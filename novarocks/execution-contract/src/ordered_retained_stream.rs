@@ -24,6 +24,8 @@
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 
+pub mod exchange;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetainedStreamWindow {
     data_positions: NonZeroUsize,

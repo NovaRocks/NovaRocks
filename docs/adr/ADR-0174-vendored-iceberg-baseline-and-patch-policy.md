@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0204
+    scope: "Ruling 2 protocol-only divergence: additionally allow bounded exact upstream Iceberg dependency backports with provenance and exit conditions"
+    link: "ADR-0204-upstream-iceberg-backports-and-provider-suspension.md"
   - id: ADR-0179
     scope: "P2 terminal builder exit and U4 Hadoop directory-discovery handoff to IRU-6c; unrelated baseline and patch policies remain active"
     link: "ADR-0179-iceberg-publication-lifecycle-and-evidence.md"

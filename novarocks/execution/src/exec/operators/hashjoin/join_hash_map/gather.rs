@@ -343,7 +343,7 @@ fn preflight_filter_columns(
     columns: usize,
 ) -> Result<(), JoinGatherError> {
     work(owner, columns)?;
-    // Arrow 58.4 FilterPredicate::filter_record_batch collects Result<Vec<_>>.
+    // Arrow 60.1.0 FilterPredicate::filter_record_batch collects Result<Vec<_>>.
     // Rust 1.98 GenericShunt has lower size_hint 0; nonempty Arc items use the
     // Vec minimum capacity 4 and geometric doubling. This opaque upper covers
     // only that column vector, excluding FilterBuilder and array payload.

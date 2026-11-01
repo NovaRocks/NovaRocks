@@ -153,13 +153,10 @@ fn pool_with_type(array: &ArrayRef, source: FunctionValueType) -> ConstantPool {
                 .try_to_field("original-collection")
                 .unwrap()
                 .with_data_type(array.data_type().clone())
-                .with_metadata(
-                    [(
-                        "source-note".into(),
-                        "original pool and selected ordinal".into(),
-                    )]
-                    .into(),
-                ),
+                .with_metadata(std::collections::HashMap::<String, String>::from([(
+                    "source-note".into(),
+                    "original pool and selected ordinal".into(),
+                )])),
         ),
         source,
         array.to_data(),
@@ -181,8 +178,12 @@ fn list(nullable: bool) -> ArrayRef {
     let raw: ArrayRef = Arc::new(
         ListArray::try_new(
             Arc::new(
-                Field::new("authored-item", DataType::Int32, true)
-                    .with_metadata([("unknown-child-fact".into(), "preserved".into())].into()),
+                Field::new("authored-item", DataType::Int32, true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "unknown-child-fact".into(),
+                        "preserved".into(),
+                    )]),
+                ),
             ),
             OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 3, 5, 6])),
             values,
@@ -201,18 +202,24 @@ fn map(nullable: bool, sorted: bool) -> ArrayRef {
     let values: ArrayRef = Arc::new(Int32Array::from(vec![None, Some(20), None, None, Some(50)]));
     let fields = vec![
         Arc::new(Field::new("key", DataType::Int32, false)),
-        Arc::new(
-            Field::new("value", DataType::Int32, true)
-                .with_metadata([("value-fact".into(), "NULL values still count".into())].into()),
-        ),
+        Arc::new(Field::new("value", DataType::Int32, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "value-fact".into(),
+                "NULL values still count".into(),
+            )]),
+        )),
     ]
     .into();
     let entries = StructArray::new(fields, vec![keys, values], None);
     let raw: ArrayRef = Arc::new(
         MapArray::try_new(
             Arc::new(
-                Field::new("actual-entries", entries.data_type().clone(), false)
-                    .with_metadata([("entry-fact".into(), "original".into())].into()),
+                Field::new("actual-entries", entries.data_type().clone(), false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "entry-fact".into(),
+                        "original".into(),
+                    )]),
+                ),
             ),
             OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2, 4, 5])),
             entries,
@@ -268,7 +275,7 @@ fn rich_list(dict_id: i64, ordered: bool) -> ArrayRef {
     ));
     let json_field = json.try_to_field("json-child").unwrap();
     let mut metadata = json_field.metadata().clone();
-    metadata.insert("unknown-json-fact".into(), "kept".into());
+    metadata.insert("unknown-json-fact".to_owned(), "kept".to_owned());
     let fields = vec![
         Arc::new(json_field.with_metadata(metadata)),
         Arc::new(large.try_to_field("large-child").unwrap()),
@@ -294,8 +301,12 @@ fn rich_list(dict_id: i64, ordered: bool) -> ArrayRef {
     Arc::new(
         ListArray::try_new(
             Arc::new(
-                Field::new("named-struct-item", values.data_type().clone(), true)
-                    .with_metadata([("unknown-struct-fact".into(), "preserved".into())].into()),
+                Field::new("named-struct-item", values.data_type().clone(), true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "unknown-struct-fact".into(),
+                        "preserved".into(),
+                    )]),
+                ),
             ),
             OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2, 4])),
             values,
@@ -743,7 +754,10 @@ fn cardinality_complete_dictionary_field_identity_and_unknown_metadata_are_not_a
     };
     // Only the unknown outer item metadata changes. All descendants, including
     // the dictionary ID/order and nominal tags, remain the same borrowed Fields.
-    let changed_item_metadata = item.as_ref().clone().with_metadata(Default::default());
+    let changed_item_metadata = item
+        .as_ref()
+        .clone()
+        .with_metadata(arrow_schema::Metadata::default());
     let lost_unknown = FunctionValueType::from_legacy_declared_projection(
         DataType::List(Arc::new(changed_item_metadata)),
         false,

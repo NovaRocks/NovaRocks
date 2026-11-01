@@ -205,6 +205,8 @@ pub enum ExchangeEdgeGateError {
     /// Two edges, or one edge twice, froze the same destination. One edge's
     /// decision would then silently reach another's destination.
     DestinationClaimedTwice(ExchangeDestinationKey),
+    /// A close must name an actual member of this producer's frozen set.
+    UnfrozenDestination(ExchangeDestinationKey),
 }
 
 impl fmt::Display for ExchangeEdgeGateError {
@@ -220,6 +222,12 @@ impl fmt::Display for ExchangeEdgeGateError {
                 formatter,
                 "exchange destination {key} is claimed by more than one outbound edge"
             ),
+            Self::UnfrozenDestination(key) => {
+                write!(
+                    formatter,
+                    "exchange destination {key} is not frozen by this producer"
+                )
+            }
         }
     }
 }
@@ -235,6 +243,7 @@ impl novarocks_failure_contract::FailureProjection for ExchangeEdgeGateError {
                 Self::DuplicateEdge(_) => R::ExchangeDuplicateFrozenEdge,
                 Self::EdgeWithoutDestinations(_) => R::ExchangeEdgeWithoutDestinations,
                 Self::DestinationClaimedTwice(_) => R::ExchangeDestinationClaimedTwice,
+                Self::UnfrozenDestination(_) => R::ExchangeStreamContract,
             }
             .reason(),
         )
@@ -456,6 +465,23 @@ impl ExchangeEdgeGates {
     /// implicit permission: the caller must fail closed.
     pub fn gate_for_destination(&self, key: ExchangeDestinationKey) -> Option<&Arc<EdgeSendGate>> {
         self.destinations.get(&key)
+    }
+
+    /// Withdraw one exact destination's input and wake every bound driver.
+    /// This says nothing about Task/context route retirement or consumption.
+    pub fn close_destination_normally(
+        &self,
+        key: ExchangeDestinationKey,
+    ) -> Result<bool, ExchangeEdgeGateError> {
+        let gate = self
+            .destinations
+            .get(&key)
+            .ok_or(ExchangeEdgeGateError::UnfrozenDestination(key))?;
+        let changed = gate.close_for_normal_cancellation();
+        if changed {
+            self.notify_open_waiters();
+        }
+        Ok(changed)
     }
 
     pub fn edges(&self) -> impl Iterator<Item = (ExchangeEdgeId, EdgeSendState)> + '_ {

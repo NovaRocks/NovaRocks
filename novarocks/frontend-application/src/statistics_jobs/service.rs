@@ -835,7 +835,11 @@ impl novarocks_query_application::session_control::GovernedStatementAction
             .value
         {
             application::StatisticsApplicationResult::JobSubmitted(_) => {
-                Poll::Ready(Ok(StatementActionValue::Ok))
+                Poll::Ready(Ok(StatementActionValue::Ok(
+                    novarocks_query_application::session_control::StatementCommandCompletion::new(
+                        0,
+                    ),
+                )))
             }
             _ => Poll::Ready(Err(error(
                 "statistics submission produced a foreign result".into(),

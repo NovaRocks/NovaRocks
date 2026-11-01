@@ -69,8 +69,8 @@ endpoint 的 heartbeat 必须返回完全相同的 descriptor，才允许新查�
 
 Data 与 Control 使用同一个准确 advertised host；可选 `[cluster].advertise_control_port`
 单独指定 Control 外部端口，未配置时等于显式的 Control bind 端口。若本地也使用 NAT，
-两条端口映射必须分别正确。BE 还必须配置本地 connector object-store binding。Paimon 查询要求 FE 与 BE 的 binding
-指向同一 warehouse 访问域。两份配置在同一进程共享 logging 与 data-runtime
+两条端口映射必须分别正确。BE 还必须配置本地 connector object-store binding。Paimon 读取恢复后，FE 与 BE 的 binding
+仍须指向同一 warehouse 访问域。两份配置在同一进程共享 logging 与 data-runtime
 sizing，其他 role-local 字段各自生效。
 
 两份正常角色配置都可包含 `[runtime.native_ingress]`：FE 只使用
@@ -179,8 +179,11 @@ cargo run -p novarocks-server -- standalone --role all-in-one \
 Data/Control/management 五个不冲突 listener port，并另外配置 MySQL 与 Trino 客户端端口。Trino 端口通过 `NOVA_ENV_TRINO_PORT` 导出；不要
 猜测端口或重用旧的 standalone config 环境变量。
 
-Paimon 本地 fixture 和支持矩阵见 [Paimon 只读 Connector](../connectors/paimon.md)。
-当前 Server 的封闭 provider 集合只有 Iceberg 与 Paimon；旧
+当前 Server 的封闭 provider manifest 保留 Iceberg 与 Paimon。Paimon catalog 配置与
+投影保留，目录和读取操作返回 `Unsupported`，不进入 pure catalogue。恢复须等待
+paimon-rust 及其依赖支持 Arrow 60 与 zstd 0.14，并重新满足 ADR-0138 的授权读取边界；
+见 [ADR-0204](../../adr/ADR-0204-upstream-iceberg-backports-and-provider-suspension.md) 与
+[Paimon Connector（读取暂停）](../connectors/paimon.md) 中保留的历史 fixture 和支持矩阵。旧
 `[connector.starrocks]` 配置会在解析阶段明确失败。
 
 ## 停止与排障

@@ -39,16 +39,6 @@ use std::{
 
 const EOS: [u8; 8] = [255, 255, 255, 255, 0, 0, 0, 0];
 
-#[test]
-#[allow(deprecated)] // Its argument type is the public opaque layout seam; no constructor is called.
-fn public_buffer_constructor_exposes_opaque_owner_layout_without_allocation() {
-    fn argument_layout<T>(_: fn(T) -> arrow_buffer::Buffer) -> std::alloc::Layout {
-        std::alloc::Layout::new::<T>()
-    }
-    let layout = argument_layout(arrow_buffer::Buffer::from_bytes);
-    assert!(layout.size() >= 5 * std::mem::size_of::<usize>());
-    assert!(layout.align() >= std::mem::align_of::<usize>());
-}
 const CAUSES: [CompileControlError; 3] = [
     CompileControlError::Cancelled,
     CompileControlError::DeadlineExceeded,
@@ -483,9 +473,8 @@ fn complete_source_fields_are_exact_without_fabricating_logical_identity() {
     }
     ordinary(&stream(array.clone(), &plain, 8), &json, limits());
     ordinary(&stream(array, &json, 8), &plain, limits());
-    let binary: ArrayRef = Arc::new(FixedSizeBinaryArray::from(vec![
-        b"0123456789abcdef".as_slice(),
-    ]));
+    let binary: ArrayRef =
+        Arc::new(FixedSizeBinaryArray::try_from(vec![b"0123456789abcdef".as_slice()]).unwrap());
     let field = Field::new("source", DataType::FixedSizeBinary(16), true);
     let input = stream(binary, &field, 8);
     let control = Control::good();

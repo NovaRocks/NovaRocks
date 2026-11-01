@@ -165,7 +165,10 @@ fn count_then_copy_preserves_dictionary_and_detaches_nested_metadata() {
     };
     assert!(!Arc::ptr_eq(&fields[0], &child));
     assert!(crate::arrow_fields_exact(&fields[0], &child));
-    assert!(fields[0].metadata().capacity() < child.metadata().capacity());
+    assert!(!Arc::ptr_eq(
+        fields[0].metadata().as_arc().unwrap(),
+        child.metadata().as_arc().unwrap()
+    ));
     assert_eq!(fields[0].metadata()["opaque"].capacity(), 64 * 1024);
 }
 #[test]
@@ -302,24 +305,35 @@ fn original_contract_errors_remain_provider_errors_with_caller_owned_footer() {
     assert_eq!(control.trace.lock().unwrap().len(), before + 1);
 }
 #[test]
-fn original_union_identity_author_runs_after_child_copy_without_a_shadow_gate() {
-    let fields: UnionFields = [
-        (1, Arc::new(Field::new("a", DataType::Int32, false))),
-        (1, Arc::new(Field::new("b", DataType::Int32, false))),
-    ]
-    .into_iter()
-    .collect();
+fn public_union_identity_gate_and_original_valid_child_copy_remain_distinct() {
+    let error = UnionFields::try_new(
+        [1, 1],
+        [
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ],
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Invalid argument error: duplicate type id: 1"
+    );
+    let children = [
+        Arc::new(Field::new("a", DataType::Int32, false)),
+        Arc::new(Field::new("b", DataType::Int32, false)),
+    ];
+    let fields = UnionFields::try_new([1, 127], children.clone()).unwrap();
     let input = ConnectorWriteInputShape::Data {
         fields: vec![field(1, DataType::Union(fields, UnionMode::Dense))],
     };
     let (binding, payload) = envelope();
     let expected =
         ConnectorWriteRecipeDraft::try_new(binding.clone(), payload.clone(), input.clone())
-            .unwrap_err();
+            .unwrap();
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::ProviderValidation).unwrap();
     let mut facts = WriterOwnedResourceFacts::default();
-    let failure = ConnectorWriteRecipeDraft::try_new_observed(
+    let actual = ConnectorWriteRecipeDraft::try_new_observed(
         &binding,
         &payload,
         &input,
@@ -330,17 +344,28 @@ fn original_union_identity_author_runs_after_child_copy_without_a_shadow_gate() 
         },
         &mut work,
     )
-    .unwrap_err();
-    let PureProviderCompileError::Provider(error) = failure else {
-        panic!()
-    };
-    assert_eq!(error, expected);
-    assert_eq!(
-        error.message(),
-        "frozen schema has invalid union field identities"
-    );
+    .unwrap();
+    work.finish().unwrap();
+    assert_eq!(actual.input(), expected.input());
+    assert_eq!(actual.input(), &input);
     assert!(facts.allocation_requests > 20);
+    let DataType::Union(copied, _) = actual
+        .input()
+        .fields_iter()
+        .next()
+        .unwrap()
+        .field()
+        .data_type()
+    else {
+        panic!("Union carrier")
+    };
+    for ((id, copied), original) in copied.iter().zip(&children) {
+        assert!(matches!(id, 1 | 127));
+        assert!(crate::arrow_fields_exact(copied, original));
+        assert!(!Arc::ptr_eq(copied, original));
+    }
 }
+
 #[test]
 fn deleted_empty_metadata_uses_real_constant_iteration_work() {
     let mut deleted = HashMap::with_capacity(16384);

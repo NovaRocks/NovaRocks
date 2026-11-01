@@ -41,6 +41,7 @@ pub enum ValueConstructionFailure<E> {
     Layout(LayoutResourceError),
     Vec(ControlResourceError),
     HashMap(crate::owned_resources::hashmap::HashMapResourceError),
+    BTree(crate::owned_resources::btree::BTreeResourceError),
 }
 impl<E> From<ExecutionValueTypeError> for ValueConstructionFailure<E> {
     fn from(value: ExecutionValueTypeError) -> Self {
@@ -69,12 +70,17 @@ impl<E> From<crate::owned_resources::hashmap::HashMapResourceError>
         Self::HashMap(error)
     }
 }
+impl<E> From<crate::owned_resources::btree::BTreeResourceError> for ValueConstructionFailure<E> {
+    fn from(error: crate::owned_resources::btree::BTreeResourceError) -> Self {
+        Self::BTree(error)
+    }
+}
 impl ValueConstructionFailure<std::convert::Infallible> {
     pub(crate) fn into_pure(self) -> ExecutionValueTypeError {
         match self {
             Self::ValueType(error) => error,
             Self::Observer(never) => match never {},
-            Self::Rule(_) | Self::Layout(_) | Self::Vec(_) | Self::HashMap(_) => {
+            Self::Rule(_) | Self::Layout(_) | Self::Vec(_) | Self::HashMap(_) | Self::BTree(_) => {
                 unreachable!("pure construction has no allocation model observer")
             }
         }
@@ -129,13 +135,46 @@ impl<'a, E> ValueConstruction<'a, E> {
         }
         Ok(())
     }
+    pub(crate) fn metadata_conversion(
+        &mut self,
+        entries: usize,
+        max_key_bytes: usize,
+    ) -> Result<(), ValueConstructionFailure<E>> {
+        let Some(observer) = self.observer.as_deref_mut() else {
+            return Ok(());
+        };
+        let conversion =
+            crate::owned_resources::arrow_metadata::hashmap_conversion_requests(entries)?;
+        for layout in [
+            conversion.entries_vector,
+            conversion.sort_scratch,
+            conversion.map_arc,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            observer(ValueConstructionRequest::Exact(layout))
+                .map_err(ValueConstructionFailure::Observer)?;
+        }
+        for _ in 0..conversion.tree_nodes {
+            observer(ValueConstructionRequest::OpaqueUpper(
+                conversion.tree_node.size(),
+            ))
+            .map_err(ValueConstructionFailure::Observer)?;
+        }
+        let work = crate::owned_resources::arrow_metadata::hashmap_conversion_work_upper_bound(
+            entries,
+            max_key_bytes,
+        )?;
+        observer(ValueConstructionRequest::Work(work)).map_err(ValueConstructionFailure::Observer)
+    }
     pub(crate) fn cloned_annotations(
         &mut self,
         capacity: usize,
     ) -> Result<(), ValueConstructionFailure<E>> {
         if self.observer.is_some() && capacity != 0 {
             // Strong fixed binding inputs are validated metadata-free ValueLayouts.
-            // This sibling does not model arbitrary external HashMap::clone.
+            // Sharing Metadata does not establish retention of arbitrary external annotations.
             return Err(ValueConstructionFailure::Layout(
                 LayoutResourceError::SourceModel,
             ));
@@ -192,7 +231,38 @@ impl<'a, E> ValueConstruction<'a, E> {
             )
         })
     }
-    /// Arrow58 Fields/UnionFields FromIterator consumes an Arc slice. The
+    /// Cover Arrow 60.1's unzip vectors, try_new pair vector and final Arc.
+    pub(crate) fn collected_union_fields(
+        &mut self,
+        count: usize,
+    ) -> Result<(), ValueConstructionFailure<E>> {
+        if let Some(observer) = self.observer.as_deref_mut() {
+            let work = count
+                .checked_mul(3)
+                .ok_or(LayoutResourceError::Arithmetic)?;
+            observer(ValueConstructionRequest::Work(work))
+                .map_err(ValueConstructionFailure::Observer)?;
+            let facts = crate::owned_resources::arrow_union::from_iterator_requests(count)
+                .map_err(|error| match error {
+                    crate::owned_resources::arrow_union::UnionFieldsRequestError::Vec(source) => {
+                        ValueConstructionFailure::Vec(source)
+                    }
+                    crate::owned_resources::arrow_union::UnionFieldsRequestError::Layout(
+                        source,
+                    ) => ValueConstructionFailure::Layout(source),
+                })?;
+            if facts.scratch_bytes_upper != 0 {
+                observer(ValueConstructionRequest::OpaqueUpper(
+                    facts.scratch_bytes_upper,
+                ))
+                .map_err(ValueConstructionFailure::Observer)?;
+            }
+            observer(ValueConstructionRequest::Exact(facts.final_arc))
+                .map_err(ValueConstructionFailure::Observer)?;
+        }
+        Ok(())
+    }
+    /// Fields FromIterator consumes an Arc slice. The
     /// original Rust Arc collector's possible Vec growth is a conservative
     /// scratch-operation upper, separate from its final Arc slice request.
     pub(crate) fn collected_arc_slice<T>(
@@ -225,5 +295,48 @@ pub fn clone_data_type_with_construction<E>(
     match observer {
         None => Ok(ty.clone()),
         Some(observer) => ValueConstruction::new(Some(observer)).cloned_data_type(ty),
+    }
+}
+
+#[cfg(test)]
+mod union_collection_tests {
+    use super::*;
+    use std::sync::Arc;
+    #[test]
+    fn original_union_scratch_refusal_is_primary_before_field_construction() {
+        let source = arrow_schema::DataType::Union(
+            arrow_schema::UnionFields::try_new(
+                [0],
+                [arrow_schema::Field::new(
+                    "original",
+                    arrow_schema::DataType::Int64,
+                    true,
+                )],
+            )
+            .unwrap(),
+            arrow_schema::UnionMode::Sparse,
+        );
+        let cause = Arc::new(73);
+        let mut saw_scratch = false;
+        let result = crate::ValueLayout::try_new_with_construction(
+            &source,
+            crate::ValueTypeStorageLifetime::pure(),
+            Some(&mut |event| {
+                assert!(
+                    !saw_scratch,
+                    "no callback after the original scratch refusal"
+                );
+                if matches!(event, ValueConstructionRequest::OpaqueUpper(_)) {
+                    saw_scratch = true;
+                    return Err(cause.clone());
+                }
+                Ok(())
+            }),
+        );
+        let Err(ValueConstructionFailure::Observer(actual)) = result else {
+            panic!("original observer refusal")
+        };
+        assert!(Arc::ptr_eq(&actual, &cause));
+        assert!(saw_scratch);
     }
 }

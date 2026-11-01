@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Real original UInt32 generated child indices, including i32-bit-pattern
-//! and wrapped-offset carriers. NullArray's huge logical length owns no payload.
+//! Arrow60.1 generates checked UInt32 child indices from usize offsets.
+//! NullArray permits wide logical extents without allocating value payload.
 use super::*;
 use arrow::array::{FixedSizeListArray, NullArray};
 
@@ -59,27 +59,48 @@ fn check_original_wide_fixed_list(row: usize) {
 
 #[cfg(target_pointer_width = "64")]
 #[test]
-fn by_copy_original_fixed_list_negative_i32_offset_is_original_u32_bits() {
+fn by_copy_original_fixed_list_offset_above_i32_stays_valid_u32() {
     let row = (i32::MAX as usize / 2) + 1;
     let (source, _) = original_wide_fixed_list(row);
     let source = source
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
         .unwrap();
-    assert_eq!(source.value_offset(row), i32::MIN);
-    assert_eq!(source.value_offset(row) as u32, 2_147_483_648);
+    assert_eq!(source.value_offset_at(row), 2_147_483_648);
     check_original_wide_fixed_list(row);
 }
 
 #[cfg(target_pointer_width = "64")]
 #[test]
-fn by_copy_original_fixed_list_wrapped_u32_offset_keeps_original_success() {
+fn by_copy_original_fixed_list_offset_above_u32_preserves_actual_sdk_error() {
     let row = (u32::MAX as usize).div_ceil(2);
-    let (source, _) = original_wide_fixed_list(row);
-    let source = source
+    let (source, indices) = original_wide_fixed_list(row);
+    let list = source
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
         .unwrap();
-    assert_eq!(source.value_offset(row), 0);
-    check_original_wide_fixed_list(row);
+    assert_eq!(list.value_offset_at(row), 4_294_967_296);
+    let expected = arrow::compute::take(source.as_ref(), indices.as_ref(), None).unwrap_err();
+    assert_eq!(
+        expected.to_string(),
+        "Compute error: FixedSizeList offset overflows u32"
+    );
+    let tr = tracker();
+    let host = Host::new(tr.clone(), None);
+    let control = Control::new(tr, None);
+    match take_copy_in(
+        source,
+        CopyIndices::UInt64(indices),
+        (),
+        host.clone(),
+        &control,
+    ) {
+        Err(CopyOperationError::OriginalData(actual)) => {
+            assert_eq!(actual, expected.to_string());
+            drop(actual);
+        }
+        Ok(_) => panic!("overflow must retain actual SDK error"),
+        Err(error) => panic!("unexpected error replacing SDK source: {error:?}"),
+    }
+    assert_released(&host);
 }

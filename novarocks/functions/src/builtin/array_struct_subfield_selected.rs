@@ -32,6 +32,7 @@ use std::sync::Arc;
 pub(super) fn evaluate_scoped<'a>(
     input: ScopedScalarCallInput<'_, 'a>,
     contract: &Arc<ScalarCallContract>,
+    field_ordinal: Option<usize>,
     control: &dyn KernelEvaluationControl,
     allocator: &HostAggregateAllocator,
     host: &Arc<dyn AggregateStateAllocator>,
@@ -82,11 +83,15 @@ pub(super) fn evaluate_scoped<'a>(
             &mut work,
         )
     })?;
+    let field_ordinal = field_ordinal.ok_or_else(|| {
+        crate::kernel_control::invalid("ARRAY projection has no prepared field ordinal")
+    })?;
     let actual = project_actual(
         &source,
         &names,
         scope.actual_domain(),
         contract,
+        field_ordinal,
         allocator,
         host,
         control,

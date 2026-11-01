@@ -231,13 +231,19 @@ pub fn append_observed_guarded<E>(
             before_extend(values.as_ref(), start, end - start, current)
                 .map_err(AppendFailure::Control)?;
             observe(observer, CollectionObservation::OpaqueBoundary)?;
-            mutable.extend(0, start, end);
+            mutable.try_extend(0, start, end).map_err(|source| {
+                AppendFailure::Operation(arrow_failure("array_append", ArrowSite::Extend, source))
+            })?;
             observe(observer, CollectionObservation::OpaqueBoundary)?;
             current += (end - start) as i64;
         }
         before_extend(targets.as_ref(), target_row, 1, current).map_err(AppendFailure::Control)?;
         observe(observer, CollectionObservation::OpaqueBoundary)?;
-        mutable.extend(1, target_row, target_row + 1);
+        mutable
+            .try_extend(1, target_row, target_row + 1)
+            .map_err(|source| {
+                AppendFailure::Operation(arrow_failure("array_append", ArrowSite::Extend, source))
+            })?;
         observe(observer, CollectionObservation::OpaqueBoundary)?;
         current = i64::from(next);
         out_offsets.push(current as i32);

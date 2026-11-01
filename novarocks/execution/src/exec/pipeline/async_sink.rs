@@ -1996,8 +1996,6 @@ mod tests {
             crate::runtime::ExecutionRuntime::new(
                 crate::runtime::ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    exchange_wait_ms: 120_000,
-                    exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1024,
                     exchange_max_transmit_batched_bytes: 1024,
                     operator_buffer_chunks: 1,

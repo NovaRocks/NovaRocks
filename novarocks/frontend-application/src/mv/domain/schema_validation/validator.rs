@@ -24,7 +24,9 @@
 use crate::mv::domain::refresh::schema_contract::{
     MvOccurrenceFieldRebind, validate_projection_target, validate_relation_occurrence_schema,
 };
-use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
+use crate::mv::domain::storage_observation::{
+    MvSchemaValidationObservation, MvSourceSchemaObservation,
+};
 use novarocks_mv_application::persistence::codec::RelationOccurrence;
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 
@@ -32,12 +34,20 @@ use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProject
 pub(crate) fn validate_schema_contract(
     projection: &StoredKeyedMvProjection,
     occurrence: &RelationOccurrence,
-    current_base: &MvSchemaValidationObservation,
+    current_base: &MvSourceSchemaObservation,
     current_target: &MvSchemaValidationObservation,
 ) -> Result<Vec<MvOccurrenceFieldRebind>, String> {
     require_projection_occurrence(projection, occurrence)?;
-    require_row_lineage("base", current_base)?;
-    require_row_lineage("target", current_target)?;
+    require_row_lineage(
+        "base",
+        current_base.is_format_v3(),
+        current_base.stored_row_lineage_enabled(),
+    )?;
+    require_row_lineage(
+        "target",
+        current_target.is_format_v3(),
+        current_target.stored_row_lineage_enabled(),
+    )?;
     validate_projection_target(projection, current_target)?;
     validate_relation_occurrence_schema(occurrence, current_base)
 }
@@ -46,7 +56,7 @@ pub(crate) fn validate_schema_contract(
 /// Repeated physical objects remain separate occurrences.
 pub(crate) fn validate_join_schema_contract(
     projection: &StoredKeyedMvProjection,
-    bases: &[(&RelationOccurrence, &MvSchemaValidationObservation)],
+    bases: &[(&RelationOccurrence, &MvSourceSchemaObservation)],
     current_target: &MvSchemaValidationObservation,
 ) -> Result<Vec<MvOccurrenceFieldRebind>, String> {
     let occurrences = &projection.facts.definition().relation_occurrences;
@@ -57,7 +67,11 @@ pub(crate) fn validate_join_schema_contract(
             occurrences.len()
         ));
     }
-    require_row_lineage("target", current_target)?;
+    require_row_lineage(
+        "target",
+        current_target.is_format_v3(),
+        current_target.stored_row_lineage_enabled(),
+    )?;
     validate_projection_target(projection, current_target)?;
 
     let mut renames = Vec::new();
@@ -68,7 +82,11 @@ pub(crate) fn validate_join_schema_contract(
                 expected.occurrence_id
             ));
         }
-        require_row_lineage("base", observation)?;
+        require_row_lineage(
+            "base",
+            observation.is_format_v3(),
+            observation.stored_row_lineage_enabled(),
+        )?;
         renames.extend(validate_relation_occurrence_schema(
             occurrence,
             observation,
@@ -88,7 +106,11 @@ pub(crate) fn validate_branch_id_field(
     if projection.facts.interpretation().branches.is_empty() {
         return Err("MV definition has no branch interpretation".to_string());
     }
-    require_row_lineage("target", current_target)?;
+    require_row_lineage(
+        "target",
+        current_target.is_format_v3(),
+        current_target.stored_row_lineage_enabled(),
+    )?;
     let bindings = validate_projection_target(projection, current_target)?;
     if bindings.branches.len() != projection.facts.interpretation().branches.len() {
         return Err("MV target schema does not retain every branch binding".to_string());
@@ -118,12 +140,13 @@ fn require_projection_occurrence(
 
 fn require_row_lineage(
     role: &str,
-    observation: &MvSchemaValidationObservation,
+    format_v3: bool,
+    stored_row_lineage_enabled: bool,
 ) -> Result<(), String> {
-    if !observation.is_format_v3() {
+    if !format_v3 {
         return Err(format!("MV {role} table is not Iceberg format v3"));
     }
-    if !observation.stored_row_lineage_enabled() {
+    if !stored_row_lineage_enabled {
         return Err(format!(
             "MV {role} table does not retain stored row lineage"
         ));
@@ -177,31 +200,35 @@ mod tests {
     fn source_observation(
         occurrence: &RelationOccurrence,
         rename_amount: bool,
-    ) -> MvSchemaValidationObservation {
+    ) -> MvSourceSchemaObservation {
+        source_observation_with_lineage(occurrence, rename_amount, true, true)
+    }
+    fn source_observation_with_lineage(
+        occurrence: &RelationOccurrence,
+        rename_amount: bool,
+        format_v3: bool,
+        stored_row_lineage: bool,
+    ) -> MvSourceSchemaObservation {
         let context = context();
         let fields = occurrence
             .fields
             .iter()
-            .enumerate()
-            .map(|(ordinal, field)| {
-                (
-                    ordinal as u32,
-                    MvObservedSourceField::try_new(
-                        Bytes::copy_from_slice(field.field_id.as_bytes()),
-                        if rename_amount && field.name_at_binding == "amount" {
-                            "amount_now".to_string()
-                        } else {
-                            field.name_at_binding.clone()
-                        },
-                        field.type_signature.clone(),
-                        field.nullable,
-                    )
-                    .unwrap(),
+            .map(|field| {
+                MvObservedSourceField::try_new(
+                    Bytes::copy_from_slice(field.field_id.as_bytes()),
+                    if rename_amount && field.name_at_binding == "amount" {
+                        "amount_now".to_string()
+                    } else {
+                        field.name_at_binding.clone()
+                    },
+                    field.type_signature.clone(),
+                    field.nullable,
                 )
+                .unwrap()
             })
             .collect();
-        convert(
-            SpiObservation::try_new(
+        crate::mv::domain::storage_observation::source_schema_from_spi(
+            novarocks_spi::connector::MvSourceSchemaObservation::try_new(
                 ConnectorTableIdentity {
                     instance_id: ConnectorInstanceId::parse(&occurrence.catalog_at_binding)
                         .unwrap(),
@@ -212,18 +239,16 @@ mod tests {
                     &occurrence.object_id,
                 )
                 .unwrap(),
-                ConnectorCommittedVersion::try_new(Bytes::from_static(b"source-metadata"), Some(9))
-                    .unwrap(),
                 Bytes::copy_from_slice(occurrence.schema_version.as_bytes()),
-                Bytes::from_static(b"source-partition"),
-                true,
-                true,
+                format_v3,
+                stored_row_lineage,
                 fields,
-                vec![],
                 &context,
             )
             .unwrap(),
+            &context,
         )
+        .unwrap()
     }
 
     fn target_observation_with_metadata(
@@ -319,5 +344,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("exact document generation"), "{error}");
+    }
+    #[test]
+    fn source_projection_keeps_both_original_row_lineage_refusals() {
+        let projection = projection();
+        let occurrence = &projection.facts.definition().relation_occurrences[0];
+        let target = target_observation(&projection);
+        for (format, lineage, expected) in [
+            (false, false, "not Iceberg format v3"),
+            (true, false, "does not retain stored row lineage"),
+        ] {
+            let source = source_observation_with_lineage(occurrence, false, format, lineage);
+            let error =
+                validate_schema_contract(&projection, occurrence, &source, &target).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 }

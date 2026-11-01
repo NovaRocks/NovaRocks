@@ -326,55 +326,98 @@ pub(crate) fn build_attempt_schedule(
         ));
     }
 
-    #[derive(Clone, Copy)]
-    struct IncomingEdge {
-        source: u32,
-        gather: bool,
-        hash_partitioned: bool,
-    }
-    let mut incoming = BTreeMap::<u32, Vec<IncomingEdge>>::new();
+    // Placement and row partitioning answer different questions. Evaluate
+    // each frozen stage policy against this one retained backend snapshot.
+    let mut predecessors = BTreeMap::<u32, BTreeSet<u32>>::new();
+    let mut gathers = BTreeSet::new();
+    let positions = plan
+        .topological_fragment_order
+        .iter()
+        .enumerate()
+        .map(|(position, &fragment)| (fragment, position))
+        .collect::<BTreeMap<_, _>>();
     for edge in &plan.edges {
-        incoming
+        let source = positions.get(&edge.source_fragment_id);
+        let target = positions.get(&edge.target_fragment_id);
+        if !matches!((source, target), (Some(source), Some(target)) if source < target) {
+            return Err(AttemptScheduleError::new(
+                "scheduling edge violates the exact topological fragment order",
+            ));
+        }
+        predecessors
             .entry(edge.target_fragment_id)
             .or_default()
-            .push(IncomingEdge {
-                source: edge.source_fragment_id,
-                gather: edge.stream_kind == SchedulingStreamKind::Gather,
-                hash_partitioned: edge.hash_partitioned,
-            });
+            .insert(edge.source_fragment_id);
+        if edge.stream_kind == SchedulingStreamKind::Gather {
+            gathers.insert(edge.target_fragment_id);
+        }
     }
 
+    use novarocks_physical_plan::StagePlacementPolicy;
+    let anchor = fragments_by_id
+        .get(&plan.execution_anchor_fragment_id)
+        .ok_or_else(|| AttemptScheduleError::new("scheduling execution anchor is absent"))?;
+    if anchor.placement != StagePlacementPolicy::Singleton {
+        return Err(AttemptScheduleError::new(
+            "scheduling execution anchor must declare singleton placement",
+        ));
+    }
     let backend_count = backends.len();
     let mut counts = BTreeMap::<u32, usize>::new();
     for &fragment_id in &plan.topological_fragment_order {
-        let fragment = fragments_by_id.get(&fragment_id).ok_or_else(|| {
-            AttemptScheduleError::new(format!("scheduling fragment {fragment_id} is missing"))
-        })?;
-        let has_gather = incoming
-            .get(&fragment_id)
-            .is_some_and(|edges| edges.iter().any(|edge| edge.gather));
-        let count = if has_gather {
-            1
-        } else if !fragment.scans.is_empty() {
-            scan_fragment_parallelism(&fragment.scans, backend_count)
-        } else {
-            incoming
-                .get(&fragment_id)
-                .into_iter()
-                .flatten()
-                .filter(|edge| edge.hash_partitioned)
-                .filter_map(|edge| counts.get(&edge.source).copied())
-                .max()
-                .unwrap_or(1)
+        let fragment = fragments_by_id[&fragment_id];
+        if gathers.contains(&fragment_id) && fragment.placement != StagePlacementPolicy::Singleton {
+            return Err(AttemptScheduleError::new(
+                "gather input conflicts with the declared stage placement",
+            ));
+        }
+        let count = match &fragment.placement {
+            StagePlacementPolicy::Singleton => 1,
+            StagePlacementPolicy::ScanWork => {
+                if fragment.scans.is_empty() {
+                    return Err(AttemptScheduleError::new(
+                        "scan-work placement requires a declared scan",
+                    ));
+                }
+                scan_fragment_parallelism(&fragment.scans, backend_count)
+            }
+            StagePlacementPolicy::Spread { max_instances } => {
+                max_instances.map_or(backend_count, |cap| backend_count.min(cap.get() as usize))
+            }
+            StagePlacementPolicy::FollowSources { sources } => {
+                if sources.is_empty() || sources.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    return Err(AttemptScheduleError::new(
+                        "placement sources must be nonempty and strictly ordered",
+                    ));
+                }
+                let mut width = 1;
+                for source in sources {
+                    let source = source.get();
+                    if !predecessors
+                        .get(&fragment_id)
+                        .is_some_and(|set| set.contains(&source))
+                    {
+                        return Err(AttemptScheduleError::new(
+                            "placement source is not an actual predecessor",
+                        ));
+                    }
+                    let source_width = counts.get(&source).ok_or_else(|| {
+                        AttemptScheduleError::new("placement source has not been scheduled")
+                    })?;
+                    width = width.max(*source_width);
+                }
+                width
+            }
         };
+        for scan in &fragment.scans {
+            if scan.scan.fragment_id() != fragment_id {
+                return Err(AttemptScheduleError::new(
+                    "scan work belongs to a different fragment",
+                ));
+            }
+        }
         counts.insert(fragment_id, count);
     }
-    if !counts.contains_key(&plan.execution_anchor_fragment_id) {
-        return Err(AttemptScheduleError::new(
-            "scheduling execution anchor is absent",
-        ));
-    }
-    counts.insert(plan.execution_anchor_fragment_id, 1);
 
     let preferred = (execution.query_id().low() as usize) % backend_count;
     #[cfg(novarocks_dev_controls)]
@@ -757,6 +800,10 @@ impl NativeAttemptDrive {
 
 #[cfg(test)]
 mod tests {
+    mod placement {
+        use super::*;
+        include!("schedule_placement_tests.rs");
+    }
     use super::*;
     use crate::api::{FragmentSchedulingFacts, PlanSeal, SchedulingEdgeFacts};
     use novarocks_types::identity::{AttemptId, QueryId};

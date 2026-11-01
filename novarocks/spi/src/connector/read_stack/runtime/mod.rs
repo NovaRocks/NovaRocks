@@ -44,6 +44,13 @@ use crate::connector::{
 
 pub use novarocks_connector_contract::{ConnectorReadBinding, ConnectorReadRelationKind};
 
+mod source_preparation;
+pub use source_preparation::{
+    ConnectorPreparedSourceRead, ConnectorPreparedSourceReadFuture,
+    ConnectorReadSourcePreparationRequest, ConnectorReadSourceProjection,
+    ConnectorReadSourceSelection, ConnectorReadSplitPreparation,
+};
+
 #[derive(Clone)]
 struct OpaquePayload(Arc<dyn Any + Send + Sync>);
 
@@ -654,6 +661,34 @@ pub type ConnectorReadRelationPreparationFuture<'a> = std::pin::Pin<
 /// Coordinator-facing read services. They are transport neutral and never
 /// expose the concrete payload of a returned handle.
 pub trait ConnectorReadMetadata: Send + Sync {
+    fn prepare_source_read<'a>(
+        &'a self,
+        _session: &'a ConnectorSession,
+        _request: &'a ConnectorReadSourcePreparationRequest,
+        _cpu: &'a Arc<dyn crate::connector::ProviderMetadataCpuPort>,
+        _original: &'a crate::connector::ConnectorOriginalResultScope,
+        _owner: &'a mut Option<crate::connector::ConnectorProcessLocalPayload>,
+    ) -> ConnectorPreparedSourceReadFuture<'a> {
+        Box::pin(async {
+            Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "read generation does not prepare frozen source reads",
+            ))
+        })
+    }
+
+    fn project_prepared_source_read(
+        &self,
+        _session: &ConnectorSession,
+        _source: &ConnectorPreparedSourceRead,
+        _projection: ConnectorReadSourceProjection,
+    ) -> Result<ConnectorReadTableHandle, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "read generation does not project frozen source reads",
+        ))
+    }
+
     fn prepare_relation<'a>(
         &'a self,
         _session: &'a ConnectorSession,
@@ -1009,6 +1044,13 @@ impl ConnectorReadAttemptAccessMint {
 /// Reacquires only request-scoped access for one immutable scan. It cannot
 /// renegotiate projection, predicate, limit, snapshot, or relation identity.
 pub trait ConnectorReadAttemptAccessReacquirer: Send + Sync {
+    /// Fact sealed with this exact read, not inferred from its relation kind.
+    /// Prepared-source reads need the original metadata CPU/scope packet;
+    /// ordinary reads retain their existing execution preparation contract.
+    fn requires_metadata_split_preparation(&self) -> bool {
+        false
+    }
+
     fn for_attempt<'a>(
         &'a self,
         request: &'a ConnectorAttemptContext,
@@ -1064,6 +1106,10 @@ impl ConnectorReadAttemptAccessSource {
 
     pub const fn frozen(&self) -> &ConnectorReadTableHandle {
         &self.frozen
+    }
+
+    pub fn requires_metadata_split_preparation(&self) -> bool {
+        self.reacquirer.requires_metadata_split_preparation()
     }
 
     pub(crate) async fn for_attempt(
@@ -1189,6 +1235,7 @@ pub struct ConnectorReadSplitOpenRequest {
     dynamic_filter_columns: BTreeSet<ConnectorReadColumnHandle>,
     constraint: ConnectorReadConstraint,
     table: ConnectorReadTableHandle,
+    preparation: Option<ConnectorReadSplitPreparation>,
 }
 impl ConnectorReadSplitOpenRequest {
     pub const fn new(
@@ -1204,7 +1251,12 @@ impl ConnectorReadSplitOpenRequest {
             columns,
             dynamic_filter_columns,
             constraint,
+            preparation: None,
         }
+    }
+    pub fn with_source_preparation(mut self, preparation: ConnectorReadSplitPreparation) -> Self {
+        self.preparation = Some(preparation);
+        self
     }
     pub(crate) fn into_parts(
         self,
@@ -1214,6 +1266,7 @@ impl ConnectorReadSplitOpenRequest {
         Vec<ConnectorReadAssignment>,
         BTreeSet<ConnectorReadColumnHandle>,
         ConnectorReadConstraint,
+        Option<ConnectorReadSplitPreparation>,
     ) {
         (
             self.session,
@@ -1221,6 +1274,7 @@ impl ConnectorReadSplitOpenRequest {
             self.columns,
             self.dynamic_filter_columns,
             self.constraint,
+            self.preparation,
         )
     }
 }
@@ -1229,7 +1283,14 @@ pub type ConnectorReadSplitOpenFuture =
 
 pub trait ConnectorReadSplitManager: Send + Sync {
     fn binding(&self) -> &ConnectorReadBinding;
-    fn get_splits(&self, request: ConnectorReadSplitOpenRequest) -> ConnectorReadSplitOpenFuture;
+    /// Install any Provider opening source into the caller's stable slot
+    /// before returning its borrowing Future. The caller retains that source
+    /// through raw receipt, actual CPU/IO exit and foreign Future Drop.
+    fn get_splits(
+        &self,
+        request: ConnectorReadSplitOpenRequest,
+        original_owner: &mut Option<crate::connector::ConnectorProcessLocalPayload>,
+    ) -> ConnectorReadSplitOpenFuture;
 }
 
 /// A role-local lease that keeps one exact read-control registration alive.
@@ -1353,6 +1414,12 @@ pub(crate) fn split_handle<T: Send + Sync + 'static>(
 
 pub(crate) fn table_value<T: 'static>(handle: &ConnectorReadTableHandle) -> Option<&T> {
     handle.payload.downcast_ref()
+}
+
+pub(crate) fn shared_table_value<T: Send + Sync + 'static>(
+    handle: &ConnectorReadTableHandle,
+) -> Option<Arc<T>> {
+    handle.payload.0.clone().downcast::<T>().ok()
 }
 
 pub(crate) fn transaction_value<T: 'static>(handle: &ConnectorReadTransactionHandle) -> Option<&T> {

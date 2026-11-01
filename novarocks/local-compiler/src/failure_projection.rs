@@ -76,6 +76,7 @@ impl FailureProjection for crate::expressions::ExpressionLoweringError {
     fn failure_fact(&self) -> FailureFact {
         match self {
             Self::Construction(source) => source.failure_fact(),
+            Self::BTree(source) => source.failure_fact(),
             Self::Publication(source) => source.failure_fact(),
             Self::Control(source) => source.failure_fact(),
             Self::Constant(source) => source.failure_fact(),

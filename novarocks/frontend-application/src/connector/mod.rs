@@ -20,7 +20,6 @@ pub mod cleanup_maintenance;
 pub mod data_mutation;
 pub mod metadata_maintenance;
 pub mod mutation;
-pub mod scan_admission;
 pub mod unified_statistics;
 pub mod write_target;
 

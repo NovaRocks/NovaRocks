@@ -783,11 +783,19 @@ impl MvTestControls {
             .grant
             .claim_once(self.process)
             .map_err(|e| e.to_string())?;
-        let (fact, public_message) = match decision.compile_control_error() {
-            Some(CompileControlError::Source(source)) => {
-                let fact = source.failure_fact();
+        // The Source identity is the original typed failure origin. Native
+        // execution facts remain distinct from compiler-control Source errors.
+        let original_fact = decision
+            .execution_failure()
+            .map(|input| input.fact())
+            .or_else(|| match decision.compile_control_error() {
+                Some(CompileControlError::Source(source)) => Some(source.failure_fact()),
+                _ => None,
+            });
+        let (fact, public_message) = match original_fact {
+            Some(fact) => {
                 // SafeDetail is bounded, not a redactor. Do not copy arbitrary
-                // Source text into a new artifact; existing role logs retain it.
+                // original execution/Source text into a new artifact.
                 let input = ExecutionFailureInput::new(
                     fact,
                     novarocks_execution_contract::SafeDetail::truncating(
@@ -800,7 +808,7 @@ impl MvTestControls {
                     Some(input.user_error().to_string()),
                 )
             }
-            _ => (None, None),
+            None => (None, None),
         };
         let cancellation = action.grant.cancellation();
         let document = serde_json::json!({
@@ -1102,7 +1110,11 @@ fn parse_action(value: &serde_json::Value) -> Result<Action, String> {
             let phase = text("phase")?;
             if !matches!(
                 phase,
-                "data-prepared" | "write-committed" | "publication-committed"
+                "source-pinned"
+                    | "source-prepared"
+                    | "data-prepared"
+                    | "write-committed"
+                    | "publication-committed"
             ) {
                 return Err("MV recovery grant has invalid phase".into());
             }
@@ -1383,6 +1395,75 @@ pub(crate) mod tests {
             )
             .unwrap()
         }
+        #[test]
+        fn original_native_execution_fact_roundtrips_through_authorized_scheduler_outcome() {
+            use novarocks_mv_application::{
+                scheduler::MvSchedulerConfig,
+                scheduler_runtime::{MvRefreshDisposition, MvRefreshSchedulerRuntime},
+            };
+            use novarocks_query_application::execution_error::{
+                ExecutionFailureInput, ExecutionFailureSite,
+            };
+            for original in [
+                novarocks_local_compiler::FragmentCompileError::Unsupported {
+                    node: Some(novarocks_physical_plan::NodeId::new(2)),
+                    feature: "private Native capability diagnostic",
+                },
+                novarocks_local_compiler::FragmentCompileError::Invalid(
+                    "unsupported private text must not choose a capability identity",
+                ),
+            ] {
+                let input = ExecutionFailureInput::new(
+                    original.failure_fact(),
+                    novarocks_execution_contract::SafeDetail::truncating(
+                        "private original Native execution diagnostic",
+                    ),
+                    ExecutionFailureSite::Coordinator,
+                );
+                let mut scheduler = MvRefreshSchedulerRuntime::<i64, ()>::new(
+                    MvSchedulerConfig::new(true, 1, 1, 10, 40),
+                );
+                let decision = scheduler.record(
+                    &7,
+                    MvRefreshDisposition::InvariantViolation(
+                        MvRefreshFailure::new("private scheduler detail", None)
+                            .with_execution_failure(Some(input.clone())),
+                    ),
+                    100,
+                );
+                assert_eq!(decision.execution_failure(), Some(&input));
+                assert_eq!(decision.compile_control_error(), None);
+                let fixture = Fixture::new();
+                fixture
+                    .controls
+                    .scheduler_request_completed(fixture.admit(&Fixture::source()), &decision)
+                    .unwrap();
+                let record = fixture.record();
+                assert_eq!(record["failure_identity"], "Source");
+                assert_eq!(fact(&record), input.fact());
+                let safe = ExecutionFailureInput::new(
+                    input.fact(),
+                    novarocks_execution_contract::SafeDetail::truncating(
+                        "MV scheduler request blocked; source diagnostic retained in FE role logs",
+                    ),
+                    ExecutionFailureSite::Coordinator,
+                );
+                assert_eq!(record["public_message"], safe.user_error().to_string());
+                assert!(!record.to_string().contains("private"));
+                assert_eq!(record["actual_task_attempt"], "NOT_OBSERVED");
+                assert_eq!(record["actual_publication_attempt"], "NOT_OBSERVED");
+            }
+            let fixture = Fixture::new();
+            fixture
+                .controls
+                .scheduler_request_completed(fixture.admit(&Fixture::source()), &blocked(None))
+                .unwrap();
+            let record = fixture.record();
+            assert_eq!(record["failure_identity"], "UNKNOWN");
+            assert!(record["failure_fact"].is_null());
+            assert!(record["public_message"].is_null());
+        }
+
         #[test]
         fn actual_admission_success_and_transient_do_not_consume_later_blocked_slot() {
             let fixture = Fixture::new();

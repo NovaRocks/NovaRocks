@@ -4,6 +4,7 @@ pub mod cache;
 pub mod dispatch_metrics;
 pub mod endpoint;
 pub mod exchange;
+pub mod exchange_slots;
 pub mod exec_env;
 pub mod execution_health;
 pub mod execution_runtime;
@@ -25,6 +26,8 @@ pub mod scan_stream_metrics;
 pub mod table_writer_metrics;
 pub mod task_control;
 pub(crate) mod tracked_state_allocator;
+#[cfg(novarocks_dev_controls)]
+pub(crate) mod writer_diagnostics;
 
 pub use execution_runtime::{
     ExecutionRuntime, ExecutionRuntimeConfig, ExecutionRuntimeConfigError,

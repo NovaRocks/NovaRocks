@@ -172,8 +172,15 @@ pub(crate) fn native_tuple_hashes_observed(
             return Err(invariant(ValueViolation::Bounds));
         }
         if needs_nested_normalization(array, ty) {
-            let normalized =
-                normalize_nested_selected(array, ty, selected, conversions, owner, checkpoint)?;
+            let normalized = normalize_nested_selected(
+                array,
+                ty,
+                selected,
+                conversions,
+                owner,
+                checkpoint,
+                novarocks_value_arrays::hydrate::HydrateOptions::default(),
+            )?;
             request::<Option<u64>>(owner, normalized.rows.len())?;
             let mut compact = normalized
                 .rows
@@ -297,7 +304,7 @@ fn append_native_column(
             let Some(accumulator) = hash.as_mut() else {
                 continue;
             };
-            if array.is_null(row) && !ty.nullable() {
+            if normalized_root_is_null(array.as_ref(), row) && !ty.nullable() {
                 return Err(invariant(ValueViolation::RequiredNull));
             }
             let leaf = primitive_hash(array, row, checkpoint)?;
@@ -305,6 +312,13 @@ fn append_native_column(
         }
     }
     Ok(())
+}
+
+/// Only for physical roots after encoded byte sources have been decoded by
+/// their original author. Arrow NullArray has no validity buffer, so is_null
+/// alone does not express the logical NULL of that carrier.
+pub(crate) fn normalized_root_is_null(array: &dyn arrow::array::Array, row: usize) -> bool {
+    matches!(array.data_type(), DataType::Null) || array.is_null(row)
 }
 
 struct NormalizedNested {
@@ -326,9 +340,10 @@ fn normalize_nested_selected(
     conversions: &mut ValueConversionContext,
     owner: &dyn InputConstructionOwner,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    options: novarocks_value_arrays::hydrate::HydrateOptions,
 ) -> ExecutionResult<NormalizedNested> {
     use novarocks_functions::selected_copy::{self, CopyConstructionError, CopyIndexView};
-    use novarocks_value_arrays::hydrate::{HydrateOptions, HydratePlan};
+    use novarocks_value_arrays::hydrate::HydratePlan;
     request::<usize>(owner, selected.len())?;
     request::<u32>(owner, selected.len())?;
     request::<usize>(owner, selected.len())?;
@@ -410,7 +425,7 @@ fn normalize_nested_selected(
     let plan = HydratePlan::plan_with_options_and_storage_observed(
         &compact,
         ty.typed_binding(),
-        HydrateOptions::default(),
+        options,
         conversions,
         &storage,
         &mut |_, _| false,
@@ -612,21 +627,80 @@ fn hash_native_list(
 /// Source-backed byte views plus the original canonical primitive/nested
 /// encoder. Tuple framing belongs to this consumer; retained keys own only
 /// their canonical bytes, never a newly published Arrow array per key.
-pub(crate) struct CanonicalTupleBatch<'a> {
-    arrays: &'a [ArrayRef],
+/// Owns only prepared columns and their original finite custody. It can move
+/// into an immutable input page without keeping references into that page.
+pub(crate) struct CanonicalTupleStorage {
     bytes: Vec<Option<DecodedBytes>>,
     normalized: Vec<Option<NormalizedNested>>,
     _storage: ValueTypeStorageLifetime,
 }
+impl CanonicalTupleStorage {
+    pub(crate) fn view<'a>(&'a self, arrays: &'a [ArrayRef]) -> CanonicalTupleView<'a> {
+        CanonicalTupleView {
+            arrays,
+            storage: self,
+        }
+    }
+    pub(crate) fn decoded_component(&self, column: usize) -> Option<&DecodedBytes> {
+        self.bytes.get(column).and_then(Option::as_ref)
+    }
+}
+pub(crate) struct CanonicalTupleView<'a> {
+    arrays: &'a [ArrayRef],
+    storage: &'a CanonicalTupleStorage,
+}
+pub(crate) struct CanonicalTupleBatch<'a> {
+    arrays: &'a [ArrayRef],
+    storage: CanonicalTupleStorage,
+}
 impl CanonicalTupleBatch<'_> {
+    pub(crate) fn into_storage(self) -> CanonicalTupleStorage {
+        self.storage
+    }
+    pub(crate) fn string_component(
+        &self,
+        column: usize,
+        row: usize,
+    ) -> ExecutionResult<Option<Option<&str>>> {
+        self.storage.view(self.arrays).string_component(column, row)
+    }
+    #[cfg(test)]
+    pub(crate) fn encode_row(
+        &self,
+        row: usize,
+        allocator: super::allocation::AggregateAllocator,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<super::allocation::AggregateVec<u8>> {
+        self.storage
+            .view(self.arrays)
+            .encode_row(row, allocator, checkpoint)
+    }
+}
+impl<'a> CanonicalTupleView<'a> {
+    pub(crate) fn physical_component(
+        &self,
+        column: usize,
+    ) -> ExecutionResult<(&'a ArrayRef, Option<&'a [usize]>)> {
+        let array = self
+            .arrays
+            .get(column)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        Ok(
+            match self.storage.normalized.get(column).and_then(Option::as_ref) {
+                Some(normalized) => (&normalized.array, Some(&normalized.row_map)),
+                None => (array, None),
+            },
+        )
+    }
+
     /// Borrow an already decoded SQL STRING component for bounded diagnostics.
     /// The outer Option distinguishes non-STRING columns from logical NULL.
     pub(crate) fn string_component(
         &self,
         column: usize,
         row: usize,
-    ) -> ExecutionResult<Option<Option<&str>>> {
-        match self.bytes.get(column) {
+    ) -> ExecutionResult<Option<Option<&'a str>>> {
+        match self.storage.bytes.get(column) {
             Some(Some(decoded)) if decoded.is_utf8() => decoded
                 .string(row)
                 .map(Some)
@@ -636,10 +710,27 @@ impl CanonicalTupleBatch<'_> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn row_has_null(&self, row: usize) -> ExecutionResult<bool> {
-        for ((array, decoded), normalized) in
-            self.arrays.iter().zip(&self.bytes).zip(&self.normalized)
+        self.row_has_null_observed(row, &|| Ok(()))
+    }
+
+    pub(crate) fn row_has_null_observed(
+        &self,
+        row: usize,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<bool> {
+        checkpoint()?;
+        for (column, ((array, decoded), normalized)) in self
+            .arrays
+            .iter()
+            .zip(&self.storage.bytes)
+            .zip(&self.storage.normalized)
+            .enumerate()
         {
+            if column.is_multiple_of(256) {
+                checkpoint()?;
+            }
             let (array, row) = if let Some(normalized) = normalized {
                 (
                     &normalized.array,
@@ -657,63 +748,102 @@ impl CanonicalTupleBatch<'_> {
                     .value(row)
                     .map_err(ExecutionFailure::from_domain)?
                     .is_none(),
-                None => array.is_null(row),
+                None => normalized_root_is_null(array.as_ref(), row),
             };
             if null {
                 return Ok(true);
             }
         }
+        checkpoint()?;
         Ok(false)
     }
 
+    #[cfg(test)]
     pub(crate) fn encode_row(
         &self,
         row: usize,
         allocator: super::allocation::AggregateAllocator,
         checkpoint: &dyn Fn() -> ExecutionResult<()>,
     ) -> ExecutionResult<super::allocation::AggregateVec<u8>> {
-        use super::allocation::AggregateVec;
-        let mut key = AggregateVec::new_in(allocator.clone());
-        for ((array, decoded), normalized) in
-            self.arrays.iter().zip(&self.bytes).zip(&self.normalized)
-        {
-            let (array, row) = if let Some(normalized) = normalized {
-                (
-                    &normalized.array,
-                    *normalized
-                        .row_map
-                        .get(row)
-                        .filter(|&&row| row != usize::MAX)
-                        .ok_or_else(|| invariant(ValueViolation::Bounds))?,
-                )
-            } else {
-                (array, row)
-            };
-            checkpoint()?;
-            if let Some(decoded) = decoded {
-                let value = decoded.value(row).map_err(ExecutionFailure::from_domain)?;
-                let count = value.map_or(1, |bytes| 9usize.saturating_add(bytes.len()));
-                key.try_reserve_exact(count).map_err(|source| {
-                    allocator.allocation_error("reserve canonical tuple bytes", source)
-                })?;
-                if let Some(bytes) = value {
-                    key.push(1);
-                    key.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-                    // Keep large-value work observable without a second codec.
-                    for part in bytes.chunks(64 * 1024) {
-                        checkpoint()?;
-                        key.extend_from_slice(part);
-                    }
-                } else {
-                    key.push(0);
-                }
-            } else {
-                super::key_builder::append_canonical_nullable_tracked_observed(
-                    array, row, &mut key, checkpoint,
-                )?;
-            }
+        let mut key = super::allocation::AggregateVec::new_in(allocator.clone());
+        for column in 0..self.arrays.len() {
+            self.append_component(column, row, &mut key, &allocator, checkpoint)?;
         }
         Ok(key)
+    }
+
+    /// The same canonical author can encode one complex component. Local
+    /// component hashing therefore never serializes neighboring STRING values
+    /// or bypasses their V dictionary cache.
+    pub(crate) fn encode_component_row(
+        &self,
+        column: usize,
+        row: usize,
+        allocator: super::allocation::AggregateAllocator,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<super::allocation::AggregateVec<u8>> {
+        let mut key = super::allocation::AggregateVec::new_in(allocator.clone());
+        self.append_component(column, row, &mut key, &allocator, checkpoint)?;
+        Ok(key)
+    }
+
+    fn append_component(
+        &self,
+        column: usize,
+        row: usize,
+        key: &mut super::allocation::AggregateVec<u8>,
+        allocator: &super::allocation::AggregateAllocator,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
+        let array = self
+            .arrays
+            .get(column)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        let decoded = self
+            .storage
+            .bytes
+            .get(column)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        let normalized = self
+            .storage
+            .normalized
+            .get(column)
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        let (array, row) = if let Some(normalized) = normalized {
+            (
+                &normalized.array,
+                *normalized
+                    .row_map
+                    .get(row)
+                    .filter(|&&row| row != usize::MAX)
+                    .ok_or_else(|| invariant(ValueViolation::Bounds))?,
+            )
+        } else {
+            (array, row)
+        };
+        checkpoint()?;
+        if let Some(decoded) = decoded {
+            let value = decoded.value(row).map_err(ExecutionFailure::from_domain)?;
+            let count = value.map_or(1, |bytes| 9usize.saturating_add(bytes.len()));
+            key.try_reserve_exact(count).map_err(|source| {
+                allocator.allocation_error("reserve canonical tuple bytes", source)
+            })?;
+            if let Some(bytes) = value {
+                key.push(1);
+                key.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                for part in bytes.chunks(64 * 1024) {
+                    checkpoint()?;
+                    key.extend_from_slice(part);
+                }
+            } else {
+                key.push(0);
+            }
+        } else {
+            super::key_builder::append_canonical_nullable_tracked_observed(
+                array, row, key, checkpoint,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -724,6 +854,50 @@ pub(crate) fn prepare_canonical_tuple<'a>(
     conversions: &mut ValueConversionContext,
     owner: &dyn InputConstructionOwner,
     checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<CanonicalTupleBatch<'a>> {
+    prepare_canonical_tuple_with_options(
+        arrays,
+        key_types,
+        selected,
+        conversions,
+        owner,
+        checkpoint,
+        novarocks_value_arrays::hydrate::HydrateOptions::default(),
+    )
+}
+
+/// A local equality index explicitly projects same-domain byte leaves to its
+/// own frozen layout. Versioned distribution callers retain the default path.
+pub(crate) fn prepare_canonical_tuple_with_byte_layout_projection<'a>(
+    arrays: &'a [ArrayRef],
+    key_types: &[FunctionValueType],
+    selected: &ReachableRows<'_>,
+    conversions: &mut ValueConversionContext,
+    owner: &dyn InputConstructionOwner,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<CanonicalTupleBatch<'a>> {
+    prepare_canonical_tuple_with_options(
+        arrays,
+        key_types,
+        selected,
+        conversions,
+        owner,
+        checkpoint,
+        novarocks_value_arrays::hydrate::HydrateOptions {
+            projection: novarocks_value_arrays::hydrate::HydrateProjection::ExactByteLayouts,
+            ..Default::default()
+        },
+    )
+}
+
+fn prepare_canonical_tuple_with_options<'a>(
+    arrays: &'a [ArrayRef],
+    key_types: &[FunctionValueType],
+    selected: &ReachableRows<'_>,
+    conversions: &mut ValueConversionContext,
+    owner: &dyn InputConstructionOwner,
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    options: novarocks_value_arrays::hydrate::HydrateOptions,
 ) -> ExecutionResult<CanonicalTupleBatch<'a>> {
     if arrays.len() != key_types.len() || arrays.is_empty() {
         return Err(invariant(ValueViolation::Layout));
@@ -754,6 +928,7 @@ pub(crate) fn prepare_canonical_tuple<'a>(
                 conversions,
                 owner,
                 checkpoint,
+                options,
             )?)
         } else {
             None
@@ -779,30 +954,59 @@ pub(crate) fn prepare_canonical_tuple<'a>(
             }
             None
         };
-        selected
-            .for_each(&mut |row| {
-                let null = if let Some(decoded) = &decoded {
-                    decoded
-                        .value(row)
-                        .map_err(ExecutionFailure::from_domain)?
-                        .is_none()
-                } else {
-                    array.is_null(row)
-                };
-                if null && !ty.nullable() {
-                    return Err(invariant(ValueViolation::RequiredNull));
+        if let Some(decoded) = &decoded {
+            // Batch binding performs the only physical byte-layout dispatch;
+            // required-NULL checking then uses V's typed selected visitor.
+            let materialized;
+            let rows = match selected {
+                ReachableRows::Selection(rows) => *rows,
+                _ => {
+                    materialized = selected
+                        .materialize_observed(
+                            &mut |layout| owner.request(layout).map_err(ExecutionFailure::from),
+                            &mut |_| checkpoint(),
+                        )
+                        .map_err(original_failure)?;
+                    &materialized
                 }
-                checkpoint()
-            })
+            };
+            let prepared = novarocks_value_arrays::batch::PreparedBytes::new_observed(
+                decoded,
+                rows,
+                &mut |_| checkpoint(),
+            )
             .map_err(original_failure)?;
+            novarocks_value_arrays::batch::selected::visit_selected(
+                &prepared,
+                &mut |_, _, value| {
+                    if value.is_none() && !ty.nullable() {
+                        return Err(invariant(ValueViolation::RequiredNull));
+                    }
+                    Ok(())
+                },
+                &mut |_| checkpoint(),
+            )
+            .map_err(original_failure)?;
+        } else {
+            selected
+                .for_each(&mut |row| {
+                    if normalized_root_is_null(array.as_ref(), row) && !ty.nullable() {
+                        return Err(invariant(ValueViolation::RequiredNull));
+                    }
+                    checkpoint()
+                })
+                .map_err(original_failure)?;
+        }
         bytes.push(decoded);
         normalized.push(nested);
     }
     Ok(CanonicalTupleBatch {
         arrays,
-        bytes,
-        normalized,
-        _storage: storage,
+        storage: CanonicalTupleStorage {
+            bytes,
+            normalized,
+            _storage: storage,
+        },
     })
 }
 

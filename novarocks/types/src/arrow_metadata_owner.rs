@@ -19,14 +19,16 @@
 //!
 //! These receipts describe allocation provenance only, never type/semantic
 //! authority or a memory-accounting grant. There is deliberately no constructor
-//! from an arbitrary HashMap, and no mutation access after construction.
+//! from arbitrary Metadata, and no mutation access after construction.
 //! Source callers must cover the complete construction peak before building.
 
 use std::collections::HashMap;
-use std::mem::{align_of, size_of};
+use std::mem::size_of;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, FieldRef, Fields, Metadata, Schema, SchemaRef};
+use novarocks_type_contract::owned_resources::arrow_metadata::hashmap_conversion_requests;
+use novarocks_type_contract::owned_resources::hashmap::fresh_table_layout;
 
 type Entry = (String, String);
 
@@ -110,11 +112,12 @@ impl novarocks_failure_contract::FailureProjection for MetadataOwnerError {
     }
 }
 
-/// Owns a newly reserved map which has never had an entry removed. Its table
-/// history is known by construction, rather than inferred from an input map.
+/// Owns freshly constructed immutable Arrow metadata. The original fallible
+/// HashMap reservation and insertion author remains, then Arrow consumes it
+/// into a BTree and Arc; no arbitrary source gains a receipt.
 #[derive(Debug)]
 pub struct ArrowMetadataOwner {
-    metadata: HashMap<String, String>,
+    metadata: Metadata,
     backing_bytes: usize,
     construction_bytes: usize,
 }
@@ -129,7 +132,7 @@ impl ArrowMetadataOwner {
         if entries.len() > limits.entries {
             return Err(MetadataOwnerError::CapacityExceeded);
         }
-        let table = requested_table_bytes(entries.len())?;
+        let table = requested_metadata_bytes(entries.len())?;
         let vector = entries
             .capacity()
             .checked_mul(size_of::<Entry>())
@@ -153,27 +156,22 @@ impl ArrowMetadataOwner {
         limits: MetadataOwnerLimits,
     ) -> Result<Self, MetadataOwnerError> {
         let construction_bytes = Self::preflight(&entries, limits)?;
-        let mut metadata = HashMap::new();
-        metadata
+        let mut values = HashMap::new();
+        values
             .try_reserve(entries.len())
             .map_err(MetadataOwnerError::allocation_failed)?;
         for (key, value) in entries {
-            if metadata.insert(key, value).is_some() {
+            if values.insert(key, value).is_some() {
                 return Err(MetadataOwnerError::DuplicateKey);
             }
         }
-        // This map is our own fresh, never-deleted table. Only that invariant
-        // permits deriving buckets from its post-construction capacity.
-        let buckets = if metadata.capacity() == 0 {
-            0
-        } else {
-            metadata
-                .capacity()
-                .checked_add(1)
-                .and_then(usize::checked_next_power_of_two)
-                .ok_or(MetadataOwnerError::CapacityExceeded)?
-        };
-        let mut backing_bytes = table_bytes(buckets)?;
+        // Arrow 60 moves this exact original staging map through its own
+        // collect/sort/BTree/Arc conversion. All temporary and retained requests
+        // were covered before the original fallible reserve; no text is copied.
+        let mut backing_bytes = hashmap_conversion_requests(values.len())
+            .and_then(|requests| requests.retained_backing_upper_bound())
+            .map_err(|_| MetadataOwnerError::CapacityExceeded)?;
+        let metadata = Metadata::from(values);
         for (key, value) in &metadata {
             backing_bytes = checked_add(backing_bytes, key.capacity())?;
             backing_bytes = checked_add(backing_bytes, value.capacity())?;
@@ -188,7 +186,7 @@ impl ArrowMetadataOwner {
         })
     }
 
-    pub fn metadata(&self) -> &HashMap<String, String> {
+    pub fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 
@@ -198,8 +196,8 @@ impl ArrowMetadataOwner {
         self.backing_bytes
     }
 
-    /// Heap peak of source Vec backing, its moved String heaps and fresh table.
-    /// Generating entries, inline owners and later Arc/Field/Schema/name/type
+    /// Heap peak of source Vec, moved String heaps and the original staging/conversion requests.
+    /// Generating entries, inline owners and later Field/Schema/name/type
     /// allocations remain separate caller obligations.
     pub fn construction_bytes(&self) -> usize {
         self.construction_bytes
@@ -238,7 +236,8 @@ impl ArrowMetadataOwner {
 }
 
 /// Arc clones retain the same immutable actual field owner. A structural Field
-/// clone or Arc::make_mut copy is a different owner and cannot reuse this proof.
+/// clone or Arc::make_mut copy is a different Field owner and cannot reuse this
+/// proof, even when its immutable Metadata Arc remains shared.
 #[derive(Clone, Debug)]
 /// Proves only the attached metadata table and key/value String heaps,
 /// excluding the Field/Arc/name/DataType/nested/wrapper scaffolds.
@@ -260,8 +259,8 @@ impl MetadataOwnedField {
     ) -> Result<Self, MetadataOwnerError> {
         let metadata =
             clone_known_metadata(self.field.metadata(), self.metadata_backing_bytes, limits)?;
-        // Build the derived Field directly from the bounded metadata copy, so
-        // the original map is never duplicated first. Only the deprecated
+        // Arrow 60 Metadata::clone only shares the immutable map Arc. The
+        // new Field/name/type scaffolds are separate caller requests. Only the deprecated
         // dictionary id is not carried over; NovaRocks never reads it.
         let field = Field::new(self.field.name().clone(), data_type, nullable)
             .with_dict_is_ordered(self.field.dict_is_ordered().unwrap_or(false))
@@ -308,36 +307,23 @@ impl MetadataOwnedSchema {
 }
 
 // Private: only exact immutable source-owner wrappers call this function.
-// An arbitrary caller-owned HashMap can never obtain a receipt through it.
+// An arbitrary caller-owned Metadata can never obtain a receipt through it.
 fn clone_known_metadata(
-    source: &HashMap<String, String>,
+    source: &Metadata,
     source_backing_bytes: usize,
     limits: MetadataOwnerLimits,
 ) -> Result<ArrowMetadataOwner, MetadataOwnerError> {
-    let count = source.len();
-    if count > limits.entries {
+    if source.len() > limits.entries || source_backing_bytes > limits.construction_bytes {
         return Err(MetadataOwnerError::CapacityExceeded);
     }
-    let peak = checked_add(
-        checked_add(source_backing_bytes, source_backing_bytes)?,
-        checked_add(
-            requested_table_bytes(count)?,
-            count
-                .checked_mul(size_of::<Entry>())
-                .ok_or(MetadataOwnerError::CapacityExceeded)?,
-        )?,
-    )?;
-    if peak > limits.construction_bytes {
-        return Err(MetadataOwnerError::CapacityExceeded);
-    }
-    let mut entries = Vec::new();
-    entries
-        .try_reserve_exact(count)
-        .map_err(MetadataOwnerError::allocation_failed)?;
-    for (key, value) in source {
-        entries.push((key.clone(), value.clone()));
-    }
-    ArrowMetadataOwner::try_new(entries, limits)
+    // Arrow 60 clones its Option<Arc<BTreeMap>> without allocating, iterating
+    // or copying text. The original backing remains live through both owners;
+    // count it once in this construction peak and retain its original receipt.
+    Ok(ArrowMetadataOwner {
+        metadata: source.clone(),
+        backing_bytes: source_backing_bytes,
+        construction_bytes: source_backing_bytes,
+    })
 }
 
 fn checked_add(left: usize, right: usize) -> Result<usize, MetadataOwnerError> {
@@ -345,38 +331,17 @@ fn checked_add(left: usize, right: usize) -> Result<usize, MetadataOwnerError> {
         .ok_or(MetadataOwnerError::CapacityExceeded)
 }
 
-// NovaRocks pins Rust 1.92.0 / std hashbrown 0.15.5. A toolchain change must
-// revalidate these construction layout receipts against the allocator oracle.
-// Group width 16 conservatively covers aarch64 NEON (8) and x86 SSE2 (16).
-fn table_bytes(buckets: usize) -> Result<usize, MetadataOwnerError> {
-    if buckets == 0 {
-        return Ok(0);
-    }
-    let align = align_of::<Entry>().max(16);
-    let payload = buckets
-        .checked_mul(size_of::<Entry>())
-        .ok_or(MetadataOwnerError::CapacityExceeded)?;
-    let aligned = checked_add(payload, align - 1)? & !(align - 1);
-    let total = checked_add(checked_add(aligned, buckets)?, 16)?;
-    if total > isize::MAX as usize - (align - 1) {
-        return Err(MetadataOwnerError::CapacityExceeded);
-    }
-    Ok(total)
-}
-
-fn requested_table_bytes(entries: usize) -> Result<usize, MetadataOwnerError> {
-    let buckets = match entries {
-        0 => 0,
-        1..=3 => 4,
-        4..=7 => 8,
-        8..=14 => 16,
-        _ => entries
-            .checked_mul(8)
-            .map(|value| value / 7)
-            .and_then(usize::checked_next_power_of_two)
-            .ok_or(MetadataOwnerError::CapacityExceeded)?,
-    };
-    table_bytes(buckets)
+fn requested_metadata_bytes(entries: usize) -> Result<usize, MetadataOwnerError> {
+    // Keep the original fallible HashMap reservation as an independent source.
+    // Arrow 60's conversion adds Vec/sort scratch, BTree nodes and its Arc.
+    // Their cumulative source-derived quote also covers every coexistence peak.
+    let staging = fresh_table_layout::<String, String>(entries)
+        .map_err(|_| MetadataOwnerError::CapacityExceeded)?
+        .request_bytes_upper_bound;
+    let conversion = hashmap_conversion_requests(entries)
+        .and_then(|requests| requests.request_bytes_upper_bound())
+        .map_err(|_| MetadataOwnerError::CapacityExceeded)?;
+    checked_add(staging, conversion)
 }
 
 /// A finite, immutable, sorted index of genuine attached-field metadata owners.

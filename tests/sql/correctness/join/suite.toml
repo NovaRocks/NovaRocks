@@ -19,6 +19,7 @@ explicit_only = false
 
 [impact]
 paths = [
+    "novarocks/execution/src/exec/hash_table/**",
     "novarocks/execution/src/exec/operators/hashjoin/**",
     "novarocks/execution/src/exec/operators/nljoin/**",
     "novarocks/execution/src/exec/operators/compiled_nljoin.rs",

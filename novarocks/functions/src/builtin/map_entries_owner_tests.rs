@@ -77,8 +77,12 @@ fn fixture(sorted: bool) -> ArrayRef {
     let entries = StructArray::new(
         vec![
             Arc::new(
-                Field::new("authored-key", DataType::Int32, false)
-                    .with_metadata([("opaque".into(), "key".into())].into()),
+                Field::new("authored-key", DataType::Int32, false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "opaque".into(),
+                        "key".into(),
+                    )]),
+                ),
             ),
             Arc::new(Field::new("authored-value", DataType::Utf8, true)),
         ]
@@ -549,8 +553,8 @@ fn raw_arrow_map_entries_noncontiguous_copy_preserves_dictionary_constructor_gua
             result.unwrap();
             let data = list.to_data();
             let mut copy = MutableArrayData::new(vec![&data], false, 2);
-            copy.extend(0, 0, 1);
-            copy.extend(0, 2, 3);
+            copy.try_extend(0, 0, 1).unwrap();
+            copy.try_extend(0, 2, 3).unwrap();
             let out = arrow_array::make_array(copy.freeze());
             assert_dictionary_extent(&out, 127);
         } else {

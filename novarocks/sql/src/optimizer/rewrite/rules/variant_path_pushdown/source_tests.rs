@@ -35,7 +35,7 @@ fn selected_text(value: &str, sentinel: &str, logical: ValueLogicalType) -> Cons
     let ty = FunctionValueType::try_with_logical_type(DataType::Utf8, false, logical).unwrap();
     let field = ty.try_to_field("original_variant_argument").unwrap();
     let mut metadata = field.metadata().clone();
-    metadata.insert("provider.unknown".into(), "original-field-metadata".into());
+    metadata.insert("provider.unknown".to_string(), "original-field-metadata".to_string());
     let field = Arc::new(field.with_metadata(metadata));
     let data = StringArray::from(vec![sentinel, value, "unused-tail"]).to_data();
     ConstantPool::try_new(

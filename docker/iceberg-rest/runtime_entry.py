@@ -374,7 +374,7 @@ role = "{role}"
             value += f'advertise_host = "127.0.0.1"\nfrontend_endpoint = "127.0.0.1:{ports["fe_grpc"]}"\n'
         else:
             value += '\n[catalog_source]\nmode = "dynamic-state-store"\n'
-        value += '\n[runtime]\nexchange_wait_ms = 300000\n'
+        value += '\n[runtime]\n'
         if role == "fe":
             value += f'''connector_split_initial_dynamic_filter_wait_cap_ms = 1000
 query_control_task_update_rpc_timeout_ms = 5000

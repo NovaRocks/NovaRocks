@@ -179,22 +179,6 @@ impl ViewEngine for FakeViewEngine {
         Ok(self.views.lock().unwrap().get(target).cloned())
     }
 
-    fn list_external_views(
-        &self,
-        catalog: &str,
-        database: &str,
-        _context: &ConnectorRequestContext,
-    ) -> Result<Vec<String>, String> {
-        Ok(self
-            .views
-            .lock()
-            .unwrap()
-            .keys()
-            .filter(|target| target.catalog == catalog && target.database == database)
-            .map(|target| target.view.clone())
-            .collect())
-    }
-
     fn analyze_external_view(
         &self,
         _catalog: &str,
@@ -257,7 +241,7 @@ fn context<'a>(catalog: Option<&'a str>, database: &'a str) -> ViewRequestContex
 trait ViewServiceTestExt {
     fn try_handle_statement(
         &self,
-        engine: &dyn ViewEngine,
+        engine: &FakeViewEngine,
         sql: &str,
         context: ViewRequestContext<'_>,
     ) -> Result<Option<ViewStatementResult>, String>;
@@ -266,7 +250,7 @@ trait ViewServiceTestExt {
 impl ViewServiceTestExt for QueryViewService {
     fn try_handle_statement(
         &self,
-        engine: &dyn ViewEngine,
+        engine: &FakeViewEngine,
         sql: &str,
         context: ViewRequestContext<'_>,
     ) -> Result<Option<ViewStatementResult>, String> {
@@ -274,6 +258,24 @@ impl ViewServiceTestExt for QueryViewService {
         let [ParsedStatement::View(statement)] = statements.as_slice() else {
             return Ok(None);
         };
+        if let novarocks_parser::ast::ViewStatement::Show(show) = statement {
+            let prepared = self.prepare_show_views(show, context)?;
+            let names = match &prepared.source {
+                crate::view::ShowViewsSource::Local(names) => names.clone(),
+                crate::view::ShowViewsSource::External { catalog, namespace } => engine
+                    .views
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .filter(|target| &target.catalog == catalog && &target.database == namespace)
+                    .map(|target| target.view.clone())
+                    .collect(),
+            };
+            return prepared
+                .finish(names)
+                .map(ViewStatementResult::Query)
+                .map(Some);
+        }
         self.execute_statement(engine, statement, context).map(Some)
     }
 }
@@ -1286,4 +1288,54 @@ async fn asynchronous_view_rewrite_preserves_circular_and_unsupported_errors() {
             .unwrap_err();
         assert_eq!(actual, expected);
     }
+}
+
+#[test]
+fn show_views_pure_declaration_keeps_external_selection_and_result_semantics() {
+    let service = QueryViewService::new();
+    let statements = novarocks_parser::parse("SHOW VIEWS FROM db").unwrap();
+    let [ParsedStatement::View(novarocks_parser::ast::ViewStatement::Show(show))] =
+        statements.as_slice()
+    else {
+        panic!("SHOW declaration");
+    };
+    let prepared = service
+        .prepare_show_views(show, context(Some("ice"), "ignored"))
+        .unwrap();
+    assert!(
+        matches!(&prepared.source, crate::view::ShowViewsSource::External { catalog, namespace } if catalog == "ice" && namespace == "db")
+    );
+    let result = prepared
+        .finish(vec!["z".into(), "a".into(), "z".into()])
+        .unwrap();
+    assert_eq!(result.columns[0].name(), "Views_in_db");
+    assert_eq!(query_rows(&result), ["a", "z"]);
+    assert!(
+        service
+            .prepare_show_views(
+                show,
+                ViewRequestContext {
+                    current_catalog: Some("ice"),
+                    current_database: "db",
+                    connector_context: None,
+                }
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn show_views_cannot_fall_back_to_synchronous_statement_dispatch() {
+    let service = QueryViewService::new();
+    let engine = FakeViewEngine::default();
+    let statements = novarocks_parser::parse("SHOW VIEWS").unwrap();
+    let [ParsedStatement::View(show)] = statements.as_slice() else {
+        panic!("SHOW declaration");
+    };
+    assert_eq!(
+        service
+            .execute_statement(&engine, show, context(None, "db"))
+            .unwrap_err(),
+        "SHOW VIEWS requires its original governed read source"
+    );
 }

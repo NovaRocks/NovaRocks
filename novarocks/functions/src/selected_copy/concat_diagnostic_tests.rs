@@ -37,7 +37,7 @@ fn by_copy_original_concat_diagnostic_geometry_preserves_all_original_type_forma
         DataType::Utf8,
         false,
     );
-    field.set_metadata(std::collections::HashMap::from([
+    field.set_metadata(std::collections::HashMap::<String, String>::from([
         ("z-last".into(), "large-original-value".repeat(100)),
         ("a-first".into(), "escaped\n\tvalue".into()),
     ]));
@@ -105,4 +105,41 @@ fn by_copy_original_concat_run_geometry_tracks_physical_ends_not_logical_rows() 
     let facts = invoice.finish(0).unwrap();
     assert!(facts.retained_new_backing_upper() >= 4 * size_of::<i16>());
     assert!(facts.retained_new_backing_upper() < 2000 * size_of::<i16>());
+}
+
+#[test]
+fn take_validation_formatter_source_observation_returns_each_original_control_without_tail() {
+    let fields = arrow_schema::UnionFields::try_new(
+        [5],
+        [Field::new(
+            "source field with Unicode 窗口",
+            DataType::Struct(vec![Arc::new(Field::new("required", DataType::Utf8, false))].into()),
+            false,
+        )],
+    )
+    .unwrap();
+    let ty = DataType::Union(fields, UnionMode::Sparse);
+    let mut baseline = Vec::new();
+    assert!(
+        original_take_validation_diagnostic_observed(&ty, &mut |boundary| {
+            baseline.push(boundary);
+            Ok::<_, CopyError>(())
+        })
+        .unwrap()
+        .is_some()
+    );
+    for at in 0..baseline.len() {
+        let cause = KernelFailure::Cancelled;
+        let mut observed = Vec::new();
+        let result = original_take_validation_diagnostic_observed(&ty, &mut |boundary| {
+            observed.push(boundary);
+            if observed.len() == at + 1 {
+                Err(CopyError::Control(cause.clone()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(CopyError::Control(actual)) if actual == cause));
+        assert_eq!(observed, baseline[..=at]);
+    }
 }

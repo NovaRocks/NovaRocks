@@ -56,7 +56,7 @@ case "${1:-}" in
     check|env|--help|-h)
         ;;
     *)
-        echo 'Usage: linux-env.sh {prepare|check|env} --user ACCOUNT --profile FILE --fixture iceberg-rest' >&2
+        echo 'Usage: linux-env.sh {prepare|check|env} --user ACCOUNT --profile FILE {--fixture iceberg-rest|--tools-only}' >&2
         exit 2
         ;;
 esac

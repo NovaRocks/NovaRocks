@@ -1682,7 +1682,10 @@ mod tests {
             novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1,
         ] {
             let source = arrow::datatypes::Field::new("nested", DataType::Int32, false)
-                .with_metadata([("provider.attribute".into(), "v".repeat(length))].into());
+                .with_metadata(std::collections::HashMap::<String, String>::from([(
+                    "provider.attribute".into(),
+                    "v".repeat(length),
+                )]));
             let same = ValueType::new(DataType::Struct(vec![source.clone()].into()), false);
             assert_eq!(same, near);
             assert_eq!(source.metadata()["provider.attribute"].len(), length);
@@ -1967,6 +1970,64 @@ mod tests {
             &SqlCompileControl::unbounded(),
         )
         .expect("provider round")
+    }
+
+    #[test]
+    fn explain_delta_projection_requests_exact_provider_window_without_private_action() {
+        for (from, to) in [(0, 0), (7, 11)] {
+            let seed = request(
+                &format!("SELECT order_key FROM __nr_ivm_delta('iceberg.db.orders', {from}, {to}) WHERE order_key > 0"),
+                SqlCompileIntent::Explain { level: crate::explain::ExplainLevel::Verbose, analyze: false },
+            ).try_into_completion().unwrap();
+            let mut progress = SqlCompiler::start(seed, &SqlCompileControl::unbounded()).unwrap();
+            loop {
+                let compilation = incomplete(progress);
+                progress = match compilation.needs() {
+                    SqlNeedBatch::CatalogRelations(needs) => {
+                        let facts = needs
+                            .iter()
+                            .map(|need| {
+                                let mut resolved = resolved_table(need);
+                                let metadata = ["_row_id", "_last_updated_sequence_number"]
+                                    .map(|name| novarocks_types::schema::ColumnDef {
+                                        name: name.into(),
+                                        data_type: DataType::Int64,
+                                        nullable: false,
+                                        write_default: None,
+                                        logical_type: None,
+                                    })
+                                    .to_vec();
+                                resolved.catalog.hidden_columns = metadata.clone();
+                                resolved.planner.iceberg_row_lineage_metadata_columns = metadata;
+                                CatalogRelationFact::resolved(need, resolved).unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        SqlCompiler::finish(
+                            compilation,
+                            SqlFactBatch::CatalogRelations(facts.into_boxed_slice()),
+                            &SqlCompileControl::unbounded(),
+                        )
+                        .expect("catalog round must admit the ordinary delta TVF")
+                    }
+                    SqlNeedBatch::Statistics(_) => answer_statistics(compilation),
+                    SqlNeedBatch::ProviderReads(needs) => {
+                        let [need] = needs.as_ref() else {
+                            panic!("one original Delta scan must request provider facts")
+                        };
+                        assert!(
+                            matches!(need.relation(), crate::compiler::ProviderReadRelationNeed::Delta { from_snapshot_id, to_snapshot_id, .. } if (*from_snapshot_id, *to_snapshot_id) == (from, to))
+                        );
+                        assert_eq!(need.columns().len(), 1);
+                        assert_eq!(need.columns()[0].name(), "order_key");
+                        // Even EXPLAIN cannot become Ready until its exact
+                        // provider window is admitted. In particular, 0..0
+                        // is not an optimizer-authored empty/no-op window.
+                        break;
+                    }
+                    other => panic!("unexpected delta projection need {other:?}"),
+                };
+            }
+        }
     }
 
     #[test]

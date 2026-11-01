@@ -25,10 +25,8 @@ use crate::exec::operators::data_stream_sink::partition_chunk_by_hash_arrays_cre
 use crate::runtime::exchange::{
     ExchangeColumnBinding, ExchangePopResult, encode_chunks_with_creation,
 };
-use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
-use crate::runtime::fragment::io::{
-    ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverRegistration,
-};
+use crate::runtime::fragment::io::exchange::test_support::Fixture;
+use crate::runtime::fragment::io::{ExchangeReceiverKey, ExchangeReceiverRegistration};
 use novarocks_types::UniqueId;
 
 pub(super) fn retain_received_buffer(
@@ -58,14 +56,27 @@ pub(super) fn retain_received_buffer(
     drop(parts);
     let tracker = MemTracker::new_root("complete-ordered-exchange-receiver");
     tracker.install_limit_once(64 << 20).unwrap();
-    let runtime = state(tracker.clone());
+    let fixture = Fixture::new();
+    let destination = UniqueId::new(0xc28, 2);
+    let source = UniqueId::new(0xc28, 1);
+    let original = fixture.state(destination);
+    let runtime = crate::runtime::runtime_state::RuntimeState::new(
+        None,
+        None,
+        None,
+        Some(destination),
+        None,
+        Some(tracker.clone()),
+        Some(fixture.runtime.clone()),
+        original.error_state().clone(),
+    );
     let factory = construction(&tracker, &runtime);
     let expected = factory.create_compiled_chunk_schema(layout).unwrap();
     assert_eq!(
         expected.slots()[1].typed_binding(),
         input.chunk_schema().slots()[1].typed_binding()
     );
-    let port = in_process_test_exchange_receiver_port();
+    let port = fixture.port.clone();
     let key = ExchangeReceiverKey {
         fragment_instance_id: UniqueId::new(0xc28, 2),
         node_id: 7,
@@ -80,23 +91,36 @@ pub(super) fn retain_received_buffer(
     .unwrap();
     port.ensure_mem_tracker(key, &tracker).unwrap();
     let handle = port.receiver_handle(key, 1).unwrap();
-    port.push(
+    fixture.bind(key, &[source]);
+    let stream = fixture.stream(source, destination, key.node_id, 0);
+    let demand = crate::runtime::fragment::io::exchange_unit::ExchangeUnitDemand {
+        sequence: crate::runtime::fragment::io::exchange_unit::ExchangeUnitSequence::FIRST,
+        wire_bytes: payload.len() as u64,
+    };
+    port.register_unit_demand(
         key,
-        ExchangeReceiverFrame {
-            stream: crate::runtime::fragment::io::exchange::fixture_stream(
-                UniqueId::new(0xc28, 1),
-                key.fragment_instance_id,
-                key.node_id,
-                0,
-            ),
-            source_fragment_instance_id: UniqueId::new(0xc28, 1),
-            sender_ordinal: 0,
+        crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry {
+            stream,
+            operation:
+                crate::runtime::fragment::io::exchange_unit::ExchangeDemandOperation::Register(
+                    demand,
+                ),
+        },
+    )
+    .unwrap();
+    port.receive_unit(
+        key,
+        crate::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame {
+            stream,
             sender_count: 1,
             sender_id: 0,
             backend_number: 0,
-            sequence: 0,
-            eos: true,
-            payload,
+            item: crate::runtime::fragment::io::exchange_unit::ExchangeUnitItem::Unit {
+                demand,
+                end_after_unit: true,
+            },
+            payload: bytes::Bytes::from(payload),
+            next_demand: None,
         },
     )
     .unwrap();
@@ -159,6 +183,8 @@ pub(super) fn retain_received_buffer(
     port.remove(key);
     drop(handle);
     drop(port);
+    drop(fixture);
+    drop(original);
     drop(factory);
     drop(runtime);
     assert!(

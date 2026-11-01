@@ -53,11 +53,52 @@ struct TimedArrowReaderMetadata {
 /// value. `ParquetMetaData::memory_size` accounts for the decoded footer,
 /// including page indexes, while the Arrow schema is separately allocated by
 /// `ArrowReaderMetadata::try_new`.
+// Field::size already includes metadata text capacities and flat String pairs.
+// Add only the immutable retained backing structure along that same recursive
+// field walk. Shared subtrees may be charged repeatedly by this upper estimate.
+fn field_metadata_backing_upper(field: &arrow::datatypes::Field) -> usize {
+    novarocks_type_contract::owned_resources::arrow_metadata::retained_backing_upper_bound(
+        field.metadata().len(),
+    )
+    .unwrap_or(usize::MAX)
+    .saturating_add(data_type_metadata_backing_upper(field.data_type()))
+}
+fn data_type_metadata_backing_upper(data_type: &arrow::datatypes::DataType) -> usize {
+    use arrow::datatypes::DataType;
+    match data_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => field_metadata_backing_upper(field),
+        DataType::Struct(fields) => fields.iter().fold(0usize, |total, field| {
+            total.saturating_add(field_metadata_backing_upper(field))
+        }),
+        DataType::Union(fields, _) => fields.iter().fold(0usize, |total, (_, field)| {
+            total.saturating_add(field_metadata_backing_upper(field))
+        }),
+        DataType::Dictionary(key, value) => data_type_metadata_backing_upper(key)
+            .saturating_add(data_type_metadata_backing_upper(value)),
+        DataType::RunEndEncoded(run_ends, values) => field_metadata_backing_upper(run_ends)
+            .saturating_add(field_metadata_backing_upper(values)),
+        _ => 0,
+    }
+}
+
 fn metadata_cache_charge(metadata: &ArrowReaderMetadata) -> usize {
     let schema = metadata.schema();
     let schema_bytes = size_of_val(schema.as_ref())
         .saturating_add(schema.fields.size())
-        .saturating_add(size_of::<(String, String)>().saturating_mul(schema.metadata.capacity()))
+        .saturating_add(schema.fields.iter().fold(0usize, |total, field| {
+            total.saturating_add(field_metadata_backing_upper(field))
+        }))
+        .saturating_add(
+            novarocks_type_contract::owned_resources::arrow_metadata::retained_backing_upper_bound(
+                schema.metadata.len(),
+            )
+            .unwrap_or(usize::MAX),
+        )
         .saturating_add(
             schema
                 .metadata
@@ -119,8 +160,10 @@ pub(crate) fn metadata_get(
     // Returning it here would silently turn an enabled page-index read into a
     // fallback, so require a complete capability match instead.
     if require_page_index
-        && (metadata.metadata().column_index().is_none()
-            || metadata.metadata().offset_index().is_none())
+        && metadata
+            .metadata()
+            .page_index()
+            .is_none_or(|index| !index.is_complete())
     {
         return None;
     }
@@ -207,6 +250,70 @@ mod tests {
         let reader = File::open(file.path()).expect("open Parquet metadata fixture");
         ArrowReaderMetadata::load(&reader, ArrowReaderOptions::new())
             .expect("load Parquet metadata fixture")
+    }
+
+    #[test]
+    fn cache_nested_field_backing_is_counted_without_recharging_text() {
+        use arrow::datatypes::{UnionFields, UnionMode};
+        let leaf = |capacity| {
+            let mut key = String::with_capacity(capacity);
+            key.push('k');
+            let mut value = String::with_capacity(capacity);
+            value.push('v');
+            Arc::new(
+                Field::new("value", DataType::Int32, true)
+                    .with_metadata(std::collections::HashMap::from([(key, value)])),
+            )
+        };
+        let small = leaf(1);
+        let spare = leaf(128);
+        let backing = field_metadata_backing_upper(&small);
+        assert!(backing > size_of::<(String, String)>());
+        // Field::size pays text capacities; this supplement pays only backing.
+        assert_eq!(backing, field_metadata_backing_upper(&spare));
+        let fields: UnionFields = [(2, Arc::new(Field::new("list", DataType::List(spare), true)))]
+            .into_iter()
+            .collect();
+        let nested = Field::new(
+            "outer",
+            DataType::Struct(
+                vec![Arc::new(Field::new(
+                    "union",
+                    DataType::Union(fields, UnionMode::Sparse),
+                    true,
+                ))]
+                .into(),
+            ),
+            true,
+        );
+        assert_eq!(field_metadata_backing_upper(&nested), backing);
+        let empty = Field::new("empty", DataType::Int32, false);
+        assert_eq!(field_metadata_backing_upper(&empty), 0);
+    }
+
+    #[test]
+    fn cache_charge_retains_schema_metadata_backing_and_text_capacities() {
+        let baseline = sample_metadata();
+        let mut key = String::with_capacity(64);
+        key.push('k');
+        let mut value = String::with_capacity(96);
+        value.push('v');
+        let texts = key.capacity() + value.capacity();
+        let schema = Arc::new(Schema::new_with_metadata(
+            baseline.schema().fields().clone(),
+            std::collections::HashMap::from([(key, value)]),
+        ));
+        let with_metadata = ArrowReaderMetadata::try_new(
+            Arc::clone(baseline.metadata()),
+            ArrowReaderOptions::new().with_schema(schema),
+        )
+        .unwrap();
+        // Only schema metadata differs. Its immutable BTree/Arc backing is
+        // additional to the unchanged original owned text-capacity charge.
+        assert!(
+            metadata_cache_charge(&with_metadata)
+                > metadata_cache_charge(&baseline) + texts + size_of::<(String, String)>()
+        );
     }
 
     #[test]

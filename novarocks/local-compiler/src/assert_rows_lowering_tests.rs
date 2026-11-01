@@ -114,7 +114,6 @@ fn options() -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        exchange_wait: std::time::Duration::from_secs(120),
         constants: ConstantPolicy {
             max_rows: 16,
             max_array_nodes: 128,
@@ -186,8 +185,12 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
         .add_values(empty, Box::from([Box::default()]), Box::default())
         .unwrap();
     let field = Arc::new(
-        Field::new("original-child", DataType::Int32, true)
-            .with_metadata([("source-key".to_owned(), "kept-λ".to_owned())].into()),
+        Field::new("original-child", DataType::Int32, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "source-key".to_owned(),
+                "kept-λ".to_owned(),
+            )]),
+        ),
     );
     let list = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>([
         Some(vec![Some(99)]),

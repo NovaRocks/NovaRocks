@@ -70,26 +70,6 @@ impl ConnectorScan {
         )
     }
 
-    pub fn try_new_change_window(
-        owner: ConnectorProviderBindingKey,
-        window: ConnectorChangeWindow,
-        admission: ConnectorChangeWindowAdmission,
-        handle: ConnectorScanHandle,
-        output_schema: SchemaRef,
-        predicate_dispositions: Vec<ConnectorPredicateDisposition>,
-        context: &ConnectorRequestContext,
-    ) -> Result<Self, ConnectorError> {
-        validate_change_window_admission(&admission, context)?;
-        Self::try_new(
-            owner,
-            ConnectorScanSelection::ChangeWindow(window),
-            ConnectorScanAdmission::ChangeWindow(admission),
-            handle,
-            output_schema,
-            predicate_dispositions,
-        )
-    }
-
     fn try_new(
         owner: ConnectorProviderBindingKey,
         selection: ConnectorScanSelection,
@@ -101,20 +81,6 @@ impl ConnectorScan {
         if handle.owner() != &owner.instance_id {
             return Err(invalid(
                 "connector scan handle owner does not match the exact control generation",
-            ));
-        }
-        if !matches!(
-            (&selection, &admission),
-            (
-                ConnectorScanSelection::Snapshot(_),
-                ConnectorScanAdmission::Snapshot
-            ) | (
-                ConnectorScanSelection::ChangeWindow(_),
-                ConnectorScanAdmission::ChangeWindow(_)
-            )
-        ) {
-            return Err(invalid(
-                "connector scan selection and admission tags do not match",
             ));
         }
         let selection_digest = connector_scan_selection_digest(selection);
@@ -208,36 +174,11 @@ pub enum ConnectorReadSelector {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorScanSelection {
     Snapshot(ConnectorReadSelector),
-    ChangeWindow(ConnectorChangeWindow),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConnectorChangeWindow {
-    from_exclusive: i64,
-    to_inclusive: i64,
-}
-
-impl ConnectorChangeWindow {
-    pub const fn new(from_exclusive: i64, to_inclusive: i64) -> Self {
-        Self {
-            from_exclusive,
-            to_inclusive,
-        }
-    }
-
-    pub const fn from_exclusive(self) -> i64 {
-        self.from_exclusive
-    }
-
-    pub const fn to_inclusive(self) -> i64 {
-        self.to_inclusive
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorScanAdmission {
     Snapshot,
-    ChangeWindow(ConnectorChangeWindowAdmission),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -422,30 +363,30 @@ fn canonicalize_partitions(partitions: &mut Vec<ConnectorChangePartition>) {
     partitions.dedup_by(|right, left| semantic_partition_cmp(left, right) == Ordering::Equal);
 }
 
-fn validate_change_window_admission(
-    admission: &ConnectorChangeWindowAdmission,
-    context: &ConnectorRequestContext,
-) -> Result<(), ConnectorError> {
-    let bytes = match admission {
-        ConnectorChangeWindowAdmission::MetadataOnly => CHANGE_ADMISSION_BYTES,
-        ConnectorChangeWindowAdmission::Incremental {
-            has_inserts,
-            has_deletes,
-            partition_impact,
-        } => {
-            if !has_inserts && !has_deletes {
-                return Err(invalid(
-                    "connector incremental change-window admission has no row changes",
-                ));
+impl ConnectorChangeWindowAdmission {
+    /// Validate the original lineage/impact facts and request payload bounds.
+    pub fn validate(&self, context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
+        let bytes = match self {
+            ConnectorChangeWindowAdmission::MetadataOnly => CHANGE_ADMISSION_BYTES,
+            ConnectorChangeWindowAdmission::Incremental {
+                has_inserts,
+                has_deletes,
+                partition_impact,
+            } => {
+                if !has_inserts && !has_deletes {
+                    return Err(invalid(
+                        "connector incremental change-window admission has no row changes",
+                    ));
+                }
+                CHANGE_ADMISSION_BYTES
+                    .saturating_add(validate_partition_impact(partition_impact, context)?)
             }
-            CHANGE_ADMISSION_BYTES
-                .saturating_add(validate_partition_impact(partition_impact, context)?)
-        }
-        ConnectorChangeWindowAdmission::FullRebuild(_) => {
-            CHANGE_ADMISSION_BYTES.saturating_add(2 * std::mem::size_of::<i64>())
-        }
-    };
-    validate_admission_bytes(bytes, context)
+            ConnectorChangeWindowAdmission::FullRebuild(_) => {
+                CHANGE_ADMISSION_BYTES.saturating_add(2 * std::mem::size_of::<i64>())
+            }
+        };
+        validate_admission_bytes(bytes, context)
+    }
 }
 
 fn validate_partition_impact(
@@ -655,11 +596,6 @@ fn connector_scan_selection_digest(selection: ConnectorScanSelection) -> [u8; 32
                 }
             }
         }
-        ConnectorScanSelection::ChangeWindow(window) => {
-            digest.update([1]);
-            digest.update(window.from_exclusive.to_le_bytes());
-            digest.update(window.to_inclusive.to_le_bytes());
-        }
     }
     digest.finalize().into()
 }
@@ -669,103 +605,8 @@ fn connector_scan_admission_digest(admission: &ConnectorScanAdmission) -> [u8; 3
     digest.update(b"novarocks.connector.scan.admission.v1\0");
     match admission {
         ConnectorScanAdmission::Snapshot => digest.update([0]),
-        ConnectorScanAdmission::ChangeWindow(admission) => {
-            digest.update([1]);
-            hash_change_window_admission(&mut digest, admission);
-        }
     }
     digest.finalize().into()
-}
-
-fn hash_change_window_admission(digest: &mut Sha256, admission: &ConnectorChangeWindowAdmission) {
-    match admission {
-        ConnectorChangeWindowAdmission::MetadataOnly => digest.update([0]),
-        ConnectorChangeWindowAdmission::Incremental {
-            has_inserts,
-            has_deletes,
-            partition_impact,
-        } => {
-            digest.update([1, u8::from(*has_inserts), u8::from(*has_deletes)]);
-            hash_partition_impact(digest, partition_impact);
-        }
-        ConnectorChangeWindowAdmission::FullRebuild(reason) => {
-            digest.update([2]);
-            match reason {
-                ConnectorChangeWindowFullRebuildReason::LineageBroken { from_snapshot_id } => {
-                    digest.update([0]);
-                    digest.update(from_snapshot_id.to_le_bytes());
-                }
-                ConnectorChangeWindowFullRebuildReason::UnprovenReplace {
-                    snapshot_id,
-                    failure,
-                } => {
-                    digest.update([1]);
-                    digest.update(snapshot_id.to_le_bytes());
-                    digest.update([match failure {
-                        ConnectorChangeWindowReplaceFailure::MissingParent => 0,
-                        ConnectorChangeWindowReplaceFailure::RecordCountChanged => 1,
-                        ConnectorChangeWindowReplaceFailure::MissingOrInvalidSummary => 2,
-                        ConnectorChangeWindowReplaceFailure::InvalidDataFileCounts => 3,
-                        ConnectorChangeWindowReplaceFailure::SchemaChanged => 4,
-                    }]);
-                }
-            }
-        }
-    }
-}
-
-fn hash_partition_impact(digest: &mut Sha256, impact: &ConnectorChangeWindowPartitionImpact) {
-    match impact {
-        ConnectorChangeWindowPartitionImpact::Unavailable => digest.update([0]),
-        ConnectorChangeWindowPartitionImpact::Unpartitioned => digest.update([1]),
-        ConnectorChangeWindowPartitionImpact::Exact {
-            has_row_deletes,
-            added,
-            removed,
-        } => {
-            digest.update([2, u8::from(*has_row_deletes)]);
-            hash_partitions(digest, added);
-            hash_partitions(digest, removed);
-        }
-    }
-}
-
-fn hash_partitions(digest: &mut Sha256, partitions: &[ConnectorChangePartition]) {
-    digest.update((partitions.len() as u64).to_le_bytes());
-    for partition in partitions {
-        hash_bytes(digest, &partition.partition_spec_identity);
-        digest.update((partition.fields.len() as u64).to_le_bytes());
-        for field in &partition.fields {
-            hash_bytes(digest, &field.source_field_identity);
-            hash_bytes(digest, field.source_column.as_bytes());
-            hash_partition_transform(digest, field.transform);
-            match &field.value {
-                ConnectorChangePartitionValue::Null => digest.update([0]),
-                ConnectorChangePartitionValue::String(value) => {
-                    digest.update([1]);
-                    hash_bytes(digest, value.as_bytes());
-                }
-            }
-        }
-    }
-}
-
-fn hash_partition_transform(digest: &mut Sha256, transform: ConnectorChangePartitionTransform) {
-    match transform {
-        ConnectorChangePartitionTransform::Identity => digest.update([0]),
-        ConnectorChangePartitionTransform::Year => digest.update([1]),
-        ConnectorChangePartitionTransform::Month => digest.update([2]),
-        ConnectorChangePartitionTransform::Day => digest.update([3]),
-        ConnectorChangePartitionTransform::Hour => digest.update([4]),
-        ConnectorChangePartitionTransform::Bucket { buckets } => {
-            digest.update([5]);
-            digest.update(buckets.get().to_le_bytes());
-        }
-        ConnectorChangePartitionTransform::Truncate { width } => {
-            digest.update([6]);
-            digest.update(width.get().to_le_bytes());
-        }
-    }
 }
 
 fn hash_bytes(digest: &mut Sha256, bytes: &[u8]) {
@@ -979,55 +820,24 @@ mod tests {
     }
 
     #[test]
-    fn scan_rejects_mismatched_selection_and_admission_tags() {
-        let owner = owner();
-        let error = ConnectorScan::try_new(
-            owner.clone(),
-            ConnectorScanSelection::Snapshot(ConnectorReadSelector::Current),
-            ConnectorScanAdmission::ChangeWindow(ConnectorChangeWindowAdmission::MetadataOnly),
-            handle(&owner, b"scan-v1"),
-            Arc::new(Schema::empty()),
-            Vec::new(),
-        )
-        .expect_err("selection and admission tags must match");
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-    }
-
-    #[test]
-    fn sealed_change_window_rejects_admission_tampering() {
-        let owner = owner();
-        let request_context = context(1024, 4096);
-        let window = ConnectorChangeWindow::new(9, 9);
-        let mut scan = ConnectorScan::try_new_change_window(
-            owner.clone(),
-            window,
-            ConnectorChangeWindowAdmission::MetadataOnly,
-            handle(&owner, b"delta-v1"),
-            Arc::new(Schema::empty()),
-            Vec::new(),
-            &request_context,
-        )
-        .expect("same-endpoint metadata-only admission is valid");
-
-        scan.validate(&owner, ConnectorScanSelection::ChangeWindow(window))
-            .expect("matching metadata-only admission");
-        scan.admission =
-            ConnectorScanAdmission::ChangeWindow(ConnectorChangeWindowAdmission::FullRebuild(
-                ConnectorChangeWindowFullRebuildReason::LineageBroken {
-                    from_snapshot_id: 9,
-                },
-            ));
+    fn metadata_only_and_full_rebuild_keep_the_original_payload_validation() {
+        ConnectorChangeWindowAdmission::MetadataOnly
+            .validate(&context(16, 16))
+            .unwrap();
+        let full = ConnectorChangeWindowAdmission::FullRebuild(
+            ConnectorChangeWindowFullRebuildReason::LineageBroken {
+                from_snapshot_id: 9,
+            },
+        );
+        full.validate(&context(1024, 4096)).unwrap();
         assert_eq!(
-            scan.validate(&owner, ConnectorScanSelection::ChangeWindow(window))
-                .expect_err("admission tampering must fail")
-                .kind(),
-            ConnectorErrorKind::CorruptData
+            full.validate(&context(16, 16)).unwrap_err().kind(),
+            ConnectorErrorKind::ResourceExhausted
         );
     }
 
     #[test]
-    fn exact_partition_impact_is_canonical_and_sealed() {
-        let owner = owner();
+    fn exact_partition_impact_is_canonical_and_validated() {
         let request_context = context(1024, 16 * 1024);
         let partition_a = ConnectorChangePartition::try_new(
             Bytes::from_static(b"spec-1"),
@@ -1051,24 +861,13 @@ mod tests {
             has_deletes: true,
             partition_impact: impact,
         };
-        let window = ConnectorChangeWindow::new(11, 19);
-        let scan = ConnectorScan::try_new_change_window(
-            owner.clone(),
-            window,
-            admission,
-            handle(&owner, b"delta-v1"),
-            Arc::new(Schema::empty()),
-            Vec::new(),
-            &request_context,
-        )
-        .expect("sealed change-window scan");
-
-        scan.validate(&owner, ConnectorScanSelection::ChangeWindow(window))
-            .expect("matching change-window seal");
-        let ConnectorScanAdmission::ChangeWindow(ConnectorChangeWindowAdmission::Incremental {
+        admission
+            .validate(&request_context)
+            .expect("valid exact admission");
+        let ConnectorChangeWindowAdmission::Incremental {
             partition_impact: ConnectorChangeWindowPartitionImpact::Exact { added, removed, .. },
             ..
-        }) = scan.admission()
+        } = &admission
         else {
             panic!("expected exact change-window admission")
         };
@@ -1112,20 +911,12 @@ mod tests {
 
     #[test]
     fn incremental_without_row_changes_is_rejected() {
-        let owner = owner();
-        let error = ConnectorScan::try_new_change_window(
-            owner.clone(),
-            ConnectorChangeWindow::new(5, 5),
-            ConnectorChangeWindowAdmission::Incremental {
-                has_inserts: false,
-                has_deletes: false,
-                partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
-            },
-            handle(&owner, b"delta-v1"),
-            Arc::new(Schema::empty()),
-            Vec::new(),
-            &context(1024, 4096),
-        )
+        let error = ConnectorChangeWindowAdmission::Incremental {
+            has_inserts: false,
+            has_deletes: false,
+            partition_impact: ConnectorChangeWindowPartitionImpact::Unpartitioned,
+        }
+        .validate(&context(1024, 4096))
         .expect_err("empty incremental admission must fail");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
@@ -1157,26 +948,18 @@ mod tests {
 
     #[test]
     fn noncanonical_direct_partition_impact_is_rejected() {
-        let owner = owner();
         let later = partition("account", "9");
         let earlier = partition("account", "1");
-        let error = ConnectorScan::try_new_change_window(
-            owner.clone(),
-            ConnectorChangeWindow::new(1, 2),
-            ConnectorChangeWindowAdmission::Incremental {
-                has_inserts: true,
-                has_deletes: false,
-                partition_impact: ConnectorChangeWindowPartitionImpact::Exact {
-                    has_row_deletes: false,
-                    added: vec![later, earlier],
-                    removed: Vec::new(),
-                },
+        let error = ConnectorChangeWindowAdmission::Incremental {
+            has_inserts: true,
+            has_deletes: false,
+            partition_impact: ConnectorChangeWindowPartitionImpact::Exact {
+                has_row_deletes: false,
+                added: vec![later, earlier],
+                removed: Vec::new(),
             },
-            handle(&owner, b"delta-v1"),
-            Arc::new(Schema::empty()),
-            Vec::new(),
-            &context(1024, 4096),
-        )
+        }
+        .validate(&context(1024, 4096))
         .expect_err("noncanonical direct exact impact must fail");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
     }

@@ -655,6 +655,16 @@ fn classify_apply_status(status: &tonic::Status) -> OperationDispatchResult {
         // of no remote effect. It must not authorize another dispatch.
         return OperationDispatchResult::NonWorkerRejected;
     }
+    // Remote NO_ERROR GOAWAY leaves this immutable operation's outcome unknown.
+    if status.code() == tonic::Code::Internal
+        && task_operation_h2_source(status).is_some_and(|source| {
+            source.is_go_away
+                && source.is_remote
+                && source.reason == Some(u32::from(h2::Reason::NO_ERROR))
+        })
+    {
+        return OperationDispatchResult::TransportUnknown;
+    }
     match status.code() {
         tonic::Code::Unavailable
         | tonic::Code::DeadlineExceeded
@@ -677,6 +687,55 @@ fn classify_apply_status(status: &tonic::Status) -> OperationDispatchResult {
         ),
         _ => OperationDispatchResult::NonWorkerRejected,
     }
+}
+
+struct TaskOperationH2Source {
+    reason: Option<u32>,
+    is_go_away: bool,
+    is_reset: bool,
+    is_remote: bool,
+    is_library: bool,
+    is_io: bool,
+    io_kind: Option<std::io::ErrorKind>,
+    io_raw_os_error: Option<i32>,
+}
+
+impl fmt::Debug for TaskOperationH2Source {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TaskOperationH2Source")
+            .field("reason", &self.reason)
+            .field("is_go_away", &self.is_go_away)
+            .field("is_reset", &self.is_reset)
+            .field("is_remote", &self.is_remote)
+            .field("is_library", &self.is_library)
+            .field("is_io", &self.is_io)
+            .field("io_kind", &self.io_kind)
+            .field("io_raw_os_error", &self.io_raw_os_error)
+            .finish()
+    }
+}
+
+// Diagnostics borrow only the original typed source; messages grant no facts.
+fn task_operation_h2_source(status: &tonic::Status) -> Option<TaskOperationH2Source> {
+    let mut source = std::error::Error::source(status);
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<h2::Error>() {
+            let io = error.get_io();
+            return Some(TaskOperationH2Source {
+                reason: error.reason().map(u32::from),
+                is_go_away: error.is_go_away(),
+                is_reset: error.is_reset(),
+                is_remote: error.is_remote(),
+                is_library: error.is_library(),
+                is_io: error.is_io(),
+                io_kind: io.map(std::io::Error::kind),
+                io_raw_os_error: io.and_then(std::io::Error::raw_os_error),
+            });
+        }
+        source = error.source();
+    }
+    None
 }
 
 /// Classifies a channel acquisition failure by type.
@@ -1751,6 +1810,9 @@ async fn send_operations_in(
         Ok(result) => result.map(tonic::Response::into_inner).map_err(|status| {
             let outcome = classify_apply_status(&status);
             tracing::warn!(
+                method = ?method,
+                channel_slot = ?acquired.slot(),
+                h2_source = ?task_operation_h2_source(&status),
                 code = ?status.code(),
                 detail = status.message(),
                 "task operation rpc failed"
@@ -4081,6 +4143,7 @@ mod tests {
         /// One receipt per request item, each with its own body.
         WithAck(Vec<(OperationOutcome, Option<proto::task_operation_verdict::Ack>)>),
         Reject(tonic::Code),
+        RejectWithMessage(tonic::Code, &'static str),
     }
 
     /// How the peer answers one `SubscribeTaskStatus`.
@@ -4165,6 +4228,9 @@ mod tests {
                 ApplyAnswer::WithAck(items) => (items, false, false),
                 ApplyAnswer::Reject(code) => {
                     return Err(Status::new(code, "task wire test peer rejection"));
+                }
+                ApplyAnswer::RejectWithMessage(code, message) => {
+                    return Err(Status::new(code, message));
                 }
             };
             let mut receipts = request
@@ -4256,13 +4322,56 @@ mod tests {
         }
     }
 
-    type EmptyExchangeStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::ExchangeResponse, Status>> + Send>>;
     type StatusStream = ReceiverStream<Result<proto::TaskStatusStreamEvent, Status>>;
 
     #[tonic::async_trait]
     impl NovaRocksGrpc for TaskWirePeer {
-        type ExchangeStream = EmptyExchangeStream;
+        type ExchangeStream = tokio_stream::Empty<Result<proto::ExchangeResponse, tonic::Status>>;
+
+        async fn exchange(
+            &self,
+            _request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
+        ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "Exchange is retired; use DeliverExchangeUnit",
+            ))
+        }
+
+        type SubscribeExchangeGrantsStream = std::pin::Pin<
+            Box<
+                dyn tokio_stream::Stream<Item = Result<proto::ExchangeGrantBatch, tonic::Status>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+
+        async fn deliver_exchange_unit(
+            &self,
+            _request: tonic::Request<proto::DeliverExchangeUnitRequest>,
+        ) -> Result<tonic::Response<proto::DeliverExchangeUnitResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "Exchange unit delivery is not installed",
+            ))
+        }
+
+        async fn register_exchange_demand(
+            &self,
+            _request: tonic::Request<proto::RegisterExchangeDemandRequest>,
+        ) -> Result<tonic::Response<proto::RegisterExchangeDemandResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "Exchange demand registration is not installed",
+            ))
+        }
+
+        async fn subscribe_exchange_grants(
+            &self,
+            _request: tonic::Request<proto::SubscribeExchangeGrantsRequest>,
+        ) -> Result<tonic::Response<Self::SubscribeExchangeGrantsStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "Exchange grant subscription is not installed",
+            ))
+        }
+
         type SubscribeTaskStatusStream = StatusStream;
 
         async fn apply_task_operations(
@@ -4394,20 +4503,6 @@ mod tests {
             _request: Request<proto::FetchRootResultRequest>,
         ) -> Result<Response<proto::FetchRootResultResponse>, Status> {
             Err(Self::rejected("FetchRootResult"))
-        }
-
-        async fn exchange(
-            &self,
-            _request: Request<tonic::Streaming<proto::ExchangeRequest>>,
-        ) -> Result<Response<Self::ExchangeStream>, Status> {
-            Err(Self::rejected("Exchange"))
-        }
-
-        async fn exchange_unary(
-            &self,
-            _request: Request<proto::ExchangeRequest>,
-        ) -> Result<Response<proto::ExchangeResponse>, Status> {
-            Err(Self::rejected("ExchangeUnary"))
         }
 
         async fn transmit_runtime_filter_envelope(
@@ -5672,6 +5767,336 @@ mod tests {
             crate::task_execution::operation::FrontendAction::FailAttempt
         );
         assert_eq!(*acks[0].payload(), AckPayload::None);
+    }
+
+    struct GoAwayWireProof {
+        stream_id: u32,
+        last_stream_id: u32,
+        reason: u32,
+        body: Vec<u8>,
+    }
+
+    // This is a real HTTP/2 wire peer, not a manufactured h2::Error. The
+    // request is received but never handed to a Task application before the
+    // real GOAWAY declares last_stream_id=0. The client library owns parsing
+    // that frame and constructing its original tonic Status/source chain.
+    async fn receive_then_goaway(
+        socket: &mut tokio::net::TcpStream,
+        reason: h2::Reason,
+    ) -> anyhow::Result<GoAwayWireProof> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut preface = [0; 24];
+        socket.read_exact(&mut preface).await?;
+        anyhow::ensure!(
+            &preface == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+            "actual client preface differs"
+        );
+        socket.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await?;
+        let mut stream_id = None;
+        let mut body = Vec::new();
+        loop {
+            let mut header = [0; 9];
+            socket.read_exact(&mut header).await?;
+            let len = (usize::from(header[0]) << 16)
+                | (usize::from(header[1]) << 8)
+                | usize::from(header[2]);
+            // Empty peer SETTINGS leave the protocol's default frame size.
+            anyhow::ensure!(len <= 16_384, "client exceeded default HTTP/2 frame size");
+            let id = u32::from_be_bytes(header[5..9].try_into()?) & 0x7fff_ffff;
+            let mut payload = vec![0; len];
+            socket.read_exact(&mut payload).await?;
+            match header[3] {
+                4 => {
+                    anyhow::ensure!(id == 0, "SETTINGS addressed an application stream");
+                    if header[4] & 1 == 0 {
+                        socket.write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0]).await?;
+                    }
+                }
+                6 => {
+                    anyhow::ensure!(id == 0 && len == 8, "invalid client PING");
+                    if header[4] & 1 == 0 {
+                        socket.write_all(&[0, 0, 8, 6, 1, 0, 0, 0, 0]).await?;
+                        socket.write_all(&payload).await?;
+                    }
+                }
+                1 => {
+                    anyhow::ensure!(id > 0 && id & 1 == 1, "invalid client request stream");
+                    anyhow::ensure!(
+                        stream_id.is_none_or(|original| original == id),
+                        "a second request preceded the controlled GOAWAY"
+                    );
+                    stream_id = Some(id);
+                    anyhow::ensure!(
+                        header[4] & 1 == 0,
+                        "unary request ended without its real message"
+                    );
+                }
+                0 => {
+                    anyhow::ensure!(
+                        stream_id == Some(id),
+                        "DATA differs from original request stream"
+                    );
+                    let bytes = if header[4] & 8 != 0 {
+                        let padding = usize::from(
+                            *payload
+                                .first()
+                                .ok_or_else(|| anyhow::anyhow!("missing DATA padding length"))?,
+                        );
+                        anyhow::ensure!(padding < len, "invalid DATA padding");
+                        &payload[1..len - padding]
+                    } else {
+                        payload.as_slice()
+                    };
+                    body.extend_from_slice(bytes);
+                    anyhow::ensure!(body.len() <= novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES + 5, "test request exceeded its original codec bound");
+                    if header[4] & 1 != 0 {
+                        break;
+                    }
+                }
+                2 | 8 | 9 => {}
+                kind => anyhow::bail!("unexpected client frame before GOAWAY: {kind}"),
+            }
+        }
+        anyhow::ensure!(
+            body.len() >= 5 && body[0] == 0,
+            "missing uncompressed unary message"
+        );
+        anyhow::ensure!(
+            u32::from_be_bytes(body[1..5].try_into()?) as usize == body.len() - 5,
+            "unary message length differs"
+        );
+        let _request = <proto::ApplyTaskOperationsRequest as prost::Message>::decode(&body[5..])?;
+        let last_stream_id = 0u32;
+        let mut frame = vec![0, 0, 8, 7, 0, 0, 0, 0, 0];
+        frame.extend_from_slice(&last_stream_id.to_be_bytes());
+        frame.extend_from_slice(&u32::from(reason).to_be_bytes());
+        socket.write_all(&frame).await?;
+        socket.flush().await?;
+        Ok(GoAwayWireProof {
+            stream_id: stream_id.ok_or_else(|| anyhow::anyhow!("no original request stream"))?,
+            last_stream_id,
+            reason: u32::from(reason),
+            body,
+        })
+    }
+
+    async fn goaway_loopback(
+        reason: h2::Reason,
+    ) -> anyhow::Result<(Loopback, tokio::sync::oneshot::Receiver<GoAwayWireProof>)> {
+        let peer = TaskWirePeer::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let endpoint = RuntimeEndpoint::new("127.0.0.1", i32::from(address.port()))
+            .map_err(anyhow::Error::msg)?;
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let (observed, proof) = tokio::sync::oneshot::channel();
+        let healthy = peer.clone();
+        let served = tokio::spawn(async move {
+            let (mut original_socket, _) = listener
+                .accept()
+                .await
+                .expect("accept original Native connection");
+            let original = receive_then_goaway(&mut original_socket, reason)
+                .await
+                .expect("send real controlled GOAWAY");
+            let _ = observed.send(original);
+            // A transparent Hyper reconnect, or an allowed exact replay, uses
+            // this same endpoint and the existing real Tonic receipt author.
+            let incoming = futures::stream::unfold(listener, |listener| async {
+                let accepted = listener.accept().await.map(|(socket, _)| socket);
+                Some((accepted, listener))
+            });
+            tonic::transport::Server::builder()
+                .add_service(NovaRocksGrpcServer::new(healthy))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("serve subsequent original Native connection");
+            // Keep the first socket alive until the original owner stops; an
+            // injected EOF must not replace the real GOAWAY source evidence.
+            drop(original_socket);
+        });
+        let mut control_peer = peer.clone();
+        control_peer.domain = NativeEndpointDomain::BackendControl;
+        let (control_endpoint, control_shutdown, control_served) =
+            Loopback::serve(control_peer).await;
+        Ok((
+            Loopback {
+                peer,
+                endpoint,
+                control_endpoint,
+                shutdown: [Some(shutdown), Some(control_shutdown)],
+                served: [served, control_served],
+            },
+            proof,
+        ))
+    }
+
+    async fn real_goaway_conformance_case(reason: h2::Reason) -> anyhow::Result<()> {
+        let backend = BackendProcessId::new_v7();
+        // Dynamic-filter updates select ApplyTaskOperations/Submission. The
+        // old cancellation fixture would exercise the separate Control lane.
+        let intent = update_intent(1, backend, 1);
+        let wire = proto::ApplyTaskOperationsRequest {
+            operations: vec![
+                encode_operation(&intent, &test_attempt_facts()).map_err(anyhow::Error::msg)?,
+            ],
+        };
+        let encoded = prost::Message::encode_to_vec(&wire);
+        let mut expected = vec![0];
+        expected.extend_from_slice(&u32::try_from(encoded.len())?.to_be_bytes());
+        expected.extend_from_slice(&encoded);
+        let (loopback, proof) = goaway_loopback(reason).await?;
+        let mut fixture = sink_fixture(loopback, backend);
+        let client = &fixture.sink.targets[&backend].client;
+        let operation = tokio::time::timeout(Duration::from_secs(5), async {
+            let method = NativeRpcMethod::ApplyTaskOperations;
+            let (mut grpc, acquired) = client.grpc_with_channel_identity(method).await.map_err(|error| anyhow::anyhow!("{error}"))?;
+            let response = grpc.apply_task_operations(Request::new(wire.clone())).await;
+            let proof = proof.await?;
+            anyhow::ensure!(proof.stream_id > proof.last_stream_id && proof.last_stream_id == 0, "actual stream did not exceed actual GOAWAY last id");
+            anyhow::ensure!(proof.reason == u32::from(reason) && proof.body == expected, "actual frame or original request bytes differ");
+            let mut receipt = None;
+            let observation = match response {
+                Ok(reply) => {
+                    receipt = Some(reply.into_inner());
+                    (None, None, None)
+                }
+                Err(status) => {
+                    let code = status.code();
+                    let observed = task_operation_h2_source(&status);
+                    let classified = classify_apply_status(&status);
+                    eprintln!("REAL_GOAWAY_CONFORMANCE reason={} stream={} last={} code={:?} h2_source={:?} classified={:?}", proof.reason, proof.stream_id, proof.last_stream_id, code, observed, classified);
+                    drop(status);
+                    if reason == h2::Reason::NO_ERROR && classified == OperationDispatchResult::TransportUnknown {
+                        client.invalidate_channel_if_current(method, &acquired);
+                        let (mut grpc, _) = client.grpc_with_channel_identity(method).await.map_err(|error| anyhow::anyhow!("{error}"))?;
+                        receipt = Some(grpc.apply_task_operations(Request::new(wire.clone())).await?.into_inner());
+                    }
+                    (Some(code), observed, Some(classified))
+                }
+            };
+            if let Some(reply) = receipt {
+                let headers = decode_receipt_batch(&reply, &[intent.operation_id()], FieldPath::root("real_goaway_receipt"))?;
+                anyhow::ensure!(headers.len() == 1 && headers[0].outcome() == OperationOutcome::Accepted, "original wire receipt did not accept the same operation");
+                let applied = fixture.loopback.peer.applied();
+                anyhow::ensure!(applied.len() == 1 && applied[0] == wire, "reconnect/replay changed the immutable request");
+                eprintln!("REAL_GOAWAY_CONFORMANCE actual_wire_receipt=true transparent_recovery={}", observation.0.is_none());
+            }
+            Ok::<_, anyhow::Error>(observation)
+        }).await;
+        let joined = fixture.loopback.settle().await;
+        anyhow::ensure!(joined, "original GOAWAY peer handles did not join");
+        let (code, observed, classified) = operation
+            .map_err(|_| anyhow::anyhow!("real GOAWAY conformance five-second watchdog"))??;
+        match code {
+            Some(tonic::Code::Internal) => {
+                let observed = observed.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "actual Internal status did not retain typed H2; no typed classifier proof"
+                    )
+                })?;
+                anyhow::ensure!(
+                    observed.reason == Some(u32::from(reason))
+                        && observed.is_remote
+                        && observed.is_go_away
+                        && !observed.is_reset,
+                    "actual Internal source differs from controlled remote GOAWAY"
+                );
+                assert_eq!(
+                    classified,
+                    Some(if reason == h2::Reason::NO_ERROR {
+                        OperationDispatchResult::TransportUnknown
+                    } else {
+                        OperationDispatchResult::NonWorkerRejected
+                    }),
+                    "classify the real typed transport source, never its message"
+                );
+            }
+            Some(code) => {
+                eprintln!(
+                    "REAL_GOAWAY_CONFORMANCE counterevidence=no_Internal actual_code={code:?} h2_source={observed:?} classified={classified:?}"
+                );
+                anyhow::ensure!(
+                    classified == Some(OperationDispatchResult::TransportUnknown),
+                    "non-Internal outcome must retain its existing classifier contract"
+                );
+            }
+            None => {
+                eprintln!(
+                    "REAL_GOAWAY_CONFORMANCE counterevidence=transparent_success no_Internal_or_typed_failure"
+                );
+                anyhow::ensure!(
+                    reason == h2::Reason::NO_ERROR,
+                    "protocol error transparently recovered without exposing an error"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_network_no_error_goaway_observes_actual_status_and_retry_contract()
+    -> anyhow::Result<()> {
+        real_goaway_conformance_case(h2::Reason::NO_ERROR).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_network_protocol_error_goaway_keeps_typed_internal_rejected() -> anyhow::Result<()>
+    {
+        real_goaway_conformance_case(h2::Reason::PROTOCOL_ERROR).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_network_remote_internal_same_literal_has_no_h2_source_and_is_rejected()
+    -> anyhow::Result<()> {
+        let backend = BackendProcessId::new_v7();
+        let mut fixture = sink_fixture(Loopback::start().await, backend);
+        fixture
+            .loopback
+            .peer
+            .expect_apply(ApplyAnswer::RejectWithMessage(
+                tonic::Code::Internal,
+                "h2 protocol error: http2 error",
+            ));
+        let request = proto::ApplyTaskOperationsRequest {
+            operations: vec![
+                encode_operation(&update_intent(1, backend, 1), &test_attempt_facts())
+                    .map_err(anyhow::Error::msg)?,
+            ],
+        };
+        let operation = tokio::time::timeout(Duration::from_secs(5), async {
+            let client = &fixture.sink.targets[&backend].client;
+            let (mut grpc, _) = client
+                .grpc_with_channel_identity(NativeRpcMethod::ApplyTaskOperations)
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let result = grpc.apply_task_operations(Request::new(request)).await;
+            match result {
+                Err(status) => Ok::<_, anyhow::Error>((
+                    status.code(),
+                    status.message().to_owned(),
+                    task_operation_h2_source(&status),
+                    classify_apply_status(&status),
+                )),
+                Ok(_) => anyhow::bail!("remote Internal unexpectedly returned a receipt"),
+            }
+        })
+        .await;
+        let joined = fixture.loopback.settle().await;
+        anyhow::ensure!(joined, "original remote Internal peer handles did not join");
+        let (code, message, source, classified) =
+            operation.map_err(|_| anyhow::anyhow!("remote Internal five-second watchdog"))??;
+        assert_eq!(code, tonic::Code::Internal);
+        assert_eq!(message, "h2 protocol error: http2 error");
+        assert!(
+            source.is_none(),
+            "remote wire status has no local typed H2 cause"
+        );
+        assert_eq!(classified, OperationDispatchResult::NonWorkerRejected);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]

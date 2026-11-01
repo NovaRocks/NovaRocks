@@ -29,6 +29,16 @@ pub(crate) fn fixture() -> (
     JointProgressDriver,
     novarocks_workload_control::ResultCapacityHandle,
 ) {
+    let (control, driver, capacity) = fixture_before_ready();
+    control.mark_ready().unwrap();
+    (control, driver, capacity)
+}
+
+pub(crate) fn fixture_before_ready() -> (
+    WorkloadControl,
+    JointProgressDriver,
+    novarocks_workload_control::ResultCapacityHandle,
+) {
     let count = 8;
     let storage = ControlStorageConfig::new(count, &[]).with_process_source_backing(
         PollRoleSourceBacking::from_layouts(
@@ -59,7 +69,6 @@ pub(crate) fn fixture() -> (
     let capacity = control
         .configure_result_capacity(ResultCapacityConfig::V1)
         .unwrap();
-    control.mark_ready().unwrap();
     (control, driver, capacity)
 }
 pub(crate) fn drive(driver: &mut JointProgressDriver) {

@@ -907,7 +907,7 @@ fn array_complete_largeint_installed_all_phases_preserve_original_state_and_orde
                 let DataType::List(item) = expected.data_type() else {
                     panic!("ARRAY result")
                 };
-                assert_eq!(item.metadata().capacity(), 0);
+                assert!(item.metadata().as_arc().is_none());
                 assert!(item.is_nullable());
             }
         }

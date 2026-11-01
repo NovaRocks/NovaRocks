@@ -344,10 +344,7 @@ mod tests {
             assert_eq!(column.self_type().get_basic_info().id(), id);
             assert!(!matches!(
                 column.logical_type_ref(),
-                Some(LogicalType::Integer {
-                    bit_width: 8 | 16,
-                    ..
-                })
+                Some(LogicalType::Integer(value)) if matches!(value.bit_width, 8 | 16)
             ));
             assert_eq!(builder.schema().field(index).data_type(), &DataType::Int32);
             assert!(builder.schema().field(index).is_nullable());
@@ -499,10 +496,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             reader.parquet_schema().columns()[0].logical_type_ref(),
-            Some(LogicalType::Timestamp {
-                is_adjusted_to_u_t_c: true,
-                ..
-            })
+            Some(LogicalType::Timestamp(value)) if value.is_adjusted_to_u_t_c
         ));
         assert_eq!(
             reader.parquet_schema().columns()[0]

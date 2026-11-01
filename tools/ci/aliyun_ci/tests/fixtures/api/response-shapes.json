@@ -1,0 +1,11 @@
+{
+  "provenance": "Documentation-derived response shapes for local replay, not observed cloud responses. Replace with sanitized P05a evidence.",
+  "sources": [
+    "https://www.alibabacloud.com/help/en/ecs/developer-reference/api-ecs-2014-05-26-runinstances",
+    "https://www.alibabacloud.com/help/en/ecs/developer-reference/api-ecs-2014-05-26-describeinstances",
+    "https://www.alibabacloud.com/help/en/oos/developer-reference/api-oos-2019-06-01-createsecretparameter"
+  ],
+  "empty_instances": {"TotalCount": 0, "Instances": {"Instance": []}},
+  "created": {"RequestId": "request-create", "InstanceIdSets": {"InstanceIdSet": ["i-exact"]}},
+  "empty_parameters": {"Parameters": [], "NextToken": ""}
+}

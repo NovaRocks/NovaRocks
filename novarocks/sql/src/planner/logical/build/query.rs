@@ -734,7 +734,7 @@ mod constant_identity_tests {
                 metadata
                     .iter()
                     .map(|(key, value)| (key.to_string(), value.to_string()))
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
         );
         let pool = novarocks_functions::ConstantPool::try_new(

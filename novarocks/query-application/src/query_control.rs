@@ -2354,7 +2354,9 @@ mod tests {
             use std::future::Future;
             std::pin::Pin::new(&mut self.gate).poll(cx).map(|ready| {
                 ready.expect("original release sender");
-                Ok(crate::session_control::StatementActionValue::Ok)
+                Ok(crate::session_control::StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                ))
             })
         }
     }
@@ -2447,7 +2449,9 @@ mod tests {
                 assert_eq!(owner.seal_success_visibility(), outcome);
                 self.outcomes.lock().unwrap().push(outcome.clone());
                 Poll::Ready(match outcome {
-                    GovernedStatementVisibilitySealOutcome::Sealed => Ok(StatementActionValue::Ok),
+                    GovernedStatementVisibilitySealOutcome::Sealed => Ok(StatementActionValue::Ok(
+                        crate::session_control::StatementCommandCompletion::new(0),
+                    )),
                     GovernedStatementVisibilitySealOutcome::Cancelled(_) => {
                         Err(QueryServiceError::new(
                             QueryServiceErrorKind::Interrupted,
@@ -2925,7 +2929,9 @@ mod tests {
             > {
                 self.polls.fetch_add(1, Ordering::SeqCst);
                 if self.ready {
-                    std::task::Poll::Ready(Ok(StatementActionValue::Ok))
+                    std::task::Poll::Ready(Ok(StatementActionValue::Ok(
+                        crate::session_control::StatementCommandCompletion::new(0),
+                    )))
                 } else {
                     std::task::Poll::Pending
                 }
@@ -3115,7 +3121,9 @@ mod tests {
                 >,
             > {
                 self.polls.fetch_add(1, Ordering::SeqCst);
-                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok))
+                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                )))
             }
         }
         impl Drop for DropPanicAction {
@@ -3200,7 +3208,9 @@ mod tests {
                     crate::session_error::QueryServiceError,
                 >,
             > {
-                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok))
+                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                )))
             }
         }
         for disposition in [
@@ -3334,7 +3344,9 @@ mod tests {
                     crate::session_error::QueryServiceError,
                 >,
             > {
-                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok))
+                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                )))
             }
         }
         impl Drop for ArmActualCleanupWake {
@@ -3733,7 +3745,9 @@ mod tests {
             ) -> std::task::Poll<
                 Result<StatementActionValue, crate::session_error::QueryServiceError>,
             > {
-                std::task::Poll::Ready(Ok(StatementActionValue::Ok))
+                std::task::Poll::Ready(Ok(StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                )))
             }
             fn handoff_residual_in(
                 &mut self,
@@ -3928,7 +3942,9 @@ mod tests {
             ) -> std::task::Poll<
                 Result<StatementActionValue, crate::session_error::QueryServiceError>,
             > {
-                std::task::Poll::Ready(Ok(StatementActionValue::Ok))
+                std::task::Poll::Ready(Ok(StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                )))
             }
             fn handoff_residual_in(
                 &mut self,
@@ -4049,7 +4065,9 @@ mod tests {
             ) -> std::task::Poll<
                 Result<StatementActionValue, crate::session_error::QueryServiceError>,
             > {
-                std::task::Poll::Ready(Ok(StatementActionValue::Ok))
+                std::task::Poll::Ready(Ok(StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                )))
             }
             fn handoff_residual_in(
                 &mut self,
@@ -4124,7 +4142,9 @@ mod tests {
                     .finish()
                     .unwrap();
                 let ready = ready.take().unwrap();
-                assert!(matches!(ready.result, Ok(StatementActionValue::Ok)));
+                assert!(
+                    matches!(ready.result, Ok(StatementActionValue::Ok(completion)) if completion.affected_rows() == 0)
+                );
                 ready.owner.finish();
             } else {
                 drop(waiter.take());

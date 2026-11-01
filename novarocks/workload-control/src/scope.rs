@@ -282,6 +282,7 @@ pub(crate) struct State {
         Option<crate::joint_admission::InternalResultClosedFactoryDescriptor>,
     pub(crate) joint: Option<crate::joint_admission::ledger::JointLedger>,
     pub(crate) cancellations: CancellationStorage,
+    pub root_admission_closed: bool,
     pub closed: bool,
     pub ready: bool,
     pub next_id: u64,
@@ -320,6 +321,10 @@ pub(crate) struct State {
 }
 
 impl State {
+    pub(crate) fn root_admission_is_closed(&self) -> bool {
+        self.root_admission_closed || self.closed
+    }
+
     fn take_root_cancellation(
         &mut self,
         class: WorkClass,
@@ -793,7 +798,7 @@ fn install_root_window(
             {
                 return Err(WorkError::Conflict);
             }
-            if state.closed {
+            if state.root_admission_is_closed() {
                 return Err(WorkError::Closed);
             }
             if !state.ready {
@@ -874,7 +879,7 @@ fn install_warehouse_root(
             if !class.uses_warehouse_concurrency() {
                 return Err(WorkError::Conflict);
             }
-            if state.closed {
+            if state.root_admission_is_closed() {
                 return Err(WorkError::Closed);
             }
             if !state.ready {
@@ -1089,9 +1094,20 @@ impl WorkloadControl {
         }
     }
 
-    /// Close new roots; existing work and control retain their authority.
+    /// Close new roots while admitted work retains its ordinary authority.
+    /// This one-way serving drain neither cancels work nor grants resources.
+    pub fn close_root_admission(&self) {
+        self.inner
+            .update(|state| state.root_admission_closed = true);
+    }
+
+    /// Close new roots and ordinary work admission during execution shutdown.
+    /// Existing settlement and cleanup retain their separately admitted authority.
     pub fn close_admission(&self) {
-        self.inner.update(|state| state.closed = true);
+        self.inner.update(|state| {
+            state.root_admission_closed = true;
+            state.closed = true;
+        });
     }
 
     /// Commit first-wins cancellation for the active roots in one State
@@ -1106,7 +1122,7 @@ impl WorkloadControl {
     /// are ready. Repeating readiness is harmless; closed admission never reopens.
     pub fn mark_ready(&self) -> Result<(), WorkError> {
         self.inner.update(|state| {
-            if state.closed {
+            if state.root_admission_is_closed() {
                 return Err(WorkError::Closed);
             }
             if state
@@ -1455,7 +1471,7 @@ impl WorkOwner {
             if remove_ready_control {
                 state.control_ready.retain(|id| *id != scope.id);
             }
-            if is_root && state.closed {
+            if is_root && state.root_admission_is_closed() {
                 state
                     .root_lifecycle
                     .completed_after_admission_closed
@@ -2076,6 +2092,25 @@ mod tests {
         first.owner.complete();
         drop(second.business);
         second.owner.complete();
+    }
+
+    #[test]
+    fn root_admission_drain_before_ready_cannot_be_reopened_or_reconfigured() {
+        let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+            .unwrap()
+            .owner;
+        control.close_root_admission();
+        assert_eq!(control.mark_ready(), Err(WorkError::Closed));
+        assert!(matches!(
+            control.configure_responsibility(crate::joint_admission::ResponsibilityConfig {
+                work_per_turn: std::num::NonZeroUsize::new(1).unwrap(),
+            }),
+            Err(WorkError::Conflict)
+        ));
+        assert!(control.snapshot().admission_closed);
+        assert!(!control.inner.state.lock().unwrap().closed);
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
     }
 
     #[test]

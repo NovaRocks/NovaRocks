@@ -27,8 +27,8 @@ use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 use prost::encoding::WireType;
 
 use super::{
-    DecodeProjectionLimits, DecodeResourceProjection, DecodeResourceUsage, ResourceCursorStatus,
-    ResourceModelError as E,
+    DecodeProjectionLimits, DecodeResourceProjection, DecodeResourceUsage, PROST_RECURSION_LIMIT,
+    ResourceCursorStatus, ResourceModelError as E,
     allocation::{
         checked_add, checked_mul, error_heap, repeated_slots, replacement_bytes,
         slice_bytes_payload,
@@ -269,7 +269,6 @@ fn scan_core(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodeResourceProjection, E> {
     let parent = admit.is_some();
-    const PROST_RECURSION_LIMIT: usize = 100;
     if limits.max_wire_depth > PROST_RECURSION_LIMIT {
         return Err(E::Schema(
             "wire depth exceeds locked Prost recursion allowance",

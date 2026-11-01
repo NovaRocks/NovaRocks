@@ -2914,14 +2914,12 @@ fn hash_time_unit(hasher: &mut Sha256, unit: TimeUnit) {
 
 fn digest_metadata(
     hasher: &mut Sha256,
-    metadata: &HashMap<String, String>,
+    metadata: &arrow::datatypes::Metadata,
     bytes: &mut usize,
 ) -> Result<(), ConnectorError> {
-    let mut keys: Vec<_> = metadata.keys().collect();
-    keys.sort();
-    hasher.update((keys.len() as u64).to_be_bytes());
-    for key in keys {
-        let value = &metadata[key];
+    // Arrow 60 Metadata iteration has the same key order as the old sort.
+    hasher.update((metadata.len() as u64).to_be_bytes());
+    for (key, value) in metadata {
         digest_bytes(hasher, key.as_bytes());
         digest_bytes(hasher, value.as_bytes());
         *bytes = checked_budget_add(*bytes, key.len())?;
@@ -4217,7 +4215,7 @@ mod typed_match_digest_tests {
             first.after_fields()[0].field(),
             second.after_fields()[0].field()
         );
-        assert_eq!(first.after_fields()[0].field().metadata().capacity(), 0);
+        assert!(first.after_fields()[0].field().metadata().is_empty());
         assert_ne!(first.digest(), second.digest());
     }
     #[test]

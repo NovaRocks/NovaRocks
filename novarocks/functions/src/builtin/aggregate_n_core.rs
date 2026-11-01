@@ -558,7 +558,13 @@ fn encode_scalar<A: ScalarStateAllocator, B: ByEncodeBuffer, R: NCodecResources>
         TrackedAggScalarValue::Decimal256(v) => {
             out.push(11)?;
             let lease = resources.before_decimal256_format(work)?;
-            let text = v.to_string();
+            // |i256| < 10^77, so sign plus decimal magnitude fits 78 bytes.
+            // Own this one output allocation before the SDK's chunked Display
+            // writes; its text and the original codec/drop order stay the same.
+            let mut text = String::with_capacity(78);
+            use std::fmt::Write as _;
+            write!(&mut text, "{v}")
+                .expect("a Display implementation returned an error unexpectedly");
             resources.after_decimal256_format(&text, text.capacity(), work)?;
             let len = source_failure::encoded_len(source_failure::Length::DecimalText, text.len())?;
             out.append(&len.to_le_bytes(), work)?;

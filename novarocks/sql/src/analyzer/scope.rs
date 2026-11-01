@@ -833,7 +833,7 @@ mod tests {
             let DataType::List(field) = declared.data_type() else {
                 panic!("list")
             };
-            assert_eq!(field.metadata().capacity(), 0);
+            assert!(field.metadata().as_arc().is_none());
         }
     }
 

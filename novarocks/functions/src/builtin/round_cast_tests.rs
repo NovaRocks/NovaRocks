@@ -71,6 +71,12 @@ fn observed(
     Ok(output)
 }
 fn arrow_oracle(array: ArrayRef) {
+    arrow_oracle_with_frozen_float(array, None)
+}
+fn frozen_decimal_oracle(array: ArrayRef, float_bits: &[Option<u64>]) {
+    arrow_oracle_with_frozen_float(array, Some(float_bits))
+}
+fn arrow_oracle_with_frozen_float(array: ArrayRef, float_bits: Option<&[Option<u64>]>) {
     for target in [CastTarget::Float64, CastTarget::Int64] {
         let target_type = match target {
             CastTarget::Float64 => DataType::Float64,
@@ -80,7 +86,59 @@ fn arrow_oracle(array: ArrayRef) {
             continue;
         }
         let recipe = prepared(&array, target);
-        let expected = arrow_cast::cast(array.as_ref(), &target_type);
+        let text_oracle: Option<ArrayRef> = match array.data_type() {
+            DataType::Utf8 => Some(match target {
+                CastTarget::Float64 => Arc::new(Float64Array::from(vec![
+                    Some(-1.5),
+                    Some(9.0),
+                    None,
+                    Some(f64::INFINITY),
+                    Some(f64::INFINITY),
+                    Some(-9_223_372_036_854_775_808.0),
+                    None,
+                ])),
+                CastTarget::Int64 => Arc::new(Int64Array::from(vec![
+                    None,
+                    Some(9),
+                    None,
+                    None,
+                    None,
+                    Some(i64::MIN),
+                    None,
+                ])),
+            }),
+            DataType::LargeUtf8 => Some(match target {
+                CastTarget::Float64 => Arc::new(Float64Array::from(vec![
+                    Some(1.5),
+                    Some(0.0),
+                    Some(9_223_372_036_854_775_808.0),
+                    None,
+                ])),
+                CastTarget::Int64 => Arc::new(Int64Array::from(vec![None, None, None, None])),
+            }),
+            DataType::Utf8View => Some(match target {
+                CastTarget::Float64 => Arc::new(Float64Array::from(vec![
+                    Some(-0.0),
+                    Some(f64::NAN),
+                    None,
+                    None,
+                ])),
+                CastTarget::Int64 => Arc::new(Int64Array::from(vec![Some(0), None, None, None])),
+            }),
+            _ => None,
+        };
+        let expected = if let Some(expected) = text_oracle {
+            Ok(expected)
+        } else if target_type == DataType::Float64 {
+            match float_bits {
+                Some(bits) => Ok(Arc::new(Float64Array::from_iter(
+                    bits.iter().map(|bits| bits.map(f64::from_bits)),
+                )) as ArrayRef),
+                None => arrow_cast::cast(array.as_ref(), &target_type),
+            }
+        } else {
+            arrow_cast::cast(array.as_ref(), &target_type)
+        };
         if expected.is_err() {
             assert!(
                 matches!(recipe.check_available(), Err(KernelFailure::Operational(_))),
@@ -212,59 +270,106 @@ fn primitive_borrowed_leaves_match_actual_arrow_numeric_and_text_casts() {
     }
 }
 #[test]
-fn all_decimal_native_widths_and_signs_match_arrow_before_policy_projection() {
-    for scale in [-2, 0, 2] {
-        arrow_oracle(Arc::new(
-            Decimal32Array::from(vec![Some(-999_999_999), Some(155), None])
-                .with_precision_and_scale(9, scale)
+fn all_decimal_native_widths_and_signs_keep_frozen_cast_before_policy_projection() {
+    // Literal IEEE bits derive from the original conversion, independently of the SDK.
+    for (scale, d32, d64, d128, d256) in [
+        (
+            -2,
+            [Some(0xc2374876e79c0000), Some(0x40ce460000000000), None],
+            [Some(0xc415af1d78b58c40), Some(0x40ce460000000000), None],
+            [Some(0x483d6329f1c35ca4), Some(0xc0ce460000000000), None],
+            [Some(0x502145b7e285bf99), Some(0xc0ce460000000000), None],
+        ),
+        (
+            0,
+            [Some(0xc1cdcd64ff800000), Some(0x4063600000000000), None],
+            [Some(0xc3abc16d674ec800), Some(0x4063600000000000), None],
+            [Some(0x47d2ced32a16a1b1), Some(0xc063600000000000), None],
+            [Some(0x4fb61bcca7119916), Some(0xc063600000000000), None],
+        ),
+        (
+            2,
+            [Some(0xc16312cfffae147b), Some(0x3ff8cccccccccccd), None],
+            [Some(0xc341c37937e08000), Some(0x3ff8cccccccccccd), None],
+            [Some(0x476812f9cf7920e3), Some(0xbff8cccccccccccd), None],
+            [Some(0x4f4c4c8b1349b9b6), Some(0xbff8cccccccccccd), None],
+        ),
+    ] {
+        frozen_decimal_oracle(
+            Arc::new(
+                Decimal32Array::from(vec![Some(-999_999_999), Some(155), None])
+                    .with_precision_and_scale(9, scale)
+                    .unwrap(),
+            ),
+            &d32,
+        );
+        frozen_decimal_oracle(
+            Arc::new(
+                Decimal64Array::from(vec![Some(-999_999_999_999_999_999), Some(155), None])
+                    .with_precision_and_scale(18, scale)
+                    .unwrap(),
+            ),
+            &d64,
+        );
+        frozen_decimal_oracle(
+            Arc::new(
+                Decimal128Array::from(vec![Some(10_i128.pow(38) - 1), Some(-155), None])
+                    .with_precision_and_scale(38, scale)
+                    .unwrap(),
+            ),
+            &d128,
+        );
+        frozen_decimal_oracle(
+            Arc::new(
+                Decimal256Array::from(vec![
+                    Some(
+                        Wide::from_i128(10)
+                            .checked_pow(76)
+                            .unwrap()
+                            .checked_sub(Wide::from_i128(1))
+                            .unwrap(),
+                    ),
+                    Some(Wide::from_i128(-155)),
+                    None,
+                ])
+                .with_precision_and_scale(76, scale)
                 .unwrap(),
-        ));
-        arrow_oracle(Arc::new(
-            Decimal64Array::from(vec![Some(-999_999_999_999_999_999), Some(155), None])
-                .with_precision_and_scale(18, scale)
-                .unwrap(),
-        ));
-        arrow_oracle(Arc::new(
-            Decimal128Array::from(vec![Some(10_i128.pow(38) - 1), Some(-155), None])
-                .with_precision_and_scale(38, scale)
-                .unwrap(),
-        ));
-        arrow_oracle(Arc::new(
-            Decimal256Array::from(vec![
-                Some(
-                    Wide::from_i128(10)
-                        .checked_pow(76)
-                        .unwrap()
-                        .checked_sub(Wide::from_i128(1))
-                        .unwrap(),
-                ),
-                Some(Wide::from_i128(-155)),
-                None,
-            ])
-            .with_precision_and_scale(76, scale)
-            .unwrap(),
-        ));
+            ),
+            &d256,
+        );
     }
-    arrow_oracle(Arc::new(
-        Decimal32Array::from(vec![None, Some(0)])
-            .with_precision_and_scale(9, -10)
-            .unwrap(),
-    ));
-    arrow_oracle(Arc::new(
-        Decimal64Array::from(vec![None, Some(0)])
-            .with_precision_and_scale(18, -19)
-            .unwrap(),
-    ));
-    arrow_oracle(Arc::new(
-        Decimal128Array::from(vec![None, Some(0)])
-            .with_precision_and_scale(38, -39)
-            .unwrap(),
-    ));
-    arrow_oracle(Arc::new(
-        Decimal256Array::from(vec![None, Some(Wide::from_i128(0))])
-            .with_precision_and_scale(76, -77)
-            .unwrap(),
-    ));
+    frozen_decimal_oracle(
+        Arc::new(
+            Decimal32Array::from(vec![None, Some(0)])
+                .with_precision_and_scale(9, -10)
+                .unwrap(),
+        ),
+        &[None, Some(0)],
+    );
+    frozen_decimal_oracle(
+        Arc::new(
+            Decimal64Array::from(vec![None, Some(0)])
+                .with_precision_and_scale(18, -19)
+                .unwrap(),
+        ),
+        &[None, Some(0)],
+    );
+    frozen_decimal_oracle(
+        Arc::new(
+            Decimal128Array::from(vec![None, Some(0)])
+                .with_precision_and_scale(38, -39)
+                .unwrap(),
+        ),
+        &[None, Some(0)],
+    );
+    frozen_decimal_oracle(
+        Arc::new(
+            Decimal256Array::from(vec![None, Some(Wide::from_i128(0))])
+                .with_precision_and_scale(76, -77)
+                .unwrap(),
+        ),
+        &[None, Some(0)],
+    );
 }
 #[test]
 fn temporal_storage_is_reinterpreted_without_unit_or_timezone_conversion() {
@@ -432,5 +537,54 @@ fn original_control_observes_each_binary_search_comparison_and_leaf_work() {
             assert!(matches!(observed(&recipe,&array,&control),Err(error) if error==failure));
             assert_eq!(control.calls.lock().unwrap().len(), at + 1);
         }
+    }
+}
+
+#[test]
+fn decimal256_round_argument_retains_original_midpoint_and_null_bits() {
+    let array: ArrayRef = Arc::new(
+        Decimal256Array::from(vec![
+            Some(Wide::from_i128(9_223_372_036_854_776_833)),
+            None,
+            Some(Wide::from_i128(-9_223_372_036_854_776_833)),
+        ])
+        .with_precision_and_scale(19, 0)
+        .unwrap(),
+    );
+    let actual = observed(
+        &prepared(&array, CastTarget::Float64),
+        &array,
+        &Control::default(),
+    )
+    .unwrap();
+    for (value, expected) in actual.into_iter().zip([
+        Some(0x43e0_0000_0000_0000),
+        None,
+        Some(0xc3e0_0000_0000_0001),
+    ]) {
+        match (value, expected) {
+            (CastValue::Float(value), Some(bits)) => assert_eq!(value.to_bits(), bits),
+            (CastValue::Null, None) => {}
+            _ => panic!("original decimal ROUND argument projection"),
+        }
+    }
+}
+
+#[test]
+fn interval_digits_keep_prepared_deferred_nonempty_refusal() {
+    for source in [
+        Arc::new(IntervalYearMonthArray::from(vec![Some(1), None])) as ArrayRef,
+        Arc::new(IntervalDayTimeArray::from(vec![
+            Some(IntervalDayTimeType::make_value(1, 0)),
+            None,
+        ])),
+    ] {
+        let recipe = prepared(&source, CastTarget::Int64);
+        let error = recipe.check_available().unwrap_err();
+        assert!(matches!(error, KernelFailure::Operational(_)));
+        assert_eq!(
+            error.to_string(),
+            "kernel operational failure: round cannot cast interval digits to Int64"
+        );
     }
 }

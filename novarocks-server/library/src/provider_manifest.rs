@@ -31,7 +31,7 @@ use novarocks_connector_iceberg::{
     IcebergControlRoleBindingFactory, IcebergExecutionRoleBindingFactory,
 };
 use novarocks_connector_paimon::role_binding::{
-    PaimonControlRoleBindingFactory, PaimonExecutionRoleBindingFactory, PaimonReadRecipeCompiler,
+    PaimonControlRoleBindingFactory, PaimonExecutionRoleBindingFactory,
 };
 use novarocks_spi::connector::provider::{ProviderContractDefinition, SealedProviderRegistry};
 use novarocks_spi::connector::{
@@ -75,7 +75,8 @@ struct ProviderBuilderDefinition {
     contract: ContractBuilder,
     control: Option<ControlFactoryBuilder>,
     execution: Option<ExecutionFactoryBuilder>,
-    pure: PureProgramBuilder,
+    // Design: ADR-0200 (docs/adr/ADR-0200-upstream-iceberg-backports-and-provider-suspension.md)
+    pure: Option<PureProgramBuilder>,
     metadata_io_geometry: Option<MetadataIoGeometryBuilder>,
     write_io_geometry: Option<MetadataIoGeometryBuilder>,
     read_io_geometry: Option<MetadataIoGeometryBuilder>,
@@ -87,7 +88,8 @@ struct SealedProviderBuilder {
     provider_id: ConnectorProviderId,
     control: ControlFactoryBuilder,
     execution: ExecutionFactoryBuilder,
-    pure: PureProgramBuilder,
+    // Design: ADR-0200 (docs/adr/ADR-0200-upstream-iceberg-backports-and-provider-suspension.md)
+    pure: Option<PureProgramBuilder>,
     metadata_io_geometry: Option<MetadataIoGeometryBuilder>,
     write_io_geometry: Option<MetadataIoGeometryBuilder>,
     read_io_geometry: Option<MetadataIoGeometryBuilder>,
@@ -101,7 +103,7 @@ const PROVIDER_BUILDERS: &[ProviderBuilderDefinition] = &[
         contract: novarocks_connector_iceberg::iceberg_contract_definition,
         control: Some(build_iceberg_control_factory),
         execution: Some(build_iceberg_execution_factory),
-        pure: iceberg_pure_program,
+        pure: Some(iceberg_pure_program),
         metadata_io_geometry: Some(novarocks_connector_iceberg::metadata_maintenance_io_geometry),
         write_io_geometry: Some(novarocks_connector_iceberg::write_control_io_geometry),
         read_io_geometry: Some(novarocks_connector_iceberg::read_io_geometry),
@@ -111,10 +113,10 @@ const PROVIDER_BUILDERS: &[ProviderBuilderDefinition] = &[
         contract: novarocks_connector_paimon::definition::paimon_contract_definition,
         control: Some(build_paimon_control_factory),
         execution: Some(build_paimon_execution_factory),
-        pure: paimon_pure_program,
+        pure: None,
         metadata_io_geometry: None,
         write_io_geometry: None,
-        read_io_geometry: Some(novarocks_connector_paimon::read_io_geometry),
+        read_io_geometry: None,
         staged_create_source_bytes: None,
     },
 ];
@@ -299,12 +301,10 @@ impl ServerProviderManifest {
 
     /// Composes the installed pure provider program catalogue.
     ///
-    /// The manifest half comes from the sealed contracts alone: every
-    /// provider reads, and writes exactly when its contract declares a write
-    /// contract. The installed half is each provider's own pure ports, so a
-    /// provider whose ports disagree with its contract fails composition
-    /// instead of being admitted with a missing or extra facet. No runtime
-    /// instance, split or credential is bound.
+    /// Active pure builders are checked against their sealed read/write
+    /// contracts. Suspended providers retain their contracts and role factories
+    /// but do not enter this catalogue. No runtime instance, split or credential
+    /// is bound.
     pub fn compose_pure_program_catalog(
         &self,
     ) -> anyhow::Result<PureProviderProgramCatalog<ConnectorCodecError>> {
@@ -312,6 +312,11 @@ impl ServerProviderManifest {
             .contracts
             .definitions()
             .iter()
+            .filter(|contract| {
+                self.builders.iter().any(|builder| {
+                    builder.provider_id == *contract.provider_id() && builder.pure.is_some()
+                })
+            })
             .map(|contract| {
                 PureProviderManifestEntry::new(
                     contract.provider_id().clone(),
@@ -323,7 +328,7 @@ impl ServerProviderManifest {
         let definitions = self
             .builders
             .iter()
-            .map(|builder| (builder.pure)(builder.provider_id.clone()))
+            .filter_map(|builder| builder.pure.map(|pure| pure(builder.provider_id.clone())))
             .collect();
         PureProviderProgramCatalog::try_new(&manifest, definitions, &CompositionControl)
             .map_err(|error| anyhow::anyhow!("compose pure provider program catalogue: {error}"))
@@ -438,35 +443,16 @@ fn iceberg_pure_program(
     )
 }
 
-fn paimon_pure_program(
-    provider: ConnectorProviderId,
-) -> PureProviderProgramDefinition<ConnectorCodecError> {
-    PureProviderProgramDefinition::new(provider, Some(Arc::new(PaimonReadRecipeCompiler)), None)
-}
-
 fn build_paimon_control_factory(
-    input: &ProviderFactoryInput<'_>,
+    _input: &ProviderFactoryInput<'_>,
 ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
-    let access = crate::composition::compose_paimon_control_access_factory(
-        input.config,
-        input.filesystem.clone(),
-    )?;
-    Ok(Arc::new(PaimonControlRoleBindingFactory::new(
-        access,
-        input.runtime.clone(),
-    )))
+    Ok(Arc::new(PaimonControlRoleBindingFactory))
 }
-
 fn build_paimon_execution_factory(
-    input: &ProviderFactoryInput<'_>,
-    scan_io: &ScanIoServices,
+    _input: &ProviderFactoryInput<'_>,
+    _scan_io: &ScanIoServices,
 ) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>> {
-    let access = crate::composition::compose_paimon_execution_access_factory(
-        input.config,
-        input.filesystem.clone(),
-        scan_io,
-    )?;
-    Ok(Arc::new(PaimonExecutionRoleBindingFactory::new(access)))
+    Ok(Arc::new(PaimonExecutionRoleBindingFactory))
 }
 
 #[cfg(test)]
@@ -597,14 +583,12 @@ mod tests {
         let write = novarocks_connector_iceberg::write_control_io_geometry().unwrap();
         let maintenance = novarocks_connector_iceberg::metadata_maintenance_io_geometry().unwrap();
         let iceberg_read = novarocks_connector_iceberg::read_io_geometry().unwrap();
-        let paimon_read = novarocks_connector_paimon::read_io_geometry().unwrap();
         assert_eq!(
             actual.max_concurrent_io(),
             write
                 .max_concurrent_io()
                 .max(maintenance.max_concurrent_io())
                 .max(iceberg_read.max_concurrent_io())
-                .max(paimon_read.max_concurrent_io())
         );
         assert_eq!(
             actual.metadata_bytes(),
@@ -612,7 +596,6 @@ mod tests {
                 .metadata_bytes()
                 .max(maintenance.metadata_bytes())
                 .max(iceberg_read.metadata_bytes())
-                .max(paimon_read.metadata_bytes())
         );
         assert_eq!(
             actual.initial_owned_bytes(),
@@ -620,7 +603,6 @@ mod tests {
                 .initial_owned_bytes()
                 .max(maintenance.initial_owned_bytes())
                 .max(iceberg_read.initial_owned_bytes())
-                .max(paimon_read.initial_owned_bytes())
         );
         assert_eq!(
             write.initial_owned_bytes().get(),
@@ -682,7 +664,7 @@ mod tests {
             contract: fixture_contract,
             control: Some(fixture_control_factory),
             execution: None,
-            pure: fixture_pure_program,
+            pure: Some(fixture_pure_program),
             metadata_io_geometry: None,
             write_io_geometry: None,
             read_io_geometry: None,
@@ -701,7 +683,7 @@ mod tests {
                 contract: fixture_contract,
                 control: Some(fixture_control_factory),
                 execution: Some(fixture_execution_factory),
-                pure: fixture_pure_program,
+                pure: Some(fixture_pure_program),
                 metadata_io_geometry: None,
                 write_io_geometry: None,
                 read_io_geometry: None,
@@ -711,7 +693,7 @@ mod tests {
                 contract: duplicate_fixture_contract,
                 control: Some(fixture_control_factory),
                 execution: Some(fixture_execution_factory),
-                pure: fixture_pure_program,
+                pure: Some(fixture_pure_program),
                 metadata_io_geometry: None,
                 write_io_geometry: None,
                 read_io_geometry: None,
@@ -730,7 +712,7 @@ mod tests {
             contract: fixture_contract,
             control: Some(drifted_control_factory),
             execution: Some(fixture_execution_factory),
-            pure: fixture_pure_program,
+            pure: Some(fixture_pure_program),
             metadata_io_geometry: None,
             write_io_geometry: None,
             read_io_geometry: None,
@@ -767,7 +749,7 @@ mod tests {
             contract: fixture_contract,
             control: Some(counted_control_factory),
             execution: Some(counted_execution_factory),
-            pure: fixture_pure_program,
+            pure: Some(fixture_pure_program),
             metadata_io_geometry: None,
             write_io_geometry: None,
             read_io_geometry: None,
@@ -880,16 +862,21 @@ mod tests {
         assert_eq!(options.reader_options.coalesce_max_gap, 16 * 1024);
     }
 
-    /// The Server manifest installs Iceberg read and write ports and the
-    /// read-only Paimon port, exactly the facets each sealed contract
-    /// declares.
+    /// Suspended providers keep their wire contracts but install no pure ports.
     #[test]
     fn the_server_manifest_composes_its_pure_program_catalogue() {
         let manifest = ServerProviderManifest::seal().expect("server provider manifest");
         let catalog = manifest
             .compose_pure_program_catalog()
             .expect("pure provider program catalogue");
-        assert_eq!(catalog.provider_count(), 2);
+        assert_eq!(catalog.provider_count(), 1);
+        let paimon = manifest
+            .builders
+            .iter()
+            .find(|builder| builder.provider_id.as_str() == "paimon")
+            .unwrap();
+        assert!(paimon.pure.is_none());
+        assert!(paimon.read_io_geometry.is_none());
         let facets = manifest
             .contracts()
             .definitions()
@@ -915,7 +902,7 @@ mod tests {
             contract: fixture_contract,
             control: Some(fixture_control_factory),
             execution: Some(fixture_execution_factory),
-            pure: fixture_pure_program,
+            pure: Some(fixture_pure_program),
             metadata_io_geometry: None,
             write_io_geometry: None,
             read_io_geometry: None,

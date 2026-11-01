@@ -266,10 +266,12 @@ fn original_utf8_parse_and_i64_formatter_have_independent_complete_oracles() {
             None
         ]
     );
-    assert_eq!(
-        ints(&actual),
-        ints(&arrow_cast::cast(source.as_ref(), &DataType::Int64).unwrap())
-    );
+    // The raw parser contract above is independent of the current SDK parser.
+    let scalar = source.slice(0, 1);
+    let broadcast = parse
+        .evaluate_complete(EvaluatedArgument::Scalar(&scalar), 11, &Control::default())
+        .unwrap();
+    assert_eq!(ints(&broadcast), vec![Some(7); 11]);
     let numbers: ArrayRef = Arc::new(Int64Array::from(vec![
         Some(i64::MIN),
         Some(i64::MAX),
@@ -568,5 +570,44 @@ fn wide_complete_mapping_has_real_quantum_and_checked_retained_layout_bounds() {
     assert_eq!(
         output_layout(&DataType::Utf8, 1, i32::MAX as usize + 1),
         Err(KernelFailure::ResourceExhausted)
+    );
+}
+
+#[test]
+fn raw_window_parse_rejects_ascii_and_unicode_edges_and_preserves_boundaries() {
+    let source: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("\t7"),
+        Some("7\n"),
+        Some("\u{a0}7"),
+        Some("7\u{2003}"),
+        Some("\u{85}7"),
+        Some("7\u{3000}"),
+        Some("\u{feff}7"),
+        Some("+9223372036854775807"),
+        Some("-9223372036854775808"),
+        Some("-9223372036854775809"),
+        Some("-0"),
+        None,
+    ]));
+    let parse = recipe(&ty(DataType::Utf8, true), &ty(DataType::Int64, true));
+    let actual = parse
+        .evaluate_complete(EvaluatedArgument::Column(&source), 12, &Control::default())
+        .unwrap();
+    assert_eq!(
+        ints(&actual),
+        vec![
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(i64::MAX),
+            Some(i64::MIN),
+            None,
+            Some(0),
+            None
+        ]
     );
 }

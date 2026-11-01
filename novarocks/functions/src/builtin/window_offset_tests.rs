@@ -588,8 +588,13 @@ fn offset_ignore_nulls_follows_selected_values_after_explicit_plain_ingress() {
 #[test]
 fn exact_nested_source_fresh_and_frozen_keep_same_installed_attachment_and_metadata() {
     let field = Arc::new(
-        Field::new("original", DataType::Int32, false)
-            .with_metadata([("long".into(), "z".repeat(1300))].into()),
+        Field::new("original", DataType::Int32, false).with_metadata(std::collections::HashMap::<
+            String,
+            String,
+        >::from([(
+            "long".into(),
+            "z".repeat(1300),
+        )])),
     );
     let values: ArrayRef = Arc::new(StructArray::new(
         vec![field.clone()].into(),

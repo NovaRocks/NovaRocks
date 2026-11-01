@@ -29,7 +29,7 @@ use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
     ValueTypeStorageLifetime,
 };
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 
 struct Control;
 impl PureCompileControl for Control {
@@ -87,7 +87,6 @@ fn values(layout: &StaticLayout, arrays: Vec<ArrayRef>) -> StaticValues {
 }
 fn exchange() -> ProgramNodeKind {
     ProgramNodeKind::ExchangeSource {
-        timeout: Duration::from_secs(1),
         runtime_filters: vec![].into(),
         hash_partition_exprs: vec![],
     }

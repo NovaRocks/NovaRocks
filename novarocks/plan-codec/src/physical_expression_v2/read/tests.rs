@@ -197,8 +197,12 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let child = Arc::new(
-            Field::new("original_child", DataType::Int32, true)
-                .with_metadata([("unknown.child".into(), "unchanged".into())].into()),
+            Field::new("original_child", DataType::Int32, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "unknown.child".into(),
+                    "unchanged".into(),
+                )]),
+            ),
         );
         let nested = DataType::Struct(vec![child].into());
         let source_types = [
@@ -310,8 +314,12 @@ impl Fixture {
         let mut pools = ConstantPools::empty();
         let i64type = types.value_type(1).unwrap().clone();
         let field = Arc::new(
-            Field::new("original_i64", DataType::Int64, true)
-                .with_metadata([("source.field".into(), "kept".into())].into()),
+            Field::new("original_i64", DataType::Int64, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "source.field".into(),
+                    "kept".into(),
+                )]),
+            ),
         );
         let pool = ConstantPool::try_new(
             field,
@@ -332,10 +340,12 @@ impl Fixture {
             vec![Arc::new(Int32Array::from(vec![Some(17), None, Some(99)]))],
             None,
         );
-        let field = Arc::new(
-            Field::new("original_nested", nested, true)
-                .with_metadata([("source.field".into(), "nested".into())].into()),
-        );
+        let field = Arc::new(Field::new("original_nested", nested, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "source.field".into(),
+                "nested".into(),
+            )]),
+        ));
         let pool = ConstantPool::try_new(
             field,
             nestedtype,

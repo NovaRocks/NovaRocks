@@ -197,8 +197,12 @@ fn nested() -> FunctionValueType {
     FunctionValueType::new(
         DataType::Struct(
             vec![Arc::new(
-                Field::new("original-child", DataType::Utf8, true)
-                    .with_metadata([("unknown".into(), "unchanged".into())].into()),
+                Field::new("original-child", DataType::Utf8, true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "unknown".into(),
+                        "unchanged".into(),
+                    )]),
+                ),
             )]
             .into(),
         ),

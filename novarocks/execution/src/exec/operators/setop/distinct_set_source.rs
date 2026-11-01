@@ -28,7 +28,10 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::exec::pipeline::operator::OperatorLifecycle;
+use crate::exec::operators::compiled_expression::RuntimeKernelControl;
+use crate::exec::pipeline::operator::{
+    ConstructionFailure, InputConstructionFactory, OperatorLifecycle,
+};
 use crate::runtime::fragment::ExecutionResult;
 
 use std::marker::PhantomData;
@@ -42,7 +45,7 @@ use crate::exec::pipeline::shape::{
 };
 use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
 use crate::runtime::runtime_state::RuntimeState;
-use arrow::array::{ArrayRef, UInt64Array};
+use arrow::array::ArrayRef;
 use std::num::NonZeroUsize;
 
 use super::distinct_set_shared::{
@@ -79,6 +82,9 @@ impl<S: DistinctSetSemantics> OperatorFactory for DistinctSetSourceFactory<S> {
             output: None,
             active: driver_id == 0,
             chunk_size: None,
+            construction: None,
+            control: None,
+            mem_tracker: None,
             _semantics: PhantomData,
         }))
     }
@@ -95,11 +101,13 @@ struct DistinctSetSourceOperator<S: DistinctSetSemantics> {
     output: Option<OutputCursor>,
     active: bool,
     chunk_size: Option<NonZeroUsize>,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
+    control: Option<RuntimeKernelControl>,
+    mem_tracker: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
     _semantics: PhantomData<S>,
 }
 
 struct OutputCursor {
-    arrays: Vec<ArrayRef>,
     selection: SetSelectionCursor,
 }
 
@@ -107,7 +115,31 @@ impl<S: DistinctSetSemantics> OperatorLifecycle for DistinctSetSourceOperator<S>
     fn name(&self) -> &str {
         &self.name
     }
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        if let Some(control) = self.control.as_mut() {
+            control.bind_construction_factory(Arc::clone(&factory));
+        }
+        self.construction = Some(factory);
+    }
+    fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
+        if let Some(control) = self.control.as_mut() {
+            control.bind_mem_tracker(Arc::clone(&tracker));
+        }
+        self.mem_tracker = Some(tracker);
+    }
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        let mut control = RuntimeKernelControl::new(state.error_state());
+        control.bind_runtime_memory(state);
+        if let Some(tracker) = &self.mem_tracker {
+            control.bind_mem_tracker(Arc::clone(tracker));
+        }
+        if let Some(factory) = &self.construction {
+            control.bind_construction_factory(Arc::clone(factory));
+        }
+        self.control = Some(control);
         self.chunk_size = Some(NonZeroUsize::new(state.chunk_size()).ok_or_else(|| {
             source_contract_failure(SourceContractFailure::MissingRuntimeBinding)
         })?);
@@ -161,8 +193,13 @@ impl<S: DistinctSetSemantics> SourceKernel for DistinctSetSourceOperator<S> {
         }
         if self.output.is_none() {
             self.output = Some(OutputCursor {
-                arrays: self.state.snapshot_arrays()?,
-                selection: SetSelectionCursor::default(),
+                selection: SetSelectionCursor::new(
+                    crate::exec::hash_table::allocation::AggregateAllocator::new(Arc::clone(
+                        self.mem_tracker
+                            .as_ref()
+                            .ok_or(ConstructionFailure::MissingOwner)?,
+                    )),
+                ),
             });
         }
         let cursor = self
@@ -183,25 +220,52 @@ impl<S: DistinctSetSemantics> SourceKernel for DistinctSetSourceOperator<S> {
             return Ok(StepResult::new(None, NextStep::Finished, 0));
         }
         ctx.checkpoint()?;
-        let indices_ref = Arc::new(UInt64Array::from(cursor.selection.take_indices())) as ArrayRef;
-        let mut out_arrays = Vec::with_capacity(cursor.arrays.len());
-        for column in &cursor.arrays {
-            out_arrays.push(
-                arrow::compute::take(column.as_ref(), &indices_ref, None).map_err(|source| {
-                    super::failure::fail(super::failure::SetStateFailure::Gather(source))
-                })?,
-            );
-        }
-        if self.output_chunk_schema.slot_ids().len() != out_arrays.len() {
+        let control = self
+            .control
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        control.checkpoint_execution()?;
+        let owner = control.construction_owner(&self.output_chunk_schema)?;
+        let positions = cursor.selection.take_indices()?;
+        let exported = self
+            .state
+            .export_selected_positions(positions.as_slice(), owner.as_ref(), control)
+            .map_err(|failure| control.project_required_failure(failure))?;
+        if self.output_chunk_schema.slot_ids().len() != exported.arrays().len() {
             return Err(source_contract_failure(
                 SourceContractFailure::ColumnCount {
                     expected: self.output_chunk_schema.slot_ids().len(),
-                    actual: out_arrays.len(),
+                    actual: exported.arrays().len(),
                 },
             ));
         }
-        let output =
-            Chunk::try_new_with_columns(Arc::clone(&self.output_chunk_schema), out_arrays)?;
+        let layout = std::alloc::Layout::array::<ArrayRef>(exported.arrays().len())
+            .map_err(|_| ConstructionFailure::from(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?;
+        if layout.size() != 0 {
+            owner.request(layout)?;
+        }
+        let mut out_arrays = Vec::new();
+        out_arrays
+            .try_reserve_exact(exported.arrays().len())
+            .map_err(|source| {
+                crate::runtime::fragment::ExecutionFailure::from_domain(
+                    novarocks_value_arrays::ValueError::Allocation {
+                        requested: layout.size(),
+                        source,
+                    },
+                )
+            })?;
+        for column in exported.arrays() {
+            control.checkpoint_execution()?;
+            out_arrays.push(Arc::clone(column));
+        }
+        let output = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            Arc::clone(&self.output_chunk_schema),
+            out_arrays,
+            positions.len(),
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )?;
         let next = if exhausted {
             NextStep::Finished
         } else {
@@ -218,7 +282,6 @@ impl<S: DistinctSetSemantics> SourceKernel for DistinctSetSourceOperator<S> {
 mod tests {
     use super::*;
     use crate::exec::{
-        chunk::ChunkSchema,
         operators::setop::{except_shared::ExceptSemantics, set_op_stage::SetOpStageController},
         pipeline::step_context::{StepContext, TurnWork},
     };
@@ -237,30 +300,20 @@ mod tests {
             vec![Arc::new(Int32Array::from(values))],
         )
         .unwrap();
-        let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
             &[SlotId::new(1)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                false,
+            )],
         )
-        .unwrap();
-        Chunk::try_new_with_chunk_schema(batch, schema).unwrap()
     }
     #[test]
     fn selection_yields_with_one_cursor_and_emits_the_expected_rows_once() {
         let interval = novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK as usize;
         let count = interval * 2 + 7;
         let input = chunk((0..count as i32).collect());
-        let shared = DistinctSetSharedState::<ExceptSemantics>::new(
-            SetOpStageController::new("EXCEPT", vec![1, 1]).unwrap(),
-            input.chunk_schema_ref(),
-        );
-        shared
-            .ingest_build(&input, MemTracker::new_root("set source fixture"))
-            .unwrap();
-        shared.finish_stage(0).unwrap();
-        shared
-            .ingest_probe(1, &chunk((0..(interval * 2) as i32).collect()))
-            .unwrap();
-        shared.finish_stage(1).unwrap();
         let state = RuntimeState::for_local_execution(
             Some(QueryOptions {
                 batch_size: Some(3),
@@ -273,7 +326,47 @@ mod tests {
             None,
             None,
         );
+        let tracker = MemTracker::new_root("set source original construction fixture");
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            Arc::clone(&tracker), state.error_state()).unwrap();
+        let owner = factory
+            .begin_typed_construction(input.chunk_schema())
+            .unwrap();
+        let kernel_control = RuntimeKernelControl::new(state.error_state());
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+        let shared = DistinctSetSharedState::<ExceptSemantics>::new(
+            SetOpStageController::new("EXCEPT", vec![1, 1]).unwrap(),
+            input.chunk_schema_ref(),
+        );
+        shared
+            .ingest_build(
+                &input,
+                Arc::clone(&tracker),
+                owner.as_ref(),
+                &kernel_control,
+                &mut conversions,
+            )
+            .unwrap();
+        shared.finish_stage(0).unwrap();
+        let probe = chunk((0..(interval * 2) as i32).collect());
+        let probe_owner = factory
+            .begin_typed_construction(probe.chunk_schema())
+            .unwrap();
+        shared
+            .ingest_probe(
+                1,
+                &probe,
+                Arc::clone(&tracker),
+                probe_owner.as_ref(),
+                &kernel_control,
+                &mut conversions,
+            )
+            .unwrap();
+        shared.finish_stage(1).unwrap();
         let mut source = DistinctSetSourceFactory::new(shared.clone(), 7).create(1, 0);
+        source.set_mem_tracker(Arc::clone(&tracker));
+        source.set_construction_factory(Arc::clone(&factory));
         source.bind_runtime_state(&state).unwrap();
         let control = state.error_state();
         let mut rows = Vec::new();
@@ -316,6 +409,9 @@ mod tests {
         );
         assert_eq!(rows, expected);
         let mut inactive = DistinctSetSourceFactory::new(shared, 7).create(2, 1);
+        inactive.set_mem_tracker(Arc::clone(&tracker));
+        inactive.set_construction_factory(Arc::clone(&factory));
+        inactive.bind_runtime_state(&state).unwrap();
         let mut work = TurnWork::new(NonZeroU64::MIN, 1);
         let step = inactive
             .as_mut()

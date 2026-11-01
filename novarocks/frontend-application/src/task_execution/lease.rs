@@ -43,7 +43,6 @@ impl RequestedLeaseDurations {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RenewSchedule {
-    #[cfg(test)]
     conservative_expiry: MonotonicInstant,
     next_renew_at: MonotonicInstant,
 }
@@ -60,14 +59,12 @@ impl RenewSchedule {
                 .saturating_sub(Self::SAFETY_MARGIN),
         );
         Self {
-            #[cfg(test)]
             conservative_expiry,
             next_renew_at: first_third.min(latest_safe),
         }
     }
 
-    #[cfg(test)]
-    pub const fn conservative_expiry(self) -> MonotonicInstant {
+    pub(crate) const fn conservative_expiry(self) -> MonotonicInstant {
         self.conservative_expiry
     }
     #[cfg(test)]

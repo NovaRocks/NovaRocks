@@ -141,10 +141,10 @@ fn buffer_extents(ty: &DataType, rows: usize) -> Result<(usize, usize), KernelFa
         .checked_add(7)
         .ok_or(KernelFailure::ResourceExhausted)?
         / 8;
-    // Arrow58.2 PrimitiveArray::unary_opt allocates exactly N values and N
-    // validity bits through BufferBuilder / BooleanBufferBuilder. Their
-    // MutableBuffer backing rounds to 64 bytes. Identity returns the gathered
-    // primitive buffers; the same conservative extent covers that path.
+    // Arrow60.1.0 PrimitiveArray::unary_opt uses an exact native Vec for N
+    // values and BooleanBufferBuilder for N validity bits. Rounding both
+    // extents to 64 remains a conservative retained-byte upper, not the
+    // actual values allocation layout. Identity reuses the gathered buffers.
     Ok((rounded_buffer(values)?, rounded_buffer(bitmap)?))
 }
 

@@ -420,7 +420,7 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
         .into_boxed_slice();
     let source_schema = ConnectorSourceSchemaFacts::try_new(
         shape,
-        original_source.metadata().clone(),
+        std::collections::HashMap::from(original_source.metadata()),
         source_fields,
         storage.clone(),
     )
@@ -591,7 +591,6 @@ fn compile(dop: usize) -> Arc<LocalProgram> {
         // The result is published by one root sink driver.
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        exchange_wait: Duration::from_secs(120),
         // Explicit fixture admission; these values are not production defaults.
         constants: ConstantPolicy {
             max_rows: 16,

@@ -737,6 +737,7 @@ def requirement_checks(requirements, environment, native, run_command=subprocess
         'fixture:iceberg-rest':('NOVAROCKS_ICEBERG_REST_URI','NOVA_ENV_REST_ENV_FILE'),
         'fixture:minio':('AWS_S3_ENDPOINT','AWS_S3_ACCESS_KEY_ID','AWS_S3_SECRET_ACCESS_KEY'),
         'fixture:iceberg-rest-publication':('UEA7_TEST_CONTROL_URI',),
+        'fixture:aliyun-ecs-oss':('NOVA_OSS_TEST_CONFIG',),
         'dataset:iceberg-java-oracle':('NOVAROCKS_UEA4G_ORACLE_RECEIPT','NOVAROCKS_UEA4G_ORACLE_OUTPUT'),
     }
     for requirement in requirements:
@@ -758,6 +759,10 @@ def requirement_checks(requirements, environment, native, run_command=subprocess
             for name in names:
                 if name.endswith(('_ENV_FILE','_RECEIPT')) and environment.get(name) and not Path(environment[name]).is_file():
                     missing.append(name)
+                if name == 'NOVA_OSS_TEST_CONFIG' and environment.get(name):
+                    path=Path(environment[name])
+                    if not path.is_absolute() or not path.is_file():
+                        missing.append(name)
             check.update(ok=not missing,missing=sorted(set(missing)),basis='declared effective configuration; native owner validates runtime facts')
         else:
             check['reason']='no native availability contract for this requirement'

@@ -110,7 +110,6 @@ fn options() -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        exchange_wait: std::time::Duration::from_secs(120),
         constants: ConstantPolicy {
             max_rows: 16,
             max_array_nodes: 128,
@@ -199,9 +198,10 @@ fn fixture(
         .map(|index| {
             if index == 0 && matches!(case, Case::NestedKey) {
                 let field = arrow_schema::Field::new("nested-source", DataType::Utf8, true)
-                    .with_metadata(
-                        [("source-fidelity".to_owned(), "kept-exact".to_owned())].into(),
-                    );
+                    .with_metadata(std::collections::HashMap::<String, String>::from([(
+                        "source-fidelity".to_owned(),
+                        "kept-exact".to_owned(),
+                    )]));
                 (
                     ExprKind::Literal(LiteralValue::Null),
                     FunctionValueType::new(DataType::Struct(vec![Arc::new(field)].into()), true),

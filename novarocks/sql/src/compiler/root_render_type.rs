@@ -797,13 +797,14 @@ mod tests {
                 .native_type,
             N::Variant
         );
-        let marked = Field::new("item", D::Binary, true).with_metadata(
-            [(
+        let marked =
+            Field::new("item", D::Binary, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
                 novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
                 "unknown-source-attribute".into(),
-            )]
-            .into(),
-        );
+            )]));
         let actual = schema(
             &[output("source", D::List(Arc::new(marked)), Domain::Plain)],
             0,

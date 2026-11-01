@@ -108,8 +108,9 @@ impl StaticPackageAdmission {
 }
 
 /// The package preflight extends the ingress decode, which observes neither a
-/// clock nor a cancellation. The scan is bounded by the carrier's own byte cap
-/// and the projection limits, so this control never refuses.
+/// clock nor a cancellation. The existing carrier byte admission bounds this
+/// scan; decoder depth and checked arithmetic remain implementation boundaries.
+/// Resource projection here grants no allocation and adds no separate quota.
 struct IngressPreflightControl;
 
 impl PureCompileControl for IngressPreflightControl {

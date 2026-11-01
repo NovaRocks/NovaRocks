@@ -38,12 +38,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::query_execution::package_freeze::CompiledPackageCarrier;
 use novarocks_execution::task_execution::FrozenBytes;
 use novarocks_physical_plan::{
     Edge, EdgeId, Fragment, FragmentPackage, FragmentSink, NodeId, NodeKind, PipelineDopDomain,
     WriteTargetOrdinal,
 };
-use novarocks_plan_codec::physical_package_v2::PackageEncodeLimits;
 use novarocks_proto_models::novarocks as wire;
 use novarocks_type_contract::PureCompileControl;
 use prost::Message;
@@ -59,6 +59,8 @@ use crate::query_execution::package_freeze::{PackageFreezeError, encode_checked_
 /// reconstructed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StaticSinkTarget {
+    edge: EdgeId,
+    role: novarocks_physical_plan::OutputRole,
     target_fragment_id: FragmentId,
     target_exchange_node_id: i32,
     delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
@@ -69,12 +71,23 @@ impl StaticSinkTarget {
     pub(crate) const fn for_test(
         target_fragment_id: FragmentId,
         target_exchange_node_id: i32,
+        delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
     ) -> Self {
         Self {
+            edge: EdgeId::new(0),
+            role: novarocks_physical_plan::OutputRole::Relational,
             target_fragment_id,
             target_exchange_node_id,
-            delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+            delivery,
         }
+    }
+
+    pub(crate) const fn edge(self) -> EdgeId {
+        self.edge
+    }
+
+    pub(crate) const fn role(self) -> novarocks_physical_plan::OutputRole {
+        self.role
     }
 
     pub(crate) const fn delivery(
@@ -114,6 +127,7 @@ pub(crate) struct FragmentFacts {
     fragment_id: FragmentId,
     dop_domain: PipelineDopDomain,
     sink_targets: Box<[StaticSinkTarget]>,
+    logical_summary_output: Option<StaticSinkTarget>,
     #[cfg(test)]
     root_plan_node_id: i32,
     table_writers: Box<[StaticTableWriter]>,
@@ -132,6 +146,12 @@ impl FragmentFacts {
     /// The static sink branches, in declared order.
     pub(crate) fn sink_targets(&self) -> &[StaticSinkTarget] {
         &self.sink_targets
+    }
+
+    /// The independent summary output declared by this exact checked package.
+    /// This never grants provider writer membership.
+    pub(crate) const fn logical_summary_output(&self) -> Option<StaticSinkTarget> {
+        self.logical_summary_output
     }
 
     /// The plan-node id of this fragment's root (output) node.
@@ -193,7 +213,7 @@ impl FragmentArtifact {
     pub(crate) fn freeze_package(
         package: &FragmentPackage,
         edges: &BTreeMap<EdgeId, Edge>,
-        limits: &PackageEncodeLimits,
+        carrier: &CompiledPackageCarrier,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<Self>, PackageFreezeError> {
         let fragment = package.fragment();
@@ -206,10 +226,29 @@ impl FragmentArtifact {
                 fragment.root().get()
             ))
         })?;
+        let sink_targets = package_sink_targets(fragment, edges)?;
+        let logical_summary_output = match fragment.sink() {
+            FragmentSink::Router { summary, .. } => Some(
+                sink_targets
+                    .iter()
+                    .copied()
+                    .find(|target| {
+                        target.edge() == summary.edge
+                            && target.role() == novarocks_physical_plan::OutputRole::LogicalSummary
+                    })
+                    .ok_or_else(|| {
+                        PackageFreezeError::Facts(format!(
+                            "fragment {fragment_id} has no exact frozen logical-summary output"
+                        ))
+                    })?,
+            ),
+            _ => None,
+        };
         let facts = FragmentFacts {
             fragment_id,
             dop_domain: fragment.dop_domain(),
-            sink_targets: package_sink_targets(fragment, edges)?,
+            sink_targets,
+            logical_summary_output,
             #[cfg(test)]
             root_plan_node_id: _validated_root_plan_node_id,
             table_writers: fragment
@@ -229,7 +268,7 @@ impl FragmentArtifact {
             carries_runtime_filter_bindings: true,
         };
         let frozen = wire::FrozenFragment {
-            package: encode_checked_package(package, limits, control)?.into(),
+            package: encode_checked_package(package, carrier, control)?.into(),
         };
         let content = FrozenBytes::freeze_encoded(frozen.encode_to_vec());
         #[cfg(test)]
@@ -261,13 +300,29 @@ fn package_sink_targets(
     let fragment_id = fragment.id();
     let branches = match fragment.sink() {
         FragmentSink::Result | FragmentSink::RootResult(_) | FragmentSink::Noop => Vec::new(),
-        FragmentSink::Stream { edge } => vec![*edge],
-        FragmentSink::Multicast { edges } => edges.to_vec(),
-        FragmentSink::Router { routes, .. } => routes.iter().map(|route| route.edge).collect(),
+        FragmentSink::Stream { edge } => vec![(*edge, None)],
+        FragmentSink::Multicast { edges } => edges.iter().map(|edge| (*edge, None)).collect(),
+        FragmentSink::Router {
+            routes, summary, ..
+        } => routes
+            .iter()
+            .map(|route| {
+                (
+                    route.edge,
+                    Some(novarocks_physical_plan::OutputRole::ProviderRoute {
+                        target: route.write_target_ordinal,
+                    }),
+                )
+            })
+            .chain(std::iter::once((
+                summary.edge,
+                Some(novarocks_physical_plan::OutputRole::LogicalSummary),
+            )))
+            .collect(),
     };
     branches
         .into_iter()
-        .map(|edge_id| {
+        .map(|(edge_id, expected_role)| {
             let edge = edges.get(&edge_id).ok_or_else(|| {
                 PackageFreezeError::Facts(format!(
                     "fragment {} sinks into absent edge {}",
@@ -275,13 +330,37 @@ fn package_sink_targets(
                     edge_id.get()
                 ))
             })?;
-            if edge.source.fragment != fragment_id {
+            if edge.id != edge_id || edge.source.fragment != fragment_id {
                 return Err(PackageFreezeError::Facts(format!(
                     "fragment {} sinks into edge {} produced by fragment {}",
                     fragment_id.get(),
                     edge_id.get(),
                     edge.source.fragment.get()
                 )));
+            }
+            if let Some(expected_role) = expected_role {
+                let expected_port =
+                    if expected_role == novarocks_physical_plan::OutputRole::LogicalSummary {
+                        novarocks_physical_plan::FragmentOutputPort::LogicalSummary
+                    } else {
+                        novarocks_physical_plan::FragmentOutputPort::Root
+                    };
+                let exact_summary_projection = match fragment.sink() {
+                    FragmentSink::Router { summary, .. } if edge_id == summary.edge => {
+                        edge.source.projection.as_ref() == summary.columns.values().as_slice()
+                    }
+                    _ => true,
+                };
+                if edge.role != expected_role
+                    || edge.source.port != expected_port
+                    || edge.delivery != novarocks_physical_plan::DeliveryRequirement::MustDrain
+                    || !exact_summary_projection
+                {
+                    return Err(PackageFreezeError::Facts(format!(
+                        "Router edge {} does not match its exact output role, port, or delivery",
+                        edge_id.get()
+                    )));
+                }
             }
             let target_exchange_node_id =
                 i32::try_from(edge.destination.node.get()).map_err(|_| {
@@ -292,6 +371,8 @@ fn package_sink_targets(
                     ))
                 })?;
             Ok(StaticSinkTarget {
+                edge: edge_id,
+                role: edge.role,
                 target_fragment_id: edge.destination.fragment.get(),
                 target_exchange_node_id,
                 delivery: match edge.delivery {
@@ -321,6 +402,15 @@ pub(crate) mod tests {
         FREEZES.with(|count| count.set(count.get() + 1));
     }
 
+    /// Inspect the production sink-fact author using a completed physical plan.
+    /// This exercises no package bytes or Native execution capability.
+    pub(crate) fn sink_targets_for_completed_fragment(
+        fragment: &Fragment,
+        edges: &BTreeMap<EdgeId, Edge>,
+    ) -> Result<Box<[StaticSinkTarget]>, PackageFreezeError> {
+        package_sink_targets(fragment, edges)
+    }
+
     /// How many static plans this thread has frozen. Tests read the delta
     /// around the call they measure, so parallel tests cannot interfere.
     pub(crate) fn freezes_on_this_thread() -> usize {
@@ -336,7 +426,11 @@ pub(crate) mod tests {
         root_node_id: i32,
         version: [u8; 16],
         dop_domain: PipelineDopDomain,
-        target: Option<(u32, i32)>,
+        target: Option<(
+            u32,
+            i32,
+            novarocks_execution_contract::ExchangeDeliveryRequirement,
+        )>,
         padding: usize,
     ) -> Arc<FragmentArtifact> {
         use novarocks_physical_plan as p;
@@ -466,7 +560,15 @@ pub(crate) mod tests {
         let mut edges = BTreeMap::new();
         let mut cuts = p::FragmentCuts::default();
         let result = match target {
-            Some((target_fragment, target_node)) => {
+            Some((target_fragment, target_node, delivery)) => {
+                let delivery = match delivery {
+                    novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven => {
+                        p::DeliveryRequirement::DemandDriven
+                    }
+                    novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain => {
+                        p::DeliveryRequirement::MustDrain
+                    }
+                };
                 let target_fragment = p::FragmentId::new(target_fragment);
                 let target_node =
                     p::NodeId::new(u32::try_from(target_node).expect("nonnegative target"));
@@ -480,7 +582,7 @@ pub(crate) mod tests {
                     edge_id,
                     p::Edge {
                         role: novarocks_physical_plan::OutputRole::Relational,
-                        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+                        delivery,
                         id: edge_id,
                         kind: p::EdgeKind::Stream,
                         source: p::EdgeSource {
@@ -520,7 +622,7 @@ pub(crate) mod tests {
                         .collect(),
                     partitioning,
                     source_port: novarocks_physical_plan::FragmentOutputPort::Root,
-                    delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+                    delivery,
                     payload: novarocks_physical_plan::ExchangePayloadContract::Relational,
                 }]
                 .into_boxed_slice();
@@ -563,8 +665,16 @@ pub(crate) mod tests {
             &control,
         )
         .expect("checked package");
-        FragmentArtifact::freeze_package(&package, &edges, &PackageEncodeLimits::FROZEN, &control)
-            .expect("a genuine package freezes")
+        FragmentArtifact::freeze_package(
+            &package,
+            &edges,
+            &CompiledPackageCarrier::for_test(
+                novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+            ),
+            &control,
+        )
+        .expect("a genuine package freezes")
     }
 
     #[test]
@@ -579,15 +689,27 @@ pub(crate) mod tests {
                 max: 8,
                 requires_power_of_two: false,
             },
-            Some((5, 20)),
+            Some((
+                5,
+                20,
+                novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+            )),
             0,
         );
         assert_eq!(freezes_on_this_thread() - before, 1);
         let facts = artifact.facts();
         assert_eq!(facts.fragment_id(), 3);
         assert_eq!(facts.root_plan_node_id(), 11);
-        assert_eq!(facts.sink_targets(), &[StaticSinkTarget::for_test(5, 20)]);
+        assert_eq!(
+            facts.sink_targets(),
+            &[StaticSinkTarget::for_test(
+                5,
+                20,
+                novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+            )]
+        );
         assert!(!facts.declares_table_writer());
+        assert_eq!(facts.logical_summary_output(), None);
         assert!(facts.carries_runtime_filter_bindings());
         let frozen = wire::FrozenFragment::decode(artifact.content().bytes().clone())
             .expect("FrozenFragment");

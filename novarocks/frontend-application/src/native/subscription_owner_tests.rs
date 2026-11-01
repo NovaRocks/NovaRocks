@@ -358,37 +358,69 @@ async fn original_panic_payload_destructor_is_actually_retired_before_scope_rele
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_lease_drop_cannot_abort_recycled_original_position() {
+    struct ReadyTracked(Arc<AtomicBool>);
+    impl Future for ReadyTracked {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> {
+            Poll::Ready(())
+        }
+    }
+    impl Drop for ReadyTracked {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
     let (control, root) = work(2);
     let (mut owner, port) = owner(2);
+    let deadline = Instant::now() + Duration::from_secs(2);
     let reservation = port.reserve(&root.owner.scope(), None, None).unwrap();
-    let original_scope = {
+    let retained_backing = {
         let state = owner.core.state.lock().unwrap();
-        let record = state.records[reservation.index].as_ref().unwrap();
-        let backing_owner = record.backing.owner.lock().unwrap();
-        backing_owner.as_ref().unwrap().scope()
+        Arc::clone(&state.records[reservation.index].as_ref().unwrap().backing)
     };
-    let stale = reservation.start(async {}).unwrap();
-    // The reaper removes the role slot before dropping its original backing
-    // outside the lock. Wait for that exact Work child to release capacity.
-    tokio::time::timeout(Duration::from_secs(2), original_scope.wait_released())
-        .await
-        .expect("the original subscription child must actually release its scope record");
-    assert!(
-        owner
-            .core
-            .state
-            .lock()
-            .unwrap()
-            .records
-            .iter()
-            .all(Option::is_none)
+    let original_scope = retained_backing
+        .owner
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .scope();
+    let future_destroyed = Arc::new(AtomicBool::new(false));
+    let stale = reservation
+        .start(ReadyTracked(Arc::clone(&future_destroyed)))
+        .unwrap();
+    tokio::time::timeout_at(deadline.into(), async {
+        while owner.core.state.lock().unwrap().records[stale.index].is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // A free role record does not release another owner's WorkScope. Retain
+    // the last real backing alias to make that interval deterministic.
+    let future_really_destroyed = future_destroyed.load(Ordering::Acquire);
+    let original_retired = retained_backing.retired.load(Ordering::Acquire);
+    let scope_still_registered = original_scope.check().is_ok();
+    let refused_before_actual_release = matches!(
+        port.reserve(&root.owner.scope(), None, None),
+        Err(RegistrationError::Work(WorkError::Capacity(
+            "scope records"
+        )))
     );
+    drop(retained_backing);
+    tokio::time::timeout_at(deadline.into(), original_scope.wait_released())
+        .await
+        .unwrap();
+    let scope_really_released = matches!(original_scope.check(), Err(WorkError::Released));
+    // Reserve once after the actual authority reports release; do not retry
+    // capacity failures or infer this fact from the role-record vacancy.
     let live = port
         .reserve(&root.owner.scope(), None, None)
         .unwrap()
         .start(std::future::pending())
         .unwrap();
-    let recycled_position = stale.index == live.index;
+    let reused_original_position = live.index == stale.index;
     let old_generation = stale.generation;
     let new_generation = live.generation;
     drop(stale);
@@ -397,12 +429,15 @@ async fn stale_lease_drop_cannot_abort_recycled_original_position() {
         .unwrap()
         .stop_requested;
     live.stop();
-    let actual = owner
-        .drain_until(Instant::now() + Duration::from_secs(2))
-        .await;
+    let actual = owner.drain_until(deadline).await;
     drop(live);
     finish_work(control, root);
-    assert!(recycled_position);
+    assert!(future_really_destroyed);
+    assert!(original_retired);
+    assert!(scope_still_registered);
+    assert!(refused_before_actual_release);
+    assert!(scope_really_released);
+    assert!(reused_original_position);
     assert_ne!(old_generation, new_generation);
     assert!(!requested);
     assert_eq!(actual, DrainObservation::Joined);

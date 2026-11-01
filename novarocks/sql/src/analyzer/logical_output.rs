@@ -282,7 +282,7 @@ mod scalar_domain_tests {
             let DataType::List(item) = expression.value_type.data_type() else {
                 panic!("list");
             };
-            assert_eq!(item.metadata().capacity(), 0);
+            assert!(item.metadata().as_arc().is_none());
         }
     }
 
@@ -368,7 +368,7 @@ mod scalar_domain_tests {
                 panic!("list");
             };
             assert_eq!(item.name(), "item");
-            assert_eq!(item.metadata().capacity(), 0);
+            assert!(item.metadata().as_arc().is_none());
         }
     }
 
@@ -856,7 +856,7 @@ mod scalar_domain_tests {
             assert_eq!(output.name(), input.name());
             assert_eq!(output.is_nullable(), input.is_nullable());
             assert_eq!(output.data_type(), input.data_type());
-            assert_eq!(output.metadata().capacity(), 0);
+            assert!(output.metadata().as_arc().is_none());
             assert_eq!(
                 domain_at(&expression, &[0]),
                 Some(novarocks_type_contract::ValueLogicalType::Bitmap)
@@ -870,7 +870,7 @@ mod scalar_domain_tests {
         assert_eq!(fields[0].data_type(), &DataType::Null);
         assert_eq!(fields[0].name(), "col1");
         assert_eq!(fields[1].name(), "col2");
-        assert_eq!(fields[1].metadata().capacity(), 0);
+        assert!(fields[1].metadata().as_arc().is_none());
         assert_eq!(
             domain_at(&expression, &[1]),
             Some(novarocks_type_contract::ValueLogicalType::Bitmap)
@@ -976,7 +976,7 @@ mod scalar_domain_tests {
                 assert_eq!(actual.is_nullable(), input.is_nullable());
                 assert_eq!(actual.data_type(), input.data_type());
             }
-            assert_eq!(map_fields[1].metadata().capacity(), 0);
+            assert!(map_fields[1].metadata().as_arc().is_none());
             assert_eq!(
                 domain_at(&expression, &[1, 1]),
                 Some(novarocks_type_contract::ValueLogicalType::Bitmap)
@@ -1359,7 +1359,7 @@ mod scalar_domain_tests {
         };
         assert_eq!(fields[0].data_type(), &DataType::Null);
         assert_eq!(fields[1].name(), "col2");
-        assert_eq!(fields[1].metadata().capacity(), 0);
+        assert!(fields[1].metadata().as_arc().is_none());
         assert_eq!(
             domain_at(&adapted, &[1]),
             Some(novarocks_type_contract::ValueLogicalType::Bitmap)
@@ -1650,7 +1650,7 @@ mod scalar_domain_tests {
             assert_eq!(fields[0].data_type(), &DataType::Null);
             assert_eq!(fields[0].name(), names[0]);
             assert_eq!(fields[1].name(), names[1]);
-            assert_eq!(fields[1].metadata().capacity(), 0);
+            assert!(fields[1].metadata().as_arc().is_none());
             assert_eq!(domain_at(expression, &[1]), Some(marker));
         }
         // SqlType has no Null member. The exact actual fields carry this proof,
@@ -1693,7 +1693,7 @@ mod scalar_domain_tests {
         let DataType::List(field) = expression.value_type.data_type() else {
             panic!("list");
         };
-        assert_eq!(field.metadata().capacity(), 0);
+        assert!(field.metadata().as_arc().is_none());
     }
 
     #[test]
@@ -1847,7 +1847,7 @@ mod scalar_domain_tests {
             };
             assert_eq!(actual.name(), selected.name());
             assert_eq!(actual.is_nullable(), selected.is_nullable());
-            assert_eq!(actual.metadata().capacity(), 0);
+            assert!(actual.metadata().as_arc().is_none());
             assert_eq!(domain_at(expression, &[0]), Some(marker));
         }
     }
@@ -1896,7 +1896,7 @@ mod scalar_domain_tests {
             panic!("partial source");
         };
         assert_eq!(children[0].data_type(), &DataType::Null);
-        assert_eq!(children[1].metadata().capacity(), 0);
+        assert!(children[1].metadata().as_arc().is_none());
         assert_eq!(
             domain_at(&expression, &[0, 0, 1]),
             Some(novarocks_type_contract::ValueLogicalType::Bitmap)
@@ -1919,7 +1919,7 @@ mod scalar_domain_tests {
                 panic!("Struct");
             };
             assert_eq!(fields[0].data_type(), &DataType::Null);
-            assert_eq!(fields[1].metadata().capacity(), 0);
+            assert!(fields[1].metadata().as_arc().is_none());
             assert_eq!(
                 domain_at(&expression, &[0, 1]),
                 Some(novarocks_type_contract::ValueLogicalType::Bitmap)
@@ -1951,7 +1951,7 @@ mod scalar_domain_tests {
             panic!("typed NULL List");
         };
         assert_eq!(item.data_type(), &DataType::LargeBinary);
-        assert_eq!(item.metadata().capacity(), 0);
+        assert!(item.metadata().as_arc().is_none());
         assert_eq!(
             domain_at(&expression, &[0]),
             Some(novarocks_type_contract::ValueLogicalType::Variant)
@@ -2155,7 +2155,7 @@ mod scalar_domain_tests {
             panic!("source Struct");
         };
         assert_eq!(fields[0].name(), "key");
-        assert_eq!(fields[0].metadata().capacity(), 0);
+        assert!(fields[0].metadata().as_arc().is_none());
         let factory = Rc::new(RefCell::new(factory));
         let scope = AnalyzerScope::new(factory.clone());
         let context = context(factory);
@@ -2289,5 +2289,47 @@ mod scalar_domain_tests {
             assert_eq!(schema.source_slot(), None);
             novarocks_physical_plan::validate_plan(completed.plan()).unwrap();
         }
+    }
+    #[test]
+    fn structure_projection_case_collisions_fail_at_analysis_and_unique_case_keeps_domain() {
+        for sql in [
+            "select s.id from (select named_struct('ID',1,'id',2) s) t",
+            "select __array_struct_subfield([named_struct('ID',1,'id',2)],'id')",
+            "select array_sortby((x)->x.id,[named_struct('ID',1,'id',2)])",
+        ] {
+            let result = super::super::analyze(&query(sql), &Catalog, "db");
+            match result {
+                Err(source) => assert!(source.to_string().contains("ambiguous"), "{sql}: {source}"),
+                Ok(_) => panic!("case collision accepted: {sql}"),
+            }
+        }
+        let expression = output_expressions(
+            "select __array_struct_subfield([named_struct('Payload',to_bitmap(1))],'pAYLOAD')",
+        )
+        .remove(0);
+        assert_eq!(
+            expression
+                .value_type
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .domain(),
+            Some(novarocks_type_contract::ValueLogicalType::Bitmap)
+        );
+        let expression = output_expressions(
+            "select array_sortby((x)->x.kEY,[named_struct('Key',1,'payload',to_bitmap(1))])",
+        )
+        .remove(0);
+        assert_eq!(
+            expression
+                .value_type
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .child_type_at(1)
+                .unwrap()
+                .domain(),
+            Some(novarocks_type_contract::ValueLogicalType::Bitmap)
+        );
     }
 }

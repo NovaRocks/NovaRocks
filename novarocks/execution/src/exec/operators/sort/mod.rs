@@ -744,7 +744,7 @@ mod tests {
             result
                 .fields()
                 .iter()
-                .all(|field| field.metadata().capacity() == 0)
+                .all(|field| field.metadata().as_arc().is_none())
         );
         assert_eq!(actual_sort_order(normalized), vec![0, 1, 2]);
         for (child, order) in [(largeint.clone(), vec![0, 1, 2]), (uuid, vec![1, 2, 0])] {

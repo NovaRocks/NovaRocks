@@ -49,7 +49,126 @@ pub struct BackendMetricsRegistry {
     preparation_snapshot_available: IntGauge,
     root_ownership_gauges: IntGaugeVec,
     root_snapshot_available: IntGauge,
+    exchange_flow: ExchangeFlowMetrics,
+    exchange_runtime:
+        Option<std::sync::Arc<novarocks_execution::runtime::execution_runtime::ExecutionRuntime>>,
     scrape_lock: std::sync::Mutex<()>,
+}
+
+struct ExchangeFlowMetrics {
+    available: IntGauge,
+    positions: IntGaugeVec,
+    limits: IntGaugeVec,
+    activity: IntGaugeVec,
+    replays: IntCounter,
+}
+
+impl ExchangeFlowMetrics {
+    fn new(registry: &Registry) -> Result<Self, String> {
+        let available = IntGauge::with_opts(Opts::new(
+            "novarocks_backend_exchange_flow_snapshot_available",
+            "Whether original receiver ledgers and sender activity were sampled without waiting. Busy is unavailable, never zero usage.",
+        )).map_err(|error| format!("construct exchange observation availability: {error}"))?;
+        let positions = IntGaugeVec::new(Opts::new(
+            "novarocks_backend_exchange_flow_positions",
+            "Receiver grant/Unit positions from the original ledgers, including retired instances held by real decode work. These are not payload-byte or memory bounds.",
+        ), &["state"]).map_err(|error| format!("construct exchange position observations: {error}"))?;
+        let limits = IntGaugeVec::new(Opts::new(
+            "novarocks_backend_exchange_flow_limits",
+            "Frozen exchange flow configuration; independent of payload and process memory capacity.",
+        ), &["limit"]).map_err(|error| format!("construct exchange configuration observations: {error}"))?;
+        let activity = IntGaugeVec::new(Opts::new(
+            "novarocks_backend_exchange_send_activity",
+            "Original sender scheduler calls and bytes remain charged until actual call guard exit; waiting streams hold no shared permit.",
+        ), &["resource"]).map_err(|error| format!("construct exchange sender observations: {error}"))?;
+        let replays = IntCounter::with_opts(Opts::new(
+            "novarocks_backend_exchange_unit_replays_total",
+            "Idempotent Unit/End admissions observed by the original receiver receipt owner, including replay during decoding.",
+        )).map_err(|error| format!("construct exchange replay observation: {error}"))?;
+        for collector in [
+            Box::new(available.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(positions.clone()),
+            Box::new(limits.clone()),
+            Box::new(activity.clone()),
+            Box::new(replays.clone()),
+        ] {
+            registry
+                .register(collector)
+                .map_err(|error| format!("register exchange flow observation: {error}"))?;
+        }
+        Ok(Self {
+            available,
+            positions,
+            limits,
+            activity,
+            replays,
+        })
+    }
+
+    fn sample(
+        &self,
+        runtime: Option<&novarocks_execution::runtime::execution_runtime::ExecutionRuntime>,
+    ) -> Result<(), String> {
+        let Some(runtime) = runtime else {
+            self.available.set(0);
+            return Ok(());
+        };
+        let receivers = runtime.exchange_registry().try_flow_snapshot();
+        let sender = runtime.exchange_unit_scheduler().try_snapshot();
+        let (Some(receivers), Some(sender)) = (receivers, sender) else {
+            self.available.set(0);
+            return Ok(());
+        };
+        for (state, value) in [
+            ("live_instances", receivers.live_instances),
+            ("closed_instances", receivers.closed_instances),
+            ("in_use", receivers.in_use),
+            ("max_instance_in_use", receivers.max_instance_in_use),
+            ("decoding", receivers.decoding),
+            ("pending_demands", receivers.pending_demands),
+            ("floating_in_use", receivers.floating_in_use),
+        ] {
+            self.positions
+                .with_label_values(&[state])
+                .set(i64::try_from(value).unwrap_or(i64::MAX));
+        }
+        let configuration = runtime.exchange_flow_limits();
+        for (name, value) in [
+            (
+                "instance_floor",
+                configuration.instance_floor_slots() as u128,
+            ),
+            ("instance_max", configuration.instance_max_slots() as u128),
+            ("floating", configuration.floating_slots() as u128),
+            ("stream_window", configuration.stream_window() as u128),
+            (
+                "transport_timeout_ms",
+                configuration.transport_timeout().as_millis(),
+            ),
+        ] {
+            self.limits
+                .with_label_values(&[name])
+                .set(i64::try_from(value).unwrap_or(i64::MAX));
+        }
+        for (resource, value) in [
+            ("calls", sender.calls),
+            ("bytes", sender.bytes),
+            ("waiting_streams", sender.waiting_streams),
+        ] {
+            self.activity
+                .with_label_values(&[resource])
+                .set(i64::try_from(value).unwrap_or(i64::MAX));
+        }
+        let delta = receivers
+            .replayed_items
+            .checked_sub(self.replays.get())
+            .ok_or_else(|| {
+                "exchange replay observation moved backwards within one runtime".to_owned()
+            })?;
+        self.replays.inc_by(delta);
+        self.available.set(1);
+        Ok(())
+    }
 }
 
 /// What the Backend `/metrics` endpoint reports about this process's memory.
@@ -461,6 +580,7 @@ impl BackendMetricsRegistry {
             Box::new(Lazy::force(&BACKEND_NATIVE_LANE_STREAMS).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_CONTROL_QUEUE_WAIT).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_BLOCKING_QUEUE_WAIT).clone()),
+            Box::new(Lazy::force(&BACKEND_EXCHANGE_GRANT_EVENTS).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_ASYNC_FIRST_POLL_LAG).clone()),
             Box::new(Lazy::force(&BACKEND_WORKER_CONTEXT_RESERVATIONS).clone()),
             Box::new(Lazy::force(&BACKEND_WORKER_RESERVATION_LAST_PUBLISHED).clone()),
@@ -489,6 +609,7 @@ impl BackendMetricsRegistry {
             &registry,
         )?;
         novarocks_execution::runtime::scan_stream_metrics::register_scan_stream_metrics(&registry)?;
+        let exchange_flow = ExchangeFlowMetrics::new(&registry)?;
         Ok(Self {
             registry,
             native_query_resources: None,
@@ -500,6 +621,8 @@ impl BackendMetricsRegistry {
             preparation_snapshot_available,
             root_ownership_gauges,
             root_snapshot_available,
+            exchange_flow,
+            exchange_runtime: None,
             scrape_lock: std::sync::Mutex::new(()),
         })
     }
@@ -578,6 +701,14 @@ impl BackendMetricsRegistry {
         Ok(self)
     }
 
+    pub fn with_exchange_flow(
+        mut self,
+        runtime: std::sync::Arc<novarocks_execution::runtime::execution_runtime::ExecutionRuntime>,
+    ) -> Self {
+        self.exchange_runtime = Some(runtime);
+        self
+    }
+
     pub fn with_native_query_resources(
         mut self,
         observation: std::sync::Arc<dyn Fn() -> NativeQueryExecutionResourceSnapshot + Send + Sync>,
@@ -614,6 +745,8 @@ impl BackendMetricsRegistry {
     fn gather(&self) -> Result<Vec<prometheus::proto::MetricFamily>, String> {
         // Keep owner sampling, gauge projection and collection in one scrape order.
         let _scrape = self.scrape_lock.lock().expect("backend metric scrape lock");
+        self.exchange_flow
+            .sample(self.exchange_runtime.as_deref())?;
         let preparation = self
             .task_preparation
             .as_ref()
@@ -950,6 +1083,19 @@ static BACKEND_NATIVE_BLOCKING_QUEUE_WAIT: Lazy<HistogramVec> = Lazy::new(|| {
     )
     .expect("construct Native blocking queue wait histogram")
 });
+
+static BACKEND_EXCHANGE_GRANT_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(Opts::new(
+        "novarocks_backend_exchange_grant_events_total",
+        "Exchange observation feed events by fixed protocol event; no query or stream identity labels.",
+    ), &["event"]).expect("exchange grant metric")
+});
+
+pub(crate) fn exchange_grant_event(event: &'static str) {
+    BACKEND_EXCHANGE_GRANT_EVENTS
+        .with_label_values(&[event])
+        .inc();
+}
 
 static BACKEND_NATIVE_ASYNC_FIRST_POLL_LAG: Lazy<HistogramVec> = Lazy::new(|| {
     HistogramVec::new(
@@ -1563,6 +1709,99 @@ mod tests {
     use prometheus::{IntGauge, Opts, Registry};
 
     use super::*;
+
+    #[test]
+    fn exchange_json_requires_the_original_runtime_and_reports_its_exact_limits() {
+        use novarocks_execution::runtime::execution_runtime::{
+            ExchangeFlowLimits, ExecutionRuntime, ExecutionRuntimeConfig,
+        };
+        let absent = BackendMetricsRegistry::new().unwrap();
+        let absent_rows: serde_json::Value =
+            serde_json::from_str(&render_metrics_json(&absent).unwrap()).unwrap();
+        assert!(absent_rows.as_array().unwrap().iter().any(|row| {
+            row["tags"]["metric"] == "novarocks_backend_exchange_flow_snapshot_available"
+                && row["value"].as_f64() == Some(0.0)
+        }));
+        let mut functions =
+            novarocks_execution::runtime::function_set::ExecutionFunctionSetBuilder::new();
+        novarocks_sql::compiler::contribute_builtin_functions(functions.catalog_builder_mut())
+            .unwrap();
+        let runtime = Arc::new(
+            ExecutionRuntime::new_with_exchange_flow_limits(
+                ExecutionRuntimeConfig {
+                    driver_threads: 1,
+                    exchange_io_max_inflight_bytes: 4096,
+                    exchange_max_transmit_batched_bytes: 4096,
+                    operator_buffer_chunks: 1,
+                    local_exchange_buffer_mem_limit_per_driver: 4096,
+                    local_exchange_max_buffered_rows: 32,
+                    runtime_filter_scan_wait_time_ms_override: None,
+                    runtime_filter_wait_timeout_ms_override: None,
+                    sink_io_worker_threads: 1,
+                    sink_io_max_blocking_threads: 1,
+                },
+                Arc::new(functions.seal().unwrap()),
+                crate::backend_test_support::test_memory_authority(),
+                ExchangeFlowLimits::try_new(2, 3, 1, 2, std::time::Duration::from_millis(7))
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let metrics = BackendMetricsRegistry::new()
+            .unwrap()
+            .with_exchange_flow(runtime);
+        let rows: serde_json::Value =
+            serde_json::from_str(&render_metrics_json(&metrics).unwrap()).unwrap();
+        let rows = rows.as_array().unwrap();
+        for (metric, label, name, value) in [
+            (
+                "novarocks_backend_exchange_flow_limits",
+                "limit",
+                "instance_floor",
+                2,
+            ),
+            (
+                "novarocks_backend_exchange_flow_limits",
+                "limit",
+                "instance_max",
+                3,
+            ),
+            (
+                "novarocks_backend_exchange_flow_limits",
+                "limit",
+                "floating",
+                1,
+            ),
+            (
+                "novarocks_backend_exchange_flow_limits",
+                "limit",
+                "transport_timeout_ms",
+                7,
+            ),
+            (
+                "novarocks_backend_exchange_flow_positions",
+                "state",
+                "in_use",
+                0,
+            ),
+            (
+                "novarocks_backend_exchange_send_activity",
+                "resource",
+                "calls",
+                0,
+            ),
+        ] {
+            assert!(
+                rows.iter().any(|row| row["tags"]["metric"] == metric
+                    && row["tags"][label] == name
+                    && row["value"].as_f64() == Some(f64::from(value))),
+                "missing {metric}/{name}"
+            );
+        }
+        assert!(rows.iter().any(|row| row["tags"]["metric"]
+            == "novarocks_backend_exchange_flow_snapshot_available"
+            && row["value"].as_f64() == Some(1.0)));
+    }
 
     struct UnusedPreparationHost;
 

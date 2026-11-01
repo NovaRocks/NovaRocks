@@ -400,7 +400,7 @@ mod signed_input_type_tests {
             Field::new(name, DataType::FixedSizeBinary(16), nullable).with_metadata(
                 [("provider.attribute".to_owned(), "opaque".to_owned())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
             ty,
         )

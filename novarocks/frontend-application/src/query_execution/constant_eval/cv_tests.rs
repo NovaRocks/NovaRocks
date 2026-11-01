@@ -788,8 +788,14 @@ fn authored_nominal_and_nested_domains_decline_without_carrier_retagging() {
             Ok(None)
         ));
     }
-    let child = Field::new("item", DataType::Utf8, true)
-        .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "json".into())].into());
+    let child =
+        Field::new("item", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
+            String,
+            String,
+        >::from([(
+            NR_LOGICAL_TYPE_KEY.into(),
+            "json".into(),
+        )]));
     let source_type = DataType::List(Arc::new(child));
     let ty = json_list_type(&source_type);
     let null = typed_arg(arrow::array::new_null_array(&source_type, 1), ty.clone());
@@ -940,10 +946,12 @@ fn newly_materialized_unsigned_negative_scale_and_nested_metadata_outputs_are_cv
         DataType::Decimal128(10, -2),
     ));
     assert_eq!(decimal_value(&output), 123);
-    let field = Arc::new(
-        Field::new("source", DataType::Int32, true)
-            .with_metadata([("provider.fact".into(), "kept".into())].into()),
-    );
+    let field = Arc::new(Field::new("source", DataType::Int32, true).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            "provider.fact".into(),
+            "kept".into(),
+        )]),
+    ));
     let source_type = DataType::List(field);
     let source = arg(arrow::array::new_null_array(&source_type, 1), true);
     let request = cast(vec![source.clone()], source_type.clone());
@@ -962,7 +970,7 @@ fn newly_materialized_unsigned_negative_scale_and_nested_metadata_outputs_are_cv
         panic!("frozen execution result is a List");
     };
     assert_eq!(output_field.name(), "item");
-    assert_eq!(output_field.metadata().capacity(), 0);
+    assert!(output_field.metadata().as_arc().is_none());
     assert!(output.value_type().nullable());
     assert!(output_field.is_nullable());
 }
@@ -1074,7 +1082,7 @@ fn real_wide_prepared_call_keeps_entry_quantum_tail_and_all_three_original_cause
 }
 #[test]
 fn actual_metadata_decline_and_successful_output_pool_keep_all_callback_prefixes() {
-    let metadata = (0..255)
+    let metadata: std::collections::HashMap<String, String> = (0..255)
         .map(|i| (format!("provider.fact.{i}"), "value".into()))
         .chain([(NR_LOGICAL_TYPE_KEY.into(), "json".into())])
         .collect();
@@ -1127,13 +1135,14 @@ fn ordinary_row_error_and_invalid_arithmetic_observe_exact_original_completion()
 }
 #[test]
 fn source_annotations_do_not_mint_a_type_resource_refusal() {
-    let field = Field::new("item", DataType::Utf8, true).with_metadata(
-        [(
+    let field =
+        Field::new("item", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
+            String,
+            String,
+        >::from([(
             "provider.fact".into(),
             "x".repeat(novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1),
-        )]
-        .into(),
-    );
+        )]));
     let annotated = DataType::List(Arc::new(field));
     let target = FunctionValueType::new(annotated.clone(), true);
     let source = typed_arg(
@@ -1151,7 +1160,7 @@ fn source_annotations_do_not_mint_a_type_resource_refusal() {
     let DataType::List(normalized) = request.result_type.data_type() else {
         panic!("frozen result is a List");
     };
-    assert_eq!(normalized.metadata().capacity(), 0);
+    assert!(normalized.metadata().as_arc().is_none());
     let DataType::List(original) = &annotated else {
         panic!("original source is a List");
     };

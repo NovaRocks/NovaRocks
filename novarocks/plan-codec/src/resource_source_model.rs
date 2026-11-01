@@ -126,14 +126,13 @@ pub(crate) const LOCKED_ARROW_VERSION: &str = match package_version(LOCK, b"arro
 };
 
 pub(crate) const fn locked_family(source: &[u8]) -> bool {
-    let names: [&[u8]; 8] = [
+    let names: [&[u8]; 7] = [
         b"arrow",
         b"arrow-array",
         b"arrow-buffer",
         b"arrow-data",
         b"arrow-ipc",
         b"arrow-schema",
-        b"num-bigint",
         b"flatbuffers",
     ];
     let arrow_version = match package_version(source, b"arrow") {
@@ -141,7 +140,7 @@ pub(crate) const fn locked_family(source: &[u8]) -> bool {
         _ => return false,
     };
     let length = source.len();
-    let mut counts = [0usize; 8];
+    let mut counts = [0usize; 7];
     let mut cursor = 0;
     while cursor < length {
         if source[cursor] != b'[' || !at(source, cursor, b"[[package]]\n") {
@@ -209,6 +208,12 @@ mod tests {
     fn lockfile_resource_sources_follow_cargo_identity_without_certifying_geometry() {
         let source = include_str!("../../../Cargo.lock");
         assert!(locked_family(source.as_bytes()));
+        // i256 Display uses fixed limbs in Arrow 60. Unrelated num-bigint
+        // identities no longer belong to the constant-reader source model.
+        assert!(locked_family(
+            format!("{source}\n[[package]]\nname = \"num-bigint\"\nversion = \"999.0.0\"\n")
+                .as_bytes()
+        ));
         assert_eq!(LOCKED_ARROW_VERSION, arrow::ARROW_VERSION);
         // A synchronized release change is an identity-consistency success,
         // not compatibility acceptance. No release/checksum is a guard policy.
@@ -221,7 +226,7 @@ mod tests {
             1,
         );
         assert!(!locked_family(split.as_bytes()));
-        for member in ["arrow", "num-bigint", "flatbuffers"] {
+        for member in ["arrow", "flatbuffers"] {
             let version =
                 std::str::from_utf8(package_version(source.as_bytes(), member.as_bytes()).unwrap())
                     .unwrap();

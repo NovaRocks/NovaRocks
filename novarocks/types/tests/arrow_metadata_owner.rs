@@ -28,6 +28,7 @@ thread_local! {
     static TRACK: Cell<bool> = const { Cell::new(false) };
     static CALLS: Cell<usize> = const { Cell::new(0) };
     static BYTES: Cell<usize> = const { Cell::new(0) };
+    static FREED: Cell<usize> = const { Cell::new(0) };
 }
 struct Probe;
 fn record(bytes: usize) {
@@ -52,6 +53,9 @@ unsafe impl GlobalAlloc for Probe {
         unsafe { System.realloc(ptr, layout, size) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if TRACK.try_with(Cell::get).unwrap_or(false) {
+            let _ = FREED.try_with(|value| value.set(value.get() + layout.size()));
+        }
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -60,6 +64,7 @@ static ALLOCATOR: Probe = Probe;
 fn tracked<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
     CALLS.with(|value| value.set(0));
     BYTES.with(|value| value.set(0));
+    FREED.with(|value| value.set(0));
     TRACK.with(|value| value.set(true));
     let result = f();
     TRACK.with(|value| value.set(false));
@@ -77,8 +82,10 @@ fn entries(count: usize) -> Vec<(String, String)> {
         .collect()
 }
 #[test]
-fn genuine_fresh_map_layout_is_prepaid_at_all_growth_boundaries() {
-    for count in [0, 1, 3, 4, 7, 8, 14, 15, 28, 29, 56, 57, 4096] {
+fn genuine_btree_metadata_and_arc_are_prepaid_at_all_growth_boundaries() {
+    for count in [
+        0, 1, 3, 4, 7, 8, 11, 12, 14, 15, 28, 29, 56, 57, 85, 86, 143, 144, 4096,
+    ] {
         let values = entries(count);
         let vector_bytes = values.capacity() * std::mem::size_of::<(String, String)>();
         let string_bytes = values
@@ -91,13 +98,23 @@ fn genuine_fresh_map_layout_is_prepaid_at_all_growth_boundaries() {
         let (owner, calls, actual_table_bytes) =
             tracked(|| ArrowMetadataOwner::try_new(values, limits()));
         let owner = owner.unwrap();
+        let conversion =
+            novarocks_type_contract::owned_resources::arrow_metadata::hashmap_conversion_requests(
+                count,
+            )
+            .unwrap();
+        let requests =
+            usize::from(count != 0) + conversion.allocation_requests_upper_bound().unwrap();
         assert_eq!(
-            calls,
-            usize::from(count != 0),
-            "only the fresh table may allocate"
+            calls, requests,
+            "the original reserve and each Arrow conversion request are separate"
         );
+        // The observed frees include the input Vec allocated before tracking.
+        // Keys/values moved into Metadata and remain live; add their unchanged
+        // input capacities separately. Temporary tables/Vec/sort heaps are gone.
+        let actual_live_tree_and_arc = actual_table_bytes + vector_bytes - FREED.with(Cell::get);
         assert!(
-            owner.backing_bytes() >= actual_table_bytes + string_bytes,
+            owner.backing_bytes() >= actual_live_tree_and_arc + string_bytes,
             "count={count}"
         );
         assert!(
@@ -148,7 +165,10 @@ fn entry_rejection_and_duplicate_failure_do_not_publish_a_receipt() {
     ];
     let (result, calls, _) = tracked(|| ArrowMetadataOwner::try_new(values, limits()));
     assert_eq!(result.unwrap_err(), MetadataOwnerError::DuplicateKey);
-    assert_eq!(calls, 1);
+    assert_eq!(
+        calls, 1,
+        "the duplicate is rejected before Arrow consumes the original HashMap"
+    );
 }
 #[test]
 fn exact_field_owner_survives_aliases_but_structural_clones_and_mutation_lose_proof() {

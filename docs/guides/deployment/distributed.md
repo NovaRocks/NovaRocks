@@ -21,7 +21,7 @@ under the License.
 
 分布式部署使用 NovaRocks native 角色能力，将协调节点和计算节点拆分为不同进程。FE 角色提供 Trino HTTP 与 MySQL 客户端入口、SQL 解析、优化和 fragment 调度；BE 角色通过独立的 Native Data 与 Control gRPC listener 执行 fragment 和处理控制请求。
 
-该模式不依赖 StarRocks FE。当前 Server 只封装 Iceberg 与 Paimon provider；StarRocks 已废弃，没有 active read capability，旧 `[connector.starrocks]` 配置会在启动解析阶段明确失败。
+该模式不依赖 StarRocks FE。当前 Server 的封闭 provider manifest 保留 Iceberg 与 Paimon；Iceberg 保留现有读写能力。Paimon 保留注册、catalog 配置与投影，目录和读取操作返回 `Unsupported`，不进入 pure catalogue。恢复须等待 paimon-rust 及其依赖支持 Arrow 60 与 zstd 0.14，并重新满足 ADR-0138 的授权读取边界，见 [ADR-0204](../../adr/ADR-0204-upstream-iceberg-backports-and-provider-suspension.md)。StarRocks 已废弃，没有 active read capability，旧 `[connector.starrocks]` 配置会在启动解析阶段明确失败。
 
 ## 部署拓扑
 
@@ -179,7 +179,7 @@ BE readiness marker 在两条 advertised endpoint 的启动就绪检查成功后
 `*_grpc_port` 是本地 bind 端口，不能替代 NAT 后的 advertised port。`role=be` 不提供
 MySQL 端口，`--port` 参数对 BE 无效。
 
-`[connector.object_store]` 是 native connector 读取 Iceberg 或 Paimon/S3 数据时使用的
+`[connector.object_store]` 是 native connector 当前读取 Iceberg/S3 数据时使用的
 role-local 静态启动配置。静态绑定须使 FE metadata 用途和 BE execution 用途分别获得
 覆盖所需资源的访问权；这不要求两种用途共享 secret。REST Catalog 的 vended 材料
 由签请求的 BE 本地 `StorageAuthority` 按需取得和续期。FE 随凭证租约公告取得路径：
@@ -277,8 +277,8 @@ FE 的 `[runtime.native_ingress]` 只设置本角色 Native report listener 的 
 使 `[state_store]` 成为该 authority 的 durable carrier；StaticFile deployment 仍可配置 SQLite
 作为可重建 Accelerator carrier，但必须只从 static snapshot 读取 catalog truth。membership 只是
 可重建的内存投影：FE 重启后由仍在运行的 BE renew announce 重建。不得添加第二套 metadata store、seed
-或内存 fallback。持久用户表属于 external Iceberg 或 Paimon catalog；只有 Iceberg 当前支持
-native 写入。`[connector.object_store]` 只提供 connector execution 的进程本地凭据。
+或内存 fallback。持久用户表属于 external Iceberg 或 Paimon catalog；Iceberg 当前支持
+native 读写，Paimon 保留 catalog 配置与投影，目录和读取操作已暂停。`[connector.object_store]` 只提供 connector execution 的进程本地凭据。
 
 启动 FE：
 
@@ -464,7 +464,7 @@ SHOW BACKENDS;
 SELECT 1;
 ```
 
-如果集群连接了 external Iceberg 或 Paimon catalog，再执行一条真实表查询，确认 FE 调度、BE 执行和外部存储访问均可用。Paimon 查询还要求外部 GC/expiration 的保留窗口覆盖最长查询时长，详见 [Paimon 只读 Connector](../connectors/paimon.md)。
+如果集群连接了 external Iceberg catalog，再执行一条真实表查询，确认 FE 调度、BE 执行和外部存储访问均可用。配置了 Paimon catalog 时，确认 catalog 投影保留、目录及读取操作返回 `Unsupported`。Paimon 的恢复条件与恢复后的外部 GC/expiration 保留前提见 [Paimon Connector（读取暂停）](../connectors/paimon.md)。
 
 ## 配置与管理 BE
 

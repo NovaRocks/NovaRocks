@@ -279,12 +279,12 @@ mod runtime_projection_tests {
             output.chunk_schema().slots()[0].typed_binding(),
             ty.typed_binding()
         );
-        assert_eq!(
+        assert!(
             output.chunk_schema().slots()[0]
                 .field()
                 .metadata()
-                .capacity(),
-            0
+                .as_arc()
+                .is_none()
         );
         assert_eq!(
             output.columns()[0]

@@ -131,7 +131,7 @@ fn schema_limits() -> NodeProjectionLimits {
         },
     }
 }
-fn source_attributes(original: &HashMap<String, String>) -> (HashMap<String, String>, usize) {
+fn source_attributes(original: &arrow::datatypes::Metadata) -> (HashMap<String, String>, usize) {
     // The fixture author creates this table in one explicit reserve. Its
     // source work proof includes actual copied String backing, not a floor.
     let table = novarocks_type_contract::owned_resources::hashmap::fresh_table_layout::<
@@ -333,8 +333,12 @@ fn read(count: usize, metadata: bool, residual: bool) -> c::FrozenConnectorRead 
     let fields = (0..count)
         .map(|i| {
             Arc::new(
-                Field::new(format!("col{i}"), DataType::Int64, i % 2 == 0)
-                    .with_metadata([("ordinal".into(), i.to_string())].into()),
+                Field::new(format!("col{i}"), DataType::Int64, i % 2 == 0).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "ordinal".into(),
+                        i.to_string(),
+                    )]),
+                ),
             )
         })
         .collect::<Vec<_>>();
@@ -1331,8 +1335,8 @@ fn read_public_execution_and_source_namespaces_accept_zero_ids_without_changing_
                 .unwrap()
                 .schema()
                 .metadata()
-                .capacity()
-                == 0
+                .as_arc()
+                .is_none()
         );
         assert_eq!(
             public.source_schema_facts().unwrap().field_facts()[1].attributes()["ordinal"],

@@ -22,7 +22,7 @@
 use crate::{allocation_exit_v2::reserve_exit, physical_type_v2::TypeCodecError};
 use novarocks_proto_models::plan;
 use novarocks_type_contract::CompileCheckpoints;
-use std::{cmp::Ordering, collections::HashMap};
+use std::cmp::Ordering;
 
 fn reserve<T>(n: usize, work: &mut CompileCheckpoints<'_>) -> Result<Vec<T>, TypeCodecError> {
     let mut output = Vec::new();
@@ -78,12 +78,12 @@ pub(crate) fn ordered_key(
     }
 }
 
-/// Generalize the existing Field metadata sorter without imposing new schema
-/// limits. The caller has admitted HashMap raw bucket iteration using its full
-/// source invoice, not len/capacity, before this first allocation or traversal.
+/// Retain the existing Field spelling-copy author without imposing new schema
+/// limits. Metadata has ordered BTree cursor traversal; caller admission still
+/// covers the original scratch and copied output before allocation/traversal.
 /// This scope neither enters nor finishes another control owner.
 pub(crate) fn encode_metadata(
-    source: &HashMap<String, String>,
+    source: &arrow::datatypes::Metadata,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<plan::ArrowFieldMetadataEntry>, TypeCodecError> {
     let mut sorted: Vec<(&str, &str)> = reserve(source.len(), work)?;

@@ -162,7 +162,7 @@ fn public_n_owner_installs_every_exact_largeint_declaration_and_phase() {
                         };
                         assert_eq!(field.data_type(), &DataType::FixedSizeBinary(16));
                         assert!(field.is_nullable());
-                        assert_eq!(field.metadata().capacity(), 0);
+                        assert!(field.metadata().as_arc().is_none());
                         assert_eq!(
                             handle
                                 .contract()
@@ -338,7 +338,7 @@ fn public_n_state_column_runs_selected_single_and_partial_final_with_last_alias_
                 let DataType::List(field) = output.data_type() else {
                     panic!("List result")
                 };
-                assert_eq!(field.metadata().capacity(), 0);
+                assert!(field.metadata().as_arc().is_none());
                 assert_eq!(
                     handle
                         .contract()

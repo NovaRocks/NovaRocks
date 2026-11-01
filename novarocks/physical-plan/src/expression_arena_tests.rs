@@ -112,8 +112,12 @@ fn check_prefixes(
 #[test]
 fn sparse_definition_constructor_preserves_zero_max_full_source_and_ordered_occurrences() {
     let child = Arc::new(
-        arrow_schema::Field::new("authored-child", DataType::Int64, false)
-            .with_metadata([("provider".into(), "exact".into())].into()),
+        arrow_schema::Field::new("authored-child", DataType::Int64, false).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider".into(),
+                "exact".into(),
+            )]),
+        ),
     );
     let mut root = definition(u32::MAX);
     root.lambda_scope = Some(ExprId::new(41));

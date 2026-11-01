@@ -886,7 +886,7 @@ fn owned_expression_requests_have_independent_stage_tree_dictionary_and_list_lay
             panic!("source Struct")
         };
         assert!(Arc::ptr_eq(&fields[0], &original[0]));
-        assert_eq!(fields[0].metadata().capacity(), 0);
+        assert!(fields[0].metadata().as_arc().is_none());
         assert_eq!(parameter_types[0].data_type(), &DataType::Utf8);
         assert!(std::ptr::eq(
             parameter_types[0].data_type(),

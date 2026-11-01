@@ -41,7 +41,7 @@ use novarocks_type_contract::{
     ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
     ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, control_argument_semantics,
 };
-use std::{num::NonZeroUsize, time::Duration};
+use std::num::NonZeroUsize;
 
 const WRITER_FRAGMENT: FragmentId = FragmentId::new(1);
 const FINISH_FRAGMENT: FragmentId = FragmentId::new(2);
@@ -73,8 +73,13 @@ fn binding() -> ConnectorWriteBinding {
 /// separately authored execution bindings determine the static projection.
 fn target_fields() -> Vec<Field> {
     vec![
-        Field::new("c1", DataType::Int64, false)
-            .with_metadata([("provider.field-id".to_string(), "1".to_string())].into()),
+        Field::new("c1", DataType::Int64, false).with_metadata(std::collections::HashMap::<
+            String,
+            String,
+        >::from([(
+            "provider.field-id".to_string(),
+            "1".to_string(),
+        )])),
         Field::new("c2", DataType::Utf8, true),
     ]
 }
@@ -108,9 +113,10 @@ fn draft_with_types(declared: [FunctionValueType; 2]) -> ConnectorWriteRecipeDra
                     let mut field =
                         Field::new(name, execution.data_type().clone(), execution.nullable());
                     if ordinal == 0 {
-                        field = field.with_metadata(
-                            [("provider.field-id".to_owned(), "1".to_owned())].into(),
-                        );
+                        field =
+                            field.with_metadata(std::collections::HashMap::<String, String>::from(
+                                [("provider.field-id".to_owned(), "1".to_owned())],
+                            ));
                     }
                     ConnectorWriteFieldBinding::try_new_typed(
                         ConnectorWriteFieldToken::from_bytes([ordinal as u8 + 1; 32]),
@@ -669,7 +675,6 @@ fn options(pipeline_dop: usize, root_sink_dop: Option<usize>) -> LocalCompileOpt
         pipeline_dop: NonZeroUsize::new(pipeline_dop).unwrap(),
         root_sink_dop: root_sink_dop.map(|dop| NonZeroUsize::new(dop).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        exchange_wait: Duration::from_millis(1_000),
         // Explicit fixture admission; these values are not production defaults.
         constants: ConstantPolicy {
             max_rows: 16,

@@ -112,13 +112,18 @@ pub enum PlannedOutputStorage {
 }
 
 /// Caller-authored representation projection. Signed external boundaries may
-/// freeze new ordinal field names and NULL declarations; carrier semantics and
-/// value parameters remain exact in both modes.
+/// freeze new ordinal field names and NULL declarations. An explicitly requested
+/// byte-layout projection changes only plain STRING/BINARY representation;
+/// scalar parameters and value domains remain exact.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HydrateProjection {
     #[default]
     Exact,
     FrozenNamesAndNullability,
+    /// Project plain bytes to the caller's exact target layout within the same
+    /// STRING or BINARY domain. Names and NULL declarations remain exact;
+    /// dictionary values retain their original D(L)/explicit-override policy.
+    ExactByteLayouts,
 }
 
 /// Primitive storage parameter for exercising a future dictionary-value
@@ -475,3 +480,6 @@ fn reserve<T, E>(
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod byte_projection_tests;

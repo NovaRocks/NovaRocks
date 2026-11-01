@@ -168,6 +168,37 @@ class RendererTests(RendererCase):
             self.assertTrue((directory / name).is_file(), name)
             self.assertNotIn('.prepare-', (directory / name).read_text())
 
+    def test_retired_exchange_keys_get_new_publication_without_rewriting_old_configs(self):
+        render_current = entry.render_role_configs
+
+        def render_legacy(staging, *args, **kwargs):
+            render_current(staging, *args, **kwargs)
+            for role in ('fe', 'be'):
+                path = staging / f'{role}.toml'
+                text = path.read_text().replace('[runtime]\n',
+                    '[runtime]\nexchange_wait_ms = 300000\nexchange_io_threads = 1\n')
+                path.write_text(text)
+
+        with mock.patch.object(publication, 'RENDERER_REVISION', publication.RENDERER_REVISION - 1), \
+                mock.patch.object(entry, 'render_role_configs', side_effect=render_legacy):
+            first = self.bind()
+        original = Path(first['published_dir'])
+        names = (*runtime.ENTRY_FILES, 'entry.json', 'files.json')
+        original_bytes = {name: (original / name).read_bytes() for name in names}
+        second = self.bind()
+        current = Path(second['published_dir'])
+        self.assertNotEqual(original, current)
+        self.assertEqual(original_bytes,
+            {name: (original / name).read_bytes() for name in names})
+        for role in ('fe', 'be'):
+            old_runtime = tomllib.loads((original / f'{role}.toml').read_text())['runtime']
+            new_runtime = tomllib.loads((current / f'{role}.toml').read_text())['runtime']
+            self.assertEqual(old_runtime.pop('exchange_wait_ms'), 300000)
+            self.assertEqual(old_runtime.pop('exchange_io_threads'), 1)
+            self.assertNotIn('exchange_wait_ms', new_runtime)
+            self.assertNotIn('exchange_io_threads', new_runtime)
+            self.assertEqual(new_runtime, old_runtime)
+
     def test_same_configuration_reuses_exact_publication_and_env_bytes(self):
         first = self.bind()
         before = (self.entry / 'env.sh').read_bytes()

@@ -37,7 +37,6 @@ hex.workspace = true
 h2.workspace = true
 novarocks-catalog-application.workspace = true
 novarocks-connector-contract.workspace = true
-novarocks-fs.workspace = true
 novarocks-functions.workspace = true
 novarocks-memory.workspace = true
 novarocks-execution.workspace = true
@@ -79,7 +78,6 @@ toml.workspace = true
 uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
-novarocks-connector-paimon.workspace = true
 novarocks-local-compiler.workspace = true
 novarocks-local-program.workspace = true
 novarocks-plan-codec = { workspace = true }

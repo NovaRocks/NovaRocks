@@ -147,7 +147,6 @@ pub(crate) fn validate_runtime_filters(plan: &PhysicalPlan, errors: &mut Validat
             );
         }
     }
-    validate_runtime_filter_wait_graph(plan, "runtime_filters", errors);
     for fragment in plan.fragments().values() {
         for id in fragment.runtime_filters() {
             if !plan.runtime_filters().contains_key(id) {
@@ -160,170 +159,40 @@ pub(crate) fn validate_runtime_filters(plan: &PhysicalPlan, errors: &mut Validat
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum RuntimeFilterWaitNode {
-    Physical(FragmentId, NodeId),
-    Filter(crate::RuntimeFilterId),
-}
-
-pub(crate) fn validate_runtime_filter_wait_graph(
+/// Check the actual frozen activations using the same dependency author as
+/// planning. Every active cycle is a rejection here; no planning downgrade runs.
+pub(crate) fn validate_runtime_filter_wait_graph_in(
     plan: &PhysicalPlan,
-    path: &str,
     errors: &mut ValidationContext,
-) {
-    let mut dependencies =
-        BTreeMap::<RuntimeFilterWaitNode, BTreeSet<RuntimeFilterWaitNode>>::new();
-    for fragment in plan.fragments().values() {
-        for node in fragment.nodes().values() {
-            let current = RuntimeFilterWaitNode::Physical(fragment.id(), node.id);
-            let current_dependencies = dependencies.entry(current).or_default();
-            current_dependencies.extend(
-                node.inputs
-                    .iter()
-                    .map(|input| RuntimeFilterWaitNode::Physical(fragment.id(), *input)),
-            );
-            if let NodeKind::ExchangeSource { edge, .. } = &node.kind
-                && let Some(edge) = plan.edges().get(edge)
-                && let Some(source) = plan.fragments().get(&edge.source.fragment)
-            {
-                current_dependencies
-                    .insert(RuntimeFilterWaitNode::Physical(source.id(), source.root()));
-            }
-        }
-    }
-    for filter in plan.runtime_filters().values() {
-        let filter_node = RuntimeFilterWaitNode::Filter(filter.id);
-        dependencies.entry(filter_node).or_default();
-        for producer in &filter.producers {
-            let Some(fragment) = plan.fragments().get(&producer.endpoint.fragment) else {
-                continue;
-            };
-            let Some(node) = fragment.nodes().get(&producer.endpoint.node) else {
-                continue;
-            };
-            let producer_root = match (&producer.target, &node.kind) {
-                (
-                    crate::RuntimeFilterProducerTarget::JoinBuildKey { .. },
-                    NodeKind::HashJoin { build_side, .. },
-                ) => usize::try_from(build_side.input_ordinal())
-                    .ok()
-                    .and_then(|ordinal| node.inputs.get(ordinal))
-                    .copied(),
-                (
-                    crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. },
-                    NodeKind::Aggregate { .. },
-                ) => node.inputs.first().copied(),
-                _ => None,
-            };
-            let Some(producer_root) = producer_root else {
-                continue;
-            };
-            dependencies
-                .entry(filter_node)
-                .or_default()
-                .insert(RuntimeFilterWaitNode::Physical(
-                    fragment.id(),
-                    producer_root,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), novarocks_type_contract::CompileControlError> {
+    use crate::wait_graph::{WaitGraph, WaitGraphError};
+    let result = WaitGraph::build_observed(
+        plan.fragments(),
+        plan.edges(),
+        plan.runtime_filters().values(),
+        work,
+    )
+    .and_then(|graph| graph.active_cycles_observed(work));
+    match result {
+        Err(WaitGraphError::Control(cause)) => return Err(cause),
+        Err(cause) => errors.push(ValidationError::new("runtime_filters", cause.to_string())),
+        Ok(cycles) => {
+            if cycles.filter {
+                errors.push(ValidationError::new(
+                    "runtime_filters",
+                    "blocking runtime-filter waits form a cycle with physical execution dependencies",
                 ));
-        }
-        for consumer in &filter.consumers {
-            if consumer.activation == crate::RuntimeFilterConsumerActivation::BlockingSnapshot {
-                dependencies
-                    .entry(RuntimeFilterWaitNode::Physical(
-                        consumer.endpoint.fragment,
-                        consumer.endpoint.node,
-                    ))
-                    .or_default()
-                    .insert(filter_node);
             }
-        }
-    }
-    let downstream = plan.edges().values().fold(
-        BTreeMap::<FragmentId, BTreeSet<FragmentId>>::new(),
-        |mut index, edge| {
-            index
-                .entry(edge.source.fragment)
-                .or_default()
-                .insert(edge.destination.fragment);
-            index
-        },
-    );
-    for source in plan.fragments().values() {
-        let FragmentSink::Multicast { edges: branches } = source.sink() else {
-            continue;
-        };
-        if branches.len() < 2 {
-            continue;
-        }
-        let mut reachable = BTreeSet::new();
-        let mut pending = branches
-            .iter()
-            .filter_map(|edge| plan.edges().get(edge).map(|edge| edge.destination.fragment))
-            .collect::<Vec<_>>();
-        while let Some(fragment) = pending.pop() {
-            if !reachable.insert(fragment) {
-                continue;
-            }
-            pending.extend(downstream.get(&fragment).into_iter().flatten().copied());
-        }
-        for consumer in plan
-            .runtime_filters()
-            .values()
-            .flat_map(|filter| &filter.consumers)
-            .filter(|consumer| {
-                consumer.activation == crate::RuntimeFilterConsumerActivation::BlockingSnapshot
-                    && reachable.contains(&consumer.endpoint.fragment)
-            })
-        {
-            dependencies
-                .entry(RuntimeFilterWaitNode::Physical(source.id(), source.root()))
-                .or_default()
-                .insert(RuntimeFilterWaitNode::Physical(
-                    consumer.endpoint.fragment,
-                    consumer.endpoint.node,
+            if cycles.data {
+                errors.push(ValidationError::new(
+                    "fragments.wait_graph",
+                    "required physical input waits form a structural cycle",
                 ));
-        }
-    }
-
-    let mut remaining = dependencies
-        .iter()
-        .map(|(node, dependencies)| (*node, dependencies.len()))
-        .collect::<BTreeMap<_, _>>();
-    let mut dependents = BTreeMap::<RuntimeFilterWaitNode, Vec<RuntimeFilterWaitNode>>::new();
-    for (node, node_dependencies) in &dependencies {
-        for dependency in node_dependencies {
-            dependents.entry(*dependency).or_default().push(*node);
-        }
-    }
-    let mut ready = remaining
-        .iter()
-        .filter_map(|(node, count)| (*count == 0).then_some(*node))
-        .collect::<Vec<_>>();
-    while let Some(node) = ready.pop() {
-        let Some(count) = remaining.remove(&node) else {
-            continue;
-        };
-        debug_assert_eq!(count, 0);
-        if let Some(nodes) = dependents.get(&node) {
-            for dependent in nodes {
-                if let Some(count) = remaining.get_mut(dependent) {
-                    *count -= 1;
-                    if *count == 0 {
-                        ready.push(*dependent);
-                    }
-                }
             }
         }
     }
-    if remaining
-        .keys()
-        .any(|node| matches!(node, RuntimeFilterWaitNode::Filter(_)))
-    {
-        errors.push(ValidationError::new(
-            path,
-            "blocking runtime-filter waits form a cycle with physical execution dependencies",
-        ));
-    }
+    Ok(())
 }
 
 pub(crate) fn validate_runtime_filter_attachment(

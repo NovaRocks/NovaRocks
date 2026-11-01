@@ -738,12 +738,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn retags_iceberg_map_without_narrowing_runtime_key_nullability() {
-        let keys = Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef;
-        let values = Arc::new(Int64Array::from(vec![Some(10), Some(20)])) as ArrayRef;
+    fn retags_iceberg_map_with_required_key_and_nullable_value() {
+        let keys = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        let values = Arc::new(Int64Array::from(vec![Some(10), None])) as ArrayRef;
         let entries = StructArray::new(
             Fields::from(vec![
-                Field::new("key", DataType::Int32, true),
+                Field::new("key", DataType::Int32, false),
                 Field::new("value", DataType::Int64, true),
             ]),
             vec![keys, values],
@@ -771,7 +771,7 @@ pub(crate) mod tests {
             false,
         );
 
-        let out = retag_iceberg_array(&source, &target).expect("retag nullable map key");
+        let out = retag_iceberg_array(&source, &target).expect("retag valid map metadata");
 
         let DataType::Map(entries, false) = out.data_type() else {
             panic!("expected map");
@@ -781,9 +781,48 @@ pub(crate) mod tests {
             panic!("expected entries struct");
         };
         assert_eq!(fields[0].name(), "iceberg_key");
-        assert!(fields[0].is_nullable());
+        assert!(!fields[0].is_nullable());
+        assert!(fields[1].is_nullable());
         let map = out.as_any().downcast_ref::<MapArray>().expect("map array");
-        assert!(map.keys().is_null(1));
+        assert_eq!(map.keys().null_count(), 0);
+        assert_eq!(
+            map.keys()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            &[1, 2]
+        );
+        assert!(map.values().is_null(1));
+    }
+    #[test]
+    fn arrow_rejects_nullable_map_keys_before_iceberg_metadata_retagging() {
+        let entries = StructArray::new(
+            vec![
+                Field::new("key", DataType::Int32, true),
+                Field::new("value", DataType::Int64, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+            ],
+            None,
+        );
+        let error = MapArray::try_new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::from_lengths([2]),
+            entries,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            arrow::error::ArrowError::InvalidArgumentError(_)
+        ));
+        assert!(error.to_string().contains("keys field cannot be nullable"));
     }
     #[test]
     fn position_path_predicate_reads_related_groups_and_reports_layout_degradation() {
@@ -804,7 +843,7 @@ pub(crate) mod tests {
                     crate::delete_semantics::POSITION_FILE_PATH_FIELD_ID.to_string(),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
             ),
             Field::new("pos", DataType::Int64, false).with_metadata(
                 [(
@@ -812,7 +851,7 @@ pub(crate) mod tests {
                     (i32::MAX - 102).to_string(),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
             ),
             Field::new("unrelated_payload", DataType::Binary, false),
         ]));
@@ -1016,7 +1055,7 @@ pub(crate) mod tests {
                     crate::delete_semantics::POSITION_FILE_PATH_FIELD_ID.to_string(),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
             ),
             Field::new("pos", DataType::Int64, false).with_metadata(
                 [(
@@ -1024,7 +1063,7 @@ pub(crate) mod tests {
                     (i32::MAX - 102).to_string(),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
             ),
         ]));
         let mut writer = ArrowWriter::try_new(

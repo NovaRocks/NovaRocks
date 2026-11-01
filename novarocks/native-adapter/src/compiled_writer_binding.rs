@@ -130,6 +130,7 @@ impl novarocks_execution_contract::failure::FailureProjection for CompiledWriter
 #[derive(Debug)]
 enum WriterBindingContractFailure {
     MissingRecipe,
+    SummaryBinding(&'static str),
     DisplayRange {
         index: usize,
         source: std::num::TryFromIntError,
@@ -141,6 +142,7 @@ impl fmt::Display for WriterBindingContractFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingRecipe => f.write_str("the writer carries no provider write recipe"),
+            Self::SummaryBinding(detail) => write!(f, "compiled summary binding refused: {detail}"),
             Self::DisplayRange { index, .. } => {
                 write!(f, "local node index {index} exceeds the display identity")
             }
@@ -164,6 +166,7 @@ impl novarocks_execution_contract::failure::FailureProjection for WriterBindingC
         use novarocks_execution_contract::failure::*;
         let (class, code) = match self {
             Self::MissingRecipe => (FailureClass::Invariant, 9720),
+            Self::SummaryBinding(_) => (FailureClass::Invariant, 9724),
             Self::DisplayRange { .. } => (FailureClass::Invariant, 9721),
             Self::WrongBinding => (FailureClass::Invariant, 9722),
             Self::Observation(_) => (FailureClass::Unexpected, 9723),
@@ -180,6 +183,7 @@ impl novarocks_execution_contract::failure::FailureProjection for WriterBindingC
 pub(crate) fn bind_compiled_writers(
     program: &LocalProgram,
     task: &CompiledWriteTask<'_>,
+    topology: &novarocks_execution_contract::descriptor::ExchangeTopology,
 ) -> Result<CompiledWriterBindings, CompiledWriterBindingError> {
     let mut bindings = CompiledWriterBindings::default();
     for (index, node) in program.graph().nodes().iter().enumerate() {
@@ -197,8 +201,58 @@ pub(crate) fn bind_compiled_writers(
                     .bind_writer(id, writer)
                     .map_err(|source| CompiledWriterBindingError::at_failure(id, source))?;
             }
-            ProgramNodeKind::TableFinish { .. } => {
-                let finish = bind_compiled_finish(id, task)?;
+            ProgramNodeKind::TableFinish {
+                inputs,
+                input_roles,
+                count_mode,
+                ..
+            } => {
+                let mut finish = bind_compiled_finish(id, task)?;
+                if *count_mode == novarocks_local_program::FinishCountMode::LogicalChanges {
+                    let invalid = |detail| {
+                        CompiledWriterBindingError::at_domain(
+                            id,
+                            WriterBindingContractFailure::SummaryBinding(detail),
+                        )
+                    };
+                    let receiver = input_roles
+                        .logical_summary
+                        .and_then(|ordinal| inputs.get(ordinal as usize))
+                        .and_then(|input| program.exchange_inputs().get(input))
+                        .ok_or_else(|| invalid("the logical role has no compiled receiver"))?;
+                    if receiver.role != novarocks_local_program::ProgramOutputRole::LogicalSummary
+                        || receiver.delivery
+                            != novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+                    {
+                        return Err(invalid(
+                            "the compiled input is not a strict logical summary",
+                        ));
+                    }
+                    let receiver_node = i32::try_from(receiver.receiver_node).map_err(|_| {
+                        invalid("summary receiver node exceeds the native identity")
+                    })?;
+                    let inbound = topology
+                        .inbound_node(
+                            novarocks_execution_contract::descriptor::FragmentNodeId::new(
+                                receiver_node,
+                            ),
+                        )
+                        .ok_or_else(|| {
+                            invalid("the summary receiver has no frozen inbound capability")
+                        })?;
+                    if inbound.delivery() != receiver.delivery
+                        || inbound.sources().iter().any(|source| {
+                            source.task().query_execution_id() != task.runtime.execution_id()
+                        })
+                    {
+                        return Err(invalid(
+                            "the summary source set has another attempt or delivery law",
+                        ));
+                    }
+                    finish = finish
+                        .with_logical_summary(receiver_node, Arc::from(inbound.sources()))
+                        .map_err(|source| CompiledWriterBindingError::at_failure(id, source))?;
+                }
                 bindings
                     .bind_finish(id, finish)
                     .map_err(|source| CompiledWriterBindingError::at_failure(id, source))?;

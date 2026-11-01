@@ -28,9 +28,9 @@ fn root_positive_source_structural_compiled_statistics_canonical_owner() {
             // Actual preparation owns the canonical schema independently of
             // the retired metadata-origin receipts.
             assert!(chunk.chunk_schema().is_typed());
-            assert_eq!(chunk.schema().metadata().capacity(), 0);
+            assert!(chunk.schema().metadata().as_arc().is_none());
             for field in chunk.schema().fields() {
-                assert_eq!(field.metadata().capacity(), 0);
+                assert!(field.metadata().as_arc().is_none());
             }
             assert!(chunk.chunk_schema().metadata_materializations().is_none());
             assert!(chunk.chunk_schema().field_metadata_origins().is_none());

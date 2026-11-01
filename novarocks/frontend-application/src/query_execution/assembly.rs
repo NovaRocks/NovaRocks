@@ -434,10 +434,12 @@ mod tests {
             D::Bitmap,
         )
         .unwrap();
-        let field =
-            Arc::new(Field::new("wire", DataType::Binary, false).with_metadata(
-                [("nr_logical_type".into(), "unknown-source-attribute".into())].into(),
-            ));
+        let field = Arc::new(Field::new("wire", DataType::Binary, false).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "nr_logical_type".into(),
+                "unknown-source-attribute".into(),
+            )]),
+        ));
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![field.clone()])),
             vec![Arc::new(BinaryArray::from(vec![b"payload".as_slice()]))],

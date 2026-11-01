@@ -258,12 +258,13 @@ impl From<novarocks_type_contract::owned_resources::metadata_materialization::Me
 }
 
 #[test]
-fn by_schema_origin_clone_invoice_uses_original_table_not_erased_capacity_or_text_capacity() {
+fn by_schema_origin_clone_invoice_shares_original_metadata_without_new_backing() {
     let mut metadata = MaterializedMetadataMap::with_capacity(64);
     let mut key = String::with_capacity(4096);
     key.push_str("key");
     let mut value = String::with_capacity(8192);
     value.push_str("value");
+    let original_capacities = (key.capacity(), value.capacity());
     metadata.insert(key, value);
     let owner = metadata
         .into_field(Field::new("k", DataType::Int64, false))
@@ -279,25 +280,21 @@ fn by_schema_origin_clone_invoice_uses_original_table_not_erased_capacity_or_tex
         .unwrap()
         .unwrap();
     assert_eq!(calls, 1);
-    assert_eq!(request.text_requests, 2);
-    assert_eq!(request.text_bytes, 8);
-    assert_eq!(
-        request.table_backing,
-        owner.metadata_origin().table_request().unwrap().layout
-    );
-    let small = MaterializedMetadataMap::with_capacity(1)
-        .into_field(Field::new("k", DataType::Int64, false))
-        .into_shared();
-    assert!(
-        request.table_backing.unwrap().size()
-            > small
-                .metadata_origin()
-                .table_request()
-                .unwrap()
-                .layout
-                .unwrap()
-                .size()
-    );
+    assert_eq!(request.text_requests, 0);
+    assert_eq!(request.text_bytes, 0);
+    assert_eq!(request.table_backing, None);
+    assert_eq!(request.request_bytes().unwrap(), 0);
+    // Original staging facts remain provenance; they do not become a new
+    // Metadata::clone request after Arrow consumes the temporary HashMap.
+    let original = owner.metadata_origin().table_request().unwrap();
+    assert!(original.layout.is_some());
+    let copied = owner.clone_original();
+    assert!(Arc::ptr_eq(
+        owner.field().metadata().as_arc().unwrap(),
+        copied.field().metadata().as_arc().unwrap(),
+    ));
+    let (key, value) = copied.field().metadata().iter().next().unwrap();
+    assert_eq!((key.capacity(), value.capacity()), original_capacities);
     let foreign = Arc::new(owner.field().as_ref().clone());
     assert!(
         loan.original_metadata_clone_request(&foreign, &mut || -> Result<(), CloneProbeError> {
@@ -308,18 +305,23 @@ fn by_schema_origin_clone_invoice_uses_original_table_not_erased_capacity_or_tex
 }
 
 #[test]
-fn by_schema_origin_clone_invoice_keeps_empty_allocated_table_and_first_borrow_refusal() {
+fn by_schema_origin_clone_invoice_has_no_empty_backing_and_keeps_first_borrow_refusal() {
     let empty = MaterializedMetadataMap::with_capacity(64).into_field(Field::new(
         "empty",
         DataType::Int64,
         false,
     ));
+    let mut empty_calls = 0;
     let request = empty
         .original_metadata_clone_request(&mut || -> Result<(), CloneProbeError> {
-            panic!("an empty table has no metadata entry callback")
+            empty_calls += 1;
+            Ok(())
         })
         .unwrap();
-    assert!(request.table_backing.is_some());
+    assert_eq!(empty_calls, 1);
+    assert!(empty.field().metadata().as_arc().is_none());
+    assert_eq!(request.table_backing, None);
+    assert_eq!(request.request_bytes().unwrap(), 0);
     assert_eq!(request.text_bytes, 0);
     assert_eq!(request.text_requests, 0);
     let mut metadata = MaterializedMetadataMap::with_capacity(2);

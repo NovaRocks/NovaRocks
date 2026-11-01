@@ -33,6 +33,7 @@ use novarocks_native_adapter::backend_application::CompiledStaticPlan;
 use novarocks_plan_codec::physical_package_v2::{
     FROZEN_CONSTANT_POLICY, PackageDecodeLimits, PackageEncodeLimits,
 };
+use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 use novarocks_spi::connector::ConnectorCodecError;
 
 use crate::provider_manifest::ServerProviderManifest;
@@ -53,6 +54,7 @@ pub(crate) fn frontend_constant_policy(
 /// Everything the production backend interpreter is composed from.
 pub(crate) struct CompiledPackage {
     decode_limits: PackageDecodeLimits,
+    decode_model: Arc<FragmentDecodeResourceModel>,
     constants: ConstantPolicy,
     functions: Arc<PureEngineFunctionCatalog>,
     providers: Arc<PureProviderProgramCatalog<ConnectorCodecError>>,
@@ -73,6 +75,7 @@ impl CompiledPackage {
         tracing::debug!(excluded = ?seal.excluded, "pure catalogue exclusions");
         Ok(Self {
             decode_limits: PackageDecodeLimits::FROZEN,
+            decode_model: Arc::new(FragmentDecodeResourceModel::try_new(&CompositionControl)?),
             constants: FROZEN_CONSTANT_POLICY,
             functions: Arc::new(seal.catalog),
             providers: Arc::new(provider_manifest.compose_pure_program_catalog()?),
@@ -90,17 +93,19 @@ impl CompiledPackage {
         novarocks_frontend_application::CompiledPackageCarrier::new(
             self.decode_limits.admission,
             PackageEncodeLimits::FROZEN,
+            Arc::clone(&self.decode_model),
+            self.decode_limits.wire,
         )
     }
 
-    pub(crate) fn backend_interpreter(&self) -> anyhow::Result<CompiledStaticPlan> {
-        CompiledStaticPlan::try_new(
+    pub(crate) fn backend_interpreter(&self) -> CompiledStaticPlan {
+        CompiledStaticPlan::new(
+            Arc::clone(&self.decode_model),
             self.decode_limits.clone(),
             Arc::clone(&self.functions),
             Arc::clone(&self.providers),
             self.constants,
         )
-        .map_err(|error| anyhow::anyhow!("compose the compiled-package interpreter: {error}"))
     }
 }
 

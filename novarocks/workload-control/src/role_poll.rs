@@ -414,7 +414,10 @@ impl<I, F: Future, M: Fn(WorkOwner, I) -> F, C> RolePollBank<I, F, M, C> {
         let geometry = PollRoleGeometry::for_factory_with_context::<I, F, M, C>(&make)?
             .with_source_backing(source)?;
         let validate = |state: &mut crate::scope::State| -> Result<(usize, u64), WorkError> {
-            if state.ready || state.closed || !state.cancellations.fixed || !state.nodes.is_empty()
+            if state.ready
+                || state.root_admission_is_closed()
+                || !state.cancellations.fixed
+                || !state.nodes.is_empty()
             {
                 return Err(WorkError::Conflict);
             }

@@ -164,7 +164,11 @@ class FakeCommands:
                 output = "rustup " + version if version else ""
             elif args[1:3] == ["toolchain", "list"]:
                 output = "1.98.1-x86_64-unknown-linux-gnu\n" if self.toolchain else ""
+            elif args[1:4] == ["set", "auto-self-update", "disable"]:
+                self.auto_self_update = False
             elif args[1:3] == ["toolchain", "install"]:
+                if getattr(self, "auto_self_update", True):
+                    self.tools["rustup"] = "1.29.2"
                 self.toolchain = True
                 self.components.update({"rustfmt", "clippy"})
             elif args[1:3] == ["component", "list"]:
@@ -246,6 +250,123 @@ class EnvironmentTests(unittest.TestCase):
 
     def commands_matching(self, name):
         return [args for args, _ in self.commands.calls if args[0] == name]
+
+    def test_tools_only_prepare_and_check_never_touch_fixture_or_docker(self):
+        profile = {key: value for key, value in self.profile.items()
+                   if not key.startswith(("fixture_", "docker_", "object_store"))}
+        self.inputs["packages"] += list(linux.DOCKER_PACKAGES)
+        installer = linux.LinuxEnvironment(self.repo, self.inputs, profile, self.account,
+            commands=self.commands, system_root=self.system, tools_only=True)
+        result = installer.prepare()
+        installer.check()
+        self.assertIsNone(result["checks"]["docker"])
+        self.assertNotIn("NOVA_FIXTURE_STORE", installer.environment)
+        self.assertNotIn("DOCKER_CONTEXT", installer.environment)
+        for args, _ in self.commands.calls:
+            self.assertFalse(any("docker" in arg or "fixture" in arg for arg in args), args)
+        self.assertTrue({"build-essential", "libssl-dev"} <= self.commands.packages)
+
+    def tools_only_installer(self, *, jobs="available"):
+        profile = {key: value for key, value in self.profile.items()
+                   if not key.startswith(("fixture_", "docker_", "object_store"))}
+        profile["cargo_build_jobs"] = jobs
+        return linux.LinuxEnvironment(self.repo, self.inputs, profile, self.account,
+            commands=self.commands, system_root=self.system, tools_only=True)
+
+    def test_tools_image_environment_survives_worker_cpu_change_without_repair(self):
+        with patch.object(linux, "available_cpus", return_value=8):
+            builder = self.tools_only_installer()
+            builder.prepare()
+        before = (builder.env_path.read_bytes(), builder.env_path.stat().st_mtime_ns)
+        self.commands.calls.clear()
+        with patch.object(linux, "available_cpus", return_value=16):
+            worker = self.tools_only_installer()
+            self.assertEqual("16", worker.environment["CARGO_BUILD_JOBS"])
+            self.assertEqual("check", worker.check()["action"])
+        self.assertEqual(before, (builder.env_path.read_bytes(), builder.env_path.stat().st_mtime_ns))
+        self.assertFalse(any(args[0] in ("curl", "apt-get", "env", "systemctl")
+                             for args, _ in self.commands.calls))
+
+    def source_cpu_environment(self, installer, mode, *, override=None):
+        # Execute the emitted shell and its Python expression, with independent
+        # CPU observations rather than replacing the writer's policy logic.
+        fake_bin = self.root / "cpu-observer-bin"
+        fake_bin.mkdir(exist_ok=True)
+        marker = self.root / "cpu-observer-called"
+        marker.unlink(missing_ok=True)
+        python = fake_bin / "python3"
+        python.write_text("#!" + sys.executable + "\n" +
+            "import os,sys\nfrom pathlib import Path\n"
+            "Path(os.environ['CPU_PROBE_MARKER']).write_text('called')\n"
+            "mode=os.environ['CPU_PROBE_MODE']\n"
+            "if mode == 'exit': sys.exit(42)\n"
+            "if hasattr(os, 'process_cpu_count'): del os.process_cpu_count\n"
+            "os.cpu_count=lambda: 128\n"
+            "if mode == 'affinity': os.sched_getaffinity=lambda _: {2,7,11}\n"
+            "elif mode == 'fallback':\n"
+            "    if hasattr(os, 'sched_getaffinity'): del os.sched_getaffinity\n"
+            "    os.cpu_count=lambda: 7\n"
+            "else: os.process_cpu_count=lambda: {'process':16,'unknown':None,'zero':0}[mode]\n"
+            "exec(sys.argv[2])\n")
+        python.chmod(0o755)
+        environment = {"PATH": str(fake_bin) + ":/bin:/usr/bin",
+                       "CPU_PROBE_MODE": mode, "CPU_PROBE_MARKER": str(marker)}
+        if override is not None:
+            environment["CARGO_BUILD_JOBS"] = override
+        # Source is used outside errexit too: its own return status must carry
+        # the probe failure; callers such as the Runner launcher use set -e.
+        result = subprocess.run(["/bin/sh", "-c",
+            '. "$1"; status=$?; [ "$status" -eq 0 ] || exit "$status"; '
+            'printf "%s" "$CARGO_BUILD_JOBS"', "sh", str(installer.env_path)],
+            env=environment, capture_output=True, text=True)
+        return result, marker.exists()
+
+    def test_tools_image_available_jobs_follow_process_or_affinity_at_source_time(self):
+        with patch.object(linux, "available_cpus", return_value=8):
+            installer = self.tools_only_installer()
+            installer.prepare()
+        for mode, expected in (("process", "16"), ("affinity", "3"), ("fallback", "7")):
+            with self.subTest(mode=mode):
+                result, called = self.source_cpu_environment(installer, mode)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual(expected, result.stdout)
+                self.assertTrue(called)
+        result, called = self.source_cpu_environment(installer, "exit", override="-2")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("-2", result.stdout)
+        self.assertFalse(called)
+
+    def test_tools_image_unknown_cpu_and_probe_failure_stop_sourcing(self):
+        with patch.object(linux, "available_cpus", return_value=8):
+            installer = self.tools_only_installer()
+            installer.prepare()
+        for mode, expected in (("unknown", 1), ("zero", 1), ("exit", 42)):
+            with self.subTest(mode=mode):
+                result, called = self.source_cpu_environment(installer, mode)
+                self.assertEqual(expected, result.returncode)
+                self.assertEqual("", result.stdout)
+                self.assertTrue(called)
+                if mode != "exit":
+                    self.assertIn("cannot observe available CPU count", result.stderr)
+
+    def test_tools_fixed_jobs_and_fixture_available_keep_existing_policy(self):
+        with patch.object(linux, "available_cpus", return_value=8):
+            for jobs in (3, -2):
+                installer = self.tools_only_installer(jobs=jobs)
+                self.assertIn('CARGO_BUILD_JOBS:=' + str(jobs) + '}', installer.environment_text())
+            self.assertIn('CARGO_BUILD_JOBS:=8}', self.installer.environment_text())
+        with patch.dict(os.environ, {"CARGO_BUILD_JOBS": "3"}):
+            self.assertEqual("3", self.tools_only_installer().environment["CARGO_BUILD_JOBS"])
+
+    def test_tools_only_rejects_fixture_or_object_store_configuration_before_commands(self):
+        for field in ("fixture_image_sources", "docker_registry_mirrors", "object_store_kind"):
+            with self.subTest(field=field), self.assertRaises(linux.EnvironmentFailure):
+                linux.LinuxEnvironment(self.repo, self.inputs, {"schema": 1, field: {}},
+                    self.account, commands=self.commands, tools_only=True)
+        with self.assertRaises(linux.EnvironmentFailure):
+            linux.LinuxEnvironment(self.repo, self.inputs, {"schema": 1}, self.account,
+                tools_only=True, object_store_config=Path("/config.json"))
+        self.assertEqual([], self.commands.calls)
 
     def test_fixture_artifact_transports_are_forwarded_only_during_prepare(self):
         self.profile["fixture_artifact_url_prefixes"] = {

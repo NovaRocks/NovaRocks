@@ -467,8 +467,14 @@ mod tests {
         use arrow_schema::Field;
         use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
         use std::sync::Arc;
-        let item = Field::new("item", DataType::Utf8, true)
-            .with_metadata([(NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string())].into());
+        let item =
+            Field::new("item", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                NR_LOGICAL_TYPE_KEY.to_string(),
+                "json".to_string(),
+            )]));
         let values = vec![
             FunctionValueType::try_from_legacy_declared_projection(
                 DataType::Utf8,

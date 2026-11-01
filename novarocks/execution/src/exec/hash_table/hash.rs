@@ -14,49 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::hash::{BuildHasher, Hash};
-
-pub fn make_hash<Q: ?Sized + Hash, S: BuildHasher>(build_hasher: &S, value: &Q) -> u64 {
-    build_hasher.hash_one(value)
-}
-
-pub fn seed_from_hasher<S: BuildHasher>(build_hasher: &S) -> u64 {
-    make_hash(build_hasher, &0u8)
-}
-
-pub fn combine_hash(acc: u64, value_hash: u64) -> u64 {
-    acc ^ value_hash
-        .wrapping_add(0x9e3779b97f4a7c15)
-        .wrapping_add(acc << 6)
-        .wrapping_add(acc >> 2)
-}
-
-pub fn hash_u64_with_seed(seed: u64, value: u64) -> u64 {
-    mix_u64(seed ^ value)
-}
-
-pub fn hash_i128_with_seed(seed: u64, value: i128) -> u64 {
-    let value = value as u128;
-    let low = value as u64;
-    let high = (value >> 64) as u64;
-    let low_hash = hash_u64_with_seed(seed, low);
-    let high_hash = hash_u64_with_seed(seed, high);
-    combine_hash(low_hash, high_hash)
-}
-
-pub fn hash_bytes_with_seed(seed: u64, bytes: &[u8]) -> u64 {
-    let mut hash = seed ^ 0xcbf29ce484222325;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
-pub fn hash_null_with_seed(seed: u64) -> u64 {
-    hash_u64_with_seed(seed, 0x9e3779b97f4a7c15)
-}
-
 /// The bits a float is keyed by.
 ///
 /// Two values SQL compares equal have to key the same, and bits alone do not
@@ -83,8 +40,4 @@ pub fn canonical_f32_bits(value: f32) -> u32 {
     } else {
         value.to_bits()
     }
-}
-
-fn mix_u64(value: u64) -> u64 {
-    novarocks_type_contract::avalanche_hash_u64(value)
 }

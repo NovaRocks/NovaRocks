@@ -550,39 +550,44 @@ fn growth_control_and_structure_refusals_preserve_original_caller_and_source() {
     );
 }
 #[test]
-fn metadata_empty_allocations_are_rebuilt_and_unchanged_subtrees_share() {
-    let child: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
-    let mut metadata = std::collections::HashMap::with_capacity(8);
-    metadata.insert("temporary".to_owned(), "value".to_owned());
-    metadata.clear();
-    let field = Arc::new(Field::new("n", DataType::Int32, false).with_metadata(metadata));
-    let source: ArrayRef =
-        Arc::new(StructArray::try_new(vec![field].into(), vec![child.clone()], None).unwrap());
-    let target = DataType::Struct(vec![Arc::new(Field::new("n", DataType::Int32, false))].into());
-    let output = execute(
-        &plan(&source, &binding(target.clone(), false)),
-        &mut ValueConversionContext::default(),
-    );
-    assert!(!Arc::ptr_eq(&source, &output));
-    let result = output.as_any().downcast_ref::<StructArray>().unwrap();
-    // Safe ArrayData reboxing creates child headers; its immutable payload
-    // remains the same source allocation rather than being copied.
-    let original = child.as_any().downcast_ref::<Int32Array>().unwrap();
-    let rebuilt = result
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
-    assert_eq!(original.values().as_ptr(), rebuilt.values().as_ptr());
-    let DataType::Struct(fields) = output.data_type() else {
-        panic!("struct")
-    };
-    assert_eq!(fields[0].metadata().capacity(), 0);
-    let second = execute(
-        &plan(&output, &binding(target, false)),
-        &mut ValueConversionContext::default(),
-    );
-    assert!(Arc::ptr_eq(&second, &output));
+fn metadata_backing_drives_rebuild_and_unchanged_payloads_share() {
+    for has_metadata in [false, true] {
+        let child: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let mut metadata = std::collections::HashMap::with_capacity(8);
+        metadata.insert("temporary".to_owned(), "value".to_owned());
+        if !has_metadata {
+            metadata.clear();
+        }
+        let field = Arc::new(Field::new("n", DataType::Int32, false).with_metadata(metadata));
+        let source: ArrayRef =
+            Arc::new(StructArray::try_new(vec![field].into(), vec![child.clone()], None).unwrap());
+        let target =
+            DataType::Struct(vec![Arc::new(Field::new("n", DataType::Int32, false))].into());
+        let output = execute(
+            &plan(&source, &binding(target.clone(), false)),
+            &mut ValueConversionContext::default(),
+        );
+        assert_eq!(Arc::ptr_eq(&source, &output), !has_metadata);
+        let result = output.as_any().downcast_ref::<StructArray>().unwrap();
+        // A real annotation rebuilds the parent, while both inputs retain the
+        // exact immutable child payload. Cleared staging has no backing to remove.
+        let original = child.as_any().downcast_ref::<Int32Array>().unwrap();
+        let rebuilt = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(original.values().as_ptr(), rebuilt.values().as_ptr());
+        let DataType::Struct(fields) = output.data_type() else {
+            panic!("struct")
+        };
+        assert!(fields[0].metadata().as_arc().is_none());
+        let second = execute(
+            &plan(&output, &binding(target, false)),
+            &mut ValueConversionContext::default(),
+        );
+        assert!(Arc::ptr_eq(&second, &output));
+    }
 }
 #[test]
 fn real_field_arithmetic_preserves_large_offsets_and_complete_top_row_prefixes() {

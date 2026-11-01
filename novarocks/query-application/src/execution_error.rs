@@ -241,6 +241,7 @@ impl ExecutionFailureInput {
             compiler_failure::UNSUPPORTED_EXPRESSION,
             compiler_failure::UNSUPPORTED_CALL,
             novarocks_failure_contract::plan_codec_reason::ENCODE_UNSUPPORTED,
+            novarocks_failure_contract::sql_reason::STRUCTURAL_WAIT_CYCLE,
         ]
         .contains(&reason)
         {
@@ -514,6 +515,56 @@ mod boundary_tests {
             AttemptFailureClass::ContractViolation
         );
         assert_ne!(invalid.descriptor().descriptor, descriptor.descriptor);
+    }
+
+    #[test]
+    fn sql_wait_cycle_has_compiled_capability_identity_without_text_classification() {
+        let reason = novarocks_failure_contract::sql_reason::STRUCTURAL_WAIT_CYCLE;
+        let fact = FailureFact::new(FailureClass::Unsupported, reason);
+        let input = ExecutionFailureInput::new(
+            fact,
+            SafeDetail::new("structural wait cycle requires decoupled retained output (B4)")
+                .unwrap(),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_eq!(input.fact(), fact);
+        assert_eq!(input.attempt_class(), AttemptFailureClass::Unsupported);
+        assert_eq!(
+            input.descriptor().descriptor,
+            UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR
+        );
+        assert_eq!(input.user_error().retry(), RetryClass::Never);
+        let service =
+            crate::session_error::QueryServiceError::from_execution_failure(input.clone());
+        let stream = QueryExecutionError::from_execution(input);
+        assert!(service.message().starts_with("[UnsupportedCompiledShape]"));
+        assert_eq!(
+            crate::session_error::execution_public_message(&stream),
+            service.message()
+        );
+        // A generic SQL capability is not a compiled-shape refusal just
+        // because it is in the same domain or repeats the diagnostic.
+        let ordinary = ExecutionFailureInput::new(
+            FailureFact::new(
+                FailureClass::Unsupported,
+                FailureReason::new(domain::SQL, std::num::NonZeroU16::new(10).unwrap()),
+            ),
+            SafeDetail::new("structural wait cycle").unwrap(),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_ne!(
+            ordinary.descriptor().descriptor,
+            UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR
+        );
+        let stop = ExecutionFailureInput::new(
+            FailureFact::stop_observation(reason),
+            SafeDetail::new("structural wait cycle").unwrap(),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_ne!(
+            stop.descriptor().descriptor,
+            UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR
+        );
     }
 
     #[test]

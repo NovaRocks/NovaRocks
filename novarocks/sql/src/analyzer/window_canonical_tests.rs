@@ -64,8 +64,12 @@ impl PlannerTableProvider for SourceCatalog {
             write_default: None,
         };
         let nested = DataType::LargeList(Arc::new(
-            Field::new("actual_item", DataType::Utf8, false)
-                .with_metadata([("provider".into(), "original".into())].into()),
+            Field::new("actual_item", DataType::Utf8, false).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "provider".into(),
+                    "original".into(),
+                )]),
+            ),
         ));
         let mut columns = vec![
             column("v", DataType::Int64, false, None),
@@ -85,7 +89,12 @@ impl PlannerTableProvider for SourceCatalog {
                         DataType::Int64,
                         ordinal % 2 == 0,
                     )
-                    .with_metadata([("provider".into(), format!("source-{ordinal}"))].into())
+                    .with_metadata(
+                        std::collections::HashMap::<String, String>::from([(
+                            "provider".into(),
+                            format!("source-{ordinal}"),
+                        )]),
+                    )
                 })
                 .collect::<Vec<_>>();
             columns.push(column("wide", DataType::Struct(fields.into()), true, None));
@@ -349,7 +358,7 @@ fn window_canonical_first_last_normalization_keeps_complete_selected_result() {
     };
     assert_eq!(item.name(), "item");
     assert!(!item.is_nullable());
-    assert_eq!(item.metadata().capacity(), 0);
+    assert!(item.metadata().as_arc().is_none());
 }
 
 #[derive(Default)]
@@ -746,7 +755,7 @@ fn window_wide_rebound_gate_observes_original_nested_source_and_terminal_control
     for (ordinal, field) in fields.iter().enumerate() {
         assert_eq!(field.name(), &format!("authored_{ordinal}"));
         assert_eq!(field.is_nullable(), ordinal % 2 == 0);
-        assert_eq!(field.metadata().capacity(), 0);
+        assert!(field.metadata().as_arc().is_none());
     }
     for name in ["first_value", "last_value"] {
         let control = Trace::default();

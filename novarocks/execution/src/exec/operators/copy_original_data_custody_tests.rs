@@ -30,7 +30,7 @@ fn bad_run() -> (ArrayRef, Arc<UInt64Array>) {
     );
     let indices = Arc::new(UInt64Array::new(
         vec![u64::MAX, 0].into(),
-        Some(NullBuffer::from(vec![false, true])),
+        Some(NullBuffer::from(vec![true, true])),
     ));
     (source, indices)
 }
@@ -38,12 +38,48 @@ fn error_with(host: Arc<Host>, control: &Control) -> CopyOperationError {
     let (source, indices) = bad_run();
     match take_copy_in(source, CopyIndices::UInt64(indices), (), host, control) {
         Err(error) => error,
-        Ok(_) => panic!("original Run hidden out-of-bounds index must return whole Data"),
+        Ok(_) => panic!("original Run valid out-of-bounds index must return whole Data"),
     }
 }
 
 #[test]
-fn by_copy_original_data_full_hidden_max_text_is_charged_until_real_drop() {
+fn by_copy_run_hidden_max_is_null_and_keeps_real_output_custody() {
+    let (source, _) = bad_run();
+    let indices = Arc::new(UInt64Array::new(
+        vec![u64::MAX, 0].into(),
+        Some(NullBuffer::from(vec![false, true])),
+    ));
+    let original = arrow::compute::take(source.as_ref(), indices.as_ref(), None).unwrap();
+    let tr = tracker();
+    let host = Host::new(tr.clone(), None);
+    let control = Control::new(tr, None);
+    let actual = take_copy_in(
+        source,
+        CopyIndices::UInt64(indices),
+        (),
+        host.clone(),
+        &control,
+    )
+    .unwrap();
+    assert_eq!(actual.values().to_data(), original.to_data());
+    let run = actual
+        .values()
+        .as_any()
+        .downcast_ref::<RunArray<Int16Type>>()
+        .unwrap();
+    assert_eq!(run.len(), 2);
+    let values = run.values().as_any().downcast_ref::<Int32Array>().unwrap();
+    let first = run.get_physical_index(0);
+    let second = run.get_physical_index(1);
+    assert!(values.is_null(first));
+    assert!(values.is_valid(second));
+    assert_eq!(values.value(second), 10);
+    drop(actual);
+    assert_released(&host);
+}
+
+#[test]
+fn by_copy_original_data_full_valid_max_text_is_charged_until_real_drop() {
     let (source, indices) = bad_run();
     let original = arrow::compute::take(source.as_ref(), indices.as_ref(), None)
         .unwrap_err()
@@ -215,7 +251,7 @@ fn by_copy_original_data_fixed_list_generated_null_zero_keeps_run_child_payload(
 }
 
 #[test]
-fn by_copy_original_data_empty_run_under_null_fixed_list_keeps_original_whole_text() {
+fn by_copy_null_empty_run_under_fixed_list_skips_hidden_index_and_keeps_real_custody() {
     use arrow::array::FixedSizeListArray;
     let run: ArrayRef = Arc::new(
         RunArray::<Int16Type>::try_new(
@@ -237,9 +273,9 @@ fn by_copy_original_data_empty_run_under_null_fixed_list_keeps_original_whole_te
         vec![99_u32].into(),
         Some(NullBuffer::from(vec![false])),
     ));
-    let original = arrow::compute::take(source.as_ref(), indices.as_ref(), None)
-        .unwrap_err()
-        .to_string();
+    let original = arrow::compute::take(source.as_ref(), indices.as_ref(), None).unwrap();
+    assert_eq!(original.len(), 1);
+    assert!(original.is_null(0));
     let tr = tracker();
     let host = Host::new(tr.clone(), None);
     let control = Control::new(tr, None);
@@ -250,11 +286,30 @@ fn by_copy_original_data_empty_run_under_null_fixed_list_keeps_original_whole_te
         host.clone(),
         &control,
     )
-    .err()
-    .expect("original Data");
-    match actual {
-        CopyOperationError::OriginalData(text) => assert_eq!(text.text(), original),
-        other => panic!("original generated raw-zero Data changed: {other:?}"),
+    .unwrap();
+    assert_eq!(actual.values().to_data(), original.to_data());
+    assert_eq!(actual.values().len(), 1);
+    assert!(actual.values().is_null(0));
+    let list = actual
+        .values()
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap();
+    assert_eq!(list.value_length(), 2);
+    assert_eq!(list.values().len(), 2);
+    let child = list
+        .values()
+        .as_any()
+        .downcast_ref::<RunArray<Int16Type>>()
+        .unwrap();
+    let strings = child
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for row in 0..child.len() {
+        assert!(strings.is_null(child.get_physical_index(row)));
     }
+    drop(actual);
     assert_released(&host);
 }

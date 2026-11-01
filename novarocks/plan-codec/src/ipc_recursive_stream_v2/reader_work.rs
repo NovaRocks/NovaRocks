@@ -180,8 +180,8 @@ pub(super) fn source_metadata_work<W: ResourceWork>(
     work: &mut W,
 ) -> Result<SourceMetadataWork, W::Error> {
     // The invoice includes both original Field and supplied FVT backing,
-    // including strings and every HashMap bucket/control byte (also deleted
-    // buckets). Source walks and nominal-key probes keep their original term.
+    // including attached BTree/Arc metadata and String capacities. Consumed
+    // HashMap staging is absent; source walks/probes keep the conservative term.
     let original = work.numeric(add(
         work.numeric(mul(
             source_retained_bytes,

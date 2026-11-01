@@ -48,7 +48,7 @@ fn internal_target_column(kind: SqlMvInternalTargetColumn) -> TableColumnDef {
 }
 
 pub(crate) fn ensure_base_row_lineage_contract(
-    observation: &crate::mv::domain::storage_observation::MvSchemaValidationObservation,
+    observation: &crate::mv::domain::storage_observation::MvSourceSchemaObservation,
     base_fqn: &str,
 ) -> Result<(), String> {
     if !observation.is_format_v3() || !observation.stored_row_lineage_enabled() {

@@ -98,7 +98,7 @@ fn sql_read_field(
     })?;
     let mut metadata = field.metadata().clone();
     if let Some(label) = logical.metadata_value() {
-        metadata.insert(NR_LOGICAL_TYPE_KEY.into(), label.into());
+        metadata.insert(NR_LOGICAL_TYPE_KEY, label);
     }
     // Clone the actual field, including provider annotations and dictionary
     // identity; replace only the carrier already authored by this read owner.
@@ -844,15 +844,27 @@ mod tests {
         for field in [
             Field::new("u", DataType::Utf8, true),
             Field::new("u", DataType::FixedSizeBinary(15), true),
-            Field::new("u", DataType::FixedSizeBinary(16), true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "largeint".into())].into()),
-            Field::new("u", DataType::FixedSizeBinary(16), true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "unknown".into())].into()),
+            Field::new("u", DataType::FixedSizeBinary(16), true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    NR_LOGICAL_TYPE_KEY.into(),
+                    "largeint".into(),
+                )]),
+            ),
+            Field::new("u", DataType::FixedSizeBinary(16), true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    NR_LOGICAL_TYPE_KEY.into(),
+                    "unknown".into(),
+                )]),
+            ),
         ] {
             assert!(sql_read_field(&field, &uuid).is_err());
         }
-        let valid = Field::new("u", DataType::FixedSizeBinary(16), true)
-            .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "uuid".into())].into());
+        let valid = Field::new("u", DataType::FixedSizeBinary(16), true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                NR_LOGICAL_TYPE_KEY.into(),
+                "uuid".into(),
+            )]),
+        );
         assert_eq!(
             field_logical_type(&sql_read_field(&valid, &uuid).unwrap()).unwrap(),
             ValueLogicalType::Uuid
@@ -860,8 +872,12 @@ mod tests {
         let fixed = NestedField::optional(12, "u", Type::Primitive(PrimitiveType::Fixed(16)));
         assert!(sql_read_field(&valid, &fixed).is_err());
         let binary = NestedField::optional(13, "u", Type::Primitive(PrimitiveType::Binary));
-        let forged_variant = Field::new("u", DataType::LargeBinary, true)
-            .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "variant".into())].into());
+        let forged_variant = Field::new("u", DataType::LargeBinary, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                NR_LOGICAL_TYPE_KEY.into(),
+                "variant".into(),
+            )]),
+        );
         assert!(sql_read_field(&forged_variant, &binary).is_err());
         let variant =
             NestedField::optional(14, "u", Type::Variant(crate::iceberg::spec::VariantType));
@@ -883,19 +899,18 @@ mod tests {
     fn read_field_projection_preserves_provider_metadata_and_dictionary_facts() {
         use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, arrow_fields_exact};
         let source = Field::new("u", DataType::FixedSizeBinary(16), false).with_metadata(
-            [
+            std::collections::HashMap::<String, String>::from([
                 (PARQUET_FIELD_ID_META_KEY.into(), "91".into()),
                 ("provider.annotation".into(), "opaque-source-fact".into()),
                 (
                     ICEBERG_INITIAL_DEFAULT_META_KEY.into(),
                     "\"00112233-4455-6677-8899-aabbccddeeff\"".into(),
                 ),
-            ]
-            .into(),
+            ]),
         );
         let uuid = NestedField::required(91, "u", Type::Primitive(PrimitiveType::Uuid));
         let mut metadata = source.metadata().clone();
-        metadata.insert(NR_LOGICAL_TYPE_KEY.into(), "uuid".into());
+        metadata.insert(NR_LOGICAL_TYPE_KEY.to_string(), "uuid".to_string());
         let projected = sql_read_field(&source, &uuid).unwrap();
         assert!(arrow_fields_exact(
             &projected,
@@ -908,7 +923,10 @@ mod tests {
             72,
             true,
         )
-        .with_metadata([("provider.annotation".into(), "kept".into())].into());
+        .with_metadata(std::collections::HashMap::<String, String>::from([(
+            "provider.annotation".into(),
+            "kept".into(),
+        )]));
         let storage = NestedField::optional(72, "codes", Type::Primitive(PrimitiveType::String));
         assert!(arrow_fields_exact(
             &sql_read_field(&dictionary, &storage).unwrap(),

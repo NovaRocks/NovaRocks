@@ -124,7 +124,10 @@ fn dictionary(id: i64, ordered: bool, nullable: bool, name: &str, metadata: &str
             id,
             ordered,
         )
-        .with_metadata([("provider.fact".into(), metadata.into())].into()),
+        .with_metadata(std::collections::HashMap::<String, String>::from([(
+            "provider.fact".into(),
+            metadata.into(),
+        )])),
     )]))
 }
 
@@ -327,8 +330,12 @@ fn wide_type() -> FunctionValueType {
     let fields = (0..320)
         .map(|index| {
             Arc::new(
-                Field::new(format!("field_{index}"), DataType::Int64, true)
-                    .with_metadata([("provider.fact".into(), format!("fact_{index}"))].into()),
+                Field::new(format!("field_{index}"), DataType::Int64, true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider.fact".into(),
+                        format!("fact_{index}"),
+                    )]),
+                ),
             )
         })
         .collect::<Vec<_>>();

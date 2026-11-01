@@ -1036,6 +1036,9 @@ impl IcebergWriteSessionControl {
         if validated.is_empty()
             && handle.empty_write_decision() == IcebergEmptyWriteDecision::SkipExternalCommit
         {
+            if handle.flavor().is_artifact_row_delta() && prepared.row_count() != 0 {
+                return Err(corrupt("nonzero logical row delta produced no artifact"));
+            }
             #[cfg(novarocks_dev_controls)]
             emit_iceberg_write_phase_marker(
                 self.observation_slot.as_ref(),
@@ -1524,33 +1527,24 @@ fn validate_document_records(
 /// failure. It needs no catalog at all, because every fact it uses was frozen
 /// at `begin_write`.
 ///
-/// A session whose target holds no snapshot has no version to report, so it
-/// fails closed there instead of claiming a commit against nothing.
+/// A target with no snapshot remains without one. Its NoOp receipt identifies
+/// the exact frozen table/ref facts and reports no invented snapshot number.
 pub(crate) fn settle_empty_write_without_commit(
     handle: &IcebergCommitHandle,
 ) -> Result<
     novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion,
     ConnectorError,
 > {
-    handle.record_empty_cleanup_disposed();
-    let Some(unchanged_snapshot_id) = handle.table().base_snapshot_id() else {
-        let message = format!(
-            "Iceberg {} write produced no artifact and its target holds no snapshot to report",
-            handle.flavor().as_str()
-        );
-        handle.settle(IcebergWriteSessionState::KnownUncommitted {
-            message: message.clone(),
-        })?;
-        return Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownUncommitted {
-            failure: failure(ConnectorMutationFailureKind::Conflict, message),
-            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-        });
-    };
-    let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
-        unchanged_snapshot_id,
-        None,
-        None,
-    )
+    let receipt = match handle.table().base_snapshot_id() {
+        // Keep existing snapshot-bearing V1 receipt bytes exactly unchanged.
+        Some(snapshot) => {
+            crate::write_codec::connector_write_receipt_with_partitioning(snapshot, None, None)
+        }
+        None => crate::write_codec::connector_unchanged_snapshotless_write_receipt(
+            handle.table(),
+            handle.base_version_digest(),
+        ),
+    }
     .map_err(invalid)?;
     let needed = Arc::new(
         novarocks_spi::connector::write_stack::ConnectorWriteNeededReady::new(
@@ -1559,9 +1553,7 @@ pub(crate) fn settle_empty_write_without_commit(
             ExternalMutationFinalization::Complete,
         ),
     );
-    handle.settle(IcebergWriteSessionState::KnownCommitted {
-        needed: Arc::clone(&needed),
-    })?;
+    handle.settle_empty_noop(Arc::clone(&needed))?;
     Ok(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::KnownCommitted {
         needed,
         cleanup: novarocks_spi::connector::write_stack::ConnectorWriteCleanupState::Observed(ExternalMutationFinalization::Complete),
@@ -1576,12 +1568,9 @@ pub(crate) fn release_session_state(
     handle: &IcebergCommitHandle,
 ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
     {
-        match handle.state()? {
+        match handle.claim_release_state()? {
             IcebergWriteSessionState::Active => {
-                handle.settle(IcebergWriteSessionState::KnownUncommitted {
-                    message: "Iceberg write session was released before any external commit"
-                        .to_string(),
-                })?;
+                // Active means the original state owner atomically claimed release.
                 Ok(ConnectorWriteAbortOutcome::KnownUncommitted {
                     cleanup: ExternalMutationFinalization::Complete,
                 })
@@ -4187,9 +4176,13 @@ mod statistics_contract_tests {
             } else {
                 "hll"
             };
-            let forged = field
-                .clone()
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), wrong_tag.into())].into());
+            let forged =
+                field
+                    .clone()
+                    .with_metadata(std::collections::HashMap::<String, String>::from([(
+                        NR_LOGICAL_TYPE_KEY.into(),
+                        wrong_tag.into(),
+                    )]));
             let (_, actual) = resolve_statistics_field(&iceberg, &arrow, &forged, false, &frozen)
                 .unwrap()
                 .unwrap();
@@ -4255,13 +4248,11 @@ mod statistics_contract_tests {
             novarocks_type_contract::ValueLogicalType::Variant
         );
         assert_eq!(value_type.data_type(), &DataType::LargeBinary);
-        let conflicting = field.with_metadata(
-            [(
+        let conflicting =
+            field.with_metadata(std::collections::HashMap::<String, String>::from([(
                 novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
                 "object".into(),
-            )]
-            .into(),
-        );
+            )]));
         assert_eq!(
             resolve_statistics_field(&iceberg, &arrow, &conflicting, false, &frozen)
                 .unwrap()

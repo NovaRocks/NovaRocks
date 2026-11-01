@@ -129,10 +129,19 @@ fn derived_field_preserves_metadata_with_a_new_exact_arc_identity() {
     assert_eq!(source.backing_bytes_for(derived.field()), None);
     assert_eq!(derived.backing_bytes_for(source.field()), None);
     assert!(derived.backing_bytes_for(derived.field()).unwrap() > 0);
+    assert!(Arc::ptr_eq(
+        source.field().metadata().as_arc().unwrap(),
+        derived.field().metadata().as_arc().unwrap()
+    ));
     for (key, value) in source.field().metadata() {
-        let (derived_key, derived_value) = derived.field().metadata().get_key_value(key).unwrap();
-        assert_ne!(key.as_ptr(), derived_key.as_ptr());
-        assert_ne!(value.as_ptr(), derived_value.as_ptr());
+        let (derived_key, derived_value) = derived
+            .field()
+            .metadata()
+            .iter()
+            .find(|(candidate, _)| *candidate == key)
+            .unwrap();
+        assert_eq!(key.as_ptr(), derived_key.as_ptr());
+        assert_eq!(value.as_ptr(), derived_value.as_ptr());
     }
     let structural_copy = Arc::new(source.field().as_ref().clone());
     assert_eq!(structural_copy.as_ref(), source.field().as_ref());
@@ -159,12 +168,21 @@ fn derived_schema_preserves_only_top_metadata_and_keeps_exact_field_arcs() {
     assert!(Arc::ptr_eq(&source.schema().fields()[0], first.field()));
     assert_eq!(source.backing_bytes_for(derived.schema()), None);
     assert_eq!(derived.backing_bytes_for(source.schema()), None);
+    assert!(Arc::ptr_eq(
+        source.schema().metadata().as_arc().unwrap(),
+        derived.schema().metadata().as_arc().unwrap()
+    ));
     let structural_copy = Arc::new(Schema::clone(source.schema().as_ref()));
     assert_eq!(source.backing_bytes_for(&structural_copy), None);
     for (key, value) in source.schema().metadata() {
-        let (derived_key, derived_value) = derived.schema().metadata().get_key_value(key).unwrap();
-        assert_ne!(key.as_ptr(), derived_key.as_ptr());
-        assert_ne!(value.as_ptr(), derived_value.as_ptr());
+        let (derived_key, derived_value) = derived
+            .schema()
+            .metadata()
+            .iter()
+            .find(|(candidate, _)| *candidate == key)
+            .unwrap();
+        assert_eq!(key.as_ptr(), derived_key.as_ptr());
+        assert_eq!(value.as_ptr(), derived_value.as_ptr());
     }
 }
 

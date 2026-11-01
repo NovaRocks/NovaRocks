@@ -59,7 +59,6 @@ fn compiled_in_source(sql: &str, scratch_len: usize) -> (CompiledTaskProgram, Ar
             &bytes,
             CompiledTaskOptions {
                 pipeline_dop: NonZeroUsize::MIN,
-                exchange_wait: Duration::from_millis(1),
             },
             &mut creation,
             &scopes,
@@ -535,8 +534,8 @@ fn actual_host_expression_each_first_tracker_refusal_preserves_cause_and_has_no_
         );
         drop(temporary);
         {
-        let _factory = factory;
-    }
+            let _factory = factory;
+        }
         drop(actual);
         assert_eq!(tracker.current(), 0);
     }

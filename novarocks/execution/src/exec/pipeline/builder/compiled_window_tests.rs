@@ -740,7 +740,6 @@ fn aggregate_over_without_a_window_kernel_is_refused_before_running() {
             root_sink_dop: Some(std::num::NonZeroUsize::MIN),
             kernel_abi: novarocks_local_program::KernelAbiVersion::CURRENT,
             constants: constant_policy(),
-            exchange_wait: std::time::Duration::from_secs(120),
         },
         &FixtureControl,
     )

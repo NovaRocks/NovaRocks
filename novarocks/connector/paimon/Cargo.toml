@@ -20,35 +20,26 @@ name = "novarocks-connector-paimon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-# Paimon tests are suspended until its detailed design is accepted.
+# SDK integration tests remain suspended until the provider supports Arrow 60 and zstd 0.14.
 autotests = false
 
 [lints]
 workspace = true
 
 [lib]
-test = false
+test = true
 doctest = false
 
 [dependencies]
-arrow.workspace = true
-async-trait.workspace = true
 bytes.workspace = true
-chrono.workspace = true
 futures.workspace = true
-paimon = { workspace = true }
 prost.workspace = true
-sha2.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
-novarocks-fs.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-spi.workspace = true
 novarocks-type-contract.workspace = true
 
 [dev-dependencies]
-paimon = { workspace = true, features = ["storage-memory"] }
-serde_json.workspace = true
-tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [build-dependencies]
 prost-build.workspace = true

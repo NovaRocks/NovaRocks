@@ -108,9 +108,9 @@ mod owner_tests {
         FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
     };
     use crate::runtime::fragment::io::{
-        ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort,
-        ExchangeReceiverRegistration, ExecutionRuntimeExchangeReceiverPort, FragmentIoError,
-        FragmentResultSession, FragmentResultWriter, ResultAbort, ResultWriteSpec,
+        ExchangeReceiverKey, ExchangeReceiverPort, ExchangeReceiverRegistration,
+        ExecutionRuntimeExchangeReceiverPort, FragmentIoError, FragmentResultSession,
+        FragmentResultWriter, ResultAbort, ResultWriteSpec,
     };
     use crate::runtime::query_options::QueryOptions;
     use novarocks_types::{QueryId, SlotId, UniqueId};
@@ -144,6 +144,56 @@ mod owner_tests {
     }
 
     impl ExchangeReceiverPort for ReceiverConstructionPort {
+        fn bind_unit_receiver(
+            &self,
+            key: ExchangeReceiverKey,
+            streams: Vec<novarocks_execution_contract::ExchangeStreamIdentity>,
+            control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+            grantable_unit_bytes: u64,
+        ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
+            self.delegate
+                .bind_unit_receiver(key, streams, control, grantable_unit_bytes)
+        }
+        fn register_unit_demand(
+            &self,
+            key: ExchangeReceiverKey,
+            entry: crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry,
+        ) -> Result<
+            crate::runtime::fragment::io::exchange_unit::ExchangeStreamObservation,
+            novarocks_failure_contract::FailureFact,
+        > {
+            self.delegate.register_unit_demand(key, entry)
+        }
+        fn receive_unit(
+            &self,
+            key: ExchangeReceiverKey,
+            frame: crate::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame,
+        ) -> Result<
+            crate::runtime::fragment::io::exchange_unit::ExchangeUnitReceipt,
+            novarocks_failure_contract::FailureFact,
+        > {
+            self.delegate.receive_unit(key, frame)
+        }
+        fn unit_sender_states(
+            &self,
+            sender: novarocks_types::BackendProcessId,
+            after: Option<novarocks_execution_contract::ExchangeStreamIdentity>,
+            limit: usize,
+        ) -> Result<
+            Vec<crate::runtime::fragment::io::exchange_unit::ExchangeStreamObservation>,
+            novarocks_failure_contract::FailureFact,
+        > {
+            self.delegate.unit_sender_states(sender, after, limit)
+        }
+        fn set_unit_state_listener(
+            &self,
+            listener: Arc<
+                dyn crate::runtime::fragment::io::exchange_unit::ExchangeUnitStateListener,
+            >,
+        ) -> Result<(), novarocks_failure_contract::FailureFact> {
+            self.delegate.set_unit_state_listener(listener)
+        }
+
         fn register(
             &self,
             registration: ExchangeReceiverRegistration,
@@ -152,13 +202,7 @@ mod owner_tests {
             self.registrations.lock().unwrap().push(registration);
             Ok(())
         }
-        fn push(
-            &self,
-            key: ExchangeReceiverKey,
-            frame: ExchangeReceiverFrame,
-        ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
-            self.delegate.push(key, frame)
-        }
+
         fn cancel(&self, key: ExchangeReceiverKey) {
             self.cancelled.fetch_add(1, Ordering::SeqCst);
             self.delegate.cancel(key);
@@ -180,6 +224,16 @@ mod owner_tests {
         > {
             self.delegate.receiver_handle(key, expected_senders)
         }
+        fn stream_close_facts(
+            &self,
+            key: ExchangeReceiverKey,
+            expected: &[novarocks_execution_contract::ExchangeStreamIdentity],
+        ) -> Result<
+            Vec<novarocks_execution_contract::ExchangeStreamClose>,
+            crate::runtime::exchange::ExchangeFailure,
+        > {
+            self.delegate.stream_close_facts(key, expected)
+        }
         fn ensure_mem_tracker(
             &self,
             key: ExchangeReceiverKey,
@@ -190,17 +244,7 @@ mod owner_tests {
         > {
             self.delegate.ensure_mem_tracker(key, root)
         }
-        fn push_local(
-            &self,
-            key: ExchangeReceiverKey,
-            sender_id: i32,
-            backend_number: i32,
-            chunks: Vec<Chunk>,
-            eos: bool,
-        ) {
-            self.delegate
-                .push_local(key, sender_id, backend_number, chunks, eos);
-        }
+
         fn snapshot(
             &self,
             key: ExchangeReceiverKey,
@@ -756,7 +800,7 @@ mod owner_tests {
         let port = ReceiverConstructionPort::new(runtime.clone());
         let control = Arc::new(owner.view(TaskFailurePhase::Execution));
         let mut context = FragmentPrepareContext::default()
-            .with_task_control(control)
+            .with_task_control(control.clone())
             .with_result_identity(owner.identity())
             .with_execution_runtime(runtime)
             .with_exchange_receiver_port(port.clone());
@@ -775,7 +819,7 @@ mod owner_tests {
             crate::runtime::mem_tracker::MemTracker::new_root("deferred retirement fixture");
         let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
             crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-            tracker, Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+            tracker, Arc::new(crate::runtime::runtime_state::RuntimeErrorState::for_task(control)),
         ).unwrap();
         let declaration =
             crate::exec::chunk::typed_fixture::layout(Arc::new(Schema::empty()), &[], &[]);
@@ -806,6 +850,133 @@ mod owner_tests {
         }
         assert!(ready(), "the actual driver reaches the controlled point");
     }
+    #[test]
+    fn actual_strict_input_failure_waits_for_deferred_task_settlement() {
+        use novarocks_execution_contract::TaskConclusionPort;
+        for consumed in [false, true] {
+            let id = UniqueId::new(84100 + i64::from(consumed), 1);
+            let owner = deferred_fragment_owner(id);
+            let (dormant, port, key) = deferred_fragment_with_receiver(id, &owner, None);
+            let source = UniqueId::new(id.high(), 99);
+            let task = owner.identity();
+            let source_task = novarocks_execution_contract::TaskIdentity::new(
+                task.query_execution_id(),
+                novarocks_types::identity::StageId::new(99).unwrap(),
+                novarocks_types::identity::TaskId::new(1).unwrap(),
+                task.backend_process_id(),
+            );
+            let stream = novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+                novarocks_execution_contract::ExchangeSource::new(source_task, source, 0),
+                task,
+                id,
+                novarocks_execution_contract::FragmentNodeId::new(key.node_id),
+            )
+            .unwrap();
+            port.bind_unit_receiver(
+                key,
+                vec![stream],
+                Arc::new(crate::runtime::runtime_state::RuntimeErrorState::for_task(
+                    Arc::new(owner.view(novarocks_execution_contract::TaskFailurePhase::Execution)),
+                )),
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+            port.receive_unit(
+                key,
+                crate::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame {
+                    stream,
+                    sender_count: 1,
+                    sender_id: 0,
+                    backend_number: 0,
+                    item: crate::runtime::fragment::io::exchange_unit::ExchangeUnitItem::End(
+                        crate::runtime::fragment::io::exchange_unit::ExchangeUnitSequence::FIRST,
+                    ),
+                    payload: bytes::Bytes::new(),
+                    next_demand: None,
+                },
+            )
+            .unwrap();
+            if consumed {
+                port.receiver_handle(key, 1)
+                    .unwrap()
+                    .complete_input_consumption(1)
+                    .unwrap();
+            }
+            let original: super::super::ExecutionFailure =
+                novarocks_functions::KernelFailure::InvalidProgram(
+                    novarocks_functions::KernelDiagnostic::new("required input remains unread"),
+                )
+                .into();
+            let failure = original.clone();
+            let receiver = port.clone();
+            let dormant = dormant.with_success_validator(move || {
+                let closes = receiver
+                    .stream_close_facts(key, &[stream])
+                    .map_err(|cause| cause.into_execution())?;
+                if closes.iter().all(|close| {
+                    matches!(
+                        close.disposition,
+                        novarocks_execution_contract::ExchangeCloseDisposition::Consumed { .. }
+                    )
+                }) {
+                    Ok(())
+                } else {
+                    Err(failure)
+                }
+            });
+            let running = dormant.start();
+            wait_for_fragment_probe(|| owner.pending_settlements() > 0);
+            assert!(
+                owner.accepted().is_none(),
+                "handoff does not imply an accepted conclusion"
+            );
+            assert!(running.stopped_fact().is_none());
+            assert!(port.snapshot(key).is_some());
+            assert_eq!(port.removed.load(Ordering::SeqCst), 0);
+            owner.advance_all();
+            let terminal = running.stopped_fact().unwrap();
+            if consumed {
+                assert!(matches!(terminal.outcome(), FragmentOutcome::Succeeded));
+                assert_eq!(port.removed.load(Ordering::SeqCst), 1);
+            } else {
+                let FragmentOutcome::Failed(error) = terminal.outcome() else {
+                    panic!("strict input failure wins after settlement");
+                };
+                assert!(error.cause().same_occurrence(&original));
+                assert_eq!(port.cancelled.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn preaccepted_cancel_does_not_run_success_validator() {
+        use novarocks_execution_contract::{
+            CancelReason, TaskConclusionPort, TaskConclusionProposal,
+        };
+        let id = UniqueId::new(84102, 1);
+        let owner = deferred_fragment_owner(id);
+        let (dormant, port, _) = deferred_fragment_with_receiver(id, &owner, None);
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let seen = invoked.clone();
+        let dormant = dormant.with_success_validator(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Err(novarocks_functions::KernelFailure::ResourceExhausted.into())
+        });
+        owner.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        owner.advance_all();
+        let running = dormant.start();
+        wait_for_fragment_probe(|| owner.pending_settlements() > 0);
+        owner.advance_all();
+        assert!(matches!(
+            running.stopped_fact().unwrap().outcome(),
+            FragmentOutcome::Cancelled { .. }
+        ));
+        assert_eq!(invoked.load(Ordering::SeqCst), 0);
+        assert_eq!(port.cancelled.load(Ordering::SeqCst), 1);
+    }
+
     // The actual result callback fails on the driver thread. The same owned
     // source is handed off before physical exit; retirement must wait for it.
     #[test]
@@ -819,6 +990,12 @@ mod owner_tests {
         Arc::get_mut(&mut session).unwrap().write_failure = Some(original.clone());
         let (dormant, port, key) =
             deferred_fragment_with_receiver(id, &owner, Some(session.clone()));
+        let validator_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = validator_calls.clone();
+        let dormant = dormant.with_success_validator(move || {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+            Err(novarocks_functions::KernelFailure::InstanceFailed.into())
+        });
         let running = dormant.start();
         wait_for_fragment_probe(|| session.entered.load(Ordering::Acquire));
         session.release();
@@ -839,6 +1016,11 @@ mod owner_tests {
             panic!("the handed-off driver failure wins")
         };
         assert!(failure.cause().same_occurrence(&original));
+        assert_eq!(
+            validator_calls.load(Ordering::SeqCst),
+            1,
+            "an unsettled original proposal is not an accepted stop; validation cannot replace its cause"
+        );
         assert!(port.snapshot(key).is_none());
         assert_eq!(port.cancelled.load(Ordering::SeqCst), 1);
         assert_eq!(port.removed.load(Ordering::SeqCst), 0);
@@ -926,6 +1108,7 @@ mod owner_tests {
         let gate = Arc::new(ResultAbortGate::default());
         let (dormant, port, key) =
             deferred_fragment_with_receiver(id, &owner, Some(session.clone()));
+        let dormant = dormant.with_success_validator(|| Ok(()));
         let running = dormant.start();
         wait_for_fragment_probe(|| {
             running.inner.pipeline.stopped_fact().is_some() && owner.pending_settlements() > 0
@@ -1115,7 +1298,6 @@ mod owner_tests {
         let id = UniqueId::new(84_500, 1);
         // The existing fixture publishes a real distributed SQL gather package
         // and compiles its ExchangeSource through the production local compiler.
-        // Its exchange wait remains the original one-second bound.
         let program = super::compiled_prepare::tests::sql_gather_receiver_program();
         assert_eq!(program.exchange_inputs().len(), 1);
         let (&compiled_node, input) = program.exchange_inputs().iter().next().unwrap();
@@ -2350,6 +2532,8 @@ impl StartFailurePoint {
     }
 }
 
+type FragmentSuccessValidator = Box<dyn FnOnce() -> super::ExecutionResult<()> + Send + 'static>;
+
 #[allow(
     dead_code,
     reason = "The dormant handle retains fault-injection state for lifecycle regression coverage."
@@ -2364,6 +2548,7 @@ pub struct DormantFragmentHandle {
     /// report the hierarchy the fragment actually charged against.
     mem_tracker: Option<Arc<MemTracker>>,
     start_failure: Option<StartFailurePoint>,
+    success_validator: Option<FragmentSuccessValidator>,
 }
 
 #[derive(Debug)]
@@ -2397,6 +2582,22 @@ impl novarocks_failure_contract::FailureProjection for PreparedDrainRefusal {
 }
 
 impl DormantFragmentHandle {
+    /// Extend the original post-stop, pre-settlement success validation. This
+    /// author checks facts only; the original Task owner still decides the
+    /// outcome. Validators compose instead of replacing earlier obligations.
+    pub fn with_success_validator(
+        mut self,
+        validator: impl FnOnce() -> super::ExecutionResult<()> + Send + 'static,
+    ) -> Self {
+        let previous = self.success_validator.take();
+        self.success_validator = Some(Box::new(move || {
+            if let Some(previous) = previous {
+                previous()?;
+            }
+            validator()
+        }));
+        self
+    }
     /// Transfer the original already-stopped prepared work to the existing
     /// executor cleanup path. A refusal leaves the caller's owner untouched.
     /// This does not activate producers or author another Task conclusion.
@@ -2457,6 +2658,7 @@ impl DormantFragmentHandle {
             fragment_instance_id,
             profiler,
             mem_tracker,
+            mut success_validator,
             ..
         } = self;
         let control = prepared.failure_control();
@@ -2486,7 +2688,21 @@ impl DormantFragmentHandle {
                 crate::exec::pipeline::global_driver_executor::FragmentStoppedFact,
             >,
         > = Some(Box::new(move |stopped| {
-            lifecycle_on_stop.settle_after_stop(stopped.conclusion())
+            let mut result = stopped.conclusion();
+            // An observed original cancellation/failure keeps its source and
+            // does not acquire a synthetic strict-input failure. A not-yet-
+            // visible proposal still competes in the same owner order below.
+            if result.is_ok()
+                && !lifecycle_on_stop.control.is_stopped()
+                && let Some(validator) = success_validator.take()
+                && let Err(cause) = validator()
+            {
+                lifecycle_on_stop.control.set_error(cause.clone());
+                result = Err(cause);
+            }
+            // Handoff has no verdict. The existing barrier settles the new
+            // proposal before resources read the current owner at retirement.
+            lifecycle_on_stop.settle_after_stop(result)
         }));
         // The original lifecycle and its mandatory finisher exist before any
         // driver can finish, including a zero-driver execution.

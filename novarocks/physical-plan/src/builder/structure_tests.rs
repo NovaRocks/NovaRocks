@@ -692,9 +692,12 @@ fn structure_signature_correspondence_ignores_only_legacy_effects_and_keeps_full
                 0,
                 true,
             ),
-            2 => dictionary_field
-                .clone()
-                .with_metadata([("source".to_owned(), "different".to_owned())].into()),
+            2 => dictionary_field.clone().with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "source".to_owned(),
+                    "different".to_owned(),
+                )]),
+            ),
             _ => unreachable!(),
         };
         let mut changed = nested.clone();

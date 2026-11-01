@@ -269,3 +269,41 @@ fn temporal_date_carrier_every_control_refusal_retains_original_typed_cause() {
         }
     }
 }
+
+#[test]
+fn timestamp_date_extremes_keep_original_row_error_under_every_policy() {
+    let source: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(i64::MAX), None]));
+    for policy in [
+        DecimalOverflowPolicy::OutputNull,
+        DecimalOverflowPolicy::ReportError,
+    ] {
+        for allow in [false, true] {
+            for nullable in [false, true] {
+                let recipe = prepare(
+                    source.data_type().clone(),
+                    DataType::Date32,
+                    nullable,
+                    policy,
+                    allow,
+                );
+                let value = recipe
+                    .evaluate_row(
+                        EvaluatedArgument::Column(&source),
+                        27,
+                        0,
+                        &Control::default(),
+                    )
+                    .unwrap();
+                let CastRowResult::RowError(error) = value else {
+                    panic!("original calendar row error");
+                };
+                assert_eq!(error.selected_ordinal(), 27);
+                assert_eq!(error.reason(), crate::DataFailureReason::InvalidValue);
+                assert_eq!(
+                    error.message(),
+                    "Cast error: Cannot convert arrow_array::types::TimestampMicrosecondType 9223372036854775807 to datetime"
+                );
+            }
+        }
+    }
+}

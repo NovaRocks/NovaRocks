@@ -479,7 +479,7 @@ fn nested(root_nullable: bool, child_nullable: bool, metadata: &str) -> ValueTyp
                 .with_metadata(
                     [("source".to_owned(), metadata.to_owned())]
                         .into_iter()
-                        .collect(),
+                        .collect::<std::collections::HashMap<String, String>>(),
                 ),
             )]
             .into(),

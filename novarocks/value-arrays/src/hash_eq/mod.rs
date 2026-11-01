@@ -41,22 +41,17 @@ impl ByteHashAlgorithm {
         }
     }
     pub fn hash_bytes(self, bytes: &[u8]) -> u64 {
+        use crate::batch::hash::{ByteHashKernel, Crc32, Fnv1a64};
         match self {
-            Self::Fnv1a64 { mut seed } => {
-                for &byte in bytes {
-                    seed = (seed ^ u64::from(byte)).wrapping_mul(1099511628211);
-                }
-                seed
+            Self::Fnv1a64 { seed } => {
+                let mut state = Fnv1a64.init(seed);
+                Fnv1a64.update(&mut state, bytes);
+                Fnv1a64.finish(state)
             }
             Self::Crc32 { seed } => {
-                let mut crc = !seed;
-                for &byte in bytes {
-                    crc ^= u32::from(byte);
-                    for _ in 0..8 {
-                        crc = (crc >> 1) ^ (0xedb88320u32.wrapping_mul(crc & 1));
-                    }
-                }
-                u64::from(!crc)
+                let mut state = Crc32.init(seed);
+                Crc32.update(&mut state, bytes);
+                Crc32.finish(state)
             }
         }
     }
@@ -191,25 +186,53 @@ pub fn hash_rows_observed<E>(
     growth: &mut Growth<'_, E>,
     work: &mut Work<'_, E>,
 ) -> Result<Vec<Option<u64>>, ValueFailure<E>> {
-    if !selection.is_subset(input.readable_rows()) {
+    use crate::batch::{
+        PreparedBytes, RowWork,
+        hash::{Crc32, Fnv1a64, HashOptions, HashScratch, HashSeed, hash_into},
+    };
+    if selection.len() != input.len() {
         return Err(ValueError::Invariant(ValueViolation::UndefinedRow).into());
     }
-    let layout = Layout::array::<Option<u64>>(input.len())
-        .map_err(|_| ValueError::Invariant(ValueViolation::Bounds))?;
-    if layout.size() != 0 {
-        growth(layout).map_err(ValueFailure::Caller)?;
+    let prepared = PreparedBytes::new_observed(input, selection, &mut |n| work(n))?;
+    let mut values = initialized_result(prepared.len(), 0u64, growth, work)?;
+    let mut scratch = HashScratch::new();
+    match algorithm {
+        ByteHashAlgorithm::Fnv1a64 { seed } => hash_into(
+            &prepared,
+            &Fnv1a64,
+            HashOptions {
+                seeds: HashSeed::Uniform(seed),
+                nulls,
+            },
+            &mut values,
+            &mut scratch,
+            &mut |layout| growth(layout),
+            &mut |n| work(n),
+        )?,
+        ByteHashAlgorithm::Crc32 { seed } => hash_into(
+            &prepared,
+            &Crc32,
+            HashOptions {
+                seeds: HashSeed::Uniform(seed),
+                nulls,
+            },
+            &mut values,
+            &mut scratch,
+            &mut |layout| growth(layout),
+            &mut |n| work(n),
+        )?,
     }
-    let mut out = Vec::new();
-    out.try_reserve_exact(input.len())
-        .map_err(|source| ValueError::Allocation {
-            requested: layout.size(),
-            source,
-        })?;
-    out.resize(input.len(), None);
-    for row in selection.iter() {
-        work(1).map_err(ValueFailure::Caller)?;
-        out[row] = Some(hash_row_observed(input, row, algorithm, nulls, work)?);
+    let mut out = initialized_result(input.len(), None, growth, work)?;
+    let mut control = RowWork::new(&mut *work);
+    let mut cursor = selection.cursor();
+    for hash in values {
+        let row = cursor
+            .next_observed(&mut |n| control.observe_metadata(n))?
+            .ok_or(ValueError::Invariant(ValueViolation::Bounds))?;
+        control.row()?;
+        out[row] = Some(hash);
     }
+    control.flush()?;
     Ok(out)
 }
 
@@ -239,29 +262,55 @@ pub fn equal_rows_observed<E>(
     growth: &mut Growth<'_, E>,
     work: &mut Work<'_, E>,
 ) -> Result<Vec<Option<bool>>, ValueFailure<E>> {
-    if left.len() != right.len()
-        || !selection.is_subset(left.readable_rows())
-        || !selection.is_subset(right.readable_rows())
-    {
+    use crate::batch::{PreparedBytes, RowWork, compare::compare_into};
+    if left.len() != right.len() || selection.len() != left.len() {
         return Err(ValueError::Invariant(ValueViolation::UndefinedRow).into());
     }
-    let layout = Layout::array::<Option<bool>>(left.len())
-        .map_err(|_| ValueError::Invariant(ValueViolation::Bounds))?;
+    let left_batch = PreparedBytes::new_observed(left, selection, &mut |n| work(n))?;
+    let right_batch = PreparedBytes::new_observed(right, selection, &mut |n| work(n))?;
+    let mut values = initialized_result(left_batch.len(), None, growth, work)?;
+    compare_into(&left_batch, &right_batch, nulls, &mut values, &mut |n| {
+        work(n)
+    })?;
+    let mut out = initialized_result(left.len(), None, growth, work)?;
+    let mut control = RowWork::new(&mut *work);
+    let mut cursor = selection.cursor();
+    for value in values {
+        let row = cursor
+            .next_observed(&mut |n| control.observe_metadata(n))?
+            .ok_or(ValueError::Invariant(ValueViolation::Bounds))?;
+        control.row()?;
+        out[row] = value;
+    }
+    control.flush()?;
+    Ok(out)
+}
+
+fn initialized_result<T: Clone, E>(
+    count: usize,
+    value: T,
+    growth: &mut Growth<'_, E>,
+    work: &mut Work<'_, E>,
+) -> Result<Vec<T>, ValueFailure<E>> {
+    let layout =
+        Layout::array::<T>(count).map_err(|_| ValueError::Invariant(ValueViolation::Bounds))?;
     if layout.size() != 0 {
         growth(layout).map_err(ValueFailure::Caller)?;
     }
-    let mut out = Vec::new();
-    out.try_reserve_exact(left.len())
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
         .map_err(|source| ValueError::Allocation {
             requested: layout.size(),
             source,
         })?;
-    out.resize(left.len(), None);
-    for row in selection.iter() {
-        work(1).map_err(ValueFailure::Caller)?;
-        out[row] = equal_row_observed(left, row, right, row, nulls, work)?;
+    let block = (crate::batch::BYTE_BLOCK / std::mem::size_of::<T>().max(1)).max(1);
+    while values.len() < count {
+        let end = (values.len() + block).min(count);
+        work((end - values.len()) * std::mem::size_of::<T>()).map_err(ValueFailure::Caller)?;
+        values.resize(end, value.clone());
     }
-    Ok(out)
+    Ok(values)
 }
 
 #[cfg(test)]
@@ -410,5 +459,29 @@ mod tests {
             equal_rows(&decoded, &decoded, &selection, NullEquality::Equal).unwrap(),
             vec![Some(true)]
         );
+    }
+    #[test]
+    fn compatibility_batches_check_empty_bitmap_work_before_full_scan() {
+        let array: ArrayRef = Arc::new(StringViewArray::new_null(200_000));
+        let decoded = decode(&array, ByteLayout::Utf8View);
+        let selected = SelectionSet::try_new(200_000).unwrap();
+        let hash = hash_rows_observed(
+            &decoded,
+            &selected,
+            ByteHashAlgorithm::Fnv1a64 { seed: 17 },
+            NullHash::Value(0),
+            &mut |_| Ok(()),
+            &mut |units| if units == 0 { Ok(()) } else { Err("metadata") },
+        );
+        assert!(matches!(hash, Err(ValueFailure::Caller("metadata"))));
+        let equality = equal_rows_observed(
+            &decoded,
+            &decoded,
+            &selected,
+            NullEquality::Equal,
+            &mut |_| Ok(()),
+            &mut |units| if units == 0 { Ok(()) } else { Err("metadata") },
+        );
+        assert!(matches!(equality, Err(ValueFailure::Caller("metadata"))));
     }
 }

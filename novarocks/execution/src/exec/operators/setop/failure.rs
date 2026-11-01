@@ -15,23 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Set-operation state and output-gather facts; callees keep their own causes.
+//! Set-operation state facts; callees keep their own construction causes.
 use crate::runtime::fragment::ExecutionFailure;
 use crate::runtime::fragment::ExecutionReason;
-use arrow::error::ArrowError;
-use novarocks_failure_contract::{
-    FailureClass, FailureFact, FailureProjection, RepresentationBoundary, RepresentationFacts,
-    RepresentationLayout, domain,
-};
-use std::{fmt, num::NonZeroU16};
+use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
+use std::fmt;
 #[derive(Debug)]
 pub(super) enum SetStateFailure {
     ZeroColumns {
         node: &'static str,
-    },
-    MissingRow {
-        build: bool,
-        row: usize,
     },
     GroupSequence {
         node: &'static str,
@@ -43,17 +35,11 @@ pub(super) enum SetStateFailure {
         group: usize,
         markers: usize,
     },
-    Gather(ArrowError),
 }
 impl fmt::Display for SetStateFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroColumns { node } => write!(f, "{node} with zero columns is unsupported"),
-            Self::MissingRow { build, row } => write!(
-                f,
-                "distinct set serialized {} row {row} missing",
-                if *build { "build" } else { "probe" }
-            ),
             Self::GroupSequence {
                 node,
                 expected,
@@ -67,69 +53,18 @@ impl fmt::Display for SetStateFailure {
                 group,
                 markers,
             } => write!(f, "{node} group id {group} is outside {markers} markers"),
-            Self::Gather(source) => write!(f, "distinct set Arrow take failed: {source}"),
         }
     }
 }
-impl std::error::Error for SetStateFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Gather(source) => Some(source),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for SetStateFailure {}
 impl FailureProjection for SetStateFailure {
     fn failure_fact(&self) -> FailureFact {
-        let (class, code) = match self {
-            Self::ZeroColumns { .. } => (
-                FailureClass::Invariant,
-                ExecutionReason::DistinctSetZeroColumns,
-            ),
-            Self::MissingRow { .. } => (
-                FailureClass::Invariant,
-                ExecutionReason::DistinctSetMissingRow,
-            ),
-            Self::GroupSequence { .. } => (
-                FailureClass::Invariant,
-                ExecutionReason::DistinctSetGroupSequence,
-            ),
-            Self::GroupBounds { .. } => (
-                FailureClass::Invariant,
-                ExecutionReason::DistinctSetGroupBounds,
-            ),
-            Self::Gather(ArrowError::MemoryError(_) | ArrowError::ArithmeticOverflow(_)) => (
-                FailureClass::Resource,
-                ExecutionReason::DistinctSetGatherAllocation,
-            ),
-            Self::Gather(ArrowError::OffsetOverflowError(_)) => (
-                FailureClass::Representation,
-                ExecutionReason::DistinctSetGatherOffsets,
-            ),
-            Self::Gather(ArrowError::IoError(..)) => (
-                FailureClass::Unexpected,
-                ExecutionReason::DistinctSetGatherIo,
-            ),
-            Self::Gather(_) => (
-                FailureClass::Invariant,
-                ExecutionReason::DistinctSetGatherContract,
-            ),
+        let code = match self {
+            Self::ZeroColumns { .. } => ExecutionReason::DistinctSetZeroColumns,
+            Self::GroupSequence { .. } => ExecutionReason::DistinctSetGroupSequence,
+            Self::GroupBounds { .. } => ExecutionReason::DistinctSetGroupBounds,
         };
-        let fact = FailureFact::new(class, code.reason());
-        if class == FailureClass::Representation {
-            fact.with_representation(RepresentationFacts {
-                boundary: RepresentationBoundary::SingleOutput,
-                layout: RepresentationLayout {
-                    domain: domain::EXECUTION,
-                    code: NonZeroU16::new(34).unwrap(),
-                },
-                required: None,
-                extent_limit: None,
-                representable_prefix: None,
-            })
-        } else {
-            fact
-        }
+        FailureFact::new(FailureClass::Invariant, code.reason())
     }
 }
 pub(super) fn fail(cause: SetStateFailure) -> ExecutionFailure {

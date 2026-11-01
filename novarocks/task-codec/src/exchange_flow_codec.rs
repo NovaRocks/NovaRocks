@@ -77,7 +77,7 @@ pub fn encode_stream(value: ExchangeStreamIdentity) -> wire::ExchangeStreamIdent
 }
 
 pub fn decode_sequence(
-    value: i64,
+    value: u64,
     path: FieldPath,
 ) -> Result<ExchangeFrameSequence, ProtocolError> {
     ExchangeFrameSequence::try_new(value).map_err(|error| invalid(path, error.to_string()))

@@ -2237,8 +2237,12 @@ mod tests {
             (arrow::datatypes::DataType::LargeBinary, "uuid"),
             (arrow::datatypes::DataType::FixedSizeBinary(16), "variant"),
         ] {
-            let field = arrow::datatypes::Field::new("v", carrier.clone(), true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), tag.to_owned())].into());
+            let field = arrow::datatypes::Field::new("v", carrier.clone(), true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    NR_LOGICAL_TYPE_KEY.to_owned(),
+                    tag.to_owned(),
+                )]),
+            );
             let value = FunctionValueType::new(carrier, true);
             let input = statistics_input_shape(field, value.clone());
             let contract = WriteStatisticsContract::try_new(

@@ -332,14 +332,23 @@ impl DefaultValueRecipe {
             work.flush()?;
             let gathered =
                 gathered.map_err(|_| internal("window default complete logical gather failed"))?;
-            // Exactly the original cast() default safe=true author. Library
+            // Raw parsing retains the original strict text domain. Library
             // parse/formatter work is opaque, with original before/after checks;
             // no fictional byte prescan claims internal 256-unit cooperation.
             work.flush()?;
-            let converted = arrow_cast::cast(gathered.as_ref(), self.target.data_type());
+            let converted = if matches!(self.conversion, Conversion::Parse) {
+                let text = gathered
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .ok_or_else(|| internal("window default parse has a foreign text carrier"))?;
+                crate::math_numeric::cast_raw_numeric(text, self.target.data_type())
+                    .map_err(|_| invalid("window default safe Arrow conversion failed"))
+            } else {
+                arrow_cast::cast(gathered.as_ref(), self.target.data_type())
+                    .map_err(|_| invalid("window default safe Arrow conversion failed"))
+            };
             work.flush()?;
-            let converted =
-                converted.map_err(|_| invalid("window default safe Arrow conversion failed"))?;
+            let converted = converted?;
             work.step()?;
             Ok(converted)
         })();
@@ -373,8 +382,8 @@ fn round64(bytes: usize) -> Result<usize, KernelFailure> {
     Ok(rounded)
 }
 fn formatter_capacities(rows: usize, bytes: usize) -> Result<(usize, usize, usize), KernelFailure> {
-    // Arrow58.2 GenericStringBuilder::new has 1024 items/data bytes,
-    // hence 1025 offsets. Rust1.92 RawVec and MutableBuffer doubling are
+    // Arrow60.1.0 GenericStringBuilder::new has 1024 items/data bytes,
+    // hence 1025 offsets. Rust1.98.1 RawVec and MutableBuffer doubling are
     // bounded by twice the larger of initial capacity and final extent.
     let offsets = mul(
         mul(

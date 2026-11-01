@@ -351,7 +351,11 @@ impl WorkloadControl {
     ) -> Result<(JointAdmissionHandle, JointProgressDriver), WorkError> {
         let config = Arc::new(config);
         self.inner.update(|state| {
-            if state.ready || state.closed || !state.nodes.is_empty() || state.joint.is_some() {
+            if state.ready
+                || state.root_admission_is_closed()
+                || !state.nodes.is_empty()
+                || state.joint.is_some()
+            {
                 return Err(WorkError::Conflict);
             }
             state.joint = Some(JointLedger {

@@ -209,8 +209,12 @@ fn fixture() -> (Vec<p::Relation>, Vec<(u32, FunctionValueType)>) {
             FunctionValueType::new(
                 DataType::Struct(
                     vec![Arc::new(
-                        Field::new("item", DataType::Int64, false)
-                            .with_metadata([("unknown".into(), "exact".into())].into()),
+                        Field::new("item", DataType::Int64, false).with_metadata(
+                            std::collections::HashMap::<String, String>::from([(
+                                "unknown".into(),
+                                "exact".into(),
+                            )]),
+                        ),
                     )]
                     .into(),
                 ),

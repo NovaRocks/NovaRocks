@@ -18,7 +18,7 @@
 //! Checked pre-operation facts for the original serde Value/canonical writer.
 //! Facts grant no authority: the pure adapter must reserve on its actual host.
 //! Pinned authors: Rust1.98.1, serde_json1.0.150 default/std/raw_value,
-//! serde_core1.0.228 and Arrow58.4.0. Dependency/feature changes require review.
+//! serde_core1.0.228 and Arrow60.1.0. Dependency/feature changes require review.
 
 use crate::{KernelFailure, arrow_result_custody::custody_type_metadata_upper_bound};
 use serde_json::Value;

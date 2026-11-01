@@ -107,12 +107,6 @@ impl<'a, E> ScalarConstruction<'a, E> {
         }
         Ok(())
     }
-    pub(super) fn cloned_annotations(&mut self, capacity: usize) -> Result<(), Failure<E>> {
-        if self.observer.is_some() && capacity != 0 {
-            return Err(Failure::Layout(layout::LayoutResourceError::SourceModel));
-        }
-        Ok(())
-    }
     pub(super) fn field(
         &mut self,
         name: &str,
@@ -256,7 +250,7 @@ pub(super) fn pure_string(error: Failure<std::convert::Infallible>) -> String {
             novarocks_type_contract::ValueTypeError::from(error).to_string()
         }
         Failure::Observer(never) => match never {},
-        Failure::Layout(_) | Failure::Vec(_) | Failure::HashMap(_) => {
+        Failure::Layout(_) | Failure::Vec(_) | Failure::HashMap(_) | Failure::BTree(_) => {
             unreachable!("pure scalar solver has no allocation observer")
         }
     }
@@ -268,7 +262,11 @@ pub(super) fn pure_value(
     match error {
         Failure::ValueType(error) => error.into(),
         Failure::Observer(never) => match never {},
-        Failure::Rule(_) | Failure::Layout(_) | Failure::Vec(_) | Failure::HashMap(_) => {
+        Failure::Rule(_)
+        | Failure::Layout(_)
+        | Failure::Vec(_)
+        | Failure::HashMap(_)
+        | Failure::BTree(_) => {
             unreachable!("pure declaration has no allocation observer or string rule")
         }
     }
@@ -416,6 +414,7 @@ fn with_scope_creation<T, H, F: ScopedFailure<H>>(
         Failure::Layout(error) => F::resource(ConstructionResource::Layout(error)),
         Failure::Vec(error) => F::resource(ConstructionResource::Vec(error)),
         Failure::HashMap(error) => F::resource(ConstructionResource::HashMap(error)),
+        Failure::BTree(error) => F::resource(ConstructionResource::BTree(error)),
     })
 }
 pub(super) fn with_resolution_creation<T, H>(

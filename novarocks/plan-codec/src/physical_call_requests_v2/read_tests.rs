@@ -91,7 +91,10 @@ fn types() -> DecodedTypeTable {
         i64::MIN,
         true,
     )
-    .with_metadata([("author".into(), "retained\0元".into())].into());
+    .with_metadata(std::collections::HashMap::<String, String>::from([(
+        "author".into(),
+        "retained\0元".into(),
+    )]));
     let roots = [
         (0, FunctionValueType::new(DataType::Int64, true)),
         (7, FunctionValueType::new(DataType::Int64, false)),
@@ -457,7 +460,7 @@ fn original_request_decode_preserves_none_typed_null_cv_ordinal_full_lambda_and_
         panic!("Struct lost")
     };
     assert!(Arc::ptr_eq(&a[0], &b[0]));
-    assert_eq!(a[0].metadata().capacity(), 0);
+    assert!(a[0].metadata().as_arc().is_none());
     assert_eq!(parameter_types[1].data_type(), &DataType::Utf8);
     assert!(std::ptr::eq(
         parameter_types[1].data_type(),

@@ -123,6 +123,50 @@ fn assert_floats(array: &ArrayRef, expected: &[Option<f64>]) {
         }
     }
 }
+fn raw_text_cast(
+    source: &ArrayRef,
+    target: super::super::rounding_binding::CastTarget,
+) -> ArrayRef {
+    use super::super::round_cast::{CastRecipe, CastValue};
+    use super::super::rounding_binding::CastTarget;
+    use crate::builtin::binding_control;
+    let source_type =
+        FunctionValueType::from_legacy_declared_projection(source.data_type().clone(), true);
+    let recipe = binding_control::scope(crate::binding_test_control(), |work| {
+        binding_control::value_type(&source_type, work)?;
+        CastRecipe::prepare(&source_type, target, work)
+    })
+    .unwrap();
+    recipe.check_available().unwrap();
+    let controller = Control::default();
+    let mut work = crate::kernel_input::EvaluationCheckpoints::new(&controller);
+    let values = (0..source.len())
+        .map(|row| recipe.read(source.as_ref(), row, &mut work).unwrap())
+        .collect::<Vec<_>>();
+    work.finish().unwrap();
+    match target {
+        CastTarget::Float64 => Arc::new(Float64Array::from(
+            values
+                .into_iter()
+                .map(|value| match value {
+                    CastValue::Float(value) => Some(value),
+                    CastValue::Null => None,
+                    _ => panic!("raw float text cast returned a foreign value"),
+                })
+                .collect::<Vec<_>>(),
+        )),
+        CastTarget::Int64 => Arc::new(Int64Array::from(
+            values
+                .into_iter()
+                .map(|value| match value {
+                    CastValue::Integer(value) => Some(value),
+                    CastValue::Null => None,
+                    _ => panic!("raw integer text cast returned a foreign value"),
+                })
+                .collect::<Vec<_>>(),
+        )),
+    }
+}
 fn assert_integers(array: &ArrayRef, expected: &[Option<i64>]) {
     assert_eq!(array.data_type(), &DataType::Int64);
     let actual = array
@@ -816,9 +860,8 @@ fn actual_text_value_carriers_preserve_arrow_parse_nulls_and_round_saturation() 
         None,
     ];
     for source in text_carriers(&values) {
-        // The independent public Arrow cast proves which source rows parse;
-        // expected ROUND outputs above are authored independently of its body.
-        let cast = arrow_cast::cast(source.as_ref(), &DataType::Float64).unwrap();
+        // Literal old raw parse expectations check the reached cast author.
+        let cast = raw_text_cast(&source, super::super::rounding_binding::CastTarget::Float64);
         let parsed = cast.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(parsed.value(0), 2.5);
         assert_eq!(parsed.value(1), -2.5);
@@ -870,7 +913,7 @@ fn actual_text_digits_carriers_keep_exact_int64_grammar_and_runtime_magnitude() 
         None,
     ];
     for digits in text_carriers(&texts) {
-        let cast = arrow_cast::cast(digits.as_ref(), &DataType::Int64).unwrap();
+        let cast = raw_text_cast(&digits, super::super::rounding_binding::CastTarget::Int64);
         assert_integers(&cast, &parsed);
         assert_floats(
             &dense(vec![floats(vec![Some(1.25); texts.len()]), digits]),

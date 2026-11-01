@@ -400,6 +400,57 @@ struct IcebergWriteReceiptV1 {
     output_facts: Option<IcebergWrittenOutputFactsV1>,
 }
 
+/// Only a snapshotless NoOp uses this distinct provider-private payload. It
+/// names the unchanged admitted target; existing snapshot receipt bytes and
+/// Unknown recovery formats remain untouched.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IcebergUnchangedSnapshotlessReceiptV1 {
+    version: u32,
+    kind: String,
+    table_uuid: String,
+    namespace: String,
+    table_name: String,
+    table_location: String,
+    data_location: String,
+    target_ref: String,
+    snapshot_id: Option<i64>,
+    base_sequence_number: i64,
+    schema_id: i32,
+    partition_spec_id: i32,
+    format_version: u8,
+    base_version_digest: Option<[u8; 32]>,
+}
+
+pub(crate) fn connector_unchanged_snapshotless_write_receipt(
+    table: &crate::commit::write_stack::IcebergWriteTableFacts,
+    base_version_digest: Option<[u8; 32]>,
+) -> Result<ConnectorWriteReceipt, String> {
+    if table.base_snapshot_id().is_some() {
+        return Err("snapshot-bearing NoOp requires its original snapshot receipt".to_string());
+    }
+    let payload = canonical_json(&IcebergUnchangedSnapshotlessReceiptV1 {
+        version: ICEBERG_WRITE_PAYLOAD_VERSION,
+        kind: "unchanged_snapshotless_target".to_string(),
+        table_uuid: table.table_uuid().to_string(),
+        namespace: table.namespace().to_string(),
+        table_name: table.table_name().to_string(),
+        table_location: table.table_location().to_string(),
+        data_location: table.data_location().to_string(),
+        target_ref: table.target_ref().to_string(),
+        snapshot_id: None,
+        base_sequence_number: table.base_sequence_number(),
+        schema_id: table.schema_id(),
+        partition_spec_id: table.default_partition_spec_id(),
+        format_version: table.format_version(),
+        base_version_digest,
+    })?;
+    let version = ConnectorCommittedVersion::try_new(payload.clone(), None)
+        .map_err(|error| error.to_string())?;
+    ConnectorWriteReceipt::try_new_with_committed_version(payload, version)
+        .map_err(|error| error.to_string())
+}
+
 /// Exact output facts for one Iceberg write publication. This is intentionally
 /// provider-private: generic applications consume only the typed projection
 /// performed by the Iceberg distributed-rewrite control.
@@ -508,7 +559,49 @@ fn encode_write_receipt_with_output_facts(
 pub(crate) fn decode_write_receipt_output_facts(
     receipt: &ConnectorWriteReceipt,
 ) -> Result<Option<IcebergWrittenOutputFacts>, String> {
-    let decoded: IcebergWriteReceiptV1 = decode_json(receipt.payload(), "write receipt")?;
+    // Preserve the existing fast decoder/bytes for ordinary committed output.
+    let decoded: IcebergWriteReceiptV1 = match decode_json(receipt.payload(), "write receipt") {
+        Ok(decoded) => decoded,
+        Err(_) => {
+            let unchanged: IcebergUnchangedSnapshotlessReceiptV1 =
+                decode_json(receipt.payload(), "snapshotless NoOp receipt")?;
+            if unchanged.version != ICEBERG_WRITE_PAYLOAD_VERSION
+                || unchanged.kind != "unchanged_snapshotless_target"
+                || unchanged.snapshot_id.is_some()
+                || unchanged.table_uuid.is_empty()
+                || unchanged.target_ref.is_empty()
+            {
+                return Err("invalid Iceberg snapshotless NoOp receipt".to_string());
+            }
+            // Reuse the original fact constructor's exact location, format and
+            // identity validation, rather than guessing a relaxed receipt schema.
+            crate::commit::write_stack::IcebergWriteTableFacts::try_new(
+                unchanged.table_uuid.clone(),
+                unchanged.namespace.clone(),
+                unchanged.table_name.clone(),
+                unchanged.table_location.clone(),
+                unchanged.data_location.clone(),
+                unchanged.target_ref.clone(),
+                None,
+                unchanged.base_sequence_number,
+                unchanged.schema_id,
+                unchanged.partition_spec_id,
+                unchanged.format_version,
+            )
+            .map_err(|error| error.to_string())?;
+            ensure_canonical_json(receipt.payload(), &unchanged, "snapshotless NoOp receipt")?;
+            receipt.validate().map_err(|error| error.to_string())?;
+            let version = receipt
+                .committed_version()
+                .ok_or_else(|| "snapshotless NoOp lost its frozen target version".to_string())?;
+            if version.snapshot_id().is_some() || version.payload() != receipt.payload() {
+                return Err(
+                    "snapshotless NoOp version differs from its original target facts".to_string(),
+                );
+            }
+            return Ok(None);
+        }
+    };
     if decoded.version != ICEBERG_WRITE_PAYLOAD_VERSION {
         return Err(format!(
             "unsupported Iceberg write receipt payload version {}; expected {}",
@@ -594,5 +687,89 @@ mod tests {
             decode_write_receipt_output_facts(&receipt).expect("decode"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshotless_noop_tests {
+    use super::*;
+    use crate::commit::write_stack::IcebergWriteTableFacts;
+
+    fn table(name: &str) -> IcebergWriteTableFacts {
+        IcebergWriteTableFacts::try_new(
+            "6f7c3a0e-0000-4000-8000-000000000001".into(),
+            "db".into(),
+            name.into(),
+            format!("s3://bucket/db/{name}"),
+            format!("s3://bucket/db/{name}/data"),
+            "main".into(),
+            None,
+            0,
+            1,
+            0,
+            3,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn unchanged_target_identity_is_exact_and_never_invents_a_snapshot_or_output() {
+        let receipt =
+            connector_unchanged_snapshotless_write_receipt(&table("a"), Some([7; 32])).unwrap();
+        let same =
+            connector_unchanged_snapshotless_write_receipt(&table("a"), Some([7; 32])).unwrap();
+        let foreign =
+            connector_unchanged_snapshotless_write_receipt(&table("b"), Some([7; 32])).unwrap();
+        let other_version =
+            connector_unchanged_snapshotless_write_receipt(&table("a"), Some([8; 32])).unwrap();
+        assert_eq!(same, receipt);
+        assert_ne!(receipt.digest(), foreign.digest());
+        assert_ne!(receipt.digest(), other_version.digest());
+        assert_eq!(receipt.committed_version().unwrap().snapshot_id(), None);
+        assert_eq!(receipt.resulting_row_count(), None);
+        assert_eq!(decode_write_receipt_output_facts(&receipt).unwrap(), None);
+        assert_eq!(
+            ConnectorWriteReceipt::try_from_wire_v1(&receipt.try_to_wire_v1().unwrap()).unwrap(),
+            receipt
+        );
+        assert_eq!(
+            encode_write_receipt(77).unwrap().as_ref(),
+            br#"{"version":1,"snapshot_id":77,"output_facts":null}"#
+        );
+    }
+    #[test]
+    fn snapshotless_payload_refuses_wrong_tag_version_fields_and_version_identity() {
+        let receipt =
+            connector_unchanged_snapshotless_write_receipt(&table("a"), Some([7; 32])).unwrap();
+        let decoded: IcebergUnchangedSnapshotlessReceiptV1 =
+            serde_json::from_slice(receipt.payload()).unwrap();
+        for mutation in 0..5 {
+            let mut wrong = decoded.clone();
+            match mutation {
+                0 => wrong.kind = "write_output".into(),
+                1 => wrong.version += 1,
+                2 => wrong.snapshot_id = Some(77),
+                3 => wrong.namespace.clear(),
+                _ => wrong.format_version = 0,
+            }
+            let payload = canonical_json(&wrong).unwrap();
+            let version = ConnectorCommittedVersion::try_new(payload.clone(), None).unwrap();
+            let wrong =
+                ConnectorWriteReceipt::try_new_with_committed_version(payload, version).unwrap();
+            assert!(decode_write_receipt_output_facts(&wrong).is_err());
+        }
+        let mut unknown: serde_json::Value = serde_json::from_slice(receipt.payload()).unwrap();
+        unknown["output_facts"] = serde_json::json!({"data_files":1});
+        let wrong =
+            ConnectorWriteReceipt::try_new(Bytes::from(serde_json::to_vec(&unknown).unwrap()))
+                .unwrap();
+        assert!(decode_write_receipt_output_facts(&wrong).is_err());
+        let foreign =
+            connector_unchanged_snapshotless_write_receipt(&table("b"), Some([7; 32])).unwrap();
+        let wrong = ConnectorWriteReceipt::try_new_with_committed_version(
+            receipt.payload().clone(),
+            foreign.committed_version().unwrap().clone(),
+        )
+        .unwrap();
+        assert!(decode_write_receipt_output_facts(&wrong).is_err());
     }
 }

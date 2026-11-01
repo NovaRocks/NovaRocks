@@ -326,7 +326,7 @@ fn private_profile_validates_all_declarations_and_actual_four_phase_contracts() 
                         };
                         assert_eq!(field.data_type(), &DataType::FixedSizeBinary(16));
                         assert!(field.is_nullable());
-                        assert_eq!(field.metadata().capacity(), 0);
+                        assert!(field.metadata().as_arc().is_none());
                         assert_eq!(
                             kernel
                                 .contract

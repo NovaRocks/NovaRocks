@@ -55,7 +55,7 @@ code-anchors:
 派生规则：
 
 - **深层代码接收值，不取全局。** 需要配置的执行/连接器/MV 代码从构造时传入的字段读取
-  （`ExecutionRuntimeConfig::exchange_wait_ms`、`StandaloneState::mv_partition_state_max_entries`、
+  （`ExecutionRuntimeConfig::exchange_io_max_inflight_bytes`、`StandaloneState::mv_partition_state_max_entries`、
   `FrontendQueryControlTimeouts`），而不是调用访问器。
 - **校验尽量前移到启动。** FE query-control 超时在 coordinator 构造时校验一次，不可用的
   `[runtime]` 配置在启动失败，而不是在第一条查询上失败。

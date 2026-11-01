@@ -372,8 +372,12 @@ fn partial_avg_local_output_uses_intermediate_utf8_not_final_float64() {
 fn partial_array_agg_cv_order_retains_original_ordinals_backing_and_final_logical_source() {
     let ty = ValueType::new(DataType::Int64, true);
     let field = Arc::new(
-        Field::new("original_cv", DataType::Int64, true)
-            .with_metadata([("provider-origin".into(), "original".into())].into()),
+        Field::new("original_cv", DataType::Int64, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider-origin".into(),
+                "original".into(),
+            )]),
+        ),
     );
     let pool = ConstantPool::try_new(
         field.clone(),

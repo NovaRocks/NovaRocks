@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 use arrow_array::{Array, ArrayRef, ListArray, StringArray, StructArray, UInt32Array};
-use arrow_cast::cast;
 use arrow_select::take::take;
 use std::sync::Arc;
 
@@ -34,8 +33,7 @@ pub(crate) enum ProjectionOperation<'a> {
         values: &'a ArrayRef,
         indices: &'a UInt32Array,
     },
-    TargetTypeClone,
-    Cast,
+    OutputField,
     ListResult,
 }
 /// The caller owns operation authorization and diagnostics. A port must keep
@@ -92,6 +90,57 @@ pub(crate) fn project_with_port<P: ProjectionPort>(
     output_type: Option<&arrow_schema::DataType>,
     port: &mut P,
 ) -> Result<ArrayRef, P::Failure> {
+    project_at_with_port(input, field_name_arr, output_type, None, port)
+}
+
+pub(crate) fn project_prepared_with_port<P: ProjectionPort>(
+    input: &ArrayRef,
+    field_name_arr: &ArrayRef,
+    output_type: &arrow_schema::DataType,
+    field_ordinal: usize,
+    port: &mut P,
+) -> Result<ArrayRef, P::Failure> {
+    project_at_with_port(
+        input,
+        field_name_arr,
+        Some(output_type),
+        Some(field_ordinal),
+        port,
+    )
+}
+
+enum InspectionFailure<E> {
+    Binding(crate::FunctionBindingError),
+    Type(novarocks_type_contract::ValueTypeError),
+    Observer(E),
+}
+impl<E> From<crate::FunctionBindingError> for InspectionFailure<E> {
+    fn from(source: crate::FunctionBindingError) -> Self {
+        Self::Binding(source)
+    }
+}
+impl<E> From<novarocks_type_contract::ValueTypeError> for InspectionFailure<E> {
+    fn from(source: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Type(source)
+    }
+}
+fn inspection_failure<P: ProjectionPort>(source: InspectionFailure<P::Failure>) -> P::Failure {
+    match source {
+        InspectionFailure::Observer(source) => source,
+        InspectionFailure::Binding(source) => {
+            super::struct_field_resolution::into_kernel(source).into()
+        }
+        InspectionFailure::Type(source) => KernelFailure::from(source).into(),
+    }
+}
+
+fn project_at_with_port<P: ProjectionPort>(
+    input: &ArrayRef,
+    field_name_arr: &ArrayRef,
+    output_type: Option<&arrow_schema::DataType>,
+    prepared_ordinal: Option<usize>,
+    port: &mut P,
+) -> Result<ArrayRef, P::Failure> {
     let list = input.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
         P::Failure::from(collection_arrow::contract(format_args!(
             "__array_struct_subfield expects ListArray, got {:?}",
@@ -109,20 +158,35 @@ pub(crate) fn project_with_port<P: ProjectionPort>(
             )))
         })?;
     let field_name = parse_constant_field_name(field_name_arr.as_ref(), port)?;
-    let mut field_idx = None;
-    for (index, field) in struct_values.fields().iter().enumerate() {
+    let field_idx = if let Some(ordinal) = prepared_ordinal {
+        let Some(field) = struct_values.fields().get(ordinal) else {
+            return Err(crate::kernel_control::invalid(
+                "ARRAY projection prepared field ordinal is outside its source",
+            )
+            .into());
+        };
         port.step()?;
-        if field.name() == field_name.as_str() {
-            field_idx = Some(index);
-            break;
+        if !field.name().eq_ignore_ascii_case(&field_name) {
+            return Err(port.value_error(format_args!(
+                "__array_struct_subfield field '{}' does not exist",
+                field_name,
+            )));
         }
-    }
-    let field_idx = field_idx.ok_or_else(|| {
-        port.value_error(format_args!(
-            "__array_struct_subfield field '{}' does not exist",
-            field_name
-        ))
-    })?;
+        ordinal
+    } else {
+        super::struct_field_resolution::resolve_struct_field_ordinal_observed::<
+            InspectionFailure<P::Failure>,
+        >(struct_values.fields(), &field_name, || {
+            port.step().map_err(InspectionFailure::Observer)
+        })
+        .map_err(inspection_failure::<P>)?
+        .ok_or_else(|| {
+            port.value_error(format_args!(
+                "__array_struct_subfield field '{}' does not exist",
+                field_name,
+            ))
+        })?
+    };
     let field_col = struct_values.column(field_idx);
 
     port.before_operation(ProjectionOperation::Indices)?;
@@ -160,7 +224,7 @@ pub(crate) fn project_with_port<P: ProjectionPort>(
         values: field_col,
         indices: &indices,
     })?;
-    let mut out_values = take(field_col.as_ref(), &indices, None).map_err(|source| {
+    let out_values = take(field_col.as_ref(), &indices, None).map_err(|source| {
         P::Failure::from(collection_arrow::arrow_failure(
             "__array_struct_subfield",
             ArrowSite::Take,
@@ -175,29 +239,30 @@ pub(crate) fn project_with_port<P: ProjectionPort>(
                 "__array_struct_subfield output type must be List, got {other:?}"
             ))));
         }
-        None => match list.data_type() {
-            arrow_schema::DataType::List(field) => field.clone(),
-            other => {
-                return Err(P::Failure::from(collection_arrow::contract(format_args!(
-                    "__array_struct_subfield output type must be List, got {:?}",
-                    other
-                ))));
-            }
-        },
+        None => {
+            port.before_operation(ProjectionOperation::OutputField)?;
+            let field = Arc::new(
+                struct_values.fields()[field_idx]
+                    .as_ref()
+                    .clone()
+                    .with_name("item")
+                    .with_nullable(true),
+            );
+            port.after_operation()?;
+            field
+        }
     };
-    port.before_operation(ProjectionOperation::TargetTypeClone)?;
-    let target_item_type = output_field.data_type().clone();
-    port.after_operation()?;
-    if out_values.data_type() != &target_item_type {
-        port.before_operation(ProjectionOperation::Cast)?;
-        out_values = cast(&out_values, &target_item_type).map_err(|source| {
-            P::Failure::from(collection_arrow::arrow_failure(
-                "__array_struct_subfield",
-                ArrowSite::Cast,
-                source,
-            ))
-        })?;
-        port.after_operation()?;
+    if !novarocks_type_contract::arrow_data_types_exact_observed::<InspectionFailure<P::Failure>>(
+        out_values.data_type(),
+        output_field.data_type(),
+        || port.step().map_err(InspectionFailure::Observer),
+    )
+    .map_err(inspection_failure::<P>)?
+    {
+        return Err(crate::kernel_control::invalid(
+            "ARRAY projection field differs from its prepared result declaration",
+        )
+        .into());
     }
 
     port.before_operation(ProjectionOperation::ListResult)?;
@@ -372,7 +437,7 @@ mod required_projection_properties {
         ));
     }
     #[test]
-    fn real_unsupported_output_cast_keeps_sdk_cause_and_no_input_owner() {
+    fn incompatible_output_declaration_is_rejected_without_implicit_cast_or_input_owner() {
         let input = source();
         let weak = Arc::downgrade(&input);
         let names: ArrayRef = Arc::new(StringArray::from(vec!["id"]));
@@ -385,7 +450,6 @@ mod required_projection_properties {
         drop(input);
         assert!(weak.upgrade().is_none());
         assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
-        assert_eq!(failure.failure_fact().reason().code(), 375);
-        assert!(!sdk(&failure).to_string().is_empty());
+        assert!(failure.to_string().contains("prepared result declaration"));
     }
 }

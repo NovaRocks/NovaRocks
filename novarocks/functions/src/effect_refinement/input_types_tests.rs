@@ -246,10 +246,12 @@ fn value_domains_and_nullable_covariance_are_checked_before_owner() {
 #[test]
 fn value_nested_covariance_preserves_the_existing_semantic_domain() {
     let field = |nullable, annotation: &str| {
-        Arc::new(
-            Field::new("item", DataType::Utf8, nullable)
-                .with_metadata([("provider".into(), annotation.into())].into()),
-        )
+        Arc::new(Field::new("item", DataType::Utf8, nullable).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider".into(),
+                annotation.into(),
+            )]),
+        ))
     };
     let mut fixture = Fixture::new(vec![value(ty(
         DataType::List(field(false, "source")),
@@ -313,7 +315,10 @@ fn dictionary_parameter(id: i64, annotation: &str, nullable: bool) -> FunctionVa
         id,
         false,
     )
-    .with_metadata([("provider".into(), annotation.into())].into());
+    .with_metadata(std::collections::HashMap::<String, String>::from([(
+        "provider".into(),
+        annotation.into(),
+    )]));
     ty(DataType::Struct(vec![Arc::new(field)].into()), false)
 }
 
@@ -385,8 +390,12 @@ fn metadata_type(size: usize) -> FunctionValueType {
     let fields = (0..20)
         .map(|i| {
             Arc::new(
-                Field::new(format!("field-{i}"), DataType::Int32, false)
-                    .with_metadata([("provider.payload".into(), "m".repeat(size))].into()),
+                Field::new(format!("field-{i}"), DataType::Int32, false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider.payload".into(),
+                        "m".repeat(size),
+                    )]),
+                ),
             )
         })
         .collect::<Vec<_>>();

@@ -20,11 +20,27 @@
 //! Design: ADR-0198 (docs/adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md).
 
 use super::*;
+
+/// Immutable business completion facts selected by the original statement action.
+/// These values grant no statement visibility, publication or protocol authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatementCommandCompletion {
+    affected_rows: u64,
+}
+impl StatementCommandCompletion {
+    pub const fn new(affected_rows: u64) -> Self {
+        Self { affected_rows }
+    }
+    pub const fn affected_rows(&self) -> u64 {
+        self.affected_rows
+    }
+}
+
 /// An action cannot return a second governed owner through its value slot.
 pub enum StatementActionValue {
     Rows(crate::api::ExecutionHandle),
     Local(crate::api::OwnedLocalResult),
-    Ok,
+    Ok(StatementCommandCompletion),
     SessionChanges(crate::session_effects::SessionEffects),
 }
 use crate::api::StatementExternalEffectDisposition;
@@ -179,8 +195,8 @@ impl StatementActionReady {
                     GovernedCompletionStatementResult::with_session_effects(ready.owner, effects),
                 )
             }
-            Ok(StatementActionValue::Ok) => QuerySessionOutput::GovernedCompletion(
-                GovernedCompletionStatementResult::new(ready.owner),
+            Ok(StatementActionValue::Ok(completion)) => QuerySessionOutput::GovernedCompletion(
+                GovernedCompletionStatementResult::new(completion, ready.owner),
             ),
             Err(error) => QuerySessionOutput::GovernedError(GovernedErrorStatementResult::new(
                 error,
@@ -367,9 +383,12 @@ impl ActionBody {
                 let mut context = owner.registered_action_context(window.as_ref(), source);
                 action.poll_action(&mut context, cx)
             }
-            (Self::Background(action), ActionOwner::Background(owner)) => owner
-                .poll(action.as_mut(), cx)
-                .map(|result| result.map(|()| StatementActionValue::Ok)),
+            (Self::Background(action), ActionOwner::Background(owner)) => {
+                owner.poll(action.as_mut(), cx).map(|result| {
+                    // Background actions return no SQL mutation count.
+                    result.map(|()| StatementActionValue::Ok(StatementCommandCompletion::new(0)))
+                })
+            }
             _ => panic!("same original action and owner kind"),
         }
     }
@@ -1468,7 +1487,7 @@ impl BackgroundActionResultGuard<'_> {
             .as_ref()
             .expect("live original background business receipt")
         {
-            Ok(StatementActionValue::Ok) => {
+            Ok(StatementActionValue::Ok(_)) => {
                 super::background_source::BackgroundActionResultView::Succeeded
             }
             Err(error) => super::background_source::BackgroundActionResultView::Failed(error),

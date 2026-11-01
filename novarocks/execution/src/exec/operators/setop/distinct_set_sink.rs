@@ -28,7 +28,10 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::exec::pipeline::operator::OperatorLifecycle;
+use crate::exec::operators::compiled_expression::RuntimeKernelControl;
+use crate::exec::pipeline::operator::{
+    ConstructionFailure, InputConstructionFactory, OperatorLifecycle,
+};
 use crate::runtime::fragment::ExecutionResult;
 
 use std::marker::PhantomData;
@@ -63,6 +66,8 @@ impl<S: DistinctSetSemantics> OperatorFactory for DistinctSetSinkFactory<S> {
             stage: self.stage,
             state: self.state.clone(),
             mem_tracker: None,
+            construction: None,
+            control: None,
             _semantics: PhantomData,
         }))
     }
@@ -77,6 +82,8 @@ struct DistinctSetSinkOperator<S: DistinctSetSemantics> {
     stage: usize,
     state: DistinctSetSharedState<S>,
     mem_tracker: Option<Arc<MemTracker>>,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
+    control: Option<RuntimeKernelControl>,
     _semantics: PhantomData<S>,
 }
 
@@ -85,8 +92,35 @@ impl<S: DistinctSetSemantics> OperatorLifecycle for DistinctSetSinkOperator<S> {
         &self.name
     }
 
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        if let Some(control) = self.control.as_mut() {
+            control.bind_construction_factory(Arc::clone(&factory));
+        }
+        self.construction = Some(factory);
+    }
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        if let Some(control) = self.control.as_mut() {
+            control.bind_mem_tracker(Arc::clone(&tracker));
+        }
         self.mem_tracker = Some(tracker);
+    }
+    fn bind_runtime_state(
+        &mut self,
+        state: &crate::runtime::runtime_state::RuntimeState,
+    ) -> ExecutionResult<()> {
+        let mut control = RuntimeKernelControl::new(state.error_state());
+        control.bind_runtime_memory(state);
+        if let Some(tracker) = &self.mem_tracker {
+            control.bind_mem_tracker(Arc::clone(tracker));
+        }
+        if let Some(factory) = &self.construction {
+            control.bind_construction_factory(Arc::clone(factory));
+        }
+        self.control = Some(control);
+        Ok(())
     }
 }
 impl<S: DistinctSetSemantics> InputEncodingPolicy for DistinctSetSinkOperator<S> {}
@@ -110,24 +144,42 @@ impl<S: DistinctSetSemantics> SinkKernel for DistinctSetSinkOperator<S> {
     }
     fn consume(
         &mut self,
-        _: &mut StepContext<'_>,
+        ctx: &mut StepContext<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<SinkStep> {
         let chunk = input.into_uncovered_chunk()?;
         let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         if !chunk.is_empty() {
-            if self.stage == 0 {
-                let tracker = self.mem_tracker.as_ref().ok_or_else(|| {
-                    novarocks_functions::KernelFailure::InvalidProgram(
-                        novarocks_functions::KernelDiagnostic::new(
-                            "distinct set key-table memory tracker is not bound",
-                        ),
-                    )
-                })?;
-                self.state.ingest_build(&chunk, Arc::clone(tracker))?;
+            ctx.checkpoint()?;
+            let control = self
+                .control
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            control.checkpoint_execution()?;
+            let owner = control.construction_owner(chunk.chunk_schema())?;
+            let tracker = self
+                .mem_tracker
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            let result = if self.stage == 0 {
+                self.state.ingest_build(
+                    &chunk,
+                    Arc::clone(tracker),
+                    owner.as_ref(),
+                    control,
+                    ctx.value_conversions(),
+                )
             } else {
-                self.state.ingest_probe(self.stage, &chunk)?;
-            }
+                self.state.ingest_probe(
+                    self.stage,
+                    &chunk,
+                    Arc::clone(tracker),
+                    owner.as_ref(),
+                    control,
+                    ctx.value_conversions(),
+                )
+            };
+            result.map_err(|failure| control.project_required_failure(failure))?;
         }
         Ok(SinkStep::new(NextStep::NeedInput, rows))
     }

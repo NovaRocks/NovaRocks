@@ -24,6 +24,7 @@ use arrow_schema::{IntervalUnit, TimeUnit, UnionFields, UnionMode};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
+use std::collections::HashMap;
 use std::sync::{Mutex, atomic::AtomicUsize};
 
 type Error = PureProviderCompileError<ConnectorError>;
@@ -179,8 +180,16 @@ fn owned_schema_all_nested_carriers_metadata_and_dictionary_identity_are_detache
             source.name().as_str(),
             actual.name().as_str()
         ));
-        let (old_key, old_value) = source.metadata().get_key_value("key\0").unwrap();
-        let (new_key, new_value) = actual.metadata().get_key_value("key\0").unwrap();
+        let (old_key, old_value) = source
+            .metadata()
+            .iter()
+            .find(|(key, _)| key.as_str() == "key\0")
+            .unwrap();
+        let (new_key, new_value) = actual
+            .metadata()
+            .iter()
+            .find(|(key, _)| key.as_str() == "key\0")
+            .unwrap();
         assert!(!std::ptr::eq(old_key.as_str(), new_key.as_str()));
         assert!(!std::ptr::eq(old_value.as_str(), new_value.as_str()));
         match (source.data_type(), actual.data_type()) {
@@ -308,44 +317,60 @@ fn owned_schema_count_and_copy_share_independent_dictionary_struct_and_union_req
 }
 
 #[test]
-fn owned_schema_invalid_union_is_original_arrow_error_after_all_children_not_a_count_domain_gate() {
-    for field in [
-        union(129),
-        Field::new(
-            "root",
-            DataType::Union(
-                [(-1, Arc::new(Field::new("negative", DataType::Int64, false)))]
-                    .into_iter()
-                    .collect::<UnionFields>(),
-                UnionMode::Sparse,
-            ),
-            false,
-        ),
+fn owned_schema_public_union_identity_rejection_and_valid_max_copy_remain_distinct() {
+    for (ids, message) in [
+        (vec![-1], "type ids must be non-negative: -1"),
+        (vec![0, 0], "duplicate type id: 0"),
     ] {
-        let c = Control::default();
-        let mut work = CompileCheckpoints::try_new(&c, CompilePhase::ProviderValidation).unwrap();
-        let mut last = WriterOwnedResourceFacts::default();
-        let mut admit = |f: &WriterOwnedResourceFacts| {
-            last = *f;
-            Ok(())
-        };
-        {
-            let mut context = ObservedCopy::new(SOURCE, &mut admit, &mut work).unwrap();
-            assert!(owned_field_core(&field, &mut context).unwrap().is_none());
-        }
-        work.finish().unwrap();
-        assert!(last.allocation_requests >= 18);
-        let plain = owned_field(&field).unwrap_err();
-        let (actual, _) = observed(&field, SOURCE, &Control::default());
-        let Error::Provider(actual) = actual.unwrap_err() else {
-            panic!("expected ordinary provider error")
-        };
-        assert_eq!(plain, actual);
-        assert_eq!(actual.kind(), ConnectorErrorKind::InvalidRequest);
-        assert_eq!(
-            actual.message(),
-            "frozen schema has invalid union field identities"
+        let fields = ids
+            .iter()
+            .map(|_| Arc::new(Field::new("child", DataType::Int64, false)));
+        let error = UnionFields::try_new(ids.clone(), fields).unwrap_err();
+        assert!(
+            matches!(&error, arrow_schema::ArrowError::InvalidArgumentError(actual) if actual == message)
         );
+    }
+    let too_many = UnionFields::try_from_fields(
+        (0..129).map(|n| Field::new(format!("u{n}"), DataType::Int64, false)),
+    )
+    .unwrap_err();
+    assert_eq!(
+        too_many.to_string(),
+        "Invalid argument error: UnionFields cannot contain more than 128 fields"
+    );
+    // The old invalid DataType is no longer safe-publicly constructible.
+    // Keep the real first-party count/copy and all child ownership checks on
+    // the largest valid identity namespace instead of fabricating an SDK error.
+    let source = union(128);
+    let c = Control::default();
+    let mut work = CompileCheckpoints::try_new(&c, CompilePhase::ProviderValidation).unwrap();
+    let mut last = WriterOwnedResourceFacts::default();
+    let mut admit = |facts: &WriterOwnedResourceFacts| {
+        last = *facts;
+        Ok(())
+    };
+    {
+        let mut context = ObservedCopy::new(SOURCE, &mut admit, &mut work).unwrap();
+        assert!(owned_field_core(&source, &mut context).unwrap().is_none());
+    }
+    work.finish().unwrap();
+    assert!(last.allocation_requests >= 18);
+    let plain = owned_field(&source).unwrap();
+    let (actual, facts) = observed(&source, SOURCE, &Control::default());
+    let actual = actual.unwrap();
+    assert_eq!(plain, actual);
+    assert_eq!(actual, source);
+    assert_eq!(last.allocation_requests, facts.allocation_requests);
+    let (DataType::Union(before, _), DataType::Union(after, _)) =
+        (source.data_type(), actual.data_type())
+    else {
+        panic!("Union carrier")
+    };
+    assert_eq!(after.len(), 128);
+    for ((old_id, old), (new_id, new)) in before.iter().zip(after.iter()) {
+        assert_eq!(old_id, new_id);
+        assert!(crate::arrow_fields_exact(old, new));
+        assert!(!Arc::ptr_eq(old, new));
     }
 }
 
@@ -423,26 +448,11 @@ fn owned_schema_source_capacity_floor_and_parent_requests_reject_without_late_co
 }
 
 #[test]
-fn owned_schema_actual_small_success_and_union_error_prefixes_keep_three_original_causes() {
+fn owned_schema_actual_small_and_max_union_success_prefixes_keep_three_original_causes() {
     for (source, ordinary) in [
         (dictionary(), false),
         (union(2), false),
-        (
-            Field::new(
-                "root",
-                DataType::Union(
-                    [
-                        (0, Arc::new(Field::new("first", DataType::Int64, false))),
-                        (0, Arc::new(Field::new("duplicate", DataType::Int64, false))),
-                    ]
-                    .into_iter()
-                    .collect::<UnionFields>(),
-                    UnionMode::Dense,
-                ),
-                false,
-            ),
-            true,
-        ),
+        (union(128), false),
     ] {
         let c = Control::default();
         let (baseline, _) = observed(&source, SOURCE, &c);

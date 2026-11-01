@@ -1,0 +1,114 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Aliyun CI Image
+on:
+  workflow_dispatch:
+    inputs:
+      preparation_sha:
+        description: Complete trusted image preparation SHA
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: aliyun-ci-worker
+  cancel-in-progress: false
+  queue: max
+jobs:
+  image:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    environment: aliyun-ci
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Record conservative STS validity bound
+        run: echo "ALIYUN_CI_STS_NOT_AFTER=$(date -u -d '+12 hours' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+      - uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d93a8781ac344a68e19a43341e79e6 # v1
+        with:
+          role-to-assume: ${{ vars.ALIYUN_CI_ROLE_ARN }}
+          oidc-provider-arn: ${{ vars.ALIYUN_CI_OIDC_PROVIDER_ARN }}
+          audience: sts.aliyuncs.com
+          role-session-expiration: 43200
+      - name: Install locked platform tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/platform"
+          "$RUNNER_TEMP/platform/bin/pip" install --require-hashes -r tools/ci/aliyun_ci/requirements.lock
+      - name: Build registered candidate image
+        working-directory: tools/ci
+        env:
+          CONFIG_JSON: ${{ vars.ALIYUN_CI_CONFIG_JSON }}
+          PREPARATION_SHA: ${{ inputs.preparation_sha }}
+        run: |
+          [[ "$PREPARATION_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 2
+          git -C "$GITHUB_WORKSPACE" archive --format=tar "$PREPARATION_SHA" > "$RUNNER_TEMP/source.tar"
+          printf '%s\n' "$CONFIG_JSON" > "$RUNNER_TEMP/config.json"
+          "$RUNNER_TEMP/platform/bin/python" -m aliyun_ci --config "$RUNNER_TEMP/config.json" --output "$RUNNER_TEMP/image-release.json" image \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --preparation-sha "$PREPARATION_SHA" --source-archive "$RUNNER_TEMP/source.tar"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: aliyun-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/image-release.json
+          if-no-files-found: warn
+          retention-days: 90
+  teardown:
+    if: always() && github.ref == 'refs/heads/main'
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: aliyun-ci
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app
+        with:
+          app-id: ${{ vars.ALIYUN_CI_APP_ID }}
+          private-key: ${{ secrets.ALIYUN_CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - name: Record conservative STS validity bound
+        run: echo "ALIYUN_CI_STS_NOT_AFTER=$(date -u -d '+12 hours' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+      - uses: aliyun/configure-aliyun-credentials-action@1e5248c8d5d93a8781ac344a68e19a43341e79e6 # v1
+        with:
+          role-to-assume: ${{ vars.ALIYUN_CI_ROLE_ARN }}
+          oidc-provider-arn: ${{ vars.ALIYUN_CI_OIDC_PROVIDER_ARN }}
+          audience: sts.aliyuncs.com
+          role-session-expiration: 43200
+      - name: Release exact builder even if image job failed
+        working-directory: tools/ci
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          CONFIG_JSON: ${{ vars.ALIYUN_CI_CONFIG_JSON }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/platform"
+          "$RUNNER_TEMP/platform/bin/pip" install --require-hashes -r aliyun_ci/requirements.lock
+          printf '%s\n' "$CONFIG_JSON" > "$RUNNER_TEMP/config.json"
+          "$RUNNER_TEMP/platform/bin/python" -m aliyun_ci --config "$RUNNER_TEMP/config.json" teardown \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --role builder

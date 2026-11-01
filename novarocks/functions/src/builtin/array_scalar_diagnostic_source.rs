@@ -141,8 +141,7 @@ impl ProjectionPort for HostProjectionDiagnostics<'_, '_, '_> {
             ProjectionOperation::Indices
             | ProjectionOperation::IndicesArray
             | ProjectionOperation::Take { .. }
-            | ProjectionOperation::TargetTypeClone
-            | ProjectionOperation::Cast
+            | ProjectionOperation::OutputField
             | ProjectionOperation::ListResult => Err(ScalarInvocationFailure::Kernel(
                 crate::kernel_control::invalid(
                     "ARRAY projection computation requires its actual opaque operation host",

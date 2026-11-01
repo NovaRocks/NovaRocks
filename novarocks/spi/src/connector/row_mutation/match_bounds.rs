@@ -16,7 +16,6 @@
 // under the License.
 
 use super::*;
-use std::collections::HashMap;
 use std::fmt::{self, Write};
 use std::mem::size_of;
 
@@ -60,10 +59,15 @@ impl Bound {
         self.nodes += 1;
         Ok(())
     }
-    fn metadata(&mut self, metadata: &HashMap<String, String>) -> Result<(), ConnectorError> {
-        // Bucket/control storage, including sparse HashMaps, is checked before
-        // visiting entries. No key Vec, sorting or field cloning is necessary.
-        self.charge(metadata.capacity().checked_mul(128).ok_or_else(exhausted)?)?;
+    fn metadata(&mut self, metadata: &arrow::datatypes::Metadata) -> Result<(), ConnectorError> {
+        // Arrow 60 metadata retains one shared Arc and a BTree with no
+        // deleted buckets. Its source-derived node bound precedes traversal.
+        self.charge(
+            novarocks_type_contract::owned_resources::arrow_metadata::retained_backing_upper_bound(
+                metadata.len(),
+            )
+            .map_err(|_| exhausted())?,
+        )?;
         for (key, value) in metadata {
             self.visit(0)?;
             self.charge(key.capacity())?;

@@ -218,6 +218,33 @@ where
         }
         Ok(())
     }
+    fn opaque_model_request(&mut self, bytes: usize, copies: usize) -> Result<(), Self::Error> {
+        let model = Layout::array::<u8>(bytes).map_err(|_| self.arithmetic())?;
+        self.original
+            .request(model, copies)
+            .map_err(Failure::Contract)?;
+        if self.materializes() && bytes != 0 {
+            for _ in 0..copies {
+                self.original.flush().map_err(Failure::Contract)?;
+                if let Some(frame) = self.fields.last_mut() {
+                    frame
+                        .scope
+                        .observe_opaque_upper_bound(bytes)
+                        .map_err(Failure::Creator)?;
+                } else {
+                    if self.recipe.is_none() {
+                        self.recipe = Some(begin(self.factory, &mut self.original)?);
+                    }
+                    self.recipe
+                        .as_mut()
+                        .expect("recipe scope opened")
+                        .observe_opaque_upper_bound(bytes)
+                        .map_err(Failure::Creator)?;
+                }
+            }
+        }
+        Ok(())
+    }
     fn temporary_request(&mut self, layout: Layout) -> Result<(), Self::Error> {
         // These validation sets/name copies are genuinely allocated during
         // Count. Their original numerical quote already precedes this event.

@@ -495,13 +495,52 @@ impl FrontendReportService {
 
 #[tonic::async_trait]
 impl NovaRocksGrpc for FrontendReportService {
-    type ExchangeStream = std::pin::Pin<
+    type ExchangeStream = tokio_stream::Empty<Result<proto::ExchangeResponse, tonic::Status>>;
+
+    async fn exchange(
+        &self,
+        _request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
+    ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "Exchange is retired; use DeliverExchangeUnit",
+        ))
+    }
+
+    type SubscribeExchangeGrantsStream = std::pin::Pin<
         Box<
-            dyn tokio_stream::Stream<Item = Result<proto::ExchangeResponse, tonic::Status>>
+            dyn tokio_stream::Stream<Item = Result<proto::ExchangeGrantBatch, tonic::Status>>
                 + Send
                 + 'static,
         >,
     >;
+
+    async fn deliver_exchange_unit(
+        &self,
+        _request: tonic::Request<proto::DeliverExchangeUnitRequest>,
+    ) -> Result<tonic::Response<proto::DeliverExchangeUnitResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "Exchange unit delivery is not installed",
+        ))
+    }
+
+    async fn register_exchange_demand(
+        &self,
+        _request: tonic::Request<proto::RegisterExchangeDemandRequest>,
+    ) -> Result<tonic::Response<proto::RegisterExchangeDemandResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "Exchange demand registration is not installed",
+        ))
+    }
+
+    async fn subscribe_exchange_grants(
+        &self,
+        _request: tonic::Request<proto::SubscribeExchangeGrantsRequest>,
+    ) -> Result<tonic::Response<Self::SubscribeExchangeGrantsStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "Exchange grant subscription is not installed",
+        ))
+    }
+
     type SubscribeTaskStatusStream = std::pin::Pin<
         Box<
             dyn tokio_stream::Stream<Item = Result<proto::TaskStatusStreamEvent, tonic::Status>>
@@ -543,20 +582,6 @@ impl NovaRocksGrpc for FrontendReportService {
         }
         .map_err(status_from_contract_error)?;
         Ok(tonic::Response::new(result.to_proto()))
-    }
-
-    async fn exchange(
-        &self,
-        _request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
-    ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
-        Err(Self::rejected("Exchange"))
-    }
-
-    async fn exchange_unary(
-        &self,
-        _request: tonic::Request<proto::ExchangeRequest>,
-    ) -> Result<tonic::Response<proto::ExchangeResponse>, tonic::Status> {
-        Err(Self::rejected("ExchangeUnary"))
     }
 
     async fn transmit_runtime_filter_envelope(

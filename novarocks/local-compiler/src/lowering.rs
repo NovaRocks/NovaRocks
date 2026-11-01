@@ -55,7 +55,6 @@ use std::{
     fmt,
     num::NonZeroUsize,
     sync::Arc,
-    time::Duration,
 };
 
 /// Host-admitted values are explicit; the compiler authors the actual layout
@@ -66,9 +65,6 @@ pub struct LocalCompileOptions {
     pub root_sink_dop: Option<NonZeroUsize>,
     pub kernel_abi: KernelAbiVersion,
     pub constants: ConstantPolicy,
-    /// Host-admitted receive wait copied into every compiled ExchangeSource.
-    /// The compiler never defaults it or derives it from the plan.
-    pub exchange_wait: Duration,
 }
 
 #[derive(Debug)]
@@ -90,6 +86,12 @@ pub enum FragmentCompileError {
     },
 }
 impl FragmentCompileError {
+    pub(crate) fn is_primary_construction(&self) -> bool {
+        matches!(self, Self::Owner { error, .. }
+            if error.downcast_ref::<ExpressionLoweringError>()
+                .is_some_and(ExpressionLoweringError::is_primary_construction))
+    }
+
     /// Capability admission is a typed fact, independent of diagnostic text.
     pub fn is_unsupported(&self) -> bool {
         match self {
@@ -1323,7 +1325,6 @@ fn lower_with_creation<
                     package,
                     node,
                     &planned.slots,
-                    options.exchange_wait,
                     work.control(),
                     creation,
                 )?;

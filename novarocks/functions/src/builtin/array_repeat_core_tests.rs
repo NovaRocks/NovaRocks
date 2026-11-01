@@ -88,15 +88,12 @@ fn interval_count_keeps_the_original_full_cast_error() {
 
 #[test]
 fn complete_output_field_and_typed_null_source_are_preserved() {
-    let field = Arc::new(
-        Field::new("authored", DataType::Int64, true).with_metadata(
-            [
-                ("owner".into(), "source".into()),
-                ("contract".into(), "exact".into()),
-            ]
-            .into(),
-        ),
-    );
+    let field = Arc::new(Field::new("authored", DataType::Int64, true).with_metadata(
+        std::collections::HashMap::<String, String>::from([
+            ("owner".into(), "source".into()),
+            ("contract".into(), "exact".into()),
+        ]),
+    ));
     let source: ArrayRef = Arc::new(Int32Array::from(vec![Some(7), None]));
     let counts = Int64Array::from(vec![2, 1]);
     let out = repeat_values(source, &counts, 2, field.clone()).unwrap();

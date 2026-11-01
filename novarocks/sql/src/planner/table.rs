@@ -659,8 +659,18 @@ impl TableCompletionRetainedBytes {
                 }
             }
             DataType::Union(fields, _) => {
-                self.add_allocation::<i8>(fields.len());
-                self.add_allocation::<arrow::datatypes::FieldRef>(fields.len());
+                // UnionFields retains one Arc pair slice, including its header.
+                let backing =
+                    std::alloc::Layout::array::<(i8, arrow::datatypes::FieldRef)>(fields.len())
+                        .ok()
+                        .and_then(|payload| {
+                            novarocks_type_contract::owned_resources::layout::arc_layout(payload)
+                                .ok()
+                        });
+                match backing {
+                    Some(layout) => self.add(layout.size()),
+                    None => self.overflowed = true,
+                }
                 for (_, field) in fields.iter() {
                     self.add_field(field);
                 }
@@ -681,7 +691,12 @@ impl TableCompletionRetainedBytes {
     fn add_field(&mut self, field: &arrow::datatypes::Field) {
         self.add(std::mem::size_of::<arrow::datatypes::Field>());
         self.add(field.name().len());
-        self.add_allocation::<(String, String)>(field.metadata().capacity());
+        match novarocks_type_contract::owned_resources::arrow_metadata::retained_backing_upper_bound(
+            field.metadata().len(),
+        ) {
+            Ok(backing) => self.add(backing),
+            Err(_) => self.overflowed = true,
+        }
         for (key, value) in field.metadata() {
             self.add(key.capacity());
             self.add(value.capacity());
@@ -796,6 +811,54 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn completion_field_metadata_preserves_owned_text_capacity_and_empty_backing() {
+        let empty = Field::new("x", DataType::Int32, false);
+        let mut bytes = TableCompletionRetainedBytes::default();
+        bytes.add_field(&empty);
+        assert_eq!(
+            bytes.finish(),
+            Some((std::mem::size_of::<Field>() + 1) as u64)
+        );
+        let mut key = String::with_capacity(64);
+        key.push('k');
+        let mut value = String::with_capacity(96);
+        value.push('v');
+        let texts = key.capacity() + value.capacity();
+        let map = std::collections::HashMap::from([(key, value)]);
+        let field = empty.with_metadata(map);
+        let mut bytes = TableCompletionRetainedBytes::default();
+        bytes.add_field(&field);
+        // A nonempty retained BTree/Arc backing must exceed the two String
+        // headers alone; the original owned text capacities remain charged.
+        assert!(
+            bytes.finish().unwrap()
+                > (std::mem::size_of::<Field>()
+                    + 1
+                    + texts
+                    + std::mem::size_of::<(String, String)>()) as u64
+        );
+    }
+
+    #[test]
+    fn completion_union_retains_one_aligned_pair_arc_even_when_empty() {
+        use arrow::datatypes::{UnionFields, UnionMode};
+        let empty = DataType::Union(UnionFields::empty(), UnionMode::Sparse);
+        let mut bytes = TableCompletionRetainedBytes::default();
+        bytes.add_data_type(&empty);
+        assert_eq!(bytes.finish(), Some(16));
+        let fields: UnionFields = [(3, Arc::new(Field::new("x", DataType::Int32, false)))]
+            .into_iter()
+            .collect();
+        let mut bytes = TableCompletionRetainedBytes::default();
+        bytes.add_data_type(&DataType::Union(fields, UnionMode::Sparse));
+        // Locked 64-bit Arc header 16 + padded pair 16 + one Field/name.
+        assert_eq!(
+            bytes.finish(),
+            Some((32 + std::mem::size_of::<Field>() + 1) as u64)
+        );
+    }
 
     #[test]
     fn metadata_table_kind_parses_the_seven_relation_suffixes() {

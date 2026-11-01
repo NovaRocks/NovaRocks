@@ -795,6 +795,8 @@ fn logical_finish_preserves_both_input_orders_and_all_writer_targets() {
         );
         let multiplex = &graph.nodes()[inputs[writer_index].index()];
         assert!(matches!(multiplex.kind(), ProgramNodeKind::UnionAll { .. }));
+        assert_eq!(names(multiplex.output_layout()), WRITER_RELATION);
+        assert_eq!(names(writer_multiplex_layout), WRITER_RELATION);
         assert_eq!(
             writer_multiplex_layout.slots(),
             multiplex.output_layout().slots()

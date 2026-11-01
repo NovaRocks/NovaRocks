@@ -136,7 +136,7 @@ impl WorkloadControl {
         }
         self.inner.update(|state| {
             if state.ready
-                || state.closed
+                || state.root_admission_is_closed()
                 || !state.nodes.is_empty()
                 || state.result_capacity.is_some()
             {
@@ -1390,6 +1390,67 @@ mod tests {
         assert!(!alias.is_for_scope(&b.owner.scope()));
         assert!(alias.is_for_root_scope(&a.owner.scope()));
         assert!(!alias.is_for_root_scope(&b.owner.scope()));
+    }
+
+    #[test]
+    fn root_drain_keeps_existing_windows_until_cancellation_or_execution_close() {
+        for hard_close in [false, true] {
+            let (control, capacity) = control();
+            let root = control
+                .try_begin_root(WorkRequest::new(WorkClass::Query))
+                .unwrap();
+            let scope = root.owner.scope();
+            control.close_root_admission();
+            control.close_root_admission();
+            assert!(control.snapshot().admission_closed);
+            assert_eq!(control.snapshot().serving, crate::ServingState::Closed);
+            assert_eq!(control.mark_ready(), Err(WorkError::Closed));
+            assert!(matches!(
+                control.try_begin_root(WorkRequest::new(WorkClass::Management)),
+                Err(WorkError::Closed)
+            ));
+            assert!(matches!(
+                control.begin_warehouse_root(WorkRequest::new(WorkClass::Query)),
+                Err(WorkError::Closed)
+            ));
+            let original = capacity
+                .try_acquire(&scope, ResultWindowClass::Internal)
+                .unwrap();
+            let alias = original.retain_alias();
+            drop(original);
+            assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+            if hard_close {
+                control.close_admission();
+                assert!(matches!(
+                    capacity.try_acquire(&scope, ResultWindowClass::Local),
+                    Err(WorkError::Closed)
+                ));
+            } else {
+                root.owner
+                    .cancel(crate::CancellationReason::FrontendDrainDeadlineExceeded);
+                assert!(matches!(
+                    capacity.try_acquire(&scope, ResultWindowClass::Local),
+                    Err(WorkError::Cancelled(
+                        crate::CancellationReason::FrontendDrainDeadlineExceeded
+                    ))
+                ));
+            }
+            assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+            root.owner.complete_after_terminal_cancel_settled();
+            root.business.release();
+            assert_eq!(control.snapshot().root_responsibilities, 1);
+            drop(alias);
+            assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+            assert_eq!(control.snapshot().root_responsibilities, 0);
+            assert_eq!(
+                control
+                    .snapshot()
+                    .root_lifecycle
+                    .completed_after_admission_closed
+                    .query,
+                1
+            );
+        }
     }
 
     #[test]

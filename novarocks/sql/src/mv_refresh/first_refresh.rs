@@ -572,6 +572,25 @@ pub enum SqlMvIncrementalWriteMode {
     RowDelta,
 }
 
+fn incremental_target_read_requirement(
+    mode: SqlMvIncrementalWriteMode,
+    snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
+) -> Result<
+    crate::planner::imv_rewrite::annotation::TargetReadRequirement,
+    crate::compiler::SqlCompileError,
+> {
+    use crate::planner::imv_rewrite::annotation::TargetReadRequirement;
+    match mode {
+        SqlMvIncrementalWriteMode::FastAppend if snapshot.schema_contract.aggregate.is_some() => {
+            Err(crate::compiler::SqlCompileError::InvalidRequest(
+                "aggregate MV refresh cannot declare insert-only target access".into(),
+            ))
+        }
+        SqlMvIncrementalWriteMode::FastAppend => Ok(TargetReadRequirement::NewOutputRowsOnly),
+        SqlMvIncrementalWriteMode::RowDelta => Ok(TargetReadRequirement::ExistingRows),
+    }
+}
+
 /// Immutable inputs for the join-incremental change-stream terminal.  The
 /// route facts are provider-signed values and the rewrite snapshot is opaque;
 /// no logical/optimized plan, factory, mutable DAG, lease, or lifecycle state
@@ -611,6 +630,14 @@ pub fn analyze_join_incremental_refresh_change_stream(
     validate_join_incremental_routes(&context.routes)?;
     let snapshot = context.rewrite_snapshot.snapshot();
     validate_join_incremental_snapshot(snapshot)?;
+    let target_read = incremental_target_read_requirement(context.write_mode, snapshot)?;
+    if context.write_mode == SqlMvIncrementalWriteMode::FastAppend
+        && context.join_mode != SqlMvJoinIncrementalRefreshMode::AppendOnly
+    {
+        return Err(crate::compiler::SqlCompileError::InvalidRequest(
+            "coalesced join refresh cannot declare insert-only target access".into(),
+        ));
+    }
     let query = *context.canonical_query;
     let base_semantics = crate::sql_mode::SqlSemanticSettings::default();
     let sql_semantics = crate::sql_mode::query_sql_semantics(&base_semantics, &query)
@@ -646,6 +673,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
     let (plan, factory, change_stream_override) = build_join_incremental_refresh_logical_plan(
         snapshot,
         context.join_mode,
+        target_read,
         logical,
         logical_output.factory,
         functions,
@@ -821,6 +849,8 @@ pub fn analyze_mv_incremental_refresh_change_stream(
     context: SqlMvIncrementalRefreshAnalyzeContext<'_>,
 ) -> Result<SqlMvIncrementalRefreshAnalyzed, crate::compiler::SqlCompileError> {
     validate_join_incremental_routes(&context.routes)?;
+    let target_read =
+        incremental_target_read_requirement(context.write_mode, context.imv_rewrite.snapshot())?;
     // Definition occurrences name canonical catalogs. Preserve that identity
     // through the captured catalog and the exact admitted-scan validator.
     let mut query = *context.canonical_query;
@@ -834,9 +864,12 @@ pub fn analyze_mv_incremental_refresh_change_stream(
             context.imv_rewrite.snapshot(),
         )?;
     }
+    let imv_rewrite = context
+        .imv_rewrite
+        .with_target_read_requirement(target_read);
     let request = canonical_incremental_change_stream_request(
         query,
-        &context.imv_rewrite,
+        &imv_rewrite,
         context.current_catalog,
         context.current_database,
         context.environment,
@@ -1126,6 +1159,7 @@ fn validate_join_incremental_snapshot(
 fn build_join_incremental_refresh_logical_plan(
     snapshot: &Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot>,
     mode: SqlMvJoinIncrementalRefreshMode,
+    target_read: crate::planner::imv_rewrite::annotation::TargetReadRequirement,
     plan: crate::planner::logical::LogicalPlanNode,
     factory: crate::column_id::ColumnRefFactory,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
@@ -1146,6 +1180,7 @@ fn build_join_incremental_refresh_logical_plan(
         crate::planner::imv_rewrite::entrypoint::ImvRewriteInput {
             plan,
             snapshot: Arc::clone(snapshot),
+            target_read,
             disabled_rules: join_incremental_disabled_rules(is_aggregate_refresh),
             decimal_overflow_policy,
             constant_policy,
@@ -3320,9 +3355,64 @@ mod tests {
                     control: SqlCompileControl::unbounded(),
                 },
             );
-            if let Err(error) = result {
-                panic!("canonical incremental analysis failed for {sql}: {error}");
+            let analyzed = result.unwrap_or_else(|error| {
+                panic!("canonical incremental analysis failed for {sql}: {error}")
+            });
+            let statistics = crate::planning::dml::DmlStatisticsSnapshot::from_evidence([
+                crate::planning::dml::DmlStatisticsEvidence::Missing {
+                    binding: SqlTableBindingId::new_for_test(1),
+                    label: "ice.db.b".into(),
+                    reason: "test fixture has no published statistics".into(),
+                },
+            ]);
+            let optimized =
+                crate::compiler::SqlCompiler::optimize(crate::compiler::SqlOptimizeRequest::new(
+                    analyzed.analyzed,
+                    &statistics,
+                    SqlCompileControl::unbounded(),
+                ))
+                .unwrap()
+                .into_optimized_output()
+                .unwrap();
+            let producer = add_join_incremental_change_stream_effect(
+                optimized.optimized_tree,
+                &optimized.change_stream,
+                analyzed.write_mode,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+            assert_eq!(
+                incremental_events(&producer),
+                vec![ConnectorRowMutationEffect::Insert]
+            );
+            let physical = crate::planner::optimizer_bridge::to_physical_plan(&producer).unwrap();
+            fn check(plan: &crate::planner::physical::PhysicalPlanNode, sources: &mut usize) {
+                use crate::planner::physical::PhysicalPlanKind;
+                if let PhysicalPlanKind::Scan(scan) = &plan.kind {
+                    let ScanSource::Sql(source) = &scan.table.source;
+                    assert!(!matches!(
+                        source.kind,
+                        SqlScanKind::MvTargetLocator { .. } | SqlScanKind::MvTargetState { .. }
+                    ));
+                    if matches!(source.kind, SqlScanKind::Delta { .. }) {
+                        *sources += 1;
+                    }
+                }
+                assert!(!matches!(
+                    plan.kind,
+                    PhysicalPlanKind::HashJoin(_) | PhysicalPlanKind::NestLoopJoin(_)
+                ));
+                for child in &plan.children {
+                    check(child, sources);
+                }
             }
+            let mut sources = 0;
+            check(&physical, &mut sources);
+            assert_eq!(
+                sources, 1,
+                "actual canonical append analysis retains the one typed Delta source"
+            );
         }
     }
 

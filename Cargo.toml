@@ -49,14 +49,14 @@ result_large_err = "allow"
 allocator-api2 = "0.2"
 anyhow = "1"
 apache-avro = "0.21"
-arrow = "58.4.0"
-arrow-array = "58.4.0"
-arrow-buffer = "58.4.0"
-arrow-cast = "58.4.0"
-arrow-data = "58.4.0"
-arrow-ipc = "58.4.0"
-arrow-schema = "58.4.0"
-arrow-select = "58.4.0"
+arrow = { version = "60.1.0", features = ["chrono-tz"] }
+arrow-array = { version = "60.1.0", features = ["chrono-tz"] }
+arrow-buffer = "60.1.0"
+arrow-cast = "60.1.0"
+arrow-data = "60.1.0"
+arrow-ipc = "60.1.0"
+arrow-schema = "60.1.0"
+arrow-select = "60.1.0"
 async-trait = "0.1"
 axum = "0.7"
 base64 = "0.22"
@@ -81,8 +81,7 @@ num-traits = "0.2"
 once_cell = "1.19"
 opendal = { version = "=0.58.1", default-features = false, features = ["executors-tokio", "layers-concurrent-limit", "layers-retry", "layers-timeout"] }
 openssl = "0.10"
-paimon = { version = "=0.3.0", default-features = false }
-parquet = "58.4.0"
+parquet = "60.1.0"
 percent-encoding = "=2.3.2"
 prometheus = "0.13"
 proc-macro2 = "1"
@@ -119,6 +118,7 @@ tracing = "0.1"
 twox-hash = "2.1"
 url = "2"
 uuid = "1.8"
+xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
 
 # Internal dependency identities are rooted here; consumers retain dependency
 # kind, target, optionality, and feature selection.
@@ -226,7 +226,6 @@ iceberg-property-macro = { path = "vendor/iceberg-property-macro-0.11.0" }
 # Preserve typed missing-table errors and entity-based table classification.
 # See vendor/iceberg-catalog-hms-0.11.0/PATCH.md.
 iceberg-catalog-hms = { path = "vendor/iceberg-catalog-hms-0.11.0" }
-paimon = { path = "vendor/paimon-0.3.0" }
 # Vendored to advertise and enforce negotiated COM_QUERY multi-statement /
 # multi-result capability. NovaRocks consumes the negotiated bits to preserve
 # fail-closed behavior for clients that did not request this protocol surface.

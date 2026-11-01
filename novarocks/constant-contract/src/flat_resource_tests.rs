@@ -541,7 +541,7 @@ fn wide_real_flat_field_metadata_reaches_quantum_and_keeps_every_primary_prefix(
     let field = Field::new("source", DataType::Int64, true).with_metadata(
         (0..320)
             .map(|i| (format!("provider_{i}"), format!("fact_{i}")))
-            .collect(),
+            .collect::<std::collections::HashMap<String, String>>(),
     );
     let ty = FunctionValueType::new(DataType::Int64, true);
     let control = Control::good();

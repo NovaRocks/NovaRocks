@@ -380,12 +380,17 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::Duration;
 
-    type RecordedMetadataRequest = (String, String, Option<String>);
+    #[derive(Debug)]
+    struct MetadataRequestObservation {
+        method: String,
+        uri: String,
+        imdsv2_token: Option<String>,
+    }
 
     #[derive(Clone, Debug)]
     struct MetadataSequence {
         responses: Arc<Mutex<VecDeque<(u16, String)>>>,
-        requests: Arc<Mutex<Vec<RecordedMetadataRequest>>>,
+        requests: Arc<Mutex<Vec<MetadataRequestObservation>>>,
         failure: Arc<Mutex<Option<MetadataFailure>>>,
     }
     impl HttpSend for MetadataSequence {
@@ -393,14 +398,17 @@ mod tests {
             &self,
             request: http::Request<Bytes>,
         ) -> reqsign_core::Result<http::Response<Bytes>> {
-            self.requests.lock().unwrap().push((
-                request.method().to_string(),
-                request.uri().to_string(),
-                request
-                    .headers()
-                    .get("X-aliyun-ecs-metadata-token")
-                    .map(|v| v.to_str().unwrap().to_string()),
-            ));
+            self.requests
+                .lock()
+                .unwrap()
+                .push(MetadataRequestObservation {
+                    method: request.method().to_string(),
+                    uri: request.uri().to_string(),
+                    imdsv2_token: request
+                        .headers()
+                        .get("X-aliyun-ecs-metadata-token")
+                        .map(|v| v.to_str().unwrap().to_string()),
+                });
             let (status, body) = self
                 .responses
                 .lock()
@@ -492,10 +500,10 @@ mod tests {
         );
         let requests = sequence.requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
-        assert_eq!(requests[0].0, "PUT");
-        assert!(requests[1].1.ends_with("/test-role"));
-        assert_eq!(requests[1].2.as_deref(), Some("imds-token-one"));
-        assert_eq!(requests[3].2.as_deref(), Some("imds-token-two"));
+        assert_eq!(requests[0].method, "PUT");
+        assert!(requests[1].uri.ends_with("/test-role"));
+        assert_eq!(requests[1].imdsv2_token.as_deref(), Some("imds-token-one"));
+        assert_eq!(requests[3].imdsv2_token.as_deref(), Some("imds-token-two"));
         assert!(!format!("{second:?}").contains("token-second"));
     }
 

@@ -444,6 +444,11 @@ impl RunStorageScope {
     }
 
     pub fn from_publication(env_file: &Path, budget: &RunBudget) -> Result<Self> {
+        let manifest = Self::publication_manifest(env_file, budget)?;
+        Self::from_environment(budget.identity(), &manifest["runtime"]["machine"])
+    }
+
+    fn publication_manifest(env_file: &Path, budget: &RunBudget) -> Result<serde_json::Value> {
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
             env_file
                 .parent()
@@ -456,9 +461,8 @@ impl RunStorageScope {
                 && manifest["runtime"]["machine"]["phase"] == "ready",
             "FixtureBudgetRejected: storage requires a ready shared machine publication"
         );
-        let record = &manifest["runtime"]["machine"];
-        budget.validate_machine(record)?;
-        Self::from_environment(budget.identity(), record)
+        budget.validate_machine(&manifest["runtime"]["machine"])?;
+        Ok(manifest)
     }
 
     fn roots(&self) -> [&str; 3] {
@@ -841,6 +845,25 @@ pub fn startup_sweep(
         .canonicalize()
         .context("resolve startup sweep immutable publication")?;
     let storage = RunStorageScope::from_publication(&env_file, budget)?;
+    startup_sweep_with_storage(repo_root, &env_file, budget, &storage)
+}
+
+/// Sweep using the caller's explicit original storage fact. The fact must
+/// agree exactly with the pinned publication and the original budget identity;
+/// no ambient process input substitutes for or relaxes that agreement.
+/// The ordinary entry above still rejects conflicting inherited environment.
+pub fn startup_sweep_with_storage(
+    repo_root: &Path,
+    pinned_env_file: &Path,
+    budget: &RunBudget,
+    storage: &RunStorageScope,
+) -> Result<serde_json::Value> {
+    budget.check_work()?;
+    let env_file = pinned_env_file
+        .canonicalize()
+        .context("resolve startup sweep immutable publication")?;
+    let manifest = RunStorageScope::publication_manifest(&env_file, budget)?;
+    storage.validate_against(budget.identity(), &manifest["runtime"]["machine"])?;
     let mut completed = budget
         .startup_sweep
         .lock()
@@ -919,7 +942,7 @@ fn unix_ms() -> Result<u64> {
 mod tests {
     use super::*;
 
-    fn sweep_fixture(script: &str) -> (tempfile::TempDir, PathBuf, RunBudget) {
+    fn sweep_fixture(script: &str) -> (tempfile::TempDir, PathBuf, RunBudget, RunStorageScope) {
         let directory = tempfile::tempdir().unwrap();
         let scripts = directory.path().join("docker/iceberg-rest");
         std::fs::create_dir_all(&scripts).unwrap();
@@ -937,15 +960,17 @@ mod tests {
             None,
         )
         .unwrap();
-        (directory, publication, budget)
+        let storage = RunStorageScope::from_record(budget.identity(), &record).unwrap();
+        (directory, publication, budget, storage)
     }
 
     #[test]
     fn startup_sweep_runs_once_across_clones_with_original_context_and_pinned_publication() {
-        let (directory, publication, budget) = sweep_fixture(
+        let (directory, publication, budget, storage) = sweep_fixture(
             "import json,os,pathlib,sys\np=pathlib.Path('calls.json')\np.write_text(json.dumps({'args':sys.argv[1:],'context':json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT']),'storage':json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE'])}))\nprint(json.dumps({'complete':False,'errors':[{'code':'ScratchSweepTimeout'}],'enumeration_complete':False}))\n",
         );
-        let report = startup_sweep(directory.path(), &publication, &budget).unwrap();
+        let report =
+            startup_sweep_with_storage(directory.path(), &publication, &budget, &storage).unwrap();
         assert_eq!(report["complete"], false);
         let recorded: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.path().join("calls.json")).unwrap())
@@ -954,8 +979,7 @@ mod tests {
             recorded["context"],
             serde_json::to_value(budget.context()).unwrap()
         );
-        let scope = RunStorageScope::from_publication(&publication, &budget).unwrap();
-        assert_eq!(recorded["storage"], serde_json::to_value(scope).unwrap());
+        assert_eq!(recorded["storage"], serde_json::to_value(&storage).unwrap());
         assert_eq!(
             recorded["args"],
             serde_json::json!([
@@ -966,20 +990,22 @@ mod tests {
         );
         std::fs::remove_file(directory.path().join("docker/iceberg-rest/fixture_run.py")).unwrap();
         assert_eq!(
-            startup_sweep(directory.path(), &publication, &budget.clone()).unwrap(),
+            startup_sweep_with_storage(directory.path(), &publication, &budget.clone(), &storage)
+                .unwrap(),
             report
         );
         let other = directory.path().join("different-env.sh");
         std::fs::write(&other, "# other publication").unwrap();
-        assert!(startup_sweep(directory.path(), &other, &budget).is_err());
+        assert!(startup_sweep_with_storage(directory.path(), &other, &budget, &storage).is_err());
     }
 
     #[test]
     fn startup_sweep_native_failure_is_not_partial_success() {
-        let (directory, publication, budget) = sweep_fixture(
+        let (directory, publication, budget, storage) = sweep_fixture(
             "import sys\nprint('AccessDenied: native S3 failure',file=sys.stderr)\nsys.exit(17)\n",
         );
-        let error = startup_sweep(directory.path(), &publication, &budget).unwrap_err();
+        let error = startup_sweep_with_storage(directory.path(), &publication, &budget, &storage)
+            .unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("17"));
         assert!(message.contains("AccessDenied: native S3 failure"));
@@ -987,13 +1013,37 @@ mod tests {
     }
 
     #[test]
+    fn explicit_startup_storage_rejects_another_original_run_before_dispatch() {
+        let (directory, publication, budget, storage) = sweep_fixture(
+            "from pathlib import Path\nPath('calls.json').write_text('model-dispatched')\nraise RuntimeError('must not dispatch')\n",
+        );
+        let another_budget = RunBudget::admit(
+            FixturePolicy::default(),
+            ScratchIdentity::create("s3://novarocks/another-run").unwrap(),
+            3600,
+            None,
+        )
+        .unwrap();
+        let error =
+            startup_sweep_with_storage(directory.path(), &publication, &another_budget, &storage)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("inherited storage projection differs")
+        );
+        assert!(!directory.path().join("calls.json").exists());
+        assert_ne!(budget.identity(), another_budget.identity());
+    }
+
+    #[test]
     fn expired_startup_sweep_does_not_dispatch_or_resolve_publication() {
-        let (directory, publication, budget) =
+        let (directory, publication, budget, storage) =
             sweep_fixture("raise RuntimeError('must not run')\n");
         let expired = budget.with_work_deadline_limit(Instant::now() - Duration::from_secs(1));
         std::fs::remove_file(&publication).unwrap();
         assert!(
-            startup_sweep(directory.path(), &publication, &expired)
+            startup_sweep_with_storage(directory.path(), &publication, &expired, &storage)
                 .unwrap_err()
                 .is::<FixtureBudgetExpired>()
         );
@@ -1001,7 +1051,7 @@ mod tests {
 
     #[test]
     fn invalid_publication_storage_is_rejected_before_startup_dispatch() {
-        let (directory, publication, budget) =
+        let (directory, publication, budget, storage) =
             sweep_fixture("raise RuntimeError('must not dispatch')\n");
         let path = directory.path().join("manifest.json");
         let mut manifest: serde_json::Value =
@@ -1010,7 +1060,7 @@ mod tests {
             serde_json::json!(&budget.identity().scope_root);
         std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert!(
-            startup_sweep(directory.path(), &publication, &budget)
+            startup_sweep_with_storage(directory.path(), &publication, &budget, &storage)
                 .unwrap_err()
                 .to_string()
                 .contains("overlap")

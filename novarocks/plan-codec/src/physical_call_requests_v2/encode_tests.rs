@@ -125,7 +125,7 @@ fn nested(name: &str) -> FunctionValueType {
                 Field::new(name, DataType::Int64, false).with_metadata(
                     [("origin".to_owned(), "full-field".to_owned())]
                         .into_iter()
-                        .collect(),
+                        .collect::<std::collections::HashMap<String, String>>(),
                 ),
             )]
             .into(),
@@ -175,7 +175,7 @@ fn fixture_with_parameters(reference: p::ConstantReference, parameter_count: usi
             Field::new("request-only", DataType::Int64, true).with_metadata(
                 [("source".to_owned(), "original".to_owned())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
         ),
         int(),

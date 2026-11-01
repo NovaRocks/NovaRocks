@@ -18,14 +18,13 @@
 //! Refresh schema observations from retained provider metadata and canonical D/L.
 
 use crate::mv::domain::refresh::schema_contract::MvOccurrenceFieldRebind;
-use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use novarocks_types::naming::TableIdentity;
 
 pub(crate) fn validate_observed_schema_locator(
-    observed: &MvSchemaValidationObservation,
+    observed: &novarocks_spi::connector::ConnectorTableIdentity,
     identity: &novarocks_spi::connector::ConnectorTableIdentity,
 ) -> Result<(), String> {
-    if observed.table() != identity {
+    if observed != identity {
         return Err(
             "MV schema observation does not match the retained metadata locator".to_string(),
         );

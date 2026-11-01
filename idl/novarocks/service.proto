@@ -37,12 +37,13 @@ import "result.proto";
 // backend only through ApplyTaskOperations, and a task's terminal is its own
 // status, read back through SubscribeTaskStatus and GetFinalTaskInfo.
 service NovaRocksGrpc {
-  // Streaming exchange shuffle: sender streams chunk payloads to a receiver
-  // fragment instance. Producer: src/service/exchange_sender.rs. Consumer:
-  // src/service/grpc_server.rs -> src/runtime/exchange.rs.
+  // Retired bidirectional compatibility entrypoint; returns unimplemented.
+  // Request/reply field numbers and names remain permanently reserved.
   rpc Exchange(stream ExchangeRequest) returns (stream ExchangeResponse);
-  // Single-message exchange path used by the current gRPC sender.
-  rpc ExchangeUnary(ExchangeRequest) returns (ExchangeResponse);
+  // Sole production Exchange path: receiver-authorized ordered Unit/End.
+  rpc DeliverExchangeUnit(DeliverExchangeUnitRequest) returns (DeliverExchangeUnitResponse);
+  rpc RegisterExchangeDemand(RegisterExchangeDemandRequest) returns (RegisterExchangeDemandResponse);
+  rpc SubscribeExchangeGrants(SubscribeExchangeGrantsRequest) returns (stream ExchangeGrantBatch);
   // Native runtime-filter envelope propagation.
   rpc TransmitRuntimeFilterEnvelope(novarocks.filter.RuntimeFilterEnvelope)
       returns (novarocks.filter.RuntimeFilterEnvelopeResponse);
@@ -433,21 +434,12 @@ message QueryTerminalProfileContributionTelemetry {
   }
 }
 
-// One exchange shuffle chunk in flight from a sender to a receiver instance.
+// Retired carrier. No RPC accepts it; old field numbers and names cannot be reused.
 message ExchangeRequest {
-  int64 finst_id_hi = 1;   // receiver fragment-instance id, high 64 bits
-  int64 finst_id_lo = 2;   // receiver fragment-instance id, low 64 bits
-  int32 node_id = 3;       // destination exchange node id within the fragment
-  int32 sender_id = 4;     // sender ordinal (for per-sender EOS tracking)
-  int32 be_number = 5;     // sender BE ordinal
-  bool eos = 6;            // true on this sender's final message
-  int64 sequence = 7;      // sequence within the exact stream; final EOS names its End
-  bytes payload = 8;       // NRX1-framed Arrow IPC chunk (src/runtime/exchange.rs)
-  int64 source_finst_id_hi = 9;
-  int64 source_finst_id_lo = 10;
-  uint32 sender_ordinal = 11;
-  uint32 sender_count = 12;
-  ExchangeStreamIdentity stream = 13;
+  reserved 1 to 13;
+  reserved "finst_id_hi", "finst_id_lo", "node_id", "sender_id", "be_number",
+      "eos", "sequence", "payload", "source_finst_id_hi", "source_finst_id_lo",
+      "sender_ordinal", "sender_count", "stream";
 }
 
 // Exact source-to-input identity; a reused endpoint never replaces Task identity.
@@ -463,7 +455,7 @@ message ExchangeStreamIdentity {
 }
 
 // Cumulative consumption through the exact stream's final EOS sequence.
-message ExchangeConsumed { int64 final_sequence = 1; }
+message ExchangeConsumed { uint64 final_sequence = 1; }
 message ExchangeWithdrawn {}
 
 // Exact receiver-side normal closure for one frozen inbound occurrence and
@@ -483,11 +475,105 @@ message ExchangeNormalClosed {
   }
 }
 
-// Result for one ExchangeRequest.
+// Retired reply carrier. No RPC emits it.
 message ExchangeResponse {
-  int64 ack_sequence = 1;                 // request sequence, including a normal close
-  novarocks.common.Status status = 2;     // native exchange handler status; code 0 == OK
-  ExchangeNormalClosed normal_closed = 3; // present only for exact normal closure
+  reserved 1 to 3;
+  reserved "ack_sequence", "status", "normal_closed";
+}
+
+// The ordered unit domain starts at 1. End occupies its own sequence and no
+// data slot; custody and actual input consumption are independent facts.
+message ExchangeUnitDemand {
+  uint64 sequence = 1;
+  uint64 wire_bytes = 2;
+}
+message ExchangeUnitData {
+  uint64 sequence = 1;
+  uint64 wire_bytes = 2;
+  bytes payload = 3;
+  bool end_after_unit = 4;
+}
+message ExchangeUnitEnd { uint64 sequence = 1; }
+message ExchangeUnitConsumed { uint64 final_sequence = 1; }
+message ExchangeUnitReceiverClosed {
+  oneof disposition {
+    ExchangeUnitConsumed consumed = 1;
+    ExchangeWithdrawn withdrawn = 2;
+  }
+}
+message ExchangeStreamState {
+  ExchangeStreamIdentity stream = 1;
+  uint64 custody_through = 2;
+  uint64 granted_through = 3;
+  // Irreversible source stop, never a proof of normal receiver consumption.
+  bool sender_stopped = 4;
+  ExchangeUnitReceiverClosed receiver_closed = 5;
+}
+enum ExchangeUnitVerdict {
+  EXCHANGE_UNIT_VERDICT_UNSPECIFIED = 0;
+  EXCHANGE_UNIT_VERDICT_APPLIED = 1;
+  EXCHANGE_UNIT_VERDICT_IDEMPOTENT = 2;
+}
+message ExchangeUnitObservation {
+  ExchangeUnitVerdict verdict = 1;
+  ExchangeStreamState state = 2;
+}
+message DeliverExchangeUnitRequest {
+  reserved 6, 7, 8;
+  reserved "eos", "sequence", "payload";
+  // Redundant frozen envelope fields are all cross-checked against stream.
+  int64 finst_id_hi = 1;
+  int64 finst_id_lo = 2;
+  int32 node_id = 3;
+  int32 sender_id = 4;
+  int32 be_number = 5;
+  int64 source_finst_id_hi = 9;
+  int64 source_finst_id_lo = 10;
+  uint32 sender_ordinal = 11;
+  uint32 sender_count = 12;
+  ExchangeStreamIdentity stream = 13;
+  oneof item {
+    ExchangeUnitData unit = 20;
+    ExchangeUnitEnd end = 21;
+  }
+  ExchangeUnitDemand next_demand = 22;
+}
+message DeliverExchangeUnitResponse {
+  uint64 item_sequence = 1;
+  oneof outcome {
+    ExchangeUnitObservation observed = 2;
+    FailureFact refused = 3;
+  }
+}
+message StopExchangeSender {}
+message ExchangeDemandEntry {
+  ExchangeStreamIdentity stream = 1;
+  oneof operation {
+    ExchangeUnitDemand demand = 2;
+    StopExchangeSender stop_sender = 3;
+  }
+}
+message RegisterExchangeDemandRequest {
+  repeated ExchangeDemandEntry entries = 1; // nonempty, exact streams must be unique
+}
+message ExchangeDemandResult {
+  ExchangeStreamIdentity stream = 1;
+  oneof outcome {
+    ExchangeStreamState state = 2;
+    FailureFact refused = 3;
+  }
+}
+message RegisterExchangeDemandResponse { repeated ExchangeDemandResult results = 1; }
+message SubscribeExchangeGrantsRequest {
+  BackendProcessId sender = 1;
+  BackendProcessId receiver = 2;
+  uint64 generation = 3; // mandatory nonzero, fenced by exact process pair
+}
+message ExchangeGrantBatch {
+  uint64 generation = 1;
+  bool snapshot = 2;
+  bool snapshot_complete = 3;
+  repeated ExchangeStreamState states = 4; // publication may page a larger snapshot
 }
 
 message ScanRangeParams {

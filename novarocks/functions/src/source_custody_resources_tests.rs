@@ -472,15 +472,12 @@ fn source_custody_resources_nonempty_offset_nested_view_union_and_validation_car
         .unwrap();
         check((Arc::new(array) as ArrayRef).slice(1, 2));
     }
-    let original_field = Arc::new(
-        Field::new("nominal", DataType::Utf8, true).with_metadata(
-            [(
-                String::from("key"),
-                String::from("independent original metadata"),
-            )]
-            .into(),
-        ),
-    );
+    let original_field = Arc::new(Field::new("nominal", DataType::Utf8, true).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            String::from("key"),
+            String::from("independent original metadata"),
+        )]),
+    ));
     let original_count = Arc::strong_count(&original_field);
     let array: ArrayRef = Arc::new(StructArray::new(
         vec![original_field.clone()].into(),

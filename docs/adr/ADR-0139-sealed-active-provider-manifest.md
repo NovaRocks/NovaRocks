@@ -5,6 +5,10 @@ domain: [provider-spi, runtime-role]
 status: active
 supersedes: [ADR-0132]
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0204
+    scope: "Manifest membership versus active capability: retain registered providers with explicitly suspended capabilities"
+    link: "ADR-0204-upstream-iceberg-backports-and-provider-suspension.md"
 date: 2026-09-09
 provenance:
   - "discussion: 2026-09-09 Iceberg and Paimon sealed provider convergence"

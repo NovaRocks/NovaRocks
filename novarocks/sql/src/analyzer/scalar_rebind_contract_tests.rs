@@ -604,8 +604,13 @@ fn scalar_rebind_catalog_shapes_never_truncate_arguments_or_publish_non_scalar_r
 fn scalar_rebind_full_value_and_callable_targets_match_actual_coerced_ast() {
     let decorated = DataType::Struct(
         vec![Arc::new(
-            Field::new("actual", DataType::Utf8, false)
-                .with_metadata([(String::from("provider"), String::from("original"))].into()),
+            Field::new("actual", DataType::Utf8, false).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                String::from("provider"),
+                String::from("original"),
+            )])),
         )]
         .into(),
     );
@@ -743,8 +748,12 @@ fn scalar_rebind_wide_actual_nested_fvt_gate_observes_quantum_and_original_contr
     let fields = (0..320)
         .map(|i| {
             Arc::new(
-                Field::new(format!("source_{i}"), DataType::Int64, i % 2 == 0)
-                    .with_metadata([(String::from("provider"), format!("original_{i}"))].into()),
+                Field::new(format!("source_{i}"), DataType::Int64, i % 2 == 0).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        String::from("provider"),
+                        format!("original_{i}"),
+                    )]),
+                ),
             )
         })
         .collect::<Vec<_>>();

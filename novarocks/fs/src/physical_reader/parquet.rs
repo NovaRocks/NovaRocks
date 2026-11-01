@@ -114,6 +114,8 @@ pub enum ParquetStatisticsSortOrder {
     Signed,
     Unsigned,
     Undefined,
+    TotalOrder,
+    Int96Timestamp,
 }
 
 /// A decoded value from a Parquet footer statistic. This deliberately retains
@@ -495,11 +497,12 @@ pub fn plan_parquet_input_ranges(
             if length == 0 {
                 continue;
             }
-            if let (Some(selection), Some(indexes)) =
-                (group_selection.as_ref(), parquet.offset_index())
-            {
-                let index =
-                    page_index_cell(indexes, group_index, column_index, "offset index", group)?;
+            if let (Some(selection), Some(index)) = (
+                group_selection.as_ref(),
+                parquet
+                    .page_index()
+                    .and_then(|indexes| indexes.offset_index(group_index, column_index)),
+            ) {
                 let locations = index.page_locations();
                 if let Some(first) = locations.first() {
                     let first_offset = u64::try_from(first.offset).map_err(|_| {
@@ -1426,14 +1429,16 @@ fn page_selection(
         })?;
         let explicit_ranges = if let Some(selected_pages) = pages_by_row_group.get(&row_group_index)
         {
-            let Some(offset_index) = metadata.offset_index() else {
+            let Some(indexes) = metadata
+                .page_index()
+                .filter(|index| index.has_offset_indexes())
+            else {
                 return Err(FileError::unsupported(
                     "explicit Parquet page selection requires an offset index",
                 ));
             };
-            let page_locations = offset_index
-                .get(row_group_index)
-                .and_then(|columns| columns.first())
+            let page_locations = indexes
+                .offset_index(row_group_index, 0)
                 .ok_or_else(|| {
                     FileError::unsupported(format!(
                         "Parquet row group {row_group_index} has no offset-index column"
@@ -1489,10 +1494,7 @@ fn automatic_page_ranges(
     selected: &[usize],
     predicates: &[ScanPredicate],
 ) -> FileResult<AutomaticPageRanges> {
-    let Some(column_indexes) = metadata.column_index() else {
-        return automatic_page_fallback(metadata, selected);
-    };
-    let Some(offset_indexes) = metadata.offset_index() else {
+    let Some(indexes) = metadata.page_index().filter(|index| index.is_complete()) else {
         return automatic_page_fallback(metadata, selected);
     };
 
@@ -1524,20 +1526,16 @@ fn automatic_page_ranges(
                 row_group_fallback = true;
                 break;
             };
-            let column_index = page_index_cell(
-                column_indexes,
-                row_group_index,
-                column_ordinal,
-                "column index",
-                row_group,
-            )?;
-            let offset_index = page_index_cell(
-                offset_indexes,
-                row_group_index,
-                column_ordinal,
-                "offset index",
-                row_group,
-            )?;
+            // Index presence is a per-column capability. A loaded provider
+            // may legitimately omit either optional cell; Parquet 58 used NONE
+            // for missing column indexes and dropped optional offset indexes.
+            let (Some(column_index), Some(offset_index)) = (
+                indexes.column_index(row_group_index, column_ordinal),
+                indexes.offset_index(row_group_index, column_ordinal),
+            ) else {
+                row_group_fallback = true;
+                break;
+            };
             let Some(predicate_ranges) = predicate_page_ranges(
                 row_group_index,
                 row_count,
@@ -1641,31 +1639,6 @@ fn predicate_column_ordinal(
         })
 }
 
-fn page_index_cell<'a, T>(
-    indexes: &'a [Vec<T>],
-    row_group_index: usize,
-    column_ordinal: usize,
-    kind: &str,
-    row_group: &RowGroupMetaData,
-) -> FileResult<&'a T> {
-    indexes
-        .get(row_group_index)
-        .and_then(|columns| columns.get(column_ordinal))
-        .ok_or_else(|| {
-            let path = row_group
-                .columns()
-                .get(column_ordinal)
-                .map(|column| column.column_path().parts().join("."))
-                .unwrap_or_else(|| "<unknown>".to_string());
-            FileError::new(
-                FileErrorKind::Corrupt,
-                format!(
-                    "Parquet {kind} is structurally incomplete for row group {row_group_index}, column chunk {column_ordinal} ({path})"
-                ),
-            )
-        })
-}
-
 fn predicate_page_ranges(
     row_group_index: usize,
     row_count: usize,
@@ -1674,9 +1647,6 @@ fn predicate_page_ranges(
     predicate: &ScanPredicate,
     row_group: &RowGroupMetaData,
 ) -> FileResult<Option<Vec<std::ops::Range<usize>>>> {
-    if matches!(column_index, ColumnIndexMetaData::NONE) {
-        return Ok(None);
-    }
     let page_count = usize::try_from(column_index.num_pages()).map_err(|_| {
         FileError::new(
             FileErrorKind::Corrupt,
@@ -2061,6 +2031,8 @@ fn parquet_sort_order(value: SortOrder) -> ParquetStatisticsSortOrder {
         SortOrder::SIGNED => ParquetStatisticsSortOrder::Signed,
         SortOrder::UNSIGNED => ParquetStatisticsSortOrder::Unsigned,
         SortOrder::UNDEFINED => ParquetStatisticsSortOrder::Undefined,
+        SortOrder::TOTAL_ORDER => ParquetStatisticsSortOrder::TotalOrder,
+        SortOrder::INT96_TIMESTAMP => ParquetStatisticsSortOrder::Int96Timestamp,
     }
 }
 
@@ -2089,4 +2061,122 @@ fn format_error(
         FileErrorKind::Corrupt
     };
     FileError::with_source(kind, format!("{operation} failed"), error)
+}
+
+#[cfg(test)]
+mod page_index_tests {
+    use super::*;
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::metadata::page_index::PageIndexProvider;
+    use parquet::file::page_index::offset_index::OffsetIndexMetaData;
+    use parquet::file::properties::WriterProperties;
+
+    /// A complete loaded provider may still omit a cell. This is explicitly
+    /// allowed by PageIndexProvider and does not contradict footer ranges.
+    #[derive(Debug)]
+    struct PartialIndexes {
+        inner: Arc<dyn PageIndexProvider>,
+        hide_column_index: bool,
+    }
+
+    impl PageIndexProvider for PartialIndexes {
+        fn has_offset_indexes(&self) -> bool {
+            self.inner.has_offset_indexes()
+        }
+        fn has_column_indexes(&self) -> bool {
+            self.inner.has_column_indexes()
+        }
+        fn column_index(&self, row_group: usize, column: usize) -> Option<&ColumnIndexMetaData> {
+            if row_group == 1 && self.hide_column_index {
+                None
+            } else {
+                self.inner.column_index(row_group, column)
+            }
+        }
+        fn offset_index(&self, row_group: usize, column: usize) -> Option<&OffsetIndexMetaData> {
+            if row_group == 1 && !self.hide_column_index {
+                None
+            } else {
+                self.inner.offset_index(row_group, column)
+            }
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn optional_index_cell_absence_falls_back_only_for_its_row_group() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let properties = WriterProperties::builder()
+            .set_data_page_row_count_limit(1)
+            .set_write_batch_size(1)
+            .build();
+        let mut buffer = Vec::new();
+        {
+            let mut writer =
+                ArrowWriter::try_new(&mut buffer, schema.clone(), Some(properties)).unwrap();
+            for values in [vec![0, 1], vec![2, 3]] {
+                let batch =
+                    RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))])
+                        .unwrap();
+                writer.write(&batch).unwrap();
+                writer.flush().unwrap();
+            }
+            writer.close().unwrap();
+        }
+        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            bytes::Bytes::from(buffer),
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
+        )
+        .unwrap();
+        let metadata = reader.metadata().as_ref().clone();
+        let original = metadata
+            .page_index()
+            .expect("fixture publishes page indexes")
+            .clone();
+        assert!(original.is_complete());
+        let predicate = ScanPredicate::new(
+            "id",
+            ScanPredicateDomain::Range {
+                op: crate::MinMaxPredicateOp::Ge,
+                value: MinMaxPredicateValue::Int32(1),
+            },
+            crate::ScanPredicateSource::Static,
+        );
+        for hide_column_index in [false, true] {
+            let partial = Arc::new(PartialIndexes {
+                inner: original.clone(),
+                hide_column_index,
+            });
+            assert!(
+                partial.is_complete(),
+                "presence flags do not promise every cell"
+            );
+            let metadata = metadata
+                .clone()
+                .into_builder()
+                .set_page_index(Some(partial))
+                .build();
+            let selected =
+                automatic_page_ranges(&metadata, &[0, 1], std::slice::from_ref(&predicate))
+                    .unwrap();
+            assert!(selected.fallback);
+            assert_eq!(
+                selected.by_row_group[&0],
+                std::iter::once(1..2).collect::<Vec<_>>(),
+                "available page index still prunes row zero"
+            );
+            assert_eq!(
+                selected.by_row_group[&1],
+                std::iter::once(0..2).collect::<Vec<_>>(),
+                "missing optional cell retains the whole group"
+            );
+            assert_eq!(selected.rows_considered, 4);
+            assert_eq!(selected.rows_pruned, 1);
+        }
+    }
 }

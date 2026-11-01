@@ -16,7 +16,7 @@
 // under the License.
 
 //! Pre-format geometry for the ONE original Arrow concat diagnostic. Arrow's
-//! DataType::Display allocates nested Strings and metadata sorting tables; it
+//! DataType::Display allocates nested Strings; it
 //! must not be called before admission, even with a counting fmt::Write sink.
 //! This module measures their borrowed structural inputs, never renders an
 //! alternative message or selects concat value semantics.
@@ -29,10 +29,37 @@ use arrow_array::Array;
 use arrow_schema::{ArrowError, DataType, Field};
 use std::fmt::{self, Write};
 
-fn debug_bytes(
+trait TypeFormatWork {
+    type Error: From<CopyError>;
+    fn step(&mut self) -> Result<(), Self::Error>;
+    fn flush(&mut self) -> Result<(), Self::Error>;
+}
+impl TypeFormatWork for EvaluationCheckpoints<'_> {
+    type Error = CopyError;
+    fn step(&mut self) -> Result<(), CopyError> {
+        EvaluationCheckpoints::step(self).map_err(CopyError::Control)
+    }
+    fn flush(&mut self) -> Result<(), CopyError> {
+        EvaluationCheckpoints::flush(self).map_err(CopyError::Control)
+    }
+}
+struct ObservedFormatWork<'a, W>(&'a mut W);
+impl<E: From<CopyError>, W: FnMut(bool) -> Result<(), E>> TypeFormatWork
+    for ObservedFormatWork<'_, W>
+{
+    type Error = E;
+    fn step(&mut self) -> Result<(), E> {
+        self.0(false)
+    }
+    fn flush(&mut self) -> Result<(), E> {
+        self.0(true)
+    }
+}
+
+fn debug_bytes<W: TypeFormatWork>(
     value: &impl fmt::Debug,
-    work: &mut EvaluationCheckpoints<'_>,
-) -> Result<usize, CopyError> {
+    work: &mut W,
+) -> Result<usize, W::Error> {
     // The borrowed string/primitive/map Debug authors used below allocate no
     // backing. Their original opaque formatting work remains bracketed.
     struct Count(usize);
@@ -42,10 +69,10 @@ fn debug_bytes(
             Ok(())
         }
     }
-    work.flush().map_err(CopyError::Control)?;
+    work.flush()?;
     let mut count = Count(0);
     fmt::write(&mut count, format_args!("{value:?}")).map_err(|_| CopyError::arithmetic(None))?;
-    work.flush().map_err(CopyError::Control)?;
+    work.flush()?;
     Ok(count.0)
 }
 fn string_peak(bytes: usize) -> Result<usize, CopyError> {
@@ -60,21 +87,20 @@ struct TypeFormatGeometry {
     temporary: usize,
 }
 impl TypeFormatGeometry {
-    fn metadata(field: &Field, work: &mut EvaluationCheckpoints<'_>) -> Result<Self, CopyError> {
+    fn metadata<W: TypeFormatWork>(field: &Field, work: &mut W) -> Result<Self, W::Error> {
         if field.metadata().is_empty() {
             return Ok(Self::default());
         }
         let bytes = add(", metadata: ".len(), debug_bytes(field.metadata(), work)?)?;
-        // FormatMetadata collects an EXACT borrowed tuple table, then stable
-        // sort may allocate at most one further table of the same length.
-        let table = mul(field.metadata().len(), size_of::<(&String, &String)>())?;
+        // Arrow60.1 FormatMetadata iterates the ordered Metadata directly.
+        // Its actual format! String remains; no sorting table is constructed.
         Ok(Self {
             bytes,
-            temporary: add(string_peak(bytes)?, mul(2, table)?)?,
+            temporary: string_peak(bytes)?,
         })
     }
-    fn field(field: &Field, work: &mut EvaluationCheckpoints<'_>) -> Result<Self, CopyError> {
-        work.step().map_err(CopyError::Control)?;
+    fn field<W: TypeFormatWork>(field: &Field, work: &mut W) -> Result<Self, W::Error> {
+        work.step()?;
         let child = Self::data_type(field.data_type(), work)?;
         let metadata = Self::metadata(field, work)?;
         let name = debug_bytes(field.name(), work)?;
@@ -95,12 +121,12 @@ impl TypeFormatGeometry {
             )?,
         })
     }
-    fn list(
+    fn list<W: TypeFormatWork>(
         field: &Field,
         prefix: usize,
-        work: &mut EvaluationCheckpoints<'_>,
-    ) -> Result<Self, CopyError> {
-        work.step().map_err(CopyError::Control)?;
+        work: &mut W,
+    ) -> Result<Self, W::Error> {
+        work.step()?;
         let child = Self::data_type(field.data_type(), work)?;
         let metadata = Self::metadata(field, work)?;
         let name = if field.name() == "item" {
@@ -123,8 +149,8 @@ impl TypeFormatGeometry {
             temporary: add(add(child.temporary, metadata.temporary)?, name_peak)?,
         })
     }
-    fn data_type(ty: &DataType, work: &mut EvaluationCheckpoints<'_>) -> Result<Self, CopyError> {
-        work.step().map_err(CopyError::Control)?;
+    fn data_type<W: TypeFormatWork>(ty: &DataType, work: &mut W) -> Result<Self, W::Error> {
+        work.step()?;
         match ty {
             DataType::List(field) => Self::list(field, "List()".len(), work),
             DataType::LargeList(field) => Self::list(field, "LargeList()".len(), work),
@@ -196,7 +222,7 @@ impl TypeFormatGeometry {
                     temporary: add(key.temporary, value.temporary)?,
                 })
             }
-            // Every remaining Arrow58.2 variant is a direct primitive/numeric/
+            // Every remaining Arrow60.1.0 variant is a direct primitive/numeric/
             // timezone write with no nested String or metadata constructor.
             // Primitive tokens match; Debug's long TimeUnit names conservatively
             // bound Display's shorter s/ms/µs/ns spelling without rendering it.
@@ -206,6 +232,73 @@ impl TypeFormatGeometry {
             }),
         }
     }
+}
+
+/// Sparse Union's empty-unselected-child route now validates newly created
+/// ArrayData. Its original error can render nested types; count the SAME
+/// borrowed source formatting structure before the SDK owns the formatter.
+/// No alternative error is rendered and no message cap is introduced.
+pub(super) fn original_take_validation_diagnostic_observed<E: From<CopyError>>(
+    ty: &DataType,
+    observe: &mut impl FnMut(bool) -> Result<(), E>,
+) -> Result<Option<(usize, usize)>, E> {
+    fn has_sparse<W: TypeFormatWork>(ty: &DataType, work: &mut W) -> Result<bool, W::Error> {
+        work.step()?;
+        match ty {
+            DataType::Union(_, arrow_schema::UnionMode::Sparse) => Ok(true),
+            DataType::Union(fields, _) => {
+                for (_, field) in fields.iter() {
+                    if has_sparse(field.data_type(), work)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            DataType::List(f)
+            | DataType::LargeList(f)
+            | DataType::ListView(f)
+            | DataType::LargeListView(f)
+            | DataType::FixedSizeList(f, _)
+            | DataType::Map(f, _) => has_sparse(f.data_type(), work),
+            DataType::RunEndEncoded(_, values) => has_sparse(values.data_type(), work),
+            DataType::Dictionary(_, values) => has_sparse(values, work),
+            DataType::Struct(fields) => {
+                for field in fields {
+                    if has_sparse(field.data_type(), work)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+    let mut work = ObservedFormatWork(observe);
+    if !has_sparse(ty, &mut work)? {
+        return Ok(None);
+    }
+    let geometry = TypeFormatGeometry::data_type(ty, &mut work)?;
+    // The new root build's validation errors contain at most a child type,
+    // a parent type, and numeric lengths. Both rendered trees are subtrees of
+    // this original root. The longest relevant validation literal is explicit.
+    let mut n = usize::MAX;
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    let description = add(
+        "Sparse union child array # has length smaller than expected for union array ( < )"
+            .len()
+            .max("non-nullable child of type  contains nulls not present in parent ".len()),
+        add(mul(2, geometry.bytes)?, mul(4, add(digits, 1)?)?)?,
+    )?;
+    let display = add(description, "Invalid argument error: ".len())?;
+    let peak = add(
+        mul(2, geometry.temporary)?,
+        add(string_peak(description)?, string_peak(display)?)?,
+    )?;
+    Ok(Some((display, peak)))
 }
 
 pub(super) struct OriginalConcatDiagnosticFacts {

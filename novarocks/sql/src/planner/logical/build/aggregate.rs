@@ -2183,8 +2183,12 @@ mod call_policy_tests {
         let fields = [("payload", true, true)];
         let layout = DataType::Struct(
             vec![
-                arrow::datatypes::Field::new("payload", DataType::Utf8, true)
-                    .with_metadata([("provider-key".into(), "source-only".into())].into()),
+                arrow::datatypes::Field::new("payload", DataType::Utf8, true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider-key".into(),
+                        "source-only".into(),
+                    )]),
+                ),
             ]
             .into(),
         );

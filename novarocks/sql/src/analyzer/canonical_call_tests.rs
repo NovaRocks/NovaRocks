@@ -388,15 +388,19 @@ fn canonical_hidden_array_literal_materializes_common_width_and_keeps_null_and_n
         result,
         &crate::test_value_types::string_list(true, true, false)
     );
-    assert_eq!(item.metadata().capacity(), 0);
+    assert!(item.metadata().as_arc().is_none());
     assert_eq!(&project(&query, 0).value_type, result);
 }
 
 #[test]
 fn canonical_higher_order_helper_keeps_original_lambda_and_nested_source_metadata() {
     let field = Arc::new(
-        Field::new("source_element", DataType::Int64, false)
-            .with_metadata([("provider".to_string(), "exact original field".to_string())].into()),
+        Field::new("source_element", DataType::Int64, false).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider".to_string(),
+                "exact original field".to_string(),
+            )]),
+        ),
     );
     let source = SourceCatalog {
         carrier: DataType::List(field),
@@ -448,7 +452,7 @@ fn canonical_higher_order_helper_keeps_original_lambda_and_nested_source_metadat
     assert_eq!(item.data_type(), &DataType::Int64);
     assert!(item.is_nullable());
     assert_eq!(item.name(), "item");
-    assert_eq!(item.metadata().capacity(), 0);
+    assert!(item.metadata().as_arc().is_none());
     let DataType::List(source_item) = &source.carrier else {
         panic!("expected original source list");
     };

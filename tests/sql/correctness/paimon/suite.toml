@@ -1,7 +1,7 @@
 # PAI-1 reads a fixture authored by an external Spark/Paimon process.
 explicit_only = true
-heavy = { reason = "fixture", detail = "Requires external Spark/Paimon-authored append-only and primary-key fixtures; suite remains suspended pending detailed connector design." }
-disabled_reason = "Paimon tests are suspended pending detailed connector design"
+heavy = { reason = "fixture", detail = "Requires external Spark/Paimon-authored append-only and primary-key fixtures; provider suspended until paimon-rust and its readers support Arrow 60 and zstd 0.14." }
+disabled_reason = "Paimon provider is suspended until paimon-rust and its readers support Arrow 60 and zstd 0.14"
 
 [impact]
 paths = ["novarocks/connector/paimon/**"]

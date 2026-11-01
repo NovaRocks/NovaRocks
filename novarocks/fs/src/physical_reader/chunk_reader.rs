@@ -22,7 +22,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
-use orc_rust::reader::ChunkReader as OrcChunkReader;
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader as ParquetChunkReader, Length};
 
@@ -497,30 +496,6 @@ impl ParquetChunkReader for BoundChunkReader {
 
     fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
         self.read_bytes(start, length).map_err(to_parquet_error)
-    }
-}
-
-impl OrcChunkReader for BoundChunkReader {
-    type T = BoundRead;
-
-    fn len(&self) -> u64 {
-        self.file.identity().file_size()
-    }
-
-    fn get_read(&self, start: u64) -> io::Result<Self::T> {
-        if start > self.file.identity().file_size() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "ORC read offset exceeds file length",
-            ));
-        }
-        Ok(BoundRead::new(self.clone(), start))
-    }
-
-    fn get_bytes(&self, start: u64, length: u64) -> io::Result<Bytes> {
-        let length = usize::try_from(length)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ORC range too large"))?;
-        self.read_bytes(start, length).map_err(to_io_error)
     }
 }
 

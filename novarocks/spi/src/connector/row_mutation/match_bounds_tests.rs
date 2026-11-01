@@ -371,9 +371,12 @@ fn match_bounds_field_count_refused_before_layout_allocation() {
 }
 
 #[test]
-fn match_bounds_sparse_metadata_capacity_is_checked_before_debug() {
-    let mut metadata = HashMap::with_capacity(16 * 1024 * 1024 / 128 + 1);
-    metadata.insert("tiny".into(), "value".into());
+fn match_bounds_owned_metadata_text_capacity_is_checked_before_debug() {
+    // HashMap staging buckets are released by Metadata conversion. The owned
+    // String allocation remains an actual source of the borrowed preflight.
+    let mut value = String::with_capacity(16 * 1024 * 1024 + 1);
+    value.push_str("value");
+    let metadata = HashMap::from([("tiny".to_owned(), value)]);
     refused(
         Field::new("id", DataType::Int64, false).with_metadata(metadata),
         bigint(false),

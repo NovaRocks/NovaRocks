@@ -28,15 +28,20 @@ the native NovaRocks FE/BE role model; one binary starts a `fe`, `be`, or
 - `all-in-one` is a test and local-development convenience. It keeps the FE/BE
   application boundary rather than adding a direct-call shortcut.
 
-The binary's sealed active Connector providers are Iceberg and Paimon. Iceberg
-supports the existing read/write surface; Paimon currently supports bounded
-snapshot reads for append-only and `deduplicate` primary-key tables. The
+The binary's sealed Connector manifest retains Iceberg and Paimon. Iceberg
+supports the existing read/write surface. Paimon catalog configuration and
+projection remain available, while catalog browsing and reads return
+`Unsupported`; Paimon is excluded from the pure program catalogue. Restoring
+reads requires paimon-rust and its dependencies to support Arrow 60 and zstd
+0.14, and the authorized-read boundary in
+[ADR-0138](docs/adr/ADR-0138-vendored-paimon-read-host-patch.md) to be satisfied
+again; see [ADR-0204](docs/adr/ADR-0204-upstream-iceberg-backports-and-provider-suspension.md). The
 StarRocks connector source is retained only as retired reference code: it has no
 active read capability, and Server rejects legacy `[connector.starrocks]`
 configuration.
 
 NovaRocks is still experimental and is not production-ready. It is useful for
-iterating on distributed execution, connector, Iceberg, and Paimon semantics and for
+iterating on distributed execution, connector, and Iceberg semantics and for
 running local SQL experiments on macOS/Linux.
 
 ## Current Scope
@@ -61,8 +66,8 @@ Implemented or actively exercised areas include:
   - Iceberg SELECT, INSERT, DELETE, UPDATE/MERGE-related mutation flows, schema
     changes, refs, and compaction experiments
   - Iceberg-backed materialized-view lifecycle work
-  - Paimon Filesystem Catalog reads for Parquet append-only and `deduplicate`
-    primary-key tables over shared S3-compatible storage
+  - Paimon registration, catalog configuration, and projection retained with
+    catalog browsing and reads suspended
 
 Known limits:
 
@@ -185,8 +190,9 @@ enable_path_style_access = true
 membership registry. Every BE self-registers to the FE native endpoint and is
 eligible only after its authenticated announce and FE-pull heartbeat agree on its
 process identity. Persistent user tables belong to explicitly created external
-Iceberg or Paimon catalogs; only Iceberg currently supplies native write
-capabilities.
+Iceberg or Paimon catalogs. Iceberg currently supplies native read/write
+capabilities; Paimon retains catalog configuration and projection with catalog
+browsing and reads suspended.
 `[connector.object_store]` supplies process-local object-store credentials for
 connector execution and does not create a native internal table store.
 
@@ -320,8 +326,9 @@ Common suites include `ssb`, `tpc-h`, `tpc-ds`, `cte`, `join`, `filter`,
 
 ### Native development
 
-The root workspace builds the native FE/BE runtime and the active Iceberg and
-Paimon Connector crates without a StarRocks server toolchain. The retired
+The root workspace builds the native FE/BE runtime, the Iceberg Connector, and
+the suspended Paimon Connector contract and binding crate without a StarRocks
+server toolchain. The retired
 StarRocks connector crate is not part of the Server provider manifest.
 
 ```bash

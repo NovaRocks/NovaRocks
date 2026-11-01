@@ -32,7 +32,7 @@ use crate::exec::operators::{ResultSinkHandle, partition_chunk_by_hash_arrays};
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::builder::build_compiled_pipeline_graph;
 use crate::exec::pipeline::dependency::DependencyManager;
-use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
+use crate::runtime::fragment::io::exchange::test_support::Fixture;
 use novarocks_physical_plan::{Distribution, EdgeId, Fragment, PhysicalPlan, ValueId};
 use novarocks_types::UniqueId;
 
@@ -479,8 +479,9 @@ fn execute(staged: bool, limit: usize) -> Vec<Output> {
     let source = compile(packages.remove(&SOURCE).unwrap(), &catalog, 1, false);
     let inner = compile(packages.remove(&INNER).unwrap(), &catalog, 2, !staged);
     let outer = staged.then(|| compile(packages.remove(&OUTER).unwrap(), &catalog, 2, true));
-    let port = in_process_test_exchange_receiver_port();
-    let transmitter = LoopbackTransmitter::new(port.clone());
+    let fixture = Fixture::new();
+    let port = fixture.port.clone();
+    let transmitter = LoopbackTransmitter::new(fixture.transport.clone());
     let instances = if staged {
         &INNER_INSTANCES[..]
     } else {
@@ -491,17 +492,18 @@ fn execute(staged: bool, limit: usize) -> Vec<Output> {
     }
     let bindings = instances
         .iter()
-        .map(|instance| register(&inner, *instance, 1, &port))
+        .map(|instance| register(&fixture, &inner, *instance, &[SOURCE_INSTANCE], &port))
         .collect::<Vec<_>>();
     geometry(&inner, bindings[0].clone(), Some(2));
     let outer_bindings = outer
         .as_ref()
-        .map(|program| register(program, OUTER_INSTANCE, instances.len(), &port));
+        .map(|program| register(&fixture, program, OUTER_INSTANCE, instances, &port));
     if let Some(program) = &outer {
         geometry(program, outer_bindings.as_ref().unwrap().clone(), None);
     }
     let tracker = MemTracker::new_root("grouped-exchange-component");
     let source_sink = stream_sink(
+        &fixture,
         &source,
         SOURCE_INSTANCE,
         instances
@@ -511,6 +513,7 @@ fn execute(staged: bool, limit: usize) -> Vec<Output> {
         &transmitter,
     );
     try_run_with_tracker(
+        &fixture,
         &source,
         source_sink,
         ExchangeBindings::default(),
@@ -522,6 +525,7 @@ fn execute(staged: bool, limit: usize) -> Vec<Output> {
     for (ordinal, (instance, binding)) in instances.iter().zip(bindings).enumerate() {
         let sink = if staged {
             stream_sink(
+                &fixture,
                 &inner,
                 *instance,
                 vec![destination(
@@ -535,10 +539,11 @@ fn execute(staged: bool, limit: usize) -> Vec<Output> {
         } else {
             result_sink(&inner, *instance, &output)
         };
-        try_run_with_tracker(&inner, sink, binding, *instance, tracker.clone()).unwrap();
+        try_run_with_tracker(&fixture, &inner, sink, binding, *instance, tracker.clone()).unwrap();
     }
     if let Some(program) = outer {
         try_run_with_tracker(
+            &fixture,
             &program,
             result_sink(&program, OUTER_INSTANCE, &output),
             outer_bindings.unwrap(),

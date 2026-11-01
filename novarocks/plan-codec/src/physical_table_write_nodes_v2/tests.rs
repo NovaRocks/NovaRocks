@@ -217,8 +217,12 @@ fn nested() -> FunctionValueType {
     FunctionValueType::new(
         DataType::Struct(
             vec![Arc::new(
-                Field::new("original-child", DataType::Utf8, true)
-                    .with_metadata([("unknown".into(), "unchanged".into())].into()),
+                Field::new("original-child", DataType::Utf8, true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "unknown".into(),
+                        "unchanged".into(),
+                    )]),
+                ),
             )]
             .into(),
         ),
@@ -270,8 +274,12 @@ fn policy() -> ConstantPolicy {
 fn pool(a: &dyn Array) -> ConstantPool {
     ConstantPool::try_new(
         Arc::new(
-            Field::new("original_source", a.data_type().clone(), true)
-                .with_metadata([("source.tag".into(), "unchanged".into())].into()),
+            Field::new("original_source", a.data_type().clone(), true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "source.tag".into(),
+                    "unchanged".into(),
+                )]),
+            ),
         ),
         FunctionValueType::new(a.data_type().clone(), true),
         a.to_data(),

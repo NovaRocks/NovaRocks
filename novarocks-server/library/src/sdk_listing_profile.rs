@@ -27,7 +27,6 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ListingStartupParameters {
     iceberg_positions: usize,
-    paimon_positions: usize,
     rest_connect: Duration,
     rest_read: Duration,
     list_body_bytes: usize,
@@ -38,7 +37,6 @@ struct ListingStartupParameters {
 // documentation file or accept alternate tuning through these parameters.
 const FROZEN_V1: ListingStartupParameters = ListingStartupParameters {
     iceberg_positions: 8,
-    paimon_positions: 8,
     rest_connect: Duration::from_millis(5000),
     rest_read: Duration::from_millis(30000),
     list_body_bytes: 16 * 1024 * 1024,
@@ -57,7 +55,6 @@ fn current_parameters() -> ListingStartupParameters {
         novarocks_connector_iceberg::catalog_runtime::frozen_sdk_listing_parameters();
     ListingStartupParameters {
         iceberg_positions: positions,
-        paimon_positions: novarocks_connector_paimon::frozen_catalog_listing_concurrency(),
         rest_connect,
         rest_read,
         list_body_bytes: novarocks_fs::frozen_object_store_list_body_limit_bytes(),
@@ -96,11 +93,6 @@ fn validate_parameters(actual: ListingStartupParameters) -> Result<()> {
             "Iceberg catalog positions",
             actual.iceberg_positions,
             FROZEN_V1.iceberg_positions,
-        ),
-        (
-            "Paimon catalog positions",
-            actual.paimon_positions,
-            FROZEN_V1.paimon_positions,
         ),
         (
             "OpenDAL List response bytes",
@@ -174,10 +166,6 @@ mod tests {
                 actual.iceberg_positions as u64,
             ),
             (
-                "per_catalog_listing_concurrency",
-                actual.paimon_positions as u64,
-            ),
-            (
                 "rest_connect_timeout_ms",
                 exact_milliseconds(actual.rest_connect, "test connect").unwrap(),
             ),
@@ -237,9 +225,6 @@ mod tests {
                 as fn(&mut ListingStartupParameters),
             |p| p.iceberg_positions = 7,
             |p| p.iceberg_positions = 9,
-            |p| p.paimon_positions = 0,
-            |p| p.paimon_positions = 7,
-            |p| p.paimon_positions = 9,
             |p| p.rest_connect = Duration::from_millis(4999),
             |p| p.rest_connect = Duration::from_millis(5001),
             |p| p.rest_read = Duration::from_millis(29999),

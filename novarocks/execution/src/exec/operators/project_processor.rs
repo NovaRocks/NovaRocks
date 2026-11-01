@@ -741,13 +741,12 @@ mod tests {
         let field = |marker: Option<&str>| {
             let field = Field::new("source", DataType::Binary, true);
             match marker {
-                Some(marker) => field.with_metadata(
-                    [(
+                Some(marker) => {
+                    field.with_metadata(std::collections::HashMap::<String, String>::from([(
                         novarocks_types::logical::NR_LOGICAL_TYPE_KEY.to_owned(),
                         marker.to_owned(),
-                    )]
-                    .into(),
-                ),
+                    )]))
+                }
                 None => field,
             }
         };
@@ -789,13 +788,12 @@ mod tests {
     fn final_struct_field(marker: Option<&str>) -> Field {
         let child = Field::new("state", DataType::Binary, true);
         let child = match marker {
-            Some(value) => child.with_metadata(
-                [(
+            Some(value) => {
+                child.with_metadata(std::collections::HashMap::<String, String>::from([(
                     novarocks_types::logical::NR_LOGICAL_TYPE_KEY.to_owned(),
                     value.to_owned(),
-                )]
-                .into(),
-            ),
+                )]))
+            }
             None => child,
         };
         Field::new(
@@ -916,8 +914,13 @@ mod tests {
             for empty in [false, true] {
                 let mut source_field = Field::new("source", DataType::Binary, true);
                 if let Some(attribute) = attribute {
-                    source_field = source_field
-                        .with_metadata([("nr_logical_type".into(), attribute.into())].into());
+                    source_field = source_field.with_metadata(std::collections::HashMap::<
+                        String,
+                        String,
+                    >::from([(
+                        "nr_logical_type".into(),
+                        attribute.into(),
+                    )]));
                 }
                 let format_field = source_field.clone();
                 let array: ArrayRef = if empty {
@@ -1315,8 +1318,14 @@ mod tests {
         let declaration =
             FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
                 .unwrap();
-        let source_format_field = Field::new("payload", DataType::Utf8, true)
-            .with_metadata([("nr_logical_type".into(), "unknown format attribute".into())].into());
+        let source_format_field =
+            Field::new("payload", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                "nr_logical_type".into(),
+                "unknown format attribute".into(),
+            )]));
         let source_slot = ChunkSlotSchema::try_new_typed(
             SlotId::new(1),
             Arc::new(source_format_field.clone()),

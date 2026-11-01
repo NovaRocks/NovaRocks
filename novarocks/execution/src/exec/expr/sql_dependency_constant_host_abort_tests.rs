@@ -131,10 +131,12 @@ fn pool(array: ArrayRef, logical: ValueLogicalType) -> ConstantPool {
     .unwrap()
 }
 fn fixtures() -> Vec<ConstantPool> {
-    let text = Arc::new(
-        Field::new("text", DataType::Utf8, true)
-            .with_metadata([("nested_source".into(), "retained".into())].into()),
-    );
+    let text = Arc::new(Field::new("text", DataType::Utf8, true).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            "nested_source".into(),
+            "retained".into(),
+        )]),
+    ));
     let values: ArrayRef = Arc::new(StructArray::new(
         vec![text, Arc::new(Field::new("number", DataType::Int32, true))].into(),
         vec![

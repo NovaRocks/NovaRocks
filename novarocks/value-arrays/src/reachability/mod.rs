@@ -387,6 +387,16 @@ impl SelectionSet {
                 })
             })
     }
+    /// Bounded metadata traversal, including empty bitmap blocks. The callback
+    /// is generic so hot consumers can aggregate it into their own work budget.
+    pub(crate) fn cursor(&self) -> SelectionCursor<'_> {
+        SelectionCursor {
+            words: &self.words,
+            next_word: 0,
+            pending: 0,
+            current_word: 0,
+        }
+    }
     pub fn descriptor_bytes(&self) -> usize {
         self.words.capacity() * std::mem::size_of::<u64>()
     }
@@ -482,6 +492,45 @@ impl SelectionSet {
             out.push(row..row + 1);
         }
         out
+    }
+}
+
+/// A cursor over set members that also observes the work of skipping zero
+/// bitmap words. Logical-row order and original coordinates are unchanged.
+pub(crate) struct SelectionCursor<'a> {
+    words: &'a [u64],
+    next_word: usize,
+    pending: u64,
+    current_word: usize,
+}
+impl SelectionCursor<'_> {
+    pub(crate) fn next_observed<E, W>(
+        &mut self,
+        work: &mut W,
+    ) -> Result<Option<usize>, ValueFailure<E>>
+    where
+        W: FnMut(usize) -> Result<(), E>,
+    {
+        loop {
+            if self.pending != 0 {
+                let bit = self.pending.trailing_zeros() as usize;
+                self.pending &= self.pending - 1;
+                return Ok(Some(self.current_word * 64 + bit));
+            }
+            if self.next_word == self.words.len() {
+                return Ok(None);
+            }
+            // Check before each bounded metadata block, even if no logical
+            // rows in the block are selected. Never hide an unbounded scan
+            // behind a single Iterator::next().
+            if self.next_word.is_multiple_of(1024) {
+                let words = (self.words.len() - self.next_word).min(1024);
+                work(words * std::mem::size_of::<u64>()).map_err(ValueFailure::Caller)?;
+            }
+            self.current_word = self.next_word;
+            self.pending = self.words[self.next_word];
+            self.next_word += 1;
+        }
     }
 }
 

@@ -86,20 +86,13 @@ struct NoPoolMutableBuffer {
     len: usize,
     allocation: Layout,
 }
-#[allow(dead_code)]
-struct NoPoolBytes {
-    data: NonNull<u8>,
-    len: usize,
-    // Locked Deallocation's Standard(Layout)/Custom(Arc<dyn Allocation>,usize)
-    // occupies three usize words. No external/custom allocation is constructed.
-    deallocation: [usize; 3],
-}
-fn argument_layout<T>(_: fn(T) -> Buffer) -> Layout {
-    Layout::new::<T>()
-}
-#[allow(deprecated)] // Infers the public opaque argument type without calling it.
+// Arrow 60 keeps Bytes private and removed Buffer::from_bytes. Source review
+// bounds Deallocation by a word-sized tag plus max(Layout, fat Arc + usize),
+// at most four words. Bytes adds pointer and length, hence six words before
+// the existing Arc-header author. This is a conservative admission estimate,
+// not an exact private layout or an allocator observation.
 fn bytes_layout() -> Layout {
-    argument_layout(Buffer::from_bytes)
+    Layout::new::<[usize; 6]>()
 }
 
 pub(crate) fn environment<W: ResourceWork>(work: &mut W) -> Result<Layout, W::Error> {
@@ -108,8 +101,7 @@ pub(crate) fn environment<W: ResourceWork>(work: &mut W) -> Result<Layout, W::Er
         && LOCKED_TOOLCHAIN
         && arrow::ARROW_VERSION == crate::resource_source_model::LOCKED_ARROW_VERSION
         && cfg!(target_endian = "little")
-        && Layout::new::<MutableBuffer>() == Layout::new::<NoPoolMutableBuffer>()
-        && bytes == Layout::new::<NoPoolBytes>();
+        && Layout::new::<MutableBuffer>() == Layout::new::<NoPoolMutableBuffer>();
     work.step()?;
     if !supported {
         return Err(invalid("flat reader allocation source or feature model changed").into());
@@ -553,7 +545,7 @@ mod tests {
         assert!(!locked_family(changed.as_bytes()));
         // These probes test actual identity/source completeness, not an
         // independently hardcoded release compatibility policy.
-        for member in ["arrow-array", "num-bigint", "flatbuffers"] {
+        for member in ["arrow-array", "flatbuffers"] {
             let record = lock
                 .split("[[package]]")
                 .find(|record| {

@@ -247,8 +247,13 @@ fn single_count_star_and_repeat_nullable_channels_publish_actual_selected_reques
 fn single_min_keeps_nested_field_metadata_and_nominal_json_source_facts() {
     let nested = DataType::Struct(
         vec![Arc::new(
-            Field::new("中国", DataType::Utf8, true)
-                .with_metadata([("provider-origin".into(), "original".into())].into()),
+            Field::new("中国", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                "provider-origin".into(),
+                "original".into(),
+            )])),
         )]
         .into(),
     );
@@ -306,8 +311,12 @@ fn single_min_keeps_nested_field_metadata_and_nominal_json_source_facts() {
 fn single_array_agg_original_nonzero_cv_and_order_keep_backing_field_and_policy() {
     let ty = ValueType::new(DataType::Int64, true);
     let field = Arc::new(
-        Field::new("original_cv", DataType::Int64, true)
-            .with_metadata([("provider-origin".into(), "source".into())].into()),
+        Field::new("original_cv", DataType::Int64, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider-origin".into(),
+                "source".into(),
+            )]),
+        ),
     );
     let pool = ConstantPool::try_new(
         field.clone(),
@@ -576,7 +585,9 @@ fn single_wide_nested_metadata_emission_observes_bounded_original_control() {
                     DataType::Int64,
                     ordinal % 2 == 0,
                 )
-                .with_metadata([("provider-origin".into(), format!("source_{ordinal}"))].into()),
+                .with_metadata(std::collections::HashMap::<String, String>::from(
+                    [("provider-origin".into(), format!("source_{ordinal}"))],
+                )),
             )
         })
         .collect::<Vec<_>>();

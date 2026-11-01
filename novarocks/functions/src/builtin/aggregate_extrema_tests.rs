@@ -1134,8 +1134,12 @@ fn aggregate_extrema_complete_source_binding_stale_domains_and_metadata_refuse()
             .unwrap(),
             FunctionValueType::from_legacy_declared_projection(
                 DataType::List(Arc::new(
-                    Field::new("item", DataType::Int64, true)
-                        .with_metadata([("opaque".into(), "source".into())].into()),
+                    Field::new("item", DataType::Int64, true).with_metadata(
+                        std::collections::HashMap::<String, String>::from([(
+                            "opaque".into(),
+                            "source".into(),
+                        )]),
+                    ),
                 )),
                 true,
             ),

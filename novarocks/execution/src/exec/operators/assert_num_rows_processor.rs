@@ -113,15 +113,23 @@ fn assert_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
 
 use crate::exec::hash_table::{
     allocation::{AggregateAllocator, AggregateVec},
-    partition_keys::{native_tuple_hashes_observed, prepare_canonical_tuple, source_key_owner},
+    key_index::{
+        IndexPurpose, KeyIndex, KeyInput, KeyMatch, KeySpec, NullPolicy, PreparedKeyBatch,
+        hash_batch,
+    },
+    partition_keys::{prepare_canonical_tuple, source_key_owner},
 };
+use crate::exec::operators::compiled_expression::RuntimeKernelControl;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputConstructionOwner,
 };
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::runtime_state::RuntimeState;
+use allocator_api2::boxed::Box as AllocBox;
 use arrow::array::{ArrayRef, BooleanArray};
-use hashbrown::raw::RawTable;
+use novarocks_functions::KernelEvaluationControl;
 use novarocks_type_contract::FunctionValueType;
+use novarocks_value_arrays::batch::hash::HashScratch;
 use novarocks_value_arrays::reachability::ReachableRows;
 use std::sync::Arc;
 
@@ -211,6 +219,7 @@ impl OperatorFactory for AssertNumRowsProcessorFactory {
             key_types: self.key_types.clone(),
             tracker: None,
             construction: None,
+            control: None,
             mode: RuntimeAssertNumRowsMode::from_plan(&self.mode)
                 .expect("validated assert_num_rows processor mode"),
         }))
@@ -224,6 +233,7 @@ struct AssertNumRowsProcessorKernel {
     key_types: Option<Arc<[FunctionValueType]>>,
     tracker: Option<Arc<MemTracker>>,
     construction: Option<Arc<dyn InputConstructionFactory>>,
+    control: Option<RuntimeKernelControl>,
 }
 
 #[cfg(test)]
@@ -258,7 +268,7 @@ enum RuntimeAssertNumRowsMode {
         key_slots: Vec<SlotId>,
         key_labels: Vec<String>,
         message_prefix: String,
-        seen_keys: Option<TypedKeyState>,
+        seen_keys: Option<AllocBox<TypedKeyState, AggregateAllocator>>,
     },
 }
 
@@ -508,7 +518,7 @@ struct DuplicateKeyDisplay<'a, 'input> {
     prefix: &'a str,
     labels: &'a [String],
     columns: &'a [ArrayRef],
-    tuples: &'a crate::exec::hash_table::partition_keys::CanonicalTupleBatch<'input>,
+    tuples: Option<&'a crate::exec::hash_table::partition_keys::CanonicalTupleBatch<'input>>,
     row: usize,
 }
 impl std::fmt::Display for DuplicateKeyDisplay<'_, '_> {
@@ -519,7 +529,11 @@ impl std::fmt::Display for DuplicateKeyDisplay<'_, '_> {
                 f.write_str(", ")?;
             }
             write!(f, "{}=", self.labels[index])?;
-            match self.tuples.string_component(index, self.row) {
+            let Some(tuples) = self.tuples else {
+                f.write_str("<unavailable>")?;
+                continue;
+            };
+            match tuples.string_component(index, self.row) {
                 Ok(Some(Some(value))) => write!(f, "{value:?}")?,
                 Ok(Some(None)) => f.write_str("<NULL>")?,
                 Ok(None) if column.is_null(self.row) => f.write_str("<NULL>")?,
@@ -539,66 +553,8 @@ impl std::fmt::Display for DuplicateKeyDisplay<'_, '_> {
     }
 }
 
-struct StoredKey {
-    hash: u64,
-    bytes: AggregateVec<u8>,
-}
 struct TypedKeyState {
-    types: AggregateVec<FunctionValueType>,
-    keys: RawTable<StoredKey, AggregateAllocator>,
-}
-impl TypedKeyState {
-    fn insert(
-        &mut self,
-        key: AggregateVec<u8>,
-        hash: u64,
-        allocator: &AggregateAllocator,
-        checkpoint: &dyn Fn() -> ExecutionResult<()>,
-    ) -> ExecutionResult<bool> {
-        checkpoint()?;
-        let mut original_failure = None;
-        let duplicate = self
-            .keys
-            .get(hash, |stored| {
-                if let Err(original) = checkpoint() {
-                    original_failure = Some(original);
-                    return true;
-                }
-                if stored.bytes.len() != key.len() {
-                    return false;
-                }
-                for (retained, incoming) in
-                    stored.bytes.chunks(64 * 1024).zip(key.chunks(64 * 1024))
-                {
-                    if let Err(original) = checkpoint() {
-                        original_failure = Some(original);
-                        // Stop the collision walk immediately. The caller
-                        // propagates this failure before interpreting a hit.
-                        return true;
-                    }
-                    if retained != incoming {
-                        return false;
-                    }
-                }
-                true
-            })
-            .is_some();
-        if let Some(original) = original_failure {
-            return Err(original);
-        }
-        checkpoint()?;
-        if duplicate {
-            return Ok(false);
-        }
-        self.keys
-            .try_reserve(1, |stored| stored.hash)
-            .map_err(|source| {
-                allocator.allocation_error("reserve keyed assertion buckets", source)
-            })?;
-        self.keys
-            .insert(hash, StoredKey { hash, bytes: key }, |stored| stored.hash);
-        Ok(true)
-    }
+    index: KeyIndex,
 }
 impl AssertNumRowsProcessorKernel {
     fn clear_state(&mut self) {
@@ -627,11 +583,15 @@ impl AssertNumRowsProcessorKernel {
             .ok_or(ConstructionFailure::MissingOwner)?;
         let original_owner = factory.begin_input_construction(chunk)?;
         let owner = source_key_owner(chunk, original_owner.as_ref())?;
-        let allocator = AggregateAllocator::new(
-            self.tracker
-                .clone()
-                .ok_or_else(|| assert_contract("keyed assertion tracker is not installed"))?,
-        );
+        let tracker = self
+            .tracker
+            .clone()
+            .ok_or_else(|| assert_contract("keyed assertion tracker is not installed"))?;
+        let allocator = AggregateAllocator::new(tracker.clone());
+        let kernel_control = self
+            .control
+            .as_ref()
+            .ok_or_else(|| assert_contract("keyed assertion runtime control is not installed"))?;
         owner.request(
             std::alloc::Layout::array::<usize>(chunk.len()).map_err(|_| {
                 ConstructionFailure::from(
@@ -691,71 +651,145 @@ impl AssertNumRowsProcessorKernel {
             types.push(expected.clone());
         }
         if let Some(state) = seen_keys.as_ref()
-            && state.types.as_slice() != types.as_slice()
+            && state.index.spec().types() != types.as_slice()
         {
             return Err(assert_contract(
                 "keyed assertion exact key types changed between batches",
             ));
         }
-        let (control, conversions) = ctx.value_conversion_scope();
-        let checkpoint = || match control.error() {
-            Some(original) => Err(original),
-            None if control.is_stopped() => {
-                Err(novarocks_functions::KernelFailure::Cancelled.into())
+        let (_, conversions) = ctx.value_conversion_scope();
+        let checkpoint = || kernel_control.checkpoint(0).map_err(ExecutionFailure::from);
+        let result = (|| {
+            if seen_keys.is_none() {
+                let policy = if self.applicability.is_some() {
+                    NullPolicy::Unmatchable
+                } else {
+                    NullPolicy::Equal
+                };
+                let mut nulls = AggregateVec::new_in(allocator.clone());
+                nulls.try_reserve_exact(types.len()).map_err(|source| {
+                    allocator.allocation_error("reserve assertion NULL policy", source)
+                })?;
+                for _ in &types {
+                    nulls.push(policy);
+                }
+                let spec = KeySpec::new(&types, &nulls, original_owner.as_ref(), &checkpoint)?;
+                let index =
+                    KeyIndex::new(spec, IndexPurpose::KeyIds, tracker, original_owner.as_ref())?;
+                *seen_keys = Some(
+                    AllocBox::try_new_in(TypedKeyState { index }, allocator.clone()).map_err(
+                        |source| {
+                            allocator.allocation_error("reserve assertion key state",
+                        novarocks_functions::allocation_failure::AllocatorRequestRefusal::new(
+                            std::alloc::Layout::new::<TypedKeyState>(), source))
+                        },
+                    )?,
+                );
             }
-            None => Ok(()),
-        };
-        let hashes = native_tuple_hashes_observed(
-            &columns,
-            &types,
-            &ReachableRows::indices(chunk.len(), &selected),
-            conversions,
-            owner.as_ref(),
-            &checkpoint,
-        )?;
-        let tuples = prepare_canonical_tuple(
-            &columns,
-            &types,
-            &ReachableRows::indices(chunk.len(), &selected),
-            conversions,
-            owner.as_ref(),
-            &checkpoint,
-        )?;
-        let state = seen_keys.get_or_insert_with(|| TypedKeyState {
-            types,
-            keys: RawTable::new_in(allocator.clone()),
-        });
-        for row in selected {
-            checkpoint()?;
-            if self.applicability.is_some() && tuples.row_has_null(row)? {
-                return Err(assert_contract(
-                    "applicable keyed assertion row has a NULL target key",
-                ));
+            let state = seen_keys.as_mut().expect("original key state installed");
+            let readable = ReachableRows::indices(chunk.len(), &selected)
+                .materialize_observed(
+                    &mut |layout| owner.request(layout).map_err(ExecutionFailure::from),
+                    &mut |_| checkpoint(),
+                )
+                .map_err(|cause| match cause {
+                    novarocks_value_arrays::ValueFailure::Value(cause) => {
+                        ExecutionFailure::from_domain(cause)
+                    }
+                    novarocks_value_arrays::ValueFailure::Caller(cause) => cause,
+                })?;
+            let input = KeyInput::new_for_spec(
+                state.index.spec(),
+                &columns,
+                &types,
+                &readable,
+                &selected,
+                conversions,
+                owner.as_ref(),
+                &checkpoint,
+            )?;
+            let prepared = PreparedKeyBatch::from_captured(
+                state.index.spec(),
+                &input,
+                allocator.clone(),
+                &checkpoint,
+            )?;
+            let hashes = hash_batch(
+                &prepared,
+                state.index.policy(),
+                &mut HashScratch::new(),
+                original_owner.as_ref(),
+                &checkpoint,
+            )?;
+            if self.applicability.is_some() {
+                for occurrence in 0..input.len() {
+                    checkpoint()?;
+                    if !hashes.participates(occurrence)? {
+                        return Err(assert_contract(
+                            "applicable keyed assertion row has a NULL target key",
+                        ));
+                    }
+                }
             }
-            let key = tuples.encode_row(row, allocator.clone(), &checkpoint)?;
-            let hash = hashes.as_slice()[row]
-                .ok_or_else(|| assert_contract("selected assertion key hash is missing"))?;
-            if !state.insert(key, hash, &allocator, &checkpoint)? {
-                // Streaming diagnostics cannot materialize an unbounded key
-                // String or replace the already proven duplicate Data fact.
+            let interned = state.index.intern_batch(
+                &prepared,
+                &hashes,
+                original_owner.as_ref(),
+                kernel_control,
+            )?;
+            let mut new_keys = interned.new_keys().iter().peekable();
+            for (occurrence, found) in interned.matches().iter().enumerate() {
+                checkpoint()?;
+                if new_keys
+                    .peek()
+                    .is_some_and(|key| key.occurrence == occurrence)
+                {
+                    new_keys.next();
+                    continue;
+                }
+                let KeyMatch::Found(_) = found else {
+                    return Err(assert_contract(
+                        "selected assertion key did not receive an equality class",
+                    ));
+                };
+                let row = input.row(occurrence)?;
+                // Only an already-proven duplicate needs display projection.
+                // It uses the existing canonical diagnostic author over one
+                // selected row, never a second lookup/hash/encoded key table.
+                // Display refusal cannot replace the duplicate Data fact.
+                let diagnostic_rows = [row];
+                let tuples = prepare_canonical_tuple(
+                    &columns,
+                    &types,
+                    &ReachableRows::indices(chunk.len(), &diagnostic_rows),
+                    conversions,
+                    owner.as_ref(),
+                    &checkpoint,
+                )
+                .ok();
                 return Err(ExecutionFailure::from_domain(
                     AssertRowsFailure::DuplicateKey(BoundedDetail::truncating_display(
                         DuplicateKeyDisplay {
                             prefix: message_prefix,
                             labels: key_labels,
                             columns: &columns,
-                            tuples: &tuples,
+                            tuples: tuples.as_ref(),
                             row,
                         },
                     )),
                 ));
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        result.map_err(|cause| kernel_control.project_required_failure(cause))
     }
 }
 
 impl OperatorLifecycle for AssertNumRowsProcessorKernel {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.control = Some(RuntimeKernelControl::new(state.error_state()));
+        Ok(())
+    }
     fn prepare(&mut self) -> ExecutionResult<()> {
         if matches!(self.mode, RuntimeAssertNumRowsMode::PerKeyAtMostOne { .. })
             && self.key_types.is_none()
@@ -871,6 +905,7 @@ mod tests {
             key_types: None,
             tracker: None,
             construction: None,
+            control: None,
             mode: RuntimeAssertNumRowsMode::from_plan(&AssertNumRowsMode::Global {
                 desired_num_rows: desired,
                 assertion,
@@ -899,6 +934,7 @@ mod tests {
             key_types: None,
             tracker: None,
             construction: None,
+            control: None,
             mode: RuntimeAssertNumRowsMode::from_plan(&AssertNumRowsMode::Global {
                 desired_num_rows: desired,
                 assertion,
@@ -1029,6 +1065,9 @@ mod tests {
         op.set_mem_tracker(tracker.clone());
         op.set_construction_factory(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
             crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), tracker, rt.error_state()).unwrap());
+        op.prepare().expect("prepare keyed assertion fixture");
+        op.bind_runtime_state(&rt)
+            .expect("bind original keyed assertion runtime");
         let mut op = TestDriver::new(op.as_mut(), &rt);
 
         let err = op
@@ -1056,6 +1095,9 @@ mod tests {
         op.set_mem_tracker(tracker.clone());
         op.set_construction_factory(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
             crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), tracker, rt.error_state()).unwrap());
+        op.prepare().expect("prepare keyed assertion fixture");
+        op.bind_runtime_state(&rt)
+            .expect("bind original keyed assertion runtime");
         let mut op = TestDriver::new(op.as_mut(), &rt);
 
         let output = op
@@ -1088,6 +1130,9 @@ mod tests {
         op.set_mem_tracker(tracker.clone());
         op.set_construction_factory(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
             crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), tracker, rt.error_state()).unwrap());
+        op.prepare().expect("prepare keyed assertion fixture");
+        op.bind_runtime_state(&rt)
+            .expect("bind original keyed assertion runtime");
         let mut op = TestDriver::new(op.as_mut(), &rt);
 
         let output = op
@@ -1241,6 +1286,9 @@ mod typed_state_tests {
         op.set_mem_tracker(tracker.clone());
         op.set_construction_factory(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
             crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), tracker, rt.error_state()).unwrap());
+        op.prepare().expect("prepare keyed assertion fixture");
+        op.bind_runtime_state(rt)
+            .expect("bind original keyed assertion runtime");
         op
     }
     fn conditional(keys: Vec<Option<i32>>, mask: Vec<Option<bool>>) -> Chunk {
@@ -1342,219 +1390,52 @@ mod typed_state_tests {
         );
     }
     #[test]
-    fn bucket_hash_collision_compares_exact_framed_keys() {
-        let tracker = MemTracker::new_root("collision");
-        let allocator = AggregateAllocator::new(tracker.clone());
-        let mut state = TypedKeyState {
-            types: AggregateVec::new_in(allocator.clone()),
-            keys: RawTable::new_in(allocator.clone()),
-        };
-        for value in [b"first".as_slice(), b"second".as_slice()] {
-            let key =
-                crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), value)
-                    .unwrap();
-            assert!(state.insert(key, 17, &allocator, &|| Ok(())).unwrap());
-        }
-        let key = crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), b"first")
-            .unwrap();
-        assert!(!state.insert(key, 17, &allocator, &|| Ok(())).unwrap());
-        assert_eq!(state.keys.len(), 2);
-        drop(state);
-        assert_eq!(tracker.current(), 0);
-    }
-    #[test]
-    fn large_equal_and_long_prefix_key_comparisons_preserve_stop_without_insertion() {
-        use std::cell::Cell;
-        for incoming_tail in *b"ac" {
-            let tracker = MemTracker::new_root("cooperative assertion equality");
-            let allocator = AggregateAllocator::new(tracker.clone());
-            let mut state = TypedKeyState {
-                types: AggregateVec::new_in(allocator.clone()),
-                keys: RawTable::new_in(allocator.clone()),
-            };
-            // Both candidates share a hash and a long prefix. A stop must
-            // end lookup even when another candidate remains in the chain.
-            for tail in *b"ab" {
-                let mut bytes = vec![b'x'; 3 * 64 * 1024];
-                *bytes.last_mut().unwrap() = tail;
-                let key =
-                    crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), &bytes)
-                        .unwrap();
-                assert!(state.insert(key, 17, &allocator, &|| Ok(())).unwrap());
-            }
-            let baseline = tracker.current();
-            let mut bytes = vec![b'x'; 3 * 64 * 1024];
-            *bytes.last_mut().unwrap() = incoming_tail;
-            let key =
-                crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), &bytes)
-                    .unwrap();
-            let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Operational(
-                novarocks_functions::KernelDiagnostic::new("key equality stop origin"),
-            ));
-            let calls = Cell::new(0usize);
-            let error = state
-                .insert(key, 17, &allocator, &|| {
-                    calls.set(calls.get() + 1);
-                    assert!(calls.get() <= 4, "failure must stop the collision walk");
-                    if calls.get() == 4 {
-                        Err(original.clone())
-                    } else {
-                        Ok(())
-                    }
-                })
-                .unwrap_err();
-            assert_eq!(calls.get(), 4);
-            assert!(error.same_occurrence(&original));
-            assert_eq!(state.keys.len(), 2, "a stopped candidate is never inserted");
-            assert_eq!(tracker.current(), baseline);
-            let retry =
-                crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), &bytes)
-                    .unwrap();
-            assert_eq!(
-                state.insert(retry, 17, &allocator, &|| Ok(())).unwrap(),
-                incoming_tail == b'c',
-                "the last chunk still distinguishes a long common prefix"
-            );
-            drop(state);
-            assert_eq!(tracker.current(), 0);
-        }
-    }
-
-    #[test]
-    fn different_length_collision_candidates_observe_stop_before_length_comparison() {
-        use std::cell::Cell;
-        let tracker = MemTracker::new_root("different-length assertion collision");
-        let allocator = AggregateAllocator::new(tracker.clone());
-        let mut state = TypedKeyState {
-            types: AggregateVec::new_in(allocator.clone()),
-            keys: RawTable::new_in(allocator.clone()),
-        };
-        for bytes in [b"a".as_slice(), b"bb".as_slice(), b"ccc".as_slice()] {
-            let key =
-                crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), bytes)
-                    .unwrap();
-            assert!(state.insert(key, 17, &allocator, &|| Ok(())).unwrap());
-        }
-        let baseline = tracker.current();
-        let key = crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), b"dddd")
-            .unwrap();
-        let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Operational(
-            novarocks_functions::KernelDiagnostic::new("different-length collision stop"),
-        ));
-        let calls = Cell::new(0usize);
-        let error = state
-            .insert(key, 17, &allocator, &|| {
-                calls.set(calls.get() + 1);
-                assert!(calls.get() <= 2, "failure must stop the collision walk");
-                if calls.get() == 2 {
-                    Err(original.clone())
-                } else {
-                    Ok(())
-                }
-            })
-            .unwrap_err();
-        assert_eq!(calls.get(), 2);
-        assert!(error.same_occurrence(&original));
-        assert_eq!(state.keys.len(), 3);
-        assert_eq!(tracker.current(), baseline);
-        let retry =
-            crate::exec::hash_table::allocation::aggregate_bytes(allocator.clone(), b"dddd")
-                .unwrap();
-        let retry_calls = Cell::new(0usize);
-        assert!(
-            state
-                .insert(retry, 17, &allocator, &|| {
-                    retry_calls.set(retry_calls.get() + 1);
-                    Ok(())
-                })
-                .unwrap()
-        );
-        assert_eq!(
-            retry_calls.get(),
-            5,
-            "each different-length collision is observed before final insertion"
-        );
-        assert_eq!(state.keys.len(), 4);
-        drop(state);
-        assert_eq!(tracker.current(), 0);
-    }
-
-    #[test]
     fn installed_parent_limit_refuses_state_and_cancel_releases_retained_layouts() {
         let rt = RuntimeState::default();
         let parent = MemTracker::new_root("keyed state parent");
-        parent.install_limit_once(4096).unwrap();
         let tracker = MemTracker::new_child("assertion operator", &parent);
         let mut op = operator(&rt, tracker.clone(), false);
-        let mut retained = 0;
+        let baseline = tracker.current();
+        {
+            let mut calls = TestDriver::new(op.as_mut(), &rt);
+            let output = calls
+                .input_and_collect(chunk(
+                    vec![Arc::new(Int32Array::from(vec![0]))],
+                    &[FunctionValueType::new(
+                        arrow::datatypes::DataType::Int32,
+                        true,
+                    )],
+                ))
+                .expect("seed one retained key before installing the parent limit");
+            assert_eq!(output.len(), 1);
+        }
+        assert!(tracker.current() > baseline);
+        parent
+            .install_limit_once(
+                parent
+                    .current()
+                    .checked_add(1)
+                    .expect("fixture limit extent"),
+            )
+            .unwrap();
         let error = {
             let mut calls = TestDriver::new(op.as_mut(), &rt);
-            (0..10_000)
-                .find_map(|value| {
-                    match calls.input_and_collect(chunk(
-                        vec![Arc::new(Int32Array::from(vec![value]))],
-                        &[FunctionValueType::new(
-                            arrow::datatypes::DataType::Int32,
-                            true,
-                        )],
-                    )) {
-                        Ok(_) => {
-                            retained = retained.max(tracker.current());
-                            None
-                        }
-                        Err(error) => Some(error),
-                    }
-                })
-                .expect("persistent keys must eventually meet the installed parent limit")
+            calls
+                .input_and_collect(chunk(
+                    vec![Arc::new(Int32Array::from(vec![1]))],
+                    &[FunctionValueType::new(
+                        arrow::datatypes::DataType::Int32,
+                        true,
+                    )],
+                ))
+                .expect_err("next distinct key must meet the measured parent limit")
         };
-        assert!(retained > 0);
         assert_eq!(error.failure_fact().class(), FailureClass::Resource);
         op.cancel();
         op.close().unwrap();
         drop(op);
         assert_eq!(tracker.current(), 0);
         assert_eq!(parent.current(), 0);
-    }
-    #[test]
-    fn rehash_reserves_replacement_while_original_buckets_remain_live() {
-        let tracker = MemTracker::new_root("assertion rehash");
-        let allocator = AggregateAllocator::new(tracker.clone());
-        let mut keys = RawTable::<StoredKey, _>::new_in(allocator.clone());
-        keys.try_reserve(3, |stored| stored.hash).unwrap();
-        for value in 0..keys.capacity() {
-            let bytes = crate::exec::hash_table::allocation::aggregate_bytes(
-                allocator.clone(),
-                &(value as u64).to_le_bytes(),
-            )
-            .unwrap();
-            keys.insert(
-                value as u64,
-                StoredKey {
-                    hash: value as u64,
-                    bytes,
-                },
-                |stored| stored.hash,
-            );
-        }
-        let baseline = tracker.current();
-        // New buckets alone fit below 3*current, while old+new do not. The
-        // allocator's exact replacement charge must preserve the live table.
-        let probe = MemTracker::new_root("replacement geometry");
-        let probe_allocator = AggregateAllocator::new(probe.clone());
-        let mut replacement = RawTable::<StoredKey, _>::new_in(probe_allocator);
-        replacement
-            .try_reserve(keys.len() + 1, |stored| stored.hash)
-            .unwrap();
-        let replacement_bytes = probe.current();
-        tracker
-            .install_limit_once(baseline + replacement_bytes - 1)
-            .unwrap();
-        let length = keys.len();
-        assert!(keys.try_reserve(1, |stored| stored.hash).is_err());
-        assert_eq!(keys.len(), length);
-        assert_eq!(tracker.current(), baseline);
-        drop(keys);
-        assert_eq!(tracker.current(), 0);
     }
     #[test]
     fn frozen_logical_string_layout_accepts_actual_dictionary_and_detects_cross_batch_identity() {
@@ -1624,6 +1505,7 @@ mod typed_state_tests {
             key_types: None,
             tracker: None,
             construction: None,
+            control: None,
         };
         let error = kernel.prepare().unwrap_err();
         assert_eq!(
@@ -1666,5 +1548,288 @@ mod typed_state_tests {
                 novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod key_index_migration_tests {
+    use super::*;
+    use arrow::{
+        array::StringArray,
+        datatypes::{DataType, Schema},
+    };
+    use novarocks_functions::{KernelEvaluationControl, KernelFailure};
+    use novarocks_value_arrays::decode::ValueConversionContext;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Control;
+    impl KernelEvaluationControl for Control {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+            panic!("local key operation never waits")
+        }
+    }
+    fn fixture() -> (Box<dyn InputConstructionOwner>, Arc<MemTracker>) {
+        let tracker = MemTracker::new_root("assert K migration fixture");
+        let factory=crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),tracker.clone(),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default())).unwrap();
+        let layout = crate::exec::chunk::typed_fixture::layout(Arc::new(Schema::empty()), &[], &[]);
+        let schema = factory.create_compiled_chunk_schema(&layout).unwrap();
+        (factory.begin_typed_construction(&schema).unwrap(), tracker)
+    }
+    fn state(owner: &dyn InputConstructionOwner, tracker: &Arc<MemTracker>) -> TypedKeyState {
+        let spec = KeySpec::new(
+            &[FunctionValueType::new(DataType::Utf8, false)],
+            &[NullPolicy::Equal],
+            owner,
+            &|| Ok(()),
+        )
+        .unwrap();
+        TypedKeyState {
+            index: KeyIndex::new(spec, IndexPurpose::KeyIds, tracker.clone(), owner).unwrap(),
+        }
+    }
+    fn input(
+        values: &[&str],
+        state: &TypedKeyState,
+        owner: &dyn InputConstructionOwner,
+        tracker: &Arc<MemTracker>,
+    ) -> (KeyInput, crate::exec::hash_table::key_index::LocalHashBatch) {
+        let array: ArrayRef = Arc::new(StringArray::from(values.to_vec()));
+        let rows = (0..values.len()).collect::<Vec<_>>();
+        let selected = ReachableRows::all(values.len())
+            .materialize_observed(
+                &mut |layout| owner.request(layout).map_err(ExecutionFailure::from),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        let input = KeyInput::new_for_spec(
+            state.index.spec(),
+            &[array],
+            &[FunctionValueType::new(DataType::Utf8, false)],
+            &selected,
+            &rows,
+            &mut ValueConversionContext::default(),
+            owner,
+            &|| Ok(()),
+        )
+        .unwrap();
+        let prepared = PreparedKeyBatch::from_captured(
+            state.index.spec(),
+            &input,
+            AggregateAllocator::new(tracker.clone()),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let hashes = hash_batch(
+            &prepared,
+            state.index.policy(),
+            &mut HashScratch::new(),
+            owner,
+            &|| Ok(()),
+        )
+        .unwrap()
+        .force_hash(0);
+        drop(prepared);
+        (input, hashes)
+    }
+    #[test]
+    fn real_collisions_preserve_first_occurrence_ids_and_exact_duplicates_across_batches() {
+        let (owner, tracker) = fixture();
+        let mut state = state(owner.as_ref(), &tracker);
+        for (values, expected, new_count) in [
+            (vec!["prefix-A", "prefix-B", "prefix-A"], vec![0, 1, 0], 2),
+            (vec!["prefix-B", "prefix-C"], vec![1, 2], 1),
+        ] {
+            let (input, hashes) = input(&values, &state, owner.as_ref(), &tracker);
+            let prepared = PreparedKeyBatch::from_captured(
+                state.index.spec(),
+                &input,
+                AggregateAllocator::new(tracker.clone()),
+                &|| Ok(()),
+            )
+            .unwrap();
+            let found = state
+                .index
+                .intern_batch(&prepared, &hashes, owner.as_ref(), &Control)
+                .unwrap();
+            assert_eq!(found.new_keys().len(), new_count);
+            assert_eq!(
+                found
+                    .matches()
+                    .iter()
+                    .map(|v| match v {
+                        KeyMatch::Found(id) => id.index(),
+                        _ => panic!("participating key"),
+                    })
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert_eq!(state.index.len(), 3);
+        drop(state);
+        drop(owner);
+        assert_eq!(tracker.current(), 0);
+    }
+    struct Count {
+        calls: AtomicUsize,
+        stop: Option<usize>,
+    }
+    impl KernelEvaluationControl for Count {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.stop == Some(n) {
+                Err(KernelFailure::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+            panic!("local key operation never waits")
+        }
+    }
+    #[test]
+    fn long_collision_comparison_observes_stop_and_readonly_failure_leaves_original_keys_readable()
+    {
+        let (owner, tracker) = fixture();
+        let mut state = state(owner.as_ref(), &tracker);
+        let mut a = "x".repeat(3 * 64 * 1024);
+        a.push('a');
+        let mut b = a.clone();
+        b.pop();
+        b.push('b');
+        let (input, hashes) = input(&[&a, &b], &state, owner.as_ref(), &tracker);
+        let prepared = PreparedKeyBatch::from_captured(
+            state.index.spec(),
+            &input,
+            AggregateAllocator::new(tracker.clone()),
+            &|| Ok(()),
+        )
+        .unwrap();
+        state
+            .index
+            .intern_batch(&prepared, &hashes, owner.as_ref(), &Control)
+            .unwrap();
+        let baseline = Count {
+            calls: AtomicUsize::new(0),
+            stop: None,
+        };
+        let expected = state
+            .index
+            .probe_batch(&prepared, &hashes, owner.as_ref(), &baseline)
+            .unwrap();
+        assert!(
+            baseline.calls.load(Ordering::Relaxed) > 4,
+            "actual long comparisons carry control observations"
+        );
+        let stopped = Count {
+            calls: AtomicUsize::new(0),
+            stop: Some(baseline.calls.load(Ordering::Relaxed) / 2),
+        };
+        assert!(
+            state
+                .index
+                .probe_batch(&prepared, &hashes, owner.as_ref(), &stopped)
+                .is_err()
+        );
+        assert_eq!(state.index.len(), 2);
+        assert_eq!(
+            state
+                .index
+                .probe_batch(&prepared, &hashes, owner.as_ref(), &Control)
+                .unwrap()
+                .matches(),
+            expected.matches()
+        );
+    }
+}
+
+#[cfg(test)]
+mod applicability_long_key_tests {
+    //! The existing K counter proves no local byte hashing for bypassed rows.
+    //! The production empty-selection return also precedes key-column access
+    //! and KeyInput preparation. Source metadata custody itself is not hidden.
+    use super::*;
+    use crate::exec::hash_table::key_index::BYTE_HASH_INITS;
+    use crate::exec::pipeline::test_driver::TestDriver;
+    use arrow::{
+        array::{BooleanArray, StringArray},
+        datatypes::DataType,
+    };
+    fn input(value: &str, masks: Vec<Option<bool>>) -> Chunk {
+        let rows = masks.len();
+        crate::exec::chunk::typed_fixture::columns(
+            &["target", "applies"],
+            &[SlotId::new(1), SlotId::new(2)],
+            &[
+                FunctionValueType::new(DataType::Utf8, true),
+                FunctionValueType::new(DataType::Boolean, true),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec![value; rows])),
+                Arc::new(BooleanArray::from(masks)),
+            ],
+            rows,
+        )
+    }
+    #[test]
+    fn false_and_null_applicability_skip_long_key_hashing_and_do_not_create_seen_state() {
+        let rt = RuntimeState::default();
+        let tracker = MemTracker::new_root("long bypass K state");
+        let mode = AssertNumRowsMode::PerKeyAtMostOne {
+            key_slots: vec![SlotId::new(1)],
+            key_labels: vec!["target".into()],
+            message_prefix: "duplicate target".into(),
+        };
+        let mut op = AssertNumRowsProcessorFactory::new_with_applicability(1, mode, SlotId::new(2))
+            .unwrap()
+            .with_key_types(vec![FunctionValueType::new(DataType::Utf8, true)])
+            .unwrap()
+            .create(1, 0);
+        op.set_mem_tracker(tracker.clone());
+        op.set_construction_factory(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),tracker.clone(),rt.error_state()).unwrap());
+        op.prepare().expect("prepare keyed assertion fixture");
+        op.bind_runtime_state(&rt)
+            .expect("bind original keyed assertion runtime");
+        let baseline = tracker.current();
+        let large = "x".repeat(1024 * 1024 + 17);
+        BYTE_HASH_INITS.with(|n| n.set(0));
+        {
+            let mut calls = TestDriver::new(op.as_mut(), &rt);
+            assert_eq!(
+                calls
+                    .input_and_collect(input(&large, vec![Some(false), None]))
+                    .unwrap()[0]
+                    .len(),
+                2
+            );
+        }
+        assert_eq!(BYTE_HASH_INITS.with(|n| n.get()), 0);
+        assert_eq!(
+            tracker.current(),
+            baseline,
+            "bypassed rows create no retained equality state"
+        );
+        {
+            let mut calls = TestDriver::new(op.as_mut(), &rt);
+            assert_eq!(
+                calls
+                    .input_and_collect(input(&large, vec![Some(true)]))
+                    .unwrap()[0]
+                    .len(),
+                1
+            );
+        }
+        assert!(
+            BYTE_HASH_INITS.with(|n| n.get()) > 0,
+            "the same live byte path is actually observed for TRUE"
+        );
+        op.cancel();
+        op.close().unwrap();
+        drop(op);
+        assert_eq!(tracker.current(), 0);
     }
 }

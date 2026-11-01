@@ -83,8 +83,14 @@ fn limits() -> BindingProjectionLimits {
     }
 }
 fn types() -> DecodedTypeTable {
-    let child = Field::new("nested", DataType::Int32, false)
-        .with_metadata([("original".into(), "retained".into())].into());
+    let child =
+        Field::new("nested", DataType::Int32, false).with_metadata(std::collections::HashMap::<
+            String,
+            String,
+        >::from([(
+            "original".into(),
+            "retained".into(),
+        )]));
     let values = [
         (
             0,
@@ -231,7 +237,7 @@ fn receiving_aggregate_headers_borrow_all_phases_sparse_ids_and_exact_type_owner
         let DataType::Struct(fields) = &root.data_type() else {
             panic!("original nested type");
         };
-        assert_eq!(fields[0].metadata().capacity(), 0);
+        assert!(fields[0].metadata().as_arc().is_none());
         assert_eq!(fields[0].name(), "nested");
         assert!(!fields[0].is_nullable());
         assert_eq!(

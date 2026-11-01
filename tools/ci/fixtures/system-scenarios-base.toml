@@ -62,7 +62,6 @@ user = "root"
 # making the ordinary correctness path host-dependent.
 [runtime]
 pipeline_exec_thread_pool_thread_num = 1
-exchange_io_threads = 1
 # Iceberg split discovery synchronously bridges onto this runtime from a data
 # runtime worker. The bridge also performs blocking metadata reads.
 data_runtime_worker_threads = 2

@@ -73,6 +73,7 @@ impl HoldListener {
             outbound_edges: field("outbound_edges")?.parse()?,
             payload,
             stream: Some(stream),
+            released_peer: None,
         };
         Ok(Some(create))
     }
@@ -97,6 +98,7 @@ pub(crate) struct HeldCreate {
     pub(crate) outbound_edges: usize,
     pub(crate) payload: String,
     stream: Option<UnixStream>,
+    released_peer: Option<UnixStream>,
 }
 impl HeldCreate {
     pub(crate) fn identity_marker(&self) -> String {
@@ -108,6 +110,9 @@ impl HeldCreate {
     pub(crate) fn release(&mut self) -> Result<()> {
         if let Some(mut stream) = self.stream.take() {
             crate::scenarios::native_direct_controls::release_hold(&mut stream, self.deadline)?;
+            // The Native peer may still set its next read timeout before consuming
+            // R. Retain this exact socket until the fixture owner retires.
+            self.released_peer = Some(stream);
         }
         Ok(())
     }
@@ -117,6 +122,7 @@ impl Drop for HeldCreate {
         if let Some(mut stream) = self.stream.take() {
             crate::scenarios::native_direct_controls::close_hold(&mut stream);
         }
+        drop(self.released_peer.take());
     }
 }
 
@@ -125,6 +131,42 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::Shutdown;
+
+    #[test]
+    fn release_keeps_peer_open_until_fixture_owner_retires() {
+        let (stream, mut backend) = UnixStream::pair().unwrap();
+        let mut create = HeldCreate {
+            deadline: Instant::now() + Duration::from_secs(1),
+            backend: 1,
+            execution: "10:20:1".into(),
+            stage: "2".into(),
+            task: "3".into(),
+            process: "exact-process".into(),
+            outbound_edges: 1,
+            payload: "exact held Create".into(),
+            stream: Some(stream),
+            released_peer: None,
+        };
+        create.release().unwrap();
+        backend
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut release = [0_u8; 1];
+        backend.read_exact(&mut release).unwrap();
+        assert_eq!(release, [b'R']);
+        backend.set_nonblocking(true).unwrap();
+        assert_eq!(
+            backend.read(&mut release).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        create.release().unwrap();
+        assert_eq!(
+            backend.read(&mut release).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(create);
+        assert_eq!(backend.read(&mut release).unwrap(), 0);
+    }
 
     #[test]
     fn listener_drop_releases_unobserved_parked_create_and_unlinks_socket() {

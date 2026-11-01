@@ -408,6 +408,15 @@ fn metadata_struct(entries: usize, sparse: bool) -> (ArrayRef, Field) {
         assert!(metadata.capacity() > entries * 100);
     }
     let child = Arc::new(Field::new("child", DataType::Int32, true).with_metadata(metadata));
+    if entries == 0 {
+        assert!(child.metadata().as_arc().is_none());
+    } else {
+        let shared = child.metadata().clone();
+        assert!(Arc::ptr_eq(
+            child.metadata().as_arc().unwrap(),
+            shared.as_arc().unwrap()
+        ));
+    }
     let array: ArrayRef = Arc::new(StructArray::new(
         vec![child].into(),
         vec![Arc::new(Int32Array::from(vec![Some(7), None]))],
@@ -534,13 +543,14 @@ fn recursive_metadata_bound_counts_three_type_passes_and_excludes_root_field_map
 }
 
 #[test]
-fn recursive_sparse_metadata_invoice_and_k_work_refuse_before_constant_preflight() {
+fn recursive_converted_metadata_invoice_and_k_work_refuse_before_constant_preflight() {
     let (array, field) = metadata_struct(20, true);
     let (metadata, body) = encoded(array, &field);
     let checked = geometry(&metadata, &body, &field);
     let input = input(&field, &metadata, &body, &checked);
-    // Explicit fixture invoices include both Field/FVT owners and all original
-    // HashMap table control backing, not its current public capacity/length.
+    // The staging HashMap has exited. These are two explicit source invoice
+    // estimates for the same attached BTree/Arc/text and Field/FVT owners;
+    // their difference exercises the conservative envelope, not spare buckets.
     let sparse_invoice = 1 << 20;
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();

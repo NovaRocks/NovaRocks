@@ -71,6 +71,13 @@ impl TaskResultTransport for UnavailableFinalInfo {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WriteProtocolRoles {
+    None,
+    UpstreamWriters,
+    IndependentSummarySource,
+}
+
 pub(crate) struct OriginalAttempt {
     pub(crate) round: TaskRound,
     pub(crate) acks: TaskAckIntakeHandle,
@@ -139,7 +146,31 @@ impl OriginalAttempt {
             plan,
             pending,
             native_credentials,
-            writers,
+            if writers {
+                WriteProtocolRoles::UpstreamWriters
+            } else {
+                WriteProtocolRoles::None
+            },
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn new_bound_with_summary_source(
+        execution: QueryExecutionId,
+        transport: Arc<dyn TaskResultTransport>,
+        description: novarocks_query_application::preparation::FrozenExecutionDescription,
+        plan: PlanSeal,
+        native_credentials: Arc<AttemptCredentialStorage>,
+    ) -> (Self, AttemptHandoffResources, InternalConsumerActivation) {
+        Self::new_bound_with_work(
+            execution,
+            transport,
+            description,
+            plan,
+            true,
+            Some(native_credentials),
+            WriteProtocolRoles::IndependentSummarySource,
             None,
         )
         .await
@@ -154,7 +185,7 @@ impl OriginalAttempt {
         plan: PlanSeal,
         pending: bool,
         native_credentials: Option<Arc<AttemptCredentialStorage>>,
-        writers: bool,
+        write_roles: WriteProtocolRoles,
         original: Option<(
             WorkloadControl,
             novarocks_workload_control::WorkOwner,
@@ -162,7 +193,14 @@ impl OriginalAttempt {
         )>,
     ) -> (Self, AttemptHandoffResources, InternalConsumerActivation) {
         let (mut round, acks, release, pending_upstream, clock, protocol, establish_facts) =
-            if writers {
+            if write_roles == WriteProtocolRoles::IndependentSummarySource {
+                assert!(pending);
+                let (round, acks, tail, clock, protocol, facts) =
+                    crate::task_execution::tests::manifest_pending_write_with_summary_source_protocol_fixture(
+                        execution, plan,
+                    );
+                (round, acks, None, Some(tail), clock, protocol, facts)
+            } else if write_roles == WriteProtocolRoles::UpstreamWriters {
                 assert!(pending);
                 let (round, acks, tail, clock, protocol, facts) =
                     crate::task_execution::tests::manifest_pending_write_with_protocol_fixture(

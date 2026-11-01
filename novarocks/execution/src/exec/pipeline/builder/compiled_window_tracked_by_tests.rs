@@ -195,12 +195,12 @@ fn window_output_schema_outlives_program_and_releases_at_last_schema_reference()
         .unwrap();
     let schema = output.chunk_schema_ref();
     assert!(schema.is_typed());
-    assert!(schema.arrow_schema_ref().metadata().capacity() == 0);
+    assert!(schema.arrow_schema_ref().metadata().as_arc().is_none());
     assert!(
         schema
             .slots()
             .iter()
-            .all(|slot| slot.field_ref().metadata().capacity() == 0)
+            .all(|slot| slot.field_ref().metadata().as_arc().is_none())
     );
     drop(output);
     drop(processor);

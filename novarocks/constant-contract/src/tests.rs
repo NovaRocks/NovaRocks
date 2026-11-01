@@ -233,10 +233,12 @@ fn declared_nullability_must_agree_and_source_attributes_do_not_reauthor_type() 
         ),
         Err(ConstantError::Invalid(_))
     ));
-    let field = Arc::new(
-        Field::new("literal", DataType::Utf8, false)
-            .with_metadata([("nr_logical_type".into(), "json".into())].into()),
-    );
+    let field = Arc::new(Field::new("literal", DataType::Utf8, false).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            "nr_logical_type".into(),
+            "json".into(),
+        )]),
+    ));
     assert!(
         ConstantPool::try_new(
             field,
@@ -786,24 +788,46 @@ fn raw_parent_offset_extent_checked_before_canonicalization() {
     assert!(eq(&accepted.value(0).unwrap(), &expected.value(0).unwrap()));
 
     let dtype = DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int64, true)), 1);
-    let raw = ArrayData::builder(dtype)
+    let rejected = ArrayData::builder(dtype.clone())
         .len(1)
         .offset(1)
         .nulls(Some(arrow_buffer::NullBuffer::new_null(1)))
         .child_data(vec![Int64Array::from(vec![None]).to_data()])
         .build()
-        .unwrap();
+        .unwrap_err();
     assert!(matches!(
-        ConstantPool::try_new(
-            Arc::new(Field::new("literal", raw.data_type().clone(), true)),
-            FunctionValueType::new(raw.data_type().clone(), true),
-            raw,
-            policy(),
-            CompilePhase::Validate,
-            &Control::good(),
-        ),
-        Err(ConstantError::Invalid(_))
+        rejected,
+        arrow_schema::ArrowError::InvalidArgumentError(message)
+            if message == "Values length 1 is less than the length + offset (2) multiplied by the value size (1) for FixedSizeList(1 x Int64)"
     ));
+    // A legal source has enough child extent even under a NULL parent. It
+    // still exercises the original pool's offset canonicalization and NULL.
+    let raw = ArrayData::builder(dtype)
+        .len(1)
+        .offset(1)
+        .nulls(Some(arrow_buffer::NullBuffer::new_null(1)))
+        .child_data(vec![Int64Array::from(vec![Some(11), None]).to_data()])
+        .build()
+        .unwrap();
+    let accepted = ConstantPool::try_new(
+        Arc::new(Field::new("literal", raw.data_type().clone(), true)),
+        FunctionValueType::new(raw.data_type().clone(), true),
+        raw,
+        policy(),
+        CompilePhase::Validate,
+        &Control::good(),
+    )
+    .unwrap();
+    let canonical = accepted.array().to_data();
+    assert_eq!(canonical.offset(), 0);
+    assert_eq!(canonical.len(), 1);
+    assert!(
+        accepted
+            .value(0)
+            .unwrap()
+            .is_null_observed(CompilePhase::Validate, &Control::good())
+            .unwrap()
+    );
 }
 
 #[test]
@@ -811,26 +835,24 @@ fn factories_reject_invalid_grammar_and_large_extents_before_arrow_allocation() 
     let invalid = [
         DataType::Time32(TimeUnit::Nanosecond),
         DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int64, true)), -1),
-        DataType::Union(
-            vec![(-1, Arc::new(Field::new("item", DataType::Int64, true)))]
-                .into_iter()
-                .collect(),
-            UnionMode::Dense,
-        ),
-        DataType::Union(
-            vec![
-                (0, Arc::new(Field::new("one", DataType::Int64, true))),
-                (0, Arc::new(Field::new("two", DataType::Int64, true))),
-            ]
-            .into_iter()
-            .collect(),
-            UnionMode::Dense,
-        ),
     ];
     for dtype in invalid {
         assert!(
             FunctionValueType::try_with_logical_type(dtype, true, ValueLogicalType::Physical)
                 .is_err()
+        );
+    }
+    // Arrow 60.1 validates identities before a safe Union DataType can exist.
+    for (ids, expected) in [
+        (vec![-1], "type ids must be non-negative: -1"),
+        (vec![0, 0], "duplicate type id: 0"),
+    ] {
+        let children = ids
+            .iter()
+            .map(|_| Arc::new(Field::new("item", DataType::Int64, true)));
+        let source = arrow_schema::UnionFields::try_new(ids.clone(), children).unwrap_err();
+        assert!(
+            matches!(source, arrow_schema::ArrowError::InvalidArgumentError(actual) if actual == expected)
         );
     }
     let dtype = DataType::FixedSizeList(

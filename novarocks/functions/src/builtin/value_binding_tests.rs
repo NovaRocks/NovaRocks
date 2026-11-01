@@ -119,15 +119,12 @@ fn variant_typeof_rejects_plain_carriers_and_cannot_thaw_json_as_text() {
     }
 }
 fn json_item(nullable: bool) -> Arc<Field> {
-    Arc::new(
-        Field::new("item", DataType::Utf8, nullable).with_metadata(
-            [(
-                novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
-                "json".to_string(),
-            )]
-            .into(),
-        ),
-    )
+    Arc::new(Field::new("item", DataType::Utf8, nullable).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
+            "json".to_string(),
+        )]),
+    ))
 }
 
 #[test]
@@ -768,11 +765,10 @@ fn empty_array_instantiation_consumes_only_explicit_valid_list_constraint() {
         FunctionValueType::try_from_legacy_declared_projection(
             DataType::List(Arc::new(
                 Field::new("item", DataType::Utf8, true).with_metadata(
-                    [(
+                    std::collections::HashMap::<String, String>::from([(
                         novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
                         "variant".to_string(),
-                    )]
-                    .into(),
+                    )]),
                 ),
             )),
             false,

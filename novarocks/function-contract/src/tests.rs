@@ -95,7 +95,7 @@ fn integer_pool(rows: Vec<Option<i64>>) -> ConstantPool {
         Field::new("original.source", DataType::Int64, true).with_metadata(
             [("producer".to_owned(), "unchanged".to_owned())]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
         ),
     );
     ConstantPool::try_new(
@@ -127,7 +127,7 @@ fn nested(nullable: bool, child_nullable: bool, metadata: &str) -> FunctionValue
                 Field::new("original.child", DataType::Int64, child_nullable).with_metadata(
                     [("original.metadata".to_owned(), metadata.to_owned())]
                         .into_iter()
-                        .collect(),
+                        .collect::<std::collections::HashMap<String, String>>(),
                 ),
             )]
             .into(),

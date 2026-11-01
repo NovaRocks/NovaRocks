@@ -330,27 +330,24 @@ mod tests {
     }
 
     #[test]
-    fn union_grammar_rejects_negative_duplicate_and_over_limit_ids_before_indexing() {
-        for ty in [union([-1]), union([0, 0])] {
-            assert!(matches!(
-                validate(&ty),
-                Err(CarrierParameterError::Invalid(
-                    "invalid or duplicate Union type id"
-                ))
-            ));
+    fn public_union_grammar_and_valid_identity_walk_keep_their_own_phases() {
+        // Invalid IDs cannot inhabit a safely constructed current UnionFields.
+        for (ids, expected) in [
+            (vec![-1], "type ids must be non-negative: -1"),
+            (vec![0, 0], "duplicate type id: 0"),
+        ] {
+            let children = ids.iter().map(|_| field(DataType::Int32, true));
+            let error = UnionFields::try_new(ids.clone(), children).unwrap_err();
+            assert!(
+                matches!(error, arrow_schema::ArrowError::InvalidArgumentError(actual) if actual == expected)
+            );
         }
-        let mut calls = 0;
-        let oversized = union((0..129).map(|id| id as i8));
-        let error = validate_arrow_carrier_parameters_observed(&oversized, || {
-            calls += 1;
-            Ok::<_, CarrierParameterError>(())
-        })
-        .unwrap_err();
-        assert_eq!(calls, 1);
-        assert!(matches!(
-            error,
-            CarrierParameterError::Invalid("too many Union type ids")
-        ));
+        let error = UnionFields::try_from_fields((0..129).map(|_| field(DataType::Int32, true)))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid argument error: UnionFields cannot contain more than 128 fields"
+        );
         let mut calls = 0;
         validate_arrow_carrier_parameters_observed(&union(0..=127), || {
             calls += 1;

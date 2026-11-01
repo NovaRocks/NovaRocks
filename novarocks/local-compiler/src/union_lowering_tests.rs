@@ -111,7 +111,6 @@ fn options() -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        exchange_wait: std::time::Duration::from_secs(120),
         constants: ConstantPolicy {
             max_rows: 16,
             max_array_nodes: 128,
@@ -165,8 +164,12 @@ fn fixture(case: Case) -> Fixture {
     let union = NodeId::new(41);
     let mut builder = FragmentBuilder::new(fragment_id);
     let nested_field = Arc::new(
-        Field::new("original-nested", DataType::Utf8, true)
-            .with_metadata([("owner".to_owned(), "kept".to_owned())].into()),
+        Field::new("original-nested", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "owner".to_owned(),
+                "kept".to_owned(),
+            )]),
+        ),
     );
     let mut branch_nodes = [left, right];
     let mut branch_values: [Vec<ValueId>; 2] = [vec![], vec![]];

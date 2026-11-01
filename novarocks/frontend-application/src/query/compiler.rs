@@ -190,6 +190,24 @@ pub(crate) use async_explain::{
 };
 
 impl FrontendQueryCompiler {
+    pub(crate) fn prepare_show_views_action(
+        &self,
+        show: novarocks_parser::ast::ShowViews,
+        request: novarocks_query_application::admitted_query_context::RequestContext,
+        command: novarocks_query_application::api::CommandContext,
+    ) -> Result<
+        Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
+        novarocks_query_application::api::CommandError,
+    > {
+        crate::query::view_read_action::prepare(
+            self.view.clone(),
+            &self.connector_blocking_io,
+            show,
+            request,
+            command,
+        )
+    }
+
     pub(crate) fn validate_original_read_runtime(
         &self,
     ) -> Result<(), novarocks_workload_control::WorkError> {

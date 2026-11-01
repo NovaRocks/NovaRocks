@@ -228,9 +228,9 @@ mod tests {
                 .schema()
                 .fields()
                 .iter()
-                .all(|field| field.metadata().capacity() == 0)
+                .all(|field| field.metadata().as_arc().is_none())
         );
-        assert_eq!(execution.schema().metadata().capacity(), 0);
+        assert!(execution.schema().metadata().as_arc().is_none());
         assert_eq!(
             source_before
                 .field(1)

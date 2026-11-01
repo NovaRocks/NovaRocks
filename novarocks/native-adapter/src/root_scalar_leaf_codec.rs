@@ -847,8 +847,10 @@ mod tests {
         )?;
         let mut field = Field::new("value", array.data_type().clone(), true);
         if let Some(annotation) = source_annotation {
-            field = field
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), annotation.to_owned())].into());
+            field = field.with_metadata(std::collections::HashMap::<String, String>::from([(
+                NR_LOGICAL_TYPE_KEY.to_owned(),
+                annotation.to_owned(),
+            )]));
         }
         let fixture_storage = ValueTypeStorageLifetime::pure();
         let slot = ChunkSlotSchema::try_new_typed(

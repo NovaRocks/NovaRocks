@@ -426,6 +426,7 @@ impl ExplainStatementAction {
                         self.capacity
                             .as_ref()
                             .expect("original positive Internal stage capacity"),
+                        &io,
                         &mut self.original,
                         #[cfg(novarocks_dev_controls)]
                         self.observation.clone(),
@@ -738,6 +739,7 @@ mod tests {
             _: &mut Option<crate::query_execution::logical_execution::PreparedLogicalComputation>,
             _: &mut Option<WorkOwner>,
             _: &QueryResultCapacityBinding,
+            _: &Arc<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>,
             _: &mut OriginalComputationStart,
             #[cfg(novarocks_dev_controls)] _: Option<
                 crate::preparation_diagnostics::StatementObservationHandle,
@@ -898,7 +900,9 @@ mod tests {
         let (_workload, _capacity, owner, _session) = statement().await;
         let token = owner.token();
         let mut source = Some(StatementActionReady {
-            result: Ok(StatementActionValue::Ok),
+            result: Ok(StatementActionValue::Ok(
+                novarocks_query_application::session_control::StatementCommandCompletion::new(0),
+            )),
             owner,
         });
         let mut target = Some(StatementResult::Ok);
@@ -911,8 +915,10 @@ mod tests {
         let StatementResult::GovernedCompletion(result) = target.take().unwrap() else {
             panic!("same governed completion")
         };
+        let (completion, mut protocol) = result.into_parts();
+        assert_eq!(completion.affected_rows(), 0);
         assert_eq!(
-            result.into_protocol().complete(),
+            protocol.complete(),
             novarocks_query_application::session_control::GovernedStatementFinishOutcome::Completed
         );
     }

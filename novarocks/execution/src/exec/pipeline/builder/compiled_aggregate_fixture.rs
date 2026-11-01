@@ -82,9 +82,7 @@ use crate::runtime::fragment::instance::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentSinkAssignment,
 };
 use crate::runtime::fragment::io::{
-    ExchangeFrame, ExchangeFrameTransmitter, ExchangeReceiverFrame, ExchangeReceiverKey,
-    ExchangeReceiverPort, ExchangeTransmitRejection, FragmentIoError, FragmentIoErrorKind,
-    FragmentIoOperation, NoopFragmentEventSink,
+    ExchangeFrameTransmitter, ExchangeReceiverPort, NoopFragmentEventSink,
 };
 use crate::runtime::fragment::sink::materialize_compiled_sink;
 use crate::runtime::runtime_state::RuntimeState;
@@ -854,7 +852,6 @@ fn try_compile_with_providers<E: std::error::Error + 'static>(
         root_sink_dop: result.then(|| NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
         constants: constant_policy(),
-        exchange_wait: Duration::from_secs(120),
     };
     compile_fragment(validated, catalog, options, &FixtureControl)
         .map(Arc::new)
@@ -887,14 +884,16 @@ pub(crate) fn compile_with_providers<E: std::error::Error + 'static>(
 /// Delivers every encoded frame to the receiver port, as the native data
 /// plane does after its wire hop, and counts the rows each sender sent.
 pub(crate) struct LoopbackTransmitter {
-    port: Arc<dyn ExchangeReceiverPort>,
+    unit: Arc<crate::runtime::fragment::io::exchange::test_support::UnitLoopback>,
     rows: Mutex<BTreeMap<(UniqueId, UniqueId), usize>>,
 }
 
 impl LoopbackTransmitter {
-    pub(crate) fn new(port: Arc<dyn ExchangeReceiverPort>) -> Arc<Self> {
+    pub(crate) fn new(
+        unit: Arc<crate::runtime::fragment::io::exchange::test_support::UnitLoopback>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            port,
+            unit,
             rows: Mutex::default(),
         })
     }
@@ -910,12 +909,17 @@ impl LoopbackTransmitter {
 }
 
 impl ExchangeFrameTransmitter for LoopbackTransmitter {
-    fn transmit(&self, frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
-        let payload = frame.payload;
-        let carried = if payload.is_empty() {
+    fn deliver_unit(
+        &self,
+        frame: crate::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+        stop: tokio_util::sync::CancellationToken,
+        activity: crate::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
+        done: crate::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+    ) {
+        let carried = if frame.receiver.payload.is_empty() {
             0
         } else {
-            decode_chunks(&payload)
+            decode_chunks(&frame.receiver.payload)
                 .expect("exchange payload")
                 .iter()
                 .map(Chunk::len)
@@ -926,42 +930,39 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
             .lock()
             .unwrap()
             .entry((
-                frame.sender_fragment_instance_id,
-                frame.destination_fragment_instance_id,
+                frame.receiver.stream.source().fragment_instance_id(),
+                frame.receiver.stream.destination_fragment_instance_id(),
             ))
             .or_default() += carried;
-        self.port
-            .push(
-                ExchangeReceiverKey {
-                    fragment_instance_id: frame.destination_fragment_instance_id,
-                    node_id: frame.destination_node_id,
-                },
-                ExchangeReceiverFrame {
-                    stream: frame.stream.unwrap_or_else(|| {
-                        crate::runtime::fragment::io::exchange::fixture_stream(
-                            frame.sender_fragment_instance_id,
-                            frame.destination_fragment_instance_id,
-                            frame.destination_node_id,
-                            frame.sender_ordinal,
-                        )
-                    }),
-                    source_fragment_instance_id: frame.sender_fragment_instance_id,
-                    sender_ordinal: frame.sender_ordinal,
-                    sender_count: frame.sender_count,
-                    sender_id: frame.sender_id,
-                    backend_number: frame.backend_number,
-                    sequence: frame.sequence,
-                    eos: frame.eos,
-                    payload,
-                },
-            )
-            .map_err(|error| {
-                ExchangeTransmitRejection::Failed(FragmentIoError::new(
-                    FragmentIoOperation::ExchangeTransmit,
-                    FragmentIoErrorKind::RemoteRejected,
-                    error.to_string(),
-                ))
-            })
+        self.unit.deliver_unit(frame, stop, activity, done);
+    }
+    fn register_unit_demands(
+        &self,
+        destination: RuntimeEndpoint,
+        entries: Vec<crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry>,
+        stop: tokio_util::sync::CancellationToken,
+        done: crate::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+    ) {
+        self.unit
+            .register_unit_demands(destination, entries, stop, done)
+    }
+    fn watch_unit_facts(
+        &self,
+        destination: RuntimeEndpoint,
+        stream: novarocks_execution_contract::ExchangeStreamIdentity,
+        wake: crate::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+    ) -> Result<(), novarocks_failure_contract::FailureFact> {
+        self.unit.watch_unit_facts(destination, stream, wake)
+    }
+    fn forget_unit_facts(&self, stream: novarocks_execution_contract::ExchangeStreamIdentity) {
+        self.unit.forget_unit_facts(stream)
+    }
+    fn schedule_unit_retry(
+        &self,
+        delay: Duration,
+        task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), novarocks_failure_contract::FailureFact> {
+        self.unit.schedule_unit_retry(delay, task)
     }
 }
 
@@ -997,23 +998,46 @@ pub(crate) fn try_run(
     )
 }
 
+/// Run a stream-connected instance on the same runtime and original Task as
+/// its frozen receiver roster and loopback transport.
+pub(crate) fn try_run_in_fixture(
+    fixture: &crate::runtime::fragment::io::exchange::test_support::Fixture,
+    program: &Arc<LocalProgram>,
+    sink: Box<dyn OperatorFactory>,
+    bindings: ExchangeBindings,
+    instance: UniqueId,
+) -> Result<(), String> {
+    try_run_in(
+        program,
+        sink,
+        bindings,
+        ScanBindings::default(),
+        instance,
+        fixture.state(instance),
+        false,
+    )
+}
+
 /// The same original local execution lane with an explicit declared query
 /// tracker. This is test input wiring, not a new source, control or executor.
 pub(crate) fn try_run_with_tracker(
+    fixture: &crate::runtime::fragment::io::exchange::test_support::Fixture,
     program: &Arc<LocalProgram>,
     sink: Box<dyn OperatorFactory>,
     bindings: ExchangeBindings,
     instance: UniqueId,
     tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
 ) -> Result<(), String> {
-    let state = Arc::new(RuntimeState::for_local_execution(
+    let original = fixture.state(instance);
+    let state = Arc::new(RuntimeState::new(
         None,
         None,
         None,
         Some(instance),
         None,
         Some(tracker),
-        Some(crate::runtime::execution_runtime::test_execution_runtime()),
+        Some(fixture.runtime.clone()),
+        original.error_state().clone(),
     ));
     try_run_in(
         program,
@@ -1027,6 +1051,7 @@ pub(crate) fn try_run_with_tracker(
 }
 /// Run the original compiled pipeline with this instance's exact scan operations.
 pub(crate) fn try_run_with_scans(
+    fixture: &crate::runtime::fragment::io::exchange::test_support::Fixture,
     program: &Arc<LocalProgram>,
     sink: Box<dyn OperatorFactory>,
     bindings: ExchangeBindings,
@@ -1039,7 +1064,7 @@ pub(crate) fn try_run_with_scans(
         bindings,
         scans,
         instance,
-        runtime_state(),
+        fixture.state(instance),
         true,
     )
 }
@@ -1082,9 +1107,10 @@ fn try_run_in(
 /// The single receiver of `program`, registered for `instance` with
 /// `senders` expected senders.
 pub(crate) fn register(
+    fixture: &crate::runtime::fragment::io::exchange::test_support::Fixture,
     program: &LocalProgram,
     instance: UniqueId,
-    senders: usize,
+    sources: &[UniqueId],
     port: &Arc<dyn ExchangeReceiverPort>,
 ) -> ExchangeBindings {
     let (_, input) = program
@@ -1101,14 +1127,16 @@ pub(crate) fn register(
         instance,
         &ExchangeInputAssignments::new(BTreeMap::from([(
             receiver,
-            ExchangeInputAssignment::new(NonZeroUsize::new(senders).unwrap()),
+            ExchangeInputAssignment::new(NonZeroUsize::new(sources.len()).unwrap()),
         )])),
         Arc::clone(port),
-        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
+        Some(&fixture.creation(instance)),
     )
     .expect("compiled receivers");
     for registration in registrations {
+        let key = registration.key;
         port.register(registration).expect("register receiver");
+        fixture.bind(key, sources);
     }
     bindings
 }
@@ -1130,23 +1158,25 @@ pub(crate) fn destination(
 }
 
 pub(crate) fn stream_sink(
+    fixture: &crate::runtime::fragment::io::exchange::test_support::Fixture,
     program: &Arc<LocalProgram>,
     instance: UniqueId,
     destinations: Vec<FragmentDestination>,
     transmitter: &Arc<LoopbackTransmitter>,
 ) -> Box<dyn OperatorFactory> {
-    materialize_compiled_sink(
-        program,
-        &FragmentSinkAssignment::StreamDestinations {
-            destinations,
-            sender_id: None,
-        },
-        instance,
-        Arc::clone(transmitter) as Arc<dyn ExchangeFrameTransmitter>,
-        None,
-        None,
-    )
-    .expect("compiled stream sink")
+    fixture
+        .sink(
+            program,
+            &FragmentSinkAssignment::StreamDestinations {
+                destinations,
+                sender_id: None,
+            },
+            instance,
+            Arc::clone(transmitter) as Arc<dyn ExchangeFrameTransmitter>,
+            None,
+            None,
+        )
+        .expect("compiled stream sink")
 }
 
 pub(crate) fn result_sink(

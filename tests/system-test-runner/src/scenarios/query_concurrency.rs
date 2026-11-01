@@ -485,8 +485,7 @@ impl Scenario for QueryConcurrency {
                 // host CPU saturation benchmark.
                 be: Some(
                     "[runtime]\n\
-                     pipeline_exec_thread_pool_thread_num = 1\n\
-                     exchange_io_threads = 1\n"
+                     pipeline_exec_thread_pool_thread_num = 1\n"
                         .to_string(),
                 ),
                 ..CrossProcessConfigOverlay::default()
@@ -898,8 +897,7 @@ fn fault_launch_config(concurrency_limit: usize, cleanup_timeout_ms: u64) -> Sce
             )),
             be: Some(
                 "[runtime]\n\
-                 pipeline_exec_thread_pool_thread_num = 1\n\
-                 exchange_io_threads = 1\n"
+                 pipeline_exec_thread_pool_thread_num = 1\n"
                     .to_string(),
             ),
             ..CrossProcessConfigOverlay::default()

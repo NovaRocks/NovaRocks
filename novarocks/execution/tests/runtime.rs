@@ -36,7 +36,6 @@ fn sample_exchange_key(node_id: i32) -> ExchangeKey {
 fn test_runtime_module_structure() {
     let key = sample_exchange_key(1);
     let registry = ExecutionExchangeRegistry::default();
-    registry.set_expected_senders(key, 2);
     registry.cancel_fragment(key.finst_id_hi, key.finst_id_lo);
 }
 

@@ -1145,7 +1145,7 @@ mod tests {
     fn invocation_scalar_resources_metadata_counts_shared_field_occurrences_and_original_requests()
     {
         let control = ProbeControl::default();
-        let metadata = (0..129)
+        let metadata: std::collections::HashMap<String, String> = (0..129)
             .map(|i| (format!("key{i}"), format!("value{i}")))
             .collect();
         let field = Arc::new(Field::new("shared", DataType::Int64, true).with_metadata(metadata));

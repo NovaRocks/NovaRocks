@@ -331,11 +331,14 @@ fn actual_writer_flat_scalar_layouts_and_slices_have_checked_geometry() {
         .with_precision_and_scale(76, 38)
         .unwrap(),
     ));
-    arrays.push(Arc::new(FixedSizeBinaryArray::from(vec![
-        Some(b"abcd".as_slice()),
-        None,
-        Some(b"wxyz".as_slice()),
-    ])));
+    arrays.push(Arc::new(
+        FixedSizeBinaryArray::try_from(vec![
+            Some(b"abcd".as_slice()),
+            None,
+            Some(b"wxyz".as_slice()),
+        ])
+        .unwrap(),
+    ));
     arrays.push(Arc::new(FixedSizeBinaryArray::new(
         0,
         Buffer::from(Vec::<u8>::new()),
@@ -472,7 +475,7 @@ fn actual_float_interval_decimal_payloads_and_empty_timezone_keep_source_identit
     )
     .unwrap();
     let message = ipc::root_as_message(&schema).unwrap();
-    let decoded = ipc::convert::fb_to_schema(message.header_as_schema().unwrap());
+    let decoded = ipc::convert::try_fb_to_schema(message.header_as_schema().unwrap()).unwrap();
     assert_eq!(decoded.field(0).data_type(), expected.data_type());
 }
 

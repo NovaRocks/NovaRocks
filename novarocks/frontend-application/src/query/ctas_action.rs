@@ -235,6 +235,7 @@ struct CtasSource {
     provider_closed: bool,
     target_cleanup: PhaseSlot<Result<ConnectorMetadataCleanupResponsibility, CtasFailure>>,
     selected: Option<Result<(), QueryServiceError>>,
+    affected_rows: Option<u64>,
     disposition: Option<LakePublicationDisposition>,
     busy: bool,
     completed: bool,
@@ -396,6 +397,7 @@ pub(crate) fn prepare(
             provider_closed: false,
             target_cleanup: PhaseSlot::default(),
             selected: None,
+            affected_rows: None,
             disposition: None,
             busy: false,
             completed: false,
@@ -472,6 +474,11 @@ impl CtasSource {
             return;
         }
         self.disposition = Some(LakePublicationDisposition::KnownCommitted);
+        if !applied {
+            // The final CREATE author proved NoOp; staged/sealed rows did not
+            // become table rows through this statement.
+            self.affected_rows = Some(0);
+        }
         self.selected = Some(match finalization {
             ExternalMutationFinalization::Complete => {
                 if !applied {
@@ -897,12 +904,35 @@ impl CtasSource {
                         }
                         Poll::Ready(Ok(())) => {}
                     }
-                    if let Err(health) = self.computation.release_result_aliases() {
-                        self.close_failure = Some(health);
-                        return Poll::Pending;
-                    }
-                    match self.computation.take_native_tail() {
-                        Ok(tail) => self.tail = Some(tail),
+                    let session = self.session();
+                    let ready = self.ready.as_ref();
+                    let rows = self
+                        .computation
+                        .transfer_native_tail_then(&mut self.tail, || {
+                            let session = session.ok_or_else(|| {
+                                internal_error("CTAS Ready has no original session")
+                            })?;
+                            let ready = ready
+                                .ok_or_else(|| internal_error("CTAS has no actual Ready write"))?;
+                            if !Arc::ptr_eq(&ready.session, &session)
+                                || !ready.accepted.belongs_to(&session)
+                            {
+                                return Err(internal_error(
+                                    "CTAS Ready replaced the original session",
+                                ));
+                            }
+                            session.freeze_received_row_count().map_err(|error| {
+                                QueryServiceError::from_failure_cause(
+                                    novarocks_failure_contract::SharedFailureCause::new(error),
+                                )
+                            })
+                        });
+                    match rows {
+                        Ok(Ok(rows)) => self.affected_rows = Some(rows),
+                        Ok(Err(error)) => {
+                            self.fail(error);
+                            continue;
+                        }
                         Err(health) => {
                             self.close_failure = Some(health);
                             return Poll::Pending;
@@ -1241,12 +1271,12 @@ impl CtasSource {
                     self.completed = true;
                 }
                 Phase::Done => {
-                    return Poll::Ready(
-                        self.selected
-                            .take()
-                            .unwrap_or(Ok(()))
-                            .map(|()| StatementActionValue::Ok),
-                    );
+                    return Poll::Ready(super::write_action::selected_command_completion(
+                        self.selected.take().unwrap_or_else(|| {
+                            Err(internal_error("CTAS has no original business selection"))
+                        }),
+                        self.affected_rows,
+                    ));
                 }
             }
         }

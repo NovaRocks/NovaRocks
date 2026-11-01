@@ -1101,10 +1101,12 @@ mod tests {
         }
         let ty = FunctionValueType::new(DataType::Binary, true);
         let metadata = write_metadata(
-            vec![
-                Field::new("v", DataType::Binary, true)
-                    .with_metadata([("nr_logical_type".into(), "unknown".into())].into()),
-            ],
+            vec![Field::new("v", DataType::Binary, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "nr_logical_type".into(),
+                    "unknown".into(),
+                )]),
+            )],
             vec![ty.clone()],
         );
         let columns = insert_columns_from_connector_metadata(&metadata, &HashMap::new()).unwrap();

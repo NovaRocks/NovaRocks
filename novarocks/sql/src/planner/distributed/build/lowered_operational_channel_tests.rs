@@ -42,7 +42,10 @@ pub(in crate::planner::distributed::build) fn selected_source_owner() -> (
     let field = Arc::new(
         ty.try_to_field("source_ordinal_not_zero")
             .unwrap()
-            .with_metadata([("provider-origin".to_owned(), "original".to_owned())].into()),
+            .with_metadata(std::collections::HashMap::<String, String>::from([(
+                "provider-origin".to_owned(),
+                "original".to_owned(),
+            )])),
     );
     let pool = ConstantPool::try_new(
         field.clone(),
@@ -79,14 +82,12 @@ fn foreign_namespace(
         panic!("actual reference")
     };
     let field = if changed_field {
-        Arc::new(
-            emitted
-                .pool()
-                .field_ref()
-                .as_ref()
-                .clone()
-                .with_metadata([("provider-origin".to_owned(), "foreign".to_owned())].into()),
-        )
+        Arc::new(emitted.pool().field_ref().as_ref().clone().with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider-origin".to_owned(),
+                "foreign".to_owned(),
+            )]),
+        ))
     } else {
         emitted.pool().field_ref().clone()
     };

@@ -21,22 +21,24 @@ use std::sync::Arc;
 
 #[test]
 fn m07_common_type_keeps_original_logical_marker_but_not_provider_decoration() {
-    let tagged = Arc::new(
-        Field::new("item", DataType::Utf8, false).with_metadata(
-            [
-                (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
-                ("provider_field_id".to_owned(), "17".to_owned()),
-            ]
-            .into(),
-        ),
-    );
+    let tagged = Arc::new(Field::new("item", DataType::Utf8, false).with_metadata(
+        std::collections::HashMap::<String, String>::from([
+            (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
+            ("provider_field_id".to_owned(), "17".to_owned()),
+        ]),
+    ));
     let empty = Arc::new(Field::new("item", DataType::Null, true));
     let result = wider_type(&DataType::List(tagged), &DataType::List(empty));
     assert_eq!(
         result,
         DataType::List(Arc::new(
-            Field::new("item", DataType::Utf8, true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned())].into())
+            Field::new("item", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                NR_LOGICAL_TYPE_KEY.to_owned(),
+                "json".to_owned()
+            )]))
         ))
     );
 }
@@ -59,8 +61,12 @@ fn m07_common_type_covers_actual_signed_integer_decimal_ranges() {
 fn m07_common_type_does_not_erase_conflicting_opaque_domain_as_variant() {
     let field = |marker: &str| {
         Arc::new(
-            Field::new("item", DataType::LargeBinary, true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), marker.to_owned())].into()),
+            Field::new("item", DataType::LargeBinary, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    NR_LOGICAL_TYPE_KEY.to_owned(),
+                    marker.to_owned(),
+                )]),
+            ),
         )
     };
     let result = wider_type(

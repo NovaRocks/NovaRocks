@@ -506,6 +506,267 @@ fn root_refusal_fact(code: u16) -> FailureFact {
         FailureReason::new(domain::WORKER, std::num::NonZeroU16::new(code).unwrap()),
     )
 }
+
+#[cfg(all(novarocks_dev_controls, unix))]
+mod root_observation_tests {
+    use super::*;
+    use novarocks_execution::runtime::exchange::TestEventObserver;
+    use novarocks_failpoint::{
+        liveness::{PreparedRoleSession, RoleSessionOwner, RunnerSession},
+        scope::ProcessBinding,
+        session::{DomainGrant, SessionDeclaration, SessionRole},
+    };
+    use novarocks_native_adapter::test_observation_controls::{DOMAIN, NativeObservationControls};
+    use serde_json::json;
+
+    struct Session {
+        _directory: tempfile::TempDir,
+        role: RoleSessionOwner,
+        runner: RunnerSession,
+        controls: Arc<NativeObservationControls>,
+        observer: Arc<dyn TestEventObserver>,
+    }
+
+    impl Session {
+        fn new(task: TaskIdentity) -> Self {
+            let directory = tempfile::Builder::new()
+                .prefix("nr-root-ob-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let root = directory.path();
+            let execution = task.query_execution_id();
+            let declaration = SessionDeclaration {
+                schema_version: 1,
+                session_id: "root-observation-be".into(),
+                launch_id: "root-observation-launch".into(),
+                role: SessionRole::Be,
+                lifetime_millis: 3000,
+                liveness_socket: root.join("live.sock"),
+                handshake_secret: "r".repeat(32),
+                domain_grants: vec![DomainGrant {
+                    domain: DOMAIN.into(),
+                    grant_id: "root-observation".into(),
+                    parameters: json!({
+                        "action": "grpc-fragment", "root": root, "backend_index": 0,
+                        "target_session_id": "root-observation-be", "max_events": 1,
+                        "query_execution": {
+                            "query_id_hi": execution.query_id().high(),
+                            "query_id_lo": execution.query_id().low(),
+                            "attempt_id": execution.attempt_id().get(),
+                        },
+                    }),
+                }],
+            };
+            let path = root.join("session.json");
+            declaration.write_private(&path).unwrap();
+            let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Be).unwrap();
+            let runner = RunnerSession::start(declaration).unwrap();
+            let role = prepared
+                .bind(ProcessBinding::Backend(task.backend_process_id()))
+                .unwrap();
+            let controls = Arc::new(
+                NativeObservationControls::from_grants(role.scope().grants_for(DOMAIN)).unwrap(),
+            );
+            let observer = controls
+                .observation_for("grpc-fragment", execution)
+                .unwrap()
+                .unwrap();
+            Self {
+                _directory: directory,
+                role,
+                runner,
+                controls,
+                observer,
+            }
+        }
+
+        fn reader(&self, fixture: &Fixture) -> NativeRootResultReader {
+            NativeRootResultReader::new(Arc::clone(&fixture.registry))
+                .with_observation_controls(Some(Arc::clone(&self.controls)))
+        }
+
+        fn assert_observed_once(&self) {
+            assert!(
+                !self.observer.is_active(),
+                "the one finite event was consumed"
+            );
+            assert_eq!(
+                self.role
+                    .scope()
+                    .observations()
+                    .iter()
+                    .filter(|event| event.event == "hit")
+                    .count(),
+                1,
+                "a real selected observation, rather than session expiry, consumed the grant",
+            );
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            self.role.close_and_join().unwrap();
+            self.runner.end_and_join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn root_end_read_uses_original_authenticated_observation_grant() {
+        let fixture = Fixture::new(true);
+        fixture.finish();
+        let session = Session::new(fixture.root.spec().task);
+        let reply = owned(
+            session
+                .reader(&fixture)
+                .read(&fixture.request(Some(1), 0, 1))
+                .await,
+        );
+        assert!(matches!(reply.reply().outcome, RootReadOutcome::End(end) if end.output_rows == 1));
+        session.assert_observed_once();
+        drop(reply);
+        assert!(fixture.root.physical_idle());
+    }
+
+    #[tokio::test]
+    async fn root_data_read_preserves_real_payload_and_attached_end_while_observing() {
+        let fixture = Fixture::new(false);
+        fixture.finish();
+        let session = Session::new(fixture.root.spec().task);
+        let reply = owned(
+            session
+                .reader(&fixture)
+                .read(&fixture.request(Some(1), 0, 1))
+                .await,
+        );
+        let RootReadOutcome::Data(data) = &reply.reply().outcome else {
+            panic!("expected original Data")
+        };
+        assert_eq!(data.body().as_ref(), b"\x02\0\0\0\x011");
+        assert_eq!(data.end_after_data().unwrap().output_rows, 1);
+        session.assert_observed_once();
+        drop(reply);
+    }
+
+    #[tokio::test]
+    async fn root_refusal_neither_observes_nor_replaces_original_failure() {
+        let fixture = Fixture::new(false);
+        let task = fixture.root.spec().task;
+        let session = Session::new(task);
+        let request = RootResultRead::try_new(
+            task,
+            RootProfileId::V1,
+            RootOutputKind::CountOnly,
+            NonZeroU64::new(1),
+            0,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let refusal = refused(session.reader(&fixture).read(&request).await, &request);
+        assert_eq!(refusal.fact(), root_refusal_fact(43));
+        assert!(session.observer.is_active());
+        assert!(session.role.scope().observations().is_empty());
+        assert!(fixture.root.physical_idle());
+    }
+
+    #[tokio::test]
+    async fn admitted_and_late_await_control_do_not_consume_stream_observation() {
+        let fixture = Fixture::new(false);
+        fixture.finish();
+        drop(owned(
+            fixture.reader.read(&fixture.request(Some(1), 0, 1)).await,
+        ));
+        drop(owned(
+            fixture.reader.read(&fixture.request(None, 1, 1)).await,
+        ));
+        let session = Session::new(fixture.root.spec().task);
+        let reader = session.reader(&fixture);
+        let request = fixture.request(Some(3), 1, 1000);
+        let mut read = Box::pin(reader.read(&request));
+        pending(read.as_mut()).await;
+        fixture.seal();
+        assert_eq!(
+            fixture.registry.context_state(fixture.context),
+            QueryContextState::Releasing
+        );
+        let reply = owned(
+            tokio::time::timeout(Duration::from_millis(100), read)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(reply.reply().outcome, RootReadOutcome::AwaitTerminalControl);
+        assert_eq!(reply.reply().accepted_consumed, 1);
+        assert!(session.observer.is_active());
+        assert!(session.role.scope().observations().is_empty());
+        assert!(matches!(
+            reader.read(&fixture.request(Some(3), 2, 1)).await,
+            NativeRootReadResponse::AwaitTerminalControl {
+                accepted_consumed: 1
+            }
+        ));
+        assert!(session.observer.is_active());
+        assert!(session.role.scope().observations().is_empty());
+        assert_eq!(fixture.root.snapshot().consumed_through, 1);
+        drop(reply);
+        fixture.registry.advance_deadlines();
+        assert_eq!(
+            fixture.registry.context_state(fixture.context),
+            QueryContextState::TerminalRetained
+        );
+        assert!(fixture.root.physical_idle());
+    }
+
+    #[tokio::test]
+    async fn root_not_ready_and_ack_only_do_not_consume_an_eos_observation() {
+        let fixture = Fixture::new(false);
+        let session = Session::new(fixture.root.spec().task);
+        let reader = session.reader(&fixture);
+        let reply = owned(reader.read(&fixture.request(Some(1), 0, 1)).await);
+        assert_eq!(reply.reply().outcome, RootReadOutcome::NotReady);
+        drop(reply);
+        let reply = owned(reader.read(&fixture.request(None, 0, 1)).await);
+        assert_eq!(reply.reply().outcome, RootReadOutcome::AckOnly);
+        drop(reply);
+        assert!(session.observer.is_active());
+        assert!(session.role.scope().observations().is_empty());
+        assert!(fixture.root.physical_idle());
+    }
+
+    #[tokio::test]
+    async fn root_observation_does_not_widen_to_another_backend_or_attempt() {
+        let fixture = Fixture::new(true);
+        fixture.finish();
+        let task = fixture.root.spec().task;
+        let foreign_backend = TaskIdentity::new(
+            task.query_execution_id(),
+            task.stage_id(),
+            task.task_id(),
+            BackendProcessId::new_v7(),
+        );
+        let foreign_attempt = TaskIdentity::new(
+            QueryExecutionId::new(
+                task.query_execution_id().query_id(),
+                AttemptId::new(2).unwrap(),
+            )
+            .unwrap(),
+            task.stage_id(),
+            task.task_id(),
+            task.backend_process_id(),
+        );
+        for foreign in [foreign_backend, foreign_attempt] {
+            let session = Session::new(foreign);
+            let reply = owned(
+                session
+                    .reader(&fixture)
+                    .read(&fixture.request(Some(1), 0, 1))
+                    .await,
+            );
+            assert!(matches!(reply.reply().outcome, RootReadOutcome::End(_)));
+            assert!(session.observer.is_active());
+            assert!(session.role.scope().observations().is_empty());
+            drop(reply);
+        }
+    }
+}
 async fn pending<F: Future>(future: std::pin::Pin<&mut F>) {
     let mut future = future;
     poll_fn(|cx| {

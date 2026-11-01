@@ -333,8 +333,12 @@ fn complete_domains_determine_same_carrier_cast_spelling() {
 #[test]
 fn nested_declared_domains_preserve_actual_cast_spelling() {
     use arrow::datatypes::Field;
-    let leaf = Field::new("format_item", DataType::Utf8, false)
-        .with_metadata([("nrLogicalType".into(), "opaque-source-label".into())].into());
+    let leaf = Field::new("format_item", DataType::Utf8, false).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            "nrLogicalType".into(),
+            "opaque-source-label".into(),
+        )]),
+    );
     let carrier = DataType::Struct(
         vec![
             Field::new("j`son", DataType::List(Arc::new(leaf)), true),

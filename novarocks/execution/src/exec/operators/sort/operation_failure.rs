@@ -122,19 +122,15 @@ mod tests {
         use std::sync::Arc;
         let field = Arc::new(Field::new(
             "ResourceExhausted",
-            DataType::Struct(
-                vec![
-                    Field::new("key", DataType::Int32, false),
-                    Field::new("value", DataType::Int32, true),
-                ]
-                .into(),
-            ),
+            // A Map entries field must be Struct. Arrow 60 supports valid Maps;
+            // this malformed declaration exercises its actual constructor error.
+            DataType::Int32,
             false,
         ));
         let weak = Arc::downgrade(&field);
-        let unsupported = DataType::Map(field.clone(), false);
-        let source = arrow::row::RowConverter::new(vec![arrow::row::SortField::new(unsupported)])
-            .expect_err("Map is not a sort-row carrier");
+        let malformed = DataType::Map(field.clone(), false);
+        let source = arrow::row::RowConverter::new(vec![arrow::row::SortField::new(malformed)])
+            .expect_err("Map entries must be a Struct");
         let failure = arrow(Operation::RowConverter, source);
         assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
         assert_eq!(failure.failure_fact().resource(), None);

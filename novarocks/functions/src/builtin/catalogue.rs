@@ -2066,13 +2066,40 @@ fn struct_field_type(
     let DataType::Struct(fields) = data_type else {
         return Ok(None);
     };
-    for field in fields {
-        work.step()?;
-        if field.name().eq_ignore_ascii_case(field_name) {
-            return Ok(Some(field.data_type().clone()));
-        }
-    }
-    Ok(None)
+    let ordinal = super::struct_field_resolution::resolve_struct_field_ordinal_observed(
+        fields,
+        field_name,
+        || work.step().map_err(FunctionBindingError::Control),
+    )?
+    .ok_or_else(|| {
+        FunctionBindingError::InvalidBinding(
+            format!("struct field '{field_name}' does not exist").into(),
+        )
+    })?;
+    Ok(Some(fields[ordinal].data_type().clone()))
+}
+
+pub(super) fn array_struct_subfield_ordinal(
+    request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<usize, FunctionBindingError> {
+    let name = utf8_constant(request.arguments.get(1), work)?
+        .ok_or(FunctionBindingError::NoMatchingOverload)?;
+    let Some(FunctionArgument::Value { value_type, .. }) = request.arguments.first() else {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    };
+    let DataType::List(item) = value_type.data_type() else {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    };
+    let DataType::Struct(fields) = item.data_type() else {
+        return Err(FunctionBindingError::NoMatchingOverload);
+    };
+    super::struct_field_resolution::resolve_struct_field_ordinal_observed(fields, name, || {
+        work.step().map_err(FunctionBindingError::Control)
+    })?
+    .ok_or_else(|| {
+        FunctionBindingError::InvalidBinding(format!("struct field '{name}' does not exist").into())
+    })
 }
 
 fn list_item_type(data_type: &DataType) -> Option<DataType> {
@@ -2991,15 +3018,16 @@ fn bind_dynamic_scalar_result_with_creation<H>(
             let DataType::Struct(fields) = source.data_type() else {
                 return Err(FunctionBindingError::NoMatchingOverload.into());
             };
-            let mut ordinal = None;
-            for (index, candidate) in fields.iter().enumerate() {
-                work.step()?;
-                if candidate.name().eq_ignore_ascii_case(name) {
-                    ordinal = Some(index);
-                    break;
-                }
-            }
-            let ordinal = ordinal.ok_or(FunctionBindingError::NoMatchingOverload)?;
+            let ordinal = super::struct_field_resolution::resolve_struct_field_ordinal_observed(
+                fields,
+                name,
+                || work.step().map_err(FunctionBindingError::Control),
+            )?
+            .ok_or_else(|| {
+                FunctionBindingError::InvalidBinding(
+                    format!("struct field '{name}' does not exist").into(),
+                )
+            })?;
             let projected = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
                 cx.child(&source, ordinal)
             })?
@@ -4625,20 +4653,22 @@ mod tests {
     #[test]
     fn rounding_catalogue_checks_shared_carrier_grammar_before_cast_authoring() {
         let field = |ty, nullable| Arc::new(arrow_schema::Field::new("v", ty, nullable));
+        let error = arrow_schema::UnionFields::try_new(
+            [7, 7],
+            [field(DataType::Float64, true), field(DataType::Utf8, true)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid argument error: duplicate type id: 7"
+        );
+        // The real shared-carrier gate is still exercised below, including
+        // an invalid unselected child under valid public Union identities.
         let invalid_sources = [
             DataType::Decimal128(0, 0),
             DataType::Decimal256(77, 0),
             DataType::Dictionary(Box::new(DataType::Float64), Box::new(DataType::Float64)),
             DataType::RunEndEncoded(field(DataType::Int32, true), field(DataType::Float64, true)),
-            DataType::Union(
-                [
-                    (7, field(DataType::Float64, true)),
-                    (7, field(DataType::Utf8, true)),
-                ]
-                .into_iter()
-                .collect(),
-                arrow_schema::UnionMode::Dense,
-            ),
             // Even an unselected child is required to be a valid carrier.
             DataType::Union(
                 [
@@ -5195,7 +5225,7 @@ mod tests {
             Field::new("element", DataType::Int32, true).with_metadata(
                 [("PARQUET:field_id".to_string(), "5".to_string())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
         );
         let fields: Fields = vec![

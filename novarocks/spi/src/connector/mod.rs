@@ -247,12 +247,12 @@ pub use mutation::{
 };
 pub use mv_storage_observation::{
     MAX_MV_OBSERVATION_FIELDS, MAX_MV_OBSERVATION_PARTITION_FIELDS, MAX_MV_OBSERVATION_REFS,
-    MAX_MV_OBSERVATION_SNAPSHOTS, MvCreateSourceObservation, MvCreatedTargetObservation,
-    MvExactPartitionField, MvExactPartitionTransform, MvMaintenanceMetadataObservation,
-    MvObservedField, MvObservedMaintenancePolicy, MvObservedPartitionField,
-    MvObservedPartitionSpec, MvObservedPartitionTransform, MvObservedRefreshMarker,
-    MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
-    MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
+    MAX_MV_OBSERVATION_SNAPSHOTS, MvCreatedTargetObservation, MvExactPartitionField,
+    MvExactPartitionTransform, MvMaintenanceMetadataObservation, MvObservedField,
+    MvObservedMaintenancePolicy, MvObservedPartitionField, MvObservedPartitionSpec,
+    MvObservedPartitionTransform, MvObservedRefreshMarker, MvObservedSnapshot,
+    MvObservedSourceField, MvRefreshBaseObservation, MvRefreshTargetObservation,
+    MvSchemaValidationObservation, MvSourceSchemaObservation, MvStorageObservationPort,
     UnavailableMvStorageObservationPort,
 };
 pub use original_result_scope::{
@@ -287,7 +287,7 @@ pub use publication::{
 pub use read::{
     ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorChangePartition,
     ConnectorChangePartitionField, ConnectorChangePartitionTransform,
-    ConnectorChangePartitionValue, ConnectorChangeWindow, ConnectorChangeWindowAdmission,
+    ConnectorChangePartitionValue, ConnectorChangeWindowAdmission,
     ConnectorChangeWindowFullRebuildReason, ConnectorChangeWindowPartitionImpact,
     ConnectorChangeWindowReplaceFailure, ConnectorReadPurpose, ConnectorReadSelector,
     ConnectorScan, ConnectorScanAdmission, ConnectorScanSelection, ConnectorSplitPlanningMetrics,

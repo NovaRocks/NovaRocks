@@ -697,8 +697,12 @@ fn merge_wide_nested_state_uses_real_type_walk_quantum_and_exact_metadata() {
     let fields = (0..320)
         .map(|n| {
             Arc::new(
-                Field::new(format!("field{n}"), DataType::Int64, false)
-                    .with_metadata([("provider-id".into(), n.to_string())].into()),
+                Field::new(format!("field{n}"), DataType::Int64, false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider-id".into(),
+                        n.to_string(),
+                    )]),
+                ),
             )
         })
         .collect::<Vec<_>>();
@@ -731,8 +735,13 @@ fn merge_wide_nested_state_uses_real_type_walk_quantum_and_exact_metadata() {
     };
     let mut changed_fields = fields.to_vec();
     changed_fields[319] = Arc::new(
-        Field::new("field319", DataType::Int64, false)
-            .with_metadata([("provider-id".into(), "wrong".into())].into()),
+        Field::new("field319", DataType::Int64, false).with_metadata(std::collections::HashMap::<
+            String,
+            String,
+        >::from([(
+            "provider-id".into(),
+            "wrong".into(),
+        )])),
     );
     changed = FunctionValueType::from_legacy_declared_projection(
         DataType::Struct(changed_fields.into()),

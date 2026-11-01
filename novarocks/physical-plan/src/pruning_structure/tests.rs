@@ -975,31 +975,31 @@ fn shared_scan_fixture(two_parents: bool) -> (FragmentPackage, PruningDomainWitn
     } else {
         (scan, scan)
     };
-    let join = builder.reserve_node_id().unwrap();
+    let union = builder.reserve_node_id().unwrap();
     builder
         .insert_node_unchecked(PhysicalNode {
-            id: join,
+            id: union,
             inputs: Box::from([left, right]),
             required_inputs: Box::from([properties(), properties()]),
             output_properties: properties(),
             output: OutputPort {
-                node: join,
+                node: union,
                 columns: Box::from([value]),
             },
-            kind: NodeKind::NestLoopJoin {
-                kind: JoinKind::Cross,
-                distribution: NestLoopJoinDistribution::Singleton,
-                predicate: None,
-                null_extended: Box::default(),
+            // Pruning ownership is independent of input order. UNION ALL
+            // keeps both occurrences without a build-before-probe data gate.
+            kind: NodeKind::SetOp {
+                kind: SetOperationKind::UnionAll,
+                input_mappings: Box::from([Box::from([value]), Box::from([value])]),
             },
         })
         .unwrap();
     let source = if two_parents {
         left
     } else {
-        append_filter(&mut builder, join, value, 1)
+        append_filter(&mut builder, union, value, 1)
     };
-    let root = if two_parents { join } else { source };
+    let root = if two_parents { union } else { source };
     let package = package(builder, root, scan);
     let input_path: Box<[PruningInputEdge]> = if two_parents {
         Box::from([PruningInputEdge {
@@ -1012,10 +1012,10 @@ fn shared_scan_fixture(two_parents: bool) -> (FragmentPackage, PruningDomainWitn
             PruningInputEdge {
                 consumer: source,
                 input_ordinal: 0,
-                producer: join,
+                producer: union,
             },
             PruningInputEdge {
-                consumer: join,
+                consumer: union,
                 input_ordinal: 0,
                 producer: scan,
             },

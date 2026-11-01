@@ -375,6 +375,7 @@ pub mod array_struct_subfield_core;
 mod array_struct_subfield_owner;
 mod array_struct_subfield_port;
 mod array_struct_subfield_selected;
+pub mod struct_field_resolution;
 
 mod percentile_approx_raw_owner;
 mod percentile_approx_raw_selected;

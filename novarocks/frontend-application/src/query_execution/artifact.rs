@@ -2159,7 +2159,10 @@ mod tests {
             let child = ValueTypeRef::try_new(child, child_nullable, S::pure()).unwrap();
             let mut field = Field::new("value", DataType::Binary, child_nullable);
             if let Some(attribute) = attribute {
-                field = field.with_metadata([("nr_logical_type".into(), attribute.into())].into());
+                field = field.with_metadata(std::collections::HashMap::<String, String>::from([(
+                    "nr_logical_type".into(),
+                    attribute.into(),
+                )]));
             }
             let field = Arc::new(field);
             let values: ArrayRef =
@@ -2189,11 +2192,10 @@ mod tests {
                     );
                     let entries_field = Arc::new(
                         Field::new("entries", entries.data_type().clone(), false).with_metadata(
-                            [(
+                            std::collections::HashMap::<String, String>::from([(
                                 "nr_logical_type".into(),
                                 "uninterpreted-map-source-attribute".into(),
-                            )]
-                            .into(),
+                            )]),
                         ),
                     );
                     (

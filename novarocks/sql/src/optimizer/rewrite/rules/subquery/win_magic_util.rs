@@ -601,11 +601,12 @@ mod tests {
         let control = crate::optimizer::test_optimizer_control();
         let value = |fact: &str| {
             ConstantValue::from_i64(
-                Arc::new(
-                    ty.try_to_field("literal")
-                        .unwrap()
-                        .with_metadata([("provider.fact".to_owned(), fact.to_owned())].into()),
-                ),
+                Arc::new(ty.try_to_field("literal").unwrap().with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider.fact".to_owned(),
+                        fact.to_owned(),
+                    )]),
+                )),
                 ty.clone(),
                 7,
                 crate::constant::test_constant_policy(),

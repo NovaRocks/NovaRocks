@@ -258,7 +258,7 @@ fn aggregate_copy_preserves_four_phases_sparse_sequences_and_full_owned_types() 
             };
             assert!(Arc::ptr_eq(&a[0], &b[0]));
             assert_eq!(b[0].name(), "original");
-            assert_eq!(b[0].metadata().capacity(), 0);
+            assert!(b[0].metadata().as_arc().is_none());
             assert!(b[0].is_nullable());
         }
     }

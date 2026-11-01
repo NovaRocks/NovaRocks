@@ -41,13 +41,16 @@ fn signed_layout_accepts_nested_names_metadata_and_nullability() {
         vec![child],
         Some(NullBuffer::from(vec![true, false])),
     ));
-    let target = DataType::Struct(
-        vec![
-            Field::new("new", DataType::Int32, false)
-                .with_metadata([("iceberg.id".into(), "5".into())].into()),
-        ]
-        .into(),
-    );
+    let target =
+        DataType::Struct(
+            vec![Field::new("new", DataType::Int32, false).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "iceberg.id".into(),
+                    "5".into(),
+                )]),
+            )]
+            .into(),
+        );
     let out = normalize_one(array, Field::new("root", target.clone(), true)).unwrap();
     assert_eq!(out.column(0).data_type(), &target);
     let structure = out

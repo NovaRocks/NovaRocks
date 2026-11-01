@@ -89,6 +89,36 @@ pub(super) fn unpivot_arrow(source: arrow::error::ArrowError) -> ExecutionFailur
     size_probe::UnpivotProbeFailure::Encoding(source).into_execution()
 }
 
+/// A failure from the actual column extension, independent of IPC size probes.
+#[derive(Debug)]
+struct UnpivotExtensionFailure(arrow::error::ArrowError);
+impl std::fmt::Display for UnpivotExtensionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unpivot array extension failed: {}", self.0)
+    }
+}
+impl std::error::Error for UnpivotExtensionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl FailureProjection for UnpivotExtensionFailure {
+    fn failure_fact(&self) -> FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        let (class, reason) = match &self.0 {
+            arrow::error::ArrowError::MemoryError(_) => (
+                FailureClass::Resource,
+                ExecutionReason::UnpivotExtensionAllocation,
+            ),
+            _ => (FailureClass::Invariant, ExecutionReason::UnpivotExtension),
+        };
+        FailureFact::new(class, reason.reason())
+    }
+}
+fn unpivot_extension_failure(source: arrow::error::ArrowError) -> ExecutionFailure {
+    ExecutionFailure::from_domain(UnpivotExtensionFailure(source))
+}
+
 #[path = "unpivot_processor/size_probe.rs"]
 mod size_probe;
 
@@ -341,7 +371,9 @@ pub(crate) fn concat_owned_with_construction(
     control.checkpoint(0)?;
     for (index, part) in parts.iter().enumerate() {
         control.checkpoint(0)?;
-        output.extend(index, 0, part.len());
+        output
+            .try_extend(index, 0, part.len())
+            .map_err(unpivot_extension_failure)?;
         control.checkpoint(0)?;
     }
     control.checkpoint(0)?;
@@ -382,5 +414,31 @@ pub(crate) fn unpivot_copy_failure(
         CopyConstructionError::Creator(cause) => cause.into(),
         CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),
         CopyConstructionError::Copy(cause) => cause.into_kernel().into(),
+    }
+}
+
+#[cfg(test)]
+mod extension_failure_tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn extension_failure_retains_actual_arrow_source_without_ipc_size_facts() {
+        let values = arrow::array::Int32Array::from(vec![1]);
+        let data = values.to_data();
+        let mut output = MutableArrayData::new(vec![&data], true, 1);
+        let actual = output.try_extend(0, 0, 2).unwrap_err();
+        let original_display = actual.to_string();
+        let failure = UnpivotExtensionFailure(actual);
+        let fact = failure.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Invariant);
+        assert_eq!(fact.reason().code(), 616);
+        assert_eq!(fact.representation(), None);
+        assert_eq!(fact.resource(), None);
+        let source = failure.source().unwrap();
+        assert!(source.downcast_ref::<arrow::error::ArrowError>().is_some());
+        assert_eq!(source.to_string(), original_display);
+        let execution = ExecutionFailure::from_domain(failure);
+        assert_eq!(execution.failure_fact(), fact);
     }
 }

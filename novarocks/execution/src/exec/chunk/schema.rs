@@ -1333,7 +1333,7 @@ impl ChunkSchema {
         work(0)?;
         if !layout.is_typed()
             || layout.schema().fields().len() != layout.slots().len()
-            || layout.schema().metadata().capacity() != 0
+            || layout.schema().metadata().as_arc().is_some()
         {
             return Err(E::from(ChunkConstructionFailure::contract(
                 ChunkSchemaViolation::CanonicalLayout,
@@ -1525,7 +1525,7 @@ impl ChunkSchema {
         layout: &novarocks_local_program::StaticLayout,
     ) -> Result<ChunkSchemaRef, ChunkConstructionFailure> {
         if layout.schema().fields().len() != layout.slots().len()
-            || layout.schema().metadata().capacity() != 0
+            || layout.schema().metadata().as_arc().is_some()
         {
             return Err(schema_contract(
                 SchemaContractSite::Layout,
@@ -1662,9 +1662,13 @@ impl ChunkSchema {
 
     pub fn try_new_with_schema_metadata(
         slots: Vec<ChunkSlotSchema>,
-        metadata: HashMap<String, String>,
+        metadata: impl Into<arrow::datatypes::Metadata>,
     ) -> Result<Self, ChunkConstructionFailure> {
-        Self::try_new_with_metadata_source(slots, ChunkMetadataSource::Foreign(metadata), None)
+        Self::try_new_with_metadata_source(
+            slots,
+            ChunkMetadataSource::Foreign(metadata.into()),
+            None,
+        )
     }
 
     /// Derive from this positively paired original Schema map and inherit its
@@ -2522,7 +2526,10 @@ mod tests {
         ] {
             let mut field = Field::new("value", carrier, true);
             if let Some(marker) = logical.metadata_value() {
-                field = field.with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into());
+                field = field.with_metadata(std::collections::HashMap::<String, String>::from([(
+                    NR_LOGICAL_TYPE_KEY.into(),
+                    marker.into(),
+                )]));
             }
             let source = ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                 SlotId::new(1),
@@ -2549,7 +2556,7 @@ mod tests {
                 ChunkSchema::from_compiled_layout(&layout).unwrap(),
             ] {
                 let slot = &restored.slots()[0];
-                assert_eq!(slot.field().metadata().capacity(), 0);
+                assert!(slot.field().metadata().as_arc().is_none());
                 assert_eq!(slot.typed_binding(), declaration.typed_binding());
                 assert_eq!(slot.field().data_type(), field.data_type());
                 assert_eq!(slot.field().is_nullable(), field.is_nullable());
@@ -2681,7 +2688,7 @@ mod tests {
         assert_eq!(*typed_source, *restored);
         assert!(restored.is_typed());
         assert_eq!(restored.slot_ids(), slots);
-        assert_eq!(restored.arrow_schema_ref().metadata().capacity(), 0);
+        assert!(restored.arrow_schema_ref().metadata().as_arc().is_none());
         for (index, new) in restored.slots().iter().enumerate() {
             assert!(Arc::ptr_eq(
                 &layout.schema().fields()[index],
@@ -2689,7 +2696,7 @@ mod tests {
             ));
             assert_eq!(new.typed_binding(), declaration.typed_binding());
             assert_eq!(new.unique_id(), Some(index as i32));
-            assert_eq!(new.field().metadata().capacity(), 0);
+            assert!(new.field().metadata().as_arc().is_none());
             assert!(!new.nullable());
         }
         let projected_owner = factory.begin_compiled_layout_construction(&layout).unwrap();
@@ -3116,7 +3123,7 @@ mod tests {
     }
 
     #[test]
-    fn align_chunk_schema_to_columns_rejects_nullable_runtime_map_keys() {
+    fn nullable_map_keys_are_rejected_before_alignment_by_sdk_and_typed_slot() {
         let expected_map = DataType::Map(
             Arc::new(Field::new(
                 "entries",
@@ -3149,15 +3156,30 @@ mod tests {
             vec![key_array, value_array],
             None,
         );
-        let map = Arc::new(MapArray::new(
+        let actual_type = DataType::Map(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            false,
+        );
+        let error = MapArray::try_new(
             Arc::new(Field::new("entries", entries.data_type().clone(), false)),
             OffsetBuffer::new(vec![0, 2].into()),
             entries,
             None,
             false,
-        )) as ArrayRef;
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            arrow::error::ArrowError::InvalidArgumentError(_)
+        ));
+        assert!(error.to_string().contains("keys field cannot be nullable"));
 
-        let error = super::align_chunk_schema_to_columns(&[map], &schema).unwrap_err();
+        // The former alignment fixture cannot be represented by a safe
+        // MapArray. Exercise the original checked slot author directly;
+        // align_chunk_schema_to_columns ultimately rebuilds this same slot.
+        let error = schema.slots()[0]
+            .with_field_and_slot_id(SlotId::new(1), Field::new("m", actual_type, false))
+            .unwrap_err();
         assert!(error.to_string().contains("map key type is nullable"));
         assert_eq!(
             novarocks_failure_contract::FailureProjection::failure_fact(&error).class(),
@@ -3336,7 +3358,7 @@ impl Eq for ChunkSchema {}
 enum ChunkMetadataSource {
     Owned(ArrowMetadataOwner),
     Derived(MetadataOwnedSchema),
-    Foreign(HashMap<String, String>),
+    Foreign(arrow::datatypes::Metadata),
     Original(OriginalMetadataClone),
     EmptyOriginal(MaterializedMetadataMap),
 }

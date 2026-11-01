@@ -19,7 +19,8 @@
 //!
 //! This crate deliberately has no connector identity and owns no table-format
 //! correctness. Connector implementations bind authorized storage access and
-//! ask this crate to read physical Parquet or ORC columns.
+//! ask this crate to read physical Parquet columns. ORC reads are suspended
+//! until orc-rust releases support for Arrow 60 and Zstd 0.14.
 
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {

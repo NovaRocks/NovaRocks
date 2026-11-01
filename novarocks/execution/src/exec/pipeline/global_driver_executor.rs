@@ -427,6 +427,26 @@ impl DriverTask {
         self.driver.source_name()
     }
 
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn writer_diagnostic(
+        &self,
+    ) -> Option<(
+        crate::runtime::writer_diagnostics::WriterDiagnostics,
+        String,
+        String,
+    )> {
+        crate::runtime::writer_diagnostics::WriterDiagnostics::from_runtime(
+            self.fragment_ctx.runtime_state(),
+        )
+        .map(|scope| {
+            (
+                scope,
+                self.driver.source_name().to_owned(),
+                self.driver.sink_name().to_owned(),
+            )
+        })
+    }
+
     pub(crate) fn fragment_instance_id(&self) -> Option<(i64, i64)> {
         self.driver.fragment_instance_id()
     }

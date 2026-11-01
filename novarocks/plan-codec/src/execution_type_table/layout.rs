@@ -888,6 +888,27 @@ pub(super) fn decode<H, F: ValueSchemaCreationFactory<H>>(
                             output
                         }
                         P::UnionType(value) => {
+                            // Call try_new directly with the already validated
+                            // entries. Arrow60.1 FromIterator would first unzip
+                            // two additional Vecs; this owner has a layout-only
+                            // admission port and retains its original inputs.
+                            // The actual try_new pair Vec uses the SAME locked
+                            // fresh-push request author as the other decoder.
+                            for _ in 0..union_entries.len() {
+                                physical.step()?;
+                            }
+                            novarocks_type_contract::owned_resources::vec::original_fresh_push_allocation_requests_observed::<
+                                (i8, FieldRef), Failure<H>,
+                            >(
+                                union_entries.len(),
+                                &mut || Ok(()),
+                                &mut Some(&mut |layout, copies| {
+                                    for _ in 0..copies {
+                                        physical.allocate(layout)?;
+                                    }
+                                    Ok(())
+                                }),
+                            )?;
                             let header = resources::arc(resources::array::<(i8, FieldRef), H>(
                                 union_entries.len(),
                             )?)?;
@@ -895,9 +916,21 @@ pub(super) fn decode<H, F: ValueSchemaCreationFactory<H>>(
                             resources::source_add(&mut own_bytes, header.size())?;
                             physical.work.flush()?;
                             let output = DataType::Union(
-                                std::mem::take(&mut union_entries)
-                                    .into_iter()
-                                    .collect::<UnionFields>(),
+                                UnionFields::try_new(
+                                    // Every immutable wire ID was checked when
+                                    // this same entries vector was prepared.
+                                    value.fields.iter().map(|entry| entry.type_id as i8),
+                                    std::mem::take(&mut union_entries)
+                                        .into_iter()
+                                        .map(|(_, field)| field),
+                                )
+                                .map_err(|source| {
+                                    Failure::Codec(
+                                        crate::value_type_table::LogicalTypeCodecError::Arrow(
+                                            source,
+                                        ),
+                                    )
+                                })?,
                                 mode(value.mode)?,
                             );
                             physical.step()?;

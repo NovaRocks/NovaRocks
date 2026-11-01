@@ -148,8 +148,12 @@ fn map_parts_actual_generic_declarations_freeze_logical_child_and_real_result_fi
             ]
             .into();
             let entries = Arc::new(
-                Field::new("authored-entries", DataType::Struct(fields), false)
-                    .with_metadata([("source-fact".into(), "preserved".into())].into()),
+                Field::new("authored-entries", DataType::Struct(fields), false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "source-fact".into(),
+                        "preserved".into(),
+                    )]),
+                ),
             );
             let source = FunctionValueType::from_legacy_declared_projection(
                 DataType::Map(entries.clone(), true),

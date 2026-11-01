@@ -62,6 +62,7 @@ pub(crate) struct LoweredExpressions {
 #[derive(Debug)]
 pub(crate) enum ExpressionLoweringError {
     Construction(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+    BTree(novarocks_type_contract::owned_resources::btree::BTreeResourceError),
     Publication(
         novarocks_local_program::ProgramCreationFailure<
             std::convert::Infallible,
@@ -84,6 +85,13 @@ pub(crate) enum ExpressionLoweringError {
     Invalid(&'static str),
 }
 impl ExpressionLoweringError {
+    /// This new model source uses the existing Owner channel, but retains the
+    /// primary construction priority of the previous Resource envelope even
+    /// when SourceModel's neutral class is Invariant rather than Resource.
+    pub(crate) fn is_primary_construction(&self) -> bool {
+        matches!(self, Self::BTree(_))
+    }
+
     pub(crate) fn is_unsupported(&self) -> bool {
         matches!(
             self,
@@ -104,6 +112,7 @@ impl fmt::Display for ExpressionLoweringError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Construction(source) => source.fmt(f),
+            Self::BTree(source) => source.fmt(f),
             Self::Publication(source) => source.fmt(f),
             Self::Control(e) => e.fmt(f),
             Self::Constant(e) => e.fmt(f),
@@ -128,6 +137,7 @@ impl Error for ExpressionLoweringError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Construction(source) => Some(source),
+            Self::BTree(source) => Some(source),
             Self::Publication(source) => Some(source),
             Self::Control(e) => Some(e),
             Self::Constant(e) => Some(e),
@@ -142,6 +152,13 @@ impl Error for ExpressionLoweringError {
             Self::Comparison(e) => Some(e),
             _ => None,
         }
+    }
+}
+impl From<novarocks_type_contract::owned_resources::btree::BTreeResourceError>
+    for ExpressionLoweringError
+{
+    fn from(source: novarocks_type_contract::owned_resources::btree::BTreeResourceError) -> Self {
+        Self::BTree(source)
     }
 }
 impl From<novarocks_functions::ArithmeticPrepareError> for ExpressionLoweringError {
@@ -249,6 +266,7 @@ fn finish<T>(
     // footer observes pending work only after ordinary validation failures.
     if result.as_ref().is_err_and(|cause| {
         matches!(cause, ExpressionLoweringError::Control(_))
+            || cause.is_primary_construction()
             || matches!(
                 cause.failure_fact().class(),
                 FailureClass::Resource | FailureClass::Control
@@ -392,6 +410,7 @@ macro_rules! expression_creation_cause {
     };
 }
 expression_creation_cause!(ValueTypeError);
+expression_creation_cause!(novarocks_type_contract::owned_resources::btree::BTreeResourceError);
 expression_creation_cause!(ConstantError);
 expression_creation_cause!(ConstantReferenceError);
 expression_creation_cause!(ExpressionsCompileError);
@@ -428,6 +447,7 @@ impl<H> From<novarocks_functions::FunctionBindingCreationFailure<H>>
             F::Binding(error) => error.into(),
             F::Creator(cause) => Self::Creator(cause),
             F::Resource(R::Layout(cause)) => Self::Resource(cause),
+            F::Resource(R::BTree(cause)) => cause.into(),
             F::Resource(R::Vec(ControlResourceError::Control(cause))) => Self::Control(cause),
             F::Resource(R::Vec(ControlResourceError::SourceModel(_)))
             | F::Resource(R::HashMap(HashMapResourceError::SourceModel(_))) => {
@@ -523,6 +543,7 @@ impl<H> From<novarocks_functions::ArithmeticCreationFailure<H>> for ExpressionCr
             F::Construction(C::Observer(T::Control(cause))) => Self::Control(cause),
             F::Construction(C::Observer(T::Creator(cause))) => Self::Creator(cause),
             F::Construction(C::Layout(cause)) => Self::Resource(cause),
+            F::Construction(C::BTree(cause)) => cause.into(),
             F::Construction(C::Vec(ControlResourceError::Control(cause))) => Self::Control(cause),
             F::Construction(C::Vec(ControlResourceError::SourceModel(_)))
             | F::Construction(C::HashMap(HashMapResourceError::SourceModel(_))) => {
@@ -646,7 +667,9 @@ pub(crate) fn lower_expressions_with_unions_with_creator<
         Err(crate::FragmentCreationError::Control(_)
             | crate::FragmentCreationError::Creator(_)
             | crate::FragmentCreationError::Resource(_))
-    ) {
+    ) || matches!(&result, Err(crate::FragmentCreationError::Compile(source))
+        if source.is_primary_construction())
+    {
         return result;
     }
     work.flush()?;
@@ -2856,7 +2879,7 @@ mod primary_cause_footer_tests {
         let publication_fact = publication.failure_fact();
         let geometry =
             novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic;
-        vec![
+        let mut cases = vec![
             (
                 ExpressionLoweringError::Publication(publication),
                 publication_fact,
@@ -2880,7 +2903,32 @@ mod primary_cause_footer_tests {
             original(FunctionSpecializationFailure::Kernel(
                 KernelFailure::ResourceExhausted,
             )),
-        ]
+        ];
+        use novarocks_type_contract::owned_resources::{
+            arrow_metadata::hashmap_conversion_requests, btree::BTreeResourceError,
+        };
+        for source in [
+            hashmap_conversion_requests(usize::MAX).unwrap_err(),
+            BTreeResourceError::SourceModel("original metadata source model"),
+        ] {
+            let expected = source.failure_fact();
+            cases.push(original(source));
+            let binding = novarocks_functions::FunctionBindingCreationFailure::<
+                std::convert::Infallible,
+            >::Resource(
+                novarocks_functions::FunctionBindingConstructionResource::BTree(source)
+            );
+            let binding: ExpressionCreationFailure<std::convert::Infallible> = binding.into();
+            cases.push((binding.into_pure(), expected));
+            let arithmetic = novarocks_functions::ArithmeticCreationFailure::<
+                std::convert::Infallible,
+            >::Construction(
+                novarocks_type_contract::ValueConstructionFailure::BTree(source)
+            );
+            let arithmetic: ExpressionCreationFailure<std::convert::Infallible> = arithmetic.into();
+            cases.push((arithmetic.into_pure(), expected));
+        }
+        cases
     }
     #[test]
     fn pure_and_created_expression_refusals_keep_source_before_later_footer_control() {

@@ -614,8 +614,13 @@ fn ordered_tokens_names_types_nullability_and_metadata_are_exact_writer_public_f
         ConnectorWriteFieldBinding::new(token(0), Field::new("v0", DataType::Int64, true)),
         ConnectorWriteFieldBinding::new(
             token(0),
-            Field::new("v0", DataType::Int64, false)
-                .with_metadata([("annotation".into(), "changed".into())].into()),
+            Field::new("v0", DataType::Int64, false).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                "annotation".into(),
+                "changed".into(),
+            )])),
         ),
     ] {
         assert_contract_mismatch(
@@ -650,10 +655,12 @@ fn dictionary_physical_id_ordering_and_nested_field_metadata_cannot_change() {
         Field::new(
             "v0",
             DataType::Struct(
-                vec![
-                    Field::new("nested", DataType::Int64, false)
-                        .with_metadata([("annotation".into(), annotation.into())].into()),
-                ]
+                vec![Field::new("nested", DataType::Int64, false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "annotation".into(),
+                        annotation.into(),
+                    )]),
+                )]
                 .into(),
             ),
             false,

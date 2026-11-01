@@ -220,7 +220,7 @@ fn aggregate_caller_chain_retains_four_phases_full_types_and_actual_namespace_lo
             panic!("source Struct");
         };
         assert!(Arc::ptr_eq(&fields[0], &original[0]));
-        assert_eq!(fields[0].metadata().capacity(), 0);
+        assert!(fields[0].metadata().as_arc().is_none());
         assert!(fields[0].is_nullable());
         assert!(std::ptr::eq(
             out.definition_in(0, &mut |_| Ok(()), &mut work)

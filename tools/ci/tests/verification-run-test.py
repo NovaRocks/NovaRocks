@@ -56,6 +56,23 @@ def rust_batch(root,binary='p',name='regular',identity=None):
 
 
 class Run(unittest.TestCase):
+    def test_ecs_oss_requires_an_explicit_absolute_config_file_without_probing_cloud(self):
+        config=self.base/'oss.json'
+        config.write_text('not parsed by the availability observer')
+        probe=mock.Mock(side_effect=AssertionError('availability must not probe cloud services'))
+        for path in (None,'oss.json',str(self.base/'missing.json'),str(self.base)):
+            with self.subTest(path=path):
+                environment={} if path is None else {'NOVA_OSS_TEST_CONFIG':path}
+                result=run.requirement_checks(['fixture:aliyun-ecs-oss'],environment,self.native,probe)
+                self.assertFalse(result[0]['ok'])
+                self.assertEqual(result[0]['missing'],['NOVA_OSS_TEST_CONFIG'])
+        result=run.requirement_checks(['fixture:aliyun-ecs-oss'],
+            {'NOVA_OSS_TEST_CONFIG':str(config)},self.native,probe)
+        self.assertTrue(result[0]['ok'])
+        self.assertEqual(result[0]['missing'],[])
+        self.assertIn('native owner validates runtime facts',result[0]['basis'])
+        probe.assert_not_called()
+
     def test_cli_direct_module_and_shell_entrypoints_start_from_another_directory(self):
         ci=Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(prefix='verification-cli-') as directory:

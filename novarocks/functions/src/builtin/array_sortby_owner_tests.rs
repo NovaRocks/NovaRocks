@@ -951,8 +951,12 @@ fn canonical_sortby_constant_pool(rows: Vec<Vec<i64>>) -> (crate::ConstantPool, 
     let list = base.as_any().downcast_ref::<ListArray>().unwrap();
     let raw: ArrayRef = Arc::new(ListArray::new(
         Arc::new(
-            Field::new("provider-element", DataType::Int64, true)
-                .with_metadata([("provider.fact".into(), "preserved".into())].into()),
+            Field::new("provider-element", DataType::Int64, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "provider.fact".into(),
+                    "preserved".into(),
+                )]),
+            ),
         ),
         list.offsets().clone(),
         list.values().clone(),

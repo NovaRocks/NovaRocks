@@ -40,6 +40,9 @@ impl ViewCommandExecutor {
         current_database: &str,
         connector_context: &ConnectorRequestContext,
     ) -> Result<StatementResult, String> {
+        if matches!(statement, novarocks_parser::ast::ViewStatement::Show(_)) {
+            return Err("SHOW VIEWS requires its original governed read source".to_string());
+        }
         self.kernel
             .view_service()
             .execute_statement(

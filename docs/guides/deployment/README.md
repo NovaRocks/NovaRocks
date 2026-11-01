@@ -58,10 +58,10 @@ application role 或生产拓扑。
 
 ## standalone部署
 
-all-in-one 部署使用单个 NovaRocks 进程并发运行完整 native FE/BE role runner。它适合快速验证 external Iceberg/Paimon catalog、SQL 功能和本地测试环境；它不绕过 Native gRPC、StateStore、topology 或 listener 路径。
+all-in-one 部署使用单个 NovaRocks 进程并发运行完整 native FE/BE role runner。它适合快速验证 external Iceberg catalog、Paimon catalog 配置与投影、SQL 功能和本地测试环境；它不绕过 Native gRPC、StateStore、topology 或 listener 路径。
 
 阅读：[standalone部署](standalone.md)
 
 ## Connector provider
 
-当前二进制的封闭 provider 集合只有 Iceberg 与 Paimon。Iceberg 保留现有读写能力；Paimon 首期只读，支持 Filesystem Catalog 上的 append-only 与 `deduplicate` 主键表快照。StarRocks 已废弃，没有 active read capability；部署中出现旧 `[connector.starrocks]` 配置会在 Server 解析阶段明确失败，不会被静默忽略。Paimon 的详细范围与外部 snapshot 保留前提见 [Paimon 只读 Connector](../connectors/paimon.md)。
+当前二进制的封闭 provider manifest 保留 Iceberg 与 Paimon。Iceberg 保留现有读写能力；Paimon 保留注册、catalog 配置与投影，目录和读取操作返回 `Unsupported`，不进入 pure catalogue。恢复须等待 paimon-rust 及其依赖支持 Arrow 60 与 zstd 0.14，并重新满足 ADR-0138 的授权读取边界，见 [ADR-0204](../../adr/ADR-0204-upstream-iceberg-backports-and-provider-suspension.md) 与 [Paimon Connector（读取暂停）](../connectors/paimon.md)。StarRocks 已废弃，没有 active read capability；部署中出现旧 `[connector.starrocks]` 配置会在 Server 解析阶段明确失败，不会被静默忽略。

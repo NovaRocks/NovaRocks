@@ -20,13 +20,14 @@ mod common;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, Int32Array, StringArray};
+use arrow::array::{Array, Float32Array, Float64Array, Int32Array, StringArray};
 use bytes::BytesMut;
 use novarocks_fs::{
     CacheOptions, DataCacheManager, DataCachePageCacheOptions, FileErrorKind, FileFormat,
     FileProjection, FileRangeScope, FileRangeService, FileReadRange, MinMaxPredicateOp,
     MinMaxPredicateValue, PhysicalPageSelection, PreparedFileInput, ScanPredicate,
     ScanPredicateDomain, ScanPredicateSource, inspect_parquet_metadata, open_file_reader,
+    open_file_reader_async,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -769,22 +770,234 @@ fn parquet_read_only_cache_hits_prewarmed_ranges_without_populating_misses() {
     assert!(metrics.cache_misses > 0);
 }
 
+// The bound fixture supplies authorized input only. Unsupported format dispatch
+// must refuse before interpreting its bytes, in both entry points.
 #[test]
-fn orc_projects_physical_columns_and_honors_row_budget() {
-    let fixture = Fixture::orc();
-    let mut reader = open_file_reader(fixture.request(
-        FileFormat::Orc,
-        FileProjection::RootNames(vec!["name".to_string()]),
-        3,
+fn orc_physical_reads_are_refused_with_a_recovery_condition() {
+    let fixture = Fixture::parquet();
+    let request = fixture.request(FileFormat::Orc, FileProjection::All, 3, 1024 * 1024);
+    let error = match open_file_reader(request) {
+        Ok(_) => panic!("suspended ORC reads must be refused"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), FileErrorKind::Unsupported);
+    assert!(
+        error
+            .to_string()
+            .contains("ORC physical reads are suspended")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("orc-rust releases Arrow 60 and Zstd 0.14 support")
+    );
+    assert_eq!(
+        fixture.io.block_on_bytes_calls(),
+        0,
+        "dispatch must not read the input"
+    );
+}
+
+#[test]
+fn awaited_orc_physical_reads_are_refused_with_a_recovery_condition() {
+    let fixture = Fixture::parquet();
+    let request = fixture.request(FileFormat::Orc, FileProjection::All, 3, 1024 * 1024);
+    let error = match fixture
+        .io
+        .handle()
+        .block_on(open_file_reader_async(request, None))
+    {
+        Ok(_) => panic!("suspended ORC reads must be refused"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), FileErrorKind::Unsupported);
+    assert!(
+        error
+            .to_string()
+            .contains("ORC physical reads are suspended")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("orc-rust releases Arrow 60 and Zstd 0.14 support")
+    );
+    assert_eq!(
+        fixture.io.block_on_bytes_calls(),
+        0,
+        "dispatch must not read the input"
+    );
+}
+
+/// Statistics can prune candidates, but cannot remove a row satisfying the
+/// independent IEEE comparison below. Row IDs avoid comparing NaNs for equality.
+#[test]
+fn parquet_float_statistics_pruning_preserves_nan_and_signed_zero_results() {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("float-statistics.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("f32", DataType::Float32, false),
+        Field::new("f64", DataType::Float64, false),
+    ]));
+    // Each slice is flushed as a separate row group. The final finite group
+    // proves that the pruning path actually eliminates candidates.
+    let groups: &[&[f64]] = &[
+        &[f64::NAN, f64::NAN],
+        &[f64::NAN, -2.0, 3.0, f64::NAN],
+        &[-0.0, 0.0],
+        &[-9.0, -7.0],
+    ];
+    let original = groups
+        .iter()
+        .flat_map(|group| group.iter().copied())
+        .collect::<Vec<_>>();
+    let properties = WriterProperties::builder()
+        .set_data_page_row_count_limit(2)
+        .set_write_batch_size(2)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(&path).unwrap(),
+        schema.clone(),
+        Some(properties),
+    )
+    .unwrap();
+    let mut next_id = 0;
+    for group in groups {
+        let end = next_id + i32::try_from(group.len()).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(next_id..end)),
+                Arc::new(Float32Array::from_iter_values(
+                    group.iter().map(|value| *value as f32),
+                )),
+                Arc::new(Float64Array::from_iter_values(group.iter().copied())),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.flush().unwrap();
+        next_id = end;
+    }
+    writer.close().unwrap();
+    let fixture = Fixture::from_path(directory, path);
+    let mut baseline = open_file_reader(fixture.request(
+        FileFormat::Parquet,
+        FileProjection::All,
+        1024,
         1024 * 1024,
     ))
-    .expect("open ORC reader");
-    let batches = collect(reader.as_mut()).expect("read ORC");
-    assert!(batches.iter().all(|batch| batch.batch.num_rows() <= 3));
-    assert!(batches[0].batch.column(0).as_any().is::<StringArray>());
-    assert!(
-        batches
-            .iter()
-            .all(|batch| batch.physical_row_positions.is_none())
-    );
+    .unwrap();
+    let baseline = collect(baseline.as_mut()).unwrap();
+    let baseline_ids = baseline
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.values().to_vec()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(baseline_ids, (0..next_id).collect::<Vec<_>>());
+
+    for (column, ordinal) in [("f32", 1), ("f64", 2)] {
+        for op in [
+            MinMaxPredicateOp::Eq,
+            MinMaxPredicateOp::Ge,
+            MinMaxPredicateOp::Lt,
+        ] {
+            // This oracle does not consult Parquet statistics or the production
+            // pruning predicate. In particular, NaN compares false and -0 == +0.
+            let matches = |value: f64| match op {
+                MinMaxPredicateOp::Eq => value == 0.0,
+                MinMaxPredicateOp::Ge => value >= 0.0,
+                MinMaxPredicateOp::Lt => value < 0.0,
+                _ => unreachable!(),
+            };
+            let expected = original
+                .iter()
+                .enumerate()
+                .filter_map(|(id, value)| matches(*value).then_some(i32::try_from(id).unwrap()))
+                .collect::<Vec<_>>();
+            let selected_ids = |batches: &[novarocks_fs::FileBatch]| {
+                let mut selected = Vec::new();
+                for batch in batches {
+                    let ids = batch
+                        .batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    for row in 0..batch.batch.num_rows() {
+                        let value = if ordinal == 1 {
+                            f64::from(
+                                batch
+                                    .batch
+                                    .column(ordinal)
+                                    .as_any()
+                                    .downcast_ref::<Float32Array>()
+                                    .unwrap()
+                                    .value(row),
+                            )
+                        } else {
+                            batch
+                                .batch
+                                .column(ordinal)
+                                .as_any()
+                                .downcast_ref::<Float64Array>()
+                                .unwrap()
+                                .value(row)
+                        };
+                        if matches(value) {
+                            selected.push(ids.value(row));
+                        }
+                    }
+                }
+                selected
+            };
+            assert_eq!(
+                selected_ids(&baseline),
+                expected,
+                "unpruned oracle: {column} {op:?}"
+            );
+            for page_index in [false, true] {
+                let mut request =
+                    fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+                request.options.enable_parquet_reader_page_index = page_index;
+                request.predicates.push(ScanPredicate::new(
+                    column,
+                    ScanPredicateDomain::Range {
+                        op,
+                        value: if ordinal == 1 {
+                            MinMaxPredicateValue::Float(0.0)
+                        } else {
+                            MinMaxPredicateValue::Double(0.0)
+                        },
+                    },
+                    ScanPredicateSource::Static,
+                ));
+                let mut reader = open_file_reader(request).unwrap();
+                let pruned = collect(reader.as_mut()).unwrap();
+                assert_eq!(
+                    selected_ids(&pruned),
+                    expected,
+                    "pruning lost matching rows: {column} {op:?}, page_index={page_index}"
+                );
+                assert!(
+                    reader.metrics_snapshot().row_groups_pruned > 0,
+                    "fixture must exercise pruning: {column} {op:?}, page_index={page_index}"
+                );
+            }
+        }
+    }
 }

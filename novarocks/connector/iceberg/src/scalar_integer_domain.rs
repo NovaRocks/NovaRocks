@@ -803,8 +803,8 @@ mod tests {
         let base = crate::schema_mapping::sql_read_schema_from_iceberg(&storage).unwrap();
         let mut fields = base.fields().iter().cloned().collect::<Vec<_>>();
         let mut annotations = fields[0].metadata().clone();
-        annotations.insert("provider.annotation".into(), "retained".into());
-        annotations.insert("default.annotation".into(), "0102".into());
+        annotations.insert("provider.annotation".to_string(), "retained".to_string());
+        annotations.insert("default.annotation".to_string(), "0102".to_string());
         fields[0] = Arc::new(
             fields[0]
                 .as_ref()
@@ -834,7 +834,7 @@ mod tests {
             &declarations,
         )
         .unwrap();
-        annotations.insert(NR_LOGICAL_TYPE_KEY.into(), "hll".into());
+        annotations.insert(NR_LOGICAL_TYPE_KEY.to_string(), "hll".to_string());
         assert_eq!(projected.field(0).metadata(), &annotations);
         assert_eq!(projected.field(5).dict_id(), Some(93));
         assert_eq!(projected.field(5).dict_is_ordered(), Some(true));
@@ -883,7 +883,7 @@ mod tests {
         for (ordinal, label) in [(0, "bitmap"), (0, "unknown"), (3, "hll"), (5, "json")] {
             let mut fields = base.fields().iter().cloned().collect::<Vec<_>>();
             let mut metadata = fields[ordinal].metadata().clone();
-            metadata.insert(NR_LOGICAL_TYPE_KEY.into(), label.into());
+            metadata.insert(NR_LOGICAL_TYPE_KEY.to_string(), label.to_string());
             fields[ordinal] = Arc::new(fields[ordinal].as_ref().clone().with_metadata(metadata));
             let error = crate::schema_mapping::nominal_declaration::apply_to_arrow(
                 Arc::new(arrow::datatypes::Schema::new(fields)),

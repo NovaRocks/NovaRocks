@@ -520,7 +520,10 @@ fn parametric_exact_actual_control_prefixes_cover_success_failure_and_nested_met
                 .map(|i| {
                     Arc::new(
                         Field::new(format!("field_{i}"), DataType::Int64, i % 2 == 0)
-                            .with_metadata([("source".into(), format!("metadata_{i}"))].into()),
+                            .with_metadata(std::collections::HashMap::<String, String>::from([(
+                                "source".into(),
+                                format!("metadata_{i}"),
+                            )])),
                     )
                 })
                 .collect(),
@@ -686,7 +689,7 @@ impl AggregateSignatureResolver for FaultyChannels {
                 assert_eq!(fields.len(), 1);
                 let original = &fields[0];
                 let mut metadata = original.metadata().clone();
-                metadata.insert("source-label".into(), "forged".into());
+                metadata.insert("source-label".to_owned(), "forged".to_owned());
                 resolved.argument_types[0] = DataType::Struct(
                     vec![Arc::new(original.as_ref().clone().with_metadata(metadata))].into(),
                 );
@@ -715,8 +718,12 @@ fn parametric_returned_channels_cannot_be_hidden_by_the_supplied_overload_identi
             ReturnedChannelFault::NestedMetadata => [argument(
                 DataType::Struct(
                     vec![Arc::new(
-                        Field::new("original-field", DataType::Int64, true)
-                            .with_metadata([("source-label".into(), "original".into())].into()),
+                        Field::new("original-field", DataType::Int64, true).with_metadata(
+                            std::collections::HashMap::<String, String>::from([(
+                                "source-label".into(),
+                                "original".into(),
+                            )]),
+                        ),
                     )]
                     .into(),
                 ),

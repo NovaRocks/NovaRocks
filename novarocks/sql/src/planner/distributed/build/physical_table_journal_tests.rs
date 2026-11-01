@@ -181,7 +181,10 @@ fn original_list_value(ordinal: u32) -> crate::analysis::TypedExpr {
     use arrow::array::Array;
     let field = std::sync::Arc::new(
         arrow::datatypes::Field::new("original.element", arrow::datatypes::DataType::Int64, true)
-            .with_metadata([("source.child".into(), "kept".into())].into()),
+            .with_metadata(std::collections::HashMap::<String, String>::from([(
+                "source.child".into(),
+                "kept".into(),
+            )])),
     );
     let array = arrow::array::ListArray::new(
         field,

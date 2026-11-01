@@ -654,7 +654,7 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
                 .types()
                 .validate_source_field_root_observed(root, work)?;
         }
-        if source.schema().metadata().capacity() != 0 {
+        if source.schema().metadata().as_arc().is_some() {
             return Err(invalid("public source shape Schema retains annotation backing").into());
         }
         // The scope is created only after the original shape/role gates.

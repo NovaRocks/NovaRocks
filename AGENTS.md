@@ -46,9 +46,10 @@ Its production runtime is the native NovaRocks FE/BE role model:
     boundary and is not an application role or separate production topology.
 
 - **Sealed external Connector providers**
-  - The active Server provider manifest contains exactly Iceberg and Paimon.
-  - Paimon is read-only for append-only and `deduplicate` primary-key snapshot
-    reads. Iceberg retains its existing read/write capabilities.
+  - Server sealed manifest 保留 Iceberg 与 Paimon 注册；Iceberg 保持既有读写能力。
+  - Paimon 读取已暂停：catalog 配置与投影保留，目录和读取操作明确返回 Unsupported，
+    不进入 pure catalogue。恢复须待 paimon-rust 及其依赖支持 Arrow 60 与 zstd 0.14，
+    并重新满足 ADR-0138 的授权读取边界；见 ADR-0204。
   - StarRocks is retired: its source remains for reference, but it has no active
     read capability and `[connector.starrocks]` is rejected at configuration
     parsing.
@@ -204,6 +205,10 @@ SQL client
   编排 prepare、计算、publication 和必要 finalize。共享阶段/计算在 `query/statement_computation.rs`，
   共享 publication 在 `query/statement_publication.rs`。计算就绪、必要业务就绪与真实退出分别取证；
   成功和失败路径保留累计外部效果，seal/NoOp 不冒充最终 CREATE 或真实提交。
+  命令完成经 Query Application 的 `StatementCommandCompletion` / `GovernedCompletionStatementResult`
+  保留原业务选定的 affected rows，再由 MySQL `terminal.rs` 标准编码。普通/MOR 取同 Session
+  完整冻结的 Root 计数，COW 取原 selection，CTAS 等最终 CREATE；控制与签名 NoOp 显式为零。
+  缺计数或失败不能转成 OK(0)，完成数据不替代原 visibility、取消、真实 flush 与退出。
 
 - `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`
   Stats 的前台 capture 与后台 governed Action：capture 的 CPU/Provider 实际关闭后，原 query permit
@@ -321,7 +326,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `novarocks/execution/src/runtime/function_set.rs`
   只封存真实 EngineFunctionCatalog metadata；不持有旧实现 map、legacy registry 或 implementation manifest。
-  `novarocks/version/src/lib.rs` 的 compatibility domain/生产 epoch 为 7；旧执行实现摘要不再参与，
+  `novarocks/version/src/lib.rs` 的 material encoding domain 为 v8，生产 epoch 为 12、test-only 为 13；旧执行实现摘要不再参与，
   函数目录、pure 目录、descriptor、plan contract 与 Provider/carrier 事实仍保持 exact-island 判定。
 
 - `novarocks/execution/src/exec/operators/**`
@@ -338,8 +343,18 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `binding.rs` 定义 `ExchangeBindings`、`ScanBindings`，writer bindings 在 `runtime/fragment`。
 
 - `novarocks/execution/src/exec/pipeline/executor.rs`
-  `prepare_compiled_program_pipeline_execution_with_profiler` 准备 compiled pipeline；
-  program 与 Task 能力分别传入，不能重建已删除的 construction plan bridge。
+  生产入口 `prepare_compiled_program_with_sink_materializer` 先建立计算图，再按实际 root DOP
+  绑定 sink。change-stream 的独立 summary pipeline 加入同一 DriverBatch/FragmentCompletion，
+  不等待 Task terminal，也不从请求 profile 猜贡献者数量。program 与 Task 能力分别传入，
+  不能重建已删除的 construction plan bridge。
+
+- `novarocks/execution/src/runtime/fragment/sink.rs`、`exec/pipeline/builder/compiled_writer.rs`
+  Router 按原 static branch 绑定 provider route 与独立 summary，表达式 root 保留原 branch 身份。
+  writer 以相同 canonical typed key 分别消费 InstanceV1 与 DriverV1 hash 域；条件断言仅对
+  WhenTrue 行判重，FALSE/NULL 绕过 key。逻辑 finish 以 Source 公平消费有界 writer-results
+  合流和准确 source-bound summary，不再为 summary 构建竞争同一 receiver 的第二个 Source。
+  核心契约见 [ADR-0208](docs/adr/ADR-0208-logical-write-counts-and-strict-stream-delivery.md)，
+  冻结放置、Task 绑定与完成装配见 [ADR-0206](docs/adr/ADR-0206-frozen-write-placement-and-task-completion-assembly.md)。
 
 - `novarocks/execution/src/exec/pipeline/driver.rs`
   Driver execution logic.
@@ -361,21 +376,31 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 ### 4.6 Exchange and Runtime
 
-- `novarocks/execution/src/runtime/exchange.rs`
-  Exchange receiver registry, chunk encode/decode, sender completion tracking.
+- `novarocks/execution/src/runtime/{exchange.rs,exchange/unit_ingress.rs,exchange_slots.rs}`
+  接收 registry、原队列与结构 slot owner。唯一解码资格、提交、真实移交和退休由同一实例串行化；
+  roster 与原 Task failure owner 在 Installed 前冻结，slot 只数单元，不是内存容量。
 
 - `novarocks/execution/src/runtime/fragment/io/**`
-  Fragment I/O edges: `exchange_edge.rs` (the Installed/normal-close gated open
-  barrier), `exchange_queue.rs` (outbound queue and backpressure),
-  `exchange_receiver.rs` (application-hosted ingress for one receiver),
-  `result.rs`, `commit.rs`.
+  `exchange_edge.rs` 拥有 Installed/正常撤回门；`exchange_sender_group.rs` 将同一 factory 的
+  drivers 接到逐流 `exchange_stream_sender.rs`，留存与实际 RPC 活动分开。driver 单 payload
+  和待授予位置决定输入背压；进程活动额度只在授予后取得。`exchange_retained_payload.rs`
+  让原 Vec 的 accounting 随所有 Bytes 别名到最后实际退出。
+  `exchange_receiver.rs` 是应用接收 port；另有 `result.rs`、`commit.rs`。旧发送队列已删除。
 
 - `novarocks/execution/src/exec/operators/exchange_source.rs`
-  Source operator for an exchange node: reconstructs chunks and tracks sender
-  completion.
+  Source operator for an exchange node: consumes receiver-decoded chunks,
+  records actual Unit/End handoff, and observes sender completion without an
+  input idle deadline.
 
 - `novarocks/native-adapter/src/{exchange_data_plane.rs,exchange_transmitter.rs,fragment_exchange_receiver.rs}`
-  Native exchange wire projection, route settlement and transmission.
+  Native 三方法的线路投影与传输，准确路由始终由 Worker `with_claimed_stream` 作者准入。
+
+- `novarocks/native-adapter/src/backend_metrics.rs`
+  从角色实际使用的同一个 `ExecutionRuntime` 读取原 slot ledger 与发送 scheduler；
+  `exchange_flow_snapshot_available=0` 表示 Busy/Unavailable，不把旧值归零。
+  退休实例仍有真实 decode lease 时保留可见；观察用 Weak 不取得路由或容量权。
+  接收与发送分别采样，不可相加为原子退出或内存上界。授予、有序重放、End 不占 slot、
+  严格消费与共享等待图边界见 [ADR-0209](docs/adr/ADR-0209-receiver-authorized-exchange-units-and-shared-wait-graph.md)。
 
 - `novarocks/worker/src/result_buffer.rs`
   BE-local result buffering, retained budget and fetch behavior.
@@ -446,10 +471,12 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   - `novarocks/connector/iceberg/src/commit/staging/**`：updates 前缀事实、ID 规范化、requirements 折算及 manifest-list 的实际 row-ID 分配。
   - `novarocks/connector/iceberg/src/commit/attempt.rs`：加载、验证、准备、冻结、单次派发和确定冲突的重试。
   - `novarocks/connector/iceberg/src/commit/operation.rs`：操作内 I/O 并发、先登记后写入、实际退出监督和有界 owned-object 清理。
+  - `novarocks/connector/iceberg/src/commit/write_stack/execution/cleanup.rs`：原 unsealed writer actor 持有准确 staged journal，首次清理启用现有 Provider 独立时间预算，保留原 scope、凭据与 I/O 能力；只在实际 DELETE 成功后移除原路径。Work 停止不取消已存在的清理义务，sealed 产物与 Unknown 仍保留原所有权及真实退出要求。
 
 - `novarocks/connector/paimon/**`
-  Read-only Paimon Filesystem Catalog, private wire codec, snapshot planning,
-  and append-only / `deduplicate` primary-key table reads.
+  Paimon Provider 已暂停；保留配置、合约与私有 wire codec，catalog materialize 成功，
+  目录与读取入口返回带恢复条件的 Unsupported，BE bind 明确拒绝。恢复须待 paimon-rust
+  及其依赖支持 Arrow 60 与 zstd 0.14，再按 ADR-0138 恢复授权读取；见 ADR-0204。
 
 - `novarocks/fs/**`
   Connector-neutral authorized object-store access. Its process-local
@@ -467,9 +494,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    entrypoint.
 2. The frontend owns session admission, catalog resolution, planning, and
    supervised statement orchestration and common logical execution assembly.
-3. Persistent tables belong to external providers. Iceberg owns its catalog and
-   mutation truth; Paimon owns its external snapshots and exposes only its
-   supported read capability.
+3. 持久表属于外部 Provider。Iceberg 拥有 catalog 与 mutation 真相；Paimon 保留注册
+   与 catalog 投影，读取已暂停。恢复须待上游闭包支持 Arrow 60 与 zstd 0.14，
+   并重新满足授权读取边界，见 ADR-0204。
 4. Frontend 将完成的物理计划冻结成 compiled packages，连同准确的 Connector facts
    经 native gRPC 提交到一个或多个 `role=be` 进程。
 5. BE hosts bind installed Connector execution instances and run Arrow batches
@@ -477,21 +504,23 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 ### 5.2 Exchange Path
 
-1. Sender-side operators encode chunks into
-   `novarocks/execution/src/runtime/fragment/io/exchange_queue.rs`, which owns the
-   outbound queue and backpressure, and transmit through
-   `novarocks/native-adapter/src/exchange_transmitter.rs`.
+1. driver 编码一次并保留单 payload；同一 factory 的逐流 owner 通过 M07 内核发布 Unit/End。
+   满待授予位置返回背压，不消耗新序号、不重新编码。授予后才公平取得实际请求的共享额度；
+   请求未知则保原项重放，custody 与实际 RPC/Bytes 退出分别观察。
 2. An exchange edge starts Closed and opens only after every frozen destination
    has an Installed fact or has normally withdrawn its exact input demand
    (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no frame
    can precede the receiver that counts it.
-3. Receiver side (`novarocks/native-adapter/src/exchange_data_plane.rs`) projects
-   the wire payload and pushes into
-   `novarocks/execution/src/runtime/fragment/io/exchange_receiver.rs` and the
-   registry in `novarocks/execution/src/runtime/exchange.rs`.
+3. Native 的活动 Exchange 数据路径仅有 `DeliverExchangeUnit`、`RegisterExchangeDemand`、`SubscribeExchangeGrants`。
+   旧双向 `Exchange` 保留 Retired 空入口并直接返回 `unimplemented`；`ExchangeUnary` 已删除，旧消息字段永久 reserved。
+   adapter 经 Worker 准确 claim 后接原接收 port：先拿唯一资格再运行原 decoder，重复只读累计事实；
+   解码失败即使原 RPC 应答未知也交原 Task owner。退休不提前回收仍在解码的 slot。
 4. The exchange source operator
-   (`novarocks/execution/src/exec/operators/exchange_source.rs`) blocks until all
-   senders reach EOS.
+   (`novarocks/execution/src/exec/operators/exchange_source.rs`) waits for every
+   sender and authors Consumed only after the actual input consumes its final
+   EOS; early withdrawal remains Withdrawn. MustDrain inputs cannot use ordinary
+   demand withdrawal to authorize success or normal retirement. Pre-success
+   validation, settled conclusion and the retirement re-read remain distinct.
 5. On cancellation, `exchange::cancel_fragment` / `cancel_exchange_key` clear
    exchange keys and wake blocked waiters.
 
@@ -506,6 +535,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    per participating backend. A context exists only where the scheduler placed
    a task, so the number of participants is a property of the plan and the
    splits, never of the cluster size.
+   `coordination/schedule.rs` 消费显式 Singleton/ScanWork/Spread/FollowSources policy，
+   独立决定 source、各 writer route 和 finish 的实例集合；driver DOP 使用同一 query options
+   冻结的域。manifest 从同一准确 placement 分别冻结 writer 与 summary-source Task 集合。
 2. Query Application 的统一逻辑执行 owner 管理各分布式意图的恢复、结果与计算就绪；
    Frontend Action 编排 prepare、领域 publication 和必要 finalize，Task 驱动只提供协议事实。
    稳定 Source 在启动前接收原输入、同 Root 责任与访问能力，跨取消和 panic 保管原件；
@@ -529,6 +561,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    BE 的 typed 能力拒绝沿 `TaskFailureCategory::Unsupported` 与
    `AttemptFailureClass::Unsupported` 传至 `[UnsupportedCompiledShape]`，不重试或重新规划。
    SQL 分析期缺 pure 实现保留 `[sql.analyze.unavailable_implementation]`。
+   写完成要求完整 Root End、准确结果覆盖及各领域冻结 Task 的完成事实，并保留取消/deadline 否决。
+   root seal 后原 Task 驱动继续推进严格尾部；所有 MustDrain 端点终态后才进入原 normal drain，
+   不把 root seal 当成 source/writer 已完成，也不为普通读新增全参与者成功屏障。
 3. Push exchange edges start Closed and open once every frozen destination has
    an Installed fact or has normally withdrawn its exact input demand
    (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no
@@ -616,7 +651,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   boundary; NWT-4 protocol slimming remains separate follow-up work.
 
 - `[runtime]`
-  `exchange_wait_ms`, `exchange_io_threads`, `exchange_io_max_inflight_bytes`,
+  `exchange_instance_floor_slots`, `exchange_instance_max_slots`,
+  `exchange_floating_slots`, `exchange_stream_window`,
+  `exchange_transport_timeout_ms`, `exchange_io_max_inflight_bytes`,
   `pipeline_exec_thread_pool_thread_num`, `scan_io_*`, `scan_range_*`, `prefetch_*`, `cache.*`
 
 - `[iceberg]`
@@ -629,8 +666,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   Trino 是客户端协议入口，SQL 仍使用当前方言；客户端 TLS、非本机访问与非空认证不在此入口范围。
 
 - `[connector.object_store]`
-  Process-local object-store credentials for Iceberg and Paimon connector
-  execution; this does not define a native internal table store.
+  Iceberg Connector 执行使用的进程本地对象存储凭据，不定义 native 内部表存储。
+  Paimon 已暂停，不组合其 SDK 存储资源；恢复前须满足 Arrow 60、zstd 0.14
+  与 ADR-0138 的授权读取边界。
 
 - `[debug]`
   `exec_node_output`, `exec_batch_plan_json`
@@ -1023,6 +1061,11 @@ suspected case against a clean server before attributing it to the change.
 - **SQL / parser / planner changes**: start with `novarocks/parser/src/**`,
   `novarocks/sql/src/{analysis,analyzer,semantic}/**`,
   `novarocks/sql/src/optimizer/**` and `novarocks/sql/src/planner/**`.
+  完成物理计划的 C/B 等待图、输入消费分类与 SCC 的单一作者是
+  `novarocks/physical-plan/src/wait_graph.rs`；SQL 原 `distributed/build/wait_graph.rs`
+  保留 facade，`contract_lowering.rs` 在冻结前解除可选 RF 等待或准确拒绝必需数据环。
+  FrozenPlan 验证使用同一作者重新核对实际 activation，不静默解除等待；观察式入口的图阶段
+  沿原调用者 checkpoint，不能回落到 plain 验证或宣称其他 legacy 验证遍历也已受控。
 - **Package decode / compiled preparation**：从 `novarocks/plan-codec/src/physical_package_v2/**`、
   `novarocks/native-adapter/src/backend_task_execution/{compiled_package.rs,execution_host.rs}`
   与 `novarocks/local-compiler/src/**` 开始；Task 能力投影见 `compiled_scan_binding.rs`、
@@ -1087,8 +1130,9 @@ suspected case against a clean server before attributing it to the change.
   gated edge-open barrier and the per-domain Apply / Idempotent / Older /
   Conflict verdict; do not add a protocol shim, a standalone direct-call path,
   or a no-runtime-filter retry inside an attempt. See ADR-0161.
-- **Connector behavior**: inspect `novarocks/connector/**` and
-  `novarocks/fs/**`. The active sealed providers are Iceberg and Paimon;
+- **Connector behavior**：读取 `novarocks/connector/**` 与 `novarocks/fs/**`。
+  sealed manifest 注册 Iceberg 与 Paimon，Paimon 能力已暂停；
+  恢复须待上游支持 Arrow 60 与 zstd 0.14，并满足 ADR-0138，见 ADR-0204。
   StarRocks is retired and must not be restored through a local-binding config
   or runtime fallback.
 - **Connector scan execution**: inspect

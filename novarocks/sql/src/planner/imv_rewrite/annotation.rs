@@ -27,10 +27,21 @@ use crate::compiler::mv_rewrite::SqlImvPartitionDerivationSpec;
 use crate::compiler::mv_rewrite::SqlImvRewriteSnapshot;
 use crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
 
+/// Closed write intent selected by the original incremental MV helper.
+/// This is a data-read requirement, not target metadata/OCC authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum TargetReadRequirement {
+    #[default]
+    ExistingRows,
+    /// Every emitted event is an Insert; old target locators are typed NULL.
+    NewOutputRowsOnly,
+}
+
 /// IMV-pipeline-level plan annotations, populated by rewrite rules and
 /// returned to the refresh driver via `ImvRewriteOutcome.annotation`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ImvPlanAnnotation {
+    pub target_read: TargetReadRequirement,
     /// Partition derivation outcome. `None` means the derivation stage did
     /// not run or did not match (non-aggregate shapes in P1, or the rule was
     /// disabled via `disable_optimizer_rules`).

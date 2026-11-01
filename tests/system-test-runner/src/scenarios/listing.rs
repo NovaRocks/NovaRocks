@@ -417,7 +417,16 @@ impl Scenario for CatalogListingCancellation {
         true
     }
     fn launch_config(&self, root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        CatalogListing.launch_config(root)
+        let mut config = CatalogListing.launch_config(root)?;
+        // One synchronous SQL worker serializes SHOW VIEWS before the eight
+        // actors can reach the catalog generation's listing admission.
+        config
+            .config_overlay
+            .fe
+            .as_mut()
+            .context("listing cancellation requires the FE fixture overlay")?
+            .push_str("\n[runtime]\nquery_blocking_worker_threads = 8\n");
+        Ok(config)
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
@@ -445,7 +454,8 @@ impl Scenario for CatalogListingCancellation {
                 matches!(&error, mysql::Error::MySqlError(error)
                     if error.code == 1317
                         && error.state == "70100"
-                        && error.message == "[query.execution.deadline_exceeded] query timed out after 1000 ms"),
+                        && error.message
+                            == "[query.execution.deadline_exceeded] query timed out after 1000 ms"),
                 "listing failed outside its absolute deadline: {error}"
             );
             control.query_drop("SET query_timeout=0")?;
@@ -492,40 +502,211 @@ impl Scenario for CatalogListingCancellation {
             audit.active_listing_requests == 0
         })?;
         fixture.set_mode(ListingMode::Delayed)?;
+        let reuse_diagnostics_path = context
+            .scenario_root()
+            .join("listing-eight-position-reuse-diagnostics.json");
         measure(context, "listing-eight-position-reuse", || {
+            #[derive(Serialize)]
+            struct ActorObservation {
+                actor_id: usize,
+                stage: &'static str,
+                connection_id: Option<u32>,
+                elapsed_millis: u128,
+                stages: Vec<(&'static str, u128)>,
+                outcome: Option<&'static str>,
+                join_outcome: Option<&'static str>,
+                joined_elapsed_millis: Option<u128>,
+                error: Option<String>,
+                observation_lock_poisoned: bool,
+            }
+            fn observe(
+                slot: &std::sync::Mutex<ActorObservation>,
+                started: std::time::Instant,
+                stage: &'static str,
+                connection_id: Option<u32>,
+            ) {
+                let mut actor = slot.lock().unwrap_or_else(|poisoned| {
+                    let mut actor = poisoned.into_inner();
+                    actor.observation_lock_poisoned = true;
+                    actor
+                });
+                actor.stage = stage;
+                actor.elapsed_millis = started.elapsed().as_millis();
+                let elapsed_millis = actor.elapsed_millis;
+                actor.stages.push((stage, elapsed_millis));
+                if connection_id.is_some() {
+                    actor.connection_id = connection_id;
+                }
+            }
+            let started = std::time::Instant::now();
             let barrier = Arc::new(Barrier::new(8));
-            std::thread::scope(|scope| -> Result<()> {
+            let actors = (0..8)
+                .map(|actor_id| {
+                    std::sync::Mutex::new(ActorObservation {
+                        actor_id,
+                        stage: "created",
+                        connection_id: None,
+                        elapsed_millis: 0,
+                        stages: Vec::new(),
+                        outcome: None,
+                        join_outcome: None,
+                        joined_elapsed_millis: None,
+                        error: None,
+                        observation_lock_poisoned: false,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let first_failure = std::sync::OnceLock::new();
+            let record_first_failure = |actor_id, trigger| {
+                first_failure.get_or_init(|| {
+                    let provider = fixture.snapshot();
+                    if let Err(error) = &provider {
+                        eprintln!("listing reuse first-error fixture snapshot failed: {error:#}");
+                    }
+                    json!({
+                        "actor_id": actor_id,
+                        "trigger": trigger,
+                        "elapsed_millis": started.elapsed().as_millis(),
+                        "observation": "instantaneous; other actors may still be active",
+                        "provider": provider.as_ref().ok(),
+                        "snapshot_error": provider.as_ref().err().map(|error| format!("{error:#}")),
+                    })
+                });
+            };
+            let outcomes = std::thread::scope(|scope| {
                 let targets = (0..8)
-                    .map(|_| {
+                    .map(|actor_id| {
                         let barrier = barrier.clone();
                         let user = &user;
+                        let actor = &actors[actor_id];
+                        let record_first_failure = &record_first_failure;
                         scope.spawn(move || -> Result<()> {
-                            barrier.wait();
-                            let mut client = mysql_actor::connect(user, port, timeout)?;
-                            client.query_drop("USE cl_cancel.cl_ns_0000")?;
-                            let views = client.query::<String, _>("SHOW VIEWS")?;
-                            ensure!(
-                                views.len() == MEMBERS,
-                                "reused listing position produced incomplete output"
-                            );
-                            Ok(())
+                            let outcome = (|| -> Result<()> {
+                                observe(actor, started, "barrier_wait", None);
+                                barrier.wait();
+                                observe(actor, started, "connect", None);
+                                let mut client = mysql_actor::connect(user, port, timeout)
+                                    .with_context(|| {
+                                        format!("listing reuse actor {actor_id} connect")
+                                    })
+                                    .inspect_err(|_| {
+                                        record_first_failure(actor_id, "actor_error")
+                                    })?;
+                                observe(actor, started, "connected", Some(client.connection_id()));
+                                observe(actor, started, "use", None);
+                                client
+                                    .query_drop("USE cl_cancel.cl_ns_0000")
+                                    .with_context(|| format!("listing reuse actor {actor_id} use"))
+                                    .inspect_err(|_| {
+                                        record_first_failure(actor_id, "actor_error")
+                                    })?;
+                                observe(actor, started, "use_done", None);
+                                observe(actor, started, "show_views", None);
+                                let views = client
+                                    .query::<String, _>("SHOW VIEWS")
+                                    .with_context(|| {
+                                        format!("listing reuse actor {actor_id} show_views")
+                                    })
+                                    .inspect_err(|_| {
+                                        record_first_failure(actor_id, "actor_error")
+                                    })?;
+                                observe(actor, started, "show_views_done", None);
+                                if views.len() != MEMBERS {
+                                    record_first_failure(actor_id, "actor_error");
+                                }
+                                ensure!(
+                                    views.len() == MEMBERS,
+                                    "reused listing position produced incomplete output"
+                                );
+                                observe(actor, started, "rows_verified", None);
+                                Ok(())
+                            })();
+                            if outcome.is_err() {
+                                record_first_failure(actor_id, "actor_error");
+                            }
+                            outcome
                         })
                     })
                     .collect::<Vec<_>>();
-                for target in targets {
-                    target
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("listing reuse actor panicked"))??;
-                }
+                targets
+                    .into_iter()
+                    .enumerate()
+                    .map(|(actor_id, target)| {
+                        let (join_outcome, outcome) = match target.join() {
+                            Ok(result) => ("returned", result),
+                            Err(_) => {
+                                record_first_failure(actor_id, "join_panic");
+                                (
+                                    "panicked",
+                                    Err(anyhow::anyhow!("listing reuse actor panicked")),
+                                )
+                            }
+                        };
+                        let mut actor = actors[actor_id].lock().unwrap_or_else(|poisoned| {
+                            let mut actor = poisoned.into_inner();
+                            actor.observation_lock_poisoned = true;
+                            actor
+                        });
+                        actor.join_outcome = Some(join_outcome);
+                        actor.joined_elapsed_millis = Some(started.elapsed().as_millis());
+                        actor.outcome = Some(if outcome.is_ok() { "passed" } else { "failed" });
+                        actor.error = outcome.as_ref().err().map(|error| format!("{error:#}"));
+                        (actor_id, outcome)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let post_join = fixture.snapshot();
+            if let Err(error) = &post_join {
+                eprintln!("listing reuse post-join fixture snapshot failed: {error:#}");
+            }
+            let observations = actors
+                .iter()
+                .map(|actor| {
+                    let actor = actor.lock().unwrap_or_else(|poisoned| {
+                        let mut actor = poisoned.into_inner();
+                        actor.observation_lock_poisoned = true;
+                        actor
+                    });
+                    json!(&*actor)
+                })
+                .collect::<Vec<_>>();
+            let diagnostics = json!({
+                "phase": "listing-eight-position-reuse",
+                "elapsed_millis": started.elapsed().as_millis(),
+                "actors": observations,
+                "first_failure_observation": first_failure.get(),
+                "post_join_observation": {
+                    "observation": "all eight actor threads actually joined; provider work may still be active",
+                    "provider": post_join.as_ref().ok(),
+                    "snapshot_error": post_join.as_ref().err().map(|error| format!("{error:#}")),
+                },
+                "primary_error_order": "first error in original actor join order; all errors retained above",
+                "primary_actor_id": outcomes.iter().find(|(_, result)| result.is_err()).map(|(actor_id, _)| actor_id),
+            });
+            let primary = outcomes.into_iter().find_map(|(_, result)| result.err());
+            let written = (|| -> Result<()> {
+                let bytes = serde_json::to_vec_pretty(&diagnostics)?;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&reuse_diagnostics_path)?;
+                std::io::Write::write_all(&mut file, &bytes)?;
                 Ok(())
-            })?;
-            let audit = fixture.snapshot()?;
+            })();
+            if let Err(error) = &written {
+                eprintln!("listing reuse diagnostic artifact write failed: {error:#}");
+            }
+            if let Some(error) = primary {
+                return Err(error);
+            }
+            let audit = post_join?;
             ensure!(
                 audit.peak_listing_requests == 8
                     && audit.view_pages == 16
                     && audit.active_listing_requests == 0,
                 "all eight listing positions were not reused: {audit:?}"
             );
+            written.context("persist listing reuse diagnostic artifact")?;
             Ok(json!({"clients":8,"provider":audit}))
         })?;
         await_resource_convergence(context, &baseline, "listing cancellation")?;

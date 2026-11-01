@@ -1677,11 +1677,10 @@ mod tests {
                 DataType::Struct(
                     vec![
                         Field::new("payload", DataType::Utf8, false).with_metadata(
-                            [
+                            std::collections::HashMap::<String, String>::from([
                                 ("nr_logical_type".into(), "json".into()),
                                 ("provider.field-id".into(), "71".into()),
-                            ]
-                            .into(),
+                            ]),
                         ),
                         Field::new_dict(
                             "dictionary",

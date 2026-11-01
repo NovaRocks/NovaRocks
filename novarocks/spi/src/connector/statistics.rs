@@ -1754,14 +1754,13 @@ mod tests {
         let source = DataType::Struct(
             vec![
                 Field::new("payload", DataType::Utf8, false).with_metadata(
-                    [
+                    std::collections::HashMap::<String, String>::from([
                         (
                             NR_LOGICAL_TYPE_KEY.into(),
                             "unknown-source-attribute".into(),
                         ),
                         ("provider.field-id".into(), "71".into()),
-                    ]
-                    .into(),
+                    ]),
                 ),
                 Field::new_dict(
                     "codes",
@@ -1860,8 +1859,13 @@ mod tests {
         );
 
         let source = DataType::List(Arc::new(
-            Field::new("child", DataType::Int64, true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "json".into())].into()),
+            Field::new("child", DataType::Int64, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                NR_LOGICAL_TYPE_KEY.into(),
+                "json".into(),
+            )])),
         ));
         let physical = FunctionValueType::new(source, true);
         let column = StatisticsScanColumn::try_new(0, "nested", physical).unwrap();

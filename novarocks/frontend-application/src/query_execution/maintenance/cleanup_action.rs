@@ -406,7 +406,9 @@ impl State {
             }
         })?;
         if !self.spark_call {
-            return Poll::Ready(Ok(StatementActionValue::Ok));
+            return Poll::Ready(Ok(StatementActionValue::Ok(
+                novarocks_query_application::session_control::StatementCommandCompletion::new(0),
+            )));
         }
         let producer = self
             .local

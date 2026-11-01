@@ -39,6 +39,20 @@ impl ConnectorProcessLocalPayload {
         }
     }
 
+    /// Observe the actual erased wrapper allocation through the caller's
+    /// existing schema creator. The supplied Arc keeps its original lifetime;
+    /// this constructor creates no grant or independent resource authority.
+    pub fn try_new_with_creation<T: Send + Sync + 'static>(
+        owner: ConnectorProviderBindingKey,
+        value: Arc<T>,
+        creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<Self, novarocks_connector_contract::PureProviderCompileError<ConnectorError>> {
+        Ok(Self {
+            owner,
+            value: creation.arc(value)?,
+        })
+    }
+
     /// Validate the complete provider generation before opening the content.
     /// Providers use their retained binding key here: `value` checks the
     /// instance and private type, but cannot establish the incarnation fence.
@@ -128,6 +142,50 @@ mod tests {
         drop(payload);
         assert!(weak.upgrade().is_some());
         drop(clone);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn observed_process_local_creation_retains_original_and_preserves_refusal() {
+        use novarocks_connector_contract::PureProviderCompileError;
+        use novarocks_type_contract::{CompileControlError, ValueTypeStorageLifetime};
+        let original = Arc::new(String::from("original private source"));
+        let weak = Arc::downgrade(&original);
+        let mut refuse = |_| Err(CompileControlError::ResourceExhausted);
+        let mut work = |_| Ok(());
+        let mut creation = super::super::read_stack::ConnectorReadSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut refuse,
+            &mut work,
+        );
+        let error = ConnectorProcessLocalPayload::try_new_with_creation(
+            owner(),
+            original.clone(),
+            &mut creation,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PureProviderCompileError::Control(CompileControlError::ResourceExhausted)
+        ));
+        assert_eq!(Arc::strong_count(&original), 1);
+        let mut accept = |_| Ok(());
+        let mut creation = super::super::read_stack::ConnectorReadSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut accept,
+            &mut work,
+        );
+        let payload =
+            ConnectorProcessLocalPayload::try_new_with_creation(owner(), original, &mut creation)
+                .unwrap();
+        assert_eq!(
+            payload.value::<String>("catalog").unwrap().as_str(),
+            "original private source"
+        );
+        let alias = payload.clone();
+        drop(payload);
+        assert!(weak.upgrade().is_some());
+        drop(alias);
         assert!(weak.upgrade().is_none());
     }
 

@@ -213,7 +213,7 @@ mod tests {
             let value_type = sink.contract.input_columns[ordinal]
                 .declared_value_type()
                 .expect("complete declared value type");
-            assert_eq!(field.metadata().capacity(), 0);
+            assert!(field.metadata().as_arc().is_none());
             assert_eq!(value_type.logical_type(), expected, "{}", field.name());
             assert_eq!(
                 field.data_type(),

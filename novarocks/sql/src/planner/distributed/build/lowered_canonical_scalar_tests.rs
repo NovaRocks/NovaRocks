@@ -302,7 +302,10 @@ fn canonical_scalar_cv_null_and_real_sql_keep_original_source_distinct_from_sele
     let field = Arc::new(
         ty.try_to_field("original_selected_utf8")
             .unwrap()
-            .with_metadata([("provider.source".into(), "original-full-field".into())].into()),
+            .with_metadata(std::collections::HashMap::<String, String>::from([(
+                "provider.source".into(),
+                "original-full-field".into(),
+            )])),
     );
     let pool = ConstantPool::try_new(
         field.clone(),

@@ -545,6 +545,7 @@ impl FrontendProviderReadFacts {
 /// thing a name and a version would select is a different read.
 enum AdmittedRead {
     Relation(crate::catalog_application::query_bindings::QueryScanMaterialization),
+    PreparedSource(Arc<crate::catalog_application::query_bindings::QueryPreparedSourceRead>),
     MvTarget {
         materialization: crate::catalog_application::query_bindings::QueryScanMaterialization,
         object_id: novarocks_spi::connector::ConnectorTableObjectId,
@@ -562,6 +563,7 @@ impl AdmittedRead {
                 materialization, ..
             } => &materialization.planning_lease,
             Self::Cohort(cohort) => cohort.planning_lease(),
+            Self::PreparedSource(source) => &source.planning,
         }
     }
 
@@ -579,6 +581,7 @@ impl AdmittedRead {
         use crate::catalog_application::query_bindings::QueryFrozenCohortRead;
 
         let (namespace, table) = match self {
+            Self::PreparedSource(source) => return Ok(source.receipt.request().name().clone()),
             Self::Relation(_) | Self::MvTarget { .. } => {
                 let identity = relation_identity(relation);
                 (
@@ -655,20 +658,43 @@ fn prepare_read_opening(
         }
     } else {
         let input = frozen_input(relation)?;
-        match input {
-            QueryFrozenReadInput::Current | QueryFrozenReadInput::Snapshot(_) => {
-                AdmittedRead::Relation(bindings.frozen_read_input(need.binding(), input).map_err(
-                    |error| {
-                        ProviderReadError::from(error).context(format!("provider read of {name}"))
-                    },
-                )?)
+        let binding = bindings.binding(need.binding())?;
+        let prepared = match relation {
+            ProviderReadRelationNeed::Data { .. }
+            | ProviderReadRelationNeed::FrozenInputSet { .. } => {
+                binding.prepared_source_read(input)?
             }
-            QueryFrozenReadInput::PinnedFileSet | QueryFrozenReadInput::TableExecute => {
-                AdmittedRead::Cohort(bindings.frozen_cohort_read(need.binding(), input).map_err(
-                    |error| {
-                        ProviderReadError::from(error).context(format!("provider read of {name}"))
-                    },
-                )?)
+            ProviderReadRelationNeed::Delta {
+                from_snapshot_id,
+                to_snapshot_id,
+                ..
+            } => binding.prepared_change_window(*from_snapshot_id, *to_snapshot_id)?,
+            _ => None,
+        };
+        if let Some(prepared) = prepared {
+            AdmittedRead::PreparedSource(prepared)
+        } else {
+            match input {
+                QueryFrozenReadInput::Current | QueryFrozenReadInput::Snapshot(_) => {
+                    AdmittedRead::Relation(
+                        bindings
+                            .frozen_read_input(need.binding(), input)
+                            .map_err(|error| {
+                                ProviderReadError::from(error)
+                                    .context(format!("provider read of {name}"))
+                            })?,
+                    )
+                }
+                QueryFrozenReadInput::PinnedFileSet | QueryFrozenReadInput::TableExecute => {
+                    AdmittedRead::Cohort(
+                        bindings
+                            .frozen_cohort_read(need.binding(), input)
+                            .map_err(|error| {
+                                ProviderReadError::from(error)
+                                    .context(format!("provider read of {name}"))
+                            })?,
+                    )
+                }
             }
         }
     };
@@ -707,6 +733,7 @@ fn prepare_read_opening(
 enum ReadObservation {
     Physical(novarocks_spi::connector::read_stack::ConnectorReadRelationPreparation),
     OriginalFrozenSource,
+    OriginalPreparedSource,
 }
 
 /// Completed physical facts and exact original request/generation. SDK facts
@@ -745,6 +772,12 @@ async fn prepare_observation(
         observation,
     } = prepared;
     if observation.is_some() {
+        return Ok(());
+    }
+    if matches!(&opening.admitted, AdmittedRead::PreparedSource(_)) {
+        // The original preparation already completed. Projection is pure and
+        // remains in the existing paid creator, never an async reopening.
+        *observation = Some(ReadObservation::OriginalPreparedSource);
         return Ok(());
     }
     let kind = if let AdmittedRead::Cohort(cohort) = &opening.admitted {
@@ -982,14 +1015,16 @@ fn finish_prepared_read_borrowed(
     })?;
     let metadata = opening.request_control.metadata();
     let opened = match observation {
-        ReadObservation::OriginalFrozenSource => open_relation(
-            metadata.as_ref(),
-            session,
-            &opening.table,
-            need.relation(),
-            &opening.admitted,
-            &opening.name,
-        )?,
+        ReadObservation::OriginalFrozenSource | ReadObservation::OriginalPreparedSource => {
+            open_relation(
+                metadata.as_ref(),
+                session,
+                &opening.table,
+                need.relation(),
+                &opening.admitted,
+                &opening.name,
+            )?
+        }
         ReadObservation::Physical(prepared) => {
             let relation = metadata
                 .create_prepared_relation(prepared)
@@ -1329,6 +1364,17 @@ fn open_relation(
     ProviderReadError,
 > {
     use crate::catalog_application::query_bindings::QueryFrozenCohortRead;
+
+    if let AdmittedRead::PreparedSource(source) = admitted {
+        return metadata
+            .project_prepared_source_read(session, &source.receipt, source.projection)
+            .map(|handle| (handle, None, None))
+            .map_err(|error| {
+                ProviderReadError::from(error).context(format!(
+                    "provider read of {name} cannot project its original prepared source"
+                ))
+            });
+    }
 
     // A cohort is frozen as a freeze of its own rather than as a table read
     // with the cohort pushed down: a pushdown may be declined, and a declined

@@ -115,6 +115,10 @@ pub struct ConnectorReadAttemptAccess {
 }
 
 impl ConnectorReadAttemptAccess {
+    pub fn requires_metadata_split_preparation(&self) -> bool {
+        self.source.requires_metadata_split_preparation()
+    }
+
     pub const fn frozen(&self) -> &ConnectorReadTableHandle {
         self.source.frozen()
     }

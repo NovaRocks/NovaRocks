@@ -51,7 +51,18 @@ impl<'a> ByteSpan<'a> {
         }
     }
 }
+#[cfg(test)]
+thread_local! {
+    static CONCRETE_BINDINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn concrete_bindings() -> usize {
+    CONCRETE_BINDINGS.get()
+}
+
 fn concrete<T: Array + 'static>(array: &dyn Array) -> Result<&T, ValueError> {
+    #[cfg(test)]
+    CONCRETE_BINDINGS.set(CONCRETE_BINDINGS.get() + 1);
     array
         .as_any()
         .downcast_ref()
@@ -197,9 +208,11 @@ pub(crate) unsafe fn make_view_unchecked(
 ) -> Result<ArrayRef, ValueError> {
     let array: ArrayRef = match layout {
         ByteLayout::Utf8View => {
+            let buffers: Arc<[Buffer]> = buffers.into();
             Arc::new(unsafe { StringViewArray::new_unchecked(views, buffers, nulls) })
         }
         ByteLayout::BinaryView => {
+            let buffers: Arc<[Buffer]> = buffers.into();
             Arc::new(unsafe { BinaryViewArray::new_unchecked(views, buffers, nulls) })
         }
         _ => return Err(ValueError::Invariant(ValueViolation::Layout)),
@@ -1259,4 +1272,120 @@ pub(crate) fn view_external_location(
 pub(crate) fn without_nulls(source: &ArrayRef) -> Result<ArrayRef, ValueError> {
     let data = source.to_data().into_builder().nulls(None).build()?;
     Ok(arrow_array::make_array(data))
+}
+
+/// A borrowed view storage binding. Carrier identification and downcast happen
+/// once, while row reads retain checked Arrow geometry and logical validity.
+#[derive(Clone, Copy)]
+pub(crate) struct BoundView<'a> {
+    views: &'a [u128],
+    buffers: &'a [Buffer],
+    nulls: Option<&'a NullBuffer>,
+}
+impl<'a> BoundView<'a> {
+    pub(crate) fn bind(array: &'a dyn Array) -> Result<Self, ValueError> {
+        let (views, buffers) = view_parts(array)?;
+        Ok(Self {
+            views,
+            buffers,
+            nulls: array.nulls(),
+        })
+    }
+    pub(crate) fn value(self, row: usize) -> Result<Option<&'a [u8]>, ValueError> {
+        let raw = self
+            .views
+            .get(row)
+            .ok_or(ValueError::Invariant(ValueViolation::Bounds))?;
+        if self.nulls.is_some_and(|nulls| nulls.is_null(row)) {
+            return Ok(None);
+        }
+        let view = ByteView::from(*raw);
+        let len = view.length as usize;
+        if len <= 12 {
+            // SAFETY: raw borrows a descriptor from the already admitted view
+            // array. Its inline extent is exactly its checked length <= 12;
+            // the returned slice borrows that descriptor, never a temporary.
+            return Ok(Some(unsafe { BinaryViewArray::inline_value(raw, len) }));
+        }
+        let data = self
+            .buffers
+            .get(view.buffer_index as usize)
+            .ok_or(ValueError::Invariant(ValueViolation::Bounds))?;
+        let start = view.offset as usize;
+        let end = start
+            .checked_add(len)
+            .ok_or(ValueError::Invariant(ValueViolation::Bounds))?;
+        Ok(Some(
+            data.as_slice()
+                .get(start..end)
+                .ok_or(ValueError::Invariant(ValueViolation::Bounds))?,
+        ))
+    }
+    pub(crate) fn prefix(self, row: usize) -> Result<[u8; 4], ValueError> {
+        let raw = self
+            .views
+            .get(row)
+            .ok_or(ValueError::Invariant(ValueViolation::Bounds))?;
+        Ok(ByteView::from(*raw).prefix.to_le_bytes())
+    }
+}
+
+/// Immutable view parts retain the actual Arrow backing without a self borrow.
+/// Cloning buffer handles does not copy payload or grant allocation authority.
+pub(crate) struct OwnedView {
+    views: ScalarBuffer<u128>,
+    buffers: Vec<Buffer>,
+    nulls: Option<NullBuffer>,
+    utf8: bool,
+}
+impl OwnedView {
+    pub(crate) fn bind_observed<E, G, W>(
+        array: &dyn Array,
+        growth: &mut G,
+        work: &mut W,
+    ) -> Result<Self, crate::ValueFailure<E>>
+    where
+        G: FnMut(std::alloc::Layout) -> Result<(), E>,
+        W: FnMut(usize) -> Result<(), E>,
+    {
+        let (views, source_buffers) = view_parts(array)?;
+        work(0).map_err(crate::ValueFailure::Caller)?;
+        let mut buffers = Vec::new();
+        let layout = std::alloc::Layout::array::<Buffer>(source_buffers.len())
+            .map_err(|_| ValueError::Invariant(ValueViolation::Bounds))?;
+        if !source_buffers.is_empty() {
+            growth(layout).map_err(crate::ValueFailure::Caller)?;
+            buffers
+                .try_reserve_exact(source_buffers.len())
+                .map_err(|source| ValueError::Allocation {
+                    requested: layout.size(),
+                    source,
+                })?;
+        }
+        // Initialize retained handles in bounded metadata blocks after the
+        // caller admits the complete allocation. Payload is never copied.
+        for block in source_buffers.chunks(1024) {
+            work(std::mem::size_of_val(block)).map_err(crate::ValueFailure::Caller)?;
+            buffers.extend_from_slice(block);
+        }
+        Ok(Self {
+            views: views.clone(),
+            buffers,
+            nulls: array.nulls().cloned(),
+            utf8: matches!(array.data_type(), arrow_schema::DataType::Utf8View),
+        })
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.views.len()
+    }
+    pub(crate) fn is_utf8(&self) -> bool {
+        self.utf8
+    }
+    pub(crate) fn view(&self) -> BoundView<'_> {
+        BoundView {
+            views: &self.views,
+            buffers: &self.buffers,
+            nulls: self.nulls.as_ref(),
+        }
+    }
 }

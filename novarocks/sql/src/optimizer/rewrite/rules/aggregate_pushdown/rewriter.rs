@@ -854,11 +854,10 @@ mod tests {
                 FunctionValueType::new(
                     DataType::List(Arc::new(
                         Field::new("item", DataType::Utf8, false).with_metadata(
-                            [
+                            std::collections::HashMap::<String, String>::from([
                                 ("nr_logical_type".into(), "json".into()),
                                 ("provider.field-id".into(), "71".into()),
-                            ]
-                            .into(),
+                            ]),
                         ),
                     )),
                     false,

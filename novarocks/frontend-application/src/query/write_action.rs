@@ -169,6 +169,7 @@ pub(crate) fn prepare<P: WriteStatementFamily>(
         sql,
         query_options,
         selected: None,
+        affected_rows: None,
         close_failure: None,
     })
 }
@@ -200,6 +201,7 @@ struct WriteStatementAction<P: WriteStatementFamily> {
     sql: String,
     query_options: QueryOptions,
     selected: Option<Result<(), QueryServiceError>>,
+    affected_rows: Option<u64>,
     close_failure: Option<StatementNativeHealthFailure>,
 }
 
@@ -255,12 +257,25 @@ impl<P: WriteStatementFamily> WriteStatementAction<P> {
             }
             Poll::Ready(Ok(())) => {}
         }
-        if let Err(health) = self.computation.release_result_aliases() {
-            self.close_failure = Some(health);
-            return Poll::Pending;
-        }
-        match self.computation.take_native_tail() {
-            Ok(tail) => self.native_tail = Some(tail),
+        let session = self.session();
+        let ready = self.ready.as_ref();
+        match self
+            .computation
+            .transfer_native_tail_then(&mut self.native_tail, || {
+                let session =
+                    session.ok_or_else(|| internal_error("write Ready has no original session"))?;
+                let ready = ready
+                    .ok_or_else(|| internal_error("write statement has no actual Ready write"))?;
+                if !Arc::ptr_eq(&ready.session, &session) || !ready.accepted.belongs_to(&session) {
+                    return Err(internal_error("write Ready replaced the original session"));
+                }
+                session.freeze_received_row_count().map_err(|error| {
+                    QueryServiceError::from_failure_cause(
+                        novarocks_failure_contract::SharedFailureCause::new(error),
+                    )
+                })
+            }) {
+            Ok(rows) => self.affected_rows = Some(rows?),
             Err(health) => {
                 self.close_failure = Some(health);
                 return Poll::Pending;
@@ -451,13 +466,25 @@ impl<P: WriteStatementFamily> WriteStatementAction<P> {
         if self.selected.is_none() {
             self.selected = Some(Ok(()));
         }
-        Poll::Ready(
-            self.selected
-                .take()
-                .unwrap()
-                .map(|()| StatementActionValue::Ok),
-        )
+        Poll::Ready(selected_command_completion(
+            self.selected.take().unwrap(),
+            self.affected_rows,
+        ))
     }
+}
+
+/// Only an already selected business success may expose the original count.
+/// A missing count is a contract refusal, never an implicit zero-row success.
+pub(super) fn selected_command_completion(
+    selected: Result<(), QueryServiceError>,
+    affected_rows: Option<u64>,
+) -> Result<StatementActionValue, QueryServiceError> {
+    selected?;
+    let rows = affected_rows
+        .ok_or_else(|| internal_error("successful write has no original affected-row count"))?;
+    Ok(StatementActionValue::Ok(
+        novarocks_query_application::session_control::StatementCommandCompletion::new(rows),
+    ))
 }
 
 pub(super) fn disposition(outcome: &WriteOutcome) -> LakePublicationDisposition {
@@ -578,25 +605,26 @@ impl<P: WriteStatementFamily> GovernedStatementAction for WriteStatementAction<P
             return Err(health("write statement residual target is occupied"));
         }
         let session = self.session();
-        if session.is_none() {
+        if session.is_none() && self.native_tail.is_none() {
             return Ok(());
         }
         // The original session checks accepted ownership, not a public error
         // classification. A later accepted/Unknown publication retains its
         // complete envelope. QA Drops this entire Action before polling residual.
-        let formation = if session
-            .as_ref()
-            .unwrap()
-            .has_no_accepted_formation()
-            .map_err(|error| {
-                StatementNativeHealthFailure::actual_exit_unproven(
-                    "write formation ownership could not be established",
-                    Arc::new(error),
-                )
-            })? {
-            self.computation.refused_formation_bytes()
-        } else {
-            None
+        let formation = match session.as_ref() {
+            Some(session) => {
+                if session.has_no_accepted_formation().map_err(|error| {
+                    StatementNativeHealthFailure::actual_exit_unproven(
+                        "write formation ownership could not be established",
+                        Arc::new(error),
+                    )
+                })? {
+                    self.computation.refused_formation_bytes()
+                } else {
+                    None
+                }
+            }
+            None => None,
         };
         let mut residual = Box::new(WriteCleanupResidual {
             formation,
@@ -720,11 +748,27 @@ impl GovernedStatementResidual for WriteCleanupResidual {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use novarocks_spi::connector::{
         ConnectorMutationFailure, ConnectorMutationFailureKind, ExternalMutationOutcome,
     };
+
+    // Test-only composition within the query module. The observer comes from
+    // the original supervisor fixture; this constructor creates no observer.
+    pub(in crate::query) fn residual_without_session(
+        tail: StatementNativeTail,
+    ) -> Box<dyn GovernedStatementResidual> {
+        Box::new(WriteCleanupResidual {
+            formation: None,
+            publication: None,
+            native_tail: Some(tail),
+            continuation_error: None,
+            health: health("original no-session residual health cause"),
+            session: None,
+            io: None,
+        })
+    }
 
     #[test]
     fn exact_commit_cleanup_and_business_finalization_are_independent() {
@@ -851,5 +895,31 @@ mod original_publication_failure_tests {
         let selected = publication_failure(&failure);
         assert_eq!(selected.failure_cause(), Some(&source));
         assert!(selected.compile_control_error().is_none());
+    }
+}
+
+#[cfg(test)]
+mod command_completion_tests {
+    use super::*;
+    #[test]
+    fn missing_count_is_not_zero_and_refusal_keeps_its_original_error() {
+        assert!(selected_command_completion(Ok(()), None).is_err());
+        let failure = internal_error("original unsuccessful publication");
+        let Err(selected) = selected_command_completion(Err(failure), Some(17)) else {
+            panic!("an unsuccessful publication cannot become command success")
+        };
+        assert!(
+            selected
+                .message()
+                .contains("original unsuccessful publication")
+        );
+    }
+    #[test]
+    fn successful_empty_write_preserves_its_explicit_zero() {
+        let StatementActionValue::Ok(rows) = selected_command_completion(Ok(()), Some(0)).unwrap()
+        else {
+            panic!("successful empty write must carry its explicit count")
+        };
+        assert_eq!(rows.affected_rows(), 0);
     }
 }

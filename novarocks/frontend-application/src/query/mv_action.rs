@@ -351,7 +351,7 @@ impl MvCommandOriginal {
         Some(
             result
                 .clone()
-                .map(|()| StatementActionValue::Ok)
+                .map(|()| StatementActionValue::Ok(novarocks_query_application::session_control::StatementCommandCompletion::new(0)))
                 .map_err(|failure| match self.observed_effect() {
                     Some(disposition) => failure
                         .service

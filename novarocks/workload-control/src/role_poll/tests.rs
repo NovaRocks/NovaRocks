@@ -908,6 +908,34 @@ async fn queued_completion_wake_keeps_the_original_anchor_retired_until_consumed
 }
 
 #[tokio::test]
+async fn root_drain_keeps_the_admitted_owner_mountable_until_its_actual_exit() {
+    let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
+    let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
+    let mut bank = RolePollBank::install(&mut control, 0, run).unwrap();
+    control.mark_ready().unwrap();
+    let root = new_root(&control);
+    control.close_root_admission();
+    root.business.release();
+    bank.mount_owned(root.owner, new_input(true))
+        .unwrap_or_else(|_| panic!("admitted owner retains its original role"));
+    assert!(
+        bank.poll_ready(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    );
+    let output = bank
+        .progress_turn(budget())
+        .map(|turn| turn.into_parts().1)
+        .expect("original admitted role ran");
+    assert_eq!(control.snapshot().root_responsibilities, 1);
+    drop(output);
+    drain(&mut driver);
+    assert_eq!(control.snapshot().root_responsibilities, 0);
+    drop(bank);
+    drain(&mut driver);
+    assert!(control.inner.state.lock().unwrap().is_drained());
+}
+
+#[tokio::test]
 async fn closed_bank_mount_returns_the_original_owner_and_input_without_queueing() {
     let roles = [PollRoleGeometry::for_factory(&run).unwrap()];
     let (mut control, _, mut driver) = prototype_profile_with_roles(2, 1, 1, 1, &roles);
