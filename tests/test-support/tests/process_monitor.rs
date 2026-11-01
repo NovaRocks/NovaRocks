@@ -249,7 +249,8 @@ fn caller_death_is_cleaned_by_an_independent_monitor_with_original_record() {
     let deadline = Instant::now() + Duration::from_secs(12);
     loop {
         let text = fs::read_to_string(root.join("record.jsonl")).unwrap();
-        if text.contains("\"event\":\"Final\"") {
+        // The append-only JSONL record is complete only after its newline.
+        if text.ends_with('\n') && text.contains("\"event\":\"Final\"") {
             let record: serde_json::Value =
                 serde_json::from_str(text.lines().last().unwrap()).unwrap();
             assert_eq!(record["owner_lost"], true);
