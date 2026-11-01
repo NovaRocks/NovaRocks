@@ -306,6 +306,13 @@ impl JoinBuildFrame {
         }
         let old = {
             let mut state = self.state()?;
+            // A late F may retain Active across another F's publication and
+            // the last Q's normal close. Published K/CSR work is settled, not
+            // withdrawn. This also covers Publishing after the completion
+            // author installed data but before its caller records Published.
+            if self.completion.published()?.is_some() {
+                return Ok(FinalizeStep::Finished);
+            }
             match &*state {
                 State::Failed(cause) => return Err(cause.clone()),
                 State::Retired => return Ok(FinalizeStep::Retired),
@@ -571,6 +578,10 @@ impl FinalizeWorker {
     }
     fn retired(&mut self, frame: &JoinBuildFrame) -> ExecutionResult<FinalizeStep> {
         let next = frame.retire()?;
+        if next == FinalizeStep::Finished {
+            self.release_published();
+            return Ok(next);
+        }
         if next == FinalizeStep::Retired {
             if let Some(active) = self.active.as_ref().cloned() {
                 self.retire_owned(&active)?;
@@ -579,6 +590,11 @@ impl FinalizeWorker {
         }
         Ok(next)
     }
+    fn release_published(&mut self) {
+        self.active = None;
+        self.projections = [None, None];
+        self.bitmap = None;
+    }
     /// Real synchronous exit, independent of output EOS. A caller with an
     /// already recorded failure drops the worker only after fail() latched it.
     pub(crate) fn finish_exit(&mut self, frame: &JoinBuildFrame) -> ExecutionResult<bool> {
@@ -586,15 +602,13 @@ impl FinalizeWorker {
         if frame.completion.published()?.is_some() {
             // Published nested work completed normally. Later output closure
             // releases these settled cursors; it does not retire ready graphs.
-            self.active = None;
-            self.projections = [None, None];
-            self.bitmap = None;
+            self.release_published();
             return Ok(true);
         }
         if frame.completion.remaining_demand()? == RemainingDemand::Released {
             return self
                 .retired(frame)
-                .map(|next| next == FinalizeStep::Retired);
+                .map(|next| matches!(next, FinalizeStep::Retired | FinalizeStep::Finished));
         }
         Err(build_contract(
             "join finalizer exited before its required build publication",

@@ -33,6 +33,15 @@ use novarocks_value_arrays::decode::ValueConversionContext;
 use std::{collections::BTreeSet, num::NonZeroU64};
 
 fn build_frame(tails: usize, bits: bool, work: &BulkWork<'_>) -> Arc<JoinBuildFrame> {
+    build_frame_with_participants(2, 3, tails, bits, work)
+}
+fn build_frame_with_participants(
+    inputs: usize,
+    finalizers: usize,
+    tails: usize,
+    bits: bool,
+    work: &BulkWork<'_>,
+) -> Arc<JoinBuildFrame> {
     let ty = FunctionValueType::new(DataType::Int32, true);
     let domains = ordinary(
         &ty,
@@ -41,8 +50,8 @@ fn build_frame(tails: usize, bits: bool, work: &BulkWork<'_>) -> Arc<JoinBuildFr
         work,
     );
     let participants = JoinParticipants {
-        inputs: 2,
-        finalizers: NonZeroUsize::new(3).unwrap(),
+        inputs,
+        finalizers: NonZeroUsize::new(finalizers).unwrap(),
         probes: 2,
         tails,
     };
@@ -67,7 +76,7 @@ fn input(frame: &JoinBuildFrame, slot: usize, values: Vec<Option<i32>>, work: &B
     let array: ArrayRef = Arc::new(Int32Array::from(values));
     let mut writer = InputRunWriter::new(
         &frame.domains,
-        B3RunId::from_input_slot(slot, 2).unwrap(),
+        B3RunId::from_input_slot(slot, frame.completion.participants().inputs).unwrap(),
         true,
         work,
     )
@@ -152,6 +161,147 @@ fn exact_e_receipts_gate_real_k_csr_and_one_bitmap_before_publication() {
     drop(workers);
     drop(frame);
     assert_eq!(published.artifact.rows.len(), values.len());
+}
+
+#[test]
+fn concurrent_original_finalizers_publish_one_small_build_and_exit_normally() {
+    // Small native builds still use all real F positions. Include both the
+    // original integer selector and a sparse range that must use original K hash.
+    for finalizers in [1, 3, 5] {
+        for values in [
+            vec![Some(11), Some(29)],
+            vec![Some(i32::MIN), Some(i32::MAX)],
+            vec![],
+            vec![None, None],
+        ] {
+            for bits in [false, true] {
+                for iteration in 0..32 {
+                    let (owner, tracker) = fixture();
+                    let work = work(owner.as_ref(), &tracker, &Control);
+                    let frame = build_frame_with_participants(5, finalizers, 0, bits, &work);
+                    input(&frame, 0, values.clone(), &work);
+                    for slot in 1..5 {
+                        input(&frame, slot, vec![], &work);
+                    }
+                    std::thread::scope(|scope| {
+                        for slot in 0..finalizers {
+                            let frame = &frame;
+                            let owner = &owner;
+                            let tracker = &tracker;
+                            scope.spawn(move || {
+                                let work = self::work(owner.as_ref(), tracker, &Control);
+                                let mut worker = FinalizeWorker::new();
+                                for _ in 0..1_000_000 {
+                                    let step = worker
+                                        .step(frame, &mut turn(), &work)
+                                        .unwrap_or_else(|cause| {
+                                            panic!(
+                                                "iteration {iteration}, finalizer {slot}: {cause:?}"
+                                            )
+                                        });
+                                    match step {
+                                        FinalizeStep::Finished => {
+                                            assert!(worker.finish_exit(frame).unwrap());
+                                            return;
+                                        }
+                                        FinalizeStep::Retired => panic!("original demand remains"),
+                                        _ => std::thread::yield_now(),
+                                    }
+                                }
+                                panic!("original concurrent finalizers did not converge");
+                            });
+                        }
+                        let mut published = false;
+                        for _ in 0..1_000_000 {
+                            if frame.completion.published().unwrap().is_some() {
+                                published = true;
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                        assert!(published, "original concurrent publication must converge");
+                        // Real Q completion can race any remaining F's turn.
+                        frame.completion.normal_after_output(0).unwrap();
+                        frame.completion.normal_after_output(1).unwrap();
+                    });
+                    assert!(matches!(&*frame.state().unwrap(), State::Published));
+                    let published = frame.completion.published().unwrap().unwrap();
+                    assert_eq!(published.rows, values.len());
+                    let BuildLookup::Ordinary(index) = &published.artifact.lookup else {
+                        panic!("original ordinary projection");
+                    };
+                    if values.first() == Some(&Some(i32::MIN)) {
+                        assert!(!index.view.is_direct(), "sparse input must exercise K hash");
+                    }
+                    let rows = index.groups.as_ref().unwrap();
+                    assert_eq!(
+                        (0..rows.row_count())
+                            .map(|position| rows.row(position).unwrap())
+                            .collect::<BTreeSet<_>>(),
+                        values
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(row, value)| value.map(|_| row))
+                            .collect()
+                    );
+                    assert_eq!(published.artifact.matches.is_some(), bits);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn published_build_wins_late_finalizer_demand_withdrawal() {
+    for bits in [false, true] {
+        let (owner, tracker) = fixture();
+        let work = work(owner.as_ref(), &tracker, &Control);
+        let frame = build_frame(0, bits, &work);
+        input(&frame, 0, vec![Some(11), Some(29)], &work);
+        input(&frame, 1, vec![], &work);
+        let mut workers: Vec<_> = (0..3).map(|_| FinalizeWorker::new()).collect();
+        let mut publisher = None;
+        for _ in 0..1_000_000 {
+            for (ordinal, worker) in workers.iter_mut().enumerate() {
+                worker.step(&frame, &mut turn(), &work).unwrap();
+                if frame.completion.published().unwrap().is_some() {
+                    publisher = Some(ordinal);
+                    break;
+                }
+            }
+            if frame.completion.published().unwrap().is_some() {
+                break;
+            }
+        }
+        let published = frame.completion.published().unwrap().unwrap();
+        let lagging = workers
+            .iter_mut()
+            .enumerate()
+            .find(|(ordinal, worker)| {
+                Some(*ordinal) != publisher
+                    && worker.active.is_some()
+                    && worker.projections[0].is_some()
+            })
+            .map(|(_, worker)| worker)
+            .expect("original F retains its Active snapshot across publication");
+        // This is the exact continuation after an F's Active snapshot and
+        // before its demand read: another F publishes, then both real Q slots
+        // finish before the paused F resumes the existing withdrawal path.
+        frame.completion.normal_after_output(0).unwrap();
+        frame.completion.normal_after_output(1).unwrap();
+        assert_eq!(
+            lagging.retired(&frame).unwrap(),
+            FinalizeStep::Finished,
+            "published work must finish rather than retire its ready projections"
+        );
+        assert!(lagging.finish_exit(&frame).unwrap());
+        assert!(matches!(&*frame.state().unwrap(), State::Published));
+        let BuildLookup::Ordinary(index) = &published.artifact.lookup else {
+            panic!("original ordinary projection");
+        };
+        assert_eq!(index.groups.as_ref().unwrap().row_count(), 2);
+        frame.completion.check().unwrap();
+    }
 }
 
 #[test]
