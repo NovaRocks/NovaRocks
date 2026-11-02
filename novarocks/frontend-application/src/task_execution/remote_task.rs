@@ -1132,6 +1132,12 @@ impl RemoteTask {
             return Err(TaskExecutionError::UnknownOperation);
         }
         self.create_in_flight = None;
+        if ack.worker_outcome() == Some(OperationOutcome::OwnerFailed) {
+            self.stand_down_after_owner_failure();
+            return Ok(CreateSettlement::FailedClosed(
+                OperationOutcome::OwnerFailed,
+            ));
+        }
         if self.fenced_out {
             if ack.is_applied() {
                 return Err(TaskExecutionError::DomainReceipt(format!(
@@ -1275,6 +1281,13 @@ impl RemoteTask {
             })
             .ok_or(TaskExecutionError::UnknownOperation)?;
         released.awaiting_outcome = false;
+        if ack.worker_outcome() == Some(OperationOutcome::OwnerFailed) {
+            self.released_update = None;
+            self.stand_down_after_owner_failure();
+            return Ok(UpdateSettlement::FailedClosed(
+                OperationOutcome::OwnerFailed,
+            ));
+        }
         let identity = released.request.identity();
         let obsolete_input =
             self.normal_stand_down && !released.request.domains().iter().all(is_destination_close);
@@ -1353,6 +1366,17 @@ impl RemoteTask {
             return Err(TaskExecutionError::UnknownOperation);
         }
         self.cancel_in_flight = None;
+        if ack.worker_outcome() == Some(OperationOutcome::OwnerFailed) {
+            self.stand_down_after_owner_failure();
+            return Err(TaskExecutionError::OperationFailed {
+                context: self.context,
+                operation_id: ack.operation_id(),
+                kind: OperationKind::CancelTask,
+                rejection: ack
+                    .worker_header()
+                    .expect("owner failure is a checked Worker verdict"),
+            });
+        }
         if ack.worker_outcome().is_none()
             && ack.dispatch_result() != OperationDispatchResult::TransportUnknown
         {
@@ -1442,6 +1466,16 @@ impl RemoteTask {
             self.enter_terminal();
         }
         Ok(())
+    }
+
+    /// Stops business sends after owner failure without inventing terminal
+    /// evidence. Existing published status and physical convergence remain
+    /// owned by the status/context channels.
+    fn stand_down_after_owner_failure(&mut self) {
+        self.discard_creation_after_attempt_failure();
+        if !self.is_terminal() {
+            self.await_terminal_status();
+        }
     }
 
     fn enter_terminal(&mut self) {
@@ -1650,6 +1684,86 @@ mod destination_close_tests {
             producer.enqueue_update(second, super::super::intent::test_queue_permit()),
             Ok(UpdateAdmission::Queued)
         ));
+    }
+
+    #[test]
+    fn owner_failed_create_stops_replay_without_synthesizing_terminal_status() {
+        let (mut producer, _, _, _) = producer_with_two_destinations();
+        producer.state = RemoteTaskState::Creating;
+        producer.status = None;
+        producer.create_ownership_proven = false;
+        let operation_id = producer.create_envelope.operation_id();
+        producer.create_in_flight = Some(operation_id);
+        assert_eq!(
+            producer
+                .on_create_ack(
+                    &OperationAcknowledgement::new(
+                        operation_id,
+                        OperationKind::CreateTask,
+                        OperationOutcome::OwnerFailed,
+                        AckPayload::None
+                    ),
+                    MonotonicInstant::ORIGIN,
+                    true,
+                    None,
+                )
+                .unwrap(),
+            CreateSettlement::FailedClosed(OperationOutcome::OwnerFailed)
+        );
+        assert!(!producer.is_terminal());
+        assert!(producer.terminal_report().is_none());
+        assert!(!producer.create_pending());
+        assert!(
+            producer
+                .create_candidate(MonotonicInstant::ORIGIN)
+                .unwrap()
+                .is_none()
+        );
+        assert!(producer.awaiting_terminal_status);
+    }
+
+    #[test]
+    fn owner_failed_update_and_cancel_preserve_the_last_real_status() {
+        let (mut producer, edge, target, _) = producer_with_two_destinations();
+        let before = producer.status.clone();
+        let close = producer.prepare_destination_close(edge, target).unwrap();
+        producer
+            .enqueue_update(close, super::super::intent::test_queue_permit())
+            .unwrap();
+        let (intent, _) = producer.next_update_intent().unwrap().unwrap();
+        assert_eq!(
+            producer
+                .on_update_ack(&OperationAcknowledgement::new(
+                    intent.operation_id(),
+                    OperationKind::UpdateTask,
+                    OperationOutcome::OwnerFailed,
+                    AckPayload::None,
+                ))
+                .unwrap(),
+            UpdateSettlement::FailedClosed(OperationOutcome::OwnerFailed)
+        );
+        assert!(!producer.is_terminal());
+        assert!(producer.terminal_report().is_none());
+        assert_eq!(producer.status, before);
+        assert!(producer.next_update_intent().unwrap().is_none());
+
+        let (mut producer, _, _, _) = producer_with_two_destinations();
+        let before = producer.status.clone();
+        let cancel = producer
+            .cancel_intent(CancelReason::UpstreamNoLongerNeeded)
+            .unwrap();
+        assert!(matches!(
+            producer.on_cancel_ack(&OperationAcknowledgement::new(
+                cancel.operation_id(),
+                OperationKind::CancelTask,
+                OperationOutcome::OwnerFailed,
+                AckPayload::None,
+            )),
+            Err(TaskExecutionError::OperationFailed { .. })
+        ));
+        assert!(!producer.is_terminal());
+        assert!(producer.terminal_report().is_none());
+        assert_eq!(producer.status, before);
     }
 
     #[test]

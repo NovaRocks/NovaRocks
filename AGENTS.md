@@ -568,15 +568,20 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    an Installed fact or has normally withdrawn its exact input demand
    (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no
    frame can precede the receiver that counts it.
-4. `novarocks/worker/src/task_registry.rs` owns the BE-local
-   context and task state, exact admission, lease renewal and expiry, bounded
-   tombstones, and one termination latch per task. The latch is first-wins with
-   a single exception: a derived cause (`Aborted(PeerTaskFailed)`) is a
-   placeholder that an originating cause (`Failed(TaskFailure)`) replaces
-   exactly once. Accepted jobs enter a bounded fair FIFO; count, byte and
-   per-context position charges remain until the preparation job actually exits,
-   including after Installed or terminal publication. See
-   `novarocks/worker/src/{task_registry.rs,task_registry_config.rs}`.
+4. `novarocks/worker-protocol/src/{control,context}.rs` owns pure BE-local
+   admission and lifecycle decisions. `novarocks/worker/src/control_runtime/**`
+   connects the common `control-runtime` driver to original request, Task,
+   preparation and host owners; it replaces the former TaskExecutionRegistry.
+   A Task conclusion is first-wins with one refinement: an originating failure
+   may replace the derived `Aborted(PeerTaskFailed)` placeholder exactly once.
+   Accepted jobs enter a bounded fair FIFO; count, byte and per-context
+   preparation-position charges remain until the original preparation job
+   actually exits, including after Installed or terminal publication.
+   Converged Contexts retain compact protocol facts through their request
+   horizon, without an execution WorkLease. Contexts, tickets and inbound
+   normal-close retention have no count/byte admission caps or early eviction.
+   Process drain retires retained metadata without waiting for that horizon;
+   it still joins every actual request, host action and physical holder.
    Native status observation uses covered subscriptions with a mandatory
    nonzero generation (`novarocks/native-adapter/src/task_protocol.rs`);
    cursor-only generation-zero requests are refused.
@@ -619,11 +624,12 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   BackendProcessId} a backend holds on an attempt's behalf. Any component
   mismatching is fatal; neither is ever partially matched.
 
-- `TaskExecutionRegistry`:
-  `novarocks/worker/src/task_registry.rs`
-  BE-owned context and task state, exact admission, per-domain progression,
-  lease renewal and expiry, bounded tombstones, and one termination latch per
-  task.
+- `WorkerNodeRuntime` / `WorkerTaskControl`:
+  `novarocks/worker/src/control_runtime/{node_bootstrap,node_api}.rs`
+  BE application runtime and typed request ports. Pure decisions live in
+  `novarocks/worker-protocol/src/**`; actual work, reports, capacity and
+  physical exit live in the common `novarocks/control-runtime/src/**` and
+  Worker host owners. A terminal protocol fact never proves actual exit.
 
 ---
 
@@ -1124,7 +1130,8 @@ suspected case against a clean server before attributing it to the change.
   `novarocks/coordination-contract/**` (minimal neutral facts; ADR-0198), then inspect
   `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs`,
   `novarocks/frontend-application/src/task_execution/**`,
-  `novarocks/worker/src/{task_registry,ingress,convergence}.rs`,
+  `novarocks/worker-protocol/src/**`, `novarocks/worker/src/control_runtime/**`,
+  `novarocks/control-runtime{,-core}/src/**`,
   `novarocks/native-adapter/src/{backend_application,task_protocol_ingress}.rs`, and
   `novarocks/execution/src/task_execution/**`. Preserve the Installed/normal-close
   gated edge-open barrier and the per-domain Apply / Idempotent / Older /

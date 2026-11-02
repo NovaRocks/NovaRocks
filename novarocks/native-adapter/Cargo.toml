@@ -47,6 +47,7 @@ prost.workspace = true
 once_cell.workspace = true
 prometheus.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util.workspace = true
 tokio-stream.workspace = true
@@ -59,6 +60,8 @@ protoc-bin-vendored.workspace = true
 tonic-build.workspace = true
 
 [dev-dependencies]
+novarocks-test-support.workspace = true
+novarocks-worker-protocol.workspace = true
 novarocks-value-arrays.workspace = true
 tempfile.workspace = true
 novarocks-execution = { workspace = true }
@@ -67,7 +70,6 @@ h2.workspace = true
 novarocks-sql.workspace = true
 novarocks-worker = { workspace = true }
 novarocks-secret.workspace = true
-sha2.workspace = true
 
 [package.metadata.novarocks.test]
 runtime-inputs = []

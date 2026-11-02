@@ -299,7 +299,7 @@ fn root_failure(
     ))
 }
 
-fn classify_fetch_task_result_rpc_status(
+fn classify_fetch_root_result_rpc_status(
     error: tonic::Status,
     root: TaskIdentity,
 ) -> RootResultFetchFailure {
@@ -608,7 +608,7 @@ impl novarocks_query_application::api::BoundedRootReadPort for NativeBoundedRoot
                 grpc.unary(wire, path, super::root_result_codec::RootResultCodec)
                     .await
                     .map(tonic::Response::into_inner)
-                    .map_err(|status| classify_fetch_task_result_rpc_status(status, root))
+                    .map_err(|status| classify_fetch_root_result_rpc_status(status, root))
             })
             .await
             .map_err(|_| {
@@ -722,7 +722,7 @@ mod tests {
             tonic::Code::Unknown,
             tonic::Code::Cancelled,
         ] {
-            let failure = classify_fetch_task_result_rpc_status(
+            let failure = classify_fetch_root_result_rpc_status(
                 tonic::Status::new(code, "Service was not ready: transport error"),
                 root,
             );
@@ -736,7 +736,7 @@ mod tests {
                 ExecutionFailureSite::RootRead { root }
             );
         }
-        let capacity = classify_fetch_task_result_rpc_status(
+        let capacity = classify_fetch_root_result_rpc_status(
             tonic::Status::resource_exhausted("private remote diagnostic"),
             root,
         );
@@ -751,7 +751,7 @@ mod tests {
             std::io::ErrorKind::ConnectionReset,
             "private socket detail",
         )));
-        let failure = classify_fetch_task_result_rpc_status(status, root);
+        let failure = classify_fetch_root_result_rpc_status(status, root);
         assert_eq!(
             failure.class(),
             AttemptFailureClass::RecoverableInfrastructure
@@ -774,7 +774,7 @@ mod tests {
             let mut status = tonic::Status::cancelled("operation canceled");
             status.set_source(Arc::new(error));
             assert_eq!(
-                classify_fetch_task_result_rpc_status(status, root).class(),
+                classify_fetch_root_result_rpc_status(status, root).class(),
                 AttemptFailureClass::ExecutionFailure
             );
         }
@@ -791,7 +791,7 @@ mod tests {
             tonic::Code::Unimplemented,
             tonic::Code::NotFound,
         ] {
-            let failure = classify_fetch_task_result_rpc_status(
+            let failure = classify_fetch_root_result_rpc_status(
                 tonic::Status::new(code, "arbitrary text"),
                 root,
             );

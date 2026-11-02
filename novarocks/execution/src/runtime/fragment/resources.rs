@@ -232,6 +232,11 @@ impl Drop for RootResultRegistration {
 pub(crate) struct ExchangeRegistration {
     port: Arc<dyn ExchangeReceiverPort>,
     keys: Vec<ExchangeReceiverKey>,
+    close_observers: Vec<(
+        ExchangeReceiverKey,
+        crate::runtime::exchange::ExchangeReceiverCloseObserver,
+    )>,
+    _close_observer_storage: novarocks_type_contract::ValueTypeStorageLifetime,
     active: bool,
     cleanup_should_fail: bool,
     construction_stop: Option<ReceiverInputConstructionStopOwner>,
@@ -249,20 +254,64 @@ impl ExchangeRegistration {
         if registrations.is_empty() {
             return Ok(None);
         }
+        // One fixed observer slot per original receiver. The same admitted
+        // input-construction owner pays its actual metadata, not another Work
+        // or a copied stream-facts table. Its lifetime outlasts all these pins.
+        let first = registrations
+            .first()
+            .expect("nonempty original receiver set");
+        let storage = first
+            .creation_factory
+            .begin_typed_construction(&first.expected_chunk_schema)
+            .map_err(registration_error)?;
+        let layout = std::alloc::Layout::array::<(
+            ExchangeReceiverKey,
+            crate::runtime::exchange::ExchangeReceiverCloseObserver,
+        )>(registrations.len())
+        .map_err(|_| {
+            registration_error(crate::exec::pipeline::operator::ConstructionFailure::from(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            ))
+        })?;
+        storage.request(layout).map_err(registration_error)?;
+        let mut close_observers = Vec::new();
+        close_observers
+            .try_reserve_exact(registrations.len())
+            .map_err(|source| {
+                registration_error(super::ExecutionFailure::from_domain(
+                    novarocks_functions::allocation_failure::AllocationRefusal::new(
+                        "reserve original exchange close observers",
+                        source,
+                    ),
+                ))
+            })?;
+        if close_observers.capacity() > registrations.len() {
+            return Err(registration_error(
+                crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
+                    "exchange observer metadata exceeds its admitted layout".into(),
+                ),
+            ));
+        }
         let mut registration = Self {
             port,
             keys: Vec::with_capacity(registrations.len()),
+            close_observers,
+            _close_observer_storage: storage.storage_lifetime(),
             active: true,
             cleanup_should_fail,
             construction_stop,
         };
         for entry in registrations {
             let key = entry.key;
-            if let Err(error) = registration.port.register(entry) {
-                let diagnostics = registration.rollback().err().into_iter().collect();
-                return Err(registration_error(error).with_cleanup_diagnostics(diagnostics));
-            }
+            let observer = match registration.port.register_with_close_observer(entry) {
+                Ok(observer) => observer,
+                Err(error) => {
+                    let diagnostics = registration.rollback().err().into_iter().collect();
+                    return Err(registration_error(error).with_cleanup_diagnostics(diagnostics));
+                }
+            };
             registration.keys.push(key);
+            registration.close_observers.push((key, observer));
         }
         Ok(Some(registration))
     }
@@ -336,13 +385,34 @@ enum ExchangeRetirementDisposition {
 }
 
 impl ExchangeReceiverRetirement {
+    /// Read this exact original registration, including after kernel cancel
+    /// removed its route. These facts never authorize normal close by themselves.
+    pub fn stream_close_facts(
+        &self,
+        key: ExchangeReceiverKey,
+        expected: &[novarocks_execution_contract::ExchangeStreamIdentity],
+    ) -> Result<
+        Vec<novarocks_execution_contract::ExchangeStreamClose>,
+        crate::runtime::exchange::ExchangeFailure,
+    > {
+        let observer = self
+            .registration
+            .close_observers
+            .iter()
+            .find(|(actual, _)| *actual == key)
+            .map(|(_, observer)| observer)
+            .ok_or_else(crate::runtime::exchange::ExchangeFailure::receiver_unavailable)?;
+        observer.stream_close_facts(expected)
+    }
     /// Record the kernel's fact before publishing task convergence. This does
     /// not remove or cancel a receiver; the application's gate still owns that.
     pub fn record_terminal(&mut self, fact: &super::FragmentTerminalFact) {
         self.disposition = match fact.outcome() {
             super::FragmentOutcome::Succeeded => ExchangeRetirementDisposition::Remove,
             super::FragmentOutcome::Failed(error) => {
-                self.stop_construction(error.cause().clone());
+                if self.registration.construction_stop.is_some() {
+                    self.stop_construction(error.cause().clone());
+                }
                 ExchangeRetirementDisposition::Cancel
             }
             super::FragmentOutcome::Cancelled { .. } => ExchangeRetirementDisposition::Cancel,
@@ -352,6 +422,16 @@ impl ExchangeReceiverRetirement {
     /// Stop construction on a real failure or abort without retiring ingress.
     pub fn stop_construction(&self, cause: super::ExecutionFailure) {
         self.registration.stop_construction(cause);
+    }
+
+    /// Move the unique live source owner after the application has fenced
+    /// actual ingress borrowers. This is metadata transfer only: it neither
+    /// closes the signal nor destroys a source or registration. The original
+    /// supervised host must call close_after_ingress and dispose the returned
+    /// source outside that fence and all other dependency locks. Keys and the
+    /// original success/cancellation disposition remain with this registration.
+    pub fn take_construction_stop(&mut self) -> Option<ReceiverInputConstructionStopOwner> {
+        self.registration.construction_stop.take()
     }
 
     /// Retire synchronously while the caller holds its original inbound gate.
@@ -737,8 +817,9 @@ struct RuntimeExchange {
 }
 
 /// Original registrations, split only at the dormant-to-running transfer.
-/// Every dynamically sized cell comes from the original registered key vector;
-/// no observer list, rejected-work queue, or process parking table is created.
+/// Every dynamically sized cleanup cell comes from the original registered
+/// keys. The paid read-only observer pins remain with that same registration;
+/// no rejected-work queue, copied stream-facts table or parking owner is created.
 pub(crate) struct RuntimeFragmentResources {
     root: Option<ResourceCell<RootResultRegistration>>,
     result: Option<ResourceCell<ResultRegistration>>,
@@ -1130,6 +1211,175 @@ mod receiver_construction_tests {
             assert_eq!(tracker.current(), 0);
         }
     }
+
+    #[test]
+    fn receiver_source_owner_moves_without_retiring_registration_or_its_original_cause() {
+        use novarocks_failure_contract::FailureProjection;
+        use std::sync::{
+            Weak,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Source {
+            factory: Weak<dyn InputConstructionFactory>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl std::fmt::Debug for Source {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("original receiver retirement source")
+            }
+        }
+        impl std::fmt::Display for Source {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Debug::fmt(self, f)
+            }
+        }
+        impl std::error::Error for Source {}
+        impl novarocks_failure_contract::FailureProjection for Source {
+            fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+                novarocks_functions::KernelFailure::ResourceExhausted.failure_fact()
+            }
+        }
+        impl Drop for Source {
+            fn drop(&mut self) {
+                let factory = self
+                    .factory
+                    .upgrade()
+                    .expect("the metadata alias remains live");
+                let ConstructionFailure::Caller(error) = factory.observe_input_work(1).unwrap_err()
+                else {
+                    panic!("closed metadata keeps its typed stop observation")
+                };
+                assert_eq!(
+                    error.failure_fact().evidence(),
+                    novarocks_failure_contract::FailureEvidence::StopObservation
+                );
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let runtime = test_execution_runtime();
+        let port: Arc<dyn ExchangeReceiverPort> =
+            Arc::new(ExecutionRuntimeExchangeReceiverPort::new(runtime));
+        let tracker = MemTracker::new_root("receiver detached source");
+        tracker.install_limit_once(1024 * 1024).unwrap();
+        let (factory, stop) = try_receiver_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker.clone(),
+            Arc::new(RuntimeErrorState::default()),
+        )
+        .unwrap();
+        let schema = typed_schema(factory.as_ref());
+        let key = ExchangeReceiverKey {
+            fragment_instance_id: UniqueId::new(85_102, 1),
+            node_id: 1,
+        };
+        let registration = ExchangeRegistration::acquire_registrations(
+            port.clone(),
+            vec![entry(key, &schema, &factory)],
+            false,
+            Some(stop),
+        )
+        .unwrap()
+        .unwrap();
+        let mut retirement = ExchangeReceiverRetirement {
+            registration,
+            disposition: ExchangeRetirementDisposition::Cancel,
+        };
+        let drops = Arc::new(AtomicUsize::new(0));
+        let original = ExecutionFailure::from_domain(Source {
+            factory: Arc::downgrade(&factory),
+            drops: drops.clone(),
+        });
+        let early_alias = original.clone();
+        retirement.record_terminal(&FragmentTerminalFact::new(
+            QueryId::new(85_102, 1),
+            key.fragment_instance_id,
+            FragmentOutcome::Failed(FragmentExecutionError::from_failure(
+                FragmentExecutionErrorKind::Pipeline,
+                original.clone(),
+            )),
+            None,
+        ));
+        let owner = retirement.take_construction_stop().unwrap();
+        assert!(retirement.take_construction_stop().is_none());
+        assert_eq!(retirement.registration.keys, vec![key]);
+        assert!(retirement.registration.active);
+        assert!(port.snapshot(key).is_some());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let detached = owner.close_after_ingress().unwrap();
+        assert!(detached.same_occurrence(&original));
+        assert!(factory.observe_input_work(1).is_err());
+        drop(detached);
+        drop(original);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "the real early source alias remains"
+        );
+        drop(early_alias);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(
+            port.snapshot(key).is_some(),
+            "source disposal does not remove ingress"
+        );
+        retirement.retire();
+        assert!(port.snapshot(key).is_none());
+        assert!(factory.observe_input_work(1).is_err());
+        drop(schema);
+        drop(factory);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn taking_receiver_source_owner_preserves_original_success_disposition() {
+        let runtime = test_execution_runtime();
+        let port: Arc<dyn ExchangeReceiverPort> =
+            Arc::new(ExecutionRuntimeExchangeReceiverPort::new(runtime));
+        let tracker = MemTracker::new_root("successful receiver detached source");
+        tracker.install_limit_once(1024 * 1024).unwrap();
+        let (factory, stop) = try_receiver_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker.clone(),
+            Arc::new(RuntimeErrorState::default()),
+        )
+        .unwrap();
+        let schema = typed_schema(factory.as_ref());
+        let key = ExchangeReceiverKey {
+            fragment_instance_id: UniqueId::new(85_102, 2),
+            node_id: 1,
+        };
+        let registration = ExchangeRegistration::acquire_registrations(
+            port.clone(),
+            vec![entry(key, &schema, &factory)],
+            false,
+            Some(stop),
+        )
+        .unwrap()
+        .unwrap();
+        let mut retirement = ExchangeReceiverRetirement {
+            registration,
+            disposition: ExchangeRetirementDisposition::Cancel,
+        };
+        retirement.record_terminal(&FragmentTerminalFact::new(
+            QueryId::new(85_102, 2),
+            key.fragment_instance_id,
+            FragmentOutcome::Succeeded,
+            None,
+        ));
+        let owner = retirement.take_construction_stop().unwrap();
+        assert!(matches!(
+            retirement.disposition,
+            ExchangeRetirementDisposition::Remove
+        ));
+        assert_eq!(retirement.registration.keys, vec![key]);
+        assert!(owner.close_after_ingress().is_none());
+        assert!(port.snapshot(key).is_some());
+        retirement.retire();
+        assert!(port.snapshot(key).is_none());
+        assert!(factory.observe_input_work(1).is_err());
+        drop(schema);
+        drop(factory);
+        assert_eq!(tracker.current(), 0);
+    }
 }
 
 #[cfg(test)]
@@ -1167,15 +1417,6 @@ mod cleanup_notification_tests {
         }
         fn accepted(&self) -> Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>> {
             self.owner.accepted()
-        }
-        fn on_settled(
-            &self,
-            continuation: novarocks_execution_contract::SettledContinuation<ExecutionFailure>,
-        ) {
-            novarocks_execution_contract::TaskConclusionPort::on_settled(
-                self.owner.as_ref(),
-                continuation,
-            );
         }
         fn submit(&self, proposal: TaskConclusionProposal<ExecutionFailure>) {
             self.owner.submit(proposal)

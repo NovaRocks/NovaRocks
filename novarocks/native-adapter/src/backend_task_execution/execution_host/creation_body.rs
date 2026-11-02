@@ -316,52 +316,6 @@ impl Body {
         body.assignment.sink_edge_ids = edge_ids;
         body
     }
-    pub(crate) fn receiver(dop: u32, node: i32) -> Self {
-        let mut builder = FragmentBuilder::new(FragmentId::new(7));
-        let root = NodeId::new(u32::try_from(node).unwrap());
-        let edge = EdgeId::new(1);
-        builder
-            .add_exchange_source(
-                root,
-                edge,
-                Box::default(),
-                Box::default(),
-                Distribution::Singleton,
-                RowMultiplicity::SingleCopy,
-            )
-            .unwrap();
-        let cuts = FragmentCuts {
-            inbound: Box::from([InboundFragmentCut {
-                edge,
-                kind: EdgeKind::Stream,
-                source_fragment: FragmentId::new(8),
-                destination_node: root,
-                imports: Box::default(),
-                partitioning: edge_partition(
-                    DataStreamPartitionType::Unpartitioned,
-                    ValueId::new(0),
-                    ValueId::new(0),
-                ),
-                source_port: novarocks_physical_plan::FragmentOutputPort::Root,
-                delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
-                payload: novarocks_physical_plan::ExchangePayloadContract::Relational,
-            }]),
-            ..Default::default()
-        };
-        finish(
-            builder,
-            root,
-            FragmentSink::RootResult(Box::new(
-                novarocks_result_contract::RootOutputContract::new(
-                    novarocks_result_contract::RootProfileId::V1,
-                    novarocks_result_contract::FrozenRootOutput::CountOnly,
-                ),
-            )),
-            dop,
-            ConstantPools::empty(),
-            cuts,
-        )
-    }
     pub(crate) fn bounded_root(
         output: novarocks_result_contract::FrozenRootOutput,
         rows: &[i64],

@@ -18,13 +18,29 @@
 //! Real Worker context/admission tests for the transport-independent reader.
 //! These tests install no RPC and make no HTTP/H2 ownership claim.
 
+use novarocks_execution::runtime::fragment::{
+    FragmentCancelReason, FragmentOutcome, FragmentTerminalFact,
+};
+use novarocks_execution_contract::AdmissionTicketId;
+use novarocks_worker::control_runtime_policy::{ControlRuntimePolicy, IngressRoleLimits};
+use novarocks_worker::{
+    AdmissionEpochCapability, LeaseBounds, NODE_CONTEXT_STEP_BUDGET, NODE_CONTROL_STEP_BUDGET,
+    NodeAdmissionTicketConfig, NodeContextCoreConfig, NodeControlConfig, NodeGeometry,
+    NodeGeometryInputs, NodeWorkers, ObservationProjection, QueryContextHostFactory,
+    QueryContextHostInstance, RequestHorizon, TaskCompletionReservation, TaskCompletionSupervisor,
+    TaskIngressRetirement, TaskPreparationChild, TaskPreparationChildExit,
+    TaskPreparationOutputExit, TaskPreparationRoles, TaskTerminalAction, TaskTerminalIntent,
+    TaskTerminalObservation, WorkerAdmissionEpochAuthority, WorkerContextReplyBody,
+    WorkerControlReplyBody, WorkerCreateReply, WorkerNodeConfig, WorkerNodeRuntime,
+    WorkerTaskControl,
+};
 use std::any::Any;
 use std::future::{Future, poll_fn};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks_execution::runtime::fragment::io::{
@@ -56,7 +72,7 @@ use novarocks_execution_contract::task_execution::lease::{LeaseSequence, LeaseVa
 use novarocks_execution_contract::task_execution::operation::{
     AcquireQueryContextAdmissionTicket, CreateTask, CredentialUpdate, EstablishQueryContext,
     OperationOutcome, QuiesceQueryContext, ReleaseQueryContext, RenewQueryExecutionLease,
-    TaskDomainUpdate, UpdateQueryContext,
+    TaskDomainUpdate,
 };
 use novarocks_execution_contract::task_execution::status::{AbortCause, CancelReason};
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
@@ -74,17 +90,19 @@ use novarocks_types::{
 use novarocks_worker::result_buffer::ResultRetainedBudget;
 use novarocks_worker::root_result_channel::RootResultChannel;
 use novarocks_worker::{
-    HostRejection, ManualClock, PreparedTaskInstallation, QueryContextHost,
-    ReleasedContextEvidence, RunnableTask, SharedFactsRequest, TaskExecutionHost,
-    TaskExecutionMetrics, TaskExecutionPorts, TaskExecutionRegistry, TaskExecutionRegistryConfig,
+    HostRejection, ManualClock, PreparedTaskInstallation, ReleasedContextEvidence, RunnableTask,
+    SharedFactsRequest, TaskExecutionHost, TaskExecutionMetrics, TaskExecutionPorts,
     TaskProtocolEvent, TaskProtocolObserver, TaskResultLifecycle, TaskStatusReporter,
-    WorkerMonotonicClock, WorkerResultRetainedLimits,
+    WorkerResultRetainedLimits,
 };
 
 const FIXED: usize = RootProfileV1::SCHEMA_BACKING_BYTES;
 const SEGMENT: usize = RootProfileV1::SEGMENT_BYTES + RootProfileV1::ENVELOPE_BYTES;
 const COPY: usize = 2 * SEGMENT;
 const PROCESS: usize = 512 * 1024 * 1024;
+
+#[path = "root_result_reader/node_retention.rs"]
+mod node_retention;
 
 #[derive(Debug)]
 struct Assignment;
@@ -118,18 +136,30 @@ impl ConfidentialContent for Secret {
         other.encoded_len() == 16
     }
 }
-struct ContextHost;
-impl QueryContextHost for ContextHost {
-    fn materialize(&self, _: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+struct ContextHost(QueryContextRef);
+impl QueryContextHostFactory for ContextFactory {
+    fn create_instance(
+        self: Arc<Self>,
+        context: QueryContextRef,
+    ) -> Result<Arc<dyn QueryContextHostInstance>, HostRejection> {
+        Ok(Arc::new(ContextHost(context)))
+    }
+}
+struct ContextFactory;
+impl QueryContextHostInstance for ContextHost {
+    fn context(&self) -> QueryContextRef {
+        self.0
+    }
+    fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+        assert_eq!(request.context(), self.0);
         Ok(())
     }
-    fn release(&self, _: QueryContextRef) -> ReleasedContextEvidence {
+    fn release(&self) -> ReleasedContextEvidence {
         ReleasedContextEvidence::none()
     }
     fn advance_shared_domain(
         &self,
-        _: QueryContextRef,
-        _: &novarocks_execution_contract::task_execution::operation::QueryContextDomainUpdate,
+        _: &novarocks_execution_contract::QueryContextDomainUpdate,
     ) -> Result<(), HostRejection> {
         Ok(())
     }
@@ -145,12 +175,216 @@ impl TaskResultLifecycle for Noop {
 impl TaskExecutionMetrics for Noop {
     fn record_task_created(&self) {}
 }
-#[derive(Debug)]
-struct Runnable;
+struct Runnable {
+    task: TaskIdentity,
+    instance: UniqueId,
+    control: Arc<novarocks_execution::runtime::task_control::TaskExecutionControl>,
+    state: Mutex<RunnableState>,
+    stop_subscription:
+        Mutex<Option<novarocks_execution::runtime::observable::ObserverSubscription>>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunnablePhase {
+    Dormant,
+    Activating,
+    Cancelling,
+    Active,
+    Completed,
+}
+struct RunnableState {
+    start: Option<novarocks_worker::TaskStartPermit>,
+    completion: Option<TaskCompletionReservation>,
+    phase: RunnablePhase,
+    outcome: Option<FragmentOutcome>,
+}
+impl std::fmt::Debug for Runnable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReaderRunnable")
+            .field("task", &self.task)
+            .finish()
+    }
+}
+impl Runnable {
+    fn complete(&self, outcome: FragmentOutcome) {
+        {
+            let mut state = self.state.lock().unwrap();
+            if matches!(
+                state.phase,
+                RunnablePhase::Cancelling | RunnablePhase::Completed
+            ) {
+                return;
+            }
+            // A stop racing dormant activation keeps the original request,
+            // but cannot publish completion before that physical body runs.
+            if state.outcome.is_none() {
+                state.outcome = Some(outcome);
+            }
+        }
+        self.publish_pending();
+    }
+    fn publish_pending(&self) {
+        let original = {
+            let mut state = self.state.lock().unwrap();
+            if state.phase != RunnablePhase::Active || state.outcome.is_none() {
+                return;
+            }
+            let completion = state.completion.take().unwrap();
+            let outcome = state.outcome.take().unwrap();
+            state.phase = RunnablePhase::Completed;
+            (completion, outcome)
+        };
+        let (completion, outcome) = original;
+        completion.publish(FragmentTerminalFact::new(
+            self.task.query_execution_id().query_id(),
+            self.instance,
+            outcome,
+            None,
+        ));
+        drop(completion);
+    }
+    fn actual_stop(&self) -> bool {
+        self.control.is_stopped()
+            && self.control.accepted().is_some_and(|accepted| {
+                matches!(
+                    accepted.neutral().conclusion(),
+                    novarocks_execution_contract::TaskConclusion::Terminated(_)
+                )
+            })
+    }
+    fn observe_stop(&self) {
+        if !self.actual_stop() {
+            return;
+        }
+        let canceled = FragmentOutcome::Cancelled {
+            reason: FragmentCancelReason::new("reader fixture observed actual stop"),
+        };
+        let (unstarted, previous) = {
+            let mut state = self.state.lock().unwrap();
+            match state.phase {
+                RunnablePhase::Completed | RunnablePhase::Cancelling => return,
+                RunnablePhase::Dormant => {
+                    // No kernel/fragment was started by this mock. Its unique
+                    // dormant body owns the original permit and completion.
+                    // The real stop fence authorizes physical withdrawal even
+                    // when provider rollback never invokes commit_creation.
+                    state.phase = RunnablePhase::Cancelling;
+                    let previous = state.outcome.take();
+                    let original = (
+                        state.start.take().unwrap(),
+                        state.completion.take().unwrap(),
+                    );
+                    (Some(original), previous)
+                }
+                RunnablePhase::Activating | RunnablePhase::Active => {
+                    // A pending output-success observation does not override
+                    // the actual Core's already accepted termination. The
+                    // in-flight activation still owns its original artifacts.
+                    (None, state.outcome.replace(canceled.clone()))
+                }
+            }
+        };
+        drop(previous);
+        if let Some((start, completion)) = unstarted {
+            // Actual unused-author withdrawal, not a synthetic Running or
+            // operator exit. No foreign Drop runs under the mock state lock.
+            drop(start);
+            completion.commit_creation();
+            completion.publish(FragmentTerminalFact::new(
+                self.task.query_execution_id().query_id(),
+                self.instance,
+                canceled,
+                None,
+            ));
+            drop(completion);
+            let mut state = self.state.lock().unwrap();
+            assert_eq!(state.phase, RunnablePhase::Cancelling);
+            state.phase = RunnablePhase::Completed;
+        } else {
+            self.publish_pending();
+        }
+    }
+    fn bind_stop(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let subscription = self.control.stop_observable().subscribe(Arc::new(move || {
+            if let Some(original) = weak.upgrade() {
+                original.observe_stop();
+            }
+        }));
+        assert!(
+            self.stop_subscription
+                .lock()
+                .unwrap()
+                .replace(subscription)
+                .is_none()
+        );
+        // The original stop flag is published before observable delivery.
+        // Subscribe then recheck covers a stop before/during registration.
+        self.observe_stop();
+    }
+}
 impl RunnableTask for Runnable {
-    fn commit_creation(&self) {}
-    fn cancel(&self, _: CancelReason) {}
-    fn abort(&self, _: AbortCause) {}
+    fn commit_creation(&self) {
+        let (start, completion) = {
+            let mut state = self.state.lock().unwrap();
+            match state.phase {
+                RunnablePhase::Dormant => state.phase = RunnablePhase::Activating,
+                // The same real stop already claimed this unstarted mock
+                // body. A late provider invocation cannot publish Running.
+                RunnablePhase::Cancelling | RunnablePhase::Completed => return,
+                RunnablePhase::Activating | RunnablePhase::Active => {
+                    panic!("original reader activation was invoked twice");
+                }
+            }
+            (
+                state.start.take().unwrap(),
+                state.completion.take().unwrap(),
+            )
+        };
+        match start.authorize_running() {
+            Ok(()) => {}
+            Err(novarocks_worker::TaskStartRefusal::Stopped { permit }) => {
+                // This actual activation found the committed stop fence.
+                // Withdraw its original unstarted Running author; the mock
+                // has no kernel captures to dispose and never claims Running.
+                drop(permit);
+            }
+            Err(error) => panic!("original reader activation refused: {error:?}"),
+        }
+        completion.commit_creation();
+        {
+            let mut state = self.state.lock().unwrap();
+            assert_eq!(state.phase, RunnablePhase::Activating);
+            assert!(state.completion.is_none());
+            state.completion = Some(completion);
+            state.phase = RunnablePhase::Active;
+        }
+        self.observe_stop();
+        self.publish_pending();
+    }
+    fn cancel(&self, _: CancelReason) {
+        self.observe_stop();
+    }
+    fn abort(&self, _: AbortCause) {
+        self.cancel(CancelReason::UpstreamNoLongerNeeded);
+    }
+}
+struct RootChild(Arc<RootResultChannel>);
+impl TaskPreparationChild for RootChild {
+    fn request_rollback(&self) {
+        self.0.close(
+            novarocks_execution_contract::root_lifetime::RootRetentionClose::ContextReleased,
+        );
+    }
+    fn poll_exit(&self) -> TaskPreparationChildExit {
+        if self.0.physical_exit_observation().output_exited() {
+            TaskPreparationChildExit::Exited {
+                output: TaskPreparationOutputExit::ActualOutputExited,
+            }
+        } else {
+            TaskPreparationChildExit::Pending
+        }
+    }
+    fn adopt_runtime(&self) {}
 }
 #[derive(Default)]
 struct Gate {
@@ -183,6 +417,10 @@ struct Host {
     root: Mutex<Option<Arc<RootResultChannel>>>,
     reporter: Mutex<Option<TaskStatusReporter>>,
     gate: Option<Arc<Gate>>,
+    roles: Mutex<Option<TaskPreparationRoles>>,
+    control: Mutex<Option<Arc<novarocks_execution::runtime::task_control::TaskExecutionControl>>>,
+    runnable: Mutex<Option<Arc<Runnable>>>,
+    completion: Arc<TaskCompletionSupervisor>,
 }
 impl TaskExecutionHost for Host {
     fn close_context_admission(&self, _: QueryContextRef) {}
@@ -192,8 +430,22 @@ impl TaskExecutionHost for Host {
         &self,
         _: &TaskDescriptor,
         _: TaskCreationInput,
-        _preparation_stop: novarocks_worker::TaskPreparationContext<'_>,
+        mut preparation: novarocks_worker::TaskPreparationContext<'_>,
     ) -> Result<PreparedTaskInstallation, HostRejection> {
+        let root = self.root.lock().unwrap().as_ref().unwrap().clone();
+        preparation
+            .register_child(Arc::new(RootChild(root.clone())))
+            .unwrap();
+        root.bind_preparation_exit_waker(preparation.readiness_waker())
+            .unwrap();
+        assert!(
+            self.control
+                .lock()
+                .unwrap()
+                .replace(preparation.runtime_control())
+                .is_none()
+        );
+        *self.roles.lock().unwrap() = Some(preparation.take_roles().unwrap());
         if let Some(gate) = &self.gate {
             gate.wait();
         }
@@ -203,17 +455,92 @@ impl TaskExecutionHost for Host {
         )
     }
     fn remove_receiver(&self, _: &TaskDescriptor) {}
+    fn retire_receiver_checked(
+        &self,
+        _: &TaskDescriptor,
+        _: TaskIngressRetirement,
+    ) -> Result<(), HostRejection> {
+        Ok(())
+    }
     fn install_inbound_capability(&self, _: &TaskDescriptor) -> Result<(), HostRejection> {
         Ok(())
     }
     fn remove_inbound_capability(&self, _: &TaskDescriptor) {}
     fn submit_runnable(
         &self,
-        _: &TaskDescriptor,
+        descriptor: &TaskDescriptor,
         reporter: TaskStatusReporter,
     ) -> Result<Arc<dyn RunnableTask>, HostRejection> {
-        *self.reporter.lock().unwrap() = Some(reporter);
-        Ok(Arc::new(Runnable))
+        *self.reporter.lock().unwrap() = Some(reporter.clone());
+        let TaskPreparationRoles {
+            fragments,
+            start,
+            terminal,
+            statistics,
+            dynamic_filters,
+            final_statistics,
+            completion_exit,
+        } = self.roles.lock().unwrap().take().unwrap();
+        // This transport fixture installs no kernel callbacks. Their original
+        // never-bound roles exit here, rather than inventing a kernel exit.
+        drop(fragments);
+        let mut completion = self
+            .completion
+            .reserve_task_slot(
+                descriptor.identity(),
+                descriptor.fragment_instance_id(),
+                reporter,
+                completion_exit,
+            )
+            .unwrap();
+        let mut captures = Some((final_statistics, statistics, dynamic_filters));
+        completion
+            .bind_action(TaskTerminalAction::new(
+                terminal,
+                Box::new(move |fact, terminal| {
+                    let (final_statistics, statistics, dynamic_filters) = captures.take().unwrap();
+                    let final_statistics = final_statistics.seal_for_terminal(None);
+                    drop(statistics);
+                    drop(dynamic_filters);
+                    terminal
+                        .handoff(TaskTerminalObservation {
+                            intent: match fact.outcome() {
+                                FragmentOutcome::Succeeded => {
+                                    TaskTerminalIntent::SuccessfulProduction {
+                                        completed_output: Some(TaskOutputFacts::new(true)),
+                                    }
+                                }
+                                FragmentOutcome::Cancelled { .. } => {
+                                    TaskTerminalIntent::FinishExistingTermination { output: None }
+                                }
+                                FragmentOutcome::Failed(_) => {
+                                    unreachable!("reader fixture has no failing kernel")
+                                }
+                            },
+                            normal_close_validated: false,
+                            output_released: false,
+                            final_statistics,
+                        })
+                        .unwrap();
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("original terminal attachment"));
+        let runnable = Arc::new(Runnable {
+            task: descriptor.identity(),
+            instance: descriptor.fragment_instance_id(),
+            control: self.control.lock().unwrap().take().unwrap(),
+            state: Mutex::new(RunnableState {
+                start: Some(start),
+                completion: Some(completion),
+                phase: RunnablePhase::Dormant,
+                outcome: None,
+            }),
+            stop_subscription: Mutex::new(None),
+        });
+        assert_eq!(runnable.control.identity(), descriptor.identity());
+        runnable.bind_stop();
+        *self.runnable.lock().unwrap() = Some(runnable.clone());
+        Ok(runnable)
     }
     fn apply_task_domain(
         &self,
@@ -224,8 +551,19 @@ impl TaskExecutionHost for Host {
         Ok(None)
     }
 }
+// This component fixture has no Native listener. Its original finite
+// ingress backing holds only the actual admission permit, never rich input.
+struct ComponentIngressBacking {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl novarocks_worker::WorkerIngressBacking for ComponentIngressBacking {}
+
 struct Fixture {
-    registry: Arc<TaskExecutionRegistry>,
+    node: Mutex<Option<WorkerNodeRuntime>>,
+    ingress: Arc<tokio::sync::Semaphore>,
+    control: WorkerTaskControl,
+    completion_runtime: Option<tokio::runtime::Runtime>,
+    release: Mutex<Option<std::thread::JoinHandle<QueryContextState>>>,
     reader: NativeRootResultReader,
     root: Arc<RootResultChannel>,
     budget: Arc<ResultRetainedBudget>,
@@ -240,6 +578,13 @@ impl Fixture {
         fixture
     }
     fn uninstalled(count_only: bool, gate: Option<Arc<Gate>>) -> Self {
+        Self::uninstalled_with_history(count_only, gate, None)
+    }
+    fn uninstalled_with_history(
+        count_only: bool,
+        gate: Option<Arc<Gate>>,
+        history: Option<novarocks_worker::WorkerHistoryCapture>,
+    ) -> Self {
         let backend = BackendProcessId::new_v7();
         let execution =
             QueryExecutionId::new(QueryId::new(32100, 32101), AttemptId::new(1).unwrap()).unwrap();
@@ -285,59 +630,89 @@ impl Fixture {
             Arc::clone(&health),
         )
         .unwrap();
+        let completion_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let completion = TaskCompletionSupervisor::start(completion_runtime.handle().clone(), 1);
         let host = Arc::new(Host {
             root: Mutex::new(Some(Arc::clone(&root))),
             reporter: Mutex::new(None),
             gate,
+            roles: Mutex::new(None),
+            control: Mutex::new(None),
+            runnable: Mutex::new(None),
+            completion,
         });
         let clock = Arc::new(ManualClock::new());
-        let registry = TaskExecutionRegistry::new(
-            TaskExecutionRegistryConfig::for_process(backend, 17, 9),
-            Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
-            Arc::new(ContextHost),
-            Arc::clone(&host) as Arc<dyn TaskExecutionHost>,
-            TaskExecutionPorts::new(Arc::new(Noop), Arc::new(Noop), Arc::new(Noop), health),
-        );
+        let (node, ingress) = start_node(backend, clock.clone(), host.clone(), health, history);
+        let control = node.task_control();
         let lease = || LeaseValidFor::new(Duration::from_secs(10)).unwrap();
-        let ticket = registry
-            .acquire_query_context_admission_ticket(AcquireQueryContextAdmissionTicket::new(
+        let ticket =
+            AdmissionTicketId::try_from_bytes(TaskOperationId::new_v7().to_bytes()).unwrap();
+        let admitted = await_original(control.acquire(
+            AcquireQueryContextAdmissionTicket::new(
                 TaskOperationId::new_v7(),
                 context,
                 lease(),
                 NativeCompatibilityId::new([0x71; 32]),
-                registry.admission_epoch_capability(),
-            ))
-            .acknowledgement()
-            .unwrap()
-            .ticket_id();
-        assert_eq!(
-            registry
-                .update_query_context(&UpdateQueryContext::Establish(EstablishQueryContext::new(
-                    TaskOperationId::new_v7(),
-                    context,
-                    ticket,
-                    Arc::new(Content),
-                    Arc::new(Content),
-                    Arc::new(Content),
-                    CredentialUpdate::new(
-                        CredentialLeaseId::new(1),
-                        CredentialEpoch::FIRST,
-                        Arc::new(Secret)
-                    ),
-                    lease()
-                )))
-                .outcome(),
-            OperationOutcome::Accepted
+                control.admission_epoch_capability(),
+            ),
+            ticket,
+            deadline(&control),
+        ))
+        .unwrap();
+        assert!(matches!(
+            admitted.body(),
+            WorkerControlReplyBody::Admission(Ok(_))
+        ));
+        drop(admitted);
+        let established = await_original(control.establish(
+            EstablishQueryContext::new(
+                TaskOperationId::new_v7(),
+                context,
+                ticket,
+                Arc::new(Content),
+                Arc::new(Content),
+                Arc::new(Content),
+                CredentialUpdate::new(
+                    CredentialLeaseId::new(1),
+                    CredentialEpoch::FIRST,
+                    Arc::new(Secret),
+                ),
+                lease(),
+            ),
+            deadline(&control),
+        ))
+        .unwrap();
+        assert!(
+            matches!(established.body(), WorkerControlReplyBody::Context(ack) if ack.outcome == OperationOutcome::Accepted)
         );
+        drop(established);
         Self {
-            reader: NativeRootResultReader::new(Arc::clone(&registry)),
-            registry,
+            reader: NativeRootResultReader::new(control.clone()),
+            node: Mutex::new(Some(node)),
+            ingress,
+            control,
+            completion_runtime: Some(completion_runtime),
+            release: Mutex::new(None),
             root,
             budget,
             host,
             clock,
             context,
         }
+    }
+    fn ingress_responsibility(&self) -> novarocks_worker::WorkerIngressResponsibility {
+        let permit = self
+            .ingress
+            .clone()
+            .try_acquire_owned()
+            .expect("the reader fixture's declared original ingress positions");
+        novarocks_worker::WorkerIngressResponsibility::from_admitted(Arc::new(
+            ComponentIngressBacking { _permit: permit },
+        ))
     }
     fn install(&self) {
         let descriptor = TaskDescriptor::try_new(
@@ -355,18 +730,37 @@ impl Fixture {
             Vec::new(),
         )
         .unwrap();
-        assert_eq!(
-            self.registry
-                .create_task(
-                    &create,
-                    TaskCreationInput::new(
-                        FrozenBytes::freeze(Bytes::from_static(b"root")),
-                        Box::new(Assignment)
-                    )
-                )
-                .outcome(),
-            OperationOutcome::Accepted
-        );
+        let reply = await_original(self.control.create(
+            Arc::new(create),
+            TaskCreationInput::new(
+                FrozenBytes::freeze(Bytes::from_static(b"root")),
+                Box::new(Assignment),
+            ),
+            0,
+            deadline(&self.control),
+            self.ingress_responsibility(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            reply.reply(),
+            WorkerCreateReply::Context(WorkerContextReplyBody::Create {
+                outcome: OperationOutcome::Accepted,
+                ..
+            })
+        ));
+        drop(reply);
+        wait_until(|| {
+            self.host.runnable.lock().unwrap().is_some()
+                && self
+                    .host
+                    .reporter
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|reporter| {
+                        reporter.current().is_ok_and(|status| status.installed())
+                    })
+        });
     }
     fn request(&self, wanted: Option<u64>, consumed: u64, wait: u64) -> RootResultRead {
         RootResultRead::try_new(
@@ -390,39 +784,255 @@ impl Fixture {
             builder.output()[..6].copy_from_slice(b"\x02\0\0\0\x011");
             self.root.publish_segment(builder, 6, true).unwrap();
         }
-        producer.finish_encoder();
-        let reporter = self.host.reporter.lock().unwrap().as_ref().unwrap().clone();
-        reporter.running();
-        reporter.finished(TaskOutputFacts::new(true));
-        reporter.release_output();
-        reporter.note_actual_stopped();
-        reporter.note_resources_converged();
-        assert_eq!(self.registry.advance_deadlines().tasks_retired, 1);
+        assert!(producer.finish_encoder().is_none());
+        self.host
+            .runnable
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .complete(FragmentOutcome::Succeeded);
+        wait_until(|| {
+            self.host
+                .reporter
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .convergence()
+                .is_ok_and(|c| c.actual_stopped() && c.resources_converged())
+        });
     }
     fn fill_process(&self, bytes: usize) -> ResultWriteCredit {
         granted(self.budget.try_reserve_process(bytes).unwrap())
     }
     fn seal(&self) {
-        assert_eq!(
-            self.registry
-                .quiesce_query_context(&QuiesceQueryContext::new(
-                    TaskOperationId::new_v7(),
-                    self.context
-                ))
-                .outcome(),
-            OperationOutcome::Accepted
-        );
-        assert_eq!(
-            self.registry
-                .release_query_context(&ReleaseQueryContext::new(
-                    TaskOperationId::new_v7(),
-                    self.context
-                ))
-                .outcome(),
-            OperationOutcome::Accepted
-        );
+        let reply = await_original(self.control.quiesce(
+            QuiesceQueryContext::new(TaskOperationId::new_v7(), self.context),
+            deadline(&self.control),
+        ))
+        .unwrap();
+        assert!(matches!(
+            reply.body(),
+            WorkerContextReplyBody::Quiesce {
+                outcome: OperationOutcome::Accepted,
+                ..
+            }
+        ));
+        drop(reply);
+        let control = self.control.clone();
+        let context = self.context;
+        *self.release.lock().unwrap() = Some(std::thread::spawn(move || {
+            let reply = await_original(control.release(
+                ReleaseQueryContext::new(TaskOperationId::new_v7(), context),
+                deadline(&control),
+            ))
+            .unwrap();
+            match reply.body() {
+                WorkerContextReplyBody::Release { state, .. } => *state,
+                other => panic!("unexpected release {other:?}"),
+            }
+        }));
+        wait_until(|| self.root.is_closed());
+    }
+    fn released(&self) {
+        let release = self.release.lock().unwrap().take().unwrap();
+        assert_eq!(release.join().unwrap(), QueryContextState::TerminalRetained);
     }
 }
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.host.gate {
+            gate.open();
+        }
+        let node = self.node.lock().unwrap().take().unwrap();
+        node.begin_drain().unwrap();
+        node.confirm_ingress_closed().unwrap();
+        node.drain_and_join().unwrap_or_else(|(error, _original)| {
+            panic!("actual Reader Node failed to join: {error}")
+        });
+        if let Some(release) = self.release.lock().unwrap().take() {
+            release.join().unwrap();
+        }
+        let completion = self.host.completion.clone();
+        // The supervisor belongs to the fixture's independent runtime. Join
+        // it outside the current-thread Tokio caller, while its own workers
+        // remain alive to finish their actual shutdown.
+        std::thread::spawn(move || completion.shutdown())
+            .join()
+            .unwrap()
+            .unwrap();
+        // Joining this fixture's independent Tokio owner happens outside the
+        // caller's async runtime; shutdown itself must not detach live work.
+        let runtime = self.completion_runtime.take().unwrap();
+        std::thread::spawn(move || drop(runtime)).join().unwrap();
+    }
+}
+
+fn nz(value: usize) -> NonZeroUsize {
+    NonZeroUsize::new(value).unwrap()
+}
+fn wait_until(mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        assert!(
+            Instant::now() < deadline,
+            "original reader owner did not progress"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+fn await_original<F: Future>(future: F) -> F::Output {
+    struct Waiter(std::thread::Thread);
+    impl std::task::Wake for Waiter {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Waiter(std::thread::current())));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "original reader delivery timeout"
+        );
+        std::thread::park_timeout(Duration::from_millis(1));
+    }
+}
+fn deadline(control: &WorkerTaskControl) -> novarocks_worker::WorkerMonotonicInstant {
+    control.now().saturating_add(Duration::from_secs(10))
+}
+fn start_node(
+    backend: BackendProcessId,
+    clock: Arc<ManualClock>,
+    execution: Arc<Host>,
+    health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
+    history: Option<novarocks_worker::WorkerHistoryCapture>,
+) -> (WorkerNodeRuntime, Arc<tokio::sync::Semaphore>) {
+    let policy = ControlRuntimePolicy::try_new_with_request_sources(
+        IngressRoleLimits {
+            ordinary_running: 1,
+            ordinary_waiting: 1,
+            control_running: 1,
+            control_waiting: 1,
+            max_batch_items: 1,
+            root_read_holders: 2,
+        },
+        2,
+        1,
+    )
+    .unwrap();
+    let tickets =
+        NodeAdmissionTicketConfig::new(Duration::from_secs(10), RequestHorizon::DEFAULT.total())
+            .unwrap();
+    let geometry = NodeGeometry::try_new(NodeGeometryInputs {
+        tasks_per_context: nz(1),
+        active_tasks: nz(1),
+        preparing_tasks: nz(1),
+        preparing_bytes: nz(64 << 20),
+
+        policy,
+        native_root_data_holders: nz(2),
+    })
+    .unwrap();
+    let requests = geometry.request_positions().get();
+    let config = WorkerNodeConfig {
+        observation: observation_projection(),
+        backend,
+        compatibility: NativeCompatibilityId::new([0x71; 32]),
+        initial_admission_epoch: AdmissionEpochCapability::try_from_bytes([1; 16]).unwrap(),
+        clock,
+        context_factory: Arc::new(ContextFactory),
+        execution,
+        execution_ports: TaskExecutionPorts::new(
+            Arc::new(Noop),
+            Arc::new(Noop),
+            Arc::new(Noop),
+            health,
+        ),
+        control: NodeControlConfig {
+            max_pending_requests: requests,
+            step_budget: NODE_CONTROL_STEP_BUDGET,
+        },
+        context: NodeContextCoreConfig {
+            request_horizon: RequestHorizon::DEFAULT,
+            max_tasks: 1,
+            max_creation_waiters: requests,
+            max_pending_requests: requests,
+            max_preparing: 1,
+            max_task_bytes: 64 << 20,
+            step_budget: NODE_CONTEXT_STEP_BUDGET,
+            lease_bounds: LeaseBounds::DEFAULT,
+            metric_publish_interval: novarocks_worker::METRIC_PUBLISH_MIN_INTERVAL,
+        },
+        tickets,
+        geometry,
+        workers: NodeWorkers {
+            pollers: nz(1),
+            context_materialization: nz(1),
+            context_cleanup: nz(1),
+            establish_getters: nz(1),
+            establish_cleanup: nz(1),
+            loading: nz(1),
+            preparation: nz(1),
+            lifecycle: nz(1),
+        },
+        cadence: Duration::from_millis(1),
+    };
+    let owner = match history {
+        Some(history) => WorkerNodeRuntime::start_with_history(config, history),
+        None => WorkerNodeRuntime::start(config),
+    }
+    .unwrap_or_else(|error| panic!("actual reader Node startup: {error:?}"));
+    (owner, Arc::new(tokio::sync::Semaphore::new(requests)))
+}
+fn observation_projection() -> ObservationProjection {
+    use novarocks_task_codec::operation::{
+        CoveredStatusStreamEvent, CoveredStatusStreamFact as WireFact,
+        NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES, covered_quiesce_fact_size_bound,
+        encode_covered_status_event,
+    };
+    fn bytes(
+        fact: &novarocks_worker::NodeCoveredObservationFact,
+    ) -> Result<usize, novarocks_worker::ObservationProjectionError> {
+        use novarocks_worker::{
+            NodeCoveredObservationFact as Fact, ObservationProjectionError as Error,
+        };
+        if let Fact::Quiesce(receipt) = fact {
+            return covered_quiesce_fact_size_bound(receipt).ok_or(Error::InvalidFact);
+        }
+        let fact = match fact {
+            Fact::Status(v) => WireFact::Status(v.clone()),
+            Fact::StatusUnchanged(v) => WireFact::StatusUnchanged(*v),
+            Fact::Unknown(v) => WireFact::Unknown(*v),
+            Fact::Gone(v) => WireFact::Gone(*v),
+            Fact::TaskConvergence(v) => WireFact::TaskConvergence(*v),
+            Fact::TaskConvergenceUnchanged(v) => WireFact::TaskConvergenceUnchanged(*v),
+            Fact::ContextConvergence(v) => WireFact::ContextConvergence(*v),
+            Fact::Quiesce(_) => unreachable!(),
+        };
+        encode_covered_status_event(&CoveredStatusStreamEvent {
+            fact,
+            source_revision: Some(u64::MAX),
+        })
+        .map(|v| v.encoded_len())
+        .map_err(|_| Error::InvalidFact)
+    }
+    ObservationProjection {
+        fact_bytes: bytes,
+        max_frame_bytes: nz(NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES),
+        max_initial_bytes: nz(64 << 20),
+    }
+}
+
 fn granted(admission: ResultWriteAdmission) -> ResultWriteCredit {
     match admission {
         ResultWriteAdmission::Granted(credit) => credit,
@@ -581,7 +1191,7 @@ mod root_observation_tests {
         }
 
         fn reader(&self, fixture: &Fixture) -> NativeRootResultReader {
-            NativeRootResultReader::new(Arc::clone(&fixture.registry))
+            NativeRootResultReader::new(fixture.control.clone())
                 .with_observation_controls(Some(Arc::clone(&self.controls)))
         }
 
@@ -624,6 +1234,7 @@ mod root_observation_tests {
         assert!(matches!(reply.reply().outcome, RootReadOutcome::End(end) if end.output_rows == 1));
         session.assert_observed_once();
         drop(reply);
+        wait_until(|| fixture.root.physical_idle());
         assert!(fixture.root.physical_idle());
     }
 
@@ -665,6 +1276,7 @@ mod root_observation_tests {
         assert_eq!(refusal.fact(), root_refusal_fact(43));
         assert!(session.observer.is_active());
         assert!(session.role.scope().observations().is_empty());
+        wait_until(|| fixture.root.physical_idle());
         assert!(fixture.root.physical_idle());
     }
 
@@ -684,10 +1296,25 @@ mod root_observation_tests {
         let mut read = Box::pin(reader.read(&request));
         pending(read.as_mut()).await;
         fixture.seal();
-        assert_eq!(
-            fixture.registry.context_state(fixture.context),
-            QueryContextState::Releasing
-        );
+        // Observe the original Core through an admitted control request;
+        // closing the channel alone is not a Context-state receipt. This
+        // closed-context Renew cannot extend its original lease.
+        let releasing = await_original(fixture.control.renew(
+            RenewQueryExecutionLease::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+                LeaseSequence::new(1),
+                LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+            ),
+            deadline(&fixture.control),
+        ))
+        .unwrap();
+        let WorkerContextReplyBody::Context(ack) = releasing.body() else {
+            panic!("the original closed-context Renew must return its Context receipt");
+        };
+        assert_eq!(ack.receipt.context(), fixture.context);
+        assert_eq!(ack.receipt.state(), QueryContextState::Releasing);
+        drop(releasing);
         let reply = owned(
             tokio::time::timeout(Duration::from_millis(100), read)
                 .await
@@ -707,11 +1334,10 @@ mod root_observation_tests {
         assert!(session.role.scope().observations().is_empty());
         assert_eq!(fixture.root.snapshot().consumed_through, 1);
         drop(reply);
-        fixture.registry.advance_deadlines();
-        assert_eq!(
-            fixture.registry.context_state(fixture.context),
-            QueryContextState::TerminalRetained
-        );
+        // Join the same Release request. Its original Core terminal receipt
+        // follows actual Root/R retirement, rather than a manual global scan.
+        fixture.released();
+        wait_until(|| fixture.root.physical_idle());
         assert!(fixture.root.physical_idle());
     }
 
@@ -728,6 +1354,7 @@ mod root_observation_tests {
         drop(reply);
         assert!(session.observer.is_active());
         assert!(session.role.scope().observations().is_empty());
+        wait_until(|| fixture.root.physical_idle());
         assert!(fixture.root.physical_idle());
     }
 
@@ -782,21 +1409,19 @@ async fn context_read_survives_task_retirement_and_horizon() {
     fixture.finish();
     for sequence in 1..=25 {
         fixture.clock.advance(Duration::from_secs(5));
-        assert_eq!(
-            fixture
-                .registry
-                .update_query_context(&UpdateQueryContext::RenewLease(
-                    RenewQueryExecutionLease::new(
-                        TaskOperationId::new_v7(),
-                        fixture.context,
-                        LeaseSequence::new(sequence),
-                        LeaseValidFor::new(Duration::from_secs(10)).unwrap()
-                    )
-                ))
-                .outcome(),
-            OperationOutcome::Accepted
+        let renewed = await_original(fixture.control.renew(
+            RenewQueryExecutionLease::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+                LeaseSequence::new(sequence),
+                LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+            ),
+            deadline(&fixture.control),
+        ))
+        .unwrap();
+        assert!(
+            matches!(renewed.body(), WorkerContextReplyBody::Context(ack) if ack.outcome == OperationOutcome::Accepted)
         );
-        fixture.registry.advance_deadlines();
     }
     let request = fixture.request(Some(1), 0, 1);
     for _ in 0..2 {
@@ -808,6 +1433,7 @@ async fn context_read_survives_task_retirement_and_horizon() {
         assert_eq!(data.end_after_data().unwrap().output_rows, 1);
         assert_eq!(reply.reply().accepted_consumed, 0);
     }
+    wait_until(|| fixture.control.metrics_snapshot().requests == 0);
     let ack = owned(fixture.reader.read(&fixture.request(None, 2, 1)).await);
     assert_eq!(ack.reply().accepted_consumed, 2);
     assert_eq!(ack.reply().outcome, RootReadOutcome::AckOnly);
@@ -815,7 +1441,11 @@ async fn context_read_survives_task_retirement_and_horizon() {
 
 #[tokio::test]
 async fn count_only_end_and_ack_only_use_typed_reply() {
-    let fixture = Fixture::new(true);
+    // The existing real Node path also proves that the optional observer sees
+    // both original ledger facts and actual driver publications in one stream.
+    let history = novarocks_worker::WorkerHistoryCapture::new(4096);
+    let fixture = Fixture::uninstalled_with_history(true, None, Some(history.clone()));
+    fixture.install();
     fixture.finish();
     let end = owned(fixture.reader.read(&fixture.request(Some(1), 0, 1)).await);
     assert!(matches!(end.reply().outcome, RootReadOutcome::End(e) if e.output_rows == 1));
@@ -826,6 +1456,30 @@ async fn count_only_end_and_ack_only_use_typed_reply() {
         2 * RootProfileV1::ENVELOPE_BYTES
     );
     assert_eq!(ack.reply().outcome, RootReadOutcome::AckOnly);
+    drop(ack);
+    drop(fixture);
+    let observed = history.drain(4096);
+    assert!(observed.complete && observed.remaining == 0);
+    use novarocks_worker::WorkerHistoryFact as HistoryFact;
+    assert!(
+        observed
+            .entries
+            .iter()
+            .any(|e| matches!(e.fact, HistoryFact::ScopeOpened { .. }))
+    );
+    assert!(
+        observed
+            .entries
+            .iter()
+            .any(|e| matches!(e.fact, HistoryFact::InputConsumed { .. }))
+    );
+    assert!(observed.entries.iter().any(|e| matches!(
+        e.fact,
+        HistoryFact::Effect {
+            phase: novarocks_worker::WorkerEffectHistoryPhase::Published,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
@@ -853,6 +1507,9 @@ async fn two_send_positions_follow_last_exported_owner() {
         read_holders_busy()
     );
     drop(owner);
+    // One original delivery remains; both the dropped read and refused R
+    // must actually retire before another request can use their positions.
+    wait_until(|| fixture.control.metrics_snapshot().requests <= 1);
     let third = owned(fixture.reader.read(&request).await);
     drop(second);
     drop(third);
@@ -888,6 +1545,7 @@ async fn shared_process_and_root_pregrants_refuse_without_leaking_read_positions
         send_backing_busy()
     );
     assert!(fixture.root.physical_idle());
+    wait_until(|| fixture.control.metrics_snapshot().requests == 0);
     drop(process);
     let root = granted(
         fixture
@@ -899,6 +1557,7 @@ async fn shared_process_and_root_pregrants_refuse_without_leaking_read_positions
         deferred(fixture.reader.read(&request).await, &request),
         send_backing_busy()
     );
+    wait_until(|| fixture.control.metrics_snapshot().requests == 0);
     drop(root);
     drop(owned(fixture.reader.read(&request).await));
     assert!(fixture.root.physical_idle());
@@ -949,6 +1608,9 @@ async fn fixed_metadata_refusal_does_not_apply_ack_or_keep_admission() {
     );
     assert_eq!(fixture.root.snapshot().consumed_through, 0);
     drop(metadata);
+    // Refusal drops the caller's holder; the original R still retires its
+    // input, captures and report asynchronously before its position returns.
+    wait_until(|| fixture.control.metrics_snapshot().requests == 0);
     assert!(
         !fixture.root.physical_idle(),
         "unacknowledged Data remains owned"
@@ -1017,6 +1679,8 @@ async fn acknowledged_original_alias_still_blocks_copy_pregrant() {
         "ACK applied despite copy refusal"
     );
     drop(alias);
+    // The failed copy offer also owns its original R until actual cleanup.
+    wait_until(|| fixture.control.metrics_snapshot().requests == 0);
     let end = owned(fixture.reader.read(&request).await);
     assert_eq!(end.reply().accepted_consumed, 1);
     drop(end);
@@ -1033,13 +1697,14 @@ async fn release_wakes_admitted_long_poll_and_late_route_uses_real_ack() {
     drop(owned(
         fixture.reader.read(&fixture.request(None, 1, 1)).await,
     ));
+    wait_until(|| fixture.control.metrics_snapshot().requests == 0);
     let request = fixture.request(Some(3), 1, 1000);
     let mut read = Box::pin(fixture.reader.read(&request));
     pending(read.as_mut()).await;
     fixture.seal();
-    assert_eq!(
-        fixture.registry.context_state(fixture.context),
-        QueryContextState::Releasing
+    assert!(
+        fixture.root.is_closed(),
+        "the original release sealed reads"
     );
     let reply = owned(
         tokio::time::timeout(Duration::from_millis(100), read)
@@ -1056,11 +1721,7 @@ async fn release_wakes_admitted_long_poll_and_late_route_uses_real_ack() {
     ));
     assert_eq!(fixture.root.snapshot().consumed_through, 1);
     drop(reply);
-    fixture.registry.advance_deadlines();
-    assert_eq!(
-        fixture.registry.context_state(fixture.context),
-        QueryContextState::TerminalRetained
-    );
+    fixture.released();
     assert!(fixture.root.physical_idle());
 }
 
@@ -1073,8 +1734,11 @@ async fn ack_retirement_callback_seals_before_send_growth_and_returns_actual_fro
     ));
     let fired = Arc::new(AtomicBool::new(false));
     let once = Arc::clone(&fired);
-    let registry = Arc::downgrade(&fixture.registry);
+    let control = fixture.control.clone();
     let context = fixture.context;
+    let release = Arc::new(Mutex::new(None));
+    let callback_release = release.clone();
+    let root = Arc::downgrade(&fixture.root);
     let subscription = fixture
         .root
         .writable_observable()
@@ -1082,25 +1746,38 @@ async fn ack_retirement_callback_seals_before_send_growth_and_returns_actual_fro
             if once.swap(true, Ordering::AcqRel) {
                 return;
             }
-            let registry = registry.upgrade().unwrap();
-            assert_eq!(
-                registry
-                    .quiesce_query_context(&QuiesceQueryContext::new(
-                        TaskOperationId::new_v7(),
-                        context
-                    ))
-                    .outcome(),
-                OperationOutcome::Accepted
-            );
-            assert_eq!(
-                registry
-                    .release_query_context(&ReleaseQueryContext::new(
-                        TaskOperationId::new_v7(),
-                        context
-                    ))
-                    .outcome(),
-                OperationOutcome::Accepted
-            );
+            let reply = await_original(control.quiesce(
+                QuiesceQueryContext::new(TaskOperationId::new_v7(), context),
+                deadline(&control),
+            ))
+            .unwrap();
+            assert!(matches!(
+                reply.body(),
+                WorkerContextReplyBody::Quiesce {
+                    outcome: OperationOutcome::Accepted,
+                    ..
+                }
+            ));
+            drop(reply);
+            // The release delivery waits for this same read holder to exit.
+            // Drive the actual request on a joined owner, never wait for its
+            // completion recursively inside the holder's own callback.
+            let control = control.clone();
+            *callback_release.lock().unwrap() = Some(std::thread::spawn(move || {
+                let result = await_original(control.release(
+                    ReleaseQueryContext::new(TaskOperationId::new_v7(), context),
+                    deadline(&control),
+                ))
+                .unwrap();
+                assert!(matches!(
+                    result.body(),
+                    WorkerContextReplyBody::Release {
+                        state: QueryContextState::TerminalRetained,
+                        ..
+                    }
+                ));
+            }));
+            wait_until(|| root.upgrade().unwrap().is_closed());
         }))
         .unwrap();
     assert!(matches!(
@@ -1116,11 +1793,7 @@ async fn ack_retirement_callback_seals_before_send_growth_and_returns_actual_fro
         "original admission and metadata rolled back"
     );
     drop(subscription);
-    fixture.registry.advance_deadlines();
-    assert_eq!(
-        fixture.registry.context_state(context),
-        QueryContextState::TerminalRetained
-    );
+    release.lock().unwrap().take().unwrap().join().unwrap();
 }
 
 #[tokio::test]
@@ -1629,6 +2302,7 @@ async fn unary_extra_metadata_is_pregranted_before_ack_or_projection() {
     drop(owned(
         fixture.reader.read(&fixture.request(None, 0, 1)).await,
     ));
+    wait_until(|| fixture.control.metrics_snapshot().requests == 0);
     let committed = fixture
         .root
         .try_ownership_snapshot()
@@ -1695,9 +2369,9 @@ async fn unary_closed_route_preserves_actual_ack_without_new_root_holder() {
     // horizon, where lookup correctly becomes UnknownRoot.
     let old_credit = granted(fixture.root.try_reserve(1).unwrap());
     fixture.seal();
-    assert_eq!(
-        fixture.registry.context_state(fixture.context),
-        QueryContextState::Releasing
+    assert!(
+        fixture.root.is_closed(),
+        "the original release sealed reads"
     );
     let filler = fixture.fill_process(PROCESS - FIXED - 1 - fixture.header_bytes());
     let mut body = root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1)))
@@ -1762,7 +2436,7 @@ async fn unary_maximum_segment_is_one_copy_without_buffer_growth() {
     }
     builder.output()[..4].copy_from_slice(&((count - 4) as u32).to_le_bytes());
     fixture.root.publish_segment(builder, count, true).unwrap();
-    producer.finish_encoder();
+    assert!(producer.finish_encoder().is_none());
     start_send_probe(SEGMENT);
     let mut body = root_result_unary(
         &fixture.reader,
@@ -2040,6 +2714,10 @@ async fn unary_backing_deferral_has_no_ack_receipt_after_actual_ack_applies() {
     drop(raw);
     drop(body);
     drop(alias);
+    // This fixture owns its Node exclusively. The prior data and deferred ACK
+    // reads must retire their original R/report/header charges before replay;
+    // dropping a reply or its last data alias alone does not prove that step.
+    wait_until(|| fixture.control.metrics_snapshot().requests == 0);
     let replay = owned(fixture.reader.read(&read).await);
     assert_eq!(
         replay.reply().accepted_consumed,
@@ -2196,13 +2874,12 @@ mod end_observation {
         let task = fixture.root.spec().task;
         let session = ObservationSession::new(task, task.query_execution_id());
         assert_eq!(session.hits(), 0);
-        fixture.reader = fixture
-            .reader
+        fixture.reader = NativeRootResultReader::new(fixture.control.clone())
             .with_observation_controls(Some(Arc::clone(&session.controls)));
         let producer = fixture.root.start_producer().unwrap();
         fixture.root.request_finish().unwrap();
         fixture.root.publish_end().unwrap();
-        producer.finish_encoder();
+        assert!(producer.finish_encoder().is_none());
         let reply = owned(fixture.reader.read(&fixture.request(Some(1), 0, 1)).await);
         assert!(
             matches!(reply.reply().outcome, RootReadOutcome::End(end) if end.sequence.get() == 1 && end.output_rows == 0)
@@ -2217,8 +2894,7 @@ mod end_observation {
         let mut fixture = Fixture::new(false);
         let task = fixture.root.spec().task;
         let session = ObservationSession::new(task, task.query_execution_id());
-        fixture.reader = fixture
-            .reader
+        fixture.reader = NativeRootResultReader::new(fixture.control.clone())
             .with_observation_controls(Some(Arc::clone(&session.controls)));
         let observer = session
             .controls
@@ -2267,8 +2943,7 @@ mod end_observation {
         )
         .unwrap();
         let foreign_session = ObservationSession::new(task, execution);
-        foreign.reader = foreign
-            .reader
+        foreign.reader = NativeRootResultReader::new(foreign.control.clone())
             .with_observation_controls(Some(Arc::clone(&foreign_session.controls)));
         foreign.finish();
         let end = owned(foreign.reader.read(&foreign.request(Some(1), 0, 1)).await);
@@ -2287,13 +2962,15 @@ mod end_observation {
             .observation_for("grpc-fragment", task.query_execution_id())
             .unwrap()
             .unwrap();
-        fixture.reader = fixture
-            .reader
+        fixture.reader = NativeRootResultReader::new(fixture.control.clone())
             .with_observation_controls(Some(Arc::clone(&session.controls)));
         assert_eq!(session.hits(), 0);
         assert!(observer.is_active());
         let producer = fixture.root.start_producer().unwrap();
         for sequence in 1..=2 {
+            // Each serial Data/ACK pair starts after the preceding pair's
+            // original request responsibilities actually retired.
+            wait_until(|| fixture.control.metrics_snapshot().requests == 0);
             fixture.root.note_rows(1).unwrap();
             let mut builder = fixture.root.try_segment().unwrap().unwrap();
             builder.output()[..6].copy_from_slice(b"\x02\0\0\0\x011");
@@ -2322,12 +2999,13 @@ mod end_observation {
             drop(ack);
             assert!(observer.is_active());
         }
+        wait_until(|| fixture.control.metrics_snapshot().requests == 0);
         fixture.root.note_rows(1).unwrap();
         fixture.root.request_finish().unwrap();
         let mut builder = fixture.root.try_segment().unwrap().unwrap();
         builder.output()[..6].copy_from_slice(b"\x02\0\0\0\x011");
         fixture.root.publish_segment(builder, 6, true).unwrap();
-        producer.finish_encoder();
+        assert!(producer.finish_encoder().is_none());
         let data = owned(fixture.reader.read(&fixture.request(Some(3), 2, 1)).await);
         assert!(
             matches!(&data.reply().outcome, RootReadOutcome::Data(data) if data.sequence().get() == 3 && data.body().len() == 6 && data.end_after_data().is_some_and(|end| end.sequence.get() == 4 && end.output_rows == 3))

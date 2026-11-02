@@ -3692,6 +3692,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-control-runtime"
+version = "0.1.0"
+dependencies = [
+ "loom",
+ "novarocks-control-runtime-core",
+]
+
+[[package]]
+name = "novarocks-control-runtime-core"
+version = "0.1.0"
+
+[[package]]
 name = "novarocks-coordination-contract"
 version = "0.1.0"
 dependencies = [
@@ -3736,6 +3748,8 @@ dependencies = [
  "novarocks-arrow-ipc-frame",
  "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
+ "novarocks-control-runtime",
+ "novarocks-control-runtime-core",
  "novarocks-coordination-contract",
  "novarocks-execution-contract",
  "novarocks-failure-contract",
@@ -4111,11 +4125,13 @@ dependencies = [
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-task-codec",
+ "novarocks-test-support",
  "novarocks-transport-io",
  "novarocks-type-contract",
  "novarocks-types",
  "novarocks-value-arrays",
  "novarocks-worker",
+ "novarocks-worker-protocol",
  "once_cell",
  "prometheus",
  "prost 0.13.5",
@@ -4794,20 +4810,39 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "novarocks-connector-contract",
+ "novarocks-control-runtime",
+ "novarocks-control-runtime-core",
  "novarocks-execution",
  "novarocks-execution-contract",
  "novarocks-failpoint",
  "novarocks-functions",
+ "novarocks-local-compiler",
+ "novarocks-local-program",
  "novarocks-memory",
  "novarocks-memory-failure",
+ "novarocks-physical-plan",
  "novarocks-result-contract",
  "novarocks-spi",
+ "novarocks-task-codec",
  "novarocks-type-contract",
  "novarocks-types",
+ "novarocks-worker-protocol",
+ "prost 0.13.5",
  "sha2 0.10.9",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "novarocks-worker-protocol"
+version = "0.1.0"
+dependencies = [
+ "novarocks-control-runtime-core",
+ "novarocks-execution-contract",
+ "novarocks-types",
 ]
 
 [[package]]

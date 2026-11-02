@@ -42,7 +42,7 @@ class Stages(unittest.TestCase):
         marker=self.root/'executed';bin_dir=self.root/'bin';bin_dir.mkdir()
         cargo=bin_dir/'cargo';cargo.write_text('#!/bin/sh\necho executed >"$STAGE_EXECUTION_MARKER"\nexit 91\n');cargo.chmod(0o755)
         environment=dict(os.environ,PATH=str(bin_dir)+os.pathsep+os.environ['PATH'],STAGE_EXECUTION_MARKER=str(marker))
-        for name in ('CI build inputs','locked Cargo metadata','legacy branding','workspace nextest and doctests','memory-model:loom'):
+        for name in ('CI build inputs','locked Cargo metadata','legacy branding','workspace nextest and doctests','memory-model:loom','control-runtime:loom'):
             output=self.root/('runtime-'+name.replace('/','-'))
             result=subprocess.run(['bash',str(REPO/'tools/ci/local-full-ci.sh'),'--describe-stage',name,str(self.root/'absent-receipt'),str(output)],cwd=REPO,env=environment,text=True,capture_output=True)
             self.assertEqual(result.returncode,0,result.stderr)

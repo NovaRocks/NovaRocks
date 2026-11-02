@@ -131,8 +131,11 @@ impl CancellationStorage {
     }
 
     pub(crate) fn drained(&self) -> bool {
-        self.free_inventory_valid()
+        // A live retired record already disproves drain. Validate the whole
+        // free inventory only after these original counts can permit drain.
+        self.retired == 0
             && self.retired_polls == 0
+            && self.free_inventory_valid()
             && self.slots.iter().all(|slot| {
                 slot.polls
                     .iter()

@@ -69,6 +69,21 @@ pub struct PreparedPipelineExecution {
 }
 
 impl PreparedPipelineExecution {
+    pub(crate) fn admit_local_completion_driver(
+        &self,
+        driver: crate::runtime::local_completion::LocalCompletionDriver,
+    ) {
+        self.completion.admit_local_completion_driver(driver);
+    }
+
+    pub(crate) fn admit_completion_work(
+        &self,
+        finisher: novarocks_execution_contract::CompletionWork,
+        wall_time: novarocks_execution_contract::CompletionWork,
+    ) {
+        self.completion.admit_completion_work(finisher, wall_time);
+    }
+
     pub(crate) fn failure_control(&self) -> Arc<crate::runtime::runtime_state::RuntimeErrorState> {
         self.runtime_state.error_state()
     }
@@ -1476,7 +1491,8 @@ mod tests {
         let context = FragmentPrepareContext::default()
             .with_execution_runtime(test_execution_runtime())
             .with_task_control(control.clone())
-            .with_result_identity(identity);
+            .with_result_identity(identity)
+            .with_completion_roles(owner.admit_completion_roles());
         let dormant =
             crate::runtime::fragment::prepare_compiled_fragment(submission, context).unwrap();
         let original: ExecutionFailure =
@@ -2162,7 +2178,8 @@ mod tests {
             control.local_exit_fault().unwrap().fact().reason(),
             novarocks_failure_contract::FailureReason::new(
                 novarocks_failure_contract::domain::EXECUTION,
-                std::num::NonZeroU16::new(617).unwrap()
+                crate::runtime::fragment::ExecutionReason::DriverStartInitialFailureCaptureDrop
+                    .code()
             )
         );
     }

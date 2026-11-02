@@ -31,6 +31,7 @@ use novarocks_memory::{
     AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TeardownEvidence, TopUpPolicy,
     lane::{RecordRef, global_store},
 };
+use novarocks_native_adapter::backend_task_execution::node_test_support::NativeNodePreparation;
 use novarocks_native_adapter::backend_task_execution::{
     CompiledPackageInterpreter, CompiledTaskOptions, CompiledTaskProgram,
     PreparedWindowMetadataForTest, ProjectMetadataHost, ProjectMetadataJournal,
@@ -50,9 +51,8 @@ use novarocks_types::{
     QueryId,
     identity::{AttemptId, QueryExecutionId},
 };
-use novarocks_worker::TestPreparationControl;
 use prost::Message;
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
 struct Control;
 impl PureCompileControl for Control {
@@ -479,10 +479,7 @@ fn analytic_original_schema_independent_aliases_keep_query_origin_to_last_free()
         let binding = binding(64 << 20);
         let tracker = construction_tracker();
         let bytes = source(input_type, 512);
-        let owner = TestPreparationControl::new(
-            preparation_identity(binding.execution()),
-            Duration::from_millis(1),
-        );
+        let owner = NativeNodePreparation::new(preparation_identity(binding.execution()));
         let loan = owner.loan();
         let mut compile_journal = ProjectMetadataJournal::default();
         let compiled = compile(&bytes, &binding, &tracker, &loan, &mut compile_journal);
@@ -623,10 +620,7 @@ fn analytic_actual_private_host_and_original_builder_capture_separate_occurrence
         let binding = binding(64 << 20);
         let tracker = construction_tracker();
         let bytes = source(bigint(), label_bytes);
-        let owner = TestPreparationControl::new(
-            preparation_identity(binding.execution()),
-            Duration::from_millis(1),
-        );
+        let owner = NativeNodePreparation::new(preparation_identity(binding.execution()));
         let loan = owner.loan();
         let mut journal = ProjectMetadataJournal::default();
         let compiled = compile(&bytes, &binding, &tracker, &loan, &mut journal);
@@ -741,15 +735,12 @@ fn analytic_original_schema_actual_capacity_and_worker_stop_remain_nominal() {
         fragment::ExecutionFailureCause, preparation_memory::PreparationMemoryRefusal,
         preparation_metadata::PreparationMetadataFailure,
     };
-    use novarocks_worker::TestPreparationIntent;
+    use novarocks_native_adapter::backend_task_execution::node_test_support::PreparationStop;
     let _ = novarocks_server_application::memory_observation::snapshot();
     let binding = binding(64 << 20);
     let tracker = construction_tracker();
     let bytes = source(bigint(), 512);
-    let owner = TestPreparationControl::new(
-        preparation_identity(binding.execution()),
-        Duration::from_millis(1),
-    );
+    let owner = NativeNodePreparation::new(preparation_identity(binding.execution()));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let first = compile(&bytes, &binding, &tracker, &loan, &mut journal);
@@ -774,7 +765,7 @@ fn analytic_original_schema_actual_capacity_and_worker_stop_remain_nominal() {
             PreparationMemoryRefusal::Capacity(_)
         ))
     ));
-    assert!(owner.stop(TestPreparationIntent::Abort(
+    assert!(owner.stop(PreparationStop::Abort(
         novarocks_execution_contract::AbortCause::QueryFailed
     )));
     let accepted = loan
@@ -812,10 +803,7 @@ fn analytic_original_schema_actual_occupied_capacity_retains_qualified_shortage(
     let binding = binding(TOTAL);
     let tracker = construction_tracker();
     let bytes = source(bigint(), 512);
-    let owner = TestPreparationControl::new(
-        preparation_identity(binding.execution()),
-        Duration::from_millis(1),
-    );
+    let owner = NativeNodePreparation::new(preparation_identity(binding.execution()));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let compiled = compile(&bytes, &binding, &tracker, &loan, &mut journal);

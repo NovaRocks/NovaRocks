@@ -35,6 +35,7 @@ use novarocks_functions::{
 use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeKind,
 };
+use novarocks_native_adapter::backend_task_execution::node_test_support::NativeNodePreparation;
 use novarocks_native_adapter::backend_task_execution::{
     CompiledPackageInterpreter, CompiledTaskOptions, PreparedProjectMetadataForTest,
     ProjectMetadataHost, ProjectMetadataJournal, TypeMaterializationHost,
@@ -50,9 +51,8 @@ use novarocks_plan_codec::{
 };
 use novarocks_type_contract::*;
 use novarocks_types::identity::{BackendProcessId, StageId, TaskId};
-use novarocks_worker::TestPreparationControl;
 use prost::Message;
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
 struct Control;
 impl PureCompileControl for Control {
@@ -418,10 +418,7 @@ pub(super) fn program_for_arguments(
         Arc::new(providers),
         constants(),
     );
-    let owner = TestPreparationControl::new(
-        preparation_identity(binding.execution()),
-        Duration::from_millis(1),
-    );
+    let owner = NativeNodePreparation::new(preparation_identity(binding.execution()));
     let loan = owner.loan();
     let mut types = TypeMaterializationJournal::default();
     let mut projects = ProjectMetadataJournal::default();

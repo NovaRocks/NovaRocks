@@ -73,7 +73,6 @@ pub mod root_statistics_codec;
 pub mod root_write_commit_codec;
 pub use native_client::NativeRpcClient;
 pub mod native_codec;
-pub mod native_control_executor;
 pub mod native_fragment_query;
 #[cfg(test)]
 mod native_fragment_query_tests;
@@ -101,12 +100,14 @@ pub mod task_execution_observation;
 pub mod task_protocol;
 #[cfg(novarocks_dev_controls)]
 pub mod task_protocol_fault;
-pub mod task_protocol_ingress;
 pub mod task_query_context_options;
 pub mod task_result_diagnostics;
 pub mod task_shared_facts;
 #[cfg(any(test, novarocks_dev_controls))]
 pub mod typed_connector_test_support;
+pub mod worker_node_ingress;
+mod worker_node_observation;
+mod worker_node_projection;
 
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
@@ -126,7 +127,7 @@ use tokio::runtime::Handle;
 
 /// Largest root-result payload admitted by the Native task wire.
 pub const FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES: u64 =
-    novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES;
+    novarocks_task_codec::operation::MAX_NATIVE_ROOT_RESULT_PAYLOAD_BYTES;
 
 #[derive(Clone, Debug)]
 pub enum BackendNativeTransport {
@@ -479,3 +480,6 @@ mod frontend_selected_origin_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod root_unknown_test;

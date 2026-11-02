@@ -82,13 +82,12 @@ mod tests {
         encode_lease_receipt,
     };
     use super::operation::{
-        DecodedOperation, DecodedUpdateQueryContext, MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES,
-        decode_fetch_task_result, decode_get_final_task_info, decode_operation,
+        DecodedOperation, DecodedUpdateQueryContext, decode_get_final_task_info, decode_operation,
         decode_operation_batch, decode_operation_outcome,
         decode_query_context_admission_ticket_ack, decode_receipt_batch,
-        encode_acquire_query_context_admission_ticket, encode_fetch_task_result,
-        encode_get_final_task_info, encode_operation_outcome,
-        encode_query_context_admission_ticket_ack, encode_query_context_state,
+        encode_acquire_query_context_admission_ticket, encode_get_final_task_info,
+        encode_operation_outcome, encode_query_context_admission_ticket_ack,
+        encode_query_context_state,
     };
     use super::status::{decode_task_status, encode_task_status};
     use novarocks_execution_contract::task_execution::creation::FrozenBytes;
@@ -102,8 +101,8 @@ mod tests {
         LeaseReceipt, LeaseSequence, LeaseValidFor,
     };
     use novarocks_execution_contract::task_execution::operation::{
-        AcquireQueryContextAdmissionTicket, MaxWait, OperationKind, OperationOutcome,
-        QueryContextAdmissionTicketReceipt, ReleaseOutcome, ResultByteLimit, ResultPacketSequence,
+        AcquireQueryContextAdmissionTicket, OperationKind, OperationOutcome,
+        QueryContextAdmissionTicketReceipt, ReleaseOutcome,
     };
     use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, SafeDetail, TaskFailure, TaskOutputFacts, TaskState, TaskStatus,
@@ -1086,6 +1085,7 @@ mod tests {
         assert_eq!(encode_query_context_state(QueryContextState::Absent), None);
         assert!(encode_query_context_state(QueryContextState::Active).is_some());
         for outcome in [
+            OperationOutcome::OwnerFailed,
             OperationOutcome::Accepted,
             OperationOutcome::Idempotent,
             OperationOutcome::OperationTimedOut,
@@ -1117,74 +1117,26 @@ mod tests {
     }
 
     #[test]
-    fn the_two_observation_reads_round_trip_their_exact_task_identity() {
+    fn owner_failed_has_a_distinct_wire_value_and_unknown_outcomes_are_refused() {
+        assert_eq!(encode_operation_outcome(OperationOutcome::OwnerFailed), 21);
+        assert_eq!(
+            decode_operation_outcome(21, FieldPath::root("operation_outcome")),
+            Ok(OperationOutcome::OwnerFailed)
+        );
+        for invalid in [0, 5, 16, i32::MAX] {
+            assert_eq!(
+                decode_operation_outcome(invalid, FieldPath::root("operation_outcome"))
+                    .unwrap_err()
+                    .kind(),
+                &ProtocolErrorKind::InvalidEnum
+            );
+        }
+    }
+
+    #[test]
+    fn final_info_read_round_trips_its_exact_task_identity() {
         let process = backend();
         let root = identity(4, 7, process);
-
-        let acknowledged = ResultPacketSequence::new(19);
-        let max_result_bytes = ResultByteLimit::new(4096).expect("result byte limit");
-        let poll = encode_fetch_task_result(
-            root,
-            MaxWait::default_for(OperationKind::CancelTask),
-            Some(acknowledged),
-            max_result_bytes,
-        );
-        let (decoded, max_wait, decoded_acknowledged, decoded_max_result_bytes) =
-            decode_fetch_task_result(&poll, FieldPath::root("fetch")).expect("a legal poll");
-        assert_eq!(decoded, root);
-        assert_eq!(max_wait, MaxWait::DEFAULT_UPDATE);
-        assert_eq!(decoded_acknowledged, Some(acknowledged));
-        assert_eq!(decoded_max_result_bytes, max_result_bytes);
-
-        // A poll that names no task cannot be answered from "the" result
-        // buffer, because the address is the only thing that says which one.
-        let anonymous = novarocks::FetchTaskResultRequest {
-            root_task: None,
-            max_wait_millis: 1_000,
-            acknowledged_packet_sequence: None,
-            max_result_bytes: 4096,
-        };
-        assert_eq!(
-            decode_fetch_task_result(&anonymous, FieldPath::root("fetch"))
-                .expect_err("no identity")
-                .kind(),
-            &ProtocolErrorKind::MissingField
-        );
-        // Zero is not "wait as little as possible": it is a duration this
-        // contract does not represent.
-        let zero = novarocks::FetchTaskResultRequest {
-            root_task: Some(encode_task_identity(root)),
-            max_wait_millis: 0,
-            acknowledged_packet_sequence: None,
-            max_result_bytes: 4096,
-        };
-        assert!(decode_fetch_task_result(&zero, FieldPath::root("fetch")).is_err());
-
-        let zero_bytes = novarocks::FetchTaskResultRequest {
-            root_task: Some(encode_task_identity(root)),
-            max_wait_millis: 1_000,
-            acknowledged_packet_sequence: None,
-            max_result_bytes: 0,
-        };
-        assert_eq!(
-            decode_fetch_task_result(&zero_bytes, FieldPath::root("fetch"))
-                .expect_err("zero is not a payload credit")
-                .kind(),
-            &ProtocolErrorKind::InvalidValue
-        );
-
-        let oversized = novarocks::FetchTaskResultRequest {
-            root_task: Some(encode_task_identity(root)),
-            max_wait_millis: 1_000,
-            acknowledged_packet_sequence: None,
-            max_result_bytes: MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES + 1,
-        };
-        assert_eq!(
-            decode_fetch_task_result(&oversized, FieldPath::root("fetch"))
-                .expect_err("the request must fit the Native response envelope")
-                .kind(),
-            &ProtocolErrorKind::OutOfRange
-        );
 
         let read = encode_get_final_task_info(root);
         let operation = TaskOperationId::new_v7();

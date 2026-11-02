@@ -353,6 +353,79 @@ struct Receiver {
     observable: Arc<Observable>,
 }
 
+/// Read-only loan of the exact receiver captured during registration. Removal
+/// from the routing map never erases its original consumed/End observations.
+/// This grants no ingress, normal-close permission or new queue capacity.
+pub struct ExchangeReceiverCloseObserver {
+    key: ExchangeKey,
+    receiver: Arc<Receiver>,
+}
+impl ExchangeReceiverCloseObserver {
+    pub fn key(&self) -> ExchangeKey {
+        self.key
+    }
+    pub fn stream_close_facts(
+        &self,
+        expected: &[ExchangeStreamIdentity],
+    ) -> Result<Vec<ExchangeStreamClose>, ExchangeFailure> {
+        let owner = self.receiver.unit_owner().ok_or_else(|| {
+            exchange_contract("exchange close facts have no installed Unit owner")
+        })?;
+        // Cancellation retires production routing, but the original Unit owner
+        // keeps its source-authored handoff and End facts in this exact loan.
+        expected
+            .iter()
+            .map(|stream| {
+                if stream.destination_fragment_instance_id()
+                    != UniqueId::new(self.key.finst_id_hi, self.key.finst_id_lo)
+                    || stream.destination_node().get() != self.key.node_id
+                {
+                    return Err(exchange_contract(
+                        "close snapshot names another exchange input",
+                    ));
+                }
+                let snapshot = owner
+                    .slots
+                    .stream_snapshot(*stream)
+                    .map_err(ExchangeFailure::from)?;
+                let disposition = match snapshot.observed_end {
+                    Some(end) if snapshot.handed_off_through == end.get() => {
+                        ExchangeCloseDisposition::Consumed {
+                            final_sequence: end,
+                        }
+                    }
+                    _ => ExchangeCloseDisposition::Withdrawn,
+                };
+                Ok(ExchangeStreamClose {
+                    stream: *stream,
+                    disposition,
+                })
+            })
+            .collect()
+    }
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn install_test_observer(
+        &self,
+        observer: Arc<dyn TestEventObserver>,
+    ) -> Result<(), ExchangeFailure> {
+        let mut state = self
+            .receiver
+            .mu
+            .lock()
+            .map_err(|_| failure::poisoned("receiver"))?;
+        if let Some(existing) = &state.test_observer {
+            if Arc::ptr_eq(existing, &observer) {
+                return Ok(());
+            }
+            return Err(exchange_contract(
+                "exchange receiver already has another test observation",
+            ));
+        }
+        state.test_observer = Some(observer);
+        Ok(())
+    }
+}
+
 fn get_or_create(registry: &ExecutionExchangeRegistry, key: ExchangeKey) -> Arc<Receiver> {
     use tracing::debug;
 
@@ -500,6 +573,7 @@ impl ExecutionExchangeRegistry {
             false,
             creation_factory,
         )
+        .map(|_| ())
     }
 
     /// Register a legacy receiver exactly once: wire columns bind by slot id
@@ -538,8 +612,29 @@ impl ExecutionExchangeRegistry {
             true,
             creation_factory,
         )
+        .map(|_| ())
     }
 
+    /// Return the original registered receiver before releasing its capture;
+    /// concurrent cancellation may remove routing but cannot lose this loan.
+    pub fn try_register_expected_chunk_schema_with_close_observer(
+        &self,
+        key: ExchangeKey,
+        expected_senders: usize,
+        chunk_schema: ChunkSchemaRef,
+        column_binding: ExchangeColumnBinding,
+        creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) -> Result<ExchangeReceiverCloseObserver, ExchangeFailure> {
+        Self::register_expected_chunk_schema_inner(
+            self,
+            key,
+            expected_senders,
+            chunk_schema,
+            column_binding,
+            true,
+            creation_factory,
+        )
+    }
     fn register_expected_chunk_schema_inner(
         registry: &ExecutionExchangeRegistry,
         key: ExchangeKey,
@@ -548,7 +643,7 @@ impl ExecutionExchangeRegistry {
         column_binding: ExchangeColumnBinding,
         reject_existing: bool,
         creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
-    ) -> Result<(), ExchangeFailure> {
+    ) -> Result<ExchangeReceiverCloseObserver, ExchangeFailure> {
         if !chunk_schema.is_typed() {
             return Err(exchange_contract(
                 "exchange receiver requires its complete frozen execution schema",
@@ -605,7 +700,8 @@ impl ExecutionExchangeRegistry {
             }
         }
         st.expected_senders = expected_senders;
-        Ok(())
+        drop(st);
+        Ok(ExchangeReceiverCloseObserver { key, receiver })
     }
 
     pub fn ensure_receiver_mem_tracker(
@@ -2072,13 +2168,12 @@ pub(crate) fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, ExchangeFailure>
 }
 
 impl ExecutionExchangeRegistry {
-    /// Snapshot only existing source-authored facts; an absent stream is not
-    /// evidence of consumption. The binding owner supplies its frozen set.
-    pub fn stream_close_facts(
+    /// Borrow an existing original receiver at registration time. This never
+    /// creates a receiver or replaces one canceled under the same numeric key.
+    pub fn close_observer(
         &self,
         key: ExchangeKey,
-        expected: &[ExchangeStreamIdentity],
-    ) -> Result<Vec<ExchangeStreamClose>, ExchangeFailure> {
+    ) -> Result<ExchangeReceiverCloseObserver, ExchangeFailure> {
         let receiver = self
             .receivers
             .lock()
@@ -2086,30 +2181,16 @@ impl ExecutionExchangeRegistry {
             .get(&key)
             .cloned()
             .ok_or_else(|| exchange_contract("exchange receiver is not registered"))?;
-        let owner = receiver.unit_owner().ok_or_else(|| {
-            exchange_contract("exchange close facts have no installed Unit owner")
-        })?;
-        expected
-            .iter()
-            .map(|stream| {
-                let snapshot = owner
-                    .slots
-                    .stream_snapshot(*stream)
-                    .map_err(ExchangeFailure::from)?;
-                let disposition = match snapshot.observed_end {
-                    Some(end) if snapshot.handed_off_through == end.get() => {
-                        ExchangeCloseDisposition::Consumed {
-                            final_sequence: end,
-                        }
-                    }
-                    _ => ExchangeCloseDisposition::Withdrawn,
-                };
-                Ok(ExchangeStreamClose {
-                    stream: *stream,
-                    disposition,
-                })
-            })
-            .collect()
+        Ok(ExchangeReceiverCloseObserver { key, receiver })
+    }
+    /// Routing-time observation; lifecycle owners capture close_observer once
+    /// during registration so cancellation cannot remove their read capability.
+    pub fn stream_close_facts(
+        &self,
+        key: ExchangeKey,
+        expected: &[ExchangeStreamIdentity],
+    ) -> Result<Vec<ExchangeStreamClose>, ExchangeFailure> {
+        self.close_observer(key)?.stream_close_facts(expected)
     }
 
     pub fn decode_chunks_for_sender(

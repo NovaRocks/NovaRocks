@@ -1292,6 +1292,40 @@ pub enum RootInputAdmission {
     Blocked,
 }
 
+/// Bounded metadata about a producer's failure. The original source belongs
+/// to its actual Task owner; retaining this value grants no execution or
+/// source-retention capability and cannot manufacture an originating failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootFailureObservation {
+    fact: novarocks_execution_contract::failure::FailureFact,
+    detail: novarocks_execution_contract::status::SafeDetail,
+}
+impl RootFailureObservation {
+    pub fn new(
+        fact: novarocks_execution_contract::failure::FailureFact,
+        detail: novarocks_execution_contract::status::SafeDetail,
+    ) -> Self {
+        // SafeDetail bounds text length, but a caller-supplied String may
+        // retain a much larger backing. A retained root record owns only its
+        // bounded text, independently of that caller's original allocation.
+        let detail = novarocks_execution_contract::status::SafeDetail::truncating(detail.as_str());
+        Self { fact, detail }
+    }
+    /// Freeze outside host/ingress locks: projecting a domain source is the
+    /// originating owner's operation, never a retained metadata getter's job.
+    pub fn from_failure(cause: &crate::runtime::fragment::ExecutionFailure) -> Self {
+        use novarocks_execution_contract::failure::FailureProjection;
+        let fact = cause.failure_fact();
+        Self::new(fact, cause.safe_detail_for_fact(fact))
+    }
+    pub const fn fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        self.fact
+    }
+    pub fn detail(&self) -> &novarocks_execution_contract::status::SafeDetail {
+        &self.detail
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RootProducerState {
     Accepting,
@@ -1300,7 +1334,11 @@ pub enum RootProducerState {
     /// End is published, the encoder actually exited, and its exact context
     /// holds every retained result owner. Consumer progress is independent.
     ContextHeld,
-    Failed(crate::runtime::fragment::ExecutionFailure),
+    /// The producer is closed or has formed a failure whose original Task
+    /// handoff/publication is still pending. Absence of that receipt is never
+    /// normal completion; live drivers wait on their actual Task stop signal.
+    AwaitTerminalControl,
+    Failed(RootFailureObservation),
 }
 
 /// Physical completion of the entire accepted producer job. Logical End,
@@ -2833,5 +2871,30 @@ mod root_input_tests {
             assert!(issuer.upgrade().is_some());
             assert_eq!(weak_resource.upgrade().unwrap().as_slice(), &[43_u8; 8192]);
         }
+    }
+}
+
+#[cfg(test)]
+mod root_failure_observation_tests {
+    use super::*;
+    use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+
+    #[test]
+    fn root_failure_observation_does_not_retain_a_callers_oversized_text_backing() {
+        let mut original =
+            String::with_capacity(8 * novarocks_execution_contract::status::SAFE_DETAIL_MAX_BYTES);
+        original.push_str("root failure");
+        let original_pointer = original.as_ptr();
+        let fact = FailureFact::new(
+            FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::RootInvalidDop.reason(),
+        );
+        let observation = RootFailureObservation::new(
+            fact,
+            novarocks_execution_contract::status::SafeDetail::new(original).unwrap(),
+        );
+        assert_eq!(observation.fact(), fact);
+        assert_eq!(observation.detail().as_str(), "root failure");
+        assert_ne!(observation.detail().as_str().as_ptr(), original_pointer);
     }
 }

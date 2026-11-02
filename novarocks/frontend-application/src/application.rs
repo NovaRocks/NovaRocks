@@ -23,6 +23,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 
+pub(crate) fn trace_shutdown_stage(stage: &'static str) {
+    tracing::info!(
+        process_id = std::process::id(),
+        stage,
+        "Frontend physical shutdown progressed"
+    );
+}
+
 pub(crate) mod workload_progress;
 use workload_progress::{FrontendWorkloadDeadlineSupervisor, FrontendWorkloadProgressPolicy};
 
@@ -621,12 +629,14 @@ impl FrontendExecutionRuntimeOwner {
         if self.workload.is_some() {
             let mut registry_errors = 0;
             loop {
+                trace_shutdown_stage("logical_supervisor_join_started");
                 let outcome = tokio::select! {
                     outcome = self.supervisor.shutdown_until(deadline) => outcome,
                     _ = std::future::poll_fn(|cx| self.deadline_supervisor.poll_exit(cx)) => {
                         return Err("frontend joint progress service terminated before workload drain".to_string());
                     }
                 };
+                trace_shutdown_stage("logical_supervisor_join_returned");
                 match outcome {
                     Ok(()) => break,
                     Err(LogicalExecutionSupervisorShutdownError::DeadlineExceeded) => {
@@ -659,12 +669,16 @@ impl FrontendExecutionRuntimeOwner {
                 }
             }
 
+            trace_shutdown_stage("workload_control_join_started");
             self.shutdown_workload_until(deadline).await?;
+            trace_shutdown_stage("workload_control_joined");
         }
+        trace_shutdown_stage("joint_progress_join_started");
         self.deadline_supervisor
             .shutdown_after_workload_drained()
             .await
             .map_err(|_| "frontend joint progress service failed before actual join".to_string())?;
+        trace_shutdown_stage("joint_progress_joined");
 
         Ok(())
     }
@@ -679,11 +693,17 @@ impl FrontendExecutionRuntimeOwner {
     /// statement Roots have drained. Join it only after those tails actually
     /// close, using the same Host deadline and the same unique process owners.
     async fn shutdown_executors_until(&mut self, deadline: Instant) -> Result<(), String> {
+        trace_shutdown_stage("query_cpu_join_started");
         self.query_cpu.shutdown_until(deadline).await?;
+        trace_shutdown_stage("query_cpu_joined");
 
+        trace_shutdown_stage("query_blocking_join_started");
         self.query_blocking.shutdown_until(deadline).await?;
+        trace_shutdown_stage("query_blocking_joined");
 
+        trace_shutdown_stage("internal_result_cpu_join_started");
         self.internal_result_cpu.shutdown_until(deadline).await?;
+        trace_shutdown_stage("internal_result_cpu_joined");
 
         self.shutdown_complete = true;
         self.terminal_error.take().map_or(Ok(()), Err)
@@ -2417,12 +2437,15 @@ impl FrontendApplicationHost {
         &mut self,
         deadline: Instant,
     ) -> Result<(), FrontendApplicationError> {
+        trace_shutdown_stage("application_shutdown_entered");
         #[cfg(novarocks_dev_controls)]
         let controls = match &mut self.test_session {
             Some(session) => session.close_and_join(),
             None => Ok(()),
         };
+        trace_shutdown_stage("host_started");
         let resources = self.release_resources_until(deadline).await;
+        trace_shutdown_stage("host_returned");
         #[cfg(novarocks_dev_controls)]
         let resources = match (controls, resources) {
             (Ok(()), result) => result,
@@ -2597,12 +2620,15 @@ impl FrontendApplicationHost {
             .as_ref()
             .and_then(|role| role.controller.as_ref())
         {
+            trace_shutdown_stage("catalog_controller_join_started");
             tokio::time::timeout_at(deadline.into(), controller.shutdown())
                 .await
                 .map_err(|_| {
                     "frontend deadline elapsed joining catalog controller".to_string()
                 })??;
+            trace_shutdown_stage("catalog_controller_joined");
         }
+        trace_shutdown_stage("workload_join_started");
         let execution_result = {
             let shutdown = self.execution_runtime_owner.drain_workload_until(deadline);
             tokio::pin!(shutdown);
@@ -2617,6 +2643,7 @@ impl FrontendApplicationHost {
                 }
             }
         };
+        trace_shutdown_stage("workload_join_returned");
         if let Err(error) = execution_result {
             if !self.execution_runtime_owner.is_shutdown_complete() {
                 return match primary_error {
@@ -2630,10 +2657,12 @@ impl FrontendApplicationHost {
                 primary_error = Some(error);
             }
         }
+        trace_shutdown_stage("heartbeat_join_started");
         let heartbeat_error = match self.topology.as_ref() {
             Some(topology) => topology.stop_heartbeat_manager_until(deadline).await.err(),
             None => None,
         };
+        trace_shutdown_stage("heartbeat_join_returned");
         if let Some(heartbeat_error) = heartbeat_error {
             if let Some(primary) = primary_error.as_mut() {
                 primary.push_str(&format!("; cleanup failed: {heartbeat_error}"));
@@ -2647,12 +2676,16 @@ impl FrontendApplicationHost {
         // final drain of its own, so nothing is lost here and no sweep races the
         // instance going away.
         if let Some(sweeper) = self.abandoned_attempt_sweeper.as_mut() {
+            trace_shutdown_stage("state_store_sweeper_join_started");
             sweeper.shutdown().await;
+            trace_shutdown_stage("state_store_sweeper_joined");
         }
+        trace_shutdown_stage("catalog_runtime_join_started");
         let catalog_runtime_error = match self.catalog_role_runtime.as_mut() {
             Some(runtime) => runtime.shutdown_until(deadline).await.err(),
             None => None,
         };
+        trace_shutdown_stage("catalog_runtime_join_returned");
         if catalog_runtime_error.is_none() {
             self.catalog_role_runtime.take();
         }
@@ -2668,6 +2701,7 @@ impl FrontendApplicationHost {
         // Execution and heartbeat shutdown precede Apply close. Retain this
         // original role owner in Host on timeout so a shutdown retry joins
         // the SAME records and handles.
+        trace_shutdown_stage("native_apply_join_started");
         if let Err(error) = self.data_runtime.drain_original_apply_until(deadline).await {
             if !self.data_runtime.original_apply_joined() {
                 return Err(match primary_error {
@@ -2681,6 +2715,8 @@ impl FrontendApplicationHost {
                 primary_error = Some(error);
             }
         }
+        trace_shutdown_stage("native_apply_join_returned");
+        trace_shutdown_stage("native_subscriptions_join_started");
         if let Err(error) = self
             .data_runtime
             .drain_original_subscriptions_until(deadline)
@@ -2698,11 +2734,13 @@ impl FrontendApplicationHost {
                 primary_error = Some(error);
             }
         }
+        trace_shutdown_stage("native_subscriptions_join_returned");
         // Role-owned callers have reached the Native tail. Close future calls,
         // retire cache aliases and wait for the original public IO/body exits
         // before StateStore, using the same absolute Host deadline.
         // This observation does not replace original caller task/F joins or
         // prove every escaped clone's undispatched stream reservation exited.
+        trace_shutdown_stage("native_outgoing_join_started");
         if let Err(error) = self
             .data_runtime
             .drain_native_outgoing_until(deadline)
@@ -2713,9 +2751,11 @@ impl FrontendApplicationHost {
                 None => error,
             });
         }
+        trace_shutdown_stage("native_outgoing_joined");
         // The same cadence's final pass borrows the Host-owned evidence
         // inventory. A waiting timeout retains that inventory and queued debt.
         if let Some(sweeper) = self.abandoned_attempt_sweeper.as_ref() {
+            trace_shutdown_stage("state_store_final_sweep_started");
             match tokio::time::timeout_at(deadline.into(), sweeper.sweep_once()).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(cause)) => {
@@ -2729,19 +2769,24 @@ impl FrontendApplicationHost {
                 }
             }
         }
+        trace_shutdown_stage("state_store_final_sweep_returned");
         // No running cadence remains. Its store alias must leave before the
         // actual instance Store/File destruction; its physical sources stay
         // with the same opening/evidence owner below.
         self.abandoned_attempt_sweeper.take();
+        trace_shutdown_stage("mv_repository_drop_started");
         drop(self.mv_repository.take());
+        trace_shutdown_stage("mv_repository_dropped");
         if let Some(opening) = self.state_store_opening.as_mut() {
             let executor = self.execution_runtime_owner.query_blocking_executor();
             let close = std::future::poll_fn(|cx| {
                 opening.poll_close(&mut self.state_store_host, &executor, deadline, cx)
             });
+            trace_shutdown_stage("state_store_close_started");
             match tokio::time::timeout_at(deadline.into(), close).await {
                 Ok(Ok(())) => {
                     self.state_store_opening.take();
+                    trace_shutdown_stage("state_store_closed");
                 }
                 Ok(Err(error)) => {
                     return Err(match primary_error {

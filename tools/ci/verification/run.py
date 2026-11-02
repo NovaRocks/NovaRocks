@@ -39,7 +39,7 @@ from .model import Attempt, Scope, UnitKey
 from .record import write_record
 from .select import (select, changed_paths, sql_case_arguments,
                      RUST_AGGREGATE, RUST_AGGREGATE_DEFERRED)
-from .declarations import native_selector_requests, validate_declarations
+from .declarations import native_selector_requests, validate_declarations, native_stage_mode
 from .scope import required_scopes
 
 
@@ -223,7 +223,7 @@ def scopes(repo, native, chosen):
             item['name'] in selected_system,'regular' if item.get('default') else 'heavy',bool(item.get('paused'))))
     selected_stages={value['name'] for value in chosen['stages']}
     for item in native['stages']['stages']:
-        mode = 'loom' if item['name']=='memory-model:loom' else 'miri' if item['name']=='memory-model:miri' else 'default'
+        mode = native_stage_mode(item)
         unit=UnitKey('stage',item['name'],mode)
         spec=stage_spec(repo,native,item,'/unused/output')
         spec=invocation_record.execution_spec('stage',stage_argv(repo,native,item,'/unused/output'),spec)
@@ -260,6 +260,7 @@ def stage_spec(repo,native,item,output):
         raise ValueError('invalid native stage command descriptor')
     spec=descriptor['spec']
     if 'inputs' in item:spec['inputs']=item['inputs']
+    if 'env_inputs' in item:spec['env_inputs']=item['env_inputs']
     return spec
 
 
@@ -994,7 +995,7 @@ def execute(repo,root,native,chosen,scope_values,pending=None):
         if error is not None:value['error']=str(error)
         errors.append(value)
     def run_stage(item):
-        mode='loom' if item['name']=='memory-model:loom' else 'miri' if item['name']=='memory-model:miri' else 'default'
+        mode=native_stage_mode(item)
         unit=UnitKey('stage',item['name'],mode)
         output=attempt/'stage-runtime'/hashlib.sha256(item['name'].encode()).hexdigest()[:12]
         output.mkdir(parents=True,exist_ok=False)
@@ -1114,7 +1115,7 @@ def execute(repo,root,native,chosen,scope_values,pending=None):
                 except (OSError,ValueError,subprocess.SubprocessError) as error:record_error('system-scenario',item['name'],error=error)
         for item in chosen['stages']:
             if item is workspace or item['name']=='workspace nextest and doctests':continue
-            mode='loom' if item['name']=='memory-model:loom' else 'miri' if item['name']=='memory-model:miri' else 'default'
+            mode=native_stage_mode(item)
             if str(UnitKey('stage',item['name'],mode)) not in selected_keys:continue
             try:run_stage(item)
             except (OSError,ValueError,subprocess.SubprocessError) as error:record_error('stage',item['name'],error=error)

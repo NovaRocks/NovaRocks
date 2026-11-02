@@ -149,10 +149,10 @@ handler 前拒绝错误域，不转发到另一条 listener：
 
 | BE endpoint | 接受的方法 |
 | --- | --- |
-| Data | `ApplyTaskOperations`、`SubscribeTaskStatus`、`FetchTaskResult`、`FetchTaskDynamicFilters`、`GetFinalTaskInfo`、`PruneCatalogs`、`ExchangeUnary`、`TransmitRuntimeFilterEnvelope` |
+| Data | `ApplyTaskOperations`、`SubscribeTaskStatus`、`FetchRootResult`、`FetchTaskDynamicFilters`、`GetFinalTaskInfo`、`PruneCatalogs`、`ExchangeUnary`、`TransmitRuntimeFilterEnvelope` |
 | Control | `ApplyTaskControlOperations`、`Heartbeat` |
 
-`AnnounceBackend` 发到 FE 原有 Native endpoint；已退役的 `FetchResult` 和 `Exchange`
+`AnnounceBackend` 发到 FE 原有 Native endpoint；已退役的 `FetchResult`、`FetchTaskResult` 和 `Exchange`
 不因换一个端口而恢复。FE 每个已准入 attempt 冻结完整 BE descriptor，再按具体 RPC method
 选择其中的 Data 或 Control endpoint，不重新查询 membership，也不在 Control 缺失时拨 Data。
 消息尺寸门位于 protobuf 对象构造之前，Worker 的 Context reservation 仍是另一道
@@ -336,19 +336,58 @@ BE management HTTP 的 `/metrics` 或 `/metrics?type=json` 提供当前 Native �
 `novarocks_backend_native_ingress_slots{class,phase,dimension}` 可比较 ordinary/control
 的 running/waiting `used` 与 `limit`；`novarocks_backend_native_response_backings`
 显示仍持有资格的 body/DATA backing，
-`novarocks_backend_worker_context_reservations` 显示另一道 Worker 门的已用量与上限。
+`novarocks_backend_worker_node_resources{resource}` 显示原 Worker 账本仍持有的
+任务、准备与请求额度，以及 Context 元数据数量；Context 数量不是准入上限。
 `novarocks_backend_native_ingress_oldest_wait_since_unixtime_seconds`、
 `novarocks_backend_native_ingress_last_progress_unixtime_seconds` 与拒绝/等待累计计数辅助
-判断门是否在推进。`novarocks_backend_native_async_first_poll_lag_seconds`、
-`novarocks_backend_native_blocking_queue_wait_seconds`、
-`novarocks_backend_native_control_queue_wait_seconds` 和
-`novarocks_backend_worker_registry_lock_observation` 分别帮助区分 async 首次调度、
-普通 blocking 排队、控制执行器排队与 Worker registry 锁等待/持有。
+判断门是否在推进。`novarocks_backend_native_async_first_poll_lag_seconds` 与
+`novarocks_backend_native_blocking_queue_wait_seconds` 分别观察 async 首次调度与仍由
+exchange、RF、catalog、heartbeat 使用的 blocking 排队。Task 协议控制由共用控制面推进；
+旧独立控制线程及其 `novarocks_backend_native_control_queue_wait_seconds` 指标已退役。
+Worker 不再有全局任务注册表锁观察指标。
+`novarocks_backend_control_plane_pollers{worker,resource}` 从原 poller 读取阶段、
+单调时间、Core/host 推进和 timer 观察；阶段 5 只表示循环退出，不证明已 join。
+`novarocks_backend_control_runtime_inputs{class,resource}` 观察各输入类别的实际步数、
+工作量、panic 与时间采样；`handoff_to_step` 包含入锁前交接等待，`step_elapsed`
+使用原单调时钟，不是 CPU 时间。没有时间来源时不输出时长。
+`novarocks_backend_control_runtime_ledger{resource}` 与
+`novarocks_backend_control_runtime_capacity_refusals{reason}` 分别保留账本锁竞争、
+Scope 失效和按类型分类的容量事务结果；`exhausted` 仍是普通背压，不产生新的失败政策。
+`novarocks_backend_control_runtime_inventory{resource}` 直接遍历原账本，每次 scrape 最多
+访问 256 条记录，只有本轮完整遍历才输出新观测区间；其起止时间、访问数与
+`novarocks_backend_control_runtime_observation_available{source}` 一起判断。
+跨页结果不是同一瞬间的库存，未完成或 busy 不使用旧缓存或默认零。
+库存诊断失败由 `novarocks_backend_control_runtime_observation_errors{source,reason}`
+保留准确类别，该区间不输出，其它原指标仍可采集。
+Work 的 queued/started/body-exited 阶段与原 Report/owned-position 库存分别列出；
+queued 不等于实际执行器排队，body 退出也不等于报告已消费或额度已归还。
+`novarocks_backend_worker_admission{resource}` 的逻辑票据数是元数据观察，
+不授予容量，也不证明真实退出。
+`novarocks_backend_protocol_retention{owner,resource}` 分别观察 `context`、`ticket`、
+`control` 与 `inbound` 原保管者的记录库存。`ticket_records`、`acquisition_decisions`、
+`replay_decisions` 不等同于 `logical_live_grants`；拒绝重放可有 decision 而无 ticket。
+`compact_contexts` 来自同原 Core 已提交的压缩事实；`failed_custodians` 来自实际失败
+保管者，冷 Core 后失败时二者可以重叠。失败 Core 未提供的 `decided_task_records`
+明确不可用，不从目录数或 Task 地址反推。`control{directory_records}` 仅是 Root 原目录行数，
+不等同于保留 Context 数。
+`metadata_bytes_estimate` 仅为定义范围内的结构估计：Core 的 inline header/key/value、
+冷 Core 已决定 Task 的 inline 记录，以及 inbound 原 Vec capacity / sources slice / closes
+slice 结构尺寸；不计 Arc 共享 backing、BTree/HashMap 节点、allocator overhead 或 RSS。
+`indirect_backing_bytes_available=0` 明确表示这些额外字节未知，不是零字节。
+估计溢出时 `metadata_bytes_estimate_available=0` 并省略值。失败 custodian 只估计同原
+retirement identity/origin；未检查的 Core 内容仍未知，不能据此声称完整内存归属。
+`novarocks_backend_protocol_retention_snapshot_available{owner}` 区分缺失、busy 或 poisoned
+owner；不可用时省略该 owner 数值，不能用上次读数或零替代。跨 owner 采样不是原子快照，
+记录与估计均不授准入容量、不触发提前淘汰，也不能作为物理退出证明。
 `novarocks_backend_task_preparation_snapshot_available` 为 1 时，本次 scrape 含有
-准确 preparation ledger；Worker registry 正忙或没有采样 owner 时为 0，本次响应
-省略 preparation 数值，不能将它解释成零占用或沿用上次读数。采样不等待 registry
-锁，因此持锁期间仍能观察真实 Control 执行器进展；registry poison 明确使 scrape
-失败。其他 owner 的采样仍有各自的同步边界。
+原 preparation ledger 和物理公平队列的分别采样。队列出队、Installed 或 terminal
+都不替代完整准备工作实际退出；只有实际退出后才归还准备额度。
+缺失采样 owner 或独立采样锁忙时，该指标为 0 并省略该族数值；不能解释成零占用
+或沿用旧读数，也不能推断整个控制面被锁住。Root ownership、execution quiescence、
+control plane 与 admission 各有自己的 availability 指标和采样边界。
+`novarocks_backend_execution_quiescence{resource}` 区分原执行责任与冷 Context/Root
+元数据，`novarocks_backend_root_ownership{resource}` 观察实际通道与 holder。
+跨 owner 采样不构成原子快照，任何 gauge 也不签发业务收敛或退款证明。
 `novarocks_backend_saturation_source_available` 对尚未接入此读数面的 Exchange slot
 与内存账本报告 unavailable（值为零），不能把它解释成这些资源空闲。
 

@@ -1,7 +1,9 @@
 //! Application-hosted ingress for one exchange receiver.
 
 use crate::exec::chunk::ChunkSchemaRef;
-use crate::runtime::exchange::{ExchangeColumnBinding, ExchangeKey, ExchangeReceiverHandle};
+use crate::runtime::exchange::{
+    ExchangeColumnBinding, ExchangeKey, ExchangeReceiverCloseObserver, ExchangeReceiverHandle,
+};
 use crate::runtime::execution_runtime::ExecutionRuntime;
 use crate::runtime::mem_tracker::MemTracker;
 use novarocks_types::UniqueId;
@@ -67,6 +69,22 @@ pub trait ExchangeReceiverPort: Send + Sync + 'static {
         &self,
         registration: ExchangeReceiverRegistration,
     ) -> Result<(), crate::runtime::exchange::ExchangeFailure>;
+    /// Lifecycle preparation must capture its exact registered receiver in
+    /// the registration operation, not re-look it up after cancellation.
+    /// An error must not leave a newly registered receiver without its owner.
+    fn register_with_close_observer(
+        &self,
+        _registration: ExchangeReceiverRegistration,
+    ) -> Result<ExchangeReceiverCloseObserver, crate::runtime::exchange::ExchangeFailure> {
+        Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
+    }
+    /// A one-time registration-stage observation; never creates a receiver.
+    fn close_observer(
+        &self,
+        _key: ExchangeReceiverKey,
+    ) -> Result<ExchangeReceiverCloseObserver, crate::runtime::exchange::ExchangeFailure> {
+        Err(crate::runtime::exchange::ExchangeFailure::receiver_unavailable())
+    }
     fn cancel(&self, key: ExchangeReceiverKey);
     fn remove(&self, key: ExchangeReceiverKey);
     fn cancel_fragment(&self, fragment_instance_id: UniqueId);
@@ -210,10 +228,17 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
         &self,
         registration: ExchangeReceiverRegistration,
     ) -> Result<(), crate::runtime::exchange::ExchangeFailure> {
+        self.register_with_close_observer(registration).map(|_| ())
+    }
+    fn register_with_close_observer(
+        &self,
+        registration: ExchangeReceiverRegistration,
+    ) -> Result<ExchangeReceiverCloseObserver, crate::runtime::exchange::ExchangeFailure> {
         let key = Self::key(registration.key);
-        self.runtime
+        let original = self
+            .runtime
             .exchange_registry()
-            .try_register_expected_chunk_schema_with_binding(
+            .try_register_expected_chunk_schema_with_close_observer(
                 key,
                 registration.expected_senders,
                 registration.expected_chunk_schema,
@@ -221,12 +246,23 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
                 registration.creation_factory,
             )?;
         #[cfg(novarocks_dev_controls)]
-        if let Some(observer) = self.test_observer.clone() {
-            self.runtime
-                .exchange_registry()
-                .install_test_observer(key, observer)?;
+        if let Some(observer) = self.test_observer.clone()
+            && let Err(error) = original.install_test_observer(observer)
+        {
+            // This operation actually registered the receiver. Its own
+            // failure retains the original loan until cancellation ends.
+            self.runtime.exchange_registry().cancel_exchange_key(key);
+            return Err(error);
         }
-        Ok(())
+        Ok(original)
+    }
+    fn close_observer(
+        &self,
+        key: ExchangeReceiverKey,
+    ) -> Result<ExchangeReceiverCloseObserver, crate::runtime::exchange::ExchangeFailure> {
+        self.runtime
+            .exchange_registry()
+            .close_observer(Self::key(key))
     }
 
     fn cancel(&self, key: ExchangeReceiverKey) {
@@ -429,14 +465,15 @@ mod tests {
             &[],
         );
         let expected = factory.create_compiled_chunk_schema(&layout).unwrap();
-        port.register(ExchangeReceiverRegistration {
-            key,
-            expected_senders: 2,
-            expected_chunk_schema: expected,
-            column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
-            creation_factory: factory.clone(),
-        })
-        .expect("actual native receiver installation");
+        let close_observer = port
+            .register_with_close_observer(ExchangeReceiverRegistration {
+                key,
+                expected_senders: 2,
+                expected_chunk_schema: expected,
+                column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
+                creation_factory: factory.clone(),
+            })
+            .expect("actual native receiver installation");
         let streams = [0_u32, 1].map(|ordinal| {
             ExchangeStreamIdentity::try_new(
                 ExchangeSource::new(
@@ -480,15 +517,20 @@ mod tests {
         assert_eq!(port.snapshot(key).unwrap().finished_senders, 2);
         let receiver = port.receiver_handle(key, 2).unwrap();
         receiver.complete_input_consumption(2).unwrap();
-        assert!(port.stream_close_facts(key, &streams).unwrap().iter().all(
-            |close| close.disposition
-                == ExchangeCloseDisposition::Consumed {
-                    final_sequence: ExchangeUnitSequence::FIRST
-                }
-        ));
+        let closes = port.stream_close_facts(key, &streams).unwrap();
+        assert!(closes.iter().all(|close| close.disposition
+            == ExchangeCloseDisposition::Consumed {
+                final_sequence: ExchangeUnitSequence::FIRST
+            }));
         drop(receiver);
         port.remove(key);
         assert!(port.snapshot(key).is_none());
+        assert_eq!(
+            close_observer.stream_close_facts(&streams).unwrap(),
+            closes,
+            "the original Unit handoff facts survive removal of routing"
+        );
+        drop(close_observer);
         drop(factory);
         assert_eq!(
             tracker.current(),

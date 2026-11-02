@@ -31,9 +31,11 @@ use novarocks_execution_contract::root_result::{
 };
 use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
 use novarocks_result_contract::RootProfileV1;
-use novarocks_worker::TaskExecutionRegistry;
 use novarocks_worker::root_result_channel::{
-    ContextRootRoute, RootChannelError, RootDeliveryOwner, RootMetadataReservation,
+    RootChannelError, RootDeliveryOwner, RootMetadataReservation,
+};
+use novarocks_worker::{
+    TaskRootDrainOutcome, WorkerRootRead, WorkerRootReadError, WorkerTaskControl,
 };
 
 /// Closed-route responses carry domain facts without admitting a new context read.
@@ -142,10 +144,10 @@ pub fn native_root_send_metadata_bytes() -> usize {
         .expect("fixed root reply layout fits usize")
 }
 
-/// A lightweight composition handle. Registry lookup mints the read under
-/// the original context fence, independent of the retired task's horizon.
+/// A composition handle over the same original Worker Node. The Context
+/// result holder survives Task retirement without a second registry lookup.
 pub struct NativeRootResultReader {
-    registry: Arc<TaskExecutionRegistry>,
+    control: WorkerTaskControl,
     #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
     #[cfg(novarocks_dev_controls)]
@@ -153,9 +155,9 @@ pub struct NativeRootResultReader {
 }
 
 impl NativeRootResultReader {
-    pub fn new(registry: Arc<TaskExecutionRegistry>) -> Self {
+    pub fn new(control: WorkerTaskControl) -> Self {
         Self {
-            registry,
+            control,
             #[cfg(novarocks_dev_controls)]
             test_controls: None,
             #[cfg(novarocks_dev_controls)]
@@ -223,7 +225,7 @@ impl NativeRootResultReader {
     async fn fail_after_visible_prefix(
         &self,
         request: &RootResultRead,
-        admitted: &novarocks_worker::root_result_channel::RootChannelRead,
+        admitted: &WorkerRootRead,
     ) -> bool {
         if request.wanted().map(|sequence| sequence.get()) != Some(2) {
             return false;
@@ -232,7 +234,7 @@ impl NativeRootResultReader {
             return false;
         };
         let identity = request.root_task();
-        let Some(control) = self.registry.live_task_execution_control_for_test(identity) else {
+        let Some(control) = self.control.live_task_execution_control_for_test(identity) else {
             return false;
         };
         let claim = match controls.claim_dormant_after_visible_prefix(
@@ -279,31 +281,58 @@ impl NativeRootResultReader {
         if !cancellation.is_active() || control.is_stopped() {
             return false;
         }
+        // This finite action borrows the original read R while waiting. The
+        // subscription is only a readiness callback and is removed with this
+        // future; it grants no new settlement registration or Task authority.
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let notice = ready.clone();
+        let observable = control.stop_observable();
+        let _subscription = match observable.try_subscribe(Arc::new(move || {
+            notice.notify_one();
+        })) {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                tracing::error!(%error, "visible-prefix action could not observe the original Task");
+                return false;
+            }
+        };
         let original = crate::task_protocol_fault::injected_task_execution_failure();
         control.report_failure(original.clone());
         let consumed = admitted.accepted_consumed();
-        let control = Arc::clone(&control);
-        control.clone().on_settled(Box::new(move |snapshot| {
-            if !snapshot.as_ref().and_then(|snapshot| snapshot.originating_failure())
-                .is_some_and(|accepted| std::ptr::eq(accepted.cause(), original.cause())) {
-                return;
+        loop {
+            let changed = ready.notified();
+            if let Some(accepted) = control.accepted() {
+                if accepted
+                    .originating_failure()
+                    .is_some_and(|cause| std::ptr::eq(cause.cause(), original.cause()))
+                {
+                    if let Err(error) =
+                        crate::task_protocol_fault::record_task_execution_failure(identity, &claim)
+                    {
+                        control.report_cleanup(&error);
+                        return true;
+                    }
+                    let execution = identity.query_execution_id();
+                    eprintln!(
+                        "NOVAROCKS_TASK_EXECUTION_FAILURE_AFTER_VISIBLE_PREFIX_ACCEPTED execution_id={}:{}:{} stage={} task={} backend={} token={} accepted_consumed={}",
+                        execution.query_id().high(),
+                        execution.query_id().low(),
+                        execution.attempt_id().get(),
+                        identity.stage_id().get(),
+                        identity.task_id().get(),
+                        identity.backend_process_id(),
+                        claim.token,
+                        consumed
+                    );
+                }
+                return true;
             }
-            if let Err(error) =
-                crate::task_protocol_fault::record_task_execution_failure(identity, &claim)
-            {
-                control.report_cleanup(&error);
-                return;
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return true,
+                _ = changed => {},
             }
-            let execution = identity.query_execution_id();
-            eprintln!(
-                "NOVAROCKS_TASK_EXECUTION_FAILURE_AFTER_VISIBLE_PREFIX_ACCEPTED execution_id={}:{}:{} stage={} task={} backend={} token={} accepted_consumed={}",
-                execution.query_id().high(), execution.query_id().low(),
-                execution.attempt_id().get(), identity.stage_id().get(),
-                identity.task_id().get(), identity.backend_process_id(),
-                claim.token, consumed
-            );
-        }));
-        true
+        }
     }
 
     pub async fn read(&self, request: &RootResultRead) -> NativeRootReadResponse {
@@ -331,21 +360,16 @@ impl NativeRootResultReader {
         request: &RootResultRead,
         transport_metadata_bytes: usize,
     ) -> NativeRootReadResponse {
-        let admitted = match self.registry.context_root_result_route(request) {
-            ContextRootRoute::Read(read) => read,
-            ContextRootRoute::AwaitTerminalControl { accepted_consumed } => {
-                return NativeRootReadResponse::AwaitTerminalControl { accepted_consumed };
-            }
-            ContextRootRoute::UnknownRoot => {
-                return refusal(request, RootChannelError::UnknownRoot);
-            }
-            ContextRootRoute::Mismatch => return refusal(request, RootChannelError::Identity),
-            ContextRootRoute::Preparing => return deferred(request, RootReadDeferral::Preparing),
-            ContextRootRoute::Busy(facts) => {
-                return deferred(request, RootReadDeferral::ReadHoldersBusy(facts));
-            }
-            ContextRootRoute::Refused(cause) => return refusal(request, cause),
+        let deadline = self.control.now().saturating_add(request.max_wait());
+        let admitted = match self.control.begin_task_root_read(
+            novarocks_execution_contract::TaskOperationId::new_v7(),
+            deadline,
+            request,
+        ) {
+            Ok(read) => read,
+            Err(error) => return worker_refusal(request, error, "begin"),
         };
+        tracing::debug!(task = ?request.root_task(), wanted = ?request.wanted(), consumed = request.consumed(), data_wait = ?request.max_wait(), deadline = ?deadline, "Native Root admitted original read");
         // ACK retires queue ownership before data-copy admission. It cannot
         // wait for the data budget that its own retirement makes available.
         // Metadata precedes ACK and every reply/Arc projection; ACK-only's
@@ -377,6 +401,7 @@ impl NativeRootResultReader {
             Err(error) => return refusal(request, error),
         };
         if let Err(error) = admitted.apply_consumed() {
+            tracing::debug!(task = ?request.root_task(), consumed = request.consumed(), error = ?error, "Native Root cumulative ACK refused");
             return if error == RootChannelError::Closed {
                 NativeRootReadResponse::AwaitTerminalControl {
                     accepted_consumed: admitted.accepted_consumed(),
@@ -416,9 +441,37 @@ impl NativeRootResultReader {
         };
         let delivery = match admitted.read().await {
             Ok(delivery) => delivery,
-            Err(error) => return refusal(request, error),
+            Err(error) => return worker_refusal(request, error, "read"),
         };
-        let (reply, guard) = delivery.into_parts();
+        let (mut reply, guard, drain) = delivery.into_parts();
+        tracing::debug!(task = ?request.root_task(), consumed = request.consumed(), accepted = reply.accepted_consumed, drain = drain.is_some(), "Native Root read returned original delivery");
+        if let Some(drain) = drain {
+            // The original R already owns the channel's accepted End fact.
+            // This observer waits for its verdict; cancellation cannot revoke it.
+            tracing::debug!(task = ?request.root_task(), consumed = request.consumed(), "Native Root awaits acknowledged End verdict");
+            let outcome = drain.submit().await;
+            tracing::debug!(task = ?request.root_task(), outcome = ?outcome, "Native Root received original End verdict");
+            match outcome {
+                TaskRootDrainOutcome::OwnerFailed { fact } => {
+                    return NativeRootReadResponse::Refused(Box::new(
+                        RootReadRefusal::for_request(
+                            request,
+                            fact,
+                            SafeDetail::truncating("the original Worker Root drain owner failed"),
+                        ),
+                    ));
+                }
+                TaskRootDrainOutcome::EndPublished { .. }
+                | TaskRootDrainOutcome::AlreadyTerminal {
+                    state: novarocks_execution_contract::TaskState::Finished,
+                } => {}
+                TaskRootDrainOutcome::AlreadyTerminal { .. }
+                | TaskRootDrainOutcome::AwaitTerminalControl
+                | TaskRootDrainOutcome::Refused(_) => {
+                    reply.outcome = novarocks_execution_contract::root_result::RootReadOutcome::AwaitTerminalControl;
+                }
+            }
+        }
         #[cfg(novarocks_dev_controls)]
         let reply = {
             let mut reply = reply;
@@ -503,6 +556,42 @@ fn refusal(request: &RootResultRead, cause: RootChannelError) -> NativeRootReadR
     let detail = SafeDetail::truncating("root read was refused by its owning channel");
     NativeRootReadResponse::Refused(Box::new(RootReadRefusal::for_request(
         request, fact, detail,
+    )))
+}
+fn worker_refusal(
+    request: &RootResultRead,
+    cause: WorkerRootReadError,
+    phase: &'static str,
+) -> NativeRootReadResponse {
+    if let Some(accepted_consumed) = cause.closed_frontier() {
+        return NativeRootReadResponse::AwaitTerminalControl { accepted_consumed };
+    }
+    if let Some(reason) = cause.deferral() {
+        return deferred(request, reason);
+    }
+    let fact = cause.failure_fact();
+    // Worker Display contains its neutral error kind, never retained payloads.
+    tracing::info!(
+        pid = std::process::id(),
+        phase,
+        task = ?request.root_task(),
+        wanted = ?request.wanted(),
+        consumed = request.consumed(),
+        data_wait = ?request.max_wait(),
+        kind = ?cause.kind(),
+        error = %cause,
+        failure = ?fact,
+        "Native Root read refused by original Worker owner"
+    );
+    NativeRootReadResponse::Refused(Box::new(RootReadRefusal::for_request(
+        request,
+        fact,
+        SafeDetail::truncating(match cause.kind() {
+            novarocks_worker::WorkerRootReadErrorKind::ForeignProcess => {
+                "root read was refused by its owning channel"
+            }
+            _ => "root read was refused by its original Worker owner",
+        }),
     )))
 }
 fn deferred(request: &RootResultRead, reason: RootReadDeferral) -> NativeRootReadResponse {

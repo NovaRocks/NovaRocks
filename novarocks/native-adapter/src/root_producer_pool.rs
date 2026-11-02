@@ -52,6 +52,18 @@ impl RootCleanupPlan {
         Self(phases)
     }
 }
+/// A read-only receipt for this invocation's original cleanup prefix. The
+/// pool issues it from completed callbacks, never from emptied owner fields
+/// or the overall job failure bit. Independent later phases may ignore it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RootCleanupPredecessors {
+    all_exited: bool,
+}
+impl RootCleanupPredecessors {
+    pub(crate) const fn all_exited(self) -> bool {
+        self.all_exited
+    }
+}
 pub(crate) trait RootProducerJob: Send + Sync {
     fn turn(&self) -> RootProducerTurn;
     fn cancel(&self);
@@ -59,7 +71,11 @@ pub(crate) trait RootProducerJob: Send + Sync {
     /// each real holder into its own once state before foreign code, retain the
     /// original input/scratch grant on unknown exit, and return its exact
     /// receipt. This is not the whole job/issuer observation or a polling hook.
-    fn cleanup_step(&self, phase: u16) -> RootCleanupProgress;
+    fn cleanup_step(
+        &self,
+        phase: u16,
+        predecessors: RootCleanupPredecessors,
+    ) -> RootCleanupProgress;
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RootCleanupProgress {
@@ -85,14 +101,12 @@ pub(crate) enum RootProducerExitStatus {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RootExitRole {
-    #[cfg(test)]
     Preparation,
     Runtime,
 }
 impl RootExitRole {
     fn index(self) -> usize {
         match self {
-            #[cfg(test)]
             Self::Preparation => 0,
             Self::Runtime => 1,
         }
@@ -339,6 +353,9 @@ struct Slot {
     cleaning: bool,
     activated: bool,
     next_cleanup: usize,
+    // An in-flight phase is represented by running + next_cleanup. Only a
+    // normal Exited callback advances this prefix; an unknown gap stays open.
+    cleanup_exited_through: usize,
     cancel_requested: bool,
     cancel_called: bool,
     execution_failed: bool,
@@ -1296,7 +1313,11 @@ fn stop(core: &Arc<Core>) {
 enum Call {
     Turn,
     Cancel,
-    Cleanup { id: u16, ordinal: usize },
+    Cleanup {
+        id: u16,
+        ordinal: usize,
+        predecessors: RootCleanupPredecessors,
+    },
     Dispose,
 }
 fn run(core: Arc<Core>) {
@@ -1322,7 +1343,13 @@ fn run(core: Arc<Core>) {
                         if let Some(id) = slot.plan.get(slot.next_cleanup).copied() {
                             let ordinal = slot.next_cleanup;
                             slot.next_cleanup += 1;
-                            Call::Cleanup { id, ordinal }
+                            Call::Cleanup {
+                                id,
+                                ordinal,
+                                predecessors: RootCleanupPredecessors {
+                                    all_exited: slot.cleanup_exited_through == ordinal,
+                                },
+                            }
                         } else {
                             slot.phase = Phase::Disposing;
                             Call::Dispose
@@ -1409,21 +1436,29 @@ fn run(core: Arc<Core>) {
                     execution_fault(&core, ticket, RootProducerPoolFailure::Cancel, 1, payload);
                 }
             }
-            Call::Cleanup { id, ordinal } => {
-                match catch_unwind(AssertUnwindSafe(|| job.cleanup_step(id))) {
-                    Ok(RootCleanupProgress::Exited) => {}
-                    Ok(RootCleanupProgress::Unresolved) => {
-                        execution_unresolved(&core, ticket, RootProducerPoolFailure::Cleanup);
+            Call::Cleanup {
+                id,
+                ordinal,
+                predecessors,
+            } => match catch_unwind(AssertUnwindSafe(|| job.cleanup_step(id, predecessors))) {
+                Ok(RootCleanupProgress::Exited) => {
+                    let mut state = core.state.lock().expect("root producer pool lock");
+                    let slot = &mut state.slots[ticket.index];
+                    if slot.cleanup_exited_through == ordinal {
+                        slot.cleanup_exited_through += 1;
                     }
-                    Err(payload) => execution_fault(
-                        &core,
-                        ticket,
-                        RootProducerPoolFailure::Cleanup,
-                        ordinal + 2,
-                        payload,
-                    ),
                 }
-            }
+                Ok(RootCleanupProgress::Unresolved) => {
+                    execution_unresolved(&core, ticket, RootProducerPoolFailure::Cleanup);
+                }
+                Err(payload) => execution_fault(
+                    &core,
+                    ticket,
+                    RootProducerPoolFailure::Cleanup,
+                    ordinal + 2,
+                    payload,
+                ),
+            },
             Call::Dispose => unreachable!(),
         }
         // The original strong work remains in the slot. This local borrowed
@@ -1468,7 +1503,11 @@ mod tests {
         fn cancel(&self) {
             (self.cancel)()
         }
-        fn cleanup_step(&self, phase: u16) -> RootCleanupProgress {
+        fn cleanup_step(
+            &self,
+            phase: u16,
+            _predecessors: RootCleanupPredecessors,
+        ) -> RootCleanupProgress {
             assert_eq!(phase, 0);
             (self.exit)();
             RootCleanupProgress::Exited
@@ -1573,6 +1612,320 @@ mod tests {
             "all schedulable CPU calls drain; Unresolved is not physical exit"
         );
     }
+    // These regressions exercise real once cleanup callbacks and the Native
+    // session's exact phase-8 predicate. Field emptiness is deliberately a
+    // different oracle from the original callback's actual return.
+    struct CleanupCapture {
+        phase: u16,
+        panic_phase: Option<u16>,
+        gate: Option<Arc<Gate>>,
+        drops: Arc<[AtomicUsize; 2]>,
+    }
+    impl Drop for CleanupCapture {
+        fn drop(&mut self) {
+            if let Some(gate) = &self.gate {
+                gate.enter();
+            }
+            self.drops[usize::from(self.phase - 6)].fetch_add(1, Ordering::SeqCst);
+            assert_ne!(
+                self.panic_phase,
+                Some(self.phase),
+                "original cleanup capture destructor panic"
+            );
+        }
+    }
+    struct PrefixJob {
+        client: Mutex<Option<CleanupCapture>>,
+        builder: Mutex<Option<CleanupCapture>>,
+        producer: Mutex<Option<novarocks_worker::root_result_channel::RootProducerExit>>,
+        receipts: Arc<[AtomicUsize; 4]>,
+        independent: Arc<AtomicUsize>,
+        turn_panics: bool,
+        unknown_phase: Option<u16>,
+    }
+    impl RootProducerJob for PrefixJob {
+        fn turn(&self) -> RootProducerTurn {
+            assert!(
+                !self.turn_panics,
+                "original turn panic before successful cleanup"
+            );
+            RootProducerTurn::Complete
+        }
+        fn cancel(&self) {}
+        fn cleanup_step(
+            &self,
+            phase: u16,
+            predecessors: RootCleanupPredecessors,
+        ) -> RootCleanupProgress {
+            self.receipts[usize::from(phase - 6)].store(
+                if predecessors.all_exited() { 1 } else { 2 },
+                Ordering::SeqCst,
+            );
+            match phase {
+                6 => {
+                    let capture = self.client.lock().unwrap().take();
+                    drop(capture);
+                }
+                7 => {
+                    let capture = self.builder.lock().unwrap().take();
+                    drop(capture);
+                }
+                8 => {
+                    if !crate::root_result_session::encoder_cleanup_ready(
+                        predecessors,
+                        false,
+                        self.builder.lock().unwrap().is_some(),
+                    ) {
+                        return RootCleanupProgress::Unresolved;
+                    }
+                    let producer = self.producer.lock().unwrap().take();
+                    if let Some(producer) = producer {
+                        assert!(producer.finish_encoder().is_none());
+                    }
+                }
+                9 => {
+                    self.independent.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => unreachable!("closed test cleanup plan"),
+            }
+            if self.unknown_phase == Some(phase) {
+                RootCleanupProgress::Unresolved
+            } else {
+                RootCleanupProgress::Exited
+            }
+        }
+    }
+    fn prefix_channel() -> Arc<novarocks_worker::root_result_channel::RootResultChannel> {
+        use novarocks_execution::runtime::fragment::io::RootResultWriteSpec;
+        use novarocks_execution_contract::TaskIdentity;
+        use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
+        use novarocks_types::{
+            AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+        };
+        let limits = novarocks_worker::WorkerResultRetainedLimits::try_new(
+            256 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024,
+        )
+        .unwrap();
+        let budget = ResultRetainedBudget::new(limits.per_process());
+        novarocks_worker::root_result_channel::RootResultChannel::try_open(
+            RootResultWriteSpec {
+                task: TaskIdentity::new(
+                    QueryExecutionId::new(QueryId::new(117001, 117002), AttemptId::new(1).unwrap())
+                        .unwrap(),
+                    StageId::new(1).unwrap(),
+                    TaskId::new(1).unwrap(),
+                    BackendProcessId::new_v7(),
+                ),
+                contract: Arc::new(RootOutputContract::new(
+                    RootProfileId::V1,
+                    FrozenRootOutput::CountOnly,
+                )),
+            },
+            budget,
+            limits,
+            Arc::new(ExecutionHealth::default()),
+        )
+        .unwrap()
+    }
+    fn prefix_job(
+        channel: &Arc<novarocks_worker::root_result_channel::RootResultChannel>,
+        panic_phase: Option<u16>,
+        turn_panics: bool,
+        unknown_phase: Option<u16>,
+        gate: Option<Arc<Gate>>,
+    ) -> (Arc<PrefixJob>, Arc<[AtomicUsize; 2]>) {
+        let producer = channel.start_producer().unwrap();
+        channel.request_finish().unwrap();
+        channel.publish_end().unwrap();
+        let drops = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
+        (
+            Arc::new(PrefixJob {
+                client: Mutex::new(Some(CleanupCapture {
+                    phase: 6,
+                    panic_phase,
+                    gate: None,
+                    drops: drops.clone(),
+                })),
+                builder: Mutex::new(Some(CleanupCapture {
+                    phase: 7,
+                    panic_phase,
+                    gate,
+                    drops: drops.clone(),
+                })),
+                producer: Mutex::new(Some(producer)),
+                receipts: Arc::new(std::array::from_fn(|_| AtomicUsize::new(0))),
+                independent: Arc::new(AtomicUsize::new(0)),
+                turn_panics,
+                unknown_phase,
+            }),
+            drops,
+        )
+    }
+    #[test]
+    fn a_taken_capture_with_panicked_or_unknown_exit_cannot_release_the_real_encoder() {
+        const PLAN: RootCleanupPlan = RootCleanupPlan::new(&[6, 7, 8, 9]);
+        for phase in [6, 7] {
+            for panic in [false, true] {
+                let (pool, budget) = pool(1);
+                let channel = prefix_channel();
+                let (job, drops) = prefix_job(
+                    &channel,
+                    panic.then_some(phase),
+                    false,
+                    (!panic).then_some(phase),
+                    None,
+                );
+                let registration = install(&pool, &budget, PLAN, job.clone());
+                let exit = registration.exit_observation();
+                registration.wake().unwrap();
+                wait_drained(&pool);
+                assert!(pool.shutdown().is_err());
+                assert!(
+                    job.client.lock().unwrap().is_none() && job.builder.lock().unwrap().is_none()
+                );
+                assert_eq!(drops[0].load(Ordering::SeqCst), 1);
+                assert_eq!(drops[1].load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    job.receipts[2].load(Ordering::SeqCst),
+                    2,
+                    "the pool reports the actual incomplete prefix even though both fields are empty"
+                );
+                assert!(
+                    job.producer.lock().unwrap().is_some(),
+                    "unknown capture exit retains the original encoder responsibility"
+                );
+                assert_eq!(
+                    channel
+                        .try_ownership_snapshot()
+                        .unwrap()
+                        .unwrap()
+                        .producers_exited,
+                    0,
+                    "the original encoder has not supplied its physical exit"
+                );
+                assert_eq!(
+                    job.independent.load(Ordering::SeqCst),
+                    1,
+                    "later independent reporting-authority cleanup still runs once"
+                );
+                assert_eq!(exit.status(), RootProducerExitStatus::Unresolved);
+            }
+        }
+    }
+    #[test]
+    fn an_in_flight_capture_does_not_advance_the_original_cleanup_prefix() {
+        const PLAN: RootCleanupPlan = RootCleanupPlan::new(&[6, 7, 8, 9]);
+        let (pool, budget) = pool(1);
+        let channel = prefix_channel();
+        let gate = Arc::new(Gate::default());
+        let release = ReleaseGate(gate.clone());
+        let (job, drops) = prefix_job(&channel, None, false, None, Some(gate.clone()));
+        let registration = install(&pool, &budget, PLAN, job.clone());
+        let exit = registration.exit_observation();
+        registration.wake().unwrap();
+        gate.wait_entered();
+        let (running, scheduled, exited) = {
+            let state = pool.core.state.lock().unwrap();
+            let slot = &state.slots[registration.ticket.index];
+            (slot.running, slot.next_cleanup, slot.cleanup_exited_through)
+        };
+        let field_empty = job.builder.lock().unwrap().is_none();
+        let encoder_held = job.producer.lock().unwrap().is_some();
+        let observed = exit.status();
+        drop(release);
+        wait_drained(&pool);
+        pool.shutdown().unwrap();
+        assert!(running && field_empty && encoder_held);
+        assert_eq!(
+            (scheduled, exited),
+            (2, 1),
+            "Started is not Exited while the actual destructor is still running"
+        );
+        assert_eq!(observed, RootProducerExitStatus::Pending);
+        assert_eq!(drops[1].load(Ordering::SeqCst), 1);
+        assert_eq!(exit.status(), RootProducerExitStatus::Exited);
+    }
+    #[test]
+    fn a_turn_failure_does_not_replace_the_actual_cleanup_prefix_receipt() {
+        const PLAN: RootCleanupPlan = RootCleanupPlan::new(&[6, 7, 8, 9]);
+        let (pool, budget) = pool(1);
+        let channel = prefix_channel();
+        let (job, drops) = prefix_job(&channel, None, true, None, None);
+        let registration = install(&pool, &budget, PLAN, job.clone());
+        let exit = registration.exit_observation();
+        registration.wake().unwrap();
+        wait_drained(&pool);
+        assert!(pool.shutdown().is_err());
+        assert_eq!(drops[0].load(Ordering::SeqCst), 1);
+        assert_eq!(drops[1].load(Ordering::SeqCst), 1);
+        for receipt in job.receipts.iter() {
+            assert_eq!(receipt.load(Ordering::SeqCst), 1);
+        }
+        assert!(job.producer.lock().unwrap().is_none());
+        assert_eq!(
+            channel
+                .try_ownership_snapshot()
+                .unwrap()
+                .unwrap()
+                .producers_exited,
+            1,
+            "the encoder's real captures exited despite a separate unknown turn"
+        );
+        assert_eq!(job.independent.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            exit.status(),
+            RootProducerExitStatus::Unresolved,
+            "successful cleanup never erases the unknown original job obligation"
+        );
+    }
+    #[test]
+    fn never_acquired_captures_still_complete_the_original_cleanup_prefix() {
+        const PLAN: RootCleanupPlan = RootCleanupPlan::new(&[6, 7, 8, 9]);
+        let (pool, budget) = pool(1);
+        let job = Arc::new(PrefixJob {
+            client: Mutex::new(None),
+            builder: Mutex::new(None),
+            producer: Mutex::new(None),
+            receipts: Arc::new(std::array::from_fn(|_| AtomicUsize::new(0))),
+            independent: Arc::new(AtomicUsize::new(0)),
+            turn_panics: false,
+            unknown_phase: None,
+        });
+        let registration = install(&pool, &budget, PLAN, job.clone());
+        let exit = registration.exit_observation();
+        registration.wake().unwrap();
+        wait_drained(&pool);
+        pool.shutdown().unwrap();
+        for receipt in job.receipts.iter() {
+            assert_eq!(receipt.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(job.independent.load(Ordering::SeqCst), 1);
+        assert_eq!(exit.status(), RootProducerExitStatus::Exited);
+    }
+
+    #[test]
+    fn a_complete_turn_requires_the_actual_channel_end_before_becoming_completed() {
+        use crate::root_result_session::turn_has_published_end;
+        let channel = prefix_channel();
+        assert!(!turn_has_published_end(
+            RootProducerTurn::Complete,
+            channel.snapshot().end_sequence
+        ));
+        let producer = channel.start_producer().unwrap();
+        channel.request_finish().unwrap();
+        channel.publish_end().unwrap();
+        assert!(turn_has_published_end(
+            RootProducerTurn::Complete,
+            channel.snapshot().end_sequence
+        ));
+        assert!(!turn_has_published_end(
+            RootProducerTurn::Idle,
+            channel.snapshot().end_sequence
+        ));
+        assert!(producer.finish_encoder().is_none());
+    }
+
     struct MetaWake {
         calls: Arc<AtomicUsize>,
         panic_payload: Option<(Arc<AtomicUsize>, Arc<AtomicUsize>)>,
@@ -1840,7 +2193,11 @@ mod tests {
                 self.fail();
             }
         }
-        fn cleanup_step(&self, phase: u16) -> RootCleanupProgress {
+        fn cleanup_step(
+            &self,
+            phase: u16,
+            _predecessors: RootCleanupPredecessors,
+        ) -> RootCleanupProgress {
             self.phases[usize::from(phase)].fetch_add(1, Ordering::SeqCst);
             if self.fault == 2 && phase == 0 {
                 self.fail();
@@ -2335,7 +2692,11 @@ mod tests {
             RootProducerTurn::Complete
         }
         fn cancel(&self) {}
-        fn cleanup_step(&self, phase: u16) -> RootCleanupProgress {
+        fn cleanup_step(
+            &self,
+            phase: u16,
+            _predecessors: RootCleanupPredecessors,
+        ) -> RootCleanupProgress {
             assert_eq!(phase, 0);
             self.phases.fetch_add(1, Ordering::SeqCst);
             RootCleanupProgress::Exited
@@ -2636,7 +2997,11 @@ mod tests {
             RootProducerTurn::Complete
         }
         fn cancel(&self) {}
-        fn cleanup_step(&self, phase: u16) -> RootCleanupProgress {
+        fn cleanup_step(
+            &self,
+            phase: u16,
+            _predecessors: RootCleanupPredecessors,
+        ) -> RootCleanupProgress {
             assert_eq!(self.data.len(), 64 * 1024);
             assert!(self.data.iter().all(|byte| *byte == 151));
             self.phases[usize::from(phase)].fetch_add(1, Ordering::SeqCst);

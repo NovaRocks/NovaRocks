@@ -13,6 +13,9 @@ partially-superseded-by:
   - id: ADR-0198
     scope: "The read-oriented visibility/seal boundary and logical business-conclusion wording are generalized into computation readiness for all distributed intents and separate statement/domain completion; exact identity, Accepted/Installed, covered observation, frozen-semantic recovery and actual convergence remain active"
     link: "ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md"
+  - id: ADR-0211
+    scope: "Worker registry implementation, control-plane scheduling and retention capacity are replaced by the deterministic runtime and Context-owned horizon retention; exact identity, Accepted/Installed, covered observation and physical convergence remain active"
+    link: "ADR-0211-deterministic-control-runtime-and-task-ownership.md"
 date: 2026-09-28
 provenance:
   - "discussion: 2026-09-24 pure local programs, accepted/installed creation, covered observation and normal convergence"
@@ -20,7 +23,8 @@ code-anchors:
   - "novarocks/local-program/src/program.rs (LocalProgram)"
   - "novarocks/execution/src/exec/node/lowering.rs (LocalRuntimeBindings)"
   - "novarocks/execution/src/exec/pipeline/builder/local.rs (direct local program instantiation)"
-  - "novarocks/worker/src/task_registry.rs (elect_creation_owner, existing_create_reply, quiesce_query_context)"
+  - "novarocks/worker-protocol/src/{control,context}.rs (pure admission, replay, quiesce and retention)"
+  - "novarocks/worker/src/control_runtime/{node,context_host}.rs (original request and host custody)"
   - "novarocks/worker/src/observation.rs (covered observation source)"
   - "novarocks/frontend-application/src/task_execution/execution.rs (QueryTaskExecution)"
   - "novarocks/frontend-application/src/task_execution/manifest_round.rs (ManifestAssembledRound)"
@@ -100,7 +104,7 @@ ADR-0159 继续拥有 driver poll 的单一扫描流、scan 分支内的 DOP 交
 - Accepted 只证明接管，FE 必须保留部署与清理状态直到额外事实到达；相比单一 Ready ACK，协议和故障诊断更复杂。P/count/bytes 与 W 也不能被合成一个简单的查询额度。
 - 流式输出降低首行成本，但第一次可见字节后放弃透明整体恢复，partial result 后可能返回错误；不以成功 EOF 掩盖失败。只读 successor 可与失联旧工作短暂共存，last-known/current-unknown 不能保证精确远端实时占用。
 - 内容不同的相同 identity 请求仍被当作原实体重放，不能发现所有发送方缺陷。单个创建仍携带完整静态字节，跨 Task 网络与 decode 成本没有通过本条消除；逻辑模板在恢复窗口内保留 backing。
-- covered stream、关闭 tombstone 和实际 stopped 事实都需要保留 count/bytes 与期限；健康静默、消费背压和真实缺口必须区别。局部容量界覆盖被声明的对象，不承诺任意部署或物理 RSS/OOM 安全。
+- covered stream、关闭记录和实际 stopped 事实仍占存储并按合法请求视界保留，条数/字节是观测事实，不作为 Context、票据或 inbound normal-close 的拒绝阈值，不提前淘汰。活跃任务、准备位置/字节与入口请求的真实容量分别准入；它们不构成保留记录或物理 RSS/OOM 上界。健康静默、消费背压和真实缺口必须区别。
 - 精确方法路由与独立小控制池需要配置和维护；它保护相关成本边界，不保证所有 h2/async/registry 饱和形态都不影响进展。纯程序边界也不等于实现了跨 Task 特化或缓存。
 - Native epoch 硬切要求部署在兼容岛之间切换。取消/围栏与实际退出分离提高了准确性，但退出较慢时资源仍真实占用；不能以放大 cap 或提前退账掩盖。
 

@@ -19,6 +19,7 @@
 //! This is cold start/rejection ownership, not a driver-step scheduling layer.
 
 use super::*;
+use crate::runtime::fragment::ExecutionReason;
 use crate::runtime::runtime_state::RuntimeErrorState;
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection, FailureReason};
 use std::{any::Any, mem::ManuallyDrop, num::NonZeroU16};
@@ -40,7 +41,13 @@ impl std::error::Error for StartFault {}
 impl FailureProjection for StartFault {
     fn failure_fact(&self) -> FailureFact {
         FailureFact::new(
-            if matches!(self.0, 630 | 631) {
+            if [
+                ExecutionReason::DriverStartDuplicateSubmission,
+                ExecutionReason::DriverRetirementRetainedWork,
+            ]
+            .into_iter()
+            .any(|reason| self.0 == reason.code().get())
+            {
                 FailureClass::Invariant
             } else {
                 FailureClass::Unexpected
@@ -282,18 +289,28 @@ impl DriverBatch {
             let health = control.exit_health_reporter();
             if slot
                 .activate
-                .run(&control, 619, || completion.activate())
+                .run(
+                    &control,
+                    ExecutionReason::DriverStartActivation.code().get(),
+                    || completion.activate(),
+                )
                 .is_some()
             {
                 let completion = slot
                     .activation
                     .take()
                     .expect("original activation metadata");
-                slot.activate_drop
-                    .run(&control, 619, || drop(ManuallyDrop::into_inner(completion)));
+                slot.activate_drop.run(
+                    &control,
+                    ExecutionReason::DriverStartActivation.code().get(),
+                    || drop(ManuallyDrop::into_inner(completion)),
+                );
             }
-            slot.activate_control_drop
-                .run_metadata(&health, 638, || drop(ManuallyDrop::into_inner(control)));
+            slot.activate_control_drop.run_metadata(
+                &health,
+                ExecutionReason::DriverActivationControlDrop.code().get(),
+                || drop(ManuallyDrop::into_inner(control)),
+            );
             if slot.empty()
                 && !slot.attachment.unknown
                 && !slot.activate.unknown
@@ -321,7 +338,14 @@ impl DriverBatch {
             phase
         };
         let mut phase = phase?;
-        let result = phase.run(control, 615 + ordinal as u16, action);
+        let reason = match ordinal {
+            0 => ExecutionReason::DriverStartRuntimeMetadata,
+            1 => ExecutionReason::DriverStartInitialFailurePublication,
+            2 => ExecutionReason::DriverStartInitialFailureCaptureDrop,
+            3 => ExecutionReason::DriverStartExecutorAdmission,
+            _ => unreachable!("only the original four start metadata phases are issued"),
+        };
+        let result = phase.run(control, reason.code().get(), action);
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         state.metadata_unknown |= phase.unknown;
         state.metadata[ordinal] = Some(phase);
@@ -339,7 +363,11 @@ impl DriverBatch {
                 .take()
                 .expect("one original submit control role")
         };
-        phase.run_metadata(&reporter, 637, || drop(ManuallyDrop::into_inner(control)));
+        phase.run_metadata(
+            &reporter,
+            ExecutionReason::DriverStartControlDrop.code().get(),
+            || drop(ManuallyDrop::into_inner(control)),
+        );
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         state.metadata_unknown |= phase.unknown;
         state.metadata[5] = Some(phase);
@@ -357,7 +385,10 @@ impl DriverBatch {
         };
         phase.started = true;
         phase.unknown = true;
-        phase.report(control, 630);
+        phase.report(
+            control,
+            ExecutionReason::DriverStartDuplicateSubmission.code().get(),
+        );
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         state.metadata_unknown = true;
         state.metadata[4] = Some(phase);
@@ -418,7 +449,11 @@ impl DriverBatch {
             return;
         };
         let control = task.completion.control.clone();
-        slot.attachment.run(&control, 618, || attach(task));
+        slot.attachment.run(
+            &control,
+            ExecutionReason::DriverStartAttachment.code().get(),
+            || attach(task),
+        );
         let unknown = slot.attachment.unknown;
         drop(loan);
         if unknown {
@@ -510,8 +545,11 @@ impl Drop for DriverBatch {
                     let slot = loan.slot.as_mut().expect("original discarded slot");
                     if let Some(completion) = slot.activation.take() {
                         let control = completion.control.clone();
-                        slot.activate_drop
-                            .run(&control, 619, || drop(ManuallyDrop::into_inner(completion)));
+                        slot.activate_drop.run(
+                            &control,
+                            ExecutionReason::DriverStartActivation.code().get(),
+                            || drop(ManuallyDrop::into_inner(completion)),
+                        );
                     }
                 }
             }
@@ -777,7 +815,11 @@ impl Retirement {
             // The original source is stored before cloning it for the one
             // accepted owner. A rejected candidate cannot destroy it inline.
             let proposal = self.proposal.as_deref().cloned();
-            let reason = if proposal.is_some() { 632 } else { 620 };
+            let reason = if proposal.is_some() {
+                ExecutionReason::DriverRetirementFailureFinish.code().get()
+            } else {
+                ExecutionReason::DriverRetirementFinish.code().get()
+            };
             self.phases[0].run(control, reason, || {
                 if let Some(proposal) = proposal {
                     context.set_final_status(proposal);
@@ -789,13 +831,23 @@ impl Retirement {
             });
         }
         if let Some(proposal) = self.proposal.take() {
-            self.phases[11].run(control, 633, || drop(ManuallyDrop::into_inner(proposal)));
+            self.phases[11].run(
+                control,
+                ExecutionReason::DriverRetirementFailureDrop.code().get(),
+                || drop(ManuallyDrop::into_inner(proposal)),
+            );
         }
         if !self.phases[1].started {
             let driver = self.driver.as_mut().expect("original driver");
-            self.phases[1].run(control, 621, || {
-                driver.cancel_for_fragment_abort();
-            });
+            self.phases[1].run(
+                control,
+                ExecutionReason::DriverRetirementSchedulerForget
+                    .code()
+                    .get(),
+                || {
+                    driver.cancel_for_fragment_abort();
+                },
+            );
         }
         if self.phases[1].unknown {
             self.unresolved = true;
@@ -803,7 +855,11 @@ impl Retirement {
         }
         if self.driver.is_some() {
             let driver = self.driver.as_mut().expect("original driver");
-            match self.phases[2].run(control, 622, || driver.has_pending_finish()) {
+            match self.phases[2].run(
+                control,
+                ExecutionReason::DriverRetirementPendingFinish.code().get(),
+                || driver.has_pending_finish(),
+            ) {
                 Some(true) => {
                     self.phases[2].reset_observation();
                     return Poll::Pending;
@@ -815,17 +871,28 @@ impl Retirement {
                 }
             }
             let driver = self.driver.take().expect("one actual driver destructor");
-            self.phases[3].run(control, 623, || drop(ManuallyDrop::into_inner(driver)));
+            self.phases[3].run(
+                control,
+                ExecutionReason::DriverRetirementDriverDrop.code().get(),
+                || drop(ManuallyDrop::into_inner(driver)),
+            );
         }
         if self.phases[3].unknown {
             self.unresolved = true;
             return Poll::Unresolved;
         }
-        match self.phases[10].run(control, 631, || !self.custody.has_retained_work()) {
+        match self.phases[10].run(
+            control,
+            ExecutionReason::DriverRetirementRetainedWork.code().get(),
+            || !self.custody.has_retained_work(),
+        ) {
             Some(true) => {}
             Some(false) => {
                 self.phases[10].unknown = true;
-                self.phases[10].report(control, 631);
+                self.phases[10].report(
+                    control,
+                    ExecutionReason::DriverRetirementRetainedWork.code().get(),
+                );
                 self.unresolved = true;
                 return Poll::Unresolved;
             }
@@ -835,7 +902,11 @@ impl Retirement {
             }
         }
         if let Some(context) = self.context.take() {
-            self.phases[4].run(control, 624, || drop(ManuallyDrop::into_inner(context)));
+            self.phases[4].run(
+                control,
+                ExecutionReason::DriverRetirementContextDrop.code().get(),
+                || drop(ManuallyDrop::into_inner(context)),
+            );
         }
         if self.phases[4].unknown {
             self.unresolved = true;
@@ -848,7 +919,11 @@ impl Retirement {
             return Poll::Unresolved;
         }
         if let Some(lease) = self.lease.take() {
-            self.phases[5].run(control, 625, || drop(ManuallyDrop::into_inner(lease)));
+            self.phases[5].run(
+                control,
+                ExecutionReason::DriverRetirementLeaseDrop.code().get(),
+                || drop(ManuallyDrop::into_inner(lease)),
+            );
         }
         if self.phases[5].unknown {
             self.unresolved = true;
@@ -857,7 +932,11 @@ impl Retirement {
         // This is not ordinary Drop: the real driver and its context/lease
         // already returned from their explicit once destructors.
         let completion = self.completion.as_ref().expect("original completion");
-        if let Some(last) = self.phases[6].run(control, 626, || completion.driver_finished()) {
+        if let Some(last) = self.phases[6].run(
+            control,
+            ExecutionReason::DriverRetirementCompletion.code().get(),
+            || completion.driver_finished(),
+        ) {
             self.last = last;
         }
         if self.phases[6].unknown {
@@ -869,25 +948,41 @@ impl Retirement {
                 .scheduler
                 .as_ref()
                 .expect("original scheduler metadata");
-            self.phases[7].run(control, 627, || scheduler.shutdown());
+            self.phases[7].run(
+                control,
+                ExecutionReason::DriverRetirementSchedulerShutdown
+                    .code()
+                    .get(),
+                || scheduler.shutdown(),
+            );
         }
         if let Some(scheduler) = self.scheduler.take() {
-            self.phases[8].run(control, 628, || drop(ManuallyDrop::into_inner(scheduler)));
+            self.phases[8].run(
+                control,
+                ExecutionReason::DriverRetirementSchedulerDrop.code().get(),
+                || drop(ManuallyDrop::into_inner(scheduler)),
+            );
         }
         let completion = self
             .completion
             .take()
             .expect("original completion metadata");
-        self.phases[9].run(control, 629, || drop(ManuallyDrop::into_inner(completion)));
+        self.phases[9].run(
+            control,
+            ExecutionReason::DriverRetirementCompletionDrop.code().get(),
+            || drop(ManuallyDrop::into_inner(completion)),
+        );
         // Last control/source/observer captures are a separate metadata role.
         // Its failure cannot revoke the already frozen actual work receipt.
         let control = self
             .control
             .take()
             .expect("one final original control drop");
-        self.phases[12].run_metadata(&self.health, 636, || {
-            drop(ManuallyDrop::into_inner(control))
-        });
+        self.phases[12].run_metadata(
+            &self.health,
+            ExecutionReason::DriverRetirementControlDrop.code().get(),
+            || drop(ManuallyDrop::into_inner(control)),
+        );
         self.unresolved = self.phases.iter().any(|phase| phase.unknown);
         if self.unresolved {
             Poll::Unresolved
@@ -1211,7 +1306,9 @@ mod tests {
         assert!(control.error().unwrap().same_occurrence(&original));
         assert_eq!(
             control.local_exit_fault().unwrap().fact().reason(),
-            StartFault(624).failure_fact().reason()
+            StartFault(ExecutionReason::DriverRetirementContextDrop.code().get())
+                .failure_fact()
+                .reason()
         );
         let state = batch.inner.state.lock().unwrap();
         let Work::Retiring(unknown) = &state.slots[0].as_ref().unwrap().work else {
@@ -1649,7 +1746,9 @@ mod tests {
         assert!(control.error().unwrap().same_occurrence(&original));
         assert_eq!(
             control.local_exit_fault().unwrap().fact().reason(),
-            StartFault(624).failure_fact().reason()
+            StartFault(ExecutionReason::DriverRetirementContextDrop.code().get())
+                .failure_fact()
+                .reason()
         );
         // This proves the real cold entry, not an entire worker-pool restart.
         // No worker thread was created and no retained count is edited.
@@ -1749,7 +1848,9 @@ mod tests {
         fn drop(&mut self) {
             assert_eq!(
                 self.health.failure().unwrap().fact().reason(),
-                StartFault(636).failure_fact().reason()
+                StartFault(ExecutionReason::DriverRetirementControlDrop.code().get())
+                    .failure_fact()
+                    .reason()
             );
             if self.secondary_unknown {
                 std::panic::panic_any(Secondary {
@@ -1831,7 +1932,9 @@ mod tests {
         assert!(weak_control.upgrade().is_none() && weak_completion.upgrade().is_none());
         assert_eq!(
             health.failure().unwrap().fact().reason(),
-            StartFault(636).failure_fact().reason()
+            StartFault(ExecutionReason::DriverRetirementControlDrop.code().get())
+                .failure_fact()
+                .reason()
         );
         assert_eq!(
             source_drops.load(Ordering::SeqCst),

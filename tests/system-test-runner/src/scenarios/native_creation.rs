@@ -81,10 +81,8 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(FrozenReplayAndMembership::default()),
         Box::new(CreationPayloadLifetime::default()),
         Box::new(FixedPlanRecovery::default()),
-        Box::new(NormalCloseCapacity {
-            byte_limited: false,
-        }),
-        Box::new(NormalCloseCapacity { byte_limited: true }),
+        Box::new(NormalCloseRetainedAdmission { byte_corpus: false }),
+        Box::new(NormalCloseRetainedAdmission { byte_corpus: true }),
         Box::new(AcceptedPreparationControlRaces),
     ]
 }
@@ -162,6 +160,77 @@ impl Scenario for FrozenReplayAndMembership {
             "established raw query context {} on BE[0] through its authenticated Native listener",
             session.execution_label()
         ));
+
+        let replay_epoch = std::time::Instant::now();
+        // Each new RPC gets a real new Worker carrier. Preserve the complete
+        // original operation/ticket/credential snapshot for every replay.
+        let original_establish = session
+            .establish_request
+            .clone()
+            .context("the raw session lost its original Establish")?;
+        let active = session.apply(
+            original_establish.clone(),
+            "active original Establish replay",
+        )?;
+        ensure!(
+            outcome(&active)? == proto::TaskOperationOutcome::Idempotent,
+            "the unchanged active Establish must be idempotent: {active:?}"
+        );
+        let Some(proto::task_operation_verdict::Ack::QueryContext(active_ack)) =
+            receipt_verdict(&active)?.ack.as_ref()
+        else {
+            bail!("active Establish replay lost its typed Context acknowledgement: {active:?}");
+        };
+        ensure!(
+            active_ack.query_context.as_ref() == Some(&session.context_under(session.frontend, 1))
+                && active_ack.state == proto::QueryContextState::Active as i32,
+            "active Establish replay changed the actual Context: {active_ack:?}"
+        );
+        let current_credential = session.advance_original_credential_epoch()?;
+        ensure!(
+            session.establish_request.as_ref() == Some(&original_establish),
+            "credential advance rewrote the immutable original Establish"
+        );
+        let stale = session.apply(
+            original_establish.clone(),
+            "unchanged original Establish after actual credential advance",
+        )?;
+        ensure!(
+            outcome(&stale)? == proto::TaskOperationOutcome::ContextConflict,
+            "the old original Establish must conflict with the advanced current credential: {stale:?}"
+        );
+        let Some(proto::task_operation_verdict::Ack::QueryContext(stale_ack)) =
+            receipt_verdict(&stale)?.ack.as_ref()
+        else {
+            bail!("conflicting original Establish lost its current Context receipt: {stale:?}");
+        };
+        ensure!(
+            stale_ack.query_context.as_ref() == Some(&session.context_under(session.frontend, 1))
+                && stale_ack.state == proto::QueryContextState::Active as i32,
+            "conflicting original Establish changed the active Context: {stale_ack:?}"
+        );
+        ensure!(
+            session.establish_request.as_ref() == Some(&original_establish),
+            "the exact replay source changed after credential comparison"
+        );
+        std::fs::write(
+            context.scenario_root().join("active-establish-replay.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "query_id_high": session.query_id.hi,
+                "query_id_low": session.query_id.lo,
+                "backend_process": session.backend.to_string(),
+                "original_operation_preserved": true,
+                "active_replay": "Idempotent",
+                "credential_advance": "Apply",
+                "current_credential_lease": current_credential.lease_id,
+                "current_credential_epoch": current_credential.epoch,
+                "unchanged_original_replay_after_advance": "ContextConflict",
+                "carrier_evidence": "distinct RPC submissions; Worker issues carrier identities",
+                "comparison_evidence": "active Pure Idempotent requires the actual current-credential comparison; no independent M or getter counter",
+                "material_omitted": true,
+            }))?,
+        )?;
+        context.action("the unchanged active Establish replay returned Idempotent; an actual same-lease credential advance returned Apply, and replaying the untouched original operation then returned ContextConflict; the original snapshot and all later Create bodies remain unchanged");
 
         // The winner.
         let first = RawCreate::values(&session, 1);
@@ -320,6 +389,12 @@ impl Scenario for FrozenReplayAndMembership {
         context.action(format!(
             "released the context ({released:?}); a later replay answered {verdict:?} and applied nothing"
         ));
+        super::result_delivery_support::await_idle(
+            context,
+            "active-establish-replay",
+            "after-original-release",
+            replay_epoch,
+        )?;
         Ok(())
     }
 }
@@ -451,6 +526,92 @@ impl RawBackendSession {
         Ok(session)
     }
 
+    /// Advance exactly the original empty-storage credential domain through
+    /// the real Native operation. Keep the frozen Establish replay source
+    /// immutable; existing RawCreate carries no context credential epoch.
+    fn advance_original_credential_epoch(&self) -> Result<proto::QueryContextCredentialDomain> {
+        let operation = self
+            .establish_request
+            .as_ref()
+            .context("the raw session lost its original Establish")?;
+        let Some(proto::task_operation::Operation::UpdateQueryContext(update)) =
+            &operation.operation
+        else {
+            bail!("the original operation is not a query-context update")
+        };
+        let Some(proto::update_query_context_request::Command::Establish(establish)) =
+            &update.command
+        else {
+            bail!("the original query-context update is not Establish")
+        };
+        let query_context = establish
+            .query_context
+            .clone()
+            .context("the original Establish omitted its exact Context")?;
+        ensure!(
+            query_context == self.context_under(self.frontend, 1),
+            "the original Establish belongs to a different Context"
+        );
+        let mut credential = establish
+            .initial_credential
+            .clone()
+            .context("the original Establish omitted its credential domain")?;
+        ensure!(
+            credential.descriptors.is_empty(),
+            "the direct replay fixture must not depend on external storage credentials"
+        );
+        credential.epoch = credential
+            .epoch
+            .checked_add(1)
+            .context("the original credential epoch cannot advance")?;
+        let receipt = self.apply(
+            proto::TaskOperation {
+                envelope: Some(raw_operation_envelope(15_000)),
+                operation: Some(proto::task_operation::Operation::UpdateQueryContext(
+                    proto::UpdateQueryContextRequest {
+                        command: Some(proto::update_query_context_request::Command::AdvanceDomain(
+                            proto::AdvanceQueryContextDomainRequest {
+                                query_context: Some(query_context.clone()),
+                                domain: Some(proto::QueryContextDomainUpdate {
+                                    domain: Some(
+                                        proto::query_context_domain_update::Domain::Credential(
+                                            credential.clone(),
+                                        ),
+                                    ),
+                                }),
+                            },
+                        )),
+                    },
+                )),
+            },
+            "advance the exact original Context credential epoch",
+        )?;
+        ensure!(
+            outcome(&receipt)? == proto::TaskOperationOutcome::Accepted,
+            "the exact next credential epoch was not accepted: {receipt:?}"
+        );
+        let Some(proto::task_operation_verdict::Ack::QueryContext(ack)) =
+            receipt_verdict(&receipt)?.ack.as_ref()
+        else {
+            bail!("credential advance omitted its typed Context acknowledgement: {receipt:?}");
+        };
+        ensure!(
+            ack.query_context.as_ref() == Some(&query_context)
+                && ack.state == proto::QueryContextState::Active as i32
+                && ack.accepted_domains.len() == 1,
+            "credential advance changed the exact active Context or receipt cardinality: {ack:?}"
+        );
+        let domain = &ack.accepted_domains[0];
+        ensure!(
+            domain.progression == proto::AcceptedDomainProgression::Apply as i32
+                && matches!(domain.receipt.as_ref(),
+                Some(proto::query_context_domain_receipt::Receipt::Credential(current))
+                if current.lease_id == credential.lease_id && current.accepted_epoch == credential.epoch),
+            "credential advance did not attest the same lease and actual next epoch Apply: {domain:?}"
+        );
+        Ok(credential)
+    }
+
     /// This session's query context, under `frontend` and `attempt`.
     pub(super) fn context_under(
         &self,
@@ -573,6 +734,7 @@ impl RawBackendSession {
 #[derive(Clone, Copy)]
 pub(super) enum RawSink {
     CountOnly,
+    ClientRows,
     Result,
     Stream { multicast: bool },
 }
@@ -719,6 +881,33 @@ pub(super) fn compiled_fragment(
                 novarocks_result_contract::FrozenRootOutput::CountOnly,
             ),
         )),
+        RawSink::ClientRows => {
+            use novarocks_result_contract::{
+                ClientRenderSchema, FrozenRootOutput, NativeRenderType, RenderColumn, RenderField,
+                RenderPresentation, RootOutputContract, RootProfileId,
+            };
+            // This fixture authors one actual non-null I64 root occurrence.
+            // LocalCompiler binds its slot from the original native layout.
+            let schema = ClientRenderSchema::try_new(
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+                vec![RenderColumn {
+                    source_ordinal: 0,
+                    source_slot: None,
+                    name: "v".into(),
+                    field: RenderField {
+                        presentation: RenderPresentation::ScalarText,
+                        nullable: false,
+                        native_type: NativeRenderType::SignedInteger(64),
+                    },
+                }],
+                1,
+            )
+            .expect("checked original one-column ClientRows root declaration");
+            FragmentSink::RootResult(Box::new(RootOutputContract::new(
+                RootProfileId::V1,
+                FrozenRootOutput::ClientRows(schema),
+            )))
+        }
         RawSink::Result => FragmentSink::Result,
         RawSink::Stream { multicast } => {
             cuts.outbound = (1..=if multicast { 2 } else { 1 })
@@ -1010,51 +1199,6 @@ pub(super) fn outcome(
     )?)
 }
 
-/// This capacity author rejects with a domain failure; it is not a Task conclusion.
-fn normal_close_outcome(
-    receipt: &proto::TaskOperationReceipt,
-) -> Result<proto::TaskOperationOutcome> {
-    let header = novarocks_task_codec::operation::decode_receipt_header(
-        receipt,
-        novarocks_proto_codec::FieldPath::root("normal_close_capacity_receipt"),
-    )?;
-    match receipt
-        .result
-        .as_ref()
-        .context("capacity receipt omitted its result")?
-    {
-        proto::task_operation_receipt::Result::Verdict(_) => {
-            let outcome = outcome(receipt)?;
-            ensure!(
-                outcome != proto::TaskOperationOutcome::ResourceExhausted,
-                "normal-close capacity must retain its producer's domain failure: {receipt:?}"
-            );
-            Ok(outcome)
-        }
-        proto::task_operation_receipt::Result::DomainFailure(failure) => {
-            let novarocks_execution_contract::operation::OperationResult::DomainFailure {
-                failure: original,
-                ..
-            } = header.result()
-            else {
-                bail!("capacity decoder lost the producer's domain failure: {receipt:?}");
-            };
-            ensure!(
-                original.fact().class()
-                    == novarocks_execution_contract::failure::FailureClass::Resource
-                    && original.fact().resource().is_some(),
-                "normal-close capacity lost the producer's resource facts: {failure:?}"
-            );
-            let outcome = proto::TaskOperationOutcome::try_from(failure.outcome)?;
-            ensure!(
-                outcome == proto::TaskOperationOutcome::ResourceExhausted,
-                "normal-close capacity returned another domain failure: {failure:?}"
-            );
-            Ok(outcome)
-        }
-    }
-}
-
 fn same_create_entity(
     original: &proto::task_operation_verdict::Ack,
     replay: &proto::task_operation_verdict::Ack,
@@ -1095,6 +1239,12 @@ fn await_count(
         if current == expected {
             return Ok(());
         }
+        // These creation scenarios require the same live roles. A marker
+        // cannot arrive from an already exited producer; report its original
+        // process failure while the remaining roles can still shut down.
+        context
+            .recheck_live_process_launch_identities()
+            .with_context(|| format!("verify original processes while observing {subject}"))?;
         let remaining = context.remaining(&format!("observe {subject}"))?;
         thread::sleep(remaining.min(POLL_INTERVAL));
     }
@@ -1596,15 +1746,15 @@ impl Scenario for FixedPlanRecovery {
 }
 
 // ---------------------------------------------------------------------------
-// Native normal-close capacity: Accepted reservations remain charged through
-// active execution and the legal late-frame retention horizon.
+// Native normal-close retention keeps exact late-frame facts while execution
+// resources admit new Tasks and Contexts throughout the original request horizon.
 // ---------------------------------------------------------------------------
 
-struct NormalCloseCapacity {
-    byte_limited: bool,
+struct NormalCloseRetainedAdmission {
+    byte_corpus: bool,
 }
 
-impl Scenario for NormalCloseCapacity {
+impl Scenario for NormalCloseRetainedAdmission {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
         crate::scenarios::declarations::for_module(
             "native_creation",
@@ -1615,24 +1765,12 @@ impl Scenario for NormalCloseCapacity {
     }
 
     fn name(&self) -> &'static str {
-        if self.byte_limited {
+        // Preserve the original runner identities for these two regressions.
+        if self.byte_corpus {
             "native-creation/normal-close-byte-capacity"
         } else {
             "native-creation/normal-close-count-capacity"
         }
-    }
-
-    fn launch_config(&self, _root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        let mut launch = ScenarioLaunchConfig::default();
-        let (records, bytes) = if self.byte_limited {
-            (32, 2048)
-        } else {
-            (2, 64 * 1024 * 1024)
-        };
-        launch.config_overlay.be = Some(format!(
-            "[runtime]\ntask_normal_close_max_records = {records}\ntask_normal_close_max_bytes = {bytes}\n"
-        ));
-        Ok(launch)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -1652,63 +1790,61 @@ impl Scenario for NormalCloseCapacity {
             create.exchange_source_backend = Some(source_process);
             create
         };
-        let first = receiver(&retained, 1);
-        ensure_accepted(&retained, &first)?;
-        await_installed(context, &retained, &first)?;
-        let mut active = Vec::new();
-        let refused = loop {
-            let create = receiver(&live, active.len() as u32 + 1);
-            let receipt = live.apply(create.operation(), "fill normal-close capacity")?;
-            match normal_close_outcome(&receipt)? {
-                proto::TaskOperationOutcome::Accepted => {
-                    await_installed(context, &live, &create)?;
-                    active.push(create);
-                    ensure!(
-                        active.len() < 32,
-                        "byte capacity did not reject before the independent record limit"
-                    );
-                }
-                proto::TaskOperationOutcome::ResourceExhausted => break create,
-                verdict => bail!("capacity probe returned {verdict:?}: {receipt:?}"),
-            }
-        };
-        let occupied = active.len() + 1;
-        ensure!(
-            !active.is_empty(),
-            "capacity fixture must hold a second live receiver"
-        );
-        if self.byte_limited {
-            ensure!(
-                occupied < 32,
-                "record limit could explain the supposed byte rejection"
-            );
-        } else {
-            ensure!(occupied == 2, "record cap 2 accepted {occupied} receivers");
+        // These are fixed input corpus sizes, with no storage-capacity claim.
+        let retained_receivers = if self.byte_corpus { 32 } else { 2 };
+        let mut originals = Vec::with_capacity(retained_receivers);
+        for index in 0..retained_receivers {
+            let create = receiver(&retained, index as u32 + 1);
+            ensure_accepted(&retained, &create)?;
+            await_installed(context, &retained, &create)?;
+            originals.push(create);
         }
-        context.action(format!("real Native Create accepted {occupied} installed inbound receivers, then returned ResourceExhausted at the configured {} bound", if self.byte_limited { "byte" } else { "record" }));
-
+        let active = receiver(&live, 1);
+        ensure_accepted(&live, &active)?;
+        await_installed(context, &live, &active)?;
         retained.release_when_ready(context)?;
-        assert_normal_close(&retained, &first, &exchange_authorization)?;
-        ensure_capacity_refused(&live, &refused)?;
-        // A still-live exact receiver accepts EOS after another Context has
-        // moved its reservation from active into retained; capacity pressure
-        // neither evicts that route nor lets a new Create overtake it.
-        let response = exchange_probe(&live, &active[0], true, &exchange_authorization)?;
-        ensure!(
-            matches!(response,novarocks_task_codec::exchange_unit_codec::DecodedExchangeDeliveryOutcome::Observed{facts,..} if facts.receiver_closed.is_none()),
-            "active receiver was evicted or closed under capacity pressure: {response:?}"
-        );
-        context.action("one Context retained exact typed normal-close evidence while another active receiver still accepted its exact sender EOS; new admission stayed refused");
-        live.release_when_ready(context)?;
-        // The retained Context itself cannot admit tasks after Quiesce. Use a
-        // third Context to prove retained reservations still occupy the cap.
-        let blocked = RawBackendSession::establish(context, 0)?;
-        let blocked_create = receiver(&blocked, 1);
-        ensure_capacity_refused(&blocked, &blocked_create)?;
-        blocked.release_when_ready(context)?;
-        assert_normal_close(&retained, &first, &exchange_authorization)?;
-        context.action("both receiver Contexts released, but their retained normal-close reservations still refused a fresh Context");
+        let mut wire_bytes = 0usize;
+        for original in &originals {
+            wire_bytes += assert_normal_close(&retained, original, &exchange_authorization)?;
+        }
+        context.action(format!(
+            "released one Context and read {} exact typed normal-close facts ({} protobuf bytes observed on the wire)",
+            originals.len(), wire_bytes,
+        ));
 
+        let next_task = receiver(&live, 2);
+        ensure_accepted(&live, &next_task)?;
+        await_installed(context, &live, &next_task)?;
+        // An already-live exact receiver remains usable while a different
+        // Context retains its normal-close facts and another Task is admitted.
+        let response = exchange_probe(&live, &active, true, &exchange_authorization)?;
+        ensure!(
+            matches!(response.outcome,novarocks_task_codec::exchange_unit_codec::DecodedExchangeDeliveryOutcome::Observed{facts,..} if facts.receiver_closed.is_none()),
+            "the live exact receiver was evicted or prematurely closed: {response:?}"
+        );
+        for original in &originals {
+            assert_normal_close(&retained, original, &exchange_authorization)?;
+        }
+        context.action("the existing live Context admitted and installed another Task, its first exact receiver accepted EOS, and every original retained normal-close fact remained readable");
+        live.release_when_ready(context)?;
+        assert_normal_close(&live, &active, &exchange_authorization)?;
+        assert_normal_close(&live, &next_task, &exchange_authorization)?;
+
+        let fresh = RawBackendSession::establish(context, 0)?;
+        let fresh_create = receiver(&fresh, 1);
+        ensure_accepted(&fresh, &fresh_create)?;
+        await_installed(context, &fresh, &fresh_create)?;
+        for original in &originals {
+            assert_normal_close(&retained, original, &exchange_authorization)?;
+        }
+        assert_normal_close(&live, &active, &exchange_authorization)?;
+        assert_normal_close(&live, &next_task, &exchange_authorization)?;
+        fresh.release_when_ready(context)?;
+        context.action("with both earlier Contexts retaining exact normal-close facts, a fresh Context established and its new receiver was Accepted and Installed; retained facts did not occupy an execution-admission position");
+
+        // Preserve the original real-clock horizon check. Start after positive
+        // retained-fact observations; no shorter retention or simulated clock
+        // is introduced to make the final forget happen sooner.
         let horizon = Duration::from_secs(120);
         let deadline = std::time::Instant::now() + horizon;
         while std::time::Instant::now() < deadline {
@@ -1720,38 +1856,40 @@ impl Scenario for NormalCloseCapacity {
                     .min(deadline.saturating_duration_since(std::time::Instant::now())),
             );
         }
-        let recovered = RawBackendSession::establish(context, 0)?;
-        let recovered_create = receiver(&recovered, 1);
+        // Expiry authorizes asynchronous physical forget. Observe the real
+        // old stream's result, rather than using unrelated fresh admission as
+        // a proxy for that callback's actual return.
         loop {
-            let receipt = recovered.apply(
-                recovered_create.operation(),
-                "admission after normal-close horizon",
-            )?;
-            match normal_close_outcome(&receipt)? {
-                proto::TaskOperationOutcome::Accepted => break,
-                proto::TaskOperationOutcome::ResourceExhausted => {
-                    thread::sleep(
-                        context
-                            .remaining("await normal-close horizon sweep")?
-                            .min(POLL_INTERVAL),
-                    );
-                }
-                verdict => bail!("post-horizon admission returned {verdict:?}: {receipt:?}"),
-            }
-        }
-        await_installed(context, &recovered, &recovered_create)?;
-        let forgotten = exchange_probe(&retained, &first, false, &exchange_authorization)?;
-        ensure!(
-            matches!(
-                forgotten,
+            let forgotten =
+                exchange_probe(&retained, &originals[0], false, &exchange_authorization)?;
+            if matches!(
+                forgotten.outcome,
                 novarocks_task_codec::exchange_unit_codec::DecodedExchangeDeliveryOutcome::Refused(
                     _
                 )
-            ),
-            "expired Context still retained normal-close evidence: {forgotten:?}"
-        );
+            ) {
+                break;
+            }
+            normal_close_response_bytes(&originals[0], &forgotten)?;
+            thread::sleep(
+                context
+                    .remaining("observe actual normal-close forget after the legal horizon")?
+                    .min(POLL_INTERVAL),
+            );
+        }
+        for original in &originals {
+            let forgotten = exchange_probe(&retained, original, false, &exchange_authorization)?;
+            ensure!(
+                matches!(forgotten.outcome, novarocks_task_codec::exchange_unit_codec::DecodedExchangeDeliveryOutcome::Refused(_)),
+                "expired Context still retained an original normal-close fact: {forgotten:?}"
+            );
+        }
+        let recovered = RawBackendSession::establish(context, 0)?;
+        let recovered_create = receiver(&recovered, 1);
+        ensure_accepted(&recovered, &recovered_create)?;
+        await_installed(context, &recovered, &recovered_create)?;
         recovered.release_when_ready(context)?;
-        context.action("after the legal horizon, the old exact late frame no longer received closure evidence and a fresh receiver installed successfully; retained capacity returned at Context Gone");
+        context.action("after the legal horizon and actual forget, all old exact streams were rejected without closure evidence; a fresh Context and receiver also admitted successfully");
         Ok(())
     }
 }
@@ -1761,21 +1899,6 @@ pub(super) fn ensure_accepted(session: &RawBackendSession, create: &RawCreate) -
     ensure!(
         outcome(&receipt)? == proto::TaskOperationOutcome::Accepted,
         "receiver Create was not accepted: {receipt:?}"
-    );
-    Ok(())
-}
-
-fn ensure_capacity_refused(session: &RawBackendSession, create: &RawCreate) -> Result<()> {
-    let receipt = session.apply(
-        create.operation(),
-        "refuse admission at occupied normal-close capacity",
-    )?;
-    ensure!(
-        matches!(
-            receipt.result.as_ref(),
-            Some(proto::task_operation_receipt::Result::DomainFailure(_))
-        ) && normal_close_outcome(&receipt)? == proto::TaskOperationOutcome::ResourceExhausted,
-        "occupied normal-close capacity must reject before Accepted: {receipt:?}"
     );
     Ok(())
 }
@@ -1810,12 +1933,18 @@ pub(super) fn await_installed(
     }
 }
 
+#[derive(Debug)]
+struct ExchangeProbeResponse {
+    outcome: novarocks_task_codec::exchange_unit_codec::DecodedExchangeDeliveryOutcome,
+    wire_bytes: usize,
+}
+
 fn exchange_probe(
     session: &RawBackendSession,
     create: &RawCreate,
     eos: bool,
     exchange_authorization: &str,
-) -> Result<novarocks_task_codec::exchange_unit_codec::DecodedExchangeDeliveryOutcome> {
+) -> Result<ExchangeProbeResponse> {
     use prost::Message;
     let Some(proto::task_operation::Operation::CreateTask(request)) = create.operation().operation
     else {
@@ -1897,25 +2026,39 @@ fn exchange_probe(
     )?;
     // Decode binds the response to this original Create's complete Task,
     // kernel, source ordinal and item identity; a close for another route fails.
-    Ok(codec::decode_delivery_response(
-        &response,
-        stream,
-        sequence,
-        novarocks_proto_codec::FieldPath::root("exchange_probe"),
-    )?)
+    Ok(ExchangeProbeResponse {
+        wire_bytes: response.encoded_len(),
+        outcome: codec::decode_delivery_response(
+            &response,
+            stream,
+            sequence,
+            novarocks_proto_codec::FieldPath::root("exchange_probe"),
+        )?,
+    })
 }
 
 fn assert_normal_close(
     session: &RawBackendSession,
     create: &RawCreate,
     exchange_authorization: &str,
-) -> Result<()> {
+) -> Result<usize> {
     let response = exchange_probe(session, create, false, exchange_authorization)?;
+    normal_close_response_bytes(create, &response)
+}
+
+fn normal_close_response_bytes(
+    _create: &RawCreate,
+    response: &ExchangeProbeResponse,
+) -> Result<usize> {
+    // The actual decoder above already bound the complete frozen route and
+    // sequence. Count the original wire response, not a reconstructed proof.
     ensure!(
-        matches!(response,novarocks_task_codec::exchange_unit_codec::DecodedExchangeDeliveryOutcome::Observed {facts,..} if facts.receiver_closed.is_some()),
+        matches!(response.outcome,
+            novarocks_task_codec::exchange_unit_codec::DecodedExchangeDeliveryOutcome::Observed { facts, .. }
+            if facts.receiver_closed.is_some()),
         "late Unit must retain this exact frozen route's typed normal close: {response:?}"
     );
-    Ok(())
+    Ok(response.wire_bytes)
 }
 
 /// A real Accepted-to-Quiesce schedule. Preparation can legitimately finish

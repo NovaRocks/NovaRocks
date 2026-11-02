@@ -335,11 +335,58 @@ pub fn prepare_compiled_fragment_with_metadata_host(
 
 fn prepare_compiled_fragment_in(
     mut submission: CompiledFragmentSubmission,
-    context: FragmentPrepareContext,
+    mut context: FragmentPrepareContext,
     schema_preparation: Option<
         &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
     >,
 ) -> Result<DormantFragmentHandle, FragmentLaunchError> {
+    // Validate the complete Task capability binding before acquiring a sink,
+    // opening a result session or allowing any execution capture to attach.
+    let control_error = match (context.result_identity, context.task_control.as_ref()) {
+        (Some(identity), Some(control)) if identity == control.identity() => None,
+        (None, None) => None,
+        (Some(_), None) => Some(crate::runtime::fragment::ExecutionFailure::from_domain(
+            crate::runtime::task_control::MissingTaskExecutionControl,
+        )),
+        _ => Some(crate::runtime::fragment::ExecutionFailure::from_domain(
+            crate::runtime::task_control::TaskControlIdentityMismatch,
+        )),
+    };
+    if let Some(error) = control_error {
+        return Err(FragmentLaunchError::from_failure(
+            FragmentLaunchStage::ValidateSubmission,
+            FragmentLaunchErrorKind::Binding,
+            error,
+        ));
+    }
+    if context.result_identity.is_some() && context.completion_roles.is_none() {
+        return Err(FragmentLaunchError::from_failure(
+            FragmentLaunchStage::ValidateSubmission,
+            FragmentLaunchErrorKind::Binding,
+            FragmentBindingError::new(
+                FragmentBindingTarget::Instance,
+                FragmentBindingErrorKind::InvalidAssignment,
+                "Task preparation requires its pre-admitted original completion roles",
+            )
+            .into(),
+        ));
+    }
+    if context
+        .completion_roles
+        .as_ref()
+        .is_some_and(|roles| roles.identity() != context.result_identity)
+    {
+        return Err(FragmentLaunchError::from_failure(
+            FragmentLaunchStage::ValidateSubmission,
+            FragmentLaunchErrorKind::Binding,
+            FragmentBindingError::new(
+                FragmentBindingTarget::Instance,
+                FragmentBindingErrorKind::InvalidAssignment,
+                "admitted completion roles do not match the fragment's exact Task identity",
+            )
+            .into(),
+        ));
+    }
     // The write capabilities move into the one pipeline graph that owns them.
     let writers = std::mem::take(&mut submission.writers);
     let program = submission.program();
@@ -554,16 +601,36 @@ fn prepare_compiled_fragment_in(
         )
     })();
     match prepare_result {
-        Ok(prepared) => Ok(DormantFragmentHandle {
-            prepared,
-            resources,
-            query_id,
-            fragment_instance_id: finst_id,
-            profiler: context.profiler.clone(),
-            mem_tracker: context.mem_tracker.clone(),
-            start_failure: context.start_failure(),
-            success_validator: None,
-        }),
+        Ok(prepared) => {
+            if context.completion_roles.is_none() && context.result_identity.is_none() {
+                let (roles, driver) =
+                    crate::runtime::local_completion::LocalCompletionDriver::admit(
+                        prepared.failure_control().exit_health_reporter(),
+                    );
+                context.completion_roles = Some(roles);
+                prepared.admit_local_completion_driver(driver);
+            }
+            let roles = context
+                .completion_roles
+                .take()
+                .expect("validated Task roles or the original taskless admission");
+            let (finisher, wall_time, publisher) = roles.into_parts();
+            let (permit, work) = finisher.into_parts();
+            prepared.admit_completion_work(work, wall_time);
+            let (settlement, publisher_work) = (permit, publisher);
+            Ok(DormantFragmentHandle {
+                prepared,
+                resources,
+                query_id,
+                fragment_instance_id: finst_id,
+                profiler: context.profiler.clone(),
+                mem_tracker: context.mem_tracker.clone(),
+                start_failure: context.start_failure(),
+                settlement,
+                publisher_work,
+                success_validator: None,
+            })
+        }
         Err(error) => Err(error.with_cleanup_diagnostics(resources.rollback())),
     }
 }

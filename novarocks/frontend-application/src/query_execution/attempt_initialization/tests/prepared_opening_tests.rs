@@ -771,10 +771,13 @@ async fn internal_production_opening_cancellation_preserves_original_mio_child_a
         .unwrap()
         .downcast_ref::<SharedFailureCause>()
         .unwrap();
-    assert_eq!(
-        carried.downcast_ref::<SharedFailureCause>(),
-        Some(&original_cause)
-    );
+    assert_eq!(carried, &original_cause);
+    assert!(std::ptr::eq(
+        carried.downcast_ref::<spi::ConnectorError>().unwrap(),
+        original_cause
+            .downcast_ref::<spi::ConnectorError>()
+            .unwrap(),
+    ));
     assert!(
         control
             .snapshot()
@@ -815,10 +818,13 @@ async fn internal_production_opening_cancellation_preserves_original_mio_child_a
         .unwrap()
         .downcast_ref::<SharedFailureCause>()
         .unwrap();
-    assert_eq!(
-        domain.downcast_ref::<SharedFailureCause>(),
-        Some(&original_cause)
-    );
+    assert_eq!(domain, &original_cause);
+    assert!(std::ptr::eq(
+        domain.downcast_ref::<spi::ConnectorError>().unwrap(),
+        original_cause
+            .downcast_ref::<spi::ConnectorError>()
+            .unwrap(),
+    ));
     assert_eq!(probe.close_calls.load(Ordering::SeqCst), 1);
     assert_eq!(probe.cpu_calls.load(Ordering::SeqCst), 1);
     assert!(initializing.ready.is_none());

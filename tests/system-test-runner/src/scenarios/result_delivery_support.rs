@@ -51,10 +51,28 @@ pub(super) fn metric(rows: &[Value], name: &str, labels: &[(&str, &str)]) -> Res
     Ok(value as u64)
 }
 
-fn idle_snapshot(context: &mut ScenarioContext, client: &Client) -> Result<(Value, bool)> {
+fn idle_snapshot(
+    context: &mut ScenarioContext,
+    client: &Client,
+    sample_tag: &str,
+) -> Result<(Value, bool)> {
     let response = context
         .handle()
         .frontend_management_get("/v1/frontend/state", Duration::from_secs(1))?;
+    std::fs::write(
+        context
+            .scenario_root()
+            .join(format!("{sample_tag}-frontend.body")),
+        response.body.as_bytes(),
+    )?;
+    std::fs::write(
+        context
+            .scenario_root()
+            .join(format!("{sample_tag}-frontend-http.json")),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({"path":"/v1/frontend/state","status":response.status}),
+        )?,
+    )?;
     ensure!(
         response.status == 200,
         "owner observation returned HTTP {}",
@@ -106,27 +124,78 @@ fn idle_snapshot(context: &mut ScenarioContext, client: &Client) -> Result<(Valu
         .collect();
     let mut backends = Vec::new();
     for (index, port) in ports.into_iter().enumerate() {
-        let rows: Value = client
-            .get(format!("http://127.0.0.1:{port}/metrics?type=json"))
-            .send()?
-            .error_for_status()?
-            .json()?;
-        let rows = rows.as_array().context("invalid backend metric array")?;
-        let reserved = metric(
-            rows,
-            "novarocks_backend_worker_context_reservations",
-            &[("dimension", "used")],
+        let url = format!("http://127.0.0.1:{port}/metrics?type=json");
+        let response = client.get(&url).send()?;
+        let status = response.status();
+        let body = response.bytes()?;
+        // Preserve the actual HTTP body before status/JSON/field validation.
+        std::fs::write(
+            context
+                .scenario_root()
+                .join(format!("{sample_tag}-be-{index}.body")),
+            &body,
         )?;
-        let published = metric(
-            rows,
-            "novarocks_backend_worker_reservation_last_published_unixtime_seconds",
-            &[],
+        std::fs::write(
+            context
+                .scenario_root()
+                .join(format!("{sample_tag}-be-{index}-http.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({"url":url,"status":status.as_u16()}))?,
         )?;
         ensure!(
-            published > 0,
-            "Worker reservation observation has no publication"
+            status.is_success(),
+            "backend owner observation returned HTTP {status}"
         );
-        idle &= reserved == 0;
+        let rows: Value = serde_json::from_slice(&body)?;
+        let rows = rows.as_array().context("invalid backend metric array")?;
+        let available = metric(
+            rows,
+            "novarocks_backend_execution_quiescence_snapshot_available",
+            &[],
+        )?;
+        ensure!(available <= 1, "invalid execution quiescence availability");
+        let execution = if available == 1 {
+            let mut values = serde_json::Map::new();
+            for resource in [
+                "active_tasks",
+                "preparing_tasks",
+                "preparing_bytes",
+                "requests",
+                "contexts_with_execution_custody",
+                "root_producers_running",
+                "root_data_positions",
+                "root_payload_bytes",
+                "root_segments",
+                "root_deliveries",
+                "root_retained_reservations",
+                "root_metadata_holders",
+                "context_records",
+                "root_channels",
+                "root_metadata_bytes",
+            ] {
+                let used = metric(
+                    rows,
+                    "novarocks_backend_execution_quiescence",
+                    &[("resource", resource)],
+                )?;
+                if !matches!(
+                    resource,
+                    "context_records" | "root_channels" | "root_metadata_bytes"
+                ) {
+                    idle &= used == 0;
+                }
+                values.insert(resource.into(), serde_json::json!(used));
+            }
+            Some(values)
+        } else {
+            ensure!(
+                !rows
+                    .iter()
+                    .any(|row| row["tags"]["metric"] == "novarocks_backend_execution_quiescence"),
+                "unavailable execution sample published stale values"
+            );
+            idle = false;
+            None
+        };
         let mut ingress = Vec::new();
         for class in [Some("ordinary"), Some("control"), root_class]
             .into_iter()
@@ -143,8 +212,8 @@ fn idle_snapshot(context: &mut ScenarioContext, client: &Client) -> Result<(Valu
             }
         }
         backends.push(
-            serde_json::json!({"index":index,"http_port":port,"worker_reservations":reserved,
-            "reservation_last_published_unix_seconds":published,"ingress":ingress}),
+            serde_json::json!({"index":index,"http_port":port,"execution_quiescence_available":available,
+            "execution_quiescence":execution,"ingress":ingress}),
         );
     }
     Ok((
@@ -169,7 +238,11 @@ pub(super) fn await_idle(
         let mut consecutive = 0;
         loop {
             context.remaining("result owner convergence barrier")?;
-            let (mut snapshot, idle) = idle_snapshot(context, &client)?;
+            let sample_tag = format!(
+                "owner-barrier-{window}-{phase}-sample-{:03}",
+                snapshots.len()
+            );
+            let (mut snapshot, idle) = idle_snapshot(context, &client, &sample_tag)?;
             snapshot["query_epoch_micros"] = serde_json::json!(epoch.elapsed().as_micros());
             snapshots.push(snapshot);
             consecutive = if idle { consecutive + 1 } else { 0 };

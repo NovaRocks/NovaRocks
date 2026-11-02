@@ -88,7 +88,7 @@ async fn driven_server() -> (
 fn request() -> Request<tonic::body::BoxBody> {
     Request::builder()
         .method("POST")
-        .uri("/novarocks.NovaRocksGrpc/FetchTaskResult")
+        .uri("/novarocks.NovaRocksGrpc/FetchRootResult")
         .body(tonic::body::empty_body())
         .unwrap()
 }

@@ -12,6 +12,7 @@ pub mod execution_services;
 pub mod fragment;
 pub mod io;
 pub mod kernel_memory;
+pub(crate) mod local_completion;
 pub mod mem_tracker;
 pub mod observable;
 pub mod operator_statistics;

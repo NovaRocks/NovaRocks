@@ -15,34 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Task conclusion storage owned by the status transaction, never another lock.
-//! Projection and foreign diagnostic work happen before entering that lock.
-//! A losing candidate is returned so its source is dropped after unlocking.
+//! Freeze rich Task proposals before handing neutral facts to the pure core.
+//! The original prepaid Source retains each rich cause through actual exit.
 
 use crate::failure_reason::WorkerFailureReason;
 use crate::task_diagnostics::TaskSecondaryDiagnostic;
 use novarocks_execution::runtime::fragment::ExecutionFailure;
 use novarocks_execution_contract::{
-    AcceptedConclusion, AcceptedTaskConclusion, ConclusionDecision, TaskConclusion,
-    TaskConclusionProposal, TaskFailure, TaskIdentity, TerminationDetail, decide_conclusion,
-    decide_reported_failure,
+    TaskConclusion, TaskConclusionProposal, TaskFailure, TerminationDetail,
     failure::{FailureClass, FailureEvidence, FailureFact, FailureProjection},
 };
-use std::{num::NonZeroU64, sync::Arc};
-
-#[derive(Debug)]
-pub(crate) struct ConclusionAcceptance<C> {
-    pub decision: ConclusionDecision,
-    pub accepted: Arc<AcceptedTaskConclusion<C>>,
-}
-impl<C> Clone for ConclusionAcceptance<C> {
-    fn clone(&self) -> Self {
-        Self {
-            decision: self.decision,
-            accepted: Arc::clone(&self.accepted),
-        }
-    }
-}
+use std::sync::Arc;
 
 #[derive(Debug)]
 struct UnownedStopReport(ExecutionFailure);
@@ -121,75 +104,31 @@ impl PreparedTaskConclusion {
             late_diagnostic,
         }
     }
-    pub(crate) fn conclusion(&self) -> &TaskConclusion {
-        &self.conclusion
-    }
-    pub(crate) fn late_diagnostic_mut(&mut self) -> &mut Option<Arc<TaskSecondaryDiagnostic>> {
-        &mut self.late_diagnostic
-    }
-}
-
-/// This member has no mutex or notifications. TaskStatusOwner's transaction
-/// serializes it together with the immutable lifecycle/status projection.
-#[derive(Debug, Default)]
-pub(crate) struct TaskConclusionState {
-    accepted: Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>>,
-}
-impl TaskConclusionState {
-    pub(crate) fn accepted(&self) -> Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>> {
-        self.accepted.clone()
-    }
-    pub(crate) fn current(&self) -> Option<&TaskConclusion> {
-        self.accepted.as_ref().map(|r| r.neutral().conclusion())
-    }
-    pub(crate) fn generation(&self) -> Option<NonZeroU64> {
-        self.accepted.as_ref().map(|r| r.neutral().generation())
-    }
-    pub(crate) fn accept(
-        &mut self,
-        identity: TaskIdentity,
-        candidate: PreparedTaskConclusion,
-        sealed: bool,
+    /// Moves only already projected neutral values into the pure protocol.
+    /// The caller retains the rich source in prepaid host custody. Rendering
+    /// and the old diagnostic record's destruction occur before its cut lock.
+    pub(crate) fn into_protocol(
+        self,
     ) -> (
-        ConclusionAcceptance<ExecutionFailure>,
-        Option<PreparedTaskConclusion>,
+        novarocks_worker_protocol::proposal_summary::Proposal,
+        Option<ExecutionFailure>,
     ) {
-        let decision = if sealed {
-            assert!(
-                self.accepted.is_some(),
-                "terminal Task has its accepted receipt"
-            );
-            ConclusionDecision::Keep
-        } else if let Some(evidence) = candidate.reported_evidence {
-            decide_reported_failure(self.current(), &candidate.conclusion, evidence)
-        } else {
-            decide_conclusion(self.current(), &candidate.conclusion)
-        };
-        if decision == ConclusionDecision::Keep {
-            return (
-                ConclusionAcceptance {
-                    decision,
-                    accepted: self.accepted().expect("kept Task conclusion exists"),
-                },
-                Some(candidate),
-            );
-        }
-        let generation = self.generation().map_or(NonZeroU64::MIN, |g| {
-            NonZeroU64::new(
-                g.get()
-                    .checked_add(1)
-                    .expect("Task conclusion generation fits u64"),
-            )
-            .expect("Task conclusion generation remains nonzero")
+        let diagnostic = self.late_diagnostic.as_ref().map(|record| {
+            novarocks_worker_protocol::proposal_summary::Diagnostic {
+                phase: record.phase(),
+                fact: record.fact(),
+                detail: novarocks_execution_contract::SafeDetail::truncating(record.detail()),
+                cleanup: false,
+            }
         });
-        let accepted = Arc::new(
-            AcceptedTaskConclusion::new(
-                AcceptedConclusion::new(identity, generation, candidate.conclusion),
-                candidate.origin,
-            )
-            .expect("prepared Task receipt keeps its originating source"),
-        );
-        self.accepted = Some(Arc::clone(&accepted));
-        (ConclusionAcceptance { decision, accepted }, None)
+        (
+            novarocks_worker_protocol::proposal_summary::Proposal {
+                conclusion: self.conclusion,
+                evidence: self.reported_evidence,
+                source: None,
+                diagnostic,
+            },
+            self.origin,
+        )
     }
 }

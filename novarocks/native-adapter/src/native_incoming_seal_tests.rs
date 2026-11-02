@@ -234,7 +234,7 @@ async fn another_process_or_lane_closes_the_connection_before_the_route() {
     let verifier = trust(None);
     for (second_caller, second_method) in [
         (peer(true, 2), NativeRpcMethod::ApplyTaskOperations),
-        (peer(true, 1), NativeRpcMethod::FetchTaskResult),
+        (peer(true, 1), NativeRpcMethod::FetchRootResult),
     ] {
         let fixture = Fixture::start(&verifier).await;
         let first = trust(Some(peer(true, 1)));

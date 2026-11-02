@@ -478,9 +478,10 @@ impl From<CapacityBound> for TaskExecutionError {
 /// FE-authored facts for ordinary Worker protocol verdicts. An originating
 /// DomainFailure bypasses this projection and keeps its exact producer fact.
 /// QUERY reasons 1..=13 and 27 belong to QueryFailureReason. This closed FE
-/// protocol projection owns 14..=26; 28..=32 remain unassigned.
+/// protocol projection owns 14..=26 and 28; 29..=32 remain unassigned.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TaskProtocolFailureReason {
+    OwnerFailed,
     OperationTimedOut,
     IdentityMismatch,
     CompatibilityMismatch,
@@ -498,6 +499,7 @@ enum TaskProtocolFailureReason {
 impl TaskProtocolFailureReason {
     fn terminal_verdict(outcome: OperationOutcome) -> Self {
         match outcome {
+            OperationOutcome::OwnerFailed => Self::OwnerFailed,
             OperationOutcome::OperationTimedOut => Self::OperationTimedOut,
             OperationOutcome::IdentityMismatch => Self::IdentityMismatch,
             OperationOutcome::CompatibilityMismatch => Self::CompatibilityMismatch,
@@ -528,6 +530,7 @@ impl novarocks_execution_contract::failure::FailureProjection for TaskProtocolFa
             FailureClass, FailureFact, FailureReason, domain,
         };
         let (class, code) = match self {
+            Self::OwnerFailed => (FailureClass::Invariant, 28),
             Self::OperationTimedOut => (FailureClass::Dependency, 14),
             Self::IdentityMismatch => return FailureFact::new(
                 FailureClass::Invariant,
@@ -980,6 +983,33 @@ mod canonical_input_tests {
             novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
         );
     }
+    #[test]
+    fn owner_failure_is_an_invariant_with_no_process_recovery_qualification() {
+        use novarocks_coordination_contract::AttemptFailureClass;
+        use novarocks_query_application::api::NativeAttemptTopologyRequirement;
+        let input = TaskExecutionError::OperationFailed {
+            context: context(),
+            operation_id: TaskOperationId::new_v7(),
+            kind: OperationKind::ReleaseQueryContext,
+            rejection: OperationResult::Verdict {
+                outcome: OperationOutcome::OwnerFailed,
+                detail: None,
+                acknowledgement: None,
+            },
+        }
+        .preparation_input();
+        assert_eq!(input.fact().class(), FailureClass::Invariant);
+        assert_eq!(input.fact().reason().code(), 28);
+        assert_eq!(
+            input.attempt_class(),
+            AttemptFailureClass::ContractViolation
+        );
+        assert_eq!(
+            input.topology_requirement(),
+            NativeAttemptTopologyRequirement::LiveSnapshot
+        );
+    }
+
     #[test]
     fn ordinary_resource_verdict_is_a_protocol_fact_without_fabricated_resource_measurements() {
         let input = TaskExecutionError::OperationFailed {

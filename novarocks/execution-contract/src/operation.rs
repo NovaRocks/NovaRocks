@@ -294,6 +294,10 @@ impl OperationEnvelope {
 /// delivery are query-side port results and do not enter this enum.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum OperationOutcome {
+    /// The operation owner failed locally. This is fatal to the attempt and
+    /// proves neither Task termination nor physical resource convergence.
+    /// Previously published receipts remain valid.
+    OwnerFailed,
     /// The operation was applied.
     Accepted,
     /// An exact replay of an already applied operation.
@@ -459,14 +463,28 @@ impl QueryContextDomainReceipt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateTaskReceipt {
     identity: TaskIdentity,
-    domains: Vec<TaskDomainReceipt>,
+    domains: Arc<Vec<TaskDomainReceipt>>,
     current_status: TaskStatus,
 }
 
 impl CreateTaskReceipt {
-    pub const fn new(
+    pub fn new(
         identity: TaskIdentity,
         domains: Vec<TaskDomainReceipt>,
+        current_status: TaskStatus,
+    ) -> Self {
+        Self {
+            identity,
+            domains: Arc::new(domains),
+            current_status,
+        }
+    }
+
+    /// Share the original bounded receipt vector without traversing its
+    /// members in a single protocol actor step.
+    pub fn from_shared(
+        identity: TaskIdentity,
+        domains: Arc<Vec<TaskDomainReceipt>>,
         current_status: TaskStatus,
     ) -> Self {
         Self {
@@ -858,6 +876,10 @@ pub struct UpdateTask {
 }
 
 impl UpdateTask {
+    /// Transfer the original domain vector without cloning its rich members.
+    pub fn into_parts(self) -> (OperationEnvelope, TaskIdentity, Vec<TaskDomainUpdate>) {
+        (self.envelope, self.identity, self.domains)
+    }
     pub fn try_new(
         operation_id: TaskOperationId,
         identity: TaskIdentity,
@@ -1001,7 +1023,44 @@ pub struct EstablishQueryContext {
     initial_lease_valid_for: LeaseValidFor,
 }
 
+/// Owned transport fields before the application attaches source custody.
+/// Moving these fields performs no opaque getter, clone or destructor. The
+/// carrier itself grants no admission, execution or retirement authority.
+/// Consumers must supervise each external field independently during disposal.
+pub struct EstablishQueryContextParts {
+    pub envelope: OperationEnvelope,
+    pub context: QueryContextRef,
+    pub admission_ticket_id: AdmissionTicketId,
+    pub catalog_binding: Arc<dyn CodecOwnedContent>,
+    pub initial_runtime_filter: Arc<dyn CodecOwnedContent>,
+    pub query_options: Arc<dyn CodecOwnedContent>,
+    pub initial_credential: CredentialUpdate,
+    pub initial_lease_valid_for: LeaseValidFor,
+}
+
 impl EstablishQueryContext {
+    pub fn into_owned_parts(self) -> EstablishQueryContextParts {
+        let Self {
+            envelope,
+            context,
+            admission_ticket_id,
+            catalog_binding,
+            initial_runtime_filter,
+            query_options,
+            initial_credential,
+            initial_lease_valid_for,
+        } = self;
+        EstablishQueryContextParts {
+            envelope,
+            context,
+            admission_ticket_id,
+            catalog_binding,
+            initial_runtime_filter,
+            query_options,
+            initial_credential,
+            initial_lease_valid_for,
+        }
+    }
     pub fn new(
         operation_id: TaskOperationId,
         context: QueryContextRef,
@@ -1095,6 +1154,10 @@ pub struct AdvanceQueryContextDomain {
 }
 
 impl AdvanceQueryContextDomain {
+    /// Transfer the original shared-domain capability to its admitted owner.
+    pub fn into_parts(self) -> (OperationEnvelope, QueryContextRef, QueryContextDomainUpdate) {
+        (self.envelope, self.context, self.domain)
+    }
     pub fn new(
         operation_id: TaskOperationId,
         context: QueryContextRef,

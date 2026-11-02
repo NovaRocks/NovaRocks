@@ -682,6 +682,9 @@ impl QueryContextOwner {
             return Err(TaskExecutionError::UnknownOperation);
         }
         self.quiesce_in_flight = false;
+        if ack.worker_outcome() == Some(OperationOutcome::OwnerFailed) {
+            return Err(self.owner_failure_error(ack));
+        }
         if ack.is_applied() {
             let AckPayload::Quiesce(receipt) = ack.payload() else {
                 return Err(TaskExecutionError::MissingReceipt(
@@ -906,6 +909,13 @@ impl QueryContextOwner {
             return Ok(());
         }
         if !ack.is_applied() {
+            if ack.worker_outcome() == Some(OperationOutcome::OwnerFailed) {
+                // The failed owner may still hold a grant or queued work.
+                // Stand down admission without manufacturing its release.
+                self.admission = None;
+                self.admission_qualified = false;
+                return Err(self.owner_failure_error(ack));
+            }
             self.fail_admission();
             let Some(_outcome) = ack.worker_outcome() else {
                 return Err(crate::task_execution::error::dispatch_rejection(
@@ -1003,6 +1013,14 @@ impl QueryContextOwner {
                 _ => return Err(TaskExecutionError::UnknownOperation),
             };
 
+        if ack.worker_outcome() == Some(OperationOutcome::OwnerFailed) {
+            if is_establish {
+                self.establish = None;
+            } else {
+                self.renewal = None;
+            }
+            return Err(self.owner_failure_error(ack));
+        }
         if ack.is_applied() {
             let AckPayload::Context(receipt) = ack.payload() else {
                 return Err(TaskExecutionError::MissingReceipt(
@@ -1143,6 +1161,9 @@ impl QueryContextOwner {
             return Err(TaskExecutionError::UnknownOperation);
         }
         self.release_in_flight = false;
+        if ack.worker_outcome() == Some(OperationOutcome::OwnerFailed) {
+            return Err(self.owner_failure_error(ack));
+        }
         if ack.is_applied() {
             let (outcome, runtime_filter) = match ack.payload() {
                 AckPayload::Release {
@@ -1224,6 +1245,18 @@ impl QueryContextOwner {
         self.released = true;
     }
 
+    /// Preserves the exact failed-owner verdict without claiming remote exit.
+    fn owner_failure_error(&self, ack: &OperationAcknowledgement) -> TaskExecutionError {
+        TaskExecutionError::OperationFailed {
+            context: self.context,
+            operation_id: ack.operation_id(),
+            kind: ack.kind(),
+            rejection: ack
+                .worker_header()
+                .expect("owner failure is a checked Worker verdict"),
+        }
+    }
+
     /// Delays another release attempt while local work remains unsettled.
     fn defer_release_retry(&mut self, now: MonotonicInstant) {
         self.release_blocked_at = Some(self.progress);
@@ -1236,5 +1269,152 @@ impl QueryContextOwner {
 
     fn request_id(request: &Arc<UpdateQueryContext>) -> TaskOperationId {
         request.envelope().operation_id()
+    }
+}
+
+#[cfg(test)]
+mod owner_failure_tests {
+    use super::*;
+    use novarocks_types::identity::{AttemptId, QueryExecutionId, QueryId};
+
+    fn owner() -> QueryContextOwner {
+        let context = QueryContextRef::new(
+            QueryExecutionId::new(QueryId::new(7101, 7102), AttemptId::new(1).unwrap()).unwrap(),
+            novarocks_types::identity::FrontendProcessId::new_v7(),
+            novarocks_types::identity::BackendProcessId::new_v7(),
+        );
+        QueryContextOwner::new(
+            context,
+            1,
+            NativeCompatibilityId::new([0x71; 32]),
+            AdmissionEpochCapability::try_from_bytes([0x72; 16]).unwrap(),
+        )
+    }
+
+    fn failed(id: TaskOperationId, kind: OperationKind) -> OperationAcknowledgement {
+        OperationAcknowledgement::new(id, kind, OperationOutcome::OwnerFailed, AckPayload::None)
+    }
+
+    fn assert_owner_failure(error: TaskExecutionError) {
+        assert!(matches!(
+            error,
+            TaskExecutionError::OperationFailed {
+                rejection: novarocks_execution_contract::operation::OperationResult::Verdict {
+                    outcome: OperationOutcome::OwnerFailed,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn failed_admission_stands_down_without_claiming_remote_resources_released() {
+        let mut owner = owner();
+        let intent = owner
+            .admission_intent(MonotonicInstant::ORIGIN)
+            .unwrap()
+            .unwrap();
+        assert_owner_failure(
+            owner
+                .on_admission_ack(
+                    &failed(intent.operation_id(), intent.kind()),
+                    MonotonicInstant::ORIGIN,
+                )
+                .unwrap_err(),
+        );
+        assert!(!owner.is_released());
+        assert_eq!(owner.state(), QueryContextState::Absent);
+        assert!(
+            owner
+                .admission_intent(MonotonicInstant::ORIGIN)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failed_renewal_keeps_the_last_published_context_state() {
+        let mut owner = owner();
+        owner.state = QueryContextState::Active;
+        let request = Arc::new(UpdateQueryContext::RenewLease(
+            RenewQueryExecutionLease::new(
+                TaskOperationId::new_v7(),
+                owner.context,
+                LeaseSequence::INITIAL,
+                LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
+            ),
+        ));
+        let id = request.envelope().operation_id();
+        owner.renewal = Some(ReleasedLease {
+            request,
+            sequence: LeaseSequence::INITIAL,
+            first_sent_at: MonotonicInstant::ORIGIN,
+            awaiting_outcome: true,
+        });
+        assert_owner_failure(
+            owner
+                .on_context_ack(&failed(id, OperationKind::UpdateQueryContext))
+                .unwrap_err(),
+        );
+        assert_eq!(owner.state(), QueryContextState::Active);
+        assert!(!owner.is_released());
+        assert!(owner.renewal.is_none());
+    }
+
+    #[test]
+    fn failed_quiesce_and_release_do_not_publish_context_convergence() {
+        let mut owner = owner();
+        owner.state = QueryContextState::Active;
+        let quiesce = owner.quiesce_intent().unwrap();
+        assert_owner_failure(
+            owner
+                .on_quiesce_ack(&failed(quiesce.operation_id(), quiesce.kind()))
+                .unwrap_err(),
+        );
+        assert_eq!(owner.state(), QueryContextState::Active);
+        assert!(!owner.is_released());
+        assert!(!owner.quiesce_acknowledged());
+
+        owner.state = QueryContextState::Quiescing;
+        let request = ReleaseQueryContext::new(TaskOperationId::new_v7(), owner.context);
+        owner.release = Some(request);
+        owner.release_in_flight = true;
+        assert_owner_failure(
+            owner
+                .on_release_ack(
+                    &failed(
+                        request.envelope().operation_id(),
+                        OperationKind::ReleaseQueryContext,
+                    ),
+                    MonotonicInstant::ORIGIN,
+                )
+                .unwrap_err(),
+        );
+        assert_eq!(owner.state(), QueryContextState::Quiescing);
+        assert!(!owner.is_released());
+    }
+
+    #[test]
+    fn a_failed_owner_does_not_revoke_an_existing_release_receipt() {
+        let mut owner = owner();
+        owner.state = QueryContextState::TerminalRetained;
+        owner.released = true;
+        let request = ReleaseQueryContext::new(TaskOperationId::new_v7(), owner.context);
+        owner.release = Some(request);
+        owner.release_in_flight = true;
+        assert_owner_failure(
+            owner
+                .on_release_ack(
+                    &failed(
+                        request.envelope().operation_id(),
+                        OperationKind::ReleaseQueryContext,
+                    ),
+                    MonotonicInstant::ORIGIN,
+                )
+                .unwrap_err(),
+        );
+        assert!(owner.is_released());
+        assert_eq!(owner.state(), QueryContextState::TerminalRetained);
     }
 }

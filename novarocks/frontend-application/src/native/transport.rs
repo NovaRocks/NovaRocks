@@ -616,7 +616,7 @@ mod routing_tests {
         let client = Client::for_backend(descriptor.clone(), runtime.clone());
         for method in [
             NativeRpcMethod::ApplyTaskOperations,
-            NativeRpcMethod::FetchTaskResult,
+            NativeRpcMethod::FetchRootResult,
             NativeRpcMethod::SubscribeTaskStatus,
             NativeRpcMethod::FetchTaskDynamicFilters,
             NativeRpcMethod::GetFinalTaskInfo,
@@ -639,6 +639,7 @@ mod routing_tests {
         for method in [
             NativeRpcMethod::AnnounceBackend,
             NativeRpcMethod::RetiredFetchResult,
+            NativeRpcMethod::RetiredFetchTaskResult,
             NativeRpcMethod::RetiredExchange,
         ] {
             assert!(matches!(
@@ -712,7 +713,7 @@ mod routing_tests {
         assert_ne!(
             observation,
             client
-                .channel_key(NativeRpcMethod::FetchTaskResult)
+                .channel_key(NativeRpcMethod::FetchRootResult)
                 .unwrap()
         );
         let replacement = Client::for_endpoint(
@@ -942,7 +943,7 @@ mod routing_tests {
                     Duration::from_secs(10),
                     dial_with_accept_confirmation(
                         &client,
-                        NativeRpcMethod::FetchTaskResult,
+                        NativeRpcMethod::FetchRootResult,
                         &accepted,
                         index + 1,
                         None,
@@ -967,7 +968,7 @@ mod routing_tests {
         fn assert_four_client_channels_but_three_server_accepts(&self) {
             let key = self
                 .client
-                .channel_key(NativeRpcMethod::FetchTaskResult)
+                .channel_key(NativeRpcMethod::FetchRootResult)
                 .unwrap();
             assert_eq!(self.runtime.cached_connections(&key), 4);
             assert_eq!(*self.accepted.borrow(), 3);
@@ -991,7 +992,7 @@ mod routing_tests {
             Duration::from_secs(10),
             dial_with_accept_confirmation(
                 &case.client,
-                NativeRpcMethod::FetchTaskResult,
+                NativeRpcMethod::FetchRootResult,
                 &case.accepted,
                 4,
                 Some(ready),
@@ -1022,7 +1023,7 @@ mod routing_tests {
             started + Duration::from_secs(10),
             dial_with_accept_confirmation(
                 &case.client,
-                NativeRpcMethod::FetchTaskResult,
+                NativeRpcMethod::FetchRootResult,
                 &case.accepted,
                 4,
                 Some(ready),
@@ -1066,7 +1067,7 @@ mod routing_tests {
         for (client, method, lane, accepted) in [
             (
                 &data_client,
-                NativeRpcMethod::FetchTaskResult,
+                NativeRpcMethod::FetchRootResult,
                 FrontendNativeLane::ResultData,
                 &data_accepted,
             ),
@@ -1147,7 +1148,7 @@ mod routing_tests {
         assert_eq!(
             runtime.cached_connections(
                 &data_client
-                    .channel_key(NativeRpcMethod::FetchTaskResult)
+                    .channel_key(NativeRpcMethod::FetchRootResult)
                     .unwrap()
             ),
             0

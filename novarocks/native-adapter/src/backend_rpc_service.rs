@@ -26,7 +26,6 @@ use std::time::Instant;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
 
-use crate::native_control_executor::NativeControlExecutor;
 use crate::native_ingress::NativeIngressOwnership;
 use crate::{
     backend_heartbeat::BackendHeartbeatResponder,
@@ -47,7 +46,6 @@ pub struct BackendRpcService {
     heartbeat: BackendHeartbeatResponder,
     exchange_data_plane: NativeExchangeDataPlane,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
-    control_executor: Arc<NativeControlExecutor>,
     #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
 }
@@ -60,7 +58,6 @@ impl BackendRpcService {
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         task_inbound_capabilities: Arc<TaskInboundCapabilities>,
         heartbeat: BackendHeartbeatResponder,
-        control_executor: Arc<NativeControlExecutor>,
     ) -> Self {
         let unit_backend = heartbeat.process_id();
         Self {
@@ -73,7 +70,6 @@ impl BackendRpcService {
                 unit_backend,
             ),
             runtime_filter_ingress,
-            control_executor,
             #[cfg(novarocks_dev_controls)]
             test_controls: None,
         }
@@ -96,7 +92,7 @@ fn ingress_ownership<T>(request: &tonic::Request<T>) -> Option<Arc<NativeIngress
 }
 
 fn retired_fetch_result_status() -> tonic::Status {
-    tonic::Status::unimplemented("FetchResult is retired; use FetchTaskResult")
+    tonic::Status::unimplemented("FetchResult is retired; use FetchRootResult")
 }
 
 #[tonic::async_trait]
@@ -278,8 +274,6 @@ impl NovaRocksGrpc for BackendRpcService {
         } else {
             None
         };
-        #[cfg(novarocks_dev_controls)]
-        let hold_deadline = ownership.deadline();
         let timing = TaskIngressTiming::new(ownership.arrival(), ownership.deadline());
         let raw = request.into_inner();
         #[cfg(novarocks_dev_controls)]
@@ -288,38 +282,28 @@ impl NovaRocksGrpc for BackendRpcService {
         } else {
             None
         };
-        let queued_at = Instant::now();
-        let response = tokio::task::spawn_blocking(move || {
-            crate::backend_metrics::native_blocking_queue_wait(
-                "apply_task_operations",
-                queued_at.elapsed(),
-            );
-            let _ownership = ownership;
-            #[cfg(novarocks_dev_controls)]
-            if let Some(token) = hold_token {
-                crate::task_protocol_fault::hold_native_ingress_ordinary_closure(
-                    token,
-                    hold_deadline,
-                )?;
-            }
-            #[cfg(novarocks_dev_controls)]
-            if let Some(token) = registry_hold_token {
-                let mut token = Some(token);
-                ingress.with_registry_lock_for_test(&mut || {
-                    crate::task_protocol_fault::hold_native_registry_lock(
-                        token.take().ok_or_else(|| {
-                            tonic::Status::internal("Native registry hold callback ran twice")
-                        })?,
-                        hold_deadline,
-                    )
-                })?;
-            }
-            ingress.apply_task_operations_at(raw, timing)
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("apply_task_operations handler panicked: {error}"))
-        })??;
+        #[cfg(novarocks_dev_controls)]
+        if registry_hold_token.is_some() {
+            return Err(tonic::Status::unimplemented(
+                "synchronous Native registry lock holds are retired",
+            ));
+        }
+        #[cfg(novarocks_dev_controls)]
+        if let Some(claim) = hold_token {
+            // This same admitted RPC owns the ordinary RunningPermit and raw
+            // input throughout the asynchronous test-role rendezvous. Neither
+            // a Worker poller nor a blocking pool owns another call or permit.
+            crate::task_protocol_fault::hold_native_ingress_ordinary_request(
+                claim,
+                ownership.deadline(),
+            )
+            .await?;
+        }
+        // This exact admitted Native owner remains live while the original
+        // Worker request is awaited. No blocking executor owns a second call.
+        let response = ingress
+            .apply_task_operations_at(raw, timing, ownership)
+            .await?;
         Ok(tonic::Response::new(response))
     }
 
@@ -333,12 +317,8 @@ impl NovaRocksGrpc for BackendRpcService {
         })?;
         let timing = TaskIngressTiming::new(ownership.arrival(), ownership.deadline());
         let raw = request.into_inner();
-        let response = self
-            .control_executor
-            .execute(move || {
-                let _ownership = ownership;
-                ingress.apply_task_control_operations_at(raw, timing)
-            })
+        let response = ingress
+            .apply_task_control_operations_at(raw, timing, ownership)
             .await?;
         Ok(tonic::Response::new(response))
     }
@@ -348,21 +328,14 @@ impl NovaRocksGrpc for BackendRpcService {
         request: tonic::Request<proto::SubscribeTaskStatusRequest>,
     ) -> Result<tonic::Response<Self::SubscribeTaskStatusStream>, tonic::Status> {
         let ingress = Arc::clone(&self.task_execution_ingress);
-        let ownership = ingress_ownership(&request);
+        let ownership = ingress_ownership(&request).ok_or_else(|| {
+            tonic::Status::internal(
+                "status subscription is missing original native ingress ownership",
+            )
+        })?;
+        let deadline = ownership.deadline();
         let raw = request.into_inner();
-        let queued_at = Instant::now();
-        let stream = tokio::task::spawn_blocking(move || {
-            crate::backend_metrics::native_blocking_queue_wait(
-                "subscribe_task_status",
-                queued_at.elapsed(),
-            );
-            let _ownership = ownership;
-            ingress.subscribe_task_status(raw)
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("subscribe_task_status handler panicked: {error}"))
-        })??;
+        let stream = ingress.subscribe_task_status(raw, deadline, ownership)?;
         Ok(tonic::Response::new(stream))
     }
 
@@ -370,24 +343,18 @@ impl NovaRocksGrpc for BackendRpcService {
         &self,
         request: tonic::Request<proto::FetchTaskDynamicFiltersRequest>,
     ) -> Result<tonic::Response<proto::FetchTaskDynamicFiltersResponse>, tonic::Status> {
-        let ingress = Arc::clone(&self.task_execution_ingress);
-        let ownership = ingress_ownership(&request);
+        let ownership = ingress_ownership(&request).ok_or_else(|| {
+            tonic::Status::internal(
+                "fetch_task_dynamic_filters request is missing original native ingress ownership",
+            )
+        })?;
+        let deadline = ownership.deadline();
         let raw = request.into_inner();
-        let queued_at = Instant::now();
-        let response = tokio::task::spawn_blocking(move || {
-            crate::backend_metrics::native_blocking_queue_wait(
-                "fetch_task_dynamic_filters",
-                queued_at.elapsed(),
-            );
-            let _ownership = ownership;
-            ingress.fetch_task_dynamic_filters(raw)
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!(
-                "fetch_task_dynamic_filters handler panicked: {error}"
-            ))
-        })??;
+        let _ownership = ownership;
+        let response = self
+            .task_execution_ingress
+            .fetch_task_dynamic_filters(raw, deadline)
+            .await?;
         Ok(tonic::Response::new(response))
     }
 
@@ -395,35 +362,28 @@ impl NovaRocksGrpc for BackendRpcService {
         &self,
         request: tonic::Request<proto::GetFinalTaskInfoRequest>,
     ) -> Result<tonic::Response<proto::GetFinalTaskInfoResponse>, tonic::Status> {
-        let ingress = Arc::clone(&self.task_execution_ingress);
-        let ownership = ingress_ownership(&request);
+        let ownership = ingress_ownership(&request).ok_or_else(|| {
+            tonic::Status::internal(
+                "get_final_task_info request is missing original native ingress ownership",
+            )
+        })?;
+        let deadline = ownership.deadline();
         let raw = request.into_inner();
-        let queued_at = Instant::now();
-        let response = tokio::task::spawn_blocking(move || {
-            crate::backend_metrics::native_blocking_queue_wait(
-                "get_final_task_info",
-                queued_at.elapsed(),
-            );
-            let _ownership = ownership;
-            ingress.get_final_task_info(raw)
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("get_final_task_info handler panicked: {error}"))
-        })??;
+        let _ownership = ownership;
+        let response = self
+            .task_execution_ingress
+            .get_final_task_info(raw, deadline)
+            .await?;
         Ok(tonic::Response::new(response))
     }
 
     async fn fetch_task_result(
         &self,
-        request: tonic::Request<proto::FetchTaskResultRequest>,
+        _request: tonic::Request<proto::FetchTaskResultRequest>,
     ) -> Result<tonic::Response<proto::FetchResultResponse>, tonic::Status> {
-        let ownership = ingress_ownership(&request);
-        let response = self
-            .task_execution_ingress
-            .fetch_task_result_with_ownership(request.into_inner(), ownership)
-            .await?;
-        Ok(tonic::Response::new(response))
+        Err(tonic::Status::unimplemented(
+            "FetchTaskResult is retired; use FetchRootResult",
+        ))
     }
 
     async fn fetch_root_result(
@@ -449,7 +409,7 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::Unimplemented);
         assert_eq!(
             status.message(),
-            "FetchResult is retired; use FetchTaskResult"
+            "FetchResult is retired; use FetchRootResult"
         );
     }
 }

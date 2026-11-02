@@ -24,8 +24,8 @@ use crate::runtime::{
 #[cfg(test)]
 use novarocks_execution_contract::{AbortCause, CancelReason};
 use novarocks_execution_contract::{
-    AcceptedTaskConclusion, SettledContinuation, TaskConclusion, TaskConclusionPort,
-    TaskConclusionProposal, TaskFailurePhase, TaskIdentity, TerminationDetail,
+    AcceptedTaskConclusion, TaskConclusion, TaskConclusionPort, TaskConclusionProposal,
+    TaskFailurePhase, TaskIdentity, TerminationDetail,
 };
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 use std::{
@@ -82,6 +82,35 @@ impl FailureProjection for MissingTaskExecutionControl {
         FailureFact::new(
             FailureClass::Invariant,
             ExecutionReason::MissingTaskExecutionControl.reason(),
+        )
+    }
+}
+
+/// A detached control observation, never a replacement Task conclusion or a
+/// reconstructed copy of a retired owner's originating failure graph.
+#[derive(Debug)]
+pub struct TaskExecutionOwnerRetired {
+    identity: TaskIdentity,
+}
+impl TaskExecutionOwnerRetired {
+    pub const fn new(identity: TaskIdentity) -> Self {
+        Self { identity }
+    }
+    pub const fn identity(&self) -> TaskIdentity {
+        self.identity
+    }
+}
+impl fmt::Display for TaskExecutionOwnerRetired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Task execution control owner has retired")
+    }
+}
+impl Error for TaskExecutionOwnerRetired {}
+impl FailureProjection for TaskExecutionOwnerRetired {
+    fn failure_fact(&self) -> FailureFact {
+        FailureFact::new(
+            FailureClass::Invariant,
+            ExecutionReason::TaskExecutionOwnerRetired.reason(),
         )
     }
 }
@@ -178,9 +207,6 @@ impl TaskExecutionControl {
             phase: self.phase,
         })
     }
-    pub fn on_settled(&self, continuation: SettledContinuation<ExecutionFailure>) {
-        self.owner.on_settled(continuation);
-    }
     pub fn report_cleanup(&self, cause: &ExecutionFailure) {
         self.owner.report_cleanup(cause, self.phase);
     }
@@ -207,10 +233,11 @@ impl TaskExecutionControl {
         if !self.is_stopped() {
             return None;
         }
-        let accepted = self
-            .owner
-            .accepted()
-            .expect("a stopped Task has an accepted receipt");
+        let Some(accepted) = self.owner.accepted() else {
+            let observation = TaskExecutionOwnerRetired::new(self.identity);
+            self.exit_reporter.report(observation.failure_fact());
+            return Some(ExecutionFailure::from_domain(observation));
+        };
         if let Some(original) = accepted.originating_failure() {
             return Some(original.clone());
         }
@@ -275,6 +302,8 @@ impl FailureProjection for TaskStopObservation {
 #[cfg(any(test, novarocks_dev_controls))]
 pub(crate) mod test_support {
     use super::*;
+    #[cfg(test)]
+    use novarocks_execution_contract::SettledContinuation;
     use novarocks_execution_contract::{
         AcceptedConclusion, ConclusionDecision, TaskFailure, decide_conclusion,
     };
@@ -312,6 +341,180 @@ pub(crate) mod test_support {
             )
         }
     }
+    #[cfg(test)]
+    mod finite_fixture {
+        use super::*;
+        // Each fixture prepays exactly one fragment (three named originals plus
+        // one settlement child) and two independent observation roles. Issuing a
+        // permit consumes its original position; registration never adds credit.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub(super) enum FixtureRolePhase {
+            Reserved,
+            Issued,
+            Started,
+            Exited,
+            Unresolved,
+        }
+        pub(super) struct FixtureRoles(Mutex<[FixtureRolePhase; 6]>);
+        impl FixtureRoles {
+            pub(super) fn new() -> Arc<Self> {
+                Arc::new(Self(Mutex::new([FixtureRolePhase::Reserved; 6])))
+            }
+            pub(super) fn issue(&self, indexes: &[usize]) {
+                let mut roles = self.0.lock().unwrap();
+                assert!(
+                    indexes
+                        .iter()
+                        .all(|i| roles[*i] == FixtureRolePhase::Reserved),
+                    "fixture role admission is finite and cannot be repeated"
+                );
+                for i in indexes {
+                    roles[*i] = FixtureRolePhase::Issued;
+                }
+            }
+            fn transition(&self, index: usize, expected: FixtureRolePhase, next: FixtureRolePhase) {
+                let mut roles = self.0.lock().unwrap();
+                assert_eq!(
+                    roles[index], expected,
+                    "the original fixture role owns its exit"
+                );
+                roles[index] = next;
+            }
+            pub(super) fn take_observation(&self) -> Option<usize> {
+                let mut roles = self.0.lock().unwrap();
+                let index = (4..6).find(|i| roles[*i] == FixtureRolePhase::Reserved)?;
+                roles[index] = FixtureRolePhase::Issued;
+                Some(index)
+            }
+            pub(super) fn phases(&self) -> [FixtureRolePhase; 6] {
+                *self.0.lock().unwrap()
+            }
+        }
+        struct FixtureOriginal {
+            pool: Arc<FixtureRoles>,
+            index: usize,
+            started: bool,
+        }
+        impl novarocks_execution_contract::CompletionWorkCapability for FixtureOriginal {
+            fn started(&mut self) {
+                self.pool.transition(
+                    self.index,
+                    FixtureRolePhase::Issued,
+                    FixtureRolePhase::Started,
+                );
+                self.started = true;
+            }
+            fn completed(self: Box<Self>) {
+                self.pool.transition(
+                    self.index,
+                    if self.started {
+                        FixtureRolePhase::Started
+                    } else {
+                        FixtureRolePhase::Issued
+                    },
+                    FixtureRolePhase::Exited,
+                );
+            }
+            fn unused_exited(self: Box<Self>) {
+                self.pool.transition(
+                    self.index,
+                    FixtureRolePhase::Issued,
+                    FixtureRolePhase::Exited,
+                );
+            }
+            fn unresolved(self: Box<Self>) {
+                self.pool.transition(
+                    self.index,
+                    if self.started {
+                        FixtureRolePhase::Started
+                    } else {
+                        FixtureRolePhase::Issued
+                    },
+                    FixtureRolePhase::Unresolved,
+                );
+            }
+        }
+        type RegistrationRoute = Box<dyn FnOnce(SettledContinuation<ExecutionFailure>) + Send>;
+        struct FixturePermit {
+            pool: Arc<FixtureRoles>,
+            index: usize,
+            route: RegistrationRoute,
+        }
+        struct FixtureCall {
+            pool: Arc<FixtureRoles>,
+            index: usize,
+            exited: bool,
+        }
+        impl Drop for FixtureCall {
+            fn drop(&mut self) {
+                self.pool.transition(
+                    self.index,
+                    FixtureRolePhase::Started,
+                    if self.exited {
+                        FixtureRolePhase::Exited
+                    } else {
+                        FixtureRolePhase::Unresolved
+                    },
+                );
+            }
+        }
+        impl novarocks_execution_contract::SettlementCapability<ExecutionFailure> for FixturePermit {
+            fn register(self: Box<Self>, continuation: SettledContinuation<ExecutionFailure>) {
+                let Self { pool, index, route } = *self;
+                route(Box::new(move |snapshot| {
+                    pool.transition(index, FixtureRolePhase::Issued, FixtureRolePhase::Started);
+                    let mut call = FixtureCall {
+                        pool,
+                        index,
+                        exited: false,
+                    };
+                    continuation(snapshot);
+                    call.exited = true;
+                }));
+            }
+            fn revoke_unused(self: Box<Self>) {
+                self.pool.transition(
+                    self.index,
+                    FixtureRolePhase::Issued,
+                    FixtureRolePhase::Exited,
+                );
+            }
+        }
+        pub(super) fn fixture_permit(
+            identity: TaskIdentity,
+            pool: Arc<FixtureRoles>,
+            index: usize,
+            route: RegistrationRoute,
+        ) -> novarocks_execution_contract::SettlementPermit<ExecutionFailure> {
+            novarocks_execution_contract::SettlementPermit::from_admitted_role(
+                identity,
+                Box::new(FixturePermit { pool, index, route }),
+            )
+        }
+        pub(super) fn fixture_fragment_roles(
+            identity: TaskIdentity,
+            pool: Arc<FixtureRoles>,
+            route: RegistrationRoute,
+        ) -> novarocks_execution_contract::AdmittedFragmentRoles<ExecutionFailure> {
+            pool.issue(&[0, 1, 2, 3]);
+            let permit = fixture_permit(identity, pool.clone(), 3, route);
+            let work = |index| {
+                Box::new(FixtureOriginal {
+                    pool: pool.clone(),
+                    index,
+                    started: false,
+                })
+                    as Box<dyn novarocks_execution_contract::CompletionWorkCapability>
+            };
+            novarocks_execution_contract::AdmittedFragmentRoles::from_admitted_roles(
+                novarocks_execution_contract::AdmittedFinisher::from_admitted_role(permit, work(0)),
+                work(1),
+                work(2),
+            )
+        }
+    }
+    #[cfg(test)]
+    use finite_fixture::{FixtureRoles, fixture_fragment_roles, fixture_permit};
     // Project a source on its reporting thread before either queue or owner lock.
     struct PreparedConclusion {
         reported_evidence: Option<novarocks_failure_contract::FailureEvidence>,
@@ -322,6 +525,8 @@ pub(crate) mod test_support {
         health: Arc<crate::runtime::execution_health::ExecutionHealth>,
         cleanup: Mutex<[Option<FailureFact>; 4]>,
         identity: TaskIdentity,
+        #[cfg(test)]
+        roles: Arc<FixtureRoles>,
         accepted: Mutex<Option<Snapshot>>,
         stopped: AtomicBool,
         cv: Condvar,
@@ -343,6 +548,8 @@ pub(crate) mod test_support {
                 health: Arc::new(crate::runtime::execution_health::ExecutionHealth::default()),
                 cleanup: Mutex::new([None; 4]),
                 identity,
+                #[cfg(test)]
+                roles: FixtureRoles::new(),
                 accepted: Mutex::new(None),
                 stopped: AtomicBool::new(false),
                 cv: Condvar::new(),
@@ -352,6 +559,33 @@ pub(crate) mod test_support {
         }
         pub(crate) fn view(self: &Arc<Self>, phase: TaskFailurePhase) -> TaskExecutionControl {
             TaskExecutionControl::new(self.identity, self.clone(), phase).unwrap()
+        }
+        #[cfg(test)]
+        pub(crate) fn admit_completion_roles(
+            self: &Arc<Self>,
+        ) -> novarocks_execution_contract::AdmittedFragmentRoles<ExecutionFailure> {
+            let owner = self.clone();
+            fixture_fragment_roles(
+                self.identity,
+                self.roles.clone(),
+                Box::new(move |callback| callback(owner.accepted())),
+            )
+        }
+        #[cfg(test)]
+        pub(crate) fn admit_barrier(
+            self: &Arc<Self>,
+        ) -> novarocks_execution_contract::SettlementPermit<ExecutionFailure> {
+            let index = self
+                .roles
+                .take_observation()
+                .expect("both prepaid observation roles were consumed");
+            let owner = self.clone();
+            fixture_permit(
+                self.identity,
+                self.roles.clone(),
+                index,
+                Box::new(move |callback| callback(owner.accepted())),
+            )
         }
     }
     impl Owner {
@@ -460,10 +694,6 @@ pub(crate) mod test_support {
         fn submit(&self, proposed: TaskConclusionProposal<ExecutionFailure>) {
             self.adjudicate(proposed);
         }
-        fn on_settled(&self, continuation: SettledContinuation<ExecutionFailure>) {
-            let snapshot = self.accepted();
-            continuation(snapshot);
-        }
     }
     impl TaskExecutionPort for Owner {
         fn execution_health(&self) -> Arc<crate::runtime::execution_health::ExecutionHealth> {
@@ -530,6 +760,34 @@ pub(crate) mod test_support {
         }
         pub(crate) fn view(self: &Arc<Self>, phase: TaskFailurePhase) -> TaskExecutionControl {
             TaskExecutionControl::new(self.identity(), self.clone(), phase).unwrap()
+        }
+        #[cfg(test)]
+        pub(crate) fn admit_completion_roles(
+            self: &Arc<Self>,
+        ) -> novarocks_execution_contract::AdmittedFragmentRoles<ExecutionFailure> {
+            let owner = self.clone();
+            fixture_fragment_roles(
+                self.identity(),
+                self.owner.roles.clone(),
+                Box::new(move |callback| owner.route_admitted(callback)),
+            )
+        }
+        #[cfg(test)]
+        pub(crate) fn admit_barrier(
+            self: &Arc<Self>,
+        ) -> novarocks_execution_contract::SettlementPermit<ExecutionFailure> {
+            let index = self
+                .owner
+                .roles
+                .take_observation()
+                .expect("both prepaid observation roles were consumed");
+            let owner = self.clone();
+            fixture_permit(
+                self.identity(),
+                self.owner.roles.clone(),
+                index,
+                Box::new(move |callback| owner.route_admitted(callback)),
+            )
         }
         pub(crate) fn pending_len(&self) -> usize {
             self.queue.lock().unwrap().inputs.len()
@@ -616,7 +874,10 @@ pub(crate) mod test_support {
             };
             drop(rejected);
         }
-        fn on_settled(&self, continuation: SettledContinuation<ExecutionFailure>) {
+    }
+    #[cfg(test)]
+    impl DeferredOwner {
+        fn route_admitted(&self, continuation: SettledContinuation<ExecutionFailure>) {
             let immediate = {
                 let mut queue = self.queue.lock().unwrap();
                 if queue.failure_published {
@@ -682,6 +943,70 @@ pub(crate) mod test_support {
             queue: Mutex::new(DeferredQueue::default()),
         })
     }
+    #[test]
+    fn a_stopped_control_without_its_owner_receipt_reports_a_typed_retirement_observation() {
+        let owner = Owner::new();
+        let control = owner.view(TaskFailurePhase::Preparation);
+        owner.stopped.store(true, Ordering::Release);
+        let error = control
+            .error()
+            .expect("retired owner is not permission for new work");
+        let expected = TaskExecutionOwnerRetired::new(owner.identity()).failure_fact();
+        assert_eq!(error.failure_fact(), expected);
+        assert_eq!(
+            error.to_string(),
+            "Task execution control owner has retired"
+        );
+        assert!(
+            owner.accepted().is_none(),
+            "an observation cannot reconstruct or accept a conclusion"
+        );
+        assert_eq!(owner.health.failure().unwrap().fact(), expected);
+        assert_eq!(
+            owner.health.failure().unwrap().origin(),
+            crate::runtime::execution_health::ExecutionExitOrigin::Task {
+                identity: owner.identity(),
+                phase: TaskFailurePhase::Preparation,
+            }
+        );
+        assert_eq!(
+            control
+                .wait_interruptibly(Duration::ZERO)
+                .unwrap_err()
+                .failure_fact(),
+            expected
+        );
+    }
+    #[test]
+    fn fixture_admission_prepays_original_fragment_and_finite_observer_roles_once() {
+        use finite_fixture::FixtureRolePhase as Phase;
+        let owner = Owner::new();
+        assert_eq!(owner.roles.phases(), [Phase::Reserved; 6]);
+        let originals = owner.admit_completion_roles();
+        let one = owner.admit_barrier();
+        let two = owner.admit_barrier();
+        assert_eq!(owner.roles.phases(), [Phase::Issued; 6]);
+        assert!(
+            owner.roles.take_observation().is_none(),
+            "clone count cannot create another role"
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        one.register(Box::new(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(owner.roles.phases()[4], Phase::Exited);
+        assert_eq!(owner.roles.phases()[5], Phase::Issued);
+        drop(two);
+        assert_eq!(owner.roles.phases()[5], Phase::Exited);
+        drop(originals);
+        assert_eq!(owner.roles.phases(), [Phase::Exited; 6]);
+        assert!(
+            owner.roles.take_observation().is_none(),
+            "exited positions are not newly signed credentials"
+        );
+    }
     // The oracle is the proposal contract: handoff order, monotonic published
     // stop and a barrier after all earlier inputs. No production async owner
     // is required to exercise execution-side callers at this lowest layer.
@@ -694,7 +1019,9 @@ pub(crate) mod test_support {
         control.report_failure(original.clone());
         let observed = Arc::new(Mutex::new(None));
         let seen = observed.clone();
-        control.on_settled(Box::new(move |snapshot| *seen.lock().unwrap() = snapshot));
+        owner
+            .admit_barrier()
+            .register(Box::new(move |snapshot| *seen.lock().unwrap() = snapshot));
         assert_eq!(owner.pending_len(), 3);
         assert!(owner.accepted().is_none());
         assert!(owner.advance_one());
@@ -756,7 +1083,7 @@ pub(crate) mod test_support {
         let owner = DeferredOwner::new();
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
-        owner.on_settled(Box::new(move |snapshot| {
+        owner.admit_barrier().register(Box::new(move |snapshot| {
             assert!(
                 snapshot.is_none(),
                 "no proposal is a legitimate success-side barrier"
@@ -770,7 +1097,7 @@ pub(crate) mod test_support {
         owner.submit(TaskConclusionProposal::Succeeded);
         owner.advance_all();
         let seen = calls.clone();
-        owner.on_settled(Box::new(move |snapshot| {
+        owner.admit_barrier().register(Box::new(move |snapshot| {
             assert_eq!(
                 snapshot.unwrap().neutral().conclusion(),
                 &TaskConclusion::Succeeded
@@ -803,7 +1130,7 @@ pub(crate) mod test_support {
                 .report_failure(cause());
             let snapshots = Arc::new(Mutex::new(Vec::new()));
             let seen = snapshots.clone();
-            owner.on_settled(Box::new(move |snapshot| {
+            owner.admit_barrier().register(Box::new(move |snapshot| {
                 seen.lock().unwrap().push(snapshot.unwrap())
             }));
             owner
@@ -830,7 +1157,7 @@ pub(crate) mod test_support {
                 .report_failure(cause());
             assert_eq!(owner.dropped_proposals(), 3);
             let seen = snapshots.clone();
-            owner.on_settled(Box::new(move |snapshot| {
+            owner.admit_barrier().register(Box::new(move |snapshot| {
                 seen.lock().unwrap().push(snapshot.unwrap())
             }));
             assert_eq!(snapshots.lock().unwrap().len(), 2);
@@ -850,7 +1177,7 @@ pub(crate) mod test_support {
         entered.wait();
         let settled = Arc::new(Mutex::new(None));
         let seen = settled.clone();
-        owner.on_settled(Box::new(move |snapshot| {
+        owner.admit_barrier().register(Box::new(move |snapshot| {
             *seen.lock().unwrap() = Some(snapshot)
         }));
         let called_before_publication_finished = settled.lock().unwrap().is_some();

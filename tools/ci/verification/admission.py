@@ -22,6 +22,7 @@ import re
 import subprocess
 
 from .model import Scope, UnitKey
+from .declarations import native_stage_mode
 from .record import write_record
 
 KINDS = {"stage", "rust-test", "rust-doctest", "sql-suite", "system-scenario"}
@@ -159,7 +160,7 @@ def compose_attempt(repo, attempt_dir, declaration_path, run_identity, output_di
             try:
                 native_stages = run.json_command(["bash", str(repo / "tools/ci/local-full-ci.sh"), "--list-stages"], repo)
                 for item in native_stages["stages"]:
-                    mode = "loom" if item["name"] == "memory-model:loom" else "miri" if item["name"] == "memory-model:miri" else "default"
+                    mode = native_stage_mode(item)
                     unit = UnitKey("stage", item["name"], mode)
                     declarations.append(Scope(str(unit), (unit,), tier="heavy" if item["tier"] == "full" else "regular"))
             except (OSError, ValueError, KeyError, subprocess.SubprocessError) as stage_error:

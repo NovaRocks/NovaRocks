@@ -8,6 +8,10 @@ partially-supersedes: [ADR-0187]
 partially-supersedes-scope:
   ADR-0187: "Only rule 5's implicit synchronous receipt contract in runtime/completion caching and notification; the single Task acceptance owner, refinement rules and every other rule remain effective."
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0211
+    scope: "Synchronous Worker implementation and inline settlement/notification choices, and settlement registration without an admitted single-use role capability; proposal handoff, causal order, adjudication, latest-at-retirement reads and original-source rules remain active"
+    link: "ADR-0211-deterministic-control-runtime-and-task-ownership.md"
 date: 2026-10-22
 provenance:
   - "discussion: 2026-10-22 task conclusion proposals, settled barriers and owner-driven termination"
@@ -15,7 +19,9 @@ code-anchors:
   - "novarocks/execution-contract/src/conclusion.rs (TaskConclusionPort, SettledContinuation)"
   - "novarocks/execution/src/runtime/task_control.rs (TaskExecutionControl)"
   - "novarocks/execution/src/runtime/fragment/handle.rs (RunningFragmentLifecycle::settle_after_stop, outcome_from_result)"
-  - "novarocks/worker/src/status.rs (TaskStatusOwner::submit_prepared_with_installed, TaskStatusOwner::conclude_failure)"
+  - "novarocks/worker-protocol/src/context.rs (LiveContextCore, ContextEffect::PublishTask)"
+  - "novarocks/worker/src/task_port.rs (TaskRuntimePort, TaskProjection)"
+  - "novarocks/worker/src/settlement.rs (SettlementRole)"
 ---
 
 ## 问题

@@ -202,15 +202,6 @@ impl RuntimeErrorState {
             }
         }
     }
-    pub(crate) fn on_settled(
-        &self,
-        continuation: novarocks_execution_contract::SettledContinuation<ExecutionFailure>,
-    ) {
-        match &self.control {
-            RuntimeFailureControl::Task(owner) => owner.on_settled(continuation),
-            RuntimeFailureControl::Local(_) => continuation(None),
-        }
-    }
     pub(crate) fn stop_observable(&self) -> std::sync::Arc<crate::runtime::observable::Observable> {
         match &self.control {
             RuntimeFailureControl::Task(owner) => owner.stop_observable(),

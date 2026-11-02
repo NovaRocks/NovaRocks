@@ -31,7 +31,6 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::time::Duration;
 
 use novarocks_execution_contract::task_execution::context_convergence::{
     QueryContextConvergenceCursor, QueryContextConvergenceReceipt,
@@ -52,8 +51,7 @@ use novarocks_execution_contract::task_execution::operation::{
     GetFinalTaskInfo, MaxWait, OperationEnvelope, OperationKind, OperationOutcome,
     QueryContextAdmissionTicketReceipt, QueryContextDomainReceipt, QueryContextReceipt,
     QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
-    RenewQueryExecutionLease, ResultByteLimit, ResultPacketSequence, TaskDomainReceipt,
-    UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    RenewQueryExecutionLease, TaskDomainReceipt, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
 };
 use novarocks_execution_contract::task_execution::status::{TaskStatus, TaskStatusCursor};
 use novarocks_execution_contract::task_execution::task_convergence::{
@@ -91,7 +89,7 @@ pub use novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED
 /// The payload stays below it by a fixed envelope reserve so protobuf tags,
 /// lengths, sequence and status fields cannot turn a legal payload into an
 /// oversized decoded message.
-pub const MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES: u64 =
+pub const MAX_NATIVE_ROOT_RESULT_PAYLOAD_BYTES: u64 =
     (NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES - 1024) as u64;
 use crate::identity::{
     decode_admission_ticket_id, decode_query_context_ref, decode_task_identity,
@@ -205,6 +203,11 @@ pub struct DecodedUpdateTask {
 }
 
 impl DecodedUpdateTask {
+    /// Move the original neutral request and its rich domain handles to the
+    /// admitted Worker owner without cloning the domain vector.
+    pub fn into_request(self) -> UpdateTask {
+        self.request
+    }
     pub const fn request(&self) -> &UpdateTask {
         &self.request
     }
@@ -1198,6 +1201,7 @@ pub fn decode_control_operation_batch(
 
 fn decode_outcome(value: i32, path: FieldPath) -> Result<OperationOutcome, ProtocolError> {
     match novarocks::TaskOperationOutcome::try_from(value) {
+        Ok(novarocks::TaskOperationOutcome::OwnerFailed) => Ok(OperationOutcome::OwnerFailed),
         Ok(novarocks::TaskOperationOutcome::Accepted) => Ok(OperationOutcome::Accepted),
         Ok(novarocks::TaskOperationOutcome::Idempotent) => Ok(OperationOutcome::Idempotent),
         Ok(novarocks::TaskOperationOutcome::OperationTimedOut) => {
@@ -1253,6 +1257,7 @@ fn decode_outcome(value: i32, path: FieldPath) -> Result<OperationOutcome, Proto
 /// one exact wire representation.
 fn encode_outcome(value: OperationOutcome) -> i32 {
     let encoded = match value {
+        OperationOutcome::OwnerFailed => novarocks::TaskOperationOutcome::OwnerFailed,
         OperationOutcome::Accepted => novarocks::TaskOperationOutcome::Accepted,
         OperationOutcome::Idempotent => novarocks::TaskOperationOutcome::Idempotent,
         OperationOutcome::OperationTimedOut => novarocks::TaskOperationOutcome::OperationTimedOut,
@@ -1527,53 +1532,6 @@ pub fn decode_get_final_task_info(
     Ok(GetFinalTaskInfo::new(operation_id, identity))
 }
 
-/// Decodes a root result poll request.
-///
-/// The root task identity is the whole point of this shape: unlike the
-/// fragment-instance-addressed form it replaces, it is fenced against an exact
-/// task and backend process.
-pub fn decode_fetch_task_result(
-    src: &novarocks::FetchTaskResultRequest,
-    path: FieldPath,
-) -> Result<
-    (
-        TaskIdentity,
-        Duration,
-        Option<ResultPacketSequence>,
-        ResultByteLimit,
-    ),
-    ProtocolError,
-> {
-    let root = src.root_task.as_ref().ok_or_else(|| {
-        missing(
-            path.clone().field("root_task"),
-            "a result poll requires a root task identity",
-        )
-    })?;
-    let root = crate::identity::decode_task_identity(root, path.clone().field("root_task"))?;
-    let max_wait = decode_duration_millis(
-        src.max_wait_millis,
-        path.clone().field("max_wait_millis"),
-        MaxWait::MAX_REPRESENTABLE,
-    )?;
-    let acknowledged = src
-        .acknowledged_packet_sequence
-        .map(ResultPacketSequence::new);
-    let max_result_bytes = ResultByteLimit::new(src.max_result_bytes)
-        .map_err(|error| invalid(path.clone().field("max_result_bytes"), error.to_string()))?;
-    if max_result_bytes.get() > MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES {
-        return Err(out_of_range(
-            path.field("max_result_bytes"),
-            format!(
-                "max_result_bytes {} exceeds the Native payload limit {}",
-                max_result_bytes.get(),
-                MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES
-            ),
-        ));
-    }
-    Ok((root, max_wait, acknowledged, max_result_bytes))
-}
-
 /// Decodes one server-reported operation outcome.
 ///
 /// A read whose response reports why it has nothing to return needs this: the
@@ -1607,27 +1565,6 @@ pub fn encode_get_final_task_info(identity: TaskIdentity) -> novarocks::GetFinal
     }
 }
 
-/// Encodes a root result poll request.
-pub fn encode_fetch_task_result(
-    root_task: TaskIdentity,
-    max_wait: MaxWait,
-    acknowledged: Option<ResultPacketSequence>,
-    max_result_bytes: ResultByteLimit,
-) -> novarocks::FetchTaskResultRequest {
-    assert!(
-        max_result_bytes.get() <= MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES,
-        "root result byte limit must fit the Native gRPC response"
-    );
-    novarocks::FetchTaskResultRequest {
-        root_task: Some(crate::identity::encode_task_identity(root_task)),
-        // `MaxWait` is already bounded by `MAX_REPRESENTABLE`, so this cannot
-        // narrow a wait the caller asked for.
-        max_wait_millis: u64::try_from(max_wait.get().as_millis()).unwrap_or(u64::MAX),
-        acknowledged_packet_sequence: acknowledged.map(ResultPacketSequence::get),
-        max_result_bytes: max_result_bytes.get(),
-    }
-}
-
 /// Encodes the credential receipt of one query context.
 ///
 /// Only the accepted epoch is reported: no credential material, and no digest
@@ -1642,27 +1579,87 @@ pub fn encode_credential_receipt(
     }
 }
 
-/// Encodes a release acknowledgement.
-///
-/// `runtime_filter` is the releasing backend's own sealed runtime-filter
-/// observation. It is passed already-validated rather than assembled here:
-/// the projection belongs to the participant's owner, and this codec's job is
-/// to carry the value it produced without inventing an empty one for a
-/// release that had nothing to seal.
-pub fn encode_quiesce_ack(
+/// The shared fixed scalar header for a Quiesce acknowledgement or fact.
+/// Membership is encoded only by the external wire projection below.
+fn encode_quiesce_scalar(
     value: &QuiesceQueryContextReceipt,
 ) -> Option<novarocks::QuiesceQueryContextAck> {
     Some(novarocks::QuiesceQueryContextAck {
         query_context: Some(encode_query_context_ref(value.context())),
         fence_version: value.fence_version(),
-        accepted_tasks: value
-            .accepted_tasks()
-            .iter()
-            .copied()
-            .map(encode_task_identity)
-            .collect(),
+        accepted_tasks: Vec::new(),
         state: encode_context_state(value.state())?,
     })
+}
+
+pub fn encode_quiesce_ack(
+    value: &QuiesceQueryContextReceipt,
+) -> Option<novarocks::QuiesceQueryContextAck> {
+    let mut wire = encode_quiesce_scalar(value)?;
+    wire.accepted_tasks = value
+        .accepted_tasks()
+        .iter()
+        .copied()
+        .map(encode_task_identity)
+        .collect();
+    Some(wire)
+}
+
+/// Constant-time conservative encoded size of a live covered Quiesce fact.
+/// This never clones or traverses accepted_tasks. It bounds every legal typed
+/// identity, including foreign-context members; membership validation remains
+/// with the actual encoder/decoder and the original Core author.
+pub fn covered_quiesce_fact_size_bound(value: &QuiesceQueryContextReceipt) -> Option<usize> {
+    use novarocks_execution_contract::QueryContextState;
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    use prost::encoding::{encoded_len_varint, key_len};
+
+    if value.fence_version() == 0
+        || value.accepted_tasks().len() > TransportBudget::DEFAULT.max_tasks_per_context()
+        || !matches!(
+            value.state(),
+            QueryContextState::Quiescing
+                | QueryContextState::Releasing
+                | QueryContextState::Aborting
+                | QueryContextState::TerminalRetained
+        )
+    {
+        return None;
+    }
+    // int64 uses ten bytes for negative values, more than positive i64::MAX.
+    // Attempt/Stage/Task use their actual maximum legal unsigned widths. The
+    // fixed UUID is a valid non-nil v7, and every UUID encodes sixteen bytes.
+    let mut uuid = [u8::MAX; 16];
+    uuid[6] = 0x7f;
+    uuid[8] = 0xbf;
+    let maximum = TaskIdentity::new(
+        QueryExecutionId::new(
+            QueryId::new(i64::MIN, i64::MIN),
+            AttemptId::new(u64::MAX).ok()?,
+        )
+        .ok()?,
+        StageId::new(u32::MAX).ok()?,
+        TaskId::new(u32::MAX).ok()?,
+        BackendProcessId::try_from_bytes(uuid).ok()?,
+    );
+    let identity_bytes = encode_task_identity(maximum).encoded_len();
+    // Quiesce Ack and Observation share scalar tags 1/2/4 and repeated Task
+    // tag3. Header encoding comes from the same scalar projection as the wire.
+    let per_member = key_len(3)
+        .checked_add(encoded_len_varint(u64::try_from(identity_bytes).ok()?))?
+        .checked_add(identity_bytes)?;
+    let payload = encode_quiesce_scalar(value)?
+        .encoded_len()
+        .checked_add(value.accepted_tasks().len().checked_mul(per_member)?)?;
+    // TaskStatusStreamEvent oneof Quiesce is field5. Optional live revision
+    // field11 is present, at its largest actual uint64 value (not guessed).
+    key_len(5)
+        .checked_add(encoded_len_varint(u64::try_from(payload).ok()?))?
+        .checked_add(payload)?
+        .checked_add(key_len(11))?
+        .checked_add(encoded_len_varint(u64::MAX))
 }
 
 pub fn decode_quiesce_ack(

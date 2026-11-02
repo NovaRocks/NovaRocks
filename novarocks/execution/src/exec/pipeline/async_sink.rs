@@ -2356,15 +2356,6 @@ mod tests {
         {
             self.task.accepted()
         }
-        fn on_settled(
-            &self,
-            continuation: novarocks_execution_contract::SettledContinuation<ExecutionFailure>,
-        ) {
-            novarocks_execution_contract::TaskConclusionPort::on_settled(
-                self.task.as_ref(),
-                continuation,
-            );
-        }
         fn submit(
             &self,
             proposal: novarocks_execution_contract::TaskConclusionProposal<ExecutionFailure>,

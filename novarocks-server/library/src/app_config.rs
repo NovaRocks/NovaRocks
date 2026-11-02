@@ -1402,11 +1402,6 @@ pub struct RuntimeConfig {
     pub task_preparation_max_bytes: usize,
     #[serde(default = "default_task_preparation_max_workers")]
     pub task_preparation_max_workers: usize,
-    /// Active and retained exact late-frame records share this process bound.
-    #[serde(default = "default_task_normal_close_max_records")]
-    pub task_normal_close_max_records: usize,
-    #[serde(default = "default_task_normal_close_max_bytes")]
-    pub task_normal_close_max_bytes: usize,
     #[serde(default = "default_task_operation_queue_residence_ms")]
     pub task_operation_queue_residence_ms: u64,
     #[serde(default = "default_task_operation_create_wait_cap_ms")]
@@ -2055,14 +2050,6 @@ fn default_task_preparation_max_workers() -> usize {
     novarocks_worker::TaskPreparationLimits::default().workers()
 }
 
-fn default_task_normal_close_max_records() -> usize {
-    novarocks_worker::TaskInboundCapabilityLimits::default().max_records()
-}
-
-fn default_task_normal_close_max_bytes() -> usize {
-    novarocks_worker::TaskInboundCapabilityLimits::default().max_bytes()
-}
-
 fn default_task_operation_queue_residence_ms() -> u64 {
     duration_millis(FrontendTaskTransportBudget::DEFAULT.frontend_queue_residence())
 }
@@ -2174,14 +2161,6 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
         (
             "runtime.task_preparation_max_workers",
             runtime.task_preparation_max_workers,
-        ),
-        (
-            "runtime.task_normal_close_max_records",
-            runtime.task_normal_close_max_records,
-        ),
-        (
-            "runtime.task_normal_close_max_bytes",
-            runtime.task_normal_close_max_bytes,
         ),
     ];
     for (field, value) in nonzero_counts {
@@ -2731,8 +2710,6 @@ impl Default for RuntimeConfig {
             task_preparation_max_tasks: default_task_preparation_max_tasks(),
             task_preparation_max_bytes: default_task_preparation_max_bytes(),
             task_preparation_max_workers: default_task_preparation_max_workers(),
-            task_normal_close_max_records: default_task_normal_close_max_records(),
-            task_normal_close_max_bytes: default_task_normal_close_max_bytes(),
             task_operation_queue_residence_ms: default_task_operation_queue_residence_ms(),
             task_operation_create_wait_cap_ms: default_task_operation_create_wait_cap_ms(),
             task_operation_update_wait_cap_ms: default_task_operation_update_wait_cap_ms(),
@@ -4026,7 +4003,7 @@ access_key_secret = ""
         reason = "The table-driven validation fixture keeps each field mutator explicit."
     )]
     fn task_execution_config_rejects_zero_values() {
-        let cases: [(&str, fn(&mut RuntimeConfig)); 25] = [
+        let cases: [(&str, fn(&mut RuntimeConfig)); 23] = [
             ("task_dispatch_create_permits", |runtime| {
                 runtime.task_dispatch_create_permits = 0;
             }),
@@ -4077,12 +4054,6 @@ access_key_secret = ""
             }),
             ("task_preparation_max_workers", |runtime| {
                 runtime.task_preparation_max_workers = 0;
-            }),
-            ("task_normal_close_max_records", |runtime| {
-                runtime.task_normal_close_max_records = 0;
-            }),
-            ("task_normal_close_max_bytes", |runtime| {
-                runtime.task_normal_close_max_bytes = 0;
             }),
             ("task_status_subscription_error_budget", |runtime| {
                 runtime.task_status_subscription_error_budget = 0;

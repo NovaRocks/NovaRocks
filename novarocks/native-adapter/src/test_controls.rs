@@ -206,6 +206,7 @@ struct HoldGrant {
     execution: QueryExecutionId,
     frontend: Option<FrontendProcessId>,
     task: Option<(u32, u32)>,
+    trigger_operation: Option<novarocks_execution_contract::TaskOperationId>,
 }
 #[derive(Debug)]
 pub struct NativeHoldClaim {
@@ -378,10 +379,11 @@ impl NativeTestControls {
                     | "registry-hold"
                     | "preparation-hold"
                     | "prepared-failure-exit-hold"
+                    | "context-owner-panic-on-renew"
             ) {
                 let preparation =
                     matches!(action, "preparation-hold" | "prepared-failure-exit-hold");
-                let keys = if preparation {
+                let mut keys = if preparation {
                     vec![
                         "action",
                         "token",
@@ -403,6 +405,9 @@ impl NativeTestControls {
                         "frontend_process_id",
                     ]
                 };
+                if action == "context-owner-panic-on-renew" {
+                    keys.push("trigger_operation");
+                }
                 if parameters.len() != keys.len()
                     || keys.iter().any(|key| !parameters.contains_key(*key))
                 {
@@ -462,6 +467,25 @@ impl NativeTestControls {
                 } else {
                     None
                 };
+                let trigger_operation = if action == "context-owner-panic-on-renew" {
+                    let values = parameters["trigger_operation"]
+                        .as_array()
+                        .filter(|values| values.len() == 16)
+                        .ok_or("declared Context trigger operation has invalid width")?;
+                    let mut bytes = [0u8; 16];
+                    for (out, value) in bytes.iter_mut().zip(values) {
+                        *out = value
+                            .as_u64()
+                            .and_then(|value| u8::try_from(value).ok())
+                            .ok_or("declared Context trigger operation has invalid bytes")?;
+                    }
+                    Some(
+                        novarocks_execution_contract::TaskOperationId::try_from_bytes(bytes)
+                            .map_err(|error| error.to_string())?,
+                    )
+                } else {
+                    None
+                };
                 if holds.iter().any(|grant: &HoldGrant| {
                     grant.action == action && grant.execution == execution && grant.task == task
                 }) {
@@ -476,6 +500,7 @@ impl NativeTestControls {
                     execution,
                     frontend,
                     task,
+                    trigger_operation,
                 });
                 continue;
             }
@@ -1251,6 +1276,27 @@ impl NativeTestControls {
         context: QueryContextRef,
         requested_token: Option<&str>,
     ) -> Result<Option<NativeHoldClaim>, String> {
+        self.claim_context_selected(action, context, requested_token, None)
+    }
+    pub(crate) fn claim_context_owner_panic(
+        &self,
+        context: QueryContextRef,
+        operation: novarocks_execution_contract::TaskOperationId,
+    ) -> Result<Option<NativeHoldClaim>, String> {
+        self.claim_context_selected(
+            "context-owner-panic-on-renew",
+            context,
+            None,
+            Some(operation),
+        )
+    }
+    fn claim_context_selected(
+        &self,
+        action: &str,
+        context: QueryContextRef,
+        requested_token: Option<&str>,
+        operation: Option<novarocks_execution_contract::TaskOperationId>,
+    ) -> Result<Option<NativeHoldClaim>, String> {
         let mut held_once = self
             .held_once
             .lock()
@@ -1260,6 +1306,7 @@ impl NativeTestControls {
                 || grant.action != action
                 || grant.execution != context.query_execution_id()
                 || grant.frontend != Some(context.frontend_process_id())
+                || grant.trigger_operation != operation
                 || requested_token.is_some_and(|token| token != grant.token)
                 || grant.handle.cancellation().process()
                     != ProcessBinding::Backend(context.backend_process_id())

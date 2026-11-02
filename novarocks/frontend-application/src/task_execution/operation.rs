@@ -88,7 +88,8 @@ pub fn frontend_action(result: OperationDispatchResult) -> FrontendAction {
         OperationOutcome::ContextTerminalReceipt
         | OperationOutcome::Gone
         | OperationOutcome::TerminalRejected => FrontendAction::StopSendingAndReconcile,
-        OperationOutcome::IdentityMismatch
+        OperationOutcome::OwnerFailed
+        | OperationOutcome::IdentityMismatch
         | OperationOutcome::CompatibilityMismatch
         | OperationOutcome::ContextNotEstablished
         | OperationOutcome::ContextConflict
@@ -115,6 +116,14 @@ mod tests {
         assert_eq!(
             frontend_action(receipt(OperationOutcome::TerminalRejected)),
             FrontendAction::StopSendingAndReconcile
+        );
+    }
+
+    #[test]
+    fn owner_failure_fails_the_attempt_without_replaying_or_reconciling() {
+        assert_eq!(
+            frontend_action(receipt(OperationOutcome::OwnerFailed)),
+            FrontendAction::FailAttempt
         );
     }
 

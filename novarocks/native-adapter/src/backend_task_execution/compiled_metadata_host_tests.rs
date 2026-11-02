@@ -23,6 +23,7 @@ use super::super::project_materialization::{
     CompiledProjectMetadataHost, ProjectMetadataHost, ProjectMetadataJournal, ProjectMetadataPhase,
 };
 use super::*;
+use crate::backend_task_execution::tests::node_fixture::{NativeNodePreparation, PreparationStop};
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::{
     exec::chunk::ChunkSchema,
@@ -46,8 +47,7 @@ use novarocks_types::{
     QueryId,
     identity::{AttemptId, QueryExecutionId},
 };
-use novarocks_worker::{TestPreparationControl, TestPreparationIntent};
-use std::{cell::Cell, sync::Arc, time::Duration};
+use std::{cell::Cell, sync::Arc};
 
 fn preparation_identity(
     binding: &QueryMemoryBinding,
@@ -120,8 +120,7 @@ fn project(program: &LocalProgram) -> ProgramNodeId {
 #[test]
 fn project_metadata_real_native_compile_and_schema_share_one_binding() {
     let binding = binding(64 << 20);
-    let owner =
-        TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
+    let owner = NativeNodePreparation::new(preparation_identity(&binding));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let output = compile(&binding, &loan, &mut journal);
@@ -165,8 +164,7 @@ fn project_metadata_real_native_compile_and_schema_share_one_binding() {
 #[test]
 fn project_metadata_private_native_loan_rejects_wrong_program_and_layout_before_body() {
     let binding = binding(64 << 20);
-    let owner =
-        TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
+    let owner = NativeNodePreparation::new(preparation_identity(&binding));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let output = compile(&binding, &loan, &mut journal).into_preparation();
@@ -211,8 +209,7 @@ fn project_metadata_private_native_loan_rejects_wrong_program_and_layout_before_
 #[test]
 fn project_metadata_explicit_direct_product_cannot_lend_native_provenance() {
     let binding = binding(64 << 20);
-    let owner =
-        TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
+    let owner = NativeNodePreparation::new(preparation_identity(&binding));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let output = compile(&binding, &loan, &mut journal);
@@ -355,8 +352,7 @@ fn assert_actual_schema_body_error_keeps_owned_bytes(
 #[test]
 fn project_metadata_original_body_error_keeps_owned_bytes_through_the_real_host() {
     let binding = binding(64 << 20);
-    let owner =
-        TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
+    let owner = NativeNodePreparation::new(preparation_identity(&binding));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let compiled = compile(&binding, &loan, &mut journal);
@@ -374,14 +370,13 @@ fn project_metadata_original_body_error_keeps_owned_bytes_through_the_real_host(
 fn project_metadata_original_worker_stop_refuses_compile_body_with_exact_cause() {
     use novarocks_execution_contract::task_execution::status::{AbortCause, CancelReason};
     for stop in [
-        TestPreparationIntent::Cancel(CancelReason::UpstreamNoLongerNeeded),
-        TestPreparationIntent::Abort(AbortCause::QueryFailed),
-        TestPreparationIntent::Abort(AbortCause::LeaseExpired),
-        TestPreparationIntent::Abort(AbortCause::PeerTaskFailed),
+        PreparationStop::Cancel(CancelReason::UpstreamNoLongerNeeded),
+        PreparationStop::Abort(AbortCause::QueryFailed),
+        PreparationStop::Abort(AbortCause::LeaseExpired),
+        PreparationStop::Abort(AbortCause::PeerTaskFailed),
     ] {
         let binding = binding(64 << 20);
-        let owner =
-            TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
+        let owner = NativeNodePreparation::new(preparation_identity(&binding));
         assert!(owner.stop(stop));
         let loan = owner.loan();
         let mut journal = ProjectMetadataJournal::default();
@@ -416,8 +411,7 @@ fn project_metadata_original_worker_stop_refuses_compile_body_with_exact_cause()
 #[test]
 fn project_metadata_real_capacity_and_arithmetic_refuse_before_compile_body() {
     let binding = binding(1024);
-    let owner =
-        TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
+    let owner = NativeNodePreparation::new(preparation_identity(&binding));
     let loan = owner.loan();
     for requests in [
         CompleteMetadataRequestFacts {
@@ -520,8 +514,7 @@ fn project_metadata_real_pending_requalifies_one_original_compiler_body() {
         account,
     )
     .unwrap();
-    let owner =
-        TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
+    let owner = NativeNodePreparation::new(preparation_identity(&binding));
     let loan = owner.loan();
     let mut type_journal = super::super::TypeMaterializationJournal::default();
     let mut type_host = TypeMaterializationHost::new(&binding, &loan, &mut type_journal);
@@ -627,8 +620,7 @@ fn analytic(program: &LocalProgram) -> ProgramNodeId {
 #[test]
 fn analytic_schema_real_native_compile_and_original_schema_share_one_binding() {
     let binding = binding(64 << 20);
-    let owner =
-        TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
+    let owner = NativeNodePreparation::new(preparation_identity(&binding));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let compiled = compile_window(&binding, &loan, &mut journal);
@@ -665,8 +657,7 @@ fn analytic_schema_real_native_compile_and_original_schema_share_one_binding() {
 #[test]
 fn analytic_schema_private_native_loan_rejects_wrong_program_kind_site_and_layout_before_body() {
     let binding = binding(64 << 20);
-    let owner =
-        TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
+    let owner = NativeNodePreparation::new(preparation_identity(&binding));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let prepared = compile_window(&binding, &loan, &mut journal).into_preparation();
@@ -747,14 +738,13 @@ fn analytic_schema_private_native_loan_rejects_wrong_program_kind_site_and_layou
 fn analytic_schema_actual_worker_stop_keeps_nominal_cause_and_runs_no_original_body() {
     use novarocks_execution_contract::task_execution::status::{AbortCause, CancelReason};
     for stop in [
-        TestPreparationIntent::Cancel(CancelReason::UpstreamNoLongerNeeded),
-        TestPreparationIntent::Abort(AbortCause::QueryFailed),
-        TestPreparationIntent::Abort(AbortCause::LeaseExpired),
-        TestPreparationIntent::Abort(AbortCause::PeerTaskFailed),
+        PreparationStop::Cancel(CancelReason::UpstreamNoLongerNeeded),
+        PreparationStop::Abort(AbortCause::QueryFailed),
+        PreparationStop::Abort(AbortCause::LeaseExpired),
+        PreparationStop::Abort(AbortCause::PeerTaskFailed),
     ] {
         let binding = binding(64 << 20);
-        let owner =
-            TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
+        let owner = NativeNodePreparation::new(preparation_identity(&binding));
         let loan = owner.loan();
         let mut journal = ProjectMetadataJournal::default();
         let prepared = compile_window(&binding, &loan, &mut journal).into_preparation();
@@ -801,8 +791,7 @@ fn analytic_schema_actual_worker_stop_keeps_nominal_cause_and_runs_no_original_b
 #[test]
 fn analytic_schema_original_body_error_keeps_owned_bytes_through_the_real_host() {
     let binding = binding(64 << 20);
-    let owner =
-        TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
+    let owner = NativeNodePreparation::new(preparation_identity(&binding));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let compiled = compile_window(&binding, &loan, &mut journal);
@@ -819,8 +808,7 @@ fn analytic_schema_original_body_error_keeps_owned_bytes_through_the_real_host()
 #[test]
 fn analytic_schema_actual_policy_refuses_before_original_body() {
     let binding = binding(64 << 20);
-    let owner =
-        TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
+    let owner = NativeNodePreparation::new(preparation_identity(&binding));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let output = compile_window(&binding, &loan, &mut journal).into_preparation();
@@ -1023,10 +1011,7 @@ fn type_tail_frozen_invoice_covers_actual_native_factory_callbacks() {
 #[test]
 fn accepted_original_task_source_crosses_both_compile_views_and_metadata_before_body() {
     use novarocks_execution::runtime::fragment::ExecutionFailure;
-    use novarocks_execution_contract::{
-        TaskFailurePhase,
-        failure::{FailureEvidence, FailureProjection},
-    };
+    use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
     for raw in [
         ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted),
         ExecutionFailure::from_domain(
@@ -1035,12 +1020,8 @@ fn accepted_original_task_source_crosses_both_compile_views_and_metadata_before_
     ] {
         let binding = binding(64 << 20);
         let expected = raw.failure_fact();
-        let owner =
-            TestPreparationControl::new(preparation_identity(&binding), Duration::from_millis(1));
-        owner
-            .status()
-            .execution_control(TaskFailurePhase::Preparation)
-            .report_failure(raw.clone());
+        let owner = NativeNodePreparation::new(preparation_identity(&binding));
+        owner.report_failure(raw.clone());
         let stop = novarocks_spi::connector::ConnectorStopOwner::new();
         let control = TaskPreparationControl::new(stop.view(), owner.stop_view());
         let interruption = control
@@ -1096,5 +1077,6 @@ fn accepted_original_task_source_crosses_both_compile_views_and_metadata_before_
         }
         assert!(journal.body.settlement.is_none());
         assert_eq!(binding.account().snapshot().granted_bytes, 0);
+        drop(raw);
     }
 }

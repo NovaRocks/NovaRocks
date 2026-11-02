@@ -34,8 +34,8 @@ pub use exchange_receiver::{
 pub use result::{
     FragmentResultSession, FragmentResultWriter, ResultAbort, ResultInputMetadata,
     ResultPresentation, ResultProjection, ResultWriteAdmission, ResultWriteCredit,
-    ResultWriteFailure, ResultWriteSpec, RootInputAdmission, RootInputAuthority, RootInputPermit,
-    RootInputReadinessNotifier, RootInputReservation, RootInputReservationAdmission,
-    RootProducerState, RootResultInput, RootResultSession, RootResultWriteSpec, RootResultWriter,
-    RootWorkExitProgress,
+    ResultWriteFailure, ResultWriteSpec, RootFailureObservation, RootInputAdmission,
+    RootInputAuthority, RootInputPermit, RootInputReadinessNotifier, RootInputReservation,
+    RootInputReservationAdmission, RootProducerState, RootResultInput, RootResultSession,
+    RootResultWriteSpec, RootResultWriter, RootWorkExitProgress,
 };

@@ -96,6 +96,8 @@ pub struct NativeIngressOwnership {
     deadline: Instant,
 }
 
+impl novarocks_worker::WorkerIngressBacking for NativeIngressOwnership {}
+
 impl NativeIngressOwnership {
     pub fn arrival(&self) -> Instant {
         self.arrival
@@ -104,26 +106,6 @@ impl NativeIngressOwnership {
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
-}
-
-/// A real one-slot ingress owner for deterministic adapter cancellation tests.
-#[cfg(test)]
-pub(crate) async fn one_slot_test_ownership() -> (Arc<NativeIngressOwnership>, Arc<Semaphore>) {
-    let gate = Gate::new(1, 0, "ordinary", false, 1024);
-    let arrival = Instant::now();
-    let deadline = arrival + LOCAL_ENTRY_CAP;
-    let permit = gate
-        .acquire(deadline)
-        .await
-        .expect("one available running slot");
-    (
-        Arc::new(NativeIngressOwnership {
-            _permit: permit,
-            arrival,
-            deadline,
-        }),
-        gate.running,
-    )
 }
 
 #[derive(Clone)]
@@ -892,11 +874,16 @@ mod tests {
         }
         for method in [
             NativeRpcMethod::ApplyTaskOperations,
-            NativeRpcMethod::FetchTaskResult,
             NativeRpcMethod::DeliverExchangeUnit,
             NativeRpcMethod::RegisterExchangeDemand,
         ] {
             assert!(matches!(data.classify(method), MethodClass::Ordinary));
+        }
+        for endpoint in [
+            NativeEndpointDomain::BackendData,
+            NativeEndpointDomain::BackendControl,
+        ] {
+            assert!(!NativeRpcMethod::RetiredFetchTaskResult.is_allowed_at(endpoint));
         }
         assert!(matches!(
             data.classify(NativeRpcMethod::FetchRootResult),

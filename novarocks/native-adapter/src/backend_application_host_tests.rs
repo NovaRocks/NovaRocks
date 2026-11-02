@@ -89,7 +89,7 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
             1024 * 1024,
         )
         .expect("finite test root producer limits"),
-        inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits::default(),
+
         preparation_limits: novarocks_worker::TaskPreparationLimits::default(),
         execution_runtime_config: ExecutionRuntimeConfig {
             driver_threads: 1,

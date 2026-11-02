@@ -18,13 +18,11 @@
 //! Worker-owned admission authority for task exchange destinations.
 
 use std::collections::{HashMap, HashSet};
-use std::mem::size_of;
 use std::sync::{Arc, Mutex, RwLock};
 
 use novarocks_execution_contract::{
-    ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeInbound, ExchangeSource,
-    ExchangeStreamClose, ExchangeStreamIdentity, FragmentNodeId, QueryContextRef, TaskDescriptor,
-    TaskIdentity,
+    ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeSource, ExchangeStreamClose,
+    ExchangeStreamIdentity, FragmentNodeId, QueryContextRef, TaskDescriptor, TaskIdentity,
 };
 use novarocks_types::{QueryExecutionId, UniqueId};
 
@@ -32,24 +30,14 @@ use crate::{HostRejection, IngressRejection, authorize_inbound_frame};
 
 const CAPABILITY_LOCK: &str = "task inbound capability lock";
 
-/// These bounds charge reserved metadata records, not measured physical heap.
+/// Refusals protect exact protocol identities and receiver-authored facts.
 #[derive(Debug)]
 enum InboundCapabilityFailure {
-    RecordSize,
     InvalidCloseFacts {
         task: TaskIdentity,
     },
-    ReservationConflict {
+    ConflictingCloseFacts {
         task: TaskIdentity,
-    },
-    CountLimit {
-        committed: usize,
-        limit: usize,
-    },
-    ByteLimit {
-        requested: usize,
-        committed: usize,
-        limit: usize,
     },
     ContextClosed {
         task: TaskIdentity,
@@ -68,26 +56,13 @@ enum InboundCapabilityFailure {
 impl std::fmt::Display for InboundCapabilityFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::RecordSize => f.write_str("normal-close record size overflow"),
             Self::InvalidCloseFacts { task } => write!(
                 f,
                 "task {task} normal-close facts do not cover its exact frozen streams and delivery obligations"
             ),
-            Self::ReservationConflict { task } => write!(
+            Self::ConflictingCloseFacts { task } => write!(
                 f,
-                "normal-close reservation conflicts with accepted task {task}"
-            ),
-            Self::CountLimit { committed, limit } => write!(
-                f,
-                "backend normal-close record capacity exhausted: {committed} reserved records, limit {limit}"
-            ),
-            Self::ByteLimit {
-                requested,
-                committed,
-                limit,
-            } => write!(
-                f,
-                "backend normal-close record capacity exhausted: {requested} requested charge bytes, {committed} reserved, limit {limit}"
+                "task {task} normal-close facts conflict with its retained original record"
             ),
             Self::ContextClosed { task } => write!(
                 f,
@@ -109,115 +84,33 @@ impl novarocks_execution_contract::failure::FailureProjection for InboundCapabil
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
         use crate::failure_reason::WorkerFailureReason as R;
         use novarocks_execution_contract::failure::*;
-        let (reason, dimension, requested, committed, limit) = match self {
-            Self::InvalidCloseFacts { .. } => {
-                return FailureFact::new(FailureClass::Invariant, R::InboundCloseContract.reason());
+        match self {
+            Self::InvalidCloseFacts { .. } | Self::ConflictingCloseFacts { .. } => {
+                FailureFact::new(FailureClass::Invariant, R::InboundCloseContract.reason())
             }
-            Self::RecordSize => {
-                return FailureFact::new(FailureClass::Resource, R::InboundRecordSize.reason());
-            }
-            Self::ReservationConflict { .. } => {
-                return FailureFact::new(
-                    FailureClass::Invariant,
-                    R::InboundReservationConflict.reason(),
-                );
-            }
-            Self::CountLimit { committed, limit } => (
-                R::InboundRecordCount,
-                ResourceDimension::Items,
-                1,
-                *committed,
-                *limit,
-            ),
-            Self::ByteLimit {
-                requested,
-                committed,
-                limit,
-            } => (
-                R::InboundRecordBytes,
-                ResourceDimension::Bytes,
-                *requested,
-                *committed,
-                *limit,
-            ),
             Self::ContextClosed { .. } => {
-                return FailureFact::stop_observation(R::InboundContextClosed.reason());
+                FailureFact::stop_observation(R::InboundContextClosed.reason())
             }
             Self::KeyClosed { task, holder, .. } => {
-                return if task == holder {
+                if task == holder {
                     FailureFact::stop_observation(R::InboundKeyClosed.reason())
                 } else {
                     FailureFact::new(FailureClass::Invariant, R::InboundForeignClosedKey.reason())
-                };
+                }
             }
             Self::KeyClaimed { .. } => {
-                return FailureFact::new(FailureClass::Invariant, R::InboundKeyClaimed.reason());
+                FailureFact::new(FailureClass::Invariant, R::InboundKeyClaimed.reason())
             }
-        };
-        let fact = FailureFact::new(FailureClass::Resource, reason.reason());
-        fact.with_resource(ResourceFacts {
-            request_scope: Some(ResourceScope::Task),
-            constraint_scope: Some(ResourceScope::Process),
-            dimension,
-            requested: u64::try_from(requested).ok(),
-            required_growth: u64::try_from(requested).ok(),
-            limit: u64::try_from(limit).ok(),
-            live: None,
-            committed: u64::try_from(committed).ok(),
-        })
+        }
     }
 }
 fn capability_rejection(source: InboundCapabilityFailure) -> HostRejection {
-    let category = match &source {
-        InboundCapabilityFailure::RecordSize
-        | InboundCapabilityFailure::CountLimit { .. }
-        | InboundCapabilityFailure::ByteLimit { .. } => {
-            novarocks_execution_contract::TaskFailureCategory::ResourceExhausted
-        }
-        _ => novarocks_execution_contract::TaskFailureCategory::Protocol,
-    };
-    // Static policy wording, identities and numeric charges are safe context.
     let detail = novarocks_execution_contract::SafeDetail::truncating_display(&source);
-    HostRejection::from_domain_with_detail(category, source, detail)
-}
-
-/// Validated process-local bounds shared by active and retained close records.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TaskInboundCapabilityLimits {
-    max_records: usize,
-    max_bytes: usize,
-}
-
-impl Default for TaskInboundCapabilityLimits {
-    fn default() -> Self {
-        Self {
-            max_records: 32_768,
-            max_bytes: 64 * 1024 * 1024,
-        }
-    }
-}
-
-impl TaskInboundCapabilityLimits {
-    pub fn try_new(max_records: usize, max_bytes: usize) -> Result<Self, String> {
-        if max_records == 0 {
-            return Err("normal-close record count limit must be nonzero".to_owned());
-        }
-        if max_bytes == 0 {
-            return Err("normal-close record byte limit must be nonzero".to_owned());
-        }
-        Ok(Self {
-            max_records,
-            max_bytes,
-        })
-    }
-
-    pub const fn max_records(self) -> usize {
-        self.max_records
-    }
-
-    pub const fn max_bytes(self) -> usize {
-        self.max_bytes
-    }
+    HostRejection::from_domain_with_detail(
+        novarocks_execution_contract::TaskFailureCategory::Protocol,
+        source,
+        detail,
+    )
 }
 
 /// Which task, if any, may receive one inbound exchange frame.
@@ -233,9 +126,10 @@ struct TaskInboundCapabilityState {
     /// delivery without serializing decode on unrelated destinations.
     delivery_gates: HashMap<UniqueId, Arc<RwLock<()>>>,
     normally_closed: HashMap<UniqueId, NormalClosedInboundRecord>,
+    // Observation of these same owned records, updated at their actual map
+    // mutations. This grants no capacity and never controls retention.
+    normal_close_bytes_estimate: Option<usize>,
     normal_closed_executions: HashSet<QueryExecutionId>,
-    reserved: HashMap<TaskIdentity, usize>,
-    reserved_bytes: usize,
     /// A descriptor carries no frontend process identity. The worker context
     /// owner admits at most one context per execution, so the execution is
     /// the complete key this data-plane owner must fence.
@@ -246,16 +140,64 @@ struct TaskInboundCapabilityState {
 #[derive(Debug)]
 pub struct TaskInboundCapabilities {
     state: Mutex<TaskInboundCapabilityState>,
-    max_records: usize,
-    max_bytes: usize,
 }
 
-/// The bounded, payload-free remainder of a receiver that normally stopped.
-#[derive(Debug)]
-struct NormalClosedInboundRecord {
-    destination: TaskIdentity,
-    inbound: Vec<ExchangeInbound>,
-    closes: Box<[ExchangeStreamClose]>,
+use novarocks_worker_protocol::inbound_cost::NormalClosedInboundRecord;
+
+/// Exact record count and documented structural estimate, never actual heap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InboundRetentionSnapshot {
+    pub records: usize,
+    pub metadata_bytes_estimate: Option<usize>,
+}
+fn normal_close_record_bytes_estimate(record: &NormalClosedInboundRecord) -> Option<usize> {
+    let inbound = record.inbound.capacity().checked_mul(std::mem::size_of::<
+        novarocks_execution_contract::ExchangeInbound,
+    >())?;
+    let sources = record.inbound.iter().try_fold(0usize, |total, node| {
+        total.checked_add(std::mem::size_of_val(node.sources()))
+    })?;
+    std::mem::size_of::<NormalClosedInboundRecord>()
+        .checked_add(inbound)?
+        .checked_add(sources)?
+        .checked_add(std::mem::size_of_val(record.closes.as_ref()))
+}
+impl TaskInboundCapabilityState {
+    fn insert_normal_close(&mut self, key: UniqueId, record: NormalClosedInboundRecord) {
+        let bytes = normal_close_record_bytes_estimate(&record);
+        let previous = if self.normally_closed.is_empty() {
+            Some(0)
+        } else {
+            self.normal_close_bytes_estimate
+        };
+        let old = self.normally_closed.insert(key, record);
+        self.normal_close_bytes_estimate = previous.zip(bytes).and_then(|(n, added)| {
+            n.checked_sub(match old.as_ref() {
+                Some(record) => normal_close_record_bytes_estimate(record)?,
+                None => 0,
+            })?
+            .checked_add(added)
+        });
+    }
+    fn forget_normal_close(&mut self, execution: QueryExecutionId) {
+        let mut removed = Some(0usize);
+        self.normally_closed.retain(|_, record| {
+            if record.destination.query_execution_id() != execution {
+                return true;
+            }
+            removed = removed
+                .zip(normal_close_record_bytes_estimate(record))
+                .and_then(|(n, size)| n.checked_add(size));
+            false
+        });
+        self.normal_close_bytes_estimate = if self.normally_closed.is_empty() {
+            Some(0)
+        } else {
+            self.normal_close_bytes_estimate
+                .zip(removed)
+                .and_then(|(n, gone)| n.checked_sub(gone))
+        };
+    }
 }
 
 /// An exact normal-close answer to a frozen sender of one input occurrence.
@@ -329,76 +271,39 @@ pub enum InboundFrameDelivery<E> {
 
 impl TaskInboundCapabilities {
     pub fn new() -> Arc<Self> {
-        Self::with_capacity_limits(TaskInboundCapabilityLimits::default())
-    }
-
-    /// The accepted-task owner must reserve against these hard bounds before
-    /// acknowledging creation. Normal retirement only converts that charge.
-    pub fn with_limits(max_records: usize, max_bytes: usize) -> Arc<Self> {
-        Self::with_capacity_limits(
-            TaskInboundCapabilityLimits::try_new(max_records, max_bytes)
-                .expect("normal-close capacity limits must be nonzero"),
-        )
-    }
-
-    pub fn with_capacity_limits(limits: TaskInboundCapabilityLimits) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(TaskInboundCapabilityState::default()),
-            max_records: limits.max_records(),
-            max_bytes: limits.max_bytes(),
         })
     }
 
-    fn record_bytes(descriptor: &TaskDescriptor) -> Option<usize> {
-        if descriptor.topology().inbound().is_empty() {
-            return Some(0);
-        }
-        descriptor.topology().inbound().iter().try_fold(
-            size_of::<NormalClosedInboundRecord>() + 128,
-            |bytes, node| {
-                bytes
-                    .checked_add(size_of::<ExchangeInbound>() + 64)?
-                    .checked_add(node.sources().len().checked_mul(
-                        size_of::<ExchangeSource>() + size_of::<ExchangeStreamClose>() + 16,
-                    )?)
+    /// Original record inventory, sampled without waiting for the owner lock.
+    /// Estimate coverage matches normal_close_retention; allocator, map nodes,
+    /// shared source allocations and Context fences are unmeasured.
+    pub fn try_normal_close_retention_snapshot(&self) -> Option<InboundRetentionSnapshot> {
+        let state = self.state.try_lock().ok()?;
+        Some(InboundRetentionSnapshot {
+            records: state.normally_closed.len(),
+            metadata_bytes_estimate: if state.normally_closed.is_empty() {
+                Some(0)
+            } else {
+                state.normal_close_bytes_estimate
             },
-        )
+        })
     }
 
-    pub fn reserve_normal_close(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
-        let bytes = Self::record_bytes(descriptor)
-            .ok_or_else(|| capability_rejection(InboundCapabilityFailure::RecordSize))?;
-        if bytes == 0 {
-            return Ok(());
-        }
-        let mut state = self.state.lock().expect(CAPABILITY_LOCK);
-        if let Some(existing) = state.reserved.get(&descriptor.identity()) {
-            return if *existing == bytes {
-                Ok(())
-            } else {
-                Err(capability_rejection(
-                    InboundCapabilityFailure::ReservationConflict {
-                        task: descriptor.identity(),
-                    },
-                ))
-            };
-        }
-        if state.reserved.len() >= self.max_records {
-            return Err(capability_rejection(InboundCapabilityFailure::CountLimit {
-                committed: state.reserved.len(),
-                limit: self.max_records,
-            }));
-        }
-        if bytes > self.max_bytes.saturating_sub(state.reserved_bytes) {
-            return Err(capability_rejection(InboundCapabilityFailure::ByteLimit {
-                requested: bytes,
-                committed: state.reserved_bytes,
-                limit: self.max_bytes,
-            }));
-        }
-        state.reserved.insert(descriptor.identity(), bytes);
-        state.reserved_bytes += bytes;
-        Ok(())
+    /// Existing estimate API. This is neither allocation/RSS nor a heap bound.
+    /// Metrics use the nonblocking typed snapshot and preserve unknown values.
+    pub fn normal_close_retention(&self) -> (usize, usize) {
+        let state = self.state.lock().expect(CAPABILITY_LOCK);
+        let bytes = state
+            .normally_closed
+            .values()
+            .fold(0usize, |total, record| {
+                total.saturating_add(
+                    normal_close_record_bytes_estimate(record).unwrap_or(usize::MAX),
+                )
+            });
+        (state.normally_closed.len(), bytes)
     }
 
     /// Authorizes one frame from only frozen task facts.
@@ -418,7 +323,7 @@ impl TaskInboundCapabilities {
                 .map(Arc::clone)
                 .ok_or(IngressRejection::UnknownDestinationTask)?;
             if state
-                .closed_executions
+                .aborted_executions
                 .contains(&descriptor.identity().query_execution_id())
             {
                 return Err(IngressRejection::UnknownDestinationTask);
@@ -665,7 +570,7 @@ impl TaskInboundCapabilities {
             return InboundFrameClaim::NotHeld;
         };
         if state
-            .closed_executions
+            .aborted_executions
             .contains(&descriptor.identity().query_execution_id())
         {
             return InboundFrameClaim::Refused(format!(
@@ -707,7 +612,6 @@ impl TaskInboundCapabilities {
 
     pub fn install(&self, descriptor: Arc<TaskDescriptor>) -> Result<(), HostRejection> {
         let key = descriptor.fragment_instance_id();
-        self.reserve_normal_close(&descriptor)?;
         let mut state = self.state.lock().expect(CAPABILITY_LOCK);
         if state
             .closed_executions
@@ -740,6 +644,9 @@ impl TaskInboundCapabilities {
         Ok(())
     }
 
+    /// Normal closure fences new receiver installation, while an already
+    /// installed exact stream keeps its DATA permission until actual retirement.
+    /// Only abort revokes that existing data-plane permission.
     pub fn close_context(&self, context: QueryContextRef) {
         self.state
             .lock()
@@ -754,38 +661,26 @@ impl TaskInboundCapabilities {
         state.closed_executions.insert(execution);
         state.aborted_executions.insert(execution);
         state.normal_closed_executions.remove(&execution);
-        let keys: Vec<_> = state
-            .normally_closed
-            .iter()
-            .filter(|(_, record)| record.destination.query_execution_id() == execution)
-            .map(|(key, _)| *key)
-            .collect();
-        for key in keys {
-            if let Some(record) = state.normally_closed.remove(&key)
-                && let Some(bytes) = state.reserved.remove(&record.destination)
-            {
-                state.reserved_bytes -= bytes;
-            }
-        }
+        state.forget_normal_close(execution);
     }
 
+    /// The original Context owner calls this only at its request horizon, or
+    /// after process ingress has closed and every installed receiver exited.
+    /// Hot execution retirement alone never forgets retained close facts.
     pub fn forget_context(&self, context: QueryContextRef) {
         let mut state = self.state.lock().expect(CAPABILITY_LOCK);
-        debug_assert!(state.installed.values().all(|descriptor| {
-            descriptor.identity().query_execution_id() != context.query_execution_id()
-        }));
-        state
-            .closed_executions
-            .remove(&context.query_execution_id());
-        state
-            .aborted_executions
-            .remove(&context.query_execution_id());
-        state
-            .normal_closed_executions
-            .remove(&context.query_execution_id());
-        state.normally_closed.retain(|_, record| {
-            record.destination.query_execution_id() != context.query_execution_id()
-        });
+        let execution = context.query_execution_id();
+        assert!(
+            state
+                .installed
+                .values()
+                .all(|descriptor| { descriptor.identity().query_execution_id() != execution }),
+            "Context forgetting requires every original receiver to exit"
+        );
+        state.closed_executions.remove(&execution);
+        state.aborted_executions.remove(&execution);
+        state.normal_closed_executions.remove(&execution);
+        state.forget_normal_close(execution);
         let live_keys: HashSet<_> = state
             .installed
             .keys()
@@ -795,22 +690,24 @@ impl TaskInboundCapabilities {
         state
             .delivery_gates
             .retain(|key, _| live_keys.contains(key));
-        let reservations: Vec<_> = state
-            .reserved
-            .keys()
-            .copied()
-            .filter(|identity| identity.query_execution_id() == context.query_execution_id())
-            .collect();
-        for identity in reservations {
-            if let Some(bytes) = state.reserved.remove(&identity) {
-                state.reserved_bytes -= bytes;
-            }
-        }
     }
 
     /// Withdraws exactly this task's capability. Identity is re-checked so a
     /// stale rollback cannot evict a newer owner of the same kernel key.
     pub fn remove(&self, descriptor: &TaskDescriptor) {
+        self.remove_with_capture(descriptor, || ());
+    }
+
+    /// Move the original receiver capture while the same delivery writer
+    /// fence excludes every already-claimed synchronous push. `detach` may
+    /// only move ownership/metadata; callbacks, source destruction and actual
+    /// receiver cleanup belong to the supervised host after this returns.
+    /// No capability-state lock is held while moving the original capture.
+    pub fn remove_with_capture<T>(
+        &self,
+        descriptor: &TaskDescriptor,
+        detach: impl FnOnce() -> T,
+    ) -> T {
         let key = descriptor.fragment_instance_id();
         let gate = self
             .state
@@ -831,9 +728,10 @@ impl TaskInboundCapabilities {
             state.installed.remove(&key);
             state.delivery_gates.remove(&key);
         }
-        if let Some(bytes) = state.reserved.remove(&descriptor.identity()) {
-            state.reserved_bytes -= bytes;
-        }
+        drop(state);
+        let captured = detach();
+        drop(_retirement);
+        captured
     }
 
     /// Existing DemandDriven retirement adapter. It records explicit withdrawal,
@@ -861,7 +759,8 @@ impl TaskInboundCapabilities {
             })
             .collect::<Vec<_>>();
         closes.sort_unstable_by_key(|close| close.stream);
-        self.close_normally_record(descriptor, closes.into_boxed_slice(), retire_receiver);
+        self.close_normally_record(descriptor, closes.into_boxed_slice(), retire_receiver)
+            .expect("the same legacy normal-close author repeats its original withdrawal facts");
     }
 
     /// Retain actual receiver-authored facts, covering every frozen stream once.
@@ -873,6 +772,18 @@ impl TaskInboundCapabilities {
         descriptor: &TaskDescriptor,
         mut closes: Vec<ExchangeStreamClose>,
         retire_receiver: impl FnOnce(),
+    ) -> Result<(), HostRejection> {
+        closes.sort_unstable_by_key(|close| close.stream);
+        Self::validate_normal_close_facts(descriptor, &closes)?;
+        self.close_normally_record(descriptor, closes.into_boxed_slice(), retire_receiver)
+    }
+
+    /// Check the receiver author's exact, canonical facts before publishing
+    /// successful Task completion. This grants no route or close authority;
+    /// the later writer-fenced close records the same exact facts.
+    pub fn validate_normal_close_facts(
+        descriptor: &TaskDescriptor,
+        closes: &[ExchangeStreamClose],
     ) -> Result<(), HostRejection> {
         let invalid = || {
             capability_rejection(InboundCapabilityFailure::InvalidCloseFacts {
@@ -886,14 +797,13 @@ impl TaskInboundCapabilities {
             .try_fold(0usize, |count, node| {
                 count.checked_add(node.sources().len())
             })
-            .ok_or_else(|| capability_rejection(InboundCapabilityFailure::RecordSize))?;
+            .ok_or_else(invalid)?;
         if closes.len() != expected {
             return Err(invalid());
         }
-        closes.sort_unstable_by_key(|close| close.stream);
         if closes
             .windows(2)
-            .any(|pair| pair[0].stream == pair[1].stream)
+            .any(|pair| pair[0].stream >= pair[1].stream)
         {
             return Err(invalid());
         }
@@ -919,7 +829,6 @@ impl TaskInboundCapabilities {
                 }
             }
         }
-        self.close_normally_record(descriptor, closes.into_boxed_slice(), retire_receiver);
         Ok(())
     }
 
@@ -930,7 +839,7 @@ impl TaskInboundCapabilities {
         descriptor: &TaskDescriptor,
         closes: Box<[ExchangeStreamClose]>,
         retire_receiver: impl FnOnce(),
-    ) {
+    ) -> Result<(), HostRejection> {
         let key = descriptor.fragment_instance_id();
         let gate = self
             .state
@@ -942,6 +851,18 @@ impl TaskInboundCapabilities {
         let _retirement = gate
             .as_ref()
             .map(|gate| gate.write().expect("task inbound delivery gate"));
+        {
+            let state = self.state.lock().expect(CAPABILITY_LOCK);
+            if let Some(original) = state.normally_closed.get(&key)
+                && (original.destination != descriptor.identity() || original.closes != closes)
+            {
+                return Err(capability_rejection(
+                    InboundCapabilityFailure::ConflictingCloseFacts {
+                        task: descriptor.identity(),
+                    },
+                ));
+            }
+        }
         // No further push can begin for this destination while the receiver
         // route is removed; a pending delivery rechecks the final verdict.
         retire_receiver();
@@ -957,11 +878,7 @@ impl TaskInboundCapabilities {
         {
             state.installed.remove(&key);
             if !descriptor.topology().inbound().is_empty() {
-                assert!(
-                    state.reserved.contains_key(&descriptor.identity()),
-                    "normal close requires accepted capacity reservation"
-                );
-                state.normally_closed.insert(
+                state.insert_normal_close(
                     key,
                     NormalClosedInboundRecord {
                         destination: descriptor.identity(),
@@ -973,14 +890,12 @@ impl TaskInboundCapabilities {
                     .normal_closed_executions
                     .insert(descriptor.identity().query_execution_id());
             }
-        } else {
-            if held {
-                state.installed.remove(&key);
-            }
-            if let Some(bytes) = state.reserved.remove(&descriptor.identity()) {
-                state.reserved_bytes -= bytes;
-            }
+        } else if held {
+            state.installed.remove(&key);
         }
+        drop(state);
+        drop(_retirement);
+        Ok(())
     }
 }
 
@@ -1004,19 +919,7 @@ mod tests {
         },
     };
 
-    use super::{InboundFrameClaim, TaskInboundCapabilities, TaskInboundCapabilityLimits};
-
-    #[test]
-    fn normal_close_capacity_limits_reject_zero_before_composition() {
-        assert!(TaskInboundCapabilityLimits::try_new(0, 1).is_err());
-        assert!(TaskInboundCapabilityLimits::try_new(1, 0).is_err());
-        let limits = TaskInboundCapabilityLimits::try_new(2, 512).unwrap();
-        assert_eq!(limits.max_records(), 2);
-        assert_eq!(limits.max_bytes(), 512);
-        let defaults = TaskInboundCapabilityLimits::default();
-        assert_eq!(defaults.max_records(), 32_768);
-        assert_eq!(defaults.max_bytes(), 64 * 1024 * 1024);
-    }
+    use super::{InboundFrameClaim, InboundRetentionSnapshot, TaskInboundCapabilities};
 
     fn descriptor(query: i64, kernel: UniqueId) -> (TaskDescriptor, UniqueId) {
         let execution =
@@ -1071,42 +974,37 @@ mod tests {
     }
 
     #[test]
-    fn accepted_capacity_is_reserved_before_normal_retirement() {
-        let capabilities = TaskInboundCapabilities::with_limits(1, 4096);
+    fn retained_normal_close_does_not_block_new_destination_installation() {
+        use novarocks_execution_contract::failure::FailureProjection;
+        let capabilities = TaskInboundCapabilities::new();
         let (first, source) = descriptor(101, UniqueId::new(1, 2));
-        let (second, _) = descriptor(201, UniqueId::new(3, 4));
-        capabilities.reserve_normal_close(&first).unwrap();
-        let refused = capabilities.reserve_normal_close(&second).unwrap_err();
-        use novarocks_execution_contract::failure::{
-            FailureProjection, ResourceDimension, ResourceScope,
-        };
-        let fact = refused.failure_fact();
-        let resource = fact.resource().unwrap();
-        assert_eq!(resource.dimension, ResourceDimension::Items);
-        assert_eq!(resource.constraint_scope, Some(ResourceScope::Process));
-        assert_eq!(
-            (
-                resource.requested,
-                resource.limit,
-                resource.committed,
-                resource.live
-            ),
-            (Some(1), Some(1), Some(1), None)
-        );
+        let (second, second_source) = descriptor(201, UniqueId::new(3, 4));
         capabilities.install(Arc::new(first.clone())).unwrap();
+        assert_eq!(capabilities.normal_close_retention(), (0, 0));
         capabilities.close_normally(&first, || {});
+        let retained = capabilities.normal_close_retention();
+        assert_eq!(retained.0, 1);
+        assert!(retained.1 > 0);
         let closed = capabilities.install(Arc::new(first.clone())).unwrap_err();
         assert_eq!(
             closed.failure_fact().evidence(),
             novarocks_execution_contract::failure::FailureEvidence::StopObservation
         );
+        capabilities.install(Arc::new(second.clone())).unwrap();
+        assert_eq!(capabilities.normal_close_retention(), retained);
         assert!(matches!(
             claim(&capabilities, first.fragment_instance_id(), source, 0, 1),
             InboundFrameClaim::NormallyClosed(_)
         ));
-        assert!(
-            capabilities.reserve_normal_close(&second).is_err(),
-            "normal-close record retains its accepted reservation"
+        assert_eq!(
+            claim(
+                &capabilities,
+                second.fragment_instance_id(),
+                second_source,
+                0,
+                1
+            ),
+            InboundFrameClaim::Authorized
         );
         let context = QueryContextRef::new(
             first.identity().query_execution_id(),
@@ -1114,20 +1012,113 @@ mod tests {
             first.identity().backend_process_id(),
         );
         capabilities.forget_context(context);
-        capabilities.reserve_normal_close(&second).unwrap();
+        assert_eq!(capabilities.normal_close_retention(), (0, 0));
+        assert_eq!(
+            claim(&capabilities, first.fragment_instance_id(), source, 0, 1),
+            InboundFrameClaim::NotHeld
+        );
+        assert_eq!(
+            claim(
+                &capabilities,
+                second.fragment_instance_id(),
+                second_source,
+                0,
+                1
+            ),
+            InboundFrameClaim::Authorized
+        );
+        capabilities.remove(&second);
     }
 
     #[test]
-    fn active_and_retained_normal_close_records_share_the_byte_bound() {
-        let (first, first_source) = descriptor(102, UniqueId::new(101, 102));
-        let (second, _) = descriptor(202, UniqueId::new(201, 202));
-        let (third, _) = descriptor(302, UniqueId::new(301, 302));
-        let one_record_bytes = TaskInboundCapabilities::record_bytes(&first).unwrap();
-        let capabilities = TaskInboundCapabilities::with_limits(3, one_record_bytes * 2);
+    fn retained_normal_close_keeps_original_facts_across_replay_and_late_removal() {
+        use novarocks_execution_contract::{ExchangeCloseDisposition, ExchangeFrameSequence};
+        use std::cell::Cell;
+        let owner = TaskInboundCapabilities::new();
+        let (first, source) = descriptor(111, UniqueId::new(11, 12));
+        let (second, _) = descriptor(211, UniqueId::new(13, 14));
+        owner.install(Arc::new(first.clone())).unwrap();
+        let callbacks = Cell::new(0);
+        owner.close_normally(&first, || callbacks.set(callbacks.get() + 1));
+        let InboundFrameClaim::NormallyClosed(original) =
+            claim(&owner, first.fragment_instance_id(), source, 0, 1)
+        else {
+            panic!("the original exact normal-close record remains visible");
+        };
+        let original = original.close();
+        let retention = owner.normal_close_retention();
+        assert_eq!(retention.0, 1);
+        assert!(retention.1 > 0);
+        owner.install(Arc::new(second.clone())).unwrap();
+        owner
+            .close_normally_with_facts(&first, vec![original], || {
+                callbacks.set(callbacks.get() + 1);
+            })
+            .unwrap();
+        assert_eq!(callbacks.get(), 2);
+        assert_eq!(owner.normal_close_retention(), retention);
 
+        owner.remove(&first);
+        assert_eq!(owner.normal_close_retention(), retention);
+        let mut conflicting = original;
+        conflicting.disposition = ExchangeCloseDisposition::Consumed {
+            final_sequence: ExchangeFrameSequence::FIRST,
+        };
+        assert!(
+            owner
+                .close_normally_with_facts(&first, vec![conflicting], || {
+                    callbacks.set(callbacks.get() + 1);
+                })
+                .is_err(),
+            "a replay cannot replace the original receiver-authored close fact"
+        );
+        assert_eq!(callbacks.get(), 2, "refusal precedes metadata detachment");
+        let InboundFrameClaim::NormallyClosed(retained) =
+            claim(&owner, first.fragment_instance_id(), source, 0, 1)
+        else {
+            panic!("a conflicting replay cannot erase the original record");
+        };
+        assert_eq!(retained.close(), original);
+        assert_eq!(owner.normal_close_retention(), retention);
+
+        owner.forget_context(QueryContextRef::new(
+            first.identity().query_execution_id(),
+            FrontendProcessId::new_v7(),
+            first.identity().backend_process_id(),
+        ));
+        assert_eq!(owner.normal_close_retention(), (0, 0));
+        owner.remove(&second);
+    }
+
+    #[test]
+    fn normal_close_metadata_grows_with_actual_records_until_each_context_forgets() {
+        let (first, first_source) = descriptor(102, UniqueId::new(101, 102));
+        let (second, second_source) = descriptor(202, UniqueId::new(201, 202));
+        let (third, _) = descriptor(302, UniqueId::new(301, 302));
+        let capabilities = TaskInboundCapabilities::new();
         capabilities.install(Arc::new(first.clone())).unwrap();
         capabilities.close_normally(&first, || {});
+        let first_retained = capabilities.normal_close_retention();
+        assert_eq!(first_retained.0, 1);
+        assert!(first_retained.1 > 0);
         capabilities.install(Arc::new(second.clone())).unwrap();
+        capabilities.install(Arc::new(third.clone())).unwrap();
+        assert_eq!(capabilities.normal_close_retention(), first_retained);
+        capabilities.close_normally(&second, || {});
+        let both_retained = capabilities.normal_close_retention();
+        assert_eq!(both_retained.0, 2);
+        assert_eq!(
+            capabilities.try_normal_close_retention_snapshot(),
+            Some(InboundRetentionSnapshot {
+                records: both_retained.0,
+                metadata_bytes_estimate: Some(both_retained.1),
+            })
+        );
+        {
+            let _original_lock = capabilities.state.lock().unwrap();
+            assert!(capabilities.try_normal_close_retention_snapshot().is_none());
+        }
+        assert!(both_retained.1 > first_retained.1);
         assert!(matches!(
             claim(
                 &capabilities,
@@ -1138,27 +1129,53 @@ mod tests {
             ),
             InboundFrameClaim::NormallyClosed(_)
         ));
-        assert_eq!(
-            capabilities
-                .reserve_normal_close(&third)
-                .expect_err("retained and active records must consume the same byte limit")
-                .category(),
-            novarocks_execution_contract::TaskFailureCategory::ResourceExhausted
-        );
-
-        capabilities.remove(&second);
-        capabilities.reserve_normal_close(&third).unwrap();
         capabilities.remove(&third);
-        let context = QueryContextRef::new(
+        assert_eq!(capabilities.normal_close_retention(), both_retained);
+        capabilities.forget_context(QueryContextRef::new(
             first.identity().query_execution_id(),
             FrontendProcessId::new_v7(),
             first.identity().backend_process_id(),
+        ));
+        assert_eq!(capabilities.normal_close_retention().0, 1);
+        let remaining = capabilities.normal_close_retention();
+        assert_eq!(
+            capabilities.try_normal_close_retention_snapshot(),
+            Some(InboundRetentionSnapshot {
+                records: remaining.0,
+                metadata_bytes_estimate: Some(remaining.1),
+            })
         );
-        capabilities.forget_context(context);
-        let state = capabilities.state.lock().unwrap();
-        assert_eq!(state.reserved_bytes, 0);
-        assert!(state.reserved.is_empty());
-        assert!(state.normally_closed.is_empty());
+        assert!(matches!(
+            claim(
+                &capabilities,
+                second.fragment_instance_id(),
+                second_source,
+                0,
+                1
+            ),
+            InboundFrameClaim::NormallyClosed(_)
+        ));
+        capabilities.forget_context(QueryContextRef::new(
+            second.identity().query_execution_id(),
+            FrontendProcessId::new_v7(),
+            second.identity().backend_process_id(),
+        ));
+        assert_eq!(capabilities.normal_close_retention(), (0, 0));
+        assert_eq!(
+            capabilities.try_normal_close_retention_snapshot(),
+            Some(InboundRetentionSnapshot {
+                records: 0,
+                metadata_bytes_estimate: Some(0),
+            })
+        );
+        assert!(
+            capabilities
+                .state
+                .lock()
+                .unwrap()
+                .normally_closed
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1203,12 +1220,38 @@ mod tests {
         let kernel = UniqueId::new(8, 9);
         let (descriptor, source) = descriptor(401, kernel);
         capabilities.install(Arc::new(descriptor.clone())).unwrap();
-        capabilities.close_normally(&descriptor, || {});
         let context = QueryContextRef::new(
             descriptor.identity().query_execution_id(),
             FrontendProcessId::new_v7(),
             descriptor.identity().backend_process_id(),
         );
+        capabilities.close_context(context);
+        assert_eq!(
+            claim(&capabilities, kernel, source, 0, 1),
+            InboundFrameClaim::Authorized,
+            "normal closure preserves this already installed exact stream"
+        );
+        capabilities
+            .authorize_frame(kernel, FragmentNodeId::new(7), source, 0, 1)
+            .expect("the same installed DATA admission remains valid");
+        let later = TaskDescriptor::try_new(
+            TaskIdentity::new(
+                context.query_execution_id(),
+                descriptor.identity().stage_id(),
+                TaskId::new(2).unwrap(),
+                context.backend_process_id(),
+            ),
+            UniqueId::new(10, 11),
+            descriptor.pipeline_dop(),
+            Vec::new(),
+            descriptor.topology().clone(),
+        )
+        .unwrap();
+        assert!(
+            capabilities.install(Arc::new(later)).is_err(),
+            "the same normal closure still fences a new destination"
+        );
+        capabilities.close_normally(&descriptor, || {});
         capabilities.abort_context(context);
         assert_eq!(
             claim(&capabilities, kernel, source, 0, 1),
@@ -1280,7 +1323,7 @@ mod tests {
     #[test]
     fn exact_stream_claim_uses_frozen_tasks_and_count() {
         use novarocks_execution_contract::{ExchangeSource, ExchangeStreamIdentity};
-        let capabilities = TaskInboundCapabilities::with_limits(4, 16384);
+        let capabilities = TaskInboundCapabilities::new();
         let (descriptor, _) = descriptor(501, UniqueId::new(51, 52));
         capabilities.install(Arc::new(descriptor.clone())).unwrap();
         let node = &descriptor.topology().inbound()[0];
@@ -1346,7 +1389,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let capabilities = TaskInboundCapabilities::with_limits(4, 16384);
+        let capabilities = TaskInboundCapabilities::new();
         capabilities.install(Arc::new(strict.clone())).unwrap();
         let retired = std::sync::atomic::AtomicBool::new(false);
         let stream = ExchangeStreamIdentity::try_new(
@@ -1541,6 +1584,54 @@ mod tests {
                 .is_err()
         );
         assert!(!delivered);
+    }
+
+    #[test]
+    fn abnormal_retirement_moves_the_original_capture_and_destroys_it_after_both_fences() {
+        use std::sync::{
+            RwLock,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Capture {
+            owner: Arc<TaskInboundCapabilities>,
+            gate: Arc<RwLock<()>>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                assert!(self.gate.try_write().is_ok(), "delivery writer exited");
+                assert!(
+                    self.owner.state.try_lock().is_ok(),
+                    "capability lock exited"
+                );
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (descriptor, _) = descriptor(911, UniqueId::new(93, 94));
+        let owner = TaskInboundCapabilities::new();
+        owner.install(Arc::new(descriptor.clone())).unwrap();
+        let gate =
+            owner.state.lock().unwrap().delivery_gates[&descriptor.fragment_instance_id()].clone();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let original = Box::new(Capture {
+            owner: owner.clone(),
+            gate: gate.clone(),
+            drops: drops.clone(),
+        });
+        let identity = std::ptr::from_ref(original.as_ref());
+        let detached = owner.remove_with_capture(&descriptor, || {
+            assert!(
+                gate.try_write().is_err(),
+                "same writer fence orders the move"
+            );
+            assert_eq!(owner.len(), 0, "no process lock encloses the move");
+            original
+        });
+        assert_eq!(std::ptr::from_ref(detached.as_ref()), identity);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(owner.normal_close_retention(), (0, 0));
+        drop(detached);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -70,6 +70,7 @@ pub(super) struct DirectHold {
     pub query_index: usize,
     pub task_id: Option<u32>,
     pub token: String,
+    pub trigger_operation: Option<[u8; 16]>,
 }
 #[derive(Clone)]
 pub(super) struct DirectIntent {
@@ -91,21 +92,35 @@ impl DirectIntentOwner {
         binary: &Path,
         deadline: Instant,
     ) -> Result<ClusterTestSessionPlan> {
+        let targets = targets
+            .iter()
+            .map(|&(backend, query, task)| (action, backend, query, task))
+            .collect::<Vec<_>>();
+        self.freeze_actions(
+            query_count,
+            &targets,
+            shared_backend_token,
+            cluster_size,
+            binary,
+            deadline,
+        )
+    }
+    /// One declared role session can authorize distinct existing actions for
+    /// the same frozen query without inventing another query/process owner.
+    pub fn freeze_actions(
+        &self,
+        query_count: usize,
+        targets: &[(&str, usize, usize, Option<u32>)],
+        shared_backend_token: bool,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<ClusterTestSessionPlan> {
         let mut owner = self
             .0
             .lock()
             .map_err(|_| anyhow::anyhow!("Native intent owner poisoned"))?;
         ensure!(owner.is_none(), "Native direct intent already frozen");
-        ensure!(
-            matches!(
-                action,
-                "ingress-hold"
-                    | "registry-hold"
-                    | "preparation-hold"
-                    | "prepared-failure-exit-hold"
-            ),
-            "unsupported Native direct action"
-        );
         ensure!(
             !targets.is_empty() && targets.len() <= 64,
             "Native direct grant count outside finite bound"
@@ -125,9 +140,20 @@ impl DirectIntentOwner {
         let mut holds = vec![];
         let mut targets_seen = BTreeSet::new();
         let mut grants: BTreeMap<usize, Vec<DomainGrant>> = BTreeMap::new();
-        for (grant_index, &(index, query_index, task_id)) in targets.iter().enumerate() {
+        for (grant_index, &(action, index, query_index, task_id)) in targets.iter().enumerate() {
             ensure!(
-                targets_seen.insert((index, query_index, task_id)),
+                matches!(
+                    action,
+                    "ingress-hold"
+                        | "registry-hold"
+                        | "preparation-hold"
+                        | "prepared-failure-exit-hold"
+                        | "context-owner-panic-on-renew"
+                ),
+                "unsupported Native direct action"
+            );
+            ensure!(
+                targets_seen.insert((action, index, query_index, task_id)),
                 "duplicate Native direct exact target"
             );
             ensure!(
@@ -161,6 +187,11 @@ impl DirectIntentOwner {
             } else {
                 parameters["frontend_process_id"] = json!(query.frontend.to_string());
             }
+            let trigger_operation = (action == "context-owner-panic-on-renew")
+                .then(|| novarocks_execution_contract::TaskOperationId::new_v7().to_bytes());
+            if let Some(operation) = trigger_operation {
+                parameters["trigger_operation"] = json!(operation);
+            }
             grants.entry(index).or_default().push(DomainGrant {
                 domain: "native".into(),
                 grant_id: format!("direct-{grant_index}"),
@@ -171,6 +202,7 @@ impl DirectIntentOwner {
                 query_index,
                 task_id,
                 token,
+                trigger_operation,
             });
         }
         for index in 0..cluster_size {

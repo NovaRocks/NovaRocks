@@ -638,7 +638,10 @@ impl WorkScope {
 
 impl WorkloadControl {
     pub fn next_control(&self) -> Option<ControlPermit> {
-        self.inner.update(|state| {
+        let permit = {
+            let mut state = self.inner.state.lock().unwrap();
+            // An empty probe is observation, not a governance event. Decide
+            // under the same lock as the original pop to avoid a lost handoff.
             if state.control_inflight >= self.inner.config.control_inflight_limit {
                 return None;
             }
@@ -648,15 +651,22 @@ impl WorkloadControl {
             node.control_inflight = true;
             let intents = std::mem::replace(&mut node.control_pending, ControlIntents::empty());
             state.control_inflight += 1;
-            Some(ControlPermit {
+            let permit = ControlPermit {
                 scope: Some(WorkScope {
                     inner: Arc::clone(&self.inner),
                     id,
                 }),
                 intents,
                 acknowledged: false,
-            })
-        })
+            };
+            crate::admission::dispatch(&mut state, &self.inner.config);
+            fill_control(&mut state, &self.inner.config);
+            state.advance_progress_revision();
+            permit
+        };
+        crate::admission::drain_wakes(&self.inner);
+        self.inner.changed.notify_waiters();
+        Some(permit)
     }
 
     pub async fn wait_control_ready(&self) {

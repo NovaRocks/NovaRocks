@@ -40,6 +40,44 @@ struct GrpcExchangeFrameTransmitter {
 }
 
 impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
+    #[cfg(novarocks_dev_controls)]
+    fn normal_close_accepted(
+        &self,
+        notice: novarocks_execution::runtime::fragment::io::exchange::ExchangeNormalCloseAccepted,
+    ) {
+        let stream = notice.stream;
+        if notice.facts.receiver_closed.is_none()
+            || notice.sender_count == 0
+            || stream.source().sender_ordinal() >= notice.sender_count
+            || self.runtime.native_trust().local_process_identity()
+                != Some(novarocks_native_trust::NativeProcessIdentity::Backend(
+                    stream.source().task().backend_process_id(),
+                ))
+        {
+            return;
+        }
+        let Some(controls) = self.observations.as_deref() else {
+            return;
+        };
+        // The original sender has already accepted these facts. Observation
+        // authorization can suppress diagnostics, but cannot roll back that
+        // acceptance or turn it into a new protocol failure.
+        let Ok(Some(observer)) = controls.observation_for(
+            "exchange-snapshot",
+            stream.source().task().query_execution_id(),
+        ) else {
+            return;
+        };
+        observer.observe(&format!(
+            "NOVAROCKS_EXCHANGE_SNAPSHOT event=normal_close_validated destination_task={} attempt={} dest_finst={} node_id={} sender_finst={} sender_ordinal={} sender_count={} custody_through={} granted_through={} close={:?}",
+            stream.destination(), stream.destination().query_execution_id().attempt_id().get(),
+            stream.destination_fragment_instance_id(), stream.destination_node().get(),
+            stream.source().fragment_instance_id(), stream.source().sender_ordinal(),
+            notice.sender_count, notice.facts.custody_through, notice.facts.granted_through,
+            notice.facts.receiver_closed,
+        ));
+    }
+
     fn deliver_unit(
         &self,
         frame: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
@@ -53,8 +91,10 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         use novarocks_task_codec::exchange_unit_codec as codec;
         let stream = frame.receiver.stream;
         let sequence = frame.receiver.item.sequence();
+        // Keep the original pre-dispatch binding check: a conflicting
+        // observation scope still refuses this request before any I/O.
         #[cfg(novarocks_dev_controls)]
-        let observer = match self
+        let _observer = match self
             .observations
             .as_deref()
             .map(|controls| {
@@ -88,8 +128,6 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
             drop(activity);
             return;
         }
-        #[cfg(novarocks_dev_controls)]
-        let request_sender_count = frame.receiver.sender_count;
         let request = codec::encode_delivery_request(codec::DecodedExchangeUnitFrame {
             stream,
             sender_count: frame.receiver.sender_count,
@@ -120,6 +158,8 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
         let runtime = self.runtime.clone();
         let timeout = self.send_timeout;
         self.runtime.handle().spawn(async move {
+            #[cfg(novarocks_dev_controls)]
+            let _observation = _observer;
             // This guard follows the real local request future, including its
             // owned DTO/payload aliases. Unknown is only a result notification;
             // the caller cannot release this guard from that callback.
@@ -140,16 +180,6 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
                     FieldPath::root("exchange_unit_response"),
                 ) {
                     Ok(codec::DecodedExchangeDeliveryOutcome::Observed { verdict, facts }) => {
-                        #[cfg(novarocks_dev_controls)]
-                        if facts.receiver_closed.is_some() && let Some(observer) = &observer {
-                            observer.observe(&format!(
-                                "NOVAROCKS_EXCHANGE_SNAPSHOT event=normal_close_validated destination_task={} attempt={} dest_finst={} node_id={} sender_finst={} sender_ordinal={} sender_count={} seq={} close={:?}",
-                                stream.destination(), stream.destination().query_execution_id().attempt_id().get(),
-                                stream.destination_fragment_instance_id(), stream.destination_node().get(),
-                                stream.source().fragment_instance_id(), stream.source().sender_ordinal(),
-                                request_sender_count, sequence.get(), facts.receiver_closed,
-                            ));
-                        }
                         ExchangeCallOutcome::Observed(ExchangeUnitReceipt { verdict, facts })
                     }
                     Ok(codec::DecodedExchangeDeliveryOutcome::Refused(fact)) => {

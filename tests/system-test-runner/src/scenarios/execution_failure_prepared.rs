@@ -56,7 +56,13 @@ const SAFE_DETAIL: &str = "Unexpected failure (reason 13:20)";
 const HEALTHY_SQL: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 1) t ORDER BY v";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![Box::new(AcceptedPreparedFailureDelayedExit::default())]
+    vec![
+        Box::new(AcceptedPreparedFailureDelayedExit::default()),
+        Box::new(context_owner_panic::ContextOwnerPanicIsolation::default()),
+        Box::new(context_owner_panic::ContextOwnerPanicIsolation::with_prepared_holder()),
+        Box::new(context_owner_panic::RetainedContextOwnerPanicIsolation::default()),
+        Box::new(context_owner_panic::RetainedContextOwnerPanicIsolation::with_expiry()),
+    ]
 }
 #[derive(Default)]
 struct AcceptedPreparedFailureDelayedExit {
@@ -725,4 +731,1055 @@ fn write_artifact(context: &ScenarioContext, name: &str, value: &Value) -> Resul
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+// S8 is a separate owner oracle. The existing prepared-failure scenario above
+// remains unchanged: a typed host failure is not a Context actor panic.
+mod context_owner_panic {
+    use super::*;
+    use crate::scenarios::native_compatibility::{
+        RawUnaryResponse, only_successful_receipt, raw_operation_envelope, raw_unary_response,
+    };
+    use crate::scenarios::native_creation::{await_installed, outcome};
+
+    const OWNER_ACTION: &str = "context-owner-panic-on-renew";
+    const REMOVED: &str = "Worker Context execution custody retired";
+
+    fn owner_launch_config(root: &Path) -> Result<ScenarioLaunchConfig> {
+        let mut launch = ScenarioLaunchConfig::default();
+        // Preserve the original application writer, not a synthetic state
+        // source or a replacement cleanup command.
+        let log = root.join("owner-application-log");
+        launch.config_overlay.be = Some(format!(
+            "sys_log_dir = {:?}\nlog_filter = \"info,novarocks_native_adapter::backend_application=debug,novarocks_worker::control_runtime::node_bootstrap=debug,novarocks_worker::control_runtime::node=debug,novarocks_worker::control_runtime::task=debug,novarocks_worker::control_runtime::context_host::requests=debug,novarocks_worker::control_runtime::causal=debug,novarocks_worker::control_runtime::context_host::task_driver=debug,novarocks_worker::control_runtime::context_host::teardown=debug,novarocks_worker::control_runtime::context_host::failure=debug,novarocks_worker::control_runtime::process_control::rejected_ingress=debug\"\n",
+            log.to_string_lossy(),
+        ));
+        Ok(launch)
+    }
+
+    #[derive(Default)]
+    pub(super) struct ContextOwnerPanicIsolation {
+        intent: DirectIntentOwner,
+        held_prepared: bool,
+    }
+    impl ContextOwnerPanicIsolation {
+        pub(super) fn with_prepared_holder() -> Self {
+            Self {
+                intent: DirectIntentOwner::default(),
+                held_prepared: true,
+            }
+        }
+    }
+    impl Scenario for ContextOwnerPanicIsolation {
+        fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+            super::super::declarations::for_module(
+                "execution_failure_prepared",
+                self.name(),
+                self.is_explicit_stage(),
+                self.is_compatibility_stage(),
+            )
+        }
+        fn name(&self) -> &'static str {
+            if self.held_prepared {
+                "execution-failure/context-owner-panic-held-prepared-isolation"
+            } else {
+                "execution-failure/context-owner-panic-isolation"
+            }
+        }
+        fn is_explicit_stage(&self) -> bool {
+            true
+        }
+        fn test_session_plan(
+            &self,
+            _launch: &ScenarioLaunchConfig,
+            _root: &Path,
+            cluster_size: usize,
+            binary: &Path,
+            deadline: Instant,
+        ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>>
+        {
+            ensure!(
+                cluster_size == 3,
+                "Context isolation requires native 1FE+3BE"
+            );
+            if self.held_prepared {
+                return Ok(Some(self.intent.freeze_actions(
+                    3,
+                    &[(OWNER_ACTION, 0, 0, None), (ACTION, 0, 0, Some(1))],
+                    false,
+                    cluster_size,
+                    binary,
+                    deadline,
+                )?));
+            }
+            Ok(Some(self.intent.freeze(
+                OWNER_ACTION,
+                3,
+                &[(0, 0, None)],
+                false,
+                cluster_size,
+                binary,
+                deadline,
+            )?))
+        }
+        fn launch_config(&self, root: &Path) -> Result<ScenarioLaunchConfig> {
+            owner_launch_config(root)
+        }
+        fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+            ensure!(
+                context.handle().be_count() == 3,
+                "Context isolation requires native 1FE+3BE"
+            );
+            let intent = self.intent.get()?;
+            ensure!(
+                intent.deadline == context.deadline(),
+                "original isolation deadline changed"
+            );
+            let baseline = resource_snapshot(context)?;
+            let processes = context.recheck_live_process_launch_identities()?;
+            let a = &intent.queries[0];
+            let failed = RawBackendSession::establish_declared(context, 0, a.query_id, a.frontend)?;
+            intent.verify_backend(0, failed.backend)?;
+            let b = &intent.queries[1];
+            let sibling =
+                RawBackendSession::establish_declared(context, 0, b.query_id, b.frontend)?;
+            let mut receiver = RawCreate::values(&failed, 1);
+            receiver.pipeline_dop = 1;
+            receiver.exchange_input = true;
+            let mut prepared_gate = if self.held_prepared {
+                receiver.sink = RawSink::CountOnly;
+                let hold = intent
+                    .holds
+                    .iter()
+                    .find(|hold| hold.task_id == Some(1))
+                    .context("original prepared holder grant missing")?;
+                Some(PreparedExitGate::bind(&hold.token)?)
+            } else {
+                None
+            };
+            ensure_accepted(&failed, &receiver)?;
+            let held_bytes = if let Some(gate) = &mut prepared_gate {
+                let marker = gate.await_entered(context, &failed, &receiver)?;
+                let before = observe_prepared_status(context, &failed, &receiver, ExitPhase::Held)?;
+                nominal_failure(&before.status)?;
+                let charged = await_snapshot_at(context, 0, 1, 0, 0)?;
+                ensure!(
+                    charged.bytes > 0 && charged.context_positions == 1,
+                    "the original prepared holder lost its physical charges: {charged:?}"
+                );
+                await_retained_fragment(context, &baseline)?;
+                write_artifact(
+                    context,
+                    "owner-held-prepared-before-panic.json",
+                    &json!({
+                        "marker_sha256":format!("{:x}",Sha256::digest(marker.as_bytes())),
+                        "covered":before.json(),"preparation_bytes":charged.bytes,
+                        "scope":"real prepared kernel/charges remain live; does not prove an old Stop/DisposeSource ticket is pending"
+                    }),
+                )?;
+                context.action("the existing exact prepared-failure-exit gate retained the real original kernel, covered Failing with no actual-stop and nonzero preparation charges before the Context actor panic; no old cleanup-ticket phase is inferred");
+                Some(charged.bytes)
+            } else {
+                await_installed(context, &failed, &receiver)?;
+                context.action("installed an original live receiver on BE0 with the sole paid inbound row before the declared Context failure");
+                None
+            };
+
+            // A different operation on the SAME Context is not the grant.
+            let normal = renew(
+                &failed,
+                raw_operation_envelope(15_000),
+                1,
+                "unselected same-Context Renew",
+            )?;
+            ensure!(
+                outcome(&normal)? == proto::TaskOperationOutcome::Accepted,
+                "unselected Renew did not preserve its normal decision: {normal:?}"
+            );
+            let trigger = intent
+                .holds
+                .first()
+                .and_then(|hold| hold.trigger_operation)
+                .context("declared original trigger operation missing")?;
+            let mut envelope = raw_operation_envelope(15_000);
+            envelope.operation_id = Some(proto::TaskOperationId {
+                value: trigger.to_vec(),
+            });
+            let receipt = renew(
+                &failed,
+                envelope,
+                2,
+                "declared original Context owner panic",
+            )?;
+            ensure!(
+                outcome(&receipt)? == proto::TaskOperationOutcome::OwnerFailed,
+                "actual owner panic did not return the original R OwnerFailed: {receipt:?}"
+            );
+            ensure!(
+                context
+                    .handle()
+                    .be_log_count(0, "declared Context owner panic context=")?
+                    == 1,
+                "the original actor turn did not report exactly one declared panic"
+            );
+            context.action("unselected same-Context Renew remained normal; the exact declared operation panicked inside its original Context Actor turn and Common returned OwnerFailed through that same R");
+
+            let mut healthy = RawCreate::values(&sibling, 2);
+            healthy.pipeline_dop = 1;
+            ensure_accepted(&sibling, &healthy)?;
+            observe_task_terminal_and_stopped(
+                context,
+                &sibling,
+                &raw_create_identity(&healthy),
+                proto::TaskState::Finished,
+            )?;
+            let connection = mysql_actor::connect_until(
+                context.mysql_user(),
+                context.mysql_port(),
+                context.deadline(),
+            )?;
+            let rows: Vec<i64> = connection.run(|connection| {
+                connection
+                    .query(HEALTHY_SQL)
+                    .context("healthy public SQL after actual Context owner failure")
+            })?;
+            ensure!(
+                rows == [1, 1],
+                "healthy SQL rows changed after owner isolation: {rows:?}"
+            );
+            ensure!(
+                context.recheck_live_process_launch_identities()? == processes,
+                "owner failure replaced a role process instead of isolating its Context"
+            );
+            ensure!(
+                sibling.release_when_ready(context)? == proto::ReleaseQueryContextOutcome::Released,
+                "the independent same-BE Context did not really release"
+            );
+            context.action("an independent Context on the SAME BE Finished and actually stopped, public SQL returned exact rows, and its original Release completed without replacing a role");
+
+            if let Some(gate) = &mut prepared_gate {
+                // This is still the exact un-released physical holder. Do not
+                // mistake logical OwnerFailed or the missing Core for its exit.
+                let charged = await_snapshot_at(context, 0, 1, 0, 0)?;
+                ensure!(
+                    Some(charged.bytes) == held_bytes && charged.context_positions == 1,
+                    "owner failure or sibling progress prematurely refunded the prepared holder: {charged:?}"
+                );
+                await_retained_fragment(context, &baseline)?;
+                let owner_log = fs::read_to_string(
+                    context
+                        .scenario_root()
+                        .join("owner-application-log/novarocks.INFO"),
+                )?;
+                ensure!(
+                    !owner_log.lines().any(|line| line.contains(REMOVED)
+                        && line.contains(&format!("query_high={}", a.query_id.hi))
+                        && line.contains(&format!("query_low={} ", a.query_id.lo))
+                        && line.contains("attempt=1")),
+                    "original Scope disappeared before its prepared kernel holder exited"
+                );
+                context.action("after actual OwnerFailed the same prepared gate remained closed with its original charges and fragment, while the independent same-BE Task/SQL/Release completed; original failed Scope has not physically disappeared");
+                let token = intent
+                    .holds
+                    .iter()
+                    .find(|hold| hold.task_id == Some(1))
+                    .context("same original prepared holder grant missing")?
+                    .token
+                    .clone();
+                gate.release(context.deadline())?;
+                await_explicit_release(context, &failed, &receiver, &token)?;
+                context.action("the original scenario owner explicitly released the same prepared-holder rendezvous after OwnerFailed; real gate release is observed without signing physical exit or cleanup-ticket completion");
+            }
+
+            // This original transition is emitted only AFTER actual Scope
+            // removal. No missing directory row or terminal bool proves it.
+            let path = context
+                .scenario_root()
+                .join("owner-application-log/novarocks.INFO");
+            let high = format!("query_high={}", a.query_id.hi);
+            let low = format!("query_low={} ", a.query_id.lo);
+            loop {
+                let log = match fs::read_to_string(&path) {
+                    Ok(log) => log,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(error) => {
+                        return Err(error).context("read original Context removal writer output");
+                    }
+                };
+                if let Some(line) = log.lines().find(|line| {
+                    line.contains(REMOVED)
+                        && line.contains(&high)
+                        && line.contains(&low)
+                        && line.contains("attempt=1")
+                }) {
+                    write_artifact(
+                        context,
+                        "owner-scope-removed.json",
+                        &json!({"original_line":line}),
+                    )?;
+                    break;
+                }
+                thread::sleep(
+                    context
+                        .remaining("wait original failed Context Scope removal")?
+                        .min(Duration::from_millis(50)),
+                );
+            }
+            await_resource_convergence(context, &baseline)?;
+            let c = &intent.queries[2];
+            let recovered =
+                RawBackendSession::establish_declared(context, 0, c.query_id, c.frontend)?;
+            let mut replacement = RawCreate::values(&recovered, 3);
+            replacement.pipeline_dop = 1;
+            replacement.exchange_input = true;
+            ensure_accepted(&recovered, &replacement)?;
+            await_installed(context, &recovered, &replacement)?;
+            ensure!(
+                recovered.release_when_ready(context)?
+                    == proto::ReleaseQueryContextOutcome::Released,
+                "recovered receiver did not complete its real normal release"
+            );
+            await_resource_convergence(context, &baseline)?;
+            ensure!(
+                context.recheck_live_process_launch_identities()? == processes,
+                "role process changed before actual failure cleanup/recovered admission"
+            );
+            ensure!(
+                context
+                    .handle()
+                    .be_log_count(0, "declared Context owner panic context=")?
+                    == 1,
+                "the once-grant produced another actor panic"
+            );
+            write_artifact(
+                context,
+                "owner-isolation-oracle.json",
+                &json!({
+                    "owner_failed_original_R":true,"same_BE_healthy_actual_stop":true,
+                    "failed_scope_physically_removed":true,"fresh_receiver_accepted_and_installed":true,
+                    "healthy_rows":rows,"role_processes_unchanged":true,
+                    "prepared_holder_kept_through_owner_failure":self.held_prepared,
+                    "old_stop_or_source_ticket_pending":"NOT_PROVED; this scene covers the actual prepared holder only",
+                    "final_required_audit":"original FE+3BE monitor Finals all raw0; no lifetime expiry/owner loss; actual Node joins and cluster/fixture cleanup. Scenario return alone is insufficient."
+                }),
+            )?;
+            context.action("the original failed Context Scope physically disappeared, original physical resources converged, and a fresh receiver was Accepted, Installed, then normally Released; final four raw exits remain independently required");
+            Ok(())
+        }
+    }
+    #[derive(Default)]
+    pub(super) struct RetainedContextOwnerPanicIsolation {
+        intent: DirectIntentOwner,
+        with_expiry: bool,
+    }
+    impl RetainedContextOwnerPanicIsolation {
+        pub(super) fn with_expiry() -> Self {
+            Self {
+                intent: DirectIntentOwner::default(),
+                with_expiry: true,
+            }
+        }
+    }
+    impl Scenario for RetainedContextOwnerPanicIsolation {
+        fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
+            super::super::declarations::for_module(
+                "execution_failure_prepared",
+                self.name(),
+                self.is_explicit_stage(),
+                self.is_compatibility_stage(),
+            )
+        }
+        fn name(&self) -> &'static str {
+            if self.with_expiry {
+                "execution-failure/context-owner-panic-retained-expiry"
+            } else {
+                "execution-failure/context-owner-panic-retained-isolation"
+            }
+        }
+        fn is_explicit_stage(&self) -> bool {
+            true
+        }
+        fn test_session_plan(
+            &self,
+            _launch: &ScenarioLaunchConfig,
+            _root: &Path,
+            cluster_size: usize,
+            binary: &Path,
+            deadline: Instant,
+        ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>>
+        {
+            ensure!(
+                cluster_size == 3,
+                "retained Context isolation requires native 1FE+3BE"
+            );
+            Ok(Some(self.intent.freeze(
+                OWNER_ACTION,
+                2,
+                &[(0, 0, None)],
+                false,
+                cluster_size,
+                binary,
+                deadline,
+            )?))
+        }
+        fn launch_config(&self, root: &Path) -> Result<ScenarioLaunchConfig> {
+            owner_launch_config(root)
+        }
+        fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+            ensure!(
+                context.handle().be_count() == 3,
+                "retained Context isolation requires native 1FE+3BE"
+            );
+            let intent = self.intent.get()?;
+            ensure!(
+                intent.deadline == context.deadline(),
+                "original retained isolation deadline changed"
+            );
+            let baseline = resource_snapshot(context)?;
+            let processes = context.recheck_live_process_launch_identities()?;
+            let original = &intent.queries[0];
+            let retained = RawBackendSession::establish_declared(
+                context,
+                0,
+                original.query_id,
+                original.frontend,
+            )?;
+            intent.verify_backend(0, retained.backend)?;
+            let mut completed = RawCreate::values(&retained, 1);
+            completed.pipeline_dop = 1;
+            ensure_accepted(&retained, &completed)?;
+            observe_task_terminal_and_stopped(
+                context,
+                &retained,
+                &raw_create_identity(&completed),
+                proto::TaskState::Finished,
+            )?;
+            ensure!(
+                retained.release_when_ready(context)?
+                    == proto::ReleaseQueryContextOutcome::Released,
+                "the original completed Context did not normally release before its cold panic"
+            );
+            let retired_line = loop {
+                let lines = execution_retirement_lines(context, &retained)?;
+                ensure!(
+                    lines.len() <= 1,
+                    "the original Context retired execution custody more than once"
+                );
+                if let Some(line) = lines.into_iter().next() {
+                    break line;
+                }
+                thread::sleep(
+                    context
+                        .remaining("observe original released Context execution retirement")?
+                        .min(Duration::from_millis(50)),
+                );
+            };
+            await_resource_convergence(context, &baseline)?;
+            // The same original retained route must answer normally before
+            // the exact operation selects its failure grant.
+            let normal = renew(
+                &retained,
+                raw_operation_envelope(15_000),
+                1,
+                "unselected original retained Context Renew",
+            )?;
+            ensure!(
+                outcome(&normal)? == proto::TaskOperationOutcome::ContextTerminalReceipt,
+                "the normally released retained Context changed its terminal decision: {normal:?}"
+            );
+            ensure!(
+                context
+                    .handle()
+                    .be_log_count(0, "declared Context owner panic context=")?
+                    == 0,
+                "an unselected operation panicked the retained actor"
+            );
+            write_artifact(
+                context,
+                "retained-owner-before-panic.json",
+                &json!({
+                    "original_execution_scope_retirement_line":retired_line,
+                    "normal_task_finished_and_actual_stopped":true,
+                    "normal_release":"Released",
+                    "unselected_retained_renew":"ContextTerminalReceipt",
+                    "resources_returned_to_baseline":true
+                }),
+            )?;
+            context.action("the original Task normally Finished and actually stopped, its Context returned Released, the original application writer recorded execution-Scope retirement, resources converged, and the same retained route answered an unselected Renew with its terminal receipt");
+
+            let trigger = intent
+                .holds
+                .first()
+                .and_then(|hold| hold.trigger_operation)
+                .context("original retained actor trigger operation missing")?;
+            let mut envelope = raw_operation_envelope(15_000);
+            envelope.operation_id = Some(proto::TaskOperationId {
+                value: trigger.to_vec(),
+            });
+            let failed = renew(
+                &retained,
+                envelope,
+                2,
+                "declared original retained Context owner panic",
+            )?;
+            ensure!(
+                outcome(&failed)? == proto::TaskOperationOutcome::OwnerFailed,
+                "the original cold R did not receive OwnerFailed: {failed:?}"
+            );
+            ensure!(
+                context
+                    .handle()
+                    .be_log_count(0, "declared Context owner panic context=")?
+                    == 1,
+                "the retained actor did not report exactly one declared original panic"
+            );
+            let fresh = renew(
+                &retained,
+                raw_operation_envelope(15_000),
+                3,
+                "fresh control request after retained Context owner failure",
+            )?;
+            ensure!(
+                outcome(&fresh)? == proto::TaskOperationOutcome::OwnerFailed,
+                "fresh failed-Context control request lost its typed OwnerFailed verdict: {fresh:?}"
+            );
+            let rich_ingress = exercise_fresh_failed_rich_ingress(context, &retained, &completed)?;
+            let healthy = &intent.queries[1];
+            let sibling = RawBackendSession::establish_declared(
+                context,
+                0,
+                healthy.query_id,
+                healthy.frontend,
+            )?;
+            intent.verify_backend(0, sibling.backend)?;
+            ensure!(
+                sibling.backend == retained.backend,
+                "the recovery Context moved to another BE process"
+            );
+            let mut task = RawCreate::values(&sibling, 2);
+            task.pipeline_dop = 1;
+            ensure_accepted(&sibling, &task)?;
+            observe_task_terminal_and_stopped(
+                context,
+                &sibling,
+                &raw_create_identity(&task),
+                proto::TaskState::Finished,
+            )?;
+            ensure!(
+                sibling.release_when_ready(context)? == proto::ReleaseQueryContextOutcome::Released,
+                "the same-BE sibling Context did not normally release after the cold panic"
+            );
+            let connection = mysql_actor::connect_until(
+                context.mysql_user(),
+                context.mysql_port(),
+                context.deadline(),
+            )?;
+            let rows: Vec<i64> = connection.run(|connection| {
+                connection
+                    .query(HEALTHY_SQL)
+                    .context("healthy SQL after retained Context panic")
+            })?;
+            ensure!(
+                rows == [1, 1],
+                "healthy SQL changed after retained isolation: {rows:?}"
+            );
+            await_resource_convergence(context, &baseline)?;
+            // Unlike resource counters, this original barrier also waits for
+            // the actual failed-owner inventory to retire before shutdown.
+            // It does not replace the earlier exact execution-Scope event.
+            crate::scenarios::result_delivery_support::await_idle(
+                context,
+                "retained-owner-panic",
+                "after-cleanup",
+                Instant::now(),
+            )?;
+            let expiry = if self.with_expiry {
+                Some(await_retained_context_expiry(context)?)
+            } else {
+                None
+            };
+            ensure!(
+                context.recheck_live_process_launch_identities()? == processes,
+                "a role process changed instead of isolating the original retained actor"
+            );
+            let after = execution_retirement_lines(context, &retained)?;
+            ensure!(
+                after == [retired_line.clone()],
+                "cold cleanup published another original execution retirement: {after:?}"
+            );
+            ensure!(
+                context
+                    .handle()
+                    .be_log_count(0, "declared Context owner panic context=")?
+                    == 1,
+                "the consumed cold grant caused another actor panic"
+            );
+            context.action("the exact retained-Context Renew panicked its original actor and its original admitted R received OwnerFailed; another Context on that same BE and public SQL completed normally, resources converged, original role identities stayed fixed, and the original execution-retirement record remained unique");
+            // The short variant exercises process-close cleanup. The expiry
+            // variant first observes the real directory empty under the same
+            // process; neither changes H or invents a RetentionOrigin reading.
+            context
+                .shutdown()
+                .context("join the original native roles after retained actor failure")?;
+            write_artifact(
+                context,
+                "retained-owner-isolation-oracle.json",
+                &json!({
+                    "original_execution_scope_retirement_line":retired_line,
+                    "cold_original_R_owner_failed":true,
+                    "fresh_failed_context_renew_owner_failed":true,
+                    "fresh_failed_context_rich_ingress":rich_ingress,
+                    "failed_owner_inventory_converged_before_shutdown":true,
+                    "same_BE_sibling_finished_actual_stopped_and_released":true,
+                    "healthy_rows":rows,
+                    "resources_returned_to_baseline":true,
+                    "role_processes_unchanged_before_shutdown":true,
+                    "original_scope_retirement_record_count":after.len(),
+                    "explicit_original_cluster_shutdown_joined":true,
+                    "horizon_directory_expiry":expiry,
+                    "horizon_expiry_and_normal_close_forget":if self.with_expiry {
+                        "Observed backend0 available context_records reach zero before shutdown with no new work; exact original-origin non-restart and individual normal-close forget are not directly observed by this counter"
+                    } else {
+                        "NOT_PROVED: no exact original RetentionOrigin Native read surface; this scene exercises real process-close cleanup without waiting for H"
+                    },
+                    "independent_new_execution_scope_allocation_census":"NOT_PROVED: the original retirement record remained unique; this is not a scope-allocation counter",
+                    "independent_cleanup_Work_profile":"NOT_PROVED: actual process cleanup is exercised through the original production path, with no synthetic Work/exit receipts",
+                    "raw_long_running_role_exit_codes":"independent original process audit required; generic shutdown success does not prove every raw code is zero"
+                }),
+            )?;
+            if self.with_expiry {
+                context.action("backend0's available original directory census reached zero after real retention expiry with no new work; the same original roles and unique execution-retirement line were then rechecked before actual shutdown and joins; exact H origin and individual normal-close facts remain separate evidence");
+            } else {
+                context.action("the original FE and three BE owners were explicitly stopped and joined without waiting for retained H; exact original-origin expiry, normal-close forget and raw role codes remain separately scoped verification");
+            }
+            Ok(())
+        }
+    }
+
+    /// Exercise the three actual rich entrypoints after the original actor
+    /// failed. Wire legality is independent of a terminal Task's business gate.
+    fn exercise_fresh_failed_rich_ingress(
+        context: &mut ScenarioContext,
+        retained: &RawBackendSession,
+        completed: &RawCreate,
+    ) -> Result<Value> {
+        let establish = retained
+            .establish_request
+            .as_ref()
+            .context("retained session lost its original Establish")?;
+        let Some(proto::task_operation::Operation::UpdateQueryContext(update)) =
+            establish.operation.as_ref()
+        else {
+            bail!("original Establish is not a query-context update");
+        };
+        let Some(proto::update_query_context_request::Command::Establish(establish)) =
+            update.command.as_ref()
+        else {
+            bail!("original query-context update is not Establish");
+        };
+        let original_context = establish
+            .query_context
+            .as_ref()
+            .context("original Establish lost its exact Context")?;
+        ensure!(
+            original_context == &completed.context,
+            "completed Task disagrees with the original established Context"
+        );
+        let mut credential = establish
+            .initial_credential
+            .clone()
+            .context("original Establish lost its credential domain")?;
+        let previous_epoch = credential.epoch;
+        credential.epoch = previous_epoch
+            .checked_add(1)
+            .context("original credential epoch cannot advance")?;
+        let credential_shape = json!({
+            "lease_id":credential.lease_id,
+            "previous_epoch":previous_epoch,
+            "requested_epoch":credential.epoch,
+            "descriptor_count":credential.descriptors.len(),
+            "descriptor_source":"unchanged original Establish descriptors; material omitted"
+        });
+        let requests = [
+            ("create", RawCreate::values(retained, 3).operation()),
+            (
+                "task_domain",
+                proto::TaskOperation {
+                    envelope: Some(raw_operation_envelope(15_000)),
+                    operation: Some(proto::task_operation::Operation::UpdateTask(
+                        proto::UpdateTaskRequest {
+                            identity: Some(raw_create_identity(completed)),
+                            domains: vec![proto::TaskDomainUpdate {
+                                domain: Some(
+                                    proto::task_domain_update::Domain::OpenExchangeEdges(
+                                        proto::OpenExchangeEdgesDomain {
+                                            version: 1,
+                                            edge_ids: vec![7],
+                                        },
+                                    ),
+                                ),
+                            }],
+                        },
+                    )),
+                },
+            ),
+            (
+                "context_domain",
+                proto::TaskOperation {
+                    envelope: Some(raw_operation_envelope(15_000)),
+                    operation: Some(proto::task_operation::Operation::UpdateQueryContext(
+                        proto::UpdateQueryContextRequest {
+                            command: Some(
+                                proto::update_query_context_request::Command::AdvanceDomain(
+                                    proto::AdvanceQueryContextDomainRequest {
+                                        query_context: Some(original_context.clone()),
+                                        domain: Some(proto::QueryContextDomainUpdate {
+                                            domain: Some(
+                                                proto::query_context_domain_update::Domain::Credential(
+                                                    credential,
+                                                ),
+                                            ),
+                                        }),
+                                    },
+                                ),
+                            ),
+                        },
+                    )),
+                },
+            ),
+        ];
+        let neutral_context = novarocks_task_codec::identity::decode_query_context_ref(
+            original_context,
+            FieldPath::root("retained_failed_rich_context"),
+        )?;
+        let context_field = format!("context={neutral_context:?}");
+        let mut operation_ids = std::collections::BTreeSet::new();
+        let mut evidence = Vec::new();
+        for (kind, request) in requests {
+            let operation = request
+                .envelope
+                .as_ref()
+                .and_then(|envelope| envelope.operation_id.as_ref())
+                .context("fresh rich request lost its original operation")?;
+            let operation = novarocks_task_codec::identity::decode_task_operation_id(
+                operation,
+                FieldPath::root("retained_failed_rich_operation"),
+            )?
+            .to_string();
+            ensure!(
+                operation_ids.insert(operation.clone()),
+                "fresh rich requests reused an operation identity"
+            );
+            let artifact = format!("retained-owner-fresh-rich-{kind}.json");
+            let mut item = json!({
+                "kind":kind,"operation":operation,"context":format!("{neutral_context:?}"),
+                "phase":"original request prepared; response not yet observed",
+                "wire_legality":match kind {
+                    "create"=>"RawCreate::values frozen package for a fresh Task identity",
+                    "task_domain"=>"nonempty OpenExchangeEdges version 1 / edge 7; no claim that this terminal Task's frozen graph contains edge 7",
+                    _=>"exact original credential lease/descriptors with checked next epoch"
+                }
+            });
+            write_artifact(context, &artifact, &item)?;
+            let receipt = retained.apply(
+                request,
+                &format!("fresh {kind} after retained Context owner failure"),
+            )?;
+            ensure!(
+                outcome(&receipt)? == proto::TaskOperationOutcome::OwnerFailed,
+                "fresh failed-Context {kind} did not reach its typed OwnerFailed verdict: {receipt:?}"
+            );
+            item["phase"] = json!("OwnerFailed observed; original physical cleanup pending");
+            item["outcome"] = json!("OwnerFailed");
+            write_artifact(context, &artifact, &item)?;
+            let cleanup =
+                await_rejected_ingress_retirement(context, &context_field, &operation, kind)?;
+            item["phase"] = json!("same original cleanup disposed and retired");
+            item["cleanup"] = cleanup;
+            write_artifact(context, &artifact, &item)?;
+            evidence.push(item);
+        }
+        context.action("three fresh wire/codec-legal rich requests reached Worker after the retained Context failed and each returned OwnerFailed; each original operation recorded positive disposal and retirement of the same scoped cleanup Work, before the healthy same-BE sibling");
+        Ok(json!({
+            "requests":evidence,"credential_shape":credential_shape,
+            "native_handler_body_frame_and_marker_exit":"NOT_PROVED by cleanup log lines; independent original role/transport exit audit required",
+            "general_R_ingress_geometry":"NOT_PROVED; these fresh failed requests use the original Native-backed pre-R cleanup path"
+        }))
+    }
+
+    fn await_rejected_ingress_retirement(
+        context: &ScenarioContext,
+        context_field: &str,
+        operation: &str,
+        kind: &str,
+    ) -> Result<Value> {
+        const DISPOSED: &str = "Worker original rejected ingress disposed";
+        const RETIRED: &str = "Worker original rejected ingress retired";
+        let path = context
+            .scenario_root()
+            .join("owner-application-log/novarocks.INFO");
+        let operation_field = format!("operation={operation}");
+        let kind_field = format!("kind=\"{kind}\"");
+        let artifact = format!("retained-owner-fresh-rich-{kind}-cleanup.json");
+        let mut last_observation = None;
+        loop {
+            let log = match fs::read_to_string(&path) {
+                Ok(log) => log,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => {
+                    return Err(error).context("read original rich-ingress cleanup writer");
+                }
+            };
+            let matching = |marker: &str| {
+                log.lines()
+                    .filter(|line| {
+                        line.contains(marker)
+                            && line.contains(context_field)
+                            && line.contains(&operation_field)
+                            && line.contains(&kind_field)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let disposed = matching(DISPOSED);
+            let retired = matching(RETIRED);
+            let observation = json!({
+                "operation":operation,"kind":kind,"context_field":context_field,
+                "disposed_lines":disposed,"retired_lines":retired,
+                "scope":"Worker cleanup facts; Native handler/marker exit remains independent"
+            });
+            if last_observation.as_ref() != Some(&observation) {
+                write_artifact(context, &artifact, &observation)?;
+                last_observation = Some(observation);
+            }
+            ensure!(
+                disposed.len() <= 1 && retired.len() <= 1,
+                "original rich-ingress {kind} operation {operation} emitted duplicate disposal/retirement records"
+            );
+            if let (Some(disposed), Some(retired)) = (disposed.first(), retired.first()) {
+                let original_work = rejected_ingress_work_field(disposed)?;
+                ensure!(
+                    original_work == rejected_ingress_work_field(retired)?,
+                    "rich-ingress disposal and retirement changed their actual scoped Work"
+                );
+                return Ok(json!({
+                    "operation":operation,"kind":kind,"context_field":context_field,
+                    "scoped_work":original_work,"disposed_line":disposed,"retired_line":retired,
+                    "body_frame_and_native_marker_exit":"separate from these Worker cleanup facts"
+                }));
+            }
+            thread::sleep(
+                context
+                    .remaining("await same original rich-ingress disposal and retirement")?
+                    .min(Duration::from_millis(25)),
+            );
+        }
+    }
+
+    fn rejected_ingress_work_field(line: &str) -> Result<&str> {
+        let (_, field) = line
+            .split_once("work=")
+            .context("original cleanup log has no scoped Work field")?;
+        ensure!(
+            field.starts_with("ScopedWorkRef { scope: ScopeId("),
+            "original cleanup log did not record an actual ScopedWorkRef"
+        );
+        let end = field
+            .find('}')
+            .context("original cleanup scoped Work field is incomplete")?;
+        let work = &field[..=end];
+        ensure!(
+            work.contains(", work: WorkId("),
+            "original cleanup scoped Work has no actual WorkId"
+        );
+        Ok(work)
+    }
+
+    fn await_retained_context_expiry(context: &mut ScenarioContext) -> Result<Value> {
+        use crate::scenarios::result_delivery_support::metric;
+
+        let port = context
+            .handle()
+            .runtime()
+            .be
+            .first()
+            .context("retained expiry requires the original backend0")?
+            .http;
+        let url = format!("http://127.0.0.1:{port}/metrics?type=json");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .context("build original backend retention observer")?;
+        let epoch = Instant::now();
+        let mut previous_start = None;
+        let mut samples = Vec::new();
+        let mut saw_positive = false;
+        let outcome = (|| -> Result<()> {
+            loop {
+                let remaining =
+                    context.remaining("observe original backend retained directory expiry")?;
+                let started = Instant::now();
+                let since_previous =
+                    previous_start.map(|previous| started.duration_since(previous).as_micros());
+                previous_start = Some(started);
+                let sample_tag = format!("retained-owner-expiry-sample-{:03}", samples.len());
+                let response = client
+                    .get(&url)
+                    .timeout(remaining.min(Duration::from_secs(1)))
+                    .send()
+                    .context("read original backend retention metrics")?;
+                let status = response.status();
+                write_artifact(
+                    context,
+                    &format!("{sample_tag}-http.json"),
+                    &json!({
+                        "url":url,"status":status.as_u16(),
+                        "request_started_after_micros":started.duration_since(epoch).as_micros(),
+                        "since_previous_request_start_micros":since_previous
+                    }),
+                )?;
+                let body = response
+                    .bytes()
+                    .context("read original retention HTTP body")?;
+                fs::write(
+                    context.scenario_root().join(format!("{sample_tag}.body")),
+                    &body,
+                )
+                .context("preserve original retention HTTP body")?;
+                ensure!(
+                    status.is_success(),
+                    "retention observation returned HTTP {status}"
+                );
+                let rows: Value =
+                    serde_json::from_slice(&body).context("decode original retention metrics")?;
+                let rows = rows
+                    .as_array()
+                    .context("retention metrics are not an array")?;
+                let available = metric(
+                    rows,
+                    "novarocks_backend_execution_quiescence_snapshot_available",
+                    &[],
+                )?;
+                ensure!(
+                    available <= 1,
+                    "invalid original retention snapshot availability"
+                );
+                let records =
+                    if available == 1 {
+                        Some(metric(
+                            rows,
+                            "novarocks_backend_execution_quiescence",
+                            &[("resource", "context_records")],
+                        )?)
+                    } else {
+                        ensure!(
+                            !rows.iter().any(|row| row["tags"]["metric"]
+                                == "novarocks_backend_execution_quiescence"),
+                            "unavailable retention snapshot exposed stale inventory"
+                        );
+                        None
+                    };
+                samples.push(json!({
+                    "sample":sample_tag,"snapshot_available":available,
+                    "context_records":records,
+                    "request_started_after_micros":started.duration_since(epoch).as_micros(),
+                    "request_finished_after_micros":epoch.elapsed().as_micros(),
+                    "since_previous_request_start_micros":since_previous
+                }));
+                if let Some(records) = records {
+                    saw_positive |= records != 0;
+                    if records == 0 {
+                        ensure!(
+                            saw_positive,
+                            "expiry observer never sampled the original nonempty retained directory"
+                        );
+                        return Ok(());
+                    }
+                }
+                // Poll an actual condition under the unchanged scene deadline;
+                // no wall-clock sleep is used as a substitute for H expiry.
+                thread::sleep(
+                    context
+                        .remaining("wait next original retention census")?
+                        .min(Duration::from_millis(500)),
+                );
+            }
+        })();
+        let evidence = json!({
+            "backend_index":0,"url":url,"elapsed_micros":epoch.elapsed().as_micros(),
+            "poll_interval_millis":500,"original_scenario_deadline_unchanged":true,
+            "snapshot_family":"novarocks_backend_execution_quiescence",
+            "resource":"context_records","observed_nonempty_retained_directory":saw_positive,
+            "all_original_backend0_context_records_removed_before_shutdown":outcome.is_ok(),
+            "error":outcome.as_ref().err().map(|error| format!("{error:#}")),
+            "samples":samples,
+            "scope_exit":"independently witnessed earlier by the original execution-retirement event",
+            "origin_contract":"the same immutable RetentionOrigin and runtime first-deadline contract apply; this HTTP census does not directly expose retired_at or prove no restart",
+            "normal_close_forget":"not an independent per-stream normal-close observation"
+        });
+        write_artifact(
+            context,
+            "retained-owner-expiry-observations.json",
+            &evidence,
+        )?;
+        outcome?;
+        context.action("with all original work already converged and no new work issued, available backend0 context_records decreased from a positive actual directory inventory to zero before shutdown; every HTTP body, status and actual sampling interval was preserved");
+        Ok(evidence)
+    }
+
+    fn execution_retirement_lines(
+        context: &ScenarioContext,
+        session: &RawBackendSession,
+    ) -> Result<Vec<String>> {
+        let path = context
+            .scenario_root()
+            .join("owner-application-log/novarocks.INFO");
+        let log = match fs::read_to_string(&path) {
+            Ok(log) => log,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(error).context("read original retained Context retirement writer");
+            }
+        };
+        let high = format!("query_high={}", session.query_id.hi);
+        let low = format!("query_low={} ", session.query_id.lo);
+        Ok(log
+            .lines()
+            .filter(|line| {
+                line.contains(REMOVED)
+                    && line.contains(&high)
+                    && line.contains(&low)
+                    && line.contains("attempt=1")
+            })
+            .map(str::to_owned)
+            .collect())
+    }
+
+    fn renew(
+        session: &RawBackendSession,
+        envelope: proto::TaskOperationEnvelope,
+        sequence: u64,
+        subject: &str,
+    ) -> Result<proto::TaskOperationReceipt> {
+        let response: RawUnaryResponse<proto::ApplyTaskOperationsResponse> = raw_unary_response(
+            &session.control_connector,
+            "/novarocks.NovaRocksGrpc/ApplyTaskControlOperations",
+            &session.authorization,
+            proto::ApplyTaskControlOperationsRequest {
+                operations: vec![proto::TaskControlOperation {
+                    envelope: Some(envelope),
+                    control: Some(proto::task_control_operation::Control::RenewLease(
+                        proto::RenewQueryExecutionLeaseRequest {
+                            query_context: Some(session.context_under(session.frontend, 1)),
+                            lease: Some(proto::QueryExecutionLeaseGrant {
+                                sequence,
+                                valid_for_millis: 30_000,
+                            }),
+                        },
+                    )),
+                }],
+            },
+            session.original_deadline,
+        )?;
+        only_successful_receipt(response, subject)
+    }
 }

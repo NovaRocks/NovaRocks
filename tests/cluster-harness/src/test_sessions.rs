@@ -126,9 +126,14 @@ impl ClusterTestSessionPlan {
             "test session original deadline expired"
         );
         // macOS Unix sockets have a small path bound; do not use a possibly long worktree path.
-        let private_directory = tempfile::Builder::new()
-            .prefix("nr-g2-")
-            .tempdir_in("/tmp")?;
+        let mut private_directory_builder = tempfile::Builder::new();
+        private_directory_builder.prefix("nr-g2-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            private_directory_builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let private_directory = private_directory_builder.tempdir_in("/tmp")?;
         Ok(Self {
             private_directory: Some(private_directory),
             deadline,

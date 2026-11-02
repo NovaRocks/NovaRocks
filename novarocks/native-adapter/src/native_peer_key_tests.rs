@@ -266,7 +266,7 @@ fn channel_key_refuses_missing_or_foreign_peer_domains_and_frontend_methods() {
         .is_err()
     );
     for method in [
-        NativeRpcMethod::FetchTaskResult,
+        NativeRpcMethod::RetiredFetchTaskResult,
         NativeRpcMethod::ApplyTaskOperations,
         NativeRpcMethod::Heartbeat,
         NativeRpcMethod::RetiredFetchResult,

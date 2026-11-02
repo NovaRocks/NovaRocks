@@ -92,15 +92,6 @@ impl TaskConclusionPort<ExecutionFailure> for Port {
     fn accepted(&self) -> Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>> {
         self.task.accepted()
     }
-    fn on_settled(
-        &self,
-        continuation: novarocks_execution_contract::SettledContinuation<ExecutionFailure>,
-    ) {
-        novarocks_execution_contract::TaskConclusionPort::on_settled(
-            self.task.as_ref(),
-            continuation,
-        );
-    }
     fn submit(&self, proposal: TaskConclusionProposal<ExecutionFailure>) {
         self.task.submit(proposal)
     }

@@ -194,7 +194,9 @@ impl NovaRocksGrpc for ProbeService {
         &self,
         _request: tonic::Request<proto::FetchTaskResultRequest>,
     ) -> Result<tonic::Response<proto::FetchResultResponse>, tonic::Status> {
-        panic!("unexpected generated handler: fetch_task_result")
+        Err(tonic::Status::unimplemented(
+            "FetchTaskResult is retired; use FetchRootResult",
+        ))
     }
     async fn fetch_root_result(
         &self,

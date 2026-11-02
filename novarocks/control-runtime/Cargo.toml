@@ -1,0 +1,21 @@
+[package]
+name = "novarocks-control-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+novarocks-control-runtime-core.workspace = true
+
+[package.metadata.novarocks.test]
+runtime-inputs = []
+env-inputs = []
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"

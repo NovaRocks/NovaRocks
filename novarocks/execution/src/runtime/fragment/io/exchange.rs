@@ -2,11 +2,25 @@
 
 use crate::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution_contract::ExchangeStreamIdentity;
+use novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeStreamFacts;
+
+/// A read-only copy of receiver close facts accepted by the original sender's
+/// complete merge. This grants no delivery, capacity, custody or exit authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExchangeNormalCloseAccepted {
+    pub stream: ExchangeStreamIdentity,
+    pub sender_count: u32,
+    pub facts: ExchangeStreamFacts,
+}
 
 /// All implementations explicitly install the Unit/End, demand and observation
 /// contract. Data call activity remains with its actual request owner through
 /// exit, independently of receipt, timeout or cancellation observations.
 pub trait ExchangeFrameTransmitter: Send + Sync + 'static {
+    /// Observe only a successfully merged typed receiver close, regardless of
+    /// whether it arrived through delivery, demand or a grant subscription.
+    /// The caller has released the original sender's state lock.
+    fn normal_close_accepted(&self, _notice: ExchangeNormalCloseAccepted) {}
     fn deliver_unit(
         &self,
         frame: super::exchange_unit::ExchangeUnitFrame,

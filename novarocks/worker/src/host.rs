@@ -37,37 +37,170 @@ use crate::RuntimeFilterReleaseObservation;
 use crate::TaskStatusReporter;
 use crate::root_result_channel::RootResultChannel;
 
-/// Actual preparation work borrows its accepted owner. Only this work scope
-/// may hand a controller to the installed runtime; immutable metadata receives
-/// the separate weak view and cannot acquire a reporting capability from it.
-#[derive(Clone, Copy)]
-pub struct TaskPreparationContext<'a> {
-    owner: &'a Arc<crate::TaskStatusOwner>,
+/// The actual preparation capture moves this complete original role set.
+/// Binding refusal returns the same set; observers cannot recreate any role.
+pub struct TaskPreparationRoles {
+    pub fragments: novarocks_execution_contract::AdmittedFragmentRoles<
+        novarocks_execution::runtime::fragment::ExecutionFailure,
+    >,
+    pub start: crate::TaskStartPermit,
+    pub terminal: crate::TaskTerminalPermit,
+    pub statistics: crate::TaskStatisticsProducer,
+    pub dynamic_filters: crate::TaskDynamicFilterProducer,
+    pub final_statistics: crate::TaskStatisticsFinalizer,
+    pub completion_exit: crate::CompletionExitNotice,
+}
+impl TaskPreparationRoles {
+    pub(crate) fn matches(&self, identity: novarocks_execution_contract::TaskIdentity) -> bool {
+        self.fragments.identity() == Some(identity)
+            && self.start.identity() == identity
+            && self.terminal.identity() == identity
+            && self.statistics.identity() == identity
+            && self.dynamic_filters.identity() == identity
+            && self.final_statistics.identity() == identity
+            && self.completion_exit.identity() == identity
+    }
+}
+impl fmt::Debug for TaskPreparationRoles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskPreparationRoles")
+            .field("identity", &self.start.identity())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Immutable metadata observes one exact accepted Task without retaining its
+/// owner, reporter, runtime, input, or publication capability. A short loan
+/// upgrades the owner only while an operation is actually using it.
+#[derive(Clone)]
+pub struct TaskPreparationView {
+    owner: std::sync::Weak<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
+    identity: novarocks_execution_contract::TaskIdentity,
     cadence: std::time::Duration,
 }
-impl<'a> TaskPreparationContext<'a> {
-    pub(crate) fn new(
-        owner: &'a Arc<crate::TaskStatusOwner>,
+
+impl TaskPreparationView {
+    pub(crate) fn from_execution_port(
+        owner: &Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
         cadence: std::time::Duration,
     ) -> Self {
-        Self { owner, cadence }
+        Self {
+            owner: Arc::downgrade(owner),
+            identity: owner.identity(),
+            cadence,
+        }
     }
-    /// Registers only the original child's exit metadata, before any runtime
-    /// commit. Immutable TaskPreparationView deliberately has no such method.
+    pub const fn identity(&self) -> novarocks_execution_contract::TaskIdentity {
+        self.identity
+    }
+    pub fn borrow_control(&self) -> crate::PreparationControlLoan<'_> {
+        crate::PreparationControlLoan::from_view(self)
+    }
+
+    pub(crate) fn control(
+        &self,
+    ) -> (
+        Option<Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>>,
+        std::time::Duration,
+    ) {
+        (self.owner.upgrade(), self.cadence)
+    }
+}
+
+/// One actual preparation body owns one original, finite fragment role set.
+/// Metadata gets only a weak stop view. Moving this context into the Native
+/// host cannot copy the finisher or sign another settlement registration.
+pub struct TaskPreparationContext<'a> {
+    owner: Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
+    children: &'a Arc<crate::task_preparation::TaskPreparationScope>,
+    cadence: std::time::Duration,
+    readiness_waker: std::task::Waker,
+    roles: Option<TaskPreparationRoles>,
+}
+impl<'a> TaskPreparationContext<'a> {
+    pub(crate) fn from_admitted(
+        owner: Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
+        children: &'a Arc<crate::task_preparation::TaskPreparationScope>,
+        cadence: std::time::Duration,
+        roles: TaskPreparationRoles,
+        readiness_waker: std::task::Waker,
+    ) -> Result<
+        Self,
+        (
+            novarocks_execution::runtime::task_control::TaskControlIdentityMismatch,
+            TaskPreparationRoles,
+        ),
+    > {
+        if !roles.matches(owner.identity()) || children.identity() != owner.identity() {
+            return Err((
+                novarocks_execution::runtime::task_control::TaskControlIdentityMismatch,
+                roles,
+            ));
+        }
+        Ok(Self {
+            owner,
+            children,
+            cadence,
+            readiness_waker,
+            roles: Some(roles),
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn original_children_for_test(
+        &self,
+    ) -> &Arc<crate::task_preparation::TaskPreparationScope> {
+        self.children
+    }
+    /// The same original preparation readiness source, installed before Root
+    /// birth. Cloning its standard Waker grants no Task/output authority.
+    pub fn readiness_waker(&self) -> std::task::Waker {
+        self.readiness_waker.clone()
+    }
+    /// Registers before the provider child attaches kernel/root captures. The
+    /// original preparation owner continues to supervise rollback/adoption.
     pub fn register_child(
         &self,
         child: Arc<dyn crate::TaskPreparationChild>,
     ) -> Result<(), crate::TaskPreparationChildRegistrationFailure> {
-        self.owner.preparation_scope().register(child)
+        self.children.register(child)
     }
     pub fn view(&self) -> crate::TaskPreparationView {
-        crate::TaskPreparationView::from_owner(self.owner, self.cadence)
+        crate::TaskPreparationView::from_execution_port(&self.owner, self.cadence)
     }
     pub fn runtime_control(
         &self,
     ) -> Arc<novarocks_execution::runtime::task_control::TaskExecutionControl> {
-        self.owner
-            .execution_control(novarocks_execution_contract::TaskFailurePhase::Execution)
+        Arc::new(
+            novarocks_execution::runtime::task_control::TaskExecutionControl::new(
+                self.owner.identity(),
+                self.owner.clone(),
+                novarocks_execution_contract::TaskFailurePhase::Execution,
+            )
+            .expect("admitted preparation retains its exact Task port"),
+        )
+    }
+    /// Move the complete original capture once, before the Native builder
+    /// attaches any kernel or completion callback. An error returns no partial
+    /// set, and metadata views expose no role factory.
+    pub fn take_roles(&mut self) -> Result<TaskPreparationRoles, TaskPreparationRolesTaken> {
+        self.roles.take().ok_or(TaskPreparationRolesTaken)
+    }
+}
+#[derive(Debug)]
+pub struct TaskPreparationRolesTaken;
+impl fmt::Display for TaskPreparationRolesTaken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the original Task preparation roles were already transferred")
+    }
+}
+impl std::error::Error for TaskPreparationRolesTaken {}
+impl FailureProjection for TaskPreparationRolesTaken {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::failure_reason::WorkerFailureReason::CompletionWorkUnresolved.reason(),
+        )
     }
 }
 
@@ -140,93 +273,6 @@ impl<'a> PreparationControlLoan<'a> {
             .expect("checkpoint qualified the live Task");
         control.wait_until_stopped(self.cadence);
         self.checkpoint()
-    }
-}
-
-/// Direct host tests own an actual Task acceptance domain for their declared
-/// identity. The fixture must outlive all operations using its weak views.
-#[cfg(any(test, novarocks_dev_controls))]
-pub struct TestPreparationControl {
-    status: Arc<crate::TaskStatusOwner>,
-    view: crate::TaskPreparationView,
-}
-#[cfg(any(test, novarocks_dev_controls))]
-impl TestPreparationControl {
-    pub fn new(
-        identity: novarocks_execution_contract::TaskIdentity,
-        cadence: std::time::Duration,
-    ) -> Self {
-        assert!(
-            !cadence.is_zero(),
-            "test preparation cadence must be explicit and nonzero"
-        );
-        let status = Arc::new(crate::TaskStatusOwner::new(
-            identity,
-            Arc::new(crate::TaskStatusSource::new()),
-            Arc::new(crate::ManualClock::new()),
-            std::time::Duration::ZERO,
-            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
-        ));
-        Self::from_status(status, cadence)
-    }
-    pub fn from_status(status: Arc<crate::TaskStatusOwner>, cadence: std::time::Duration) -> Self {
-        let cell = crate::task_registry_entry::CreationCell::for_accepted_fixture(&status);
-        cell.accept(status.clone());
-        Self {
-            status,
-            view: cell.preparation_stop_view(cadence),
-        }
-    }
-    pub fn status(&self) -> &Arc<crate::TaskStatusOwner> {
-        &self.status
-    }
-    pub fn loan(&self) -> PreparationControlLoan<'_> {
-        self.view.borrow_control()
-    }
-    pub fn stop_view(&self) -> crate::TaskPreparationView {
-        self.view.clone()
-    }
-    pub fn scope(&self) -> TaskPreparationContext<'_> {
-        TaskPreparationContext::new(&self.status, self.view.control().1)
-    }
-    /// The direct host call has returned. Drive the original finite rollback
-    /// scope with the actual host cleanup calls, without accepting a new cause.
-    /// The fixture must first publish its real refusal or explicit stop intent.
-    pub fn rollback_host(&self, remove_inbound: impl FnOnce(), remove_receiver: impl FnOnce()) {
-        let scope = self.status.preparation_scope();
-        scope.request_rollback();
-        scope.cleanup(
-            crate::task_preparation::PreparationCleanup::Inbound,
-            remove_inbound,
-        );
-        scope.cleanup(
-            crate::task_preparation::PreparationCleanup::Receiver,
-            remove_receiver,
-        );
-        scope.body_exited();
-    }
-    /// Actual child/holder exit, rather than disappearance of a fixture alias.
-    pub fn rollback_exited(&self) -> bool {
-        self.status.preparation_scope().rollback_exited()
-    }
-    pub fn stop(&self, stop: crate::TestPreparationIntent) -> bool {
-        use novarocks_execution_contract::{
-            TaskConclusion, TaskConclusionPort, TaskConclusionProposal, TerminationDetail,
-        };
-        let (proposal, expected) = match stop {
-            crate::TestPreparationIntent::Cancel(reason) => (
-                TaskConclusionProposal::Canceled(reason),
-                TerminationDetail::Canceled(reason),
-            ),
-            crate::TestPreparationIntent::Abort(cause) => (
-                TaskConclusionProposal::Aborted(cause),
-                TerminationDetail::Aborted(cause),
-            ),
-        };
-        self.status.submit(proposal);
-        // This helper binds the synchronous Worker implementation.
-        self.status.accepted().unwrap().neutral().conclusion()
-            == &TaskConclusion::Terminated(expected)
     }
 }
 
@@ -375,7 +421,6 @@ fn installation_rejection(source: PreparedInstallationFailure) -> HostRejection 
 #[derive(Debug)]
 pub(crate) enum TestUpdateConsumptionFailure {
     UnsupportedHost,
-    LiveTaskRequired(novarocks_execution_contract::TaskIdentity),
 }
 #[cfg(novarocks_dev_controls)]
 impl fmt::Display for TestUpdateConsumptionFailure {
@@ -384,9 +429,6 @@ impl fmt::Display for TestUpdateConsumptionFailure {
             Self::UnsupportedHost => f.write_str(
                 "this execution host does not support a controlled split-consumption gate",
             ),
-            Self::LiveTaskRequired(identity) => {
-                write!(f, "replay gate requires actual live Task {identity}")
-            }
         }
     }
 }
@@ -401,7 +443,6 @@ impl novarocks_execution_contract::failure::FailureProjection for TestUpdateCons
             FailureClass::Invariant,
             match self {
                 Self::UnsupportedHost => R::TestUpdateConsumptionUnsupportedHost.reason(),
-                Self::LiveTaskRequired(_) => R::TestUpdateConsumptionLiveTaskRequired.reason(),
             },
         )
     }
@@ -410,7 +451,7 @@ impl novarocks_execution_contract::failure::FailureProjection for TestUpdateCons
 /// A port refusal retaining its actual local domain source. The legacy
 /// category/detail are this operation's response projection, never a Task
 /// conclusion and never an authority that can reclassify the domain facts.
-/// Only TaskStatusOwner accepts a Task failure, with explicit scope/phase.
+/// The pure Context core accepts Task proposals with explicit scope and phase.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostRejection {
     response_category: TaskFailureCategory,
@@ -524,16 +565,58 @@ impl novarocks_execution_contract::failure::FailureProjection for HostRejection 
     }
 }
 
-/// The opaque terminal evidence one query-context release sealed.
+/// Immutable codec facts with no host object or foreign destructor.
+/// The producing adapter owns the exact domain tag, canonical fingerprint and
+/// encoding. Retaining or dropping this value invokes no codec or host callback.
+#[derive(Clone)]
+pub struct FrozenCodecContent {
+    domain_tag: &'static [u8],
+    fingerprint: novarocks_execution_contract::ContentFingerprint,
+    bytes: Arc<[u8]>,
+}
+impl FrozenCodecContent {
+    pub fn new(
+        domain_tag: &'static [u8],
+        fingerprint: novarocks_execution_contract::ContentFingerprint,
+        bytes: Arc<[u8]>,
+    ) -> Self {
+        Self {
+            domain_tag,
+            fingerprint,
+            bytes,
+        }
+    }
+    pub const fn domain_tag(&self) -> &'static [u8] {
+        self.domain_tag
+    }
+    pub const fn fingerprint(&self) -> novarocks_execution_contract::ContentFingerprint {
+        self.fingerprint
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn encoded_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+impl fmt::Debug for FrozenCodecContent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FrozenCodecContent")
+            .field("fingerprint", &self.fingerprint)
+            .field("encoded_len", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// The frozen terminal evidence one query-context release sealed.
 ///
-/// The Worker owns the lifetime of this fact: a context keeps it after shared
-/// facts are released so the transport adapter can include it in the matching
-/// release acknowledgement.  It deliberately does not name the generated
-/// message.  Only the role-local adapter that produced the content may recover
-/// and encode that representation.
+/// Worker retains only plain immutable codec facts after the host has exited.
+/// The producing role-local adapter validates the exact domain and decodes the
+/// original bytes for the matching release acknowledgement.
 #[derive(Clone)]
 pub struct ReleasedContextEvidence {
-    runtime_filter: Option<Arc<dyn CodecOwnedContent>>,
+    runtime_filter: Option<FrozenCodecContent>,
     runtime_filter_observation: RuntimeFilterReleaseObservation,
 }
 
@@ -584,7 +667,7 @@ impl ReleasedContextEvidence {
     /// that would make the retained value and the lifecycle marker contradict
     /// one another.
     pub fn with_runtime_filter(
-        runtime_filter: Arc<dyn CodecOwnedContent>,
+        runtime_filter: FrozenCodecContent,
         runtime_filter_observation: RuntimeFilterReleaseObservation,
     ) -> Self {
         assert!(
@@ -600,7 +683,7 @@ impl ReleasedContextEvidence {
         }
     }
 
-    pub fn runtime_filter(&self) -> Option<&Arc<dyn CodecOwnedContent>> {
+    pub fn runtime_filter(&self) -> Option<&FrozenCodecContent> {
         self.runtime_filter.as_ref()
     }
 
@@ -633,6 +716,36 @@ pub trait QueryContextHost: Send + Sync {
     fn advance_shared_domain(
         &self,
         context: QueryContextRef,
+        domain: &novarocks_execution_contract::task_execution::operation::QueryContextDomainUpdate,
+    ) -> Result<(), HostRejection>;
+}
+
+/// Allocates one actual host instance inside an admitted materialization job.
+/// The caller publishes the returned capability to its Context owner before
+/// invoking materialization. Release and updates must use that same capability.
+/// Allocation does not establish the Context or publish a protocol result.
+/// The factory allocates metadata only; I/O belongs to `materialize`. An error
+/// must leave no new unpublished instance behind.
+pub trait QueryContextHostFactory: Send + Sync {
+    fn create_instance(
+        self: Arc<Self>,
+        context: QueryContextRef,
+    ) -> Result<Arc<dyn QueryContextHostInstance>, HostRejection>;
+}
+
+/// The host resources of one Context incarnation. No operation resolves a
+/// Context key again: a delayed job retains its original instance, never a
+/// later occupant of the directory. The owning scope must retain this
+/// capability until all admitted calls and their reports have actually exited.
+pub trait QueryContextHostInstance: Send + Sync {
+    fn context(&self) -> QueryContextRef;
+
+    fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection>;
+
+    fn release(&self) -> ReleasedContextEvidence;
+
+    fn advance_shared_domain(
+        &self,
         domain: &novarocks_execution_contract::task_execution::operation::QueryContextDomainUpdate,
     ) -> Result<(), HostRejection>;
 }
@@ -674,6 +787,14 @@ pub trait TestTaskUpdateConsumptionReservation: Send {
 /// transaction commits them, and `submit_runnable` is last. It prepares a
 /// dormant runnable; `commit_creation` starts executable work only after the
 /// registry has installed the Live record.
+/// The original Core's receiver retirement decision. Preserving normal close
+/// requires the receiver owner's checked facts; it is never a removal fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskIngressRetirement {
+    Remove,
+    PreserveNormalClose,
+}
+
 pub trait TaskExecutionHost: Send + Sync {
     /// Closes data-plane admission for every task of this exact query
     /// execution. The registry calls this while it linearizes context
@@ -692,8 +813,8 @@ pub trait TaskExecutionHost: Send + Sync {
     /// the context itself. No task capability for the execution may remain.
     fn forget_context_admission(&self, context: QueryContextRef);
 
-    /// Whether this context still owns a reserved normal-close answer that
-    /// must survive retained-context capacity pressure until its request horizon.
+    /// Whether this context retains exact normal-close facts until its
+    /// request horizon. This observation grants no resource capacity.
     fn retains_normal_close(&self, _context: QueryContextRef) -> bool {
         false
     }
@@ -716,24 +837,17 @@ pub trait TaskExecutionHost: Send + Sync {
 
     fn remove_receiver(&self, descriptor: &TaskDescriptor);
 
+    /// Retire the exact receiver only after its owner checks the frozen mode.
+    /// A refusal preserves original Worker cleanup custody and is not success.
+    fn retire_receiver_checked(
+        &self,
+        descriptor: &TaskDescriptor,
+        retirement: TaskIngressRetirement,
+    ) -> Result<(), HostRejection>;
+
     fn install_inbound_capability(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection>;
 
-    /// Reserve the bounded late-frame record before Create is Accepted.
-    fn reserve_inbound_close_capacity(
-        &self,
-        _descriptor: &TaskDescriptor,
-    ) -> Result<(), HostRejection> {
-        Ok(())
-    }
-
     fn remove_inbound_capability(&self, descriptor: &TaskDescriptor);
-
-    /// The production host serializes receiver removal with inbound delivery.
-    fn retire_receiver_normally(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
-        self.remove_inbound_capability(descriptor);
-        self.remove_receiver(descriptor);
-        Ok(())
-    }
 
     fn submit_runnable(
         &self,
@@ -804,75 +918,6 @@ mod tests {
         assert!(rejection.is_closed_queue());
         assert!(rejection.detail().as_str().len() < 8 * 1024);
     }
-
-    fn preparation_identity() -> novarocks_execution_contract::TaskIdentity {
-        use novarocks_types::identity::{
-            AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
-        };
-        novarocks_execution_contract::TaskIdentity::new(
-            QueryExecutionId::new(QueryId::new(812, 1), AttemptId::new(1).unwrap()).unwrap(),
-            StageId::new(1).unwrap(),
-            TaskId::new(1).unwrap(),
-            BackendProcessId::new_v7(),
-        )
-    }
-
-    #[test]
-    fn preparation_control_stop_before_wait_and_notification_race_never_lose_stop() {
-        for before in [false, true] {
-            for _ in 0..64 {
-                let owner = std::sync::Arc::new(TestPreparationControl::new(
-                    preparation_identity(),
-                    std::time::Duration::from_secs(30),
-                ));
-                let stop =
-                    crate::TestPreparationIntent::Cancel(CancelReason::UpstreamNoLongerNeeded);
-                if before {
-                    assert!(owner.stop(stop));
-                }
-                let (send, receive) = std::sync::mpsc::channel();
-                let other = Arc::clone(&owner);
-                let worker = std::thread::spawn(move || {
-                    send.send(other.loan().wait()).unwrap();
-                });
-                if !before {
-                    assert!(owner.stop(stop));
-                }
-                let observed = receive
-                    .recv_timeout(std::time::Duration::from_secs(1))
-                    .unwrap()
-                    .unwrap_err();
-                use novarocks_execution_contract::{
-                    TaskConclusion, TaskConclusionPort, TerminationDetail,
-                };
-                assert_eq!(
-                    owner.status().accepted().unwrap().neutral().conclusion(),
-                    &TaskConclusion::Terminated(TerminationDetail::Canceled(
-                        CancelReason::UpstreamNoLongerNeeded
-                    ))
-                );
-                assert_eq!(
-                    novarocks_execution_contract::failure::FailureProjection::failure_fact(
-                        &observed
-                    )
-                    .evidence(),
-                    novarocks_execution_contract::failure::FailureEvidence::StopObservation
-                );
-                worker.join().unwrap();
-                assert!(owner.loan().checkpoint().is_err());
-            }
-        }
-    }
-
-    #[test]
-    fn preparation_control_explicit_cadence_returns_retry_without_creating_stop() {
-        let owner = TestPreparationControl::new(
-            preparation_identity(),
-            std::time::Duration::from_millis(1),
-        );
-        assert!(owner.loan().wait().is_ok());
-        assert!(owner.loan().checkpoint().is_ok());
-    }
 }
 
 #[cfg(test)]
@@ -934,9 +979,8 @@ mod operation_failure_snapshot_tests {
         }
     }
     #[test]
-    fn frozen_operation_snapshot_and_cached_replay_never_reproject_the_original_source() {
+    fn frozen_operation_snapshot_never_reprojects_the_original_source() {
         use novarocks_execution::runtime::fragment::{ExecutionFailure, PipelineOperation};
-        use novarocks_execution_contract::operation::{DomainFailureOutcome, OperationResult};
         let nz = |n| std::num::NonZeroU16::new(n).unwrap();
         let first = FailureFact::new(
             FailureClass::Representation,
@@ -990,23 +1034,10 @@ mod operation_failure_snapshot_tests {
             assert_eq!(alias.operation_failure(), snapshot);
             assert_eq!(rejection.operation_failure(), snapshot);
             assert_eq!(rejection.failure_fact(), first);
-            let cached = crate::task_registry_entry::CreationFailure::domain(
-                DomainFailureOutcome::InvalidStateOrRequest,
-                snapshot.clone(),
-            );
-            for _ in 0..3 {
-                let receipt: crate::OperationReceipt<()> =
-                    cached.receipt(novarocks_execution_contract::TaskOperationId::new_v7());
-                let OperationResult::DomainFailure { failure, .. } = receipt.result() else {
-                    panic!("the actual cached domain branch must survive replay");
-                };
-                assert_eq!(failure, &snapshot);
-                assert!(receipt.acknowledgement().is_none());
-            }
             assert_eq!(
                 projections.load(Ordering::Acquire),
                 1,
-                "all snapshots and cached replay use the already frozen fact"
+                "all snapshots use the already frozen fact"
             );
             drop(alias);
             let carried = rejection.into_failure();

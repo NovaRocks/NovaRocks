@@ -517,6 +517,9 @@ struct MeasuredTransmitter {
     profiles: Arc<Mutex<Option<OperatorProfiles>>>,
 }
 impl ExchangeFrameTransmitter for MeasuredTransmitter {
+    fn normal_close_accepted(&self, notice: super::exchange::ExchangeNormalCloseAccepted) {
+        self.inner.normal_close_accepted(notice);
+    }
     fn deliver_unit(
         &self,
         frame: super::exchange_unit::ExchangeUnitFrame,

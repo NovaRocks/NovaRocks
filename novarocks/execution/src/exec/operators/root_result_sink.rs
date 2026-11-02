@@ -119,6 +119,10 @@ impl RootResultSinkFactory {
             .ok_or(RootReceiverFailure::MetadataExtent)?;
         let per_driver = std::mem::size_of::<RootResultSink>()
             + std::mem::size_of::<Option<(usize, RootInputPermit)>>()
+            // One transient producer snapshot per driver. Its neutral detail
+            // is bounded but owns a String allocation independently of Self.
+            + std::mem::size_of::<RootProducerState>()
+            + novarocks_execution_contract::status::SAFE_DETAIL_MAX_BYTES
             // Driver sink/finish callbacks and their Arc registrations,
             // driver sink/finish forwarding, live slots and notify snapshots.
             + 32 * std::mem::size_of::<usize>();
@@ -171,6 +175,7 @@ impl OperatorFactory for RootResultSinkFactory {
             activated: false,
             finishing: false,
             contributed: false,
+            finish_pending: false,
             cancelled: false,
             exiting: false,
             failure: None,
@@ -226,9 +231,16 @@ struct RootResultSink {
     activated: bool,
     finishing: bool,
     contributed: bool,
+    // Only the last driver owes this host call. A stopped publication window
+    // cannot repeat the shared decrement or discard the original finish intent.
+    finish_pending: bool,
     cancelled: bool,
     exiting: bool,
     valid_dop: bool,
+}
+enum RootObservation {
+    Ready(RootProducerState),
+    AwaitOwner(WaitFact),
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RootReceiverFailure {
@@ -400,17 +412,59 @@ impl RootResultSink {
         self.retiring_input = None;
         true
     }
-    fn check_state(&self) -> ExecutionResult<()> {
+    fn observe_producer(
+        &self,
+        control: &crate::runtime::runtime_state::RuntimeErrorState,
+        operation_stopped: bool,
+    ) -> ExecutionResult<RootObservation> {
         if !self.valid_dop {
             return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
                 RootReceiverFailure::InvalidDop,
             ));
         }
-        // The producer retains its original domain cause through actual exit.
-        if let RootProducerState::Failed(error) = self.session.producer_state() {
+        // Sample before observing the producer. Publication may notify between
+        // this read and the returned WaitFact; the driver's recheck covers it.
+        let observable = control.stop_observable();
+        let observed_generation = observable.generation();
+        let producer = self.session.producer_state();
+        if let Some(error) = control.error() {
             return Err(error);
         }
-        Ok(())
+        if operation_stopped
+            || matches!(
+                producer,
+                RootProducerState::Failed(_) | RootProducerState::AwaitTerminalControl
+            )
+        {
+            // Metadata never supplies an originating error. A concrete stop
+            // returned by a raced host call follows this same owner boundary.
+            Ok(RootObservation::AwaitOwner(WaitFact {
+                reason: WaitReason::Dependency,
+                observable,
+                observed_generation,
+                deadline: None,
+            }))
+        } else {
+            Ok(RootObservation::Ready(producer))
+        }
+    }
+    fn park_owner(&mut self, wait: WaitFact) -> StepResult {
+        self.next = NextStep::Wait(wait);
+        StepResult::new(None, self.next.clone(), 0)
+    }
+    fn host_failure(
+        &mut self,
+        ctx: &StepContext<'_>,
+        error: crate::runtime::fragment::ExecutionFailure,
+    ) -> ExecutionResult<StepResult> {
+        use novarocks_failure_contract::{FailureEvidence, FailureProjection};
+        if error.failure_fact().evidence() != FailureEvidence::StopObservation {
+            return Err(self.fail(ctx, error));
+        }
+        match self.observe_producer(ctx.failure_port(), true)? {
+            RootObservation::AwaitOwner(wait) => Ok(self.park_owner(wait)),
+            RootObservation::Ready(_) => unreachable!("a concrete stop cannot reopen data work"),
+        }
     }
     fn fail(
         &mut self,
@@ -420,7 +474,12 @@ impl RootResultSink {
         ctx.report_failure(error.clone());
         self.failure.get_or_insert(error).clone()
     }
-    fn finish_step(&mut self) -> ExecutionResult<StepResult> {
+    fn finish_step(&mut self, ctx: &StepContext<'_>) -> ExecutionResult<StepResult> {
+        if let RootObservation::AwaitOwner(wait) =
+            self.observe_producer(ctx.failure_port(), false)?
+        {
+            return Ok(self.park_owner(wait));
+        }
         let observable = self.session.writable_observable();
         let observed_generation = observable.generation();
         if !self.contributed {
@@ -435,22 +494,46 @@ impl RootResultSink {
                     )
                 })?;
             self.contributed = true;
-            if old == 1 {
-                self.session.finish_input()?;
-            }
+            self.finish_pending = old == 1;
         }
-        self.check_state()?;
-        self.next = if self.session.producer_state() == RootProducerState::ContextHeld {
-            NextStep::Finished
-        } else {
-            NextStep::Wait(WaitFact {
+        if self.finish_pending {
+            if let Err(error) = self.session.finish_input() {
+                return self.host_failure(ctx, error.into());
+            }
+            self.finish_pending = false;
+        }
+        self.next = match self.observe_producer(ctx.failure_port(), false)? {
+            RootObservation::AwaitOwner(wait) => NextStep::Wait(wait),
+            RootObservation::Ready(RootProducerState::ContextHeld) => NextStep::Finished,
+            RootObservation::Ready(_) => NextStep::Wait(WaitFact {
                 reason: WaitReason::Finish,
                 observable,
                 observed_generation,
                 deadline: None,
-            })
+            }),
         };
         Ok(StepResult::new(None, self.next.clone(), 0))
+    }
+    fn submit_pending(&mut self, ctx: &StepContext<'_>) -> ExecutionResult<StepResult> {
+        if let RootObservation::AwaitOwner(wait) =
+            self.observe_producer(ctx.failure_port(), false)?
+        {
+            return Ok(self.park_owner(wait));
+        }
+        let rows = u64::try_from(self.pending_input.as_ref().unwrap().chunk().len())
+            .expect("supported row count fits u64");
+        if let Err(error) = self.session.submit_input(&mut self.pending_input) {
+            return self.host_failure(ctx, error.into());
+        }
+        if self.pending_input.is_some() {
+            return Err(self.fail(ctx, RootReceiverFailure::InputSubmissionContract.into()));
+        }
+        self.next = if self.finishing {
+            NextStep::Runnable
+        } else {
+            NextStep::NeedInput
+        };
+        Ok(StepResult::new(None, self.next.clone(), rows))
     }
 }
 impl Drop for RootResultSink {
@@ -479,7 +562,14 @@ impl OperatorLifecycle for RootResultSink {
         if self.activated {
             return Ok(());
         }
-        self.check_state()?;
+        if let RootObservation::AwaitOwner(wait) = self.observe_producer(
+            self.runtime_error
+                .as_ref()
+                .expect("activation binds the actual runtime owner"),
+            false,
+        )? {
+            self.next = NextStep::Wait(wait);
+        }
         self.activated = true;
         Ok(())
     }
@@ -541,7 +631,11 @@ impl StepOperator for RootResultSink {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
-        self.check_state().map_err(|error| self.fail(ctx, error))?;
+        if let RootObservation::AwaitOwner(wait) =
+            self.observe_producer(ctx.failure_port(), false)?
+        {
+            self.next = NextStep::Wait(wait);
+        }
         Ok(ControlStep::Active)
     }
     fn reserve_upstream(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<UpstreamPull> {
@@ -553,8 +647,12 @@ impl StepOperator for RootResultSink {
                 RootReceiverFailure::NotActivated,
             ));
         }
-        ctx.checkpoint()?;
-        self.check_state().map_err(|error| self.fail(ctx, error))?;
+        if let RootObservation::AwaitOwner(wait) =
+            self.observe_producer(ctx.failure_port(), false)?
+        {
+            self.next = NextStep::Wait(wait.clone());
+            return Ok(UpstreamPull::Wait(wait));
+        }
         if self.finishing
             || self.cancelled
             || self.receiver.is_occupied()
@@ -573,7 +671,13 @@ impl StepOperator for RootResultSink {
                 observed_generation,
                 deadline: None,
             })),
-            Err(error) => Err(self.fail(ctx, error.into())),
+            Err(error) => match self.host_failure(ctx, error.into())? {
+                StepResult {
+                    next: NextStep::Wait(wait),
+                    ..
+                } => Ok(UpstreamPull::Wait(wait)),
+                _ => unreachable!("a concrete stop waits for its original owner"),
+            },
         }
     }
     fn try_push(&mut self, ctx: &mut StepContext<'_>, input: RawInput) -> InputResult {
@@ -588,8 +692,16 @@ impl StepOperator for RootResultSink {
                 ),
             };
         }
-        if let Err(failure) = self.check_state() {
-            return InputResult::Rejected { input, failure };
+        match self.observe_producer(ctx.failure_port(), false) {
+            Err(failure) => return InputResult::Rejected { input, failure },
+            Ok(RootObservation::AwaitOwner(wait)) => {
+                self.next = NextStep::Wait(wait.clone());
+                return InputResult::Deferred {
+                    input,
+                    next: AdmissionNext::Wait(wait),
+                };
+            }
+            Ok(RootObservation::Ready(_)) => {}
         }
         if self.finishing || self.cancelled || matches!(self.next, NextStep::Finished) {
             return InputResult::Rejected {
@@ -623,11 +735,17 @@ impl StepOperator for RootResultSink {
                 RootReceiverFailure::NotActivated,
             ));
         }
-        ctx.checkpoint()?;
+        if let RootObservation::AwaitOwner(wait) =
+            self.observe_producer(ctx.failure_port(), false)?
+        {
+            return Ok(self.park_owner(wait));
+        }
         if matches!(&self.next, NextStep::Wait(wait) if !wait.is_ready()) {
             return Ok(StepResult::new(None, self.next.clone(), 0));
         }
-        self.check_state().map_err(|error| self.fail(ctx, error))?;
+        if self.pending_input.is_some() {
+            return self.submit_pending(ctx);
+        }
         let target = RootInputTarget {
             task: self.session.spec().task,
         };
@@ -636,28 +754,13 @@ impl StepOperator for RootResultSink {
                 // Install original ownership before a stop check or any host
                 // code. Rejection/panic leaves this same continuation intact.
                 self.retain_prepared_input(input);
-                let rows = u64::try_from(self.pending_input.as_ref().unwrap().chunk().len())
-                    .expect("supported row count fits u64");
-                self.check_state().map_err(|error| self.fail(ctx, error))?;
-                self.session
-                    .submit_input(&mut self.pending_input)
-                    .map_err(|error| self.fail(ctx, error.into()))?;
-                if self.pending_input.is_some() {
-                    return Err(self.fail(ctx, RootReceiverFailure::InputSubmissionContract.into()));
-                }
-                self.next = NextStep::NeedInput;
-                if self.finishing {
-                    self.next = NextStep::Runnable;
-                }
-                Ok(StepResult::new(None, self.next.clone(), rows))
+                self.submit_pending(ctx)
             }
             Ok(ReceiverPreparation::Pending(next)) => {
                 self.next = next;
                 Ok(StepResult::new(None, self.next.clone(), 0))
             }
-            Ok(ReceiverPreparation::Empty) if self.finishing => {
-                self.finish_step().map_err(|error| self.fail(ctx, error))
-            }
+            Ok(ReceiverPreparation::Empty) if self.finishing => self.finish_step(ctx),
             Ok(ReceiverPreparation::Empty) => Ok(StepResult::new(None, self.next.clone(), 0)),
             Err(error) => Err(self.fail(ctx, error)),
         }
@@ -666,8 +769,13 @@ impl StepOperator for RootResultSink {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
-        ctx.checkpoint()?;
         self.finishing = true;
+        if let RootObservation::AwaitOwner(wait) =
+            self.observe_producer(ctx.failure_port(), false)?
+        {
+            self.next = NextStep::Wait(wait);
+            return Ok(());
+        }
         if matches!(self.next, NextStep::NeedInput) {
             self.next = NextStep::Runnable;
         }
@@ -682,7 +790,7 @@ mod tests {
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
     use crate::runtime::fragment::io::{
         FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, ResultWriteCredit,
-        RootInputAuthority, RootResultWriteSpec,
+        RootFailureObservation, RootInputAuthority, RootResultWriteSpec,
     };
     use arrow::array::Int32Array;
     use novarocks_execution_contract::TaskIdentity;
@@ -712,6 +820,7 @@ mod tests {
         panic_in_submit: AtomicBool,
         reject_before_take: Mutex<Option<FragmentIoError>>,
         error_after_take: Mutex<Option<FragmentIoError>>,
+        stop_race: AtomicUsize,
     }
     impl Session {
         fn new() -> Arc<Self> {
@@ -749,6 +858,7 @@ mod tests {
                 panic_in_submit: AtomicBool::new(false),
                 reject_before_take: Mutex::new(None),
                 error_after_take: Mutex::new(None),
+                stop_race: AtomicUsize::new(0),
             })
         }
         fn complete_input(&self) {
@@ -762,19 +872,39 @@ mod tests {
                 );
             }
         }
-        fn fail(&self) {
-            *self.state.lock().unwrap() = RootProducerState::Failed(
+        fn fail(&self, owner: &crate::runtime::runtime_state::RuntimeErrorState) {
+            let original: crate::runtime::fragment::ExecutionFailure =
                 novarocks_functions::KernelFailure::Internal(
                     novarocks_functions::KernelDiagnostic::new("root producer failed"),
                 )
-                .into(),
-            );
+                .into();
+            let observation = RootFailureObservation::from_failure(&original);
+            *self.state.lock().unwrap() = RootProducerState::Failed(observation);
+            owner.set_error(original);
             self.writable_observable().notify_observers();
+        }
+        fn stop_at(&self, point: usize) -> Result<(), FragmentIoError> {
+            if self
+                .stop_race
+                .compare_exchange(point, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                *self.state.lock().unwrap() = RootProducerState::AwaitTerminalControl;
+                return Err(FragmentIoError::from_domain(
+                    FragmentIoOperation::ResultWrite,
+                    FragmentIoErrorKind::Cancelled,
+                    RootRaceStop,
+                ));
+            }
+            Ok(())
         }
         fn actual_exit(&self) {
             self.complete_input();
             let mut state = self.state.lock().unwrap();
-            if !matches!(*state, RootProducerState::Failed(_)) {
+            if !matches!(
+                *state,
+                RootProducerState::Failed(_) | RootProducerState::AwaitTerminalControl
+            ) {
                 *state = RootProducerState::ContextHeld;
             }
             drop(state);
@@ -792,6 +922,7 @@ mod tests {
         }
         fn try_acquire_input(&self) -> Result<RootInputAdmission, FragmentIoError> {
             self.acquisitions.fetch_add(1, Ordering::AcqRel);
+            self.stop_at(1)?;
             let crate::runtime::fragment::io::RootInputReservationAdmission::Granted(
                 mut reservation,
             ) = self.authority.try_reserve()?
@@ -841,6 +972,7 @@ mod tests {
                     "foreign root input grant",
                 ));
             }
+            self.stop_at(2)?;
             if let Some(error) = self.reject_before_take.lock().unwrap().as_ref() {
                 return Err(error.clone());
             }
@@ -848,6 +980,7 @@ mod tests {
             assert!(input.is_none());
             *input = submitted.take();
             drop(input);
+            self.stop_at(3)?;
             // Like a host's metadata wake, this failure happens after transfer.
             if let Some(error) = self.error_after_take.lock().unwrap().as_ref() {
                 return Err(error.clone());
@@ -856,6 +989,7 @@ mod tests {
         }
         fn finish_input(&self) -> Result<(), FragmentIoError> {
             self.finishes.fetch_add(1, Ordering::SeqCst);
+            self.stop_at(4)?;
             *self.state.lock().unwrap() = RootProducerState::Finishing;
             Ok(())
         }
@@ -892,6 +1026,21 @@ mod tests {
         }
         fn abort(&self, _reason: ResultAbort) {
             self.authority.close();
+        }
+    }
+    #[derive(Debug)]
+    struct RootRaceStop;
+    impl std::fmt::Display for RootRaceStop {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("root host observed its closed producer")
+        }
+    }
+    impl std::error::Error for RootRaceStop {}
+    impl novarocks_failure_contract::FailureProjection for RootRaceStop {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            novarocks_failure_contract::FailureFact::stop_observation(
+                crate::runtime::fragment::ExecutionReason::TaskControlObservedStop.reason(),
+            )
         }
     }
     fn factory(session: &Arc<Session>, dop: i32) -> RootResultSinkFactory {
@@ -1184,8 +1333,11 @@ mod tests {
         let mut sink = factory.create(1, 0);
         let original = grant(&mut sink);
         submit(&mut sink, Chunk::default(), original).unwrap();
-        session.fail();
-        let error = with_context(|ctx| sink.as_mut().poll_control(ctx)).unwrap_err();
+        let error = with_context(|ctx| {
+            session.fail(ctx.failure_port());
+            sink.as_mut().poll_control(ctx)
+        })
+        .unwrap_err();
         assert!(error.detail().contains("root producer failed"));
         sink.cancel();
         assert!(pending_exit(&mut sink));
@@ -1196,6 +1348,262 @@ mod tests {
         session.actual_exit();
         assert!(!pending_exit(&mut sink));
         assert_eq!(session.held_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    fn delayed_root_fixture() -> (
+        Arc<Session>,
+        RootResultSinkFactory,
+        RuntimeState,
+        Arc<crate::runtime::task_control::test_support::DeferredOwner>,
+        Arc<crate::runtime::task_control::TaskExecutionControl>,
+    ) {
+        use novarocks_execution_contract::TaskFailurePhase;
+        let owner = crate::runtime::task_control::test_support::DeferredOwner::new();
+        let control = Arc::new(owner.view(TaskFailurePhase::Execution));
+        let state = RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::for_task(
+                control.clone(),
+            )),
+        );
+        let mut session = Session::new();
+        let original = Arc::get_mut(&mut session).unwrap();
+        original.spec.task = control.identity();
+        original.authority = RootInputAuthority::new(
+            &original.spec,
+            Arc::new(crate::runtime::execution_health::ExecutionHealth::new()),
+        );
+        let factory = factory(&session, 1);
+        (session, factory, state, owner, control)
+    }
+
+    fn owner_wait(next: NextStep, state: &RuntimeState) -> WaitFact {
+        let NextStep::Wait(wait) = next else {
+            panic!("the original owner's publication must remain pending");
+        };
+        assert_eq!(wait.reason, WaitReason::Dependency);
+        assert!(Arc::ptr_eq(
+            &wait.observable,
+            &state.error_state().stop_observable()
+        ));
+        assert!(wait.deadline.is_none());
+        assert!(!wait.is_ready());
+        wait
+    }
+
+    #[test]
+    fn every_root_entry_waits_for_the_real_task_failure_before_publication() {
+        #[derive(Clone, Copy, Debug)]
+        enum Entry {
+            Activate,
+            Control,
+            Reserve,
+            Push,
+            Drive,
+            Finish,
+            FinishStep,
+        }
+        for failed_metadata in [false, true] {
+            for entry in [
+                Entry::Activate,
+                Entry::Control,
+                Entry::Reserve,
+                Entry::Push,
+                Entry::Drive,
+                Entry::Finish,
+                Entry::FinishStep,
+            ] {
+                let (session, factory, state, owner, control) = delayed_root_fixture();
+                let mut sink = factory.create(1, 0);
+                sink.bind_runtime_state(&state).unwrap();
+                if !matches!(entry, Entry::Activate) {
+                    sink.activate(&state).unwrap();
+                }
+                let permit = matches!(entry, Entry::Push).then(|| {
+                    input_exit_context(&state, |ctx| match sink.reserve_upstream(ctx).unwrap() {
+                        UpstreamPull::Root(permit) => permit,
+                        _ => panic!("the original finite input position is available"),
+                    })
+                });
+                if matches!(entry, Entry::FinishStep) {
+                    input_exit_context(&state, |ctx| sink.finish(ctx)).unwrap();
+                }
+                let original: crate::runtime::fragment::ExecutionFailure =
+                    novarocks_functions::KernelFailure::ResourceExhausted.into();
+                *session.state.lock().unwrap() = if failed_metadata {
+                    RootProducerState::Failed(RootFailureObservation::from_failure(&original))
+                } else {
+                    RootProducerState::AwaitTerminalControl
+                };
+                let before_acquisitions = session.acquisitions.load(Ordering::SeqCst);
+                let mut retained = None;
+                let wait = match entry {
+                    Entry::Activate => {
+                        sink.activate(&state).unwrap();
+                        owner_wait(sink.initial_step(), &state)
+                    }
+                    Entry::Control => {
+                        assert_eq!(
+                            input_exit_context(&state, |ctx| sink.poll_control(ctx)).unwrap(),
+                            ControlStep::Active
+                        );
+                        owner_wait(sink.initial_step(), &state)
+                    }
+                    Entry::Reserve => {
+                        let UpstreamPull::Wait(wait) =
+                            input_exit_context(&state, |ctx| sink.reserve_upstream(ctx)).unwrap()
+                        else {
+                            panic!("failed metadata cannot acquire another Root permit");
+                        };
+                        owner_wait(NextStep::Wait(wait), &state)
+                    }
+                    Entry::Push => {
+                        let array: arrow::array::ArrayRef =
+                            Arc::new(Int32Array::from(vec![21, 34, 55]));
+                        let schema = Arc::new(
+                            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                                SlotId::new(1),
+                                arrow::datatypes::Field::new("original", DataType::Int32, false),
+                                None,
+                                None,
+                            )])
+                            .unwrap(),
+                        );
+                        let batch = arrow::record_batch::RecordBatch::try_new(
+                            schema.arrow_schema_ref(),
+                            vec![array.clone()],
+                        )
+                        .unwrap();
+                        let chunk = Chunk::new_with_chunk_schema(batch, schema);
+                        let input = RawInput::covered_for_test(chunk, permit.unwrap());
+                        let InputResult::Deferred {
+                            input,
+                            next: AdmissionNext::Wait(wait),
+                        } = input_exit_context(&state, |ctx| sink.try_push(ctx, input))
+                        else {
+                            panic!("the caller retains the exact covered input until publication");
+                        };
+                        assert_eq!(input.rows(), 3);
+                        assert!(Arc::ptr_eq(
+                            input.original_for_test().record_batch().column(0),
+                            &array
+                        ));
+                        assert!(session.held_bytes.load(Ordering::SeqCst) > 0);
+                        retained = Some(input);
+                        owner_wait(NextStep::Wait(wait), &state)
+                    }
+                    Entry::Drive | Entry::FinishStep => {
+                        let step = input_exit_context(&state, |ctx| sink.drive(ctx)).unwrap();
+                        assert!(step.output.is_none());
+                        assert_eq!(step.committed_rows, 0);
+                        owner_wait(step.next, &state)
+                    }
+                    Entry::Finish => {
+                        input_exit_context(&state, |ctx| sink.finish(ctx)).unwrap();
+                        owner_wait(sink.initial_step(), &state)
+                    }
+                };
+                assert_eq!(session.finishes.load(Ordering::SeqCst), 0, "{entry:?}");
+                assert_eq!(factory.remaining.load(Ordering::SeqCst), 1, "{entry:?}");
+                assert_eq!(
+                    session.acquisitions.load(Ordering::SeqCst),
+                    before_acquisitions,
+                    "{entry:?}"
+                );
+                assert_eq!(owner.pending_len(), 0, "metadata submitted no new cause");
+                assert!(state.error_state().error().is_none());
+                control.report_failure(original.clone());
+                assert_eq!(owner.pending_len(), 1);
+                assert!(!wait.is_ready(), "submission is not accepted publication");
+                owner.advance_all();
+                assert!(
+                    wait.is_ready(),
+                    "the actual owner wakes its original waiter"
+                );
+                let observed =
+                    input_exit_context(&state, |ctx| sink.poll_control(ctx)).unwrap_err();
+                assert!(observed.same_occurrence(&original));
+                assert_eq!(owner.pending_len(), 0);
+                assert_eq!(session.finishes.load(Ordering::SeqCst), 0);
+                drop(retained);
+                sink.cancel();
+                session.actual_exit();
+                assert!(!pending_exit(&mut sink));
+                assert_eq!(session.held_bytes.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn raced_root_stop_observations_cannot_overtake_the_original_task_cause() {
+        for point in [1, 2, 3, 4] {
+            let (session, factory, state, owner, control) = delayed_root_fixture();
+            let mut sink = factory.create(1, 0);
+            sink.bind_runtime_state(&state).unwrap();
+            sink.activate(&state).unwrap();
+            if matches!(point, 2 | 3) {
+                accept_exit_input(&mut sink, &state, Chunk::default());
+            }
+            if point == 4 {
+                input_exit_context(&state, |ctx| sink.finish(ctx)).unwrap();
+            }
+            session.stop_race.store(point, Ordering::SeqCst);
+            let next = if point == 1 {
+                match input_exit_context(&state, |ctx| sink.reserve_upstream(ctx)).unwrap() {
+                    UpstreamPull::Wait(wait) => NextStep::Wait(wait),
+                    _ => panic!("a raced stopped acquire waits for the actual owner"),
+                }
+            } else {
+                let step = input_exit_context(&state, |ctx| sink.drive(ctx)).unwrap();
+                assert!(step.output.is_none());
+                assert_eq!(step.committed_rows, 0);
+                step.next
+            };
+            let wait = owner_wait(next, &state);
+            assert_eq!(
+                owner.pending_len(),
+                0,
+                "no unowned stop proposal was submitted"
+            );
+            assert!(state.error_state().error().is_none());
+            assert_eq!(session.input.lock().unwrap().is_some(), point == 3);
+            if matches!(point, 2 | 3) {
+                assert!(session.held_bytes.load(Ordering::SeqCst) > 0);
+            }
+            for _ in 0..3 {
+                let step = input_exit_context(&state, |ctx| sink.drive(ctx)).unwrap();
+                assert_eq!(step.committed_rows, 0);
+                owner_wait(step.next, &state);
+            }
+            assert_eq!(
+                session.finishes.load(Ordering::SeqCst),
+                usize::from(point == 4)
+            );
+            assert_eq!(
+                factory.remaining.load(Ordering::SeqCst),
+                i32::from(point != 4),
+                "a raced finish contributes to the shared count only once"
+            );
+            let original: crate::runtime::fragment::ExecutionFailure =
+                novarocks_functions::KernelFailure::ResourceExhausted.into();
+            control.report_failure(original.clone());
+            assert_eq!(owner.pending_len(), 1);
+            owner.advance_all();
+            assert!(wait.is_ready());
+            let observed = input_exit_context(&state, |ctx| sink.drive(ctx)).unwrap_err();
+            assert!(observed.same_occurrence(&original));
+            assert_eq!(owner.pending_len(), 0);
+            sink.cancel();
+            session.actual_exit();
+            assert!(!pending_exit(&mut sink));
+            assert_eq!(session.held_bytes.load(Ordering::SeqCst), 0);
+        }
     }
     #[test]
     fn unresolved_job_keeps_its_finish_obligation_and_original_input() {
@@ -1306,7 +1714,7 @@ mod tests {
         }
     }
     impl crate::exec::pipeline::shape::SourceKernel for Source {
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
             assert!(!self.produced, "last pull is delivered only once");
             assert_eq!(
                 self.session.held_bytes.load(Ordering::SeqCst),
@@ -1333,7 +1741,7 @@ mod tests {
                 )
                 .unwrap();
                 let chunk = Chunk::new_with_chunk_schema(batch, schema);
-                self.session.fail();
+                self.session.fail(ctx.failure_port());
                 Some(chunk)
             } else {
                 (!self.empty).then(Chunk::default)
@@ -1440,6 +1848,7 @@ mod tests {
     fn late_producer_failure_cannot_turn_pending_success_into_finished() {
         let session = Session::new();
         let factory = factory(&session, 1);
+        let runtime = Arc::new(RuntimeState::default());
         let mut driver = PipelineDriver::new(
             1,
             vec![
@@ -1454,14 +1863,14 @@ mod tests {
             ],
             None,
             Vec::new(),
-            Arc::new(RuntimeState::default()),
+            runtime.clone(),
             None,
         );
         assert_eq!(
             driver.process(Duration::from_millis(100)),
             DriverState::Blocked(crate::exec::pipeline::operator::BlockedReason::OutputFull)
         );
-        session.fail();
+        session.fail(runtime.error_state().as_ref());
         assert_eq!(
             driver.process(Duration::from_millis(100)),
             DriverState::PendingFinish
@@ -1970,17 +2379,6 @@ mod tests {
             >,
         > {
             novarocks_execution_contract::TaskConclusionPort::accepted(self.owner.as_ref())
-        }
-        fn on_settled(
-            &self,
-            continuation: novarocks_execution_contract::SettledContinuation<
-                crate::runtime::fragment::ExecutionFailure,
-            >,
-        ) {
-            novarocks_execution_contract::TaskConclusionPort::on_settled(
-                self.owner.as_ref(),
-                continuation,
-            );
         }
         fn submit(
             &self,

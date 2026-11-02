@@ -56,7 +56,7 @@ pub enum NativeBodyKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum NativeRpcMethod {
-    FetchTaskResult,
+    RetiredFetchTaskResult,
     FetchRootResult,
     ApplyTaskOperations,
     ApplyTaskControlOperations,
@@ -98,9 +98,9 @@ use FrontendNativeLane::{LifecycleControl, Observation, ResultData, Submission};
 use NativeTrafficClass::Frontend;
 pub const NATIVE_METHODS: [NativeMethodContract; 16] = [
     contract!(
-        FetchTaskResult,
+        RetiredFetchTaskResult,
         "FetchTaskResult",
-        Frontend(ResultData),
+        NativeTrafficClass::Retired,
         BackendData,
         FrontendToBackend,
         Unary
@@ -301,7 +301,8 @@ mod tests {
         assert!(NativeRpcMethod::Heartbeat.is_allowed_at(NativeEndpointDomain::BackendControl));
         assert!(!NativeRpcMethod::Heartbeat.is_allowed_at(NativeEndpointDomain::BackendData));
         assert!(
-            !NativeRpcMethod::FetchTaskResult.is_allowed_at(NativeEndpointDomain::BackendControl)
+            !NativeRpcMethod::RetiredFetchTaskResult
+                .is_allowed_at(NativeEndpointDomain::BackendControl)
         );
         assert!(NativeRpcMethod::FetchRootResult.is_allowed_at(NativeEndpointDomain::BackendData));
         assert!(
@@ -310,6 +311,15 @@ mod tests {
         assert_eq!(
             NativeRpcMethod::FetchRootResult.contract().traffic,
             NativeTrafficClass::Frontend(FrontendNativeLane::ResultData)
+        );
+        assert!(!NativeRpcMethod::RetiredExchange.is_allowed_at(NativeEndpointDomain::BackendData));
+        assert!(
+            !NativeRpcMethod::RetiredFetchTaskResult
+                .is_allowed_at(NativeEndpointDomain::BackendData)
+        );
+        assert_eq!(
+            NativeRpcMethod::RetiredFetchTaskResult.contract().traffic,
+            NativeTrafficClass::Retired
         );
         assert_eq!(
             NativeRpcMethod::from_path("/novarocks.NovaRocksGrpc/ExchangeUnary"),

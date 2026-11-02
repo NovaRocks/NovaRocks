@@ -12686,6 +12686,8 @@ pub(crate) fn manifest_original_gated_round_fixture(
     (round, owner, acks, status, clock)
 }
 
+mod owner_failed_actor_abort;
+
 /// Same admitted context, original released Create, and real Worker refusal.
 /// The trace lets Manifest tests present the original Establish to QA as well.
 pub(crate) fn pre_ready_original_create_refusal() -> (

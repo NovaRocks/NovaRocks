@@ -47,8 +47,6 @@ task_preparation_max_tasks_per_context = 4096
 task_preparation_max_tasks = 32768
 task_preparation_max_bytes = 268435456
 task_preparation_max_workers = 4
-task_normal_close_max_records = 32768
-task_normal_close_max_bytes = 67108864
 
 # Native task ingress limits are per BE listener. The response cap stays large
 # because a Release acknowledgement may include runtime-filter/statistics data.
