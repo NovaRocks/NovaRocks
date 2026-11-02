@@ -55,7 +55,7 @@ use crate::physical_value_origin_v2::ValueOriginProjectionLimits;
 use crate::physical_value_v2::ValueProjectionLimits;
 use crate::physical_writer_recipe_v2::WriterRecipeProjectionLimits;
 use crate::physical_writer_schema_v2::WriterSchemaProjectionLimits;
-use crate::resource_preflight_v2::DecodeProjectionLimits;
+use crate::resource_preflight_v2::{DecodeProjectionLimits, PROST_RECURSION_LIMIT};
 use novarocks_arrow_ipc_frame::VerifierOptions;
 use novarocks_functions::ConstantPolicy;
 use novarocks_physical_plan as p;
@@ -72,7 +72,7 @@ impl PackageEncodeLimits {
 }
 
 impl PackageDecodeLimits {
-    /// Production structure ceilings, including pre-Prost wire admission.
+    /// Production codec profile, including pre-Prost resource projection.
     pub const FROZEN: Self = frozen_decode_limits();
 }
 
@@ -389,22 +389,25 @@ const fn frozen_encode_limits() -> PackageEncodeLimits {
     }
 }
 
-/// Frozen receiver limits for one whole package: the sender's component
-/// limits where one limit type serves both directions, the receiver's own
-/// wire, constant-record and verifier admission, and the shared package
-/// admission. These are structural refusal bounds, not runtime quotas.
+/// Shared component limits, constant-record/verifier admission, and resource
+/// projection for one package. The wire projection adds no independent byte,
+/// occurrence, heap, copy or initialization quota. Native carrier admission and
+/// the winning query's existing resource owner retain those responsibilities.
 const fn frozen_decode_limits() -> PackageDecodeLimits {
     let encode = frozen_encode_limits();
     PackageDecodeLimits {
         wire: DecodeProjectionLimits {
-            max_input_bytes: 64 * MIB,
-            max_requested_heap_bytes: 512 * MIB,
-            max_message_occurrences: 1_000_000,
-            max_scalar_elements: 1_000_000,
-            max_field_occurrences: 1_000_000,
-            max_copied_bytes: 512 * MIB,
-            max_initialization_bytes: 512 * MIB,
-            max_wire_depth: 100,
+            // These former candidate sizing values had no production basis.
+            // Keep checked resource accounting, but leave capacity decisions
+            // to the caller instead of refusing an arbitrary structural count.
+            max_input_bytes: usize::MAX,
+            max_requested_heap_bytes: usize::MAX,
+            max_message_occurrences: usize::MAX,
+            max_scalar_elements: usize::MAX,
+            max_field_occurrences: usize::MAX,
+            max_copied_bytes: usize::MAX,
+            max_initialization_bytes: usize::MAX,
+            max_wire_depth: PROST_RECURSION_LIMIT,
         },
         types: encode.types,
         node: encode.node,
@@ -473,6 +476,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn production_wire_projection_counts_legal_occurrences_without_a_second_quota() {
+        use crate::resource_preflight_v2::{
+            FragmentDecodeResourceModel, ResourceCursorStatus, ResourceModelError,
+        };
+        use novarocks_proto_models::physical_package_v2::FragmentPackage;
+        use prost::Message;
+        use prost::encoding::{WireType, encode_key, encode_varint};
+
+        // Lawful unknown varints fit the existing native carrier. Their
+        // number is accounted for, but is not a separate allocation quota.
+        // Required package semantics remain the regular receiver's concern.
+        const OCCURRENCES: usize = 1_000_001;
+        let mut field = Vec::new();
+        encode_key(100_000, WireType::Varint, &mut field);
+        encode_varint(0, &mut field);
+        let raw = field.repeat(OCCURRENCES);
+        let model = FragmentDecodeResourceModel::try_new(&Control).unwrap();
+        let limits = PackageDecodeLimits::FROZEN.wire;
+        let projection = model.preflight(&raw, limits, &Control).unwrap();
+        assert_eq!(projection.status, ResourceCursorStatus::Complete);
+        assert_eq!(projection.usage.field_occurrences, OCCURRENCES);
+        assert_eq!(projection.usage.input_bytes, raw.len());
+        FragmentPackage::decode(raw.as_slice()).expect("the pinned decoder accepts lawful fields");
+
+        // Explicit caller policies are still enforced. Only the unexplained
+        // production default quota was removed, not the caller's authority.
+        assert!(matches!(
+            model.preflight(
+                &raw,
+                DecodeProjectionLimits {
+                    max_field_occurrences: OCCURRENCES - 1,
+                    ..limits
+                },
+                &Control,
+            ),
+            Err(ResourceModelError::Limit(
+                "protobuf field occurrences exceed caller limit"
+            ))
+        ));
+    }
+
     /// The frontend author and the backend receiver share one admission,
     /// whose source floor is exactly the sender's invoiced source and whose
     /// property projection fits the shared coexistence envelope. Namespace
@@ -502,7 +547,9 @@ mod tests {
             encode.source_retained_bytes + encode.types.max_allocation_request_bytes
                 <= encode.types.max_coexisting_source_and_request_bytes
         );
-        assert!(decode.wire.max_input_bytes <= encode.max_wire_bytes);
+        // The decoder must not reject the sender's legitimate wire size.
+        // A receiver-only sizing quota is not part of that compatibility.
+        assert!(encode.max_wire_bytes <= decode.wire.max_input_bytes);
         assert_eq!(decode.constant_policy, FROZEN_CONSTANT_POLICY);
         assert_eq!(
             decode

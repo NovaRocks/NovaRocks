@@ -7,7 +7,7 @@ novarocks-fs --test <target> -- --test-threads=1`.
 | --- | --- |
 | `access_conformance` | Bound file identity, access domains, authorized ranges, and error redaction. |
 | `lifecycle_conformance` | Cancellation, deadlines, close, and prevention of I/O after termination. |
-| `reader_conformance` | Parquet projection, row group/page selection, absolute positions, budgets, and existing cache behavior; also ORC projection. |
+| `reader_conformance` | Parquet projection, row group/page selection, absolute positions, budgets, and existing cache behavior; typed ORC refusal with its recovery condition. |
 | `parquet_probe_conformance` | Object-store Parquet read and metadata probe. |
 | `writer_corpus_conformance` (UEA-4A-2 I00) | Frozen Spark/parquet-mr, PyArrow, Trino, and Flink files read through the current production FS reader with row-value and absolute-position oracles. |
 | `parquet_session_conformance` (UEA-4A-2 I02) | One identity-bound footer across runs, incremental index capability, projected column/page planning without a decoder, small-file one-read reuse, and absolute positions. |

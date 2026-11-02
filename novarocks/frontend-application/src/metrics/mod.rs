@@ -363,6 +363,15 @@ impl FrontendMetricsRegistry {
         }))
     }
 
+    pub(crate) fn install_trino(
+        &self,
+        observation: &novarocks_trino_adapter::TrinoProtocolObservation,
+    ) -> Result<(), String> {
+        observation
+            .register(&self.registry)
+            .map_err(|error| error.to_string())
+    }
+
     fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
         // Sampling and collection happen in one scrape order.
         let _scrape = self.process_memory.as_ref().map(|(lock, gauges)| {

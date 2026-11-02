@@ -849,12 +849,6 @@ pub trait TaskExecutionHost: Send + Sync {
 
     fn remove_inbound_capability(&self, descriptor: &TaskDescriptor);
 
-    /// The production host serializes receiver removal with inbound delivery.
-    fn retire_receiver_normally(&self, descriptor: &TaskDescriptor) {
-        self.remove_inbound_capability(descriptor);
-        self.remove_receiver(descriptor);
-    }
-
     fn submit_runnable(
         &self,
         descriptor: &TaskDescriptor,

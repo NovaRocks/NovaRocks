@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Writer task-terminal proof and accepted final-info validation.
+//! Writer and logical-summary source terminals and accepted final-info validation.
 //!
-//! The result owner proves local End consumption and asks TaskRound for its
-//! accepted-root success seal. This module owns only the independent writer
-//! terminal half; prepared write facts and external publication stay with their
-//! original domain authors. Protocol terminals never prove physical exit.
+//! The registered result consumer proves complete local End consumption.
+//! This module owns only the independent Task-terminal half for writers and
+//! logical-summary sources; prepared facts and external publication stay with
+//! their original domain authors. Protocol terminals never prove physical exit.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,13 +29,13 @@ use novarocks_execution::task_execution::{FinalTaskInfo, TaskIdentity, TaskState
 
 use super::error::TaskExecutionError;
 
-/// Whether this attempt's declared writers all reached their terminal, and
+/// Whether this attempt's declared writers and summary sources completed, and
 /// why not when they did not.
 ///
 /// This is the task-terminal half of a write's completion and nothing more.
-/// Whether a complete prepared write set arrived is the write commit
-/// barrier's fact, and whether the external commit succeeded is
-/// `finish_write_session`'s. Each of those has exactly one owner, and this
+/// Complete prepared facts belong to the registered write consumer, and
+/// external publication belongs to the original Session and statement owner.
+/// Each of those has exactly one owner, and this
 /// type deliberately cannot answer either: a second answer to a question that
 /// admits one is how a partial write comes to report success.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -44,7 +44,7 @@ pub enum WriteVerdict {
     Complete,
     /// The attempt latched a failure or an abort.
     AttemptFailed,
-    /// A writer or the root finish task is not `FINISHED`.
+    /// A writer, logical summary source, or root finish task has not completed.
     TaskNotFinished {
         task: TaskIdentity,
         state: TaskState,
@@ -97,16 +97,19 @@ impl std::fmt::Display for WriteVerdict {
 #[derive(Clone, Debug)]
 pub struct WriteCompletionTracker {
     writers: BTreeSet<TaskIdentity>,
+    summary_sources: BTreeSet<TaskIdentity>,
     root_finish: TaskIdentity,
     // Each original writer remains here until its current status satisfies
     // this owner's success-compatible rule. Verdicts never rescan completed writers.
     pending_writers: BTreeMap<TaskIdentity, TaskState>,
+    pending_summary_sources: BTreeMap<TaskIdentity, TaskState>,
     root_state: TaskState,
     undeclared_writers: BTreeSet<TaskIdentity>,
 }
 
 impl WriteCompletionTracker {
-    /// Freezes the writer set of one write attempt.
+    /// Freezes independent writer and logical-summary source Task sets.
+    /// Ordinary writes declare an empty summary-source set.
     ///
     /// A write with no declared writer is refused rather than treated as a
     /// write that trivially finished: if the caller cannot name the writers,
@@ -114,8 +117,10 @@ impl WriteCompletionTracker {
     pub fn try_new(
         root_finish: TaskIdentity,
         writers: impl IntoIterator<Item = TaskIdentity>,
+        summary_sources: impl IntoIterator<Item = TaskIdentity>,
     ) -> Result<Self, TaskExecutionError> {
         let writers: BTreeSet<TaskIdentity> = writers.into_iter().collect();
+        let summary_sources: BTreeSet<TaskIdentity> = summary_sources.into_iter().collect();
         if writers.is_empty() {
             return Err(TaskExecutionError::Schedule(
                 "a distributed write declares no writer task".to_owned(),
@@ -125,10 +130,16 @@ impl WriteCompletionTracker {
             .iter()
             .map(|&writer| (writer, TaskState::Planned))
             .collect();
+        let pending_summary_sources = summary_sources
+            .iter()
+            .map(|&source| (source, TaskState::Planned))
+            .collect();
         Ok(Self {
             writers,
+            summary_sources,
             root_finish,
             pending_writers,
+            pending_summary_sources,
             root_state: TaskState::Planned,
             undeclared_writers: BTreeSet::new(),
         })
@@ -155,6 +166,21 @@ impl WriteCompletionTracker {
                 self.pending_writers.insert(identity, status.state());
             }
         }
+        if self.summary_sources.contains(&identity) {
+            // The original BE completion owner must validate MustDrain
+            // retirement before publishing a success-compatible terminal.
+            // A FE status cannot manufacture that physical-exit proof.
+            if status.state() == TaskState::Finished
+                || (status.state() == TaskState::Canceled
+                    && status.is_success_compatible_terminal())
+            {
+                self.pending_summary_sources.remove(&identity);
+            } else {
+                self.pending_summary_sources
+                    .insert(identity, status.state());
+            }
+        }
+        // Summary membership grants no writer authority.
         if is_writer || identity == self.root_finish {
             return;
         }
@@ -176,6 +202,9 @@ impl WriteCompletionTracker {
             return WriteVerdict::UndeclaredWriter(undeclared);
         }
         if let Some((&task, &state)) = self.pending_writers.first_key_value() {
+            return WriteVerdict::TaskNotFinished { task, state };
+        }
+        if let Some((&task, &state)) = self.pending_summary_sources.first_key_value() {
             return WriteVerdict::TaskNotFinished { task, state };
         }
         if self.root_state != TaskState::Finished {
@@ -253,12 +282,113 @@ mod tests {
     }
 
     #[test]
+    fn root_and_writers_cannot_replace_a_missing_summary_source_terminal() {
+        let backend = BackendProcessId::new_v7();
+        let root = identity(1, 1, backend);
+        let writer = identity(2, 2, backend);
+        let source = identity(3, 3, backend);
+        let mut tracker = WriteCompletionTracker::try_new(root, [writer], [source]).unwrap();
+        tracker.observe_status(&status(root, 2, TaskState::Finished));
+        tracker.observe_status(&status(writer, 2, TaskState::Finished));
+        assert_eq!(
+            tracker.execution_verdict(false),
+            WriteVerdict::TaskNotFinished {
+                task: source,
+                state: TaskState::Planned,
+            }
+        );
+        tracker.observe_status(&status(source, 2, TaskState::Running));
+        assert_eq!(
+            tracker.execution_verdict(false),
+            WriteVerdict::TaskNotFinished {
+                task: source,
+                state: TaskState::Running,
+            }
+        );
+        tracker.observe_status(&status(source, 3, TaskState::Finished));
+        assert_eq!(tracker.execution_verdict(false), WriteVerdict::Complete);
+        assert_eq!(tracker.execution_verdict(true), WriteVerdict::AttemptFailed);
+    }
+
+    #[test]
+    fn a_foreign_process_status_cannot_satisfy_an_exact_summary_source() {
+        let backend = BackendProcessId::new_v7();
+        let root = identity(1, 1, backend);
+        let writer = identity(2, 2, backend);
+        let source = identity(3, 3, backend);
+        let foreign = identity(3, 3, BackendProcessId::new_v7());
+        let mut tracker = WriteCompletionTracker::try_new(root, [writer], [source]).unwrap();
+        tracker.observe_status(&status(root, 2, TaskState::Finished));
+        tracker.observe_status(&status(writer, 2, TaskState::Finished));
+        tracker.observe_status(&status(foreign, 2, TaskState::Finished));
+        assert_eq!(
+            tracker.execution_verdict(false),
+            WriteVerdict::TaskNotFinished {
+                task: source,
+                state: TaskState::Planned,
+            }
+        );
+        tracker.observe_status(&status(source, 2, TaskState::Aborted));
+        let verdict = tracker.execution_verdict(false);
+        assert_eq!(
+            verdict,
+            WriteVerdict::TaskNotFinished {
+                task: source,
+                state: TaskState::Aborted
+            }
+        );
+        assert!(
+            !verdict.is_pending(),
+            "a non-success terminal cannot become a successful wait"
+        );
+    }
+
+    #[test]
+    fn a_summary_source_is_not_an_undeclared_writer_exemption() {
+        let backend = BackendProcessId::new_v7();
+        let root = identity(1, 1, backend);
+        let writer = identity(2, 2, backend);
+        let source = identity(3, 3, backend);
+        let mut tracker = WriteCompletionTracker::try_new(root, [writer], [source]).unwrap();
+        tracker.observe_status(&status(root, 2, TaskState::Finished));
+        tracker.observe_status(&status(writer, 2, TaskState::Finished));
+        tracker.observe_status(
+            &status(source, 2, TaskState::Finished).with_writer(TaskWriterFacts::empty()),
+        );
+        assert_eq!(
+            tracker.execution_verdict(false),
+            WriteVerdict::UndeclaredWriter(source)
+        );
+    }
+
+    #[test]
+    fn one_exact_task_status_can_satisfy_multiple_declared_roles() {
+        let root = identity(1, 1, BackendProcessId::new_v7());
+        let mut tracker = WriteCompletionTracker::try_new(root, [root], [root]).unwrap();
+        tracker.observe_status(&status(root, 2, TaskState::Finished));
+        assert_eq!(tracker.execution_verdict(false), WriteVerdict::Complete);
+    }
+
+    #[test]
+    fn summary_sources_use_the_original_success_compatible_terminal_rule() {
+        let backend = BackendProcessId::new_v7();
+        let root = identity(1, 1, backend);
+        let writer = identity(2, 2, backend);
+        let source = identity(3, 3, backend);
+        let mut tracker = WriteCompletionTracker::try_new(root, [writer], [source]).unwrap();
+        tracker.observe_status(&status(root, 2, TaskState::Finished));
+        tracker.observe_status(&status(writer, 2, TaskState::Finished));
+        tracker.observe_status(&status(source, 2, TaskState::Canceled));
+        assert_eq!(tracker.execution_verdict(false), WriteVerdict::Complete);
+    }
+
+    #[test]
     fn a_write_needs_every_declared_writer_and_the_root_finish_task() {
         let backend = BackendProcessId::new_v7();
         let writer_one = identity(2, 1, backend);
         let writer_two = identity(2, 2, backend);
         let root = identity(1, 3, backend);
-        let mut tracker = WriteCompletionTracker::try_new(root, [writer_one, writer_two])
+        let mut tracker = WriteCompletionTracker::try_new(root, [writer_one, writer_two], [])
             .expect("a declared writer set");
 
         assert_eq!(
@@ -303,7 +433,7 @@ mod tests {
         let writer = identity(2, 1, backend);
         let root = identity(1, 3, backend);
         let mut tracker =
-            WriteCompletionTracker::try_new(root, [writer]).expect("a declared writer set");
+            WriteCompletionTracker::try_new(root, [writer], []).expect("a declared writer set");
 
         // The task verdict is only one half of the write gate. This normal
         // stand-down is accepted here because the other half -- a complete
@@ -328,7 +458,7 @@ mod tests {
         let writer = identity(2, 1, backend);
         let root = identity(1, 3, backend);
         let mut tracker =
-            WriteCompletionTracker::try_new(root, [writer]).expect("a declared writer set");
+            WriteCompletionTracker::try_new(root, [writer], []).expect("a declared writer set");
 
         let completed_then_canceled = TaskStatus::try_new(
             writer,
@@ -353,7 +483,7 @@ mod tests {
         let undeclared = identity(2, 7, backend);
         let root = identity(1, 3, backend);
         let mut tracker =
-            WriteCompletionTracker::try_new(root, [writer]).expect("a declared writer set");
+            WriteCompletionTracker::try_new(root, [writer], []).expect("a declared writer set");
 
         tracker.observe_status(&status(writer, 2, TaskState::Finished));
         tracker.observe_status(&status(root, 2, TaskState::Finished));
@@ -375,7 +505,7 @@ mod tests {
     fn a_write_with_no_declared_writer_is_refused_rather_than_trivially_complete() {
         let root = identity(1, 3, BackendProcessId::new_v7());
         assert!(matches!(
-            WriteCompletionTracker::try_new(root, []),
+            WriteCompletionTracker::try_new(root, [], []),
             Err(TaskExecutionError::Schedule(_))
         ));
     }
@@ -386,7 +516,7 @@ mod tests {
         let writer = identity(2, 1, backend);
         let root = identity(1, 3, backend);
         let mut tracker =
-            WriteCompletionTracker::try_new(root, [writer]).expect("a declared writer set");
+            WriteCompletionTracker::try_new(root, [writer], []).expect("a declared writer set");
         tracker.observe_status(&status(writer, 2, TaskState::Finished));
         tracker.observe_status(&status(root, 2, TaskState::Finished));
         // Every task reached FINISHED, so only the latch stands between this
@@ -402,7 +532,7 @@ mod tests {
         let writer = identity(2, 1, backend);
         let root = identity(1, 1, backend);
         for state in [TaskState::Finished, TaskState::Running, TaskState::Aborted] {
-            let mut tracker = WriteCompletionTracker::try_new(root, [writer]).unwrap();
+            let mut tracker = WriteCompletionTracker::try_new(root, [writer], []).unwrap();
             tracker.observe_status(&status(root, 2, TaskState::Finished));
             tracker.observe_status(&status(writer, 2, state));
             let verdict = tracker.execution_verdict(false);

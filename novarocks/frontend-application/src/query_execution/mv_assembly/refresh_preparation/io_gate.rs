@@ -32,12 +32,13 @@ use std::task::{Context, Poll};
 
 use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
 use novarocks_spi::connector::{
-    ConnectorChangeWindow, ConnectorControlPlanningLease, ConnectorError,
-    ConnectorOriginalResultScope, ConnectorRequestContext, ConnectorScan, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePreparation,
-    ConnectorTableRequest, ConnectorTableResolution, ProviderMetadataCpuPort,
+    ConnectorControlPlanningLease, ConnectorError, ConnectorOriginalResultScope,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTablePreparation, ConnectorTableRequest, ConnectorTableResolution,
+    ProviderMetadataCpuPort,
 };
 
+use super::captured_sources::CapturedRefreshSources;
 /// Concrete inputs only. There is no callback or caller-supplied future.
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::staged_create::{
@@ -49,6 +50,9 @@ use novarocks_mv_application::persistence::keyed_documents::{
 use novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection;
 use novarocks_spi::connector::document_storage::{
     ConnectorDocumentStorageLease, KeyedDocumentObservationRequest,
+};
+use novarocks_spi::connector::read_stack::{
+    ConnectorPreparedSourceRead, ConnectorReadSourcePreparationRequest,
 };
 
 #[expect(
@@ -101,10 +105,15 @@ enum Request {
         lease: ConnectorControlPlanningLease,
         request: ConnectorTableRequest,
     },
-    ChangeWindow {
+    SourceMetadata {
         lease: ConnectorControlPlanningLease,
-        table: ConnectorTableHandle,
-        request: novarocks_spi::connector::ConnectorBeginScanRequest,
+        request: ConnectorTableRequest,
+    },
+    SourceRead {
+        source: IcebergMvCorePorts,
+        lease: ConnectorControlPlanningLease,
+        request: ConnectorReadSourcePreparationRequest,
+        context: ConnectorRequestContext,
     },
 }
 enum Response {
@@ -118,7 +127,7 @@ enum Response {
     Admit(Result<(), MvApplicationError>),
     InstallCurrent(Result<(), MvApplicationError>),
     MetadataReady,
-    ChangeWindow(Result<(), ConnectorError>),
+    SourceRead(Result<(), ConnectorError>),
 }
 type Operation = Pin<Box<dyn Future<Output = Response> + Send + 'static>>;
 #[expect(
@@ -142,24 +151,24 @@ pub(crate) struct MvRefreshPreparationServices {
     pub(crate) wake: Arc<dyn crate::task_execution::status_intake::StatusIntakeWake>,
     pub(crate) requests: Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>,
 }
-struct ScanReceiving {
-    result: Option<Result<ConnectorScan, ConnectorError>>,
+struct SourceReceiving {
+    result: Option<Result<ConnectorPreparedSourceRead, ConnectorError>>,
     owner: Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
     cpu: Arc<dyn ProviderMetadataCpuPort>,
 }
 // The actual Provider future only borrows the opaque-owner slot. Unwind
 // restores that same owner before the original driver may retire its future.
-struct ScanOwnerLoan {
+struct SourceOwnerLoan {
     gate: std::sync::Weak<MvRefreshPreparationIo>,
     owner: Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
 }
-impl Drop for ScanOwnerLoan {
+impl Drop for SourceOwnerLoan {
     fn drop(&mut self) {
         let gate = self
             .gate
             .upgrade()
             .expect("original scan gate outlives its child");
-        let mut receiver = gate.scan_result.lock().unwrap_or_else(|e| e.into_inner());
+        let mut receiver = gate.source_result.lock().unwrap_or_else(|e| e.into_inner());
         let receiver = receiver
             .as_mut()
             .expect("original scan receiver was installed");
@@ -174,6 +183,52 @@ struct Retained {
     _owner: Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
     cpu: Arc<dyn ProviderMetadataCpuPort>,
 }
+/// Select the stable business result and transfer its original custody only
+/// after the caller has observed the real CPU close. Failed close keeps both slots intact.
+fn receive_prepared_source_result(
+    receiving: &Mutex<Option<SourceReceiving>>,
+    retired_originals: &Mutex<Option<Vec<Retained>>>,
+    closed: Result<(), ConnectorError>,
+) -> Result<ConnectorPreparedSourceRead, MvApplicationError> {
+    // An unproven close leaves original Source/CPU in the receiving slot.
+    if let Err(close_error) = closed {
+        // The raw business failure was selected before the child/CPU close.
+        // Keep the entire receiving slot for the original health/exit owner.
+        let received = receiving.lock().unwrap_or_else(|e| e.into_inner());
+        let original = received
+            .as_ref()
+            .and_then(|value| value.result.as_ref())
+            .and_then(|result| result.as_ref().err());
+        return Err(provider_error(original.cloned().unwrap_or(close_error)));
+    }
+    let mut received = receiving
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .expect("original source result preceded its child exit");
+    let result = received
+        .result
+        .take()
+        .expect("original source raw result is present");
+    retired_originals
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .expect("original MV retained custody is not loaned")
+        .push(Retained {
+            _owner: received.owner,
+            cpu: received.cpu,
+        });
+    result.map_err(provider_error)
+}
+
+#[cfg(novarocks_dev_controls)]
+#[derive(Clone)]
+struct SourceWindowControl {
+    controls: Arc<crate::mv::test_controls::MvTestControls>,
+    target: novarocks_sql::planning::mv::SqlMvTarget,
+}
+
 pub(crate) struct MvRefreshPreparationIo {
     state: Mutex<Option<State>>,
     poisoned: AtomicBool,
@@ -182,10 +237,12 @@ pub(crate) struct MvRefreshPreparationIo {
     original: ConnectorOriginalResultScope,
     admission: Arc<MvPublicationAdmissionReceiving>,
     registration: Arc<CurrentProjectionRegistration>,
-    optional_failure: Mutex<Option<MvApplicationError>>,
     metadata_result: Mutex<Option<Result<ConnectorTablePreparation, ConnectorError>>>,
-    scan_result: Mutex<Option<ScanReceiving>>,
+    source_result: Mutex<Option<SourceReceiving>>,
     current_metadata_cpu: Arc<crate::mv::domain::staged_create::CurrentProjectionMetadataCpu>,
+    sources: Arc<CapturedRefreshSources>,
+    #[cfg(novarocks_dev_controls)]
+    source_window_control: Option<SourceWindowControl>,
 }
 
 struct Loan<'a> {
@@ -225,11 +282,33 @@ impl MvRefreshPreparationIo {
             original,
             admission: Arc::new(MvPublicationAdmissionReceiving::new()),
             registration: Arc::new(CurrentProjectionRegistration::new()),
-            optional_failure: Mutex::new(None),
             metadata_result: Mutex::new(None),
-            scan_result: Mutex::new(None),
+            source_result: Mutex::new(None),
             current_metadata_cpu,
+            sources: Arc::new(CapturedRefreshSources::default()),
+            #[cfg(novarocks_dev_controls)]
+            source_window_control: None,
         }
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn with_source_window_control(
+        mut self,
+        controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
+        target: novarocks_sql::planning::mv::SqlMvTarget,
+    ) -> Result<Self, novarocks_query_application::session_error::QueryServiceError> {
+        if let Some(controls) = controls {
+            if target.catalog.is_none() {
+                return Err(
+                    novarocks_query_application::session_error::QueryServiceError::new(
+                        novarocks_query_application::session_error::QueryServiceErrorKind::Internal,
+                        "MV source-window control requires its resolved target catalog",
+                    ),
+                );
+            }
+            self.source_window_control = Some(SourceWindowControl { controls, target });
+        }
+        Ok(self)
     }
 
     pub(crate) async fn refresh_graph(
@@ -297,6 +376,8 @@ impl MvRefreshPreparationIo {
                 unreachable!()
             };
             let services = Arc::clone(&self.services);
+            #[cfg(novarocks_dev_controls)]
+            let source_window_control = self.source_window_control.clone();
             let original = self.original.clone();
             let admission = Arc::clone(&self.admission);
             let registration = Arc::clone(&self.registration);
@@ -408,8 +489,17 @@ impl MvRefreshPreparationIo {
                         };
                         Response::InstallCurrent(result)
                     }
-                    Request::Metadata { lease, request } => {
-                        let mut child = lease.binding().metadata().prepare_table(request);
+                    request @ (Request::Metadata { .. } | Request::SourceMetadata { .. }) => {
+                        let (lease, request, source_only) = match request {
+                            Request::Metadata { lease, request } => (lease, request, false),
+                            Request::SourceMetadata { lease, request } => (lease, request, true),
+                            _ => unreachable!(),
+                        };
+                        let mut child = if source_only {
+                            lease.binding().metadata().prepare_source_table(request)
+                        } else {
+                            lease.binding().metadata().prepare_table(request)
+                        };
                         let result = std::future::poll_fn(|cx| child.as_mut().poll(cx)).await;
                         {
                             let gate = original_gate
@@ -430,11 +520,36 @@ impl MvRefreshPreparationIo {
                         drop(child);
                         Response::MetadataReady
                     }
-                    Request::ChangeWindow {
+                    Request::SourceRead {
+                        source,
                         lease,
-                        table,
                         request,
+                        context,
                     } => {
+                        #[cfg(novarocks_dev_controls)]
+                        if let Some(control) = &source_window_control {
+                            // The original driver is servicing its named SourceRead
+                            // after the reader worker joined, before Provider prepare.
+                            if let Err(error) = control
+                                .controls
+                                .recovery_async(
+                                    control
+                                        .target
+                                        .catalog
+                                        .as_deref()
+                                        .expect("resolved control target"),
+                                    &control.target.database,
+                                    &control.target.name,
+                                    "source-pinned",
+                                )
+                                .await
+                            {
+                                return Response::SourceRead(Err(ConnectorError::new(
+                                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                                    error,
+                                )));
+                            }
+                        }
                         let cpu = match services.cpu.planning_metadata_cpu_port(
                             &services.scope,
                             services.window.clone(),
@@ -445,7 +560,7 @@ impl MvRefreshPreparationIo {
                         ) {
                             Ok(cpu) => cpu,
                             Err(error) => {
-                                return Response::ChangeWindow(Err(ConnectorError::from_domain(
+                                return Response::SourceRead(Err(ConnectorError::from_domain(
                                     work_error_kind(&error),
                                     error,
                                 )));
@@ -456,21 +571,52 @@ impl MvRefreshPreparationIo {
                                 .upgrade()
                                 .expect("original scan gate outlives its child");
                             let mut receiver =
-                                gate.scan_result.lock().unwrap_or_else(|e| e.into_inner());
+                                gate.source_result.lock().unwrap_or_else(|e| e.into_inner());
                             assert!(receiver.is_none(), "original MV scan receiver is occupied");
-                            *receiver = Some(ScanReceiving {
+                            *receiver = Some(SourceReceiving {
                                 result: None,
                                 owner: None,
                                 cpu: Arc::clone(&cpu),
                             });
                         }
-                        let mut owner = ScanOwnerLoan {
+                        let mut owner = SourceOwnerLoan {
                             gate: original_gate.clone(),
                             owner: None,
                         };
-                        let mut child = lease.binding().planning().begin_scan_async_in(
-                            &table,
-                            request,
+                        let control = match source
+                            .typed_connector_control()
+                            .typed_read_for_planning_lease(&lease)
+                        {
+                            Ok(control) => control,
+                            Err(error) => return Response::SourceRead(Err(error)),
+                        };
+                        let factory = match control.request_factory() {
+                            Some(factory) => factory,
+                            None => {
+                                return Response::SourceRead(Err(ConnectorError::new(
+                                    novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                                    "MV source preparation requires its exact request factory",
+                                )));
+                            }
+                        };
+                        let planning = match novarocks_spi::connector::ConnectorPlanningContext::try_from_request(
+                            context.without_attempt_capabilities()) {
+                            Ok(planning) => planning,
+                            Err(error) => return Response::SourceRead(Err(error)),
+                        };
+                        let read = match factory.for_planning(&planning) {
+                            Ok(read) => read,
+                            Err(error) => return Response::SourceRead(Err(error)),
+                        };
+                        let metadata = read.metadata();
+                        let session = match crate::query_execution::compiler::typed_connector_session() {
+                            Ok(session) => session,
+                            Err(error) => return Response::SourceRead(Err(ConnectorError::new(
+                                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest, error))),
+                        };
+                        let mut child = metadata.prepare_source_read(
+                            &session,
+                            &request,
                             &cpu,
                             &original,
                             &mut owner.owner,
@@ -481,7 +627,7 @@ impl MvRefreshPreparationIo {
                                 .upgrade()
                                 .expect("original scan gate outlives its child");
                             let mut receiver =
-                                gate.scan_result.lock().unwrap_or_else(|e| e.into_inner());
+                                gate.source_result.lock().unwrap_or_else(|e| e.into_inner());
                             let receiver = receiver
                                 .as_mut()
                                 .expect("original scan receiver was installed");
@@ -493,7 +639,10 @@ impl MvRefreshPreparationIo {
                         }
                         drop(child);
                         drop(owner);
-                        Response::ChangeWindow(Ok(()))
+                        // The receipt contains only frozen facts. Keep the actual
+                        // opaque Source and serial CPU here until the original close.
+                        let closed = std::future::poll_fn(|cx| cpu.poll_closed(cx)).await;
+                        Response::SourceRead(closed)
                     }
                 }
             });
@@ -549,19 +698,6 @@ impl MvRefreshPreparationIo {
             panic!("MV read-only installation response changed kind")
         };
         result
-    }
-    pub(crate) fn retain_optional_failure(&self, error: MvApplicationError) {
-        let mut error = Some(error);
-        {
-            let mut slot = self
-                .optional_failure
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if slot.is_none() {
-                *slot = error.take();
-            }
-        }
-        drop(error);
     }
     pub(crate) fn registration(&self) -> &CurrentProjectionRegistration {
         &self.registration
@@ -741,53 +877,73 @@ impl MvRefreshPreparationIo {
         .map_err(crate::connector::schema_creation::connector_schema_error)
     }
 
-    pub(crate) async fn change_window(
+    pub(crate) fn captured_sources(&self) -> Arc<CapturedRefreshSources> {
+        Arc::clone(&self.sources)
+    }
+
+    pub(crate) async fn source_read(
+        &self,
+        source: &IcebergMvCorePorts,
+        lease: &ConnectorControlPlanningLease,
+        request: ConnectorReadSourcePreparationRequest,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorPreparedSourceRead, MvApplicationError> {
+        let context = crate::connector::context_for_planning_lease_typed(lease, context)
+            .map_err(provider_error)?;
+        let Response::SourceRead(closed) = self
+            .exchange(Request::SourceRead {
+                source: source.clone(),
+                lease: lease.clone(),
+                request,
+                context,
+            })
+            .await
+        else {
+            panic!("MV source preparation response changed kind")
+        };
+        receive_prepared_source_result(&self.source_result, &self.retired_originals, closed)
+    }
+
+    pub(crate) async fn source_table_metadata(
         &self,
         lease: &ConnectorControlPlanningLease,
-        table: &ConnectorTableHandle,
-        schema: arrow::datatypes::SchemaRef,
         context: ConnectorRequestContext,
-        window: ConnectorChangeWindow,
-    ) -> Result<ConnectorScan, MvApplicationError> {
-        crate::connector::scan_admission::validate_owner(table, lease).map_err(provider_error)?;
-        let request = crate::connector::scan_admission::change_window_request(
-            schema.as_ref(),
-            context,
-            window,
-        );
-        let Response::ChangeWindow(result) = self
-            .exchange(Request::ChangeWindow {
+        namespace: &str,
+        table: &str,
+    ) -> Result<ConnectorTableMetadata, ConnectorError> {
+        let context = crate::connector::context_for_planning_lease_typed(lease, context)?;
+        context.original_operation_control().check_active()?;
+        let request = ConnectorTableRequest {
+            table: ConnectorTableIdentity {
+                instance_id: lease.binding().descriptor().instance_id.clone(),
+                namespace: Arc::from(namespace),
+                table: Arc::from(table),
+            },
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context.clone(),
+        };
+        let Response::MetadataReady = self
+            .exchange(Request::SourceMetadata {
                 lease: lease.clone(),
-                table: table.clone(),
                 request,
             })
             .await
         else {
-            panic!("MV change-window response changed kind")
+            panic!("MV source metadata response changed kind")
         };
-        result.map_err(provider_error)?;
-        let mut received = self
-            .scan_result
+        let preparation = self
+            .metadata_result
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
-            .expect("original scan result was received before its child exited");
-        let result = received
-            .result
-            .take()
-            .expect("original scan raw result is present");
-        self.retired_originals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_mut()
-            .expect("original MV retained custody is not loaned")
-            .push(Retained {
-                _owner: received.owner,
-                cpu: received.cpu,
-            });
-        let scan = result.map_err(provider_error)?;
-        crate::connector::scan_admission::validate_scan(scan, schema.as_ref(), lease, window)
-            .map_err(provider_error)
+            .expect("original metadata result preceded its child exit")?;
+        crate::connector::schema_creation::with_schema_creation(&context, |creation| {
+            lease
+                .binding()
+                .metadata()
+                .create_prepared_table(preparation, creation)
+        })
+        .map_err(crate::connector::schema_creation::connector_schema_error)
     }
 }
 
@@ -893,7 +1049,7 @@ impl MvRefreshPreparationIo {
             return Some(health);
         }
         let scan_cpu = self
-            .scan_result
+            .source_result
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
@@ -937,7 +1093,7 @@ impl MvRefreshPreparationIo {
             drop(retired);
         }
         let scan_cpu = self
-            .scan_result
+            .source_result
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
@@ -946,7 +1102,7 @@ impl MvRefreshPreparationIo {
             match cpu.poll_closed(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
-                    "MV metadata CPU close is unproven", Arc::new(error)))),
+                    "MV metadata CPU close is unproven", cpu.local_failure().unwrap_or_else(|| Arc::new(error))))),
                 Poll::Ready(Ok(())) => {},
             }
             if let Some(cause) = cpu.local_failure() {
@@ -960,7 +1116,7 @@ impl MvRefreshPreparationIo {
             match item.cpu.poll_closed(cx) {
                 Poll::Pending=>return Poll::Pending,
                 Poll::Ready(Err(error))=>return Poll::Ready(Err(novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
-                    "MV metadata CPU close is unproven",Arc::new(error)))),
+                    "MV metadata CPU close is unproven",item.cpu.local_failure().unwrap_or_else(|| Arc::new(error))))),
                 Poll::Ready(Ok(()))=>{},
             }
             if let Some(cause) = item.cpu.local_failure() {
@@ -1077,5 +1233,95 @@ mod repository_original_cause_tests {
         );
         assert_eq!(cause.failure_fact(), fact);
         assert_eq!(projected.clone().original_failure(), Some(cause));
+    }
+}
+
+#[cfg(test)]
+mod source_receiving_transition_tests {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_spi::connector::{
+        ConnectorErrorKind, ConnectorInstanceId, ConnectorProviderBindingKey, ProviderBindingEpoch,
+        ProviderMetadataCpuInput,
+    };
+
+    // This test begins after the real CPU response. It proves the receiving
+    // transition, not worker execution or close; no method may invent that proof.
+    struct NeverCpu;
+    impl ProviderMetadataCpuPort for NeverCpu {
+        fn submit_metadata_in(
+            &self,
+            _: &mut Option<ProviderMetadataCpuInput>,
+        ) -> Result<(), ConnectorError> {
+            panic!("receiving must not submit CPU work")
+        }
+        fn poll_finished(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+            panic!("receiving must not select CPU outcomes")
+        }
+        fn poll_closed(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+            panic!("receiving must not manufacture CPU close")
+        }
+        fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+            panic!("receiving must not consume original health")
+        }
+    }
+    #[test]
+    fn late_close_failure_preserves_raw_business_fact_and_original_source_until_real_release() {
+        let raw = ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "original source data failure",
+        );
+        let late = ConnectorError::new(ConnectorErrorKind::Unavailable, "later unproven CPU close");
+        let held = Arc::new(());
+        let weak = Arc::downgrade(&held);
+        let owner = novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+            ConnectorProviderBindingKey {
+                instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+                incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
+            },
+            held,
+        );
+        let receiving = Mutex::new(Some(SourceReceiving {
+            result: Some(Err(raw.clone())),
+            owner: Some(owner),
+            cpu: Arc::new(NeverCpu),
+        }));
+        let retired = Mutex::new(Some(Vec::new()));
+        let error = receive_prepared_source_result(&receiving, &retired, Err(late)).unwrap_err();
+        assert_eq!(
+            error.original_failure().unwrap().failure_fact(),
+            raw.failure_fact()
+        );
+        assert!(receiving.lock().unwrap().as_ref().unwrap().owner.is_some());
+        assert!(retired.lock().unwrap().as_ref().unwrap().is_empty());
+        assert!(weak.upgrade().is_some());
+        // An independently observed real close permits transfer, not early Source disposal.
+        let error = receive_prepared_source_result(&receiving, &retired, Ok(())).unwrap_err();
+        assert_eq!(
+            error.original_failure().unwrap().failure_fact(),
+            raw.failure_fact()
+        );
+        assert!(receiving.lock().unwrap().is_none());
+        assert_eq!(retired.lock().unwrap().as_ref().unwrap().len(), 1);
+        assert!(weak.upgrade().is_some());
+        drop(retired.into_inner().unwrap());
+        assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn preflight_refusal_needs_no_raw_receipt_or_original_source() {
+        let error = ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "source rejected before start",
+        );
+        let receiving = Mutex::new(None);
+        let retired = Mutex::new(Some(Vec::new()));
+        let actual =
+            receive_prepared_source_result(&receiving, &retired, Err(error.clone())).unwrap_err();
+        assert_eq!(
+            actual.original_failure().unwrap().failure_fact(),
+            error.failure_fact()
+        );
+        assert!(receiving.lock().unwrap().is_none());
+        assert!(retired.lock().unwrap().as_ref().unwrap().is_empty());
     }
 }

@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0204
+    scope: "Patch allowlist: remove paimon while its provider is suspended; no accounting forks and registry identity rules remain active"
+    link: "ADR-0204-upstream-iceberg-backports-and-provider-suspension.md"
   - id: ADR-0174
     scope: "Patch allowlist: add iceberg-property-macro; current Iceberg baseline and vendor code anchors"
 date: 2026-10-06

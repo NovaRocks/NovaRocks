@@ -58,6 +58,7 @@ pub mod execution_error;
 /// Exact client-session identity and protocol-owned termination contracts.
 pub mod client_connection;
 
+mod client_query_id;
 /// Session registry and cancellation implementation owned by the query application.
 pub mod query_control;
 
@@ -72,6 +73,9 @@ pub mod session_outcome;
 
 /// Query-session admission requests independent of a wire protocol.
 pub mod session;
+pub mod session_effects;
+pub mod session_value;
+pub mod statement_kind;
 
 /// Process-local serving admission whose transitions are driven by role composition.
 pub mod serving_admission;

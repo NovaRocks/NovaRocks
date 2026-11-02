@@ -122,6 +122,7 @@ grpc_port = {fe_grpc_port}
 
 [standalone_server]
 mysql_port = {fe_mysql_port}
+trino_port = 0
 user = "root"
 
 [cluster]
@@ -665,6 +666,7 @@ grpc_port = {}
 
 [standalone_server]
 mysql_port = {}
+trino_port = 0
 
 [cluster]
 role = "fe"

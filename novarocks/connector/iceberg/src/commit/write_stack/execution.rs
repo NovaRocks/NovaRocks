@@ -27,6 +27,9 @@
 //! claims, merge, and write. A read that fails for any reason fails the writer
 //! and therefore the query — it never degrades into an empty old delete set.
 
+mod cleanup;
+use cleanup::UnsealedWriterCleanup;
+
 use crate::commit::model::EntryIdentity;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -46,8 +49,8 @@ use novarocks_spi::connector::{
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::PositionDeleteGroup;
 use crate::commit::data_writer::{
-    StagedDataFile, StagedPathJournal, StagedWriteContext, cleanup_staged_files,
-    staged_data_file_to_writer_report, write_record_batches_journaled,
+    StagedDataFile, StagedPathJournal, StagedWriteContext, staged_data_file_to_writer_report,
+    write_record_batches_journaled,
 };
 use crate::commit::frozen_write::{FrozenDataWriteFacts, staged_write_context_from_frozen_facts};
 use crate::commit::position_delete_writer::write_position_delete_files_journaled;
@@ -251,6 +254,7 @@ struct IcebergDataStackWriter {
     request_context: ConnectorRequestContext,
     fragments: Vec<ConnectorCommitFragment>,
     staged_paths: StagedPathJournal,
+    cleanup: UnsealedWriterCleanup,
     lifecycle: WriterLifecycle,
 }
 
@@ -291,12 +295,18 @@ impl IcebergDataStackWriter {
         let context =
             staged_write_context_from_frozen_facts(&binding, &request.expected_schema, facts)
                 .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        let cleanup = UnsealedWriterCleanup::new(
+            binding,
+            request.context.clone(),
+            handle.table().data_location(),
+        );
         Ok(Self {
             adapter: execution.adapter.clone(),
             context,
             request_context: request.context,
             fragments: Vec::new(),
             staged_paths: StagedPathJournal::default(),
+            cleanup,
             lifecycle: WriterLifecycle::Live,
         })
     }
@@ -405,16 +415,9 @@ impl ConnectorBatchWriter for IcebergDataStackWriter {
             return Ok(());
         }
         self.lifecycle = WriterLifecycle::Aborting;
-        // Keep each original path until its own deletion is observed. Failed
-        // cleanup or a dropped wait never erases the remaining responsibility.
-        while let Some(path) = self.staged_paths.last() {
-            cleanup_staged_files(&self.context, std::slice::from_ref(&path))
-                .await
-                .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
-            self.staged_paths
-                .confirm_deleted(&path)
-                .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
-        }
+        // The same unsealed journal activates the Provider's existing cleanup
+        // phase once; Task stop still forbids append/finish work.
+        self.cleanup.run(&self.staged_paths).await?;
         self.fragments.clear();
         self.lifecycle = WriterLifecycle::Aborted;
         Ok(())
@@ -435,6 +438,7 @@ struct IcebergDeleteStackWriter {
     file_io: crate::iceberg::io::FileIO,
     pending: BTreeMap<String, roaring::RoaringTreemap>,
     staged_paths: StagedPathJournal,
+    cleanup: UnsealedWriterCleanup,
     next_sequence: u64,
     lifecycle: WriterLifecycle,
 }
@@ -448,6 +452,11 @@ impl IcebergDeleteStackWriter {
         let binding = execution.binding.for_request(request.context.clone());
         let file_io = build_staged_file_io(&binding, handle.table().data_location())
             .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        let cleanup = UnsealedWriterCleanup::new(
+            binding,
+            request.context.clone(),
+            handle.table().data_location(),
+        );
         Ok(Self {
             adapter: execution.adapter.clone(),
             binding: execution.binding.clone(),
@@ -457,6 +466,7 @@ impl IcebergDeleteStackWriter {
             file_io,
             pending: BTreeMap::new(),
             staged_paths: StagedPathJournal::default(),
+            cleanup,
             next_sequence: 0,
             lifecycle: WriterLifecycle::Live,
         })
@@ -599,19 +609,7 @@ impl IcebergDeleteStackWriter {
     }
 
     async fn cleanup(&mut self) -> Result<(), ConnectorError> {
-        let file_io = self.file_io.clone();
-        while let Some(path) = self.staged_paths.last() {
-            file_io.delete(&path).await.map_err(|delete_error| {
-                error(
-                    ConnectorErrorKind::Internal,
-                    format!("cleanup staged Iceberg delete artifact {path}: {delete_error}"),
-                )
-            })?;
-            self.staged_paths
-                .confirm_deleted(&path)
-                .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
-        }
-        Ok(())
+        self.cleanup.run(&self.staged_paths).await
     }
 }
 
@@ -776,6 +774,7 @@ struct IcebergEqualityDeleteStackWriter {
     partition: IcebergArtifactPartition,
     fragments: Vec<ConnectorCommitFragment>,
     staged_paths: StagedPathJournal,
+    cleanup: UnsealedWriterCleanup,
     lifecycle: WriterLifecycle,
 }
 
@@ -813,6 +812,11 @@ impl IcebergEqualityDeleteStackWriter {
             handle.table().default_partition_spec_id(),
             crate::write_descriptor::IcebergPartitionDescriptor { values: Vec::new() },
         )?;
+        let cleanup = UnsealedWriterCleanup::new(
+            binding,
+            request.context.clone(),
+            handle.table().data_location(),
+        );
         Ok(Self {
             adapter: execution.adapter.clone(),
             handle,
@@ -824,24 +828,13 @@ impl IcebergEqualityDeleteStackWriter {
             partition,
             fragments: Vec::new(),
             staged_paths: StagedPathJournal::default(),
+            cleanup,
             lifecycle: WriterLifecycle::Live,
         })
     }
 
     async fn cleanup(&mut self) -> Result<(), ConnectorError> {
-        let file_io = self.file_io.clone();
-        while let Some(path) = self.staged_paths.last() {
-            file_io.delete(&path).await.map_err(|delete_error| {
-                error(
-                    ConnectorErrorKind::Internal,
-                    format!("cleanup staged Iceberg equality-delete file {path}: {delete_error}"),
-                )
-            })?;
-            self.staged_paths
-                .confirm_deleted(&path)
-                .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
-        }
-        Ok(())
+        self.cleanup.run(&self.staged_paths).await
     }
 }
 

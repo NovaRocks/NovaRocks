@@ -396,7 +396,11 @@ pub(super) fn evaluate<'a>(
                 work.borrow_mut().flush()?;
                 let selected = argument.array().slice(row, 1);
                 work.borrow_mut().flush()?;
-                let converted = cast_one(&selected, recipe.result.data_type());
+                let converted = cast_one(
+                    &selected,
+                    recipe.result.data_type(),
+                    recipe.allow_throw_exception,
+                );
                 match converted {
                     Ok(out) => {
                         work.borrow_mut().flush()?;
@@ -536,6 +540,8 @@ pub(super) enum ArrayCastFailure {
     Outer(KernelFailure),
     Decimal(crate::legacy_decimal::DecimalMathFailure),
     Arrow(arrow_schema::ArrowError),
+    RawNumeric(crate::math_numeric::RawNumericCastFailure),
+    Temporal(crate::temporal_carrier::TemporalCastFailure),
 }
 impl From<KernelFailure> for ArrayCastFailure {
     fn from(cause: KernelFailure) -> Self {
@@ -550,6 +556,8 @@ impl From<crate::legacy_decimal::DecimalMathFailure> for ArrayCastFailure {
 impl ArrayCastFailure {
     pub(super) fn into_row(self, ordinal: usize) -> Result<RowDataError, KernelFailure> {
         match self {
+            Self::RawNumeric(cause) => RowDataError::from_domain(ordinal, cause),
+            Self::Temporal(cause) => RowDataError::from_domain(ordinal, cause),
             Self::Outer(cause) => Err(cause),
             Self::Decimal(cause) => RowDataError::from_domain(ordinal, cause),
             Self::Arrow(cause) => RowDataError::from_domain(ordinal, ArrayCastArrowFailure(cause)),
@@ -660,7 +668,18 @@ pub(super) fn arrow_decimal_wide_delta(
             .and_then(|(value, limit)| (value < limit && value > -limit).then_some(value)),
     )
 }
-fn cast_one(source: &ArrayRef, result: &DataType) -> Result<ArrayRef, ArrayCastFailure> {
+fn cast_one(
+    source: &ArrayRef,
+    result: &DataType,
+    allow_throw_exception: bool,
+) -> Result<ArrayRef, ArrayCastFailure> {
+    if source.data_type() == &DataType::LargeUtf8 && result == &DataType::Date32 {
+        let source = source
+            .as_any()
+            .downcast_ref::<arrow_array::LargeStringArray>()
+            .ok_or_else(|| invalid("DATE text CAST has a foreign carrier"))?;
+        return Ok(crate::temporal_carrier::cast_large_date_text(source));
+    }
     if let DataType::Decimal256(target_precision, target_scale) = result {
         let input = match source.data_type() {
             DataType::Decimal128(precision, scale) => {
@@ -781,7 +800,35 @@ fn cast_one(source: &ArrayRef, result: &DataType) -> Result<ArrayRef, ArrayCastF
             })?;
         return Ok(Arc::new(array));
     }
-    let out = arrow_cast::cast(source.as_ref(), result).map_err(ArrayCastFailure::Arrow)?;
+    if matches!(
+        source.data_type(),
+        DataType::Time32(_) | DataType::Time64(_)
+    ) && matches!(result, DataType::Time32(_) | DataType::Time64(_))
+    {
+        return match crate::temporal_carrier::cast_time_units(source.as_ref(), result) {
+            Ok(out) => Ok(out),
+            Err(cause) if cause.is_data() && !allow_throw_exception => {
+                Ok(new_null_array(result, source.len()))
+            }
+            Err(cause) => Err(ArrayCastFailure::Temporal(cause)),
+        };
+    }
+    let out = if numeric(result) {
+        if let Some(text) = source
+            .as_any()
+            .downcast_ref::<arrow_array::LargeStringArray>()
+        {
+            crate::math_numeric::cast_raw_numeric(text, result)
+                .map_err(ArrayCastFailure::RawNumeric)?
+        } else if let Some(text) = source.as_any().downcast_ref::<StringArray>() {
+            crate::math_numeric::cast_raw_numeric(text, result)
+                .map_err(ArrayCastFailure::RawNumeric)?
+        } else {
+            arrow_cast::cast(source.as_ref(), result).map_err(ArrayCastFailure::Arrow)?
+        }
+    } else {
+        arrow_cast::cast(source.as_ref(), result).map_err(ArrayCastFailure::Arrow)?
+    };
     // The old scalar evaluator sanitized parser-produced non-finite floats.
     let invalid = match result {
         DataType::Float32 => out

@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// The real dynamic ARRAY binder admits "id" against authored "ID" by its
-// original case-insensitive rule. The ONE original runtime projection then
-// rejects the byte-sensitive name. No request/runtime value is substituted.
-// The private factory funds only original diagnostics; it publishes no ARRAY
-// success capability. These probes verify the actual compiled failure route.
+// The real dynamic ARRAY binder resolves a unique ASCII-case-insensitive
+// field once. Successful probes use the installed public ARRAY owner. The
+// private diagnostic factory remains limited to the original failure probes;
+// it cannot fund successful computation.
 use super::*;
 use crate::runtime::fragment::ExecutionFailure;
 use crate::runtime::fragment::ExecutionFailureCause;
@@ -619,38 +618,48 @@ fn data(error: ExecutionFailure, message: &str) -> novarocks_functions::ScalarIn
     data.clone()
 }
 #[test]
-fn scalar_invocation_original_required_full_data_keeps_actual_domain_and_clone_drop() {
-    let program = invocation_program(2, Guard::Direct);
+fn scalar_invocation_case_insensitive_required_result_keeps_exact_type_and_clone_drop() {
+    let program = original_source_program("id", Guard::Direct, SourceMode::Slot);
     for null in [false, true] {
         let batch = input(&program, vec![Some(true); 3], null);
         let (mut instance, tracker) = tracked_instance(&program);
-        let error = crate::exec::operators::compiled_expression::evaluate_all(
+        let output = crate::exec::operators::compiled_expression::evaluate_all(
             &mut instance,
             root(),
             &batch,
             &crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::default()),
         )
-        .unwrap_err();
-        let ExecutionFailureCause::ScalarInvocationData(actual) = error.cause() else {
-            panic!("required root reclassified original Data: {error:?}")
-        };
+        .unwrap();
         assert_eq!(
-            actual.message(),
-            "__array_struct_subfield field 'id' does not exist"
+            output.data_type(),
+            program.graph().nodes()[2]
+                .output_layout()
+                .schema()
+                .field(0)
+                .data_type()
         );
-        assert_eq!(actual.batch_rows(), 3);
-        assert_eq!(actual.source_len(), 3);
-        assert_eq!(actual.source_row(0), Some(0));
-        assert_eq!(actual.source_row(2), Some(2));
-        let clone = error.clone();
+        let list = output.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list.null_count(), if null { 3 } else { 0 });
+        assert_eq!(
+            list.values()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            &[7, 7, 7]
+        );
+        let clone = output.clone();
         assert!(tracker.current() > 0);
-        drop(error);
+        drop(output);
         drop(instance);
         assert!(tracker.current() > 0);
         drop(clone);
         assert_eq!(tracker.current(), 0);
     }
 }
+
 #[test]
 fn scalar_invocation_noarguments_keeps_full_definition_n_but_invokes_no_children() {
     for count in [3, 5] {
@@ -793,22 +802,30 @@ fn scalar_invocation_every_original_checkpoint_cause_has_no_tail_and_failed_reen
 }
 
 #[test]
-fn scalar_invocation_boolean_truth_only_and_filter_keep_atomic_original_data() {
-    for guard in [Guard::And, Guard::Or] {
-        let program = invocation_program(2, guard);
+fn scalar_invocation_case_insensitive_result_is_the_same_in_boolean_and_filter_contexts() {
+    for (guard, expected) in [(Guard::And, false), (Guard::Or, true)] {
+        let program = original_source_program("id", guard, SourceMode::Slot);
         let batch = input(&program, vec![Some(true); 3], false);
         let (mut instance, _) = tracked_instance(&program);
-        data(
-            instance
-                .evaluate_evaluation(&batch, Selection::all(3), Activation::Activated, &Control)
-                .unwrap_err(),
-            "__array_struct_subfield field 'id' does not exist",
+        let output = instance
+            .evaluate_evaluation(&batch, Selection::all(3), Activation::Activated, &Control)
+            .unwrap();
+        assert!(output.errors().is_empty());
+        assert_eq!(
+            output
+                .values()
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(expected); 3]
         );
     }
-    let program = invocation_program(2, Guard::Filter);
+    let program = original_source_program("id", Guard::Filter, SourceMode::Slot);
     let batch = input(&program, vec![Some(true); 3], false);
-    let tracker = MemTracker::new_root("actual-filter-invocation-probe");
-    let host = crate::runtime::tracked_state_allocator::expression_allocation_host(tracker);
+    let tracker = MemTracker::new_root("case-insensitive-filter-invocation");
+    let host = crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
     let mut filter = super::super::CompiledFilterConjunctionInstance::try_new_with_allocator(
         program,
         ProgramNodeId::new(2),
@@ -816,22 +833,23 @@ fn scalar_invocation_boolean_truth_only_and_filter_keep_atomic_original_data() {
         Some(host),
     )
     .unwrap();
-    let error = filter
+    let output = filter
         .evaluate_required(&batch, Selection::all(3), &Control)
-        .unwrap_err();
-    assert!(
-        matches!(error.cause(),ExecutionFailureCause::ScalarInvocationData(data) if data.message()=="__array_struct_subfield field 'id' does not exist")
+        .unwrap();
+    assert_eq!(
+        output
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(false); 3]
     );
-    let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
-    let error = filter
-        .evaluate_required(&batch, Selection::all(3), &after)
-        .unwrap_err();
-    assert!(matches!(
-        error.cause(),
-        ExecutionFailureCause::Kernel(KernelFailure::InstanceFailed)
-    ));
-    assert!(after.trace.lock().unwrap().is_empty());
+    drop(output);
+    drop(filter);
+    assert_eq!(tracker.current(), 0);
 }
+
 #[test]
 fn scalar_invocation_three_compile_causes_remain_typed_at_actual_declaration_loan() {
     struct Stop(CompileControlError);
@@ -975,13 +993,14 @@ fn original_domain_computed_child_covers_actual_three_and_projects_only_outer_tw
 }
 
 #[test]
-fn original_domain_whole_data_uses_actual_three_not_outer_two_and_failed_replay_is_first() {
+fn original_domain_case_insensitive_computed_child_projects_outer_demand_and_keeps_control_failure()
+{
     let program = original_source_program("id", Guard::Direct, SourceMode::Computed);
     let batch = input(&program, vec![Some(true); 6], false);
     let actual = [1, 3, 5];
     let demand = [3, 5];
     let (mut frame, _) = tracked_instance(&program);
-    let error = frame
+    let output = frame
         .evaluate_scoped_evaluation(
             &batch,
             novarocks_functions::ScalarInvocationScope::new(
@@ -991,28 +1010,36 @@ fn original_domain_whole_data_uses_actual_three_not_outer_two_and_failed_replay_
             Activation::Activated,
             &Control,
         )
-        .unwrap_err();
-    let ExecutionFailureCause::ScalarInvocationData(data) = error.cause() else {
-        panic!("original whole Data must remain atomic: {error:?}")
-    };
+        .unwrap();
+    assert_eq!(output.selection().iter().collect::<Vec<_>>(), demand);
+    assert!(output.errors().is_empty());
     assert_eq!(
-        data.message(),
-        "__array_struct_subfield field 'id' does not exist"
+        output
+            .values()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .as_ref(),
+        &[7, 7]
     );
-    assert_eq!(data.batch_rows(), 6);
-    assert_eq!(data.source_len(), 3);
-    assert_eq!(
-        (0..3).map(|i| data.source_row(i)).collect::<Vec<_>>(),
-        vec![Some(1), Some(3), Some(5)]
-    );
-    let after = CallbackControl::new(KernelFailure::DeadlineExceeded, 0);
+    drop(output);
+    let stop = CallbackControl::new(KernelFailure::DeadlineExceeded, 1);
     let error = frame
-        .evaluate_scoped_evaluation(
-            &batch,
-            novarocks_functions::ScalarInvocationScope::new(Selection::all(6), Selection::all(6)),
-            Activation::Activated,
-            &after,
-        )
+        .evaluate_evaluation(&batch, Selection::all(6), Activation::Activated, &stop)
+        .unwrap_err();
+    assert_eq!(
+        error.cause(),
+        &ExecutionFailureCause::Kernel(KernelFailure::DeadlineExceeded)
+    );
+    assert_eq!(stop.trace.lock().unwrap().len(), 1);
+    let after = CallbackControl::new(KernelFailure::Cancelled, usize::MAX);
+    let error = frame
+        .evaluate_evaluation(&batch, Selection::all(6), Activation::Activated, &after)
         .unwrap_err();
     assert_eq!(
         error.cause(),
@@ -1192,19 +1219,21 @@ fn original_domain_nested_if_uses_its_immediate_filtered_parent_rows() {
     columns[2] = Arc::new(Int64Array::from(vec![1, 1, 0, 1]));
     let batch = RecordBatch::try_new(original.schema(), columns).unwrap();
     let (mut frame, _) = tracked_instance(&program);
-    let error = frame
+    let output = frame
         .evaluate_evaluation(&batch, Selection::all(4), Activation::Activated, &Control)
-        .unwrap_err();
-    let ExecutionFailureCause::ScalarInvocationData(data) = error.cause() else {
-        panic!("original whole error: {error:?}")
-    };
-    // The outer actual IF selects global0/2/3. Its nested IF is evaluated in
-    // that same 3-row parent domain; C03 sees the complete required result3.
-    assert_eq!(data.source_len(), 3);
+        .unwrap();
+    // The outer IF consumes IS NULL(projected), so its result is Boolean.
     assert_eq!(
-        (0..3).map(|i| data.source_row(i)).collect::<Vec<_>>(),
-        vec![Some(0), Some(2), Some(3)]
+        output
+            .values()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(false), None, Some(true), Some(false)]
     );
+    assert!(output.errors().is_empty());
 }
 
 #[test]
@@ -1380,7 +1409,7 @@ fn original_domain_policy_conditional_mask_uses_actual_parent_not_outer_demand()
     let demand = [3, 5];
     let (mut frame, _) = tracked_instance(&program);
     let mut spy = ActualScopeSpy::default();
-    let error = frame
+    let output = frame
         .evaluate_scoped_runtime(
             &batch,
             novarocks_functions::ScalarInvocationScope::new(
@@ -1391,15 +1420,23 @@ fn original_domain_policy_conditional_mask_uses_actual_parent_not_outer_demand()
             &Control,
             &mut spy,
         )
-        .unwrap_err();
+        .unwrap();
     assert_eq!(
         spy.scoped,
         vec![(vec![1, 5], vec![1, 5])],
         "typed original owner needs the actual IF true-mask, including global1 outside output demand"
     );
-    let ExecutionFailureCause::ScalarInvocationData(data) = error.cause() else {
-        panic!("real original whole Data: {error:?}")
-    };
-    assert_eq!(data.source_len(), 2);
-    assert_eq!((data.source_row(0), data.source_row(1)), (Some(1), Some(5)));
+    assert!(output.errors().is_empty());
+    assert_eq!(output.selection().iter().collect::<Vec<_>>(), demand);
+    // Global row 3 takes NULL; row 5 tests the non-null projected ARRAY.
+    assert_eq!(
+        output
+            .values()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![None, Some(false)]
+    );
 }

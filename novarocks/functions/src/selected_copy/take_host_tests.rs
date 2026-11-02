@@ -181,3 +181,35 @@ fn by_copy_joint_invoice_original_empty_nested_offsets_are_actual_backing() {
         );
     }
 }
+
+#[test]
+fn original_filter_null_compression_requests_the_extra_u64_word() {
+    for (selected, bytes) in [
+        (0, 8),
+        (1, 8),
+        (63, 8),
+        (64, 16),
+        (511, 64),
+        (512, 72),
+        (513, 72),
+    ] {
+        assert_eq!(original_filter_null_words_bytes(selected).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn original_array_iterator_vec_upper_keeps_minimum_capacity_for_single_slot() {
+    assert_eq!(
+        original_unreserved_vec_upper::<Option<usize>>(1).unwrap(),
+        4 * size_of::<Option<usize>>()
+    );
+    assert_eq!(
+        original_unreserved_vec_upper::<u32>(1).unwrap(),
+        4 * size_of::<u32>()
+    );
+    assert_eq!(
+        original_unreserved_vec_upper::<u64>(1).unwrap(),
+        4 * size_of::<u64>()
+    );
+    assert_eq!(original_unreserved_vec_upper::<u64>(0).unwrap(), 0);
+}

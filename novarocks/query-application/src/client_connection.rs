@@ -78,7 +78,9 @@ impl std::error::Error for ClientConnectionTokenError {}
 /// The protocol-lifecycle reason that has won termination of a connection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientConnectionTerminationReason {
-    ExplicitKillConnection { requester_connection_id: u32 },
+    ExplicitKillConnection {
+        requester_session: crate::session_control::ClientSessionKey,
+    },
     ServerShutdown,
 }
 

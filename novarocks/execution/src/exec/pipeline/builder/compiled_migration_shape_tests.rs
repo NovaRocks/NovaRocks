@@ -18,7 +18,6 @@
 //! Independent shape and per-call phase assertions after construction-tree removal.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::PureKernelAbi;
@@ -280,7 +279,6 @@ fn mixed_phase_program() -> Arc<LocalProgram> {
                 root_sink_dop: Some(std::num::NonZeroUsize::MIN),
                 kernel_abi: KernelAbiVersion::CURRENT,
                 constants: constant_policy(),
-                exchange_wait: Duration::from_secs(1),
             },
             &FixtureControl,
         )

@@ -400,7 +400,7 @@ where
         statement_run_token: String,
         frontend_process_id: String,
         connection_id: u32,
-        session_epoch: u64,
+        session_key: u64,
         statement_generation: u64,
     }
     let wire = WireNomination::deserialize(deserializer)?;
@@ -409,7 +409,7 @@ where
         statement_run_token: wire.statement_run_token,
         frontend_process_id: wire.frontend_process_id,
         connection_id: wire.connection_id,
-        session_epoch: wire.session_epoch,
+        session_key: wire.session_key,
         statement_generation: wire.statement_generation,
     })
 }

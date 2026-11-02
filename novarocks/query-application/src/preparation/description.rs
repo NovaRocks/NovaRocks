@@ -674,7 +674,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(raw_error.contains("frozen root purpose"), "{raw_error}");
-        let render = novarocks_sql::compiler::client_render_schema(candidate.plan(), 0).unwrap();
+        let render = novarocks_sql::compiler::client_render_schema(
+            candidate.plan(),
+            novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
+                timezone_offset_seconds: 0,
+            },
+        )
+        .unwrap();
         let candidate = candidate
             .freeze_root_output(novarocks_result_contract::FrozenRootOutput::ClientRows(
                 render,

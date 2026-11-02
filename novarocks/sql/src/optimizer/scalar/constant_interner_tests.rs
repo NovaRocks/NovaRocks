@@ -205,7 +205,7 @@ fn root_source_metadata_is_independent_and_authored_logical_domains_remain_ident
                         (logical == ValueLogicalType::Json)
                             .then(|| (NR_LOGICAL_TYPE_KEY.into(), "json".into())),
                     )
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
         );
         cv(Arc::new(StringArray::from(vec!["x"])), ty, field, 0)

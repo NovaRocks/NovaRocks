@@ -183,6 +183,9 @@ impl RenderSchemaScan {
     fn scan(&mut self, raw: &[u8]) -> ScanResult {
         use novarocks_proto_models::result as wire;
         use novarocks_result_contract::RootProfileV1;
+        // The complete schema includes both family alternatives (fields 3/4).
+        // Their inline bool facts allocate no separate backing; raw bytes still
+        // participate in the wire and simultaneous decode-overlap allowances.
         self.wire_bytes = self
             .wire_bytes
             .checked_add(raw.len())
@@ -1316,6 +1319,24 @@ mod root_preflight_tests {
         assert!(check_client_render_schema(&columns).is_err());
     }
     #[test]
+    fn presentation_family_bytes_count_toward_wire_and_decode_overlap() {
+        for (field, payload) in [(3, vec![]), (4, vec![8, 1, 16, 1, 24, 1])] {
+            let mut raw = Vec::new();
+            bytes_field(&mut raw, field, &payload);
+            let mut scan = RenderSchemaScan::new();
+            let initial = scan.expansion.backing;
+            scan.scan(&raw).unwrap();
+            assert_eq!(scan.wire_bytes, raw.len());
+            assert_eq!(scan.expansion.backing, initial + raw.len());
+            // Repeated family messages consume the same profile even though
+            // prost retains only the oneof's latest value.
+            while raw.len() <= RootProfileV1::SCHEMA_WIRE_BYTES {
+                bytes_field(&mut raw, field, &payload);
+            }
+            assert!(check_client_render_schema(&raw).is_err());
+        }
+    }
+    #[test]
     fn widest_short_primitive_schema_passes_raw_prost_and_neutral_decode() {
         use novarocks_result_contract::{
             ClientRenderSchema, NativeRenderType, RenderColumn, RenderField, RenderPresentation,
@@ -1332,7 +1353,12 @@ mod root_preflight_tests {
                 },
             })
             .collect();
-        let schema = ClientRenderSchema::try_new(columns, RootProfileV1::MAX_COLUMNS).unwrap();
+        let schema = ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            columns,
+            RootProfileV1::MAX_COLUMNS,
+        )
+        .unwrap();
         let encoded =
             novarocks_proto_codec::root_result::encode_client_schema(&schema).encode_to_vec();
         check_client_render_schema(&encoded).unwrap();

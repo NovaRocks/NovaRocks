@@ -82,13 +82,15 @@ pub struct IcebergStorageTargetField {
     pub nullable: bool,
 }
 
-/// Provider-owned source schema facts frozen from one decoded Iceberg
-/// metadata document. The byte identity is emitted here, rather than by the
+/// Provider-owned Current or selected-To source schema facts from one frozen
+/// Iceberg metadata document. The byte identity is emitted here, rather than by the
 /// Frontend, so consumers cannot manufacture a durable provider field ID.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IcebergStorageCreateSourceObservation {
+pub struct IcebergStorageSourceSchemaObservation {
     pub object_id: ConnectorTableObjectId,
     pub schema_version: Bytes,
+    pub format_v3: bool,
+    pub stored_row_lineage_enabled: bool,
     pub fields: Vec<IcebergStorageSourceField>,
 }
 
@@ -250,14 +252,22 @@ impl IcebergStorageInspector {
         Ok(observed)
     }
 
-    pub fn observe_create_source(
+    pub fn observe_source_schema(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
-    ) -> Result<IcebergStorageCreateSourceObservation, ConnectorError> {
+    ) -> Result<IcebergStorageSourceSchemaObservation, ConnectorError> {
+        validate_context(&context)?;
+        let owner = novarocks_spi::connector::ConnectorProviderBindingKey {
+            instance_id: exact_lease.binding().descriptor().instance_id.clone(),
+            incarnation: exact_lease.binding().incarnation(),
+        };
+        if let Some(marker) = metadata.source_read_facts() {
+            marker.validate_owner(&owner)?;
+        }
         let table = decoded_table(exact_lease, metadata, &context)?;
-        create_source_observation(&table, &context)
+        source_schema_observation(&table, metadata, &owner, &context)
     }
 
     pub fn observe_created_target(
@@ -581,7 +591,7 @@ fn target_observation(
 fn create_source_observation(
     table: &TableMetadata,
     context: &ConnectorRequestContext,
-) -> Result<IcebergStorageCreateSourceObservation, ConnectorError> {
+) -> Result<IcebergStorageSourceSchemaObservation, ConnectorError> {
     let target = target_observation(table, context)?;
     let object_id = iceberg_object_id_from_uuid(target.table_uuid)?;
     let schema_version = exact_schema_version(target.schema_id);
@@ -595,9 +605,151 @@ fn create_source_observation(
             nullable: field.nullable,
         })
         .collect();
-    Ok(IcebergStorageCreateSourceObservation {
+    Ok(IcebergStorageSourceSchemaObservation {
         object_id,
         schema_version,
+        format_v3: target.format_v3,
+        stored_row_lineage_enabled: target.explicit_row_lineage_enabled,
+        fields,
+    })
+}
+
+/// One source-schema projection; it carries no target partition/OCC contract.
+/// `table` is the already-decoded frozen handle, not a fresh catalog load.
+/// The public entrypoint supplies its exact retained lease binding.
+pub(crate) fn source_schema_observation(
+    table: &TableMetadata,
+    admitted: &ConnectorTableMetadata,
+    owner: &novarocks_spi::connector::ConnectorProviderBindingKey,
+    context: &ConnectorRequestContext,
+) -> Result<IcebergStorageSourceSchemaObservation, ConnectorError> {
+    use crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::{
+        IcebergObservedSourceReadFacts, frozen_snapshot_schema,
+    };
+    use crate::metadata::TableMetadataProjection;
+    validate_context(context)?;
+    if owner.instance_id != admitted.identity.instance_id
+        || admitted.table.owner() != &admitted.identity.instance_id
+    {
+        return Err(invalid(
+            "source schema observation belongs to another connector",
+        ));
+    }
+    let projection = match admitted.source_read_facts() {
+        Some(marker) => {
+            marker.validate_owner(owner)?;
+            let facts =
+                marker.value::<IcebergObservedSourceReadFacts>(owner.instance_id.as_str())?;
+            if facts.access.identifier().namespace().to_url_string()
+                != admitted.identity.namespace.as_ref()
+                || facts.access.identifier().name() != admitted.identity.table.as_ref()
+                || facts.access.metadata() != table
+            {
+                return Err(invalid(
+                    "source schema provenance differs from its frozen table frame",
+                ));
+            }
+            facts.projection
+        }
+        // An unmarked ordinary observation retains its original CREATE path.
+        // Only the private SnapshotTo provenance selects a historical schema.
+        None => TableMetadataProjection::Current,
+    };
+    let observed = match projection {
+        TableMetadataProjection::Current => return create_source_observation(table, context),
+        TableMetadataProjection::SnapshotTo(snapshot) => {
+            let schema = frozen_snapshot_schema(table, snapshot, table.current_schema_id())?;
+            selected_source_schema_observation(table, &schema, admitted, context)?
+        }
+    };
+    if admitted.version.as_ref() != Some(&observed.schema_version) {
+        return Err(corrupt(
+            "source schema observation differs from the admitted schema version",
+        ));
+    }
+    Ok(observed)
+}
+
+fn selected_source_schema_observation(
+    table: &TableMetadata,
+    schema: &crate::iceberg::spec::Schema,
+    admitted: &ConnectorTableMetadata,
+    context: &ConnectorRequestContext,
+) -> Result<IcebergStorageSourceSchemaObservation, ConnectorError> {
+    if schema.as_struct().fields().len() > MAX_TARGET_FIELDS {
+        return Err(exhausted(
+            "Iceberg MV source schema exceeds the inspection field limit",
+        ));
+    }
+    // Reuse the complete Provider schema/nominal author. An Arrow carrier or a
+    // Current schema is not an alternate author of this selected To domain.
+    let document =
+        crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata(table)?;
+    let expected = crate::scalar_integer_domain::sql_schema_from_document(schema, &document)?;
+    let pseudo_columns = crate::metadata::metadata_column_names(table);
+    if admitted.schema().fields().len() != expected.fields().len() + pseudo_columns.len() {
+        return Err(corrupt(
+            "source schema fields differ from the selected To projection",
+        ));
+    }
+    let mut budget = 0_usize;
+    let mut fields = Vec::with_capacity(schema.as_struct().fields().len());
+    for (ordinal, field) in schema.as_struct().fields().iter().enumerate() {
+        validate_context(context)?;
+        let actual = admitted.schema().field(ordinal);
+        let expected = expected.field(ordinal);
+        let expected_type = novarocks_type_contract::FunctionValueType::try_from_field(expected)
+            .map_err(|cause| {
+                ConnectorError::from_domain_static(
+                    ConnectorErrorKind::CorruptData,
+                    cause,
+                    "selected source schema has an invalid complete type",
+                )
+            })?;
+        let actual_type = novarocks_type_contract::FunctionValueType::try_from_field(actual)
+            .map_err(|cause| {
+                ConnectorError::from_domain_static(
+                    ConnectorErrorKind::CorruptData,
+                    cause,
+                    "admitted source schema has an invalid complete type",
+                )
+            })?;
+        if actual.name() != &field.name || expected_type != actual_type {
+            return Err(corrupt(
+                "source schema field differs from its selected To declaration",
+            ));
+        }
+        reserve(context, &mut budget, &field.name)?;
+        let type_signature = field.field_type.to_string();
+        reserve(context, &mut budget, &type_signature)?;
+        // Preserve the existing Source signature vocabulary and provider-owned
+        // field identity. Do not encode a new SQL/nominal signature policy.
+        fields.push(IcebergStorageSourceField {
+            provider_field_id: Bytes::copy_from_slice(&field.id.to_be_bytes()),
+            name: field.name.clone(),
+            type_signature,
+            nullable: !field.required,
+        });
+    }
+    for (ordinal, name) in pseudo_columns.iter().enumerate() {
+        validate_context(context)?;
+        if admitted.schema().field(fields.len() + ordinal).name() != name {
+            return Err(corrupt(
+                "source schema metadata suffix differs from its Provider author",
+            ));
+        }
+    }
+    let uuid = table.uuid().to_string();
+    reserve(context, &mut budget, &uuid)?;
+    validate_context(context)?;
+    Ok(IcebergStorageSourceSchemaObservation {
+        object_id: iceberg_object_id_from_uuid(uuid)?,
+        schema_version: exact_schema_version(schema.schema_id()),
+        format_v3: matches!(table.format_version(), FormatVersion::V3),
+        stored_row_lineage_enabled: table
+            .properties()
+            .get("write.row-lineage")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true")),
         fields,
     })
 }

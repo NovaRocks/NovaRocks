@@ -44,8 +44,15 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     current_database: &str,
     stmt: &MvRefreshRequest,
     target: MvTarget,
+    full_sources: bool,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<RefreshPlan, RefreshError> {
+    let full_statement = full_sources.then(|| {
+        let mut full = stmt.clone();
+        full.full = true;
+        full
+    });
+    let stmt = full_statement.as_ref().unwrap_or(stmt);
     let iceberg_target =
         resolve_refresh_target(current_catalog, current_database, &stmt.name_parts)
             .map_err(RefreshError::from)?;
@@ -104,17 +111,17 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     }
     // D's own occurrence inventory is the base-locator authority now; the
     // retired projection copy of the resolved FQN list is gone.
+    let refresh_state_baseline = build_refresh_state_baseline(&mv_definition, &target_binding)
+        .map_err(RefreshError::from)?;
+    io.capture_refresh_sources(
+        source,
+        &mv_definition,
+        &refresh_state_baseline,
+        stmt.full || full_sources,
+        connector_context,
+    )
+    .await?;
     let base_refs = definition_base_refs(&mv_definition).map_err(RefreshError::from)?;
-    let (mv_definition, refresh_query_source) = io
-        .rebind_definition(
-            source,
-            &mv_definition,
-            &base_refs,
-            &iceberg_target,
-            None,
-            connector_context,
-        )
-        .await?;
     // One exact target generation serves the whole plan: the snapshot fence
     // above, the state baseline, the L bindings, and the typed partition facts
     // every sub-planner reads. Re-resolving `latest` per fact could split one
@@ -127,8 +134,18 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
             connector_context.clone(),
         )
         .map_err(RefreshError::from)?;
-    let refresh_state_baseline = build_refresh_state_baseline(&mv_definition, &target_binding)
-        .map_err(RefreshError::from)?;
+
+    let (mv_definition, refresh_query_source) = io
+        .rebind_definition(
+            source,
+            &mv_definition,
+            &base_refs,
+            &iceberg_target,
+            Some(&target_schema_observation),
+            connector_context,
+        )
+        .await?;
+
     let resolution = &mv_definition.facts.definition().query.resolution;
     let canonical_select_query = canonicalize_iceberg_mv_select_query(
         &parse_mv_select_query(&refresh_query_source).map_err(RefreshError::from)?,
@@ -481,7 +498,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
         previous_snapshot_id,
         current_snapshot_id,
     )
-    .await;
+    .await?;
     log_planned_iceberg_mv_affected_partitions(&iceberg_target, &affected_partitions);
     Ok(RefreshPlan {
         contract: RefreshPlanContract {
@@ -648,7 +665,7 @@ pub(crate) async fn plan_iceberg_union_projection_mv_refresh(
         },
         "UNION ALL MV affected partition planning",
     )
-    .await;
+    .await?;
     log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
     Ok(RefreshPlan {
         contract: RefreshPlanContract {
@@ -814,7 +831,7 @@ pub(crate) async fn plan_iceberg_all_bases_aggregate_mv_refresh(
         },
         &affected_partition_context,
     )
-    .await;
+    .await?;
     log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
     Ok(build_iceberg_refresh_plan(
         mv_definition,
@@ -963,7 +980,7 @@ pub(crate) async fn plan_iceberg_aggregate_mv_refresh(
                 previous,
                 current,
             )
-            .await;
+            .await?;
             log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
             Ok(build_iceberg_refresh_plan(
                 mv_definition,
@@ -1126,6 +1143,49 @@ pub(crate) async fn plan_iceberg_aggregate_mv_refresh(
     }
 }
 
+/// Read-only policy projection over the already captured source/target facts.
+/// It performs no target reload, management recovery, publication or split opening.
+pub(crate) async fn captured_refresh_decision_original(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    projection: &StoredKeyedMvProjection,
+    bindings: &novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings,
+    baseline: &RefreshStateBaseline,
+    query: &novarocks_parser::ast::Query,
+    full: bool,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<ExecutableRefreshDecision, RefreshError> {
+    let refs = definition_base_refs(projection)?;
+    let bases = base_relation_occurrences(projection, &refs)?;
+    let previous =
+        previous_refresh_locators(io, baseline, source.connector_control(), context).await?;
+    let mut current = BTreeMap::new();
+    for base in &bases {
+        current.insert(
+            base.occurrence_id,
+            io.current_base(source, &base.table, context)
+                .await?
+                .current_snapshot_id(),
+        );
+    }
+    let caps = RefreshCapabilities::from_canonical_facts(
+        projection.facts.interpretation(),
+        bindings,
+        projection.facts.definition().relation_occurrences.len(),
+        definition_has_join(query),
+    )?;
+    let statuses = base_snapshot_statuses_for_plan(&bases, &previous.snapshots, &current);
+    Ok(decide_requested_refresh_plan(
+        &RefreshPlanningInput {
+            snapshot_policy: caps.snapshot_policy,
+            base_snapshots: &statuses,
+            label: "EXPLAIN REFRESH MATERIALIZED VIEW",
+        },
+        full,
+    )?
+    .refresh)
+}
+
 async fn previous_refresh_locators(
     io: &MvRefreshPreparationIo,
     baseline: &RefreshStateBaseline,
@@ -1161,87 +1221,91 @@ pub(crate) async fn plan_aggregate_mv_affected_partitions(
     mode: RefreshMode,
     previous_snapshot_id: Option<i64>,
     current_snapshot_id: Option<i64>,
-) -> crate::mv::domain::model::AffectedTargetPartitions {
+) -> Result<crate::mv::domain::model::AffectedTargetPartitions, RefreshError> {
+    use crate::mv::domain::model::AffectedTargetPartitions;
     match mode {
-        RefreshMode::Noop => noop_affected_partitions(target_partition),
+        RefreshMode::Noop => Ok(noop_affected_partitions(target_partition)),
         RefreshMode::Incremental => {
-            if is_unpartitioned_mv_target(target_partition) {
-                crate::mv::domain::model::AffectedTargetPartitions::Unpartitioned
-            } else {
-                let Some(previous) = previous_snapshot_id else {
-                    return crate::mv::domain::model::AffectedTargetPartitions::not_derived(
-                        "incremental aggregate MV affected partition planning missing previous snapshot",
-                    );
-                };
-                let Some(current) = current_snapshot_id else {
-                    return crate::mv::domain::model::AffectedTargetPartitions::not_derived(
-                        "incremental aggregate MV affected partition planning missing current snapshot",
-                    );
-                };
-                let previous_revision =
-                    match crate::mv::domain::refresh::planning::baseline_revision_for_occurrence(
-                        state_baseline,
-                        base,
-                    ) {
-                        Ok(revision) => revision,
-                        Err(error) => {
-                            return crate::mv::domain::model::AffectedTargetPartitions::not_derived(
-                                error,
-                            );
-                        }
-                    };
-                match crate::mv::domain::refresh::rewrite_context::observe_and_admit_change_window_for_table_original(io, source.connector_control(), source.storage_observation(), &base.table, previous_revision, previous, current, connector_context).await {
-                    Ok((
-                        novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
-                        _,
-                    )) => crate::mv::domain::model::AffectedTargetPartitions::known(
-                        std::iter::empty::<crate::mv::domain::model::MvPartitionKey>(),
-                    ),
-                    Ok((
-                        novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental {
-                            partition_impact,
-                            ..
-                        },
-                        observation,
-                    )) => crate::mv::domain::partition::planner::plan_affected_partitions(
-                        &crate::mv::domain::partition::planner::AffectedPartitionPlanInput {
-                            projection,
-                            source_occurrence_id: base.occurrence_id.get(),
-                            target_partition,
-                            partition_impact: Some(&partition_impact),
-                            schema_observation: Some(&observation),
-                        },
-                    ),
-                    Ok((
-                        novarocks_spi::connector::ConnectorChangeWindowAdmission::FullRebuild(_),
-                        _,
-                    )) => crate::mv::domain::model::AffectedTargetPartitions::not_derived(
-                        "connector change-window admission requires a full rebuild",
-                    ),
-                    Err(err) => {
-                        let message = format!("failed to admit connector changes for affected partitions: {err}");
-                        io.retain_optional_failure(err.0);
-                        crate::mv::domain::model::AffectedTargetPartitions::not_derived(message)
-                    },
-                }
-            }
+            let previous = previous_snapshot_id
+                .ok_or("incremental partition planning has no From snapshot")?;
+            let current =
+                current_snapshot_id.ok_or("incremental partition planning has no To snapshot")?;
+            plan_prepared_base_partitions(
+                io,
+                source,
+                connector_context,
+                base,
+                state_baseline,
+                projection,
+                target_partition,
+                previous,
+                current,
+            )
+            .await
         }
         RefreshMode::Full | RefreshMode::Rebuild => {
             if is_unpartitioned_mv_target(target_partition) {
-                crate::mv::domain::model::AffectedTargetPartitions::Unpartitioned
-            } else {
-                crate::mv::domain::partition::planner::plan_affected_partitions(
-                    &crate::mv::domain::partition::planner::AffectedPartitionPlanInput {
-                        projection,
-                        source_occurrence_id: base.occurrence_id.get(),
-                        target_partition,
-                        partition_impact: None,
-                        schema_observation: None,
-                    },
-                )
+                return Ok(AffectedTargetPartitions::Unpartitioned);
             }
+            crate::mv::domain::partition::planner::plan_affected_partitions(
+                &crate::mv::domain::partition::planner::AffectedPartitionPlanInput {
+                    projection,
+                    source_occurrence_id: base.occurrence_id.get(),
+                    target_partition,
+                    prepared_source: None,
+                },
+            )
+            .map_err(Into::into)
         }
     }
+}
+
+async fn plan_prepared_base_partitions(
+    io: &MvRefreshPreparationIo,
+    source: &IcebergMvCorePorts,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    base: &RefreshBaseRelationOccurrence,
+    baseline: &RefreshStateBaseline,
+    projection: &StoredKeyedMvProjection,
+    target_partition: &mv_schema::MvPartitionContract,
+    previous: i64,
+    current: i64,
+) -> Result<crate::mv::domain::model::AffectedTargetPartitions, RefreshError> {
+    let revision =
+        crate::mv::domain::refresh::planning::baseline_revision_for_occurrence(baseline, base)?;
+    let captured = io.captured_sources().require(&base.table)?;
+    if captured.snapshot != Some(current) {
+        return Err("partition planning To differs from its original pin".into());
+    }
+    let receipt = captured
+        .receipt(Some(revision))
+        .ok_or("partition planning has no original typed window")?;
+    let novarocks_spi::connector::read_stack::ConnectorReadSourceSelection::ChangeWindow(window) =
+        receipt.request().selection()
+    else {
+        return Err("partition planning cannot use a snapshot as a window".into());
+    };
+    if window.from_snapshot_id() != previous || window.to_snapshot_id() != current {
+        return Err(
+            "partition planning numeric window differs from its exact prepared source".into(),
+        );
+    }
+    let observation = io.schema(source, &base.table, context).await?;
+    crate::mv::domain::partition::planner::plan_affected_partitions(
+        &crate::mv::domain::partition::planner::AffectedPartitionPlanInput {
+            projection,
+            source_occurrence_id: base.occurrence_id.get(),
+            target_partition,
+            prepared_source: Some(
+                crate::mv::domain::partition::planner::PreparedPartitionSource {
+                    receipt: &receipt,
+                    planning: &captured.lease,
+                    schema: &observation,
+                },
+            ),
+        },
+    )
+    .map_err(Into::into)
 }
 
 async fn plan_multi_base_affected_partitions_original(
@@ -1254,100 +1318,55 @@ async fn plan_multi_base_affected_partitions_original(
     mode: RefreshMode,
     window: OccurrenceSnapshotWindow<'_>,
     context: &str,
-) -> crate::mv::domain::model::AffectedTargetPartitions {
+) -> Result<crate::mv::domain::model::AffectedTargetPartitions, RefreshError> {
+    use crate::mv::domain::model::AffectedTargetPartitions;
     let OccurrenceSnapshotWindow {
         bases,
         previous,
         current,
     } = window;
     match mode {
-        RefreshMode::Noop => noop_affected_partitions(target_partition),
+        RefreshMode::Noop => Ok(noop_affected_partitions(target_partition)),
         RefreshMode::Full | RefreshMode::Rebuild => {
             if is_unpartitioned_mv_target(target_partition) {
-                crate::mv::domain::model::AffectedTargetPartitions::Unpartitioned
+                Ok(AffectedTargetPartitions::Unpartitioned)
             } else {
-                crate::mv::domain::model::AffectedTargetPartitions::not_derived(format!(
+                Ok(AffectedTargetPartitions::not_derived(format!(
                     "{context}: full refresh affected partition planning is not implemented"
-                ))
+                )))
             }
         }
         RefreshMode::Incremental => {
-            if is_unpartitioned_mv_target(target_partition) {
-                return crate::mv::domain::model::AffectedTargetPartitions::Unpartitioned;
-            }
-
             let mut results = Vec::with_capacity(bases.len());
             for base in bases {
-                let result = match (
-                    previous.get(&base.occurrence_id).copied(),
-                    current
-                        .get(&base.occurrence_id)
-                        .copied()
-                        .flatten(),
-                ) {
-                    (Some(previous), Some(current)) if previous == current => {
-                        crate::mv::domain::model::AffectedTargetPartitions::known(
-                            std::iter::empty::<crate::mv::domain::model::MvPartitionKey>(),
-                        )
-                    }
-                    (Some(previous), Some(current)) => {
-                        match match crate::mv::domain::refresh::planning::baseline_revision_for_occurrence(baseline,base) {
-                            Ok(revision) => crate::mv::domain::refresh::rewrite_context::observe_and_admit_change_window_for_table_original(
-                                io,source.connector_control(),source.storage_observation(),&base.table,revision,previous,current,connector_context).await,
-                            Err(error) => Err(RefreshError::from(error)),
-                        } {
-                            Ok((
-                                novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
-                                _,
-                            )) => crate::mv::domain::model::AffectedTargetPartitions::known(
-                                std::iter::empty::<crate::mv::domain::model::MvPartitionKey>(),
-                            ),
-                            Ok((
-                                novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental {
-                                    partition_impact,
-                                    ..
-                                },
-                                observation,
-                            )) => crate::mv::domain::partition::planner::plan_affected_partitions(
-                                &crate::mv::domain::partition::planner::AffectedPartitionPlanInput {
-                                    projection,
-                                    source_occurrence_id: base.occurrence_id.get(),
-                                    target_partition,
-                                    partition_impact: Some(&partition_impact),
-                                    schema_observation: Some(&observation),
-                                },
-                            ),
-                            Ok((
-                                novarocks_spi::connector::ConnectorChangeWindowAdmission::FullRebuild(_),
-                                _,
-                            )) => crate::mv::domain::model::AffectedTargetPartitions::not_derived(
-                                "connector change-window admission requires a full rebuild",
-                            ),
-                            Err(err) => {
-                                let message = format!("failed to admit connector changes for affected partitions: {err}");
-                                io.retain_optional_failure(err.0);
-                                crate::mv::domain::model::AffectedTargetPartitions::not_derived(message)
-                            },
-                        }
-                    }
-                    (None, _) => crate::mv::domain::model::AffectedTargetPartitions::not_derived(
-                        "incremental affected partition planning missing previous snapshot",
-                    ),
-                    (_, None) => crate::mv::domain::model::AffectedTargetPartitions::not_derived(
-                        "incremental affected partition planning missing current snapshot",
-                    ),
-                };
-                let stop = matches!(
-                    result,
-                    crate::mv::domain::model::AffectedTargetPartitions::NotDerived { .. }
-                );
+                let previous = previous
+                    .get(&base.occurrence_id)
+                    .copied()
+                    .ok_or("incremental partition planning has no From snapshot")?;
+                let current = current
+                    .get(&base.occurrence_id)
+                    .copied()
+                    .flatten()
+                    .ok_or("incremental partition planning has no To snapshot")?;
+                let result = plan_prepared_base_partitions(
+                    io,
+                    source,
+                    connector_context,
+                    base,
+                    baseline,
+                    projection,
+                    target_partition,
+                    previous,
+                    current,
+                )
+                .await?;
+                let stop = matches!(result, AffectedTargetPartitions::NotDerived { .. });
                 results.push((base.display(), result));
                 if stop {
                     break;
                 }
             }
-
-            merge_affected_partition_results(context, results)
+            Ok(merge_affected_partition_results(context, results))
         }
     }
 }
@@ -1388,7 +1407,10 @@ async fn reobserve_current_management_before_refresh(
         &metadata,
         context.clone(),
     )?;
-    crate::mv::domain::refresh::observation::validate_observed_schema_locator(&schema, &table)?;
+    crate::mv::domain::refresh::observation::validate_observed_schema_locator(
+        schema.table(),
+        &table,
+    )?;
     let documents = lease.derive_document_storage_lease()?;
     let request = crate::mv::domain::staged_create::keyed_request(
         &documents,
@@ -1463,7 +1485,7 @@ async fn reconcile_published_lake_projection(
         context.clone(),
     )?;
     crate::mv::domain::refresh::observation::validate_observed_schema_locator(
-        &schema,
+        schema.table(),
         &metadata.identity,
     )?;
     io.rebuild_read_only(
@@ -1615,7 +1637,7 @@ mod partition_planning_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn plan_multi_base_affected_partitions_unchanged_bases_return_empty_known_set() {
+    async fn unchanged_partition_bases_require_the_original_exact_window_preparation() {
         let projection = projection();
         let partition = identity_partition();
         let base_refs = vec![
@@ -1731,17 +1753,18 @@ mod partition_planning_tests {
             tokio::runtime::Handle::current(),
             entrance.clone(),
         ));
-        let ports = IcebergMvCorePorts::new(
+        let ports = IcebergMvCorePorts::new_with_management_entrance(
             Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             host.clone(),
+            host.clone(),
             readiness,
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
+            entrance,
             crate::application::test_constant_policy(),
-        )
-        .with_management_entrance(entrance);
-        // Unchanged occurrences must not resolve a predecessor or read target metadata.
+        );
+        // Equal numeric IDs cannot replace the original exact source/window preparation.
         let baseline = RefreshStateBaseline::SnapshotBacked {
             previous_sources: Vec::new(),
             target_snapshot_id: projection.facts.publication_snapshot(),
@@ -1799,17 +1822,14 @@ mod partition_planning_tests {
             .unwrap();
         assert!(
             !requested_change_window,
-            "unchanged bases should not require change-window admission"
+            "unprepared source facts must fail before submitting physical work"
         );
         let Poll::Ready(planned) = planned else {
-            panic!("unchanged bases should finish without requesting change-window admission");
+            panic!("missing original exact facts must refuse synchronously");
         };
 
-        assert_eq!(
-            planned,
-            crate::mv::domain::model::AffectedTargetPartitions::known(std::iter::empty::<
-                crate::mv::domain::model::MvPartitionKey,
-            >(),)
-        );
+        let error = planned
+            .expect_err("unprepared unchanged windows cannot authorize an empty partition set");
+        assert!(error.to_string().contains("no exact revision"));
     }
 }

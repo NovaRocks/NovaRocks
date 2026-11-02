@@ -228,6 +228,10 @@ struct ClosingSplit {
     exit: BoxFuture<'static, Result<(), ConnectorError>>,
     #[cfg(novarocks_dev_controls)]
     reader_marker: Option<TypedConnectorReaderMarker>,
+    #[cfg(novarocks_dev_controls)]
+    reader_rows_decoded: u64,
+    #[cfg(novarocks_dev_controls)]
+    reader_batches_delivered: u64,
 }
 
 impl ClosingSplit {
@@ -241,6 +245,10 @@ impl ClosingSplit {
             exit: split.stream.close(),
             #[cfg(novarocks_dev_controls)]
             reader_marker: split.reader_marker,
+            #[cfg(novarocks_dev_controls)]
+            reader_rows_decoded: split.file_metrics.rows_decoded,
+            #[cfg(novarocks_dev_controls)]
+            reader_batches_delivered: split.file_metrics.batches_delivered,
         }
     }
 }
@@ -499,6 +507,8 @@ impl Stream for TypedConnectorScanStream {
                         #[cfg(novarocks_dev_controls)]
                         emit_split_close_markers(
                             closing.reader_marker.as_ref(),
+                            closing.reader_rows_decoded,
+                            closing.reader_batches_delivered,
                             this.shared.test_observation.as_deref(),
                             this.shared.plan_node_id,
                         );
@@ -736,6 +746,8 @@ impl ScanChunkStream for TypedConnectorScanStream {
                         #[cfg(novarocks_dev_controls)]
                         emit_split_close_markers(
                             split.reader_marker.as_ref(),
+                            split.reader_rows_decoded,
+                            split.reader_batches_delivered,
                             markers.0.as_deref(),
                             markers.1,
                         );
@@ -757,11 +769,13 @@ impl ScanChunkStream for TypedConnectorScanStream {
 #[cfg(novarocks_dev_controls)]
 fn emit_split_close_markers(
     reader_marker: Option<&TypedConnectorReaderMarker>,
+    reader_rows_decoded: u64,
+    reader_batches_delivered: u64,
     observation: Option<&dyn novarocks_execution::runtime::exchange::TestEventObserver>,
     plan_node_id: i32,
 ) {
     if let Some(marker) = reader_marker {
-        marker.emit("CLOSE");
+        marker.emit_close(reader_rows_decoded, reader_batches_delivered);
     }
     #[cfg(novarocks_dev_controls)]
     emit_page_source_marker(

@@ -78,6 +78,7 @@ impl ResultField {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResultSchema {
     fields: Arc<[ResultField]>,
+    client_render: Option<Arc<novarocks_result_contract::ClientRenderSchema>>,
 }
 
 /// Fully materialized immediate query output owned by the query application.
@@ -233,7 +234,21 @@ impl ResultSchema {
     pub fn new(fields: impl Into<Arc<[ResultField]>>) -> Self {
         Self {
             fields: fields.into(),
+            client_render: None,
         }
+    }
+
+    /// Preserve the completed root's original presentation declaration.
+    pub(crate) fn with_client_render(
+        mut self,
+        schema: novarocks_result_contract::ClientRenderSchema,
+    ) -> Self {
+        self.client_render = Some(Arc::new(schema));
+        self
+    }
+
+    pub fn client_render(&self) -> Option<&novarocks_result_contract::ClientRenderSchema> {
+        self.client_render.as_deref()
     }
 
     pub fn fields(&self) -> &[ResultField] {

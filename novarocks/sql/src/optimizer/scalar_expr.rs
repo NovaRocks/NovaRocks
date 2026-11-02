@@ -1528,7 +1528,7 @@ mod selected_boolean_consumer_tests {
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .chain([("provider.fact".to_owned(), "kept".to_owned())])
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
         );
         ConstantPool::try_new(

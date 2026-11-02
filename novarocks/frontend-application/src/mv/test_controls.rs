@@ -783,11 +783,19 @@ impl MvTestControls {
             .grant
             .claim_once(self.process)
             .map_err(|e| e.to_string())?;
-        let (fact, public_message) = match decision.compile_control_error() {
-            Some(CompileControlError::Source(source)) => {
-                let fact = source.failure_fact();
+        // The Source identity is the original typed failure origin. Native
+        // execution facts remain distinct from compiler-control Source errors.
+        let original_fact = decision
+            .execution_failure()
+            .map(|input| input.fact())
+            .or_else(|| match decision.compile_control_error() {
+                Some(CompileControlError::Source(source)) => Some(source.failure_fact()),
+                _ => None,
+            });
+        let (fact, public_message) = match original_fact {
+            Some(fact) => {
                 // SafeDetail is bounded, not a redactor. Do not copy arbitrary
-                // Source text into a new artifact; existing role logs retain it.
+                // original execution/Source text into a new artifact.
                 let input = ExecutionFailureInput::new(
                     fact,
                     novarocks_execution_contract::SafeDetail::truncating(
@@ -800,7 +808,7 @@ impl MvTestControls {
                     Some(input.user_error().to_string()),
                 )
             }
-            _ => (None, None),
+            None => (None, None),
         };
         let cancellation = action.grant.cancellation();
         let document = serde_json::json!({
@@ -897,8 +905,7 @@ impl MvTestControls {
                 .ok_or("MV rewrite has no frozen statement nomination")?;
             let actual = statement_target.actual_statement;
             if original.statement_run_token != statement_target.run_token
-                || original.connection_id != actual.session().connection_id()
-                || original.session_epoch != actual.session().session_epoch()
+                || original.session_key != actual.session().key().get()
                 || original.statement_generation != actual.generation()
             {
                 return Err("MV rewrite statement differs from its frozen original target".into());
@@ -1103,7 +1110,11 @@ fn parse_action(value: &serde_json::Value) -> Result<Action, String> {
             let phase = text("phase")?;
             if !matches!(
                 phase,
-                "data-prepared" | "write-committed" | "publication-committed"
+                "source-pinned"
+                    | "source-prepared"
+                    | "data-prepared"
+                    | "write-committed"
+                    | "publication-committed"
             ) {
                 return Err("MV recovery grant has invalid phase".into());
             }
@@ -1385,6 +1396,75 @@ pub(crate) mod tests {
             .unwrap()
         }
         #[test]
+        fn original_native_execution_fact_roundtrips_through_authorized_scheduler_outcome() {
+            use novarocks_mv_application::{
+                scheduler::MvSchedulerConfig,
+                scheduler_runtime::{MvRefreshDisposition, MvRefreshSchedulerRuntime},
+            };
+            use novarocks_query_application::execution_error::{
+                ExecutionFailureInput, ExecutionFailureSite,
+            };
+            for original in [
+                novarocks_local_compiler::FragmentCompileError::Unsupported {
+                    node: Some(novarocks_physical_plan::NodeId::new(2)),
+                    feature: "private Native capability diagnostic",
+                },
+                novarocks_local_compiler::FragmentCompileError::Invalid(
+                    "unsupported private text must not choose a capability identity",
+                ),
+            ] {
+                let input = ExecutionFailureInput::new(
+                    original.failure_fact(),
+                    novarocks_execution_contract::SafeDetail::truncating(
+                        "private original Native execution diagnostic",
+                    ),
+                    ExecutionFailureSite::Coordinator,
+                );
+                let mut scheduler = MvRefreshSchedulerRuntime::<i64, ()>::new(
+                    MvSchedulerConfig::new(true, 1, 1, 10, 40),
+                );
+                let decision = scheduler.record(
+                    &7,
+                    MvRefreshDisposition::InvariantViolation(
+                        MvRefreshFailure::new("private scheduler detail", None)
+                            .with_execution_failure(Some(input.clone())),
+                    ),
+                    100,
+                );
+                assert_eq!(decision.execution_failure(), Some(&input));
+                assert_eq!(decision.compile_control_error(), None);
+                let fixture = Fixture::new();
+                fixture
+                    .controls
+                    .scheduler_request_completed(fixture.admit(&Fixture::source()), &decision)
+                    .unwrap();
+                let record = fixture.record();
+                assert_eq!(record["failure_identity"], "Source");
+                assert_eq!(fact(&record), input.fact());
+                let safe = ExecutionFailureInput::new(
+                    input.fact(),
+                    novarocks_execution_contract::SafeDetail::truncating(
+                        "MV scheduler request blocked; source diagnostic retained in FE role logs",
+                    ),
+                    ExecutionFailureSite::Coordinator,
+                );
+                assert_eq!(record["public_message"], safe.user_error().to_string());
+                assert!(!record.to_string().contains("private"));
+                assert_eq!(record["actual_task_attempt"], "NOT_OBSERVED");
+                assert_eq!(record["actual_publication_attempt"], "NOT_OBSERVED");
+            }
+            let fixture = Fixture::new();
+            fixture
+                .controls
+                .scheduler_request_completed(fixture.admit(&Fixture::source()), &blocked(None))
+                .unwrap();
+            let record = fixture.record();
+            assert_eq!(record["failure_identity"], "UNKNOWN");
+            assert!(record["failure_fact"].is_null());
+            assert!(record["public_message"].is_null());
+        }
+
+        #[test]
         fn actual_admission_success_and_transient_do_not_consume_later_blocked_slot() {
             let fixture = Fixture::new();
             let source = Fixture::source();
@@ -1645,9 +1725,33 @@ pub(crate) mod tests {
 
     #[test]
     fn rewrite_nomination_rejects_another_connection_or_generation() {
-        let actual = StatementToken::new(SessionToken::new(7, 1), 2);
-        let other_connection = StatementToken::new(SessionToken::new(8, 1), 2);
-        let later = StatementToken::new(SessionToken::new(7, 1), 3);
+        let actual = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            2,
+        );
+        let other_connection = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (8_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            2,
+        );
+        let later = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            3,
+        );
         assert!(MvRewriteStatementTarget::new(actual, other_connection, "run".into()).is_err());
         assert!(MvRewriteStatementTarget::new(actual, later, "run".into()).is_err());
         assert!(MvRewriteStatementTarget::new(actual, actual, "run".into()).is_ok());
@@ -1666,7 +1770,15 @@ pub(crate) mod tests {
             3000,
         );
         let controls = session.controls().unwrap();
-        let statement = StatementToken::new(SessionToken::new(7, 1), 2);
+        let statement = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            2,
+        );
         let target = MvRewriteStatementTarget::new(statement, statement, "wrong".into()).unwrap();
         let statements = novarocks_parser::parse("SELECT 1").unwrap();
         let [Statement::Query(query)] = statements.as_slice() else {
@@ -1804,8 +1916,8 @@ pub(crate) mod tests {
             target_session_id: session.role.scope().session_id().into(),
             statement_run_token: run_token.into(),
             frontend_process_id: session.role.scope().process().process_id(),
-            connection_id: statement.session().connection_id(),
-            session_epoch: statement.session().session_epoch(),
+            connection_id: 7,
+            session_key: statement.session().key().get(),
             statement_generation: statement.generation(),
         }
     }
@@ -1821,7 +1933,7 @@ pub(crate) mod tests {
             statement_run_token: nomination.statement_run_token.clone(),
             frontend_process_id: nomination.frontend_process_id.clone(),
             connection_id: nomination.connection_id,
-            session_epoch: nomination.session_epoch,
+            session_key: nomination.session_key,
             sql_sha256: sha2::Sha256::digest(b"SELECT 1").into(),
         }
     }
@@ -1837,7 +1949,15 @@ pub(crate) mod tests {
             3000,
         );
         let controls = session.controls().unwrap();
-        let actual = StatementToken::new(SessionToken::new(7, 1), 1);
+        let actual = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            1,
+        );
         let original = nomination(&session, actual, "first");
         let pinned = input(&session, &original);
         assert!(controls.nominate_statement(&pinned, &original).is_err());
@@ -1858,7 +1978,7 @@ pub(crate) mod tests {
         controls.pin_statement_input(&pinned).unwrap();
         controls.pin_statement_input(&pinned).unwrap();
         let mut different_client = pinned.clone();
-        different_client.session_epoch += 1;
+        different_client.session_key += 1;
         let mut different_connection = pinned.clone();
         different_connection.connection_id += 1;
         let mut different_sql = pinned.clone();
@@ -1896,7 +2016,15 @@ pub(crate) mod tests {
         assert!(controls.actions[1].frozen_input.lock().unwrap().is_none());
         let fresh_nom = nomination(
             &session,
-            StatementToken::new(SessionToken::new(8, 2), 1),
+            StatementToken::new(
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (8_u64 << 32) | 2_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+                1,
+            ),
             "fresh",
         );
         let fresh_input = input(&session, &fresh_nom);
@@ -1923,7 +2051,15 @@ pub(crate) mod tests {
             3000,
         );
         let controls = session.controls().unwrap();
-        let a = StatementToken::new(SessionToken::new(7, 1), 1);
+        let a = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            1,
+        );
         let original = nomination(&session, a, "frozen-run");
         controls
             .pin_statement_input(&input(&session, &original))
@@ -1953,9 +2089,33 @@ pub(crate) mod tests {
             .unwrap();
         assert!(session.role.scope().observations().is_empty());
         for b in [
-            StatementToken::new(SessionToken::new(7, 1), 2),
-            StatementToken::new(SessionToken::new(7, 2), 1),
-            StatementToken::new(SessionToken::new(8, 1), 1),
+            StatementToken::new(
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (7_u64 << 32) | 1_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+                2,
+            ),
+            StatementToken::new(
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (7_u64 << 32) | 2_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+                1,
+            ),
+            StatementToken::new(
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (8_u64 << 32) | 1_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+                1,
+            ),
         ] {
             assert!(
                 controls
@@ -2011,7 +2171,15 @@ pub(crate) mod tests {
             3000,
         );
         let controls = session.controls().unwrap();
-        let other = StatementToken::new(SessionToken::new(8, 1), 1);
+        let other = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (8_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            1,
+        );
         controls
             .nominate_statement(
                 &input(&session, &nomination(&session, other, "unlisted")),
@@ -2025,7 +2193,15 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_none()
         );
-        let actual = StatementToken::new(SessionToken::new(7, 1), 1);
+        let actual = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            1,
+        );
         controls
             .pin_statement_input(&input(&session, &nomination(&session, actual, "listed")))
             .unwrap();
@@ -2174,7 +2350,15 @@ pub(crate) mod tests {
             3000,
         );
         let controls = session.controls().unwrap();
-        let statement = StatementToken::new(SessionToken::new(7, 1), 1);
+        let statement = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            1,
+        );
         let original = nomination(&session, statement, "listed");
         let mut wrong_session = original.clone();
         wrong_session.target_session_id = "other-fe-session".into();
@@ -2474,7 +2658,15 @@ pub(crate) mod tests {
             3000,
         );
         let controls = std::sync::Arc::new(session.controls().unwrap());
-        let actual = StatementToken::new(SessionToken::new(7, 1), 1);
+        let actual = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (7_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            1,
+        );
         controls
             .pin_statement_input(&input(&session, &nomination(&session, actual, "exact")))
             .unwrap();

@@ -223,6 +223,7 @@ mod request_context_tests {
             cancellation.view(),
             SessionOptimizerSettings::default(),
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ));
 
         let connector = connector_request_context_for_execution(None, request.execution()).unwrap();
@@ -250,6 +251,7 @@ mod request_context_tests {
             QueryCancellationSource::new().view(),
             SessionOptimizerSettings::default(),
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ));
         let before = Instant::now();
         let connector = connector_request_context_for_execution(None, request.execution()).unwrap();
@@ -1008,7 +1010,10 @@ mod source_value_type_tests {
         let source = DataType::Struct(
             vec![
                 Field::new("u", DataType::FixedSizeBinary(16), false).with_metadata(
-                    [("nr_logical_type".into(), "unknown-source-attribute".into())].into(),
+                    std::collections::HashMap::<String, String>::from([(
+                        "nr_logical_type".into(),
+                        "unknown-source-attribute".into(),
+                    )]),
                 ),
                 Field::new(
                     "items",

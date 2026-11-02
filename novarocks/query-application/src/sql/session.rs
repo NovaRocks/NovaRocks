@@ -28,6 +28,13 @@ use novarocks_result_contract::ScalarProfileV1;
 use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::naming::DEFAULT_DATABASE;
 
+mod property;
+pub(crate) use property::SessionProperty;
+
+use crate::session_effects::SessionEffects;
+use crate::session_value::{SessionTimeZone, SessionValue, StatementSessionError};
+use novarocks_result_contract::ClientPresentationFamily;
+
 use crate::{
     session_error::{QueryServiceError, QueryServiceErrorKind},
     sql::session_admit::SessionAdmitError,
@@ -44,6 +51,8 @@ pub struct SessionSqlState {
     optimizer_settings: SessionOptimizerSettings,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     user_variables: BTreeMap<String, String>,
+    presentation: ClientPresentationFamily,
+    time_zone: Option<SessionTimeZone>,
 }
 
 impl Default for SessionSqlState {
@@ -55,6 +64,8 @@ impl Default for SessionSqlState {
             optimizer_settings: SessionOptimizerSettings::default(),
             sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
             user_variables: BTreeMap::new(),
+            presentation: ClientPresentationFamily::MysqlText,
+            time_zone: None,
         }
     }
 }
@@ -76,6 +87,82 @@ impl SessionSqlState {
         &self.execution_settings
     }
 
+    pub fn presentation(&self) -> &ClientPresentationFamily {
+        &self.presentation
+    }
+    pub fn time_zone(&self) -> Option<&SessionTimeZone> {
+        self.time_zone.as_ref()
+    }
+
+    pub fn from_session_value(value: SessionValue) -> Result<Self, StatementSessionError> {
+        let mut state = Self {
+            presentation: value.presentation,
+            time_zone: value.time_zone,
+            ..Self::default()
+        };
+        state.assign_session_names(
+            value.catalog,
+            value.schema.unwrap_or_else(|| DEFAULT_DATABASE.into()),
+        );
+        for (name, text) in value.properties {
+            state.apply_session_property_text(&name, &text)?;
+        }
+        Ok(state)
+    }
+    /// Names supplied by the client are input values, never a catalog existence proof.
+    pub fn assign_session_names(&mut self, catalog: Option<String>, schema: String) {
+        self.apply_effects(&SessionEffects::set_catalog_schema(catalog, schema))
+            .expect("names have no fallible property mutation");
+    }
+    pub fn apply_session_property_text(
+        &mut self,
+        name: &str,
+        text: &str,
+    ) -> Result<(), StatementSessionError> {
+        let invalid = |detail: String| StatementSessionError::InvalidSessionProperty {
+            name: name.to_owned(),
+            detail,
+        };
+        // Header properties use the closed canonical vocabulary. SQL SET owns
+        // its separate, existing case-insensitive identifier interpretation.
+        if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err(invalid("Session property names are case sensitive".into()));
+        }
+        if name == "catalog" {
+            let catalog = novarocks_types::naming::normalize_identifier(text).map_err(invalid)?;
+            let catalog = (catalog != novarocks_types::naming::DEFAULT_CATALOG).then_some(catalog);
+            self.assign_session_names(catalog, self.current_database.clone());
+            return Ok(());
+        }
+        let property = SessionProperty::parse(name, text)
+            .map_err(|error| invalid(error.message().to_owned()))?
+            .ok_or_else(|| invalid("Unknown session property".into()))?;
+        self.apply_effects(&SessionEffects::property(property))
+            .map_err(|error| invalid(error.message().to_owned()))
+    }
+    pub fn render_session_property(&self, name: &str) -> Option<String> {
+        if name.eq_ignore_ascii_case("catalog") {
+            return Some(
+                self.current_catalog
+                    .as_deref()
+                    .unwrap_or(novarocks_types::naming::DEFAULT_CATALOG)
+                    .to_owned(),
+            );
+        }
+        SessionProperty::read(&name.to_ascii_lowercase(), self).map(|property| property.render())
+    }
+    /// Apply the actual executor's typed mutations, retaining the existing order of assignments.
+    pub fn apply_effects(&mut self, effects: &SessionEffects) -> Result<(), QueryServiceError> {
+        if let Some(names) = &effects.catalog_schema {
+            self.current_catalog = names.catalog.clone();
+            self.current_database = names.schema.clone();
+        }
+        for property in &effects.properties {
+            property.apply(self)?;
+        }
+        Ok(())
+    }
+
     /// Stores a catalog the role owner has already resolved against its
     /// external projection. If the default catalog is selected and the old
     /// database does not exist there, reset to the portable default database.
@@ -84,17 +171,17 @@ impl SessionSqlState {
         catalog: Option<String>,
         current_database_exists: bool,
     ) {
-        self.current_catalog = catalog;
-        if self.current_catalog.is_none() && !current_database_exists {
-            self.current_database = DEFAULT_DATABASE.to_string();
-        }
+        let schema = if catalog.is_none() && !current_database_exists {
+            DEFAULT_DATABASE.to_owned()
+        } else {
+            self.current_database.clone()
+        };
+        self.assign_session_names(catalog, schema);
     }
 
-    /// Replaces the already-resolved database context selected by a role
-    /// adapter. Validation remains with that adapter's external catalog owner.
+    /// Apply names already validated by the role's original resolver.
     pub fn set_resolved_database_context(&mut self, catalog: Option<String>, database: String) {
-        self.current_catalog = catalog;
-        self.current_database = database;
+        self.assign_session_names(catalog, database);
     }
 
     /// Transfers the immutable inputs needed to construct one query attempt.
@@ -226,11 +313,39 @@ pub enum SessionSetAssignmentOutcome {
 ///
 /// The caller retains only catalog resolution and any role-local projection it
 /// requires. This function deliberately has no frontend dependency.
+/// A parsed assignment still leaves external catalog resolution with the original role owner.
+pub enum SessionAssignment {
+    Effects(SessionEffects),
+    UserVariable { name: String, value: String },
+    SelectCatalog(String),
+}
+
 pub fn apply_session_set_assignment(
     source: &str,
     assignment: &ast::SetAssignment,
     state: &mut SessionSqlState,
 ) -> Result<SessionSetAssignmentOutcome, QueryServiceError> {
+    match session_set_assignment_effects(source, assignment)? {
+        SessionAssignment::Effects(effects) => {
+            state.apply_effects(&effects)?;
+            Ok(SessionSetAssignmentOutcome::Applied)
+        }
+        SessionAssignment::UserVariable { name, value } => {
+            state.set_user_variable(&name, value).map_err(|detail| {
+                QueryServiceError::new(QueryServiceErrorKind::InvalidValue, detail)
+            })?;
+            Ok(SessionSetAssignmentOutcome::Applied)
+        }
+        SessionAssignment::SelectCatalog(catalog) => {
+            Ok(SessionSetAssignmentOutcome::SelectCatalog(catalog))
+        }
+    }
+}
+
+pub fn session_set_assignment_effects(
+    source: &str,
+    assignment: &ast::SetAssignment,
+) -> Result<SessionAssignment, QueryServiceError> {
     match &assignment.target {
         ast::SetTarget::UserVariable(variable) => {
             let value = match &assignment.value {
@@ -248,12 +363,10 @@ pub fn apply_session_set_assignment(
                     ));
                 }
             };
-            state
-                .set_user_variable(&variable.value, value)
-                .map_err(|message| {
-                    QueryServiceError::new(QueryServiceErrorKind::InvalidValue, message)
-                })?;
-            Ok(SessionSetAssignmentOutcome::Applied)
+            Ok(SessionAssignment::UserVariable {
+                name: variable.value.clone(),
+                value,
+            })
         }
         ast::SetTarget::SystemVariable(variable) => {
             let name = variable.value.to_ascii_lowercase();
@@ -271,7 +384,7 @@ pub fn apply_session_set_assignment(
                 // Preserve the previously admitted GLOBAL no-op. This feature
                 // owns connection and statement settings, not global state.
                 if matches!(assignment.scope, ast::SetScope::Global) {
-                    return Ok(SessionSetAssignmentOutcome::Applied);
+                    return Ok(SessionAssignment::Effects(SessionEffects::default()));
                 }
                 let mode = match &assignment.value {
                     ast::SetValue::Expression(value) => {
@@ -295,11 +408,20 @@ pub fn apply_session_set_assignment(
                     }
                     ast::SetValue::Query(_) => return Err(session_value_expression_error()),
                 };
-                state.sql_semantics = state.sql_semantics.clone().with_sql_mode(mode);
-                return Ok(SessionSetAssignmentOutcome::Applied);
+                return Ok(SessionAssignment::Effects(SessionEffects::property(
+                    SessionProperty::SqlMode(mode),
+                )));
             }
             let value = session_setting_value(&assignment.value)?;
-            apply_session_system_variable(state, &name, &value)
+            if name == "catalog" {
+                return Ok(SessionAssignment::SelectCatalog(value));
+            }
+            Ok(SessionAssignment::Effects(
+                match SessionProperty::parse(&name, &value)? {
+                    Some(property) => SessionEffects::property(property),
+                    None => SessionEffects::default(),
+                },
+            ))
         }
         ast::SetTarget::Catalog { .. } => {
             if matches!(assignment.scope, ast::SetScope::Global) {
@@ -311,12 +433,12 @@ pub fn apply_session_set_assignment(
                     ),
                 ));
             }
-            Ok(SessionSetAssignmentOutcome::SelectCatalog(
-                session_catalog_value(&assignment.value)?,
-            ))
+            Ok(SessionAssignment::SelectCatalog(session_catalog_value(
+                &assignment.value,
+            )?))
         }
         ast::SetTarget::Names { .. } | ast::SetTarget::Transaction { .. } => {
-            Ok(SessionSetAssignmentOutcome::Applied)
+            Ok(SessionAssignment::Effects(SessionEffects::default()))
         }
     }
 }
@@ -343,86 +465,6 @@ pub fn admit_session_set_assignment(
             ),
         )),
     }
-}
-
-fn apply_session_system_variable(
-    state: &mut SessionSqlState,
-    name: &str,
-    value: &str,
-) -> Result<SessionSetAssignmentOutcome, QueryServiceError> {
-    if name == "catalog" {
-        return Ok(SessionSetAssignmentOutcome::SelectCatalog(
-            value.to_string(),
-        ));
-    }
-    if name == "autocommit" {
-        debug_assert!(matches!(
-            lower_autocommit_value(value),
-            Ok(AutocommitSetting::Enabled)
-        ));
-        return Ok(SessionSetAssignmentOutcome::Applied);
-    }
-    match name {
-        "decimal_overflow_to_double" => {
-            state.sql_semantics = state
-                .sql_semantics
-                .clone()
-                .with_decimal_overflow_to_double(parse_bool(value)?);
-        }
-        "query_timeout" => {
-            let seconds = parse_value(value, "query_timeout")?;
-            state.execution_settings.set_query_timeout_secs(seconds);
-        }
-        "group_concat_max_len" => {
-            let value = parse_value(value, "group_concat_max_len")?;
-            state.execution_settings.set_group_concat_max_len(value);
-        }
-        "pipeline_dop" => {
-            let value = parse_value(value, "pipeline_dop")?;
-            state.execution_settings.set_pipeline_dop(value);
-        }
-        "enable_parquet_reader_page_index" => state
-            .execution_settings
-            .set_enable_parquet_reader_page_index(parse_bool(value)?),
-        "enable_scan_datacache" => state
-            .execution_settings
-            .set_enable_scan_datacache(parse_bool(value)?),
-        "enable_populate_datacache" => state
-            .execution_settings
-            .set_enable_populate_datacache(parse_bool(value)?),
-        "runtime_filter_scan_wait_time" => {
-            let value = parse_value(value, "runtime_filter_scan_wait_time")?;
-            state
-                .execution_settings
-                .set_runtime_filter_scan_wait_time_ms(value)
-                .map_err(session_setting_error)?;
-        }
-        "global_runtime_filter_wait_timeout" => {
-            let value = parse_value(value, "global_runtime_filter_wait_timeout")?;
-            state
-                .execution_settings
-                .set_runtime_filter_wait_timeout_ms(value)
-                .map_err(session_setting_error)?;
-        }
-        "disable_optimizer_rules" | "cbo_disabled_rules" => {
-            state.optimizer_settings.set_disabled_rules(
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|rule| !rule.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect(),
-            )
-        }
-        "enable_eliminate_agg" => state
-            .optimizer_settings
-            .set_enable_eliminate_agg(parse_bool(value)?),
-        "enable_ukfk_opt" => state
-            .optimizer_settings
-            .set_enable_ukfk_opt(parse_bool(value)?),
-        _ => apply_optimizer_session_set(&mut state.optimizer_settings, name, value)?,
-    }
-    Ok(SessionSetAssignmentOutcome::Applied)
 }
 
 fn session_setting_value(value: &ast::SetValue) -> Result<String, QueryServiceError> {
@@ -559,74 +601,6 @@ fn parse_value<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, Query
 
 fn session_setting_error(error: SessionSettingError) -> QueryServiceError {
     QueryServiceError::new(QueryServiceErrorKind::InvalidValue, error.to_string())
-}
-
-fn apply_optimizer_session_set(
-    settings: &mut SessionOptimizerSettings,
-    name: &str,
-    value: &str,
-) -> Result<(), QueryServiceError> {
-    let parse_bool_value = || parse_bool(value);
-    let parse_u64_value = || parse_value(value, name);
-    let parse_f64_value = || parse_value(value, name);
-    let parse_usize_value = || parse_value(value, name);
-
-    match name {
-        "cbo_broadcast_backend_count" => settings.set_broadcast_backend_count(parse_f64_value()?),
-        "cbo_broadcast_node_mem_budget_bytes" => {
-            settings.cbo_broadcast_node_mem_budget_bytes = Some(parse_f64_value()?)
-        }
-        "global_runtime_filter_build_max_size" => {
-            settings.rf_build_max_bytes = Some(parse_u64_value()?)
-        }
-        "global_runtime_filter_build_min_size" => {
-            settings.rf_build_min_bytes = Some(parse_u64_value()?)
-        }
-        "global_runtime_filter_probe_min_size" => {
-            settings.rf_probe_min_bytes = Some(parse_u64_value()?)
-        }
-        "global_runtime_filter_probe_min_selectivity" => {
-            settings.rf_probe_min_selectivity = Some(parse_f64_value()?)
-        }
-        "cbo_max_reorder_node_use_exhaustive" => {
-            settings.max_reorder_node_use_exhaustive = Some(parse_usize_value()?)
-        }
-        "cbo_max_reorder_node_use_dp" => {
-            settings.max_reorder_node_use_dp = Some(parse_usize_value()?)
-        }
-        "cbo_max_reorder_node_use_greedy" => {
-            settings.max_reorder_node_use_greedy = Some(parse_usize_value()?)
-        }
-        "cbo_max_reorder_node" => settings.max_reorder_node = Some(parse_usize_value()?),
-        "enable_query_rewrite_table_prune" => {
-            settings.enable_query_rewrite_table_prune = parse_bool_value()?
-        }
-        "enable_cbo_table_prune" => settings.enable_cbo_table_prune = parse_bool_value()?,
-        "enable_table_prune_on_update" => {
-            settings.enable_table_prune_on_update = parse_bool_value()?
-        }
-        "enable_common_subexpr_reuse" => {
-            settings.enable_common_subexpr_reuse = Some(parse_bool_value()?)
-        }
-        "enable_global_runtime_filter" => {
-            settings.enable_global_runtime_filter = Some(parse_bool_value()?)
-        }
-        "enable_materialized_view_rewrite" => {
-            settings.enable_materialized_view_rewrite = Some(parse_bool_value()?)
-        }
-        "enable_connector_static_predicate_pushdown" => {
-            settings.enable_connector_static_predicate_pushdown = Some(parse_bool_value()?)
-        }
-        "cbo_enable_dp_join_reorder" => settings.enable_dp_join_reorder = Some(parse_bool_value()?),
-        "cbo_enable_greedy_join_reorder" => {
-            settings.enable_greedy_join_reorder = Some(parse_bool_value()?)
-        }
-        "enable_global_runtime_filter_cross_exchange" => {
-            settings.allow_cross_exchange_rf = Some(parse_bool_value()?)
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 /// Connection-local settings that SQL admission has validated.

@@ -2003,10 +2003,7 @@ mod tests {
         let columns = reader.parquet_schema().columns();
         assert!(matches!(
             columns[0].logical_type_ref(),
-            Some(LogicalType::Timestamp {
-                is_adjusted_to_u_t_c: true,
-                ..
-            })
+            Some(LogicalType::Timestamp(value)) if value.is_adjusted_to_u_t_c
         ));
         let paths = columns
             .iter()

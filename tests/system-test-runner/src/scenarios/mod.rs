@@ -10,6 +10,7 @@ mod distributed_writer;
 pub(crate) mod exact_mysql_native_driver;
 #[cfg(unix)]
 pub(crate) mod exact_mysql_native_oracle;
+mod exchange_flow;
 mod exchange_normal_close;
 mod execution_failure;
 #[cfg(unix)]
@@ -59,6 +60,8 @@ mod runtime_filter;
 mod state_family;
 mod table_maintenance;
 mod task_evidence;
+mod trino_interop;
+mod trino_protocol;
 mod uea4_catalog_planning;
 mod uea4_range_reads;
 mod uea4_scan_readiness;
@@ -108,6 +111,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(native_ingress::scenarios());
     scenarios.extend(native_creation::scenarios());
     scenarios.extend(exchange_normal_close::scenarios());
+    scenarios.extend(exchange_flow::scenarios());
     scenarios.extend(preparation_capacity::scenarios());
     scenarios.extend(execution_failure::scenarios());
     scenarios.extend(execution_failure_representation::scenarios());
@@ -116,6 +120,8 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(execution_failure_prepared::scenarios());
     scenarios.extend(state_family::scenarios());
     scenarios.extend(table_maintenance::scenarios());
+    scenarios.extend(trino_interop::scenarios());
+    scenarios.extend(trino_protocol::scenarios());
     scenarios
 }
 
@@ -134,9 +140,9 @@ pub fn disabled_reason(name: &str) -> Option<&'static str> {
         | "uea4/catalog-planning-responsibility"
         | "catalog/provider-read-queued-progress"
         | "uea4/scan-producer-readiness"
-        | "uea4/scan-producer-cancel" => {
-            Some("Paimon tests are suspended pending detailed connector design")
-        }
+        | "uea4/scan-producer-cancel" => Some(
+            "Paimon provider is suspended until paimon-rust and its readers support Arrow 60 and zstd 0.14",
+        ),
         _ => None,
     }
 }

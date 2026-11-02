@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Borrowed geometry of Arrow 58.4's default StreamWriter operations.
+//! Borrowed geometry of Arrow 60.1.0's default StreamWriter operations.
 //! The schema uses the shared numerical author. Batch spans follow writer.rs
 //! write_array_data/get_byte_array_buffers/get_list_array_buffers exactly;
 //! source stock is never substituted for selected copied bytes. Dynamic
@@ -35,6 +35,7 @@ use arrow_array::{
     LargeListArray, LargeListViewArray, LargeStringArray, ListArray, ListViewArray, MapArray,
     RecordBatch, RunArray, StringArray, StringViewArray, StructArray, UnionArray,
 };
+use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_type_contract::{
     MAX_VALUE_TYPE_NODES, ValueSchemaCreation, ValueTypeError, ValueTypeVisit,
@@ -132,7 +133,7 @@ impl Counts {
     fn field(&mut self, field: &Field) -> Result<(), IpcGeometryError> {
         // This consumer is the typed execution stream. Provider/source schemas
         // retain their separate original annotation/provenance codec.
-        if field.metadata().capacity() != 0 {
+        if !field.metadata().is_empty() {
             return Err(IpcGeometryError::SourceModel);
         }
         self.fields = add(self.fields, 1)?;
@@ -164,7 +165,7 @@ pub fn observe_stream_writer_schema_construction<'a, H>(
     control: &dyn KernelEvaluationControl,
 ) -> Result<IpcStreamSchemaFacts<'a>, IpcConstructionError<H>> {
     control.checkpoint(0)?;
-    if schema.metadata().capacity() != 0 {
+    if !schema.metadata().is_empty() {
         return Err(IpcGeometryError::SourceModel.into());
     }
     let mut work = EvaluationCheckpoints::new(control);
@@ -257,6 +258,7 @@ struct Body {
     copied: usize,
     scratch: usize,
     variadic_counts: usize,
+    metadata_scratch: usize,
 }
 impl Body {
     fn buffer(&mut self, bytes: usize) -> Result<(), IpcGeometryError> {
@@ -373,7 +375,7 @@ fn window<H>(
             // Pinned writer truncates the u128 views buffer, but deliberately
             // writes every existing external data buffer in its visible extent.
             body.buffer(mul(rows, std::mem::size_of::<u128>())?)?;
-            for buffer in buffers {
+            for buffer in buffers.iter() {
                 work.step()?;
                 body.buffer(buffer.len())?;
             }
@@ -415,6 +417,15 @@ fn window<H>(
             for (id, _) in fields.iter() {
                 work.step()?;
                 let child = union.child(id);
+                if *mode == arrow_schema::UnionMode::Sparse {
+                    // Arrow60.1 slices each owned sparse child ArrayData before
+                    // writing it. The same source visitor bounds that clone's
+                    // metadata separately from the outer column.to_data().
+                    body.metadata_scratch = add(
+                        body.metadata_scratch,
+                        crate::array_backing_geometry::source_metadata_bytes(child.as_ref(), work)?,
+                    )?;
+                }
                 window::<H>(child.as_ref(), 0, child.len(), body, work, depth + 1)?;
             }
         }
@@ -551,6 +562,23 @@ fn message_upper<H>(
     if body.variadic_counts != 0 {
         backing = add(backing, add(mul(body.variadic_counts, 8)?, 4 + 7)?)?;
     }
+    // write_to_sink reuses a private Vec<EncodedBuffer> across dictionary
+    // and record-batch messages. Each element is Raw(Buffer) or
+    // Compressed(Vec<u8>); public payload size plus one alignment word is
+    // a source-reviewed opaque enum envelope, not a private Layout claim.
+    // Any doubling from a smaller existing capacity requests less than four
+    // times the required slots in total, including old/new growth requests.
+    let encoded_entry = add(
+        std::mem::size_of::<Buffer>().max(std::mem::size_of::<Vec<u8>>()),
+        std::mem::align_of::<Buffer>().max(std::mem::align_of::<Vec<u8>>()),
+    )?;
+    requests.bytes = add(
+        requests.bytes,
+        add(
+            body.metadata_scratch,
+            mul(mul(body.buffers, 4)?, encoded_entry)?,
+        )?,
+    )?;
     let mut observe = || work.step().map_err(IpcConstructionError::<H>::from);
     requests.geometric::<[i64; 2], IpcConstructionError<H>>(body.nodes, 0, 1, &mut observe)?;
     requests.geometric::<[i64; 2], IpcConstructionError<H>>(body.buffers, 0, 1, &mut observe)?;
@@ -587,11 +615,18 @@ fn dictionary_messages<H>(
                 && matches!(values.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
         {
             let values = concrete::<DictionaryArray<Int32Type>>(array)?.values();
-            // writer.rs::encode_dictionaries and DictionaryTracker::insert_column
-            // EACH invoke column.to_data(). The cloned values then go through
-            // make_array before recursive dictionary discovery. These are three
-            // distinct operations, not reuse of one metadata envelope.
-            for source in [array, array, values.as_ref()] {
+            // collect_dict_updates and DictionaryTracker each call to_data;
+            // make_array reconstructs the values for recursive discovery.
+            // Arrow60.1 additionally clones the values ArrayData into the
+            // collected DictionaryToEncode and again for message encoding.
+            // Each operation keeps its own source-derived metadata envelope.
+            for source in [
+                array,
+                array,
+                values.as_ref(),
+                values.as_ref(),
+                values.as_ref(),
+            ] {
                 let metadata = crate::array_backing_geometry::source_metadata_bytes(source, work)?;
                 requests.bytes = add(requests.bytes, metadata)?;
             }
@@ -690,15 +725,36 @@ pub fn observe_stream_writer_batch_construction<'a, H>(
     }
     let mut work = EvaluationCheckpoints::new(control);
     let mut requests = SchemaRequestAccumulator::default();
-    // encode() allocates flattened_fields() and an EncodedData vector of that
-    // capacity; each EncodedData is its two public Vec<u8> members. This is
-    // private-operation geometry, not an exact private struct Layout request.
+    // Arrow60.1 collect_all_dicts creates flattened_fields and reserves a
+    // private DictionaryToEncode vector at that field count. Its ArrayData,
+    // i64 and bool payloads plus alignment padding give an opaque upper;
+    // no private layout is mirrored or asserted. StreamWriter then reserves
+    // one public (header_len, body_len) pair per possible dictionary message.
     requests.exact::<&Field, IpcConstructionError<H>>(schema.fields, 1, &mut || {
         work.step().map_err(Into::into)
     })?;
-    requests.exact::<Vec<u8>, IpcConstructionError<H>>(schema.fields, 2, &mut || {
-        work.step().map_err(Into::into)
-    })?;
+    requests.bytes = add(
+        requests.bytes,
+        mul(
+            schema.fields,
+            add(
+                std::mem::size_of::<arrow_data::ArrayData>(),
+                add(
+                    std::mem::size_of::<i64>(),
+                    mul(
+                        2,
+                        std::mem::align_of::<arrow_data::ArrayData>()
+                            .max(std::mem::align_of::<i64>()),
+                    )?,
+                )?,
+            )?,
+        )?,
+    )?;
+    requests.exact::<(usize, usize), IpcConstructionError<H>>(
+        schema.dictionaries,
+        1,
+        &mut || work.step().map_err(Into::into),
+    )?;
     requests.exact::<i64, IpcConstructionError<H>>(schema.dictionaries, 1, &mut || {
         work.step().map_err(Into::into)
     })?;
@@ -725,6 +781,17 @@ pub fn observe_stream_writer_batch_construction<'a, H>(
         window::<H>(array.as_ref(), 0, array.len(), &mut body, &mut work, 0)?;
         dictionary_messages::<H>(array.as_ref(), &mut requests, &mut work, 0)?;
     }
+    // estimate_encoded_buffer_count reserves from the batch type. Its
+    // ByteView estimate is three even for zero external regions; one extra
+    // slot per node bounds that initial reserve beside later actual growth.
+    let encoded_entry = add(
+        std::mem::size_of::<Buffer>().max(std::mem::size_of::<Vec<u8>>()),
+        std::mem::align_of::<Buffer>().max(std::mem::align_of::<Vec<u8>>()),
+    )?;
+    requests.bytes = add(
+        requests.bytes,
+        mul(add(body.buffers, body.nodes)?, encoded_entry)?,
+    )?;
     message_upper::<H>(&body, false, &mut requests, &mut work)?;
     work.flush()?;
     creation

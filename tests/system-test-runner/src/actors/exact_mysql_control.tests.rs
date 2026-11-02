@@ -184,7 +184,7 @@ fn literal_replies_preserve_full_original_fixed_facts_without_minted_tokens() {
         gate.statement,
         Some(StatementFacts {
             connection_id: 0x01020304,
-            session_epoch: 9,
+            session_key: 9,
             generation: 11
         })
     );

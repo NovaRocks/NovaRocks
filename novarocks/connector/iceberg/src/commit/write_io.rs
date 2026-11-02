@@ -17,6 +17,7 @@
 
 //! Provider-owned physical Iceberg writer I/O.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs;
@@ -206,15 +207,17 @@ fn collect_iceberg_column_stats(metadata: &ParquetMetaData) -> Option<IcebergCol
             let Some(stats) = column.statistics() else {
                 continue;
             };
+            // Iceberg bounds exclude NaNs, including all-NaN Parquet groups.
+            let stats = iceberg_bounds_statistics(stats);
             accumulator.has_statistics = true;
             accumulator.value_count += column.num_values();
             if let Some(null_count) = stats.null_count_opt() {
                 accumulator.null_value_count += null_count as i64;
             }
             if let Some(merged) = accumulator.merged_statistics.as_mut() {
-                merge_statistics(merged, stats);
+                merge_statistics(merged, stats.as_ref());
             } else {
-                accumulator.merged_statistics = Some(stats.clone());
+                accumulator.merged_statistics = Some(stats.into_owned());
             }
         }
     }
@@ -253,6 +256,45 @@ fn collect_iceberg_column_stats(metadata: &ParquetMetaData) -> Option<IcebergCol
     })
 }
 
+// Parquet 60 emits NaN extrema for an all-NaN column chunk. Remove them
+// before merging groups so a leading NaN group cannot hide later real bounds.
+// Preserve Arrow 58 signed-zero bound normalization as well.
+fn iceberg_bounds_statistics(stats: &Statistics) -> Cow<'_, Statistics> {
+    fn filtered<T: Clone + AsBytes>(
+        stats: &ValueStatistics<T>,
+        is_nan: impl Fn(&T) -> bool,
+        lower: impl Fn(T) -> T,
+        upper: impl Fn(T) -> T,
+    ) -> ValueStatistics<T> {
+        ValueStatistics::new(
+            stats.min_opt().filter(|v| !is_nan(v)).cloned().map(lower),
+            stats.max_opt().filter(|v| !is_nan(v)).cloned().map(upper),
+            stats.distinct_count(),
+            stats.null_count_opt(),
+            false,
+        )
+        .with_nan_count(stats.nan_count_opt())
+        .with_backwards_compatible_min_max(stats.is_min_max_backwards_compatible())
+        .with_min_is_exact(stats.min_is_exact())
+        .with_max_is_exact(stats.max_is_exact())
+    }
+    match stats {
+        Statistics::Float(value) => Cow::Owned(Statistics::Float(filtered(
+            value,
+            |v| v.is_nan(),
+            |v| if v == 0.0 { -0.0 } else { v },
+            |v| if v == 0.0 { 0.0 } else { v },
+        ))),
+        Statistics::Double(value) => Cow::Owned(Statistics::Double(filtered(
+            value,
+            |v| v.is_nan(),
+            |v| if v == 0.0 { -0.0 } else { v },
+            |v| if v == 0.0 { 0.0 } else { v },
+        ))),
+        _ => Cow::Borrowed(stats),
+    }
+}
+
 #[derive(Default)]
 struct ColumnStatsAccumulator {
     column_size: i64,
@@ -277,10 +319,10 @@ fn merge_statistics(current: &mut Statistics, next: &Statistics) {
             *current = merge_typed_statistics(current, next, PartialOrd::partial_cmp);
         }
         (Statistics::Float(current), Statistics::Float(next)) => {
-            *current = merge_typed_statistics(current, next, PartialOrd::partial_cmp);
+            *current = merge_typed_statistics(current, next, |a, b| Some(a.total_cmp(b)));
         }
         (Statistics::Double(current), Statistics::Double(next)) => {
-            *current = merge_typed_statistics(current, next, PartialOrd::partial_cmp);
+            *current = merge_typed_statistics(current, next, |a, b| Some(a.total_cmp(b)));
         }
         (Statistics::ByteArray(current), Statistics::ByteArray(next)) => {
             *current = merge_typed_statistics(current, next, PartialOrd::partial_cmp);
@@ -369,6 +411,79 @@ mod tests {
 
     use super::{unique_file_path, write_parquet_file};
     use crate::access_binding::IcebergReadBinding;
+
+    // Iceberg specification: lower/upper bounds constrain non-null, non-NaN
+    // values; zero bounds must retain the ordering of -0.0 and +0.0.
+    #[test]
+    fn floating_iceberg_bounds_exclude_nan_across_row_groups() {
+        use arrow::array::{Float32Array, Float64Array};
+        use parquet::file::properties::WriterProperties;
+        for wide in [false, true] {
+            for values in [
+                vec![f64::NAN, -f64::NAN, f64::NAN, f64::NAN],
+                vec![f64::NAN, f64::NAN, -3.0, 2.0],
+                vec![0.0, 0.0, -0.0, -0.0],
+                vec![0.0, 0.0],
+                vec![-0.0, -0.0],
+            ] {
+                let all_nan = values.iter().all(|v| v.is_nan());
+                let zero = values.iter().all(|v| *v == 0.0);
+                let field = Field::new(
+                    "value",
+                    if wide {
+                        DataType::Float64
+                    } else {
+                        DataType::Float32
+                    },
+                    false,
+                )
+                .with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "3".to_string(),
+                )]));
+                let schema = Arc::new(Schema::new(vec![field]));
+                let array: ArrayRef = if wide {
+                    Arc::new(Float64Array::from(values))
+                } else {
+                    Arc::new(Float32Array::from(
+                        values.into_iter().map(|v| v as f32).collect::<Vec<_>>(),
+                    ))
+                };
+                let batch =
+                    arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+                let (_, result) = super::write_parquet_to_bytes(
+                    schema,
+                    &batch,
+                    WriterProperties::builder()
+                        .set_max_row_group_row_count(Some(2))
+                        .build(),
+                )
+                .unwrap();
+                let stats = result.column_stats.unwrap();
+                if all_nan {
+                    assert!(!stats.lower_bounds.contains_key(&3));
+                    assert!(!stats.upper_bounds.contains_key(&3));
+                } else {
+                    let read = |bytes: &[u8]| -> f64 {
+                        if wide {
+                            f64::from_le_bytes(bytes.try_into().unwrap())
+                        } else {
+                            f32::from_le_bytes(bytes.try_into().unwrap()) as f64
+                        }
+                    };
+                    let lower = read(&stats.lower_bounds[&3]);
+                    let upper = read(&stats.upper_bounds[&3]);
+                    if zero {
+                        assert_eq!(lower.to_bits(), (-0.0_f64).to_bits());
+                        assert_eq!(upper.to_bits(), 0.0_f64.to_bits());
+                    } else {
+                        assert_eq!(lower, -3.0);
+                        assert_eq!(upper, 2.0);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn unique_file_path_requires_one_reference() {

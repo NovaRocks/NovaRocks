@@ -107,6 +107,8 @@ enum CompletionEvent {
     RootRows,
     RootEnd,
     WriterSuccess,
+    SummarySuccess,
+    SummaryFailure,
     TaskFailure,
     Cancelled,
     DeadlineExpired,
@@ -150,6 +152,15 @@ enum ControlCut {
 }
 
 async fn run_arrival_order(order: &[CompletionEvent], publish: bool, cut: ControlCut) {
+    run_arrival_order_with_summary_source(order, publish, cut, false).await;
+}
+
+async fn run_arrival_order_with_summary_source(
+    order: &[CompletionEvent],
+    publish: bool,
+    cut: ControlCut,
+    independent_summary_source: bool,
+) {
     let (mut identity_owner, client) =
         crate::query_execution::logical_execution_test_profile::process(
             tokio::runtime::Handle::current(),
@@ -183,19 +194,31 @@ async fn run_arrival_order(order: &[CompletionEvent], publish: bool, cut: Contro
     credentials.verify_native_storage(&native_storage).unwrap();
     assert!(credentials.take_source(execution).is_err());
     let (description, plan) = internal_write_description();
-    let (mut attempt, resources, activation) = watchdog(
-        "original admission and Establish",
-        OriginalAttempt::new_bound(
-            execution,
-            Arc::new(UnavailableInfo),
-            description.clone(),
-            plan,
-            true,
-            Some(Arc::clone(&native_storage)),
-            true,
-        ),
-    )
-    .await;
+    let (mut attempt, resources, activation) =
+        watchdog("original admission and Establish", async {
+            if independent_summary_source {
+                OriginalAttempt::new_bound_with_summary_source(
+                    execution,
+                    Arc::new(UnavailableInfo),
+                    description.clone(),
+                    plan,
+                    Arc::clone(&native_storage),
+                )
+                .await
+            } else {
+                OriginalAttempt::new_bound(
+                    execution,
+                    Arc::new(UnavailableInfo),
+                    description.clone(),
+                    plan,
+                    true,
+                    Some(Arc::clone(&native_storage)),
+                    true,
+                )
+                .await
+            }
+        })
+        .await;
     assert!(Arc::ptr_eq(&attempt.native_credentials, &native_storage));
     let cancellation_requester = attempt.cancellation_requester.take().unwrap();
     let control = order.iter().copied().find(|event| {
@@ -348,6 +371,7 @@ async fn run_arrival_order(order: &[CompletionEvent], publish: bool, cut: Contro
         let mut expected = None;
         let mut end_received = false;
         let mut writers_succeeded = false;
+        let mut summary_succeeded = !independent_summary_source;
         let mut control_requested = false;
         let mut accepted_before_control = None;
         let mut retained_ready = None;
@@ -424,12 +448,31 @@ async fn run_arrival_order(order: &[CompletionEvent], publish: bool, cut: Contro
                     }
                 }
                 CompletionEvent::WriterSuccess => {
+                    let upstream = attempt.pending_upstream.as_ref().unwrap();
+                    if independent_summary_source {
+                        upstream.publish_original_distinct_writer_success(&mut attempt.round);
+                    } else {
+                        upstream.publish_original_writer_success(&mut attempt.round);
+                    }
+                    writers_succeeded = true;
+                }
+                CompletionEvent::SummarySuccess => {
+                    assert!(independent_summary_source);
                     attempt
                         .pending_upstream
                         .as_ref()
                         .unwrap()
-                        .publish_original_writer_success(&mut attempt.round);
-                    writers_succeeded = true;
+                        .publish_original_summary_success(&mut attempt.round);
+                    summary_succeeded = true;
+                }
+                CompletionEvent::SummaryFailure => {
+                    assert!(independent_summary_source);
+                    let selected = attempt
+                        .pending_upstream
+                        .as_ref()
+                        .unwrap()
+                        .publish_original_summary_failure(&mut attempt.round, original_failure());
+                    expected = Some(ExecutionFailureInput::from_selected_task(&selected).unwrap());
                 }
                 CompletionEvent::TaskFailure => {
                     let selected = attempt
@@ -441,7 +484,7 @@ async fn run_arrival_order(order: &[CompletionEvent], publish: bool, cut: Contro
                 }
                 CompletionEvent::Cancelled | CompletionEvent::DeadlineExpired => {
                     if cut == ControlCut::AfterReady {
-                        assert!(end_received && writers_succeeded);
+                        assert!(end_received && writers_succeeded && summary_succeeded);
                         if result.is_none() {
                             result = Some(
                                 watchdog(
@@ -508,16 +551,19 @@ async fn run_arrival_order(order: &[CompletionEvent], publish: bool, cut: Contro
                 // No successful delivery receipt is manufactured for it.
                 break;
             }
-            if expected.is_none() && !control_requested && (!end_received || !writers_succeeded) {
+            if expected.is_none()
+                && !control_requested
+                && (!end_received || !writers_succeeded || !summary_succeeded)
+            {
                 assert!(
                     result.is_none(),
-                    "Ready requires both original facts: {order:?}"
+                    "Ready requires complete Root and every original writer/source terminal: {order:?}"
                 );
                 assert!(logical.original_internal_outcome().borrow().is_none());
                 assert_eq!(
                     session.accumulated_row_count().unwrap(),
                     0,
-                    "EOF decoded the original generation; union is forbidden before writer proof"
+                    "EOF decoded the original generation; union needs both writer and summary-source proof"
                 );
                 assert_eq!(fixture.recorded.lock().unwrap().finish, 0);
             }
@@ -534,7 +580,7 @@ async fn run_arrival_order(order: &[CompletionEvent], publish: bool, cut: Contro
         };
         match (expected, result) {
             (Some(expected), result) => {
-                let error = result.expect_err("original failed writer cannot reach Ready");
+                let error = result.expect_err("an original failed Task cannot reach Ready");
                 assert_eq!(error.execution_failure(), Some(&expected));
                 terminal = Some(
                 novarocks_query_application::api::NativeAttemptTerminal::Failed(
@@ -619,7 +665,11 @@ async fn run_arrival_order(order: &[CompletionEvent], publish: bool, cut: Contro
         }
         if !delivery_refusals.is_empty() {
             assert!(
-                control.is_some() || order.contains(&CompletionEvent::TaskFailure),
+                control.is_some()
+                    || order.iter().any(|event| matches!(
+                        event,
+                        CompletionEvent::TaskFailure | CompletionEvent::SummaryFailure
+                    )),
                 "an otherwise valid completion cannot lose its original delivery"
             );
         }
@@ -695,7 +745,14 @@ async fn run_arrival_order(order: &[CompletionEvent], publish: bool, cut: Contro
                 assert_eq!(ready.accepted.row_count(), 3);
                 assert!(Arc::ptr_eq(&ready._credentials, &native_storage));
             }
-        } else if publish && !order.contains(&CompletionEvent::TaskFailure) {
+        } else if publish
+            && !order.iter().any(|event| {
+                matches!(
+                    event,
+                    CompletionEvent::TaskFailure | CompletionEvent::SummaryFailure
+                )
+            })
+        {
             let mut call = session.prepare_finish_call(publication_context).unwrap();
             watchdog(
                 "same Ready union original publication Call",
@@ -786,6 +843,54 @@ async fn fixed_write_eof_then_original_writer_proof_then_second_cpu_union_reache
 #[tokio::test(flavor = "current_thread")]
 async fn fixed_write_original_te_task_failure_after_end_keeps_exact_cause_and_no_union() {
     run_case(true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn independent_summary_terminal_and_original_writer_accept_every_causal_arrival_order() {
+    let orders = causal_orders(&[
+        CompletionEvent::RootRows,
+        CompletionEvent::RootEnd,
+        CompletionEvent::WriterSuccess,
+        CompletionEvent::SummarySuccess,
+    ]);
+    assert_eq!(orders.len(), 12);
+    for order in orders {
+        run_arrival_order_with_summary_source(&order, true, ControlCut::Arrival, true).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn summary_source_failure_after_eof_and_writer_success_keeps_original_cause_and_no_union() {
+    run_arrival_order_with_summary_source(
+        &[
+            CompletionEvent::RootRows,
+            CompletionEvent::RootEnd,
+            CompletionEvent::WriterSuccess,
+            CompletionEvent::SummaryFailure,
+        ],
+        false,
+        ControlCut::Arrival,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn original_control_after_eof_and_writer_success_vetoes_before_summary_session_union() {
+    for control in [CompletionEvent::Cancelled, CompletionEvent::DeadlineExpired] {
+        run_arrival_order_with_summary_source(
+            &[
+                CompletionEvent::RootRows,
+                CompletionEvent::RootEnd,
+                CompletionEvent::WriterSuccess,
+                control,
+            ],
+            true,
+            ControlCut::Arrival,
+            true,
+        )
+        .await;
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

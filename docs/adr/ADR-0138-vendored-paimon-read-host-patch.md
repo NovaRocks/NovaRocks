@@ -5,6 +5,10 @@ domain: [provider-spi, crate-boundary]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0204
+    scope: "Paimon vendor retention while suspended; authorized read-host boundaries remain required for restoration"
+    link: "ADR-0204-upstream-iceberg-backports-and-provider-suspension.md"
 date: 2026-09-08
 provenance:
   - "discussion: 2026-09-08 Paimon read-only SDK integration decision"

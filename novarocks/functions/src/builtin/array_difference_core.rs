@@ -20,7 +20,7 @@ use super::array_literal_core::CollectionObservation;
 use super::collection_arrow::{self, ArrowSite};
 use crate::KernelFailure;
 use arrow_array::types::{ArrowPrimitiveType, Decimal128Type, Float64Type, Int64Type};
-use arrow_array::{Array, ArrayRef, ListArray, PrimitiveArray};
+use arrow_array::{Array, ArrayRef, Decimal128Array, ListArray, PrimitiveArray};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_schema::DataType;
 use novarocks_failure_contract::{FailureFact, FailureProjection, OuterFailureProjection};
@@ -214,6 +214,22 @@ pub fn difference_observed<E>(
     }
     let values = if list.values().data_type() == field.data_type() {
         list.values().clone()
+    } else if let (DataType::Decimal128(_, scale), DataType::Float64) =
+        (list.values().data_type(), field.data_type())
+    {
+        // Preserve the original complete child conversion, including hidden
+        // NULL payloads. Parent selection does not change this author's demand.
+        observe(CollectionObservation::OpaqueBoundary).map_err(DifferenceFailure::Caller)?;
+        let source = list
+            .values()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .ok_or_else(|| {
+                collection_arrow::contract("array_difference decimal carrier differs")
+            })?;
+        Arc::new(crate::decimal_float_cast::decimal128_array_to_f64(
+            source, *scale,
+        )) as ArrayRef
     } else {
         observe(CollectionObservation::OpaqueBoundary).map_err(DifferenceFailure::Caller)?;
         arrow_cast::cast(list.values(), field.data_type()).map_err(|source| {

@@ -158,12 +158,11 @@ impl QueryViewService {
         Ok(ViewStatementResult::Ok)
     }
 
-    fn handle_show_views(
+    fn prepare_show_views_input(
         &self,
-        engine: &dyn ViewEngine,
         show_views: &novarocks_parser::ast::ShowViews,
         context: ViewRequestContext<'_>,
-    ) -> Result<ViewStatementResult, String> {
+    ) -> Result<crate::view::PreparedShowViews, String> {
         let database = show_views
             .database
             .as_ref()
@@ -173,14 +172,17 @@ impl QueryViewService {
         let active_external_catalog = context
             .current_catalog
             .filter(|catalog| !catalog.eq_ignore_ascii_case(DEFAULT_CATALOG));
-        let mut names = match active_external_catalog {
+        let source = match active_external_catalog {
             Some(catalog) => {
                 let catalog = normalize_identifier(catalog)?;
-                let connector_context = context.connector_context.ok_or_else(|| {
+                context.connector_context.ok_or_else(|| {
                     "SHOW VIEWS for an external catalog requires connector request context"
                         .to_string()
                 })?;
-                engine.list_external_views(&catalog, &normalized_database, connector_context)?
+                crate::view::ShowViewsSource::External {
+                    catalog,
+                    namespace: normalized_database,
+                }
             }
             None => {
                 // Each name is counted against the local result bound before
@@ -202,14 +204,13 @@ impl QueryViewService {
                         .map_err(|error| format!("SHOW VIEWS: {error}"))?;
                     names.push(key.view.clone());
                 }
-                names
+                crate::view::ShowViewsSource::Local(names)
             }
         };
-        names.sort();
-        Ok(ViewStatementResult::Query(build_string_result(
-            &format!("Views_in_{database}"),
-            names,
-        )?))
+        Ok(crate::view::PreparedShowViews {
+            column_name: format!("Views_in_{database}"),
+            source,
+        })
     }
 
     fn registry_snapshot(&self) -> Result<HashMap<SessionViewKey, StoredView>, String> {
@@ -221,6 +222,14 @@ impl QueryViewService {
 }
 
 impl ViewService for QueryViewService {
+    fn prepare_show_views(
+        &self,
+        statement: &novarocks_parser::ast::ShowViews,
+        context: ViewRequestContext<'_>,
+    ) -> Result<crate::view::PreparedShowViews, String> {
+        self.prepare_show_views_input(statement, context)
+    }
+
     fn execute_statement(
         &self,
         engine: &dyn ViewEngine,
@@ -230,7 +239,9 @@ impl ViewService for QueryViewService {
         match statement {
             ViewStatement::Create(create_view) => self.handle_create(engine, create_view, context),
             ViewStatement::Drop(drop_view) => self.handle_drop(engine, drop_view, context),
-            ViewStatement::Show(show_views) => self.handle_show_views(engine, show_views, context),
+            ViewStatement::Show(_) => {
+                Err("SHOW VIEWS requires its original governed read source".to_string())
+            }
             ViewStatement::ShowCreate(show_create) => {
                 crate::view_iceberg::show_create_view(engine, &show_create.name, context)
             }
@@ -341,10 +352,6 @@ fn query_definition(
         context.current_catalog.unwrap_or(DEFAULT_CATALOG),
         context.current_database,
     )
-}
-
-fn build_string_result(column_name: &str, rows: Vec<String>) -> Result<QueryResult, String> {
-    build_query_result(vec![(column_name.to_string(), rows)])
 }
 
 pub(crate) fn build_query_result(

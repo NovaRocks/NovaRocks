@@ -58,6 +58,7 @@ impl ConnectorOriginalResultScopeCheck for ReadOriginalCheck {
     }
 }
 struct StatisticsReadAction {
+    family: novarocks_result_contract::ClientPresentationFamily,
     io: Arc<MetadataIoAdmission>,
     origin: ResultWindowAlias,
     scope: novarocks_workload_control::WorkScope,
@@ -131,6 +132,7 @@ impl FrontendStatisticsApplicationPort {
         target: application::StatisticsTableTarget,
         execution: &QueryExecutionContext,
         context: &ConnectorRequestContext,
+        family: novarocks_result_contract::ClientPresentationFamily,
     ) -> Result<Box<dyn GovernedStatementAction>, application::StatisticsApplicationError> {
         let fail = |e: WorkError| application::StatisticsApplicationError::new(e.to_string());
         let capacity = execution.result_capacity().ok_or_else(|| {
@@ -152,6 +154,7 @@ impl FrontendStatisticsApplicationPort {
             MetadataIoAdmission::new(capacity.scope().clone(), profile, metadata).map_err(fail)?;
         let context = context.clone().with_io_admission(io.clone());
         Ok(Box::new(StatisticsReadAction {
+            family,
             io,
             origin,
             scope: capacity.scope().clone(),
@@ -297,8 +300,8 @@ impl GovernedStatementAction for StatisticsReadAction {
         let window = owner
             .result_window_alias()
             .ok_or_else(|| service_error("statistics read lost original window"))?;
-        let producer =
-            LocalResultProducer::try_new(owner.scope(), window).map_err(service_error)?;
+        let producer = LocalResultProducer::try_new(owner.scope(), window, self.family)
+            .map_err(service_error)?;
         Poll::Ready(
             producer
                 .produce(|| {
@@ -354,6 +357,7 @@ impl GovernedStatementAction for StatisticsReadAction {
         // Same stable action state, no worker/task or second original owner.
         *target = Some(Box::new(StatisticsReadResidual {
             original: StatisticsReadAction {
+                family: self.family,
                 io: self.io.clone(),
                 origin: self.origin.clone(),
                 scope: self.scope.clone(),

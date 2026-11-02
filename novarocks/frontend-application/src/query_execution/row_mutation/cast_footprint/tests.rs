@@ -151,3 +151,36 @@ fn layout_preflight_preserves_utf8_extent_from_small_legal_dictionary() {
     assert!(Arc::ptr_eq(input.column(0), &dictionary));
     assert_eq!(dictionary.len(), ROWS);
 }
+
+#[test]
+fn metadata_resource_source_model_and_arithmetic_keep_their_original_facts_and_causes() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_type_contract::owned_resources::btree::BTreeResourceError;
+    use std::error::Error;
+    for (source, class, kind) in [
+        (
+            BTreeResourceError::Arithmetic("count overflow"),
+            FailureClass::Resource,
+            ConnectorErrorKind::ResourceExhausted,
+        ),
+        (
+            BTreeResourceError::SourceModel("source mismatch"),
+            FailureClass::Invariant,
+            ConnectorErrorKind::InvalidRequest,
+        ),
+    ] {
+        let fact = source.failure_fact();
+        let error = metadata_resource_error(source);
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.failure_fact(), fact);
+        assert_eq!(error.failure_fact().class(), class);
+        let mut cause = error.source();
+        let mut actual = false;
+        while let Some(source) = cause {
+            actual |= source.is::<BTreeResourceError>();
+            assert!(!source.is::<arrow::error::ArrowError>());
+            cause = source.source();
+        }
+        assert!(actual);
+    }
+}

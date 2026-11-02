@@ -71,6 +71,10 @@ pub(crate) struct NativeAttemptConvergenceOwner {
     source: BackendProcessObservationService,
     targets: Box<[NativeAttemptConvergenceTarget]>,
     mode: Option<NativeAttemptConvergenceMode>,
+    /// One request to the original bridge, not another delivery or Task verdict.
+    split_close_requested: bool,
+    split_failure:
+        Option<crate::query_execution::split_assignment_round::SplitAssignmentFailureSource>,
     remote_deadline: Option<std::time::Instant>,
     remote_closure: Option<NativeActiveConvergenceClosure>,
     local_unresolved: Option<StatementNativeHealthFailure>,
@@ -105,10 +109,21 @@ impl NativeAttemptConvergenceOwner {
             source,
             targets: targets.into_boxed_slice(),
             mode: None,
+            split_close_requested: false,
+            split_failure: None,
             remote_deadline: None,
             remote_closure: None,
             local_unresolved: None,
         })
+    }
+
+    pub(crate) fn bind_split_failure_source(
+        &mut self,
+        source: Option<
+            crate::query_execution::split_assignment_round::SplitAssignmentFailureSource,
+        >,
+    ) {
+        self.split_failure = source;
     }
 
     /// Idempotently closes the original producer path. A later cleanup cut
@@ -122,13 +137,23 @@ impl NativeAttemptConvergenceOwner {
         match (self.mode, mode) {
             (None, mode) => {
                 self.mode = Some(mode);
-                begin_convergence(round, split_delivery, mode);
+                self.split_close_requested = begin_convergence(round, split_delivery, mode);
             }
             (Some(NativeAttemptConvergenceMode::Normal), NativeAttemptConvergenceMode::Cleanup) => {
                 self.mode = Some(NativeAttemptConvergenceMode::Cleanup);
-                begin_convergence(round, split_delivery, NativeAttemptConvergenceMode::Cleanup);
+                self.split_close_requested =
+                    begin_convergence(round, split_delivery, NativeAttemptConvergenceMode::Cleanup);
             }
-            _ => {}
+            _ => {
+                if !self.split_close_requested
+                    && let Some(effective) = self.mode
+                {
+                    // Normal's initial request may have preceded the strict
+                    // Task tail. Reconcile actual closure on this same owner.
+                    self.split_close_requested =
+                        begin_convergence(round, split_delivery, effective);
+                }
+            }
         }
     }
 
@@ -215,24 +240,60 @@ impl NativeAttemptConvergenceOwner {
         mode: NativeAttemptConvergenceMode,
         requested_cleanup: bool,
     ) -> Result<NativeAttemptConvergenceStep, TaskExecutionError> {
-        self.begin(round, split_delivery, mode);
-        if self.mode == Some(NativeAttemptConvergenceMode::Normal)
-            && (requested_cleanup || round.failure_cause().is_some())
+        let effective = if requested_cleanup || round.failure_cause().is_some() {
+            NativeAttemptConvergenceMode::Cleanup
+        } else {
+            mode
+        };
+        if effective == NativeAttemptConvergenceMode::Cleanup
+            && self.mode != Some(NativeAttemptConvergenceMode::Cleanup)
         {
             tracing::warn!(
                 requested_cleanup,
                 failure = ?round.failure_cause(),
                 "Native convergence entered terminal cleanup after a late cancellation or Task failure"
             );
+        }
+        self.begin(round, split_delivery, effective);
+        if self.mode == Some(NativeAttemptConvergenceMode::Normal)
+            && let Some(error) = self
+                .split_failure
+                .as_ref()
+                .and_then(|source| source.failure())
+        {
+            // The original split driver still owns this cause. Convergence
+            // observes it once while normal input remains live, then keeps
+            // advancing actual cleanup without rewriting an accepted result.
+            tracing::warn!(%error, "Native split assignment failed before strict drain closed");
             self.begin(round, split_delivery, NativeAttemptConvergenceMode::Cleanup);
+            return Err(TaskExecutionError::SplitAssignment(error));
         }
         if round.pumps_closed() && self.observed_contexts(round).is_some() {
             return Ok(NativeAttemptConvergenceStep::Ready);
         }
-        match round.turn() {
-            Ok(report) => Ok(NativeAttemptConvergenceStep::Pending {
-                moved: !report.is_idle(),
-            }),
+        let advanced = if self.mode == Some(NativeAttemptConvergenceMode::Normal)
+            && !round.execution().normal_drain_started()
+        {
+            // Required inputs retain the exact original bridge. The same
+            // take/enqueue/admit path answers each immutable delivery once.
+            advance_task_round(round, split_delivery)
+        } else {
+            round.turn()
+        };
+        match advanced {
+            Ok(report) => {
+                let effective = if round.failure_cause().is_some() {
+                    NativeAttemptConvergenceMode::Cleanup
+                } else {
+                    effective
+                };
+                // This turn may have applied the final strict terminal and
+                // started normal closure. Close the original bridge now.
+                self.begin(round, split_delivery, effective);
+                Ok(NativeAttemptConvergenceStep::Pending {
+                    moved: !report.is_idle(),
+                })
+            }
             Err(error) => {
                 if self.mode == Some(NativeAttemptConvergenceMode::Normal) {
                     tracing::warn!(%error, "Native convergence Task turn failed before cleanup");
@@ -275,7 +336,13 @@ impl NativeAttemptConvergenceOwner {
                     round.execution_mut().release_profile_diagnostics();
                 }
             }
-            self.begin(round, split_delivery, mode);
+            let effective =
+                if request.cancellation().reason().is_some() || round.failure_cause().is_some() {
+                    NativeAttemptConvergenceMode::Cleanup
+                } else {
+                    mode
+                };
+            self.begin(round, split_delivery, effective);
             self.observe_local_close(round)?;
             self.observe_remote_closure(round, deadline);
             if round.pumps_closed()
@@ -528,10 +595,13 @@ pub(super) fn begin_convergence(
     round: &mut TaskRound,
     split_delivery: &SplitDeliveryBridge,
     mode: NativeAttemptConvergenceMode,
-) {
+) -> bool {
     match mode {
         NativeAttemptConvergenceMode::Normal => {
             round.begin_normal_drain();
+            if !round.execution().normal_drain_started() {
+                return false;
+            }
             split_delivery.abandon("Native attempt entered normal drain");
         }
         NativeAttemptConvergenceMode::Cleanup => {
@@ -539,6 +609,7 @@ pub(super) fn begin_convergence(
             split_delivery.abandon("Native attempt entered convergence");
         }
     }
+    true
 }
 
 #[cfg(test)]
@@ -1129,4 +1200,5 @@ mod tests {
     }
 
     include!("attempt_convergence_diagnostic_exit_tests.rs");
+    include!("attempt_convergence_split_failure_tests.rs");
 }

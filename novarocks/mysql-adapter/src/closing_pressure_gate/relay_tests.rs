@@ -146,7 +146,12 @@ impl Fixture {
             }
         };
         let hook = owner
-            .bind_relay(connection, actual_statement, ORIGINAL_SQL_SHA256)
+            .bind_relay(
+                connection,
+                actual_statement.session(),
+                actual_statement,
+                ORIGINAL_SQL_SHA256,
+            )
             .unwrap()
             .unwrap();
         Ok(Self {
@@ -195,7 +200,9 @@ impl Fixture {
         self.control.cancel_session_statement(
             self.hook.statement.session(),
             QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 100,
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(100)
+                        .expect("nonzero fixture requester"),
             },
         );
         if !self

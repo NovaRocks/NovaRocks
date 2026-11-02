@@ -79,6 +79,7 @@ pub(super) async fn serve<F>(
     host: &FrontendApplicationHost,
     drain_timeout: Duration,
     cleanup_timeout: Duration,
+    trino_server: &mut novarocks_trino_adapter::TrinoServerHandle,
 ) -> Result<(), FrontendApplicationError>
 where
     F: Future<Output = ()> + Send,
@@ -107,6 +108,7 @@ where
         }
     };
     let ready_user = mysql_listener.user().to_string();
+    let trino_port = trino_server.bound_addr().port();
     let mysql_server = novarocks_mysql_adapter::closing_pressure_fixture_listener(
         mysql_listener,
         server_version,
@@ -115,7 +117,7 @@ where
         wait_for_signal(drain_rx),
         wait_for_signal(finalize_rx),
         cleanup_timeout,
-        move |addr| emit_frontend_mysql_ready(addr, &ready_user),
+        move |addr| emit_frontend_mysql_ready(addr, &ready_user, trino_port),
         binding,
     );
     tokio::pin!(mysql_server);
@@ -132,7 +134,7 @@ where
                 result = &mut mysql_server => Some(Exit::Mysql(result)),
                 _ = &mut shutdown => Some(Exit::Shutdown),
                 _ = cancellation.cancelled() => Some(Exit::Shutdown),
-                error = wait_for_frontend_listener_failure(report_server, management_server)
+                error = wait_for_frontend_listener_failure(report_server, management_server, trino_server, host)
                     => Some(Exit::Listener(error)),
                 _ = original_failures.wait_for_failure() => Some(Exit::OriginalTask),
                 result = &mut control, if !control_completed => match result {
@@ -162,6 +164,7 @@ where
         }
         exit => {
             host.begin_serving_drain(drain_timeout);
+            trino_server.begin_drain();
             let _ = drain_tx.send(true);
             if matches!(&exit, Exit::Shutdown) {
                 let graceful = tokio::time::timeout(

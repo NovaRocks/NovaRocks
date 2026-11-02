@@ -122,8 +122,6 @@ pub(super) fn runtime_for_names(
         ExecutionRuntime::new(
             ExecutionRuntimeConfig {
                 driver_threads: 1,
-                exchange_wait_ms: 50,
-                exchange_io_threads: 1,
                 exchange_io_max_inflight_bytes: 1 << 20,
                 exchange_max_transmit_batched_bytes: 1 << 20,
                 operator_buffer_chunks: 1,
@@ -435,7 +433,6 @@ pub(super) fn program_for_arguments(
             &bytes,
             CompiledTaskOptions {
                 pipeline_dop: NonZeroUsize::MIN,
-                exchange_wait: Duration::from_millis(50),
             },
             Arc::clone(&tracker),
             &Control,

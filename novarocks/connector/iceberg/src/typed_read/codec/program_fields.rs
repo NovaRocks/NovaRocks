@@ -962,7 +962,10 @@ mod tests {
         let columns = vec![column2, column1.clone(), column1];
         let mut field = fields.fields()[1].as_ref().clone();
         let mut metadata = field.metadata().clone();
-        metadata.insert("provider.opaque".into(), "not reconstructed".into());
+        metadata.insert(
+            "provider.opaque".to_string(),
+            "not reconstructed".to_string(),
+        );
         field = field.with_metadata(metadata);
         let public = physical_public(vec![
             Arc::new(field),
@@ -1045,7 +1048,7 @@ mod tests {
         let wrong_id = field.as_ref().clone().with_nullable(true).with_metadata(
             [(PARQUET_FIELD_ID_META_KEY.into(), "999".into())]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
         );
         rejected(
             &relation,
@@ -1167,7 +1170,7 @@ mod tests {
         // Same physical shape and complete value declaration cannot repair a
         // changed known source attribute. Empty is not the SDK's absent key.
         let mut variant_attrs = arrow.fields()[1].metadata().clone();
-        variant_attrs.insert("ARROW:extension:metadata".into(), String::new());
+        variant_attrs.insert("ARROW:extension:metadata".to_string(), String::new());
         let mut wrong_source = arrow.fields().iter().cloned().collect::<Vec<_>>();
         wrong_source[1] = Arc::new(
             arrow.fields()[1]
@@ -1197,7 +1200,7 @@ mod tests {
             arrow.fields()[0].as_ref().clone().with_metadata(
                 [(PARQUET_FIELD_ID_META_KEY.into(), "1".into())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
         );
         rejected(
@@ -1341,7 +1344,7 @@ mod tests {
             output.push(Arc::clone(&fields.fields()[0]));
             let mut first = output[0].as_ref().clone();
             let mut metadata = first.metadata().clone();
-            metadata.insert("provider.dynamic".into(), "frozen".into());
+            metadata.insert("provider.dynamic".to_string(), "frozen".to_string());
             first = first.with_metadata(metadata);
             output[0] = Arc::new(first);
             let public = system_public(kind, output);
@@ -1593,7 +1596,7 @@ mod tests {
                         ICEBERG_CHANGE_OP_FIELD_ID.to_string(),
                     )]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
                 ),
             ),
         ]);
@@ -1620,7 +1623,10 @@ mod tests {
             .as_ref()
             .clone();
         let mut metadata = field.metadata().clone();
-        metadata.insert(ICEBERG_INITIAL_DEFAULT_META_KEY.into(), " 7 \n".into());
+        metadata.insert(
+            ICEBERG_INITIAL_DEFAULT_META_KEY.to_string(),
+            " 7 \n".to_string(),
+        );
         let good = physical_public(vec![Arc::new(
             field.clone().with_metadata(metadata.clone()),
         )]);
@@ -1632,7 +1638,10 @@ mod tests {
             &Control::default(),
         )
         .unwrap();
-        metadata.insert(ICEBERG_INITIAL_DEFAULT_META_KEY.into(), "8".into());
+        metadata.insert(
+            ICEBERG_INITIAL_DEFAULT_META_KEY.to_string(),
+            "8".to_string(),
+        );
         rejected(
             &relation,
             &[column],

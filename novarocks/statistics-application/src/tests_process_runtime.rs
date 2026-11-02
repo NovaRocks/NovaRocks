@@ -310,7 +310,7 @@ mod statement_observation_tests {
             statement_run_token: "original-analyze".into(),
             frontend_process_id: "019200aa-0000-7000-8000-0000000000ab".into(),
             connection_id: 1,
-            session_epoch: 2,
+            session_key: 2,
             statement_generation: 3,
         })
     }

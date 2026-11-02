@@ -264,7 +264,6 @@ pub struct IsolatedIcebergRestFixture {
     fixture_budget: Option<RunBudget>,
     private_budget: Option<RunBudget>,
     shared_iam: Mutex<Vec<(String, String, Registration)>>,
-    shared_scope_registration: Option<Registration>,
     shared_machine: Option<serde_json::Value>,
     run_storage: Option<RunStorageScope>,
 }
@@ -281,6 +280,27 @@ struct RuntimeEntry {
 enum FixtureProfile {
     Stock,
     PublicationHook { image: String, control_port: u16 },
+}
+
+#[derive(Clone, Copy)]
+enum SharedRequestKind {
+    Script { cleanup: bool },
+    CheckUsersAbsent,
+    CleanupUsers,
+}
+
+impl SharedRequestKind {
+    fn cleanup(self) -> bool {
+        matches!(self, Self::Script { cleanup: true } | Self::CleanupUsers)
+    }
+
+    fn action(self) -> Option<&'static str> {
+        match self {
+            Self::Script { .. } => None,
+            Self::CheckUsersAbsent => Some("--check-users-absent"),
+            Self::CleanupUsers => Some("--cleanup-users"),
+        }
+    }
 }
 
 impl FixtureProfile {
@@ -462,17 +482,6 @@ impl IsolatedIcebergRestFixture {
             &compose_project,
         )?;
 
-        let shared_scope_registration = fixture_budget
-            .as_ref()
-            .map(|budget| {
-                register(
-                    &scenario_root,
-                    "shared-minio-prefix",
-                    &budget.identity().run_id,
-                    &budget.identity().scope_root,
-                )
-            })
-            .transpose()?;
         let mut fixture = Self {
             repo_root,
             scenario_root,
@@ -500,7 +509,6 @@ impl IsolatedIcebergRestFixture {
             fixture_budget,
             private_budget,
             shared_iam: Mutex::new(Vec::new()),
-            shared_scope_registration,
             shared_machine,
             run_storage,
         };
@@ -1194,15 +1202,10 @@ impl IsolatedIcebergRestFixture {
     }
 
     fn run_shared_mc(&self, script: &str, cleanup: bool) -> Result<Output> {
-        self.run_shared_request(script, false, cleanup)
+        self.run_shared_request(script, SharedRequestKind::Script { cleanup })
     }
 
-    fn run_shared_request(
-        &self,
-        payload: &str,
-        cleanup_run: bool,
-        cleanup: bool,
-    ) -> Result<Output> {
+    fn run_shared_request(&self, payload: &str, kind: SharedRequestKind) -> Result<Output> {
         let budget = self
             .fixture_budget
             .as_ref()
@@ -1254,13 +1257,13 @@ impl IsolatedIcebergRestFixture {
                     .as_str()
                     .context("machine generation")?,
             );
-        if cleanup {
+        if kind.cleanup() {
             command.arg("--cleanup");
         }
-        if cleanup_run {
-            command.arg("--cleanup-run");
+        if let Some(action) = kind.action() {
+            command.arg(action);
         }
-        let deadline = if cleanup {
+        let deadline = if kind.cleanup() {
             budget.deadline()
         } else {
             budget.work_deadline()
@@ -1292,6 +1295,12 @@ impl IsolatedIcebergRestFixture {
             .iter()
             .map(|(user, policy, _)| serde_json::json!({"user":user,"policy":policy}))
             .collect::<Vec<_>>();
+        // This fixture borrows the caller's run even when that caller minted it.
+        // Only the outer owner can observe every descendant exit and perform
+        // the complete catalog barrier and original-root cleanup.
+        if pairs.is_empty() {
+            return Ok(());
+        }
         let storage = self
             .run_storage
             .as_ref()
@@ -1299,7 +1308,9 @@ impl IsolatedIcebergRestFixture {
         let request =
             serde_json::json!({"identity":budget.identity(),"storage":storage,"users":pairs})
                 .to_string();
-        let result = self.run_shared_request(&request, true, true).map(|_| ());
+        let result = self
+            .run_shared_request(&request, SharedRequestKind::CleanupUsers)
+            .map(|_| ());
         let mut settlements = Vec::new();
         for (_, _, registration) in self
             .shared_iam
@@ -1310,11 +1321,6 @@ impl IsolatedIcebergRestFixture {
             if let Err(error) = registration.settle(&result) {
                 settlements.push(format!("{error:#}"));
             }
-        }
-        if let Some(registration) = &mut self.shared_scope_registration
-            && let Err(error) = registration.settle(&result)
-        {
-            settlements.push(format!("{error:#}"));
         }
         match (result, settlements.is_empty()) {
             (value, true) => value,
@@ -1347,6 +1353,20 @@ impl IsolatedIcebergRestFixture {
                 secret_access_key: secret_key(prefix, &self.compose_project),
             };
             let policy_name = budget.identity().resource_name(purpose)?;
+            // These canonical names may already belong to the outer caller.
+            // Claim only absent native identities; never rotate or revoke a
+            // parent's existing user/policy merely because the run is shared.
+            let storage = self
+                .run_storage
+                .as_ref()
+                .context("shared IAM provisioning omitted original storage projection")?;
+            let request = serde_json::json!({
+                "identity":budget.identity(),
+                "storage":storage,
+                "users":[{"user":identity.access_key_id,"policy":policy_name}]
+            })
+            .to_string();
+            self.run_shared_request(&request, SharedRequestKind::CheckUsersAbsent)?;
             let registration = register(
                 &self.scenario_root,
                 "shared-minio-user",
@@ -3188,7 +3208,6 @@ mod tests {
             fixture_budget: None,
             private_budget: None,
             shared_iam: Mutex::new(Vec::new()),
-            shared_scope_registration: None,
             shared_machine: None,
             run_storage: None,
         };
@@ -3239,7 +3258,7 @@ mod tests {
         assert_eq!(budget.to_json().unwrap(), original.to_json().unwrap());
     }
     #[test]
-    fn shared_prefix_cleanup_waits_for_confirmed_private_exit() {
+    fn shared_owned_iam_cleanup_waits_for_confirmed_private_exit() {
         use crate::fixture_run::{FixturePolicy, RunBudget, ScratchIdentity};
         use std::os::unix::fs::PermissionsExt;
         for private_succeeds in [false, true] {
@@ -3252,15 +3271,15 @@ mod tests {
             )
             .unwrap();
             let before = crate::resource_registration::list(&fixture.scenario_root).unwrap();
-            fixture.shared_scope_registration = Some(
-                register(
-                    &fixture.scenario_root,
-                    "shared-minio-prefix",
-                    &budget.identity().run_id,
-                    &budget.identity().scope_root,
-                )
-                .unwrap(),
-            );
+            let user = budget.identity().iam_name("rot").unwrap();
+            let policy = budget.identity().resource_name("rot").unwrap();
+            let registration =
+                register(&fixture.scenario_root, "shared-minio-user", &user, &policy).unwrap();
+            fixture
+                .shared_iam
+                .lock()
+                .unwrap()
+                .push((user, policy, registration));
             fixture.fixture_budget = Some(budget);
             let vectors: serde_json::Value = serde_json::from_str(include_str!(
                 "../../../docker/iceberg-rest/tests/run_storage_scope_vectors.json"
@@ -3292,7 +3311,7 @@ mod tests {
             fs::write(
                 script_root.join("machine_mc.py"),
                 format!(
-                    "import json,os,sys\nfrom pathlib import Path\nrequest=json.loads(Path(sys.argv[sys.argv.index('--script-file')+1]).read_text())\nassert request['storage']==json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE'])\nassert request['identity']==json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT'])['identity']\nPath({:?}).write_text(json.dumps(request))\n",
+                    "import json,os,sys\nfrom pathlib import Path\nassert '--cleanup-users' in sys.argv and '--cleanup' in sys.argv\nassert '--cleanup-run' not in sys.argv\nrequest=json.loads(Path(sys.argv[sys.argv.index('--script-file')+1]).read_text())\nassert request['storage']==json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE'])\nassert request['identity']==json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT'])['identity']\nPath({:?}).write_text(json.dumps(request))\n",
                     marker.to_str().unwrap()
                 ),
             )
@@ -3308,7 +3327,14 @@ mod tests {
                     request["storage"],
                     serde_json::to_value(fixture.run_storage.as_ref().unwrap()).unwrap()
                 );
-                assert!(request["users"].as_array().unwrap().is_empty());
+                let budget = fixture.fixture_budget.as_ref().unwrap();
+                assert_eq!(
+                    request["users"],
+                    serde_json::json!([{
+                        "user": budget.identity().iam_name("rot").unwrap(),
+                        "policy": budget.identity().resource_name("rot").unwrap()
+                    }])
+                );
             }
             let observed = crate::resource_registration::collect(
                 &fixture.scenario_root,
@@ -3326,6 +3352,171 @@ mod tests {
                 }
             );
         }
+    }
+
+    fn shared_model_budget(inherited: bool) -> RunBudget {
+        use crate::fixture_run::{FixturePolicy, ScratchIdentity};
+        let original = RunBudget::admit(
+            FixturePolicy::default(),
+            ScratchIdentity::create("s3://novarocks/shared-owner-test").unwrap(),
+            600,
+            None,
+        )
+        .unwrap();
+        if inherited {
+            RunBudget::admit(
+                FixturePolicy::default(),
+                original.identity().clone(),
+                600,
+                Some(original.context().clone()),
+            )
+            .unwrap()
+        } else {
+            original
+        }
+    }
+
+    fn install_shared_model(
+        fixture: &mut IsolatedIcebergRestFixture,
+        budget: RunBudget,
+        private_succeeds: bool,
+        mc_script: &str,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docker/iceberg-rest/tests/run_storage_scope_vectors.json"
+        ))
+        .unwrap();
+        let mut snapshot = vectors["record"].clone();
+        snapshot["control_root"] = serde_json::json!("/unused");
+        fixture.run_storage =
+            Some(RunStorageScope::from_record(budget.identity(), &snapshot).unwrap());
+        fixture.shared_machine = Some(snapshot);
+        fixture.fixture_budget = Some(budget);
+        let scripts = fixture.repo_root.join("docker/iceberg-rest");
+        let down = scripts.join("down.sh");
+        fs::write(
+            &down,
+            if private_succeeds {
+                "#!/bin/sh\nexit 0\n"
+            } else {
+                "#!/bin/sh\nexit 17\n"
+            },
+        )
+        .unwrap();
+        fs::set_permissions(&down, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(scripts.join("machine_mc.py"), mc_script).unwrap();
+    }
+
+    #[test]
+    fn two_fixtures_borrow_the_same_fresh_run_without_root_cleanup() {
+        let budget = shared_model_budget(false);
+        let (_first_temp, mut first, _) = manifest_fixture();
+        let (_second_temp, mut second, _) = manifest_fixture();
+        for fixture in [&mut first, &mut second] {
+            install_shared_model(
+                fixture,
+                budget.clone(),
+                true,
+                "raise AssertionError('borrowed run without owned IAM must not dispatch cleanup')\n",
+            );
+            fixture.active = true;
+        }
+        first.shutdown().unwrap();
+        assert!(second.active);
+        second.shutdown().unwrap();
+        for fixture in [&first, &second] {
+            assert!(
+                crate::resource_registration::list(&fixture.scenario_root)
+                    .unwrap()
+                    .iter()
+                    .all(|record| {
+                        let record: serde_json::Value =
+                            serde_json::from_slice(&fs::read(record).unwrap()).unwrap();
+                        record["owner"] != "shared-minio-prefix"
+                    })
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_run_cleanup_releases_only_owned_iam_after_private_exit() {
+        for inherited in [false, true] {
+            for private_succeeds in [false, true] {
+                for owns_user in [false, true] {
+                    let (_temp, mut fixture, _) = manifest_fixture();
+                    let budget = shared_model_budget(inherited);
+                    let parent_user = budget.identity().iam_name("init").unwrap();
+                    let own_user = budget.identity().iam_name("rot").unwrap();
+                    let own_policy = budget.identity().resource_name("rot").unwrap();
+                    let marker = fixture.scenario_root.join("owned-iam-cleanup-called");
+                    let script = format!(
+                        "import json,os,sys\nfrom pathlib import Path\nassert '--cleanup-users' in sys.argv and '--cleanup' in sys.argv\nassert '--cleanup-run' not in sys.argv\nrequest=json.loads(Path(sys.argv[sys.argv.index('--script-file')+1]).read_text())\nassert request['users']==[{{'user':{:?},'policy':{:?}}}]\nassert all(pair['user']!={:?} for pair in request['users'])\nassert request['storage']==json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE'])\nPath({:?}).write_text(json.dumps(request))\n",
+                        own_user,
+                        own_policy,
+                        parent_user,
+                        marker.to_str().unwrap()
+                    );
+                    install_shared_model(&mut fixture, budget, private_succeeds, &script);
+                    let before =
+                        crate::resource_registration::list(&fixture.scenario_root).unwrap();
+                    if owns_user {
+                        let registration = register(
+                            &fixture.scenario_root,
+                            "shared-minio-user",
+                            &own_user,
+                            &own_policy,
+                        )
+                        .unwrap();
+                        fixture.shared_iam.lock().unwrap().push((
+                            own_user,
+                            own_policy,
+                            registration,
+                        ));
+                    }
+                    fixture.active = true;
+                    let result = fixture.shutdown();
+                    assert_eq!(result.is_ok(), private_succeeds);
+                    assert_eq!(marker.exists(), private_succeeds && owns_user);
+                    let observed = crate::resource_registration::collect(
+                        &fixture.scenario_root,
+                        &before,
+                        std::process::id(),
+                    )
+                    .unwrap();
+                    assert_eq!(observed.len(), usize::from(owns_user));
+                    if owns_user {
+                        assert_eq!(
+                            observed[0].state,
+                            if private_succeeds {
+                                crate::resource_registration::ObservedResourceState::Released
+                            } else {
+                                crate::resource_registration::ObservedResourceState::Unsettled
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn existing_parent_iam_refusal_precedes_fixture_registration_and_provisioning() {
+        let (_temp, mut fixture, _) = manifest_fixture();
+        let marker = fixture.scenario_root.join("parent-iam-preflight");
+        let script = format!(
+            "import json,sys\nfrom pathlib import Path\nassert '--check-users-absent' in sys.argv\nassert '--cleanup-run' not in sys.argv and '--cleanup' not in sys.argv\nrequest=json.loads(Path(sys.argv[sys.argv.index('--script-file')+1]).read_text())\nPath({:?}).write_text(json.dumps(request))\nsys.exit(29)\n",
+            marker.to_str().unwrap()
+        );
+        install_shared_model(&mut fixture, shared_model_budget(true), true, &script);
+        let before = crate::resource_registration::list(&fixture.scenario_root).unwrap();
+        assert!(fixture.new_builtin_user_identity("ccai").is_err());
+        assert!(marker.is_file());
+        assert!(fixture.shared_iam.lock().unwrap().is_empty());
+        assert_eq!(
+            crate::resource_registration::list(&fixture.scenario_root).unwrap(),
+            before
+        );
     }
 
     #[test]

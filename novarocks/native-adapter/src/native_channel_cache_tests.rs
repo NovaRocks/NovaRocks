@@ -97,7 +97,7 @@ fn counting_waker(panic: bool) -> (Waker, Arc<WakeCount>) {
 #[tokio::test]
 async fn one_leader_eight_waiters_and_ninth_refusal_publish_one_result() {
     let (cache, _factory, _budget, _) = fixture();
-    let key = identity(1, 9000, NativeRpcMethod::ExchangeUnary);
+    let key = identity(1, 9000, NativeRpcMethod::DeliverExchangeUnit);
     let leader = elect(&cache, key);
     let (waker, count) = counting_waker(false);
     let mut waiting: Vec<_> = (0..8).map(|_| cache.acquire(key)).collect();
@@ -128,9 +128,9 @@ async fn one_leader_eight_waiters_and_ninth_refusal_publish_one_result() {
 fn distinct_frozen_peers_endpoints_and_lanes_elect_independently() {
     let (cache, _factory, _budget, _) = fixture();
     let leaders: Vec<_> = [
-        identity(1, 9000, NativeRpcMethod::ExchangeUnary),
-        identity(2, 9000, NativeRpcMethod::ExchangeUnary),
-        identity(1, 9001, NativeRpcMethod::ExchangeUnary),
+        identity(1, 9000, NativeRpcMethod::DeliverExchangeUnit),
+        identity(2, 9000, NativeRpcMethod::DeliverExchangeUnit),
+        identity(1, 9001, NativeRpcMethod::DeliverExchangeUnit),
         identity(1, 9000, NativeRpcMethod::TransmitRuntimeFilterEnvelope),
     ]
     .into_iter()
@@ -147,7 +147,7 @@ fn distinct_frozen_peers_endpoints_and_lanes_elect_independently() {
 #[test]
 fn cancelled_waiter_returns_its_position_and_cancelled_leader_notifies_failure() {
     let (cache, _factory, _budget, _) = fixture();
-    let key = identity(1, 9000, NativeRpcMethod::ExchangeUnary);
+    let key = identity(1, 9000, NativeRpcMethod::DeliverExchangeUnit);
     let leader = elect(&cache, key);
     let (waker, count) = counting_waker(false);
     let mut waiting: Vec<_> = (0..8).map(|_| cache.acquire(key)).collect();
@@ -172,7 +172,7 @@ fn cancelled_waiter_returns_its_position_and_cancelled_leader_notifies_failure()
 #[tokio::test]
 async fn stale_election_cannot_publish_or_cancel_the_replacement_generation() {
     let (cache, _factory, _budget, _) = fixture();
-    let key = identity(1, 9000, NativeRpcMethod::ExchangeUnary);
+    let key = identity(1, 9000, NativeRpcMethod::DeliverExchangeUnit);
     let old = elect(&cache, key);
     let entry = old.entry;
     let generation = old.generation;
@@ -204,7 +204,7 @@ async fn stale_election_cannot_publish_or_cancel_the_replacement_generation() {
 #[test]
 fn exhausted_entry_and_waiter_generations_refuse_without_wrapping() {
     let (cache, _factory, _budget, _) = fixture();
-    let key = identity(1, 9000, NativeRpcMethod::ExchangeUnary);
+    let key = identity(1, 9000, NativeRpcMethod::DeliverExchangeUnit);
     let leader = elect(&cache, key);
     {
         let mut state = cache.core().state.lock().unwrap();
@@ -289,7 +289,7 @@ static REENTRANT_VTABLE: RawWakerVTable = RawWakerVTable::new(
 #[test]
 fn arbitrary_waker_clone_drop_and_wake_can_reenter_the_unlocked_cache() {
     let (cache, _factory, _budget, _) = fixture();
-    let key = identity(1, 9000, NativeRpcMethod::ExchangeUnary);
+    let key = identity(1, 9000, NativeRpcMethod::DeliverExchangeUnit);
     let leader = elect(&cache, key);
     let owner = Arc::new(ReentrantWake {
         core: Arc::downgrade(cache.core()),
@@ -315,7 +315,7 @@ fn arbitrary_waker_clone_drop_and_wake_can_reenter_the_unlocked_cache() {
 #[tokio::test]
 async fn first_notification_panic_does_not_skip_second_or_poison_published_result() {
     let (cache, _factory, _budget, _) = fixture();
-    let key = identity(1, 9000, NativeRpcMethod::ExchangeUnary);
+    let key = identity(1, 9000, NativeRpcMethod::DeliverExchangeUnit);
     let leader = elect(&cache, key);
     let (first_waker, first_count) = counting_waker(true);
     let (second_waker, second_count) = counting_waker(false);
@@ -342,7 +342,7 @@ async fn first_notification_panic_does_not_skip_second_or_poison_published_resul
 #[test]
 fn leader_cancellation_during_outer_unwind_notifies_all_without_double_panic() {
     let (cache, _factory, _budget, _) = fixture();
-    let key = identity(1, 9000, NativeRpcMethod::ExchangeUnary);
+    let key = identity(1, 9000, NativeRpcMethod::DeliverExchangeUnit);
     let leader = elect(&cache, key);
     let (first_waker, first_count) = counting_waker(true);
     let (second_waker, second_count) = counting_waker(false);
@@ -383,7 +383,7 @@ async fn full_ready_cache_recycles_cold_entries_with_fresh_generations_and_rotat
             identity(
                 u8::try_from(suffix).unwrap(),
                 9000,
-                NativeRpcMethod::ExchangeUnary,
+                NativeRpcMethod::DeliverExchangeUnit,
             )
         })
         .collect();
@@ -393,7 +393,7 @@ async fn full_ready_cache_recycles_cold_entries_with_fresh_generations_and_rotat
         previous_generations[leader.entry] = leader.generation;
         leader.publish(channel.clone()).unwrap();
     }
-    let first_key = identity(231, 9000, NativeRpcMethod::ExchangeUnary);
+    let first_key = identity(231, 9000, NativeRpcMethod::DeliverExchangeUnit);
     let first = elect(&cache, first_key);
     let first_entry = first.entry;
     assert_eq!(first.generation, previous_generations[first_entry] + 1);
@@ -403,7 +403,10 @@ async fn full_ready_cache_recycles_cold_entries_with_fresh_generations_and_rotat
         poll(&mut cache.acquire(first_key), Waker::noop()),
         Poll::Ready(Ok(Election::Ready(_)))
     ));
-    let second = elect(&cache, identity(232, 9000, NativeRpcMethod::ExchangeUnary));
+    let second = elect(
+        &cache,
+        identity(232, 9000, NativeRpcMethod::DeliverExchangeUnit),
+    );
     assert_ne!(
         second.entry, first_entry,
         "eviction must rotate instead of replacing the newest row repeatedly"
@@ -429,11 +432,11 @@ async fn full_connecting_occupied_ready_or_exhausted_rows_refuse_cold_eviction()
             identity(
                 u8::try_from(suffix).unwrap(),
                 9000,
-                NativeRpcMethod::ExchangeUnary,
+                NativeRpcMethod::DeliverExchangeUnit,
             )
         })
         .collect();
-    let cold_key = identity(231, 9000, NativeRpcMethod::ExchangeUnary);
+    let cold_key = identity(231, 9000, NativeRpcMethod::DeliverExchangeUnit);
     let leaders: Vec<_> = keys.iter().map(|&key| elect(&cache, key)).collect();
     assert_error(
         poll(&mut cache.acquire(cold_key), Waker::noop()),

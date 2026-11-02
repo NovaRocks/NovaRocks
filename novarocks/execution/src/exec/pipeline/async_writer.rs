@@ -176,6 +176,8 @@ struct WriterShared<O> {
     unknown_actor: Mutex<Option<std::mem::ManuallyDrop<WriterActorFuture<O>>>>,
     unknown_output: Mutex<Option<std::mem::ManuallyDrop<Option<O>>>>,
     unknown_self: Mutex<Option<Arc<WriterShared<O>>>>,
+    #[cfg(test)]
+    empty_result_observed: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -216,6 +218,8 @@ impl<O> WriterShared<O> {
             unknown_actor: Mutex::new(None),
             unknown_output: Mutex::new(None),
             unknown_self: Mutex::new(None),
+            #[cfg(test)]
+            empty_result_observed: std::sync::OnceLock::new(),
         }
     }
 
@@ -848,6 +852,34 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
             .is_some()
     }
 
+    /// Observe and consume one terminal output at the publisher's result cut.
+    /// An empty slot observed before publication is Pending, even when the
+    /// actor publishes immediately after this method releases the result lock.
+    pub(crate) fn poll_output(&self) -> ExecutionResult<std::task::Poll<O>> {
+        let (output, done) = {
+            let mut result = self.shared.result.lock().expect("async writer result lock");
+            let output = result.take();
+            #[cfg(test)]
+            if output.is_none()
+                && let Some(observed) = self.shared.empty_result_observed.get()
+            {
+                observed();
+            }
+            (output, self.shared.done.load(Ordering::Acquire))
+        };
+        // The result lock never covers error projection, a callback, or the
+        // caller's output destruction. Preserve a cause published after the
+        // driver's earlier error check rather than manufacturing a new one.
+        match output {
+            Some(output) => Ok(std::task::Poll::Ready(output)),
+            None if done => Err(self
+                .error()
+                .unwrap_or_else(|| WriterFailure::MissingTerminalOutcome.into())),
+            None => Ok(std::task::Poll::Pending),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn take_output(&self) -> Option<O> {
         self.shared
             .result
@@ -2026,8 +2058,6 @@ pub(crate) mod tests {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    exchange_wait_ms: 120_000,
-                    exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1024,
                     exchange_max_transmit_batched_bytes: 1024,
                     operator_buffer_chunks: 1,
@@ -2163,6 +2193,144 @@ pub(crate) mod tests {
         assert!(admission.same_occurrence(&original));
         assert!(finish.same_occurrence(&original));
         assert_eq!(owner.queued_usage(), (0, 0));
+    }
+
+    fn terminal_observation_owner() -> AsyncWriterOwner<u64> {
+        AsyncWriterOwner::new(
+            Arc::new(ControlledExecution {
+                catalog_handle: catalog_handle(),
+                calls: Arc::new(Calls::default()),
+                append_gate: None,
+                fail_append: false,
+                fail_abort: false,
+            }),
+            request(),
+            AsyncWriterQueueConfig::default(),
+            Box::new(|rows, _| Ok(rows)),
+        )
+    }
+
+    fn is_missing_terminal(error: &ExecutionFailure) -> bool {
+        matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Writer(cause)
+            if matches!(cause.cause(), WriterFailure::MissingTerminalOutcome))
+    }
+
+    #[test]
+    fn original_split_observations_have_a_false_missing_cut_with_a_real_publisher() {
+        use std::task::Poll;
+
+        let owner = terminal_observation_owner();
+        let empty = owner.take_output();
+        let shared = Arc::clone(&owner.shared);
+        let publisher = std::thread::spawn(move || shared.publish_terminal_success(17));
+        let publication = publisher.join();
+        // The real publication has actually completed between the old two
+        // consumer reads. The old branch would report missing despite the
+        // original output still being available to the single consumer.
+        let legacy_missing = empty.is_none() && owner.is_done();
+        let actual = owner.poll_output();
+        publication.unwrap();
+        assert!(legacy_missing);
+        assert_eq!(actual.unwrap(), Poll::Ready(17));
+    }
+
+    #[test]
+    fn empty_terminal_observation_cannot_race_success_publication() {
+        use std::sync::{TryLockError, mpsc};
+        use std::task::Poll;
+
+        let owner = terminal_observation_owner();
+        let shared = Arc::clone(&owner.shared);
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let release_observed = Arc::new(AtomicBool::new(false));
+        let released = Arc::clone(&release_observed);
+        let first = AtomicBool::new(true);
+        assert!(
+            shared
+                .empty_result_observed
+                .set(Arc::new(move || {
+                    if first.swap(false, Ordering::AcqRel) {
+                        let _ = reached_tx.send(());
+                        let received = release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .is_ok();
+                        released.store(received, Ordering::Release);
+                    }
+                }))
+                .is_ok()
+        );
+        let consumer = std::thread::spawn(move || {
+            let observation = owner.poll_output();
+            (owner, observation)
+        });
+        // Pause after the real empty take, before the real done load. The
+        // publisher must wait at its original result mutex, not an extra gate.
+        let reached = reached_rx.recv_timeout(Duration::from_secs(5));
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            let blocked = matches!(shared.result.try_lock(), Err(TryLockError::WouldBlock));
+            let _ = blocked_tx.send(blocked);
+            shared.publish_terminal_success(17);
+        });
+        let blocked = blocked_rx.recv_timeout(Duration::from_secs(5));
+        let _ = release_tx.send(());
+        // Release and actually join both owners before any assertion, even
+        // when a checkpoint or the observed lock contract failed.
+        let consumer_result = consumer.join();
+        let publisher_result = publisher.join();
+        let (owner, initial) = consumer_result.unwrap();
+        publisher_result.unwrap();
+        assert!(reached.is_ok());
+        assert!(blocked.unwrap());
+        assert!(release_observed.load(Ordering::Acquire));
+        assert!(matches!(initial, Ok(Poll::Pending)));
+        assert_eq!(owner.poll_output().unwrap(), Poll::Ready(17));
+    }
+
+    #[test]
+    fn terminal_observation_preserves_cause_published_after_initial_error_check() {
+        let owner = terminal_observation_owner();
+        assert!(owner.error().is_none());
+        let original: ExecutionFailure = ConnectorCallFailure::new(
+            ConnectorOperation::FinishWriter,
+            ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "original finish failure after driver error check",
+            ),
+        )
+        .into();
+        let runtime_error = RuntimeErrorState::default();
+        owner.shared.set_error(original.clone(), &runtime_error);
+        owner.shared.set_done();
+        let observed = owner.poll_output().unwrap_err();
+        assert!(observed.same_occurrence(&original));
+        assert!(runtime_error.error().unwrap().same_occurrence(&original));
+        assert!(!is_missing_terminal(&observed));
+    }
+
+    #[test]
+    fn true_missing_terminal_and_second_consumption_keep_the_original_failure() {
+        use std::task::Poll;
+
+        let missing = terminal_observation_owner();
+        assert_eq!(missing.poll_output().unwrap(), Poll::Pending);
+        missing.shared.set_done();
+        assert!(is_missing_terminal(&missing.poll_output().unwrap_err()));
+
+        let produced = terminal_observation_owner();
+        produced.shared.publish_terminal_success(17);
+        assert_eq!(produced.poll_output().unwrap(), Poll::Ready(17));
+        assert!(is_missing_terminal(&produced.poll_output().unwrap_err()));
+        let runtime_error = RuntimeErrorState::default();
+        produced.shared.ensure_terminal_outcome(&runtime_error);
+        assert!(
+            runtime_error.error().is_none(),
+            "single consumer ownership does not erase the actor's actual production fact"
+        );
     }
 
     #[test]

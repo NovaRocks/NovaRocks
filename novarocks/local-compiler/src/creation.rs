@@ -51,10 +51,12 @@ pub(crate) fn finish_attempt<T, H>(
     // cause must not make a later footer replace its already observed refusal.
     if let Err(FragmentCreationError::Compile(source)) = &result {
         use novarocks_failure_contract::{FailureClass, FailureProjection};
-        if matches!(
-            source.failure_fact().class(),
-            FailureClass::Resource | FailureClass::Control
-        ) {
+        if source.is_primary_construction()
+            || matches!(
+                source.failure_fact().class(),
+                FailureClass::Resource | FailureClass::Control
+            )
+        {
             return result;
         }
     }

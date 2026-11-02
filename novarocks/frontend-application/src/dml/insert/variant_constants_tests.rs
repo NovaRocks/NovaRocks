@@ -131,7 +131,7 @@ fn original_encoder_keeps_variant_constants_and_mixed_multiline_syntax() {
         assert_eq!(value.value_type().logical_type(), ValueLogicalType::Variant);
         assert_eq!(value.value_type().data_type(), &DataType::LargeBinary);
         assert!(!value.value_type().nullable());
-        assert_eq!(value.field().metadata().capacity(), 0);
+        assert!(value.field().metadata().as_arc().is_none());
         let expected =
             novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(json)
                 .unwrap();

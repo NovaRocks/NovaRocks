@@ -484,8 +484,13 @@ mod client_computation_tests {
                     .expect("the actual one-column SQL result has its frozen scalar contract"),
             )
         } else {
-            let render =
-                novarocks_sql::compiler::client_render_schema(plan.candidate().plan(), 0).unwrap();
+            let render = novarocks_sql::compiler::client_render_schema(
+                plan.candidate().plan(),
+                novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
+                    timezone_offset_seconds: 0,
+                },
+            )
+            .unwrap();
             FrozenRootOutput::ClientRows(render)
         };
         let candidate = crate::preparation::CompletedPhysicalPlanCandidate::for_program(

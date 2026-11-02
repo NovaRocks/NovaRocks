@@ -75,7 +75,10 @@ fn arguments() -> [FunctionArgument; 1] {
         value_type: FunctionValueType::new(
             DataType::List(Arc::new(
                 arrow::datatypes::Field::new("authored item", DataType::Int64, false)
-                    .with_metadata([("original".into(), "preserved".into())].into()),
+                    .with_metadata(std::collections::HashMap::<String, String>::from([(
+                        "original".into(),
+                        "preserved".into(),
+                    )])),
             )),
             true,
         ),

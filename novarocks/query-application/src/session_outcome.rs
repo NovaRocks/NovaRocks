@@ -80,7 +80,8 @@ pub fn cancellation_failure_input(reason: QueryCancellationReason) -> ExecutionF
             QueryFailureReason::Cancelled,
             "Query execution was interrupted because the connection was killed".to_string(),
         ),
-        QueryCancellationReason::ClientDisconnected => (
+        QueryCancellationReason::ClientCancelRequested
+        | QueryCancellationReason::ClientDisconnected => (
             QueryFailureReason::Cancelled,
             "Query execution was interrupted because the client disconnected".to_string(),
         ),
@@ -170,7 +171,8 @@ pub fn governed_cancellation_failure_input(
             QueryFailureReason::Cancelled,
             "Query execution was interrupted because the connection was killed".to_string(),
         ),
-        WorkCancellationReason::ClientDisconnected => (
+        WorkCancellationReason::ClientCancelRequested
+        | WorkCancellationReason::ClientDisconnected => (
             QueryFailureReason::Cancelled,
             "Query execution was interrupted because the client disconnected".to_string(),
         ),
@@ -352,19 +354,21 @@ mod tests {
             ),
             (
                 QueryCancellationReason::ExplicitKill {
-                    requester_connection_id: request_id,
+                    requester_session: crate::session_control::ClientSessionKey::new(request_id)
+                        .unwrap(),
                 },
                 WorkCancellationReason::ExplicitKill {
-                    requester_connection_id: u64::from(request_id),
+                    requester_session: request_id,
                 },
                 "Query execution was interrupted",
             ),
             (
                 QueryCancellationReason::ExplicitKillConnection {
-                    requester_connection_id: request_id,
+                    requester_session: crate::session_control::ClientSessionKey::new(request_id)
+                        .unwrap(),
                 },
                 WorkCancellationReason::ExplicitKillConnection {
-                    requester_connection_id: u64::from(request_id),
+                    requester_session: request_id,
                 },
                 "Query execution was interrupted because the connection was killed",
             ),
@@ -404,7 +408,8 @@ mod tests {
         let before = cancellation_error(view.reason().expect("the source accepted the deadline"));
         assert_eq!(
             source.request(QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 1188237
+                requester_session: crate::session_control::ClientSessionKey::new(1188237)
+                    .expect("nonzero fixture requester")
             }),
             QueryCancellationRequestResult::AlreadyRequested(deadline.clone())
         );
@@ -427,10 +432,12 @@ mod tests {
             QueryCancellationReason::ExecutionCancellationRequested,
             QueryCancellationReason::ExecutionOwnerDropped,
             QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 1188237,
+                requester_session: crate::session_control::ClientSessionKey::new(1188237)
+                    .expect("nonzero fixture requester"),
             },
             QueryCancellationReason::ExplicitKillConnection {
-                requester_connection_id: 1188237,
+                requester_session: crate::session_control::ClientSessionKey::new(1188237)
+                    .expect("nonzero fixture requester"),
             },
             QueryCancellationReason::ClientDisconnected,
             QueryCancellationReason::ServerShutdown,
@@ -450,10 +457,10 @@ mod tests {
             WorkCancellationReason::Requested,
             WorkCancellationReason::OwnerDropped,
             WorkCancellationReason::ExplicitKill {
-                requester_connection_id: 1188237,
+                requester_session: 1188237,
             },
             WorkCancellationReason::ExplicitKillConnection {
-                requester_connection_id: 1188237,
+                requester_session: 1188237,
             },
             WorkCancellationReason::ClientDisconnected,
             WorkCancellationReason::ServerShutdown,
@@ -508,11 +515,11 @@ mod tests {
                 GovernedStatementFinishOutcome::Stale,
                 GovernedStatementFinishOutcome::ProtocolFailed,
                 GovernedStatementFinishOutcome::Cancelled(WorkCancellationReason::ExplicitKill {
-                    requester_connection_id: 1188237,
+                    requester_session: 1188237,
                 }),
                 GovernedStatementFinishOutcome::Cancelled(
                     WorkCancellationReason::ExplicitKillConnection {
-                        requester_connection_id: 1188237,
+                        requester_session: 1188237,
                     },
                 ),
                 GovernedStatementFinishOutcome::Cancelled(
@@ -539,10 +546,10 @@ mod tests {
             QueryExecutionError::new(QueryExecutionErrorKind::Failed, "application start failed");
         for reason in [
             WorkCancellationReason::ExplicitKill {
-                requester_connection_id: 7,
+                requester_session: 7,
             },
             WorkCancellationReason::ExplicitKillConnection {
-                requester_connection_id: 7,
+                requester_session: 7,
             },
             WorkCancellationReason::ClientDisconnected,
             WorkCancellationReason::ServerShutdown,
@@ -570,7 +577,8 @@ mod tests {
     fn only_kill_query_fences_the_successor_statement() {
         assert!(cancellation_requires_statement_fence(
             &QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 8
+                requester_session: crate::session_control::ClientSessionKey::new(8)
+                    .expect("nonzero fixture requester")
             }
         ));
         assert!(!cancellation_requires_statement_fence(

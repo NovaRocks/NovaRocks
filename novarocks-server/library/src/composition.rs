@@ -54,12 +54,12 @@ use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExec
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableMetadata, MvCreateSourceObservation, MvCreatedTargetObservation,
-    MvMaintenanceMetadataObservation, MvObservedField, MvObservedMaintenancePolicy,
-    MvObservedPartitionField, MvObservedPartitionSpec, MvObservedPartitionTransform,
-    MvObservedRefreshMarker, MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
-    MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
-    WriteCommitEvidenceLimits,
+    ConnectorTableMetadata, MvCreatedTargetObservation, MvMaintenanceMetadataObservation,
+    MvObservedField, MvObservedMaintenancePolicy, MvObservedPartitionField,
+    MvObservedPartitionSpec, MvObservedPartitionTransform, MvObservedRefreshMarker,
+    MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
+    MvRefreshTargetObservation, MvSchemaValidationObservation, MvSourceSchemaObservation,
+    MvStorageObservationPort, WriteCommitEvidenceLimits,
 };
 use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
 use novarocks_state_store_runtime::{
@@ -70,7 +70,6 @@ use novarocks_types::{ClusterRole, NativeCompatibilityId};
 use novarocks_worker::{LeaseBounds, OperationWaitCaps};
 use novarocks_workload_control::WorkloadConfig;
 
-use crate::paimon_access::ServerPaimonRoleFileIoFactory;
 use crate::provider_manifest::ServerProviderManifest;
 use crate::scan_io::ScanIoServices;
 use crate::static_plan::ServerStaticPlan;
@@ -149,15 +148,15 @@ fn mv_partition_observation(
 }
 
 impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
-    fn observe_create_source(
+    fn observe_source_schema(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
-    ) -> Result<MvCreateSourceObservation, ConnectorError> {
+    ) -> Result<MvSourceSchemaObservation, ConnectorError> {
         let observed =
             self.inspector
-                .observe_create_source(exact_lease, metadata, context.clone())?;
+                .observe_source_schema(exact_lease, metadata, context.clone())?;
         if metadata.version.as_ref() != Some(&observed.schema_version) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
@@ -176,10 +175,12 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        MvCreateSourceObservation::try_new(
+        MvSourceSchemaObservation::try_new(
             metadata.identity.clone(),
             observed.object_id,
             observed.schema_version,
+            observed.format_v3,
+            observed.stored_row_lineage_enabled,
             fields,
             &context,
         )
@@ -457,6 +458,7 @@ pub fn compose_backend_server_config(
         )
         .map_err(|error| anyhow::anyhow!("resolve preparation limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
+        exchange_flow_limits: runtime_config.exchange_flow_limits()?,
         scan_preparation_config: novarocks_worker::ScanPreparationConfig::try_new(
             runtime_config.prefetch_input_bytes_per_stream,
             runtime_config.prefetch_max_candidates,
@@ -488,7 +490,7 @@ pub fn compose_backend_server_config(
             #[cfg(novarocks_dev_controls)]
             &test_slots,
         )?,
-        static_plan_interpreter: static_plan.backend_interpreter()?,
+        static_plan_interpreter: static_plan.backend_interpreter(),
         process_memory: backend_process_memory_observation(memory_authority),
     })
 }
@@ -607,12 +609,15 @@ pub fn compose_frontend_role_config(
         result_profile,
         capacity_profile,
     );
+    // The frontend freezes the one carrier its island's backends interpret,
+    // under the same structural package admission as their receiver.
     let mut execution = FrontendExecutionConfig::new(
         runtime_filter_worker_count,
         native_compatibility_id,
         function_catalog,
         logical_runtime,
         constant_policy,
+        static_plan.frontend_carrier(),
     )
     .with_catalog_desired_state_source(catalog_source)
     .try_with_catalog_prune_config(
@@ -670,9 +675,6 @@ pub fn compose_frontend_role_config(
         Duration::from_millis(runtime_config.frontend_workload.planning_idle_keepalive_ms),
     ))
     .with_query_blocking_executor_config(query_blocking_config);
-    // The frontend freezes the one carrier its island's backends interpret,
-    // under the same structural package admission as their receiver.
-    execution = execution.with_static_plan_carrier(static_plan.frontend_carrier());
     let (remote_effect_policy, management_audit, startup_isolation) =
         mv_management_continuation(config)?;
     execution =
@@ -724,6 +726,16 @@ pub fn compose_frontend_role_config(
         port_override,
     )
     .map_err(|error| anyhow::anyhow!("resolve MySQL listener settings: {error}"))?;
+    let trino_settings = config
+        .standalone_server
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+    let trino_listener = novarocks_trino_adapter::TrinoListenerSettings {
+        port: trino_settings.trino_port,
+        user: trino_settings.user,
+        client_timeout: Duration::from_millis(trino_settings.trino_client_timeout_ms),
+    };
     let state_store_provider_registry = state_store_provider_registry(config)?;
     let state_store_input = state_store_input(config)?;
     #[cfg(novarocks_dev_controls)]
@@ -771,6 +783,7 @@ pub fn compose_frontend_role_config(
                 config.server.frontend_cleanup_timeout_ms,
             ),
             mysql_listener,
+            trino_listener,
             native_trust: std::sync::Arc::clone(native_trust.trust()),
             native_transport: frontend_native_transport(native_trust.transport()),
             native_ingress: runtime_config.native_ingress.to_adapter_config(),
@@ -1062,8 +1075,6 @@ fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntim
     let runtime = &config.runtime;
     ExecutionRuntimeConfig {
         driver_threads: runtime.actual_exec_threads(),
-        exchange_wait_ms: runtime.exchange_wait_ms,
-        exchange_io_threads: runtime.exchange_io_threads.max(1),
         exchange_io_max_inflight_bytes: runtime.exchange_io_max_inflight_bytes.max(1),
         exchange_max_transmit_batched_bytes: runtime.exchange_max_transmit_batched_bytes.max(1),
         operator_buffer_chunks: runtime.operator_buffer_chunks.max(1),
@@ -1137,43 +1148,6 @@ pub(crate) fn compose_iceberg_metadata_access_template(
     Ok(IcebergReadBinding::with_metadata_credential_resolver(
         resources, resolver,
     ))
-}
-
-/// The coordinator's Paimon file access: metadata reads on the process
-/// runtime, outside the scan I/O services.
-pub(crate) fn compose_paimon_control_access_factory(
-    config: &NovaRocksConfig,
-    resources: FsAccessResources,
-) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
-    Ok(std::sync::Arc::new(
-        compose_paimon_access_factory_with_resources(config, ClusterRole::Fe, resources)?,
-    ))
-}
-
-/// A backend's Paimon file access: the same scan I/O services as every other
-/// provider's execution reads, so its HEADs and GETs share their windows.
-pub(crate) fn compose_paimon_execution_access_factory(
-    config: &NovaRocksConfig,
-    resources: FsAccessResources,
-    scan_io: &ScanIoServices,
-) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
-    let resources = resources.with_file_io(scan_io.file_runtime(), scan_io.file_task_spawner());
-    Ok(std::sync::Arc::new(
-        compose_paimon_access_factory_with_resources(config, ClusterRole::Be, resources)?
-            .with_range_service(scan_io.range_service()),
-    ))
-}
-
-pub(crate) fn compose_paimon_access_factory_with_resources(
-    config: &NovaRocksConfig,
-    role: ClusterRole,
-    resources: FsAccessResources,
-) -> anyhow::Result<ServerPaimonRoleFileIoFactory> {
-    let credentials = config
-        .connector
-        .credential_registry(role)
-        .map_err(|error| anyhow::anyhow!("resolve role-local catalog credentials: {error}"))?;
-    Ok(ServerPaimonRoleFileIoFactory::new(resources, credentials))
 }
 
 pub fn compose_connector_file_planning_resources(

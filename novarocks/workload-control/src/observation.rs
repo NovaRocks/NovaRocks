@@ -223,14 +223,14 @@ impl WorkloadObservationHandle {
 fn snapshot(inner: &crate::scope::Inner) -> WorkloadSnapshot {
     let state = inner.state.lock().unwrap();
     WorkloadSnapshot {
-        serving: if state.closed {
+        serving: if state.root_admission_is_closed() {
             crate::ServingState::Closed
         } else if state.ready {
             crate::ServingState::Ready
         } else {
             crate::ServingState::Initializing
         },
-        admission_closed: state.closed,
+        admission_closed: state.root_admission_is_closed(),
         root_responsibilities: state.roots,
         businesses: state.businesses,
         admitted_queries: state.admitted_queries,

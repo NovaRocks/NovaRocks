@@ -278,7 +278,10 @@ fn frozen_read_kind(
                 "provider.field-id".into(),
                 (ordinal + 1).to_string(),
             )]);
-            assert_eq!(&attributes, field.metadata());
+            assert_eq!(
+                &attributes,
+                &std::collections::HashMap::<String, String>::from(field.metadata())
+            );
             let mut work =
                 CompileCheckpoints::try_new(&Unbounded, CompilePhase::ProviderValidation).unwrap();
             let facts = novarocks_connector_contract::ConnectorSourceFieldFacts::try_new_observed(
@@ -303,7 +306,10 @@ fn frozen_read_kind(
         .collect::<Box<[_]>>();
     let (schema_attributes, schema_source_bytes) =
         bounded_source_attributes(vec![("provider.schema".into(), "generation-1".into())]);
-    assert_eq!(&schema_attributes, original.metadata());
+    assert_eq!(
+        &schema_attributes,
+        &std::collections::HashMap::<String, String>::from(original.metadata())
+    );
     let mut work =
         CompileCheckpoints::try_new(&Unbounded, CompilePhase::ProviderValidation).unwrap();
     let source_facts = novarocks_connector_contract::ConnectorSourceSchemaFacts::try_new_observed_with_source_invoice(
@@ -338,7 +344,7 @@ fn frozen_read_kind(
     );
     assert_eq!(
         public.source_schema_facts().unwrap().schema_attributes(),
-        original.metadata()
+        &std::collections::HashMap::<String, String>::from(original.metadata())
     );
     FrozenConnectorRead::try_new(scan, public).unwrap()
 }

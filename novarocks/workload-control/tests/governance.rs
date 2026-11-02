@@ -793,7 +793,7 @@ async fn cloned_cancellation_requester_is_first_wins_and_downward_only() {
     assert_eq!(
         requester
             .request_with_outcome(CancellationReason::ExplicitKill {
-                requester_connection_id: 41,
+                requester_session: 41,
             })
             .unwrap(),
         WorkCancellationRequestOutcome::Requested
@@ -804,12 +804,12 @@ async fn cloned_cancellation_requester_is_first_wins_and_downward_only() {
             .request_with_outcome(CancellationReason::ServerShutdown)
             .unwrap(),
         WorkCancellationRequestOutcome::AlreadyRequested(CancellationReason::ExplicitKill {
-            requester_connection_id: 41,
+            requester_session: 41,
         })
     );
 
     let expected = CancellationReason::ExplicitKill {
-        requester_connection_id: 41,
+        requester_session: 41,
     };
     assert_eq!(
         target.scope().cancellation().unwrap().reason(),
@@ -850,7 +850,7 @@ fn success_seal_and_cancellation_share_one_first_wins_authority() {
             .owner
             .cancellation_requester()
             .request_with_outcome(CancellationReason::ExplicitKill {
-                requester_connection_id: 9,
+                requester_session: 9,
             })
             .unwrap(),
         WorkCancellationRequestOutcome::Requested
@@ -858,7 +858,7 @@ fn success_seal_and_cancellation_share_one_first_wins_authority() {
     assert_eq!(
         sealer.seal().unwrap(),
         WorkSuccessSealOutcome::Cancelled(CancellationReason::ExplicitKill {
-            requester_connection_id: 9,
+            requester_session: 9,
         })
     );
 }

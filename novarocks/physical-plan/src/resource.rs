@@ -2559,8 +2559,12 @@ mod constant_resource_tests {
     }
     fn pool() -> ConstantPool {
         let array = Int64Array::from(vec![11, 42, 71]);
-        let field = Field::new("actual_source", DataType::Int64, false)
-            .with_metadata([("provider.id".to_owned(), "source-42".to_owned())].into());
+        let field = Field::new("actual_source", DataType::Int64, false).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider.id".to_owned(),
+                "source-42".to_owned(),
+            )]),
+        );
         let policy = ConstantPolicy {
             max_rows: 1024,
             max_array_nodes: 4096,

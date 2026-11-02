@@ -628,7 +628,15 @@ async fn run_catalog_action(
     let command_context = CommandContext::new(
         scope.clone(),
         connector,
-        StatementToken::new(SessionToken::new(710, 1), generation),
+        StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (710_u64 << 32) | 1_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            generation,
+        ),
         "catalog-original-test",
     )
     .with_result_window(alias.clone())
@@ -660,7 +668,7 @@ async fn run_catalog_action(
     )
     .await
     .expect("Catalog Action made progress with the sole ordinary worker");
-    let result = result.map(|value| assert!(matches!(value, StatementActionValue::Ok)));
+    let result = result.map(|value| assert!(matches!(value, StatementActionValue::Ok(_))));
     assert!(action.local_health_failure().is_none());
     let mut residual: Option<Box<dyn GovernedStatementResidual>> = None;
     action.handoff_residual_in(&mut residual).unwrap();

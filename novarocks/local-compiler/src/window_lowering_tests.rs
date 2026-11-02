@@ -784,7 +784,6 @@ fn try_compile(shape: &Shape) -> Result<LocalProgram, FragmentCompileError> {
             root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
             kernel_abi: KernelAbiVersion::CURRENT,
             constants: constant_policy(),
-            exchange_wait: std::time::Duration::from_secs(120),
         },
         &Control,
     )
@@ -1221,7 +1220,7 @@ impl crate::ProjectMetadataScope for WindowOutputHost {
         let output = body().map_err(crate::ProjectMetadataFailure::Body)?;
         assert!(output.exprs.is_empty());
         assert!(output.expr_slot_ids.is_empty());
-        assert_eq!(output.layout.schema().metadata().capacity(), 0);
+        assert!(output.layout.schema().metadata().as_arc().is_none());
         self.completed += 1;
         Ok(output)
     }
@@ -1246,7 +1245,6 @@ fn compile_hosted_window_output(
             root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
             kernel_abi: KernelAbiVersion::CURRENT,
             constants: constant_policy(),
-            exchange_wait: std::time::Duration::from_secs(120),
         },
         &Control,
         host,

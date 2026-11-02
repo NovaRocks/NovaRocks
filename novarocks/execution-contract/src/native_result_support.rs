@@ -22,6 +22,11 @@
 use crate::RuntimeEndpoint;
 use novarocks_result_contract::RootProfileId;
 
+/// Existing decoded Native message ceiling shared by host composition and
+/// carrier-neutral execution. Full protobuf size is still checked at the wire
+/// boundary; this is not an additional payload credit or memory budget.
+pub const NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeResultSupportGeometry {
     pub frontend_client_compute_positions: u64,

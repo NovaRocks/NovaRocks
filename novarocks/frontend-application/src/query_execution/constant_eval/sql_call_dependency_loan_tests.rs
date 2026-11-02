@@ -183,7 +183,7 @@ fn sql_call_dependency_loan_real_typed_empty_array_has_original_constraint() {
     ));
     assert_eq!(original_child.data_type(), item.data_type());
     assert_eq!(original_child.nullable(), item.is_nullable());
-    assert_eq!(item.metadata().capacity(), 0);
+    assert!(item.metadata().as_arc().is_none());
     assert!(loan.original_arguments().is_empty());
     assert_eq!(loan.original_logical_argument_count(), 0);
     let canonical = loan.canonical().unwrap();

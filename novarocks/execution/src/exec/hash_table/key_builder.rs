@@ -14,28 +14,34 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+//! The shared canonical component framing and typed decoder.
+//!
+//! Local equality indexing belongs to `key_index`. These canonical helpers
+//! retain their original distributed FNV/CRC and complex-value contracts;
+//! their bytes and hashes are not an instance-local key-index identity.
+
+#[cfg(test)]
+use arrow::array::Int32Array;
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
-    DictionaryArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, ListArray, MapArray, NullArray,
-    StringArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Decimal128Array,
+    Decimal256Array, FixedSizeBinaryArray, LargeBinaryArray, LargeStringArray, ListArray, MapArray,
+    StringArray, StringViewArray, StructArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow::datatypes::{DataType, Int32Type, TimeUnit};
-use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
+use arrow::datatypes::{DataType, TimeUnit};
+#[cfg(test)]
+use arrow_buffer::OffsetBuffer;
 #[cfg(test)]
 use novarocks_failure_contract::FailureProjection;
+#[cfg(test)]
 use std::sync::Arc;
 
-use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec};
-use crate::exec::hash_table::array_views::{FloatArrayView, IntArrayView};
+#[cfg(test)]
+use crate::exec::hash_table::allocation::AggregateAllocator;
+use crate::exec::hash_table::allocation::AggregateVec;
 use novarocks_types::largeint;
 
-use super::hash::{
-    canonical_f32_bits, canonical_f64_bits, combine_hash, hash_bytes_with_seed,
-    hash_i128_with_seed, hash_null_with_seed, hash_u64_with_seed,
-};
-use super::key_layout::{CompressedKeyContext, compressed_key_is_valid};
+use super::hash::{canonical_f32_bits, canonical_f64_bits};
 
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,35 +123,6 @@ pub(super) fn group_key_request_arithmetic() -> ExecutionFailure {
     ExecutionFailure::from_domain(
         novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
     )
-}
-
-#[derive(Debug)]
-struct GroupKeyDictionaryAddress {
-    row: usize,
-    code: i32,
-    source: std::num::TryFromIntError,
-}
-impl std::fmt::Display for GroupKeyDictionaryAddress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "dictionary group key code must be non-negative, got {} at row {}",
-            self.code, self.row
-        )
-    }
-}
-impl std::error::Error for GroupKeyDictionaryAddress {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-impl novarocks_failure_contract::FailureProjection for GroupKeyDictionaryAddress {
-    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        novarocks_failure_contract::FailureFact::new(
-            novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::GroupKeyDictionaryAddress.reason(),
-        )
-    }
 }
 
 #[derive(Debug)]
@@ -317,368 +294,6 @@ impl GroupKeyOutputTally {
         }
     }
 }
-fn check_group_key_byte_output(
-    values: &[Option<&[u8]>],
-    kind: GroupKeyOutputKind,
-) -> ExecutionResult<()> {
-    let mut tally = GroupKeyOutputTally::default();
-    for value in values.iter().flatten() {
-        tally.add(value.len())?;
-    }
-    tally.finish(kind)
-}
-/// Read only canonical headers before creating any child-reference/output
-/// vector. The selected output layout stays exact; it is never widened.
-fn check_group_key_nested_output(
-    rows: &[Option<&[u8]>],
-    marker: u8,
-    kind: GroupKeyOutputKind,
-) -> ExecutionResult<()> {
-    let mut tally = GroupKeyOutputTally::default();
-    for row in rows.iter().flatten() {
-        let mut cursor = EncodedCursor::new(row);
-        cursor.expect_marker(marker)?;
-        tally.add(cursor.read_u32()? as usize)?;
-    }
-    tally.finish(kind)
-}
-
-pub enum DictionaryStringValues<'a> {
-    Utf8(&'a StringArray),
-    LargeUtf8(&'a LargeStringArray),
-}
-
-impl<'a> DictionaryStringValues<'a> {
-    fn len(&self) -> usize {
-        match self {
-            Self::Utf8(values) => values.len(),
-            Self::LargeUtf8(values) => values.len(),
-        }
-    }
-
-    fn is_null(&self, code: usize) -> bool {
-        match self {
-            Self::Utf8(values) => values.is_null(code),
-            Self::LargeUtf8(values) => values.is_null(code),
-        }
-    }
-
-    fn value(&self, code: usize) -> &'a str {
-        match self {
-            Self::Utf8(values) => values.value(code),
-            Self::LargeUtf8(values) => values.value(code),
-        }
-    }
-}
-
-pub struct DictionaryGroupKeyView<'a> {
-    dict: &'a DictionaryArray<Int32Type>,
-    values: DictionaryStringValues<'a>,
-    values_ptr: usize,
-}
-
-impl<'a> DictionaryGroupKeyView<'a> {
-    pub fn new(dict: &'a DictionaryArray<Int32Type>) -> ExecutionResult<Self> {
-        let values = dict.values();
-        let values_ptr = Arc::as_ptr(values) as *const () as usize;
-        let values = match values.data_type() {
-            DataType::Utf8 => {
-                let values = values
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        group_key_encoding_contract(
-                            "failed to downcast dictionary values to StringArray",
-                        )
-                    })?;
-                if values.null_count() != 0 {
-                    return Err(group_key_encoding_contract(
-                        "dictionary group key values must not contain nulls",
-                    ));
-                }
-                DictionaryStringValues::Utf8(values)
-            }
-            DataType::LargeUtf8 => {
-                let values = values
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .ok_or_else(|| {
-                        group_key_encoding_contract(
-                            "failed to downcast dictionary values to LargeStringArray",
-                        )
-                    })?;
-                if values.null_count() != 0 {
-                    return Err(group_key_encoding_contract(
-                        "dictionary group key values must not contain nulls",
-                    ));
-                }
-                DictionaryStringValues::LargeUtf8(values)
-            }
-            other => {
-                return Err(group_key_encoding_contract(format_args!(
-                    "dictionary group key unsupported value type: {:?}",
-                    other
-                )));
-            }
-        };
-        Ok(Self {
-            dict,
-            values,
-            values_ptr,
-        })
-    }
-
-    pub fn values_ptr(&self) -> usize {
-        self.values_ptr
-    }
-
-    pub fn values_len(&self) -> usize {
-        self.values.len()
-    }
-
-    pub fn code_at(&self, row: usize) -> ExecutionResult<Option<usize>> {
-        if self.dict.is_null(row) {
-            return Ok(None);
-        }
-        let code = self.dict.keys().value(row);
-        usize::try_from(code).map(Some).map_err(|source| {
-            ExecutionFailure::from_domain(GroupKeyDictionaryAddress { row, code, source })
-        })
-    }
-
-    pub fn is_null(&self, row: usize) -> bool {
-        self.dict.is_null(row)
-    }
-
-    pub fn value_as_bytes(&self, row: usize) -> ExecutionResult<Option<&'a [u8]>> {
-        let Some(code) = self.code_at(row)? else {
-            return Ok(None);
-        };
-        self.value_bytes_for_code(code).map(Some)
-    }
-
-    pub fn value_bytes_for_code(&self, code: usize) -> ExecutionResult<&'a [u8]> {
-        Ok(self.value_str_for_code(code)?.as_bytes())
-    }
-
-    pub fn value_str_for_code(&self, code: usize) -> ExecutionResult<&'a str> {
-        if code >= self.values_len() {
-            return Err(group_key_encoding_contract(
-                "dictionary group key code out of bounds",
-            ));
-        }
-        if self.values.is_null(code) {
-            return Err(group_key_encoding_contract(
-                "dictionary group key value cannot be null when key is valid",
-            ));
-        }
-        Ok(self.values.value(code))
-    }
-}
-
-pub enum GroupKeyArrayView<'a> {
-    Int(IntArrayView<'a>),
-    Float(FloatArrayView<'a>),
-    Boolean(&'a BooleanArray),
-    Utf8(&'a StringArray),
-    Dictionary(DictionaryGroupKeyView<'a>),
-    Date32(&'a Date32Array),
-    TimestampSecond(&'a TimestampSecondArray),
-    TimestampMillisecond(&'a TimestampMillisecondArray),
-    TimestampMicrosecond(&'a TimestampMicrosecondArray),
-    TimestampNanosecond(&'a TimestampNanosecondArray),
-    Decimal128(&'a Decimal128Array),
-    Decimal256(&'a Decimal256Array),
-    LargeIntBinary(&'a FixedSizeBinaryArray),
-    ListUtf8 {
-        list: &'a ListArray,
-        values: &'a StringArray,
-    },
-    ListInt32 {
-        list: &'a ListArray,
-        values: &'a Int32Array,
-    },
-    Complex(&'a ArrayRef),
-}
-
-pub fn build_group_key_views<'a>(
-    arrays: &'a [ArrayRef],
-) -> ExecutionResult<Vec<GroupKeyArrayView<'a>>> {
-    let mut views = Vec::with_capacity(arrays.len());
-    for array in arrays {
-        let view = match array.data_type() {
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                GroupKeyArrayView::Int(IntArrayView::new(array)?)
-            }
-            DataType::Float32 | DataType::Float64 => {
-                GroupKeyArrayView::Float(FloatArrayView::new(array)?)
-            }
-            DataType::Boolean => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| {
-                        group_key_encoding_contract("failed to downcast to BooleanArray")
-                    })?;
-                GroupKeyArrayView::Boolean(arr)
-            }
-            DataType::Utf8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        group_key_encoding_contract("failed to downcast to StringArray")
-                    })?;
-                GroupKeyArrayView::Utf8(arr)
-            }
-            DataType::Dictionary(key_type, value_type)
-                if matches!(key_type.as_ref(), DataType::Int32)
-                    && matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
-            {
-                let dict = array
-                    .as_any()
-                    .downcast_ref::<DictionaryArray<Int32Type>>()
-                    .ok_or_else(|| {
-                        group_key_encoding_contract(
-                            "failed to downcast to DictionaryArray<Int32Type>",
-                        )
-                    })?;
-                GroupKeyArrayView::Dictionary(DictionaryGroupKeyView::new(dict)?)
-            }
-            DataType::Dictionary(key_type, value_type) => {
-                return Err(group_key_encoding_contract(format_args!(
-                    "dictionary group key unsupported type: key={:?}, value={:?}",
-                    key_type, value_type
-                )));
-            }
-            DataType::Date32 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Date32Array>()
-                    .ok_or_else(|| {
-                        group_key_encoding_contract("failed to downcast to Date32Array")
-                    })?;
-                GroupKeyArrayView::Date32(arr)
-            }
-            DataType::Timestamp(unit, _tz) => match unit {
-                TimeUnit::Second => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampSecondArray>()
-                        .ok_or_else(|| {
-                            group_key_encoding_contract(
-                                "failed to downcast to TimestampSecondArray",
-                            )
-                        })?;
-                    GroupKeyArrayView::TimestampSecond(arr)
-                }
-                TimeUnit::Millisecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampMillisecondArray>()
-                        .ok_or_else(|| {
-                            group_key_encoding_contract(
-                                "failed to downcast to TimestampMillisecondArray",
-                            )
-                        })?;
-                    GroupKeyArrayView::TimestampMillisecond(arr)
-                }
-                TimeUnit::Microsecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .ok_or_else(|| {
-                            group_key_encoding_contract(
-                                "failed to downcast to TimestampMicrosecondArray",
-                            )
-                        })?;
-                    GroupKeyArrayView::TimestampMicrosecond(arr)
-                }
-                TimeUnit::Nanosecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampNanosecondArray>()
-                        .ok_or_else(|| {
-                            group_key_encoding_contract(
-                                "failed to downcast to TimestampNanosecondArray",
-                            )
-                        })?;
-                    GroupKeyArrayView::TimestampNanosecond(arr)
-                }
-            },
-            DataType::Decimal128(_precision, _scale) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Decimal128Array>()
-                    .ok_or_else(|| {
-                        group_key_encoding_contract("failed to downcast to Decimal128Array")
-                    })?;
-                GroupKeyArrayView::Decimal128(arr)
-            }
-            DataType::Decimal256(_precision, _scale) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Decimal256Array>()
-                    .ok_or_else(|| {
-                        group_key_encoding_contract("failed to downcast to Decimal256Array")
-                    })?;
-                GroupKeyArrayView::Decimal256(arr)
-            }
-            DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<FixedSizeBinaryArray>()
-                    .ok_or_else(|| {
-                        group_key_encoding_contract("failed to downcast to FixedSizeBinaryArray")
-                    })?;
-                if arr.value_length() != largeint::LARGEINT_BYTE_WIDTH {
-                    return Err(group_key_encoding_contract(format_args!(
-                        "group by type mismatch: expected FixedSizeBinary({}), got FixedSizeBinary({})",
-                        largeint::LARGEINT_BYTE_WIDTH,
-                        arr.value_length()
-                    )));
-                }
-                GroupKeyArrayView::LargeIntBinary(arr)
-            }
-            DataType::List(field) if matches!(field.data_type(), DataType::Utf8) => {
-                let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                    group_key_encoding_contract("failed to downcast to ListArray")
-                })?;
-                let values = list
-                    .values()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        group_key_encoding_contract("failed to downcast list values to StringArray")
-                    })?;
-                GroupKeyArrayView::ListUtf8 { list, values }
-            }
-            DataType::List(field) if matches!(field.data_type(), DataType::Int32) => {
-                let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                    group_key_encoding_contract("failed to downcast to ListArray")
-                })?;
-                let values = list
-                    .values()
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| {
-                        group_key_encoding_contract("failed to downcast list values to Int32Array")
-                    })?;
-                GroupKeyArrayView::ListInt32 { list, values }
-            }
-            DataType::Null => {
-                return Err(group_key_encoding_contract("group by type is null"));
-            }
-            other => {
-                let _ = other;
-                GroupKeyArrayView::Complex(array)
-            }
-        };
-        views.push(view);
-    }
-    Ok(views)
-}
-
 #[cfg(test)]
 pub fn encode_group_key_row(array: &ArrayRef, row: usize) -> ExecutionResult<Option<Vec<u8>>> {
     if array.is_null(row) {
@@ -689,6 +304,7 @@ pub fn encode_group_key_row(array: &ArrayRef, row: usize) -> ExecutionResult<Opt
     Ok(Some(out))
 }
 
+#[cfg(test)]
 pub(crate) fn encode_group_key_row_tracked(
     array: &ArrayRef,
     row: usize,
@@ -788,6 +404,7 @@ impl KeyByteSink for ComparingKeyByteSink<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn canonical_group_key_equals(
     array: &ArrayRef,
     row: usize,
@@ -802,6 +419,27 @@ pub(crate) fn canonical_group_key_equals(
         equal: true,
     };
     encode_group_key_non_null_value(array, row, &mut sink)?;
+    Ok(sink.equal && sink.offset == expected.len())
+}
+
+/// Compare one normalized complex component using the original nullable
+/// framing and cooperative canonical walker. Ordinary STRING/BINARY keys use
+/// value-arrays batch equality instead of this nested-value author.
+pub(crate) fn canonical_nullable_equals_observed(
+    array: &ArrayRef,
+    row: usize,
+    expected: &[u8],
+    checkpoint: &dyn Fn() -> ExecutionResult<()>,
+) -> ExecutionResult<bool> {
+    checkpoint()?;
+    let mut sink = ComparingKeyByteSink {
+        expected,
+        offset: 0,
+        equal: true,
+    };
+    let mut work = ObservedCanonicalKeyWork::new(checkpoint);
+    encode_nullable_nested_with(array, row, &mut sink, "tuple component", &mut work)?;
+    checkpoint()?;
     Ok(sink.equal && sink.offset == expected.len())
 }
 
@@ -1048,6 +686,42 @@ pub(crate) fn append_canonical_nullable_tracked_observed(
     checkpoint()
 }
 
+/// Borrow the original byte leaf value and its existing canonical frame.
+/// Physical UTF8 offsets/view layouts share marker8; BinaryView shares the
+/// original Binary marker20. LargeBinary deliberately keeps marker21.
+/// Dictionary encoding is removed by the original typed preparation owner.
+fn canonical_byte_value(
+    array: &ArrayRef,
+    row: usize,
+) -> ExecutionResult<(&[u8], u8, &'static str)> {
+    macro_rules! value {
+        ($array:ty) => {
+            array
+                .as_any()
+                .downcast_ref::<$array>()
+                .ok_or_else(|| {
+                    group_key_encoding_contract(
+                        "canonical byte value does not match its declared carrier",
+                    )
+                })?
+                .value(row)
+        };
+    }
+    Ok(match array.data_type() {
+        DataType::Utf8 => (value!(StringArray).as_bytes(), 8, "Utf8"),
+        DataType::LargeUtf8 => (value!(LargeStringArray).as_bytes(), 8, "LargeUtf8"),
+        DataType::Utf8View => (value!(StringViewArray).as_bytes(), 8, "Utf8View"),
+        DataType::Binary => (value!(BinaryArray), 20, "Binary"),
+        DataType::BinaryView => (value!(BinaryViewArray), 20, "BinaryView"),
+        DataType::LargeBinary => (value!(LargeBinaryArray), 21, "LargeBinary"),
+        _ => {
+            return Err(group_key_encoding_contract(
+                "canonical byte value requires a byte carrier",
+            ));
+        }
+    })
+}
+
 fn encode_group_key_non_null_value_with<S: KeyByteSink, W: CanonicalKeyWork>(
     array: &ArrayRef,
     row: usize,
@@ -1147,50 +821,15 @@ fn encode_group_key_non_null_value_with<S: KeyByteSink, W: CanonicalKeyWork>(
             work.extend(out, &canonical_f64_bits(arr.value(row)).to_le_bytes())?;
             Ok(())
         }
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    group_key_encoding_contract(
-                        "failed to downcast StringArray while encoding group key",
-                    )
-                })?;
-            work.push(out, 8)?;
-            let value = arr.value(row).as_bytes();
-            let len = value.len() as u32;
-            work.extend(out, &len.to_le_bytes())?;
-            work.extend(out, value)?;
-            Ok(())
-        }
-        DataType::Binary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    group_key_encoding_contract(
-                        "failed to downcast BinaryArray while encoding group key",
-                    )
-                })?;
-            work.push(out, 20)?;
-            let value = arr.value(row);
-            let len = group_key_component_len(value.len(), "Binary")?;
-            work.extend(out, &len.to_le_bytes())?;
-            work.extend(out, value)?;
-            Ok(())
-        }
-        DataType::LargeBinary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| {
-                    group_key_encoding_contract(
-                        "failed to downcast LargeBinaryArray while encoding group key",
-                    )
-                })?;
-            work.push(out, 21)?;
-            let value = arr.value(row);
-            let len = group_key_component_len(value.len(), "LargeBinary")?;
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::BinaryView
+        | DataType::LargeBinary => {
+            let (value, marker, component) = canonical_byte_value(array, row)?;
+            let len = group_key_component_len(value.len(), component)?;
+            work.push(out, marker)?;
             work.extend(out, &len.to_le_bytes())?;
             work.extend(out, value)?;
             Ok(())
@@ -1406,38 +1045,15 @@ fn encoded_group_key_non_null_len_with<W: CanonicalKeyWork>(
         return Ok(fixed);
     }
     match array.data_type() {
-        DataType::Utf8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    group_key_encoding_contract(
-                        "failed to downcast StringArray while sizing group key",
-                    )
-                })?;
-            Ok(5usize.saturating_add(array.value(row).len()))
-        }
-        DataType::Binary => {
-            let array = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    group_key_encoding_contract(
-                        "failed to downcast BinaryArray while sizing group key",
-                    )
-                })?;
-            Ok(5usize.saturating_add(array.value(row).len()))
-        }
-        DataType::LargeBinary => {
-            let array = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| {
-                    group_key_encoding_contract(
-                        "failed to downcast LargeBinaryArray while sizing group key",
-                    )
-                })?;
-            Ok(5usize.saturating_add(array.value(row).len()))
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::BinaryView
+        | DataType::LargeBinary => {
+            let (value, _, component) = canonical_byte_value(array, row)?;
+            group_key_component_len(value.len(), component)?;
+            checked_encoded_len_add(5, value.len())
         }
         DataType::List(_) => {
             let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
@@ -1519,365 +1135,24 @@ fn checked_encoded_len_add(left: usize, right: usize) -> ExecutionResult<usize> 
         .ok_or_else(group_key_request_arithmetic)
 }
 
-pub(crate) fn decode_group_key_rows(
-    data_type: &DataType,
-    rows: &[Option<&[u8]>],
-) -> ExecutionResult<ArrayRef> {
-    macro_rules! fixed_array {
-        ($marker:expr, $size:expr, $array:ty, $decode:expr) => {{
-            let values = rows
-                .iter()
-                .map(|row| {
-                    row.as_ref()
-                        .map(|row| decode_fixed_value(row, $marker, $size, $decode))
-                        .transpose()
-                })
-                .collect::<ExecutionResult<Vec<_>>>()?;
-            Ok(Arc::new(<$array>::from(values)) as ArrayRef)
-        }};
-    }
-
-    match data_type {
-        DataType::Null => {
-            if rows.iter().any(Option::is_some) {
-                return Err(group_key_decoding_contract(
-                    "canonical Null group-key contains a non-null value",
-                ));
-            }
-            Ok(Arc::new(NullArray::new(rows.len())))
-        }
-        DataType::Boolean => fixed_array!(1, 1, BooleanArray, |bytes: &[u8]| Ok(bytes[0] != 0)),
-        DataType::Int8 => fixed_array!(2, 1, Int8Array, |bytes: &[u8]| Ok(bytes[0] as i8)),
-        DataType::Int16 => fixed_array!(3, 2, Int16Array, |bytes: &[u8]| {
-            Ok(i16::from_le_bytes(bytes.try_into().expect("i16 bytes")))
-        }),
-        DataType::Int32 => fixed_array!(4, 4, Int32Array, |bytes: &[u8]| {
-            Ok(i32::from_le_bytes(bytes.try_into().expect("i32 bytes")))
-        }),
-        DataType::Int64 => fixed_array!(5, 8, Int64Array, |bytes: &[u8]| {
-            Ok(i64::from_le_bytes(bytes.try_into().expect("i64 bytes")))
-        }),
-        DataType::Float32 => fixed_array!(6, 4, Float32Array, |bytes: &[u8]| {
-            Ok(f32::from_bits(u32::from_le_bytes(
-                bytes.try_into().expect("f32 bytes"),
-            )))
-        }),
-        DataType::Float64 => fixed_array!(7, 8, Float64Array, |bytes: &[u8]| {
-            Ok(f64::from_bits(u64::from_le_bytes(
-                bytes.try_into().expect("f64 bytes"),
-            )))
-        }),
-        DataType::Utf8 => {
-            let values = decode_variable_rows(rows, 8)?;
-            check_group_key_byte_output(&values, GroupKeyOutputKind::Utf8)?;
-            let values = values
-                .iter()
-                .map(|value| {
-                    value
-                        .map(|value| {
-                            std::str::from_utf8(value).map_err(|source| {
-                                ExecutionFailure::from_domain(GroupKeyDecodeFailure::Utf8(source))
-                            })
-                        })
-                        .transpose()
-                })
-                .collect::<ExecutionResult<Vec<_>>>()?;
-            Ok(Arc::new(StringArray::from(values)))
-        }
-        DataType::Binary => {
-            let values = decode_variable_rows(rows, 20)?;
-            check_group_key_byte_output(&values, GroupKeyOutputKind::Binary)?;
-            Ok(Arc::new(BinaryArray::from(values)))
-        }
-        DataType::LargeBinary => Ok(Arc::new(LargeBinaryArray::from(decode_variable_rows(
-            rows, 21,
-        )?))),
-        DataType::Date32 => fixed_array!(9, 4, Date32Array, |bytes: &[u8]| {
-            Ok(i32::from_le_bytes(bytes.try_into().expect("date32 bytes")))
-        }),
-        DataType::Timestamp(unit, timezone) => {
-            let marker = match unit {
-                TimeUnit::Second => 10,
-                TimeUnit::Millisecond => 11,
-                TimeUnit::Microsecond => 12,
-                TimeUnit::Nanosecond => 13,
-            };
-            let values = rows
-                .iter()
-                .map(|row| {
-                    row.as_ref()
-                        .map(|row| {
-                            decode_fixed_value(row, marker, 8, |bytes| {
-                                Ok(i64::from_le_bytes(
-                                    bytes.try_into().expect("timestamp bytes"),
-                                ))
-                            })
-                        })
-                        .transpose()
-                })
-                .collect::<ExecutionResult<Vec<_>>>()?;
-            let array: ArrayRef = match unit {
-                TimeUnit::Second => {
-                    Arc::new(TimestampSecondArray::from(values).with_timezone_opt(timezone.clone()))
-                }
-                TimeUnit::Millisecond => Arc::new(
-                    TimestampMillisecondArray::from(values).with_timezone_opt(timezone.clone()),
-                ),
-                TimeUnit::Microsecond => Arc::new(
-                    TimestampMicrosecondArray::from(values).with_timezone_opt(timezone.clone()),
-                ),
-                TimeUnit::Nanosecond => Arc::new(
-                    TimestampNanosecondArray::from(values).with_timezone_opt(timezone.clone()),
-                ),
-            };
-            Ok(array)
-        }
-        DataType::Decimal128(precision, scale) => {
-            let values = rows
-                .iter()
-                .map(|row| {
-                    row.as_ref()
-                        .map(|row| {
-                            decode_fixed_value(row, 14, 16, |bytes| {
-                                Ok(i128::from_le_bytes(
-                                    bytes.try_into().expect("decimal128 bytes"),
-                                ))
-                            })
-                        })
-                        .transpose()
-                })
-                .collect::<ExecutionResult<Vec<_>>>()?;
-            Ok(Arc::new(
-                Decimal128Array::from(values)
-                    .with_precision_and_scale(*precision, *scale)
-                    .map_err(group_key_decode_arrow)?,
-            ))
-        }
-        DataType::Decimal256(precision, scale) => {
-            let values = rows
-                .iter()
-                .map(|row| {
-                    row.as_ref()
-                        .map(|row| {
-                            decode_fixed_value(row, 19, 32, |bytes| {
-                                Ok(i256::from_le_bytes(
-                                    bytes.try_into().expect("decimal256 bytes"),
-                                ))
-                            })
-                        })
-                        .transpose()
-                })
-                .collect::<ExecutionResult<Vec<_>>>()?;
-            Ok(Arc::new(
-                Decimal256Array::from(values)
-                    .with_precision_and_scale(*precision, *scale)
-                    .map_err(group_key_decode_arrow)?,
-            ))
-        }
-        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-            let values = rows
-                .iter()
-                .map(|row| {
-                    row.as_ref()
-                        .map(|row| {
-                            decode_fixed_value(row, 15, 16, |bytes| {
-                                Ok(i128::from_le_bytes(
-                                    bytes.try_into().expect("largeint bytes"),
-                                ))
-                            })
-                        })
-                        .transpose()
-                })
-                .collect::<ExecutionResult<Vec<_>>>()?;
-            let output = largeint::array_from_i128_observed(&values, &mut |_| {
-                Ok::<_, std::convert::Infallible>(())
-            });
-            Ok(output.unwrap_or_else(|never| match never {}))
-        }
-        DataType::List(field) => decode_list_rows(field, rows),
-        DataType::Struct(fields) => decode_struct_rows(fields, rows),
-        DataType::Map(field, ordered) => decode_map_rows(field, *ordered, rows),
-        other => Err(group_key_decoding_contract(format_args!(
-            "canonical group-key decode unsupported type: {other:?}"
-        ))),
-    }
-}
-
-fn decode_fixed_value<T>(
-    bytes: &[u8],
-    marker: u8,
-    payload_len: usize,
-    decode: impl FnOnce(&[u8]) -> ExecutionResult<T>,
-) -> ExecutionResult<T> {
-    if bytes.first().copied() != Some(marker) || bytes.len() != payload_len.saturating_add(1) {
-        return Err(group_key_decoding_contract(
-            "invalid canonical fixed-width group key",
-        ));
-    }
-    decode(&bytes[1..])
-}
-
-fn decode_variable_rows<'a>(
-    rows: &'a [Option<&'a [u8]>],
-    marker: u8,
-) -> ExecutionResult<Vec<Option<&'a [u8]>>> {
-    rows.iter()
-        .map(|row| {
-            row.as_ref()
-                .map(|row| decode_variable_value(row, marker))
-                .transpose()
-        })
-        .collect()
-}
-
-fn decode_variable_value(bytes: &[u8], marker: u8) -> ExecutionResult<&[u8]> {
-    let mut cursor = EncodedCursor::new(bytes);
-    cursor.expect_marker(marker)?;
-    let len = cursor.read_u32()? as usize;
-    let value = cursor.read_slice(len)?;
-    cursor.finish()?;
-    Ok(value)
-}
-
-fn decode_list_rows(
-    field: &Arc<arrow::datatypes::Field>,
-    rows: &[Option<&[u8]>],
-) -> ExecutionResult<ArrayRef> {
-    check_group_key_nested_output(rows, 16, GroupKeyOutputKind::List)?;
-    let mut offsets = Vec::with_capacity(rows.len().saturating_add(1));
-    offsets.push(0_i32);
-    let mut nulls = NullBufferBuilder::new(rows.len());
-    let mut children = Vec::new();
-    for row in rows {
-        match row {
-            None => nulls.append_null(),
-            Some(row) => {
-                nulls.append_non_null();
-                let mut cursor = EncodedCursor::new(row);
-                cursor.expect_marker(16)?;
-                let count = cursor.read_u32()? as usize;
-                for _ in 0..count {
-                    children.push(cursor.read_nested()?);
-                }
-                cursor.finish()?;
-            }
-        }
-        offsets
-            .push(i32::try_from(children.len()).expect("preflighted canonical list output extent"));
-    }
-    let child_array = decode_group_key_rows(field.data_type(), &children)?;
-    Ok(Arc::new(
-        ListArray::try_new(
-            Arc::clone(field),
-            OffsetBuffer::new(offsets.into()),
-            child_array,
-            nulls.finish(),
-        )
-        .map_err(group_key_decode_arrow)?,
-    ))
-}
-
-fn decode_struct_rows(
-    fields: &arrow::datatypes::Fields,
-    rows: &[Option<&[u8]>],
-) -> ExecutionResult<ArrayRef> {
-    let mut columns: Vec<Vec<Option<&[u8]>>> = (0..fields.len())
-        .map(|_| Vec::with_capacity(rows.len()))
-        .collect();
-    let mut nulls = NullBufferBuilder::new(rows.len());
-    for row in rows {
-        match row {
-            None => {
-                nulls.append_null();
-                for column in &mut columns {
-                    column.push(None);
-                }
-            }
-            Some(row) => {
-                nulls.append_non_null();
-                let mut cursor = EncodedCursor::new(row);
-                cursor.expect_marker(17)?;
-                let count = cursor.read_u32()? as usize;
-                if count != fields.len() {
-                    return Err(group_key_decoding_contract(
-                        "canonical struct group-key field count mismatch",
-                    ));
-                }
-                for column in &mut columns {
-                    column.push(cursor.read_nested()?);
-                }
-                cursor.finish()?;
-            }
-        }
-    }
-    let arrays = fields
-        .iter()
-        .zip(columns)
-        .map(|(field, rows)| decode_group_key_rows(field.data_type(), &rows))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Arc::new(
-        StructArray::try_new(fields.clone(), arrays, nulls.finish())
-            .map_err(group_key_decode_arrow)?,
-    ))
-}
-
-fn decode_map_rows(
-    field: &Arc<arrow::datatypes::Field>,
-    ordered: bool,
-    rows: &[Option<&[u8]>],
-) -> ExecutionResult<ArrayRef> {
-    let DataType::Struct(entry_fields) = field.data_type() else {
-        return Err(group_key_decoding_contract(
-            "map group key requires struct entry type",
-        ));
-    };
-    if entry_fields.len() != 2 {
-        return Err(group_key_decoding_contract(
-            "map group key requires key/value entry fields",
-        ));
-    }
-    check_group_key_nested_output(rows, 18, GroupKeyOutputKind::Map)?;
-    let mut offsets = Vec::with_capacity(rows.len().saturating_add(1));
-    offsets.push(0_i32);
-    let mut nulls = NullBufferBuilder::new(rows.len());
-    let mut keys = Vec::new();
-    let mut values = Vec::new();
-    for row in rows {
-        match row {
-            None => nulls.append_null(),
-            Some(row) => {
-                nulls.append_non_null();
-                let mut cursor = EncodedCursor::new(row);
-                cursor.expect_marker(18)?;
-                let count = cursor.read_u32()? as usize;
-                for _ in 0..count {
-                    keys.push(cursor.read_nested()?);
-                    values.push(cursor.read_nested()?);
-                }
-                cursor.finish()?;
-            }
-        }
-        offsets.push(i32::try_from(keys.len()).expect("preflighted canonical map output extent"));
-    }
-    let key_array = decode_group_key_rows(entry_fields[0].data_type(), &keys)?;
-    let value_array = decode_group_key_rows(entry_fields[1].data_type(), &values)?;
-    let entries = StructArray::try_new(entry_fields.clone(), vec![key_array, value_array], None)
-        .map_err(group_key_decode_arrow)?;
-    Ok(Arc::new(
-        MapArray::try_new(
-            Arc::clone(field),
-            OffsetBuffer::new(offsets.into()),
-            entries,
-            nulls.finish(),
-            ordered,
-        )
-        .map_err(group_key_decode_arrow)?,
-    ))
-}
+mod decode;
+#[cfg(test)]
+pub(crate) use decode::decode_group_key_rows;
+pub(crate) use decode::decode_group_key_rows_construction;
 
 struct EncodedCursor<'a> {
     bytes: &'a [u8],
     offset: usize,
+}
+
+/// Borrow the original nullable component frame without inventing a second
+/// tuple parser in a key store. The payload remains the canonical author's
+/// non-NULL group-key encoding, not an Arrow value or a physical value layout.
+pub(crate) fn canonical_component_payload(bytes: &[u8]) -> ExecutionResult<Option<&[u8]>> {
+    let mut cursor = EncodedCursor::new(bytes);
+    let payload = cursor.read_nested()?;
+    cursor.finish()?;
+    Ok(payload)
 }
 
 impl<'a> EncodedCursor<'a> {
@@ -1946,877 +1221,20 @@ impl<'a> EncodedCursor<'a> {
     }
 }
 
-pub fn list_utf8_row_value(
-    list: &ListArray,
-    values: &StringArray,
-    row: usize,
-) -> Option<Vec<Option<String>>> {
-    if list.is_null(row) {
-        return None;
-    }
-    let offsets = list.value_offsets();
-    let start = offsets[row] as usize;
-    let end = offsets[row + 1] as usize;
-    let mut out = Vec::with_capacity(end.saturating_sub(start));
-    for idx in start..end {
-        if values.is_null(idx) {
-            out.push(None);
-        } else {
-            out.push(Some(values.value(idx).to_string()));
-        }
-    }
-    Some(out)
-}
-
-pub fn list_int32_row_value(
-    list: &ListArray,
-    values: &Int32Array,
-    row: usize,
-) -> Option<Vec<Option<i32>>> {
-    if list.is_null(row) {
-        return None;
-    }
-    let offsets = list.value_offsets();
-    let start = offsets[row] as usize;
-    let end = offsets[row + 1] as usize;
-    let mut out = Vec::with_capacity(end.saturating_sub(start));
-    for idx in start..end {
-        if values.is_null(idx) {
-            out.push(None);
-        } else {
-            out.push(Some(values.value(idx)));
-        }
-    }
-    Some(out)
-}
-
-fn hash_list_utf8_row(list: &ListArray, values: &StringArray, row: usize, seed: u64) -> u64 {
-    let offsets = list.value_offsets();
-    let start = offsets[row] as usize;
-    let end = offsets[row + 1] as usize;
-    let mut hash = hash_u64_with_seed(seed, (end.saturating_sub(start)) as u64);
-    for idx in start..end {
-        if values.is_null(idx) {
-            let marker = hash_u64_with_seed(seed, 0);
-            hash = combine_hash(hash, marker);
-            continue;
-        }
-        let marker = hash_u64_with_seed(seed, 1);
-        hash = combine_hash(hash, marker);
-        let value_hash = hash_bytes_with_seed(seed, values.value(idx).as_bytes());
-        hash = combine_hash(hash, value_hash);
-    }
-    hash
-}
-
-fn hash_list_int32_row(list: &ListArray, values: &Int32Array, row: usize, seed: u64) -> u64 {
-    let offsets = list.value_offsets();
-    let start = offsets[row] as usize;
-    let end = offsets[row + 1] as usize;
-    let mut hash = hash_u64_with_seed(seed, (end.saturating_sub(start)) as u64);
-    for idx in start..end {
-        if values.is_null(idx) {
-            let marker = hash_u64_with_seed(seed, 0);
-            hash = combine_hash(hash, marker);
-            continue;
-        }
-        let marker = hash_u64_with_seed(seed, 1);
-        hash = combine_hash(hash, marker);
-        let value_hash = hash_u64_with_seed(seed, values.value(idx) as i64 as u64);
-        hash = combine_hash(hash, value_hash);
-    }
-    hash
-}
-
-fn largeint_row_value(arr: &FixedSizeBinaryArray, row: usize) -> ExecutionResult<Option<i128>> {
-    if arr.is_null(row) {
-        return Ok(None);
-    }
-    if arr.value_length() != 16 {
-        return Err(group_key_encoding_contract(
-            "LARGEINT group key has a foreign physical width",
-        ));
-    }
-    let fixed: [u8; 16] = arr
-        .value(row)
-        .try_into()
-        .expect("checked LARGEINT group-key physical width");
-    Ok(Some(i128::from_be_bytes(fixed)))
-}
-
-pub fn build_one_number_hashes(
-    view: &GroupKeyArrayView<'_>,
-    num_rows: usize,
-    seed: u64,
-) -> ExecutionResult<Vec<u64>> {
-    let mut hashes = Vec::with_capacity(num_rows);
-    let null_hash = hash_null_with_seed(seed);
-    match view {
-        GroupKeyArrayView::Int(view) => match view {
-            IntArrayView::Int64(arr) => {
-                if arr.null_count() == 0 {
-                    for value in arr.values() {
-                        let value_hash = hash_u64_with_seed(seed, *value as u64);
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                } else {
-                    for row in 0..num_rows {
-                        if arr.is_null(row) {
-                            hashes.push(combine_hash(seed, null_hash));
-                        } else {
-                            let value = arr.value(row);
-                            let value_hash = hash_u64_with_seed(seed, value as u64);
-                            hashes.push(combine_hash(seed, value_hash));
-                        }
-                    }
-                }
-            }
-            IntArrayView::Int32(arr) => {
-                if arr.null_count() == 0 {
-                    for value in arr.values() {
-                        let value_hash = hash_u64_with_seed(seed, *value as i64 as u64);
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                } else {
-                    for row in 0..num_rows {
-                        if arr.is_null(row) {
-                            hashes.push(combine_hash(seed, null_hash));
-                        } else {
-                            let value = arr.value(row) as i64;
-                            let value_hash = hash_u64_with_seed(seed, value as u64);
-                            hashes.push(combine_hash(seed, value_hash));
-                        }
-                    }
-                }
-            }
-            IntArrayView::Int16(arr) => {
-                if arr.null_count() == 0 {
-                    for value in arr.values() {
-                        let value_hash = hash_u64_with_seed(seed, *value as i64 as u64);
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                } else {
-                    for row in 0..num_rows {
-                        if arr.is_null(row) {
-                            hashes.push(combine_hash(seed, null_hash));
-                        } else {
-                            let value = arr.value(row) as i64;
-                            let value_hash = hash_u64_with_seed(seed, value as u64);
-                            hashes.push(combine_hash(seed, value_hash));
-                        }
-                    }
-                }
-            }
-            IntArrayView::Int8(arr) => {
-                if arr.null_count() == 0 {
-                    for value in arr.values() {
-                        let value_hash = hash_u64_with_seed(seed, *value as i64 as u64);
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                } else {
-                    for row in 0..num_rows {
-                        if arr.is_null(row) {
-                            hashes.push(combine_hash(seed, null_hash));
-                        } else {
-                            let value = arr.value(row) as i64;
-                            let value_hash = hash_u64_with_seed(seed, value as u64);
-                            hashes.push(combine_hash(seed, value_hash));
-                        }
-                    }
-                }
-            }
-        },
-        GroupKeyArrayView::Float(view) => match view {
-            FloatArrayView::Float64(arr) => {
-                if arr.null_count() == 0 {
-                    for value in arr.values() {
-                        let bits = canonical_f64_bits(*value);
-                        let value_hash = hash_u64_with_seed(seed, bits);
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                } else {
-                    for row in 0..num_rows {
-                        if arr.is_null(row) {
-                            hashes.push(combine_hash(seed, null_hash));
-                        } else {
-                            let bits = canonical_f64_bits(arr.value(row));
-                            let value_hash = hash_u64_with_seed(seed, bits);
-                            hashes.push(combine_hash(seed, value_hash));
-                        }
-                    }
-                }
-            }
-            FloatArrayView::Float32(arr) => {
-                if arr.null_count() == 0 {
-                    for value in arr.values() {
-                        let bits = canonical_f32_bits(*value);
-                        let value_hash = hash_u64_with_seed(seed, bits as u64);
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                } else {
-                    for row in 0..num_rows {
-                        if arr.is_null(row) {
-                            hashes.push(combine_hash(seed, null_hash));
-                        } else {
-                            let bits = canonical_f32_bits(arr.value(row));
-                            let value_hash = hash_u64_with_seed(seed, bits as u64);
-                            hashes.push(combine_hash(seed, value_hash));
-                        }
-                    }
-                }
-            }
-        },
-        GroupKeyArrayView::Boolean(arr) => {
-            if arr.null_count() == 0 {
-                for row in 0..num_rows {
-                    let value = arr.value(row);
-                    let hash_value = if value { 1u64 } else { 0u64 };
-                    let value_hash = hash_u64_with_seed(seed, hash_value);
-                    hashes.push(combine_hash(seed, value_hash));
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        hashes.push(combine_hash(seed, null_hash));
-                    } else {
-                        let value = arr.value(row);
-                        let hash_value = if value { 1u64 } else { 0u64 };
-                        let value_hash = hash_u64_with_seed(seed, hash_value);
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::Date32(arr) => {
-            if arr.null_count() == 0 {
-                for value in arr.values() {
-                    let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    hashes.push(combine_hash(seed, value_hash));
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        hashes.push(combine_hash(seed, null_hash));
-                    } else {
-                        let value = arr.value(row);
-                        let value_hash = hash_u64_with_seed(seed, value as u64);
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::TimestampSecond(arr) => {
-            if arr.null_count() == 0 {
-                for value in arr.values() {
-                    let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    hashes.push(combine_hash(seed, value_hash));
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        hashes.push(combine_hash(seed, null_hash));
-                    } else {
-                        let value = arr.value(row);
-                        let value_hash = hash_u64_with_seed(seed, value as u64);
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::TimestampMillisecond(arr) => {
-            if arr.null_count() == 0 {
-                for value in arr.values() {
-                    let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    hashes.push(combine_hash(seed, value_hash));
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        hashes.push(combine_hash(seed, null_hash));
-                    } else {
-                        let value = arr.value(row);
-                        let value_hash = hash_u64_with_seed(seed, value as u64);
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::TimestampMicrosecond(arr) => {
-            if arr.null_count() == 0 {
-                for value in arr.values() {
-                    let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    hashes.push(combine_hash(seed, value_hash));
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        hashes.push(combine_hash(seed, null_hash));
-                    } else {
-                        let value = arr.value(row);
-                        let value_hash = hash_u64_with_seed(seed, value as u64);
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::TimestampNanosecond(arr) => {
-            if arr.null_count() == 0 {
-                for value in arr.values() {
-                    let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    hashes.push(combine_hash(seed, value_hash));
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        hashes.push(combine_hash(seed, null_hash));
-                    } else {
-                        let value = arr.value(row);
-                        let value_hash = hash_u64_with_seed(seed, value as u64);
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::Decimal128(arr) => {
-            if arr.null_count() == 0 {
-                for value in arr.values() {
-                    let value_hash = hash_i128_with_seed(seed, *value);
-                    hashes.push(combine_hash(seed, value_hash));
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        hashes.push(combine_hash(seed, null_hash));
-                    } else {
-                        let value = arr.value(row);
-                        let value_hash = hash_i128_with_seed(seed, value);
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::Decimal256(arr) => {
-            if arr.null_count() == 0 {
-                for value in arr.values() {
-                    let value_hash = hash_bytes_with_seed(seed, &value.to_le_bytes());
-                    hashes.push(combine_hash(seed, value_hash));
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        hashes.push(combine_hash(seed, null_hash));
-                    } else {
-                        let value_hash = hash_bytes_with_seed(seed, &arr.value(row).to_le_bytes());
-                        hashes.push(combine_hash(seed, value_hash));
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::LargeIntBinary(arr) => {
-            if arr.null_count() == 0 {
-                for row in 0..num_rows {
-                    let value = largeint_row_value(arr, row)?.ok_or_else(|| {
-                        group_key_encoding_contract("group key LARGEINT unexpected null")
-                    })?;
-                    let value_hash = hash_i128_with_seed(seed, value);
-                    hashes.push(combine_hash(seed, value_hash));
-                }
-            } else {
-                for row in 0..num_rows {
-                    if let Some(value) = largeint_row_value(arr, row)? {
-                        let value_hash = hash_i128_with_seed(seed, value);
-                        hashes.push(combine_hash(seed, value_hash));
-                    } else {
-                        hashes.push(combine_hash(seed, null_hash));
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::Utf8(_)
-        | GroupKeyArrayView::Dictionary(_)
-        | GroupKeyArrayView::ListUtf8 { .. }
-        | GroupKeyArrayView::ListInt32 { .. }
-        | GroupKeyArrayView::Complex(_) => {
-            return Err(group_key_encoding_contract(
-                "one number key does not support variable-length types",
-            ));
-        }
-    }
-    Ok(hashes)
-}
-
-pub fn build_group_key_hashes(
-    views: &[GroupKeyArrayView<'_>],
-    num_rows: usize,
-    seed: u64,
-) -> ExecutionResult<Vec<u64>> {
-    let mut hashes = vec![seed; num_rows];
-    for view in views {
-        hash_column(view, num_rows, seed, &mut hashes)?;
-    }
-    Ok(hashes)
-}
-
-#[inline]
-fn combine_hash_at(hashes: &mut [u64], row: usize, value_hash: u64) {
-    hashes[row] = combine_hash(hashes[row], value_hash);
-}
-
-fn hash_column(
-    view: &GroupKeyArrayView<'_>,
-    num_rows: usize,
-    seed: u64,
-    hashes: &mut [u64],
-) -> ExecutionResult<()> {
-    let null_hash = hash_null_with_seed(seed);
-    match view {
-        GroupKeyArrayView::Int(view) => match view {
-            IntArrayView::Int64(arr) => {
-                if arr.null_count() == 0 {
-                    for (row, value) in arr.values().iter().enumerate() {
-                        let value_hash = hash_u64_with_seed(seed, *value as u64);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                } else {
-                    for row in 0..num_rows {
-                        if arr.is_null(row) {
-                            combine_hash_at(hashes, row, null_hash);
-                        } else {
-                            let value_hash = hash_u64_with_seed(seed, arr.value(row) as u64);
-                            combine_hash_at(hashes, row, value_hash);
-                        }
-                    }
-                }
-            }
-            IntArrayView::Int32(arr) => {
-                if arr.null_count() == 0 {
-                    for (row, value) in arr.values().iter().enumerate() {
-                        let value_hash = hash_u64_with_seed(seed, *value as i64 as u64);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                } else {
-                    for row in 0..num_rows {
-                        if arr.is_null(row) {
-                            combine_hash_at(hashes, row, null_hash);
-                        } else {
-                            let value_hash = hash_u64_with_seed(seed, arr.value(row) as i64 as u64);
-                            combine_hash_at(hashes, row, value_hash);
-                        }
-                    }
-                }
-            }
-            IntArrayView::Int16(arr) => {
-                if arr.null_count() == 0 {
-                    for (row, value) in arr.values().iter().enumerate() {
-                        let value_hash = hash_u64_with_seed(seed, *value as i64 as u64);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                } else {
-                    for row in 0..num_rows {
-                        if arr.is_null(row) {
-                            combine_hash_at(hashes, row, null_hash);
-                        } else {
-                            let value_hash = hash_u64_with_seed(seed, arr.value(row) as i64 as u64);
-                            combine_hash_at(hashes, row, value_hash);
-                        }
-                    }
-                }
-            }
-            IntArrayView::Int8(arr) => {
-                if arr.null_count() == 0 {
-                    for (row, value) in arr.values().iter().enumerate() {
-                        let value_hash = hash_u64_with_seed(seed, *value as i64 as u64);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                } else {
-                    for row in 0..num_rows {
-                        if arr.is_null(row) {
-                            combine_hash_at(hashes, row, null_hash);
-                        } else {
-                            let value_hash = hash_u64_with_seed(seed, arr.value(row) as i64 as u64);
-                            combine_hash_at(hashes, row, value_hash);
-                        }
-                    }
-                }
-            }
-        },
-        GroupKeyArrayView::Float(view) => match view {
-            FloatArrayView::Float64(arr) => {
-                if arr.null_count() == 0 {
-                    for (row, value) in arr.values().iter().enumerate() {
-                        let bits = canonical_f64_bits(*value);
-                        let value_hash = hash_u64_with_seed(seed, bits);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                } else {
-                    for row in 0..num_rows {
-                        if arr.is_null(row) {
-                            combine_hash_at(hashes, row, null_hash);
-                        } else {
-                            let bits = canonical_f64_bits(arr.value(row));
-                            let value_hash = hash_u64_with_seed(seed, bits);
-                            combine_hash_at(hashes, row, value_hash);
-                        }
-                    }
-                }
-            }
-            FloatArrayView::Float32(arr) => {
-                if arr.null_count() == 0 {
-                    for (row, value) in arr.values().iter().enumerate() {
-                        let bits = canonical_f32_bits(*value) as u64;
-                        let value_hash = hash_u64_with_seed(seed, bits);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                } else {
-                    for row in 0..num_rows {
-                        if arr.is_null(row) {
-                            combine_hash_at(hashes, row, null_hash);
-                        } else {
-                            let bits = canonical_f32_bits(arr.value(row)) as u64;
-                            let value_hash = hash_u64_with_seed(seed, bits);
-                            combine_hash_at(hashes, row, value_hash);
-                        }
-                    }
-                }
-            }
-        },
-        GroupKeyArrayView::Boolean(arr) => {
-            if arr.null_count() == 0 {
-                for row in 0..num_rows {
-                    let value = if arr.value(row) { 1u64 } else { 0u64 };
-                    let value_hash = hash_u64_with_seed(seed, value);
-                    combine_hash_at(hashes, row, value_hash);
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        combine_hash_at(hashes, row, null_hash);
-                    } else {
-                        let value = if arr.value(row) { 1u64 } else { 0u64 };
-                        let value_hash = hash_u64_with_seed(seed, value);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::Utf8(arr) => {
-            if arr.null_count() == 0 {
-                for row in 0..num_rows {
-                    let value_hash = hash_bytes_with_seed(seed, arr.value(row).as_bytes());
-                    combine_hash_at(hashes, row, value_hash);
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        combine_hash_at(hashes, row, null_hash);
-                    } else {
-                        let value_hash = hash_bytes_with_seed(seed, arr.value(row).as_bytes());
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::Dictionary(dict) => {
-            let mut value_hashes = vec![None; dict.values_len()];
-            for row in 0..num_rows {
-                let Some(code) = dict.code_at(row)? else {
-                    combine_hash_at(hashes, row, null_hash);
-                    continue;
-                };
-                let value_hash = match value_hashes.get(code).copied().flatten() {
-                    Some(hash) => hash,
-                    None => {
-                        let hash = hash_bytes_with_seed(seed, dict.value_bytes_for_code(code)?);
-                        let slot = value_hashes.get_mut(code).ok_or_else(|| {
-                            group_key_encoding_contract("dictionary group key code out of bounds")
-                        })?;
-                        *slot = Some(hash);
-                        hash
-                    }
-                };
-                combine_hash_at(hashes, row, value_hash);
-            }
-        }
-        GroupKeyArrayView::Date32(arr) => {
-            if arr.null_count() == 0 {
-                for (row, value) in arr.values().iter().enumerate() {
-                    let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    combine_hash_at(hashes, row, value_hash);
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        combine_hash_at(hashes, row, null_hash);
-                    } else {
-                        let value_hash = hash_u64_with_seed(seed, arr.value(row) as u64);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::TimestampSecond(arr) => {
-            if arr.null_count() == 0 {
-                for (row, value) in arr.values().iter().enumerate() {
-                    let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    combine_hash_at(hashes, row, value_hash);
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        combine_hash_at(hashes, row, null_hash);
-                    } else {
-                        let value_hash = hash_u64_with_seed(seed, arr.value(row) as u64);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::TimestampMillisecond(arr) => {
-            if arr.null_count() == 0 {
-                for (row, value) in arr.values().iter().enumerate() {
-                    let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    combine_hash_at(hashes, row, value_hash);
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        combine_hash_at(hashes, row, null_hash);
-                    } else {
-                        let value_hash = hash_u64_with_seed(seed, arr.value(row) as u64);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::TimestampMicrosecond(arr) => {
-            if arr.null_count() == 0 {
-                for (row, value) in arr.values().iter().enumerate() {
-                    let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    combine_hash_at(hashes, row, value_hash);
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        combine_hash_at(hashes, row, null_hash);
-                    } else {
-                        let value_hash = hash_u64_with_seed(seed, arr.value(row) as u64);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::TimestampNanosecond(arr) => {
-            if arr.null_count() == 0 {
-                for (row, value) in arr.values().iter().enumerate() {
-                    let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    combine_hash_at(hashes, row, value_hash);
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        combine_hash_at(hashes, row, null_hash);
-                    } else {
-                        let value_hash = hash_u64_with_seed(seed, arr.value(row) as u64);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::Decimal128(arr) => {
-            if arr.null_count() == 0 {
-                for (row, value) in arr.values().iter().enumerate() {
-                    let value_hash = hash_i128_with_seed(seed, *value);
-                    combine_hash_at(hashes, row, value_hash);
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        combine_hash_at(hashes, row, null_hash);
-                    } else {
-                        let value_hash = hash_i128_with_seed(seed, arr.value(row));
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::Decimal256(arr) => {
-            if arr.null_count() == 0 {
-                for (row, value) in arr.values().iter().enumerate() {
-                    let value_hash = hash_bytes_with_seed(seed, &value.to_le_bytes());
-                    combine_hash_at(hashes, row, value_hash);
-                }
-            } else {
-                for row in 0..num_rows {
-                    if arr.is_null(row) {
-                        combine_hash_at(hashes, row, null_hash);
-                    } else {
-                        let value_hash = hash_bytes_with_seed(seed, &arr.value(row).to_le_bytes());
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::LargeIntBinary(arr) => {
-            if arr.null_count() == 0 {
-                for row in 0..num_rows {
-                    let value = largeint_row_value(arr, row)?.ok_or_else(|| {
-                        group_key_encoding_contract("group key LARGEINT unexpected null")
-                    })?;
-                    let value_hash = hash_i128_with_seed(seed, value);
-                    combine_hash_at(hashes, row, value_hash);
-                }
-            } else {
-                for row in 0..num_rows {
-                    if let Some(value) = largeint_row_value(arr, row)? {
-                        let value_hash = hash_i128_with_seed(seed, value);
-                        combine_hash_at(hashes, row, value_hash);
-                    } else {
-                        combine_hash_at(hashes, row, null_hash);
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::ListUtf8 { list, values } => {
-            if list.null_count() == 0 {
-                for row in 0..num_rows {
-                    let value_hash = hash_list_utf8_row(list, values, row, seed);
-                    combine_hash_at(hashes, row, value_hash);
-                }
-            } else {
-                for row in 0..num_rows {
-                    if list.is_null(row) {
-                        combine_hash_at(hashes, row, null_hash);
-                    } else {
-                        let value_hash = hash_list_utf8_row(list, values, row, seed);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::ListInt32 { list, values } => {
-            if list.null_count() == 0 {
-                for row in 0..num_rows {
-                    let value_hash = hash_list_int32_row(list, values, row, seed);
-                    combine_hash_at(hashes, row, value_hash);
-                }
-            } else {
-                for row in 0..num_rows {
-                    if list.is_null(row) {
-                        combine_hash_at(hashes, row, null_hash);
-                    } else {
-                        let value_hash = hash_list_int32_row(list, values, row, seed);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
-                }
-            }
-        }
-        GroupKeyArrayView::Complex(array) => {
-            for row in 0..num_rows {
-                match canonical_group_key_hash_with_seed(array, row, seed)? {
-                    Some(value_hash) => combine_hash_at(hashes, row, value_hash),
-                    None => {
-                        combine_hash_at(hashes, row, null_hash);
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn build_compressed_flags(
-    ctx: &CompressedKeyContext,
-    views: &[GroupKeyArrayView<'_>],
-    num_rows: usize,
-) -> ExecutionResult<Vec<bool>> {
-    let mut flags = Vec::with_capacity(num_rows);
-    for row in 0..num_rows {
-        flags.push(compressed_key_is_valid(ctx, views, row)?);
-    }
-    Ok(flags)
-}
+#[cfg(test)]
+#[path = "key_builder/nested_byte_tests.rs"]
+mod nested_byte_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::mem_tracker::MemTracker;
     use arrow::array::{
-        ArrayRef, DictionaryArray, Int32Builder, Int64Array, MapBuilder, MapFieldNames,
-        StringBuilder,
+        ArrayRef, Int32Builder, Int64Array, MapBuilder, MapFieldNames, NullArray, StringBuilder,
     };
-    use arrow::datatypes::{Field, Fields, Int32Type};
+    use arrow::datatypes::{Field, Fields};
     use arrow_buffer::NullBuffer;
     use std::sync::Arc;
-
-    fn dict_utf8(values: Vec<Option<&str>>) -> ArrayRef {
-        Arc::new(values.into_iter().collect::<DictionaryArray<Int32Type>>())
-    }
-
-    #[test]
-    fn build_group_key_views_builds_dictionary_view_for_utf8_dictionary() {
-        let array = dict_utf8(vec![Some("PAID"), None, Some("NEW"), Some("PAID")]);
-        let arrays = [array];
-        let views = build_group_key_views(&arrays).expect("views");
-        let GroupKeyArrayView::Dictionary(dict) = &views[0] else {
-            panic!("expected dictionary view");
-        };
-        assert_ne!(dict.values_ptr(), 0);
-        assert_eq!(
-            dict.value_as_bytes(0).expect("value"),
-            Some(b"PAID".as_slice())
-        );
-        assert_eq!(dict.value_as_bytes(1).expect("null"), None);
-        assert_eq!(
-            dict.value_as_bytes(2).expect("value"),
-            Some(b"NEW".as_slice())
-        );
-    }
-
-    #[test]
-    fn dictionary_group_key_hashes_by_logical_value_across_local_codes() {
-        let first = dict_utf8(vec![Some("A"), Some("B")]);
-        let second = dict_utf8(vec![Some("B"), Some("A")]);
-        let first_arrays = [first];
-        let second_arrays = [second];
-        let first_views = build_group_key_views(&first_arrays).expect("first views");
-        let second_views = build_group_key_views(&second_arrays).expect("second views");
-
-        let first_hashes = build_group_key_hashes(&first_views, 2, 0x1234).expect("first hashes");
-        let second_hashes =
-            build_group_key_hashes(&second_views, 2, 0x1234).expect("second hashes");
-
-        assert_eq!(
-            first_hashes[0], second_hashes[1],
-            "A must hash by value, not code"
-        );
-        assert_eq!(
-            first_hashes[1], second_hashes[0],
-            "B must hash by value, not code"
-        );
-    }
-
-    #[test]
-    fn build_group_key_views_rejects_dictionary_values_with_nulls() {
-        let keys = Int32Array::from(vec![Some(1)]);
-        let values: ArrayRef = Arc::new(StringArray::from(vec![Some("A"), None]));
-        let array: ArrayRef =
-            Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap());
-        let arrays = [array];
-
-        let err = match build_group_key_views(&arrays) {
-            Ok(_) => panic!("expected dictionary values null error"),
-            Err(err) => err,
-        };
-
-        assert_eq!(
-            err.failure_fact().class(),
-            novarocks_failure_contract::FailureClass::Invariant
-        );
-        assert_eq!(
-            err.failure_fact().reason(),
-            crate::runtime::fragment::ExecutionReason::GroupKeyEncodingContract.reason()
-        );
-    }
 
     #[test]
     fn encode_group_key_row_accepts_binary_arrays() {

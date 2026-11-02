@@ -121,7 +121,7 @@ fn n_results(chunks: &[Chunk]) -> Vec<NOutput> {
                 panic!("complete LARGEINT list declaration")
             };
             assert_eq!(child.domain(), Some(ValueLogicalType::LargeInt));
-            assert_eq!(item.metadata().capacity(), 0);
+            assert!(item.metadata().as_arc().is_none());
             let values = lists.value(row);
             let binary = values
                 .as_any()

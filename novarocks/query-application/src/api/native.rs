@@ -132,9 +132,11 @@ pub enum NativeAttemptTopologyRequirement {
 }
 
 /// Independent exact process-replacement evidence retained beside an original
-/// pre-ready Establish refusal. The producer must have observed a real Worker
-/// IdentityMismatch for this operation and a different process at its frozen
-/// endpoint within the ORIGINAL observation horizon. This value does not claim
+/// pre-ready Establish or Create refusal. Native must have correlated a real
+/// Worker IdentityMismatch with its original operation and Task/context; QA
+/// retains the parent Establish and current recovery policy. The producer must
+/// also observe a different process at its frozen endpoint within the ORIGINAL
+/// observation horizon. This value does not claim
 /// that the wire identified a particular IdentityField, grant retry, or prove exit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreReadyProcessReplacementWitness {
@@ -147,6 +149,7 @@ pub struct PreReadyProcessReplacementWitness {
 struct PreReadyProcessReplacementFacts {
     context: novarocks_execution_contract::QueryContextRef,
     operation_id: novarocks_execution_contract::TaskOperationId,
+    kind: novarocks_execution_contract::OperationKind,
     replacement: BackendProcessId,
     refusal_fact: novarocks_failure_contract::FailureFact,
 }
@@ -157,7 +160,12 @@ impl PreReadyProcessReplacementWitness {
         operation_id: novarocks_execution_contract::TaskOperationId,
         replacement: BackendProcessId,
     ) -> Result<Self, &'static str> {
-        if Self::refusal_operation(input) != Some((context, operation_id))
+        let Some((original_context, original_operation, kind)) = Self::refusal_operation(input)
+        else {
+            return Err("pre-ready replacement evidence has no exact original refusal");
+        };
+        if original_context != context
+            || original_operation != operation_id
             || replacement == context.backend_process_id()
         {
             return Err("pre-ready replacement evidence does not match its original refusal");
@@ -166,6 +174,7 @@ impl PreReadyProcessReplacementWitness {
             facts: Arc::new(PreReadyProcessReplacementFacts {
                 context,
                 operation_id,
+                kind,
                 replacement,
                 refusal_fact: input.fact(),
             }),
@@ -176,6 +185,7 @@ impl PreReadyProcessReplacementWitness {
     ) -> Option<(
         QueryContextRef,
         novarocks_execution_contract::TaskOperationId,
+        novarocks_execution_contract::OperationKind,
     )> {
         use crate::execution_error::{
             ExecutionFailureSite, TASK_PROTOCOL_IDENTITY_MISMATCH_REASON,
@@ -192,8 +202,8 @@ impl PreReadyProcessReplacementWitness {
             ExecutionFailureSite::Operation {
                 context,
                 operation_id,
-                kind: OperationKind::UpdateQueryContext,
-            } => Some((context, operation_id)),
+                kind: kind @ (OperationKind::UpdateQueryContext | OperationKind::CreateTask),
+            } => Some((context, operation_id, kind)),
             _ => None,
         }
     }
@@ -215,7 +225,7 @@ impl PreReadyProcessReplacementWitness {
                 == (crate::execution_error::ExecutionFailureSite::Operation {
                     context: self.facts.context,
                     operation_id: self.facts.operation_id,
-                    kind: novarocks_execution_contract::OperationKind::UpdateQueryContext,
+                    kind: self.facts.kind,
                 })
     }
 }
@@ -2625,10 +2635,25 @@ pub(crate) fn pre_ready_identity_refusal_test_fixture(
     PreReadyProcessReplacementWitness,
     NativeAttemptPreparationFailure,
 ) {
+    pre_ready_identity_refusal_test_fixture_for_kind(
+        context,
+        novarocks_execution_contract::OperationKind::UpdateQueryContext,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn pre_ready_identity_refusal_test_fixture_for_kind(
+    context: novarocks_execution_contract::QueryContextRef,
+    kind: novarocks_execution_contract::OperationKind,
+) -> (
+    crate::execution_error::ExecutionFailureInput,
+    PreReadyProcessReplacementWitness,
+    NativeAttemptPreparationFailure,
+) {
     use crate::execution_error::{
         ExecutionFailureInput, ExecutionFailureSite, TASK_PROTOCOL_IDENTITY_MISMATCH_REASON,
     };
-    use novarocks_execution_contract::{OperationKind, SafeDetail, TaskOperationId};
+    use novarocks_execution_contract::{SafeDetail, TaskOperationId};
     use novarocks_failure_contract::{FailureClass, FailureFact};
     let operation_id = TaskOperationId::new_v7();
     let input = ExecutionFailureInput::new(
@@ -2640,7 +2665,7 @@ pub(crate) fn pre_ready_identity_refusal_test_fixture(
         ExecutionFailureSite::Operation {
             context,
             operation_id,
-            kind: OperationKind::UpdateQueryContext,
+            kind,
         },
     );
     let witness = PreReadyProcessReplacementWitness::try_new(
@@ -2732,5 +2757,56 @@ mod pre_ready_replacement_evidence_tests {
         );
         assert_eq!(ordinary_failure.input(), &ordinary);
         assert!(ordinary_failure.pre_ready_replacement().is_none());
+    }
+    #[test]
+    fn create_replacement_witness_preserves_kind_and_rejects_cross_kind_input() {
+        use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
+        use novarocks_execution_contract::{OperationKind, QueryContextRef};
+        let execution = QueryExecutionId::new(
+            novarocks_types::QueryId::new(29, 33),
+            novarocks_types::AttemptId::new(1).unwrap(),
+        )
+        .unwrap();
+        let context = QueryContextRef::new(
+            execution,
+            novarocks_types::FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let (input, witness, failure) =
+            pre_ready_identity_refusal_test_fixture_for_kind(context, OperationKind::CreateTask);
+        assert_eq!(failure.input(), &input);
+        assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
+        assert_eq!(
+            PreReadyProcessReplacementWitness::refusal_operation(&input),
+            Some((context, witness.operation_id(), OperationKind::CreateTask))
+        );
+        let other = ExecutionFailureInput::new(
+            input.fact(),
+            input.detail().clone(),
+            ExecutionFailureSite::Operation {
+                context,
+                operation_id: witness.operation_id(),
+                kind: OperationKind::UpdateQueryContext,
+            },
+        );
+        assert!(!witness.matches_input(&other));
+        let unrelated = ExecutionFailureInput::new(
+            input.fact(),
+            input.detail().clone(),
+            ExecutionFailureSite::Operation {
+                context,
+                operation_id: witness.operation_id(),
+                kind: OperationKind::UpdateTask,
+            },
+        );
+        assert!(
+            PreReadyProcessReplacementWitness::try_new(
+                &unrelated,
+                context,
+                witness.operation_id(),
+                witness.replacement_process()
+            )
+            .is_err()
+        );
     }
 }

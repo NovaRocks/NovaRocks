@@ -257,7 +257,7 @@ mod tests {
         for (column, field) in source.iter().zip(&fields) {
             assert_eq!(field.execution_type(), Some(&column.value_type));
             assert_eq!(field.field().is_nullable(), column.value_type.nullable());
-            assert_eq!(field.field().metadata().capacity(), 0);
+            assert!(field.field().metadata().as_arc().is_none());
         }
     }
 
@@ -401,7 +401,7 @@ mod tests {
             let requests = source_columns_to_write_fields(std::slice::from_ref(&source)).unwrap();
             assert_eq!(requests[0].execution_type(), Some(&source.value_type));
             assert_eq!(requests[0].field().data_type(), &carrier);
-            assert_eq!(requests[0].field().metadata().capacity(), 0);
+            assert!(requests[0].field().metadata().as_arc().is_none());
         }
         let nominal = typed(
             "v",
@@ -426,7 +426,7 @@ mod tests {
         let DataType::List(field) = fields[0].field().data_type() else {
             panic!("expected list layout");
         };
-        assert_eq!(field.metadata().capacity(), 0);
+        assert!(field.metadata().as_arc().is_none());
         assert!(!field.is_nullable());
         assert_eq!(
             source_columns_to_table_column_defs(&[plain(

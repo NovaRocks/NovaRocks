@@ -18,7 +18,11 @@
 explicit_only = false
 
 [impact]
-paths = ["novarocks/sql/src/optimizer/**"]
+paths = [
+    "novarocks/sql/src/optimizer/**",
+    "novarocks/execution/src/exec/hash_table/**",
+    "novarocks/execution/src/exec/operators/assert_num_rows_processor.rs",
+]
 
 [reuse]
 scope = "suite"

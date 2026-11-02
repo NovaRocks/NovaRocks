@@ -36,10 +36,6 @@ mod blocked_duration;
 pub(crate) mod compiled_aggregate;
 mod compiled_aggregate_topn;
 pub(crate) mod compiled_change_events;
-#[expect(
-    dead_code,
-    reason = "P07 operator kernels await P08 Task bindings and P09 builder integration."
-)]
 pub(crate) mod compiled_change_router;
 pub(crate) mod compiled_expression;
 pub(crate) mod compiled_generate_series;
@@ -65,10 +61,6 @@ mod limit_processor;
 mod local_exchange_sink;
 mod local_exchange_source;
 pub(crate) mod local_exchanger;
-#[expect(
-    dead_code,
-    reason = "P07 summary kernels await P08 Task bindings and P09 builder integration."
-)]
 pub(crate) mod logical_change_summary;
 mod nljoin;
 mod noop_sink;

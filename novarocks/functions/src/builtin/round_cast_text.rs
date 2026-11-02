@@ -63,8 +63,6 @@ pub(crate) fn parse_i64(
 mod tests {
     use super::*;
     use crate::{KernelEvaluationControl, MAX_UNOBSERVED_KERNEL_WORK};
-    use arrow_array::types::Int64Type;
-    use arrow_cast::parse::Parser;
     use std::{sync::Mutex, time::Duration};
 
     #[derive(Default)]
@@ -110,7 +108,7 @@ mod tests {
     fn assert_arrow(text: &str) {
         assert_eq!(
             observed(text, &Control::default()).unwrap(),
-            Int64Type::parse(text),
+            text.parse::<i64>().ok(),
             "input {text:?}"
         );
     }
@@ -190,7 +188,7 @@ mod tests {
         let overflow = "9".repeat(4097);
         let control = Control::default();
         assert_eq!(observed(&overflow, &control), Ok(None));
-        assert_eq!(Int64Type::parse(&overflow), None);
+        assert_eq!(overflow.parse::<i64>().ok(), None);
         let calls = control.calls();
         assert_eq!(calls.first(), Some(&0));
         assert_eq!(calls.last(), Some(&1));
@@ -203,7 +201,7 @@ mod tests {
         let text = format!("{}x0", "0".repeat(300));
         let control = Control::default();
         assert_eq!(observed(&text, &control), Ok(None));
-        assert_eq!(Int64Type::parse(&text), None);
+        assert_eq!(text.parse::<i64>().ok(), None);
         // The invalid byte is observed; input after it is not evaluated.
         assert_eq!(control.calls(), [0, 256, 45]);
         for text in ["１２", "١", "−1", "＋1", "1é0", "1\u{a0}", "💡0"] {

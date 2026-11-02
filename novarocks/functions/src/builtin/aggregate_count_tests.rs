@@ -972,8 +972,12 @@ fn aggregate_count_exact_binding_distinct_order_state_and_required_children_reje
 
     let metadata_type = FunctionValueType::from_legacy_declared_projection(
         arrow_schema::DataType::List(Arc::new(
-            arrow_schema::Field::new("item", arrow_schema::DataType::Int64, true)
-                .with_metadata([("source".into(), "original".into())].into()),
+            arrow_schema::Field::new("item", arrow_schema::DataType::Int64, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "source".into(),
+                    "original".into(),
+                )]),
+            ),
         )),
         true,
     );
@@ -985,8 +989,12 @@ fn aggregate_count_exact_binding_distinct_order_state_and_required_children_reje
     );
     let changed_type = FunctionValueType::from_legacy_declared_projection(
         arrow_schema::DataType::List(Arc::new(
-            arrow_schema::Field::new("item", arrow_schema::DataType::Int64, true)
-                .with_metadata([("source".into(), "different".into())].into()),
+            arrow_schema::Field::new("item", arrow_schema::DataType::Int64, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "source".into(),
+                    "different".into(),
+                )]),
+            ),
         )),
         true,
     );

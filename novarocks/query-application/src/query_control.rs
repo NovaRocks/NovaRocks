@@ -22,11 +22,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::cancellation::{QueryCancellationReason, QueryCancellationSource};
+#[cfg(test)]
 use crate::client_connection::ClientConnectionToken;
 use crate::session_control::{
-    ConnectionKillAuthorization, GovernedStatementCancellation, GovernedStatementFinishOutcome,
-    GovernedStatementRegistration, GovernedStatementVisibilitySealOutcome, QueryCancelOutcome,
-    QueryControlError, QueryControlPort, QueryControlService, SessionIdentity, SessionProcess,
+    ClientQueryId, ClientSessionKey, ConnectionKillAuthorization, GovernedStatementCancellation,
+    GovernedStatementFinishOutcome, GovernedStatementRegistration,
+    GovernedStatementVisibilitySealOutcome, QueryCancelOutcome, QueryControlError,
+    QueryControlPort, QueryControlService, SessionIdentity, SessionOrigin, SessionProcess,
     SessionToken, StatementFinishOutcome, StatementRegistration, StatementToken,
 };
 use novarocks_workload_control::{
@@ -34,24 +36,34 @@ use novarocks_workload_control::{
 };
 
 // Design: ADR-0102 (docs/adr/ADR-0102-mysql-kill-connection-lifecycle-ownership.md)
-#[derive(Default)]
 pub struct QueryApplicationControl {
+    query_ids: crate::client_query_id::ClientQueryIdGenerator,
     state: Mutex<QueryControlState>,
 }
 
 #[derive(Default)]
 struct QueryControlState {
-    next_session_epoch: u64,
+    next_session_key: u64,
     statement_progress: std::sync::Weak<crate::session_control::StatementProgressSlot>,
     statement_actions_open: bool,
     statement_progress_installed: bool,
     statement_sources: Box<[Option<Arc<crate::session_control::StatementActionSource>>]>,
-    sessions: BTreeMap<u32, SessionEntry>,
+    sessions: BTreeMap<ClientSessionKey, SessionEntry>,
+    by_connection: BTreeMap<u32, ClientSessionKey>,
+}
+
+impl QueryControlState {
+    fn remove_session(&mut self, key: ClientSessionKey) {
+        if let Some(entry) = self.sessions.remove(&key)
+            && let SessionOrigin::Connection(connection) = entry.origin
+        {
+            self.by_connection.remove(&connection.connection_id());
+        }
+    }
 }
 
 struct SessionEntry {
-    session_epoch: u64,
-    connection: ClientConnectionToken,
+    origin: SessionOrigin,
     principal: Arc<str>,
     next_statement_generation: u64,
     active: Option<ActiveStatement>,
@@ -119,16 +131,17 @@ fn workload_cancellation_reason(reason: &QueryCancellationReason) -> Cancellatio
     match reason {
         QueryCancellationReason::ExecutionCancellationRequested => CancellationReason::Requested,
         QueryCancellationReason::ExecutionOwnerDropped => CancellationReason::OwnerDropped,
-        QueryCancellationReason::ExplicitKill {
-            requester_connection_id,
-        } => CancellationReason::ExplicitKill {
-            requester_connection_id: u64::from(*requester_connection_id),
-        },
-        QueryCancellationReason::ExplicitKillConnection {
-            requester_connection_id,
-        } => CancellationReason::ExplicitKillConnection {
-            requester_connection_id: u64::from(*requester_connection_id),
-        },
+        QueryCancellationReason::ExplicitKill { requester_session } => {
+            CancellationReason::ExplicitKill {
+                requester_session: requester_session.get(),
+            }
+        }
+        QueryCancellationReason::ExplicitKillConnection { requester_session } => {
+            CancellationReason::ExplicitKillConnection {
+                requester_session: requester_session.get(),
+            }
+        }
+        QueryCancellationReason::ClientCancelRequested => CancellationReason::ClientCancelRequested,
         QueryCancellationReason::ClientDisconnected => CancellationReason::ClientDisconnected,
         QueryCancellationReason::DeadlineExceeded { .. } => CancellationReason::DeadlineExceeded,
         QueryCancellationReason::FrontendDrainDeadlineExceeded { .. } => {
@@ -143,16 +156,19 @@ fn query_cancellation_reason(
     requested: &QueryCancellationReason,
 ) -> QueryCancellationReason {
     match reason {
-        CancellationReason::ExplicitKill {
-            requester_connection_id,
-        } => QueryCancellationReason::ExplicitKill {
-            requester_connection_id: u32::try_from(requester_connection_id).unwrap_or(u32::MAX),
-        },
-        CancellationReason::ExplicitKillConnection {
-            requester_connection_id,
-        } => QueryCancellationReason::ExplicitKillConnection {
-            requester_connection_id: u32::try_from(requester_connection_id).unwrap_or(u32::MAX),
-        },
+        CancellationReason::ExplicitKill { requester_session } => {
+            QueryCancellationReason::ExplicitKill {
+                requester_session: ClientSessionKey::new(requester_session)
+                    .expect("registered requester session is nonzero"),
+            }
+        }
+        CancellationReason::ExplicitKillConnection { requester_session } => {
+            QueryCancellationReason::ExplicitKillConnection {
+                requester_session: ClientSessionKey::new(requester_session)
+                    .expect("registered requester session is nonzero"),
+            }
+        }
+        CancellationReason::ClientCancelRequested => QueryCancellationReason::ClientCancelRequested,
         CancellationReason::ClientDisconnected => QueryCancellationReason::ClientDisconnected,
         CancellationReason::DeadlineExceeded => match requested {
             QueryCancellationReason::DeadlineExceeded { timeout_ms } => {
@@ -184,13 +200,26 @@ pub struct QueryControlSessionGeometry {
     pub record: std::alloc::Layout,
 }
 
+#[cfg(any(test, novarocks_dev_controls))]
+impl Default for QueryApplicationControl {
+    fn default() -> Self {
+        Self::new(novarocks_types::FrontendProcessId::new_v7())
+    }
+}
 impl QueryApplicationControl {
+    pub fn new(process: novarocks_types::FrontendProcessId) -> Self {
+        Self {
+            state: Mutex::new(QueryControlState::default()),
+            query_ids: crate::client_query_id::ClientQueryIdGenerator::new(process),
+        }
+    }
     pub fn session_geometry() -> QueryControlSessionGeometry {
         QueryControlSessionGeometry {
             owner: std::alloc::Layout::new::<Self>(),
-            record: std::alloc::Layout::new::<(u32, SessionEntry)>(),
+            record: std::alloc::Layout::new::<(ClientSessionKey, SessionEntry)>(),
         }
     }
+    #[cfg(any(test, novarocks_dev_controls))]
     pub fn service() -> QueryControlService {
         QueryControlService::new(Arc::new(Self::default()))
     }
@@ -201,12 +230,9 @@ impl QueryApplicationControl {
         source: Option<&Arc<crate::session_control::StatementActionSource>>,
     ) -> GovernedStatementVisibilitySealOutcome {
         let mut state = self.lock();
-        let Some(entry) = state.sessions.get_mut(&statement.session().connection_id()) else {
+        let Some(entry) = state.sessions.get_mut(&statement.session().key()) else {
             return GovernedStatementVisibilitySealOutcome::Stale;
         };
-        if entry.session_epoch != statement.session().session_epoch() {
-            return GovernedStatementVisibilitySealOutcome::Stale;
-        }
         let Some(active) = entry.active.as_mut() else {
             return GovernedStatementVisibilitySealOutcome::Stale;
         };
@@ -254,18 +280,26 @@ impl QueryApplicationControl {
             .state
             .lock()
             .map_err(|_| "statement input query-control lock poisoned".to_owned())?;
-        let entry = state
-            .sessions
+        let key = state
+            .by_connection
             .get(&connection_id)
-            .filter(|entry| !entry.unregister_pending)
+            .filter(|key| {
+                state
+                    .sessions
+                    .get(key)
+                    .is_some_and(|entry| !entry.unregister_pending)
+            })
             .ok_or_else(|| {
                 "statement input requires an active registered client session".to_owned()
             })?;
-        Ok(SessionToken::new(connection_id, entry.session_epoch))
+        Ok(SessionToken::new(*key))
     }
 }
 
 impl QueryControlPort for QueryApplicationControl {
+    fn mint_client_query_id(&self) -> ClientQueryId {
+        self.query_ids.mint()
+    }
     fn attach_statement_progress(
         &self,
         slot: &Arc<crate::session_control::StatementProgressSlot>,
@@ -328,11 +362,8 @@ impl QueryControlPort for QueryApplicationControl {
             .ok_or(QueryControlError::StatementActionCapacity)?;
         let entry = state
             .sessions
-            .get_mut(&token.session().connection_id())
+            .get_mut(&token.session().key())
             .ok_or(QueryControlError::UnknownSession)?;
-        if entry.session_epoch != token.session().session_epoch() {
-            return Err(QueryControlError::StaleSession);
-        }
         let active = entry
             .active
             .as_mut()
@@ -397,11 +428,7 @@ impl QueryControlPort for QueryApplicationControl {
     ) -> bool {
         let removed = {
             let mut state = self.lock();
-            let Some(entry) = state
-                .sessions
-                .get_mut(&token.session().connection_id())
-                .filter(|entry| entry.session_epoch == token.session().session_epoch())
-            else {
+            let Some(entry) = state.sessions.get_mut(&token.session().key()) else {
                 return false;
             };
             let Some(active) = entry
@@ -430,11 +457,7 @@ impl QueryControlPort for QueryApplicationControl {
     ) -> bool {
         let retired = {
             let mut state = self.lock();
-            let Some(entry) = state
-                .sessions
-                .get_mut(&token.session().connection_id())
-                .filter(|entry| entry.session_epoch == token.session().session_epoch())
-            else {
+            let Some(entry) = state.sessions.get_mut(&token.session().key()) else {
                 return false;
             };
             let Some(active) = entry
@@ -455,7 +478,7 @@ impl QueryControlPort for QueryApplicationControl {
             let unregister_pending = entry.unregister_pending;
             let retired = entry.active.take();
             if unregister_pending {
-                state.sessions.remove(&token.session().connection_id());
+                state.remove_session(token.session().key());
             }
             retired
         };
@@ -489,19 +512,31 @@ impl QueryControlPort for QueryApplicationControl {
         identity: SessionIdentity,
     ) -> Result<SessionToken, QueryControlError> {
         let mut state = self.lock();
-        if state.sessions.contains_key(&identity.connection_id()) {
+        let connection = match identity.origin() {
+            SessionOrigin::Connection(connection) => Some(*connection),
+            SessionOrigin::ClientStatement(_) => None,
+        };
+        if connection.is_some_and(|connection| {
+            state
+                .by_connection
+                .contains_key(&connection.connection_id())
+        }) {
             return Err(QueryControlError::ConnectionIdInUse);
         }
-        state.next_session_epoch = state.next_session_epoch.wrapping_add(1);
-        if state.next_session_epoch == 0 {
-            state.next_session_epoch = 1;
+        state.next_session_key = state
+            .next_session_key
+            .checked_add(1)
+            .ok_or(QueryControlError::SessionIdentityExhausted)?;
+        let key =
+            ClientSessionKey::new(state.next_session_key).expect("incremented nonzero session key");
+        let token = SessionToken::new(key);
+        if let Some(connection) = connection {
+            state.by_connection.insert(connection.connection_id(), key);
         }
-        let token = SessionToken::new(identity.connection_id(), state.next_session_epoch);
         state.sessions.insert(
-            token.connection_id(),
+            key,
             SessionEntry {
-                session_epoch: token.session_epoch(),
-                connection: identity.connection_token(),
+                origin: identity.origin().clone(),
                 principal: Arc::from(identity.principal()),
                 next_statement_generation: 0,
                 active: None,
@@ -514,12 +549,8 @@ impl QueryControlPort for QueryApplicationControl {
 
     fn unregister_session(&self, token: SessionToken) {
         let mut state = self.lock();
-        if state
-            .sessions
-            .get(&token.connection_id())
-            .is_some_and(|entry| entry.session_epoch == token.session_epoch())
-        {
-            let entry = state.sessions.get_mut(&token.connection_id()).unwrap();
+        if state.sessions.contains_key(&token.key()) {
+            let entry = state.sessions.get_mut(&token.key()).unwrap();
             if let Some(active) = entry.active.as_ref() {
                 entry.unregister_pending = true;
                 if !active.success_visibility_sealed
@@ -528,15 +559,14 @@ impl QueryControlPort for QueryApplicationControl {
                         .request(QueryCancellationReason::ClientDisconnected)
                 {
                     tracing::error!(
-                        connection_id = token.connection_id(),
-                        session_epoch = token.session_epoch(),
+                        session_key = token.key().get(),
                         error = %error,
                         "retain query-control session after workload cancellation failed"
                     );
                 }
                 return;
             }
-            state.sessions.remove(&token.connection_id());
+            state.remove_session(token.key());
         }
     }
 
@@ -555,11 +585,8 @@ impl QueryControlPort for QueryApplicationControl {
         let mut state = self.lock();
         let entry = state
             .sessions
-            .get_mut(&session.connection_id())
+            .get_mut(&session.key())
             .ok_or(QueryControlError::UnknownSession)?;
-        if entry.session_epoch != session.session_epoch() {
-            return Err(QueryControlError::StaleSession);
-        }
         if entry.unregister_pending {
             return Err(QueryControlError::UnknownSession);
         }
@@ -594,11 +621,8 @@ impl QueryControlPort for QueryApplicationControl {
         let mut state = self.lock();
         let entry = state
             .sessions
-            .get_mut(&session.connection_id())
+            .get_mut(&session.key())
             .ok_or(QueryControlError::UnknownSession)?;
-        if entry.session_epoch != session.session_epoch() {
-            return Err(QueryControlError::StaleSession);
-        }
         if entry.unregister_pending {
             return Err(QueryControlError::UnknownSession);
         }
@@ -627,12 +651,11 @@ impl QueryControlPort for QueryApplicationControl {
     fn list_processes(&self) -> Vec<SessionProcess> {
         let now = Instant::now();
         let state = self.lock();
-        // `sessions` is keyed by connection id, so iteration order is already
-        // the order a reader expects.
         state
-            .sessions
-            .values()
-            .map(|entry| {
+            .by_connection
+            .iter()
+            .map(|(connection_id, key)| {
+                let entry = &state.sessions[key];
                 let (since, statement) = entry
                     .active
                     .as_ref()
@@ -640,7 +663,7 @@ impl QueryControlPort for QueryApplicationControl {
                         (active.began_at, active.text.clone())
                     });
                 SessionProcess {
-                    connection_id: entry.connection.connection_id(),
+                    connection_id: *connection_id,
                     principal: Arc::clone(&entry.principal),
                     elapsed: now.saturating_duration_since(since),
                     statement,
@@ -651,12 +674,9 @@ impl QueryControlPort for QueryApplicationControl {
 
     fn finish_statement(&self, statement: StatementToken) -> StatementFinishOutcome {
         let mut state = self.lock();
-        let Some(entry) = state.sessions.get_mut(&statement.session().connection_id()) else {
+        let Some(entry) = state.sessions.get_mut(&statement.session().key()) else {
             return StatementFinishOutcome::Stale;
         };
-        if entry.session_epoch != statement.session().session_epoch() {
-            return StatementFinishOutcome::Stale;
-        }
         let Some(active) = entry.active.as_ref() else {
             return StatementFinishOutcome::Stale;
         };
@@ -678,7 +698,7 @@ impl QueryControlPort for QueryApplicationControl {
             None => StatementFinishOutcome::Completed,
         };
         if unregister_pending {
-            state.sessions.remove(&statement.session().connection_id());
+            state.remove_session(statement.session().key());
         }
         outcome
     }
@@ -702,12 +722,9 @@ impl QueryControlPort for QueryApplicationControl {
         statement: StatementToken,
     ) -> GovernedStatementFinishOutcome {
         let mut state = self.lock();
-        let Some(entry) = state.sessions.get_mut(&statement.session().connection_id()) else {
+        let Some(entry) = state.sessions.get_mut(&statement.session().key()) else {
             return GovernedStatementFinishOutcome::Stale;
         };
-        if entry.session_epoch != statement.session().session_epoch() {
-            return GovernedStatementFinishOutcome::Stale;
-        }
         let Some(active) = entry.active.as_ref() else {
             return GovernedStatementFinishOutcome::Stale;
         };
@@ -732,19 +749,16 @@ impl QueryControlPort for QueryApplicationControl {
             None => GovernedStatementFinishOutcome::Completed,
         };
         if unregister_pending {
-            state.sessions.remove(&statement.session().connection_id());
+            state.remove_session(statement.session().key());
         }
         outcome
     }
 
     fn fail_governed_statement(&self, statement: StatementToken) -> GovernedStatementFinishOutcome {
         let mut state = self.lock();
-        let Some(entry) = state.sessions.get_mut(&statement.session().connection_id()) else {
+        let Some(entry) = state.sessions.get_mut(&statement.session().key()) else {
             return GovernedStatementFinishOutcome::Stale;
         };
-        if entry.session_epoch != statement.session().session_epoch() {
-            return GovernedStatementFinishOutcome::Stale;
-        }
         let Some(active) = entry.active.as_ref() else {
             return GovernedStatementFinishOutcome::Stale;
         };
@@ -762,7 +776,7 @@ impl QueryControlPort for QueryApplicationControl {
         let unregister_pending = entry.unregister_pending;
         entry.active = None;
         if unregister_pending {
-            state.sessions.remove(&statement.session().connection_id());
+            state.remove_session(statement.session().key());
         }
         GovernedStatementFinishOutcome::ProtocolFailed
     }
@@ -773,12 +787,9 @@ impl QueryControlPort for QueryApplicationControl {
         reason: CancellationReason,
     ) -> Result<Option<WorkCancellationRequestOutcome>, WorkError> {
         let state = self.lock();
-        let Some(entry) = state.sessions.get(&statement.session().connection_id()) else {
+        let Some(entry) = state.sessions.get(&statement.session().key()) else {
             return Ok(None);
         };
-        if entry.session_epoch != statement.session().session_epoch() {
-            return Ok(None);
-        }
         let Some(active) = entry.active.as_ref() else {
             return Ok(None);
         };
@@ -803,12 +814,9 @@ impl QueryControlPort for QueryApplicationControl {
         reason: QueryCancellationReason,
     ) -> QueryCancelOutcome {
         let state = self.lock();
-        let Some(entry) = state.sessions.get(&session.connection_id()) else {
+        let Some(entry) = state.sessions.get(&session.key()) else {
             return QueryCancelOutcome::UnknownSession;
         };
-        if entry.session_epoch != session.session_epoch() {
-            return QueryCancelOutcome::UnknownSession;
-        }
         let Some(active) = entry.active.as_ref() else {
             return QueryCancelOutcome::NoActiveStatement;
         };
@@ -820,14 +828,15 @@ impl QueryControlPort for QueryApplicationControl {
 
     fn kill_query(&self, requester: SessionToken, target_connection_id: u32) -> QueryCancelOutcome {
         let state = self.lock();
-        let Some(requester_entry) = state.sessions.get(&requester.connection_id()) else {
+        let Some(requester_entry) = state.sessions.get(&requester.key()) else {
             return QueryCancelOutcome::UnknownSession;
         };
-        if requester_entry.session_epoch != requester.session_epoch() {
-            return QueryCancelOutcome::UnknownSession;
-        }
         let requester_principal = Arc::clone(&requester_entry.principal);
-        let Some(target_entry) = state.sessions.get(&target_connection_id) else {
+        let Some(target_entry) = state
+            .by_connection
+            .get(&target_connection_id)
+            .and_then(|key| state.sessions.get(key))
+        else {
             return QueryCancelOutcome::UnknownSession;
         };
         if target_entry.principal != requester_principal {
@@ -842,7 +851,7 @@ impl QueryControlPort for QueryApplicationControl {
         active
             .cancellation
             .request(QueryCancellationReason::ExplicitKill {
-                requester_connection_id: requester.connection_id(),
+                requester_session: requester.key(),
             })
     }
 
@@ -852,19 +861,27 @@ impl QueryControlPort for QueryApplicationControl {
         target_connection_id: u32,
     ) -> ConnectionKillAuthorization {
         let state = self.lock();
-        let Some(requester_entry) = state.sessions.get(&requester.connection_id()) else {
+        let Some(requester_entry) = state.sessions.get(&requester.key()) else {
             return ConnectionKillAuthorization::UnknownSession;
         };
-        if requester_entry.session_epoch != requester.session_epoch() {
-            return ConnectionKillAuthorization::UnknownSession;
-        }
-        let Some(target_entry) = state.sessions.get(&target_connection_id) else {
+        let Some(target_entry) = state
+            .by_connection
+            .get(&target_connection_id)
+            .and_then(|key| state.sessions.get(key))
+        else {
             return ConnectionKillAuthorization::UnknownSession;
         };
         if target_entry.principal != requester_entry.principal {
             return ConnectionKillAuthorization::PermissionDenied;
         }
-        ConnectionKillAuthorization::Authorized(target_entry.connection)
+        match target_entry.origin {
+            SessionOrigin::Connection(connection) => {
+                ConnectionKillAuthorization::Authorized(connection)
+            }
+            SessionOrigin::ClientStatement(_) => {
+                unreachable!("connection index only contains connections")
+            }
+        }
     }
 
     fn cancel_all(&self, reason: QueryCancellationReason) {
@@ -909,6 +926,59 @@ mod tests {
                 principal,
             ))
             .expect("register session")
+    }
+
+    #[test]
+    fn statement_sessions_have_independent_nonreused_keys_and_no_connection_position() {
+        let control = QueryApplicationControl::default();
+        let requester = register(&control, 1, 1, "root");
+        let query_id = control.mint_client_query_id();
+        let client = control
+            .register_session(SessionIdentity::client_statement(query_id, "root"))
+            .unwrap();
+        let statement = control.begin_statement(client).unwrap();
+        assert_ne!(client.key(), requester.key());
+        assert_eq!(control.list_processes().len(), 1);
+        // A numerical coincidence with a session key never makes it a connection.
+        assert_eq!(
+            control.kill_query(requester, client.key().get() as u32),
+            QueryCancelOutcome::UnknownSession
+        );
+        assert_eq!(
+            control.authorize_connection_kill(requester, client.key().get() as u32),
+            ConnectionKillAuthorization::UnknownSession
+        );
+        control.unregister_session(client);
+        assert_eq!(
+            control.finish_statement(statement.token()),
+            StatementFinishOutcome::Cancelled(QueryCancellationReason::ClientDisconnected)
+        );
+        let successor = control
+            .register_session(SessionIdentity::client_statement(
+                control.mint_client_query_id(),
+                "root",
+            ))
+            .unwrap();
+        assert!(successor.key() > client.key());
+        control.cancel_all(QueryCancellationReason::ServerShutdown);
+        control.unregister_session(successor);
+        control.unregister_session(requester);
+        assert!(control.lock().sessions.is_empty());
+        assert!(control.lock().by_connection.is_empty());
+    }
+
+    #[test]
+    fn session_key_exhaustion_refuses_without_reusing_a_retired_key() {
+        let control = QueryApplicationControl::default();
+        control.lock().next_session_key = u64::MAX;
+        assert_eq!(
+            control.register_session(SessionIdentity::client_statement(
+                control.mint_client_query_id(),
+                "root"
+            )),
+            Err(QueryControlError::SessionIdentityExhausted)
+        );
+        assert!(control.lock().sessions.is_empty());
     }
 
     #[cfg(novarocks_dev_controls)]
@@ -988,13 +1058,13 @@ mod tests {
         assert_eq!(
             control.kill_query(requester, 7),
             QueryCancelOutcome::AlreadyRequested(QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 8,
+                requester_session: requester.key(),
             })
         );
         assert_eq!(
             control.finish_statement(active.token()),
             StatementFinishOutcome::Cancelled(QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 8,
+                requester_session: requester.key(),
             })
         );
     }
@@ -1039,7 +1109,7 @@ mod tests {
         assert_eq!(
             control.finish_statement(active.token()),
             StatementFinishOutcome::Cancelled(QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 8,
+                requester_session: requester.key(),
             })
         );
         assert_eq!(
@@ -1681,7 +1751,8 @@ mod tests {
             control.cancel_session_statement(
                 second_session,
                 QueryCancellationReason::ExplicitKill {
-                    requester_connection_id: 7,
+                    requester_session: crate::session_control::ClientSessionKey::new(7)
+                        .expect("nonzero fixture requester"),
                 },
             ),
             QueryCancelOutcome::Requested
@@ -1717,20 +1788,20 @@ mod tests {
             .expect("root owner transfers once");
 
         assert_eq!(
-            control.kill_query(requester, target.connection_id()),
+            control.kill_query(requester, 7),
             QueryCancelOutcome::Requested
         );
         assert_eq!(
             statement.cancellation().reason(),
             Some(CancellationReason::ExplicitKill {
-                requester_connection_id: u64::from(requester.connection_id()),
+                requester_session: requester.key().get(),
             })
         );
         owner.complete();
         assert_eq!(
             statement.finish(),
             GovernedStatementFinishOutcome::Cancelled(CancellationReason::ExplicitKill {
-                requester_connection_id: u64::from(requester.connection_id()),
+                requester_session: requester.key().get(),
             })
         );
         assert_eq!(workload.snapshot().businesses, 0);
@@ -1751,7 +1822,7 @@ mod tests {
             QueryCancelOutcome::Requested
         );
         assert_eq!(
-            control.kill_query(requester, target.connection_id()),
+            control.kill_query(requester, 7),
             QueryCancelOutcome::AlreadyRequested(QueryCancellationReason::ExecutionOwnerDropped,)
         );
         assert_eq!(
@@ -1965,7 +2036,7 @@ mod tests {
         );
         assert_eq!(workload.snapshot().businesses, 1);
         assert_eq!(
-            control.kill_query(requester, target.connection_id()),
+            control.kill_query(requester, 7),
             QueryCancelOutcome::NoActiveStatement
         );
         assert_eq!(statement.cancellation().reason(), None);
@@ -2099,14 +2170,9 @@ mod tests {
         let successor = service
             .register_session(SessionIdentity::new(connection, "root"))
             .expect("settlement completes deferred unregister");
-        assert_ne!(successor.token().session_epoch(), token.session_epoch());
+        assert_ne!(successor.token().key(), token.key());
         drop(successor);
-        assert!(
-            !control
-                .lock()
-                .sessions
-                .contains_key(&connection.connection_id())
-        );
+        assert!(!control.lock().sessions.contains_key(&token.key()));
     }
 
     #[tokio::test]
@@ -2174,7 +2240,9 @@ mod tests {
             use std::future::Future;
             std::pin::Pin::new(&mut self.gate).poll(cx).map(|ready| {
                 ready.expect("original release sender");
-                Ok(crate::session_control::StatementActionValue::Ok)
+                Ok(crate::session_control::StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                ))
             })
         }
     }
@@ -2267,7 +2335,9 @@ mod tests {
                 assert_eq!(owner.seal_success_visibility(), outcome);
                 self.outcomes.lock().unwrap().push(outcome.clone());
                 Poll::Ready(match outcome {
-                    GovernedStatementVisibilitySealOutcome::Sealed => Ok(StatementActionValue::Ok),
+                    GovernedStatementVisibilitySealOutcome::Sealed => Ok(StatementActionValue::Ok(
+                        crate::session_control::StatementCommandCompletion::new(0),
+                    )),
                     GovernedStatementVisibilitySealOutcome::Cancelled(_) => {
                         Err(QueryServiceError::new(
                             QueryServiceErrorKind::Interrupted,
@@ -2319,7 +2389,7 @@ mod tests {
             let source = control.next_statement_action(None).unwrap().1.unwrap();
             assert!(Arc::ptr_eq(
                 &source,
-                control.lock().sessions[&session.connection_id()]
+                control.lock().sessions[&session.key()]
                     .active
                     .as_ref()
                     .unwrap()
@@ -2366,7 +2436,7 @@ mod tests {
                 .unwrap()
                 .finish()
                 .unwrap();
-            let foreign_source = control.lock().sessions[&foreign_session.connection_id()]
+            let foreign_source = control.lock().sessions[&foreign_session.key()]
                 .active
                 .as_ref()
                 .unwrap()
@@ -2381,7 +2451,7 @@ mod tests {
             );
             for stale in [
                 StatementToken::new(
-                    SessionToken::new(session.connection_id(), session.session_epoch() + 1),
+                    SessionToken::new(ClientSessionKey::new(session.key().get() + 1).unwrap()),
                     token.generation(),
                 ),
                 StatementToken::new(session, token.generation() + 1),
@@ -2392,7 +2462,7 @@ mod tests {
                 );
             }
             assert!(
-                !control.lock().sessions[&session.connection_id()]
+                !control.lock().sessions[&session.key()]
                     .active
                     .as_ref()
                     .unwrap()
@@ -2745,7 +2815,9 @@ mod tests {
             > {
                 self.polls.fetch_add(1, Ordering::SeqCst);
                 if self.ready {
-                    std::task::Poll::Ready(Ok(StatementActionValue::Ok))
+                    std::task::Poll::Ready(Ok(StatementActionValue::Ok(
+                        crate::session_control::StatementCommandCompletion::new(0),
+                    )))
                 } else {
                     std::task::Poll::Pending
                 }
@@ -2935,7 +3007,9 @@ mod tests {
                 >,
             > {
                 self.polls.fetch_add(1, Ordering::SeqCst);
-                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok))
+                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                )))
             }
         }
         impl Drop for DropPanicAction {
@@ -3020,7 +3094,9 @@ mod tests {
                     crate::session_error::QueryServiceError,
                 >,
             > {
-                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok))
+                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                )))
             }
         }
         for disposition in [
@@ -3154,7 +3230,9 @@ mod tests {
                     crate::session_error::QueryServiceError,
                 >,
             > {
-                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok))
+                std::task::Poll::Ready(Ok(crate::session_control::StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                )))
             }
         }
         impl Drop for ArmActualCleanupWake {
@@ -3277,22 +3355,23 @@ mod tests {
                 return Poll::Pending;
             }
             let window = owner.result_window_alias().expect("same Local window");
-            let value = crate::api::LocalResultProducer::try_new(owner.scope(), window)
-                .and_then(|producer| {
-                    producer.produce(|| {
-                        crate::api::build_string_query_result(
-                            "Explain String",
-                            vec!["ready".into()],
-                        )
-                    })
+            let value = crate::api::LocalResultProducer::try_new(
+                owner.scope(),
+                window,
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
+            )
+            .and_then(|producer| {
+                producer.produce(|| {
+                    crate::api::build_string_query_result("Explain String", vec!["ready".into()])
                 })
-                .map(crate::session_control::StatementActionValue::Local)
-                .map_err(|error| {
-                    crate::session_error::QueryServiceError::new(
-                        crate::session_error::QueryServiceErrorKind::Internal,
-                        error,
-                    )
-                });
+            })
+            .map(crate::session_control::StatementActionValue::Local)
+            .map_err(|error| {
+                crate::session_error::QueryServiceError::new(
+                    crate::session_error::QueryServiceErrorKind::Internal,
+                    error,
+                )
+            });
             Poll::Ready(value)
         }
     }
@@ -3468,6 +3547,7 @@ mod tests {
         let local = crate::api::LocalResultProducer::try_new(
             foreign.scope(),
             foreign.result_window_alias().unwrap(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         )
         .unwrap()
         .produce(|| crate::api::build_string_query_result("Explain String", vec!["foreign".into()]))
@@ -3551,7 +3631,9 @@ mod tests {
             ) -> std::task::Poll<
                 Result<StatementActionValue, crate::session_error::QueryServiceError>,
             > {
-                std::task::Poll::Ready(Ok(StatementActionValue::Ok))
+                std::task::Poll::Ready(Ok(StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                )))
             }
             fn handoff_residual_in(
                 &mut self,
@@ -3746,7 +3828,9 @@ mod tests {
             ) -> std::task::Poll<
                 Result<StatementActionValue, crate::session_error::QueryServiceError>,
             > {
-                std::task::Poll::Ready(Ok(StatementActionValue::Ok))
+                std::task::Poll::Ready(Ok(StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                )))
             }
             fn handoff_residual_in(
                 &mut self,
@@ -3867,7 +3951,9 @@ mod tests {
             ) -> std::task::Poll<
                 Result<StatementActionValue, crate::session_error::QueryServiceError>,
             > {
-                std::task::Poll::Ready(Ok(StatementActionValue::Ok))
+                std::task::Poll::Ready(Ok(StatementActionValue::Ok(
+                    crate::session_control::StatementCommandCompletion::new(0),
+                )))
             }
             fn handoff_residual_in(
                 &mut self,
@@ -3942,7 +4028,9 @@ mod tests {
                     .finish()
                     .unwrap();
                 let ready = ready.take().unwrap();
-                assert!(matches!(ready.result, Ok(StatementActionValue::Ok)));
+                assert!(
+                    matches!(ready.result, Ok(StatementActionValue::Ok(completion)) if completion.affected_rows() == 0)
+                );
                 ready.owner.finish();
             } else {
                 drop(waiter.take());

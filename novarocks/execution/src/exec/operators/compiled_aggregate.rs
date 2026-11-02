@@ -24,7 +24,7 @@
 //! the exact prepared aggregate handle the compiler attached to its site, so
 //! no implementation is selected by name and no legacy expression is read.
 //!
-//! Group-key equivalence has one owner, the existing `KeyTable`: NULL keys
+//! Group-key equivalence has one owner, the shared `KeyIndex`: NULL keys
 //! form one group, every NaN of a float key is one group, and `-0.0` and
 //! `+0.0` are one group. The table's first stored key represents its group.
 //!
@@ -50,11 +50,12 @@ use std::sync::Arc;
 use arrow::array::ArrayRef;
 #[cfg(test)]
 use arrow::array::RecordBatch;
+#[cfg(test)]
 use arrow::datatypes::DataType;
 use novarocks_functions::{
     AggregateCallContract, AggregateStateAllocator, AggregateStateColumn, EvaluatedArgument,
-    FunctionArgumentType, FunctionValueType, KernelDiagnostic, KernelFailure,
-    PreparedAggregateHandle, SelectedAggregateMergeInput, SelectedAggregateUpdateInput, Selection,
+    FunctionValueType, KernelDiagnostic, KernelFailure, PreparedAggregateHandle,
+    SelectedAggregateMergeInput, SelectedAggregateUpdateInput, Selection,
 };
 use novarocks_local_program::{
     CompiledAggregateGrouping, LocalProgram, ProgramCallSite, ProgramExpressionRootSite,
@@ -62,14 +63,16 @@ use novarocks_local_program::{
 };
 
 use super::compiled_aggregate_topn::{CompiledAggregateTopN, CompiledAggregateTopNFactory};
-use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
+use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances, root_value_type};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
-use crate::exec::hash_table::key_builder::build_group_key_views;
-use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
-use crate::exec::hash_table::key_table::KeyTable;
+use crate::exec::hash_table::allocation::AggregateAllocator;
+use crate::exec::hash_table::key_index::{
+    IndexPurpose, KeyIndex, KeyInput, KeyMatch, KeySpec, NullPolicy, PreparedKeyBatch, hash_batch,
+};
 use crate::exec::pipeline::operator::{
-    ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
+    ConstructionFailure, InputConstructionFactory, InputConstructionOwner, InputEncodingPolicy,
+    Operator,
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
@@ -84,44 +87,17 @@ use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime_filter::{
     OrderedTopNAllocationHost, RuntimeFilterProducerFailure, RuntimeFilterSessionRef,
 };
+use novarocks_value_arrays::{
+    ValueFailure, batch::hash::HashScratch, decode::ValueConversionContext,
+    reachability::ReachableRows,
+};
 
-/// Group keys use the table's specialized layouts where they apply.
-const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
 /// Rows per emitted chunk; the whole result is materialized at finish.
 const OUTPUT_CHUNK_ROWS: usize = 4096;
 /// Target bytes of one state backing block for a grouped aggregate.
 const STATE_BLOCK_BYTES: usize = 64 * 1024;
 const MAX_STATES_PER_BLOCK: usize = 4096;
 
-#[derive(Debug)]
-struct AggregateSourceFailure {
-    operation: &'static str,
-    source: crate::runtime::fragment::SharedDomainFailure,
-}
-impl std::fmt::Display for AggregateSourceFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.operation, self.source)
-    }
-}
-impl std::error::Error for AggregateSourceFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-impl novarocks_failure_contract::FailureProjection for AggregateSourceFailure {
-    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        self.source.failure_fact()
-    }
-}
-fn failure<E>(operation: &'static str, error: E) -> ExecutionFailure
-where
-    E: std::error::Error + novarocks_failure_contract::FailureProjection + Send + Sync + 'static,
-{
-    ExecutionFailure::from_domain(AggregateSourceFailure {
-        operation,
-        source: crate::runtime::fragment::SharedDomainFailure::new(error),
-    })
-}
 #[derive(Debug)]
 struct AggregateGroupContractFailure(novarocks_failure_contract::BoundedDetail);
 impl std::fmt::Display for AggregateGroupContractFailure {
@@ -144,25 +120,31 @@ fn group_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
     ))
 }
 
-fn root_value_type(
-    program: &LocalProgram,
-    site: ProgramExpressionRootSite,
-) -> Result<&FunctionValueType, KernelFailure> {
-    let expressions = program.checked().channels().expressions();
-    let root = expressions
-        .resolved_calls()
-        .snapshot()
-        .roots()
-        .sites()
-        .get(&site)
-        .ok_or_else(|| {
-            KernelFailure::InvalidProgram(KernelDiagnostic::new("aggregate input root is missing"))
-        })?;
-    match expressions.definition_type(site.arena(), root.definition) {
-        Some(FunctionArgumentType::Value(value)) => Ok(value),
-        _ => Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
-            "aggregate input root has no complete value binding",
-        ))),
+fn aggregate_vector<T>(
+    owner: &dyn InputConstructionOwner,
+    count: usize,
+) -> ExecutionResult<Vec<T>> {
+    let layout = Layout::array::<T>(count).map_err(|_| {
+        ConstructionFailure::Resource(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        )
+    })?;
+    if layout.size() != 0 {
+        owner.request(layout)?;
+    }
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).map_err(|source| {
+        ExecutionFailure::from_domain(novarocks_value_arrays::ValueError::Allocation {
+            requested: layout.size(),
+            source,
+        })
+    })?;
+    Ok(values)
+}
+fn aggregate_value_failure<E: Into<ExecutionFailure>>(cause: ValueFailure<E>) -> ExecutionFailure {
+    match cause {
+        ValueFailure::Value(cause) => ExecutionFailure::from_domain(cause),
+        ValueFailure::Caller(cause) => cause.into(),
     }
 }
 
@@ -236,7 +218,7 @@ pub struct CompiledAggregateProcessorFactory {
     sites: Vec<ProgramExpressionRootSite>,
     groups: usize,
     calls: Vec<CallPlan>,
-    key_types: Vec<DataType>,
+    key_types: Vec<FunctionValueType>,
     output_layout: novarocks_local_program::StaticLayout,
     output_role: AggregateSchemaRole,
     grouping: CompiledAggregateGrouping,
@@ -455,10 +437,10 @@ impl CompiledAggregateProcessorFactory {
                 ),
             ));
         }
-        let key_types = fields[..group_by.len()]
+        let key_types = sites[..group_by.len()]
             .iter()
-            .map(|field| field.data_type().clone())
-            .collect();
+            .map(|&site| root_value_type(&program, site).map_err(ExecutionFailure::from_domain))
+            .collect::<ExecutionResult<Vec<_>>>()?;
         let groups = group_by.len();
         Ok(Self {
             name: format!("COMPILED_AGGREGATE (node={at})"),
@@ -632,7 +614,7 @@ struct CompiledAggregateProcessor {
     sites: Vec<ProgramExpressionRootSite>,
     group_roots: usize,
     calls: Vec<CallPlan>,
-    key_types: Vec<DataType>,
+    key_types: Vec<FunctionValueType>,
     output_layout: novarocks_local_program::StaticLayout,
     output_role: AggregateSchemaRole,
     output: Option<ChunkSchemaRef>,
@@ -643,7 +625,7 @@ struct CompiledAggregateProcessor {
     tracker: Option<Arc<MemTracker>>,
     instances: Option<Vec<CompiledExpressionInstance>>,
     /// Present exactly when the aggregate has group keys.
-    key_table: Option<KeyTable>,
+    key_table: Option<KeyIndex>,
     /// One column per call, created on first use.
     states: Option<Vec<AggregateStateColumn>>,
     /// Groups created so far; every state column holds exactly this many.
@@ -729,14 +711,21 @@ impl CompiledAggregateProcessor {
         }
         let tracker = self.tracker()?;
         if self.group_roots > 0 {
-            self.key_table = Some(
-                KeyTable::new_with_tracker(
-                    self.key_types.clone(),
-                    ENABLE_GROUP_KEY_OPTIMIZATIONS,
-                    MemTracker::new_child("CompiledAggregateKeys", &tracker),
-                )
-                .map_err(|error| failure("compiled aggregate key table", error))?,
-            );
+            let schema = Arc::clone(self.prepared_output()?);
+            let owner = self.control.construction_owner(schema.as_ref())?;
+            let checkpoint = || self.control.checkpoint_execution();
+            let mut nulls = aggregate_vector(owner.as_ref(), self.key_types.len())?;
+            for _ in &self.key_types {
+                checkpoint()?;
+                nulls.push(NullPolicy::Equal);
+            }
+            let spec = KeySpec::new(&self.key_types, &nulls, owner.as_ref(), &checkpoint)?;
+            self.key_table = Some(KeyIndex::new(
+                spec,
+                IndexPurpose::KeyIds,
+                MemTracker::new_child("CompiledAggregateKeys", &tracker),
+                owner.as_ref(),
+            )?);
         }
         let allocator: Arc<dyn AggregateStateAllocator> = Arc::new(TrackedStateAllocator::new(
             MemTracker::new_child("CompiledAggregateStates", &tracker),
@@ -771,158 +760,126 @@ impl CompiledAggregateProcessor {
         Ok(())
     }
 
-    /// Assign every row its group, creating groups in first-arrival order.
-    fn assign_groups(&mut self, keys: &[ArrayRef], rows: usize) -> ExecutionResult<Vec<usize>> {
+    /// Assign original occurrences through the shared key author. Aggregate
+    /// states and TopN publication keep their original lifecycle and owners.
+    fn assign_groups(
+        &mut self,
+        keys: &[ArrayRef],
+        bindings: &[FunctionValueType],
+        rows: usize,
+        owner: &dyn InputConstructionOwner,
+    ) -> ExecutionResult<Vec<usize>> {
+        // The caller keeps this same actual creator alive through the returned
+        // mapping's final use. A different construction scope is not a substitute.
+        let control = &self.control;
+        let checkpoint = || control.checkpoint_execution();
+        let mut mapping = aggregate_vector(owner, rows)?;
         if self.group_roots == 0 {
-            // The one group of a group-less aggregate exists from its first row.
             self.groups = 1;
-            return Ok(vec![0; rows]);
-        }
-        for (ordinal, (key, expected)) in keys.iter().zip(&self.key_types).enumerate() {
-            if !novarocks_type_contract::arrow_data_types_exact(key.data_type(), expected) {
-                return Err(group_contract(format_args!(
-                    "compiled aggregate group key {ordinal} is {:?}, frozen {expected:?}",
-                    key.data_type()
-                )));
+            for _ in 0..rows {
+                checkpoint()?;
+                mapping.push(0);
             }
+            return Ok(mapping);
         }
+        let tracker = self.tracker()?;
         let table = self
             .key_table
             .as_mut()
-            .expect("grouped aggregate has a key table");
-        let views = build_group_key_views(keys)
-            .map_err(|error| failure("compiled aggregate group keys", error))?;
-        if table.key_strategy() == GroupKeyStrategy::CompressedFixed
-            && table.compressed_ctx().is_none()
-        {
-            table
-                .ensure_compressed_ctx(&views)
-                .map_err(|error| failure("compiled aggregate compressed keys", error))?;
+            .expect("grouped aggregate has an index");
+        if keys.len() != self.group_roots || bindings.len() != self.group_roots {
+            return Err(group_contract(
+                "compiled aggregate group columns differ from their complete bindings",
+            ));
         }
-        let mut group_ids = Vec::with_capacity(rows);
+        let readable = ReachableRows::all(rows)
+            .materialize_observed(
+                &mut |layout| owner.request(layout).map_err(ExecutionFailure::from),
+                &mut |_| checkpoint(),
+            )
+            .map_err(aggregate_value_failure)?;
+        let mut occurrences = aggregate_vector(owner, rows)?;
+        for row in 0..rows {
+            checkpoint()?;
+            occurrences.push(row);
+        }
+        let input = KeyInput::new_for_spec(
+            table.spec(),
+            keys,
+            bindings,
+            &readable,
+            &occurrences,
+            &mut ValueConversionContext::default(),
+            owner,
+            &checkpoint,
+        )?;
+        let prepared = PreparedKeyBatch::from_captured(
+            table.spec(),
+            &input,
+            AggregateAllocator::new(tracker),
+            &checkpoint,
+        )?;
+        let hashes = hash_batch(
+            &prepared,
+            table.policy(),
+            &mut HashScratch::default(),
+            owner,
+            &checkpoint,
+        )?;
+        let interned = table
+            .intern_batch(&prepared, &hashes, owner, control)
+            .map_err(|cause| control.project_required_failure(cause))?;
         let mut next = self.groups;
-        let mut record = |row, lookup: crate::exec::hash_table::key_table::KeyLookup| {
-            if lookup.is_new {
-                if lookup.group_id != next {
-                    return Err(group_contract(
-                        "compiled aggregate key table created a group out of order",
-                    ));
-                }
-                if let Some(topn) = &mut self.topn {
-                    topn.observe_new_group(&self.program, keys, row, lookup.group_id)?;
-                }
-                next += 1;
-            }
-            group_ids.push(lookup.group_id);
-            Ok(())
-        };
-        let key_error = |error| failure("compiled aggregate group lookup", error);
-        match table.key_strategy() {
-            GroupKeyStrategy::Serialized => {
-                let rows_bytes = table.build_rows_fallback(keys).map_err(key_error)?;
-                let hashes = table.build_group_hashes(&views, rows).map_err(key_error)?;
-                for (row, hash) in hashes.iter().copied().enumerate().take(rows) {
-                    let bytes = rows_bytes
-                        .get(row)
-                        .map(|bytes| bytes.as_slice())
-                        .ok_or_else(|| group_contract("serialized group row missing"))?;
-                    record(
-                        row,
-                        table
-                            .find_or_insert_from_row(&views, row, bytes, hash)
-                            .map_err(key_error)?,
-                    )?;
-                }
-            }
-            GroupKeyStrategy::Scalar => {
+        let observe_topn = self.topn.is_some();
+        let mut new_ids = aggregate_vector(
+            owner,
+            if observe_topn {
+                interned.new_keys().len()
+            } else {
+                0
+            },
+        )?;
+        for new in interned.new_keys() {
+            checkpoint()?;
+            if new.id.index() != next {
                 return Err(group_contract(
-                    "group key strategy Scalar is invalid for group keys",
+                    "compiled aggregate index created a group out of order",
                 ));
             }
-            GroupKeyStrategy::OneNumber => {
-                let view = views
-                    .first()
-                    .ok_or_else(|| group_contract("one number key view missing"))?;
-                let hashes = table
-                    .build_one_number_hashes(view, rows)
-                    .map_err(key_error)?;
-                for (row, hash) in hashes.iter().copied().enumerate().take(rows) {
-                    record(
-                        row,
-                        table
-                            .find_or_insert_one_number(view, row, hash)
-                            .map_err(key_error)?,
-                    )?;
-                }
+            if observe_topn {
+                new_ids.push(new.id);
             }
-            GroupKeyStrategy::OneString => {
-                let view = views
-                    .first()
-                    .ok_or_else(|| group_contract("one string key view missing"))?;
-                let hashes = table.build_group_hashes(&views, rows).map_err(key_error)?;
-                for (row, hash) in hashes.iter().copied().enumerate().take(rows) {
-                    record(
-                        row,
-                        table
-                            .find_or_insert_one_string_like(view, row, hash)
-                            .map_err(key_error)?,
-                    )?;
-                }
-            }
-            GroupKeyStrategy::FixedSize => {
-                let hashes = table.build_group_hashes(&views, rows).map_err(key_error)?;
-                for (row, hash) in hashes.iter().copied().enumerate().take(rows) {
-                    record(
-                        row,
-                        table
-                            .find_or_insert_fixed_size(&views, row, hash)
-                            .map_err(key_error)?,
-                    )?;
-                }
-            }
-            GroupKeyStrategy::CompressedFixed => {
-                let compressed = table
-                    .build_compressed_flags(&views, rows)
-                    .map_err(key_error)?;
-                let hashes = table.build_group_hashes(&views, rows).map_err(key_error)?;
-                let mut fallback = None;
-                for (row, (compressed, hash)) in compressed
-                    .iter()
-                    .copied()
-                    .zip(hashes.iter().copied())
-                    .enumerate()
-                    .take(rows)
-                {
-                    let lookup = if compressed {
-                        table
-                            .find_or_insert_compressed(&views, row, hash)
-                            .map_err(key_error)?
-                    } else {
-                        if fallback.is_none() {
-                            fallback = Some(table.build_rows_fallback(keys).map_err(key_error)?);
-                        }
-                        let bytes = fallback
-                            .as_ref()
-                            .and_then(|rows| rows.get(row))
-                            .map(|bytes| bytes.as_slice())
-                            .ok_or_else(|| {
-                                group_contract("compressed fallback group row missing")
-                            })?;
-                        table
-                            .find_or_insert_from_row(&views, row, bytes, hash)
-                            .map_err(key_error)?
-                    };
-                    record(row, lookup)?;
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| group_contract("compiled aggregate group count overflow"))?;
+        }
+        if next != table.len() {
+            return Err(group_contract(
+                "compiled aggregate index and state group counts differ",
+            ));
+        }
+        for &found in interned.matches() {
+            checkpoint()?;
+            match found {
+                KeyMatch::Found(id) => mapping.push(id.index()),
+                _ => {
+                    return Err(group_contract(
+                        "GROUP BY equality input did not receive a group",
+                    ));
                 }
             }
         }
-        if group_ids.len() != rows {
+        if mapping.len() != rows {
             return Err(group_contract(
                 "compiled aggregate group id count differs from its rows",
             ));
         }
+        if let Some(topn) = &mut self.topn {
+            let read = table.read_keys(&new_ids, owner, control)?;
+            topn.observe_new_groups(&self.program, &read, &new_ids)?;
+        }
         self.groups = next;
-        Ok(group_ids)
+        Ok(mapping)
     }
 
     fn consume(&mut self, chunk: &Chunk) -> ExecutionResult<()> {
@@ -960,7 +917,38 @@ impl CompiledAggregateProcessor {
             values
         };
         let rows = chunk.len();
-        let mapping = self.assign_groups(&values[..self.group_roots], rows)?;
+        let schema = Arc::clone(self.prepared_output()?);
+        let owner = self.control.construction_owner(schema.as_ref())?;
+        // Static root facts come from the same checked-expression author as
+        // evaluation; local merge uses its actual prepared input declarations.
+        let mut bindings = aggregate_vector(owner.as_ref(), values.len())?;
+        if self.direct_intermediate {
+            for slot in chunk.chunk_schema().slots() {
+                self.control.checkpoint_execution()?;
+                bindings.push(
+                    FunctionValueType::try_from_typed_binding(
+                        slot.typed_binding()
+                            .clone_observed(|| self.control.checkpoint_execution())?,
+                    )
+                    .map_err(KernelFailure::from)?,
+                );
+            }
+        } else {
+            for &site in &self.sites {
+                self.control.checkpoint_execution()?;
+                bindings.push(
+                    root_value_type(&self.program, site).map_err(ExecutionFailure::from_domain)?,
+                );
+            }
+        }
+        let mapping = self
+            .assign_groups(
+                &values[..self.group_roots],
+                &bindings[..self.group_roots],
+                rows,
+                owner.as_ref(),
+            )
+            .map_err(|cause| self.control.project_required_failure(cause))?;
         self.grow_states()?;
         let selection = Selection::all(rows);
         let states = self.states.as_mut().expect("states were created");
@@ -995,7 +983,13 @@ impl CompiledAggregateProcessor {
                     selection,
                     &arguments[..logical_count],
                     &arguments[logical_count..],
-                    |ordinal| root_value_type(&self.program, self.sites[call.first_root + ordinal]),
+                    |ordinal| {
+                        bindings.get(call.first_root + ordinal).ok_or_else(|| {
+                            KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                                "aggregate input root binding is missing",
+                            ))
+                        })
+                    },
                     |ordinal| call.handle.argument_encoding(ordinal),
                     &self.control,
                 )?;
@@ -1034,23 +1028,23 @@ impl CompiledAggregateProcessor {
             .try_reserve_exact(fields.fields().len())
             .map_err(|_| KernelFailure::ResourceExhausted)?;
         if let Some(table) = self.key_table.as_ref() {
-            for (ordinal, key) in table.key_columns().iter().enumerate() {
-                let array = key
-                    .to_array()
-                    .map_err(|error| failure("compiled aggregate key output", error))?;
-                let expected = fields.field(ordinal).data_type();
-                if !novarocks_type_contract::arrow_data_types_exact(array.data_type(), expected) {
-                    return Err(group_contract(format_args!(
-                        "compiled aggregate key output {ordinal} is {:?}, frozen {expected:?}",
-                        array.data_type()
-                    )));
-                }
-                if array.len() != groups {
-                    return Err(group_contract(
-                        "compiled aggregate key output differs from its group count",
-                    ));
-                }
-                columns.push(array);
+            let mut targets = aggregate_vector(owner.as_ref(), self.group_roots)?;
+            for slot in &output_schema.slots()[..self.group_roots] {
+                self.control.checkpoint_execution()?;
+                targets.push(
+                    FunctionValueType::try_from_typed_binding(
+                        slot.typed_binding()
+                            .clone_observed(|| self.control.checkpoint_execution())?,
+                    )
+                    .map_err(KernelFailure::from)?,
+                );
+            }
+            let keys = table
+                .export_key_range(0..groups, &targets, owner.as_ref(), &self.control)
+                .map_err(|cause| self.control.project_required_failure(cause))?;
+            for array in keys.arrays() {
+                self.control.checkpoint_execution()?;
+                columns.push(Arc::clone(array));
             }
         }
         // This temporary releases its actual allocation at the end of emit;
@@ -1309,7 +1303,7 @@ mod failure_latch_tests {
     use crate::runtime::fragment::{
         ExecutionFailureCause, PipelineOperation, RequiredExpressionRowError,
     };
-    use arrow::array::Int64Array;
+    use arrow::array::{Array, Int64Array};
     use novarocks_functions::PureKernelAbi;
     use novarocks_physical_plan::{
         AggregateCallId, AggregateGrouping, AggregatePhase, FragmentBuilder, FragmentId,
@@ -1332,6 +1326,22 @@ mod failure_latch_tests {
         Arc<RuntimeErrorState>,
         Arc<MemTracker>,
     ) {
+        processor_for_key_count(
+            distinct,
+            int64(false),
+            &[vec![LiteralValue::Int64(1)], vec![LiteralValue::Int64(2)]],
+        )
+    }
+    fn processor_for_key_count(
+        distinct: bool,
+        key_type: FunctionValueType,
+        literal_rows: &[Vec<LiteralValue>],
+    ) -> (
+        CompiledAggregateProcessor,
+        Chunk,
+        Arc<RuntimeErrorState>,
+        Arc<MemTracker>,
+    ) {
         let catalog = if distinct {
             aggregate_catalog(&[("multi_distinct_count", PureKernelAbi::AggregateV1)])
         } else {
@@ -1348,8 +1358,8 @@ mod failure_latch_tests {
         let keys = values(
             &mut builder,
             source,
-            &[int64(false)],
-            &[vec![LiteralValue::Int64(1)], vec![LiteralValue::Int64(2)]],
+            std::slice::from_ref(&key_type),
+            literal_rows,
         );
         let (node, _) = add_aggregate(
             &mut builder,
@@ -1374,7 +1384,7 @@ mod failure_latch_tests {
             fields: output
                 .columns
                 .iter()
-                .zip([int64(false), count.result_type()])
+                .zip([key_type, count.result_type()])
                 .enumerate()
                 .map(|(ordinal, (value, ty))| ResultField {
                     domain: crate::test_result_domain::result_value_domain(&ty),
@@ -1442,6 +1452,122 @@ mod failure_latch_tests {
             .expect("prepare actual aggregate schema");
         (processor, input, error, tracker)
     }
+    #[test]
+    fn compiled_aggregate_k_cross_dictionary_generations_share_dense_states_and_export_declared_offsets()
+     {
+        use arrow::array::{DictionaryArray, StringArray};
+        use arrow::datatypes::Int32Type;
+        let ty = FunctionValueType::new(DataType::Utf8, true);
+        let (mut processor, _input, _, _tracker) =
+            processor_for_key_count(false, ty, &[vec![LiteralValue::Utf8("seed".into())]]);
+        processor.ensure_state().unwrap();
+        let declared = processor.key_types.clone();
+        let schema = Arc::clone(processor.prepared_output().unwrap());
+        let owner = processor
+            .control
+            .construction_owner(schema.as_ref())
+            .unwrap();
+        let first: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                arrow::array::Int32Array::from(vec![Some(1), Some(0), Some(1), Some(2)]),
+                Arc::new(StringArray::from(vec![Some("b"), Some("a"), None])),
+            )
+            .unwrap(),
+        );
+        let second: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                arrow::array::Int32Array::from(vec![Some(0), Some(1), Some(2), Some(0), None]),
+                Arc::new(StringArray::from(vec![Some("b"), None, Some("a")])),
+            )
+            .unwrap(),
+        );
+        for (array, expected) in [(first, vec![0, 1, 0, 2]), (second, vec![1, 2, 0, 1, 2])] {
+            let rows = array.len();
+            let mapping = processor
+                .assign_groups(&[array], &declared, rows, owner.as_ref())
+                .unwrap();
+            assert_eq!(mapping, expected);
+            processor.grow_states().unwrap();
+            let call = &processor.calls[0];
+            let input = SelectedAggregateUpdateInput::try_new_with_typed_source_lookup(
+                call.handle.contract().as_ref(),
+                Selection::all(rows),
+                &[],
+                &[],
+                |_| {
+                    Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                        "COUNT(*) has no argument root",
+                    )))
+                },
+                |ordinal| call.handle.argument_encoding(ordinal),
+                &processor.control,
+            )
+            .unwrap();
+            processor.states.as_mut().unwrap()[0]
+                .prepare_update_batch_evaluation(&mapping, input, &processor.control)
+                .unwrap()
+                .run(&processor.control)
+                .unwrap();
+        }
+        let output = processor
+            .finalize_for_test(&RuntimeState::default())
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(output.columns()[0].data_type(), &DataType::Utf8);
+        assert_eq!(
+            output.columns()[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some("a"), Some("b"), None]
+        );
+        assert_eq!(
+            output.columns()[1]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            &[3, 3, 3]
+        );
+    }
+
+    #[test]
+    fn compiled_aggregate_k_real_root_float_batches_preserve_first_zero_nan_null_and_counts() {
+        let nan = f64::from_bits(0x7ff8_0000_0000_0042);
+        let ty = FunctionValueType::new(DataType::Float64, true);
+        let rows = vec![
+            vec![LiteralValue::Float64Bits((-0.0f64).to_bits())],
+            vec![LiteralValue::Float64Bits(0.0f64.to_bits())],
+            vec![LiteralValue::Float64Bits(nan.to_bits())],
+            vec![LiteralValue::Float64Bits(f64::NAN.to_bits())],
+            vec![LiteralValue::Null],
+            vec![LiteralValue::Float64Bits(1.5f64.to_bits())],
+        ];
+        let (mut processor, input, _, _tracker) = processor_for_key_count(false, ty, &rows);
+        let state = RuntimeState::default();
+        processor.apply_for_test(&state, input.clone()).unwrap();
+        processor.apply_for_test(&state, input).unwrap();
+        let output = processor.finalize_for_test(&state).unwrap().output.unwrap();
+        let keys = output.columns()[0]
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        let count = output.columns()[1]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(keys.len(), 4);
+        assert!(keys.value(0) == 0.0 && keys.value(0).is_sign_negative());
+        assert!(keys.value(1).is_nan());
+        assert!(keys.is_null(2));
+        assert_eq!(keys.value(3), 1.5);
+        assert_eq!(count.values().as_ref(), &[4, 4, 2, 2]);
+    }
+
     fn with_context<T>(state: &RuntimeState, action: impl FnOnce(&mut StepContext<'_>) -> T) -> T {
         let error = state.error_state();
         let mut work =

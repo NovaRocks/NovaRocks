@@ -19,6 +19,7 @@
 //! These source models provide no allocator, live-byte, CPU or MEM grant.
 //! Admission and truthful retained-source invoices belong to each caller.
 
+pub mod arrow_metadata;
 pub mod btree;
 #[cfg(test)]
 mod bytes_profile;
@@ -32,3 +33,5 @@ pub mod type_validation;
 pub mod vec;
 
 pub mod metadata_materialization;
+
+pub mod arrow_union;

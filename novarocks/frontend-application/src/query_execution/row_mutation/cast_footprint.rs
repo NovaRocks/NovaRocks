@@ -29,8 +29,6 @@ use arrow::{
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorRowConversionFootprint,
 };
-use std::collections::HashMap;
-use std::mem::size_of;
 const INPUT_BYTES: usize = 32 * 1024 * 1024;
 const SELECTION_BYTES: usize = 64 * 1024 * 1024;
 pub(super) const TRANSFORM_BYTES: usize = 256 * 1024 * 1024;
@@ -276,11 +274,17 @@ impl TypeWalk {
         }
         Ok(())
     }
-    fn metadata(&mut self, values: &HashMap<String, String>) -> Result<(), ConnectorError> {
-        if values.capacity() > MAX_NODES {
+    fn metadata(&mut self, values: &arrow::datatypes::Metadata) -> Result<(), ConnectorError> {
+        // The immutable BTree has entry traversal, without spare HashMap buckets.
+        if values.len() > MAX_NODES {
             return Err(exhausted());
         }
-        self.bytes(mul(values.capacity(), size_of::<(String, String)>())?)?;
+        self.bytes(
+            novarocks_type_contract::owned_resources::arrow_metadata::retained_backing_upper_bound(
+                values.len(),
+            )
+            .map_err(metadata_resource_error)?,
+        )?;
         for (key, value) in values {
             self.bytes(add(key.capacity(), value.capacity())?)?;
         }
@@ -350,6 +354,17 @@ impl TypeWalk {
         }
         Ok(())
     }
+}
+
+fn metadata_resource_error(
+    source: novarocks_type_contract::owned_resources::btree::BTreeResourceError,
+) -> ConnectorError {
+    use novarocks_type_contract::owned_resources::btree::BTreeResourceError;
+    let kind = match &source {
+        BTreeResourceError::Arithmetic(_) => ConnectorErrorKind::ResourceExhausted,
+        BTreeResourceError::SourceModel(_) => ConnectorErrorKind::InvalidRequest,
+    };
+    ConnectorError::from_domain(kind, source)
 }
 
 #[cfg(test)]

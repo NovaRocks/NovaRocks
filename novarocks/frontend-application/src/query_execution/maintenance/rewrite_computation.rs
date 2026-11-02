@@ -157,7 +157,7 @@ impl RewriteCohortComputation {
             crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
             crate::native::data_runtime::FrontendDataRuntime,
         ),
-        io: &MetadataIoAdmission,
+        io: &Arc<MetadataIoAdmission>,
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), QueryServiceError>> {

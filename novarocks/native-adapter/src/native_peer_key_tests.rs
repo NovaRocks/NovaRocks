@@ -155,13 +155,41 @@ async fn connection_id(channel: Channel, method: NativeRpcMethod) -> usize {
 }
 
 #[tokio::test]
+async fn unit_methods_reuse_one_exact_peer_connection_without_changing_the_rpc_path() {
+    let runtime = test_backend_data_runtime();
+    let server = Server::start(1).await;
+    let peer = BackendProcessId::new_v7();
+    let methods = [
+        NativeRpcMethod::DeliverExchangeUnit,
+        NativeRpcMethod::RegisterExchangeDemand,
+        NativeRpcMethod::SubscribeExchangeGrants,
+    ];
+    let mut first_key = None;
+    for method in methods {
+        let key = NativeChannelKey::new(Some(peer), server.endpoint.clone(), method).unwrap();
+        if let Some(first) = &first_key {
+            assert_eq!(&key, first);
+        } else {
+            first_key = Some(key.clone());
+        }
+        let channel = get_or_create_channel(&runtime, key).await.unwrap();
+        assert_eq!(connection_id(channel, method).await, 1);
+    }
+    assert_eq!(server.accepted.load(Ordering::SeqCst), 1);
+    runtime
+        .channels()
+        .remove(first_key.unwrap().inline_identity().unwrap());
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn actual_cached_channels_separate_process_endpoint_and_manifest_method() {
     let runtime = test_backend_data_runtime();
     let first = Server::start(1).await;
     let other = Server::start(100).await;
     let old = BackendProcessId::new_v7();
     let replacement = BackendProcessId::new_v7();
-    let exchange = NativeRpcMethod::ExchangeUnary;
+    let exchange = NativeRpcMethod::DeliverExchangeUnit;
     let filter = NativeRpcMethod::TransmitRuntimeFilterEnvelope;
     let old_exchange = NativeChannelKey::new(Some(old), first.endpoint.clone(), exchange).unwrap();
     let new_exchange =
@@ -217,7 +245,10 @@ async fn actual_cached_channels_separate_process_endpoint_and_manifest_method() 
 fn channel_key_refuses_missing_or_foreign_peer_domains_and_frontend_methods() {
     let endpoint = NativeEndpoint::from_host_port("127.0.0.1", 9010).unwrap();
     let process = BackendProcessId::new_v7();
-    assert!(NativeChannelKey::new(None, endpoint.clone(), NativeRpcMethod::ExchangeUnary).is_err());
+    assert!(
+        NativeChannelKey::new(None, endpoint.clone(), NativeRpcMethod::DeliverExchangeUnit)
+            .is_err()
+    );
     assert!(
         NativeChannelKey::new(
             None,
@@ -238,7 +269,7 @@ fn channel_key_refuses_missing_or_foreign_peer_domains_and_frontend_methods() {
         NativeRpcMethod::RetiredFetchTaskResult,
         NativeRpcMethod::ApplyTaskOperations,
         NativeRpcMethod::Heartbeat,
-        NativeRpcMethod::RetiredExchange,
+        NativeRpcMethod::RetiredFetchResult,
     ] {
         assert!(NativeChannelKey::new(Some(process), endpoint.clone(), method).is_err());
         assert!(NativeChannelKey::new(None, endpoint.clone(), method).is_err());
@@ -291,7 +322,7 @@ async fn funded_singleflight_nine_real_callers_share_one_dial_and_exact_peer_key
     let other = Server::start(100).await;
     let old = BackendProcessId::new_v7();
     let replacement = BackendProcessId::new_v7();
-    let exchange = NativeRpcMethod::ExchangeUnary;
+    let exchange = NativeRpcMethod::DeliverExchangeUnit;
     let filter = NativeRpcMethod::TransmitRuntimeFilterEnvelope;
     let key = NativeChannelKey::new(Some(old), first.endpoint.clone(), exchange).unwrap();
     let gate = Arc::new(Barrier::new(10));

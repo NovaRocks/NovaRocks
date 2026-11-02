@@ -1337,7 +1337,7 @@ fn round_i256(sum: i256, count: i64) -> Result<i256, KernelFailure> {
     } else {
         r
     };
-    let threshold = (abs_b >> 1)
+    let threshold = (abs_b >> 1_u32)
         .checked_add(abs_b & i256::ONE)
         .ok_or_else(overflow)?;
     if abs_r >= threshold {

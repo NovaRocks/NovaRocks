@@ -74,18 +74,20 @@ use novarocks_query_application::serving_admission::{
     FrontendAdmissionError, FrontendServingAdmission,
 };
 use novarocks_query_application::session::{
-    QuerySession, QuerySessionFactory, QuerySessionOpenRequest,
+    QuerySession, QuerySessionFactory, QuerySessionOpenRequest, StatementSessionRequest,
 };
 use novarocks_query_application::session_control::{
     GovernedQueryStatementBeginError, GovernedStatementAction, QueryControlService,
     QuerySessionLease, SessionIdentity, SessionToken, StatementToken,
 };
+use novarocks_query_application::session_effects::SessionEffects;
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_query_application::session_outcome::{
     cancellation_error, cancellation_requires_statement_fence, governed_cancellation_error,
     governed_query_deadline, governed_query_execution_error, governed_statement_begin_error,
     scalar_query_error,
 };
+use novarocks_query_application::session_value::StatementSessionError;
 use novarocks_query_application::sql::admission::{
     admin_raise_engine_error, requires_lake_publication_deadline, typed_statement_work_class,
     unnegotiated_query_statement,
@@ -94,9 +96,8 @@ use novarocks_query_application::sql::catalog::SessionCatalogService;
 use novarocks_query_application::sql::dml_admission::validate_table_statement_admission;
 use novarocks_query_application::sql::kill::execute_control_session_statement;
 use novarocks_query_application::sql::session::{
-    SessionExecutionSettings, SessionSetAssignmentOutcome, SessionSqlState,
+    SessionExecutionSettings, SessionSqlState,
     admit_session_set_assignment as admit_query_application_session_set_assignment,
-    apply_session_set_assignment as apply_query_application_session_set_assignment,
 };
 use novarocks_query_application::sql::session_admit::SessionAdmitError;
 use novarocks_query_application::sql::{
@@ -106,6 +107,7 @@ use novarocks_query_application::sql::{
     SpecializedStatementRoute, parse_single_statement, query_service_parse_error,
     strip_leading_line_comments,
 };
+use novarocks_query_application::statement_kind::StatementKind;
 use novarocks_type_contract::CompileControlError;
 use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
@@ -131,6 +133,7 @@ mod set_action;
 mod statement_action;
 pub(crate) mod statement_computation;
 pub(crate) mod statement_publication;
+pub(crate) mod view_read_action;
 pub(crate) mod write_action;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
@@ -362,6 +365,7 @@ impl StatisticsCommandConsumer for FrontendStatisticsCommandConsumer {
                 request_context.session().current_database(),
                 request_context.execution(),
                 command_context.connector_context(),
+                *request_context.session().presentation(),
             )
             .map_err(|e| CommandError::new(CommandErrorKind::Rejected, e))
     }
@@ -1329,6 +1333,35 @@ impl FrontendQueryService {
 }
 
 impl QuerySessionFactory for FrontendQueryService {
+    // Design: ADR-0203 (docs/adr/ADR-0203-client-result-presentation-and-trino-paged-delivery.md)
+    fn open_statement_session(
+        &self,
+        request: StatementSessionRequest,
+    ) -> Result<Arc<dyn QuerySession>, StatementSessionError> {
+        let (query_id, principal, value) = request.into_parts();
+        let state = SessionSqlState::from_session_value(value)?;
+        let identity = SessionIdentity::client_statement(query_id.clone(), Arc::clone(&principal));
+        let lease = self
+            .serving_admission
+            .register_session(|| self.query_control.register_session(identity))
+            .map_err(query_service_admission_error)?
+            .map_err(|error| {
+                internal_error(format!(
+                    "register frontend statement session failed: {error:?}"
+                ))
+            })?;
+        Ok(Arc::new(FrontendQuerySession {
+            service: self.clone(),
+            origin: novarocks_query_application::session_control::SessionOrigin::ClientStatement(
+                query_id,
+            ),
+            lease: Mutex::new(Some(lease)),
+            state: Arc::new(Mutex::new(state)),
+            statement_ready: statement_action::StatementReadyReceiver::default(),
+            principal,
+        }))
+    }
+
     fn open_session(
         &self,
         request: QuerySessionOpenRequest,
@@ -1348,6 +1381,9 @@ impl QuerySessionFactory for FrontendQueryService {
             })?;
         Ok(Arc::new(FrontendQuerySession {
             service: self.clone(),
+            origin: novarocks_query_application::session_control::SessionOrigin::Connection(
+                request.connection_token(),
+            ),
             lease: Mutex::new(Some(lease)),
             state: Arc::new(Mutex::new(SessionSqlState::default())),
             statement_ready: statement_action::StatementReadyReceiver::default(),
@@ -1373,6 +1409,7 @@ fn query_service_admission_error(error: FrontendAdmissionError) -> QueryServiceE
 }
 
 struct FrontendQuerySession {
+    origin: novarocks_query_application::session_control::SessionOrigin,
     service: FrontendQueryService,
     lease: Mutex<Option<QuerySessionLease>>,
     state: Arc<Mutex<SessionSqlState>>,
@@ -1380,6 +1417,23 @@ struct FrontendQuerySession {
     /// Who the server authenticated on this connection. A command that records
     /// what someone did takes this, never an argument that claims an identity.
     principal: Arc<str>,
+}
+
+/// Statement-origin errors retain the original SQL prefix for exact locations.
+/// Connection-origin framing keeps its existing normalization policy.
+fn statement_execution_source<'a>(
+    origin: &novarocks_query_application::session_control::SessionOrigin,
+    original: &'a str,
+    legacy_normalized: &'a str,
+) -> &'a str {
+    match origin {
+        novarocks_query_application::session_control::SessionOrigin::ClientStatement(_) => {
+            original.trim_end().trim_end_matches(';').trim_end()
+        }
+        novarocks_query_application::session_control::SessionOrigin::Connection(_) => {
+            legacy_normalized
+        }
+    }
 }
 
 impl FrontendQuerySession {
@@ -1426,14 +1480,17 @@ impl FrontendQuerySession {
             return Ok(
                 novarocks_query_application::session::QuerySessionStatement::output_owned(
                     StatementResult::Ok,
+                    StatementKind::Empty,
                 ),
             );
         }
         if let Some(error) = admin_raise_engine_error(trimmed)? {
             return Err(error);
         }
-        let parsed_statement = parse_single_statement(trimmed)
-            .map_err(|error| query_service_parse_error(error, trimmed))?;
+        let source = statement_execution_source(&self.origin, statement, trimmed);
+        let parsed_statement = parse_single_statement(source)
+            .map_err(|error| query_service_parse_error(error, source))?;
+        let kind = StatementKind::from_statement(&parsed_statement);
         let result = match parsed_statement {
             ParsedStatement::Session(ast::SessionStatement::Set(statement))
                 if statement
@@ -1441,26 +1498,30 @@ impl FrontendQuerySession {
                     .iter()
                     .any(|assignment| matches!(assignment.value, ast::SetValue::Query(_))) =>
             {
-                self.execute_governed_set(trimmed.to_string(), statement)
+                self.execute_governed_set(source.to_string(), statement)
                     .await
             }
             ParsedStatement::Session(statement) => {
-                self.execute_session_statement(trimmed, &statement).await
+                self.execute_session_statement(source, &statement).await
             }
             ParsedStatement::Query(_) => {
                 return self
-                    .execute_governed_read(trimmed.to_string(), parsed_statement)
+                    .execute_governed_read(source.to_string(), parsed_statement)
                     .await
-                    .map(
-                        novarocks_query_application::session::QuerySessionStatement::output_owned,
-                    );
+                    .map(|output| {
+                        novarocks_query_application::session::QuerySessionStatement::output_owned(
+                            output, kind,
+                        )
+                    });
             }
             statement => {
-                self.execute_typed_statement(trimmed.to_string(), statement)
+                self.execute_typed_statement(source.to_string(), statement)
                     .await
             }
         };
-        result.map(novarocks_query_application::session::QuerySessionStatement::output_owned)
+        result.map(|output| {
+            novarocks_query_application::session::QuerySessionStatement::output_owned(output, kind)
+        })
     }
 
     async fn execute_session_statement(
@@ -1491,6 +1552,7 @@ impl FrontendQuerySession {
                 ResultWindowClass::Local,
             )
             .map_err(|error| self.governed_statement_begin_error(error))?;
+        let mut effects = SessionEffects::default();
         let result = match statement {
             ast::SessionStatement::Set(statement) => {
                 for assignment in &statement.assignments {
@@ -1499,8 +1561,9 @@ impl FrontendQuerySession {
                     }
                 }
                 for assignment in &statement.assignments {
-                    if let Err(error) = self.apply_session_set_assignment(source, assignment).await {
-                        return Ok(self.governed_typed_error(error, governed));
+                    match self.apply_session_set_assignment(source, assignment).await {
+                        Ok(change) => effects.append(change),
+                        Err(error) => return Ok(self.governed_typed_error(error, governed)),
                     }
                 }
                 Ok(StatementResult::Ok)
@@ -1514,11 +1577,9 @@ impl FrontendQuerySession {
                     governed.cancellation().clone(),
                     governed.timeout_ms(),
                 );
-                if let Err(error) = self
-                    .init_database_with_cancellation(&schema, cancellation, &governed)
-                    .await
-                {
-                    return Ok(self.governed_typed_error(error, governed));
+                match self.init_database_with_cancellation(&schema, cancellation, &governed).await {
+                    Ok(change) => effects.append(change),
+                    Err(error) => return Ok(self.governed_typed_error(error, governed)),
                 }
                 Ok(StatementResult::Ok)
             }
@@ -1540,7 +1601,7 @@ impl FrontendQuerySession {
         };
         match result {
             Ok(StatementResult::Ok) => Ok(StatementResult::GovernedCompletion(
-                GovernedCompletionStatementResult::new(governed),
+                GovernedCompletionStatementResult::with_session_effects(governed, effects),
             )),
             Ok(StatementResult::Query(result)) => {
                 // Local delivery may still use transitional LRA credits under
@@ -1565,7 +1626,11 @@ impl FrontendQuerySession {
         result: QueryResult,
         statement: novarocks_query_application::session_control::GovernedQueryStatementOwner,
     ) -> StatementResult {
-        match GovernedImmediateStatementResult::try_new(result, statement) {
+        let family = match self.state.lock() {
+            Ok(state) => *state.presentation(),
+            Err(error) => return self.governed_typed_error(poisoned_state(error), statement),
+        };
+        match GovernedImmediateStatementResult::try_new(result, statement, family) {
             Ok(result) => StatementResult::GovernedQuery(result),
             Err((error, statement)) => self.governed_typed_error(internal_error(error), statement),
         }
@@ -1583,7 +1648,7 @@ impl FrontendQuerySession {
         &self,
         source: &str,
         assignment: &ast::SetAssignment,
-    ) -> Result<(), QueryServiceError> {
+    ) -> Result<SessionEffects, QueryServiceError> {
         let mut state = self.state.lock().map_err(poisoned_state)?;
         self.apply_session_set_assignment_to_state(source, assignment, &mut state)
     }
@@ -1593,7 +1658,7 @@ impl FrontendQuerySession {
         source: &str,
         assignment: &ast::SetAssignment,
         state: &mut SessionSqlState,
-    ) -> Result<(), QueryServiceError> {
+    ) -> Result<SessionEffects, QueryServiceError> {
         set_action::apply_session_assignment_in(
             &self.service.session_catalog_resolver,
             source,
@@ -1607,7 +1672,7 @@ impl FrontendQuerySession {
         schema: &str,
         cancellation: QueryCancellationView,
         statement: &novarocks_query_application::session_control::GovernedQueryStatementOwner,
-    ) -> Result<(), QueryServiceError> {
+    ) -> Result<SessionEffects, QueryServiceError> {
         let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
             statement.scope(),
             statement.result_window_alias().ok_or_else(|| {
@@ -1635,8 +1700,9 @@ impl FrontendQuerySession {
         )
         .await?;
         let mut state = self.state.lock().map_err(poisoned_state)?;
-        state.set_resolved_database_context(context.catalog, context.database);
-        Ok(())
+        let effects = SessionEffects::set_catalog_schema(context.catalog, context.database);
+        state.apply_effects(&effects)?;
+        Ok(effects)
     }
 
     async fn execute_governed_set(
@@ -1864,6 +1930,7 @@ impl FrontendQuerySession {
         } else {
             topology
         };
+        let presentation = *state.presentation();
         let (
             current_catalog,
             current_database,
@@ -1891,6 +1958,7 @@ impl FrontendQuerySession {
             cancellation.clone(),
             optimizer_settings,
             sql_semantics.clone(),
+            presentation,
         ));
         let command_executor = Arc::clone(&self.service.command_executor);
         let product_command_router = self.service.product_command_router.clone();
@@ -1987,6 +2055,26 @@ impl FrontendQuerySession {
             },
             None => command_context,
         };
+        if let ParsedStatement::View(novarocks_parser::ast::ViewStatement::Show(show)) =
+            &parsed_statement
+        {
+            let action = match self.service.query_compiler.prepare_show_views_action(
+                show.clone(),
+                context,
+                command_context,
+            ) {
+                Ok(action) => action,
+                Err(error) => {
+                    return Ok(self.governed_typed_error(
+                        routed_execution_service_error(product_command_error(error)),
+                        statement,
+                    ));
+                }
+            };
+            return self
+                .execute_observed_statement_action(statement, action)
+                .await;
+        }
         if let Ok(Some(ProductSqlCommand::Catalog(
             command @ (novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(_)
             | novarocks_sql::semantic::CatalogSqlCommand::DropCatalog { .. }),
@@ -2544,7 +2632,12 @@ impl FrontendQuerySession {
         match result {
             Ok(StatementResult::Query(result)) => Ok(self.governed_local_result(result, statement)),
             Ok(StatementResult::Ok) => Ok(StatementResult::GovernedCompletion(
-                GovernedCompletionStatementResult::new(statement),
+                GovernedCompletionStatementResult::new(
+                    novarocks_query_application::session_control::StatementCommandCompletion::new(
+                        0,
+                    ),
+                    statement,
+                ),
             )),
             Ok(
                 StatementResult::GovernedQuery(_)
@@ -2598,6 +2691,25 @@ fn with_query_hints(
 
 #[async_trait]
 impl QuerySession for FrontendQuerySession {
+    #[cfg(novarocks_dev_controls)]
+    fn connection_session(
+        &self,
+        connection: novarocks_query_application::client_connection::ClientConnectionToken,
+    ) -> Option<SessionToken> {
+        match &self.origin {
+            novarocks_query_application::session_control::SessionOrigin::Connection(original)
+                if *original == connection =>
+            {
+                self.lease
+                    .lock()
+                    .ok()?
+                    .as_ref()
+                    .map(QuerySessionLease::token)
+            }
+            _ => None,
+        }
+    }
+
     async fn init_database(
         &self,
         schema: &str,
@@ -2625,16 +2737,18 @@ impl QuerySession for FrontendQuerySession {
             .init_database_with_cancellation(schema, cancellation, &statement)
             .await
         {
-            Ok(()) => Ok(
+            Ok(effects) => Ok(
                 novarocks_query_application::session::QuerySessionStatement::output_owned(
-                    StatementResult::GovernedCompletion(GovernedCompletionStatementResult::new(
-                        statement,
-                    )),
+                    StatementResult::GovernedCompletion(
+                        GovernedCompletionStatementResult::with_session_effects(statement, effects),
+                    ),
+                    StatementKind::Use,
                 ),
             ),
             Err(error) => Ok(
                 novarocks_query_application::session::QuerySessionStatement::output_owned(
                     self.governed_typed_error(error, statement),
+                    StatementKind::Use,
                 ),
             ),
         }
@@ -2649,6 +2763,7 @@ impl QuerySession for FrontendQuerySession {
             return Ok(
                 novarocks_query_application::session::QuerySessionStatement::output_owned(
                     StatementResult::Ok,
+                    StatementKind::Empty,
                 ),
             );
         };
@@ -2984,6 +3099,66 @@ fn query_options_from_session_settings(settings: &SessionExecutionSettings) -> Q
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn statement_origin_parser_errors_keep_the_original_source_prefix() {
+        use novarocks_query_application::{
+            query_control::QueryApplicationControl,
+            session_control::{QueryControlService, SessionOrigin},
+        };
+        let control = QueryControlService::new(Arc::new(QueryApplicationControl::new(
+            novarocks_types::FrontendProcessId::new_v7(),
+        )));
+        let origin = SessionOrigin::ClientStatement(control.mint_client_query_id());
+        for (sql, line, column) in [
+            ("                    SELECT );;", 1, 28),
+            ("-- 中文😀 comment\n  SELECT '中😀中', );;", 2, 24),
+            ("\n\nSELECT\n '中😀',\n );;", 5, 2),
+        ] {
+            let legacy = strip_leading_line_comments(sql.trim().trim_end_matches(';').trim());
+            let source = statement_execution_source(&origin, sql, legacy);
+            assert_eq!(
+                source.as_ptr(),
+                sql.as_ptr(),
+                "the original source prefix stays borrowed"
+            );
+            let error = parse_single_statement(source)
+                .expect_err("actual parser must reject the closing parenthesis");
+            let error = query_service_parse_error(error, source);
+            let location = error.user_error().unwrap().location().unwrap();
+            assert_eq!(
+                (location.line(), location.column()),
+                (line, column),
+                "{sql}"
+            );
+        }
+        let sql = "  -- original prefix\n SELECT '中😀';;;  ";
+        let source = statement_execution_source(
+            &origin,
+            sql,
+            strip_leading_line_comments(sql.trim().trim_end_matches(';').trim()),
+        );
+        assert!(
+            parse_single_statement(source).is_ok(),
+            "trailing-semicolon tolerance stays intact"
+        );
+        assert_eq!(source.as_ptr(), sql.as_ptr());
+    }
+
+    #[test]
+    fn connection_origin_parser_framing_keeps_legacy_normalization() {
+        let origin = novarocks_query_application::session_control::SessionOrigin::Connection(
+            novarocks_query_application::client_connection::ClientConnectionToken::new(41, 1)
+                .unwrap(),
+        );
+        let sql = "  -- existing connection prefix\n   SELECT );; ";
+        let legacy = strip_leading_line_comments(sql.trim().trim_end_matches(';').trim());
+        let source = statement_execution_source(&origin, sql, legacy);
+        assert_eq!(source, "SELECT )");
+        let error = query_service_parse_error(parse_single_statement(source).unwrap_err(), source);
+        let location = error.user_error().unwrap().location().unwrap();
+        assert_eq!((location.line(), location.column()), (1, 8));
+    }
 
     #[test]
     fn runtime_task_refusal_survives_distributed_dml_and_final_user_projection() {
@@ -3783,7 +3958,9 @@ mod tests {
             let service = selected_execution_or_worker_fallback(
                 Err(routed),
                 cancellation_error(QueryCancellationReason::ExplicitKill {
-                    requester_connection_id: 7,
+                    requester_session:
+                        novarocks_query_application::session_control::ClientSessionKey::new(7)
+                            .expect("nonzero fixture requester"),
                 }),
             );
             assert_eq!(service.execution_failure(), Some(&expected));
@@ -3860,7 +4037,9 @@ mod tests {
         for reason in [
             QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 },
             QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 7,
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(7)
+                        .expect("nonzero fixture requester"),
             },
         ] {
             for disposition in [
@@ -4504,7 +4683,7 @@ mod tests {
         let service: BackendTopologyService = topology;
         let (_workload, root, cancellation) = test_governed_cancellation();
         root.owner.cancel(WorkCancellationReason::ExplicitKill {
-            requester_connection_id: 91,
+            requester_session: 91,
         });
 
         let error = wait_for_initial_query_topology(&service, &cancellation, None)
@@ -4610,7 +4789,9 @@ mod tests {
         );
         assert_eq!(
             cancellation_error(QueryCancellationReason::ExplicitKillConnection {
-                requester_connection_id: 8
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(8)
+                        .expect("nonzero fixture requester")
             })
             .kind(),
             QueryServiceErrorKind::Interrupted
@@ -4639,12 +4820,16 @@ mod tests {
     fn only_kill_query_fences_the_successor_statement() {
         assert!(cancellation_requires_statement_fence(
             &QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 8,
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(8)
+                        .expect("nonzero fixture requester"),
             }
         ));
         for reason in [
             QueryCancellationReason::ExplicitKillConnection {
-                requester_connection_id: 8,
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(8)
+                        .expect("nonzero fixture requester"),
             },
             QueryCancellationReason::ClientDisconnected,
             QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms: 10 },

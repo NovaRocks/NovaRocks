@@ -690,7 +690,7 @@ fn actual_compiled_value_conversion_json_root_and_nested_struct_preserve_bytes_n
         array
             .fields()
             .iter()
-            .all(|field| field.metadata().capacity() == 0)
+            .all(|field| field.metadata().as_arc().is_none())
     );
     assert_eq!(target_fields[1].metadata()["PARQUET:field_id"], "29");
 }

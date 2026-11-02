@@ -40,6 +40,7 @@ pub struct RequestAdmission {
     cancellation: QueryCancellationView,
     optimizer_settings: SessionOptimizerSettings,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+    presentation: novarocks_result_contract::ClientPresentationFamily,
 }
 
 impl RequestAdmission {
@@ -52,6 +53,7 @@ impl RequestAdmission {
         cancellation: QueryCancellationView,
         optimizer_settings: SessionOptimizerSettings,
         sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+        presentation: novarocks_result_contract::ClientPresentationFamily,
     ) -> Self {
         Self {
             current_catalog,
@@ -62,6 +64,7 @@ impl RequestAdmission {
             cancellation,
             optimizer_settings,
             sql_semantics,
+            presentation,
         }
     }
 }
@@ -111,6 +114,7 @@ impl StatementAdmissionContext {
         cancellation: QueryCancellationView,
         optimizer_settings: SessionOptimizerSettings,
         sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
+        presentation: novarocks_result_contract::ClientPresentationFamily,
     ) -> Self {
         Self {
             #[cfg(novarocks_dev_controls)]
@@ -120,6 +124,7 @@ impl StatementAdmissionContext {
                 current_database,
                 optimizer_settings,
                 sql_semantics,
+                presentation,
             ),
             role,
             deadline,
@@ -915,6 +920,7 @@ impl RequestContext {
             admission.cancellation,
             admission.optimizer_settings,
             admission.sql_semantics,
+            admission.presentation,
         );
         statement.for_topology(admission.topology)
     }
@@ -1014,6 +1020,7 @@ mod tests {
             QueryCancellationSource::new().view(),
             SessionOptimizerSettings::default(),
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ))
         .with_result_capacity(
             QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias())
@@ -1035,6 +1042,7 @@ mod tests {
             execution.cancellation().clone(),
             execution.optimizer_settings().clone(),
             execution.sql_semantics().clone(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         )
         .for_topology(topology(8, 1));
         assert!(replacement.execution().result_capacity().is_none());
@@ -1155,6 +1163,7 @@ mod tests {
                 "db1".to_string(),
                 SessionOptimizerSettings::default(),
                 novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
             ),
             QueryExecutionContext::new(
                 ClusterRole::Fe,
@@ -1187,6 +1196,7 @@ mod tests {
                 "db1".to_string(),
                 admitted_settings.clone(),
                 novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
             ),
             QueryExecutionContext::new(
                 ClusterRole::Fe,
@@ -1230,6 +1240,7 @@ mod tests {
             QueryCancellationSource::new().view(),
             SessionOptimizerSettings::default(),
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ));
         let statement = StatementAdmissionContext::new(
             None,
@@ -1239,6 +1250,7 @@ mod tests {
             first.execution().cancellation().clone(),
             first.execution().optimizer_settings().clone(),
             first.execution().sql_semantics().clone(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         );
         let replacement = statement.for_topology(topology(8, 1));
 
@@ -1276,6 +1288,7 @@ mod tests {
                 ..SessionOptimizerSettings::default()
             },
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ));
         let statement = StatementAdmissionContext::new(
             None,
@@ -1285,6 +1298,7 @@ mod tests {
             first.execution().cancellation().clone(),
             first.execution().optimizer_settings().clone(),
             first.execution().sql_semantics().clone(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         );
         let replacement = statement.for_topology(topology(8, 1));
 
@@ -1320,6 +1334,7 @@ mod tests {
                 ..SessionOptimizerSettings::default()
             },
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ));
 
         assert_eq!(
@@ -1345,6 +1360,7 @@ mod tests {
                 ..SessionOptimizerSettings::default()
             },
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ));
 
         assert_eq!(
@@ -1367,6 +1383,7 @@ mod tests {
             QueryCancellationSource::new().view(),
             SessionOptimizerSettings::default(),
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ));
 
         assert_eq!(
@@ -1394,6 +1411,7 @@ mod tests {
             QueryCancellationSource::new().view(),
             SessionOptimizerSettings::default(),
             mode.clone(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ));
         assert_eq!(first.session().sql_semantics(), &mode);
         assert_eq!(first.execution().sql_semantics(), &mode);
@@ -1405,6 +1423,7 @@ mod tests {
             first.execution().cancellation().clone(),
             first.execution().optimizer_settings().clone(),
             first.session().sql_semantics().clone(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         );
         let replacement = statement.for_topology(topology(8, 1));
         assert_eq!(replacement.session().sql_semantics(), &mode);

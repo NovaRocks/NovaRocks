@@ -344,8 +344,12 @@ fn nullsafe_wide_exact_metadata_walk_preserves_every_three_cause_callback_prefix
         DataType::Struct(
             (0..320)
                 .map(|i| {
-                    Field::new(format!("f{i}"), DataType::Int64, false)
-                        .with_metadata([("provider.id".into(), i.to_string())].into())
+                    Field::new(format!("f{i}"), DataType::Int64, false).with_metadata(
+                        std::collections::HashMap::<String, String>::from([(
+                            "provider.id".into(),
+                            i.to_string(),
+                        )]),
+                    )
                 })
                 .collect(),
         ),

@@ -814,12 +814,20 @@ mod tests {
                             dict_id,
                             ordered,
                         )
-                        .with_metadata([("provider".to_owned(), annotation.to_owned())].into()),
+                        .with_metadata(std::collections::HashMap::<
+                            String,
+                            String,
+                        >::from([
+                            ("provider".to_owned(), annotation.to_owned()),
+                        ])),
                         if logical.is_empty() {
                             Field::new("payload", DataType::Utf8, false)
                         } else {
                             Field::new("payload", DataType::Utf8, false).with_metadata(
-                                [(NR_LOGICAL_TYPE_KEY.to_owned(), logical.to_owned())].into(),
+                                std::collections::HashMap::<String, String>::from([(
+                                    NR_LOGICAL_TYPE_KEY.to_owned(),
+                                    logical.to_owned(),
+                                )]),
                             )
                         },
                     ]
@@ -931,9 +939,13 @@ mod tests {
             FunctionValueType::try_from_field(&physical).unwrap(),
             FunctionValueType::new(DataType::FixedSizeBinary(16), false)
         );
-        let uuid = physical
-            .clone()
-            .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), "uuid".to_owned())].into());
+        let uuid =
+            physical
+                .clone()
+                .with_metadata(std::collections::HashMap::<String, String>::from([(
+                    NR_LOGICAL_TYPE_KEY.to_owned(),
+                    "uuid".to_owned(),
+                )]));
         let exact_uuid = FunctionValueType::try_from_field(&uuid).unwrap();
         assert_eq!(exact_uuid.logical_type(), ValueLogicalType::Uuid);
         assert_eq!(
@@ -946,14 +958,16 @@ mod tests {
                 .is_err()
         );
         let unknown =
-            physical.with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), "unknown".to_owned())].into());
+            physical.with_metadata(std::collections::HashMap::<String, String>::from([(
+                NR_LOGICAL_TYPE_KEY.to_owned(),
+                "unknown".to_owned(),
+            )]));
         assert!(FunctionValueType::try_from_field(&unknown).is_err());
         let item = Field::new("provider_item", DataType::Utf8, false).with_metadata(
-            [
+            std::collections::HashMap::<String, String>::from([
                 (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
                 ("provider.field_id".to_owned(), "91".to_owned()),
-            ]
-            .into(),
+            ]),
         );
         let nested = Field::new(
             "values",

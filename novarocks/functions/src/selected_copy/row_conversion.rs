@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Arrow-row 58.4 RowConverter::new STRUCTURES, not encoded row payload or
+//! Arrow-row 60.0 RowConverter::new STRUCTURES, not encoded row payload or
 //! lexsort's different comparator. No converter, null array or row is made here.
 use super::{CopyConstructionError, CopyError, add, mul};
 use arrow_buffer::ScalarBuffer;
@@ -142,8 +142,9 @@ impl<H> Model<'_, '_, '_, '_, H> {
     }
     fn supported(&mut self, ty: &DataType) -> Result<(), RowConversionStructureFailure<H>> {
         self.step()?;
-        // This is the pinned supports_datatype source law, not a Row encoding
-        // algorithm or inferred value domain. Map remains originally unsupported.
+        // Preserve the existing admitted first-party resource profile. Arrow
+        // 60 itself supports Map, but this upgrade does not widen the product's
+        // row-conversion capability through allocation-model admission.
         if !self.is_nested_observed(ty)? {
             return Ok(());
         }
@@ -159,7 +160,7 @@ impl<H> Model<'_, '_, '_, '_, H> {
                 self.checked_types(fields.iter().map(|(_, f)| f.data_type()))
             }
             _ => Err(RowConversionStructureFailure::Unsupported(
-                "Arrow row format does not support this nested carrier",
+                "current row conversion resource profile does not admit this nested carrier",
             )),
         }
     }
@@ -256,7 +257,7 @@ impl<H> Model<'_, '_, '_, '_, H> {
                 Ok(())
             }
             _ => Err(RowConversionStructureFailure::Unsupported(
-                "Arrow row codec has no installed constructor for this carrier",
+                "row conversion resource profile has no admitted constructor for this carrier",
             )),
         }
     }
@@ -383,8 +384,9 @@ impl<H> Model<'_, '_, '_, '_, H> {
     }
 }
 fn codec_upper() -> Result<usize, CopyError> {
-    // Private Codec variants at Arrow-row lib.rs539: no mirrored enum or
-    // fabricated Layout. Largest public payload plus tag/alignment padding.
+    // Arrow 60 Codec adds Map(RowConverter), dominated by the existing
+    // Struct/Union payloads below. No mirrored enum or fabricated Layout:
+    // largest public payload plus tag/alignment padding remains an upper.
     let payload = size_of::<(RowConverter, OwnedRow)>().max(size_of::<(
         Vec<RowConverter>,
         Vec<i8>,
@@ -393,8 +395,8 @@ fn codec_upper() -> Result<usize, CopyError> {
     add(payload, mul(2, align_of::<usize>())?)
 }
 fn encoder_upper() -> Result<usize, CopyError> {
-    // Private Encoder variants at lib.rs820 use Rows/Row or four public
-    // Union payload fields. This upper is temporary opaque geometry only.
+    // Arrow 60 Encoder adds Map(Rows), dominated by the existing Rows/Row
+    // and four public Union payloads. This is temporary opaque geometry only.
     let payload = size_of::<(Rows, Row<'static>)>().max(size_of::<(
         Vec<Rows>,
         Vec<i8>,

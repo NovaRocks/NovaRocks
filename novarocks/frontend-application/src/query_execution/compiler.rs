@@ -831,6 +831,7 @@ fn test_request_context_with_role(
             current_database.to_string(),
             novarocks_sql::compiler::SessionOptimizerSettings::default(),
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ),
         QueryExecutionContext::new(
             role,

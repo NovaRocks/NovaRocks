@@ -1280,7 +1280,7 @@ mod tests {
         Field::new(name, data_type, true).with_metadata(
             [(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string())]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
         )
     }
 

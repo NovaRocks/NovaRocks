@@ -64,6 +64,7 @@ enum RenderPresentation {
   OPAQUE_NULL = 6;
   MYSQL_CONTAINER = 7;
   TIMESTAMP_CONTAINER_TEXT = 8;
+  TRINO_VALUE = 9;
 }
 message RenderField {
   bool nullable = 1;
@@ -93,11 +94,21 @@ message RenderColumn {
   string name = 3;
   uint32 field_node_id = 4; // One-based index into the schema node table.
 }
+message MysqlTextFamily {}
+message TrinoJsonFamily {
+  bool parametric_datetime = 1;
+  bool variant = 2;
+  bool variant_binary = 3;
+}
 // A tree encoded as a flat table: protobuf depth is independent of semantic
 // nesting. Every node is referenced exactly once; sharing/cycles are refused.
 message ClientRenderSchema {
   repeated RenderColumn columns = 1;
   repeated RenderField field_nodes = 2;
+  oneof family {
+    MysqlTextFamily mysql_text = 3;
+    TrinoJsonFamily trino_json = 4;
+  }
 }
 enum InternalResultDomain {
   INTERNAL_RESULT_DOMAIN_UNSPECIFIED = 0;

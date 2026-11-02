@@ -30,7 +30,7 @@ pub use statement_action::{
     BackgroundActionResultGuard, GovernedStatementAction, GovernedStatementResidual,
     StatementActionAttempt, StatementActionFailure, StatementActionReady, StatementActionReceipt,
     StatementActionValue, StatementActionWaitError, StatementActionWaiter,
-    StatementProgressGeometry,
+    StatementCommandCompletion, StatementProgressGeometry,
 };
 #[doc(hidden)]
 pub use statement_action::{StatementActionSource, StatementProgressSlot};
@@ -48,28 +48,68 @@ use novarocks_workload_control::{
     WorkSuccessSealer,
 };
 
+/// Query-application identity, never reused during this control owner's lifetime.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ClientSessionKey(std::num::NonZeroU64);
+
+impl ClientSessionKey {
+    pub const fn new(value: u64) -> Option<Self> {
+        match std::num::NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct ClientQueryId(pub(crate) Box<str>);
+impl ClientQueryId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl std::borrow::Borrow<str> for ClientQueryId {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+impl std::fmt::Display for ClientQueryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionOrigin {
+    Connection(ClientConnectionToken),
+    ClientStatement(ClientQueryId),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionIdentity {
-    connection: ClientConnectionToken,
+    origin: SessionOrigin,
     principal: Arc<str>,
 }
 
 impl SessionIdentity {
     pub fn new(connection: ClientConnectionToken, principal: impl Into<Arc<str>>) -> Self {
         Self {
-            connection,
+            origin: SessionOrigin::Connection(connection),
             principal: principal.into(),
         }
     }
-
-    pub const fn connection_id(&self) -> u32 {
-        self.connection.connection_id()
+    pub fn client_statement(query: ClientQueryId, principal: impl Into<Arc<str>>) -> Self {
+        Self {
+            origin: SessionOrigin::ClientStatement(query),
+            principal: principal.into(),
+        }
     }
-
-    pub const fn connection_token(&self) -> ClientConnectionToken {
-        self.connection
+    pub fn origin(&self) -> &SessionOrigin {
+        &self.origin
     }
-
     pub fn principal(&self) -> &str {
         &self.principal
     }
@@ -77,24 +117,14 @@ impl SessionIdentity {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SessionToken {
-    connection_id: u32,
-    session_epoch: u64,
+    key: ClientSessionKey,
 }
-
 impl SessionToken {
-    pub const fn new(connection_id: u32, session_epoch: u64) -> Self {
-        Self {
-            connection_id,
-            session_epoch,
-        }
+    pub const fn new(key: ClientSessionKey) -> Self {
+        Self { key }
     }
-
-    pub const fn connection_id(self) -> u32 {
-        self.connection_id
-    }
-
-    pub const fn session_epoch(self) -> u64 {
-        self.session_epoch
+    pub const fn key(self) -> ClientSessionKey {
+        self.key
     }
 }
 
@@ -217,6 +247,7 @@ impl GovernedStatementRegistration {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryControlError {
+    SessionIdentityExhausted,
     ConnectionIdInUse,
     UnknownSession,
     StaleSession,
@@ -317,6 +348,7 @@ impl SessionProcess {
 }
 
 pub trait QueryControlPort: Send + Sync + 'static {
+    fn mint_client_query_id(&self) -> ClientQueryId;
     fn register_session(
         &self,
         identity: SessionIdentity,
@@ -434,6 +466,10 @@ pub struct QueryControlService {
 impl QueryControlService {
     pub fn new(port: Arc<dyn QueryControlPort>) -> Self {
         Self { port }
+    }
+
+    pub fn mint_client_query_id(&self) -> ClientQueryId {
+        self.port.mint_client_query_id()
     }
 
     pub fn register_session(
@@ -1353,6 +1389,9 @@ struct TestQueryControlPort;
 
 #[cfg(test)]
 impl QueryControlPort for TestQueryControlPort {
+    fn mint_client_query_id(&self) -> ClientQueryId {
+        panic!("test control does not mint client queries")
+    }
     fn register_session(
         &self,
         _identity: SessionIdentity,

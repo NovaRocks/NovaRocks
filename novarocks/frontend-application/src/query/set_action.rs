@@ -33,6 +33,7 @@ use novarocks_query_application::session_control::{
     GovernedStatementResidual, GovernedStatementVisibilitySealOutcome, StatementActionValue,
 };
 use novarocks_state_store_api::StateStoreExecutionRequests;
+use novarocks_types::naming::DEFAULT_DATABASE;
 use novarocks_workload_control::WorkError;
 use std::task::{Context, Poll};
 
@@ -579,6 +580,7 @@ struct SetStatementAction {
     cursor: usize,
     live: Arc<Mutex<SessionSqlState>>,
     staged: Option<SessionSqlState>,
+    effects: SessionEffects,
     resolver: SessionCatalogService,
     compiler: FrontendQueryCompiler,
     topology: BackendTopologyService,
@@ -784,11 +786,15 @@ impl SetStatementAction {
                         break;
                     }
                 }
-            } else if let Err(error) =
-                apply_session_assignment_in(&self.resolver, &self.source, assignment, staged)
-            {
-                self.error = Some(error);
-                break;
+            } else {
+                match apply_session_assignment_in(&self.resolver, &self.source, assignment, staged)
+                {
+                    Ok(change) => self.effects.append(change),
+                    Err(error) => {
+                        self.error = Some(error);
+                        break;
+                    }
+                }
             }
             self.cursor += 1;
         }
@@ -820,7 +826,9 @@ impl SetStatementAction {
                     self.staged.as_mut().expect("all assignments staged"),
                 );
                 self.delivered = true;
-                Poll::Ready(Ok(StatementActionValue::Ok))
+                Poll::Ready(Ok(StatementActionValue::SessionChanges(std::mem::take(
+                    &mut self.effects,
+                ))))
             }
             GovernedStatementVisibilitySealOutcome::Cancelled(reason) => {
                 self.error = Some(governed_cancellation_error(reason));
@@ -882,17 +890,32 @@ pub(super) fn apply_session_assignment_in(
     source: &str,
     assignment: &ast::SetAssignment,
     state: &mut SessionSqlState,
-) -> Result<(), QueryServiceError> {
-    match apply_query_application_session_set_assignment(source, assignment, state)? {
-        SessionSetAssignmentOutcome::Applied => Ok(()),
-        SessionSetAssignmentOutcome::SelectCatalog(catalog) => {
+) -> Result<SessionEffects, QueryServiceError> {
+    use novarocks_query_application::sql::session::{
+        SessionAssignment, session_set_assignment_effects,
+    };
+    let effects = match session_set_assignment_effects(source, assignment)? {
+        SessionAssignment::Effects(effects) => effects,
+        SessionAssignment::UserVariable { name, value } => {
+            state.set_user_variable(&name, value).map_err(|detail| {
+                QueryServiceError::new(QueryServiceErrorKind::InvalidValue, detail)
+            })?;
+            return Ok(SessionEffects::default());
+        }
+        SessionAssignment::SelectCatalog(catalog) => {
             let catalog = resolve_catalog_name(resolver, &catalog)?;
             let database_exists =
                 catalog.is_some() || resolver.database_exists(state.current_database())?;
-            state.apply_resolved_catalog(catalog, database_exists);
-            Ok(())
+            let schema = if catalog.is_none() && !database_exists {
+                DEFAULT_DATABASE.to_owned()
+            } else {
+                state.current_database().to_owned()
+            };
+            SessionEffects::set_catalog_assignment(catalog, schema)
         }
-    }
+    };
+    state.apply_effects(&effects)?;
+    Ok(effects)
 }
 
 impl FrontendQuerySession {
@@ -953,6 +976,7 @@ impl FrontendQuerySession {
             cursor: 0,
             live: Arc::clone(&self.state),
             staged: None,
+            effects: SessionEffects::default(),
             resolver: Arc::clone(&self.service.session_catalog_resolver),
             compiler: self.service.query_compiler.clone(),
             topology: self.service.topology.clone(),

@@ -429,3 +429,37 @@ fn real_digest_cast_failure_prevents_a_subsequent_observer_from_replacing_it() {
     assert_eq!(calls, 1);
     assert!(matches!(failure, CoreError::OutputCast(_)));
 }
+
+#[test]
+fn md5_varchar_cast_keeps_arrow_named_timezone_values() {
+    // Independent wall-clock expectations exercise Arrow's IANA timezone
+    // parser and formatter through the original digest input conversion.
+    for (zone, values, expected) in [
+        (
+            "Asia/Shanghai",
+            vec![Some(0), Some(-1), None],
+            [
+                Some("1970-01-01T08:00:00+08:00"),
+                Some("1970-01-01T07:59:59+08:00"),
+                None,
+            ],
+        ),
+        (
+            "America/New_York",
+            vec![Some(1_615_705_199), Some(1_615_705_200), None],
+            [
+                Some("2021-03-14T01:59:59-05:00"),
+                Some("2021-03-14T03:00:00-04:00"),
+                None,
+            ],
+        ),
+    ] {
+        let source: ArrayRef =
+            Arc::new(arrow_array::TimestampSecondArray::from(values).with_timezone(zone));
+        let actual = to_owned_bytes_array_with_varchar_cast(source, "md5sum", 0).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (row, expected) in expected.into_iter().enumerate() {
+            assert_eq!(actual.utf8(row), expected, "{zone} row {row}");
+        }
+    }
+}

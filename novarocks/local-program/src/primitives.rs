@@ -161,6 +161,12 @@ fn arithmetic_creation_failure<H>(
             novarocks_type_contract::owned_resources::hashmap::HashMapResourceError::SourceModel(_) =>
                 ProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
         },
+        Failure::Construction(Construction::BTree(error)) => match error {
+            novarocks_type_contract::owned_resources::btree::BTreeResourceError::Arithmetic(_) =>
+                ProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic),
+            novarocks_type_contract::owned_resources::btree::BTreeResourceError::SourceModel(_) =>
+                ProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
+        },
         Failure::Construction(Construction::ValueType(_) | Construction::Rule(_)) =>
             ProgramPrimitiveError::Arithmetic(novarocks_functions::ArithmeticPrepareError::TypeMismatch).into(),
     }

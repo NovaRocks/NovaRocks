@@ -71,7 +71,10 @@ impl PlannerTableProvider for SourceCatalog {
                 "ja_meta",
                 DataType::List(Arc::new(
                     Field::new("source_item", DataType::Utf8, false).with_metadata(
-                        [("provider".to_string(), "retained-source".to_string())].into(),
+                        std::collections::HashMap::<String, String>::from([(
+                            "provider".to_string(),
+                            "retained-source".to_string(),
+                        )]),
                     ),
                 )),
                 Some(SqlType::Array(Box::new(SqlType::Json))),
@@ -171,7 +174,7 @@ fn actual_field_domain_reaches_lambda_parameter_body_and_bound_result() {
     let expected =
         crate::test_value_types::string_list(item.is_nullable(), true, result.nullable());
     assert_eq!(result, &expected);
-    assert_eq!(item.metadata().capacity(), 0);
+    assert!(item.metadata().as_arc().is_none());
 }
 
 #[test]
@@ -238,7 +241,7 @@ fn empty_array_declares_expected_result_only_to_its_exact_owner() {
     let expected =
         crate::test_value_types::string_list(item.is_nullable(), true, result.nullable());
     assert_eq!(result, &expected);
-    assert_eq!(item.metadata().capacity(), 0);
+    assert!(item.metadata().as_arc().is_none());
     assert_eq!(item.data_type(), &DataType::Utf8);
 }
 
@@ -367,7 +370,7 @@ fn assignment_common_owner_preserves_complete_same_domain_and_null_sources() {
         common,
         crate::test_value_types::string_list(true, true, false)
     );
-    assert_eq!(item.metadata().capacity(), 0);
+    assert!(item.metadata().as_arc().is_none());
 }
 
 #[test]
@@ -899,7 +902,7 @@ fn nested_json_conversion_preserves_source_facts_before_same_domain_cast() {
     };
     assert_eq!(item.name(), "item");
     assert!(!item.is_nullable());
-    assert_eq!(item.metadata().capacity(), 0);
+    assert!(item.metadata().as_arc().is_none());
     assert_eq!(
         expr.value_type,
         crate::test_value_types::string_list(false, false, false),
@@ -926,7 +929,7 @@ fn nested_json_conversion_preserves_source_facts_before_same_domain_cast() {
     };
     assert!(target.is_nullable());
     assert_eq!(target.name(), "item");
-    assert_eq!(target.metadata().capacity(), 0);
+    assert!(target.metadata().as_arc().is_none());
     assert_eq!(
         expression.value_type,
         crate::test_value_types::string_list(true, false, true)

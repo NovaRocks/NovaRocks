@@ -738,7 +738,7 @@ pub fn validate_writer_prefix_schema(fields: &Fields) -> Result<(), ConnectorErr
         if field.name() != name
             || field.data_type() != &ty
             || field.is_nullable() != nullable
-            || field.metadata().capacity() != 0
+            || !field.metadata().is_empty()
         {
             return Err(corrupt(
                 "writer fixed prefix differs from its protocol purpose",
@@ -899,7 +899,7 @@ impl RootColumnShape {
         fn field_matches(field: &Field, name: &str, ty: &DataType) -> bool {
             field.name() == name
                 && !field.is_nullable()
-                && field.metadata().capacity() == 0
+                && field.metadata().is_empty()
                 && field.data_type() == ty
         }
         match (self, actual) {
@@ -910,7 +910,7 @@ impl RootColumnShape {
             (Self::Properties, DataType::Map(entries, false)) => {
                 entries.name() == "entries"
                     && !entries.is_nullable()
-                    && entries.metadata().capacity() == 0
+                    && entries.metadata().is_empty()
                     && matches!(entries.data_type(),DataType::Struct(fields) if fields.len()==2 && field_matches(&fields[0],"key",&DataType::Utf8) && field_matches(&fields[1],"value",&DataType::Utf8))
             }
             _ => false,
@@ -919,8 +919,7 @@ impl RootColumnShape {
 }
 /// Borrow the fixed purposes without creating another expected Arrow schema.
 pub fn validate_root_write_result_schema(actual: &Schema) -> Result<(), ConnectorError> {
-    if actual.metadata().capacity() != 0 || actual.fields().len() != ROOT_WRITE_RESULT_COLUMN_COUNT
-    {
+    if !actual.metadata().is_empty() || actual.fields().len() != ROOT_WRITE_RESULT_COLUMN_COUNT {
         return Err(corrupt(
             "root write result Arrow schema does not match the fixed contract",
         ));
@@ -928,7 +927,7 @@ pub fn validate_root_write_result_schema(actual: &Schema) -> Result<(), Connecto
     for (field, (name, shape, nullable)) in actual.fields().iter().zip(root_column_descriptors()) {
         if field.name() != name
             || field.is_nullable() != nullable
-            || field.metadata().capacity() != 0
+            || !field.metadata().is_empty()
             || !shape.matches(field.data_type())
         {
             return Err(corrupt(
@@ -1956,9 +1955,14 @@ mod borrowed_root_descriptor_tests {
         attrs.insert("opaque".to_owned(), "value".to_owned());
         attrs.clear();
         assert!(attrs.capacity() > 0);
+        let cleared = Schema::new(original.fields().clone()).with_metadata(attrs);
+        assert!(cleared.metadata().as_arc().is_none());
+        validate_root_write_result_schema(&cleared).unwrap();
         assert!(
             validate_root_write_result_schema(
-                &Schema::new(original.fields().clone()).with_metadata(attrs)
+                &Schema::new(original.fields().clone()).with_metadata(
+                    std::collections::HashMap::from([("opaque".to_owned(), "value".to_owned())]),
+                )
             )
             .is_err()
         );

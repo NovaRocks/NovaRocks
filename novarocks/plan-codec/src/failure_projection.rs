@@ -99,7 +99,9 @@ impl FailureProjection for TypeCodecError {
 impl FailureProjection for LogicalTypeCodecError {
     fn failure_fact(&self) -> FailureFact {
         match self {
-            Self::InvalidShape(_) => CodecReason::LogicalShape.fact(FailureClass::Data),
+            Self::InvalidShape(_) | Self::Arrow(_) => {
+                CodecReason::LogicalShape.fact(FailureClass::Data)
+            }
             Self::ResourceSource(_) => {
                 CodecReason::LogicalSourceModel.fact(FailureClass::Invariant)
             }

@@ -98,7 +98,6 @@ fn compile(
         &bytes,
         CompiledTaskOptions {
             pipeline_dop: NonZeroUsize::MIN,
-            exchange_wait: Duration::from_millis(50),
         },
         MemTracker::new_root("native funded compile fixture"),
         &Control,
@@ -555,7 +554,6 @@ fn project_metadata_real_pending_requalifies_one_original_compiler_body() {
                     root_sink_dop: Some(NonZeroUsize::MIN),
                     kernel_abi: KernelAbiVersion::CURRENT,
                     constants: interpreter.constants,
-                    exchange_wait: Duration::from_millis(50),
                 },
                 creation,
                 &mut temporary,
@@ -601,7 +599,6 @@ fn compile_window(
         &window_producer(),
         CompiledTaskOptions {
             pipeline_dop: NonZeroUsize::MIN,
-            exchange_wait: Duration::from_millis(50),
         },
         MemTracker::new_root("native funded compile fixture"),
         &Control,

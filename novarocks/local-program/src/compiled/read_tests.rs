@@ -472,7 +472,10 @@ fn final_read_links_reject_source_schema_and_same_carrier_logical_retagging() {
         LocalProgramCompileError::Provider(ProviderLinkError::TypeMismatch(site))
     );
     let mut meta = schema().metadata().clone();
-    meta.insert("provider.schema".into(), "foreign-generation".into());
+    meta.insert(
+        "provider.schema".to_string(),
+        "foreign-generation".to_string(),
+    );
     let foreign_meta = Schema::new_with_metadata(schema().fields().clone(), meta);
     assert_eq!(
         finish(

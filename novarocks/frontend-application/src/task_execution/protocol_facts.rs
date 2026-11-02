@@ -21,7 +21,6 @@ use super::completion::{WriteCompletionTracker, WriteVerdict};
 use super::error::TaskExecutionError;
 use super::execution::QueryTaskExecution;
 use super::graph::TaskGraph;
-use crate::query_execution::artifact::FragmentId;
 use novarocks_coordination_contract::{AttemptActivationIdentity, SelectedTaskTermination};
 use novarocks_execution_contract::{TaskIdentity, TaskStatus};
 use novarocks_query_application::api::PlanSeal;
@@ -39,32 +38,21 @@ struct FrozenAttemptProtocol {
     tasks: Box<[TaskIdentity]>,
     indices: BTreeMap<TaskId, usize>,
     writers: BTreeSet<TaskIdentity>,
+    summary_sources: BTreeSet<TaskIdentity>,
 }
 impl FrozenAttemptProtocol {
     fn from_graph(
         plan: PlanSeal,
         graph: &TaskGraph,
-        fragments: &BTreeSet<FragmentId>,
+        writers: &BTreeSet<TaskIdentity>,
+        summary_sources: &BTreeSet<TaskIdentity>,
     ) -> Result<Self, TaskExecutionError> {
-        let mut seen = BTreeSet::new();
-        let writers = graph
-            .tasks()
-            .filter(|task| fragments.contains(&task.fragment_id()))
-            .map(|task| {
-                seen.insert(task.fragment_id());
-                task.identity()
-            })
-            .collect();
-        if &seen != fragments {
-            return Err(protocol_error(
-                "frozen writer declaration has no Task in this graph",
-            ));
-        }
         Self::from_tasks(
             plan,
             graph.root_identity(),
             graph.tasks().map(|task| task.identity()).collect(),
-            writers,
+            writers.clone(),
+            summary_sources.clone(),
         )
     }
     fn from_tasks(
@@ -72,6 +60,7 @@ impl FrozenAttemptProtocol {
         root: TaskIdentity,
         tasks: Box<[TaskIdentity]>,
         writers: BTreeSet<TaskIdentity>,
+        summary_sources: BTreeSet<TaskIdentity>,
     ) -> Result<Self, TaskExecutionError> {
         let indices = tasks
             .iter()
@@ -82,12 +71,13 @@ impl FrozenAttemptProtocol {
         if indices.len() != tasks.len()
             || !identities.contains(&root)
             || !writers.is_subset(&identities)
+            || !summary_sources.is_subset(&identities)
             || tasks
                 .iter()
                 .any(|task| task.query_execution_id() != root.query_execution_id())
         {
             return Err(protocol_error(
-                "frozen protocol Tasks or writers do not match one graph",
+                "frozen protocol Tasks, writers, or summary sources do not match one graph",
             ));
         }
         Ok(Self {
@@ -97,6 +87,7 @@ impl FrozenAttemptProtocol {
             tasks,
             indices,
             writers,
+            summary_sources,
         })
     }
     fn index(&self, identity: TaskIdentity) -> Result<usize, TaskExecutionError> {
@@ -268,10 +259,14 @@ impl AttemptProtocolFactsPublisher {
     pub(super) fn for_graph(
         plan: PlanSeal,
         graph: &TaskGraph,
-        fragments: &BTreeSet<FragmentId>,
+        writers: &BTreeSet<TaskIdentity>,
+        summary_sources: &BTreeSet<TaskIdentity>,
     ) -> Result<(Self, AttemptProtocolFactsReceiver), TaskExecutionError> {
         Ok(Self::pair(FrozenAttemptProtocol::from_graph(
-            plan, graph, fragments,
+            plan,
+            graph,
+            writers,
+            summary_sources,
         )?))
     }
     fn pair(frozen: FrozenAttemptProtocol) -> (Self, AttemptProtocolFactsReceiver) {
@@ -566,6 +561,7 @@ impl WriteProtocolTracker {
             tracker: WriteCompletionTracker::try_new(
                 changes.frozen.root,
                 changes.frozen.writers.iter().copied(),
+                changes.frozen.summary_sources.iter().copied(),
             )?,
         };
         tracker.observe(changes)?;
@@ -658,12 +654,19 @@ mod tests {
         .unwrap()
     }
     fn pair(writers: &[u32]) -> (AttemptProtocolFactsPublisher, AttemptProtocolFactsReceiver) {
+        pair_with_summary_sources(writers, &[])
+    }
+    fn pair_with_summary_sources(
+        writers: &[u32],
+        summary_sources: &[u32],
+    ) -> (AttemptProtocolFactsPublisher, AttemptProtocolFactsReceiver) {
         AttemptProtocolFactsPublisher::pair(
             FrozenAttemptProtocol::from_tasks(
                 plan(),
                 identity(1),
                 [identity(1), identity(2), identity(3)].into(),
                 writers.iter().map(|task| identity(*task)).collect(),
+                summary_sources.iter().map(|task| identity(*task)).collect(),
             )
             .unwrap(),
         )
@@ -682,6 +685,93 @@ mod tests {
             .unwrap()
             .unwrap()
     }
+    #[test]
+    fn summary_sources_are_an_independent_frozen_task_obligation() {
+        let (mut publisher, mut receiver) = pair_with_summary_sources(&[2], &[3]);
+        publisher.bind_identity(activation(1)).unwrap();
+        publisher
+            .publish_updates(
+                1,
+                vec![update(1, status(1, 2)), update(2, status(2, 2))],
+                None,
+                false,
+            )
+            .unwrap();
+        let mut tracker = WriteProtocolTracker::from_initial(&take(&mut receiver)).unwrap();
+        assert_eq!(
+            tracker.execution_verdict(),
+            WriteVerdict::TaskNotFinished {
+                task: identity(3),
+                state: TaskState::Planned,
+            }
+        );
+        publisher
+            .publish_updates(2, vec![update(3, running(3, 2))], None, false)
+            .unwrap();
+        publisher
+            .publish_updates(3, vec![update(3, status(3, 3))], None, false)
+            .unwrap();
+        tracker.observe(&take(&mut receiver)).unwrap();
+        assert_eq!(tracker.execution_verdict(), WriteVerdict::Complete);
+    }
+
+    #[test]
+    fn summary_source_membership_does_not_authorize_writer_facts() {
+        let (mut publisher, mut receiver) = pair_with_summary_sources(&[2], &[3]);
+        publisher.bind_identity(activation(1)).unwrap();
+        publisher
+            .publish_updates(
+                1,
+                vec![
+                    update(1, status(1, 2)),
+                    update(2, status(2, 2)),
+                    update(3, running(3, 2).with_writer(TaskWriterFacts::empty())),
+                ],
+                None,
+                false,
+            )
+            .unwrap();
+        publisher
+            .publish_updates(2, vec![update(3, status(3, 3))], None, false)
+            .unwrap();
+        let tracker = WriteProtocolTracker::from_initial(&take(&mut receiver)).unwrap();
+        assert_eq!(
+            tracker.execution_verdict(),
+            WriteVerdict::UndeclaredWriter(identity(3))
+        );
+    }
+
+    #[test]
+    fn frozen_summary_sources_must_belong_to_the_exact_task_graph() {
+        assert!(
+            FrozenAttemptProtocol::from_tasks(
+                plan(),
+                identity(1),
+                [identity(1), identity(2)].into(),
+                [identity(2)].into(),
+                [identity(3)].into(),
+            )
+            .is_err()
+        );
+        let original = identity(2);
+        let foreign = TaskIdentity::new(
+            original.query_execution_id(),
+            original.stage_id(),
+            original.task_id(),
+            BackendProcessId::new_v7(),
+        );
+        assert!(
+            FrozenAttemptProtocol::from_tasks(
+                plan(),
+                identity(1),
+                [identity(1), identity(2)].into(),
+                [identity(2)].into(),
+                [foreign].into(),
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn stale_binding_cannot_rebind_or_consume_the_current_dirty_frontier() {
         let (mut publisher, mut receiver) = pair(&[2]);

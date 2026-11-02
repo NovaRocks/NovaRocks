@@ -257,13 +257,10 @@ fn nested_json_leaf_requires_its_logical_metadata() {
     let make = |metadata: bool| {
         let mut item = Field::new("item", DataType::Utf8, true);
         if metadata {
-            item = item.with_metadata(
-                [(
-                    NR_LOGICAL_TYPE_KEY.to_string(),
-                    LogicalType::Json.metadata_value().to_string(),
-                )]
-                .into(),
-            );
+            item = item.with_metadata(std::collections::HashMap::<String, String>::from([(
+                NR_LOGICAL_TYPE_KEY.to_string(),
+                LogicalType::Json.metadata_value().to_string(),
+            )]));
         }
         let list = ListArray::try_new(
             Arc::new(item),

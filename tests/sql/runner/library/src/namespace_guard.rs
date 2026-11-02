@@ -631,13 +631,10 @@ mod tests {
             .unwrap();
         guard.after(&format!(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest", "uri"="{base}");"#)).unwrap();
         assert!(guard.before("CREATE DATABASE catalog.foreign;").is_err());
-        assert!(
-            guard
-                .after(&format!("CREATE TABLE {namespace}.t (id INT);"))
-                .unwrap_err()
-                .to_string()
-                .contains("outside")
-        );
+        let error = guard
+            .after(&format!("CREATE TABLE {namespace}.t (id INT);"))
+            .unwrap_err();
+        assert!(error.to_string().contains("outside"), "{error:#}");
         assert_eq!(thread.join().unwrap().len(), 1);
     }
     #[test]

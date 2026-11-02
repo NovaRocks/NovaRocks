@@ -88,10 +88,12 @@ fn field() -> Arc<Field> {
     Arc::new(Field::new("original", DataType::Int64, true))
 }
 fn original_source_field() -> Arc<Field> {
-    Arc::new(
-        Field::new("original", DataType::Int64, true)
-            .with_metadata([("field.tag".into(), "unmodified".into())].into()),
-    )
+    Arc::new(Field::new("original", DataType::Int64, true).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            "field.tag".into(),
+            "unmodified".into(),
+        )]),
+    ))
 }
 fn metadata() -> HashMap<String, String> {
     [
@@ -206,7 +208,10 @@ fn schema_metadata_hand_oracle_is_independent_of_complete_field_metadata() {
             77,
             true,
         )
-        .with_metadata([("unknown.field".into(), "雪".into())].into()),
+        .with_metadata(std::collections::HashMap::<String, String>::from([(
+            "unknown.field".into(),
+            "雪".into(),
+        )])),
     );
     let structure = Arc::new(Field::new(
         "nested",
@@ -322,7 +327,14 @@ fn schema_metadata_hand_oracle_is_independent_of_complete_field_metadata() {
             .schema_attributes(),
         &metadata()
     );
-    assert_eq!(schemas.definitions()[0].1.schema().metadata().capacity(), 0);
+    assert!(
+        schemas.definitions()[0]
+            .1
+            .schema()
+            .metadata()
+            .as_arc()
+            .is_none()
+    );
     work.finish().unwrap();
     // The original large Unicode annotation remains a source fact. It is
     // carried through the actual independent codec, never an execution shape.
@@ -581,7 +593,7 @@ fn schema_request_layout_golden_includes_empty_fields_arc_and_persistent_index()
     }
 }
 #[test]
-fn shared_schema_source_union_floor_and_deleted_hash_backing_remain_truthful() {
+fn shared_schema_source_union_floor_and_consumed_empty_staging_remain_truthful() {
     let control = Control::default();
     let original = field();
     let roots = [(0, original.clone())];
@@ -592,7 +604,9 @@ fn shared_schema_source_union_floor_and_deleted_hash_backing_remain_truthful() {
         deleted.insert(id.to_string(), String::new());
     }
     deleted.clear();
-    let schema = Schema::new_with_metadata(vec![original], deleted);
+    assert!(deleted.capacity() >= 4096);
+    let schema = Schema::new_with_metadata(vec![original.clone()], deleted);
+    assert!(schema.metadata().as_arc().is_none());
     let ids = [0];
     let sources = [
         SchemaSource {
@@ -606,8 +620,24 @@ fn shared_schema_source_union_floor_and_deleted_hash_backing_remain_truthful() {
             field_ids: &ids,
         },
     ];
-    ordinary(run_encode(&sources, &types, &control).map(|_| ()));
-    assert!(schema.metadata().is_empty() && schema.metadata().capacity() > 0);
+    let converted = run_encode(&sources, &types, &control).unwrap();
+    let empty = Schema::new(vec![original]);
+    let clean_sources = [
+        SchemaSource {
+            id: 0,
+            source: &empty,
+            field_ids: &ids,
+        },
+        SchemaSource {
+            id: u32::MAX,
+            source: &empty,
+            field_ids: &ids,
+        },
+    ];
+    let canonical = run_encode(&clean_sources, &types, &control).unwrap();
+    assert_eq!(converted.as_wire(), canonical.as_wire());
+    assert_eq!(converted.facts(), canonical.facts());
+    assert!(schema.metadata().as_arc().is_none());
     let mut input = vec![wire::SchemaDefinition {
         id: 0,
         field_ids: vec![0],
@@ -893,7 +923,14 @@ fn observed_schema_composition_keeps_original_loans_and_one_caller_scope() {
     let decoded = observed_decode(encoded.as_wire(), &read, &control, &mut |_| Ok(())).unwrap();
     assert_eq!(decoded.facts(), original_decoded.facts());
     assert_eq!(decoded.definitions()[0].0, u32::MAX);
-    assert_eq!(decoded.definitions()[0].1.schema().metadata().capacity(), 0);
+    assert!(
+        decoded.definitions()[0]
+            .1
+            .schema()
+            .metadata()
+            .as_arc()
+            .is_none()
+    );
     assert!(Arc::ptr_eq(
         &decoded.definitions()[0].1.schema().fields()[0],
         read.field(u32::MAX).unwrap()

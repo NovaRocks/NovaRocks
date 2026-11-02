@@ -74,6 +74,7 @@ pub(super) async fn prepare_read(
         let topology =
             wait_for_initial_query_topology(&input.topology, &input.cancellation, input.deadline)
                 .await?;
+        let presentation = *input.state.presentation();
         let (catalog, database, execution, mut optimizer, semantics) =
             input.state.into_query_attempt_inputs();
         let semantics = novarocks_sql::sql_mode::statement_sql_semantics(&semantics, &parsed)
@@ -100,6 +101,7 @@ pub(super) async fn prepare_read(
             input.cancellation,
             optimizer,
             semantics,
+            presentation,
         ))
         .with_result_capacity(capacity)
         .map_err(|e| internal_error(e.to_string()))?;
@@ -122,7 +124,7 @@ pub(super) async fn prepare_read(
         .observation
         .as_ref()
         .and_then(|h| h.statement_target())
-        .map(|(run, nominated)| {
+        .map(|(run, nominated, _connection_id)| {
             crate::mv::test_controls::MvRewriteStatementTarget::new(
                 input.statement_token,
                 nominated,
@@ -505,6 +507,7 @@ impl GovernedStatementResidual for ReadNativeTail {
     }
 }
 struct ReadStatementAction {
+    family: novarocks_result_contract::ClientPresentationFamily,
     planning_cpu: Arc<FrontendPlanningCpuSource>,
     preparation_health: Option<StatementNativeHealthFailure>,
     provider: Arc<FrontendCompletionCustody>,
@@ -596,6 +599,7 @@ impl ReadStatementAction {
                                 match LocalResultProducer::try_new(
                                     owner.scope(),
                                     owner.result_window_alias().expect("admitted local window"),
+                                    self.family,
                                 )
                                 .and_then(|p| p.produce(|| Ok(result)))
                                 {
@@ -880,6 +884,7 @@ impl FrontendQuerySession {
             .statement_observation
             .as_ref()
             .and_then(|o| o.bound_statement(statement.token()));
+        let family = *state.presentation();
         let input = ReadPreparationInput {
             compiler: self.service.query_compiler.clone(),
             topology: self.service.topology.clone(),
@@ -910,6 +915,7 @@ impl FrontendQuerySession {
             Arc::clone(&planning_cpu),
         )) as ProviderClose);
         let action = ReadStatementAction {
+            family,
             planning_cpu,
             preparation_health: None,
             provider,

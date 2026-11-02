@@ -259,36 +259,103 @@ pub fn observe(child: &Child) -> io::Result<Option<(i32, i32)>> {
     Ok(Some((info.code, info.status)))
 }
 
-pub fn signal_group(child: &Child, signal: i32) -> io::Result<()> {
+enum SignalChildObservation {
+    NotRequested,
+    NotExited,
+    Exited { code: i32, status: i32 },
+    Failed { errno: Option<i32> },
+}
+
+struct GroupSignalObservation {
+    raw_group_errno: Option<i32>,
+    child: SignalChildObservation,
+}
+
+impl GroupSignalObservation {
+    fn diagnostic(&self) -> String {
+        let child = match &self.child {
+            SignalChildObservation::NotRequested => "not_requested".to_owned(),
+            SignalChildObservation::NotExited => "not_exited".to_owned(),
+            SignalChildObservation::Exited { code, status } => {
+                format!("exited(code={code},status={status})")
+            }
+            SignalChildObservation::Failed { errno } => format!("failed(errno={errno:?})"),
+        };
+        format!(
+            "raw_group_errno={:?}; pinned_child_observation={child}; child_observation_order=after_group_refusal_before_fallback; group_exit_observation=later_Final",
+            self.raw_group_errno
+        )
+    }
+}
+
+fn refused_group_signal(
+    child: &Child,
+    cause: io::Error,
+    observation: &mut Option<GroupSignalObservation>,
+) -> io::Result<()> {
+    let facts = observation.insert(GroupSignalObservation {
+        raw_group_errno: cause.raw_os_error(),
+        child: SignalChildObservation::NotRequested,
+    });
+    if cause.raw_os_error() == Some(3) {
+        return Ok(());
+    }
+    // Preserve the existing Darwin EPERM decision and its one original
+    // unreaped-Child observation. Diagnostics never observe the child again.
+    if cause.raw_os_error() == Some(1) {
+        match observe(child) {
+            Ok(Some((code, status))) => {
+                facts.child = SignalChildObservation::Exited { code, status };
+                return Ok(());
+            }
+            Ok(None) => facts.child = SignalChildObservation::NotExited,
+            Err(error) => {
+                facts.child = SignalChildObservation::Failed {
+                    errno: error.raw_os_error(),
+                };
+                return Err(error);
+            }
+        }
+    }
+    Err(cause)
+}
+
+fn signal_group(
+    child: &Child,
+    signal: i32,
+    observation: &mut Option<GroupSignalObservation>,
+) -> io::Result<()> {
     let pid = i32::try_from(child.id()).map_err(error)?;
     // SAFETY: caller still owns unreaped group leader; never called after wait.
     if unsafe { kill(-pid, signal) } == 0 {
         return Ok(());
     }
-    let cause = io::Error::last_os_error();
-    if cause.raw_os_error() == Some(3) {
-        return Ok(());
-    }
-    // Darwin refuses signals to a group containing only the exited leader.
-    if cause.raw_os_error() == Some(1) && observe(child)?.is_some() {
-        return Ok(());
-    }
-    Err(cause)
+    refused_group_signal(child, io::Error::last_os_error(), observation)
 }
 
-pub fn signal_or_kill_original(child: &mut Child, signal: i32, failures: &mut Vec<String>) {
-    signal_or_kill_with(child, signal, failures, signal_group);
+pub fn signal_or_kill_original(
+    child: &mut Child,
+    signal: i32,
+    failures: &mut Vec<String>,
+    stage: &str,
+) {
+    signal_or_kill_with(child, signal, failures, stage, signal_group);
 }
 
 fn signal_or_kill_with(
     child: &mut Child,
     signal: i32,
     failures: &mut Vec<String>,
-    group: impl FnOnce(&Child, i32) -> io::Result<()>,
+    stage: &str,
+    group: impl FnOnce(&Child, i32, &mut Option<GroupSignalObservation>) -> io::Result<()>,
 ) {
-    if let Err(error) = group(child, signal) {
+    let mut observation = None;
+    if let Err(error) = group(child, signal, &mut observation) {
+        let context = observation.as_ref().map(GroupSignalObservation::diagnostic);
+        // Keep the original refusal and fallback order. This is context in
+        // the existing Final.errors string, not a new monitor protocol event.
         failures.push(format!(
-            "original process group refused signal {signal}: {error}"
+            "original process group refused signal {signal}: {error}; signal_stage={stage}; signal_observation={context:?}"
         ));
         // A failure to signal the group cannot waive the independently owned
         // direct Child obligation, or be turned into cleanup success.
@@ -500,13 +567,21 @@ mod tests {
             .spawn()
             .unwrap();
         let mut failures = vec![];
-        signal_or_kill_with(&mut child, TERM, &mut failures, |_, _| {
-            Err(io::Error::from_raw_os_error(1))
-        });
+        let raw_refusal = io::Error::from_raw_os_error(1).to_string();
+        signal_or_kill_with(
+            &mut child,
+            TERM,
+            &mut failures,
+            "test_group_refusal",
+            |_, _, _| Err(io::Error::from_raw_os_error(1)),
+        );
         let status = child.wait().unwrap();
         assert_eq!(status.signal(), Some(KILL));
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("refused signal"));
+        assert!(failures[0].contains(&raw_refusal));
+        assert!(failures[0].contains("signal_stage=test_group_refusal"));
+        assert!(failures[0].contains("signal_observation=None"));
     }
 
     #[test]

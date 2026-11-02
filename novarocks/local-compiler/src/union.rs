@@ -267,6 +267,11 @@ fn output_layout_with_creation<H>(
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<StaticLayout, crate::FragmentCreationError<H>> {
+    if let Some(layout) =
+        crate::writer::finish_input_layout_with_creation(package, node, slots, work, creation)?
+    {
+        return Ok(layout);
+    }
     let mut result_names = package
         .result()
         .filter(|result| result.output.columns.len() == node.output.columns.len());

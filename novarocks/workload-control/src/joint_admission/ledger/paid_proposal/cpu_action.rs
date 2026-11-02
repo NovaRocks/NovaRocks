@@ -242,7 +242,7 @@ impl WorkloadControl {
         descriptor: InternalResultClosedFactoryDescriptor,
     ) -> Result<InternalCpuFactoryBinding, WorkError> {
         let mut state = self.inner.state.lock().unwrap();
-        if state.ready || state.closed || state.internal_cpu_factory.is_some() {
+        if state.ready || state.root_admission_is_closed() || state.internal_cpu_factory.is_some() {
             return Err(WorkError::Conflict);
         }
         if descriptor.pool.strong_count() == 0 {

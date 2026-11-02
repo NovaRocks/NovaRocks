@@ -63,7 +63,7 @@ fn field(ty: &FunctionValueType) -> Arc<Field> {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .chain([("provider.annotation".to_owned(), "authored".to_owned())])
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
         ),
     )
 }

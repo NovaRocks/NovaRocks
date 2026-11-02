@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Arrow 58.4 locked-operation logical observations. Private Bytes owners,
+//! Arrow 60.1.0 locked-operation logical observations. Private Bytes owners,
 //! ArrayData reconstruction and validation scratch are explicitly upper bounds,
 //! never exact Layout invoices or retained foreign backing estimates.
 //! Source anchors: arrow-select/take.rs::{take_bytes,take_nulls};
@@ -203,9 +203,24 @@ fn type_bound<E: From<ArrayProjectionFailure>>(
     work: &mut Work<'_, E>,
 ) -> Result<(), E> {
     work(1)?;
+    if let DataType::Union(fields, _) = ty {
+        // Arrow60.1 FromIterator unzips two Vecs before try_new's pair Vec.
+        // Reuse the common source author, preserving the actual constructor
+        // and distinguishing its opaque growth from the final public Arc.
+        work(mul(fields.len(), 3)?)?;
+        let requests =
+            novarocks_type_contract::owned_resources::arrow_union::from_iterator_requests(
+                fields.len(),
+            )
+            .map_err(|source| E::from(ArrayProjectionFailure::UnionFields(source)))?;
+        return opaque(ArrayProjectionOpaqueBound {
+            requests_upper: add(requests.scratch_requests_upper, 1)?,
+            bytes_upper: add(requests.scratch_bytes_upper, requests.final_arc.size())?,
+            work_upper: mul(fields.len(), 3)?,
+        });
+    }
     let (elements, width, extra) = match ty {
         DataType::Struct(fields) => (fields.len(), std::mem::size_of::<FieldRef>(), 1),
-        DataType::Union(fields, _) => (fields.len(), std::mem::size_of::<(i8, FieldRef)>(), 4),
         DataType::Dictionary(_, _) => (2, std::mem::size_of::<DataType>(), 0),
         _ => (0, 0, 0),
     };
@@ -421,10 +436,41 @@ fn metadata_fallback<E: From<ArrayProjectionFailure>>(
             ARROW_BUFFER_OWNER_METADATA_BOUND,
         )?,
     )?;
+    // Arrow60.1 validate_values now constructs a fixed 128-slot child-length
+    // lookup for a Union root. The fallback's existing bounded constructor
+    // repetitions conservatively cover that actual validation scratch too;
+    // this is separate from ArrayData/wrapper metadata and bitmap scratch.
+    let union_validation = if matches!(target, DataType::Union(..)) {
+        mul(
+            repeats,
+            Layout::array::<Option<usize>>(128)
+                .map_err(|source| ArrayProjectionFailure::ArrayLayout {
+                    count: 128,
+                    width: std::mem::size_of::<Option<usize>>(),
+                    source,
+                })?
+                .size(),
+        )?
+    } else {
+        0
+    };
     opaque(ArrayProjectionOpaqueBound {
-        requests_upper: mul(repeats, 12)?,
-        bytes_upper: add(mul(repeats, node_bytes)?, null_scratch)?,
-        work_upper: add(repeats, mul(nodes, span)?)?,
+        requests_upper: add(
+            mul(repeats, 12)?,
+            if union_validation != 0 { repeats } else { 0 },
+        )?,
+        bytes_upper: add(
+            add(mul(repeats, node_bytes)?, null_scratch)?,
+            union_validation,
+        )?,
+        work_upper: add(
+            add(repeats, mul(nodes, span)?)?,
+            if union_validation != 0 {
+                mul(repeats, 128)?
+            } else {
+                0
+            },
+        )?,
     })
 }
 

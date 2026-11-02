@@ -5,6 +5,7 @@ domain: runtime-filter
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0209]
 date: 2026-08-02
 provenance:
   - "discussion: 2026-08-02 SQL runtime-filter planning ownership"

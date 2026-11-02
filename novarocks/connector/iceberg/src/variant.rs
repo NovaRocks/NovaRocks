@@ -67,10 +67,10 @@ pub fn collapse_variant_struct_to_largebinary(
         })?;
         unshredded_holder = unshred_variant(&variant)
             .map_err(|error| format!("variant column `{column_name}`: unshred failed: {error}"))?;
-        let value = unshredded_holder.value_field().ok_or_else(|| {
-            format!("variant column `{column_name}`: unshred produced no value column")
-        })?;
-        (unshredded_holder.metadata_field().clone(), value.clone())
+        (
+            unshredded_holder.metadata_column().clone(),
+            unshredded_holder.value_column().clone(),
+        )
     } else {
         let mut metadata_index = None;
         let mut value_index = None;

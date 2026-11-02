@@ -302,3 +302,47 @@ fn text_time_frozen_target_contract_precedes_any_observer() {
         "CAST failed: TIME target must be Time64(Microsecond), got Time64(Nanosecond)"
     );
 }
+
+#[test]
+fn raw_time_text_keeps_distinct_carrier_whitespace_and_numeric_grammar() {
+    use arrow_array::{Array, Time64MicrosecondArray};
+    let raw = vec![
+        Some(" 01:02:03 "),
+        Some("01:02:03"),
+        Some("123"),
+        Some(" 123 "),
+        None,
+    ];
+    for source in [
+        Arc::new(LargeStringArray::from(raw.clone())) as ArrayRef,
+        Arc::new(StringViewArray::from(raw.clone())) as ArrayRef,
+    ] {
+        let output = crate::time_text_cast::evaluate_arrays(
+            &source,
+            &DataType::Time64(TimeUnit::Microsecond),
+            crate::time_text_cast::TimeTextParseMode::Duration,
+        )
+        .unwrap();
+        assert_eq!(
+            output
+                .as_any()
+                .downcast_ref::<Time64MicrosecondArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![None, Some(3_723_000_000), Some(123), None, None]
+        );
+        let prepared = recipe(source.data_type().clone(), true);
+        assert_eq!(
+            prepared
+                .evaluate_row(
+                    EvaluatedArgument::Column(&source),
+                    9,
+                    0,
+                    &Control::default()
+                )
+                .unwrap(),
+            CastRowResult::Null
+        );
+    }
+}

@@ -913,12 +913,7 @@ impl Body {
         };
         self.keyed = Some(intent);
         self.documents = Some(documents);
-        let host = self
-            .input
-            .ports
-            .typed_connector_control()
-            .map_err(invalid)?
-            .clone();
+        let host = self.input.ports.typed_connector_control().clone();
         if let Err(error) = self
             .empty
             .seal(
@@ -1622,25 +1617,18 @@ mod original_stage_tests {
         let (property, persistence) = prepare_mv_create_properties(&shape, &control).unwrap();
         let object_id =
             ConnectorTableObjectId::try_new(Bytes::from_static(b"orders-object")).unwrap();
-        let observation = crate::mv::domain::storage_observation::schema_validation_from_spi(
-            MvSchemaValidationObservation::try_new(
+        let observation = crate::mv::domain::storage_observation::source_schema_from_spi(
+            novarocks_spi::connector::MvSourceSchemaObservation::try_new(
                 ConnectorTableIdentity {
                     instance_id: ConnectorInstanceId::parse("iceberg").unwrap(),
                     namespace: Arc::from("db"),
                     table: Arc::from("orders"),
                 },
                 object_id,
-                ConnectorCommittedVersion::try_new(
-                    Bytes::from_static(b"orders-metadata"),
-                    Some(11),
-                )
-                .unwrap(),
                 Bytes::from_static(b"schema-1"),
-                Bytes::from_static(b"spec-0"),
                 true,
                 true,
-                vec![(
-                    0,
+                vec![
                     MvObservedSourceField::try_new(
                         Bytes::from_static(b"id-1"),
                         "id".into(),
@@ -1648,8 +1636,7 @@ mod original_stage_tests {
                         true,
                     )
                     .unwrap(),
-                )],
-                Vec::new(),
+                ],
                 context,
             )
             .unwrap(),
@@ -1784,16 +1771,18 @@ mod original_stage_tests {
                 tokio::runtime::Handle::current(),
                 entrance.clone(),
             ));
-            let ports = IcebergMvCorePorts::new(
+            let host = Arc::new(novarocks_catalog_application::ConnectorControlHost::new());
+            let ports = IcebergMvCorePorts::new_with_management_entrance(
                 Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
                 None,
-                Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
+                host.clone(),
+                host,
                 readiness,
                 Arc::new(UnavailableMvStorageObservationPort),
+                entrance.clone(),
                 crate::application::test_constant_policy(),
-            )
-            .with_management_entrance(entrance.clone());
+            );
             let wake = Arc::new(Wake::default());
             let cancellation = QueryCancellationView::governed(scope.cancellation().unwrap(), None);
             let requests = Arc::new(NoRepositoryIo);

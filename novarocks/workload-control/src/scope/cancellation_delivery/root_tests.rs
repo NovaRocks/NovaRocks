@@ -68,7 +68,7 @@ async fn batch_decisions_and_counts_precede_cross_root_reentrant_callbacks() {
         Ok(WorkSuccessSealOutcome::Sealed)
     );
     let original = CancellationReason::ExplicitKill {
-        requester_connection_id: 31,
+        requester_session: 31,
     };
     existing.owner.cancel(original.clone());
     let first_view = first.owner.scope().cancellation().unwrap();

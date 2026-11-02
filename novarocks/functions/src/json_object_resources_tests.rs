@@ -94,7 +94,7 @@ fn json_object_resources_type_debug_covers_every_variant_and_hidden_field_facts(
         LargeListView(field.clone()),
         Struct(vec![field.clone(), field.clone()].into()),
         Union(
-            UnionFields::new([1, 127], [field.clone(), field.clone()]),
+            UnionFields::try_new([1, 127], [field.clone(), field.clone()]).unwrap(),
             UnionMode::Sparse,
         ),
         Dictionary(Box::new(UInt64), Box::new(LargeListView(field.clone()))),

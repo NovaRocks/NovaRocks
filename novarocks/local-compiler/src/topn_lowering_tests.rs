@@ -377,8 +377,12 @@ fn topn_transparent_tail_preserves_original_ordering_and_passthrough_result_chan
 fn topn_duplicate_passthrough_occurrences_keep_independent_slots_and_nested_field_metadata() {
     let scalar = integer_pool();
     let field = Arc::new(
-        Field::new("nested-original", DataType::Utf8, true)
-            .with_metadata([("provider.annotation".into(), "source-text".into())].into()),
+        Field::new("nested-original", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider.annotation".into(),
+                "source-text".into(),
+            )]),
+        ),
     );
     let nested: ArrayRef = Arc::new(StructArray::new(
         vec![field].into(),
@@ -908,7 +912,6 @@ mod scan_split {
         collections::BTreeMap,
         num::{NonZeroU64, NonZeroUsize},
         sync::Arc,
-        time::Duration,
     };
 
     const PRODUCER: FragmentId = FragmentId::new(1);
@@ -1330,7 +1333,6 @@ mod scan_split {
                 pipeline_dop: NonZeroUsize::new(1).unwrap(),
                 root_sink_dop: root_sink_dop.map(|dop| NonZeroUsize::new(dop).unwrap()),
                 kernel_abi: KernelAbiVersion::CURRENT,
-                exchange_wait: Duration::from_millis(1_000),
                 constants: super::policy(),
             },
             &Good,

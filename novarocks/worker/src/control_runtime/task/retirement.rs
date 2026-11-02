@@ -85,6 +85,19 @@ impl TaskHostRecord {
                 None
             }
         };
+        // A genuine strict-input cancellation withdraws rather than claims
+        // consumption, even if another input already drained. Its original
+        // conclusion remains Canceled while its receiver uses abort cleanup.
+        let strict_canceled = self.resources.port.current().state()
+            == novarocks_execution_contract::TaskState::Canceled
+            && owner.as_ref().is_some_and(|owner| {
+                owner.state.lock().expect("original retirement descriptor")
+                    .descriptor.as_ref().is_some_and(|descriptor| {
+                        descriptor.topology().inbound().iter().any(|input| {
+                            input.delivery() == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+                        })
+                    })
+            });
         let exited = TaskExecutionBorrowersExited { owner: self };
         let call = self.host_call(TaskHostCallKind::RetireBorrowing).clone();
         let job = call
@@ -100,7 +113,7 @@ impl TaskHostRecord {
                     WorkerAction::Context(ContextEffect::FinalizeTaskExecution {
                         normally_stopped: true,
                         ..
-                    }) => crate::TaskIngressRetirement::PreserveNormalClose,
+                    }) if !strict_canceled => crate::TaskIngressRetirement::PreserveNormalClose,
                     _ => crate::TaskIngressRetirement::Remove,
                 },
                 pending: self.pending.clone(),

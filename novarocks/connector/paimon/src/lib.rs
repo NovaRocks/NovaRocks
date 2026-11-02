@@ -15,30 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Read-only Apache Paimon connector.
+//! Suspended Apache Paimon connector with preserved configuration and wire contracts.
 
 pub const PROVIDER_ID: &str = "paimon";
 
-/// Read the fixed catalog-generation listing admission limit.
-/// This is an observation of the original owner, not a configurable allowance.
-pub const fn frozen_catalog_listing_concurrency() -> usize {
-    crate::catalog::listing_admission::LISTING_CONCURRENCY
-}
-
-pub mod catalog;
 pub mod definition;
 pub mod domain;
-pub mod io;
-pub mod metadata;
 pub mod options;
-pub mod page_source;
-pub mod reader;
 pub mod resources;
 pub mod role_binding;
 pub mod schema;
-pub mod sdk_control;
-pub mod split_source;
 pub mod wire;
-
-/// Pure geometry of the original FE read factory and its SDK scan program.
-pub use role_binding::read_io_geometry;

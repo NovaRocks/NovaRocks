@@ -438,6 +438,7 @@ pub trait StatisticsApplicationPort: Send + Sync {
         _command: StatisticsApplicationCommand,
         _execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
         _context: &novarocks_spi::connector::ConnectorRequestContext,
+        _family: novarocks_result_contract::ClientPresentationFamily,
     ) -> Result<
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         StatisticsApplicationError,

@@ -47,6 +47,7 @@ struct DirectInput {
     product: Arc<TableMaintenanceProduct>,
 }
 struct DirectRewriteAction {
+    family: novarocks_result_contract::ClientPresentationFamily,
     starting: Option<Starting>,
     input: Option<Arc<DirectInput>>,
     state: Option<RewriteActionState>,
@@ -89,6 +90,7 @@ pub(crate) fn prepare(
     context: MaintenanceRequestContext<'_>,
     execution: &QueryExecutionContext,
     connector: &ConnectorRequestContext,
+    family: novarocks_result_contract::ClientPresentationFamily,
     #[cfg(novarocks_dev_controls)] observation: Option<
         crate::preparation_diagnostics::StatementObservationHandle,
     >,
@@ -138,6 +140,7 @@ pub(crate) fn prepare(
         .map_err(TerminalError::pre_dispatch_failed)?
         .product;
     Ok(Box::new(DirectRewriteAction {
+        family,
         starting: Some(Starting {
             engine,
             target,
@@ -239,7 +242,7 @@ impl DirectRewriteAction {
                     computation_service_error(TerminalError::from_original_cause(e))
                 })?;
             self.local = Some(
-                LocalResultProducer::try_new(owner.scope(), grant.retain_alias())
+                LocalResultProducer::try_new(owner.scope(), grant.retain_alias(), self.family)
                     .map_err(service)?,
             );
             drop(grant);
@@ -394,6 +397,7 @@ impl GovernedStatementAction for DirectRewriteAction {
             ));
         }
         let original = Self {
+            family: self.family,
             starting: self.starting.take(),
             input: self.input.take(),
             state: self.state.take(),
@@ -483,7 +487,12 @@ mod tests {
             ResultWindowClass::Internal
         );
         assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
-        let producer = LocalResultProducer::try_new(&scope, local.retain_alias()).unwrap();
+        let producer = LocalResultProducer::try_new(
+            &scope,
+            local.retain_alias(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+        )
+        .unwrap();
         let result = produce_local(
             producer,
             MaintenanceActionOutcome::RewriteDataFiles {

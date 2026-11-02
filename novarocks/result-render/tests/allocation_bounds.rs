@@ -24,7 +24,7 @@ use novarocks_result_contract::{
     ClientRenderSchema, NativeRenderType as N, RenderColumn, RenderField, RenderPresentation as P,
     RenderTimeUnit as U, RootProfileV1 as V,
 };
-use novarocks_result_render::{ArrowMysqlTextEncoder, BoundedMysqlTextEncoder, RenderTurnStatus};
+use novarocks_result_render::{ArrowMysqlTextEncoder, BoundedClientRowEncoder, RenderTurnStatus};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
@@ -98,6 +98,7 @@ fn prepare(array: ArrayRef, render: RenderField) -> (Arc<ClientRenderSchema>, Re
     .unwrap();
     let schema = Arc::new(
         ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: None,
@@ -301,4 +302,80 @@ fn maximum_native_depth_keeps_fixed_capacity() {
     }
     let (schema, batch) = prepare(array, render);
     probe(schema, batch);
+}
+
+#[test]
+fn trino_large_strings_temporal_and_variant_turns_allocate_nothing() {
+    use novarocks_result_contract::{ClientPresentationFamily, TrinoJsonFacts};
+    use novarocks_result_render::ClientRowEncoder;
+    let text = "\n中文\"".repeat(100_000);
+    let mut variant = vec![16 << 2];
+    let raw = text.as_bytes();
+    variant.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+    variant.extend_from_slice(raw);
+    let mut variant_bytes = ((3 + variant.len()) as u32).to_le_bytes().to_vec();
+    variant_bytes.extend_from_slice(&[1, 0, 0]);
+    variant_bytes.extend_from_slice(&variant);
+    let inputs: Vec<(ArrayRef, N)> = vec![
+        (Arc::new(StringArray::from(vec![text.as_str()])), N::String),
+        (
+            Arc::new(
+                TimestampNanosecondArray::from(vec![-123_456_789]).with_timezone("Asia/Shanghai"),
+            ),
+            N::Timestamp {
+                unit: U::Nanosecond,
+                timezone: Some("Asia/Shanghai".into()),
+            },
+        ),
+        (
+            Arc::new(LargeBinaryArray::from(vec![variant_bytes.as_slice()])),
+            N::Variant,
+        ),
+    ];
+    for (array, native) in inputs {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "v",
+                array.data_type().clone(),
+                true,
+            )])),
+            vec![array],
+        )
+        .unwrap();
+        let schema = Arc::new(
+            ClientRenderSchema::try_new(
+                ClientPresentationFamily::TrinoJson(TrinoJsonFacts::default()),
+                vec![RenderColumn {
+                    source_ordinal: 0,
+                    source_slot: None,
+                    name: "v".into(),
+                    field: f(native, P::TrinoValue),
+                }],
+                1,
+            )
+            .unwrap(),
+        );
+        let mut output = vec![0; V::SEGMENT_BYTES];
+        start();
+        let cursor = ClientRowEncoder::try_new(schema, batch);
+        let (allocated, calls, _) = stop();
+        let mut cursor = cursor.unwrap();
+        let capacity = cursor.scratch_capacity_bytes();
+        assert_eq!(calls, 3);
+        assert!(allocated <= capacity);
+        assert!(capacity < 2 * 1024 * 1024);
+        loop {
+            start();
+            let turn = cursor.step(&mut output);
+            let (allocated, calls, _) = stop();
+            assert_eq!((allocated, calls), (0, 0));
+            let turn = turn.unwrap();
+            assert!(turn.emitted_bytes + turn.examined_bytes <= V::EMIT_BYTES_PER_TURN);
+            assert!(turn.visited_cells <= V::CELLS_PER_TURN);
+            assert_eq!(cursor.scratch_capacity_bytes(), capacity);
+            if turn.status == RenderTurnStatus::InputComplete {
+                break;
+            }
+        }
+    }
 }

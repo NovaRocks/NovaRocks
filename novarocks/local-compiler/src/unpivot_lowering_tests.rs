@@ -112,7 +112,6 @@ fn options() -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        exchange_wait: std::time::Duration::from_secs(120),
         constants: ConstantPolicy {
             max_rows: 16,
             max_array_nodes: 128,
@@ -372,10 +371,12 @@ fn fixture(
             Some(vec![Some(2), None]),
             None,
         ]);
-        let field = Arc::new(
-            Field::new("item", DataType::Int32, true)
-                .with_metadata([("original-child".to_owned(), "preserved".to_owned())].into()),
-        );
+        let field = Arc::new(Field::new("item", DataType::Int32, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "original-child".to_owned(),
+                "preserved".to_owned(),
+            )]),
+        ));
         let array = ListArray::try_new(
             field.clone(),
             array.offsets().clone(),

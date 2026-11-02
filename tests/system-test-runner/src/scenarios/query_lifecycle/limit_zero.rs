@@ -257,21 +257,17 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
         drop(restore);
         Ok(execution)
     })();
-    // Disable future holds before releasing the observed requests. Listener
-    // drop also releases pending connections and unlinks the socket, so a
-    // late hook cannot remain parked while the bounded client is joined.
-    let cleared = context.handle().clear_query_lifecycle_faults();
-    let mut released = Ok(());
-    for create in &mut held {
-        released =
-            crate::scenarios::paimon::scan_statement_actor::combine(released, create.release());
-    }
+    // Keep observed peers alive until their release bytes are written. Ending
+    // the action lets those peers close their sockets without reading a release.
+    let released_and_cleared = release_observed_then_clear(&mut held, || {
+        context.handle().clear_query_lifecycle_faults()
+    });
+    // The grant is now retired. Listener drop releases pending connections and
+    // unlinks the socket before joining the bounded client.
     drop(listener);
     let joined = query.join();
-    let cleanup = crate::scenarios::paimon::scan_statement_actor::combine(
-        crate::scenarios::paimon::scan_statement_actor::combine(cleared, released),
-        joined,
-    );
+    let cleanup =
+        crate::scenarios::paimon::scan_statement_actor::combine(released_and_cleared, joined);
     let execution = crate::scenarios::paimon::scan_statement_actor::combine(result, cleanup)?;
     // The public answer above is the seal witness. Full background cleanup
     // evidence is read only after restoring transport and releasing every
@@ -288,6 +284,18 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
     );
     await_resource_convergence(context, &baseline)?;
     Ok(())
+}
+
+fn release_observed_then_clear(
+    held: &mut [HeldCreate],
+    clear: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let mut released = Ok(());
+    for create in held {
+        released =
+            crate::scenarios::paimon::scan_statement_actor::combine(released, create.release());
+    }
+    crate::scenarios::paimon::scan_statement_actor::combine(released, clear())
 }
 
 struct QueryRead(Option<thread::JoinHandle<Result<()>>>);

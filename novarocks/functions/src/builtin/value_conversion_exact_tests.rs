@@ -352,11 +352,10 @@ fn json_pair(fields: usize) -> (FunctionValueType, FunctionValueType) {
         .map(|index| {
             Arc::new(
                 Field::new(format!("c{index}"), DataType::Utf8, true).with_metadata(
-                    [
+                    std::collections::HashMap::<String, String>::from([
                         (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
                         ("provider-id".to_owned(), "retained".to_owned()),
-                    ]
-                    .into(),
+                    ]),
                 ),
             )
         })
@@ -364,8 +363,12 @@ fn json_pair(fields: usize) -> (FunctionValueType, FunctionValueType) {
     let target = (0..fields)
         .map(|index| {
             Arc::new(
-                Field::new(format!("c{index}"), DataType::Utf8, true)
-                    .with_metadata([("provider-id".to_owned(), "retained".to_owned())].into()),
+                Field::new(format!("c{index}"), DataType::Utf8, true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider-id".to_owned(),
+                        "retained".to_owned(),
+                    )]),
+                ),
             )
         })
         .collect::<Vec<_>>();
@@ -384,21 +387,22 @@ fn exact_conversion_json_preserves_nested_annotations_and_field_identity() {
     let DataType::Struct(fields) = target.data_type() else {
         unreachable!()
     };
-    let decorated = physical(
-        DataType::Struct(
-            vec![
-                Arc::new(
-                    fields[0]
-                        .as_ref()
-                        .clone()
-                        .with_metadata([("provider-id".to_owned(), "changed".to_owned())].into()),
-                ),
-                fields[1].clone(),
-            ]
-            .into(),
-        ),
-        true,
-    );
+    let decorated =
+        physical(
+            DataType::Struct(
+                vec![
+                    Arc::new(fields[0].as_ref().clone().with_metadata(
+                        std::collections::HashMap::<String, String>::from([(
+                            "provider-id".to_owned(),
+                            "changed".to_owned(),
+                        )]),
+                    )),
+                    fields[1].clone(),
+                ]
+                .into(),
+            ),
+            true,
+        );
     assert!(selected(&catalog, JSON_TEXT, &arguments, &decorated, &control()).is_ok());
     for changed in [
         fields[0].as_ref().clone().with_name("foreign"),

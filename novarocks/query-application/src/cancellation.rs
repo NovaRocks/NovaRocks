@@ -31,11 +31,12 @@ pub enum QueryCancellationReason {
     ExecutionCancellationRequested,
     ExecutionOwnerDropped,
     ExplicitKill {
-        requester_connection_id: u32,
+        requester_session: crate::session_control::ClientSessionKey,
     },
     ExplicitKillConnection {
-        requester_connection_id: u32,
+        requester_session: crate::session_control::ClientSessionKey,
     },
+    ClientCancelRequested,
     ClientDisconnected,
     DeadlineExceeded {
         timeout_ms: u64,
@@ -171,16 +172,21 @@ fn governed_reason(
     timeout_ms: Option<u64>,
 ) -> QueryCancellationReason {
     match reason {
-        novarocks_workload_control::CancellationReason::ExplicitKill {
-            requester_connection_id,
-        } => QueryCancellationReason::ExplicitKill {
-            requester_connection_id: u32::try_from(requester_connection_id).unwrap_or(u32::MAX),
-        },
+        novarocks_workload_control::CancellationReason::ExplicitKill { requester_session } => {
+            QueryCancellationReason::ExplicitKill {
+                requester_session: crate::session_control::ClientSessionKey::new(requester_session)
+                    .expect("registered requester session is nonzero"),
+            }
+        }
         novarocks_workload_control::CancellationReason::ExplicitKillConnection {
-            requester_connection_id,
+            requester_session,
         } => QueryCancellationReason::ExplicitKillConnection {
-            requester_connection_id: u32::try_from(requester_connection_id).unwrap_or(u32::MAX),
+            requester_session: crate::session_control::ClientSessionKey::new(requester_session)
+                .expect("registered requester session is nonzero"),
         },
+        novarocks_workload_control::CancellationReason::ClientCancelRequested => {
+            QueryCancellationReason::ClientCancelRequested
+        }
         novarocks_workload_control::CancellationReason::ClientDisconnected => {
             QueryCancellationReason::ClientDisconnected
         }
@@ -223,7 +229,8 @@ mod tests {
         );
         assert_eq!(
             source.request(QueryCancellationReason::ExplicitKillConnection {
-                requester_connection_id: 9,
+                requester_session: crate::session_control::ClientSessionKey::new(9)
+                    .expect("nonzero fixture requester"),
             }),
             QueryCancellationRequestResult::AlreadyRequested(
                 QueryCancellationReason::DeadlineExceeded { timeout_ms: 10 }
@@ -239,11 +246,12 @@ mod tests {
     fn concurrent_requests_have_one_winner() {
         let source = Arc::new(QueryCancellationSource::new());
         let mut workers = Vec::new();
-        for connection_id in 0..16 {
+        for session_key in 1..=16 {
             let source = Arc::clone(&source);
             workers.push(std::thread::spawn(move || {
                 source.request(QueryCancellationReason::ExplicitKill {
-                    requester_connection_id: connection_id,
+                    requester_session: crate::session_control::ClientSessionKey::new(session_key)
+                        .expect("nonzero fixture requester"),
                 })
             }));
         }

@@ -42,9 +42,10 @@ impl NCodecBudgetPolicyV1 {
     }
 }
 
-// Default signed-i256 ToString writes an optional sign (first capacity8),
-// then one magnitude (final capacity<=78): requests/overlap<=86. This OWN
-// writer fact is independent of num-bigint's internal initial capacity.
+// The original codec owns a preallocated 78-byte String before invoking
+// signed-i256 Display. The maximum text is 77 magnitude digits plus a sign,
+// so chunked writes do not grow it. Keep the existing conservative 86-byte
+// OWN reservation and the separate unchanged library policy invoice.
 const FORMAT_STRING_PEAK: usize = 86;
 const FORMAT_STRING_CAPACITY: usize = 78;
 

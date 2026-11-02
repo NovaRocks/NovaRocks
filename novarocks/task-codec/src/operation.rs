@@ -81,8 +81,7 @@ pub const ESTABLISH_FILTER_DOMAIN_TAG: &[u8] =
 pub const ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.establish.query_options.v1";
 
-/// Process-wide decoded-message ceiling configured on the Native FE client.
-pub const NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub use novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
 
 /// Largest root-result payload the current Native gRPC envelope can carry.
 ///

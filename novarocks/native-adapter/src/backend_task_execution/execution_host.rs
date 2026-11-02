@@ -50,7 +50,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
 
 use novarocks_execution::connector::{
     SplitQueueConfig, SplitQueueError, SplitQueueErrorKind, SplitQueueRegistry,
@@ -261,6 +260,9 @@ impl fmt::Debug for NativeTaskExecutionHost {
     }
 }
 
+type NativeInboundCloseFacts =
+    Arc<Mutex<Option<Box<[novarocks_execution_contract::ExchangeStreamClose]>>>>;
+
 /// One task's execution-side state, from `install_receiver` to
 /// `remove_receiver`.
 struct TaskRuntime {
@@ -285,6 +287,8 @@ struct TaskRuntime {
     exchange_retirement: Mutex<Option<ExchangeReceiverRetirement>>,
     // Frozen receiver-authored facts survive removal from the live registry.
     normal_close_facts: Mutex<Option<Vec<novarocks_execution_contract::ExchangeStreamClose>>>,
+    /// Original source-authored facts captured by pre-success validation.
+    inbound_close_facts: NativeInboundCloseFacts,
     edges: Arc<ExchangeEdgeGates>,
     splits: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
     #[cfg(novarocks_dev_controls)]
@@ -420,6 +424,14 @@ fn receiver_close_facts(
     runtime: &TaskRuntime,
     descriptor: &TaskDescriptor,
 ) -> Result<Vec<novarocks_execution_contract::ExchangeStreamClose>, HostRejection> {
+    if let Some(closes) = runtime
+        .inbound_close_facts
+        .lock()
+        .expect("original pre-success receiver facts")
+        .as_ref()
+    {
+        return Ok(closes.to_vec());
+    }
     let retirement = runtime
         .exchange_retirement
         .lock()
@@ -889,9 +901,6 @@ impl NativeTaskExecutionHost {
             carrier.package(),
             CompiledTaskOptions {
                 pipeline_dop: descriptor.pipeline_dop(),
-                exchange_wait: Duration::from_millis(
-                    self.execution_runtime.config().exchange_wait_ms,
-                ),
             },
             &mut creation,
             &type_scopes,
@@ -913,6 +922,19 @@ impl NativeTaskExecutionHost {
                 pipeline_dop = descriptor.pipeline_dop().get(),
                 reason = *reason,
                 "local compiler rejected a fragment invariant"
+            );
+        }
+        if let Err(CompiledPackageError::Compile(
+            novarocks_local_compiler::FragmentCompileError::Unsupported { node, feature },
+        )) = &compiled
+        {
+            // Both fields are static compiler vocabulary, never Provider payload.
+            tracing::warn!(
+                task = %identity,
+                pipeline_dop = descriptor.pipeline_dop().get(),
+                node = ?node,
+                feature = *feature,
+                "local compiler rejected an unsupported fragment"
             );
         }
         let compiled = compiled.map_err(|error| compiled_package_rejection(identity, error))?;
@@ -972,6 +994,7 @@ impl NativeTaskExecutionHost {
                 query_options: &instance_input.query_options,
                 stop: task_stop.view(),
             },
+            descriptor.topology(),
         )
         .map_err(protocol_failure)?;
         let sink_assignment = compiled_fragment_sink_assignment(
@@ -1130,7 +1153,53 @@ impl NativeTaskExecutionHost {
             // any bounded-native author or preparation metadata admission.
             None => prepare_compiled_fragment(submission, context),
         };
-        let dormant = prepared.map_err(|error| preparation_failure_to_host(identity, &error))?;
+        // Bind the complete frozen stream roster and the same Task conclusion
+        // owner before Installed can authorize native delivery. Decoding failures
+        // remain originating proposals even when their RPC reply has been lost.
+        let prepared = prepared.map_err(|error| preparation_failure_to_host(identity, &error))?;
+        for input in descriptor.topology().inbound() {
+            let streams = input
+                .sources()
+                .iter()
+                .map(|source| {
+                    novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+                        *source,
+                        identity,
+                        descriptor.fragment_instance_id(),
+                        input.node_id(),
+                    )
+                    .map_err(|source| {
+                        host_failure(NativeInboundCloseFailure::InvalidStream(source))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.exchange_receiver_port
+                .bind_unit_receiver(
+                    novarocks_execution::runtime::fragment::io::ExchangeReceiverKey {
+                        fragment_instance_id: descriptor.fragment_instance_id(),
+                        node_id: input.node_id().get(),
+                    },
+                    streams,
+                    Arc::new(
+                        novarocks_execution::runtime::runtime_state::RuntimeErrorState::for_task(
+                            Arc::clone(&kernel_control),
+                        ),
+                    ),
+                    novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64,
+                )
+                .map_err(host_failure)?;
+        }
+        let inbound_close_facts = Arc::new(Mutex::new(None));
+        let captured_facts = Arc::clone(&inbound_close_facts);
+        let receiver = Arc::clone(&self.exchange_receiver_port);
+        let inbound_descriptor = descriptor.clone();
+        let dormant = prepared.with_success_validator(move || {
+            let closes = native_inbound_close_facts(receiver.as_ref(), &inbound_descriptor)?;
+            validate_native_strict_inputs(&inbound_descriptor, &closes)?;
+            *captured_facts.lock().expect("native inbound close facts") =
+                Some(closes.into_boxed_slice());
+            Ok(())
+        });
         kernel_construction.install(dormant, registration, kernel_control);
         #[cfg(novarocks_dev_controls)]
         if let Some(controls) = self.test_controls.as_deref()
@@ -1185,6 +1254,7 @@ impl NativeTaskExecutionHost {
                 completion_exit: Mutex::new(Some(completion_exit)),
                 exchange_retirement: Mutex::new(exchange_retirement),
                 normal_close_facts: Mutex::new(None),
+                inbound_close_facts,
                 edges,
                 splits,
                 #[cfg(novarocks_dev_controls)]
@@ -1662,9 +1732,8 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             return Ok(());
         }
         let runtime = self.task_runtime(descriptor.identity()).ok_or_else(|| {
-            internal_failure(NativePreparationContractFailure::new(
-                NativePreparationReason::ReceiverCloseFactsMissing,
-                "checked normal retirement has no original receiver owner",
+            host_failure(NativeInboundCloseFailure::MissingRuntime(
+                descriptor.identity(),
             ))
         })?;
         let closes = runtime
@@ -1681,11 +1750,6 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         let captured = self.capture_receiver_after_normal_close(descriptor, closes)?;
         dispose_receiver_capture(captured);
         Ok(())
-    }
-
-    fn retire_receiver_normally(&self, descriptor: &TaskDescriptor) {
-        self.capabilities
-            .close_normally(descriptor, || self.remove_receiver(descriptor));
     }
 
     /// Reserves the prepared fragment's terminal supervision and returns a
@@ -2035,9 +2099,10 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 let gate = runtime.edges.gate_for_destination(key)
                     .filter(|gate| gate.edge_id() == *edge)
                     .ok_or_else(|| protocol_failure(NativePreparationContractFailure::new(NativePreparationReason::MissingExchangeGate, format_args!("task {identity} has no matching runtime gate for destination {destination} on edge {edge}"))))?;
-                self.execution_runtime
-                    .exchange_send_queue()
-                    .close_destination_normally(gate);
+                runtime
+                    .edges
+                    .close_destination_normally(gate.destination())
+                    .map_err(protocol_failure)?;
                 Ok(None)
             }
         }
@@ -2097,6 +2162,131 @@ impl FragmentStandDown for RunningFragmentHandle {
     fn cancel(&self, reason: FragmentCancelReason) {
         Self::cancel(self, reason);
     }
+}
+
+#[derive(Debug)]
+enum NativeInboundCloseFailure {
+    InvalidStream(novarocks_execution_contract::ExchangeFlowContractError),
+    MissingRuntime(TaskIdentity),
+    InvalidFacts(TaskIdentity),
+    StrictWithdrawn(novarocks_execution_contract::ExchangeStreamIdentity),
+}
+impl fmt::Display for NativeInboundCloseFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidStream(source) => write!(f, "invalid frozen inbound stream: {source}"),
+            Self::MissingRuntime(task) => {
+                write!(f, "normal inbound retirement has no runtime for {task}")
+            }
+            Self::InvalidFacts(task) => write!(
+                f,
+                "receiver close facts do not cover the frozen streams for {task}"
+            ),
+            Self::StrictWithdrawn(stream) => {
+                write!(f, "required inbound stream was not consumed: {stream:?}")
+            }
+        }
+    }
+}
+impl std::error::Error for NativeInboundCloseFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidStream(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for NativeInboundCloseFailure {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(
+                domain::NATIVE,
+                std::num::NonZeroU16::new(match self {
+                    Self::InvalidStream(_) => 701,
+                    Self::MissingRuntime(_) => 702,
+                    Self::StrictWithdrawn(_) => 703,
+                    Self::InvalidFacts(_) => 704,
+                })
+                .unwrap(),
+            ),
+        )
+    }
+}
+
+fn native_inbound_close_facts(
+    receiver: &dyn ExchangeReceiverPort,
+    descriptor: &TaskDescriptor,
+) -> Result<Vec<novarocks_execution_contract::ExchangeStreamClose>, ExecutionFailure> {
+    use novarocks_execution_contract::ExchangeStreamIdentity;
+    let mut closes = Vec::new();
+    for input in descriptor.topology().inbound() {
+        let streams = input
+            .sources()
+            .iter()
+            .map(|source| {
+                ExchangeStreamIdentity::try_new(
+                    *source,
+                    descriptor.identity(),
+                    descriptor.fragment_instance_id(),
+                    input.node_id(),
+                )
+                .map_err(|source| {
+                    ExecutionFailure::from_domain(NativeInboundCloseFailure::InvalidStream(source))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut actual = receiver
+            .stream_close_facts(
+                novarocks_execution::runtime::fragment::io::ExchangeReceiverKey {
+                    fragment_instance_id: descriptor.fragment_instance_id(),
+                    node_id: input.node_id().get(),
+                },
+                &streams,
+            )
+            .map_err(|cause| cause.into_execution())?;
+        actual.sort_unstable_by_key(|close| close.stream);
+        let mut expected = streams;
+        expected.sort_unstable();
+        if actual.len() != expected.len()
+            || actual
+                .iter()
+                .zip(&expected)
+                .any(|(close, expected)| close.stream != *expected)
+        {
+            return Err(ExecutionFailure::from_domain(
+                NativeInboundCloseFailure::InvalidFacts(descriptor.identity()),
+            ));
+        }
+        closes.extend(actual);
+    }
+    Ok(closes)
+}
+
+fn validate_native_strict_inputs(
+    descriptor: &TaskDescriptor,
+    closes: &[novarocks_execution_contract::ExchangeStreamClose],
+) -> Result<(), ExecutionFailure> {
+    use novarocks_execution_contract::{ExchangeCloseDisposition, ExchangeDeliveryRequirement};
+    let strict_nodes = descriptor
+        .topology()
+        .inbound()
+        .iter()
+        .filter(|input| input.delivery() == ExchangeDeliveryRequirement::MustDrain)
+        .map(|input| input.node_id())
+        .collect::<BTreeSet<_>>();
+    for close in closes
+        .iter()
+        .filter(|close| strict_nodes.contains(&close.stream.destination_node()))
+    {
+        if !matches!(close.disposition, ExchangeCloseDisposition::Consumed { .. }) {
+            return Err(ExecutionFailure::from_domain(
+                NativeInboundCloseFailure::StrictWithdrawn(close.stream),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The first stand-down a task was asked for. It is latched, not queued: a
@@ -2939,6 +3129,7 @@ pub(crate) mod tests {
         NativePreparationReason, NativeRunnableTask, NativeTaskExecutionHost, PreparationStopGuard,
         QueryContextOptions, ReceiverConstructionAborted, RootProducerPool, StandDown,
         TaskCompletionSupervisor, TaskQueryContextFacts, internal_failure,
+        native_inbound_close_facts, validate_native_strict_inputs,
     };
     use crate::backend_task_execution::CompiledPackageError;
     use crate::task_query_context_options::query_options_fingerprint;
@@ -3004,7 +3195,7 @@ pub(crate) mod tests {
     use prost::Message;
 
     use novarocks_native_adapter::exchange_data_plane::{
-        ExchangeRouteQuery, NativeExchangeDataPlane, TaskInboundCapabilitiesRouteAuthority,
+        ExchangeRouteQuery, NativeExchangeDataPlane,
     };
 
     use novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime;
@@ -3642,8 +3833,6 @@ pub(crate) mod tests {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    exchange_wait_ms: 120_000,
-                    exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1,
                     exchange_max_transmit_batched_bytes: 1,
                     operator_buffer_chunks: 1,
@@ -4017,61 +4206,50 @@ pub(crate) mod tests {
 
         let plane = NativeExchangeDataPlane::new(
             Arc::new(UnavailableExchangeReceiverPort),
-            vec![Arc::new(TaskInboundCapabilitiesRouteAuthority::new(
-                Arc::clone(&capabilities),
-            ))],
+            capabilities,
+            consumer.backend_process_id(),
         );
-        let request = |destination: UniqueId, source: UniqueId| proto::ExchangeRequest {
-            stream: Some(novarocks_task_codec::exchange_flow_codec::encode_stream(
-                novarocks_execution_contract::ExchangeStreamIdentity::try_new(
-                    ExchangeSource::new(producer, source, 0),
-                    consumer,
-                    destination,
-                    node,
-                )
-                .unwrap(),
-            )),
-            finst_id_hi: destination.high(),
-            finst_id_lo: destination.low(),
-            node_id: node.get(),
-            source_finst_id_hi: source.high(),
-            source_finst_id_lo: source.low(),
-            sender_ordinal: 0,
-            sender_count: 1,
-            sender_id: 7,
-            be_number: 0,
-            eos: false,
-            sequence: 1,
-            payload: vec![0x01],
+        let request = |destination: UniqueId, source: UniqueId| {
+            let stream = novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+                ExchangeSource::new(producer, source, 0),
+                consumer,
+                destination,
+                node,
+            )
+            .unwrap();
+            novarocks_task_codec::exchange_unit_codec::encode_delivery_request(
+                novarocks_task_codec::exchange_unit_codec::DecodedExchangeUnitFrame {
+                    stream,sender_count:1,sender_id:7,backend_number:0,
+                    item:novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitItem::End(
+                        novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitSequence::FIRST),
+                    payload:bytes::Bytes::new(),next_demand:None,
+                })
         };
-
-        // The receiver port is deliberately unavailable, so reaching delivery
-        // is the proof the route was authorized.
-        let status = plane
-            .transmit(request(kernel_key, producer_key))
-            .status
-            .expect("status");
-        assert_eq!(status.code, 1);
-        assert!(
-            status.message.contains("exchange ingress failed"),
-            "the composed plane must admit a task-held route: {}",
-            status.message
-        );
-
-        // A destination neither owner holds is still refused, and the refusal
-        // names no owner.
-        let status = plane
-            .transmit(request(UniqueId::new(1, 1), producer_key))
-            .status
-            .expect("status");
-        assert_eq!(status.code, 1);
-        assert!(
-            status
-                .message
-                .contains("no active exchange owner on this backend holds this destination"),
-            "unexpected refusal: {}",
-            status.message
-        );
+        let reply = plane
+            .deliver_unit(
+                request(kernel_key, producer_key),
+                producer.backend_process_id(),
+            )
+            .unwrap();
+        let proto::deliver_exchange_unit_response::Outcome::Refused(authorized_refusal) =
+            reply.outcome.unwrap()
+        else {
+            panic!("unavailable receiver must refuse")
+        };
+        let reply = plane
+            .deliver_unit(
+                request(UniqueId::new(1, 1), producer_key),
+                producer.backend_process_id(),
+            )
+            .unwrap();
+        let proto::deliver_exchange_unit_response::Outcome::Refused(absent_refusal) =
+            reply.outcome.unwrap()
+        else {
+            panic!("unknown destination must refuse")
+        };
+        // The authorized route reaches the explicit unavailable receiver; an
+        // absent kernel key is rejected by Worker before the receiver port.
+        assert_ne!(authorized_refusal, absent_refusal);
     }
 
     #[test]
@@ -5796,13 +5974,48 @@ pub(crate) mod tests {
             *self.expected_schema.lock().unwrap() = Some(schema);
             Ok(())
         }
-        fn push(
+        fn bind_unit_receiver(
             &self,
             key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey,
-            frame: novarocks_execution::runtime::fragment::io::ExchangeReceiverFrame,
+            streams: Vec<novarocks_execution_contract::ExchangeStreamIdentity>,
+            control: Arc<novarocks_execution::runtime::runtime_state::RuntimeErrorState>,
+            max_bytes: u64,
         ) -> Result<(), novarocks_execution::runtime::exchange::ExchangeFailure> {
-            self.inner.push(key, frame)
+            self.inner
+                .bind_unit_receiver(key, streams, control, max_bytes)
         }
+        fn register_unit_demand(
+            &self,
+            key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey,
+            entry: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDemandEntry,
+        ) -> Result<
+            novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeStreamObservation,
+            novarocks_execution_contract::failure::FailureFact,
+        > {
+            self.inner.register_unit_demand(key, entry)
+        }
+        fn receive_unit(
+            &self,
+            key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey,
+            frame:novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame,
+        ) -> Result<
+            novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitReceipt,
+            novarocks_execution_contract::failure::FailureFact,
+        > {
+            self.inner.receive_unit(key, frame)
+        }
+        fn unit_sender_states(&self, sender:novarocks_types::BackendProcessId,
+            after:Option<novarocks_execution_contract::ExchangeStreamIdentity>,limit:usize,
+        ) -> Result<Vec<novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeStreamObservation>,novarocks_execution_contract::failure::FailureFact>{
+            self.inner.unit_sender_states(sender, after, limit)
+        }
+        fn set_unit_state_listener(
+            &self,
+            listener:Arc<dyn novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitStateListener>,
+        ) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
+            self.inner.set_unit_state_listener(listener)
+        }
+
         fn cancel(&self, key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey) {
             self.cancelled.fetch_add(1, Ordering::SeqCst);
             self.inner.cancel(key);
@@ -5824,6 +6037,16 @@ pub(crate) mod tests {
         > {
             self.inner.receiver_handle(key, expected)
         }
+        fn stream_close_facts(
+            &self,
+            key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey,
+            expected: &[novarocks_execution_contract::ExchangeStreamIdentity],
+        ) -> Result<
+            Vec<novarocks_execution_contract::ExchangeStreamClose>,
+            novarocks_execution::runtime::exchange::ExchangeFailure,
+        > {
+            self.inner.stream_close_facts(key, expected)
+        }
         fn ensure_mem_tracker(
             &self,
             key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey,
@@ -5833,16 +6056,6 @@ pub(crate) mod tests {
             novarocks_execution::runtime::exchange::ExchangeFailure,
         > {
             self.inner.ensure_mem_tracker(key, root)
-        }
-        fn push_local(
-            &self,
-            key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey,
-            sender: i32,
-            backend: i32,
-            chunks: Vec<novarocks_execution::exec::chunk::Chunk>,
-            eos: bool,
-        ) {
-            self.inner.push_local(key, sender, backend, chunks, eos);
         }
         fn snapshot(
             &self,
@@ -5898,6 +6111,189 @@ pub(crate) mod tests {
         payload
     }
 
+    fn receiver_unit_frame(
+        stream: novarocks_execution_contract::ExchangeStreamIdentity,
+        payload: Vec<u8>,
+        end: bool,
+    ) -> novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame {
+        use novarocks_execution_contract::ordered_retained_stream::exchange::{
+            ExchangeUnitDemand, ExchangeUnitItem, ExchangeUnitSequence,
+        };
+        let item = if payload.is_empty() {
+            ExchangeUnitItem::End(ExchangeUnitSequence::FIRST)
+        } else {
+            ExchangeUnitItem::Unit {
+                demand: ExchangeUnitDemand {
+                    sequence: ExchangeUnitSequence::FIRST,
+                    wire_bytes: payload.len() as u64,
+                },
+                end_after_unit: end,
+            }
+        };
+        novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame {
+            stream,
+            sender_count: 1,
+            sender_id: 0,
+            backend_number: 0,
+            item,
+            payload: bytes::Bytes::from(payload),
+            next_demand: None,
+        }
+    }
+    fn register_receiver_unit(
+        port: &dyn novarocks_execution::runtime::fragment::io::ExchangeReceiverPort,
+        key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey,
+        frame:&novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame,
+    ) {
+        use novarocks_execution::runtime::fragment::io::exchange_unit::{
+            ExchangeDemandEntry, ExchangeDemandOperation,
+        };
+        if let novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitItem::Unit{demand,..}=frame.item {
+            port.register_unit_demand(key,ExchangeDemandEntry{stream:frame.stream,operation:ExchangeDemandOperation::Register(demand)}).unwrap();
+        }
+    }
+
+    #[test]
+    fn native_strict_input_validation_reads_actual_data_and_empty_end_consumption() {
+        use novarocks_execution::runtime::fragment::io::{
+            ExchangeReceiverKey, ExchangeReceiverRegistration,
+        };
+        use novarocks_execution_contract::{
+            ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeInbound, ExchangeSource,
+            ExchangeStreamIdentity,
+        };
+        struct Control;
+        impl novarocks_type_contract::PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                _: novarocks_type_contract::CompilePhase,
+                _: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
+        for data in [false, true] {
+            let (mut host, _) = isolated_resource_host();
+            host.exchange_receiver_port = Arc::new(
+                novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort::new(
+                    Arc::clone(&host.execution_runtime),
+                ),
+            );
+            let task = identity(84090 + i64::from(data), 2, 1);
+            let source_task = identity(84090 + i64::from(data), 1, 1);
+            let kernel = UniqueId::new(84090, 2);
+            let source_kernel = UniqueId::new(84090, 1);
+            let node = FragmentNodeId::new(73);
+            let source = ExchangeSource::new(source_task, source_kernel, 0);
+            let topology = ExchangeTopology::try_new(
+                Vec::new(),
+                vec![
+                    ExchangeInbound::try_new(
+                        node,
+                        vec![source],
+                        ExchangeDeliveryRequirement::MustDrain,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+            let descriptor = descriptor_with(task, kernel, 1, topology);
+            let port = host.exchange_receiver_port.clone();
+            let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+                "strict input close fixture",
+            );
+            let factory = novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                novarocks_execution::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                tracker, Arc::new(novarocks_execution::runtime::runtime_state::RuntimeErrorState::default()),
+            ).unwrap();
+            let ty = novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            );
+            let declaration = novarocks_local_program::StaticLayout::try_new_typed_for_compile(
+                Arc::new(arrow::datatypes::Schema::new(vec![
+                    arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, false),
+                ])),
+                Arc::from([novarocks_types::SlotId::new(1)]),
+                vec![(ty.typed_binding().clone(), None)],
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                |_| Ok(()),
+                &Control,
+            )
+            .unwrap();
+            let schema = factory.create_compiled_chunk_schema(&declaration).unwrap();
+            let key = ExchangeReceiverKey {
+                fragment_instance_id: kernel,
+                node_id: node.get(),
+            };
+            port.register(ExchangeReceiverRegistration {
+                key,
+                expected_senders: 1,
+                expected_chunk_schema: schema.clone(),
+                column_binding:
+                    novarocks_execution::runtime::exchange::ExchangeColumnBinding::Positional,
+                creation_factory: factory,
+            })
+            .unwrap();
+            let stream = ExchangeStreamIdentity::try_new(source, task, kernel, node).unwrap();
+            let payload = if data {
+                let chunk = novarocks_execution::exec::chunk::Chunk::try_new_with_columns(
+                    schema,
+                    vec![Arc::new(arrow::array::Int64Array::from(vec![7]))],
+                )
+                .unwrap();
+                novarocks_execution::runtime::exchange::encode_chunks(&[chunk], true).unwrap()
+            } else {
+                Vec::new()
+            };
+            let preparation = super::super::tests::node_fixture::NativeNodePreparation::new(task);
+            let control = Arc::new(
+                novarocks_execution::runtime::runtime_state::RuntimeErrorState::for_task(
+                    preparation.execution_control(),
+                ),
+            );
+            port.bind_unit_receiver(key,vec![stream],control,novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64).unwrap();
+            let frame = receiver_unit_frame(stream, payload, true);
+            register_receiver_unit(port.as_ref(), key, &frame);
+            port.receive_unit(key, frame).unwrap();
+            let closes = native_inbound_close_facts(port.as_ref(), &descriptor).unwrap();
+            assert_eq!(closes[0].disposition, ExchangeCloseDisposition::Withdrawn);
+            assert!(validate_native_strict_inputs(&descriptor, &closes).is_err());
+            let receiver = port.receiver_handle(key, 1).unwrap();
+            assert!(receiver.has_output_or_finished(1));
+            assert!(
+                validate_native_strict_inputs(
+                    &descriptor,
+                    &native_inbound_close_facts(port.as_ref(), &descriptor).unwrap()
+                )
+                .is_err(),
+                "readiness cannot author consumption"
+            );
+            if data {
+                assert!(
+                    receiver.complete_input_consumption(1).is_err(),
+                    "unread DATA+End cannot be consumed"
+                );
+                assert!(matches!(
+                    receiver.try_pop_next_with_stats(1).unwrap(),
+                    Some(novarocks_execution::runtime::exchange::ExchangePopResult::Chunk(_))
+                ));
+            }
+            receiver.complete_input_consumption(1).unwrap();
+            let closes = native_inbound_close_facts(port.as_ref(), &descriptor).unwrap();
+            assert!(matches!(
+                closes[0].disposition,
+                ExchangeCloseDisposition::Consumed { .. }
+            ));
+            validate_native_strict_inputs(&descriptor, &closes).unwrap();
+            port.remove(key);
+            assert!(
+                native_inbound_close_facts(port.as_ref(), &descriptor).is_err(),
+                "missing receiver cannot imply Consumed"
+            );
+        }
+    }
+
     fn receiver_retirement_case(
         mut native: NativeTaskExecutionHost,
         descriptor: TaskDescriptor,
@@ -5909,7 +6305,7 @@ pub(crate) mod tests {
             NativeNodeFixture, await_original, factory_from_host,
         };
         use novarocks_execution::runtime::fragment::io::{
-            ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort,
+            ExchangeReceiverKey, ExchangeReceiverPort,
         };
         let port = Arc::new(RetirementPort {
             inner: Arc::new(novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort::new(native.execution_runtime.clone())),
@@ -6022,47 +6418,42 @@ pub(crate) mod tests {
             node_id: inbound.node_id().get(),
         };
         assert!(port.snapshot(key).is_some());
-        let frame = || ExchangeReceiverFrame {
-            stream: novarocks_execution_contract::ExchangeStreamIdentity::try_new(
-                source,
-                descriptor.identity(),
-                key.fragment_instance_id,
-                inbound.node_id(),
-            )
-            .unwrap(),
-            source_fragment_instance_id: source.fragment_instance_id(),
-            sender_ordinal: source.sender_ordinal(),
-            sender_count: 1,
-            sender_id: 0,
-            backend_number: 0,
-            sequence: 0,
-            eos: true,
-            payload: vec![],
+        let stream = novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+            source,
+            descriptor.identity(),
+            key.fragment_instance_id,
+            inbound.node_id(),
+        )
+        .unwrap();
+        let deliver = |unit: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame| {
+            register_receiver_unit(port.as_ref(), key, &unit);
+            host.inner.capabilities.with_claimed_stream(unit.stream, |_| {
+                host.inner.execution_runtime.exchange_registry().receive_unit(
+                    novarocks_execution::runtime::exchange::ExchangeKey {
+                        finst_id_hi: key.fragment_instance_id.high(),
+                        finst_id_lo: key.fragment_instance_id.low(),
+                        node_id: key.node_id,
+                    },
+                    unit,
+                )
+            })
         };
         let payload = nonempty_data.then(|| receiver_data_payload(&port));
         let control = node.control.clone();
         let deadline = node.deadline();
         let control_reply = if matches!(stop, ReceiverStop::Success) {
             if let Some(payload) = &payload {
-                let mut data = frame();
-                data.eos = false;
-                data.payload = payload.clone();
-                let delivered = host.inner.capabilities.deliver_frame_with_receiver_error(
-                    key.fragment_instance_id,
-                    inbound.node_id(),
-                    source.fragment_instance_id(),
-                    source.sender_ordinal(),
-                    1,
-                    || port.push(key, data),
-                );
-                assert!(matches!(
-                    delivered,
-                    novarocks_worker::InboundFrameDelivery::Claim(InboundFrameClaim::Authorized)
-                ));
+                let delivered = deliver(receiver_unit_frame(stream, payload.clone(), false));
+                assert!(matches!(delivered, Ok(Ok(_))));
             }
-            let mut end = frame();
-            end.sequence = i64::from(payload.is_some());
-            port.push(key, end).expect("actual exact sender EOS");
+            let mut end = receiver_unit_frame(stream, Vec::new(), true);
+            end.item = novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitItem::End(
+                novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitSequence::try_new(
+                    if payload.is_some() { 2 } else { 1 },
+                ).unwrap(),
+            );
+            port.receive_unit(key, end)
+                .expect("actual exact sender End");
             None
         } else if matches!(stop, ReceiverStop::Rollback) {
             None
@@ -6107,22 +6498,10 @@ pub(crate) mod tests {
         if matches!(stop, ReceiverStop::Quiesce)
             && let Some(payload) = &payload
         {
-            let mut data = frame();
-            data.eos = false;
-            data.payload = payload.clone();
+            let delivered = deliver(receiver_unit_frame(stream, payload.clone(), false));
             assert!(
-                matches!(
-                    host.inner.capabilities.deliver_frame_with_receiver_error(
-                        key.fragment_instance_id,
-                        inbound.node_id(),
-                        source.fragment_instance_id(),
-                        source.sender_ordinal(),
-                        1,
-                        || port.push(key, data)
-                    ),
-                    novarocks_worker::InboundFrameDelivery::Claim(InboundFrameClaim::Authorized)
-                ),
-                "DemandDriven normal withdrawal preserves the actual authorized DATA path until physical retirement"
+                matches!(delivered, Ok(Ok(_))),
+                "DemandDriven normal withdrawal preserves the actual authorized DATA path until physical retirement: {delivered:?}"
             );
         }
         drop(retirement_pause);
@@ -7745,6 +8124,7 @@ pub(crate) mod tests {
             RenderPresentation, RootOutputKind,
         };
         let schema = ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: Some(0),
@@ -8506,7 +8886,6 @@ pub(crate) mod tests {
                     &bytes,
                     CompiledTaskOptions {
                         pipeline_dop: NonZeroUsize::MIN,
-                        exchange_wait: Duration::from_millis(1),
                     },
                     &mut creation,
                     &scopes,
@@ -8842,7 +9221,12 @@ pub(crate) mod tests {
                 std::sync::atomic::AtomicI64::new(1);
             let node = FragmentNodeId::new(i32::try_from(receiver).expect("small node"));
             let destination = ExchangeDestination::new(
-                super::identity(70, 2, 1),
+                TaskIdentity::new(
+                    identity.query_execution_id(),
+                    StageId::new(2).expect("nonzero stage"),
+                    TaskId::new(1).expect("nonzero task"),
+                    BackendProcessId::new_v7(),
+                ),
                 UniqueId::new(900, 901),
                 RuntimeEndpoint::new("127.0.0.1", 9060).expect("a legal endpoint"),
                 node,
@@ -9236,7 +9620,6 @@ pub(crate) mod tests {
                     &bytes,
                     CompiledTaskOptions {
                         pipeline_dop: NonZeroUsize::MIN,
-                        exchange_wait: Duration::from_millis(1),
                     },
                     &mut creation,
                     &scopes,
@@ -9303,7 +9686,6 @@ pub(crate) mod tests {
                     &bytes,
                     CompiledTaskOptions {
                         pipeline_dop: NonZeroUsize::MIN,
-                        exchange_wait: Duration::from_millis(1),
                     },
                     &mut creation,
                     &scopes,
@@ -9573,7 +9955,6 @@ pub(crate) mod tests {
                 &bytes,
                 CompiledTaskOptions {
                     pipeline_dop: NonZeroUsize::MIN,
-                    exchange_wait: Duration::from_millis(1),
                 },
                 &mut creation,
                 &scopes,
@@ -9641,7 +10022,6 @@ pub(crate) mod tests {
                 &bytes,
                 CompiledTaskOptions {
                     pipeline_dop: NonZeroUsize::MIN,
-                    exchange_wait: Duration::from_millis(1),
                 },
                 &mut creation,
                 &scopes,
@@ -10368,7 +10748,12 @@ pub(crate) mod tests {
         ) -> TaskDescriptor {
             let node = FragmentNodeId::new(i32::try_from(receiver).expect("small node"));
             let destination = ExchangeDestination::new(
-                super::identity(70, 2, 1),
+                TaskIdentity::new(
+                    identity.query_execution_id(),
+                    StageId::new(2).expect("nonzero stage"),
+                    TaskId::new(1).expect("nonzero task"),
+                    BackendProcessId::new_v7(),
+                ),
                 UniqueId::new(900, 901),
                 RuntimeEndpoint::new("127.0.0.1", 9060).expect("a legal endpoint"),
                 node,

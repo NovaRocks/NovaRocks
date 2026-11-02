@@ -104,7 +104,9 @@ fn finish<T>(
     work: EvaluationCheckpoints<'_>,
     result: Result<T, KernelFailure>,
 ) -> Result<T, KernelFailure> {
-    if result.as_ref().is_err_and(KernelFailure::is_interruption) {
+    if result.as_ref().is_err_and(|cause| {
+        cause.is_interruption() || super::collection_arrow::is_extension_failure(cause)
+    }) {
         return result;
     }
     work.finish()?;
@@ -263,7 +265,15 @@ impl Cursor<'_> {
             while position < copy_end {
                 let count = (copy_end - position).min(256);
                 work.flush()?;
-                mutable.extend(0, position, position + count);
+                mutable
+                    .try_extend(0, position, position + count)
+                    .map_err(|source| {
+                        super::collection_arrow::arrow_failure(
+                            "unnest",
+                            super::collection_arrow::ArrowSite::Extend,
+                            source,
+                        )
+                    })?;
                 work.flush()?;
                 for _ in 0..count {
                     work.step()?;
@@ -274,7 +284,13 @@ impl Cursor<'_> {
             while remaining_nulls > 0 {
                 let count = remaining_nulls.min(256);
                 work.flush()?;
-                mutable.extend_nulls(count);
+                mutable.try_extend_nulls(count).map_err(|source| {
+                    super::collection_arrow::arrow_failure(
+                        "unnest",
+                        super::collection_arrow::ArrowSite::Extend,
+                        source,
+                    )
+                })?;
                 work.flush()?;
                 for _ in 0..count {
                     work.step()?;
@@ -336,5 +352,38 @@ impl TableKernelCursor for Cursor<'_> {
         // Shared immutable owner/input remain loans, not uniquely owned backing.
         let _ = &self.owner;
         std::mem::size_of::<Self>()
+    }
+}
+
+#[cfg(test)]
+mod extension_failure_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn actual_extension_failure_wins_without_a_completion_checkpoint() {
+        struct RefuseCompletion(AtomicUsize);
+        impl KernelEvaluationControl for RefuseCompletion {
+            fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Err(KernelFailure::Cancelled)
+            }
+            fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+                self.checkpoint(0)
+            }
+        }
+        let values = arrow_array::Int32Array::from(vec![1]);
+        let data = values.to_data();
+        let mut mutable = MutableArrayData::new(vec![&data], true, 1);
+        let source = mutable.try_extend(0, 0, 2).unwrap_err();
+        let cause = super::super::collection_arrow::arrow_failure(
+            "unnest",
+            super::super::collection_arrow::ArrowSite::Extend,
+            source,
+        );
+        let control = RefuseCompletion(AtomicUsize::new(0));
+        let result = finish::<()>(EvaluationCheckpoints::new(&control), Err(cause.clone()));
+        assert_eq!(result.unwrap_err(), cause);
+        assert_eq!(control.0.load(Ordering::Relaxed), 0);
     }
 }

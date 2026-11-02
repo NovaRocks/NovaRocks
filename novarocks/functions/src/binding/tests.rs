@@ -1282,8 +1282,14 @@ fn frozen_bindings_refuse_root_and_nested_logical_identity_drift() {
         FunctionValueType::try_with_logical_type(DataType::Int64, false, ValueLogicalType::Json)
             .is_err()
     );
-    let unknown = Field::new("item", DataType::Utf8, true)
-        .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "unknown".into())].into());
+    let unknown =
+        Field::new("item", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
+            String,
+            String,
+        >::from([(
+            NR_LOGICAL_TYPE_KEY.into(),
+            "unknown".into(),
+        )]));
     assert!(FunctionValueType::try_from_legacy_field_projection(&unknown).is_err());
     let nested_json = crate::builtin::signature::declared_list(
         &FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
@@ -1627,7 +1633,7 @@ fn argument_observed_comparison_keeps_full_lambda_and_nominal_types() {
                     Field::new("child", DataType::Int64, true).with_metadata(
                         [("provider".to_owned(), metadata.to_owned())]
                             .into_iter()
-                            .collect(),
+                            .collect::<std::collections::HashMap<String, String>>(),
                     ),
                 )]
                 .into(),

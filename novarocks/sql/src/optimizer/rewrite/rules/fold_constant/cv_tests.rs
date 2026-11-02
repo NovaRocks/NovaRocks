@@ -74,8 +74,12 @@ fn fold_identity(value: ConstantValue) -> (ScalarArena, ScalarId, ConstantValue,
 fn nonzero_materialized_float32_nan_bits_keep_source_pool_field_and_ordinal() {
     let ty = FunctionValueType::new(DataType::Float32, false);
     let field = Arc::new(
-        Field::new("original", DataType::Float32, false)
-            .with_metadata([("provider.fact".into(), "kept".into())].into()),
+        Field::new("original", DataType::Float32, false).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider.fact".into(),
+                "kept".into(),
+            )]),
+        ),
     );
     let array = Float32Array::from(vec![9.0, f32::from_bits(0x7f800123)]);
     let source = ConstantPool::try_new(
@@ -115,10 +119,12 @@ fn nonzero_materialized_float32_nan_bits_keep_source_pool_field_and_ordinal() {
 #[test]
 fn typed_null_materialized_input_keeps_full_nullable_field_metadata() {
     let ty = FunctionValueType::new(DataType::Int32, true);
-    let field = Arc::new(
-        Field::new("original", DataType::Int32, true)
-            .with_metadata([("provider.fact".into(), "null-source".into())].into()),
-    );
+    let field = Arc::new(Field::new("original", DataType::Int32, true).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            "provider.fact".into(),
+            "null-source".into(),
+        )]),
+    ));
     let source = ConstantPool::try_new(
         field.clone(),
         ty.clone(),

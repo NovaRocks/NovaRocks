@@ -245,11 +245,10 @@ mod tests {
             assert_eq!(frozen.declared_value_type().unwrap(), original);
         }
         let child = Field::new("source_item", DataType::Utf8, false).with_metadata(
-            [
+            std::collections::HashMap::<String, String>::from([
                 (NR_LOGICAL_TYPE_KEY.into(), "json".into()),
                 ("provider.id".into(), "73".into()),
-            ]
-            .into(),
+            ]),
         );
         let original = FunctionValueType::from_legacy_declared_projection(
             DataType::LargeList(Arc::new(child)),
@@ -269,8 +268,12 @@ mod tests {
     }
     #[test]
     fn declared_children_separate_semantics_layout_and_provider_facts() {
-        let item = Field::new("provider_element", DataType::Utf8, false)
-            .with_metadata([("provider.id".into(), "37".into())].into());
+        let item = Field::new("provider_element", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider.id".into(),
+                "37".into(),
+            )]),
+        );
         let source = column(
             DataType::LargeList(Arc::new(item)),
             Some(SqlType::Array(Box::new(SqlType::Json))),
@@ -295,8 +298,12 @@ mod tests {
     #[test]
     fn execution_domains_do_not_come_from_nested_annotations() {
         for tag in ["json", "not_a_domain"] {
-            let item = Field::new("provider_item", DataType::Utf8, true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), tag.into())].into());
+            let item = Field::new("provider_item", DataType::Utf8, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    NR_LOGICAL_TYPE_KEY.into(),
+                    tag.into(),
+                )]),
+            );
             let explicit = column(
                 DataType::List(Arc::new(item.clone())),
                 Some(SqlType::Array(Box::new(SqlType::String))),

@@ -69,6 +69,10 @@ use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpe
 #[path = "writer_statement_actor.rs"]
 mod writer_statement_actor;
 use writer_statement_actor::{WriterActor, retain_write_result};
+#[path = "distributed_writer_row_level.rs"]
+mod row_level_contract;
+#[path = "distributed_writer_small_slots.rs"]
+mod small_slots;
 
 use super::connector::{
     await_resource_convergence, connector_launch_config, create_catalog, create_warehouse,
@@ -101,7 +105,11 @@ const SEED_ROWS: i64 = SEED_ROWS_PER_FILE * SEED_FILES;
 const SEED_SUM: i64 = SEED_ROWS * (SEED_ROWS + 1) / 2;
 const WIDE_STATISTICS_CHANNELS: usize = 1_024;
 const WIDE_SEED_FILES: i64 = 12;
-const WIDE_ROWS_PER_FILE: i64 = 4;
+// Compact Theta v3 stores 16 + 8*n bytes for exact n > 1. Sixteen
+// distinct inputs produce 144 bytes, crossing the IPC 64-byte payload bucket.
+// This keeps the 1024-channel case a real sparse-packing fixture when an
+// all-valid IPC bitmap is omitted, without changing the packet limit.
+const WIDE_ROWS_PER_FILE: i64 = 16;
 const WIDE_ROWS: i64 = WIDE_ROWS_PER_FILE * WIDE_SEED_FILES;
 const STATISTICS_PACKET_BYTES: usize = 320 * 1024;
 
@@ -122,7 +130,8 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(DistributedWriterConcurrentProgress::default()),
         Box::new(DistributedStatisticsDataflow),
         Box::new(DistributedWriterOverwrite),
-        Box::new(DistributedWriterRowLevel),
+        Box::new(DistributedWriterRowLevel::default()),
+        Box::new(DistributedWriterRowLevel::small_slots()),
         Box::new(DistributedWriterFaults::default()),
     ]
 }
@@ -2097,7 +2106,20 @@ impl Scenario for DistributedWriterOverwrite {
 /// refuses a commit whose artifact superseded a different reference set, so a
 /// second DELETE that both commits and preserves the first one's effect is
 /// end-to-end evidence that the merge used exactly the frozen references.
-struct DistributedWriterRowLevel;
+#[derive(Default)]
+struct DistributedWriterRowLevel {
+    observations: SqlIntentOwner,
+    small_slots: bool,
+}
+
+impl DistributedWriterRowLevel {
+    fn small_slots() -> Self {
+        Self {
+            observations: SqlIntentOwner::default(),
+            small_slots: true,
+        }
+    }
+}
 
 impl Scenario for DistributedWriterRowLevel {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
@@ -2110,15 +2132,49 @@ impl Scenario for DistributedWriterRowLevel {
     }
 
     fn name(&self) -> &'static str {
-        "connector/distributed-writer-row-level"
+        if self.small_slots {
+            "connector/distributed-writer-row-level-small-slots"
+        } else {
+            "connector/distributed-writer-row-level"
+        }
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        if self.small_slots {
+            small_slots::launch_config()
+        } else {
+            Ok(connector_launch_config())
+        }
+    }
+
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let mut specs = row_level_contract::observation_specs(cluster_size);
+        if self.small_slots {
+            small_slots::add_append_holds(&mut specs, cluster_size)?;
+            specs.push(small_slots::partition_observation(cluster_size));
+            specs.push(small_slots::selected_update_observation(cluster_size));
+        }
+        Ok(Some(self.observations.freeze(
+            specs,
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
+        if self.small_slots {
+            small_slots::require_effective_config(context)?;
+        }
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
         let mut control = mysql_actor::connect(
@@ -2127,8 +2183,8 @@ impl Scenario for DistributedWriterRowLevel {
             context.remaining("connect row-level mutation control session")?,
         )?;
 
-        const CATALOG: &str = "row_level_writer";
-        const DATABASE: &str = "row_level_writer_db";
+        const CATALOG: &str = row_level_contract::CATALOG;
+        const DATABASE: &str = row_level_contract::DATABASE;
         let warehouse = create_warehouse(context, "distributed-writer-row-level")?;
         create_catalog(&mut control, CATALOG, &warehouse)?;
         control
@@ -2168,6 +2224,7 @@ impl Scenario for DistributedWriterRowLevel {
         control
             .query_drop(format!("DELETE FROM {dv} WHERE id IN (1, 5, 9)"))
             .context("first deletion-vector DELETE")?;
+        row_level_contract::assert_affected(&control, 3, "first deletion-vector DELETE")?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -2201,6 +2258,7 @@ impl Scenario for DistributedWriterRowLevel {
         control
             .query_drop(format!("DELETE FROM {dv} WHERE v > 10"))
             .context("second deletion-vector DELETE")?;
+        row_level_contract::assert_affected(&control, 2, "second deletion-vector DELETE")?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         assert_committed_once(
             before_terminals,
@@ -2252,6 +2310,7 @@ impl Scenario for DistributedWriterRowLevel {
         control
             .query_drop(format!("DELETE FROM {positional} WHERE id IN (1, 5, 9)"))
             .context("position-delete DELETE")?;
+        row_level_contract::assert_affected(&control, 3, "position-delete DELETE")?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -2312,6 +2371,7 @@ impl Scenario for DistributedWriterRowLevel {
                 "UPDATE {cow} SET v = v + 100 WHERE id IN (1, 5, 9)"
             ))
             .context("copy-on-write UPDATE")?;
+        row_level_contract::assert_affected(&control, 3, "copy-on-write UPDATE")?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -2361,6 +2421,11 @@ impl Scenario for DistributedWriterRowLevel {
                  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)"
             ))
             .context("MERGE across the delete and data branches")?;
+        row_level_contract::assert_affected(
+            &control,
+            2,
+            "MERGE across the delete and data branches",
+        )?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
@@ -2397,7 +2462,35 @@ impl Scenario for DistributedWriterRowLevel {
             bail!("MERGE left {merged:?}");
         }
 
+        let partition_diagnostic = if self.small_slots {
+            Some(
+                self.observations
+                    .take(small_slots::PARTITION_OBSERVATION_INDEX)?,
+            )
+        } else {
+            None
+        };
+        row_level_contract::run(
+            context,
+            &mut control,
+            CATALOG,
+            DATABASE,
+            &self.observations,
+            partition_diagnostic,
+            if self.small_slots {
+                Some(
+                    self.observations
+                        .take(small_slots::SELECTED_UPDATE_OBSERVATION_INDEX)?,
+                )
+            } else {
+                None
+            },
+        )?;
+
         await_resource_convergence(context, &baseline, "distributed row-level writes")?;
+        if self.small_slots {
+            small_slots::retain_idle_flow(context)?;
+        }
         Ok(())
     }
 }

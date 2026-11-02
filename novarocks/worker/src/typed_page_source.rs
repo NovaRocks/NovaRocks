@@ -55,6 +55,20 @@ impl TypedConnectorReaderMarker {
         })
     }
 
+    /// Reports the last provider metrics sampled by the original read poll.
+    /// This is an observation of delivered work, not a consumption proof.
+    pub(crate) fn emit_close(&self, rows_decoded: u64, batches_delivered: u64) {
+        self.observation.observe(&format!(
+            "NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE provider={} instance={} catalog_version={} scheduled_split_sequence_id={} rows_decoded={} batches_delivered={}",
+            self.provider_id,
+            self.instance_id,
+            self.catalog_version,
+            self.scheduled_split_sequence_id,
+            rows_decoded,
+            batches_delivered,
+        ));
+    }
+
     pub(crate) fn emit(&self, event: &str) {
         self.observation.observe(&format!(
             "NOVAROCKS_CONNECTOR_UNIT_READER_{event} provider={} instance={} catalog_version={} scheduled_split_sequence_id={}",

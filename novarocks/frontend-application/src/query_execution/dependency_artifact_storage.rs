@@ -240,15 +240,14 @@ impl SqlDependencyArtifactFactory {
         let path_bytes = root
             .len()
             .checked_add(self.descriptor.run_namespace.len())
-            .and_then(|n| n.checked_add(1 + 1 + 10 + 1 + 20 + 1 + 20 + 4))
+            .and_then(|n| n.checked_add(1 + 1 + 20 + 1 + 20 + 4))
             .ok_or(CaptureStorageError::InvalidLayout)?;
         let mut path = AdmittedCaptureBytes::try_new(&self.authority, scope, path_bytes)?;
         write!(
             &mut path,
-            "{root}/{}-{}-{}-{}.cap",
+            "{root}/{}-{}-{}.cap",
             self.descriptor.run_namespace,
-            token.session().connection_id(),
-            token.session().session_epoch(),
+            token.session().key().get(),
             token.generation()
         )
         .map_err(|_| CaptureStorageError::InvalidLayout)?;
@@ -268,12 +267,11 @@ impl SqlDependencyArtifactFactory {
         };
         // Private envelope only; FVT/CV/binding bodies remain original encoder DTOs.
         let mut header = [0u8; 64];
-        header[..8].copy_from_slice(b"NRDEPS01");
-        header[8..12].copy_from_slice(&token.session().connection_id().to_le_bytes());
-        header[12..20].copy_from_slice(&token.session().session_epoch().to_le_bytes());
+        header[..8].copy_from_slice(b"NRDEPS02");
+        header[8..16].copy_from_slice(&token.session().key().get().to_le_bytes());
         header[20..28].copy_from_slice(&token.generation().to_le_bytes());
         header[28..60].copy_from_slice(original_sql_sha256);
-        header[60..64].copy_from_slice(&1u32.to_le_bytes());
+        header[60..64].copy_from_slice(&2u32.to_le_bytes());
         artifact.write_bytes(&header)?;
         Ok(artifact)
     }

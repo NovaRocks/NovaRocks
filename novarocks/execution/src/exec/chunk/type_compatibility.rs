@@ -660,17 +660,15 @@ mod tests {
     }
 
     #[test]
-    fn retag_keeps_a_map_key_required_when_the_carrier_only_declares_it_nullable() {
-        // The exchange wire carries a generic Arrow map: `entries`, no field
-        // ids, both children declared nullable. The expected type is the
-        // provider's own, whose MAP key Arrow pins to non-nullable. No key is
-        // actually null, so the carrier's permissive declaration must not
-        // rewrite the expected type into one the result contract rejects.
+    fn retag_keeps_a_valid_map_key_required_and_ignores_generic_child_annotation() {
+        // Arrow requires the key field to be non-nullable even when no key
+        // is NULL. Keep the real retag path on a valid Map, and separately
+        // check that a permissive source annotation is not null evidence.
         let keys = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
         let values = Arc::new(Int32Array::from(vec![Some(10), None])) as ArrayRef;
         let entries = StructArray::new(
             Fields::from(vec![
-                Field::new("key", DataType::Int32, true),
+                Field::new("key", DataType::Int32, false),
                 Field::new("value", DataType::Int32, true),
             ]),
             vec![keys, values],
@@ -701,6 +699,16 @@ mod tests {
         let out = retag_column(&wire, &expected).expect("retag generic map carrier");
 
         assert_eq!(out.data_type(), &expected);
+        let map = out.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map.keys().null_count(), 0);
+        assert!(map.values().is_null(1));
+        let target = Arc::new(Field::new("key", DataType::Int32, false));
+        let generic = Arc::new(Field::new("key", DataType::Int32, true));
+        let child = map.keys().to_data();
+        assert!(Arc::ptr_eq(
+            &super::runtime_field(&target, &generic, &child),
+            &target
+        ));
     }
 
     #[test]
@@ -853,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn retag_column_widens_runtime_map_key_nullability() {
+    fn arrow_rejects_nullable_map_keys_before_a_retaggable_array_exists() {
         let keys = Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef;
         let values = Arc::new(Int64Array::from(vec![Some(10), Some(20)])) as ArrayRef;
         let entries = StructArray::new(
@@ -864,26 +872,19 @@ mod tests {
             vec![keys, values],
             None,
         );
-        let source = Arc::new(MapArray::new(
+        let error = MapArray::try_new(
             Arc::new(Field::new("entries", entries.data_type().clone(), false)),
             OffsetBuffer::from_lengths([2]),
             entries,
             None,
             false,
-        )) as ArrayRef;
-        let target = map(DataType::Int32, DataType::Int64, false);
-
-        let out = retag_column(&source, &target).expect("retag nullable map key");
-
-        let DataType::Map(entries, false) = out.data_type() else {
-            panic!("expected map");
-        };
-        let DataType::Struct(fields) = entries.data_type() else {
-            panic!("expected entries struct");
-        };
-        assert!(fields[0].is_nullable());
-        let map = out.as_any().downcast_ref::<MapArray>().expect("map array");
-        assert!(map.keys().is_null(1));
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            arrow::error::ArrowError::InvalidArgumentError(_)
+        ));
+        assert!(error.to_string().contains("keys field cannot be nullable"));
     }
 
     #[test]

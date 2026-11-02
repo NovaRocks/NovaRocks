@@ -390,7 +390,7 @@ impl ConstantSourceOwner {
                     count = count
                         .checked_add(1)
                         .ok_or(CompileControlError::ResourceExhausted)?;
-                } else if actual.metadata().capacity() != 0 {
+                } else if actual.metadata().as_arc().is_some() {
                     return Err(novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError::MissingOriginalFieldOrigin.into());
                 }
                 Ok(())
@@ -521,14 +521,15 @@ fn source_fields_in<
 }
 
 /// An explicit pure source branch has no invoice or allocator provenance.
-/// Every reachable map must have zero backing, including removed-entry maps.
+/// Every reachable Metadata must have no Arc backing. Arrow 60 canonicalizes
+/// removed-entry and cleared maps to None; an empty map retains no allocation.
 /// No format annotation is interpreted as a semantic author here.
 pub fn validate_pure_borrowed_source_in(
     field: &Field,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ConstantError> {
     source_fields_in(field, work, &mut |actual, _| {
-        if actual.metadata().capacity() != 0 {
+        if actual.metadata().as_arc().is_some() {
             Err(ConstantError::Invalid(
                 "pure constant source metadata requires original creation provenance",
             ))
@@ -763,10 +764,9 @@ mod tests {
     fn missing_metadata_provenance_is_typed_and_empty_backing_is_explicitly_pure() {
         let mut metadata = std::collections::HashMap::with_capacity(4);
         metadata.insert("removed".into(), "entry".into());
-        metadata.clear();
         let field = Arc::new(Field::new("source", DataType::Utf8, false).with_metadata(metadata));
-        assert!(field.metadata().is_empty());
-        assert!(field.metadata().capacity() > 0);
+        assert!(!field.metadata().is_empty());
+        assert!(field.metadata().as_arc().is_some());
         let namespace = MaterializedFieldNamespace::from_original_loans(Vec::new().into());
         let control = Control(AtomicBool::new(false));
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
@@ -790,6 +790,30 @@ mod tests {
         assert!(validate_pure_borrowed_source_in(&field, &mut work).is_err());
         let pure = Field::new("pure", DataType::Utf8, false);
         validate_pure_borrowed_source_in(&pure, &mut work).unwrap();
+        work.finish().unwrap();
+    }
+
+    #[test]
+    fn emptied_metadata_has_no_backing_and_is_a_pure_borrowed_source() {
+        let mut reserved = std::collections::HashMap::<String, String>::with_capacity(4);
+        reserved.insert("removed".into(), "entry".into());
+        reserved.clear();
+        assert!(reserved.capacity() > 0);
+        let converted = arrow_schema::Metadata::from(reserved);
+        let mut removed = arrow_schema::Metadata::new().with("removed", "entry");
+        removed.remove("removed");
+        let mut retained = arrow_schema::Metadata::new().with("removed", "entry");
+        retained.retain(|_, _| false);
+        let mut cleared = arrow_schema::Metadata::new().with("removed", "entry");
+        cleared.clear();
+        let control = Control(AtomicBool::new(false));
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        for metadata in [converted, removed, retained, cleared] {
+            assert!(metadata.is_empty());
+            assert!(metadata.as_arc().is_none());
+            let field = Field::new("pure", DataType::Utf8, false).with_metadata(metadata);
+            validate_pure_borrowed_source_in(&field, &mut work).unwrap();
+        }
         work.finish().unwrap();
     }
 }

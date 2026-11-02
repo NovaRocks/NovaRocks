@@ -32,9 +32,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::query_execution::package_freeze::CompiledPackageCarrier;
 use novarocks_physical_plan::{FragmentPackage, PhysicalPlan};
 use novarocks_plan_codec::PhysicalEncodeError;
-use novarocks_plan_codec::physical_package_v2::PackageEncodeLimits;
 use novarocks_type_contract::PureCompileControl;
 
 use crate::query_execution::artifact::FragmentId;
@@ -60,7 +60,7 @@ pub(crate) fn freeze_completed_packages(
     physical: &PhysicalPlan,
     plan: &SubmissionPlanFacts,
     root_fragment_id: FragmentId,
-    limits: &PackageEncodeLimits,
+    carrier: &CompiledPackageCarrier,
     control: &dyn PureCompileControl,
 ) -> Result<BTreeMap<FragmentId, Arc<FragmentArtifact>>, PhysicalEncodeError> {
     let mut frozen = BTreeMap::new();
@@ -81,7 +81,7 @@ pub(crate) fn freeze_completed_packages(
         validate_fragment_output_kind(fragment_id, is_root, has_stream_edge, facts.role())?;
         assembly::ensure_native_fragment_sink_supported(fragment_id, is_root, has_stream_edge)?;
         let artifact =
-            FragmentArtifact::freeze_package(package, physical.edges(), limits, control)?;
+            FragmentArtifact::freeze_package(package, physical.edges(), carrier, control)?;
         if frozen.insert(fragment_id, artifact).is_some() {
             return Err(
                 format!("completed plan packaged duplicate fragment id={fragment_id}").into(),

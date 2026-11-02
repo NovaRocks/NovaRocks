@@ -38,25 +38,40 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 struct Session {
+    connection: ClientConnectionToken,
     result: Mutex<Option<StreamingStatementResult>>,
     lease: QuerySessionLease,
 }
 struct Factory(Arc<Session>);
 impl QuerySessionFactory for Factory {
+    fn open_statement_session(
+        &self,
+        _: novarocks_query_application::session::StatementSessionRequest,
+    ) -> Result<
+        Arc<dyn QuerySession>,
+        novarocks_query_application::session_value::StatementSessionError,
+    > {
+        unreachable!("this fixture exercises the connection session entry")
+    }
+
     fn open_session(
         &self,
         request: QuerySessionOpenRequest,
     ) -> Result<Arc<dyn QuerySession>, QueryServiceError> {
-        assert_eq!(
-            request.connection_id(),
-            self.0.lease.token().connection_id()
-        );
+        assert_eq!(request.connection_id(), self.0.connection.connection_id());
         Ok(self.0.clone())
     }
     fn cancel_all(&self, _: QueryCancellationReason) {}
 }
 #[async_trait::async_trait]
 impl QuerySession for Session {
+    fn connection_session(
+        &self,
+        connection: ClientConnectionToken,
+    ) -> Option<novarocks_query_application::session_control::SessionToken> {
+        (connection == self.connection).then_some(self.lease.token())
+    }
+
     async fn init_database(
         &self,
         _: &str,
@@ -78,6 +93,7 @@ impl QuerySession for Session {
                         .take()
                         .expect("single original query"),
                 )),
+                novarocks_query_application::statement_kind::StatementKind::Query,
             ),
         )
     }
@@ -218,6 +234,7 @@ async fn original_pressure_intermediary(pool_refusal: bool) {
         Some(crate::closing_pressure_gate::Failure::Identity)
     );
     let session = Arc::new(Session {
+        connection,
         result: Mutex::new(Some(result)),
         lease,
     });
@@ -316,7 +333,7 @@ async fn original_pressure_intermediary(pool_refusal: bool) {
         control.cancel_session_statement(
             session.lease.token(),
             QueryCancellationReason::ExplicitKill {
-                requester_connection_id: connection.connection_id(),
+                requester_session: session.lease.token().key(),
             },
         );
         if !pool_refusal {
@@ -450,6 +467,16 @@ async fn authenticate(stream: &mut TcpStream) {
 struct ErrorSession(Mutex<Option<QueryServiceError>>);
 struct ErrorFactory(Arc<ErrorSession>);
 impl QuerySessionFactory for ErrorFactory {
+    fn open_statement_session(
+        &self,
+        _: novarocks_query_application::session::StatementSessionRequest,
+    ) -> Result<
+        Arc<dyn QuerySession>,
+        novarocks_query_application::session_value::StatementSessionError,
+    > {
+        unreachable!("this fixture exercises the connection session entry")
+    }
+
     fn open_session(
         &self,
         _: QuerySessionOpenRequest,
@@ -460,6 +487,13 @@ impl QuerySessionFactory for ErrorFactory {
 }
 #[async_trait::async_trait]
 impl QuerySession for ErrorSession {
+    fn connection_session(
+        &self,
+        _: ClientConnectionToken,
+    ) -> Option<novarocks_query_application::session_control::SessionToken> {
+        None
+    }
+
     async fn init_database(
         &self,
         _: &str,

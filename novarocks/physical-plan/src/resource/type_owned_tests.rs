@@ -350,11 +350,10 @@ fn typed_semantic_author_refuses_invalid_domains_and_does_not_read_metadata() {
     );
     let field = Arc::new(
         Field::new("ignored-role", DataType::Int64, false).with_metadata(
-            [(
+            std::collections::HashMap::<String, String>::from([(
                 novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
                 "unknown".to_owned(),
-            )]
-            .into(),
+            )]),
         ),
     );
     let nested = ValueType::new(DataType::List(field), false);

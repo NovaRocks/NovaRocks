@@ -21,11 +21,11 @@ use super::{LocalResultBound, QueryResult};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_result_contract::{
-    ClientRenderSchema, NativeRenderType, RenderColumn, RenderField, RenderPresentation,
-    RootProfileV1,
+    ClientPresentationFamily, ClientRenderSchema, NativeRenderType, RenderColumn, RenderField,
+    RenderPresentation, RootProfileV1,
 };
 use novarocks_result_render::{
-    ArrowMysqlTextEncoder, BoundedMysqlTextEncoder, RenderError, RenderTurn, RenderTurnStatus,
+    BoundedClientRowEncoder, ClientRowEncoder, RenderError, RenderTurn, RenderTurnStatus,
 };
 use novarocks_workload_control::{ResultWindowAlias, ResultWindowClass, WorkScope};
 use std::sync::Arc;
@@ -56,9 +56,14 @@ pub struct LocalColumnView<'a> {
 /// this factory merely because they contain Arrow.
 pub struct LocalResultProducer {
     window: ResultWindowAlias,
+    family: ClientPresentationFamily,
 }
 impl LocalResultProducer {
-    pub fn try_new(scope: &WorkScope, window: ResultWindowAlias) -> Result<Self, String> {
+    pub fn try_new(
+        scope: &WorkScope,
+        window: ResultWindowAlias,
+        family: ClientPresentationFamily,
+    ) -> Result<Self, String> {
         if !window.is_for_scope(scope)
             || !matches!(
                 window.class(),
@@ -71,7 +76,7 @@ impl LocalResultProducer {
         window
             .check_backing_total(LOCAL_PEAK_BYTES)
             .map_err(|error| error.to_string())?;
-        Ok(Self { window })
+        Ok(Self { window, family })
     }
     /// The complete allowance already exists before the source is called.
     /// Failure/panic destroys source locals before this capability can exit.
@@ -80,7 +85,7 @@ impl LocalResultProducer {
         source: impl FnOnce() -> Result<QueryResult, String>,
     ) -> Result<OwnedLocalResult, String> {
         let result = source()?;
-        OwnedLocalResult::seal_exclusive(result, self.window)
+        OwnedLocalResult::seal_exclusive(result, self.window, self.family)
     }
 }
 
@@ -94,6 +99,7 @@ impl LocalResultProducer {
 pub struct OwnedLocalResult {
     result: QueryResult,
     schema: Arc<ClientRenderSchema>,
+    retained_backing_bytes: u64,
     // Fields drop in declaration order: every graph owner precedes the guard.
     window: ResultWindowAlias,
 }
@@ -110,6 +116,7 @@ impl OwnedLocalResult {
     pub(crate) fn seal_exclusive(
         result: QueryResult,
         window: ResultWindowAlias,
+        family: ClientPresentationFamily,
     ) -> Result<Self, String> {
         let input = LocalSourceInput { result, window };
         if !matches!(
@@ -200,7 +207,12 @@ impl OwnedLocalResult {
                     source_slot: None,
                     name: field.name().to_owned(),
                     field: RenderField {
-                        presentation: RenderPresentation::ScalarText,
+                        presentation: match family {
+                            ClientPresentationFamily::MysqlText => RenderPresentation::ScalarText,
+                            ClientPresentationFamily::TrinoJson(_) => {
+                                RenderPresentation::TrinoValue
+                            }
+                        },
                         nullable: field.nullable(),
                         native_type: native(kind(field.data_type(), false)?),
                     },
@@ -208,15 +220,25 @@ impl OwnedLocalResult {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let schema = Arc::new(
-            ClientRenderSchema::try_new(columns, fields.len())
+            ClientRenderSchema::try_new(family, columns, fields.len())
                 .map_err(|error| error.to_string())?,
         );
+        let retained_backing_bytes = buffers
+            .checked_add(schema.backing_bytes())
+            .and_then(|bytes| bytes.checked_add(ClientRowEncoder::scratch_capacity_bound_bytes()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or("Local delivery backing size overflows")?;
         let LocalSourceInput { result, window } = input;
         Ok(Self {
             result,
             schema,
+            retained_backing_bytes,
             window,
         })
+    }
+    /// Borrow the exact pure declaration sealed with this owned graph.
+    pub fn client_render(&self) -> &ClientRenderSchema {
+        &self.schema
     }
     pub fn row_count(&self) -> usize {
         self.result.row_count()
@@ -232,6 +254,7 @@ impl OwnedLocalResult {
         let Self {
             result,
             schema,
+            retained_backing_bytes,
             window,
         } = self;
         LocalRenderCursor {
@@ -239,6 +262,7 @@ impl OwnedLocalResult {
             remaining: result.batches.into_iter(),
             schema,
             terminal_error: None,
+            retained_backing_bytes,
             _window: window,
         }
     }
@@ -267,13 +291,23 @@ fn native(kind: LocalColumnKind) -> NativeRenderType {
 /// A move-only cursor that exposes only encoded bytes. Its private renderer,
 /// remaining batches, schema and scratch all exit before the final guard.
 pub struct LocalRenderCursor {
-    encoder: Option<ArrowMysqlTextEncoder>,
+    encoder: Option<ClientRowEncoder>,
     remaining: std::vec::IntoIter<RecordBatch>,
     schema: Arc<ClientRenderSchema>,
     terminal_error: Option<RenderError>,
+    retained_backing_bytes: u64,
     _window: ResultWindowAlias,
 }
 impl LocalRenderCursor {
+    /// The original buffer-capacity sum, immutable render schema and maximum
+    /// future encoder scratch coexist with delivery. Keep the frozen observation
+    /// through actual cursor exit, including after cancellation or batch release.
+    pub fn retained_backing_bytes(&self) -> u64 {
+        self.retained_backing_bytes
+    }
+    pub fn client_render(&self) -> &ClientRenderSchema {
+        &self.schema
+    }
     pub fn step(&mut self, output: &mut [u8]) -> Result<RenderTurn, RenderError> {
         if let Some(error) = self.terminal_error {
             return Err(error);
@@ -295,10 +329,7 @@ impl LocalRenderCursor {
                     status: RenderTurnStatus::InputComplete,
                 });
             };
-            self.encoder = Some(ArrowMysqlTextEncoder::try_new(
-                Arc::clone(&self.schema),
-                batch,
-            )?);
+            self.encoder = Some(ClientRowEncoder::try_new(Arc::clone(&self.schema), batch)?);
         }
         let mut turn = self
             .encoder
@@ -331,7 +362,7 @@ impl LocalRenderCursor {
     pub fn scratch_capacity_bytes(&self) -> usize {
         self.encoder
             .as_ref()
-            .map_or(0, BoundedMysqlTextEncoder::scratch_capacity_bytes)
+            .map_or(0, BoundedClientRowEncoder::scratch_capacity_bytes)
     }
 }
 
@@ -363,6 +394,13 @@ mod tests {
         (host, capacity)
     }
     fn produce_text(host: &WorkloadControl, text: &str) -> OwnedLocalResult {
+        produce_text_for_family(host, text, ClientPresentationFamily::MysqlText)
+    }
+    fn produce_text_for_family(
+        host: &WorkloadControl,
+        text: &str,
+        family: ClientPresentationFamily,
+    ) -> OwnedLocalResult {
         let (root, window) = host
             .root_admission()
             .try_begin_root_with_result(
@@ -371,7 +409,8 @@ mod tests {
             )
             .unwrap();
         let source =
-            LocalResultProducer::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
+            LocalResultProducer::try_new(&root.owner.scope(), window.retain_alias(), family)
+                .unwrap();
         let result = source
             .produce(|| super::super::build_string_query_result("value", vec![text.to_owned()]))
             .unwrap();
@@ -406,17 +445,37 @@ mod tests {
     }
     #[test]
     fn cancellation_latches_before_first_encoder_and_after_a_counting_turn() {
-        for after_count in [false, true] {
+        for (family, after_count) in [
+            (ClientPresentationFamily::MysqlText, false),
+            (ClientPresentationFamily::MysqlText, true),
+            (
+                ClientPresentationFamily::TrinoJson(Default::default()),
+                false,
+            ),
+            (
+                ClientPresentationFamily::TrinoJson(Default::default()),
+                true,
+            ),
+        ] {
             let (host, capacity) = fixture();
-            let result = produce_text(&host, &"x".repeat(128 * 1024));
+            let result = produce_text_for_family(&host, &"x".repeat(128 * 1024), family);
             let mut cursor = result.into_cursor();
+            let retained = cursor.retained_backing_bytes();
+            assert!(retained >= ClientRowEncoder::scratch_capacity_bound_bytes() as u64);
+            assert_eq!(cursor.scratch_capacity_bytes(), 0);
             let mut output = [0xab; 128];
             if after_count {
                 let turn = cursor.step(&mut output).unwrap();
                 assert!(turn.examined_bytes <= RootProfileV1::EMIT_BYTES_PER_TURN);
                 assert_eq!(turn.emitted_bytes, 0);
+                assert_eq!(
+                    cursor.scratch_capacity_bytes(),
+                    ClientRowEncoder::scratch_capacity_bound_bytes()
+                );
+                assert_eq!(cursor.retained_backing_bytes(), retained);
             }
             cursor.cancel();
+            assert_eq!(cursor.retained_backing_bytes(), retained);
             for _ in 0..2 {
                 assert_eq!(
                     cursor.step(&mut output).unwrap_err().kind,
@@ -428,6 +487,135 @@ mod tests {
             drop(cursor);
             assert_eq!(capacity.snapshot().held_positions, [0; 4]);
         }
+    }
+    #[test]
+    fn delivery_backing_counts_spare_buffers_near_collector_for_both_window_classes() {
+        use super::super::{ResultField, build_arrow_query_result};
+        use arrow::array::{Array, StringArray};
+        use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+
+        for class in [ResultWindowClass::Local, ResultWindowClass::Internal] {
+            for family in [
+                ClientPresentationFamily::MysqlText,
+                ClientPresentationFamily::TrinoJson(Default::default()),
+            ] {
+                let (host, capacity) = fixture();
+                let (root, window) = host
+                    .root_admission()
+                    .try_begin_root_with_result(WorkRequest::new(WorkClass::Management), class)
+                    .unwrap();
+                let source = LocalResultProducer::try_new(
+                    &root.owner.scope(),
+                    window.retain_alias(),
+                    family,
+                )
+                .unwrap();
+                let measured = std::cell::Cell::new(0usize);
+                let result = source
+                    .produce(|| {
+                        let mut values = Vec::with_capacity(LocalResultBound::V1.bytes - 4096);
+                        values.push(b'v');
+                        let array = StringArray::new(
+                            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1])),
+                            Buffer::from(values),
+                            None,
+                        );
+                        measured.set(array.get_buffer_memory_size());
+                        build_arrow_query_result(
+                            vec![ResultField::new(
+                                "value",
+                                novarocks_type_contract::FunctionValueType::new(
+                                    DataType::Utf8,
+                                    false,
+                                ),
+                            )],
+                            vec![Arc::new(array)],
+                        )
+                    })
+                    .unwrap();
+                assert!(measured.get() > LocalResultBound::V1.bytes - 8192);
+                let expected = measured.get()
+                    + result.client_render().backing_bytes()
+                    + ClientRowEncoder::scratch_capacity_bound_bytes();
+                root.owner.complete();
+                root.business.release();
+                drop(window);
+
+                let mut cursor = result.into_cursor();
+                assert_eq!(cursor.client_render().family(), &family);
+                assert_eq!(cursor.retained_backing_bytes(), expected as u64);
+                assert!(cursor.retained_backing_bytes() < LOCAL_PEAK_BYTES);
+                assert_eq!(cursor.scratch_capacity_bytes(), 0);
+                let mut output = [0; 256];
+                let turn = cursor.step(&mut output).unwrap();
+                assert_eq!(turn.status, RenderTurnStatus::InputComplete);
+                let expected_bytes: &[u8] = match family {
+                    ClientPresentationFamily::MysqlText => &[2, 0, 0, 0, 1, b'v'],
+                    ClientPresentationFamily::TrinoJson(_) => {
+                        &[5, 0, 0, 0, b'[', b'"', b'v', b'"', b']']
+                    }
+                };
+                assert_eq!(&output[..turn.emitted_bytes], expected_bytes);
+                assert_eq!(cursor.retained_backing_bytes(), expected as u64);
+                cursor.cancel();
+                assert_eq!(cursor.retained_backing_bytes(), expected as u64);
+                let index = match class {
+                    ResultWindowClass::Local => 1,
+                    ResultWindowClass::Internal => 2,
+                    _ => unreachable!(),
+                };
+                assert_eq!(capacity.snapshot().held_positions[index], 1);
+                drop(cursor);
+                assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_local_graph_keeps_schema_and_future_scratch_observation_until_exit() {
+        use super::super::ResultField;
+        let (host, capacity) = fixture();
+        let (root, window) = host
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Local,
+            )
+            .unwrap();
+        let result = LocalResultProducer::try_new(
+            &root.owner.scope(),
+            window.retain_alias(),
+            ClientPresentationFamily::TrinoJson(Default::default()),
+        )
+        .unwrap()
+        .produce(|| {
+            Ok(QueryResult {
+                columns: vec![ResultField::new(
+                    "value",
+                    novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+                )],
+                batches: Vec::new(),
+            })
+        })
+        .unwrap();
+        let expected = result.client_render().backing_bytes()
+            + ClientRowEncoder::scratch_capacity_bound_bytes();
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+
+        let mut cursor = result.into_cursor();
+        assert_eq!(cursor.retained_backing_bytes(), expected as u64);
+        assert_eq!(cursor.scratch_capacity_bytes(), 0);
+        let turn = cursor.step(&mut [0; 32]).unwrap();
+        assert_eq!(turn.status, RenderTurnStatus::InputComplete);
+        assert_eq!(turn.emitted_bytes, 0);
+        assert_eq!(cursor.retained_backing_bytes(), expected as u64);
+        cursor.cancel();
+        assert_eq!(cursor.retained_backing_bytes(), expected as u64);
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        drop(cursor);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
     #[test]
     fn foreign_same_number_scope_and_client_class_refuse_before_source() {
@@ -444,7 +632,14 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Management))
             .unwrap();
         assert_eq!(root.owner.scope().id(), other.owner.scope().id());
-        assert!(LocalResultProducer::try_new(&other.owner.scope(), window.retain_alias()).is_err());
+        assert!(
+            LocalResultProducer::try_new(
+                &other.owner.scope(),
+                window.retain_alias(),
+                ClientPresentationFamily::MysqlText
+            )
+            .is_err()
+        );
         let (client_root, client_window) = first
             .root_admission()
             .try_begin_root_with_result(
@@ -453,8 +648,12 @@ mod tests {
             )
             .unwrap();
         assert!(
-            LocalResultProducer::try_new(&client_root.owner.scope(), client_window.retain_alias())
-                .is_err()
+            LocalResultProducer::try_new(
+                &client_root.owner.scope(),
+                client_window.retain_alias(),
+                ClientPresentationFamily::MysqlText
+            )
+            .is_err()
         );
         root.owner.complete();
         root.business.release();
@@ -477,40 +676,41 @@ mod tests {
                 ResultWindowClass::Local,
             )
             .unwrap();
-        let result = LocalResultProducer::try_new(&root.owner.scope(), window.retain_alias())
-            .unwrap()
-            .produce(|| {
-                build_arrow_query_result(
-                    vec![
-                        ResultField::new(
-                            "active",
-                            novarocks_type_contract::FunctionValueType::new(
-                                DataType::Boolean,
-                                false,
-                            ),
-                        ),
-                        ResultField::new(
-                            "small",
-                            novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
-                        ),
-                        ResultField::new(
-                            "large",
-                            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-                        ),
-                        ResultField::new(
-                            "text",
-                            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
-                        ),
-                    ],
-                    vec![
-                        Arc::new(BooleanArray::from(vec![true])),
-                        Arc::new(Int32Array::from(vec![-2])),
-                        Arc::new(Int64Array::from(vec![7])),
-                        Arc::new(StringArray::from(vec![None::<&str>])),
-                    ],
-                )
-            })
-            .unwrap();
+        let result = LocalResultProducer::try_new(
+            &root.owner.scope(),
+            window.retain_alias(),
+            ClientPresentationFamily::MysqlText,
+        )
+        .unwrap()
+        .produce(|| {
+            build_arrow_query_result(
+                vec![
+                    ResultField::new(
+                        "active",
+                        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+                    ),
+                    ResultField::new(
+                        "small",
+                        novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+                    ),
+                    ResultField::new(
+                        "large",
+                        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                    ),
+                    ResultField::new(
+                        "text",
+                        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+                    ),
+                ],
+                vec![
+                    Arc::new(BooleanArray::from(vec![true])),
+                    Arc::new(Int32Array::from(vec![-2])),
+                    Arc::new(Int64Array::from(vec![7])),
+                    Arc::new(StringArray::from(vec![None::<&str>])),
+                ],
+            )
+        })
+        .unwrap();
         assert_eq!(
             result
                 .columns()
@@ -538,6 +738,122 @@ mod tests {
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
     #[test]
+    fn trino_local_primitives_freeze_family_and_render_json_rows() {
+        use super::super::{ResultField, build_arrow_query_result};
+        use arrow::array::{BooleanArray, Int32Array, Int64Array, StringArray};
+        use novarocks_result_contract::TrinoJsonFacts;
+        let (host, capacity) = fixture();
+        let (root, window) = host
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                ResultWindowClass::Local,
+            )
+            .unwrap();
+        let family = ClientPresentationFamily::TrinoJson(TrinoJsonFacts {
+            parametric_datetime: true,
+            variant: false,
+            variant_binary: false,
+        });
+        let result =
+            LocalResultProducer::try_new(&root.owner.scope(), window.retain_alias(), family)
+                .unwrap()
+                .produce(|| {
+                    build_arrow_query_result(
+                        vec![
+                            ResultField::new(
+                                "active",
+                                novarocks_type_contract::FunctionValueType::new(
+                                    DataType::Boolean,
+                                    false,
+                                ),
+                            ),
+                            ResultField::new(
+                                "small",
+                                novarocks_type_contract::FunctionValueType::new(
+                                    DataType::Int32,
+                                    false,
+                                ),
+                            ),
+                            ResultField::new(
+                                "large",
+                                novarocks_type_contract::FunctionValueType::new(
+                                    DataType::Int64,
+                                    false,
+                                ),
+                            ),
+                            ResultField::new(
+                                "text",
+                                novarocks_type_contract::FunctionValueType::new(
+                                    DataType::Utf8,
+                                    true,
+                                ),
+                            ),
+                        ],
+                        vec![
+                            Arc::new(BooleanArray::from(vec![true, false])),
+                            Arc::new(Int32Array::from(vec![-2, i32::MIN])),
+                            Arc::new(Int64Array::from(vec![i64::MAX, 7])),
+                            Arc::new(StringArray::from(vec![None, Some("a\"\n")])),
+                        ],
+                    )
+                })
+                .unwrap();
+        assert_eq!(result.schema.family(), &family);
+        assert!(
+            result
+                .schema
+                .columns()
+                .iter()
+                .all(|column| column.field.presentation == RenderPresentation::TrinoValue)
+        );
+        assert_eq!(
+            result
+                .schema
+                .columns()
+                .iter()
+                .map(|column| &column.field.native_type)
+                .collect::<Vec<_>>(),
+            vec![
+                &NativeRenderType::Boolean,
+                &NativeRenderType::SignedInteger(32),
+                &NativeRenderType::SignedInteger(64),
+                &NativeRenderType::String
+            ],
+        );
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        let mut cursor = result.into_cursor();
+        let mut body = Vec::new();
+        let mut rows = 0;
+        for _ in 0..256 {
+            let mut output = [0; 7];
+            let turn = cursor.step(&mut output).unwrap();
+            assert!(turn.emitted_bytes <= output.len());
+            assert!(turn.examined_bytes <= RootProfileV1::EMIT_BYTES_PER_TURN);
+            rows += turn.completed_rows;
+            body.extend_from_slice(&output[..turn.emitted_bytes]);
+            if turn.status == RenderTurnStatus::InputComplete {
+                break;
+            }
+        }
+        let mut expected = Vec::new();
+        for payload in [
+            br#"[true,-2,9223372036854775807,null]"#.as_slice(),
+            br#"[false,-2147483648,7,"a\"\n"]"#.as_slice(),
+        ] {
+            expected.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            expected.extend_from_slice(payload);
+        }
+        assert_eq!(rows, 2);
+        assert_eq!(body, expected);
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        drop(cursor);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[test]
     fn empty_input_batch_yields_before_the_following_batch_without_false_end() {
         let (host, _) = fixture();
         let (root, window) = host
@@ -547,27 +863,45 @@ mod tests {
                 ResultWindowClass::Local,
             )
             .unwrap();
-        let result = LocalResultProducer::try_new(&root.owner.scope(), window.retain_alias())
-            .unwrap()
-            .produce(|| {
-                let mut empty = super::super::build_string_query_result("value", vec![])?;
-                let mut next = super::super::build_string_query_result("value", vec!["a".into()])?;
-                empty.batches.append(&mut next.batches);
-                Ok(empty)
-            })
-            .unwrap();
+        let result = LocalResultProducer::try_new(
+            &root.owner.scope(),
+            window.retain_alias(),
+            ClientPresentationFamily::MysqlText,
+        )
+        .unwrap()
+        .produce(|| {
+            let mut empty = super::super::build_string_query_result("value", vec![])?;
+            let mut next = super::super::build_string_query_result("value", vec!["a".into()])?;
+            empty.batches.append(&mut next.batches);
+            Ok(empty)
+        })
+        .unwrap();
+        let expected = result
+            .result
+            .batches
+            .iter()
+            .flat_map(|batch| batch.columns())
+            .map(|array| array.get_buffer_memory_size())
+            .sum::<usize>()
+            + result.client_render().backing_bytes()
+            + ClientRowEncoder::scratch_capacity_bound_bytes();
         root.owner.complete();
         root.business.release();
         drop(window);
         let mut cursor = result.into_cursor();
+        assert_eq!(cursor.retained_backing_bytes(), expected as u64);
         let mut bytes = [0; 256];
         assert_eq!(
             cursor.step(&mut bytes).unwrap().status,
             RenderTurnStatus::Yielded
         );
+        assert_eq!(cursor.retained_backing_bytes(), expected as u64);
         let turn = cursor.step(&mut bytes).unwrap();
         assert_eq!(turn.status, RenderTurnStatus::InputComplete);
         assert_eq!(&bytes[..turn.emitted_bytes], &[2, 0, 0, 0, 1, b'a']);
+        assert_eq!(cursor.retained_backing_bytes(), expected as u64);
+        cursor.cancel();
+        assert_eq!(cursor.retained_backing_bytes(), expected as u64);
     }
 
     #[test]
@@ -583,8 +917,12 @@ mod tests {
                     ResultWindowClass::Local,
                 )
                 .unwrap();
-            let source =
-                LocalResultProducer::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
+            let source = LocalResultProducer::try_new(
+                &root.owner.scope(),
+                window.retain_alias(),
+                ClientPresentationFamily::MysqlText,
+            )
+            .unwrap();
             let result = source.produce(|| {
                 if mismatch {
                     let mut result = build_arrow_query_result(

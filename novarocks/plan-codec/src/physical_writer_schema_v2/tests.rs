@@ -118,7 +118,12 @@ fn roots() -> Vec<(u32, FunctionValueType)> {
                         93,
                         true,
                     )
-                    .with_metadata([("source.key".into(), "exact / 值".into())].into()),
+                    .with_metadata(
+                        std::collections::HashMap::<String, String>::from([(
+                            "source.key".into(),
+                            "exact / 值".into(),
+                        )]),
+                    ),
                 )),
                 true,
             ),

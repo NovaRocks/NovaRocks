@@ -251,4 +251,274 @@ mod split_delivery_local_terminal_tests {
         assert!(!harness.execution.task(leaf).unwrap().is_terminal());
         assert!(harness.execution.failure_cause().is_none());
     }
+    #[test]
+    fn strict_tail_keeps_original_split_delivery_until_normal_close_or_real_cleanup() {
+        use crate::query_execution::connector_domain::{
+            PlanNodeAssignmentState, TaskUpdateRequest,
+        };
+        use crate::task_execution::attempt_convergence::{
+            NativeAttemptConvergenceMode, NativeAttemptConvergenceOwner,
+            NativeAttemptConvergenceTarget,
+        };
+        use novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain;
+        use novarocks_query_application::api::{
+            BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
+        };
+        struct CurrentProcess;
+        impl BackendProcessObservationPort for CurrentProcess {
+            fn observe_process_at_endpoint(
+                &self,
+                _: BackendProcessId,
+                _: &novarocks_execution::runtime::endpoint::RuntimeEndpoint,
+            ) -> Result<BackendProcessObservation, BackendTopologyError> {
+                Ok(BackendProcessObservation::Current)
+            }
+        }
+        for requested_cleanup in [false, true] {
+            let schedule = chain_schedule(&[0], &[1]);
+            let mut edges = chain_edges();
+            for edge in &mut edges {
+                edge.delivery = MustDrain;
+            }
+            let graph = build_graph(&schedule, &edges, &backends(2), 512).unwrap();
+            let bridge = SplitDeliveryBridge::for_graph(&graph);
+            let sink = Arc::new(RecordingSink::default());
+            let harness = Harness::from_graph_with_original_transport(
+                graph,
+                4096,
+                sink.clone(),
+                bridge.sink(sink.clone()),
+            );
+            let leaf = harness.stage_tasks(1)[0];
+            let leaf_identity = harness.identity(leaf);
+            let leaf_kernel = harness
+                .execution
+                .graph()
+                .task(leaf)
+                .unwrap()
+                .fragment_instance_id();
+            let (round, status, acks, creates) = round_waiting_on_creates(harness);
+            let mut round = round.observing(bridge.clone());
+            for create in &creates {
+                let identity = create_identity(create);
+                acks.publish(OperationAcknowledgement::new(
+                    create.operation_id(),
+                    OperationKind::CreateTask,
+                    OperationOutcome::Accepted,
+                    AckPayload::Create(Box::new(CreateTaskReceipt::new(
+                        identity,
+                        Vec::new(),
+                        TaskStatus::created(identity).with_installed(),
+                    ))),
+                ));
+            }
+            round.turn().unwrap();
+            // Settle the real edge-open domain operations before adding the
+            // source's final delivery. No receipt is inferred from a send.
+            for _ in 0..8 {
+                let released = sink
+                    .take()
+                    .into_iter()
+                    .flat_map(|(_, operations)| operations)
+                    .collect::<Vec<_>>();
+                if released.is_empty() {
+                    break;
+                }
+                for intent in released {
+                    if let OperationIntent::UpdateTask(update) = &intent {
+                        acks.publish(OperationAcknowledgement::new(
+                            intent.operation_id(),
+                            OperationKind::UpdateTask,
+                            OperationOutcome::Accepted,
+                            AckPayload::Update(UpdateTaskReceipt::new(
+                                update.identity(),
+                                update.domains().iter().map(task_domain_receipt).collect(),
+                            )),
+                        ));
+                    }
+                }
+                round.turn().unwrap();
+            }
+            let root = round.root_task();
+            let source = round.take_root_status_source().unwrap();
+            let mut seal = source.begin_success_seal_request().unwrap();
+            // The original ordered intake applies this control before later statuses.
+            round.turn().unwrap();
+            assert!(matches!(
+                seal.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            for (version, state, complete) in [
+                (2, TaskState::Running, false),
+                (3, TaskState::Flushing, false),
+                (4, TaskState::Finished, true),
+            ] {
+                status.publish(StatusEvent::Published(Box::new(
+                    TaskStatus::try_new(
+                        root,
+                        TaskStatusVersion::new(version).unwrap(),
+                        state,
+                        None,
+                        TaskOutputFacts::new(complete),
+                    )
+                    .unwrap()
+                    .with_installed(),
+                )));
+                round.turn().unwrap();
+            }
+            assert_eq!(seal.try_recv().unwrap(), Ok(()));
+            assert!(!round.execution().normal_drain_started());
+            let target = AssignmentTarget {
+                backend_idx: 0,
+                fragment_instance_id: leaf_kernel,
+            };
+            let scan = ScanNodeKey::new(LEAF_FRAGMENT, SCAN_NODE);
+            let mut driver = SplitAssignmentDriver::new(
+                leaf_identity.query_execution_id(),
+                bridge.clone(),
+                BTreeMap::from([(scan, vec![target.clone()])]),
+                1,
+                BTreeMap::from([(
+                    scan,
+                    Arc::new(TerminalOnlyEncoder) as Arc<dyn ConnectorReadWireEncoder>,
+                )]),
+                crate::task_protocol_config::TaskUpdateRetryPolicy::default(),
+                SplitAssignmentStop::default(),
+            );
+            driver.start_delivery(scan, BTreeMap::new(), true).unwrap();
+            assert!(driver.drive_delivery().unwrap());
+            let targets = round
+                .execution()
+                .graph()
+                .contexts()
+                .map(|&context| {
+                    NativeAttemptConvergenceTarget::new(
+                        context,
+                        novarocks_execution::runtime::endpoint::RuntimeEndpoint::new(
+                            "127.0.0.1",
+                            1,
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect();
+            let mut convergence =
+                NativeAttemptConvergenceOwner::new(&round, Arc::new(CurrentProcess), targets)
+                    .unwrap();
+            convergence
+                .step(
+                    &mut round,
+                    &bridge,
+                    NativeAttemptConvergenceMode::Normal,
+                    false,
+                )
+                .unwrap();
+            assert!(!round.execution().normal_drain_started());
+            assert!(
+                bridge.take_pending().is_empty(),
+                "the original owner admitted the queued delivery"
+            );
+            let released = sink
+                .take()
+                .into_iter()
+                .flat_map(|(_, operations)| operations)
+                .collect::<Vec<_>>();
+            let split = released.iter().find(|intent| matches!(intent, OperationIntent::UpdateTask(update)
+                if update.identity() == leaf_identity && update.domains().iter().any(|domain| matches!(domain, TaskDomainUpdate::SplitAssignment(_))))).expect("strict tail still releases its original split update");
+            assert_no_strict_demand_controls(&released);
+            let OperationIntent::UpdateTask(update) = split else {
+                unreachable!()
+            };
+            acks.publish(OperationAcknowledgement::new(
+                split.operation_id(),
+                OperationKind::UpdateTask,
+                OperationOutcome::Accepted,
+                AckPayload::Update(UpdateTaskReceipt::new(
+                    update.identity(),
+                    update
+                        .domains()
+                        .iter()
+                        .map(|domain| {
+                            let mut receipt = task_domain_receipt(domain);
+                            if let TaskDomainReceipt::SplitAssignment { nodes, .. } = &mut receipt {
+                                // This original offer is terminal-only, with no queued split.
+                                for node in nodes {
+                                    *node = node.with_queued_splits(0);
+                                }
+                            }
+                            receipt
+                        })
+                        .collect(),
+                )),
+            ));
+            convergence
+                .step(
+                    &mut round,
+                    &bridge,
+                    NativeAttemptConvergenceMode::Normal,
+                    false,
+                )
+                .unwrap();
+            assert!(driver.drive_delivery().unwrap());
+            assert!(driver.is_terminal_for(scan));
+            if requested_cleanup {
+                convergence
+                    .step(
+                        &mut round,
+                        &bridge,
+                        NativeAttemptConvergenceMode::Normal,
+                        true,
+                    )
+                    .unwrap();
+                assert!(
+                    !round.execution().normal_drain_started(),
+                    "cleanup cannot manufacture strict success"
+                );
+            } else {
+                for create in creates
+                    .iter()
+                    .filter(|create| create_identity(create) != root)
+                {
+                    for (version, state, complete) in [
+                        (2, TaskState::Running, false),
+                        (3, TaskState::Flushing, false),
+                        (4, TaskState::Finished, true),
+                    ] {
+                        status.publish(StatusEvent::Published(Box::new(
+                            TaskStatus::try_new(
+                                create_identity(create),
+                                TaskStatusVersion::new(version).unwrap(),
+                                state,
+                                None,
+                                TaskOutputFacts::new(complete),
+                            )
+                            .unwrap()
+                            .with_installed(),
+                        )));
+                        convergence
+                            .step(
+                                &mut round,
+                                &bridge,
+                                NativeAttemptConvergenceMode::Normal,
+                                false,
+                            )
+                            .unwrap();
+                    }
+                }
+                assert!(round.execution().normal_drain_started());
+            }
+            let assignment = PlanNodeAssignmentState::new()
+                .assign(SCAN_NODE, Vec::new(), true, Arc::new(TerminalOnlyEncoder))
+                .unwrap();
+            let request = TaskUpdateRequest::new(leaf_kernel, vec![assignment]);
+            let error = bridge
+                .begin(leaf_identity.query_execution_id(), &target, &request)
+                .expect_err("only the original close cut abandons the bridge");
+            assert!(error.detail().contains("abandoned"));
+            assert!(
+                round.accepted_root_success_sealed(),
+                "cleanup keeps the original accepted root cut"
+            );
+        }
+    }
 }

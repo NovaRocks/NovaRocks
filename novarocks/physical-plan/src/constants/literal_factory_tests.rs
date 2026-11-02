@@ -136,7 +136,7 @@ fn same_source(value: &ConstantValue, ty: &FunctionValueType) {
     assert_eq!(value.field().name(), "constant");
     assert_eq!(value.field().data_type(), ty.data_type());
     assert_eq!(value.field().is_nullable(), ty.nullable());
-    assert_eq!(value.field().metadata().capacity(), 0);
+    assert!(value.field().metadata().as_arc().is_none());
     assert_eq!(value.ordinal(), 0);
     assert_eq!(value.pool().array().len(), 1);
     assert_eq!(value.pool().resource_facts().rows, 1);

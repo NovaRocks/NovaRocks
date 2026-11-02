@@ -241,13 +241,12 @@ impl RestEndpoints {
         )
         .await
         .map_err(|failure| {
-            ConnectorError::new(
-                ConnectorErrorKind::Unavailable,
-                format!(
-                    "Iceberg REST session could not be established: {:?}",
-                    failure.step
-                ),
-            )
+            failure.into_connector(|step| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    format!("Iceberg REST session could not be established: {step:?}"),
+                )
+            })
         })
     }
 
@@ -321,6 +320,33 @@ impl RestEndpoints {
         }
     }
 
+    /// One governed listing page's original bytes. Parsing/collector work is
+    /// borrowed only by the same Provider's closed metadata CPU author.
+    pub(crate) async fn list_views_page_bytes_in(
+        &self,
+        namespace: &NamespaceIdent,
+        page_token: Option<&str>,
+        page_size: usize,
+        context: &RequestContext,
+    ) -> Result<Vec<u8>, ConnectorError> {
+        const OPERATION: &str = "list views";
+        let binding = self.binding_in(context).await?;
+        let url = page_url(
+            binding.views_url(namespace),
+            page_token,
+            page_size,
+            OPERATION,
+        )?;
+        match self
+            .get_in(OPERATION, &binding, url, None, &[200], context)
+            .await?
+        {
+            Answer::Success { body, .. } => read_document_bytes(OPERATION, body).await,
+            Answer::Status(404) => Err(not_found(OPERATION)),
+            Answer::Status(code) => Err(status_error(OPERATION, code)),
+        }
+    }
+
     /// Complete metadata or a conditionally validated representation. A 304
     /// never decodes a body or contributes storage credentials.
     pub(crate) async fn load_table_conditional(
@@ -358,7 +384,11 @@ impl RestEndpoints {
         self.owner
             .authorize_in(&mut headers, context)
             .await
-            .map_err(|_| unavailable("Iceberg REST load table failed: no catalog token".into()))?;
+            .map_err(|failure| {
+                failure.into_connector(|_| {
+                    unavailable("Iceberg REST load table failed: no catalog token".into())
+                })
+            })?;
         let (stage, body) = self
             .owner
             .http()
@@ -367,7 +397,7 @@ impl RestEndpoints {
                 &[200, 304],
                 context,
             )
-            .await;
+            .await?;
         match (stage, body) {
             (DispatchStage::Status { code: 200, .. }, Some(body)) => {
                 let etag = body.header(reqwest::header::ETAG).cloned();
@@ -800,16 +830,17 @@ impl RestEndpoints {
             .authorize_in(&mut headers, context)
             .await
             .map_err(|failure| {
-                unavailable(format!(
-                    "Iceberg REST {operation} failed: no catalog token ({:?})",
-                    failure.step
-                ))
+                failure.into_connector(|step| {
+                    unavailable(format!(
+                        "Iceberg REST {operation} failed: no catalog token ({step:?})"
+                    ))
+                })
             })?;
         let (stage, body) = self
             .owner
             .http()
             .send_once(Ok(RestRequest::new(method, url, headers)), success, context)
-            .await;
+            .await?;
         match (stage, body) {
             (DispatchStage::Status { code, .. }, Some(body)) => Ok(Answer::Success { code, body }),
             (DispatchStage::Status { code, .. }, None) => Ok(Answer::Status(code)),
@@ -866,10 +897,11 @@ pub(crate) async fn acquire_routed_in(
         .authorize_in(&mut headers, context)
         .await
         .map_err(|failure| {
-            retryable(unavailable(format!(
-                "Iceberg REST {OPERATION} failed: no catalog token ({:?})",
-                failure.step
-            )))
+            failure.into_connector(|step| {
+                retryable(unavailable(format!(
+                    "Iceberg REST {OPERATION} failed: no catalog token ({step:?})"
+                )))
+            })
         })?;
     let (stage, body) = owner
         .http()
@@ -882,7 +914,7 @@ pub(crate) async fn acquire_routed_in(
             &[200],
             context,
         )
-        .await;
+        .await?;
     let body = match (stage, body) {
         (DispatchStage::Status { .. }, Some(body)) => body,
         (DispatchStage::Status { code, .. }, None) => {
@@ -947,14 +979,21 @@ async fn decode_document<T: DeserializeOwned>(
     operation: &'static str,
     body: ResponseBody,
 ) -> Result<T, ConnectorError> {
-    let bytes = body.read_to_end().await.map_err(|error| {
-        unavailable(format!(
-            "Iceberg REST {operation} failed while reading the response ({error:?})"
-        ))
-    })?;
+    let bytes = read_document_bytes(operation, body).await?;
     serde_json::from_slice(&bytes).map_err(|_| {
         unavailable(format!(
             "Iceberg REST {operation} returned a response that could not be decoded"
+        ))
+    })
+}
+
+async fn read_document_bytes(
+    operation: &'static str,
+    body: ResponseBody,
+) -> Result<Vec<u8>, ConnectorError> {
+    body.read_to_end().await.map_err(|error| {
+        unavailable(format!(
+            "Iceberg REST {operation} failed while reading the response ({error:?})"
         ))
     })
 }

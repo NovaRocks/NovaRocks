@@ -107,8 +107,13 @@ fn ty(data_type: DataType) -> FunctionValueType {
 fn nested() -> FunctionValueType {
     ty(DataType::Struct(
         vec![Arc::new(
-            Field::new("child", DataType::Utf8, false)
-                .with_metadata([(String::from("unknown"), String::from("retained"))].into()),
+            Field::new("child", DataType::Utf8, false).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                String::from("unknown"),
+                String::from("retained"),
+            )])),
         )]
         .into(),
     ))

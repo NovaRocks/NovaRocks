@@ -110,6 +110,7 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
         command: application::StatisticsApplicationCommand,
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
         context: &novarocks_spi::connector::ConnectorRequestContext,
+        family: novarocks_result_contract::ClientPresentationFamily,
     ) -> Result<
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         application::StatisticsApplicationError,
@@ -117,7 +118,7 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
         use crate::query_execution::maintenance::io_admission::MetadataIoAdmission;
         let command = match command {
             application::StatisticsApplicationCommand::ShowTableStats { target } => {
-                return self.prepare_read_action(target, execution, context);
+                return self.prepare_read_action(target, execution, context, family);
             }
             command => command,
         };
@@ -834,7 +835,11 @@ impl novarocks_query_application::session_control::GovernedStatementAction
             .value
         {
             application::StatisticsApplicationResult::JobSubmitted(_) => {
-                Poll::Ready(Ok(StatementActionValue::Ok))
+                Poll::Ready(Ok(StatementActionValue::Ok(
+                    novarocks_query_application::session_control::StatementCommandCompletion::new(
+                        0,
+                    ),
+                )))
             }
             _ => Poll::Ready(Err(error(
                 "statistics submission produced a foreign result".into(),

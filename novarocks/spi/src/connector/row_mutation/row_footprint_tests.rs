@@ -300,7 +300,14 @@ fn row_footprint_independent_equal_batch_schemas_refuse_before_converter() {
     let batches = (0..16)
         .map(|_| {
             RecordBatch::try_new(
-                Arc::new(schema.as_ref().clone()),
+                Arc::new(Schema::new_with_metadata(
+                    schema.fields().clone(),
+                    schema
+                        .metadata()
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<HashMap<_, _>>(),
+                )),
                 vec![Arc::new(NullArray::new(1))],
             )
             .unwrap()

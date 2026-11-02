@@ -212,7 +212,10 @@ impl RootRetentionCustody {
         let state = self.state.lock().expect("original Context Root idle");
         state.seal_body_done
             && state.panic.is_none()
-            && state.root.as_ref().is_some_and(|root| root.physical_idle())
+            && state
+                .root
+                .as_ref()
+                .is_some_and(|root| root.try_join_physical())
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

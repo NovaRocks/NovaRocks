@@ -129,7 +129,7 @@ impl ActualBinding {
                 && raw.connection_id != 0
                 && raw.session_connection_id == raw.connection_id
                 && raw.connection_generation != 0
-                && raw.session_epoch != 0
+                && raw.session_key != 0
                 && raw.statement_generation != 0,
             "original FE target binding differs from independent root frontend or has invalid domains"
         );
@@ -146,7 +146,7 @@ impl ActualBinding {
             },
             statement: StatementFacts {
                 connection_id: raw.session_connection_id,
-                session_epoch: raw.session_epoch,
+                session_key: raw.session_key,
                 generation: raw.statement_generation,
             },
             root: RootTaskFacts {
@@ -720,7 +720,7 @@ mod frozen_geometry_tests {
             },
             statement: StatementFacts {
                 connection_id: 7,
-                session_epoch: 13,
+                session_key: 13,
                 generation: 17,
             },
             root: RootTaskFacts {

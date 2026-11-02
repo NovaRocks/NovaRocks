@@ -40,10 +40,90 @@ pub(crate) struct AttemptId(u64);
 
 /// A failed acquisition: the attempt that failed and its failed step. Every
 /// participant of that attempt observes the same value.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct AttemptFailure {
     pub(crate) attempt: AttemptId,
     pub(crate) step: BindingFailure,
+    pub(crate) original: Option<novarocks_spi::connector::ConnectorError>,
+}
+
+/// A failed step retains an already-selected original refusal separately from
+/// its transport/session diagnosis. Neither field grants another Root control.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct BindingStepError {
+    pub(crate) step: BindingFailure,
+    pub(crate) original: Option<novarocks_spi::connector::ConnectorError>,
+}
+impl fmt::Debug for BindingStepError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BindingStepError")
+            .field("step", &self.step)
+            .field(
+                "original_fact",
+                &self
+                    .original
+                    .as_ref()
+                    .map(novarocks_failure_contract::FailureProjection::failure_fact),
+            )
+            .finish_non_exhaustive()
+    }
+}
+impl fmt::Debug for AttemptFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AttemptFailure")
+            .field("attempt", &self.attempt)
+            .field("step", &self.step)
+            .field(
+                "original_fact",
+                &self
+                    .original
+                    .as_ref()
+                    .map(novarocks_failure_contract::FailureProjection::failure_fact),
+            )
+            .finish_non_exhaustive()
+    }
+}
+impl From<BindingFailure> for BindingStepError {
+    fn from(step: BindingFailure) -> Self {
+        Self {
+            step,
+            original: None,
+        }
+    }
+}
+impl From<AttemptFailure> for BindingStepError {
+    fn from(failure: AttemptFailure) -> Self {
+        Self {
+            step: failure.step,
+            original: failure.original,
+        }
+    }
+}
+impl BindingStepError {
+    pub(crate) fn from_original(
+        step: BindingFailure,
+        original: novarocks_spi::connector::ConnectorError,
+    ) -> Self {
+        Self {
+            step,
+            original: Some(original),
+        }
+    }
+}
+impl AttemptFailure {
+    pub(crate) fn from_cause(attempt: AttemptId, cause: BindingStepError) -> Self {
+        Self {
+            attempt,
+            step: cause.step,
+            original: cause.original,
+        }
+    }
+    pub(crate) fn into_connector(
+        self,
+        fallback: impl FnOnce(BindingFailure) -> novarocks_spi::connector::ConnectorError,
+    ) -> novarocks_spi::connector::ConnectorError {
+        self.original.unwrap_or_else(|| fallback(self.step))
+    }
 }
 
 type AttemptFuture<T, E> = BoxFuture<'static, Result<T, E>>;
@@ -228,9 +308,9 @@ pub(crate) async fn ensure_session_in(
                 super::configuration::establish_in(&owner, &properties, &context),
             )
             .await
-            .unwrap_or(Err(BindingFailure::ConfigFetch))
+            .unwrap_or(Err(BindingFailure::ConfigFetch.into()))
             .map(Arc::new)
-            .map_err(|step| AttemptFailure { attempt, step })
+            .map_err(|cause| AttemptFailure::from_cause(attempt, cause))
         }
         .boxed()
     })
@@ -666,5 +746,30 @@ mod establishment_tests {
         let mut headers = HeaderMap::new();
         fixture.owner.authorize(&mut headers).await.unwrap();
         assert_eq!(headers["authorization"], "Bearer role-token");
+    }
+}
+
+#[cfg(test)]
+mod typed_cause_tests {
+    use super::*;
+    #[test]
+    fn private_attempt_debug_keeps_steps_but_never_formats_original_details() {
+        let original = novarocks_spi::connector::ConnectorError::compile_interruption(
+            novarocks_type_contract::CompileControlError::from_domain(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
+            ),
+        )
+        .map_message(|_| "private-secret-url-header-body".to_string());
+        let step =
+            BindingStepError::from_original(BindingFailure::TokenUnavailable, original.clone());
+        let attempt = AttemptFailure::from_cause(AttemptId(13), step.clone());
+        for debug in [format!("{step:?}"), format!("{attempt:?}")] {
+            assert!(debug.contains("TokenUnavailable"));
+            assert!(!debug.contains("private-secret"));
+        }
+        assert_eq!(
+            attempt.into_connector(|_| panic!("the original cause exists")),
+            original
+        );
     }
 }

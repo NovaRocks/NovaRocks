@@ -127,7 +127,7 @@ pub(crate) fn admit_session_connector_write_target(
             }),
             frozen_cohort_read: None,
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
-            admitted_change_scans: std::collections::BTreeMap::new(),
+            prepared_source_reads: std::collections::BTreeMap::new(),
         })
     })
 }
@@ -220,7 +220,7 @@ mod tests {
     ) -> ConnectorWriteFieldBinding {
         let field_id = (u32::from(ordinal) + 1).to_string();
         let mut metadata = field.metadata().clone();
-        metadata.insert("PARQUET:field_id".into(), field_id);
+        metadata.insert("PARQUET:field_id".to_string(), field_id);
         ConnectorWriteFieldBinding::try_new_typed(
             ConnectorWriteFieldToken::from_bytes([ordinal + 1; 32]),
             field.with_metadata(metadata),
@@ -230,8 +230,12 @@ mod tests {
     }
 
     fn annotated(name: &str, data_type: DataType, logical: &str) -> Field {
-        Field::new(name, data_type, true)
-            .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), logical.into())].into())
+        Field::new(name, data_type, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                NR_LOGICAL_TYPE_KEY.into(),
+                logical.into(),
+            )]),
+        )
     }
 
     /// The planner's writer input columns carry each signed field's root

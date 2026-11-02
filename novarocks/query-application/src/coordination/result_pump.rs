@@ -3709,58 +3709,64 @@ mod tests {
     }
     #[tokio::test]
     async fn native_terminal_keeps_exact_replacement_witness_through_real_root_pump() {
-        let (
-            Harness {
-                control: _control,
-                scope,
-                actor,
-                owner,
-                permit,
-                mut stream,
-                root,
-            },
-            window,
-        ) = relay_harness(79).await;
-        let (_sender, statuses) = accepted_root_status_projection(root);
-        let port = ScriptedRootPort::new(Vec::new());
-        let context = QueryContextRef::new(
-            root.query_execution_id(),
-            novarocks_types::FrontendProcessId::new_v7(),
-            root.backend_process_id(),
-        );
-        let (input, witness, native) = crate::api::pre_ready_identity_refusal_test_fixture(context);
-        let (terminal_sender, terminal) = native_attempt_terminal_channel();
-        terminal_sender.publish(NativeAttemptTerminal::Failed(native));
-        let error = tokio::time::timeout(
-            Duration::from_secs(1),
-            run_root_relay(
-                permit,
-                root,
-                scope,
-                relay_binding(root, port.clone(), &window),
-                statuses,
-                terminal,
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
-        let ResultPumpFailure::DecisionPending(decision) = error else {
-            panic!("the original attempt authority must remain available");
-        };
-        assert_eq!(decision.class(), AttemptFailureClass::ContractViolation);
-        assert_eq!(decision.error().execution_failure(), Some(&input));
-        assert_eq!(decision.pre_ready_replacement(), Some(&witness));
-        assert_eq!(
-            decision.topology_requirement(),
-            NativeAttemptTopologyRequirement::ExcludeProcess(root.backend_process_id())
-        );
-        assert_eq!(
-            decision.fail_logical(&actor).await.unwrap(),
-            LogicalConclusion::Failed
-        );
-        assert!(stream.next().await.is_err());
-        assert!(port.requests().is_empty());
-        drop((stream, actor, owner, window));
+        for kind in [
+            novarocks_execution_contract::OperationKind::UpdateQueryContext,
+            novarocks_execution_contract::OperationKind::CreateTask,
+        ] {
+            let (
+                Harness {
+                    control: _control,
+                    scope,
+                    actor,
+                    owner,
+                    permit,
+                    mut stream,
+                    root,
+                },
+                window,
+            ) = relay_harness(79).await;
+            let (_sender, statuses) = accepted_root_status_projection(root);
+            let port = ScriptedRootPort::new(Vec::new());
+            let context = QueryContextRef::new(
+                root.query_execution_id(),
+                novarocks_types::FrontendProcessId::new_v7(),
+                root.backend_process_id(),
+            );
+            let (input, witness, native) =
+                crate::api::pre_ready_identity_refusal_test_fixture_for_kind(context, kind);
+            let (terminal_sender, terminal) = native_attempt_terminal_channel();
+            terminal_sender.publish(NativeAttemptTerminal::Failed(native));
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                run_root_relay(
+                    permit,
+                    root,
+                    scope,
+                    relay_binding(root, port.clone(), &window),
+                    statuses,
+                    terminal,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            let ResultPumpFailure::DecisionPending(decision) = error else {
+                panic!("the original attempt authority must remain available");
+            };
+            assert_eq!(decision.class(), AttemptFailureClass::ContractViolation);
+            assert_eq!(decision.error().execution_failure(), Some(&input));
+            assert_eq!(decision.pre_ready_replacement(), Some(&witness));
+            assert_eq!(
+                decision.topology_requirement(),
+                NativeAttemptTopologyRequirement::ExcludeProcess(root.backend_process_id())
+            );
+            assert_eq!(
+                decision.fail_logical(&actor).await.unwrap(),
+                LogicalConclusion::Failed
+            );
+            assert!(stream.next().await.is_err());
+            assert!(port.requests().is_empty());
+            drop((stream, actor, owner, window));
+        }
     }
 }

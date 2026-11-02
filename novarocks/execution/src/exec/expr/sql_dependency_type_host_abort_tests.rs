@@ -89,10 +89,12 @@ fn owner() -> WorkloadControl {
     owner
 }
 fn value() -> FunctionValueType {
-    let field = Arc::new(
-        Field::new("nested", DataType::Utf8, true)
-            .with_metadata([("actual_key".to_string(), "original_value".to_string())].into()),
-    );
+    let field = Arc::new(Field::new("nested", DataType::Utf8, true).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            "actual_key".to_string(),
+            "original_value".to_string(),
+        )]),
+    ));
     FunctionValueType::try_with_logical_type(
         DataType::Struct(vec![field].into()),
         true,

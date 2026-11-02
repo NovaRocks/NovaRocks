@@ -16,8 +16,9 @@
 // under the License.
 
 //! Construction facts and the original nested Values constructor.
-//! Arrow 58.4 uses primitive/bytes interleave or MutableArrayData. The nested
+//! Arrow 60.1.0 uses primitive/bytes interleave or MutableArrayData. The nested
 //! constructor below borrows the existing multi-source operation's sole invoice.
+//! The fixed-byte branch has its own paired, controlled flat writer.
 use super::{
     CopyConstructionError, CopyError, CopyMode, CopyObservation, CopyOperationFacts,
     ScratchCoverage, add, mul, mutable_constructor_geometry, take_host, validate_interleave_plan,
@@ -270,14 +271,14 @@ pub fn preflight_null_structure_construction<H>(
     Ok(facts)
 }
 
-fn null_node<E: From<CopyError>>(
+pub(super) fn null_node<E: From<CopyError>>(
     ty: &DataType,
     rows: usize,
     invoice: &mut take_host::CopyInvoiceTotals,
     raw_arrow: bool,
     work: &mut impl FnMut(bool) -> Result<(), E>,
 ) -> Result<usize, E> {
-    // Arrow 58.4 data.rs637: new_empty is exactly new_null(type, 0).
+    // Arrow 60.1.0 ArrayData::new_empty is exactly new_null(type, 0).
     // One zeroed Buffer constructor rounds its actual requested extent once;
     // no append/growth or guessed average value width enters this model.
     work(false)?;
@@ -331,7 +332,7 @@ fn null_node<E: From<CopyError>>(
             DataType::FixedSizeList(_, _) => (0, 1, true),
             DataType::Struct(fields) => (0, fields.len(), true),
             DataType::Union(fields, mode) => {
-                if fields.is_empty() {
+                if fields.is_empty() && !(raw_arrow && rows == 0) {
                     return Err(
                         CopyError::Invalid("empty Union lacks Arrow constructor child").into(),
                     );
@@ -518,32 +519,68 @@ pub fn preflight_primitive_vec_adoption_construction_observed<H>(
 ) -> Result<(), CopyConstructionError<H>> {
     crate::arrow_result_custody::preflight_buffer_adoption_structure(creation, observe)
 }
-/// SAME result-custody node author, without payload allocation or semantic
-/// inference. The caller performs the original flat constructor afterwards.
-pub fn preflight_flat_arrow_structure_construction<H>(
+/// Metadata for one actual Arrow node, without payload allocation or semantic
+/// inference. Child nodes and their payloads must be constructed and observed
+/// separately. The envelope includes private Buffer owners, the concrete
+/// Array Arc and this node's retained child-reference table. Preflight before
+/// allocating that table; do not invoice those same headers/table twice.
+pub fn preflight_arrow_node_structure_construction<H>(
     ty: &DataType,
     has_nulls: bool,
     creation: &mut ValueSchemaCreation<'_, H>,
     observe: &mut impl FnMut(bool) -> Result<(), H>,
 ) -> Result<(), CopyConstructionError<H>> {
     observe(false).map_err(CopyConstructionError::Creator)?;
-    let buffers = if ty.primitive_width().is_some()
-        || matches!(ty, DataType::Boolean | DataType::FixedSizeBinary(_))
-    {
-        1
-    } else if matches!(
-        ty,
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
-    ) {
-        2
+    let (buffers, children) = if ty.primitive_width().is_some() {
+        (1, 0)
     } else {
-        return Err(CopyError::unsupported(ty).into());
+        match ty {
+            DataType::Null => (0, 0),
+            DataType::Boolean | DataType::FixedSizeBinary(_) => (1, 0),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+                (2, 0)
+            }
+            DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => (1, 1),
+            DataType::Struct(fields) => (0, fields.len()),
+            _ => return Err(CopyError::unsupported(ty).into()),
+        }
     };
-    let metadata = take_host::result_node_metadata_upper(ty, buffers, has_nulls, 0)?;
+    let metadata = take_host::result_node_metadata_upper(
+        ty,
+        buffers,
+        has_nulls && *ty != DataType::Null,
+        children,
+    )?;
     observe(true).map_err(CopyConstructionError::Creator)?;
     creation
         .observe_opaque_upper_bound(metadata)
         .map_err(CopyConstructionError::Creator)
+}
+
+/// The flat constructor retains its existing admissible carrier set while
+/// sharing the original one-node metadata arithmetic with nested construction.
+pub fn preflight_flat_arrow_structure_construction<H>(
+    ty: &DataType,
+    has_nulls: bool,
+    creation: &mut ValueSchemaCreation<'_, H>,
+    observe: &mut impl FnMut(bool) -> Result<(), H>,
+) -> Result<(), CopyConstructionError<H>> {
+    if ty.primitive_width().is_some()
+        || matches!(
+            ty,
+            DataType::Boolean
+                | DataType::FixedSizeBinary(_)
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Binary
+                | DataType::LargeBinary
+        )
+    {
+        preflight_arrow_node_structure_construction(ty, has_nulls, creation, observe)
+    } else {
+        observe(false).map_err(CopyConstructionError::Creator)?;
+        Err(CopyError::unsupported(ty).into())
+    }
 }
 pub fn preflight_flat_array_structure_construction<H>(
     layout: &novarocks_type_contract::ValueLayout,
@@ -1114,8 +1151,8 @@ pub fn values_copy_kind_observed(
     )
 }
 
-/// Execute the selected nested Values copy already modeled by the sole
-/// multi-source preflight. The compiler's constant backing and runtime's mixed
+/// Execute selected Values through the original nested author or its fixed-byte
+/// writer. The compiler's constant backing and runtime's mixed
 /// cells share this actual constructor. Source payload custody stays with the
 /// caller's original retained holds; this port creates no memory authority.
 pub fn copy_nested_values_construction<H>(
@@ -1124,6 +1161,12 @@ pub fn copy_nested_values_construction<H>(
     creation: &mut ValueSchemaCreation<'_, H>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<ArrayRef, CopyConstructionError<H>> {
+    if sources
+        .first()
+        .is_some_and(|source| matches!(source.data_type(), DataType::FixedSizeBinary(_)))
+    {
+        return super::fixed_binary::copy_selected(sources, choices, creation, control);
+    }
     fn reserve<T, H>(
         count: usize,
         creation: &mut ValueSchemaCreation<'_, H>,
@@ -1187,12 +1230,22 @@ pub fn copy_nested_values_construction<H>(
     work.flush().map_err(CopyError::Control)?;
     for &(source, row) in choices {
         work.flush().map_err(CopyError::Control)?;
-        output.extend(
-            source,
-            row,
-            row.checked_add(1)
-                .ok_or_else(|| CopyError::arithmetic(Some(row as u128 + 1)))?,
-        );
+        output
+            .try_extend(
+                source,
+                row,
+                row.checked_add(1)
+                    .ok_or_else(|| CopyError::arithmetic(Some(row as u128 + 1)))?,
+            )
+            .map_err(|source| {
+                CopyError::Control(
+                    crate::control_values::AssemblyFailure::arrow("nested Values copy", source)
+                        .into_kernel(),
+                )
+            })?;
+        // Only successful extension reaches the following checkpoint. The
+        // existing assembly source channel owns the unchanged SDK ArrowError.
+
         work.flush().map_err(CopyError::Control)?;
     }
     let output = arrow_array::make_array(output.freeze());
@@ -1219,8 +1272,12 @@ mod values_copy_tests {
     }
     fn sources() -> Vec<ArrayRef> {
         let field = Arc::new(
-            arrow_schema::Field::new("source-item", DataType::Int64, true)
-                .with_metadata([("nested.unknown".into(), "keep-cross-pool".into())].into()),
+            arrow_schema::Field::new("source-item", DataType::Int64, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "nested.unknown".into(),
+                    "keep-cross-pool".into(),
+                )]),
+            ),
         );
         [
             ListArray::from_iter_primitive::<Int64Type, _, _>([Some(vec![Some(10), None]), None]),
@@ -1352,6 +1409,41 @@ mod values_copy_tests {
                 matches!(values_copy_kind_observed(sources[0].data_type(), || Err(cause.clone())),
                 Err(CopyError::Control(actual)) if actual == cause)
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod empty_union_601_tests {
+    use super::*;
+    use novarocks_type_contract::ValueTypeStorageLifetime;
+    use std::alloc::Layout;
+    #[test]
+    fn raw_empty_union_constructor_keeps_zero_length_sdk_success_without_typed_admission() {
+        for mode in [
+            arrow_schema::UnionMode::Sparse,
+            arrow_schema::UnionMode::Dense,
+        ] {
+            let ty = DataType::Union(arrow_schema::UnionFields::empty(), mode);
+            let mut exact = |_: Layout| Ok::<_, std::convert::Infallible>(());
+            let mut opaque = |_| Ok::<_, std::convert::Infallible>(());
+            let mut creation =
+                ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
+            preflight_null_arrow_structure_observed(&ty, 0, &mut creation, &mut |_| Ok(()))
+                .unwrap();
+            let actual = arrow_array::new_empty_array(&ty);
+            assert_eq!(actual.len(), 0);
+            assert_eq!(actual.data_type(), &ty);
+            assert!(matches!(
+                null_node(
+                    &ty,
+                    0,
+                    &mut take_host::CopyInvoiceTotals::default(),
+                    false,
+                    &mut |_| Ok::<_, CopyError>(())
+                ),
+                Err(CopyError::Invalid(_))
+            ));
         }
     }
 }

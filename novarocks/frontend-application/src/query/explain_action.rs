@@ -102,6 +102,7 @@ async fn make_explain_preparation(
         } else {
             topology
         };
+        let presentation = *input.state.presentation();
         let (catalog, database, execution, mut optimizer, semantics) =
             input.state.into_query_attempt_inputs();
         let semantics = novarocks_sql::sql_mode::statement_sql_semantics(
@@ -128,6 +129,7 @@ async fn make_explain_preparation(
             input.cancellation,
             optimizer,
             semantics,
+            presentation,
         ))
         .with_result_capacity(capacity.clone())
         .map_err(|e| internal_error(e.to_string()))?;
@@ -183,6 +185,7 @@ async fn make_profile_diagnostics(
 }
 
 struct ExplainStatementAction {
+    family: novarocks_result_contract::ClientPresentationFamily,
     // Outside the polled preparation F: async unwind may destroy its fields.
     provider_source: Arc<crate::query_execution::completion_facts::FrontendCompletionCustody>,
     planning_cpu: Arc<FrontendPlanningCpuSource>,
@@ -423,6 +426,7 @@ impl ExplainStatementAction {
                         self.capacity
                             .as_ref()
                             .expect("original positive Internal stage capacity"),
+                        &io,
                         &mut self.original,
                         #[cfg(novarocks_dev_controls)]
                         self.observation.clone(),
@@ -504,7 +508,7 @@ impl ExplainStatementAction {
                         .result_window_alias()
                         .ok_or_else(|| internal_error("EXPLAIN has no original result window"))
                         .and_then(|window| {
-                            LocalResultProducer::try_new(owner.scope(), window)
+                            LocalResultProducer::try_new(owner.scope(), window, self.family)
                                 .map_err(internal_error)
                         })
                         .and_then(|producer| {
@@ -611,6 +615,7 @@ impl FrontendQuerySession {
         let provider_source =
             crate::query_execution::completion_facts::FrontendCompletionCustody::new();
         let planning_cpu = self.service.query_compiler.new_planning_cpu_source();
+        let family = *state.presentation();
         let input = ExplainPreparationInput {
             compiler: self.service.query_compiler.clone(),
             topology: self.service.topology.clone(),
@@ -638,6 +643,7 @@ impl FrontendQuerySession {
             Arc::clone(&planning_cpu),
         )) as ProviderClose);
         let action = Box::new(ExplainStatementAction {
+            family,
             provider_source,
             planning_cpu,
             preparation_health: None,
@@ -733,6 +739,7 @@ mod tests {
             _: &mut Option<crate::query_execution::logical_execution::PreparedLogicalComputation>,
             _: &mut Option<WorkOwner>,
             _: &QueryResultCapacityBinding,
+            _: &Arc<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>,
             _: &mut OriginalComputationStart,
             #[cfg(novarocks_dev_controls)] _: Option<
                 crate::preparation_diagnostics::StatementObservationHandle,
@@ -786,6 +793,7 @@ mod tests {
     }
     fn action(preparation: PreparationFuture) -> ExplainStatementAction {
         ExplainStatementAction {
+            family: novarocks_result_contract::ClientPresentationFamily::MysqlText,
             provider_source:
                 crate::query_execution::completion_facts::FrontendCompletionCustody::new(),
             planning_cpu: FrontendPlanningCpuSource::new(
@@ -892,7 +900,9 @@ mod tests {
         let (_workload, _capacity, owner, _session) = statement().await;
         let token = owner.token();
         let mut source = Some(StatementActionReady {
-            result: Ok(StatementActionValue::Ok),
+            result: Ok(StatementActionValue::Ok(
+                novarocks_query_application::session_control::StatementCommandCompletion::new(0),
+            )),
             owner,
         });
         let mut target = Some(StatementResult::Ok);
@@ -905,8 +915,10 @@ mod tests {
         let StatementResult::GovernedCompletion(result) = target.take().unwrap() else {
             panic!("same governed completion")
         };
+        let (completion, mut protocol) = result.into_parts();
+        assert_eq!(completion.affected_rows(), 0);
         assert_eq!(
-            result.into_protocol().complete(),
+            protocol.complete(),
             novarocks_query_application::session_control::GovernedStatementFinishOutcome::Completed
         );
     }

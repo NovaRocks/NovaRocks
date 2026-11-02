@@ -88,7 +88,7 @@ pub fn execute_kill_statement(
             match connection_control.terminate(
                 target,
                 ClientConnectionTerminationReason::ExplicitKillConnection {
-                    requester_connection_id: requester.connection_id(),
+                    requester_session: requester.key(),
                 },
             ) {
                 ClientConnectionTerminateOutcome::Requested
@@ -359,7 +359,7 @@ mod tests {
                     &[(
                         ClientConnectionToken::new(7, 11).expect("valid token"),
                         ClientConnectionTerminationReason::ExplicitKillConnection {
-                            requester_connection_id: 8,
+                            requester_session: requester.token().key(),
                         },
                     )]
                 );

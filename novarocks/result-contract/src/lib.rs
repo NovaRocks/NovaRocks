@@ -52,8 +52,9 @@ pub use scalar_record::{SCALAR_RECORD_MAX_BYTES, ScalarRecord, ScalarRecordWrite
 
 mod render_schema;
 pub use render_schema::{
-    ClientRenderSchema, NamedRenderField, NativeRenderType, OpaqueRenderType, RenderColumn,
-    RenderField, RenderPresentation, RenderTimeUnit,
+    ClientPresentationFamily, ClientRenderSchema, NamedRenderField, NativeRenderType,
+    OpaqueRenderType, RenderColumn, RenderField, RenderPresentation, RenderTimeUnit,
+    TrinoJsonFacts,
 };
 
 mod write_counts;

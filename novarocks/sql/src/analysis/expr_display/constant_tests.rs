@@ -51,13 +51,13 @@ fn source(ty: DataType, selected: &str) -> ConstantPool {
         _ => unreachable!(),
     };
     let ty = FunctionValueType::new(array.data_type().clone(), true);
-    let field = ty.try_to_field("provider.original").unwrap().with_metadata(
-        [(
-            "provider.fact".to_owned(),
-            "not.a.rendered.value".to_owned(),
-        )]
-        .into(),
-    );
+    let field =
+        ty.try_to_field("provider.original")
+            .unwrap()
+            .with_metadata(std::collections::HashMap::<String, String>::from([(
+                "provider.fact".to_owned(),
+                "not.a.rendered.value".to_owned(),
+            )]));
     ConstantPool::try_new(
         Arc::new(field),
         ty,

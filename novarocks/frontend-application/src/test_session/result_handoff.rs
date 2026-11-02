@@ -78,10 +78,10 @@ impl ResultHandoffControl {
     pub(crate) async fn before_protocol(
         &self,
         actual: StatementToken,
-        nominated: Option<(String, StatementToken)>,
+        nominated: Option<(String, StatementToken, u32)>,
         failure: Option<ResultFailureView>,
     ) -> Result<(), String> {
-        let Some((run_token, nominated)) = nominated else {
+        let Some((run_token, nominated, connection_id)) = nominated else {
             return Ok(());
         };
         if run_token != self.run_token {
@@ -146,8 +146,8 @@ impl ResultHandoffControl {
         eprintln!(
             "NOVAROCKS_RESULT_HANDOFF_TERMINAL_OBSERVED token={} statement={}:{}:{}",
             self.run_token.escape_default(),
-            actual.session().connection_id(),
-            actual.session().session_epoch(),
+            connection_id,
+            actual.session().key().get(),
             actual.generation()
         );
         Ok(())
@@ -262,10 +262,18 @@ mod tests {
         serde_json::json!({"action":"await-terminal-before-protocol","statement_run_token":token})
     }
     fn statement() -> StatementToken {
-        StatementToken::new(SessionToken::new(17, 3), 9)
+        StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (17_u64 << 32) | 3_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            9,
+        )
     }
-    fn nomination(actual: StatementToken) -> Option<(String, StatementToken)> {
-        Some(("selected".into(), actual))
+    fn nomination(actual: StatementToken) -> Option<(String, StatementToken, u32)> {
+        Some(("selected".into(), actual, 7))
     }
     fn pending<F: Future>(future: std::pin::Pin<&mut F>) {
         assert!(matches!(
@@ -381,7 +389,7 @@ mod tests {
         let actual = statement();
         control.before_protocol(actual, None, None).await.unwrap();
         control
-            .before_protocol(actual, Some(("another-run".into(), actual)), None)
+            .before_protocol(actual, Some(("another-run".into(), actual, 7)), None)
             .await
             .unwrap();
         let foreign = StatementToken::new(actual.session(), actual.generation() + 1);

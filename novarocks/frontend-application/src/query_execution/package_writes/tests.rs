@@ -622,7 +622,10 @@ pub(crate) fn frozen_write_fragments() -> (
                 crate::native::fragment_encoder::frozen::FragmentArtifact::freeze_package(
                     &package,
                     plan.edges(),
-                    &novarocks_plan_codec::physical_package_v2::test_support::encode_limits(),
+                    &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
+                        novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                        novarocks_plan_codec::physical_package_v2::test_support::encode_limits(),
+                    ),
                     &control,
                 )
                 .expect("production frozen writer facts");
@@ -693,7 +696,10 @@ fn the_sealing_session_authors_the_written_recipe_the_package_carries() {
         let frozen = crate::native::fragment_encoder::frozen::FragmentArtifact::freeze_package(
             package,
             plan.edges(),
-            &encode_limits(),
+            &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
+                novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                encode_limits(),
+            ),
             &control,
         )
         .expect("freeze the same checked write package");
@@ -880,7 +886,6 @@ fn a_compiled_root_relation_passes_the_frontend_exact_schema_decoder() {
             root_sink_dop: std::num::NonZeroUsize::new(1),
             kernel_abi: KernelAbiVersion::CURRENT,
             constants: crate::application::test_constant_policy(),
-            exchange_wait: std::time::Duration::from_secs(60),
         },
         &control,
     )

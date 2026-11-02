@@ -172,6 +172,87 @@ fn batch_parts(bytes: &[u8]) -> (ipc::RecordBatch<'_>, &[u8]) {
     );
     (batch, body)
 }
+// Derive descriptor roles from the public Arrow layout and the original
+// arrays, without consulting either writer's geometry or descriptor lengths.
+// A validity entry keeps its exact source bytes, including unused tail bits.
+#[derive(Default)]
+struct SourceWireOracle {
+    nodes: Vec<(usize, usize)>,
+    buffers: Vec<Option<(usize, Vec<u8>)>>,
+    variadic_counts: Vec<i64>,
+}
+impl SourceWireOracle {
+    fn visit(&mut self, array: &ArrayRef) {
+        match array.data_type() {
+            DataType::Boolean
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Utf8View
+            | DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::Map(_, _)
+            | DataType::Struct(_) => {}
+            other => panic!("no independent recursive IPC fixture oracle for {other:?}"),
+        }
+        let node = self.nodes.len();
+        self.nodes.push((array.len(), array.null_count()));
+        let layout = arrow::array::layout(array.data_type());
+        if layout.can_contain_null_mask {
+            let bitmap = match array.nulls() {
+                // Public bit slicing preserves a byte-aligned source tail;
+                // an unaligned slice packs only the declared source bits.
+                Some(nulls) => nulls.inner().sliced().as_slice().to_vec(),
+                None => vec![0xff; array.len().div_ceil(8)],
+            };
+            assert_eq!(bitmap.len(), array.len().div_ceil(8));
+            self.buffers.push(Some((node, bitmap)));
+        }
+        self.buffers.extend((0..layout.buffers.len()).map(|_| None));
+        if layout.variadic {
+            let data = array.to_data();
+            let count = data
+                .buffers()
+                .len()
+                .checked_sub(layout.buffers.len())
+                .unwrap();
+            self.variadic_counts.push(i64::try_from(count).unwrap());
+            self.buffers.extend((0..count).map(|_| None));
+        }
+        match array.data_type() {
+            DataType::Struct(_) => {
+                let structure = array.as_any().downcast_ref::<StructArray>().unwrap();
+                for child in structure.columns() {
+                    self.visit(child);
+                }
+            }
+            DataType::List(_) => {
+                let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+                let offsets = list.value_offsets();
+                let start = usize::try_from(offsets[0]).unwrap();
+                let end = usize::try_from(*offsets.last().unwrap()).unwrap();
+                self.visit(&list.values().slice(start, end - start));
+            }
+            DataType::LargeList(_) => {
+                let list = array.as_any().downcast_ref::<LargeListArray>().unwrap();
+                let offsets = list.value_offsets();
+                let start = usize::try_from(offsets[0]).unwrap();
+                let end = usize::try_from(*offsets.last().unwrap()).unwrap();
+                self.visit(&list.values().slice(start, end - start));
+            }
+            DataType::Map(_, _) => {
+                let map = array.as_any().downcast_ref::<MapArray>().unwrap();
+                let offsets = map.value_offsets();
+                let start = usize::try_from(offsets[0]).unwrap();
+                let end = usize::try_from(*offsets.last().unwrap()).unwrap();
+                let entries: ArrayRef = Arc::new(map.entries().slice(start, end - start));
+                self.visit(&entries);
+            }
+            _ => {}
+        }
+    }
+}
 fn agree_with_standard(pool: &ConstantPool, bytes: &[u8]) -> ArrayRef {
     let original = standard(pool);
     let (left, lb) = batch_parts(bytes);
@@ -179,19 +260,48 @@ fn agree_with_standard(pool: &ConstantPool, bytes: &[u8]) -> ArrayRef {
     assert_eq!(left.length(), right.length());
     let ln = left.nodes().unwrap();
     let rn = right.nodes().unwrap();
+    let mut source = SourceWireOracle::default();
+    source.visit(pool.array());
+    assert_eq!(ln.len(), source.nodes.len());
     assert_eq!(ln.len(), rn.len());
-    for (a, b) in ln.iter().zip(rn.iter()) {
+    for ((a, b), &(length, nulls)) in ln.iter().zip(rn.iter()).zip(&source.nodes) {
         assert_eq!((a.length(), a.null_count()), (b.length(), b.null_count()));
+        assert_eq!(
+            (
+                usize::try_from(a.length()).unwrap(),
+                usize::try_from(a.null_count()).unwrap()
+            ),
+            (length, nulls)
+        );
+    }
+    for batch in [left, right] {
+        let variadic = batch
+            .variadicBufferCounts()
+            .map(|counts| counts.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert_eq!(variadic, source.variadic_counts);
     }
     let ld = left.buffers().unwrap();
     let rd = right.buffers().unwrap();
     assert_eq!(ld.len(), rd.len());
-    for (a, b) in ld.iter().zip(rd.iter()) {
-        assert_eq!(a.length(), b.length());
+    assert_eq!(ld.len(), source.buffers.len());
+    for ((a, b), role) in ld.iter().zip(rd.iter()).zip(&source.buffers) {
         let astart = usize::try_from(a.offset()).unwrap();
         let bstart = usize::try_from(b.offset()).unwrap();
         let length = usize::try_from(a.length()).unwrap();
-        assert_eq!(&lb[astart..astart + length], &rb[bstart..bstart + length]);
+        let actual = &lb[astart..astart + length];
+        if let Some((node, bitmap)) = role {
+            assert_eq!(length, bitmap.len());
+            assert_eq!(actual, bitmap.as_slice());
+            if source.nodes[*node].1 == 0 {
+                // Arrow 60.1 omits only the all-valid bitmap. Our frozen
+                // writer still emits the complete, independently checked bits.
+                assert_eq!(b.length(), 0);
+                continue;
+            }
+        }
+        assert_eq!(a.length(), b.length());
+        assert_eq!(actual, &rb[bstart..bstart + length]);
     }
     let mut reader = StreamReader::try_new(Cursor::new(bytes), None).unwrap();
     assert!(
@@ -205,6 +315,90 @@ fn agree_with_standard(pool: &ConstantPool, bytes: &[u8]) -> ArrayRef {
     assert!(reader.next().is_none());
     Arc::clone(batch.column(0))
 }
+#[test]
+fn actual_recursive_writer_all_valid_child_slice_keeps_source_bitmap_tail_bits() {
+    for (offsets, expected, expected_values) in [
+        // Child [8, 10) starts at a byte boundary; unused source bits survive.
+        (vec![0, 8, 10, 12], 0x0b, [8, 9]),
+        // Child [1, 3) is repacked, so unused destination bits are zero.
+        (vec![0, 1, 3, 12], 0x03, [1, 2]),
+    ] {
+        // Author every source validity bit explicitly, including the tail.
+        let values = Int32Array::new(
+            ScalarBuffer::from((0..12).collect::<Vec<i32>>()),
+            Some(NullBuffer::new(arrow_buffer::BooleanBuffer::new(
+                arrow_buffer::Buffer::from(vec![0xfe_u8, 0x0b]),
+                0,
+                12,
+            ))),
+        );
+        assert_eq!(values.len(), 12);
+        assert_eq!(values.null_count(), 2);
+        assert_eq!(values.nulls().unwrap().inner().values(), &[0xfe_u8, 0x0b]);
+        let array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(values),
+            None,
+        )
+        .slice(1, 1);
+        let original = pool(Arc::new(array));
+        let source = original
+            .array()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(source.len(), 1);
+        assert_eq!(
+            source.value_offsets(),
+            &[expected_values[0], expected_values[1] + 1]
+        );
+        assert_eq!(source.values().len(), 12);
+        assert_eq!(source.values().null_count(), 2);
+        let row = source.value(0);
+        let row = row.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(row.len(), 2);
+        assert_eq!(row.null_count(), 0);
+        assert_eq!(row.values().as_ref(), &expected_values);
+        let bytes = encode_recursive_pool(
+            &original,
+            invoice(&original),
+            limits(),
+            &Control::good(CompilePhase::Encode),
+        )
+        .unwrap();
+        let output = agree_with_standard(&original, &bytes);
+        assert_eq!(
+            output
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap()
+                .values()
+                .null_count(),
+            0
+        );
+        let output = output.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output.value_offsets(), &[0, 2]);
+        assert_eq!(output.values().len(), 2);
+        assert_eq!(
+            output
+                .values()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            &expected_values
+        );
+        // List validity + offsets precede the primitive child's validity.
+        let (batch, body) = batch_parts(&bytes);
+        let validity = batch.buffers().unwrap().get(2);
+        assert_eq!(validity.length(), 1);
+        assert_eq!(body[usize::try_from(validity.offset()).unwrap()], expected);
+    }
+}
+
 fn list_fixture(rows: usize) -> ConstantPool {
     let offsets = (0..=rows)
         .map(|i| i32::try_from(i * 2).unwrap())

@@ -65,7 +65,7 @@ fn by_schema_allocation_stream_equals_original_request_contribution() {
 }
 
 #[test]
-fn by_schema_allocation_band_is_applied_per_original_string_not_sum() {
+fn by_schema_allocation_shared_metadata_requests_only_the_original_field_name() {
     let mut map = MaterializedMetadataMap::with_capacity(160);
     for n in 0..160 {
         map.insert(format!("k{n:03}"), "v".to_owned());
@@ -92,10 +92,15 @@ fn by_schema_allocation_band_is_applied_per_original_string_not_sum() {
         )
         .unwrap();
     assert_eq!(raw, facts.request_bytes);
-    assert!(small > 512); // All 321 strings remain individual process requests.
-    let table = facts.metadata.table_backing.unwrap();
-    assert!(band::is_tagged(table.size()));
-    assert_eq!(tagged, band::tagged_layout(table).unwrap().size());
+    // Arrow 60 shares the immutable Metadata Arc: the 320 metadata strings
+    // and every tree node make no new allocation request. The actual Field
+    // clone still allocates its one-byte name, through the same host band.
+    assert_eq!(facts.metadata.table_backing, None);
+    assert_eq!(facts.metadata.text_requests, 0);
+    assert_eq!(facts.metadata.text_bytes, 0);
+    assert_eq!(raw, "n".len());
+    assert_eq!(small, "n".len());
+    assert_eq!(tagged, 0);
 }
 
 #[test]

@@ -80,10 +80,12 @@ fn fixture(nullable: bool, sorted: bool) -> ArrayRef {
     let entries = StructArray::new(
         vec![
             Arc::new(Field::new("key", DataType::Int32, false)),
-            Arc::new(
-                Field::new("value", DataType::Utf8, true)
-                    .with_metadata([("value-fact".into(), "preserved".into())].into()),
-            ),
+            Arc::new(Field::new("value", DataType::Utf8, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "value-fact".into(),
+                    "preserved".into(),
+                )]),
+            )),
         ]
         .into(),
         vec![
@@ -100,8 +102,12 @@ fn fixture(nullable: bool, sorted: bool) -> ArrayRef {
     );
     let external: ArrayRef = Arc::new(MapArray::new(
         Arc::new(
-            Field::new("entries", entries.data_type().clone(), false)
-                .with_metadata([("entry-fact".into(), "preserved".into())].into()),
+            Field::new("entries", entries.data_type().clone(), false).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "entry-fact".into(),
+                    "preserved".into(),
+                )]),
+            ),
         ),
         OffsetBuffer::new(vec![0, 2, 2, 4, 5].into()),
         entries,

@@ -49,14 +49,13 @@ use novarocks_type_contract::{
     ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
     PartitionCountParameterId, PartitionSpaceId, PureCompileControl,
 };
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
 const PRODUCER: FragmentId = FragmentId::new(1);
 const CONSUMER: FragmentId = FragmentId::new(2);
 const EDGE: EdgeId = EdgeId::new(5);
 const VALUES: NodeId = NodeId::new(10);
 const RECEIVER: NodeId = NodeId::new(20);
-const WAIT: Duration = Duration::from_millis(4_321);
 
 struct FixtureControl;
 impl PureCompileControl for FixtureControl {
@@ -488,7 +487,6 @@ fn options(root_sink_dop: Option<usize>) -> LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(1).unwrap(),
         root_sink_dop: root_sink_dop.map(|dop| NonZeroUsize::new(dop).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        exchange_wait: WAIT,
         // Explicit fixture admission; these values are not production defaults.
         constants: ConstantPolicy {
             max_rows: 16,
@@ -574,14 +572,12 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
     let consumer = compile(packages.remove(&CONSUMER).unwrap(), Some(1)).unwrap();
     let receiver = &consumer.graph().nodes()[0];
     let ProgramNodeKind::ExchangeSource {
-        timeout,
         runtime_filters,
         hash_partition_exprs,
     } = receiver.kind()
     else {
         panic!("ExchangeSource");
     };
-    assert_eq!(*timeout, WAIT);
     assert!(runtime_filters.is_empty() && hash_partition_exprs.is_empty());
     let layout = receiver.output_layout();
     let names = layout

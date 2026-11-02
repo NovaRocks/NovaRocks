@@ -129,6 +129,9 @@ impl<O: OwnedCopy> OwnedCopy for MetadataMaterializationCopy<'_, O> {
     fn request(&mut self, layout: Layout, copies: usize) -> Result<(), Self::Error> {
         self.inner.request(layout, copies)
     }
+    fn opaque_model_request(&mut self, bytes: usize, copies: usize) -> Result<(), Self::Error> {
+        self.inner.opaque_model_request(bytes, copies)
+    }
     fn work(&mut self, units: usize) -> Result<(), Self::Error> {
         self.inner.work(units)
     }

@@ -94,6 +94,8 @@ impl OperatorFactory for LogicalTableFinishFactory {
             construction: None,
             tracker: None,
             failure,
+            #[cfg(novarocks_dev_controls)]
+            diagnostics: None,
         }))
     }
 }
@@ -116,6 +118,8 @@ struct LogicalFinish {
     construction: Option<Arc<dyn InputConstructionFactory>>,
     tracker: Option<Arc<MemTracker>>,
     failure: Option<ExecutionFailure>,
+    #[cfg(novarocks_dev_controls)]
+    diagnostics: Option<crate::runtime::writer_diagnostics::WriterDiagnostics>,
 }
 fn runnable(next: &NextStep) -> bool {
     match next {
@@ -125,6 +129,15 @@ fn runnable(next: &NextStep) -> bool {
     }
 }
 impl LogicalFinish {
+    #[cfg(novarocks_dev_controls)]
+    fn emit_diagnostic(&self, event: &str, service: Option<usize>) {
+        if let Some(scope) = &self.diagnostics {
+            scope.emit(event, || format!(
+                "service={service:?} cursor={} writer_end={} summary_end={} writer_pending={} receiver_occupied={} core_next={:?} summary_wait={:?}",
+                self.cursor, self.writer_end, self.summary_end, self.writer_pending.is_some(), self.receiver.is_occupied(), self.core_next, self.summary_wait
+            ));
+        }
+    }
     fn writer_ready(&self) -> bool {
         if self.writer_end {
             return false;
@@ -321,6 +334,8 @@ impl SourceKernel for LogicalFinish {
                 return Ok(StepResult::new(None, NextStep::Yield, 0));
             }
             self.cursor = (service + 1) % 3;
+            #[cfg(novarocks_dev_controls)]
+            self.emit_diagnostic("logical_finish_service_enter", Some(service));
             match service {
                 0 => self.service_writer(ctx)?,
                 1 => {
@@ -331,6 +346,8 @@ impl SourceKernel for LogicalFinish {
                 }
                 _ => output = self.service_core(ctx)?,
             }
+            #[cfg(novarocks_dev_controls)]
+            self.emit_diagnostic("logical_finish_service_returned", Some(service));
             break;
         }
         let next = self.next(generation);
@@ -377,6 +394,14 @@ impl OperatorLifecycle for LogicalFinish {
         self.construction = Some(factory);
     }
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        #[cfg(novarocks_dev_controls)]
+        {
+            self.diagnostics =
+                crate::runtime::writer_diagnostics::WriterDiagnostics::from_runtime(state);
+            if let Some(summary) = &mut self.summary {
+                summary.bind_diagnostics(self.diagnostics.clone());
+            }
+        }
         self.writer_state.bind_runtime(state)?;
         self.writer.bind_runtime_state(state)?;
         self.core.bind_runtime_state(state)

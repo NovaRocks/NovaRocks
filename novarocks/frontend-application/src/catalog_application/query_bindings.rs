@@ -30,6 +30,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use novarocks_query_application::api::ExactBindingReceiptStore;
+use novarocks_spi::connector::read_stack::{
+    ConnectorPreparedSourceRead, ConnectorReadSourceProjection, ConnectorReadSourceSelection,
+};
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
     ConnectorTableMetadata,
@@ -301,11 +304,62 @@ pub struct QueryTableBinding {
     /// The map is query-local and shares the binding's planning lease; it is
     /// never populated by a later catalog lookup.
     pub frozen_snapshot_materializations: BTreeMap<i64, QueryScanMaterialization>,
-    /// Provider-sealed snapshot-window admissions retained for SQL delta
-    /// scans. Core never decodes their handles or reconstructs provider
-    /// physical facts; preparation reuses the exact sealed scan through this
-    /// binding's request-local token.
-    pub admitted_change_scans: BTreeMap<(i64, i64), novarocks_spi::connector::ConnectorScan>,
+    /// Completed source preparations selected for this binding. A nonempty
+    /// inventory forbids generic reopening for every data/window selector.
+    pub prepared_source_reads: BTreeMap<QueryPreparedSourceSelector, Arc<QueryPreparedSourceRead>>,
+}
+
+/// Exact query-local selector; the receipt remains the actual Provider authority.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum QueryPreparedSourceSelector {
+    Snapshot(i64),
+    Delta {
+        from_exclusive: i64,
+        to_inclusive: i64,
+    },
+}
+
+#[derive(Clone)]
+pub struct QueryPreparedSourceRead {
+    pub(crate) receipt: ConnectorPreparedSourceRead,
+    pub(crate) projection: ConnectorReadSourceProjection,
+    pub(crate) planning: ConnectorControlPlanningLease,
+}
+
+fn prepared_source_selector(
+    selection: ConnectorReadSourceSelection,
+    projection: ConnectorReadSourceProjection,
+    admission: Option<&novarocks_spi::connector::ConnectorChangeWindowAdmission>,
+) -> Result<QueryPreparedSourceSelector, String> {
+    use ConnectorReadSourceProjection as P;
+    use ConnectorReadSourceSelection as S;
+    let incremental = matches!(
+        admission,
+        Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::Incremental { .. })
+    );
+    let empty_delta = projection == P::Delta
+        && matches!(selection, S::ChangeWindow(_))
+        && matches!(
+            admission,
+            Some(novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly)
+        );
+    if projection != P::To && !incremental && !empty_delta {
+        return Err("prepared source does not authorize a From or Delta projection".into());
+    }
+    match (selection, projection) {
+        (S::Snapshot(id), P::To) => Ok(QueryPreparedSourceSelector::Snapshot(id)),
+        (S::ChangeWindow(window), P::To) => Ok(QueryPreparedSourceSelector::Snapshot(
+            window.to_snapshot_id(),
+        )),
+        (S::ChangeWindow(window), P::From) => Ok(QueryPreparedSourceSelector::Snapshot(
+            window.from_snapshot_id(),
+        )),
+        (S::ChangeWindow(window), P::Delta) => Ok(QueryPreparedSourceSelector::Delta {
+            from_exclusive: window.from_snapshot_id(),
+            to_inclusive: window.to_snapshot_id(),
+        }),
+        _ => Err("snapshot preparation cannot supply a From or Delta projection".into()),
+    }
 }
 
 /// One admitted terminal write target retained beside the SQL binding token.
@@ -367,8 +421,133 @@ impl QueryTableBinding {
             write_target_admission: None,
             frozen_cohort_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
-            admitted_change_scans: BTreeMap::new(),
+            prepared_source_reads: BTreeMap::new(),
         }
+    }
+
+    /// Install only a projection of the same original To metadata/generation.
+    pub fn install_prepared_source_read(
+        &mut self,
+        receipt: ConnectorPreparedSourceRead,
+        projection: ConnectorReadSourceProjection,
+        planning: ConnectorControlPlanningLease,
+    ) -> Result<(), String> {
+        let admitted = self.admission.exact_planning_lease()?;
+        receipt
+            .request()
+            .observed_source_facts()
+            .validate_owner(&novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: planning.binding().descriptor().instance_id.clone(),
+                incarnation: planning.binding().incarnation(),
+            })
+            .map_err(|error| error.to_string())?;
+        let metadata = self
+            .source_metadata
+            .as_ref()
+            .ok_or("prepared source binding has no original To metadata")?;
+        if !Arc::ptr_eq(admitted.binding(), planning.binding())
+            || receipt.binding().descriptor() != planning.binding().descriptor()
+            || receipt.binding().catalog_handle()
+                != planning
+                    .binding()
+                    .catalog_handle()
+                    .map_err(|e| e.to_string())?
+            || metadata.table != receipt.to_metadata().table
+            || metadata.identity != receipt.to_metadata().identity
+            || metadata.version != receipt.to_metadata().version
+        {
+            return Err(
+                "prepared source differs from its query binding's original To materialization"
+                    .into(),
+            );
+        }
+        let to_snapshot = match receipt.request().selection() {
+            ConnectorReadSourceSelection::Snapshot(id) => id,
+            ConnectorReadSourceSelection::ChangeWindow(window) => window.to_snapshot_id(),
+        };
+        let primary = self
+            .scan_materialization
+            .as_ref()
+            .ok_or("prepared source has no primary To materialization")?;
+        if primary.selector != ConnectorReadSelector::SnapshotId(to_snapshot)
+            || primary.table != receipt.to_metadata().table
+            || !Arc::ptr_eq(primary.planning_lease.binding(), planning.binding())
+        {
+            return Err(
+                "prepared source primary materialization is not its original Snapshot(To)".into(),
+            );
+        }
+        if self.prepared_source_reads.values().any(|original| {
+            original.receipt.request().object_id() != receipt.request().object_id()
+                || original.receipt.request().to_revision() != receipt.request().to_revision()
+                || original.receipt.request().observed_table() != receipt.request().observed_table()
+        }) {
+            return Err(
+                "query binding cannot mix prepared source objects or original To pins".into(),
+            );
+        }
+        let key = prepared_source_selector(
+            receipt.request().selection(),
+            projection,
+            receipt.admission(),
+        )?;
+        if self.prepared_source_reads.contains_key(&key) {
+            return Err("prepared source selector was installed twice".into());
+        }
+        self.prepared_source_reads.insert(
+            key,
+            Arc::new(QueryPreparedSourceRead {
+                receipt,
+                projection,
+                planning,
+            }),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn prepared_source_read(
+        &self,
+        input: QueryFrozenReadInput,
+    ) -> Result<Option<Arc<QueryPreparedSourceRead>>, String> {
+        if self.prepared_source_reads.is_empty() {
+            return Ok(None);
+        }
+        let id = match input {
+            QueryFrozenReadInput::Current => match self
+                .scan_materialization
+                .as_ref()
+                .map(|value| value.selector)
+            {
+                Some(ConnectorReadSelector::SnapshotId(id)) => id,
+                _ => {
+                    return Err(
+                        "prepared source Current has no primary Snapshot(To) materialization"
+                            .into(),
+                    );
+                }
+            },
+            QueryFrozenReadInput::Snapshot(id) => id,
+            _ => return Err("prepared source data lookup cannot use a cohort selector".into()),
+        };
+        self.prepared_source_reads
+            .get(&QueryPreparedSourceSelector::Snapshot(id))
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| format!("prepared source snapshot {id} has no exact original receipt"))
+    }
+
+    pub(crate) fn prepared_change_window(
+        &self,
+        from_exclusive: i64,
+        to_inclusive: i64,
+    ) -> Result<Option<Arc<QueryPreparedSourceRead>>, String> {
+        // Ordinary explicit delta TVFs keep their original typed preparation.
+        // Once this binding has prepared facts, no missing window may reopen.
+        if self.prepared_source_reads.is_empty() {
+            return Ok(None);
+        }
+        self.prepared_source_reads.get(&QueryPreparedSourceSelector::Delta { from_exclusive, to_inclusive }).cloned().map(Some)
+            .ok_or_else(|| format!("prepared source window ({from_exclusive}, {to_inclusive}] has no exact original receipt"))
     }
 
     /// Verify that the application materializer paired this table with the
@@ -730,8 +909,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
+        ConnectorReadSourceProjection, ConnectorReadSourceSelection, QueryPreparedSourceSelector,
         QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
-        parse_time_travel_overlay_identity, time_travel_overlay_identity,
+        parse_time_travel_overlay_identity, prepared_source_selector, time_travel_overlay_identity,
     };
 
     #[test]
@@ -776,6 +956,65 @@ mod tests {
         .expect("test catalog facts materialize")
         .into_resolved_table();
         QueryTableBinding::local(resolved, binding)
+    }
+
+    #[test]
+    fn prepared_source_selectors_keep_exact_endpoints_and_original_admission() {
+        use ConnectorReadSourceProjection as P;
+        use ConnectorReadSourceSelection as S;
+        use novarocks_spi::connector::read_stack::ConnectorReadChangeWindow;
+        use novarocks_spi::connector::{
+            ConnectorChangeWindowAdmission as A, ConnectorChangeWindowPartitionImpact as I,
+        };
+        let window = S::ChangeWindow(ConnectorReadChangeWindow::new(7, 19));
+        let admitted = A::Incremental {
+            has_inserts: true,
+            has_deletes: false,
+            partition_impact: I::Unpartitioned,
+        };
+        assert_eq!(
+            prepared_source_selector(S::Snapshot(19), P::To, None).unwrap(),
+            QueryPreparedSourceSelector::Snapshot(19)
+        );
+        assert_eq!(
+            prepared_source_selector(window, P::To, Some(&admitted)).unwrap(),
+            QueryPreparedSourceSelector::Snapshot(19)
+        );
+        assert_eq!(
+            prepared_source_selector(window, P::From, Some(&admitted)).unwrap(),
+            QueryPreparedSourceSelector::Snapshot(7)
+        );
+        assert_eq!(
+            prepared_source_selector(window, P::Delta, Some(&admitted)).unwrap(),
+            QueryPreparedSourceSelector::Delta {
+                from_exclusive: 7,
+                to_inclusive: 19
+            }
+        );
+        assert!(prepared_source_selector(S::Snapshot(19), P::From, None).is_err());
+        assert!(prepared_source_selector(S::Snapshot(19), P::Delta, None).is_err());
+        assert_eq!(
+            prepared_source_selector(window, P::To, Some(&A::MetadataOnly)).unwrap(),
+            QueryPreparedSourceSelector::Snapshot(19)
+        );
+        let full = A::FullRebuild(
+            novarocks_spi::connector::ConnectorChangeWindowFullRebuildReason::LineageBroken {
+                from_snapshot_id: 7,
+            },
+        );
+        assert!(prepared_source_selector(window, P::From, Some(&A::MetadataOnly)).is_err());
+        assert_eq!(
+            prepared_source_selector(window, P::Delta, Some(&A::MetadataOnly)).unwrap(),
+            QueryPreparedSourceSelector::Delta {
+                from_exclusive: 7,
+                to_inclusive: 19
+            }
+        );
+        assert!(prepared_source_selector(window, P::From, Some(&full)).is_err());
+        assert!(prepared_source_selector(window, P::Delta, Some(&full)).is_err());
+        assert!(
+            prepared_source_selector(S::Snapshot(19), P::Delta, Some(&A::MetadataOnly)).is_err()
+        );
     }
 
     #[test]

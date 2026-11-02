@@ -82,6 +82,7 @@ impl FailureProjection for MetadataMaterializationError {
     fn failure_fact(&self) -> FailureFact {
         match self {
             Self::Model(cause) => cause.failure_fact(),
+            Self::BTree(cause) => cause.failure_fact(),
             Self::ValueType(cause) => cause.failure_fact(),
             Self::Arithmetic => fact(FailureClass::Resource, 34),
             Self::InsertCountExceededOriginalReservation => fact(FailureClass::Invariant, 30),
@@ -104,6 +105,39 @@ impl FailureProjection for MetadataRequestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_btree_model_keeps_the_original_reason_and_discoverable_source() {
+        use crate::owned_resources::{
+            arrow_metadata::hashmap_conversion_requests, btree::BTreeResourceError,
+        };
+        use std::error::Error;
+        for source in [
+            hashmap_conversion_requests(usize::MAX).unwrap_err(),
+            BTreeResourceError::SourceModel("original metadata model"),
+        ] {
+            let wrapped = MetadataMaterializationError::BTree(source);
+            assert_eq!(wrapped.failure_fact(), source.failure_fact());
+            assert_eq!(
+                wrapped
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<BTreeResourceError>(),
+                Some(&source)
+            );
+        }
+        let mut sum = crate::owned_resources::metadata_request::MetadataRequestSum::default();
+        let original = sum.facts();
+        let error = sum.metadata_conversion(usize::MAX).unwrap_err();
+        let cause = error
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<BTreeResourceError>()
+            .expect("the original metadata numeric cause");
+        assert_eq!(error.failure_fact(), cause.failure_fact());
+        assert_eq!(sum.facts(), original);
+    }
     #[test]
     fn layout_request_arithmetic_does_not_invent_value_representation_facts() {
         let arithmetic = LayoutResourceError::Arithmetic.failure_fact();

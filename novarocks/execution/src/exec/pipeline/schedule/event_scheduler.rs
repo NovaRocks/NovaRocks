@@ -896,8 +896,11 @@ impl EventScheduler {
             .as_ref()
             .is_some_and(|observer| observer.is_active())
             && matches!(reason, BlockedReason::InputEmpty)
-            && task.source_name().contains("EXCHANGE")
-            && generation == 0;
+            && task.source_name().contains("EXCHANGE");
+        #[cfg(novarocks_dev_controls)]
+        let exchange_source_name = emit_exchange_marker.then(|| task.source_name().to_owned());
+        #[cfg(novarocks_dev_controls)]
+        let writer_diagnostic = task.writer_diagnostic();
         let key = DriverKey::new(task.fragment_instance_id(), task.driver_id());
         let block_epoch = self
             .next_block_epoch
@@ -955,16 +958,27 @@ impl EventScheduler {
                 test_observer.as_deref(),
                 || {
                     format!(
-                        "event=driver_park finst={:?} driver_id={} reason={:?} frozen_generation={} current_generation={} block_epoch={}",
+                        "event=driver_park finst={:?} driver_id={} reason={:?} frozen_generation={} current_generation={} block_epoch={} source_name={:?}",
                         key.finst,
                         key.driver_id,
                         reason,
                         generation,
                         observable.generation(),
                         block_epoch,
+                        exchange_source_name
+                            .as_deref()
+                            .expect("active Exchange observer"),
                     )
                 },
             );
+        }
+
+        #[cfg(novarocks_dev_controls)]
+        if let Some((scope, source, sink)) = writer_diagnostic {
+            scope.emit("driver_park", || format!(
+                "finst={:?} driver_id={} source={source:?} sink={sink:?} reason={reason:?} frozen_generation={generation} current_generation={} block_epoch={block_epoch}",
+                key.finst, key.driver_id, observable.generation()
+            ));
         }
 
         // Registration can race with a transition that already made the task
@@ -1225,9 +1239,25 @@ impl EventScheduler {
     fn try_schedule_key(self: &Arc<Self>, key: DriverKey) {
         #[cfg(novarocks_dev_controls)]
         let mut exchange_marker = None;
+        #[cfg(novarocks_dev_controls)]
+        let mut writer_marker = None;
         let task = {
             let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
             let entry = blocked.remove(&key);
+            #[cfg(novarocks_dev_controls)]
+            if let Some(entry) = entry.as_ref()
+                && let Some(scope) = entry.task.writer_diagnostic()
+            {
+                let generations = entry
+                    .observable
+                    .as_ref()
+                    .and_then(|(observable, generation)| {
+                        observable
+                            .upgrade()
+                            .map(|observable| (*generation, observable.generation()))
+                    });
+                writer_marker = Some((scope, generations, entry.block_epoch));
+            }
             #[cfg(novarocks_dev_controls)]
             if let Some(entry) = entry.as_ref()
                 && entry.task.source_name().contains("EXCHANGE")
@@ -1245,14 +1275,12 @@ impl EventScheduler {
                             .map(|observable| (*blocked_generation, observable.generation()))
                     })
                     .unwrap_or((0, 0));
-                if blocked_generation == 0 {
-                    exchange_marker = Some((
-                        observer,
-                        blocked_generation,
-                        current_generation,
-                        entry.block_epoch,
-                    ));
-                }
+                exchange_marker = Some((
+                    observer,
+                    blocked_generation,
+                    current_generation,
+                    entry.block_epoch,
+                ));
             }
             let mut state = self
                 .reschedule_queue
@@ -1281,6 +1309,13 @@ impl EventScheduler {
                     )
                 },
             );
+        }
+        #[cfg(novarocks_dev_controls)]
+        if let Some(((scope, source, sink), generations, epoch)) = writer_marker {
+            scope.emit("driver_wake", || format!(
+                "finst={:?} driver_id={} source={source:?} sink={sink:?} generations={generations:?} block_epoch={epoch}",
+                key.finst, key.driver_id
+            ));
         }
         let Some((mut task, origin)) = task else {
             return;
@@ -1329,6 +1364,125 @@ mod tests {
     use crate::exec::pipeline::step_context::StepContext;
     use crate::runtime::runtime_state::RuntimeState;
     use std::sync::atomic::AtomicUsize;
+
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn exchange_park_and_wake_observe_the_same_actual_nonzero_generation_epoch() {
+        #[derive(Debug, Default)]
+        struct Events(Mutex<Vec<String>>);
+        impl crate::runtime::exchange::TestEventObserver for Events {
+            fn is_active(&self) -> bool {
+                true
+            }
+            fn observe(&self, event: &str) {
+                self.0.lock().unwrap().push(event.to_owned());
+            }
+        }
+        struct ExchangeSource(Arc<Observable>);
+        impl OperatorLifecycle for ExchangeSource {
+            fn name(&self) -> &str {
+                "EXCHANGE_TEST_SOURCE"
+            }
+        }
+        impl SourceKernel for ExchangeSource {
+            fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+                Ok(StepResult::new(
+                    None,
+                    NextStep::Wait(WaitFact {
+                        reason: WaitReason::Input,
+                        observable: Arc::clone(&self.0),
+                        observed_generation: self.0.generation(),
+                        deadline: None,
+                    }),
+                    0,
+                ))
+            }
+        }
+        let events = Arc::new(Events::default());
+        let observable = Arc::new(Observable::new());
+        observable.notify_observers();
+        let runtime =
+            Arc::new(RuntimeState::default().with_exchange_test_observer(Some(events.clone())));
+        let finst = Some((67_900, 65_590));
+        let mut driver = PipelineDriver::new(
+            9,
+            vec![
+                Box::new(Source::new(ExchangeSource(Arc::clone(&observable)))),
+                Box::new(EarlyFinishSink {
+                    finished: Arc::new(AtomicBool::new(false)),
+                    early_finish: Arc::new(Observable::new()),
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::clone(&runtime),
+            finst,
+        );
+        assert!(matches!(
+            driver.process(Duration::from_millis(10)),
+            DriverState::Blocked(BlockedReason::InputEmpty)
+        ));
+        let (driver_event, first_generation, _) = driver.blocked_observable_snapshot().unwrap();
+        assert!(
+            !Arc::ptr_eq(&driver_event, &observable),
+            "the scheduler parks the driver's frontier endpoint, not its raw source event"
+        );
+        // The first turn installed the real source-to-frontier subscription.
+        // Only a subsequent source notification can advance that endpoint;
+        // notifying before construction does not give the driver a generation.
+        observable.notify_observers();
+        assert!(driver_event.generation() > first_generation);
+        assert!(matches!(
+            driver.process(Duration::from_millis(10)),
+            DriverState::Blocked(BlockedReason::InputEmpty)
+        ));
+        let (reparked_event, generation, _) = driver.blocked_observable_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&driver_event, &reparked_event));
+        assert!(generation > 0);
+        assert_eq!(generation, driver_event.generation());
+        let scheduler = Arc::new(EventScheduler::new());
+        let executor = Arc::new(ExecutorShared::new());
+        assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
+        let task = DriverTask::new(
+            driver,
+            FragmentCompletion::new(1, runtime.error_state()),
+            Arc::new(FragmentContext::new(None, runtime, finst, None, None, None)),
+            Duration::from_millis(10),
+        );
+        assert!(
+            scheduler
+                .add_blocked(task, BlockedReason::InputEmpty)
+                .is_ok()
+        );
+        let key = DriverKey::new(finst, 9);
+        let epoch = scheduler.blocked.lock().unwrap()[&key].block_epoch;
+        let parked = events.0.lock().unwrap().clone();
+        assert_eq!(parked.len(), 1);
+        assert!(parked[0].contains("event=driver_park"));
+        assert!(parked[0].contains(&format!("frozen_generation={generation}")));
+        assert!(parked[0].contains(&format!("block_epoch={epoch}")));
+        observable.notify_observers();
+        assert!(driver_event.generation() > generation);
+        // Drive the actual queued key through the normal scheduling author.
+        let queued = scheduler
+            .reschedule_queue
+            .lock()
+            .unwrap()
+            .queue
+            .pop_front()
+            .unwrap();
+        assert_eq!(queued, key);
+        scheduler.try_schedule_key(queued);
+        assert_eq!(executor.queue.lock().unwrap().len(), 1);
+        let completed = events.0.lock().unwrap();
+        assert_eq!(completed.len(), 2);
+        assert!(completed[1].contains("event=driver_wake"));
+        assert!(completed[1].contains(&format!("blocked_generation={generation}")));
+        assert!(
+            completed[1].contains(&format!("current_generation={}", driver_event.generation()))
+        );
+        assert!(completed[1].contains(&format!("block_epoch={epoch}")));
+    }
 
     #[test]
     fn deadline_index_replace_remove_and_clear_leave_no_stale_entries() {

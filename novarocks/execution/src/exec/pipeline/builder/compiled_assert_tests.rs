@@ -144,3 +144,154 @@ fn compiled_keyed_assertion_allows_distinct_keys_and_refuses_a_duplicate() {
     let error = try_run(&program(&nulls, keyed)).expect_err("a repeated NULL key fails");
     assert!(error.contains("duplicate k=<NULL>"), "{error}");
 }
+
+/// The applicability is an original materialized nullable Boolean column.
+/// Duplicate bypass keys deliberately remain in the result unchanged.
+fn conditional_program(rows: &[(Option<i64>, i64, Option<bool>)], dop: usize) -> Arc<LocalProgram> {
+    use novarocks_physical_plan::{AssertionApplicability, LiteralValue};
+    let mut builder = FragmentBuilder::new(FragmentId::new(52));
+    let source = NodeId::new(0);
+    let assertion = NodeId::new(1);
+    let cells = rows
+        .iter()
+        .map(|(key, value, applies)| {
+            vec![
+                cell(*key),
+                cell(Some(*value)),
+                applies.map_or(LiteralValue::Null, LiteralValue::Boolean),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let columns = values(
+        &mut builder,
+        source,
+        &[
+            int64(true),
+            int64(false),
+            novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Boolean,
+                true,
+            ),
+        ],
+        &cells,
+    );
+    builder
+        .add_assert_one_row(
+            assertion,
+            source,
+            RowCountAssertionSpec::PerKeyAtMostOne {
+                applicability: AssertionApplicability::WhenTrue(columns[2]),
+                keys: Box::from([columns[0]]),
+                labels: Box::from(["target".into()]),
+                message: "selected target repeated".into(),
+            },
+        )
+        .unwrap();
+    compile(
+        package(builder, assertion, ConstantPools::empty(), dop as u32),
+        dop,
+    )
+}
+
+#[test]
+fn compiled_keyed_builder_keeps_when_true_and_parallel_driver_key_authority() {
+    use crate::exec::pipeline::{
+        binding::{ExchangeBindings, ScanBindings},
+        dependency::DependencyManager,
+    };
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    let rows = [
+        (Some(7), 10, Some(true)),
+        (Some(7), 20, Some(false)),
+        (Some(7), 30, None),
+        (None, 40, Some(false)),
+        (None, 50, None),
+    ];
+    for dop in [1, 3, 4] {
+        let program = conditional_program(&rows, dop);
+        let runtime = crate::runtime::execution_runtime::test_execution_runtime();
+        let graph = super::build_compiled_pipeline_graph_for_test(
+            &program,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            crate::runtime::fragment::CompiledWriterBindings::default(),
+            None,
+            DependencyManager::new(),
+            dop as i32,
+            Some(1),
+            runtime.function_set().clone(),
+            Arc::new(RuntimeErrorState::default()),
+        )
+        .unwrap();
+        let assertion_pipelines = graph
+            .pipelines
+            .iter()
+            .filter(|pipeline| {
+                pipeline
+                    .factories
+                    .iter()
+                    .any(|factory| factory.name().starts_with("AssertNumRows"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assertion_pipelines.len(), 1);
+        assert_eq!(
+            assertion_pipelines[0].dop, dop as i32,
+            "keyed assertion retains real partition drivers before the independent result gather"
+        );
+        let output = run(&program);
+        let mut values = output
+            .iter()
+            .flat_map(|chunk| {
+                chunk.columns()[1]
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        assert_eq!(values, vec![10, 20, 30, 40, 50]);
+        let duplicate = conditional_program(
+            &[
+                (Some(7), 10, Some(true)),
+                (Some(7), 20, Some(false)),
+                (Some(7), 30, Some(true)),
+            ],
+            dop,
+        );
+        let failure =
+            try_run(&duplicate).expect_err("same selected key must reach one driver authority");
+        assert!(
+            failure.contains("selected target repeated: duplicate target=7"),
+            "{failure}"
+        );
+    }
+}
+
+#[test]
+fn compiled_conditional_builder_preserves_all_bypass_rows_with_null_keys() {
+    let rows = (0..12)
+        .map(|row| (None, row, if row % 2 == 0 { Some(false) } else { None }))
+        .collect::<Vec<_>>();
+    for dop in [1, 3, 4] {
+        let output = run(&conditional_program(&rows, dop));
+        let mut actual = output
+            .iter()
+            .flat_map(|chunk| {
+                chunk.columns()[1]
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            (0..12).collect::<Vec<_>>(),
+            "bypass rows never enter the target-key decoder or duplicate set"
+        );
+    }
+}

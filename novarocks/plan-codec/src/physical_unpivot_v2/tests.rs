@@ -169,8 +169,12 @@ fn policy() -> ConstantPolicy {
 }
 fn pool(array: &dyn Array) -> ConstantPool {
     let field = Arc::new(
-        Field::new("original_source", array.data_type().clone(), true)
-            .with_metadata([("source.tag".into(), "unchanged".into())].into()),
+        Field::new("original_source", array.data_type().clone(), true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "source.tag".into(),
+                "unchanged".into(),
+            )]),
+        ),
     );
     ConstantPool::try_new(
         field,

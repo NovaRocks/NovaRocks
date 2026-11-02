@@ -17,7 +17,7 @@
 
 //! Requested diagnostic allocations for the checked, one-column flat reader
 //! and its ConstantPool validation. This is not the whole reader envelope or
-//! a memory grant. Its current source audit covers Arrow 58.4.0, num-bigint 0.4.6 and
+//! a memory grant. Its current source audit covers Arrow 60.1.0 and
 //! Rust 1.98.1 String/RawVec growth. Cargo identity is a separate receipt. The parent owns entry/tail
 //! observations and combines this with all successful reader allocations.
 
@@ -189,45 +189,14 @@ fn scaled_length(coefficient: usize, scale: i8) -> Result<usize, FlatPoolResourc
     }
 }
 
-/// Extra allocations inside one i256 Display, excluding its destination
-/// String. BigInt::from_signed_bytes_le may copy 32 negative bytes. The two
-/// limb Vecs contain at most 8 u32 / 4 u64 limbs (32 bytes), and normalization
-/// shrinks only below one quarter capacity: all shrinking requests together
-/// are below their original 32 bytes. At most eight positive limb counts can
-/// be visited, so eight requests is a representation-derived count bound.
-/// The radix10 Vec starts at ceil(bits/log2(10)) <= 256; any later growth is
-/// conservatively covered by the same u8 RawVec rule for <=78 decimal digits.
-/// The >=64-limb big-number branch cannot be entered by this 256-bit source.
-fn bigint_display_requests<W: ResourceWork>(
-    work: &mut W,
-) -> Result<ReaderDiagnosticRequests, W::Error> {
-    let representation_bytes = 256usize / 8;
-    let maximum_limbs = 256usize / 32;
-    work.numeric(byte_layout(representation_bytes))?;
-    work.numeric(byte_layout(256))?;
-    // Both possible num-bigint native limb layouts have the same 32-byte
-    // representation bound; verify their actual element alignment as well.
-    Layout::array::<u32>(maximum_limbs).map_err(|_| invalid())?;
-    Layout::array::<u64>(256 / 64).map_err(|_| invalid())?;
-    let mut result = ReaderDiagnosticRequests {
-        // Negative byte copy, original limbs + shrink, cloned limbs + shrink,
-        // and initial radix byte Vec. These are cumulative requested payloads.
-        request_bytes_upper_bound: work
-            .numeric(add(work.numeric(mul(representation_bytes, 5))?, 256))?,
-        allocation_requests_upper_bound: work
-            .numeric(add(4, work.numeric(mul(maximum_limbs, 2))?))?,
-    };
-    work.step()?;
-    result = result.plus(string_requests(78, work)?)?;
-    work.step()?;
-    Ok(result)
-}
+// Arrow 60 i256 Display uses fixed i128 limbs/div_rem on the stack. Only
+// the original destination formatting strings below allocate; there are no
+// BigInt byte/limb/radix-vector requests to add to this source profile.
 fn decimal_error<W: ResourceWork>(
     width: &'static str,
     coefficient_length: usize,
     precision: u8,
     scale: i8,
-    bigint: bool,
     work: &mut W,
 ) -> Result<ReaderDiagnosticRequests, W::Error> {
     let bound_length = work.numeric(add(usize::from(precision), 1))?; // includes a possible minus
@@ -247,11 +216,6 @@ fn decimal_error<W: ResourceWork>(
         work,
     )?;
     requests = requests.plus(arrow_error(description, work)?)?;
-    if bigint {
-        let display = bigint_display_requests(work)?;
-        // Value and precision bound each perform an i256 Display.
-        requests = requests.plus(display)?.plus(display)?;
-    }
     work.step()?;
     Ok(requests)
 }
@@ -386,14 +350,14 @@ pub(crate) fn preflight_field<W: ResourceWork>(
         _ => ReaderDiagnosticRequests::default(),
     };
     let decimal = match ty {
-        DataType::Decimal32(p, s) => Some(("Decimal32", 11, *p, *s, false)),
-        DataType::Decimal64(p, s) => Some(("Decimal64", 20, *p, *s, false)),
-        DataType::Decimal128(p, s) => Some(("Decimal128", 40, *p, *s, false)),
-        DataType::Decimal256(p, s) => Some(("Decimal256", 78, *p, *s, true)),
+        DataType::Decimal32(p, s) => Some(("Decimal32", 11, *p, *s)),
+        DataType::Decimal64(p, s) => Some(("Decimal64", 20, *p, *s)),
+        DataType::Decimal128(p, s) => Some(("Decimal128", 40, *p, *s)),
+        DataType::Decimal256(p, s) => Some(("Decimal256", 78, *p, *s)),
         _ => None,
     };
-    if let Some((name, coefficient, p, s, bigint)) = decimal {
-        largest = largest.maximum(decimal_error(name, coefficient, p, s, bigint, work)?);
+    if let Some((name, coefficient, p, s)) = decimal {
+        largest = largest.maximum(decimal_error(name, coefficient, p, s, work)?);
         work.step()?;
     }
     // Only the first semantic failure is formatted. All successful-prefix
@@ -467,19 +431,15 @@ mod tests {
     }
 
     #[test]
-    fn decimal_scale_minus_128_keeps_all_numeric_scaled_and_bigint_requests() {
+    fn decimal_scale_minus_128_keeps_the_original_destination_requests() {
         assert_eq!(scaled_length(78, -128).unwrap(), 206);
         assert_eq!(scaled_length(77, -128).unwrap(), 205);
         assert_eq!(scaled_length(40, 38).unwrap(), 41);
         let c = control();
         let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
-        let native = decimal_error("Decimal256", 78, 76, -128, false, &mut work).unwrap();
-        let bigint = decimal_error("Decimal256", 78, 76, -128, true, &mut work).unwrap();
-        let extra = bigint_display_requests(&mut work).unwrap();
-        assert_eq!(bigint, native.plus(extra).unwrap().plus(extra).unwrap());
-        assert!(bigint.request_bytes_upper_bound > native.request_bytes_upper_bound);
-        let plain = decimal_error("Decimal256", 78, 76, 0, true, &mut work).unwrap();
-        assert!(bigint.request_bytes_upper_bound > plain.request_bytes_upper_bound);
+        let scaled = decimal_error("Decimal256", 78, 76, -128, &mut work).unwrap();
+        let plain = decimal_error("Decimal256", 78, 76, 0, &mut work).unwrap();
+        assert!(scaled.request_bytes_upper_bound > plain.request_bytes_upper_bound);
     }
 
     #[test]

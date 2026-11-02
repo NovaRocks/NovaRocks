@@ -81,8 +81,12 @@ fn implicit_signed_cast_nullability_preserves_complete_source_and_policy() {
 #[test]
 fn same_carrier_keeps_nominal_and_nested_type_identity() {
     let nested = DataType::List(Arc::new(
-        arrow::datatypes::Field::new("original_item", DataType::Int32, false)
-            .with_metadata([("provider.field_id".into(), "41".into())].into()),
+        arrow::datatypes::Field::new("original_item", DataType::Int32, false).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider.field_id".into(),
+                "41".into(),
+            )]),
+        ),
     ));
     let types = [
         FunctionValueType::new(nested, false),
@@ -107,8 +111,12 @@ fn same_carrier_keeps_nominal_and_nested_type_identity() {
 #[test]
 fn non_signed_constructor_keeps_existing_nullability_and_target_metadata() {
     let nested = DataType::List(Arc::new(
-        arrow::datatypes::Field::new("original_item", DataType::Int16, true)
-            .with_metadata([("provider.field_id".into(), "41".into())].into()),
+        arrow::datatypes::Field::new("original_item", DataType::Int16, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider.field_id".into(),
+                "41".into(),
+            )]),
+        ),
     ));
     for (carrier, target) in [
         (DataType::Boolean, DataType::Int8),

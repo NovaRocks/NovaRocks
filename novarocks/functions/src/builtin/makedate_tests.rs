@@ -116,7 +116,10 @@ fn pool(array: &ArrayRef) -> ConstantPool {
         Arc::new(
             ty.try_to_field("original")
                 .unwrap()
-                .with_metadata([("source-note".into(), "original makedate ordinal".into())].into()),
+                .with_metadata(std::collections::HashMap::<String, String>::from([(
+                    "source-note".into(),
+                    "original makedate ordinal".into(),
+                )])),
         ),
         ty,
         array.to_data(),

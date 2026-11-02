@@ -44,7 +44,7 @@ use tokio::sync::{Notify, watch};
 use tonic::body::boxed;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
-use tower::ServiceExt;
+use tower::{Layer, ServiceExt};
 
 use crate::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 use crate::native_incoming_key_capacity::NativeIncomingKey;
@@ -384,11 +384,11 @@ impl NativeRpcServerHandle {
                         .with_lane_streams(
                             Some(admission.admission.clone()),
                         );
-                        let app = NativeListenerAuthService::new(
-                            app,
-                            native_trust.server_admission(),
-                            authentication_failure,
-                        );
+                        let app = native_trust
+                            .server_admission()
+                            .listener_layer()
+                            .with_authentication_failure_observer(authentication_failure)
+                            .layer(app);
                         serve_native_listener(
                             listener,
                             app,
@@ -936,59 +936,6 @@ impl Drop for ServedConnection {
     }
 }
 
-#[derive(Clone)]
-struct NativeListenerAuthService<S> {
-    admission: NativeServerAdmission,
-    inner: S,
-    on_authentication_failure: Arc<dyn Fn() + Send + Sync>,
-}
-
-impl<S> NativeListenerAuthService<S> {
-    fn new(
-        inner: S,
-        admission: NativeServerAdmission,
-        on_authentication_failure: Arc<dyn Fn() + Send + Sync>,
-    ) -> Self {
-        Self {
-            admission,
-            inner,
-            on_authentication_failure,
-        }
-    }
-}
-
-impl<S, Body> Service<axum::http::Request<Body>> for NativeListenerAuthService<S>
-where
-    S: Service<axum::http::Request<Body>, Response = axum::http::Response<tonic::body::BoxBody>>
-        + Send,
-    S::Future: Send + 'static,
-    S::Error: Send + 'static,
-{
-    type Response = axum::http::Response<tonic::body::BoxBody>;
-    type Error = S::Error;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
-    >;
-
-    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(context)
-    }
-
-    fn call(&mut self, request: axum::http::Request<Body>) -> Self::Future {
-        if self.admission.admit_headers(request.headers()).is_err() {
-            (self.on_authentication_failure)();
-            drop(request);
-            let response = tonic::Status::new(
-                tonic::Code::Unauthenticated,
-                "native caller authentication failed",
-            )
-            .into_http();
-            return Box::pin(async move { Ok(response) });
-        }
-        Box::pin(self.inner.call(request))
-    }
-}
-
 async fn grpc_unimplemented_fallback(
     request: axum::http::Request<axum::body::Body>,
 ) -> axum::http::Response<axum::body::Body> {
@@ -1076,13 +1023,13 @@ mod tests {
             async { Ok::<_, std::convert::Infallible>(tonic::Status::ok("").into_http()) }
         });
         let rejected = failures.clone();
-        let mut service = NativeListenerAuthService::new(
-            inner,
-            crate::backend_test_support::test_backend_native_trust().server_admission(),
-            Arc::new(move || {
+        let mut service = crate::backend_test_support::test_backend_native_trust()
+            .server_admission()
+            .listener_layer()
+            .with_authentication_failure_observer(Arc::new(move || {
                 rejected.fetch_add(1, Ordering::SeqCst);
-            }),
-        );
+            }))
+            .layer(inner);
         let response = service
             .call(axum::http::Request::new(axum::body::Body::empty()))
             .await

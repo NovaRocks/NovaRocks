@@ -94,3 +94,14 @@ python3 -m unittest discover -s tools/dev/tests -p 'test_*.py' -v
 这些标准库功能测试维护安装、账户与幂等合同；命令适配器不证明冷系统安装。实际部署还应检查 native 编译、nextest、Docker 拉取/构建/Compose 网络、fixture verify/status/attach 和最小 Spark SQL。独立空白机器必须从无旧镜像、BOM/READY 和 target 开始，成功后用相同配置复执行，对比 daemon 启动时间和 machine generation。已安装机器复验只证明当前条件。
 
 实际部署保留机器规格、候选源码、非秘密 profile、命令和真实退出到实例外；旧机释放前核对材料可恢复。部署者负责网络与实例生命周期，本工具不申请/释放实例、不注册 GitHub Runner；未来 CI 平台可消费同一准备入口。Linux 扩展测试矩阵和整工作区构建不属于环境准备。
+
+## 仅准备 Rust 工具
+
+固定 CI 镜像使用独立的工具 profile：
+
+```sh
+sudo tools/dev/linux-env.sh prepare --user runner --profile tools/dev/profiles/aliyun-ubuntu26-amd64-tools.json --tools-only
+tools/dev/linux-env.sh check --user runner --profile tools/dev/profiles/aliyun-ubuntu26-amd64-tools.json --tools-only
+```
+
+`prepare`、`check`、`env` 必须显式选择 `--tools-only` 或 `--fixture iceberg-rest`。工具模式只处理 native 包、locale、Rust、nextest 与账户环境；拒绝 fixture、Docker 和对象存储配置。测试 owner 为 Linux 准备入口维护者，低成本命令适配器测试随入口变更运行，冷机验收独立记录。

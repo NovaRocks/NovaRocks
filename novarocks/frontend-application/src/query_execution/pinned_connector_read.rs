@@ -133,6 +133,6 @@ fn pinned_file_set_query_table_binding(
         write_target_admission: None,
         frozen_cohort_read: Some(QueryFrozenCohortRead::PinnedFileSet(read)),
         frozen_snapshot_materializations: BTreeMap::new(),
-        admitted_change_scans: BTreeMap::new(),
+        prepared_source_reads: BTreeMap::new(),
     })
 }

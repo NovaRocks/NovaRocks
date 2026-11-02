@@ -221,12 +221,12 @@ fn sparse_union_masks_dictionary_keys_but_list_before_dictionary_drops_that_mask
 }
 
 #[test]
-fn dense_union_nullable_take_into_runs_uses_raw_index_even_when_tag_mask_is_null() {
+fn dense_union_nullable_take_into_runs_ignores_hidden_index_under_null_tag() {
     let selected = runs(&[1, 2], floats(&[Some(3.0), Some(4.0)]));
     let array = union(&[7, 1], Some(&[0, 1]), selected, 2);
-    // take_run obtains physical indices from raw offsets without inspecting
-    // the nullable indices bitmap, unlike the primitive take kernel.
-    assert_eq!(arrow_values(&array), [Some(3.0), Some(4.0)]);
+    // Arrow 60.1 take_run respects the nullable index created by the tag
+    // mask. The inactive run's physical value is not the selected value.
+    assert_eq!(arrow_values(&array), [Some(3.0), None]);
     assert_eq!(strict_values(&array), [Some(3.0), None]);
 }
 

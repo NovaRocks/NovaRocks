@@ -618,7 +618,10 @@ mod tests {
             match label {
                 None => field,
                 Some(label) => {
-                    field.with_metadata([(NR_LOGICAL_TYPE_KEY.into(), label.into())].into())
+                    field.with_metadata(std::collections::HashMap::<String, String>::from([(
+                        NR_LOGICAL_TYPE_KEY.into(),
+                        label.into(),
+                    )]))
                 }
             }
         };
@@ -770,12 +773,18 @@ mod tests {
     }
 
     fn identity_field(label: Option<&str>) -> Arc<Field> {
-        let field = Field::new("item", DataType::Utf8, true)
-            .with_metadata([("provider.field.id".into(), "73".into())].into());
+        let field =
+            Field::new("item", DataType::Utf8, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                "provider.field.id".into(),
+                "73".into(),
+            )]));
         Arc::new(match label {
             Some(label) => {
                 let mut metadata = field.metadata().clone();
-                metadata.insert(NR_LOGICAL_TYPE_KEY.into(), label.into());
+                metadata.insert(NR_LOGICAL_TYPE_KEY.to_string(), label.to_string());
                 field.with_metadata(metadata)
             }
             None => field,
@@ -857,8 +866,12 @@ mod tests {
         ));
         let nominal = |label: &str| {
             DataType::List(Arc::new(
-                Field::new("item", DataType::FixedSizeBinary(16), false)
-                    .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), label.into())].into()),
+                Field::new("item", DataType::FixedSizeBinary(16), false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        NR_LOGICAL_TYPE_KEY.into(),
+                        label.into(),
+                    )]),
+                ),
             ))
         };
         assert!(!preserves_nested_logical_identity(

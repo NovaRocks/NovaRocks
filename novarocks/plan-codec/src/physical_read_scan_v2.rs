@@ -2144,7 +2144,7 @@ fn decode_read_scans_core<H>(
                 work,
             )?;
             let schema = schema_owner.schema();
-            if schema.metadata().capacity() != 0 {
+            if schema.metadata().as_arc().is_some() {
                 return Err(E::InvalidShape(
                     "execution read schema carries format metadata backing",
                 )

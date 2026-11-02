@@ -45,6 +45,25 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 
+fn client_render_schema_error(
+    error: novarocks_sql::compiler::ClientRenderSchemaError,
+) -> FrontendQueryCompilerError {
+    match error {
+        error @ novarocks_sql::compiler::ClientRenderSchemaError::UnsupportedClientType {
+            ..
+        } => FrontendQueryCompilerError::Application(
+            novarocks_query_application::session_error::QueryServiceError::from_user_error(
+                novarocks_query_application::sql::session_admit::client_type_unsupported_error(
+                    error.to_string(),
+                ),
+            ),
+        ),
+        novarocks_sql::compiler::ClientRenderSchemaError::Invalid(message) => {
+            FrontendQueryCompilerError::Engine(message)
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum ReadEncodingPurpose {
     Read(FrontendQueryPurpose),
@@ -54,6 +73,7 @@ pub(crate) struct ReadEncodingInput {
     pub(crate) purpose: ReadEncodingPurpose,
     pub(crate) version: novarocks_physical_plan::PlanVersionId,
     pub(crate) options: Option<novarocks_proto_codec::lifecycle::QueryOptions>,
+    pub(crate) family: novarocks_result_contract::ClientPresentationFamily,
     pub(crate) offset: i32,
     pub(crate) carrier: CompiledPackageCarrier,
     pub(crate) policy: novarocks_physical_plan::ConstantPolicy,
@@ -264,9 +284,18 @@ impl PlanningCpuOriginal {
                 novarocks_result_contract::FrozenRootOutput::ClientRows(
                     novarocks_sql::compiler::client_render_schema_from_port(
                         candidate.original_public_result_port(),
-                        input.offset,
+                        match &input.family {
+                            novarocks_result_contract::ClientPresentationFamily::MysqlText => {
+                                novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
+                                    timezone_offset_seconds: input.offset,
+                                }
+                            }
+                            novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                                facts,
+                            ) => novarocks_sql::compiler::RenderFamilyRequest::TrinoJson(facts),
+                        },
                     )
-                    .map_err(FrontendQueryCompilerError::Engine)?,
+                    .map_err(client_render_schema_error)?,
                 )
             }
             ReadEncodingPurpose::Read(FrontendQueryPurpose::ScalarValue) => {
@@ -822,5 +851,38 @@ impl SqlCompletionCpuPort for FrontendPlanningCpuSource {
             panic!("planning candidate returned another phase")
         };
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod client_render_error_tests {
+    use super::*;
+
+    #[test]
+    fn protocol_type_rejection_retains_typed_application_error() {
+        let error = client_render_schema_error(
+            novarocks_sql::compiler::ClientRenderSchemaError::UnsupportedClientType {
+                column: "wide_result".into(),
+                native_type: novarocks_result_contract::NativeRenderType::LargeInt,
+            },
+        );
+        let FrontendQueryCompilerError::Application(error) = error else {
+            panic!("client type rejection must remain a typed application failure");
+        };
+        let user = error.user_error().expect("admit descriptor");
+        assert_eq!(user.code().as_str(), "sql.admit.client_type_unsupported");
+        assert_eq!(user.phase(), novarocks_user_error::ErrorPhase::Admit);
+        assert!(user.location().is_none());
+        assert!(user.to_string().contains("wide_result"));
+        assert!(user.to_string().contains("LargeInt"));
+    }
+
+    #[test]
+    fn preexisting_render_errors_keep_original_engine_message() {
+        let message = "public output logical type UUID is unsupported";
+        let error = client_render_schema_error(
+            novarocks_sql::compiler::ClientRenderSchemaError::Invalid(message.into()),
+        );
+        assert!(matches!(error, FrontendQueryCompilerError::Engine(actual) if actual == message));
     }
 }

@@ -331,7 +331,6 @@ fn options(dop: usize) -> LocalCompileOptions {
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
         constants: constant_policy(),
-        exchange_wait: Duration::from_secs(120),
     }
 }
 

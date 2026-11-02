@@ -30,7 +30,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -235,7 +234,7 @@ fn typed_frozen_read_with_distribution(
         .into_boxed_slice();
     let source_schema = ConnectorSourceSchemaFacts::try_new(
         shape,
-        original_source.metadata().clone(),
+        std::collections::HashMap::from(original_source.metadata()),
         source_fields,
         storage.clone(),
     )
@@ -674,7 +673,6 @@ fn options(dop: usize) -> LocalCompileOptions {
         // The result is published by one root sink driver.
         root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
         kernel_abi: KernelAbiVersion::CURRENT,
-        exchange_wait: Duration::from_secs(120),
         // Explicit fixture admission; these values are not production defaults.
         constants: ConstantPolicy {
             max_rows: 16,

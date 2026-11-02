@@ -778,13 +778,17 @@ impl Encoder<'_> {
         self.put(
             &facts
                 .statement
-                .map_or(0, |token| token.session().connection_id())
+                .map_or(0, |_| {
+                    facts
+                        .connection
+                        .map_or(0, |connection| connection.connection_id())
+                })
                 .to_le_bytes(),
         );
         self.u64(
             facts
                 .statement
-                .map_or(0, |token| token.session().session_epoch()),
+                .map_or(0, |token| token.session().key().get()),
         );
         self.u64(facts.statement.map_or(0, |token| token.generation()));
         self.flag(facts.original_sql_sha256.is_some());

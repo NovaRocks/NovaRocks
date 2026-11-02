@@ -30,8 +30,8 @@ pub fn supports(source: &DataType, target: &DataType) -> bool {
     )
 }
 
-/// Date32 multiplication is checked on active values only. Other conversions
-/// retain the Arrow author, including Timestamp -> Date32 calendar flooring.
+/// Date32 multiplication and Timestamp calendar conversion retain their original
+/// active-value authors. SDK formatting remains a separate operation.
 pub fn cast(array: &dyn Array, target: &DataType) -> Result<ArrayRef, TemporalCastFailure> {
     if !supports(array.data_type(), target) {
         return Err(TemporalCastFailure::Contract(
@@ -71,13 +71,188 @@ pub fn cast(array: &dyn Array, target: &DataType) -> Result<ArrayRef, TemporalCa
             }
         };
     }
+    if let (DataType::Timestamp(unit, None), DataType::Date32) = (array.data_type(), target) {
+        return match unit {
+            TimeUnit::Second => {
+                timestamps_to_date32::<arrow_array::types::TimestampSecondType>(array)
+            }
+            TimeUnit::Millisecond => {
+                timestamps_to_date32::<arrow_array::types::TimestampMillisecondType>(array)
+            }
+            TimeUnit::Microsecond => {
+                timestamps_to_date32::<arrow_array::types::TimestampMicrosecondType>(array)
+            }
+            TimeUnit::Nanosecond => {
+                timestamps_to_date32::<arrow_array::types::TimestampNanosecondType>(array)
+            }
+        };
+    }
     arrow_cast::cast(array, target).map_err(TemporalCastFailure::Arrow)
+}
+
+/// The actual original calendar author rejected this timestamp. This is a
+/// first-party value source, not a reconstructed SDK error.
+#[derive(Debug)]
+pub struct TimestampDateOutOfRange {
+    timestamp_type: &'static str,
+    value: i64,
+}
+impl std::fmt::Display for TimestampDateOutOfRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cast error: Cannot convert {} {} to datetime",
+            self.timestamp_type, self.value
+        )
+    }
+}
+impl std::error::Error for TimestampDateOutOfRange {}
+
+fn timestamps_to_date32<T: arrow_array::types::ArrowTimestampType>(
+    array: &dyn Array,
+) -> Result<ArrayRef, TemporalCastFailure> {
+    let array = array
+        .as_any()
+        .downcast_ref::<arrow_array::PrimitiveArray<T>>()
+        .ok_or_else(|| {
+            TemporalCastFailure::Contract(
+                novarocks_failure_contract::BoundedDetail::truncating_display(
+                    "Timestamp temporal cast has a foreign carrier",
+                ),
+            )
+        })?;
+    // try_unary visits only valid values, retains the original first failure,
+    // and shares the original validity instead of interpreting hidden payloads.
+    let output = array
+        .try_unary::<_, arrow_array::types::Date32Type, _>(|value| {
+            arrow_array::temporal_conversions::as_datetime::<T>(value)
+                .map(|date| arrow_array::types::Date32Type::from_naive_date(date.date()))
+                .ok_or_else(|| TimestampDateOutOfRange {
+                    timestamp_type: std::any::type_name::<T>(),
+                    value,
+                })
+        })
+        .map_err(TemporalCastFailure::TimestampDate)?;
+    Ok(std::sync::Arc::new(output))
+}
+
+/// Checked scaling for the already admitted Time32/Time64 unit pairs. This
+/// entry does not expand the general temporal CAST profile or its timezone policy.
+pub(crate) fn cast_time_units(
+    array: &dyn Array,
+    target: &DataType,
+) -> Result<ArrayRef, TemporalCastFailure> {
+    use arrow_array::types::*;
+    let source_unit = match array.data_type() {
+        DataType::Time32(TimeUnit::Second | TimeUnit::Millisecond)
+        | DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond) => match array.data_type()
+        {
+            DataType::Time32(unit) | DataType::Time64(unit) => *unit,
+            _ => unreachable!(),
+        },
+        _ => return Err(time_contract()),
+    };
+    let target_unit = match target {
+        DataType::Time32(TimeUnit::Second | TimeUnit::Millisecond)
+        | DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond) => match target {
+            DataType::Time32(unit) | DataType::Time64(unit) => *unit,
+            _ => unreachable!(),
+        },
+        _ => return Err(time_contract()),
+    };
+    macro_rules! source {
+        ($ty:ty) => {{
+            let source = array
+                .as_any()
+                .downcast_ref::<arrow_array::PrimitiveArray<$ty>>()
+                .ok_or_else(time_contract)?;
+            match target {
+                DataType::Time32(TimeUnit::Second) => {
+                    time_units::<$ty, Time32SecondType>(source, source_unit, target_unit, 32)
+                }
+                DataType::Time32(TimeUnit::Millisecond) => {
+                    time_units::<$ty, Time32MillisecondType>(source, source_unit, target_unit, 32)
+                }
+                DataType::Time64(TimeUnit::Microsecond) => {
+                    time_units::<$ty, Time64MicrosecondType>(source, source_unit, target_unit, 64)
+                }
+                DataType::Time64(TimeUnit::Nanosecond) => {
+                    time_units::<$ty, Time64NanosecondType>(source, source_unit, target_unit, 64)
+                }
+                _ => Err(time_contract()),
+            }
+        }};
+    }
+    match array.data_type() {
+        DataType::Time32(TimeUnit::Second) => source!(Time32SecondType),
+        DataType::Time32(TimeUnit::Millisecond) => source!(Time32MillisecondType),
+        DataType::Time64(TimeUnit::Microsecond) => source!(Time64MicrosecondType),
+        DataType::Time64(TimeUnit::Nanosecond) => source!(Time64NanosecondType),
+        _ => Err(time_contract()),
+    }
+}
+fn time_contract() -> TemporalCastFailure {
+    TemporalCastFailure::Contract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(
+            "TIME unit conversion has a foreign frozen carrier",
+        ),
+    )
+}
+fn time_units<S, T>(
+    source: &arrow_array::PrimitiveArray<S>,
+    source_unit: TimeUnit,
+    target_unit: TimeUnit,
+    width: u8,
+) -> Result<ArrayRef, TemporalCastFailure>
+where
+    S: arrow_array::types::ArrowPrimitiveType,
+    S::Native: Into<i64>,
+    T: arrow_array::types::ArrowPrimitiveType,
+    T::Native: TryFrom<i128, Error = std::num::TryFromIntError>,
+{
+    let factor = |unit| match unit {
+        TimeUnit::Second => 1_i128,
+        TimeUnit::Millisecond => 1_000,
+        TimeUnit::Microsecond => 1_000_000,
+        TimeUnit::Nanosecond => 1_000_000_000,
+    };
+    let from = factor(source_unit);
+    let to = factor(target_unit);
+    // try_unary visits active values only and preserves the original NULL mask.
+    let out = source.try_unary::<_, T, _>(|value| {
+        let value = value.into();
+        // i64 * 10^9 fits i128. A native-width conversion checks both scaling
+        // and narrowing after division toward zero; no day-range rule applies.
+        let ticks = if from >= to {
+            i128::from(value) / (from / to)
+        } else {
+            i128::from(value) * (to / from)
+        };
+        T::Native::try_from(ticks).map_err(|source| TemporalCastFailure::TimeUnits {
+            value,
+            source_unit,
+            target_unit,
+            ticks,
+            width,
+            source,
+        })
+    })?;
+    Ok(std::sync::Arc::new(out))
 }
 
 #[derive(Debug)]
 pub enum TemporalCastFailure {
+    TimeUnits {
+        value: i64,
+        source_unit: TimeUnit,
+        target_unit: TimeUnit,
+        ticks: i128,
+        width: u8,
+        source: std::num::TryFromIntError,
+    },
     Contract(novarocks_failure_contract::BoundedDetail),
     Arrow(arrow_schema::ArrowError),
+    TimestampDate(TimestampDateOutOfRange),
     Numeric {
         days: i32,
         unit: TimeUnit,
@@ -88,10 +263,12 @@ pub enum TemporalCastFailure {
 impl TemporalCastFailure {
     pub fn data_reason(&self) -> Option<crate::DataFailureReason> {
         match self {
-            Self::Numeric { .. } | Self::Arrow(arrow_schema::ArrowError::ArithmeticOverflow(_)) => {
+            Self::TimeUnits { .. }
+            | Self::Numeric { .. }
+            | Self::Arrow(arrow_schema::ArrowError::ArithmeticOverflow(_)) => {
                 Some(crate::DataFailureReason::NumericOutOfRange)
             }
-            Self::Arrow(arrow_schema::ArrowError::CastError(_)) => {
+            Self::TimestampDate(_) | Self::Arrow(arrow_schema::ArrowError::CastError(_)) => {
                 Some(crate::DataFailureReason::InvalidValue)
             }
             _ => None,
@@ -129,8 +306,20 @@ fn dates_to_timestamp<T: arrow_array::types::ArrowPrimitiveType<Native = i64>>(
 impl std::fmt::Display for TemporalCastFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::TimeUnits {
+                value,
+                source_unit,
+                target_unit,
+                ticks,
+                width,
+                ..
+            } => write!(
+                f,
+                "TIME value {value} {source_unit:?} requires {ticks} {target_unit:?} units, outside i{width}"
+            ),
             Self::Contract(detail) => f.write_str(detail.as_str()),
             Self::Arrow(source) => source.fmt(f),
+            Self::TimestampDate(source) => source.fmt(f),
             Self::Numeric {
                 days, unit, ticks, ..
             } => write!(
@@ -144,7 +333,8 @@ impl std::error::Error for TemporalCastFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Arrow(source) => Some(source),
-            Self::Numeric { source, .. } => Some(source),
+            Self::TimestampDate(source) => Some(source),
+            Self::TimeUnits { source, .. } | Self::Numeric { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -166,7 +356,10 @@ impl novarocks_failure_contract::FailureProjection for TemporalCastFailure {
             Self::Arrow(ArrowError::OffsetOverflowError(_)) => (FailureClass::Representation, 210),
             Self::Arrow(ArrowError::IoError(..)) => (FailureClass::Unexpected, 211),
             Self::Arrow(_) => (FailureClass::Invariant, 212),
-            Self::Numeric { .. } => unreachable!("numeric temporal facts returned above"),
+            Self::TimeUnits { .. } | Self::Numeric { .. } => {
+                unreachable!("numeric temporal facts returned above")
+            }
+            Self::TimestampDate(_) => unreachable!("calendar value facts returned above"),
         };
         let fact = FailureFact::new(
             class,
@@ -381,5 +574,174 @@ mod outer_witness_tests {
         let kernel = crate::KernelFailure::from_domain(outer);
         assert_eq!(kernel.failure_fact(), original);
         assert_eq!(original.class(), FailureClass::Invariant);
+    }
+}
+
+/// Original LargeUtf8 DATE conversion. Its raw date grammar and Chrono range
+/// remain distinct from Utf8's SQL calendar parser and later SDK extensions.
+pub fn cast_large_date_text(array: &arrow_array::LargeStringArray) -> ArrayRef {
+    use chrono::Datelike;
+    let values = array.iter().map(|text| {
+        text.and_then(parse_date_text)
+            .map(|date| date.num_days_from_ce() - 719_163)
+    });
+    // SAFETY: mapping LargeStringArray's ArrayIter preserves its exact upper length.
+    std::sync::Arc::new(unsafe { arrow_array::Date32Array::from_trusted_len_iter(values) })
+}
+
+// Original Arrow date grammar, now owned at this exact temporal boundary.
+// Do not retry with trimmed input or extend signed years past Chrono's range.
+fn parse_date_text(string: &str) -> Option<chrono::NaiveDate> {
+    // If the date has an extended (signed) year such as "+10999-12-31" or "-0012-05-06"
+    //
+    // According to [ISO 8601], years have:
+    //  Four digits or more for the year. Years in the range 0000 to 9999 will be pre-padded by
+    //  zero to ensure four digits. Years outside that range will have a prefixed positive or negative symbol.
+    //
+    // [ISO 8601]: https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/time/format/DateTimeFormatter.html#ISO_LOCAL_DATE
+    if string.starts_with('+') || string.starts_with('-') {
+        // Skip the sign and look for the hyphen that terminates the year digits.
+        // According to ISO 8601 the unsigned part must be at least 4 digits.
+        let rest = &string[1..];
+        let hyphen = rest.find('-')?;
+        if hyphen < 4 {
+            return None;
+        }
+        // The year substring is the sign and the digits (but not the separator)
+        // e.g. for "+10999-12-31", hyphen is 5 and s[..6] is "+10999"
+        let year: i32 = string[..hyphen + 1].parse().ok()?;
+        // The remainder should begin with a '-' which we strip off, leaving the month-day part.
+        let remainder = string[hyphen + 1..].strip_prefix('-')?;
+        let mut parts = remainder.splitn(2, '-');
+        let month: u32 = parts.next()?.parse().ok()?;
+        let day: u32 = parts.next()?.parse().ok()?;
+        return chrono::NaiveDate::from_ymd_opt(year, month, day);
+    }
+
+    if string.len() > 10 {
+        // Try to parse as datetime and return just the date part
+        return arrow_cast::parse::string_to_datetime(&chrono::Utc, string)
+            .map(|dt| dt.date_naive())
+            .ok();
+    };
+    let mut digits = [0; 10];
+    let mut mask = 0;
+
+    // Treating all bytes the same way, helps LLVM vectorise this correctly
+    for (idx, (o, i)) in digits.iter_mut().zip(string.bytes()).enumerate() {
+        *o = i.wrapping_sub(b'0');
+        mask |= ((*o < 10) as u16) << idx
+    }
+
+    const HYPHEN: u8 = b'-'.wrapping_sub(b'0');
+
+    //  refer to https://www.rfc-editor.org/rfc/rfc3339#section-3
+    if digits[4] != HYPHEN {
+        let (year, month, day) = match (mask, string.len()) {
+            (0b11111111, 8) => (
+                digits[0] as u16 * 1000
+                    + digits[1] as u16 * 100
+                    + digits[2] as u16 * 10
+                    + digits[3] as u16,
+                digits[4] * 10 + digits[5],
+                digits[6] * 10 + digits[7],
+            ),
+            _ => return None,
+        };
+        return chrono::NaiveDate::from_ymd_opt(year as _, month as _, day as _);
+    }
+
+    let (month, day) = match mask {
+        0b1101101111 => {
+            if digits[7] != HYPHEN {
+                return None;
+            }
+            (digits[5] * 10 + digits[6], digits[8] * 10 + digits[9])
+        }
+        0b101101111 => {
+            if digits[7] != HYPHEN {
+                return None;
+            }
+            (digits[5] * 10 + digits[6], digits[8])
+        }
+        0b110101111 => {
+            if digits[6] != HYPHEN {
+                return None;
+            }
+            (digits[5], digits[7] * 10 + digits[8])
+        }
+        0b10101111 => {
+            if digits[6] != HYPHEN {
+                return None;
+            }
+            (digits[5], digits[7])
+        }
+        _ => return None,
+    };
+
+    let year =
+        digits[0] as u16 * 1000 + digits[1] as u16 * 100 + digits[2] as u16 * 10 + digits[3] as u16;
+
+    chrono::NaiveDate::from_ymd_opt(year as _, month as _, day as _)
+}
+
+#[cfg(test)]
+mod frozen_calendar_tests {
+    use super::*;
+    use std::error::Error;
+    #[test]
+    fn timestamp_date_actual_range_failure_keeps_typed_value_source_and_first_error() {
+        let source = arrow_array::TimestampMicrosecondArray::from(vec![i64::MAX, i64::MIN]);
+        let error = cast(&source, &DataType::Date32).unwrap_err();
+        assert_eq!(
+            error.data_reason(),
+            Some(crate::DataFailureReason::InvalidValue)
+        );
+        assert_eq!(
+            error.to_string(),
+            "Cast error: Cannot convert arrow_array::types::TimestampMicrosecondType 9223372036854775807 to datetime"
+        );
+        let cause = error
+            .source()
+            .unwrap()
+            .downcast_ref::<TimestampDateOutOfRange>()
+            .unwrap();
+        assert_eq!(cause.value, i64::MAX);
+        assert!(!error.source().unwrap().is::<arrow_schema::ArrowError>());
+        let source = arrow_array::TimestampMicrosecondArray::new(
+            vec![i64::MAX, 0].into(),
+            Some(arrow_buffer::NullBuffer::from(vec![false, true])),
+        );
+        let output = cast(&source, &DataType::Date32).unwrap();
+        assert!(output.is_null(0));
+        assert_eq!(
+            output
+                .as_any()
+                .downcast_ref::<arrow_array::Date32Array>()
+                .unwrap()
+                .value(1),
+            0
+        );
+    }
+    #[test]
+    fn large_date_text_keeps_raw_grammar_and_original_calendar_range() {
+        let input = arrow_array::LargeStringArray::from(vec![
+            Some("1970-1-1"),
+            Some("19700102"),
+            Some(" 1970-01-01 "),
+            Some("+5881580-07-11"),
+            Some("1970-01-01T12:00:00Z"),
+            None,
+        ]);
+        let output = cast_large_date_text(&input);
+        assert_eq!(
+            output
+                .as_any()
+                .downcast_ref::<arrow_array::Date32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), None, None, Some(0), None]
+        );
     }
 }

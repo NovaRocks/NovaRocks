@@ -48,6 +48,7 @@ pub mod connector_write_data_plane;
 pub mod connector_write_test_support;
 pub mod descriptor_snapshot;
 pub mod exchange_data_plane;
+mod exchange_grant_subscription;
 pub mod exchange_transmitter;
 pub mod fragment_instance;
 pub mod fragment_result_writer;

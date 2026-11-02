@@ -34,8 +34,8 @@ novarocks-failure-contract.workspace = true
 datasketches = { workspace = true, features = ["hll"] }
 openssl.workspace = true
 url.workspace = true
-arrow-arith = "58.2.0"
-arrow-ord = "58.2.0"
+arrow-arith = "60.1.0"
+arrow-ord = "60.1.0"
 regex.workspace = true
 roaring.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -46,7 +46,7 @@ hex.workspace = true
 libm = "0.2"
 base64.workspace = true
 arrow-array.workspace = true
-arrow-row = "58.4.0"
+arrow-row = "60.1.0"
 arrow-buffer.workspace = true
 arrow-cast.workspace = true
 arrow-data.workspace = true

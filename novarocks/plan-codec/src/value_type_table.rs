@@ -52,6 +52,7 @@ pub enum LogicalTypeCodecError {
     Control(CompileControlError),
     ValueType(ExecutionValueTypeError),
     ResourceSource(&'static str),
+    Arrow(arrow::error::ArrowError),
 }
 impl fmt::Display for LogicalTypeCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -59,6 +60,7 @@ impl fmt::Display for LogicalTypeCodecError {
             Self::InvalidShape(message) | Self::ResourceSource(message) => f.write_str(message),
             Self::Control(error) => error.fmt(f),
             Self::ValueType(error) => error.fmt(f),
+            Self::Arrow(error) => error.fmt(f),
         }
     }
 }
@@ -67,6 +69,7 @@ impl std::error::Error for LogicalTypeCodecError {
         match self {
             Self::Control(source) => Some(source),
             Self::ValueType(source) => Some(source),
+            Self::Arrow(source) => Some(source),
             Self::InvalidShape(_) | Self::ResourceSource(_) => None,
         }
     }

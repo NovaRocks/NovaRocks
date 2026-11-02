@@ -229,18 +229,61 @@ mod tests {
 
     #[test]
     #[ignore = "requires a live UEA-7 publication fixture"]
-    fn reads_live_fixture_trace_and_metrics() {
-        let uri = std::env::var("UEA7_TEST_CONTROL_URI")
-            .expect("UEA7_TEST_CONTROL_URI must identify the isolated fixture");
-        let actor = PublicationCatalogActor::connect(&uri, Duration::from_secs(5)).unwrap();
-        assert_eq!(actor.metrics().unwrap().commit_attempts, 0);
-        assert_eq!(
-            actor
-                .trace()
-                .unwrap()
-                .last()
-                .map(|event| event.event.as_str()),
-            Some("control-started")
-        );
+    fn reads_live_fixture_trace_and_metrics() -> Result<()> {
+        // Keep the root from creation so startup, assertion or cleanup failure
+        // cannot erase the original registration through TempDir's Drop.
+        let scenario_root = tempfile::Builder::new()
+            .prefix("uea7-publication-actor-")
+            .tempdir()
+            .context("create publication actor fixture root")?
+            .keep();
+        let (mut fixture, uri) = novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture::start_with_publication_hook(&scenario_root)
+            .with_context(|| format!("start publication actor fixture; original root retained at {}", scenario_root.display()))?;
+        let assertion = std::panic::catch_unwind(|| {
+            let actor = PublicationCatalogActor::connect(&uri, Duration::from_secs(5)).unwrap();
+            assert_eq!(actor.metrics().unwrap().commit_attempts, 0);
+            assert_eq!(
+                actor
+                    .trace()
+                    .unwrap()
+                    .last()
+                    .map(|event| event.event.as_str()),
+                Some("control-started")
+            );
+        });
+        // The same original fixture owner closes even if an assertion panics.
+        // Its registration records cleanup independently of the test outcome.
+        let shutdown = fixture.shutdown();
+        if let Err(error) = &shutdown {
+            eprintln!(
+                "publication actor fixture cleanup failed; original root retained at {}: {error:#}",
+                scenario_root.display()
+            );
+        }
+        match assertion {
+            Ok(()) => {
+                shutdown.with_context(|| {
+                    format!(
+                        "publication actor fixture shutdown; original root retained at {}",
+                        scenario_root.display()
+                    )
+                })?;
+                std::fs::remove_dir_all(&scenario_root).with_context(|| {
+                    format!(
+                        "remove released publication actor fixture root {}",
+                        scenario_root.display()
+                    )
+                })
+            }
+            Err(payload) => {
+                if shutdown.is_ok() {
+                    eprintln!(
+                        "publication actor assertion failed after confirmed fixture cleanup; original root retained at {}",
+                        scenario_root.display()
+                    );
+                }
+                std::panic::resume_unwind(payload)
+            }
+        }
     }
 }

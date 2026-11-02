@@ -51,7 +51,7 @@ impl RootFieldSource<'_> {
         observe: &mut impl FnMut() -> Result<(), RootSchemaBackingError>,
     ) -> Result<usize, RootSchemaBackingError> {
         match self {
-            Self::CanonicalExecution if field.metadata().capacity() == 0 => Ok(0),
+            Self::CanonicalExecution if field.metadata().as_arc().is_none() => Ok(0),
             Self::CanonicalExecution => Err(RootSchemaBackingError::UnknownFieldMetadataOwner),
             Self::M07(origins) => origins
                 .metadata_bytes_for(field)
@@ -115,7 +115,15 @@ pub(crate) enum RootSchemaSource<'a> {
 impl From<MetadataMaterializationError> for RootSchemaBackingError {
     fn from(error: MetadataMaterializationError) -> Self {
         match error {
-            MetadataMaterializationError::Arithmetic => Self::CapacityExceeded,
+            MetadataMaterializationError::Arithmetic
+            | MetadataMaterializationError::BTree(
+                novarocks_type_contract::owned_resources::btree::BTreeResourceError::Arithmetic(_),
+            ) => Self::CapacityExceeded,
+            // This boundary deliberately has allocation-free coarse receipts;
+            // detailed BTree sources remain on upstream numerical envelopes.
+            MetadataMaterializationError::BTree(
+                novarocks_type_contract::owned_resources::btree::BTreeResourceError::SourceModel(_),
+            ) => Self::UnknownFieldMetadataOwner,
             _ => Self::UnknownFieldMetadataOwner,
         }
     }
@@ -296,7 +304,7 @@ impl<'a> RootSchemaInspection<'a> {
         origins: RootFieldSource<'_>,
     ) -> Result<(), RootSchemaBackingError> {
         let metadata = match owner {
-            RootSchemaSource::CanonicalExecution if schema.metadata().capacity() == 0 => 0,
+            RootSchemaSource::CanonicalExecution if schema.metadata().as_arc().is_none() => 0,
             RootSchemaSource::CanonicalExecution => {
                 return Err(RootSchemaBackingError::UnknownSchemaMetadataOwner);
             }
@@ -491,7 +499,7 @@ impl<'a> RootSchemaInspection<'a> {
         // source lookup alone proves the child's independent construction.
         match origins {
             RootFieldSource::CanonicalExecution => {
-                if child.metadata().capacity() != 0 {
+                if child.metadata().as_arc().is_some() {
                     return Err(RootSchemaBackingError::UnknownFieldMetadataOwner);
                 }
                 if actual_array_type {
@@ -706,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_schema_and_actual_child_reject_even_empty_spare_metadata() {
+    fn canonical_schema_and_actual_child_accept_cleared_staging_and_reject_owned_metadata() {
         let mut spare = HashMap::with_capacity(256);
         spare.insert("discarded".to_owned(), "source attribute".to_owned());
         spare.clear();
@@ -716,7 +724,15 @@ mod tests {
         child_spare.clear();
         assert!(child_spare.is_empty() && child_spare.capacity() > 0);
         let child = Arc::new(Field::new("item", DataType::Int32, true).with_metadata(child_spare));
+        assert!(child.metadata().as_arc().is_none());
         let mut state = inspection();
+        state
+            .inspect_data_type_source(&DataType::List(child), RootFieldSource::CanonicalExecution)
+            .unwrap();
+        let child = Arc::new(Field::new("item", DataType::Int32, true).with_metadata(
+            HashMap::from([("source".to_owned(), "attribute".to_owned())]),
+        ));
+        assert!(child.metadata().as_arc().is_some());
         assert_eq!(
             state.inspect_data_type_source(
                 &DataType::List(child),
@@ -727,6 +743,19 @@ mod tests {
         let schema = Arc::new(
             Schema::new(vec![Field::new("value", DataType::Int32, true)]).with_metadata(spare),
         );
+        assert!(schema.metadata().as_arc().is_none());
+        state
+            .inspect_schema_source(
+                &schema,
+                RootSchemaSource::CanonicalExecution,
+                RootFieldSource::CanonicalExecution,
+            )
+            .unwrap();
+        let schema = Arc::new(schema.as_ref().clone().with_metadata(HashMap::from([(
+            "source".to_owned(),
+            "attribute".to_owned(),
+        )])));
+        assert!(schema.metadata().as_arc().is_some());
         assert_eq!(
             state.inspect_schema_source(
                 &schema,

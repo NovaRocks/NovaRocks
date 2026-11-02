@@ -108,6 +108,7 @@ struct Body {
     gc_failure: Option<GcOwnedRefObservationInError>,
 }
 struct State {
+    family: novarocks_result_contract::ClientPresentationFamily,
     body: Arc<tokio::sync::Mutex<Body>>,
     dependencies: Vec<SharedDependency>,
     io: Option<Arc<MetadataIoAdmission>>,
@@ -155,6 +156,7 @@ pub(crate) fn prepare(
     spark_call: bool,
     execution: &QueryExecutionContext,
     connector: &ConnectorRequestContext,
+    family: novarocks_result_contract::ClientPresentationFamily,
 ) -> Result<Box<dyn GovernedStatementAction>, TerminalError> {
     let capacity = execution.result_capacity().ok_or_else(|| {
         TerminalError::pre_dispatch_failed("cleanup has no original result capacity")
@@ -219,6 +221,7 @@ pub(crate) fn prepare(
     }));
     Ok(Box::new(Action {
         state: Some(State {
+            family,
             body,
             dependencies,
             io: None,
@@ -280,8 +283,10 @@ impl State {
             let window = owner
                 .result_window_alias()
                 .ok_or_else(|| service("cleanup original Local result window is absent"))?;
-            self.local =
-                Some(LocalResultProducer::try_new(owner.scope(), window).map_err(service)?);
+            self.local = Some(
+                LocalResultProducer::try_new(owner.scope(), window, self.family)
+                    .map_err(service)?,
+            );
         }
         let work = owner
             .execution_owner_slot()
@@ -401,7 +406,9 @@ impl State {
             }
         })?;
         if !self.spark_call {
-            return Poll::Ready(Ok(StatementActionValue::Ok));
+            return Poll::Ready(Ok(StatementActionValue::Ok(
+                novarocks_query_application::session_control::StatementCommandCompletion::new(0),
+            )));
         }
         let producer = self
             .local
@@ -1173,8 +1180,12 @@ mod tests {
         );
         let allowance = retained.window_alias().reserve_payload_bytes(16).unwrap();
         let original_bytes = vec![0u8; 16];
-        let producer =
-            LocalResultProducer::try_new(&root.owner.scope(), local.retain_alias()).unwrap();
+        let producer = LocalResultProducer::try_new(
+            &root.owner.scope(),
+            local.retain_alias(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
+        )
+        .unwrap();
         let result = produce_local(
             producer,
             MaintenanceActionOutcome::RemoveOrphanFiles {

@@ -105,10 +105,20 @@ mod tests {
 
     #[test]
     fn hll_and_object_metadata_are_recognized() {
-        let hll = Field::new("hll", DataType::Binary, true)
-            .with_metadata([(NR_LOGICAL_TYPE_KEY.to_string(), "hll".to_string())].into());
-        let object = Field::new("object", DataType::LargeBinary, true)
-            .with_metadata([(NR_LOGICAL_TYPE_KEY.to_string(), "object".to_string())].into());
+        let hll =
+            Field::new("hll", DataType::Binary, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                NR_LOGICAL_TYPE_KEY.to_string(),
+                "hll".to_string(),
+            )]));
+        let object = Field::new("object", DataType::LargeBinary, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                NR_LOGICAL_TYPE_KEY.to_string(),
+                "object".to_string(),
+            )]),
+        );
 
         assert_eq!(logical_type_of_field(&hll), Some(LogicalType::Hll));
         assert_eq!(logical_type_of_field(&object), Some(LogicalType::Object));

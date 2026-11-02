@@ -512,6 +512,9 @@ struct RootWritableNotification {
     work: Option<RootNotificationWork>,
     failed: bool,
     self_pin: Option<Arc<PhysicalOwners>>,
+    running: bool,
+    pending: bool,
+    joined: bool,
 }
 impl Default for RootWritableNotification {
     fn default() -> Self {
@@ -519,6 +522,9 @@ impl Default for RootWritableNotification {
             work: Some(RootNotificationWork::default()),
             failed: false,
             self_pin: None,
+            running: false,
+            pending: false,
+            joined: false,
         }
     }
 }
@@ -533,7 +539,7 @@ struct RootNotificationRun {
 impl Drop for RootNotificationRun {
     fn drop(&mut self) {
         let failed = !self.completed || self.work.as_ref().is_some_and(|work| work.failed);
-        let pin = {
+        {
             let mut slot = self
                 .owner
                 .notification
@@ -541,23 +547,17 @@ impl Drop for RootNotificationRun {
                 .unwrap_or_else(|p| p.into_inner());
             slot.failed |= failed;
             slot.work = self.work.take();
-            if failed { None } else { slot.self_pin.take() }
-        };
-        if failed {
-            if !self.completed {
-                self.owner.report_metadata_fault(true);
+            if failed {
+                slot.running = false;
+                // Unknown foreign work retains its original self pin and
+                // physical notification position; it can never join.
             }
-        } else {
-            self.owner
-                .metadata_notification_held
-                .store(false, Ordering::Release);
         }
-        // This borrow still strongly owns PhysicalOwners. Releasing a healthy
-        // pin cannot destroy its credit or invoke any notification here.
-        drop(pin);
         if !self.completed {
-            self.owner.notifying.store(false, Ordering::Release);
+            self.owner.report_metadata_fault(true);
         }
+        // Healthy per-pass return does not release notification ownership:
+        // pending work is decided by the same gate before the final release.
     }
 }
 
@@ -600,8 +600,6 @@ struct PhysicalOwners {
     task: novarocks_execution_contract::TaskIdentity,
     health: Arc<ExecutionHealth>,
     notification: Mutex<RootWritableNotification>,
-    notifying: AtomicBool,
-    notification_pending: AtomicBool,
     metadata_notification_held: AtomicBool,
     notification_exited: RuntimeNotify,
     // One fixed driver I/O wake; it owns no Root read or physical-exit proof.
@@ -611,6 +609,7 @@ struct PhysicalOwners {
     producer_started: AtomicBool,
     producer_exited: AtomicBool,
     closed: AtomicBool,
+    seal_in_progress: AtomicBool,
     segments: AtomicUsize,
     deliveries: AtomicUsize,
     retained_reservations: RootReservationPositions,
@@ -622,6 +621,15 @@ struct PhysicalOwners {
     _fixed_credit: ResultWriteCredit,
     // The original wallet itself also outlives the final physical alias.
     _budget_owner: Arc<ResultRetainedBudget>,
+    #[cfg(test)]
+    test_checkpoint: OnceLock<Arc<dyn Fn(RootNotificationTestPoint) + Send + Sync>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootNotificationTestPoint {
+    OwnerExitCommitted,
+    NotificationPassReturned,
 }
 
 /// A structural sub-allocation of the already charged fixed root envelope.
@@ -634,13 +642,14 @@ pub struct RootMetadataReservation {
 }
 impl Drop for RootMetadataReservation {
     fn drop(&mut self) {
-        self.owner
-            .fixed_metadata_bytes
-            .fetch_sub(self.bytes, Ordering::AcqRel);
-        self.owner
-            .fixed_metadata_holders
-            .fetch_sub(1, Ordering::AcqRel);
-        self.owner.wake();
+        self.owner.exit_and_wake(|| {
+            self.owner
+                .fixed_metadata_bytes
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+            self.owner
+                .fixed_metadata_holders
+                .fetch_sub(1, Ordering::AcqRel);
+        });
     }
 }
 impl PhysicalOwners {
@@ -666,28 +675,62 @@ impl PhysicalOwners {
             ),
         );
     }
-    fn wake(self: &Arc<Self>) {
-        self.notification_pending.store(true, Ordering::Release);
-        if self
-            .notifying
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
+    // Only private, inert owner-counter/state mutations may run under this
+    // gate. No callback, payload destruction, or foreign owner Drop runs here.
+    fn arm_notification_locked(self: &Arc<Self>, slot: &mut RootWritableNotification) -> bool {
+        if slot.joined || slot.failed {
+            return false;
         }
+        slot.pending = true;
+        if slot.running {
+            return false;
+        }
+        slot.running = true;
+        self.metadata_notification_held
+            .store(true, Ordering::Release);
+        slot.self_pin = Some(self.clone());
+        true
+    }
+    fn arm_exit(self: &Arc<Self>, exit: impl FnOnce()) -> bool {
+        let mut slot = self.notification.lock().unwrap_or_else(|p| p.into_inner());
+        let drive = self.arm_notification_locked(&mut slot);
+        // The physical owner cannot disappear before notification ownership
+        // has been installed, nor can a drainer consume this handoff first.
+        exit();
+        drive
+    }
+    fn exit_and_wake(self: &Arc<Self>, exit: impl FnOnce()) {
+        let drive = self.arm_exit(exit);
+        #[cfg(test)]
+        self.checkpoint(RootNotificationTestPoint::OwnerExitCommitted);
+        if drive {
+            self.drain_notifications();
+        }
+    }
+    #[cfg(test)]
+    fn checkpoint(&self, point: RootNotificationTestPoint) {
+        if let Some(checkpoint) = self.test_checkpoint.get() {
+            checkpoint(point);
+        }
+    }
+    fn wake(self: &Arc<Self>) {
+        let drive = {
+            let mut slot = self.notification.lock().unwrap_or_else(|p| p.into_inner());
+            self.arm_notification_locked(&mut slot)
+        };
+        if drive {
+            self.drain_notifications();
+        }
+    }
+    fn drain_notifications(self: &Arc<Self>) {
         loop {
-            self.notification_pending.store(false, Ordering::Release);
             let work = {
                 let mut slot = self.notification.lock().unwrap_or_else(|p| p.into_inner());
                 if slot.failed {
-                    self.notifying.store(false, Ordering::Release);
+                    slot.running = false;
                     return;
                 }
-                // The position and original fixed-grant keeper precede every
-                // foreign action, including a synchronous reentrant callback.
-                self.metadata_notification_held
-                    .store(true, Ordering::Release);
-                slot.self_pin = Some(self.clone());
+                slot.pending = false;
                 slot.work.take()
             };
             let mut run = RootNotificationRun {
@@ -702,26 +745,34 @@ impl PhysicalOwners {
             }
             let failed = run.work.as_ref().is_none_or(|work| work.failed);
             run.completed = run.work.is_some();
-            drop(run); // restore original batch before admitting another borrower
-            if !failed {
-                // The original callbacks and their captures have actually
-                // retired and the holder has been cleared. This concrete
-                // metadata wake cannot call a host or start another batch.
-                self.notification_exited.notify();
-                if let Some(waker) = self.exit_waker.get() {
-                    waker.wake_by_ref();
-                }
-            }
-            self.notifying.store(false, Ordering::Release);
-            if failed
-                || !self.notification_pending.load(Ordering::Acquire)
-                || self
-                    .notifying
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-            {
+            drop(run);
+            #[cfg(test)]
+            self.checkpoint(RootNotificationTestPoint::NotificationPassReturned);
+            if failed {
                 return;
             }
+            let pin = {
+                let mut slot = self.notification.lock().unwrap_or_else(|p| p.into_inner());
+                if slot.pending {
+                    // One continuous physical owner covers every coalesced
+                    // pass. There is no idle gap between callbacks.
+                    continue;
+                }
+                slot.running = false;
+                self.metadata_notification_held
+                    .store(false, Ordering::Release);
+                slot.self_pin.take()
+            };
+            // This method still strongly owns PhysicalOwners, so releasing
+            // its healthy pin cannot run its final destructor under the gate.
+            drop(pin);
+            // This is revision-only, not a foreign readiness callback. Publish
+            // it after the final physical notification position has exited.
+            self.notification_exited.notify();
+            if let Some(waker) = self.exit_waker.get() {
+                waker.wake_by_ref();
+            }
+            return;
         }
     }
 }
@@ -729,9 +780,36 @@ struct PhysicalSegmentPosition(Arc<PhysicalOwners>);
 struct PhysicalReservationPosition(Arc<PhysicalOwners>, bool);
 impl Drop for PhysicalReservationPosition {
     fn drop(&mut self) {
-        let last_closed = self.0.retained_reservations.release_is_last_closed();
-        if self.1 || last_closed {
-            self.0.wake();
+        // A successful borrower publishes its notification owner before its
+        // physical position vanishes. A failed tentative admission remains
+        // quiet while open, avoiding a blocked-credit retry loop.
+        let drive = {
+            let mut slot = self
+                .0
+                .notification
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let notify = self.1 || self.0.closed.load(Ordering::Acquire);
+            let drive = if notify {
+                self.0.arm_notification_locked(&mut slot)
+            } else {
+                false
+            };
+            let last_closed = self.0.retained_reservations.release_is_last_closed();
+            // If seal raced the tentative exit, its seal work already guards
+            // the zero-owner observation. Keep the final wake at the same
+            // notification gate before that seal can finish.
+            if last_closed && !notify {
+                self.0.arm_notification_locked(&mut slot)
+            } else {
+                drive
+            }
+        };
+        #[cfg(test)]
+        self.0
+            .checkpoint(RootNotificationTestPoint::OwnerExitCommitted);
+        if drive {
+            self.0.drain_notifications();
         }
     }
 }
@@ -753,8 +831,9 @@ impl RetainedReservationOwner {
 }
 impl Drop for PhysicalSegmentPosition {
     fn drop(&mut self) {
-        self.0.segments.fetch_sub(1, Ordering::AcqRel);
-        self.0.wake();
+        self.0.exit_and_wake(|| {
+            self.0.segments.fetch_sub(1, Ordering::AcqRel);
+        });
     }
 }
 
@@ -765,8 +844,8 @@ pub struct RootSegmentBuilder {
     // The backing is destroyed before its credit and physical position.
     backing: Vec<u8>,
     _credit: ResultWriteCredit,
-    position: PhysicalSegmentPosition,
     active: ActiveBuilderPosition,
+    position: PhysicalSegmentPosition,
 }
 impl RootSegmentBuilder {
     pub fn output(&mut self) -> &mut [u8] {
@@ -803,8 +882,8 @@ impl RootSegmentBuilder {
 // tail, including a last remote body alias after logical ACK or context seal.
 struct RootSegmentExit {
     _credit: ResultWriteCredit,
-    _position: PhysicalSegmentPosition,
     _active: ActiveBuilderPosition,
+    _position: PhysicalSegmentPosition,
 }
 struct ActiveBuilderPosition(Option<Weak<RootResultChannel>>);
 impl Drop for ActiveBuilderPosition {
@@ -881,6 +960,7 @@ impl RootPhysicalExitObservation {
     /// an actual original owner observation, including after the channel exits.
     pub fn output_exited(&self) -> bool {
         self.original.closed.load(Ordering::Acquire)
+            && !self.original.seal_in_progress.load(Ordering::Acquire)
             && (!self.original.producer_started.load(Ordering::Acquire)
                 || self.original.producer_exited.load(Ordering::Acquire))
             && self.original.segments.load(Ordering::Acquire) == 0
@@ -1120,14 +1200,13 @@ impl RootResultChannel {
             task: spec.task,
             health,
             notification: Mutex::new(RootWritableNotification::default()),
-            notifying: AtomicBool::new(false),
-            notification_pending: AtomicBool::new(false),
             metadata_notification_held: AtomicBool::new(false),
             notification_exited: RuntimeNotify::default(),
             exit_waker: OnceLock::new(),
             producer_started: AtomicBool::new(false),
             producer_exited: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            seal_in_progress: AtomicBool::new(false),
             segments: AtomicUsize::new(0),
             deliveries: AtomicUsize::new(0),
             retained_reservations: RootReservationPositions::new(),
@@ -1140,6 +1219,8 @@ impl RootResultChannel {
             ),
             _fixed_credit: credit,
             _budget_owner: Arc::clone(&budget),
+            #[cfg(test)]
+            test_checkpoint: OnceLock::new(),
         });
         // Realize the new platform notification mutex before publication. Its
         // backing is included in the same finite core-capacity calculation.
@@ -1572,8 +1653,9 @@ impl RootResultChannel {
         self.bind_exit_waker(waker)
     }
     pub fn physical_idle(&self) -> bool {
-        (!self.physical.producer_started.load(Ordering::Acquire)
-            || self.physical.producer_exited.load(Ordering::Acquire))
+        !self.physical.seal_in_progress.load(Ordering::Acquire)
+            && (!self.physical.producer_started.load(Ordering::Acquire)
+                || self.physical.producer_exited.load(Ordering::Acquire))
             && self.physical.segments.load(Ordering::Acquire) == 0
             && self.physical.deliveries.load(Ordering::Acquire) == 0
             && self.physical.retained_reservations.count() == 0
@@ -1609,6 +1691,40 @@ impl RootResultChannel {
             ready: &self.physical.notification_exited,
         }
     }
+    /// Close notification admission only after the sealed root's actual
+    /// owners, seal work and entire notification drain have exited. Success
+    /// is stable through the registry's later convergence assertion.
+    pub(crate) fn try_join_physical(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        let mut notification = self
+            .physical
+            .notification
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if notification.joined {
+            return true;
+        }
+        if !state.stream.snapshot().sealed
+            || self.physical.seal_in_progress.load(Ordering::Acquire)
+            || (self.physical.producer_started.load(Ordering::Acquire)
+                && !self.physical.producer_exited.load(Ordering::Acquire))
+            || self.physical.segments.load(Ordering::Acquire) != 0
+            || self.physical.deliveries.load(Ordering::Acquire) != 0
+            || self.physical.retained_reservations.count() != 0
+            || self.physical.fixed_metadata_holders.load(Ordering::Acquire) != 0
+            || notification.running
+            || notification.pending
+            || notification.failed
+            || self
+                .physical
+                .metadata_notification_held
+                .load(Ordering::Acquire)
+        {
+            return false;
+        }
+        notification.joined = true;
+        true
+    }
     pub fn close(&self, reason: RootRetentionClose) {
         self.seal_reads(reason);
         self.finish_seal();
@@ -1618,17 +1734,34 @@ impl RootResultChannel {
     pub fn seal_reads(&self, reason: RootRetentionClose) {
         let mut state = self.state.lock().unwrap();
         state.lifetime.close(reason);
-        self.physical.closed.store(true, Ordering::Release);
-        self.physical.retained_reservations.close();
-        state.stream.seal();
-        if state.retiring_payloads.is_none() {
+        if !state.stream.snapshot().sealed {
+            // Seal work precedes the closed observation used outside the
+            // channel, so an empty retirement cannot appear physically idle.
+            self.physical
+                .seal_in_progress
+                .store(true, Ordering::Release);
+            self.physical.closed.store(true, Ordering::Release);
+            self.physical.retained_reservations.close();
+            state.stream.seal();
             state.retiring_payloads = Some(std::mem::take(&mut state.payloads));
         }
     }
     pub fn finish_seal(&self) {
-        let retired = self.state.lock().unwrap().retiring_payloads.take();
+        let Some(retired) = self.state.lock().unwrap().retiring_payloads.take() else {
+            return;
+        };
         drop(retired);
-        self.physical.wake();
+        let drive = {
+            let _state = self.state.lock().unwrap();
+            self.physical.arm_exit(|| {
+                self.physical
+                    .seal_in_progress
+                    .store(false, Ordering::Release);
+            })
+        };
+        if drive {
+            self.physical.drain_notifications();
+        }
     }
     /// Observe a closed route without admitting a delivery or applying an ACK.
     /// The same channel lock orders this marker against read sealing.
@@ -1883,11 +2016,6 @@ impl RootProducerExit {
         self,
     ) -> Option<novarocks_execution::runtime::fragment::ExecutionFailure> {
         let mut state = self.channel.state.lock().unwrap();
-        self.channel
-            .physical
-            .producer_exited
-            .store(true, Ordering::Release);
-        state.lifetime.encoder_exited();
         let failure = if state.lifetime.end().is_none()
             && state.lifetime.allows_read()
             && state.failed.is_none()
@@ -1904,11 +2032,20 @@ impl RootProducerExit {
         } else {
             None
         };
-        self.channel.try_handoff(&mut state);
+        let drive = self.channel.physical.arm_exit(|| {
+            self.channel
+                .physical
+                .producer_exited
+                .store(true, Ordering::Release);
+            state.lifetime.encoder_exited();
+            self.channel.try_handoff(&mut state);
+        });
         drop(state);
         let failure =
             failure.map(novarocks_execution::runtime::fragment::ExecutionFailure::from_domain);
-        self.channel.physical.wake();
+        if drive {
+            self.channel.physical.drain_notifications();
+        }
         failure
     }
 }
@@ -1967,8 +2104,9 @@ impl Drop for RootDeliveryOwner {
 }
 impl Drop for RootDeliveryPosition {
     fn drop(&mut self) {
-        self.physical.deliveries.fetch_sub(1, Ordering::AcqRel);
-        self.physical.wake();
+        self.physical.exit_and_wake(|| {
+            self.physical.deliveries.fetch_sub(1, Ordering::AcqRel);
+        });
     }
 }
 
@@ -2075,6 +2213,157 @@ mod tests {
     };
     use std::num::NonZeroUsize;
     use std::time::Duration;
+
+    fn notification_checkpoint(
+        channel: &Arc<RootResultChannel>,
+        point: RootNotificationTestPoint,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered, observed) = std::sync::mpsc::sync_channel(1);
+        let (resume, released) = std::sync::mpsc::sync_channel(1);
+        let released = Mutex::new(released);
+        let once = AtomicBool::new(true);
+        assert!(
+            channel
+                .physical
+                .test_checkpoint
+                .set(Arc::new(move |seen| {
+                    if seen == point && once.swap(false, Ordering::AcqRel) {
+                        let _ = entered.send(());
+                        let _ = released.lock().unwrap().recv();
+                    }
+                }))
+                .is_ok()
+        );
+        (observed, resume)
+    }
+
+    #[test]
+    fn last_metadata_exit_hands_off_before_a_zero_owner_snapshot() {
+        let (channel, _) = channel(facts());
+        let metadata = channel
+            .try_reserve_metadata(std::mem::size_of::<RootMetadataReservation>())
+            .unwrap();
+        channel.close(RootRetentionClose::ContextReleased);
+        let (entered, resume) =
+            notification_checkpoint(&channel, RootNotificationTestPoint::OwnerExitCommitted);
+        let exit = std::thread::spawn(move || drop(metadata));
+        let observed = entered.recv_timeout(Duration::from_secs(5));
+        let owners = channel
+            .physical
+            .fixed_metadata_holders
+            .load(Ordering::Acquire);
+        let idle = channel.physical_idle();
+        let joined = channel.try_join_physical();
+        // Join real threads before asserting, even if the regression returned
+        // a false idle observation. No test failure strands the barrier.
+        let _ = resume.send(());
+        let exited = exit.join();
+        assert!(observed.is_ok());
+        assert!(exited.is_ok());
+        assert_eq!(owners, 0);
+        assert!(!idle, "last owner has handed off real notification work");
+        assert!(!joined);
+        assert!(channel.try_join_physical());
+    }
+
+    #[test]
+    fn pending_notification_pass_has_no_physical_idle_gap() {
+        let (channel, _) = channel(facts());
+        channel.close(RootRetentionClose::ContextReleased);
+        let weak = Arc::downgrade(&channel.physical);
+        let once = AtomicBool::new(true);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        channel
+            .writable_observable()
+            .try_add_observer(Arc::new(move || {
+                counted.fetch_add(1, Ordering::AcqRel);
+                if once.swap(false, Ordering::AcqRel) {
+                    weak.upgrade().unwrap().wake();
+                }
+            }))
+            .unwrap();
+        let (entered, resume) = notification_checkpoint(
+            &channel,
+            RootNotificationTestPoint::NotificationPassReturned,
+        );
+        let physical = channel.physical.clone();
+        let notification = std::thread::spawn(move || physical.wake());
+        let observed = entered.recv_timeout(Duration::from_secs(5));
+        let idle = channel.physical_idle();
+        let joined = channel.try_join_physical();
+        let _ = resume.send(());
+        let exited = notification.join();
+        assert!(observed.is_ok());
+        assert!(exited.is_ok());
+        assert!(
+            !idle,
+            "a pending second pass keeps the original physical owner"
+        );
+        assert!(!joined);
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert!(channel.try_join_physical());
+    }
+
+    #[test]
+    fn sealed_empty_batch_and_late_wakes_obey_the_join_cut() {
+        let (channel, _) = channel(facts());
+        channel.seal_reads(RootRetentionClose::ContextReleased);
+        channel.seal_reads(RootRetentionClose::ContextReleased);
+        assert!(
+            !channel.physical_idle(),
+            "the first empty seal still has real finish work"
+        );
+        assert!(!channel.try_join_physical());
+        channel.finish_seal();
+        assert!(channel.physical_idle());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        channel
+            .writable_observable()
+            .try_add_observer(Arc::new(move || {
+                counted.fetch_add(1, Ordering::AcqRel);
+            }))
+            .unwrap();
+        // These public repeated seal calls must not manufacture another empty
+        // retirement or call a foreign observer, even before the join cut.
+        channel.finish_seal();
+        channel.seal_reads(RootRetentionClose::ContextAborted);
+        channel.finish_seal();
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert!(channel.try_join_physical());
+        channel.physical.wake();
+        assert!(channel.physical_idle());
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            0,
+            "joined notification admission cannot reopen"
+        );
+    }
+
+    #[test]
+    fn active_builder_tail_exits_before_the_last_segment_position() {
+        let (channel, _) = channel(facts());
+        let builder = channel.try_segment().unwrap().unwrap();
+        let weak = Arc::downgrade(&channel);
+        let late_active = Arc::new(AtomicBool::new(false));
+        let observed = late_active.clone();
+        channel
+            .writable_observable()
+            .try_add_observer(Arc::new(move || {
+                let root = weak.upgrade().unwrap();
+                if root.physical.segments.load(Ordering::Acquire) == 0 {
+                    observed.fetch_or(root.state.lock().unwrap().active_builder, Ordering::AcqRel);
+                }
+            }))
+            .unwrap();
+        drop(builder);
+        assert!(!late_active.load(Ordering::Acquire));
+        assert_eq!(channel.physical.segments.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn sealed_channel_notifies_the_last_tentative_funding_exit() {
@@ -2798,6 +3087,7 @@ mod tests {
         let mut name = String::with_capacity(name_capacity);
         name.push('x');
         let schema = ClientRenderSchema::try_new(
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
             vec![RenderColumn {
                 source_ordinal: 0,
                 source_slot: None,

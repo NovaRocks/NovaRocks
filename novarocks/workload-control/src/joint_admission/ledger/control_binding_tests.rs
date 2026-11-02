@@ -385,6 +385,46 @@ fn delegated_retained_builder_cannot_submit_after_original_push_wake_unwind() {
 }
 
 #[test]
+fn root_drain_keeps_original_control_binding_at_each_publication_cut() {
+    for cut in 0..3 {
+        let (control, handle, mut driver) = fixture();
+        let work = root(&control);
+        let scope = work.owner.scope();
+        let original_id = work.owner.control_claim_view().unwrap().id;
+        let fact = network("draining-original");
+        if cut == 0 {
+            control.close_root_admission();
+        }
+        let mut admission = binding(&scope, &fact);
+        if cut == 1 {
+            control.close_root_admission();
+        }
+        drive(&mut driver);
+        if cut == 2 {
+            control.close_root_admission();
+        }
+        let mut reply = receive(&mut admission);
+        assert!(reply.new_claims.is_empty());
+        reply
+            .adjustment
+            .as_mut()
+            .unwrap()
+            .install_control_scope_in(&scope)
+            .unwrap()
+            .notify();
+        drop(reply);
+        drive(&mut driver);
+        assert!(domains(&handle, &scope, &[fact]));
+        assert_eq!(work.owner.control_claim_view().unwrap().id, original_id);
+        assert!(matches!(
+            control.try_begin_root(WorkRequest::new(WorkClass::Query)),
+            Err(WorkError::Closed)
+        ));
+        finish(work, &mut driver);
+    }
+}
+
+#[test]
 fn delegated_closed_install_keeps_receipt_and_original_fixed_base() {
     let (control, handle, mut driver) = fixture();
     let work = root(&control);

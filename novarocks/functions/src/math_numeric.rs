@@ -391,3 +391,289 @@ mod source_tests {
         assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
     }
 }
+
+/// Original raw numeric text semantics. Callers retain their own selection,
+/// blank-text normalization, non-finite policy and output ownership.
+#[derive(Debug)]
+pub(crate) enum RawNumericCastFailure {
+    NegativeScale(i8),
+    Target(arrow_schema::DataType),
+    Metadata(arrow_schema::ArrowError),
+}
+impl std::fmt::Display for RawNumericCastFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NegativeScale(scale) => write!(
+                f,
+                "Invalid argument error: Cannot cast string to decimal with negative scale {scale}"
+            ),
+            Self::Target(target) => write!(
+                f,
+                "raw numeric parser has an unsupported frozen target {target}"
+            ),
+            Self::Metadata(cause) => cause.fmt(f),
+        }
+    }
+}
+impl std::error::Error for RawNumericCastFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Metadata(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for RawNumericCastFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        // The old direct text-to-decimal negative-scale refusal was an outer
+        // InvalidArgumentError. This is now the actual first-party source.
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(6104).unwrap()),
+        )
+    }
+}
+
+fn raw_primitive<P, O>(source: &arrow_array::GenericStringArray<O>) -> ArrayRef
+where
+    P: arrow_cast::parse::Parser,
+    O: arrow_array::OffsetSizeTrait,
+{
+    let iter = source.iter().map(|text| {
+        text.and_then(|text| {
+            let bytes = text.as_bytes();
+            // Match only the new SDK's ASCII trim domain. Unicode text remains
+            // subject to the same raw parser, without a new SQL whitespace rule.
+            if bytes.first().is_some_and(u8::is_ascii_whitespace)
+                || bytes.last().is_some_and(u8::is_ascii_whitespace)
+            {
+                None
+            } else {
+                P::parse(text)
+            }
+        })
+    });
+    // SAFETY: StringArray's ArrayIter has an exact trusted length; map keeps
+    // that length and never changes or skips an input row.
+    Arc::new(unsafe { arrow_array::PrimitiveArray::<P>::from_trusted_len_iter(iter) })
+}
+
+fn raw_decimal_coefficient(text: &str, scale: usize) -> Option<arrow_buffer::i256> {
+    use arrow_buffer::i256;
+    // Decimal's original whitespace and rounding domain differs from the raw
+    // primitive parser. Preserve the complete original Unicode trim here.
+    let text = text.trim();
+    let parts: Vec<&str> = text.split('.').collect();
+    if parts.len() > 2 {
+        return None;
+    }
+    let (negative, integers) = match parts[0].as_bytes().first() {
+        Some(b'-') => (true, &parts[0][1..]),
+        Some(b'+') => (false, &parts[0][1..]),
+        _ => (false, parts[0]),
+    };
+    let decimals = if parts.len() == 2 { parts[1] } else { "" };
+    if (!integers.is_empty() && !integers.as_bytes()[0].is_ascii_digit())
+        || (!decimals.is_empty() && !decimals.as_bytes()[0].is_ascii_digit())
+    {
+        return None;
+    }
+    let mut coefficient = if decimals.len() > scale {
+        let decimal = i256::from_string(decimals)?;
+        let div = i256::from_i128(10).checked_pow((decimals.len() - scale) as u32)?;
+        let half = div.wrapping_div(i256::from_i128(2));
+        let d = decimal.wrapping_div(div);
+        let r = decimal.wrapping_rem(div);
+        let adjusted = match decimal >= i256::ZERO {
+            true if r >= half => d.wrapping_add(i256::ONE),
+            false if r <= half.wrapping_neg() => d.wrapping_sub(i256::ONE),
+            _ => d,
+        };
+        let integers = if integers.is_empty() {
+            i256::ZERO
+        } else {
+            i256::from_string(integers)?
+                .wrapping_mul(i256::from_i128(10).wrapping_pow(scale as u32))
+        };
+        format!("{}", integers.wrapping_add(adjusted))
+    } else {
+        let padding = if scale > decimals.len() { scale } else { 0 };
+        let decimals = format!("{decimals:0<padding$}");
+        format!("{integers}{decimals}")
+    };
+    if negative {
+        coefficient.insert(0, '-');
+    }
+    i256::from_string(&coefficient)
+}
+
+pub(crate) fn cast_raw_numeric<O: arrow_array::OffsetSizeTrait>(
+    source: &arrow_array::GenericStringArray<O>,
+    target: &DataType,
+) -> Result<ArrayRef, RawNumericCastFailure> {
+    use arrow_array::types::*;
+    macro_rules! primitive {
+        ($ty:ty) => {
+            Ok(raw_primitive::<$ty, O>(source))
+        };
+    }
+    match target {
+        DataType::Int8 => primitive!(Int8Type),
+        DataType::Int16 => primitive!(Int16Type),
+        DataType::Int32 => primitive!(Int32Type),
+        DataType::Int64 => primitive!(Int64Type),
+        DataType::UInt8 => primitive!(UInt8Type),
+        DataType::UInt16 => primitive!(UInt16Type),
+        DataType::UInt32 => primitive!(UInt32Type),
+        DataType::UInt64 => primitive!(UInt64Type),
+        DataType::Float32 => primitive!(Float32Type),
+        DataType::Float64 => primitive!(Float64Type),
+        DataType::Decimal128(precision, scale) => {
+            if *scale < 0 {
+                return Err(RawNumericCastFailure::NegativeScale(*scale));
+            }
+            let iter = source.iter().map(|text| {
+                text.and_then(|text| raw_decimal_coefficient(text, *scale as usize))
+                    .and_then(|value| value.to_i128())
+                    .filter(|value| Decimal128Type::is_valid_decimal_precision(*value, *precision))
+            });
+            // SAFETY: ArrayIter.map keeps the original trusted exact row count.
+            let out = unsafe {
+                arrow_array::PrimitiveArray::<Decimal128Type>::from_trusted_len_iter(iter)
+            }
+            .with_precision_and_scale(*precision, *scale)
+            .map_err(RawNumericCastFailure::Metadata)?;
+            Ok(Arc::new(out))
+        }
+        DataType::Decimal256(precision, scale) => {
+            if *scale < 0 {
+                return Err(RawNumericCastFailure::NegativeScale(*scale));
+            }
+            let iter = source.iter().map(|text| {
+                text.and_then(|text| raw_decimal_coefficient(text, *scale as usize))
+                    .filter(|value| Decimal256Type::is_valid_decimal_precision(*value, *precision))
+            });
+            // SAFETY: ArrayIter.map keeps the original trusted exact row count.
+            let out = unsafe {
+                arrow_array::PrimitiveArray::<Decimal256Type>::from_trusted_len_iter(iter)
+            }
+            .with_precision_and_scale(*precision, *scale)
+            .map_err(RawNumericCastFailure::Metadata)?;
+            Ok(Arc::new(out))
+        }
+        target => Err(RawNumericCastFailure::Target(target.clone())),
+    }
+}
+
+#[cfg(test)]
+mod raw_numeric_contract_tests {
+    use super::*;
+    use arrow_array::*;
+    #[test]
+    fn integer_extrema_and_signed_unsigned_zero_keep_independent_values() {
+        macro_rules! check {
+            ($array:ty, $target:expr, $texts:expr, $expected:expr) => {{
+                let source = StringArray::from($texts);
+                let out = cast_raw_numeric(&source, &$target).unwrap();
+                assert_eq!(
+                    out.as_any()
+                        .downcast_ref::<$array>()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>(),
+                    $expected
+                );
+            }};
+        }
+        check!(
+            Int8Array,
+            DataType::Int8,
+            vec!["127", "128", "-128", "-129", "-0"],
+            vec![Some(127), None, Some(-128), None, Some(0)]
+        );
+        check!(
+            Int16Array,
+            DataType::Int16,
+            vec!["32767", "32768", "-32768", "-32769", "-99999"],
+            vec![Some(32767), None, Some(-32768), None, None]
+        );
+        check!(
+            Int32Array,
+            DataType::Int32,
+            vec!["2147483647", "2147483648", "-2147483648", "-2147483649"],
+            vec![Some(i32::MAX), None, Some(i32::MIN), None]
+        );
+        check!(
+            Int64Array,
+            DataType::Int64,
+            vec![
+                "9223372036854775807",
+                "9223372036854775808",
+                "-9223372036854775808",
+                "-9223372036854775809"
+            ],
+            vec![Some(i64::MAX), None, Some(i64::MIN), None]
+        );
+        check!(
+            UInt8Array,
+            DataType::UInt8,
+            vec!["255", "256", "-1", "-0", "+0"],
+            vec![Some(255), None, None, Some(0), Some(0)]
+        );
+        check!(
+            UInt16Array,
+            DataType::UInt16,
+            vec!["65535", "65536", "-1", "-0"],
+            vec![Some(65535), None, None, Some(0)]
+        );
+        check!(
+            UInt32Array,
+            DataType::UInt32,
+            vec!["4294967295", "4294967296", "-1", "-0"],
+            vec![Some(u32::MAX), None, None, Some(0)]
+        );
+        check!(
+            UInt64Array,
+            DataType::UInt64,
+            vec!["18446744073709551615", "18446744073709551616", "-1", "-0"],
+            vec![Some(u64::MAX), None, None, Some(0)]
+        );
+    }
+    #[test]
+    fn raw_float_bits_and_decimal_large_coefficients_have_literal_oracles() {
+        let source = StringArray::from(vec!["-0", "0.1"]);
+        let out = cast_raw_numeric(&source, &DataType::Float64).unwrap();
+        let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(out.value(0).to_bits(), 0x8000000000000000);
+        assert_eq!(out.value(1).to_bits(), 0x3fb999999999999a);
+        let out = cast_raw_numeric(&source, &DataType::Float32).unwrap();
+        let out = out.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(out.value(0).to_bits(), 0x80000000);
+        assert_eq!(out.value(1).to_bits(), 0x3dcccccd);
+        let source = StringArray::from(vec![
+            "170141183460469231731687303715884105727",
+            "1e2",
+            ".005",
+            "-.005",
+        ]);
+        let out = cast_raw_numeric(&source, &DataType::Decimal256(76, 0)).unwrap();
+        assert_eq!(
+            out.as_any()
+                .downcast_ref::<Decimal256Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![
+                Some(arrow_buffer::i256::from_i128(i128::MAX)),
+                None,
+                Some(arrow_buffer::i256::ZERO),
+                Some(arrow_buffer::i256::ZERO)
+            ]
+        );
+        let out = cast_raw_numeric(&source, &DataType::Decimal256(76, 2)).unwrap();
+        let values = out.as_any().downcast_ref::<Decimal256Array>().unwrap();
+        assert_eq!(values.value(2), arrow_buffer::i256::ONE);
+        assert_eq!(values.value(3), arrow_buffer::i256::MINUS_ONE);
+    }
+}

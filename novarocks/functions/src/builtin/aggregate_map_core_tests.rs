@@ -125,7 +125,7 @@ fn target() -> DataType {
             "entries",
             DataType::Struct(
                 vec![
-                    Field::new("key", DataType::Utf8, true),
+                    Field::new("key", DataType::Utf8, false),
                     Field::new("value", DataType::Utf8, true),
                 ]
                 .into(),
@@ -162,6 +162,11 @@ fn map_agg_core_actual_host_first_wins_partial_roundtrip_and_last_drop() {
     .unwrap();
     let map = partial.as_any().downcast_ref::<MapArray>().unwrap();
     assert_eq!(map.value_offsets(), &[0, 2]);
+    assert_eq!(map.keys().null_count(), 0);
+    assert!(!map.entries().fields()[0].is_nullable());
+    let keys = map.keys().as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(keys.value(0), "x".repeat(600));
+    assert_eq!(keys.value(1), "other");
     let values = map.values().as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(values.value(0), "first");
     assert!(values.is_null(1));

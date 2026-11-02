@@ -27,6 +27,7 @@ use crate::maintenance::{MvBackgroundEngineError, MvBackgroundEngineErrorKind};
 pub struct MvRefreshFailure {
     message: String,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
+    execution: Option<novarocks_query_application::execution_error::ExecutionFailureInput>,
 }
 
 impl MvRefreshFailure {
@@ -37,7 +38,22 @@ impl MvRefreshFailure {
         Self {
             message: message.into(),
             compile_control,
+            execution: None,
         }
+    }
+    /// Retain the original execution projection independently of compile control.
+    /// Diagnostic payload does not determine the scheduler's product policy.
+    pub fn with_execution_failure(
+        mut self,
+        execution: Option<novarocks_query_application::execution_error::ExecutionFailureInput>,
+    ) -> Self {
+        self.execution = execution;
+        self
+    }
+    pub fn execution_failure(
+        &self,
+    ) -> Option<&novarocks_query_application::execution_error::ExecutionFailureInput> {
+        self.execution.as_ref()
     }
     pub fn message(&self) -> &str {
         &self.message
@@ -61,14 +77,14 @@ impl From<&str> for MvRefreshFailure {
 pub enum MvRefreshDisposition {
     Completed,
     NoOp,
-    AlreadyActive(Option<novarocks_type_contract::CompileControlError>),
-    TargetGone(Option<novarocks_type_contract::CompileControlError>),
+    AlreadyActive(MvRefreshFailure),
+    TargetGone(MvRefreshFailure),
     TransientUnavailable(MvRefreshFailure),
     InvalidDefinition(MvRefreshFailure),
     TerminalFailure(MvRefreshFailure),
     Corruption(MvRefreshFailure),
     InvariantViolation(MvRefreshFailure),
-    ShutdownCancelled(Option<novarocks_type_contract::CompileControlError>),
+    ShutdownCancelled(MvRefreshFailure),
 }
 
 impl MvRefreshDisposition {
@@ -78,10 +94,26 @@ impl MvRefreshDisposition {
             | Self::InvalidDefinition(failure)
             | Self::TerminalFailure(failure)
             | Self::Corruption(failure)
-            | Self::InvariantViolation(failure) => failure.compile_control_error(),
-            Self::AlreadyActive(control)
-            | Self::TargetGone(control)
-            | Self::ShutdownCancelled(control) => control.clone(),
+            | Self::InvariantViolation(failure)
+            | Self::AlreadyActive(failure)
+            | Self::TargetGone(failure)
+            | Self::ShutdownCancelled(failure) => failure.compile_control_error(),
+            Self::Completed | Self::NoOp => None,
+        }
+    }
+
+    pub fn execution_failure(
+        &self,
+    ) -> Option<&novarocks_query_application::execution_error::ExecutionFailureInput> {
+        match self {
+            Self::TransientUnavailable(failure)
+            | Self::InvalidDefinition(failure)
+            | Self::TerminalFailure(failure)
+            | Self::Corruption(failure)
+            | Self::InvariantViolation(failure)
+            | Self::AlreadyActive(failure)
+            | Self::TargetGone(failure)
+            | Self::ShutdownCancelled(failure) => failure.execution_failure(),
             Self::Completed | Self::NoOp => None,
         }
     }
@@ -89,9 +121,7 @@ impl MvRefreshDisposition {
     pub fn from_background_error(error: MvBackgroundEngineError) -> Self {
         let failure = || MvRefreshFailure::new(error.message(), error.compile_control_error());
         match error.kind() {
-            MvBackgroundEngineErrorKind::TargetGone => {
-                Self::TargetGone(error.compile_control_error())
-            }
+            MvBackgroundEngineErrorKind::TargetGone => Self::TargetGone(failure()),
             MvBackgroundEngineErrorKind::TransientUnavailable => {
                 Self::TransientUnavailable(failure())
             }
@@ -99,9 +129,7 @@ impl MvRefreshDisposition {
             MvBackgroundEngineErrorKind::TerminalFailure => Self::TerminalFailure(failure()),
             MvBackgroundEngineErrorKind::Corruption => Self::Corruption(failure()),
             MvBackgroundEngineErrorKind::InvariantViolation => Self::InvariantViolation(failure()),
-            MvBackgroundEngineErrorKind::ShutdownCancelled => {
-                Self::ShutdownCancelled(error.compile_control_error())
-            }
+            MvBackgroundEngineErrorKind::ShutdownCancelled => Self::ShutdownCancelled(failure()),
         }
     }
 }
@@ -117,17 +145,26 @@ pub enum MvRefreshRuntimeDecision {
         error: MvRefreshFailure,
     },
     NoChange {
-        compile_control: Option<novarocks_type_contract::CompileControlError>,
+        error: MvRefreshFailure,
     },
 }
 
 impl MvRefreshRuntimeDecision {
     pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         match self {
-            Self::TransientBackoff { error, .. } | Self::Blocked { error } => {
-                error.compile_control_error()
-            }
-            Self::NoChange { compile_control } => compile_control.clone(),
+            Self::TransientBackoff { error, .. }
+            | Self::Blocked { error }
+            | Self::NoChange { error } => error.compile_control_error(),
+            Self::Success => None,
+        }
+    }
+    pub fn execution_failure(
+        &self,
+    ) -> Option<&novarocks_query_application::execution_error::ExecutionFailureInput> {
+        match self {
+            Self::TransientBackoff { error, .. }
+            | Self::Blocked { error }
+            | Self::NoChange { error } => error.execution_failure(),
             Self::Success => None,
         }
     }
@@ -342,10 +379,10 @@ where
             | MvRefreshDisposition::InvariantViolation(error) => {
                 MvRefreshRuntimeDecision::Blocked { error }
             }
-            MvRefreshDisposition::AlreadyActive(compile_control)
-            | MvRefreshDisposition::TargetGone(compile_control)
-            | MvRefreshDisposition::ShutdownCancelled(compile_control) => {
-                MvRefreshRuntimeDecision::NoChange { compile_control }
+            MvRefreshDisposition::AlreadyActive(error)
+            | MvRefreshDisposition::TargetGone(error)
+            | MvRefreshDisposition::ShutdownCancelled(error) => {
+                MvRefreshRuntimeDecision::NoChange { error }
             }
         };
         match &decision {

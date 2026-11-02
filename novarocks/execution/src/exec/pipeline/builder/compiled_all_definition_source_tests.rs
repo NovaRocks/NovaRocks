@@ -89,8 +89,12 @@ fn source_fixture() -> SourceFixture {
     let utf8 = FunctionValueType::new(DataType::Utf8, true);
     let pool = ConstantPool::try_new(
         Arc::new(
-            Field::new("original_payload", DataType::Utf8, true)
-                .with_metadata([("provider.field_id".into(), "41".into())].into()),
+            Field::new("original_payload", DataType::Utf8, true).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "provider.field_id".into(),
+                    "41".into(),
+                )]),
+            ),
         ),
         utf8.clone(),
         arrow::array::Array::to_data(&StringArray::from(vec![None, Some("key")])),
@@ -572,8 +576,8 @@ fn all_definition_source_borrowed_type_encoder_keeps_nested_provider_and_nominal
     ));
     assert_eq!(decoded.field(9).unwrap().dict_id(), None);
     assert_eq!(decoded.field(9).unwrap().dict_is_ordered(), None);
-    assert_eq!(decoded.field(17).unwrap().metadata().capacity(), 0);
-    assert_eq!(decoded.field(9).unwrap().metadata().capacity(), 0);
+    assert!(decoded.field(17).unwrap().metadata().as_arc().is_none());
+    assert!(decoded.field(9).unwrap().metadata().as_arc().is_none());
     assert_eq!(
         decoded.value_type(900).unwrap().logical_type(),
         ValueLogicalType::LargeInt

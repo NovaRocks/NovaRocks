@@ -257,7 +257,7 @@ async fn served_stream_position_outlives_the_handler_and_returns_at_body_eof() {
             NativeRpcMethod::SubscribeTaskStatus,
             NativeLane::Observation,
         ),
-        (NativeRpcMethod::ExchangeUnary, NativeLane::Exchange),
+        (NativeRpcMethod::DeliverExchangeUnit, NativeLane::Exchange),
     ] {
         let (service, mut senders) = ingress(&admission);
         // The handler has returned and Tonic's response future resolved.
@@ -503,19 +503,53 @@ type TaskStatusEvents = Pin<
 #[tonic::async_trait]
 impl NovaRocksGrpc for LaneProbe {
     type ExchangeStream = tokio_stream::Empty<Result<proto::ExchangeResponse, tonic::Status>>;
-    type SubscribeTaskStatusStream = TaskStatusEvents;
+
     async fn exchange(
         &self,
         _request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("probe"))
+        Err(tonic::Status::unimplemented(
+            "Exchange is retired; use DeliverExchangeUnit",
+        ))
     }
-    async fn exchange_unary(
+
+    type SubscribeExchangeGrantsStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<Item = Result<proto::ExchangeGrantBatch, tonic::Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    async fn deliver_exchange_unit(
         &self,
-        _request: tonic::Request<proto::ExchangeRequest>,
-    ) -> Result<tonic::Response<proto::ExchangeResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("probe"))
+        _request: tonic::Request<proto::DeliverExchangeUnitRequest>,
+    ) -> Result<tonic::Response<proto::DeliverExchangeUnitResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "Exchange unit delivery is not installed",
+        ))
     }
+
+    async fn register_exchange_demand(
+        &self,
+        _request: tonic::Request<proto::RegisterExchangeDemandRequest>,
+    ) -> Result<tonic::Response<proto::RegisterExchangeDemandResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "Exchange demand registration is not installed",
+        ))
+    }
+
+    async fn subscribe_exchange_grants(
+        &self,
+        _request: tonic::Request<proto::SubscribeExchangeGrantsRequest>,
+    ) -> Result<tonic::Response<Self::SubscribeExchangeGrantsStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "Exchange grant subscription is not installed",
+        ))
+    }
+
+    type SubscribeTaskStatusStream = TaskStatusEvents;
+
     async fn transmit_runtime_filter_envelope(
         &self,
         _request: tonic::Request<filter::RuntimeFilterEnvelope>,

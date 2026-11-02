@@ -102,13 +102,13 @@ impl PreparedRestMutation {
         // remains driven by other waiters if this caller stops waiting.
         let request_context = RequestContext::from_connector(preparation);
         let session = tokio::select! {
-            result = endpoints.session_in(&request_context) => result.map_err(|failure| binding_failure(failure.step))?,
+            result = endpoints.session_in(&request_context) => result.map_err(|failure| match failure.original { Some(original) => PreparationFailure::from(original), None => binding_failure(failure.step) })?,
             _ = preparation.stop().stopped() => return Err(PreparationFailure(novarocks_spi::connector::ConnectorMutationFailure::new(novarocks_spi::connector::ConnectorMutationFailureKind::Cancelled, "REST publication preparation cancelled"))),
             _ = tokio::time::sleep_until(preparation.deadline().into()) => return Err(PreparationFailure(novarocks_spi::connector::ConnectorMutationFailure::new(novarocks_spi::connector::ConnectorMutationFailureKind::DeadlineExceeded, "REST publication preparation deadline elapsed"))),
         };
         let mut headers = session.request_headers(delegation);
         tokio::select! {
-            result = endpoints.owner().authorize_in(&mut headers, &request_context) => result.map_err(|failure| binding_failure(failure.step))?,
+            result = endpoints.owner().authorize_in(&mut headers, &request_context) => result.map_err(|failure| match failure.original { Some(original) => PreparationFailure::from(original), None => binding_failure(failure.step) })?,
             _ = preparation.stop().stopped() => return Err(PreparationFailure(novarocks_spi::connector::ConnectorMutationFailure::new(novarocks_spi::connector::ConnectorMutationFailureKind::Cancelled, "REST publication preparation cancelled"))),
             _ = tokio::time::sleep_until(preparation.deadline().into()) => return Err(PreparationFailure(novarocks_spi::connector::ConnectorMutationFailure::new(novarocks_spi::connector::ConnectorMutationFailureKind::DeadlineExceeded, "REST publication preparation deadline elapsed"))),
         }
@@ -200,7 +200,10 @@ impl PreparedRestMutation {
     }
 
     /// Starts no new session/auth request and serializes no request data.
-    pub(crate) async fn dispatch(self, context: EvidenceContext) -> PreparedRestOutcome {
+    pub(crate) async fn dispatch(
+        self,
+        context: EvidenceContext,
+    ) -> Result<PreparedRestOutcome, novarocks_spi::connector::ConnectorError> {
         // First publication is independent of statement cancellation after
         // dispatch. A nested necessary publication retains its phase's own
         // stop and the deadline already bounded by the original journal.
@@ -225,7 +228,7 @@ impl PreparedRestMutation {
                 self.expectation.endpoint().success_statuses(),
                 &request_context,
             )
-            .await;
+            .await?;
         let (read, document) = match (self.expectation.endpoint().response_shape(), body) {
             (Some(shape), Some(body)) => {
                 read_view(shape, &self.expectation, body, self.keep_document).await
@@ -235,11 +238,11 @@ impl PreparedRestMutation {
         };
         let evidence = classify(&stage, read, &self.expectation);
         let document = document.filter(|_| matches!(evidence, RestEvidence::Applied { .. }));
-        PreparedRestOutcome {
+        Ok(PreparedRestOutcome {
             evidence,
             stage,
             document,
-        }
+        })
     }
 }
 
@@ -405,7 +408,7 @@ mod tests {
         .await
         .unwrap();
         stop.request_stop();
-        let outcome = task.await.unwrap();
+        let outcome = task.await.unwrap().unwrap();
         assert!(matches!(
             outcome.dispatch_evidence(),
             DispatchEvidence::Applied { .. }
@@ -456,7 +459,8 @@ mod tests {
             };
             let outcome = prepared
                 .dispatch(policy.begin_evidence(&preparation).unwrap())
-                .await;
+                .await
+                .unwrap();
             assert!(matches!(
                 outcome.dispatch_evidence(),
                 DispatchEvidence::Unknown { .. }

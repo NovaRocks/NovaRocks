@@ -55,6 +55,7 @@ pub(super) fn prepare(
             context.session().current_database(),
             context.execution(),
             command_context.connector_context(),
+            *context.session().presentation(),
             #[cfg(novarocks_dev_controls)]
             observation,
         )
@@ -69,6 +70,7 @@ pub(super) fn prepare(
             context.session().current_database(),
             context.execution(),
             command_context.connector_context(),
+            *context.session().presentation(),
         )
         .map_err(maintenance_command_error)?
     {
@@ -102,6 +104,7 @@ pub(super) fn prepare(
         )
         .map_err(maintenance_command_error)?;
     Ok(Box::new(MetadataMaintenanceAction {
+        family: *context.session().presentation(),
         call,
         origin,
         started: false,
@@ -110,6 +113,7 @@ pub(super) fn prepare(
 }
 
 struct MetadataMaintenanceAction {
+    family: novarocks_result_contract::ClientPresentationFamily,
     call: MaintenanceCommandCall,
     origin: novarocks_workload_control::ResultWindowAlias,
     started: bool,
@@ -179,7 +183,9 @@ impl MetadataMaintenanceAction {
             Err(error) => return Poll::Ready(Err(error)),
         };
         Poll::Ready(match result {
-            MaintenanceStatementResult::Ok => Ok(StatementActionValue::Ok),
+            MaintenanceStatementResult::Ok => Ok(StatementActionValue::Ok(
+                novarocks_query_application::session_control::StatementCommandCompletion::new(0),
+            )),
             MaintenanceStatementResult::Query(result) => {
                 let window = match owner.result_window_alias() {
                     Some(window) => window,
@@ -189,10 +195,11 @@ impl MetadataMaintenanceAction {
                         )));
                     }
                 };
-                let producer = match LocalResultProducer::try_new(owner.scope(), window) {
-                    Ok(producer) => producer,
-                    Err(error) => return Poll::Ready(Err(internal_error(error))),
-                };
+                let producer =
+                    match LocalResultProducer::try_new(owner.scope(), window, self.family) {
+                        Ok(producer) => producer,
+                        Err(error) => return Poll::Ready(Err(internal_error(error))),
+                    };
                 producer
                     .produce(|| Ok(result))
                     .map(StatementActionValue::Local)
@@ -291,7 +298,9 @@ mod tests {
     fn irreversible_maintenance_keeps_success_and_required_failure_after_cancel() {
         for reason in [
             QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 7,
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(7)
+                        .expect("nonzero fixture requester"),
             },
             QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 },
             QueryCancellationReason::ClientDisconnected,
@@ -335,7 +344,9 @@ mod tests {
                 Some(LakePublicationDisposition::KnownCommitted),
                 false,
                 Some(QueryCancellationReason::ExplicitKill {
-                    requester_connection_id: 7
+                    requester_session:
+                        novarocks_query_application::session_control::ClientSessionKey::new(7)
+                            .expect("nonzero fixture requester")
                 }),
             )
             .is_err()

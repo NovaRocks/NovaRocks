@@ -225,25 +225,32 @@ fn source_type_requires_exact_nullable_nested_metadata_and_nominal_identity() {
             ConstantReferenceError::SourceTypeMismatch(reference(0, 0))
         );
     }
-    let child = Arc::new(
-        Field::new("child", DataType::Int64, true)
-            .with_metadata([("provider.id".into(), "a".into())].into()),
-    );
+    let child = Arc::new(Field::new("child", DataType::Int64, true).with_metadata(
+        std::collections::HashMap::<String, String>::from([("provider.id".into(), "a".into())]),
+    ));
     let nested = FunctionValueType::new(DataType::List(child), true);
     let backing = plain(new_null_array(nested.data_type(), 1), true);
     table.insert(ConstantPoolId::new(1), backing).unwrap();
     for (index, bad) in [
         FunctionValueType::new(
             DataType::List(Arc::new(
-                Field::new("child", DataType::Int64, true)
-                    .with_metadata([("provider.id".into(), "b".into())].into()),
+                Field::new("child", DataType::Int64, true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider.id".into(),
+                        "b".into(),
+                    )]),
+                ),
             )),
             true,
         ),
         FunctionValueType::new(
             DataType::List(Arc::new(
-                Field::new("child", DataType::Int64, false)
-                    .with_metadata([("provider.id".into(), "a".into())].into()),
+                Field::new("child", DataType::Int64, false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider.id".into(),
+                        "a".into(),
+                    )]),
+                ),
             )),
             true,
         ),
@@ -324,11 +331,12 @@ fn source_type_requires_exact_nullable_nested_metadata_and_nominal_identity() {
 fn projection_retains_only_selected_sparse_pools_without_rebuilding_unused_backing() {
     let array: ArrayRef = Arc::new(StringArray::from(vec!["x".repeat(320_000), "kept".into()]));
     let ty = FunctionValueType::new(DataType::Utf8, false);
-    let field = Arc::new(
-        ty.try_to_field("original")
-            .unwrap()
-            .with_metadata([("provider.fact".into(), "unchanged".into())].into()),
-    );
+    let field = Arc::new(ty.try_to_field("original").unwrap().with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            "provider.fact".into(),
+            "unchanged".into(),
+        )]),
+    ));
     let backing = pool(array, ty.clone(), field.clone());
     let mut table = ConstantPools::empty();
     table
@@ -462,7 +470,7 @@ fn source_metadata_is_retained_without_semantic_projection_copy_and_controls_pre
         Field::new("child", DataType::Int64, true).with_metadata(
             (0..320)
                 .map(|i| (format!("provider.{i:04}"), "kept".into()))
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
         ),
     );
     let source_type = DataType::List(child);

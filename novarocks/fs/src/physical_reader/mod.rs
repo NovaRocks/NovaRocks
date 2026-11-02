@@ -17,7 +17,6 @@
 
 mod budget;
 mod chunk_reader;
-mod orc;
 mod parquet;
 mod range_io;
 
@@ -25,6 +24,8 @@ use crate::{
     FileBatch, FileBatchReader, FileError, FileFormat, FileMetricsSnapshot, FileReadRequest,
     FileResult,
 };
+
+const ORC_SUSPENSION: &str = "ORC physical reads are suspended; restore support after orc-rust releases Arrow 60 and Zstd 0.14 support.";
 
 pub fn open_file_reader(request: FileReadRequest) -> FileResult<Box<dyn FileBatchReader>> {
     open_file_reader_with_parquet_inspection(request, None)
@@ -42,23 +43,22 @@ pub fn open_file_reader_with_parquet_inspection(
         FileFormat::Parquet => Box::new(parquet::ParquetPhysicalReader::try_new(
             request, inspection,
         )?),
-        FileFormat::Orc => Box::new(orc::OrcPhysicalReader::try_new(request)?),
+        FileFormat::Orc => return Err(FileError::unsupported(ORC_SUSPENSION)),
     };
     Ok(Box::new(budget::BudgetedFileReader::new(reader, budget)))
 }
 
 /// Opens a Parquet reader for a caller that must not block: its footer, page
 /// indexes and data ranges are awaited through the source's range service,
-/// and the decoder runs on the awaiting task. ORC has no awaited reader.
+/// and the decoder runs on the awaiting task. ORC physical reads are suspended
+/// until orc-rust releases support for Arrow 60 and Zstd 0.14.
 pub async fn open_file_reader_async(
     request: FileReadRequest,
     inspection: Option<&ParquetMetadataInspection>,
 ) -> FileResult<AsyncFileBatchReader> {
     request.context.check_active()?;
     if request.format != FileFormat::Parquet {
-        return Err(FileError::unsupported(
-            "only Parquet files have an awaited physical reader",
-        ));
+        return Err(FileError::unsupported(ORC_SUSPENSION));
     }
     let budget = request.budget;
     Ok(AsyncFileBatchReader {

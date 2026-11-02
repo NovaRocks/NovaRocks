@@ -249,8 +249,9 @@ fn validate_row<E>(
     })
 }
 
-// Primitive override changes only dictionary-value storage. All ordinary
-// physical parameters, named occurrences and NULL declarations remain exact.
+// Primitive override changes only dictionary-value storage. Byte projection
+// is an explicit plain-leaf operation; only the signed names/NULL mode relaxes
+// those declarations. All other scalar and container parameters stay exact.
 fn parameterized_shape<E>(
     source: &ArrayRef,
     binding: BorrowedTypedValueBinding<'_>,
@@ -266,12 +267,12 @@ fn parameterized_shape<E>(
         work: &mut Work<'_, E>,
     ) -> Result<bool, ValueFailure<E>> {
         work(1).map_err(ValueFailure::Caller)?;
-        if options.projection == HydrateProjection::Exact
+        if options.projection != HydrateProjection::FrozenNamesAndNullability
             && expected.is_nullable() != actual.is_nullable()
         {
             return Ok(false);
         }
-        if named && options.projection == HydrateProjection::Exact {
+        if named && options.projection != HydrateProjection::FrozenNamesAndNullability {
             if expected.name().len() != actual.name().len() {
                 return Ok(false);
             }
@@ -318,6 +319,15 @@ fn parameterized_shape<E>(
                     layout.is_utf8() && &layout.data_type() == values.as_ref()
                 }));
         }
+        if options.projection == HydrateProjection::ExactByteLayouts
+            && let (Some(target), Some(source)) = (
+                ByteLayout::from_data_type(expected),
+                ByteLayout::from_data_type(actual),
+            )
+        {
+            // This is representation projection, never a text/binary cast.
+            return Ok(target.is_utf8() == source.is_utf8());
+        }
         match (expected, actual) {
             (DataType::Struct(a), DataType::Struct(b)) if a.len() == b.len() => {
                 for (a, b) in a.iter().zip(b) {
@@ -344,7 +354,7 @@ fn parameterized_shape<E>(
             }
             (DataType::Map(a, asort), DataType::Map(b, bsort))
                 if asort == bsort
-                    && (options.projection != HydrateProjection::Exact
+                    && (options.projection == HydrateProjection::FrozenNamesAndNullability
                         || a.is_nullable() == b.is_nullable()) =>
             {
                 let (DataType::Struct(af), DataType::Struct(bf)) = (a.data_type(), b.data_type())

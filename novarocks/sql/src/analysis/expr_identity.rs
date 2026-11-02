@@ -506,8 +506,12 @@ mod tests {
             slot_id: 7,
             value_type: FunctionValueType::new(
                 DataType::List(Arc::new(
-                    Field::new("provider_item", DataType::Int64, false)
-                        .with_metadata([("provider.id".into(), "19".into())].into()),
+                    Field::new("provider_item", DataType::Int64, false).with_metadata(
+                        std::collections::HashMap::<String, String>::from([(
+                            "provider.id".into(),
+                            "19".into(),
+                        )]),
+                    ),
                 )),
                 false,
             ),
@@ -534,8 +538,12 @@ mod tests {
         let mut changed_type = parameter.clone();
         changed_type.value_type = FunctionValueType::new(
             DataType::List(Arc::new(
-                Field::new("provider_item", DataType::Int64, false)
-                    .with_metadata([("provider.id".into(), "20".into())].into()),
+                Field::new("provider_item", DataType::Int64, false).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider.id".into(),
+                        "20".into(),
+                    )]),
+                ),
             )),
             false,
         );

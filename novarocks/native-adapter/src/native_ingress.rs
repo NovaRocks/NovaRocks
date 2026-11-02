@@ -872,10 +872,13 @@ mod tests {
         ] {
             assert!(matches!(control.classify(method), MethodClass::Control));
         }
-        assert!(matches!(
-            data.classify(NativeRpcMethod::ApplyTaskOperations),
-            MethodClass::Ordinary
-        ));
+        for method in [
+            NativeRpcMethod::ApplyTaskOperations,
+            NativeRpcMethod::DeliverExchangeUnit,
+            NativeRpcMethod::RegisterExchangeDemand,
+        ] {
+            assert!(matches!(data.classify(method), MethodClass::Ordinary));
+        }
         for endpoint in [
             NativeEndpointDomain::BackendData,
             NativeEndpointDomain::BackendControl,
@@ -888,6 +891,10 @@ mod tests {
         ));
         assert!(matches!(
             data.classify(NativeRpcMethod::SubscribeTaskStatus),
+            MethodClass::Stream
+        ));
+        assert!(matches!(
+            data.classify(NativeRpcMethod::SubscribeExchangeGrants),
             MethodClass::Stream
         ));
         assert_eq!(NativeRpcMethod::from_path("/Other/Heartbeat"), None);

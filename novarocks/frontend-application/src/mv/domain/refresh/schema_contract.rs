@@ -18,7 +18,9 @@
 //! Exact D/L schema validation; no legacy descriptor or schema-contract recovery.
 
 use crate::mv::domain::refresh::target::IcebergMvTarget;
-use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
+use crate::mv::domain::storage_observation::{
+    MvSchemaValidationObservation, MvSourceSchemaObservation,
+};
 use novarocks_mv_application::persistence::codec::{InterpretationDocument, RelationOccurrence};
 use novarocks_mv_application::persistence::identity::FieldIdentity;
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
@@ -58,7 +60,7 @@ pub(crate) fn validate_projection_target(
 /// Every bound field must still have the same exact identity, type and nullability.
 pub(crate) fn validate_relation_occurrence_schema(
     occurrence: &RelationOccurrence,
-    observation: &MvSchemaValidationObservation,
+    observation: &MvSourceSchemaObservation,
 ) -> Result<Vec<MvOccurrenceFieldRebind>, String> {
     // D records the source object inside the canonical exact-fact envelope;
     // the observation reports the provider's raw identity. Comparing the two
@@ -131,7 +133,7 @@ pub fn validate_aggregate_schema_contract_metadata<'a>(
 pub(crate) fn validate_aggregate_schema_contract_for_base(
     projection: &StoredKeyedMvProjection,
     occurrence: &RelationOccurrence,
-    base_observation: &MvSchemaValidationObservation,
+    base_observation: &MvSourceSchemaObservation,
     target_observation: &MvSchemaValidationObservation,
 ) -> Result<Vec<MvOccurrenceFieldRebind>, String> {
     validate_projection_target(projection, target_observation)?;
@@ -220,30 +222,26 @@ mod tests {
         occurrence: &RelationOccurrence,
         object: &[u8],
         rename: bool,
-    ) -> MvSchemaValidationObservation {
+    ) -> MvSourceSchemaObservation {
         let fields = occurrence
             .fields
             .iter()
-            .enumerate()
-            .map(|(ordinal, field)| {
-                (
-                    ordinal as u32,
-                    MvObservedSourceField::try_new(
-                        Bytes::copy_from_slice(field.field_id.as_bytes()),
-                        if rename {
-                            format!("new_{}", field.name_at_binding)
-                        } else {
-                            field.name_at_binding.clone()
-                        },
-                        field.type_signature.clone(),
-                        field.nullable,
-                    )
-                    .unwrap(),
+            .map(|field| {
+                MvObservedSourceField::try_new(
+                    Bytes::copy_from_slice(field.field_id.as_bytes()),
+                    if rename {
+                        format!("new_{}", field.name_at_binding)
+                    } else {
+                        field.name_at_binding.clone()
+                    },
+                    field.type_signature.clone(),
+                    field.nullable,
                 )
+                .unwrap()
             })
             .collect();
-        crate::mv::domain::storage_observation::schema_validation_from_spi(
-            SpiObservation::try_new(
+        crate::mv::domain::storage_observation::source_schema_from_spi(
+            novarocks_spi::connector::MvSourceSchemaObservation::try_new(
                 ConnectorTableIdentity {
                     instance_id: ConnectorInstanceId::parse(&occurrence.catalog_at_binding)
                         .unwrap(),
@@ -251,17 +249,10 @@ mod tests {
                     table: occurrence.relation_at_binding.clone().into(),
                 },
                 ConnectorTableObjectId::try_new(Bytes::copy_from_slice(object)).unwrap(),
-                ConnectorCommittedVersion::try_new(
-                    Bytes::from_static(b"source-metadata"),
-                    Some(12),
-                )
-                .unwrap(),
                 Bytes::from_static(b"source-schema-after-rename"),
-                Bytes::from_static(b"source-spec"),
                 true,
                 true,
                 fields,
-                vec![],
                 &context(),
             )
             .unwrap(),

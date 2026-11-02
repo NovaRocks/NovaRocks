@@ -1076,8 +1076,13 @@ mod tests {
                 .unwrap();
             let output = if client {
                 FrozenRootOutput::ClientRows(
-                    novarocks_sql::compiler::client_render_schema(completed.candidate().plan(), 0)
-                        .unwrap(),
+                    novarocks_sql::compiler::client_render_schema(
+                        completed.candidate().plan(),
+                        novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
+                            timezone_offset_seconds: 0,
+                        },
+                    )
+                    .unwrap(),
                 )
             } else {
                 FrozenRootOutput::CountOnly

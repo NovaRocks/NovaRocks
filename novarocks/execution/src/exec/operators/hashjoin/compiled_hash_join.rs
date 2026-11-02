@@ -68,17 +68,22 @@ use super::join_hash_map::gather::{
     JoinGatherError, MAX_JOIN_OUTPUT_ROWS_PER_BATCH, TypedJoinBatch, filter_probe_typed,
     gather_left_with_null_right_typed, gather_probe_build_batches_typed,
 };
-use super::join_hash_map::method::{
-    BuildKeyBatch, JoinCursorFailure, JoinHashMap, JoinHashMapBuildOptions, JoinPairCursor,
-};
+use super::join_hash_map::method::{JoinCursorFailure, JoinHashMap, JoinKeyBuild, JoinPairCursor};
 use super::join_hash_map::search::JoinSelection;
 use super::native_runtime_filter::{
     NativeRuntimeFilterProducerFactory, NativeRuntimeFilterProducerSet,
 };
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use crate::exec::hash_table::partition_keys::source_key_owner;
+use crate::exec::hash_table::{
+    allocation::AggregateAllocator,
+    key_index::{BulkWork, PreparedKeyBatch},
+};
 use crate::exec::node::join::JoinType;
-use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
+use crate::exec::operators::compiled_expression::{
+    RuntimeKernelControl, evaluate_all, instances, root_value_type,
+};
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
@@ -94,6 +99,8 @@ use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime_filter::RuntimeFilterProducerFailure;
+use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+use novarocks_value_arrays::decode::ValueConversionContext;
 
 #[derive(Debug)]
 struct HashJoinContractFailure(novarocks_failure_contract::BoundedDetail);
@@ -183,6 +190,8 @@ pub(crate) struct CompiledHashJoinPlan {
     join_type: JoinType,
     probe_sites: Vec<ProgramExpressionRootSite>,
     build_sites: Vec<ProgramExpressionRootSite>,
+    build_key_bindings: Vec<FunctionValueType>,
+    probe_key_bindings: Vec<FunctionValueType>,
     residual: Option<ProgramExpressionRootSite>,
     eq_null_safe: Vec<bool>,
     build: novarocks_local_program::StaticLayout,
@@ -271,6 +280,14 @@ impl CompiledHashJoinPlan {
             probe_sites.push(site(ProgramNodeExpressionRole::JoinProbeKey { key }));
             build_sites.push(site(ProgramNodeExpressionRole::JoinBuildKey { key }));
         }
+        let build_key_bindings = build_sites
+            .iter()
+            .map(|site| root_value_type(program, *site).map_err(ExecutionFailure::from))
+            .collect::<ExecutionResult<Vec<_>>>()?;
+        let probe_key_bindings = probe_sites
+            .iter()
+            .map(|site| root_value_type(program, *site).map_err(ExecutionFailure::from))
+            .collect::<ExecutionResult<Vec<_>>>()?;
         let residual = residual_predicate.map(|_| site(ProgramNodeExpressionRole::JoinResidual));
         let requirements = required_build_components(join_type, residual.is_some(), true, true);
         Ok(Self {
@@ -278,6 +295,8 @@ impl CompiledHashJoinPlan {
             join_type,
             probe_sites,
             build_sites,
+            build_key_bindings,
+            probe_key_bindings,
             residual,
             eq_null_safe: eq_null_safe.clone(),
             build: right_layout.clone(),
@@ -368,7 +387,8 @@ impl OperatorFactory for CompiledHashJoinBuildSinkFactory {
                 prepared_build: None,
                 prepare_failure: None,
                 input_chunks: Vec::new(),
-                key_batches: Vec::new(),
+                key_build: None,
+                key_conversions: ValueConversionContext::default(),
                 row_count: 0,
                 has_null_key: false,
                 null_key_rows,
@@ -398,7 +418,8 @@ struct CompiledHashJoinBuildSink {
     /// Retained only to charge the build rows to this operator's tracker
     /// until the artifact owns them.
     input_chunks: Vec<Chunk>,
-    key_batches: Vec<BuildKeyBatch>,
+    key_build: Option<JoinKeyBuild>,
+    key_conversions: ValueConversionContext,
     row_count: usize,
     has_null_key: bool,
     null_key_rows: Option<Vec<u32>>,
@@ -562,30 +583,94 @@ impl CompiledHashJoinBuildSink {
                 incoming: rows,
             })
         })?;
-        self.has_null_key |= keys.iter().any(|key| key.null_count() > 0);
-        if let Some(null_key_rows) = self.null_key_rows.as_mut() {
-            // A row whose non-null-safe key is NULL can never be an equal
-            // match; a null-aware residual still sees it.
-            for row in 0..rows {
-                let forbidden = keys
-                    .iter()
-                    .zip(&self.plan.eq_null_safe)
-                    .any(|(key, null_safe)| !null_safe && key.is_null(row));
-                if forbidden {
-                    let flat = base
-                        .checked_add(row)
-                        .and_then(|row| u32::try_from(row).ok())
-                        .ok_or_else(|| {
-                            ExecutionFailure::from_domain(JoinCursorFailure::RowIdExtent)
-                        })?;
-                    null_key_rows.push(flat);
-                }
-            }
-        }
         // The producers observe the same evaluated key arrays the table is
         // built from, after the build accepted the chunk.
         let submitted = self.runtime_filters.is_some().then(|| keys.clone());
-        self.key_batches.push(BuildKeyBatch::new(keys, rows)?);
+        let tracker = self
+            .artifact_memory
+            .as_ref()
+            .and_then(|memory| memory.table.as_ref())
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let work = BulkWork {
+            owner: owner.as_ref(),
+            allocator: AggregateAllocator::new(Arc::clone(tracker)),
+            host: self
+                .control
+                .allocator()
+                .ok_or(ConstructionFailure::MissingOwner)?,
+            control: &self.control,
+        };
+        if self.key_build.is_none() {
+            let purpose = self
+                .plan
+                .requirements
+                .join_hash_map_purpose()
+                .ok_or_else(|| {
+                    hash_join_contract("compiled keyed join lookup purpose is missing")
+                })?;
+            self.key_build = Some(
+                JoinKeyBuild::new(
+                    &self.plan.build_key_bindings,
+                    &self.plan.eq_null_safe,
+                    purpose,
+                    &work,
+                )
+                .map_err(|cause| self.control.project_required_failure(cause))?,
+            );
+        }
+        // Only the original captured input receives source custody. Spec,
+        // domain, later graph and copied representatives use destination work.
+        let source_owner = source_key_owner(&chunk, owner.as_ref())?;
+        let source_work = BulkWork {
+            owner: source_owner.as_ref(),
+            allocator: work.allocator.clone(),
+            host: Arc::clone(&work.host),
+            control: work.control,
+        };
+        let has_null_key = &mut self.has_null_key;
+        let null_key_rows = &mut self.null_key_rows;
+        self.key_build
+            .as_mut()
+            .expect("join capture was created")
+            .push_observed(
+                &keys,
+                &self.plan.build_key_bindings,
+                rows,
+                &mut self.key_conversions,
+                &source_work,
+                &mut |row, logical_null, participates| {
+                    *has_null_key |= logical_null;
+                    if !participates && let Some(null_rows) = null_key_rows.as_mut() {
+                        let flat = base
+                            .checked_add(row)
+                            .and_then(|row| u32::try_from(row).ok())
+                            .ok_or_else(|| {
+                                ExecutionFailure::from_domain(JoinCursorFailure::RowIdExtent)
+                            })?;
+                        let growth =
+                            novarocks_type_contract::owned_resources::vec::push_growth(null_rows)
+                                .map_err(|cause| match cause {
+                                novarocks_type_contract::ControlResourceError::Control(cause) => {
+                                    ConstructionFailure::Control(cause)
+                                }
+                                novarocks_type_contract::ControlResourceError::SourceModel(
+                                    cause,
+                                ) => ConstructionFailure::InvalidSource(cause.to_owned()),
+                            })?;
+                        if let Some(layout) = growth.requested_backing {
+                            work.owner.request(layout)?;
+                            null_rows.try_reserve(1).map_err(|source| {
+                                work.allocator
+                                    .allocation_error("join null physical rows", source)
+                            })?;
+                        }
+                        null_rows.push(flat);
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|cause| self.control.project_required_failure(cause))?;
+        self.key_conversions.clear();
         if self.plan.requirements.requires_row_payload() {
             self.store.push_chunk_owned(&chunk, owner.as_ref())?;
             if let Some(tracker) = self.chunks_tracker.as_ref() {
@@ -616,31 +701,41 @@ impl CompiledHashJoinBuildSink {
             ))
         })?;
         let requirements = self.plan.requirements;
-        let mut table = match self.key_batches.first() {
-            Some(first) => {
-                let key_types = first
-                    .arrays()
-                    .iter()
-                    .map(|array| array.data_type().clone())
-                    .collect::<Vec<_>>();
-                Some(JoinHashMap::build_from_key_batches_with_tracker(
-                    key_types,
-                    self.plan.eq_null_safe.clone(),
-                    &self.key_batches,
-                    JoinHashMapBuildOptions {
-                        purpose: requirements.join_hash_map_purpose().ok_or_else(|| {
-                            hash_join_contract(
-                                "compiled hash join lookup purpose missing for keyed build",
-                            )
-                        })?,
-                        ..JoinHashMapBuildOptions::default()
-                    },
-                    self.table_tracker.as_ref().map(Arc::clone),
-                )?)
-            }
-            None => None,
+        let tracker = memory
+            .table
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let work = BulkWork {
+            owner: owner.as_ref(),
+            allocator: AggregateAllocator::new(Arc::clone(tracker)),
+            host: self
+                .control
+                .allocator()
+                .ok_or(ConstructionFailure::MissingOwner)?,
+            control: &self.control,
         };
-        self.key_batches.clear();
+        if self.key_build.is_none() {
+            let purpose = requirements.join_hash_map_purpose().ok_or_else(|| {
+                hash_join_contract("compiled keyed join lookup purpose is missing")
+            })?;
+            self.key_build = Some(
+                JoinKeyBuild::new(
+                    &self.plan.build_key_bindings,
+                    &self.plan.eq_null_safe,
+                    purpose,
+                    &work,
+                )
+                .map_err(|cause| self.control.project_required_failure(cause))?,
+            );
+        }
+        let table = Some(
+            self.key_build
+                .take()
+                .expect("join capture was created")
+                .finish(&work)
+                .map_err(|cause| self.control.project_required_failure(cause))?,
+        );
+        self.key_conversions.clear();
         let mut store = if requirements.requires_row_payload() {
             std::mem::replace(&mut self.store, BuildStoreBuilder::new())
                 .finish_owned(owner.as_ref())?
@@ -648,9 +743,6 @@ impl CompiledHashJoinBuildSink {
             None
         };
         self.input_chunks.clear();
-        if let (Some(table), Some(tracker)) = (table.as_mut(), memory.table.as_ref()) {
-            table.set_mem_tracker(Arc::clone(tracker));
-        }
         if let (Some(store), Some(tracker)) = (store.as_mut(), memory.store.as_ref()) {
             store.transfer_to_with_header_owner(tracker, owner.as_ref())?;
         }
@@ -753,6 +845,8 @@ impl OperatorFactory for CompiledHashJoinProbeProcessorFactory {
             instances: None,
             build: None,
             cursor: None,
+            key_tracker: None,
+            key_conversions: ValueConversionContext::default(),
         }))
     }
 }
@@ -781,6 +875,8 @@ struct CompiledHashJoinProbe {
     instances: Option<Vec<CompiledExpressionInstance>>,
     build: Option<LoadedBuild>,
     cursor: Option<HashProbeCursor>,
+    key_tracker: Option<Arc<MemTracker>>,
+    key_conversions: ValueConversionContext,
 }
 
 impl OperatorLifecycle for CompiledHashJoinProbe {
@@ -829,7 +925,8 @@ impl OperatorLifecycle for CompiledHashJoinProbe {
         Ok(())
     }
     fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
-        self.control.bind_mem_tracker(tracker);
+        self.control.bind_mem_tracker(Arc::clone(&tracker));
+        self.key_tracker = Some(tracker);
     }
     fn name(&self) -> &str {
         &self.name
@@ -866,6 +963,7 @@ struct HashProbeCursor {
     matched_any: Vec<bool>,
     probe_position: usize,
     build_position: usize,
+    _key_storage: ValueTypeStorageLifetime,
 }
 impl InputEncodingPolicy for CompiledHashJoinProbe {}
 impl TransformKernel for CompiledHashJoinProbe {
@@ -943,6 +1041,7 @@ impl CompiledHashJoinProbe {
         self.cursor = None;
         self.build = None;
         self.instances = None;
+        self.key_conversions.clear();
     }
     fn complete_step(
         &mut self,
@@ -1036,16 +1135,81 @@ impl CompiledHashJoinProbe {
             )?);
         }
         let rows = chunk.len();
+        let owner = self
+            .control
+            .construction_owner(&self.prepared_schemas()?.output)?;
+        let tracker = self
+            .key_tracker
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let work = BulkWork {
+            owner: owner.as_ref(),
+            allocator: AggregateAllocator::new(Arc::clone(tracker)),
+            host: self
+                .control
+                .allocator()
+                .ok_or(ConstructionFailure::MissingOwner)?,
+            control: &self.control,
+        };
+        let source_owner = source_key_owner(&chunk, owner.as_ref())?;
+        let source_work = BulkWork {
+            owner: source_owner.as_ref(),
+            allocator: work.allocator.clone(),
+            host: Arc::clone(&work.host),
+            control: work.control,
+        };
         let table = self
             .loaded()?
             .table
             .clone()
             .filter(|table| !table.is_empty());
+        let key_input = table
+            .as_ref()
+            .map(|table| {
+                table.input(
+                    &arrays,
+                    &self.plan.probe_key_bindings,
+                    rows,
+                    &mut self.key_conversions,
+                    &source_work,
+                )
+            })
+            .transpose()
+            .map_err(|cause| self.control.project_required_failure(cause))?;
+        self.key_conversions.clear();
+        let prepared = table
+            .as_ref()
+            .zip(key_input.as_ref())
+            .map(|(table, input)| {
+                PreparedKeyBatch::from_captured(
+                    table.spec(),
+                    input,
+                    work.allocator.clone(),
+                    &|| self.control.checkpoint_execution(),
+                )
+            })
+            .transpose()
+            .map_err(|cause| self.control.project_required_failure(cause))?;
         let null_aware = self.plan.join_type == JoinType::NullAwareLeftAnti;
         let null_probe = if null_aware {
-            (0..rows)
-                .map(|row| arrays.iter().any(|array| array.is_null(row)))
-                .collect::<Vec<_>>()
+            let mut nulls = Vec::new();
+            let layout = std::alloc::Layout::array::<bool>(rows)
+                .map_err(|_| hash_join_contract("join logical null mask extent overflow"))?;
+            work.owner.request(layout)?;
+            nulls.try_reserve_exact(rows).map_err(|source| {
+                work.allocator
+                    .allocation_error("join logical null mask", source)
+            })?;
+            for row in 0..rows {
+                self.control.checkpoint_execution()?;
+                nulls.push(match key_input.as_ref() {
+                    Some(input) => {
+                        input.row_has_null_observed(row, &|| self.control.checkpoint_execution())?
+                    }
+                    None => false, // No build lookup: only the empty-build decision consumes this path.
+                });
+            }
+            nulls
         } else {
             Vec::new()
         };
@@ -1055,8 +1219,12 @@ impl CompiledHashJoinProbe {
                 JoinType::LeftSemi | JoinType::LeftAnti | JoinType::NullAwareLeftAnti
             )
         {
-            let matched = match table {
-                Some(table) => table.search_membership_arrays(&arrays, rows)?.0.into_vec(),
+            let matched = match table.as_ref().zip(prepared.as_ref()) {
+                Some((table, prepared)) => table
+                    .membership(prepared, &work)
+                    .map_err(|cause| self.control.project_required_failure(cause))?
+                    .0
+                    .into_vec(),
                 None => vec![false; rows],
             };
             let keep = match self.plan.join_type {
@@ -1076,13 +1244,16 @@ impl CompiledHashJoinProbe {
         if null_aware && self.loaded()?.row_count == 0 {
             return self.keep_probe(&chunk, &vec![true; rows]);
         }
-        let groups = match table {
-            Some(table) => table.lookup_group_ids_arrays(&arrays, rows)?,
+        let groups = match table.as_ref().zip(prepared.as_ref()) {
+            Some((table, prepared)) => table
+                .lookup_groups(prepared, &work)
+                .map_err(|cause| self.control.project_required_failure(cause))?,
             None => vec![None; rows],
         };
         self.cursor = Some(HashProbeCursor {
             input: chunk,
-            pairs: Some(JoinPairCursor::new(groups)),
+            pairs: Some(JoinPairCursor::new(groups, owner.storage_lifetime())),
+            _key_storage: owner.storage_lifetime(),
             phase: HashProbePhase::EqualPairs,
             matched: vec![false; rows],
             null_probe,
@@ -1178,8 +1349,9 @@ impl CompiledHashJoinProbe {
                             table,
                             NonZeroUsize::new(MAX_JOIN_OUTPUT_ROWS_PER_BATCH)
                                 .expect("positive output page size"),
+                            &self.control,
                         )
-                        .map_err(ExecutionFailure::from_domain)?,
+                        .map_err(|cause| self.control.project_required_failure(cause))?,
                     None => JoinSelection::new(),
                 };
                 let output = self.evaluate_page(&cursor.input, &mut selection, publish)?;

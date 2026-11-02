@@ -450,7 +450,15 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
             port.step()?;
             port.before_operation(SortByOperation::Extend)?;
             let next = crate::aggregate_scalar::checked_list_output_offset(current, 1)?;
-            mutable.extend(0, src_idx, src_idx + 1);
+            mutable
+                .try_extend(0, src_idx, src_idx + 1)
+                .map_err(|source| {
+                    P::Failure::from(collection_arrow::arrow_failure(
+                        "array_sortby",
+                        ArrowSite::Extend,
+                        source,
+                    ))
+                })?;
             port.after_operation()?;
             current = next;
         }

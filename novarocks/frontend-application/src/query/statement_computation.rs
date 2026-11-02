@@ -591,7 +591,7 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
             crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
             crate::native::data_runtime::FrontendDataRuntime,
         ),
-        io: &MetadataIoAdmission,
+        io: &Arc<MetadataIoAdmission>,
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), QueryServiceError>> {
@@ -609,7 +609,7 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
             crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
             crate::native::data_runtime::FrontendDataRuntime,
         ),
-        io: &MetadataIoAdmission,
+        io: &Arc<MetadataIoAdmission>,
         owner: &mut GovernedActionContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), QueryServiceError>> {
@@ -657,6 +657,7 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
                     &mut self.computation,
                     self.admission.owner_slot(),
                     &capacity,
+                    io,
                     &mut self.original,
                     #[cfg(novarocks_dev_controls)]
                     self.observation.clone(),
@@ -811,6 +812,20 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
         self.admission.release_capacity_alias();
         Ok(())
     }
+    /// Install the exact original observer before a fallible domain observation.
+    /// Refusal and unwind leave that observer in the caller's stable tail slot.
+    pub(crate) fn transfer_native_tail_then<T, E>(
+        &mut self,
+        target: &mut Option<StatementNativeTail>,
+        observe: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Result<T, E>, StatementNativeHealthFailure> {
+        if target.is_some() {
+            return Err(self.admission.health.clone());
+        }
+        self.release_result_aliases()?;
+        *target = Some(self.take_native_tail()?);
+        Ok(observe())
+    }
     pub(crate) fn take_native_tail(
         &mut self,
     ) -> Result<StatementNativeTail, StatementNativeHealthFailure> {
@@ -952,6 +967,7 @@ mod tests {
             _: &mut Option<crate::query_execution::logical_execution::PreparedLogicalComputation>,
             _: &mut Option<WorkOwner>,
             _: &QueryResultCapacityBinding,
+            _: &Arc<MetadataIoAdmission>,
             _: &mut OriginalComputationStart,
             #[cfg(novarocks_dev_controls)] _: Option<
                 crate::preparation_diagnostics::StatementObservationHandle,
@@ -1194,4 +1210,6 @@ mod tests {
         control.close_admission();
         assert!(control.shutdown().is_ok());
     }
+
+    include!("statement_computation_count_handoff_tests.rs");
 }

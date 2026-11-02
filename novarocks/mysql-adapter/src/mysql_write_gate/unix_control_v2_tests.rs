@@ -174,7 +174,15 @@ fn maximal_fixed_projection_matches_independent_literal_744_bytes() {
     snapshot.used_arm = true;
     snapshot.gate = Some(MysqlWriteGateSnapshot {
         connection: ClientConnectionToken::new(0x01020304, 5).unwrap(),
-        statement: Some(StatementToken::new(SessionToken::new(0x01020304, 9), 11)),
+        statement: Some(StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    ((0x01020304 as u64) << 32) | 9_u64,
+                )
+                .expect("nonzero fixture session"),
+            ),
+            11,
+        )),
         sql_sha256: Some([0x22; 32]),
         phase: GatePhase::Rows,
         failure: None,

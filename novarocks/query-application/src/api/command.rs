@@ -409,7 +409,13 @@ mod tests {
             4_096,
         )
         .unwrap();
-        let statement_token = StatementToken::new(SessionToken::new(7, 11), 13);
+        let statement_token = StatementToken::new(
+            SessionToken::new(
+                crate::session_control::ClientSessionKey::new((7_u64 << 32) | 11_u64)
+                    .expect("nonzero fixture session"),
+            ),
+            13,
+        );
         let context = CommandContext::new(
             expected_scope.clone(),
             connector_context,
@@ -469,7 +475,13 @@ mod tests {
                     4096,
                 )
                 .unwrap(),
-                StatementToken::new(SessionToken::new(7, 11), 13),
+                StatementToken::new(
+                    SessionToken::new(
+                        crate::session_control::ClientSessionKey::new((7_u64 << 32) | 11_u64)
+                            .expect("nonzero fixture session"),
+                    ),
+                    13,
+                ),
                 "test-principal",
             )
         };

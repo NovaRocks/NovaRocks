@@ -104,7 +104,10 @@ pub fn repeat_values(
     let mut out = MutableArrayData::new(vec![&data], false, 0);
     for segment in segments {
         for _ in 0..segment.repeats {
-            out.extend(0, segment.start, segment.start + 1);
+            out.try_extend(0, segment.start, segment.start + 1)
+                .map_err(|source| {
+                    collection_arrow::arrow_failure("array_repeat", ArrowSite::Extend, source)
+                })?;
         }
     }
     let result = ListArray::try_new(

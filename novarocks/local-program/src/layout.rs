@@ -484,8 +484,8 @@ impl StaticLayout {
             return Err(LayoutError::ValueBindingMismatch.into());
         }
         if writer_row_obligation
-            && (self.schema.metadata().capacity() != 0
-                || expected.schema.metadata().capacity() != 0)
+            && (self.schema.metadata().as_arc().is_some()
+                || expected.schema.metadata().as_arc().is_some())
         {
             return Err(LayoutError::ValueBindingMismatch.into());
         }
@@ -529,8 +529,8 @@ impl StaticLayout {
                 || (!writer_row_obligation
                     && source_field.is_nullable() != target_field.is_nullable())
                 || (writer_row_obligation
-                    && (source_field.metadata().capacity() != 0
-                        || target_field.metadata().capacity() != 0))
+                    && (source_field.metadata().as_arc().is_some()
+                        || target_field.metadata().as_arc().is_some()))
             {
                 return Ok(false);
             }
@@ -667,7 +667,7 @@ impl StaticLayout {
             if schema.fields().len() != slots.len() || bindings.len() != slots.len() {
                 return Err(LayoutError::ArityMismatch.into());
             }
-            if schema.metadata().capacity() != 0 {
+            if schema.metadata().as_arc().is_some() {
                 return Err(LayoutError::ValueBindingMismatch.into());
             }
             let array_layout = std::alloc::Layout::array::<(SlotId, usize)>(slots.len())
@@ -695,7 +695,7 @@ impl StaticLayout {
             let mut expanded = 0usize;
             for (field, (binding, unique_id)) in schema.fields().iter().zip(bindings) {
                 work.step()?;
-                if field.metadata().capacity() != 0
+                if field.metadata().as_arc().is_some()
                     || field.is_nullable() != binding.nullable()
                     || !binding.layout().matches_projection_observed(
                         field.data_type(),
@@ -1807,8 +1807,8 @@ mod tests {
         assert_eq!(projected.slots(), &[SlotId::new(3)]);
         assert_eq!(projected.schema().field(0), schema.field(1));
         assert_eq!(projected.schema().metadata(), schema.metadata());
-        assert_eq!(projected.schema().metadata().capacity(), 0);
-        assert_eq!(projected.schema().field(0).metadata().capacity(), 0);
+        assert!(projected.schema().metadata().as_arc().is_none());
+        assert!(projected.schema().field(0).metadata().as_arc().is_none());
         assert_eq!(projected.slot_metadata_at(0), Some((&nested, Some(17))));
         assert_eq!(
             projected.identity_for_compile(&control).unwrap(),

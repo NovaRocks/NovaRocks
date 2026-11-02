@@ -233,10 +233,38 @@ impl Observer {
     fn reset(&mut self, phase: &str) -> Result<()> {
         let value = self.command(&json!({"command":"reset","phase":phase}))?;
         ensure!(
-            value["command"] == "reset" && value["current"]["phase"] == phase,
-            "observer phase reset refused while HTTP request work is live"
+            value["command"] == "reset"
+                && value["state"] == "OPEN"
+                && value["previous"]["valid_observation"] == true
+                && value["previous"]["lifetime_failures"].as_u64() == Some(0)
+                && value["current"]["phase"] == phase,
+            "observer phase reset lacks valid prior traffic or confirmed transport quiescence"
         );
         Ok(())
+    }
+
+    fn quiesce_until(&mut self, deadline: Instant) -> Result<Value> {
+        ensure!(
+            Instant::now() < deadline,
+            "observer quiescence original deadline expired"
+        );
+        self.input.write_all(b"{\"command\":\"quiesce\"}\n")?;
+        self.input.flush()?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .context("observer quiescence original deadline expired")?;
+        let value = self.receive(remaining.min(Duration::from_secs(35)))?;
+        ensure!(
+            Instant::now() < deadline,
+            "observer quiescence completed after its original deadline"
+        );
+        ensure!(
+            value["command"] == "quiesce"
+                && value["state"] == "QUIESCENT"
+                && value["audit"].is_object(),
+            "observer did not confirm actual transport and handler quiescence"
+        );
+        Ok(value["audit"].clone())
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -397,18 +425,82 @@ fn idle(audit: &Value) -> bool {
     .all(|field| audit[*field].as_u64() == Some(0))
 }
 
+fn work_drained(audit: &Value) -> bool {
+    [
+        "active_requests",
+        "active_upstream_requests",
+        "active_upstream_listings",
+    ]
+    .iter()
+    .all(|field| audit[*field].as_u64() == Some(0))
+}
+
 fn actual_count(audit: &Value, field: &str) -> Result<u64> {
     audit["counters"][field]
         .as_u64()
         .context("actual REST counter missing")
 }
 
+fn phase_work_matches(audit: &Value, expected_loads: Option<u64>) -> Result<bool> {
+    ensure!(
+        audit["valid_observation"] == true,
+        "actual REST observation was tainted"
+    );
+    ensure!(
+        actual_count(audit, "listing_active_peak")? <= 8,
+        "actual catalog listing exceeded eight concurrent requests"
+    );
+    let loads = actual_count(audit, "metadata_loads")?;
+    if let Some(expected) = expected_loads {
+        ensure!(
+            loads <= expected,
+            "actual REST discovery duplicated metadata loads"
+        );
+    }
+    Ok(expected_loads.is_none_or(|expected| loads == expected))
+}
+
+fn finish_phase_result(
+    outcome: Result<Value>,
+    audit: Result<Value>,
+    mut failures: Vec<String>,
+) -> Result<Value> {
+    let sql = match outcome {
+        Ok(value) => Some(value),
+        Err(error) => {
+            failures.insert(0, format!("native SQL phase failed: {error:#}"));
+            None
+        }
+    };
+    let provider = match audit {
+        Ok(value) => Some(value),
+        Err(error) => {
+            failures.push(format!("observer quiescence failed: {error:#}"));
+            None
+        }
+    };
+    ensure!(failures.is_empty(), "{}", failures.join("; "));
+    Ok(json!({"sql":sql,"provider":provider}))
+}
+
 impl PreparedListing {
-    fn await_idle(&mut self, timeout: Duration, expected_loads: Option<u64>) -> Result<Value> {
-        let deadline = self
+    fn phase_deadline(&self, timeout: Duration) -> Result<Instant> {
+        Ok(self
             .native_deadline
             .context("native acceptance deadline missing")?
-            .min(Instant::now() + timeout);
+            .min(Instant::now() + timeout))
+    }
+
+    fn await_idle(&mut self, deadline: Instant, expected_loads: Option<u64>) -> Result<Value> {
+        self.await_observation(deadline, expected_loads, idle)
+    }
+
+    fn await_observation(
+        &mut self,
+        deadline: Instant,
+        expected_loads: Option<u64>,
+        drained: fn(&Value) -> bool,
+    ) -> Result<Value> {
         let mut previous_match = false;
         loop {
             ensure!(
@@ -416,22 +508,7 @@ impl PreparedListing {
                 "actual REST native acceptance deadline expired"
             );
             let audit = self.observer.snapshot()?;
-            ensure!(
-                audit["valid_observation"] == true,
-                "actual REST observation was tainted"
-            );
-            ensure!(
-                actual_count(&audit, "listing_active_peak")? <= 8,
-                "actual catalog listing exceeded eight concurrent requests"
-            );
-            let loads = actual_count(&audit, "metadata_loads")?;
-            if let Some(expected) = expected_loads {
-                ensure!(
-                    loads <= expected,
-                    "actual REST discovery duplicated metadata loads"
-                );
-            }
-            let matches = idle(&audit) && expected_loads.is_none_or(|expected| loads == expected);
+            let matches = phase_work_matches(&audit, expected_loads)? && drained(&audit);
             if matches && previous_match {
                 ensure!(
                     Instant::now() < deadline,
@@ -444,7 +521,11 @@ impl PreparedListing {
                 "actual REST phase did not reach its frozen idle condition"
             );
             previous_match = matches;
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100)),
+            );
         }
     }
 
@@ -455,11 +536,24 @@ impl PreparedListing {
         expected_loads: Option<u64>,
         operation: impl FnOnce() -> Result<Value>,
     ) -> Result<Value> {
-        self.await_idle(timeout, None)?;
+        let pre_deadline = self.phase_deadline(timeout)?;
+        let pre_audit = self.observer.quiesce_until(pre_deadline)?;
+        ensure!(
+            idle(&pre_audit),
+            "observer pre-phase quiescence was not idle"
+        );
+        write_json(
+            &self
+                .preparation_root
+                .join(format!("native-{phase}-prequiescent.json")),
+            &pre_audit,
+        )?;
+        self.await_idle(pre_deadline, None)?;
         self.observer.reset(phase)?;
         let outcome = operation();
-        // Retain actual traffic even when SQL refuses or times out. Do not
-        // continue to later workloads after such a refusal.
+        // SQL retains its existing timeout. All post-SQL drain and physical
+        // quiescence consume one original post-phase/native deadline.
+        let post_deadline = self.phase_deadline(timeout)?;
         let immediate = self.observer.snapshot();
         let sql_error = outcome.as_ref().err().map(|error| format!("{error:#}"));
         let observer_error = immediate.as_ref().err().map(|error| format!("{error:#}"));
@@ -471,35 +565,67 @@ impl PreparedListing {
                 "sql":outcome.as_ref().ok(),"sql_error":sql_error,
                 "provider":immediate.as_ref().ok(),"observer_error":observer_error}),
         );
-        if let Err(error) = outcome {
-            return Err(anyhow::anyhow!(
-                "native SQL phase failed: {error:#}; observer outcome: {}; receipt outcome: {}",
-                observer_error.as_deref().unwrap_or("snapshot retained"),
-                saved
-                    .as_ref()
-                    .err()
-                    .map(|error| format!("{error:#}"))
-                    .unwrap_or_else(|| "retained".to_owned())
-            ));
+        let mut failures = Vec::new();
+        if let Err(error) = saved {
+            failures.push(format!("immediate receipt failed: {error:#}"));
         }
-        saved?;
-        immediate?;
-        let result = outcome?;
-        ensure!(
-            Instant::now()
-                < self
-                    .native_deadline
-                    .context("native acceptance deadline missing")?,
-            "actual REST native acceptance deadline expired after SQL"
-        );
-        let audit = self.await_idle(timeout, expected_loads)?;
-        write_json(
+        if let Err(error) = immediate {
+            failures.push(format!("immediate observer snapshot failed: {error:#}"));
+        }
+        if outcome.is_ok() {
+            // CREATE can return before discovery starts. Keep the original
+            // expected loads and two matching observations 100ms apart before
+            // closing idle keepalive transports. This is not an owner join.
+            if let Err(error) = self.await_observation(post_deadline, expected_loads, work_drained)
+            {
+                failures.push(format!("observer work drain failed: {error:#}"));
+            }
+        }
+        // Attempt actual transport close/handler join even after SQL, snapshot,
+        // receipt or drain failure; none of those errors can skip retirement.
+        let quiesced = self.observer.quiesce_until(post_deadline);
+        let saved_quiescence = write_json(
             &self
                 .preparation_root
-                .join(format!("native-{phase}-idle.json")),
-            &audit,
-        )?;
-        Ok(json!({"sql":result,"provider":audit}))
+                .join(format!("native-{phase}-quiescent.json")),
+            &json!({"state":if quiesced.is_ok() {"QUIESCENT"} else {"NOT_CONFIRMED"},
+                "audit":quiesced.as_ref().ok(),
+                "error":quiesced.as_ref().err().map(|error|format!("{error:#}"))}),
+        );
+        if let Err(error) = saved_quiescence {
+            failures.push(format!("quiescence receipt failed: {error:#}"));
+        }
+        let final_expected = if outcome.is_ok() {
+            expected_loads
+        } else {
+            None
+        };
+        let audit = quiesced.and_then(|audit| {
+            ensure!(idle(&audit), "observer quiescence retained live owners");
+            ensure!(
+                phase_work_matches(&audit, final_expected)?,
+                "actual REST quiescent phase omitted expected metadata loads"
+            );
+            ensure!(
+                Instant::now() < post_deadline,
+                "actual REST native acceptance deadline expired after quiescence"
+            );
+            // Keep the original two matching four-counter observations after
+            // the stronger physical close/join receipt, on the same deadline.
+            self.await_idle(post_deadline, final_expected)
+        });
+        if outcome.is_ok()
+            && let Ok(value) = &audit
+            && let Err(error) = write_json(
+                &self
+                    .preparation_root
+                    .join(format!("native-{phase}-idle.json")),
+                value,
+            )
+        {
+            failures.push(format!("idle receipt failed: {error:#}"));
+        }
+        finish_phase_result(outcome, audit, failures)
     }
 }
 
@@ -645,13 +771,13 @@ impl Scenario for RealRestListing {
             })?);
         }
         for namespace in 0..32 {
-            control.query_drop(format!("USE cl_normal.cl_ns_{namespace:04}"))?;
             phases.push(measure(context, "real-rest-show-views", || {
                 let result = fixture.phase(
                     &format!("show_views_{namespace:04}"),
                     timeout,
                     Some(0),
                     || {
+                        control.query_drop(format!("USE cl_normal.cl_ns_{namespace:04}"))?;
                         let mut views = control.query::<String, _>("SHOW VIEWS")?;
                         views.sort();
                         let expected = (0..512)
@@ -834,5 +960,49 @@ sys.exit(1)
         assert!(observer.reader.is_none());
         assert!(observer.replies.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn completed_work_keeps_idle_connections_distinct_from_quiescence() {
+        let mut audit = json!({
+            "active_connections":2,"active_upstream_connections":2,
+            "active_http_requests":1,"active_requests":0,
+            "active_upstream_requests":0,"active_upstream_listings":0,
+            "valid_observation":true,
+            "counters":{"metadata_loads":0,"listing_active_peak":8}
+        });
+        assert!(work_drained(&audit));
+        assert!(!idle(&audit));
+        assert!(!phase_work_matches(&audit, Some(16384)).unwrap());
+        audit["counters"]["metadata_loads"] = json!(16384);
+        assert!(phase_work_matches(&audit, Some(16384)).unwrap());
+        assert!(!idle(&audit));
+        audit["active_http_requests"] = json!(0);
+        assert!(idle(&audit));
+        // Request idle is not QUIESCENT while socket owners remain live.
+        assert_eq!(audit["active_connections"], 2);
+        assert_eq!(audit["active_upstream_connections"], 2);
+        audit["active_connections"] = json!(0);
+        audit["active_upstream_connections"] = json!(0);
+        assert!(idle(&audit));
+        audit["counters"]["metadata_loads"] = json!(16385);
+        assert!(phase_work_matches(&audit, Some(16384)).is_err());
+    }
+
+    #[test]
+    fn sql_quiescence_and_receipt_failures_are_all_retained() {
+        let result = finish_phase_result(
+            Err(anyhow::anyhow!("original SQL refusal")),
+            Err(anyhow::anyhow!("original quiescence deadline")),
+            vec!["immediate receipt write refused".into()],
+        );
+        let error = format!("{:#}", result.unwrap_err());
+        for required in [
+            "original SQL refusal",
+            "original quiescence deadline",
+            "immediate receipt write refused",
+        ] {
+            assert!(error.contains(required), "missing failure: {required}");
+        }
     }
 }

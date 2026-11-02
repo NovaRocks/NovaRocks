@@ -42,11 +42,11 @@ import oss_ops
 
 HERE = Path(__file__).resolve().parent
 FILES = runtime.ENTRY_FILES
-LOCAL_RANGES = {"mysql": 9030, "fe_grpc": 9080, "be_grpc": 9280, "be_control_grpc": 9480, "fe_http": 8240, "be_http": 8440}
+LOCAL_RANGES = {"trino": 8640, "mysql": 9030, "fe_grpc": 9080, "be_grpc": 9280, "be_control_grpc": 9480, "fe_http": 8240, "be_http": 8440}
 MANAGED = """NOVA_ENV_CONFIG_FILE NOVA_ENV_ID NOVA_ENV_SHARED_DOCKER NOVA_ENV_COMPOSE_PROJECT
 NOVA_ENV_RUNTIME_DIR NOVA_ENV_CURRENT_DIR NOVA_ENV_REST_ENV_FILE NOVA_ENV_MANIFEST NOVA_ENV_README
 NOVA_ENV_COMPOSE_FILE NOVA_ENV_COMPOSE_ENV NOVA_ENV_MINIO_PORT NOVA_ENV_MINIO_CONSOLE_PORT
-NOVA_ENV_REST_PORT NOVA_ENV_SPARK_UI_PORT NOVA_ENV_MYSQL_PORT NOVA_ENV_FE_GRPC_PORT
+NOVA_ENV_REST_PORT NOVA_ENV_SPARK_UI_PORT NOVA_ENV_TRINO_PORT NOVA_ENV_MYSQL_PORT NOVA_ENV_FE_GRPC_PORT
 NOVA_ENV_REST_MV_PORT NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI NOVAROCKS_SPARK_REST_MV_URI
 NOVAROCKS_ICEBERG_REST_MV_URI NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE
 NOVA_ENV_FE_HTTP_PORT NOVA_ENV_BE_GRPC_PORT NOVA_ENV_BE_CONTROL_GRPC_PORT NOVA_ENV_BE_HTTP_PORT NOVAROCKS_NATIVE_SHARED_SECRET
@@ -374,7 +374,7 @@ role = "{role}"
             value += f'advertise_host = "127.0.0.1"\nfrontend_endpoint = "127.0.0.1:{ports["fe_grpc"]}"\n'
         else:
             value += '\n[catalog_source]\nmode = "dynamic-state-store"\n'
-        value += '\n[runtime]\nexchange_wait_ms = 300000\n'
+        value += '\n[runtime]\n'
         if role == "fe":
             value += f'''connector_split_initial_dynamic_filter_wait_cap_ms = 1000
 query_control_task_update_rpc_timeout_ms = 5000
@@ -389,6 +389,7 @@ cluster_id = {json_string(env_id)}
 
 [standalone_server]
 mysql_port = {ports["mysql"]}
+trino_port = {ports["trino"]}
 user = "root"
 mv_refresh_scheduler_enabled = true
 mv_refresh_scheduler_interval_ms = 200

@@ -125,6 +125,7 @@ impl MvCommandExecutor {
                 services,
                 request,
                 context.execution().clone(),
+                *context.session().presentation(),
             );
         }
         use crate::query::mv_action::{CreateRequest, MvCommandRequest, prepare};

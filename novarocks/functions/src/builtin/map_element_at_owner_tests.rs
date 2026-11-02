@@ -199,12 +199,19 @@ pub(crate) fn uninhabited_map(value: &FunctionValueType, sorted: bool) -> Functi
             value.data_type().clone(),
             value.nullable(),
         )
-        .with_metadata([("opaque-value".into(), "preserve".into())].into()),
+        .with_metadata(std::collections::HashMap::<String, String>::from([(
+            "opaque-value".into(),
+            "preserve".into(),
+        )])),
     ];
     let layout = DataType::Map(
         Arc::new(
-            Field::new("declared-entries", DataType::Struct(fields.into()), false)
-                .with_metadata([("opaque-entries".into(), "preserve".into())].into()),
+            Field::new("declared-entries", DataType::Struct(fields.into()), false).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "opaque-entries".into(),
+                    "preserve".into(),
+                )]),
+            ),
         ),
         sorted,
     );

@@ -427,7 +427,7 @@ pub struct StatementWorkNomination {
     pub statement_run_token: String,
     pub frontend_process_id: String,
     pub connection_id: u32,
-    pub session_epoch: u64,
+    pub session_key: u64,
     pub statement_generation: u64,
 }
 impl StatementWorkNomination {
@@ -447,7 +447,7 @@ impl StatementWorkNomination {
         if !identifier(&self.target_session_id)
             || !identifier(&self.statement_run_token)
             || self.connection_id == 0
-            || self.session_epoch == 0
+            || self.session_key == 0
             || self.statement_generation == 0
         {
             return Err(invalid("invalid exact statement work nomination"));
@@ -466,7 +466,7 @@ pub struct StatementInputNomination {
     pub statement_run_token: String,
     pub frontend_process_id: String,
     pub connection_id: u32,
-    pub session_epoch: u64,
+    pub session_key: u64,
     pub sql_sha256: [u8; 32],
 }
 impl StatementInputNomination {
@@ -487,7 +487,7 @@ impl StatementInputNomination {
             || !identifier(&self.target_launch_id)
             || !identifier(&self.statement_run_token)
             || self.connection_id == 0
-            || self.session_epoch == 0
+            || self.session_key == 0
         {
             return Err(invalid("invalid exact statement input nomination"));
         }
@@ -503,7 +503,7 @@ impl StatementInputNomination {
             || self.statement_run_token != statement.statement_run_token
             || self.frontend_process_id != statement.frontend_process_id
             || self.connection_id != statement.connection_id
-            || self.session_epoch != statement.session_epoch
+            || self.session_key != statement.session_key
         {
             return Err(invalid(
                 "actual statement does not extend its exact input nomination",

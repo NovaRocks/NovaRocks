@@ -32,6 +32,7 @@ code-anchors:
   - "novarocks/connector/iceberg/src/commit/staging/manifests.rs (ArtifactWriter)"
   - "novarocks/connector/iceberg/src/commit/attempt.rs (run, RetryPolicy)"
   - "novarocks/connector/iceberg/src/commit/operation.rs (IcebergCommitOperation, IcebergCommitAttempt)"
+  - "novarocks/connector/iceberg/src/commit/write_stack/execution/cleanup.rs (UnsealedWriterCleanup)"
   - "novarocks/connector/iceberg/src/commit/attempt/observation.rs (PublicationJournal)"
   - "novarocks/connector/iceberg/src/commit/recovery.rs (FrozenPublicationFacts)"
   - "novarocks/connector/iceberg/src/catalog_control/staged_create/publication.rs (publish)"

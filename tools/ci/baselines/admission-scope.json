@@ -58,6 +58,17 @@
       },
       "owner": "System execution owner",
       "enable_when": "Enable with the corresponding System admission scenarios."
+    },
+    {
+      "selector": {
+        "kind": "stage",
+        "names": [
+          "Linux environment tests",
+          "Aliyun CI platform tests"
+        ]
+      },
+      "owner": "Linux preparation and CI platform maintainers",
+      "enable_when": "Pass on main in the admission environment, then enable in a follow-up PR."
     }
   ],
   "enumeration_gaps": [

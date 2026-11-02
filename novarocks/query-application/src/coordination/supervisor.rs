@@ -1660,7 +1660,20 @@ async fn run_logical_role(
     let internal = internal_consumer.is_some();
     let active_plan = super::ActiveLogicalPlan::activate(description.completed_candidate().clone());
     let result_schema = match description.output() {
-        OutputContract::Rows(fields) => Some(ResultSchema::new(Arc::clone(fields))),
+        OutputContract::Rows(fields) => {
+            let mut schema = ResultSchema::new(Arc::clone(fields));
+            let plan = description.completed_candidate().plan();
+            if let Some(novarocks_physical_plan::FragmentSink::RootResult(root)) = plan
+                .result_port()
+                .and_then(|port| plan.fragments().get(&port.fragment))
+                .map(|fragment| fragment.sink())
+                && let novarocks_result_contract::FrozenRootOutput::ClientRows(render) =
+                    root.output()
+            {
+                schema = schema.with_client_render(render.clone());
+            }
+            Some(schema)
+        }
         OutputContract::CompletionOnly => None,
     };
     if !internal && result_schema.is_none() && description.recovery() != RecoveryMode::NoRecovery {
@@ -4776,8 +4789,13 @@ mod tests {
     ) -> QueryExecutionRequest {
         let plan = crate::completed_plan_fixture::completed_values_plan_blocking(fixture_version());
         use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
-        let render =
-            novarocks_sql::compiler::client_render_schema(plan.candidate().plan(), 0).unwrap();
+        let render = novarocks_sql::compiler::client_render_schema(
+            plan.candidate().plan(),
+            novarocks_sql::compiler::RenderFamilyRequest::MysqlText {
+                timezone_offset_seconds: 0,
+            },
+        )
+        .unwrap();
         let candidate = crate::preparation::CompletedPhysicalPlanCandidate::for_program(
             plan.candidate()
                 .plan()

@@ -14,6 +14,7 @@ query.execution.representation	Execution
 query.execution.resource_exhausted	Execution
 query.execution.unexpected	Execution
 query.execution.unsupported	Execution
+sql.admit.client_type_unsupported	Admit
 sql.admit.create_table_unsupported_form	Admit
 sql.admit.delete_requires_where	Admit
 sql.admit.delete_unsupported_form	Admit

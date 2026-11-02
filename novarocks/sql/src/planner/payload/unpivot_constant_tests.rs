@@ -68,8 +68,12 @@ fn policy() -> ConstantPolicy {
 fn cv(array: ArrayRef, ty: FunctionValueType, ordinal: u32) -> ConstantValue {
     ConstantPool::try_new(
         Arc::new(
-            Field::new("actual.source", array.data_type().clone(), ty.nullable())
-                .with_metadata([("provider.fact".into(), "retained".into())].into()),
+            Field::new("actual.source", array.data_type().clone(), ty.nullable()).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "provider.fact".into(),
+                    "retained".into(),
+                )]),
+            ),
         ),
         ty,
         array.to_data(),
@@ -301,8 +305,12 @@ fn actual_unpivot_cv_controls_preserve_success_ordinary_tail_and_wide_type_quant
         (0..320)
             .map(|index| {
                 Arc::new(
-                    Field::new(format!("child_{index}"), DataType::Utf8, false)
-                        .with_metadata([("provider.attribute".into(), "kept".into())].into()),
+                    Field::new(format!("child_{index}"), DataType::Utf8, false).with_metadata(
+                        std::collections::HashMap::<String, String>::from([(
+                            "provider.attribute".into(),
+                            "kept".into(),
+                        )]),
+                    ),
                 )
             })
             .collect::<Vec<_>>(),

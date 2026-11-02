@@ -7383,6 +7383,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
 /// those foreign MV references and refuses cleanup. Such a suite gets its own
 /// REST Catalog so its outcome does not depend on other worktrees.
 const ISOLATED_REST_CATALOG_SUITES: &[&str] = &[
+    "materialized-view",
     "iceberg-ivm",
     "iceberg-mv-apply",
     "iceberg-mv-scheduler",
@@ -9423,10 +9424,12 @@ mod tests {
             fe_http_port: 28080,
             fe_grpc_port: 29070,
             fe_mysql_port: 29030,
+            fe_trino_port: 28081,
         };
         let base = r#"
 [standalone_server]
 mysql_port = 9030
+trino_port = 8080
 
 [[connector.credentials]]
 purpose = "object-store-data"
@@ -9473,6 +9476,16 @@ access_key_secret = "admin123"
         assert_eq!(
             fe_value["standalone_server"]["mysql_port"].as_integer(),
             Some(29030)
+        );
+        assert_eq!(
+            fe_value["standalone_server"]["trino_port"].as_integer(),
+            Some(i64::from(runtime.fe_trino_port))
+        );
+        assert!(
+            be_value
+                .get("standalone_server")
+                .and_then(|table| table.get("trino_port"))
+                .is_none()
         );
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
         assert!(fe_value["cluster"].get("backends").is_none());
@@ -10107,21 +10120,23 @@ oss_sk = "private-secret"
 
     #[test]
     fn an_ordinary_suite_never_silently_gets_the_isolated_catalog() {
-        let result = super::start_isolated_rest_catalog(
-            &[
-                "mv-storage-contract".to_string(),
-                "iceberg-compatibility".to_string(),
-            ],
-            &test_fixture_budget(),
-        );
-        let error = match result {
-            Ok(_) => panic!("a shared-environment suite must not be redirected silently"),
-            Err(error) => error,
-        };
-        assert!(
-            error.to_string().contains("cannot share this run"),
-            "{error}"
-        );
+        for isolated_suite in ["mv-storage-contract", "materialized-view"] {
+            let result = super::start_isolated_rest_catalog(
+                &[
+                    isolated_suite.to_string(),
+                    "iceberg-compatibility".to_string(),
+                ],
+                &test_fixture_budget(),
+            );
+            let error = match result {
+                Ok(_) => panic!("a shared-environment suite must not be redirected silently"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("cannot share this run"),
+                "{isolated_suite}: {error}"
+            );
+        }
     }
 
     #[test]

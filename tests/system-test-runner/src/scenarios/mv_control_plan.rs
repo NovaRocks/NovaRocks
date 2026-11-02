@@ -140,7 +140,11 @@ pub(in crate::scenarios) fn recovery(
     ensure!(
         matches!(
             phase,
-            "data-prepared" | "write-committed" | "publication-committed"
+            "source-pinned"
+                | "source-prepared"
+                | "data-prepared"
+                | "write-committed"
+                | "publication-committed"
         ),
         "unknown MV recovery phase"
     );

@@ -29,10 +29,12 @@ fn selected(name: &str, metadata: &str, values: Vec<Option<i64>>, ordinal: u32) 
     let nullable = values.iter().any(Option::is_none);
     let ty = FunctionValueType::new(DataType::Int64, nullable);
     ConstantPool::try_new(
-        Arc::new(
-            Field::new(name, DataType::Int64, nullable)
-                .with_metadata([("provider".into(), metadata.into())].into()),
-        ),
+        Arc::new(Field::new(name, DataType::Int64, nullable).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider".into(),
+                metadata.into(),
+            )]),
+        )),
         ty,
         Int64Array::from(values).to_data(),
         crate::constant::test_constant_policy(),
@@ -121,10 +123,12 @@ fn normalization_keeps_original_selected_ordinal_backing_and_nested_field_facts(
         Some(vec![Some(7)]),
         Some(vec![Some(42), None]),
     ]);
-    let field = Arc::new(
-        Field::new("elements", DataType::Int64, true)
-            .with_metadata([("provider-child".into(), "retained".into())].into()),
-    );
+    let field = Arc::new(Field::new("elements", DataType::Int64, true).with_metadata(
+        std::collections::HashMap::<String, String>::from([(
+            "provider-child".into(),
+            "retained".into(),
+        )]),
+    ));
     let list = ListArray::new(
         field.clone(),
         original_list.offsets().clone(),
@@ -325,8 +329,12 @@ fn normalized_types_policy_and_authored_ordering_are_complete_identity() {
     let nested = |value: &str| {
         FunctionValueType::new(
             DataType::List(Arc::new(
-                Field::new("item", DataType::Int64, value == "one")
-                    .with_metadata([("provider".into(), value.into())].into()),
+                Field::new("item", DataType::Int64, value == "one").with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider".into(),
+                        value.into(),
+                    )]),
+                ),
             )),
             true,
         )
@@ -474,8 +482,12 @@ fn mv_dimension_mapping_requires_exact_source_and_output_types_before_publicatio
     let nested = |metadata: &str| {
         FunctionValueType::new(
             DataType::List(Arc::new(
-                Field::new("item", DataType::Int64, metadata == "source")
-                    .with_metadata([("provider".into(), metadata.into())].into()),
+                Field::new("item", DataType::Int64, metadata == "source").with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider".into(),
+                        metadata.into(),
+                    )]),
+                ),
             )),
             true,
         )

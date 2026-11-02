@@ -128,11 +128,7 @@ pub(crate) fn compiled_table_finish_factory(
     compiled_finish_core(program, id, display_id, binding, error, false)
 }
 
-/// P07 factory only; P09 will install this source over the two exact roles.
-#[expect(
-    dead_code,
-    reason = "P08 binds exact summary sources before P09 opens the builder path."
-)]
+/// Materialize the source that fairly consumes both exact finish roles.
 pub(crate) fn compiled_logical_table_finish_factory(
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,
@@ -141,7 +137,7 @@ pub(crate) fn compiled_logical_table_finish_factory(
     error: &Arc<RuntimeErrorState>,
     writer: crate::exec::operators::setop::union_all_shared::UnionAllSharedState,
     summary: crate::exec::operators::logical_change_summary::SourceBoundSummaryInput,
-) -> ExecutionResult<impl OperatorFactory> {
+) -> ExecutionResult<impl OperatorFactory + use<>> {
     let factory = compiled_finish_core(program, id, display_id, binding, error, true)?;
     let ProgramNodeKind::TableFinish {
         logical_summary_layout: Some(layout),

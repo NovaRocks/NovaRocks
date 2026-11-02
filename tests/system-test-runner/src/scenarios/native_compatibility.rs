@@ -1098,6 +1098,14 @@ fn assert_other_island_admission_cut(
 }
 
 fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
+    let rows = context.handle().frontend_backend_topology()?;
+    let target_port = context.handle().runtime().be[2].grpc;
+    let backend = rows
+        .iter()
+        .find(|row| row.grpc_port == target_port)
+        .context("SHOW BACKENDS omitted raw Exchange ingress target")?
+        .process_id
+        .parse::<BackendProcessId>()?;
     let endpoint = context.handle().native_be_endpoint(2)?;
     let mode = context.handle().native_trust_mode();
     let connector = context.handle().native_probe_connector(endpoint, mode)?;
@@ -1109,7 +1117,10 @@ fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
         novarocks_types::QueryId::new(11, 12),
         novarocks_types::AttemptId::new(1)?,
     )?;
-    let process = BackendProcessId::new_v7();
+    let process = match trust.local_process_identity() {
+        Some(novarocks_native_trust::NativeProcessIdentity::Backend(process)) => process,
+        _ => anyhow::bail!("Exchange probe requires its authenticated backend process"),
+    };
     let source = novarocks_execution_contract::TaskIdentity::new(
         query,
         novarocks_types::StageId::new(2)?,
@@ -1120,7 +1131,7 @@ fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
         query,
         novarocks_types::StageId::new(1)?,
         novarocks_types::TaskId::new(1)?,
-        process,
+        backend,
     );
     let stream = novarocks_execution_contract::ExchangeStreamIdentity::try_new(
         novarocks_execution_contract::ExchangeSource::new(
@@ -1132,36 +1143,42 @@ fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
         novarocks_types::UniqueId::new(11, 12),
         novarocks_execution_contract::FragmentNodeId::new(0),
     )?;
-    let exchange = proto::ExchangeRequest {
-        stream: Some(novarocks_task_codec::exchange_flow_codec::encode_stream(
-            stream,
-        )),
-        finst_id_hi: 11,
-        finst_id_lo: 12,
-        node_id: 0,
-        sender_id: 0,
-        be_number: 0,
-        eos: true,
-        sequence: 1,
-        payload: vec![0xff],
-        source_finst_id_hi: 21,
-        source_finst_id_lo: 22,
-        sender_ordinal: 0,
-        sender_count: 1,
+    use novarocks_execution_contract::ordered_retained_stream::exchange::{
+        ExchangeUnitDemand, ExchangeUnitItem, ExchangeUnitSequence,
     };
-    let exchange_response: proto::ExchangeResponse = raw_unary(
+    use novarocks_task_codec::exchange_unit_codec as codec;
+    let sequence = ExchangeUnitSequence::FIRST;
+    let exchange = codec::encode_delivery_request(codec::DecodedExchangeUnitFrame {
+        stream,
+        sender_count: 1,
+        sender_id: 0,
+        backend_number: 0,
+        item: ExchangeUnitItem::Unit {
+            demand: ExchangeUnitDemand {
+                sequence,
+                wire_bytes: 1,
+            },
+            end_after_unit: true,
+        },
+        payload: Bytes::from_static(&[0xff]),
+        next_demand: None,
+    });
+    let response: proto::DeliverExchangeUnitResponse = raw_unary(
         connector,
-        "/novarocks.NovaRocksGrpc/ExchangeUnary",
+        "/novarocks.NovaRocksGrpc/DeliverExchangeUnit",
         &authorization,
         exchange,
         context.deadline(),
     )?;
-    let status = exchange_response
-        .status
-        .context("ExchangeUnary response missing status")?;
+    let outcome = codec::decode_delivery_response(
+        &response,
+        stream,
+        sequence,
+        novarocks_proto_codec::FieldPath::root("unknown_exchange_probe"),
+    )?;
     ensure!(
-        status.code != 0 && status.message.contains("exchange ingress route rejected"),
-        "unknown malformed Exchange must reject before decode, got {status:?}"
+        matches!(outcome,codec::DecodedExchangeDeliveryOutcome::Refused(fact) if fact.reason().code()==460),
+        "unknown malformed Exchange Unit must reject at the frozen route before decode, got {outcome:?}"
     );
     context.action("malformed unknown Exchange route rejected before decode");
     Ok(())

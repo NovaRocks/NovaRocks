@@ -29,8 +29,9 @@ use tokio::{sync::Notify, time::Instant};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CancellationReason {
     Requested,
-    ExplicitKill { requester_connection_id: u64 },
-    ExplicitKillConnection { requester_connection_id: u64 },
+    ExplicitKill { requester_session: u64 },
+    ExplicitKillConnection { requester_session: u64 },
+    ClientCancelRequested,
     ClientDisconnected,
     DeadlineExceeded,
     FrontendDrainDeadlineExceeded,

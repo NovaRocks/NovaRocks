@@ -18,6 +18,7 @@
 
 mod contract_lowering;
 mod lowered_draft;
+mod wait_graph;
 #[cfg(test)]
 pub(crate) use lowered_draft::CheckedAggregateLogicalSourceEntry;
 pub use lowered_draft::{

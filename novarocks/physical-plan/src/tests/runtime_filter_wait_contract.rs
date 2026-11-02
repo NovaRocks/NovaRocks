@@ -477,9 +477,16 @@ fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
         RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
             late_apply: LateApplyGranularity::Batch,
         };
-    let valid = finish(non_blocking).expect("late apply breaks the multicast wait cycle");
-    let cuts = fragment_cuts(&valid, probe_fragment_id).unwrap();
-    validate_fragment(&valid.fragments()[&probe_fragment_id], &cuts).unwrap();
+    // Both direct branches still feed opposite ordered join inputs. Removing
+    // the optional RF wait cannot remove that mandatory shared-data cycle.
+    let data_cycle = finish(non_blocking)
+        .expect_err("late application cannot break the required multicast input-order cycle");
+    assert!(
+        data_cycle
+            .errors()
+            .iter()
+            .any(|error| error.path() == "fragments.wait_graph")
+    );
 
     let error = finish(filter).unwrap_err().to_string();
     assert!(error.contains(
@@ -487,14 +494,24 @@ fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
     ));
 }
 
-#[test]
-fn blocking_runtime_filter_rejects_a_cycle_through_a_nested_producer_build() {
+#[derive(Clone, Copy)]
+struct NestedJoinFacts {
+    equality: u32,
+    fragment: FragmentId,
+    join: NodeId,
+    probe: ValueId,
+    build: ValueId,
+    build_edge: EdgeId,
+}
+
+fn nested_unicast_plan(
+    make_filters: impl FnOnce(NestedJoinFacts, NestedJoinFacts) -> Vec<RuntimeFilter>,
+) -> Result<PhysicalPlan, ValidationErrors> {
     let build_fragment_id = FragmentId::new(400);
     let inner_fragment_id = FragmentId::new(401);
     let outer_fragment_id = FragmentId::new(402);
     let build_edge = EdgeId::new(400);
     let nested_build_edge = EdgeId::new(401);
-    let filter_id = RuntimeFilterId::new(400);
 
     let mut build_builder = FragmentBuilder::new(build_fragment_id);
     let (build_root, build_value) = append_single_copy_literal(&mut build_builder);
@@ -511,17 +528,6 @@ fn blocking_runtime_filter_rejects_a_cycle_through_a_nested_producer_build() {
     let inner_probe = append_single_copy_literal(&mut inner_builder);
     let inner_build = append_exchange(&mut inner_builder, build_edge, build_value, broadcast());
     let inner_join = append_broadcast_join(&mut inner_builder, inner_probe, inner_build);
-    inner_builder.attach_runtime_filter(filter_id).unwrap();
-    let inner_fragment = inner_builder
-        .finish_definition(
-            inner_join,
-            FragmentSink::Stream {
-                edge: nested_build_edge,
-            },
-            dop(),
-            crate::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
 
     let mut outer_builder = FragmentBuilder::new(outer_fragment_id);
     let outer_probe = append_single_copy_literal(&mut outer_builder);
@@ -532,7 +538,52 @@ fn blocking_runtime_filter_rejects_a_cycle_through_a_nested_producer_build() {
         broadcast(),
     );
     let outer_join = append_broadcast_join(&mut outer_builder, outer_probe, outer_build);
-    outer_builder.attach_runtime_filter(filter_id).unwrap();
+    let filters = make_filters(
+        NestedJoinFacts {
+            equality: 400,
+            fragment: inner_fragment_id,
+            join: inner_join,
+            probe: inner_probe.1,
+            build: inner_build.1,
+            build_edge,
+        },
+        NestedJoinFacts {
+            equality: 401,
+            fragment: outer_fragment_id,
+            join: outer_join,
+            probe: outer_probe.1,
+            build: outer_build.1,
+            build_edge: nested_build_edge,
+        },
+    );
+    for filter in &filters {
+        for (fragment, builder) in [
+            (inner_fragment_id, &mut inner_builder),
+            (outer_fragment_id, &mut outer_builder),
+        ] {
+            if filter
+                .producers
+                .iter()
+                .any(|producer| producer.endpoint.fragment == fragment)
+                || filter
+                    .consumers
+                    .iter()
+                    .any(|consumer| consumer.endpoint.fragment == fragment)
+            {
+                builder.attach_runtime_filter(filter.id).unwrap();
+            }
+        }
+    }
+    let inner_fragment = inner_builder
+        .finish_definition(
+            inner_join,
+            FragmentSink::Stream {
+                edge: nested_build_edge,
+            },
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
     let outer_fragment = outer_builder
         .finish_definition(
             outer_join,
@@ -541,38 +592,6 @@ fn blocking_runtime_filter_rejects_a_cycle_through_a_nested_producer_build() {
             crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
-
-    let filter = filter(
-        filter_id,
-        Box::from([
-            equality(400, inner_fragment_id, inner_join),
-            equality(401, outer_fragment_id, outer_join),
-        ]),
-        Box::from([
-            producer(
-                400,
-                400,
-                inner_fragment_id,
-                inner_join,
-                inner_build.1,
-                Box::from([build_edge]),
-            ),
-            producer(
-                401,
-                401,
-                outer_fragment_id,
-                outer_join,
-                outer_build.1,
-                Box::from([nested_build_edge]),
-            ),
-        ]),
-        Box::from([blocking_consumer(
-            400,
-            inner_fragment_id,
-            inner_join,
-            inner_probe.1,
-        )]),
-    );
 
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(build_fragment).unwrap();
@@ -602,12 +621,145 @@ fn blocking_runtime_filter_rejects_a_cycle_through_a_nested_producer_build() {
         },
         true,
     );
-    plan.add_runtime_filter(filter).unwrap();
-    let error = plan.finish().unwrap_err().to_string();
+    for filter in filters {
+        plan.add_runtime_filter(filter).unwrap();
+    }
+    plan.finish()
+}
 
-    assert!(error.contains(
-        "blocking runtime-filter waits form a cycle with physical execution dependencies"
-    ));
+#[test]
+fn nested_runtime_filter_consumer_cannot_borrow_another_joins_equality_witness() {
+    let error = nested_unicast_plan(|inner, outer| {
+        let mut filter = filter(
+            RuntimeFilterId::new(400),
+            Box::from([
+                equality(inner.equality, inner.fragment, inner.join),
+                equality(outer.equality, outer.fragment, outer.join),
+            ]),
+            Box::from([producer(
+                outer.equality,
+                outer.equality,
+                outer.fragment,
+                outer.join,
+                outer.build,
+                Box::from([outer.build_edge]),
+            )]),
+            Box::from([blocking_consumer(
+                inner.equality,
+                inner.fragment,
+                inner.join,
+                inner.probe,
+            )]),
+        );
+        // This is a same-key contract negative, not an executable RF cycle.
+        // Disable the optional wait so no dependency diagnostic can mask it.
+        filter.consumers[0].activation =
+            RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+                late_apply: LateApplyGranularity::Batch,
+            };
+        vec![filter]
+    })
+    .expect_err("an outer producer cannot authorize an inner join's consumer equality");
+    assert_eq!(error.errors().len(), 1, "{error:?}");
+    let diagnostic = &error.errors()[0];
+    assert_eq!(
+        diagnostic.category(),
+        ValidationErrorCategory::StructuralInvariant
+    );
+    assert_eq!(diagnostic.path(), "runtime_filters[400]");
+    assert_eq!(
+        diagnostic.message(),
+        "runtime filter consumer equality witness has no producer for the same join key"
+    );
+}
+
+#[test]
+fn nested_unicast_joins_keep_their_own_blocking_or_late_runtime_filter_contracts() {
+    let make = |activation| {
+        nested_unicast_plan(|inner, outer| {
+            [inner, outer]
+                .into_iter()
+                .map(|join| {
+                    let mut filter = filter(
+                        RuntimeFilterId::new(join.equality),
+                        Box::from([equality(join.equality, join.fragment, join.join)]),
+                        Box::from([producer(
+                            join.equality,
+                            join.equality,
+                            join.fragment,
+                            join.join,
+                            join.build,
+                            Box::from([join.build_edge]),
+                        )]),
+                        Box::from([blocking_consumer(
+                            join.equality,
+                            join.fragment,
+                            join.join,
+                            join.probe,
+                        )]),
+                    );
+                    filter.consumers[0].activation = activation;
+                    filter
+                })
+                .collect()
+        })
+        .expect("each nested join owns one exact producer, consumer, and coverage witness")
+    };
+    let blocking = make(RuntimeFilterConsumerActivation::BlockingSnapshot);
+    let late = make(
+        RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+            late_apply: LateApplyGranularity::Batch,
+        },
+    );
+    assert_eq!(blocking.fragments(), late.fragments());
+    assert_eq!(blocking.edges(), late.edges());
+    assert_eq!(blocking.runtime_filters().len(), 2);
+    for plan in [&blocking, &late] {
+        validate_plan(plan).unwrap();
+        for fragment in plan.fragments().values() {
+            let cuts = fragment_cuts(plan, fragment.id()).unwrap();
+            validate_fragment(fragment, &cuts).unwrap();
+        }
+        for filter in plan.runtime_filters().values() {
+            assert_eq!(filter.producers.len(), 1);
+            assert_eq!(filter.consumers.len(), 1);
+            let producer = &filter.producers[0];
+            let consumer = &filter.consumers[0];
+            assert_eq!(producer.endpoint.fragment, consumer.endpoint.fragment);
+            assert_eq!(producer.endpoint.node, consumer.endpoint.node);
+            assert_eq!(filter.equality_witnesses.len(), 1);
+            let witness = filter.equality_witnesses[0];
+            assert_eq!(witness.fragment, producer.endpoint.fragment);
+            assert_eq!(witness.join, producer.endpoint.node);
+            assert_eq!(
+                producer.target,
+                RuntimeFilterProducerTarget::JoinBuildKey {
+                    equality: witness.id,
+                }
+            );
+            assert_eq!(
+                consumer.target,
+                RuntimeFilterConsumerTarget::JoinProbeKey {
+                    equality: witness.id,
+                }
+            );
+        }
+    }
+    assert!(
+        blocking
+            .runtime_filters()
+            .values()
+            .all(|filter| filter.consumers[0].activation
+                == RuntimeFilterConsumerActivation::BlockingSnapshot)
+    );
+    assert!(
+        late.runtime_filters()
+            .values()
+            .all(|filter| filter.consumers[0].activation
+                == RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+                    late_apply: LateApplyGranularity::Batch,
+                })
+    );
 }
 
 pub(super) struct AcyclicFixture {
@@ -821,4 +973,90 @@ fn local_validation_rejects_an_unattached_runtime_filter() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("differ from fragment attachments"));
+}
+
+#[test]
+fn caller_observed_complete_plan_waits_keep_the_original_three_control_causes() {
+    use novarocks_type_contract::{
+        CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RefuseGraphWork {
+        cause: CompileControlError,
+        calls: AtomicUsize,
+    }
+    impl PureCompileControl for RefuseGraphWork {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert_eq!(phase, CompilePhase::Validate);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if units == 0 {
+                Ok(())
+            } else {
+                Err(self.cause.clone())
+            }
+        }
+    }
+    let fixture = acyclic_cross_fragment_fixture();
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let owner = RefuseGraphWork {
+            cause: cause.clone(),
+            calls: AtomicUsize::new(0),
+        };
+        let mut work = CompileCheckpoints::try_new(&owner, CompilePhase::Validate).unwrap();
+        // Enter the complete-plan core with the caller's existing scope, not
+        // the graph convenience API or the plain validation adapter.
+        let error = crate::validation::validate_plan_with_limits_in(
+            &fixture.plan,
+            PlanLimits::FROZEN,
+            &mut work,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &error,
+            PlanConstructionError::Constants(ConstantReferenceError::Control(original))
+                if original == &cause
+        ));
+        let calls = owner.calls.load(Ordering::Relaxed);
+        let finished = work
+            .finish_result::<(), PlanConstructionError>(Err(error.clone()), |cause| {
+                ConstantReferenceError::from(cause).into()
+            });
+        assert_eq!(finished, Err(error));
+        assert_eq!(owner.calls.load(Ordering::Relaxed), calls);
+        assert!(
+            fixture.plan.runtime_filters().values().all(|filter| filter
+                .consumers
+                .iter()
+                .all(|consumer| consumer.activation
+                    == RuntimeFilterConsumerActivation::BlockingSnapshot))
+        );
+    }
+}
+
+#[test]
+fn observed_complete_plan_validation_retains_acyclic_frozen_blocking_activations() {
+    use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ObserveWork(AtomicUsize);
+    impl PureCompileControl for ObserveWork {
+        fn checkpoint(&self, _phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            self.0.fetch_add(units as usize, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    let fixture = acyclic_cross_fragment_fixture();
+    let owner = ObserveWork(AtomicUsize::new(0));
+    validate_plan_observed(&fixture.plan, &owner).unwrap();
+    assert!(owner.0.load(Ordering::Relaxed) > 1);
+    assert!(fixture.plan.runtime_filters().values().all(|filter| {
+        filter.consumers.iter().all(|consumer| {
+            consumer.activation == RuntimeFilterConsumerActivation::BlockingSnapshot
+        })
+    }));
 }

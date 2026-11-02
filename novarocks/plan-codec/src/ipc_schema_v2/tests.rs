@@ -17,7 +17,7 @@
 
 use super::*;
 use arrow::datatypes::{IntervalUnit, Schema, TimeUnit, UnionFields, UnionMode};
-use arrow::ipc::{convert::fb_to_schema, writer::StreamWriter};
+use arrow::ipc::{convert::try_fb_to_schema, writer::StreamWriter};
 use novarocks_type_contract::{CompileControlError, NR_LOGICAL_TYPE_KEY, arrow_fields_exact};
 use std::{
     collections::HashMap,
@@ -80,7 +80,7 @@ fn decoded_field(metadata: &[u8]) -> Field {
     assert_eq!(message.header_type(), arrow::ipc::MessageHeader::Schema);
     assert_eq!(message.bodyLength(), 0);
     assert!(message.custom_metadata().is_none());
-    let schema = fb_to_schema(message.header_as_schema().unwrap());
+    let schema = try_fb_to_schema(message.header_as_schema().unwrap()).unwrap();
     assert_eq!(schema.fields().len(), 1);
     assert!(schema.metadata().is_empty());
     schema.field(0).clone()

@@ -16,8 +16,8 @@
 // under the License.
 
 use super::{
-    HydrateEvent, HydrateObserver, HydrateOptions, HydratePathStep, HydrateRequirements, child,
-    invalid, reserve,
+    HydrateEvent, HydrateObserver, HydrateOptions, HydratePathStep, HydrateProjection,
+    HydrateRequirements, child, invalid, reserve,
 };
 use crate::{
     ByteLayout, ValueError, ValueFailure, ValueViolation,
@@ -37,6 +37,9 @@ pub(super) struct Node {
     pub source: ArrayRef,
     pub children: Vec<Node>,
     pub layout: Option<ByteLayout>,
+    // Reading and output layout are separate only for an explicit plain-byte
+    // projection. Dictionary parse policy continues to use frozen output L.
+    pub source_layout: Option<ByteLayout>,
     pub convert: bool,
     pub clear_nulls: bool,
     pub rebuild: bool,
@@ -70,9 +73,20 @@ impl Node {
         let layout = ByteLayout::from_data_type(binding.data_type());
         let dictionary = matches!(source.data_type(), DataType::Dictionary(..));
         let keep = dictionary && keep_encoded(&path[..depth], source.data_type());
+        let source_layout =
+            if options.projection == HydrateProjection::ExactByteLayouts && !dictionary {
+                ByteLayout::from_data_type(source.data_type())
+            } else {
+                layout
+            };
+        let byte_projection = options.projection == HydrateProjection::ExactByteLayouts
+            && !dictionary
+            && layout.is_some()
+            && layout != source_layout;
         let required_inactive_nulls = !binding.value_type().nullable() && source.null_count() != 0;
-        let convert =
-            dictionary && !keep || !dictionary && layout.is_some() && required_inactive_nulls;
+        let convert = dictionary && !keep
+            || !dictionary && layout.is_some() && required_inactive_nulls
+            || byte_projection;
         let clear_nulls = !dictionary && layout.is_none() && required_inactive_nulls;
         if convert && layout.is_none() {
             return Err(invalid().into());
@@ -83,6 +97,7 @@ impl Node {
             source: Arc::clone(source),
             children: Vec::new(),
             layout,
+            source_layout,
             convert,
             clear_nulls,
             rebuild: convert || clear_nulls,
@@ -173,7 +188,7 @@ impl Node {
         if self.convert {
             let source = ByteSource::parse(
                 &self.source,
-                self.layout.ok_or_else(invalid)?,
+                self.source_layout.ok_or_else(invalid)?,
                 self.dictionary_layout,
             )?;
             if let Some(length) = source.value_len(row)? {
@@ -273,7 +288,7 @@ impl Node {
         if self.convert && self.layout.is_some_and(ByteLayout::is_view) {
             let source = ByteSource::parse(
                 &self.source,
-                self.layout.ok_or_else(invalid)?,
+                self.source_layout.ok_or_else(invalid)?,
                 self.dictionary_layout,
             )?
             .with_storage(storage);
@@ -435,7 +450,11 @@ impl Node {
     ) -> Result<(), ValueFailure<E>> {
         if self.convert {
             let layout = self.layout.ok_or_else(invalid)?;
-            let source = ByteSource::parse(&self.source, layout, self.dictionary_layout)?;
+            let source = ByteSource::parse(
+                &self.source,
+                self.source_layout.ok_or_else(invalid)?,
+                self.dictionary_layout,
+            )?;
             let mut logical = 0u128;
             let mut copied = 0u128;
             for row in self.active.iter() {

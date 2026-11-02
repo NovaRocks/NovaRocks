@@ -197,8 +197,12 @@ fn nested() -> FunctionValueType {
     FunctionValueType::new(
         DataType::Struct(
             vec![Arc::new(
-                Field::new("original-child", DataType::Utf8, true)
-                    .with_metadata([("unknown".into(), "unchanged".into())].into()),
+                Field::new("original-child", DataType::Utf8, true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "unknown".into(),
+                        "unchanged".into(),
+                    )]),
+                ),
             )]
             .into(),
         ),
@@ -870,7 +874,7 @@ fn topn_owned_signatures_keep_lambda_nominal_metadata_and_original_aliases() {
                 assert_eq!(result_type, &nominal());
                 if let DataType::Struct(fields) = &parameter_types[0].data_type() {
                     assert_eq!(fields[0].name(), "original-child");
-                    assert_eq!(fields[0].metadata().capacity(), 0);
+                    assert!(fields[0].metadata().as_arc().is_none());
                     assert!(fields[0].is_nullable());
                 } else {
                     panic!("original Lambda Struct was lost");

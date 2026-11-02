@@ -480,16 +480,17 @@ mod tests {
     #[test]
     fn opaque_source_annotations_do_not_author_scalar_children() {
         for annotation in ["json", "unknown", " HLL "] {
-            let field = Field::new("item", D::Utf8, true).with_metadata(
-                [
+            let field =
+                Field::new("item", D::Utf8, true).with_metadata(std::collections::HashMap::<
+                    String,
+                    String,
+                >::from([
                     (
                         novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
                         annotation.to_string(),
                     ),
                     ("PARQUET:field_id".to_string(), "17".to_string()),
-                ]
-                .into(),
-            );
+                ]));
             let ty = physical(D::List(Arc::new(field.clone())), true);
             assert_eq!(
                 project(&ty).value_type,
@@ -506,7 +507,7 @@ mod tests {
             let D::List(clean) = ty.data_type() else {
                 unreachable!()
             };
-            assert_eq!(clean.metadata().capacity(), 0);
+            assert!(clean.metadata().as_arc().is_none());
         }
     }
 

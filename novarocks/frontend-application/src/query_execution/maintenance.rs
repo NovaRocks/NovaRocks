@@ -2095,7 +2095,9 @@ mod rewrite_selected_failure_tests {
     fn rewrite_guard_retains_selected_input_but_does_not_infer_one_from_text() {
         let input = novarocks_query_application::session_outcome::cancellation_failure_input(
             QueryCancellationReason::ExplicitKill {
-                requester_connection_id: 17,
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(17)
+                        .expect("nonzero fixture requester"),
             },
         );
         let terminal = rewrite_job::guard_terminal_error(

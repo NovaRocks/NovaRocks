@@ -30,20 +30,32 @@ pub fn running(child: &Child) -> io::Result<bool> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        let (_, fields) = text
-            .rsplit_once(')')
-            .ok_or_else(|| super::error("invalid native process stat"))?;
-        let fields: Vec<_> = fields.split_whitespace().collect();
-        let group: u32 = fields
-            .get(2)
-            .ok_or_else(|| super::error("missing native process group"))?
-            .parse()
-            .map_err(super::error)?;
-        if group == child.id() && !matches!(fields.first(), Some(&"Z" | &"X")) {
+        if linux_stat_in_live_group(&text, child.id())? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+// Linux do_task_stat initializes pgid to -1 and only replaces it while
+// lock_task_sighand succeeds. A concurrently exiting task can retain that
+// signed sentinel; it cannot belong to the original positive, pinned PGID.
+#[cfg(any(target_os = "linux", test))]
+fn linux_stat_in_live_group(text: &str, expected_group: u32) -> io::Result<bool> {
+    let (_, fields) = text
+        .rsplit_once(')')
+        .ok_or_else(|| super::error("invalid native process stat"))?;
+    let fields: Vec<_> = fields.split_whitespace().collect();
+    let group: i32 = fields
+        .get(2)
+        .ok_or_else(|| super::error("missing native process group"))?
+        .parse()
+        .map_err(super::error)?;
+    if group < -1 {
+        return Err(super::error("invalid native process group"));
+    }
+    Ok(i64::from(group) == i64::from(expected_group)
+        && !matches!(fields.first(), Some(&"Z" | &"X")))
 }
 
 #[cfg(target_os = "macos")]
@@ -109,5 +121,46 @@ pub fn running(child: &Child) -> io::Result<bool> {
             }
         }
         return Ok(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::linux_stat_in_live_group;
+
+    // CI maintainers exercise the same raw-stat decoder as the native Linux
+    // monitor. Kernel signed fields are the oracle, independent of local /proc.
+    fn stat(state: &str, group: &str) -> String {
+        format!("4812 (worker with ) name) {state} 47 {group} 47 0 -1 4194304 0 0 0\n")
+    }
+
+    #[test]
+    fn linux_signed_group_sentinels_do_not_match_the_original_group() {
+        for group in ["-1", "0"] {
+            assert!(!linux_stat_in_live_group(&stat("R", group), 4812).unwrap());
+        }
+        assert!(linux_stat_in_live_group(&stat("R", "4812"), 4812).unwrap());
+        assert!(!linux_stat_in_live_group(&stat("S", "4813"), 4812).unwrap());
+    }
+
+    #[test]
+    fn linux_exited_members_do_not_keep_the_original_group_running() {
+        for state in ["Z", "X"] {
+            assert!(!linux_stat_in_live_group(&stat(state, "4812"), 4812).unwrap());
+        }
+        assert!(linux_stat_in_live_group(&stat("S", "4812"), 4812).unwrap());
+    }
+
+    #[test]
+    fn linux_invalid_group_fields_still_fail_observation() {
+        for raw in [
+            stat("R", "not-a-group"),
+            stat("R", "2147483648"),
+            stat("R", "-2"),
+            "4812 (worker) R 47".into(),
+            "4812 worker R 47 4812".into(),
+        ] {
+            assert!(linux_stat_in_live_group(&raw, 4812).is_err(), "{raw}");
+        }
     }
 }

@@ -2007,7 +2007,7 @@ mod tests {
             Field::new("element", DataType::Int32, true).with_metadata(
                 [("PARQUET:field_id".to_string(), "5".to_string())]
                     .into_iter()
-                    .collect(),
+                    .collect::<std::collections::HashMap<String, String>>(),
             ),
         );
         let fields: Fields = vec![

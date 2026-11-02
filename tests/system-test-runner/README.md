@@ -37,6 +37,14 @@ CLI package 为 `novarocks-system-test-cli`，原 package `novarocks-system-test
 
 ## 声明与收束材料
 
+UEA-5F 的六个 `exchange/` 场景在真实 1FE+3BE 上覆盖 gather/broadcast/shuffle 的有序背压、多查询 probe/build 进展、接纳后丢 Unit 应答与准确重放、grant 订阅新 generation、超传输期限的真实 Source 停泊、以及压力下短查询和 KILL QUERY。它们使用原受管 runtime 的私有 Hadoop Iceberg warehouse 和普通 SQL 写入种子数据，不调用共享 fixture 维护或 benchmark producer。
+
+这六场景显式使用 floor1/max2/floating1/window2、单次传输 1000ms、既有 256KiB 共享发送预算及 8KiB batch target（不是新的消息拒绝边界）；没有修改生产默认值。种子保留六个各 4096 行的独立 Parquet 文件，并检查原文件大小的最小 split weight 前提；实际等权放置和单文件 page 边界共同保证 shuffle 流有第二个 Data Unit。`connector/distributed-writer-row-level-small-slots` 单独保留原 row-level 数据、oracle、DOP 和期限，仅使用 floor1/max2/floating0/window1 与原 authenticated writer append hold；原 `connector/distributed-writer-row-level` 继续使用默认配置。发现与影响声明是原 Scenario 集合的事实，注册存在不代表运行通过。
+
+故障走原受认证的 BE→BE H2 actor：预转发 hold 与接纳后丢应答分开记录，场景用真实 statement nomination、BE process roster、stream/sequence/请求摘要精化候选。长等要求同 receiver node、fragment instance、driver 和 block epoch 的实际 `InputEmpty` park/wake；缺失 build Unit 与 probe 输入背压分别观察，不冒称 probe driver 的 dependency 事件。重放必须到原接收作者的 Idempotent 计数；订阅重建必须保留原需求 stream 并取得完整新代 snapshot。
+
+Slot 指标中的 `in_use` 含已授予未送达的位置，不等于 payload 占用。只有原 owner `available=1` 才可用于界限和归零判断；不可观测不是零，也不跨时间拼装容量界。SQL 结果逐行核对独立唯一整数域。QueryOwner 的 deadline/cancel、原 RPC/解码/发送 guard 的退出、SQL actor join、query resource 收敛及角色 shutdown 各自保留，不能互相替代。本轮受影响场景验证不覆盖用户延后的 benchmark、完整默认或兼容集合。
+
 `--list-declarations` 不启动 fixture/cluster，输出 schema 1 的完整注册集合，包括 default、explicit、compatibility、paused/paused_reason，以及原生 `declaration` 中的 `impact.paths`、`env_inputs`（value/file-content）、`initial_state`、`basis`、`heavy`。它是 `dev-verify.sh` 的场景影响来源；shell 不另存场景表。声明初始状态只接受已有隔离、复位或不可变事实，未证明的状态保留 null。暂停项仍拒绝执行；显式/重项不能当作暂停。
 
 每个场景在 cluster shutdown 和 fixture teardown 后另写 schema 1 `scenario-teardown.json`，无论断言通过还是失败；`scenario-evidence.json` schema 5 保持原合同。收束材料分别给出 fixture launch_config、teardown 状态/错误、外部 resources，cluster launch、shutdown、error 和 partial_cleanup。部分 cluster 启动失败会注明由 monitor 补证，不能由一次总退出码推断清理。缺记录或缺必需 monitor/资源终态一律未知。`tools/ci` 调用 owner 在执行前后写 invocation 和范围身份，关联这两份材料；直接 CLI 的本地输出仍需完整材料才能组合。

@@ -45,6 +45,10 @@ pub(crate) enum ExecutionReason {
     SetDuplicateCompletion = 26,
     ReceiverInputAfterFinish = 27,
     JoinGroupUnavailable = 28,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     JoinBuildRowUnavailable = 29,
     JoinPresenceOnly = 30,
     JoinRowIdExtent = 31,
@@ -280,6 +284,10 @@ pub(crate) enum ExecutionReason {
     FinalIdentityInput = 321,
     HashJoinExecutionContract = 322,
     JoinBuildCountExtent = 323,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     JoinBuildKeyRows = 324,
     FilterContributionLength = 325,
     FilterContributionResource = 326,
@@ -299,15 +307,21 @@ pub(crate) enum ExecutionReason {
     TopNCandidateValue = 340,
     TopNBoundLoosened = 341,
     TopNAfterFinish = 342,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     AggregateViewWrapper = 345,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     AggregateViewType = 346,
     RootStorageCarrier = 351,
     RootStorageOwner = 352,
     RootStorageByteBound = 353,
     RootStorageWorkBound = 354,
-    ExchangeQueueOwnerStopped = 355,
-    ExchangeObservationPoisoned = 356,
-    ExchangeObservationRebound = 357,
+    // 355..=357 retired with the old Exchange send queue; never reuse.
     ExchangeStreamContract = 358,
     ExchangePartitionAllocation = 359,
     ExchangePartitionOffset = 360,
@@ -317,6 +331,10 @@ pub(crate) enum ExecutionReason {
     ExchangePartitionRowExtent = 364,
     GroupKeyEncodingContract = 365,
     GroupKeyComponentExtent = 366,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     GroupKeyDictionaryAddress = 367,
     AggregateRequestExtent = 368,
     GroupKeyDecodeContract = 369,
@@ -326,11 +344,35 @@ pub(crate) enum ExecutionReason {
     GroupKeyDecodeArrow = 373,
     GroupKeyDecodeUtf8 = 374,
     GroupKeyOutputExtent = 375,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     CompressedKeyContract = 376,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     AggregateBlockLayout = 377,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     AggregateBlockAlignment = 378,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     KeyColumnContract = 380,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     KeyColumnNarrowing = 381,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     KeyTableContract = 382,
     FilterOrderedTupleArity = 394,
     FilterOrderedTupleType = 395,
@@ -341,9 +383,21 @@ pub(crate) enum ExecutionReason {
     OrderedFilterOffset = 400,
     OrderedFilterUnexpected = 401,
     OrderedFilterArrow = 402,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     JoinHashTableContract = 411,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     JoinRowIndexCapacity = 412,
     JoinMapContract = 413,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     JoinMapExtent = 414,
     JoinSelectionContract = 415,
     JoinGatherContract = 416,
@@ -362,12 +416,32 @@ pub(crate) enum ExecutionReason {
     MissingCompiledSchemaSite = 459,
     NlJoinContract = 460,
     DistinctSetZeroColumns = 465,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     DistinctSetMissingRow = 466,
     DistinctSetGroupSequence = 467,
     DistinctSetGroupBounds = 468,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     DistinctSetGatherAllocation = 469,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     DistinctSetGatherOffsets = 470,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     DistinctSetGatherIo = 471,
+    #[expect(
+        dead_code,
+        reason = "Stable Execution failure reason slot retained after its producer retired; never renumber or reuse."
+    )]
     DistinctSetGatherContract = 472,
     SinkMaterializationContract = 490,
     SinkRootIdentityExtent = 491,
@@ -453,11 +527,37 @@ pub(crate) enum ExecutionReason {
     LogicalChangeCount = 613,
     LogicalSummaryContract = 614,
     FanoutRequiredBranchWithdrawn = 615,
-    // Driver start/retirement scopes already allocate 615..=638.
     SettlementContinuationPanicked = 639,
     CompletionWorkUnresolved = 640,
     TaskExecutionOwnerRetired = 641,
     ReceiverConstructionClosed = 642,
+    UnpivotExtension = 616,
+    UnpivotExtensionAllocation = 617,
+    DriverStartRuntimeMetadata = 646,
+    DriverStartInitialFailurePublication = 647,
+    DriverStartInitialFailureCaptureDrop = 648,
+    DriverStartAttachment = 649,
+    DriverStartActivation = 650,
+    DriverRetirementFinish = 651,
+    DriverRetirementSchedulerForget = 652,
+    DriverRetirementPendingFinish = 653,
+    DriverRetirementDriverDrop = 654,
+    DriverRetirementContextDrop = 655,
+    DriverRetirementLeaseDrop = 656,
+    DriverRetirementCompletion = 657,
+    DriverRetirementSchedulerShutdown = 658,
+    DriverRetirementSchedulerDrop = 659,
+    DriverRetirementCompletionDrop = 660,
+    DriverStartDuplicateSubmission = 661,
+    DriverRetirementRetainedWork = 662,
+    DriverRetirementFailureFinish = 663,
+    DriverRetirementFailureDrop = 664,
+    DriverParking = 665,
+    DriverStartExecutorAdmission = 666,
+    DriverRetirementControlDrop = 667,
+    DriverStartControlDrop = 668,
+    DriverActivationControlDrop = 669,
+    DriverParkingControlDrop = 670,
 }
 impl ExecutionReason {
     pub(crate) const fn code(self) -> NonZeroU16 {

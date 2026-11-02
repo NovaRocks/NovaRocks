@@ -25,7 +25,7 @@ use crate::cancellation::QueryCancellationView;
 use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason};
 use crate::session_control::{
     GovernedQueryStatementOwner, GovernedStatementFinishOutcome,
-    GovernedStatementVisibilitySealOutcome, StatementToken,
+    GovernedStatementVisibilitySealOutcome, StatementCommandCompletion, StatementToken,
 };
 use crate::session_error::QueryServiceError;
 use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
@@ -51,6 +51,16 @@ impl GovernedProtocolOwner {
         self.statement
             .as_ref()
             .map(GovernedQueryStatementOwner::token)
+    }
+
+    pub fn result_window_alias(
+        &self,
+    ) -> Result<novarocks_workload_control::ResultWindowAlias, WorkError> {
+        self.statement
+            .as_ref()
+            .expect("original protocol owner")
+            .result_window_alias()
+            .ok_or(WorkError::Conflict)
     }
 
     /// Match a read-only observer to this original statement's workload owner.
@@ -160,6 +170,10 @@ impl GovernedProtocolOwner {
             .take()
             .expect("protocol result retains its governed owner")
             .protocol_fail()
+    }
+
+    pub fn client_cancel_requested(&mut self) -> GovernedStatementFinishOutcome {
+        self.fail_with_reason(novarocks_workload_control::CancellationReason::ClientCancelRequested)
     }
 
     pub fn client_disconnected(&mut self) -> GovernedStatementFinishOutcome {
@@ -369,12 +383,13 @@ impl GovernedImmediateStatementResult {
     pub fn try_new(
         result: QueryResult,
         statement: GovernedQueryStatementOwner,
+        family: novarocks_result_contract::ClientPresentationFamily,
     ) -> Result<Self, (String, GovernedQueryStatementOwner)> {
         let sealed = (|| {
             let window = statement
                 .result_window_alias()
                 .ok_or("Local result has no admitted producer window")?;
-            let producer = LocalResultProducer::try_new(statement.scope(), window)?;
+            let producer = LocalResultProducer::try_new(statement.scope(), window, family)?;
             producer.produce(|| Ok(result))
         })();
         match sealed {
@@ -395,18 +410,40 @@ impl GovernedImmediateStatementResult {
 /// terminal protocol OK packet.
 #[must_use = "the governed completion must be settled by its protocol owner"]
 pub struct GovernedCompletionStatementResult {
+    completion: StatementCommandCompletion,
     protocol: GovernedProtocolOwner,
+    effects: crate::session_effects::SessionEffects,
 }
 
 impl GovernedCompletionStatementResult {
-    pub fn new(statement: GovernedQueryStatementOwner) -> Self {
+    pub fn new(
+        completion: StatementCommandCompletion,
+        statement: GovernedQueryStatementOwner,
+    ) -> Self {
         Self {
+            completion,
             protocol: GovernedProtocolOwner::new(statement),
+            effects: crate::session_effects::SessionEffects::default(),
         }
     }
+    pub fn with_session_effects(
+        statement: GovernedQueryStatementOwner,
+        effects: crate::session_effects::SessionEffects,
+    ) -> Self {
+        Self {
+            // Session mutations are control statements with no affected rows.
+            // DML completion carries its own explicit logical row count.
+            completion: StatementCommandCompletion::new(0),
+            protocol: GovernedProtocolOwner::new(statement),
+            effects,
+        }
+    }
+    pub(crate) fn take_session_effects(&mut self) -> crate::session_effects::SessionEffects {
+        std::mem::take(&mut self.effects)
+    }
 
-    pub fn into_protocol(self) -> GovernedProtocolOwner {
-        self.protocol
+    pub fn into_parts(self) -> (StatementCommandCompletion, GovernedProtocolOwner) {
+        (self.completion, self.protocol)
     }
 }
 
@@ -593,6 +630,12 @@ impl StreamingStatementResult {
         }
     }
 
+    pub fn result_window_alias(
+        &self,
+    ) -> Result<novarocks_workload_control::ResultWindowAlias, WorkError> {
+        self.protocol.result_window_alias()
+    }
+
     pub fn complete(mut self) -> GovernedStatementFinishOutcome {
         self.settled = true;
         self.protocol.complete()
@@ -610,10 +653,19 @@ impl StreamingStatementResult {
         self.protocol.settle_cancellation()
     }
 
-    pub fn client_disconnected(mut self) -> GovernedStatementFinishOutcome {
+    pub fn client_cancel_requested(mut self) -> GovernedStatementFinishOutcome {
+        // Publish the specific client cause before the generic execution interrupt.
+        let outcome = self.protocol.client_cancel_requested();
         let _ = self.execution.request_cancel();
         self.settled = true;
-        self.protocol.client_disconnected()
+        outcome
+    }
+
+    pub fn client_disconnected(mut self) -> GovernedStatementFinishOutcome {
+        let outcome = self.protocol.client_disconnected();
+        let _ = self.execution.request_cancel();
+        self.settled = true;
+        outcome
     }
 }
 
@@ -635,6 +687,78 @@ mod execution_handoff_tests {
         CancellationReason, ResourceConfig, WorkloadConfig, WorkloadControl,
     };
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn explicit_client_cancel_preserves_sealed_success_and_specific_unsealed_cause() {
+        for sealed in [false, true] {
+            let application = Arc::new(QueryApplicationControl::default());
+            let service = QueryControlService::new(application);
+            let session = service
+                .register_session(SessionIdentity::client_statement(
+                    service.mint_client_query_id(),
+                    "root",
+                ))
+                .unwrap();
+            let workload = WorkloadControl::try_new(
+                WorkloadConfig::default(),
+                ResourceConfig {
+                    total_bytes: 1024,
+                    control_bytes: 128,
+                    per_scope_bytes: 896,
+                },
+            )
+            .unwrap();
+            workload.mark_ready().unwrap();
+            let mut statement = service
+                .begin_queued_governed_query_statement(
+                    session.token(),
+                    &workload.root_admission(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let owner = statement.take_execution_owner().unwrap();
+            let scope = statement.scope().clone();
+            // Keep the original read-only facts before settlement releases Work.
+            let cancellation = scope.cancellation().unwrap();
+            owner.complete();
+            let mut protocol = GovernedProtocolOwner::new(statement);
+            if sealed {
+                assert_eq!(
+                    protocol.seal_success_visibility(),
+                    GovernedStatementVisibilitySealOutcome::Sealed
+                );
+            }
+            let outcome = protocol.client_cancel_requested();
+            assert_eq!(
+                outcome,
+                if sealed {
+                    GovernedStatementFinishOutcome::ProtocolFailed
+                } else {
+                    GovernedStatementFinishOutcome::Cancelled(
+                        CancellationReason::ClientCancelRequested,
+                    )
+                }
+            );
+            assert_eq!(
+                cancellation.reason(),
+                if sealed {
+                    None
+                } else {
+                    Some(CancellationReason::ClientCancelRequested)
+                }
+            );
+            drop(cancellation);
+            while let Some(permit) = workload.next_control() {
+                permit.acknowledge();
+            }
+            scope.wait_released().await;
+            assert_eq!(workload.snapshot().admitted_queries, 0);
+            assert_eq!(workload.snapshot().root_responsibilities, 0);
+        }
+    }
 
     #[tokio::test]
     async fn real_output_handoff_guards_preserve_cancel_and_original_work_exit() {

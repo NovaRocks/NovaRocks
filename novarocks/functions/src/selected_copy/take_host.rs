@@ -157,6 +157,18 @@ impl CopyOperationFacts {
         self.copied_root == Some(Arc::as_ptr(original) as *const () as usize)
     }
 }
+fn original_unreserved_vec_upper<T>(count: usize) -> Result<usize, CopyError> {
+    novarocks_type_contract::owned_resources::vec::original_fresh_push_requests::<
+        T,
+        novarocks_type_contract::ControlResourceError,
+    >(count, &mut || Ok(()))
+    .map_err(|cause| CopyError::Control(KernelFailure::from_domain(cause)))
+}
+
+fn original_filter_null_words_bytes(selected_count: usize) -> Result<usize, CopyError> {
+    mul(add(selected_count / 64, 1)?, size_of::<u64>())
+}
+
 #[derive(Default)]
 pub(super) struct CopyInvoiceTotals {
     initial_buffers: usize,
@@ -284,6 +296,66 @@ impl CopyInvoiceTotals {
         // no append/realloc path. This is a locked upper bound, not Layout.
         self.exact(zip::rounded_capacity(width)?)
     }
+    pub(super) fn original_comparator_scratch(&mut self, bytes: usize) -> Result<(), CopyError> {
+        self.metadata = add(self.metadata, bytes)?;
+        Ok(())
+    }
+    pub(super) fn original_nullable_union_scratch(
+        &mut self,
+        fields: usize,
+        rows: usize,
+        mode: CopyMode,
+        union_mode: UnionMode,
+    ) -> Result<(), CopyError> {
+        // take_union_type_ids keeps take_native's bytes while collecting the
+        // replacement type ids. Only the replacement survives in the result.
+        self.temporary_exact(rows)?;
+        if union_mode == UnionMode::Sparse {
+            let index_width = match mode {
+                CopyMode::Take { index_maximum, .. } if index_maximum > u32::MAX as usize => 8,
+                _ => 4,
+            };
+            // Each non-selected child independently builds non-null dummy
+            // indices. ArrayIter has an exact hint but is not TrustedLen, so
+            // use the original fresh Vec author, including minimum capacity.
+            // The empty child skips this request.
+            let dummy = if index_width == 8 {
+                original_unreserved_vec_upper::<u64>(rows)?
+            } else {
+                original_unreserved_vec_upper::<u32>(rows)?
+            };
+            self.temporary_exact(mul(fields.saturating_sub(1), dummy)?)?;
+        } else {
+            for _ in 0..fields {
+                // Dense offsets retain indices.nulls. A mixed per-child mask
+                // calls filter_bits_compress: Vec<u64>(count /64 +1), not a
+                // MutableBuffer round64 bitmap. count <= this selected length.
+                self.temporary_exact(original_filter_null_words_bytes(rows)?)?;
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn original_union_padding_scratch(&mut self, nulls: usize) -> Result<(), CopyError> {
+        self.temporary_exact(nulls)
+    }
+    pub(super) fn original_null_scratch_metadata(
+        &mut self,
+        metadata: usize,
+    ) -> Result<(), CopyError> {
+        // new_null_array -> to_data -> build -> make_array temporarily keeps
+        // the original packet/wrapper beside the replacement packet/wrapper.
+        // Reuse the same source-derived node envelope for those operations.
+        self.metadata = add(self.metadata, mul(metadata, 3)?)?;
+        if self.classify_structure {
+            self.result_metadata = add(self.result_metadata, metadata)?;
+        }
+        Ok(())
+    }
+    pub(super) fn original_union_validation_scratch(&mut self) -> Result<(), CopyError> {
+        // ArrayDataBuilder::build validates this Union root; validate_values
+        // authors one Vec<Option<usize>> indexed by the permitted type-id set.
+        self.temporary_exact(mul(128, size_of::<Option<usize>>())?)
+    }
     pub(super) fn selected_payload(
         &mut self,
         bytes: usize,
@@ -383,9 +455,18 @@ impl CopyInvoiceTotals {
                     .primitive_width()
                     .ok_or(CopyError::Invalid("copy frozen primitive width is absent"))?;
                 if mode.is_take() {
-                    // RunEndBuffer owns ordered_indices AND physical_indices
-                    // simultaneously. Unstable index sort allocates no heap.
+                    // physical_indices_for_take retains Vec<Option<usize>>.
+                    // With nullable indices it first collects valid logical
+                    // integers (input width <=8) and maps only those. The
+                    // RunEndBuffer mapping owns ordered+physical usize tables.
+                    // Non-null input also converts its mapped Vec to Option.
+                    self.temporary_exact(original_unreserved_vec_upper::<Option<usize>>(rows)?)?;
+                    let valid_logical = original_unreserved_vec_upper::<u64>(rows)?;
+                    self.temporary_exact(valid_logical)?;
                     self.temporary_exact(mul(2, mul(rows, size_of::<usize>())?)?)?;
+                    // take_run's new per-run validity builder has at most one
+                    // bit per logical occurrence, independently of value merge.
+                    self.required(bitmap)?;
                     // Both original builders start at one and double; final
                     // emitted runs cannot exceed actual selected logical rows.
                     self.initial(width)?;
@@ -698,7 +779,16 @@ pub fn take_copy_in<C: Send + Sync + 'static>(
     drop(metadata_scope);
     let mut facts = invoice.finish(source_metadata)?;
     work.flush()?;
-    let diagnostic = super::copy_diagnostic::OriginalTakeDiagnosticFacts::try_new()?;
+    let diagnostic = super::copy_diagnostic::OriginalTakeDiagnosticFacts::try_new_observed(
+        sources.source.data_type(),
+        &mut |boundary| {
+            if boundary {
+                work.flush().map_err(CopyError::Control)
+            } else {
+                work.step().map_err(CopyError::Control)
+            }
+        },
+    )?;
     facts.admit_original_take_diagnostic(&diagnostic)?;
     let mut reservation = charge.reserve_operation(facts.operation_peak_bytes())?;
     work.flush()?;

@@ -1301,221 +1301,69 @@ fn materialize_runtime_filter(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum RuntimeFilterWaitNode {
-    Physical(FragmentId, NodeId),
-    Filter(RuntimeFilterId),
+fn wait_graph_error(error: super::wait_graph::WaitGraphError) -> ContractLoweringError {
+    match error {
+        super::wait_graph::WaitGraphError::Control(cause) => ContractLoweringError::Control(cause),
+        other => ContractLoweringError::InvalidWaitGraph {
+            detail: other.to_string(),
+        },
+    }
 }
 
+#[cfg(test)]
 fn resolve_runtime_filter_activations(
     filters: &mut [RuntimeFilter],
     fragments: &BTreeMap<FragmentId, Fragment>,
     edges: &BTreeMap<EdgeId, Edge>,
-) {
-    let mut dependencies =
-        BTreeMap::<RuntimeFilterWaitNode, BTreeSet<RuntimeFilterWaitNode>>::new();
-    for fragment in fragments.values() {
-        for node in fragment.nodes().values() {
-            let current = RuntimeFilterWaitNode::Physical(fragment.id(), node.id);
-            let current_dependencies = dependencies.entry(current).or_default();
-            current_dependencies.extend(
-                node.inputs
-                    .iter()
-                    .map(|input| RuntimeFilterWaitNode::Physical(fragment.id(), *input)),
-            );
-            if let NodeKind::ExchangeSource { edge, .. } = node.kind
-                && let Some(edge) = edges.get(&edge)
-                && let Some(source) = fragments.get(&edge.source.fragment)
-            {
-                current_dependencies
-                    .insert(RuntimeFilterWaitNode::Physical(source.id(), source.root()));
-            }
-        }
-    }
-    for filter in filters.iter() {
-        let filter_node = RuntimeFilterWaitNode::Filter(filter.id);
-        dependencies.entry(filter_node).or_default();
-        for producer in &filter.producers {
-            let Some(fragment) = fragments.get(&producer.endpoint.fragment) else {
-                continue;
-            };
-            let Some(node) = fragment.nodes().get(&producer.endpoint.node) else {
-                continue;
-            };
-            let producer_root = match (&producer.target, &node.kind) {
-                (
-                    RuntimeFilterProducerTarget::JoinBuildKey { .. },
-                    NodeKind::HashJoin { build_side, .. },
-                ) => usize::try_from(build_side.input_ordinal())
-                    .ok()
-                    .and_then(|ordinal| node.inputs.get(ordinal))
-                    .copied(),
-                (
-                    RuntimeFilterProducerTarget::AggregateTopNKey { .. },
-                    NodeKind::Aggregate { .. },
-                ) => node.inputs.first().copied(),
-                _ => None,
-            };
-            if let Some(producer_root) = producer_root {
-                dependencies.entry(filter_node).or_default().insert(
-                    RuntimeFilterWaitNode::Physical(fragment.id(), producer_root),
-                );
-            }
-        }
-        for consumer in &filter.consumers {
-            if consumer.activation == RuntimeFilterConsumerActivation::BlockingSnapshot {
-                dependencies
-                    .entry(RuntimeFilterWaitNode::Physical(
-                        consumer.endpoint.fragment,
-                        consumer.endpoint.node,
-                    ))
-                    .or_default()
-                    .insert(filter_node);
-            }
-        }
-    }
-    let downstream = edges.values().fold(
-        BTreeMap::<FragmentId, BTreeSet<FragmentId>>::new(),
-        |mut index, edge| {
-            index
-                .entry(edge.source.fragment)
-                .or_default()
-                .insert(edge.destination.fragment);
-            index
-        },
-    );
-    let mut multicast_waits = BTreeSet::new();
-    for source in fragments.values() {
-        let FragmentSink::Multicast { edges: branches } = source.sink() else {
-            continue;
-        };
-        if branches.len() < 2 {
-            continue;
-        }
-        let mut reachable = BTreeSet::new();
-        let mut pending = branches
-            .iter()
-            .filter_map(|edge| edges.get(edge).map(|edge| edge.destination.fragment))
-            .collect::<Vec<_>>();
-        while let Some(fragment) = pending.pop() {
-            if !reachable.insert(fragment) {
-                continue;
-            }
-            pending.extend(downstream.get(&fragment).into_iter().flatten().copied());
-        }
-        for consumer in filters
-            .iter()
-            .flat_map(|filter| &filter.consumers)
-            .filter(|consumer| {
-                consumer.activation == RuntimeFilterConsumerActivation::BlockingSnapshot
-                    && reachable.contains(&consumer.endpoint.fragment)
-            })
-        {
-            let source_node = RuntimeFilterWaitNode::Physical(source.id(), source.root());
-            let consumer_node =
-                RuntimeFilterWaitNode::Physical(consumer.endpoint.fragment, consumer.endpoint.node);
-            dependencies
-                .entry(source_node)
-                .or_default()
-                .insert(consumer_node);
-            multicast_waits.insert((source_node, consumer_node));
-        }
-    }
+) -> Result<(), ContractLoweringError> {
+    let control = crate::compiler::SqlCompileControl::unbounded();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate)?;
+    let result = resolve_runtime_filter_activations_observed(filters, fragments, edges, &mut work);
+    work.finish_result(result, ContractLoweringError::Control)
+}
 
-    let mut reverse = BTreeMap::<RuntimeFilterWaitNode, BTreeSet<RuntimeFilterWaitNode>>::new();
-    for (node, node_dependencies) in &dependencies {
-        reverse.entry(*node).or_default();
-        for dependency in node_dependencies {
-            reverse.entry(*dependency).or_default().insert(*node);
-        }
-    }
-    let nodes = reverse.keys().copied().collect::<Vec<_>>();
-    let mut visited = BTreeSet::new();
-    let mut finish_order = Vec::with_capacity(nodes.len());
-    for start in nodes {
-        if visited.contains(&start) {
-            continue;
-        }
-        let mut stack = vec![(start, false)];
-        while let Some((node, exiting)) = stack.pop() {
-            if exiting {
-                finish_order.push(node);
-                continue;
-            }
-            if !visited.insert(node) {
-                continue;
-            }
-            stack.push((node, true));
-            if let Some(next) = dependencies.get(&node) {
-                stack.extend(next.iter().rev().map(|dependency| (*dependency, false)));
-            }
-        }
-    }
-    let mut component_by_node = BTreeMap::new();
-    let mut next_component = 0_u32;
-    while let Some(start) = finish_order.pop() {
-        if component_by_node.contains_key(&start) {
-            continue;
-        }
-        let mut stack = vec![start];
-        while let Some(node) = stack.pop() {
-            if component_by_node.contains_key(&node) {
-                continue;
-            }
-            component_by_node.insert(node, next_component);
-            if let Some(next) = reverse.get(&node) {
-                stack.extend(next.iter().rev().copied());
-            }
-        }
-        next_component = next_component.saturating_add(1);
-    }
-
-    for filter in filters {
-        let filter_component = component_by_node
-            .get(&RuntimeFilterWaitNode::Filter(filter.id))
-            .copied();
-        for consumer in &mut filter.consumers {
-            if consumer.activation != RuntimeFilterConsumerActivation::BlockingSnapshot {
-                continue;
-            }
-            let consumer_component = component_by_node
-                .get(&RuntimeFilterWaitNode::Physical(
-                    consumer.endpoint.fragment,
-                    consumer.endpoint.node,
+/// Resolve optional filter waits and mandatory input order in one graph before
+/// a completed plan can escape. A required data cycle needs decoupled retained
+/// output; treating it as a slow source would deadlock bounded receivers.
+fn resolve_runtime_filter_activations_observed(
+    filters: &mut [RuntimeFilter],
+    fragments: &BTreeMap<FragmentId, Fragment>,
+    edges: &BTreeMap<EdgeId, Edge>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ContractLoweringError> {
+    let mut graph =
+        super::wait_graph::WaitGraph::build_observed(fragments, edges, filters.iter(), work)
+            .map_err(wait_graph_error)?;
+    let resolution = graph.resolve_observed(work).map_err(wait_graph_error)?;
+    if !resolution.is_acyclic() {
+        let witness = resolution
+            .data_cycles
+            .first()
+            .expect("a cyclic resolution retains its witness");
+        return Err(ContractLoweringError::UnsupportedWaitCycle(
+            crate::compiler::StructuralWaitCycle::new(
+                novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+                    "structural wait cycle requires decoupled retained output (B4): {witness:?}"
                 ))
-                .copied();
-            let consumer_node =
-                RuntimeFilterWaitNode::Physical(consumer.endpoint.fragment, consumer.endpoint.node);
-            // A multicast may itself wait on a blocked downstream consumer,
-            // even when that consumer's own filter has an independent build.
-            // Break that physical cycle as well as filter-containing cycles.
-            let multicast_cycle = consumer_component.is_some()
-                && multicast_waits.iter().any(|(source, target)| {
-                    *target == consumer_node
-                        && component_by_node.get(source).copied() == consumer_component
-                });
-            if (filter_component.is_some() && filter_component == consumer_component)
-                || multicast_cycle
-            {
-                if matches!(
-                    consumer.target,
-                    RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
-                ) {
-                    continue;
-                }
-                // A membership filter is applied a batch at a time, by every
-                // operator that applies one: a scan reading through it, an
-                // exchange source standing where that scan's rows arrive, and
-                // a join probe all see rows in batches. Finer granularities
-                // belong to the ordered filters, which narrow what is read
-                // rather than which rows survive.
-                consumer.activation =
-                    RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
-                        late_apply: novarocks_physical_plan::LateApplyGranularity::Batch,
-                    };
-            }
-        }
+                .into_string(),
+            ),
+        ));
     }
+    let mut filter_indices = BTreeMap::new();
+    for (ordinal, filter) in filters.iter().enumerate() {
+        work.step()?;
+        filter_indices.insert(filter.id, ordinal);
+    }
+    for consumer in &resolution.filter_downgrades {
+        work.step()?;
+        let filter = &mut filters[filter_indices[&consumer.filter]];
+        filter.consumers[consumer.ordinal].activation =
+            RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+                late_apply: novarocks_physical_plan::LateApplyGranularity::Batch,
+            };
+    }
+    work.flush()?;
+    Ok(())
 }
 
 impl<'a> ContractLoweringVisitor<'a> {
@@ -2283,7 +2131,12 @@ impl<'a> ContractLoweringVisitor<'a> {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        resolve_runtime_filter_activations(&mut filters, fragments, &self.edges);
+        resolve_runtime_filter_activations_observed(
+            &mut filters,
+            fragments,
+            &self.edges,
+            &mut self.work,
+        )?;
         Ok(filters)
     }
 
@@ -6632,6 +6485,19 @@ impl<'a> ContractLoweringVisitor<'a> {
             output.push(value);
         }
 
+        // Only newly authored syntax literals share these column-local runs.
+        // Expressions are still registered in the original row-major order;
+        // admitted constants and nonliteral cells keep their original authors.
+        let mut literal_runs = Vec::new();
+        self.work.flush()?;
+        literal_runs
+            .try_reserve_exact(plan.output_columns.len())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        for _ in &plan.output_columns {
+            self.work.step()?;
+            literal_runs.push(None);
+        }
+        self.work.flush()?;
         let mut rows = Vec::with_capacity(values.rows.len());
         for (row_ordinal, row) in values.rows.iter().enumerate() {
             if row.len() != plan.output_columns.len() {
@@ -6644,13 +6510,42 @@ impl<'a> ContractLoweringVisitor<'a> {
             let mut lowered_row = Vec::with_capacity(row.len());
             for (column_ordinal, expression) in row.iter().enumerate() {
                 let expected = value_type(&plan.output_columns[column_ordinal]);
-                lowered_row.push(self.lower_values_expression(
-                    node,
-                    expression,
-                    &expected,
-                    row_ordinal,
-                    column_ordinal,
-                )?);
+                let literal_type =
+                    self.values_literal_type(expression, &expected, row_ordinal, column_ordinal)?;
+                let lowered = match literal_type {
+                    Some(ty) if crate::constant::syntax_run_carrier(ty.data_type()) => {
+                        let cached = &mut literal_runs[column_ordinal];
+                        let reused = cached.as_ref().is_some_and(
+                            |(start, pool): &(usize, novarocks_constant_contract::ConstantPool)| {
+                                row_ordinal >= *start && row_ordinal - *start < pool.array().len()
+                            },
+                        );
+                        if !reused {
+                            let pool = self.author_values_literal_run(
+                                values,
+                                row_ordinal,
+                                column_ordinal,
+                                &ty,
+                            )?;
+                            *cached = Some((row_ordinal, pool));
+                        }
+                        let (start, pool) =
+                            cached.as_ref().expect("original literal run was installed");
+                        let ordinal = checked_ordinal("Values literal run", row_ordinal - *start)?;
+                        let value = pool.value(ordinal)?;
+                        self.lower_constant_expression(node, &value, ty)?
+                    }
+                    Some(ty) => {
+                        let ExprKind::Literal(literal) = &expression.kind else {
+                            unreachable!(
+                                "the original position contract selected a syntax literal"
+                            );
+                        };
+                        self.author_literal_expression(node, literal, ty)?
+                    }
+                    None => self.lower_values_expression(node, expression, &expected)?,
+                };
+                lowered_row.push(lowered);
             }
             rows.push(lowered_row.into_boxed_slice());
         }
@@ -8977,14 +8872,15 @@ impl<'a> ContractLoweringVisitor<'a> {
         )
     }
 
-    fn lower_values_expression(
-        &mut self,
-        owner: NodeId,
+    /// Retain the existing per-position assignment contract before deciding
+    /// whether this exact syntax occurrence can enter a first-created run.
+    fn values_literal_type(
+        &self,
         expression: &TypedExpr,
         target: &ValueType,
         row_ordinal: usize,
         column_ordinal: usize,
-    ) -> Result<ExprId, ContractLoweringError> {
+    ) -> Result<Option<ValueType>, ContractLoweringError> {
         let source = expression_type(expression);
         if source.nullable() && !target.nullable()
             || novarocks_types::wider_type(source.data_type(), target.data_type())
@@ -8997,20 +8893,72 @@ impl<'a> ContractLoweringVisitor<'a> {
             });
         }
 
-        // A literal carries this already-analyzed position's nullability directly.
-        // It still enters the same controlled constant author and source journal.
-        if source.same_physical_binding_ignoring_root_nullability_observed(target, || {
-            self.control
-                .checkpoint(CompilePhase::LowerProgram, 1)
-                .map_err(ContractLoweringError::from)
-        })? && let ExprKind::Literal(literal) = &expression.kind
+        if matches!(expression.kind, ExprKind::Literal(_))
+            && source.same_physical_binding_ignoring_root_nullability_observed(target, || {
+                self.control
+                    .checkpoint(CompilePhase::LowerProgram, 1)
+                    .map_err(ContractLoweringError::from)
+            })?
         {
-            let mut carrier = target.clone();
-            carrier = carrier
-                .with_nullable(carrier.nullable() || (source.nullable()))
-                .expect("validated root NULL contract");
-            return self.author_literal_expression(owner, literal, carrier);
+            return Ok(Some(target.clone()));
         }
+        Ok(None)
+    }
+
+    fn author_values_literal_run(
+        &mut self,
+        values: &crate::planner::payload::PlanValuesNode,
+        row: usize,
+        column: usize,
+        ty: &ValueType,
+    ) -> Result<novarocks_constant_contract::ConstantPool, ContractLoweringError> {
+        let maximum = usize::try_from(self.constant_policy.max_rows)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let count = values.rows.len().saturating_sub(row).min(maximum);
+        let mut literals = Vec::new();
+        self.work.flush()?;
+        literals
+            .try_reserve_exact(count)
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        self.work.flush()?;
+        for next in values.rows.iter().skip(row).take(count) {
+            self.work.step()?;
+            let Some(expression) = next.get(column) else {
+                break;
+            };
+            let ExprKind::Literal(literal) = &expression.kind else {
+                break;
+            };
+            let source = expression_type(expression);
+            if source.nullable() && !ty.nullable()
+                || !source.same_physical_binding_ignoring_root_nullability_observed(ty, || {
+                    self.control
+                        .checkpoint(CompilePhase::LowerProgram, 1)
+                        .map_err(ContractLoweringError::from)
+                })?
+            {
+                break;
+            }
+            literals.push(literal);
+        }
+        self.work.flush()?;
+        let (pool, _) = crate::constant::admit_syntax_constant_run(
+            &literals,
+            ty,
+            self.constant_policy,
+            self.control,
+        )?;
+        self.work.flush()?;
+        Ok(pool)
+    }
+
+    fn lower_values_expression(
+        &mut self,
+        owner: NodeId,
+        expression: &TypedExpr,
+        target: &ValueType,
+    ) -> Result<ExprId, ContractLoweringError> {
         // A cell keeps its analyzed type until here, so a NULL cell is typed
         // by its column as it is lowered rather than converted afterwards.
         let lowered = self.lower_expression_as(
@@ -12900,6 +12848,10 @@ pub(crate) enum ContractLoweringError {
         id: i32,
         detail: String,
     },
+    InvalidWaitGraph {
+        detail: String,
+    },
+    UnsupportedWaitCycle(crate::compiler::StructuralWaitCycle),
     UnsupportedSortMode {
         detail: &'static str,
     },
@@ -13065,6 +13017,10 @@ impl fmt::Display for ContractLoweringError {
             Self::InvalidRuntimeFilter { id, detail } => {
                 write!(formatter, "runtime filter {id} is invalid: {detail}")
             }
+            Self::InvalidWaitGraph { detail } => {
+                write!(formatter, "invalid physical wait graph: {detail}")
+            }
+            Self::UnsupportedWaitCycle(cause) => cause.fmt(formatter),
             Self::UnsupportedSortMode { detail } => {
                 write!(formatter, "unsupported final Sort mode: {detail}")
             }
@@ -13160,6 +13116,7 @@ impl std::error::Error for ContractLoweringError {
         match self {
             Self::ComparisonCoercion(cause) => Some(cause),
             Self::ConstantSource(cause) => Some(cause),
+            Self::UnsupportedWaitCycle(cause) => Some(cause),
             _ => None,
         }
     }
@@ -13290,6 +13247,9 @@ impl From<ContractLoweringError> for crate::compiler::SqlCompileError {
                 Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(cause))
             }
             ContractLoweringError::ConstantSource(cause) => Self::from(cause),
+            ContractLoweringError::UnsupportedWaitCycle(cause) => {
+                Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(cause))
+            }
             error => Self::Compilation(error.to_string()),
         }
     }
@@ -13902,10 +13862,16 @@ mod tests {
             CompileControlError::Cancelled
         );
         let observed = control.observations.lock().unwrap();
-        assert!(matches!(
-            observed.last(),
-            Some((CompilePhase::LowerProgram, 1))
-        ));
+        // The first short pending-work flush must refuse before a draft is
+        // published. Its phase and exact unit count follow the actual author.
+        let (_, pending) = observed.last().expect("pending work must be observed");
+        assert!((1..256).contains(pending), "observations: {observed:?}");
+        assert!(
+            observed[..observed.len() - 1]
+                .iter()
+                .all(|(_, units)| *units == 0),
+            "the first positive observation must be the final callback: {observed:?}"
+        );
     }
 
     #[test]
@@ -14829,6 +14795,17 @@ mod tests {
             .clone();
 
             assert_eq!(plan.fragments().len(), 4);
+            let control = crate::compiler::SqlCompileControl::unbounded();
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+            let mut graph = super::super::wait_graph::WaitGraph::build_observed(
+                plan.fragments(),
+                plan.edges(),
+                &[],
+                &mut work,
+            )
+            .unwrap();
+            assert!(graph.resolve_observed(&mut work).unwrap().is_acyclic());
+            work.finish().unwrap();
             let (router_fragment, summary) = plan
                 .fragments()
                 .values()
@@ -17334,7 +17311,7 @@ mod tests {
             },
         }];
 
-        resolve_runtime_filter_activations(&mut filters, plan.fragments(), plan.edges());
+        resolve_runtime_filter_activations(&mut filters, plan.fragments(), plan.edges()).unwrap();
 
         assert_eq!(
             filters[0].consumers[0].activation,
@@ -17513,6 +17490,48 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn right_outer_left_build_keeps_source_output_and_null_extends_empty_target() {
+        let target = column(1, "target_key", DataType::Int64, false);
+        let source = column(2, "source_key", DataType::Int64, false);
+        let nullable_target = column(1, "target_key", DataType::Int64, true);
+        let joined = hash_join(
+            crate::common::JoinKind::RightOuter,
+            PhysicalHashJoinBuildSide::Left,
+            SqlJoinDistribution::Singleton,
+            Some(JoinExecutionMode::Singleton),
+            values(vec![target], Vec::new()),
+            values(
+                vec![source.clone()],
+                vec![vec![literal_int(7)], vec![literal_int(7)]],
+            ),
+            vec![nullable_target, source],
+        );
+        let plan = finish_for_test(&joined).unwrap();
+        let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        let root = fragment.nodes().get(&fragment.root()).unwrap();
+        let NodeKind::HashJoin {
+            kind,
+            build_side,
+            null_extended,
+            ..
+        } = &root.kind
+        else {
+            panic!("expected hash join")
+        };
+        assert_eq!(*kind, ContractJoinKind::RightOuter);
+        assert_eq!(*build_side, ContractJoinSide::Left);
+        assert_eq!(null_extended.len(), 1);
+        assert_eq!(root.output.columns.len(), 2);
+        assert_eq!(root.output.columns[0], null_extended[0]);
+        assert!(fragment.values()[&root.output.columns[0]].ty.nullable());
+        assert!(!fragment.values()[&root.output.columns[1]].ty.nullable());
+        assert!(
+            matches!(fragment.values()[&null_extended[0]].origin, ValueOrigin::NullExtended { node, .. } if node == root.id)
+        );
+        assert!(plan.runtime_filters().is_empty());
     }
 
     #[test]
@@ -18728,6 +18747,56 @@ mod tests {
     }
 
     #[test]
+    fn cte_self_join_rejects_the_data_wait_cycle_before_publication() {
+        for build_side in [
+            PhysicalHashJoinBuildSide::Left,
+            PhysicalHashJoinBuildSide::Right,
+        ] {
+            let cte_id = 80;
+            let shared = column(1, "shared", DataType::Int64, false);
+            let produce = cte_produce(
+                cte_id,
+                vec![shared.clone()],
+                values(vec![shared.clone()], vec![vec![literal_int(9)]]),
+            );
+            let left = column(10, "left_alias", DataType::Int64, false);
+            let right = column(20, "right_alias", DataType::Int64, false);
+            let branch = |column: &OutputColumn, alias| {
+                redistribute(
+                    cte_consume(cte_id, alias, vec![column.clone()], vec![shared.column_id]),
+                    RedistributeMode::Gather,
+                )
+            };
+            let join = hash_join(
+                crate::common::JoinKind::Inner,
+                build_side,
+                SqlJoinDistribution::Singleton,
+                Some(JoinExecutionMode::Singleton),
+                branch(&left, "left_cte"),
+                branch(&right, "right_cte"),
+                vec![left.clone(), right.clone()],
+            );
+            let error = finish_for_test(&cte_anchor(cte_id, produce, join)).unwrap_err();
+            let ContractLoweringError::UnsupportedWaitCycle(cause) = &error else {
+                panic!("shared producer must be rejected for its data wait cycle: {error}");
+            };
+            assert!(cause.to_string().contains("decoupled retained output (B4)"));
+            let expected = cause.clone();
+            let crate::compiler::SqlCompileError::CompilationSource(source) = error.into() else {
+                panic!("the planning capability must retain its original source");
+            };
+            assert_eq!(
+                source.downcast_ref::<crate::compiler::StructuralWaitCycle>(),
+                Some(&expected)
+            );
+            assert_eq!(
+                novarocks_failure_contract::FailureProjection::failure_fact(&source).reason(),
+                novarocks_failure_contract::sql_reason::STRUCTURAL_WAIT_CYCLE
+            );
+        }
+    }
+
+    #[test]
     fn cte_multicast_has_one_exact_edge_per_consumer() {
         let cte_id = 8;
         let producer_column = column(1, "producer", DataType::Int64, false);
@@ -18787,7 +18856,7 @@ mod tests {
     }
 
     #[test]
-    fn multicast_physical_wait_cycle_late_applies_only_its_blocked_consumers() {
+    fn multicast_with_independent_builds_keeps_blocking_runtime_filters() {
         let cte_id = 81;
         let producer_column = column(1, "shared_key", DataType::Int64, false);
         let produce = cte_produce(
@@ -18862,9 +18931,7 @@ mod tests {
             assert_eq!(filter.consumers.len(), 1);
             assert_eq!(
                 filter.consumers[0].activation,
-                RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
-                    late_apply: novarocks_physical_plan::LateApplyGranularity::Batch,
-                }
+                RuntimeFilterConsumerActivation::BlockingSnapshot
             );
         }
         assert_eq!(
@@ -19193,7 +19260,29 @@ mod tests {
                     .collect()
             })
             .collect();
-        let final_plan = finish_for_test(&values(columns, rows)).unwrap();
+        // The existing production pool row ceiling is 4096; this fixture
+        // exercises the unchanged 16,384-by-four occurrence scale across it.
+        let caps = novarocks_constant_contract::ConstantPolicy {
+            max_rows: 4096,
+            ..crate::constant::test_constant_policy()
+        };
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let final_plan = lower_final_physical_plan(
+            &values(columns, rows),
+            version(),
+            dop(),
+            crate::functions::builtin_sql_function_catalog().snapshot(),
+            false,
+            caps,
+            &control,
+        )
+        .unwrap()
+        .finish_observed(&control)
+        .unwrap()
+        .plan()
+        .clone();
+        assert_eq!(final_plan.constants().entries().len(), 16);
+        let mut occurrences = BTreeSet::new();
         let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
         assert_eq!(fragment.expressions().len(), 65_536);
         let root = fragment.nodes().get(&fragment.root()).unwrap();
@@ -19204,9 +19293,15 @@ mod tests {
         for (row, expressions) in rows.iter().enumerate() {
             assert_eq!(expressions.len(), 4);
             for (col, expression) in expressions.iter().enumerate() {
+                assert!(
+                    occurrences.insert(*expression),
+                    "each original cell retains its own expression occurrence"
+                );
                 let expression = fragment.expressions().get(*expression).unwrap();
                 assert_eq!(expression.ty, ValueType::new(DataType::Utf8, true));
                 let value = checked_constant_for_test(&final_plan, expression);
+                assert_eq!(value.ordinal(), (row % 4096) as u32);
+                assert_eq!(value.pool().array().len(), 4096);
                 if row == 0 && col == 0 {
                     assert_eq!(value.try_utf8().unwrap(), None);
                 } else {
@@ -19218,6 +19313,160 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn physical_values_first_literal_author_keeps_original_typed_refusals() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Control {
+            cause: CompileControlError,
+            refused: AtomicBool,
+        }
+        impl PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert!(
+                    !self.refused.load(Ordering::Relaxed),
+                    "no callbacks after original typed refusal"
+                );
+                if phase == CompilePhase::FunctionSpecialization && units == 256 {
+                    self.refused.store(true, Ordering::Relaxed);
+                    return Err(self.cause.clone());
+                }
+                Ok(())
+            }
+        }
+        let input = values(
+            vec![column(1, "text", DataType::Utf8, false)],
+            (0..1024)
+                .map(|row| {
+                    vec![TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::String(format!("row{row}"))),
+                        value_type: ValueType::new(DataType::Utf8, false),
+                    }]
+                })
+                .collect(),
+        );
+        let original = novarocks_failure_contract::SharedFailureCause::new(
+            novarocks_constant_contract::ConstantError::Limit("original source refusal"),
+        );
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            CompileControlError::Source(original),
+        ] {
+            let control = Control {
+                cause: cause.clone(),
+                refused: AtomicBool::new(false),
+            };
+            let error = lower_final_physical_plan(
+                &input,
+                version(),
+                dop(),
+                crate::functions::builtin_sql_function_catalog().snapshot(),
+                false,
+                crate::constant::test_constant_policy(),
+                &control,
+            )
+            .err()
+            .expect("original owner must refuse");
+            assert!(control.refused.load(Ordering::Relaxed));
+            assert!(matches!(error,ContractLoweringError::Control(actual) if actual==cause));
+        }
+    }
+
+    #[test]
+    fn values_runs_keep_permuted_columns_nonliteral_sites_and_admitted_backing() {
+        use arrow::array::{Array, Int32Array};
+        use novarocks_constant_contract::ConstantPool;
+        let declared = ValueType::new(DataType::Int32, false);
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let original = ConstantPool::try_new(
+            Arc::new(arrow::datatypes::Field::new(
+                "original",
+                DataType::Int32,
+                false,
+            )),
+            declared.clone(),
+            Int32Array::from(vec![11, 22, 33]).to_data(),
+            crate::constant::test_constant_policy(),
+            CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for row in 0..6 {
+            let integer = match row {
+                1 => TypedExpr {
+                    kind: ExprKind::Constant(original.value(1).unwrap()),
+                    value_type: declared.clone(),
+                },
+                2 => TypedExpr {
+                    kind: ExprKind::Nested(Box::new(literal_int32(2))),
+                    value_type: declared.clone(),
+                },
+                _ => literal_int32(row),
+            };
+            let text = TypedExpr {
+                kind: ExprKind::Literal(if row == 2 {
+                    LiteralValue::Null
+                } else {
+                    LiteralValue::String(format!("row{row}"))
+                }),
+                value_type: ValueType::new(DataType::Utf8, row == 2),
+            };
+            rows.push(vec![integer, text]);
+        }
+        let plan = finish_for_test(&values(
+            vec![
+                column(9, "second", DataType::Int32, false),
+                column(3, "first", DataType::Utf8, true),
+            ],
+            rows,
+        ))
+        .unwrap();
+        let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        let NodeKind::Values { rows } = &fragment.nodes().get(&fragment.root()).unwrap().kind
+        else {
+            panic!("expected original Values");
+        };
+        let mut occurrences = BTreeSet::new();
+        for (row, cells) in rows.iter().enumerate() {
+            for (column, expression) in cells.iter().enumerate() {
+                assert!(occurrences.insert(*expression));
+                let expression = fragment.expressions().get(*expression).unwrap();
+                let value = checked_constant_for_test(&plan, expression);
+                if column == 0 {
+                    assert_eq!(
+                        value.try_i64().unwrap(),
+                        Some(if row == 1 { 22 } else { row as i64 })
+                    );
+                    if row == 1 {
+                        assert_eq!(value.pool().backing_identity(), original.backing_identity());
+                        assert_eq!(value.ordinal(), 1);
+                        assert_eq!(value.pool().field_ref().name(), "original");
+                    } else {
+                        assert_ne!(value.pool().backing_identity(), original.backing_identity());
+                        assert_eq!(value.ordinal(), if row >= 3 { (row - 3) as u32 } else { 0 });
+                    }
+                } else {
+                    assert_eq!(value.ordinal(), row as u32);
+                    let expected = format!("row{row}");
+                    assert_eq!(
+                        value.try_utf8().unwrap(),
+                        if row == 2 {
+                            None
+                        } else {
+                            Some(expected.as_str())
+                        }
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn narrowed_integer_literal_keeps_its_checked_width_without_guessed_source_cast() {
         let output = column(1, "small", DataType::Int32, false);
@@ -19282,11 +19531,10 @@ mod logical_projection_tests {
     fn contract_full_source_type_keeps_nested_names_metadata_and_lambda_domains() {
         let source_shape = DataType::List(Arc::new(
             Field::new("provider_item", DataType::Utf8, true).with_metadata(
-                [
+                std::collections::HashMap::<String, String>::from([
                     (NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string()),
                     ("iceberg.field.id".to_string(), "19".to_string()),
-                ]
-                .into(),
+                ]),
             ),
         ));
         let source = ValueType::try_from_typed_binding(

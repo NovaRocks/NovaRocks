@@ -170,7 +170,10 @@ fn invoice(pool: &ConstantPool) -> usize {
     // Explicit conservative fixture retention, not a global allocator or MEM receipt.
     32768
         + pool.resource_facts().retained_buffer_capacity_bytes as usize
-        + 2 * (pool.field().metadata().capacity() + 1) * std::mem::size_of::<(String, String)>()
+        + novarocks_type_contract::owned_resources::arrow_metadata::retained_backing_upper_bound(
+            pool.field().metadata().len(),
+        )
+        .unwrap()
         + pool
             .field()
             .metadata()
@@ -924,12 +927,12 @@ fn actual_flat_writer_all_explicit_envelopes_have_exact_and_one_over_boundaries(
 }
 
 #[test]
-fn actual_flat_writer_tombstoned_metadata_uses_original_source_invoice() {
+fn actual_flat_writer_converted_metadata_keeps_source_invoice_independent_of_staging() {
     let mut metadata = HashMap::with_capacity(4096);
     for i in 0..4096 {
         metadata.insert(format!("key-{i}"), String::from("value"));
     }
-    let old_capacity = metadata.capacity();
+    assert!(metadata.capacity() >= 4096);
     metadata.retain(|k, _| k == "key-0");
     assert_eq!(metadata.len(), 1);
     let field = Arc::new(Field::new("original", DataType::Int64, true).with_metadata(metadata));
@@ -938,8 +941,16 @@ fn actual_flat_writer_tombstoned_metadata_uses_original_source_invoice() {
         field,
         FunctionValueType::new(DataType::Int64, true),
     );
-    let retained =
-        invoice(&original) + 2 * (old_capacity + 1) * std::mem::size_of::<(String, String)>();
+    // Arrow moved the surviving entry into a BTree/Arc; the staging table
+    // has exited. The fixture invoice covers only the attached source.
+    assert!(original.field().metadata().as_arc().is_some());
+    let shared = original.field().metadata().clone();
+    assert!(Arc::ptr_eq(
+        original.field().metadata().as_arc().unwrap(),
+        shared.as_arc().unwrap(),
+    ));
+    assert_eq!(shared.get("key-0").map(String::as_str), Some("value"));
+    let retained = invoice(&original);
     let lower = preflight_flat_pool_write(
         &original,
         retained,

@@ -375,7 +375,7 @@ impl StatisticsPlanCpuInput {
                     .unwrap(),
             ),
             constant_policy: crate::application::test_constant_policy(),
-            static_plan_carrier: CompiledPackageCarrier::new(
+            static_plan_carrier: CompiledPackageCarrier::for_test(
                 novarocks_physical_plan::FragmentPackageAdmission {
                     plan_limits: novarocks_physical_plan::PlanLimits::FROZEN,
                     source_retained_bytes: 64 << 20,

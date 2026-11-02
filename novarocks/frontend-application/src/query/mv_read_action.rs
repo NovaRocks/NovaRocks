@@ -398,6 +398,7 @@ struct Explain {
     received: bool,
 }
 struct State {
+    family: novarocks_result_contract::ClientPresentationFamily,
     readiness: Arc<MvReadinessPort>,
     entrance: Arc<ManagementEntrance>,
     binding: StateStoreOriginalBinding,
@@ -435,6 +436,7 @@ pub(crate) fn prepare(
     services: MvExecutionServices,
     request: ReadRequest,
     execution: QueryExecutionContext,
+    family: novarocks_result_contract::ClientPresentationFamily,
 ) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
     let capacity = execution.result_capacity().ok_or_else(|| {
         CommandError::new(
@@ -467,6 +469,7 @@ pub(crate) fn prepare(
     let scope = capacity.root_scope().clone();
     Ok(Box::new(Action {
         state: Some(State {
+            family,
             readiness: ports.readiness().clone(),
             entrance,
             binding,
@@ -645,6 +648,7 @@ impl State {
                     owner
                         .result_window_alias()
                         .ok_or_else(|| contract("MV read Local delivery is absent"))?,
+                    self.family,
                 )
                 .map_err(contract)?,
             );

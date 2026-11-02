@@ -381,7 +381,8 @@ impl RestEndpoints {
                 // Prepared publication consumes the journal's evidence grant.
                 &RequestContext::for_read(),
             )
-            .await;
+            .await
+            .expect("the legacy read context has no original MIO admission source");
         let (read, document) = match (expect.endpoint().response_shape(), body) {
             (Some(shape), Some(body)) => read_view(shape, expect, body, keep_document).await,
             // A drop's success body must be empty (L24); its bytes are only

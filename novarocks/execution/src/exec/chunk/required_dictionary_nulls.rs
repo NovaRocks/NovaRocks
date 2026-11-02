@@ -236,7 +236,10 @@ mod tests {
         let make_list = |name: &str, dirty: bool| {
             let field = Field::new(name, child.data_type().clone(), false);
             let field = if dirty {
-                field.with_metadata([("provider.fact".to_owned(), "retained".to_owned())].into())
+                field.with_metadata(std::collections::HashMap::<String, String>::from([(
+                    "provider.fact".to_owned(),
+                    "retained".to_owned(),
+                )]))
             } else {
                 field
             };
@@ -282,11 +285,11 @@ mod tests {
                     unreachable!()
                 };
                 assert_eq!(field.name(), "item");
-                assert_eq!(field.metadata().capacity(), 0);
+                assert!(field.metadata().as_arc().is_none());
                 let DataType::List(source_field) = input.data_type() else {
                     unreachable!()
                 };
-                if source_field.metadata().capacity() != 0 {
+                if source_field.metadata().as_arc().is_some() {
                     assert_eq!(source_field.metadata()["provider.fact"], "retained");
                     assert!(
                         !Arc::ptr_eq(source.values(), actual.values()),

@@ -373,7 +373,7 @@ fn zip_actual_mask_runs_match_independent_mutable_buffer_growth_oracles() {
     assert_eq!(output.to_data().buffers()[1].capacity(), 256);
     let output = copy(&BooleanArray::from(vec![true, true]), &truthy, &falsy);
     assert_eq!(output.to_data().buffers()[1].capacity(), 192);
-    let mut extent = ByteBufferExtent::new(2).unwrap();
+    let mut extent = ByteBufferExtent::new(2, false).unwrap();
     extent.extend(80, false).unwrap();
     extent.extend(65, false).unwrap();
     assert_eq!((extent.len, extent.capacity), (145, 256));
@@ -487,7 +487,7 @@ fn zip_static_layout_offset_and_growth_exact_boundaries_need_no_giant_allocation
         flat_extent(&DataType::LargeUtf8, usize::MAX),
         Err(CopyError::Extent(_))
     ));
-    let mut extent = ByteBufferExtent::new(0).unwrap();
+    let mut extent = ByteBufferExtent::new(0, false).unwrap();
     if usize::BITS > 32 {
         extent.extend(i32::MAX as usize, false).unwrap();
         assert_eq!(extent.len, i32::MAX as usize);
@@ -500,12 +500,12 @@ fn zip_static_layout_offset_and_growth_exact_boundaries_need_no_giant_allocation
             Err(CopyError::Extent(_))
         ));
     }
-    let mut extent = ByteBufferExtent::new(0).unwrap();
+    let mut extent = ByteBufferExtent::new(0, false).unwrap();
     extent.extend(maximum_aligned, true).unwrap();
     assert!(matches!(extent.extend(1, true), Err(CopyError::Extent(_))));
     // Required final bytes fit, but the real old-capacity doubling does not.
     let half = (isize::MAX as usize).div_ceil(2);
-    let mut extent = ByteBufferExtent::new(half).unwrap();
+    let mut extent = ByteBufferExtent::new(half, false).unwrap();
     assert!(matches!(
         extent.extend(half + 1, true),
         Err(CopyError::Extent(_))
@@ -640,5 +640,51 @@ fn zip_real_wide_mask_run_walk_emits_256_and_preserves_original_meter_prefix() {
     let array = actual.as_any().downcast_ref::<StringArray>().unwrap();
     for row in 0..320 {
         assert_eq!(array.value(row), if row % 2 == 0 { "a" } else { "b" });
+    }
+}
+
+#[test]
+fn zip_long_nullable_masks_keep_row_values_across_source_dispatch_paths() {
+    // Independent row oracle covers both the original MutableArrayData path
+    // and Arrow 60's fragmented-mask interleave path, including sliced masks.
+    for rows in [1023, 1024, 1025, 2048] {
+        for fragmented in [false, true] {
+            let mask_values = (0..rows + 2)
+                .map(|row| {
+                    (row % 7 != 0).then_some(if fragmented {
+                        row % 2 == 0
+                    } else {
+                        row < rows / 2
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mask = BooleanArray::from(mask_values).slice(1, rows);
+            let left_values = (0..rows)
+                .map(|row| (row % 11 != 0).then(|| format!("truthy-{row}")))
+                .collect::<Vec<_>>();
+            let right_values = (0..rows)
+                .map(|row| (row % 13 != 0).then(|| format!("falsy-{row}")))
+                .collect::<Vec<_>>();
+            let expected = (0..rows)
+                .map(|row| {
+                    if mask.is_valid(row) && mask.value(row) {
+                        left_values[row].clone()
+                    } else {
+                        right_values[row].clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let left: ArrayRef = Arc::new(StringArray::from(left_values));
+            let right: ArrayRef = Arc::new(StringArray::from(right_values));
+            let actual = copy(&mask, &left, &right);
+            let actual = actual.as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.map(str::to_owned))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
     }
 }

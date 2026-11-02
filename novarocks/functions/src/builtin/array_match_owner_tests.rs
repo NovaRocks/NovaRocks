@@ -244,8 +244,12 @@ fn array_match_selected_original_string_safe_nulls_and_exact_child_metadata() {
         let list = a.as_any().downcast_ref::<ListArray>().unwrap();
         let altered: ArrayRef = Arc::new(ListArray::new(
             Arc::new(
-                Field::new("authored-item", list.values().data_type().clone(), true)
-                    .with_metadata([("opaque-child".into(), "not-erased".into())].into()),
+                Field::new("authored-item", list.values().data_type().clone(), true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "opaque-child".into(),
+                        "not-erased".into(),
+                    )]),
+                ),
             ),
             list.offsets().clone(),
             list.values().clone(),

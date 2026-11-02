@@ -22,4 +22,6 @@ paths = ["novarocks/mv-application/**"]
 
 [reuse]
 scope = "suite"
-# Initial state and environment inputs remain undeclared; historical results are not reusable.
+initial_state = "isolated"
+basis = "The SQL runner starts and shuts down a private REST Catalog and MinIO for this suite; its Server and fixture lifecycle is recorded."
+env_inputs = []

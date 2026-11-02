@@ -112,9 +112,9 @@ fn write_original_mysql_bound_marker<W: std::io::Write>(
         length: 0,
     };
     write!(&mut line,
-        "{} connection_id={} connection_generation={} session_connection_id={} session_epoch={} statement_generation={} sql_sha256=",
-        marker, connection.connection_id(), connection.generation(), statement.session().connection_id(),
-        statement.session().session_epoch(), statement.generation(),
+        "{} connection_id={} connection_generation={} session_connection_id={} session_key={} statement_generation={} sql_sha256=",
+        marker, connection.connection_id(), connection.generation(), connection.connection_id(),
+        statement.session().key().get(), statement.generation(),
     ).map_err(invalid)?;
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in exact_sql_sha256 {
@@ -152,8 +152,10 @@ async fn write_negotiated_statement<'writer, W: AsyncWrite + Unpin>(
             .await
         }
         StatementResult::GovernedCompletion(result) => {
+            let (completion, protocol) = result.into_parts();
             crate::terminal::write_governed_terminal_ok_with_more(
-                result.into_protocol(),
+                completion,
+                protocol,
                 results,
                 more_results,
             )
@@ -846,11 +848,11 @@ fn query_cancellation_reason_for_connection_termination(
     reason: &ClientConnectionTerminationReason,
 ) -> QueryCancellationReason {
     match reason {
-        ClientConnectionTerminationReason::ExplicitKillConnection {
-            requester_connection_id,
-        } => QueryCancellationReason::ExplicitKillConnection {
-            requester_connection_id: *requester_connection_id,
-        },
+        ClientConnectionTerminationReason::ExplicitKillConnection { requester_session } => {
+            QueryCancellationReason::ExplicitKillConnection {
+                requester_session: *requester_session,
+            }
+        }
         ClientConnectionTerminationReason::ServerShutdown => {
             QueryCancellationReason::ServerShutdown
         }
@@ -1111,7 +1113,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         let outcome = match statement {
             StatementResult::Ok => writer.ok().await,
             StatementResult::GovernedCompletion(result) => {
-                crate::write_governed_init_ok(result.into_protocol(), writer).await
+                let (completion, protocol) = result.into_parts();
+                crate::write_governed_init_ok(completion, protocol, writer).await
             }
             StatementResult::GovernedError(result) => {
                 let (error, protocol) = result.into_parts();
@@ -1269,7 +1272,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                             owner.fail(crate::closing_pressure_gate::Failure::Identity);
                             io::Error::new(io::ErrorKind::InvalidData, "pressure streaming result has no original statement token")
                         })?;
-                        let hook = owner.bind_relay(self.connection, token, fixture_sql_sha256)?;
+                        let hook = owner.bind_relay(self.connection, self.session.get().and_then(|session| session.connection_session(self.connection)).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "fixture connection has no original session association"))?, token, fixture_sql_sha256)?;
                         if hook.is_some() {
                             owner.validate_streaming_owner(&result)?;
                             let stdout = std::io::stdout();
@@ -1300,7 +1303,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                                 hub.fail_selected(self.connection, crate::mysql_write_gate::GateFailure::Identity);
                                 io::Error::new(io::ErrorKind::InvalidData, "fixture streaming result has no original statement token")
                             })?;
-                            let hook = hub.bind_statement(self.connection, token, fixture_sql_sha256)?;
+                            let hook = hub.bind_statement(self.connection, self.session.get().and_then(|session| session.connection_session(self.connection)).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "fixture connection has no original session association"))?, token, fixture_sql_sha256)?;
                             if hook.is_some() {
                                 // Copy only the raw inputs of this ONE successful original bind.
                                 // Stdout failure follows the existing retained protocol IO path.
@@ -1335,7 +1338,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                 }.await
             }
             StatementResult::GovernedCompletion(result) => {
-                crate::write_governed_terminal_ok(result.into_protocol(), results).await
+                let (completion, protocol) = result.into_parts();
+                crate::write_governed_terminal_ok(completion, protocol, results).await
             }
             StatementResult::GovernedError(result) => {
                 let (error, protocol) = result.into_parts();
@@ -1357,6 +1361,16 @@ mod tests {
     struct RawResultFactory;
     struct RawResultSession;
     impl QuerySessionFactory for RawResultFactory {
+        fn open_statement_session(
+            &self,
+            _: novarocks_query_application::session::StatementSessionRequest,
+        ) -> Result<
+            Arc<dyn QuerySession>,
+            novarocks_query_application::session_value::StatementSessionError,
+        > {
+            unreachable!("this fixture exercises the connection session entry")
+        }
+
         fn open_session(
             &self,
             _: QuerySessionOpenRequest,
@@ -1367,6 +1381,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl QuerySession for RawResultSession {
+        #[cfg(novarocks_dev_controls)]
+        fn connection_session(
+            &self,
+            _: ClientConnectionToken,
+        ) -> Option<novarocks_query_application::session_control::SessionToken> {
+            None
+        }
+
         async fn init_database(
             &self,
             _: &str,
@@ -1375,6 +1397,7 @@ mod tests {
             Ok(
                 novarocks_query_application::session::QuerySessionStatement::output_owned(
                     StatementResult::Ok,
+                    novarocks_query_application::statement_kind::StatementKind::Use,
                 ),
             )
         }
@@ -1392,6 +1415,7 @@ mod tests {
                         )
                         .unwrap(),
                     ),
+                    novarocks_query_application::statement_kind::StatementKind::Query,
                 ),
             )
         }
@@ -1488,6 +1512,16 @@ mod tests {
     }
 
     impl QuerySessionFactory for CancellationProbeFactory {
+        fn open_statement_session(
+            &self,
+            _: novarocks_query_application::session::StatementSessionRequest,
+        ) -> Result<
+            Arc<dyn QuerySession>,
+            novarocks_query_application::session_value::StatementSessionError,
+        > {
+            unreachable!("this fixture exercises the connection session entry")
+        }
+
         fn open_session(
             &self,
             _request: QuerySessionOpenRequest,
@@ -1766,7 +1800,7 @@ mod exact_successful_bind_marker_tests {
             .arm(frontend, [1; 16], connection.connection_id(), digest, 1)
             .unwrap();
         let hook = hub
-            .bind_statement(connection, statement, digest)
+            .bind_statement(connection, statement.session(), statement, digest)
             .unwrap()
             .unwrap();
         (hub, controller, hook)
@@ -1806,7 +1840,15 @@ mod exact_successful_bind_marker_tests {
     fn raw() -> (ClientConnectionToken, StatementToken) {
         (
             ClientConnectionToken::new(71, 19).unwrap(),
-            StatementToken::new(SessionToken::new(71, 23), 29),
+            StatementToken::new(
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (71_u64 << 32) | 23_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+                29,
+            ),
         )
     }
     #[test]
@@ -1826,7 +1868,7 @@ mod exact_successful_bind_marker_tests {
             digest,
         )
         .unwrap();
-        let expected = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id=71 connection_generation=19 session_connection_id=71 session_epoch=23 statement_generation=29 sql_sha256=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n";
+        let expected = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id=71 connection_generation=19 session_connection_id=71 session_key=23 statement_generation=29 sql_sha256=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n";
         assert_eq!(&sink.bytes[..sink.length], expected);
         assert!(sink.writes > 1);
         assert_eq!(sink.flushes, 1);
@@ -1843,7 +1885,15 @@ mod exact_successful_bind_marker_tests {
     #[test]
     fn maximum_raw_numeric_identity_and_digest_fit_the_fixed_ascii_cap() {
         let connection = ClientConnectionToken::new(u32::MAX, u64::MAX).unwrap();
-        let statement = StatementToken::new(SessionToken::new(u32::MAX, u64::MAX), u64::MAX);
+        let statement = StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    ((u32::MAX as u64) << 32) | (u64::MAX as u64),
+                )
+                .expect("nonzero fixture session"),
+            ),
+            u64::MAX,
+        );
         let (_hub, _controller, hook) = owner(connection, statement, [255; 32]);
         let mut sink = Sink::new(384);
         write_exact_mysql_bound_marker_for_hook(
@@ -1854,7 +1904,7 @@ mod exact_successful_bind_marker_tests {
             [255; 32],
         )
         .unwrap();
-        let expected = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id=4294967295 connection_generation=18446744073709551615 session_connection_id=4294967295 session_epoch=18446744073709551615 statement_generation=18446744073709551615 sql_sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n";
+        let expected = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id=4294967295 connection_generation=18446744073709551615 session_connection_id=4294967295 session_key=18446744073709551615 statement_generation=18446744073709551615 sql_sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n";
         assert_eq!(&sink.bytes[..sink.length], expected);
         assert!(sink.length <= 384);
         assert_eq!(sink.writes, 1);
@@ -1868,7 +1918,9 @@ mod exact_successful_bind_marker_tests {
             MysqlWriteGateHub::new(frontend, [1; 16], Instant::now() + Duration::from_secs(5))
                 .unwrap();
         controller.arm(frontend, [1; 16], 72, [7; 32], 1).unwrap();
-        let hook = hub.bind_statement(connection, statement, [7; 32]).unwrap();
+        let hook = hub
+            .bind_statement(connection, statement.session(), statement, [7; 32])
+            .unwrap();
         assert!(hook.is_none());
         let mut sink = Sink::new(384);
         write_exact_mysql_bound_marker_for_hook(
@@ -1897,7 +1949,10 @@ mod exact_successful_bind_marker_tests {
         )
         .unwrap();
         let first = sink.length;
-        assert!(hub.bind_statement(connection, statement, [7; 32]).is_err());
+        assert!(
+            hub.bind_statement(connection, statement.session(), statement, [7; 32])
+                .is_err()
+        );
         assert_eq!(sink.length, first);
     }
 

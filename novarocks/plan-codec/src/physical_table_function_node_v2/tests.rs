@@ -189,10 +189,12 @@ impl Fixture {
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
             true,
         );
-        let field = Arc::new(
-            Field::new("preserved", DataType::Utf8, true)
-                .with_metadata([("unknown.tag".into(), "original".into())].into()),
-        );
+        let field = Arc::new(Field::new("preserved", DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "unknown.tag".into(),
+                "original".into(),
+            )]),
+        ));
         let structure = FunctionValueType::new(DataType::Struct(vec![field.clone()].into()), true);
         assert_eq!(field.metadata()["unknown.tag"], "original");
         let json =
@@ -531,7 +533,7 @@ fn full_relation_signature_preserves_lambda_dictionary_metadata_and_nominal_type
             panic!()
         };
         assert!(Arc::ptr_eq(&fields[0], &original_fields[0]));
-        assert_eq!(fields[0].metadata().capacity(), 0);
+        assert!(fields[0].metadata().as_arc().is_none());
         assert_eq!(fields[0].name(), "preserved");
         assert!(fields[0].is_nullable());
         assert_eq!(a.result_types[2].logical_type(), ValueLogicalType::Json);

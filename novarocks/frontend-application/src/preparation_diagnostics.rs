@@ -80,6 +80,7 @@ pub(crate) struct StatementObservationHandle {
 struct StatementObserver {
     generation: u64,
     session: SessionToken,
+    connection_id: u32,
     sql_digest: [u8; 32],
     statement: Option<StatementToken>,
     logical_query: Option<QueryId>,
@@ -105,7 +106,7 @@ impl StatementObservers {
             || self
                 .runs
                 .values()
-                .any(|run| run.session.connection_id() == request.connection_id)
+                .any(|run| run.connection_id == request.connection_id)
         {
             return Err("statement observation token or connection is already armed".into());
         }
@@ -136,9 +137,6 @@ impl StatementObservers {
         session: SessionToken,
     ) -> Result<(), String> {
         let sql_digest = self.validate_arm(&request)?;
-        if session.connection_id() != request.connection_id || session.session_epoch() == 0 {
-            return Err("statement observation requires its current exact session".into());
-        }
         let generation = self
             .next_generation
             .checked_add(1)
@@ -149,6 +147,7 @@ impl StatementObservers {
             StatementObserver {
                 generation,
                 session,
+                connection_id: request.connection_id,
                 sql_digest,
                 statement: None,
                 logical_query: None,
@@ -164,7 +163,7 @@ impl StatementObservers {
         statement: StatementToken,
         sql: &str,
     ) -> Option<StatementObservationHandle> {
-        if statement.session().session_epoch() == 0 || statement.generation() == 0 {
+        if statement.generation() == 0 {
             return None;
         }
         let digest: [u8; 32] = Sha256::digest(sql.as_bytes()).into();
@@ -253,8 +252,8 @@ impl StatementObservers {
             work_id: run.statement.map(|statement| {
                 format!(
                     "statement:{}:{}:{}",
-                    statement.session().connection_id(),
-                    statement.session().session_epoch(),
+                    run.connection_id,
+                    statement.session().key().get(),
                     statement.generation()
                 )
             }),
@@ -382,10 +381,12 @@ impl StatementObservationOwner {
             .ok_or("statement observation session owner is not installed")?(
             request.connection_id
         )?;
-        if session.connection_id() != request.connection_id || session.session_epoch() == 0 {
-            return Err("statement observation requires its current exact session".into());
-        }
-        let input = self.input_for_session(session, &request.run_token, sql_digest)?;
+        let input = self.input_for_session(
+            session,
+            request.connection_id,
+            &request.run_token,
+            sql_digest,
+        )?;
         self.input_freezer
             .get()
             .ok_or("statement input freezer is not installed")?(&input)?;
@@ -394,6 +395,7 @@ impl StatementObservationOwner {
     fn input_for_session(
         &self,
         session: SessionToken,
+        connection_id: u32,
         run_token: &str,
         sql_sha256: [u8; 32],
     ) -> Result<StatementInputNomination, String> {
@@ -405,8 +407,8 @@ impl StatementObservationOwner {
             target_launch_id: self.cancellation.launch_id().into(),
             statement_run_token: run_token.into(),
             frontend_process_id: process.to_string(),
-            connection_id: session.connection_id(),
-            session_epoch: session.session_epoch(),
+            connection_id,
+            session_key: session.key().get(),
             sql_sha256,
         };
         input.validate().map_err(|error| error.to_string())?;
@@ -480,13 +482,14 @@ impl StatementObservationOwner {
             target_session_id: self.cancellation.session_id().to_owned(),
             statement_run_token: handle.run_token.clone(),
             frontend_process_id: process.to_string(),
-            connection_id: statement.session().connection_id(),
-            session_epoch: statement.session().session_epoch(),
+            connection_id: state.runs[&handle.run_token].connection_id,
+            session_key: statement.session().key().get(),
             statement_generation: statement.generation(),
         };
         nomination.validate().map_err(|error| error.to_string())?;
         let input = self.input_for_session(
             statement.session(),
+            state.runs[&handle.run_token].connection_id,
             &handle.run_token,
             Sha256::digest(sql.as_bytes()).into(),
         )?;
@@ -602,22 +605,22 @@ impl StatementObservationHandle {
                 target_session_id: owner.cancellation.session_id().to_owned(),
                 statement_run_token: self.run_token.clone(),
                 frontend_process_id: process.to_string(),
-                connection_id: statement.session().connection_id(),
-                session_epoch: statement.session().session_epoch(),
+                connection_id: run.connection_id,
+                session_key: statement.session().key().get(),
                 statement_generation: statement.generation(),
             },
         )
     }
 
     /// A nomination is observation identity only, never injection authority.
-    pub(crate) fn statement_target(&self) -> Option<(String, StatementToken)> {
+    pub(crate) fn statement_target(&self) -> Option<(String, StatementToken, u32)> {
         let owner = self.owner.as_ref()?.upgrade()?;
         let mut state = owner.state.lock().ok()?;
         if !owner.active(&mut state) {
             return None;
         }
         let run = state.run_mut(self)?;
-        Some((self.run_token.clone(), run.statement?))
+        Some((self.run_token.clone(), run.statement?, run.connection_id))
     }
     pub(crate) fn bind_attempt(&self, execution: QueryExecutionId) {
         let Some(owner) = self.owner.as_ref().and_then(Weak::upgrade) else {
@@ -709,7 +712,12 @@ mod authorization_tests {
                     connection_id: 91,
                     sql_sha256: format!("{:x}", Sha256::digest(b"SELECT 1")),
                 },
-                SessionToken::new(91, 1),
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (91_u64 << 32) | 1_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
             )
             .expect("the authorized statement owner remains available");
         assert_eq!(
@@ -741,7 +749,15 @@ mod statement_observation_tests {
     }
 
     fn statement(connection: u32, epoch: u64, generation: u64) -> StatementToken {
-        StatementToken::new(SessionToken::new(connection, epoch), generation)
+        StatementToken::new(
+            SessionToken::new(
+                novarocks_query_application::session_control::ClientSessionKey::new(
+                    (u64::from(connection) << 32) | epoch,
+                )
+                .unwrap(),
+            ),
+            generation,
+        )
     }
 
     fn execution(high: i64, low: i64, attempt: u64) -> QueryExecutionId {
@@ -763,10 +779,16 @@ mod statement_observation_tests {
     #[test]
     fn statement_observation_matches_exact_connection_sql_and_statement_owner() {
         let mut state = StatementObservers::default();
+        let session_key = (7_u64 << 32) | 9;
         state
             .arm(
                 arm_request("selected", 7, "SELECT k FROM t"),
-                SessionToken::new(7, 9),
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        session_key,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
             )
             .unwrap();
         assert!(
@@ -807,7 +829,10 @@ mod statement_observation_tests {
         state.bind_attempt(&handle, exact);
         state.bind_attempt(&handle, execution(-19, 99, 2));
         let response = state.response("selected").unwrap();
-        assert_eq!(response.work_id.as_deref(), Some("statement:7:9:12"));
+        assert_eq!(
+            response.work_id,
+            Some(format!("statement:7:{session_key}:12"))
+        );
         assert_eq!(response.logical_execution_id.as_deref(), Some("-19:41"));
         assert_eq!(response.execution_id.as_deref(), Some("-19:41:1"));
         assert_eq!(
@@ -824,7 +849,12 @@ mod statement_observation_tests {
         state
             .arm(
                 arm_request("selected", 7, "SELECT k FROM t"),
-                SessionToken::new(7, 9),
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (7_u64 << 32) | 9_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
             )
             .unwrap();
         let previous = execution(-19, 40, 1);
@@ -909,14 +939,25 @@ mod statement_observation_tests {
         let mut state = StatementObservers::default();
         assert!(
             state
-                .arm(arm_request("zero", 0, "SELECT 1"), SessionToken::new(0, 1))
+                .arm(
+                    arm_request("zero", 0, "SELECT 1"),
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(1_u64)
+                            .expect("nonzero fixture session")
+                    )
+                )
                 .is_err()
         );
         for connection in 1..=MAX_STATEMENT_OBSERVERS as u32 {
             state
                 .arm(
                     arm_request(&format!("run-{connection}"), connection, "SELECT 1"),
-                    SessionToken::new(connection, 1),
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (u64::from(connection) << 32) | 1,
+                        )
+                        .unwrap(),
+                    ),
                 )
                 .unwrap();
         }
@@ -924,7 +965,12 @@ mod statement_observation_tests {
             state
                 .arm(
                     arm_request("run-1", 100, "SELECT 1"),
-                    SessionToken::new(100, 1)
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (100_u64 << 32) | 1_u64
+                        )
+                        .expect("nonzero fixture session")
+                    )
                 )
                 .is_err()
         );
@@ -932,7 +978,12 @@ mod statement_observation_tests {
             state
                 .arm(
                     arm_request("another", 1, "SELECT 1"),
-                    SessionToken::new(1, 1)
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (1_u64 << 32) | 1_u64
+                        )
+                        .expect("nonzero fixture session")
+                    )
                 )
                 .is_err()
         );
@@ -940,7 +991,12 @@ mod statement_observation_tests {
             state
                 .arm(
                     arm_request("overflow", 100, "SELECT 1"),
-                    SessionToken::new(100, 1)
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (100_u64 << 32) | 1_u64
+                        )
+                        .expect("nonzero fixture session")
+                    )
                 )
                 .is_err()
         );
@@ -958,7 +1014,15 @@ mod statement_observation_tests {
         state.drain("run-1").unwrap();
         assert!(state.response("run-1").is_err());
         state
-            .arm(arm_request("run-1", 1, "SELECT 1"), SessionToken::new(1, 1))
+            .arm(
+                arm_request("run-1", 1, "SELECT 1"),
+                SessionToken::new(
+                    novarocks_query_application::session_control::ClientSessionKey::new(
+                        (1_u64 << 32) | 1_u64,
+                    )
+                    .expect("nonzero fixture session"),
+                ),
+            )
             .unwrap();
         state.bind_attempt(&a, execution(5, 43, 2));
         state.publish(&snapshot(execution(5, 41, 1)));
@@ -972,7 +1036,12 @@ mod statement_observation_tests {
             state
                 .arm(
                     arm_request("exhausted", 1, "SELECT 1"),
-                    SessionToken::new(1, 1)
+                    SessionToken::new(
+                        novarocks_query_application::session_control::ClientSessionKey::new(
+                            (1_u64 << 32) | 1_u64
+                        )
+                        .expect("nonzero fixture session")
+                    )
                 )
                 .is_err()
         );
@@ -1076,7 +1145,7 @@ mod session_owner_tests {
         let mut actual = service.begin_statement(session.token()).unwrap();
         let token = actual.token();
         let handle = owner.bind_statement(token, "SELECT 1").unwrap().unwrap();
-        assert_eq!(handle.statement_target(), Some(("one".into(), token)));
+        assert_eq!(handle.statement_target(), Some(("one".into(), token, 7)));
         assert!(
             StatementObservationOwner::from_grants(
                 role.scope().grants_for(StatementObservationOwner::DOMAIN)
@@ -1336,7 +1405,7 @@ mod session_owner_tests {
                         _ => unreachable!(),
                     },
                     connection_id: 7,
-                    session_epoch: statement.token().session().session_epoch(),
+                    session_key: statement.token().session().key().get(),
                     statement_generation: statement.token().generation(),
                 })
                 .is_none(),
@@ -1367,7 +1436,7 @@ mod session_owner_tests {
                         novarocks_types::FrontendProcessId::new_v7().to_string()
                 }
                 2 => foreign.connection_id += 1,
-                3 => foreign.session_epoch += 1,
+                3 => foreign.session_key += 1,
                 4 => foreign.statement_generation += 1,
                 _ => unreachable!(),
             }
@@ -1642,7 +1711,7 @@ mod session_owner_tests {
             .unwrap();
         assert_eq!(
             new_handle.statement_target(),
-            Some(("reused".into(), next.token()))
+            Some(("reused".into(), next.token(), 7))
         );
         assert_ne!(next.token().session(), original_session);
         next.finish();

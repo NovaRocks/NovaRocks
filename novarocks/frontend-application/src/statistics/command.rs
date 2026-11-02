@@ -141,6 +141,7 @@ impl StatisticsCommandExecutor {
         current_database: &str,
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
         context: &novarocks_spi::connector::ConnectorRequestContext,
+        family: novarocks_result_contract::ClientPresentationFamily,
     ) -> Result<
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         String,
@@ -150,6 +151,7 @@ impl StatisticsCommandExecutor {
                 lower_application_command(command, current_catalog, current_database)?,
                 execution,
                 context,
+                family,
             )
             .map_err(|e| e.to_string())
     }

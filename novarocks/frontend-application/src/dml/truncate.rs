@@ -411,6 +411,7 @@ mod tests {
             cancellation.view(),
             Default::default(),
             novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            novarocks_result_contract::ClientPresentationFamily::MysqlText,
         ))
     }
 

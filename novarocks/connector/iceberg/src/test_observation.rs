@@ -100,7 +100,7 @@ fn same_nomination(a: &StatementWorkNomination, b: &StatementWorkNomination) -> 
         && a.statement_run_token == b.statement_run_token
         && a.frontend_process_id == b.frontend_process_id
         && a.connection_id == b.connection_id
-        && a.session_epoch == b.session_epoch
+        && a.session_key == b.session_key
         && a.statement_generation == b.statement_generation
 }
 impl IcebergObservationSlot {
@@ -565,7 +565,7 @@ mod exact_statement_tests {
             statement_run_token: "selected".into(),
             frontend_process_id: frontend.to_string(),
             connection_id: 7,
-            session_epoch: 1,
+            session_key: 1,
             statement_generation: 3,
         };
         let input = StatementInputNomination {
@@ -574,7 +574,7 @@ mod exact_statement_tests {
             statement_run_token: "selected".into(),
             frontend_process_id: frontend.to_string(),
             connection_id: 7,
-            session_epoch: 1,
+            session_key: 1,
             sql_sha256: [1; 32],
         };
         // A nominal statement cannot silently invent the missing arm-era input.
@@ -621,7 +621,7 @@ mod exact_statement_tests {
                 ..input.clone()
             },
             StatementInputNomination {
-                session_epoch: 2,
+                session_key: 2,
                 ..input.clone()
             },
             StatementInputNomination {
@@ -651,7 +651,7 @@ mod exact_statement_tests {
                 statement_run_token: replacement_input.statement_run_token.clone(),
                 frontend_process_id: replacement_input.frontend_process_id.clone(),
                 connection_id: replacement_input.connection_id,
-                session_epoch: replacement_input.session_epoch,
+                session_key: replacement_input.session_key,
                 statement_generation: nomination.statement_generation,
             };
             assert!(
@@ -683,14 +683,14 @@ mod exact_statement_tests {
         let fresh_input = StatementInputNomination {
             statement_run_token: "fresh".into(),
             connection_id: 9,
-            session_epoch: 2,
+            session_key: 2,
             sql_sha256: [3; 32],
             ..input.clone()
         };
         let fresh_nomination = StatementWorkNomination {
             statement_run_token: "fresh".into(),
             connection_id: 9,
-            session_epoch: 2,
+            session_key: 2,
             ..nomination.clone()
         };
         slot.pin_statement_input(&fresh_input).unwrap();

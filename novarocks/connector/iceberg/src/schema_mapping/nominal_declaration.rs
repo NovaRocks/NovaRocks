@@ -708,11 +708,8 @@ fn project_field(
     }
     if explicit.is_some() {
         projected.metadata_mut().insert(
-            NR_LOGICAL_TYPE_KEY.into(),
-            logical
-                .metadata_value()
-                .expect("explicit nominal domain")
-                .into(),
+            NR_LOGICAL_TYPE_KEY,
+            logical.metadata_value().expect("explicit nominal domain"),
         );
     }
     Ok(projected)

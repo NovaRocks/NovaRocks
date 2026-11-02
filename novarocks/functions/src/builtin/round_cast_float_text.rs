@@ -105,7 +105,13 @@ pub(super) fn parse_f64(
             work.step()?;
         }
         work.step()?;
-        let value = Float64Type::parse(text);
+        // Arrow 58's complete raw special-token parser rejects an unconsumed
+        // suffix. Keep that domain before the newer SDK's ASCII trim retry.
+        let value = if bytes.last().is_some_and(u8::is_ascii_whitespace) {
+            None
+        } else {
+            Float64Type::parse(text)
+        };
         work.step()?;
         return Ok(value);
     }
@@ -299,7 +305,15 @@ mod tests {
     }
     fn oracle(text: &str) {
         let actual = observed(text, &Control::default()).unwrap();
-        let expected = Float64Type::parse(text);
+        let expected = if text.as_bytes().first().is_some_and(u8::is_ascii_whitespace)
+            || text.as_bytes().last().is_some_and(u8::is_ascii_whitespace)
+        {
+            // Original Arrow 58 raw lexical grammar rejects boundary ASCII
+            // whitespace. This literal does not depend on the current SDK.
+            None
+        } else {
+            Float64Type::parse(text)
+        };
         match (actual, expected) {
             (Some(actual), Some(expected)) if actual.is_nan() && expected.is_nan() => {
                 // NaN payload is not a SQL result identity; sign is retained.
@@ -369,6 +383,65 @@ mod tests {
             "1e1e1",
         ] {
             oracle(text);
+        }
+    }
+
+    #[test]
+    fn special_tokens_keep_original_complete_raw_grammar_and_control_tail() {
+        // Independent original lexical STANDARD full-consumption expectations.
+        // Signed NaNs retain the original sign-only identity assertion.
+        for (text, expected) in [
+            ("inf", Some(f64::INFINITY)),
+            ("+INF", Some(f64::INFINITY)),
+            ("-inF", Some(f64::NEG_INFINITY)),
+            ("Infinity", Some(f64::INFINITY)),
+            ("-INFINITY", Some(f64::NEG_INFINITY)),
+            ("NaN", Some(f64::NAN)),
+            ("+nan", Some(f64::NAN)),
+            ("-nAn", Some(-f64::NAN)),
+            ("infinity ", None),
+            ("infinity\t", None),
+            ("inf     ", None),
+            ("+inf\r", None),
+            ("NaN ", None),
+            ("-NaN\n", None),
+            (" inf", None),
+            (" NaN", None),
+            ("inf\u{a0}", None),
+            ("NaN\u{85}", None),
+            ("infinite", None),
+            ("nan(1)", None),
+        ] {
+            let actual = observed(text, &Control::default()).unwrap();
+            match (actual, expected) {
+                (Some(actual), Some(expected)) if expected.is_nan() => {
+                    assert!(actual.is_nan(), "source={text:?}");
+                    assert_eq!(
+                        actual.is_sign_negative(),
+                        expected.is_sign_negative(),
+                        "source={text:?}"
+                    );
+                }
+                (Some(actual), Some(expected)) => {
+                    assert_eq!(actual.to_bits(), expected.to_bits(), "source={text:?}")
+                }
+                (None, None) => {}
+                (actual, expected) => {
+                    panic!("source={text:?} actual={actual:?} expected={expected:?}")
+                }
+            }
+        }
+        let control = Control::default();
+        assert_eq!(observed("infinity ", &control), Ok(None));
+        assert_eq!(control.calls(), vec![0, 11]);
+        for cause in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+        ] {
+            let control = Control::refusing(1, cause.clone());
+            assert_eq!(observed("infinity ", &control), Err(cause));
+            assert_eq!(control.calls(), vec![0, 11]);
         }
     }
 

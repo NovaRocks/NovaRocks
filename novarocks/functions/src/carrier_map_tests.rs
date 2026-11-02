@@ -338,7 +338,7 @@ fn carrier_map_actual_wide_rows_observe_quantum_and_keep_nullable_value() {
 }
 
 #[test]
-fn raw_arrow_nullable_map_key_is_rejected_by_checked_typed_author() {
+fn nullable_map_key_is_rejected_by_sdk_and_checked_typed_author() {
     let fields = vec![
         Arc::new(Field::new("key", DataType::Int32, true)),
         Arc::new(Field::new("value", DataType::Int32, true)),
@@ -352,18 +352,26 @@ fn raw_arrow_nullable_map_key_is_rejected_by_checked_typed_author() {
         ],
         None,
     );
-    let array = MapArray::try_new(
+    let data_type = DataType::Map(
+        Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+        false,
+    );
+    let error = MapArray::try_new(
         Arc::new(Field::new("entries", entries.data_type().clone(), false)),
         OffsetBuffer::new(vec![0, 1].into()),
         entries,
         None,
         false,
     )
-    .unwrap();
-    array.to_data().validate_full().unwrap();
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        arrow_schema::ArrowError::InvalidArgumentError(_)
+    ));
+    assert!(error.to_string().contains("keys field cannot be nullable"));
     assert!(
         FunctionValueType::try_with_logical_type(
-            array.data_type().clone(),
+            data_type,
             false,
             novarocks_type_contract::ValueLogicalType::Physical
         )

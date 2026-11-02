@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Borrowed preflight for the registry Arrow 58.2 row converter. This is a
+//! Borrowed preflight for the admitted Arrow 60.1.0 row converter. This is a
 //! structural bound, not a second memory account. Re-audit on Arrow upgrades.
 //!
 //! Arrow creates all child Rows before the parent Rows, and retains them while
@@ -31,7 +31,6 @@
 //! Private container capacities must also come from bounded constructors; any
 //! unreported spare allocation belongs to that caller source proof.
 
-use std::collections::HashMap;
 use std::mem::size_of;
 
 use arrow::array::{Array, ArrayRef, AsArray, UnionArray};
@@ -258,11 +257,16 @@ fn add(a: usize, b: usize) -> Result<usize, ConnectorError> {
 fn mul(a: usize, b: usize) -> Result<usize, ConnectorError> {
     check(a.checked_mul(b).ok_or_else(exhausted)?)
 }
-fn metadata_bytes(metadata: &HashMap<String, String>) -> Result<usize, ConnectorError> {
-    // HashMap buckets, control bytes and sorted borrowed key pointers, including
-    // a possible stable-sort scratch allocation in canonical schema hashing.
-    let mut bytes = mul(metadata.capacity(), 128)?;
-    bytes = add(bytes, mul(metadata.len(), 2 * size_of::<&String>())?)?;
+fn metadata_bytes(metadata: &arrow::datatypes::Metadata) -> Result<usize, ConnectorError> {
+    // Metadata is already key-sorted in Arrow 60, so canonical hashing
+    // allocates no borrowed-key vector or sorting scratch. Its shared Arc
+    // and BTree nodes remain live with their original String capacities.
+    let mut bytes = check(
+        novarocks_type_contract::owned_resources::arrow_metadata::retained_backing_upper_bound(
+            metadata.len(),
+        )
+        .map_err(|_| exhausted())?,
+    )?;
     for (key, value) in metadata {
         bytes = add(bytes, add(key.capacity(), value.capacity())?)?;
     }
@@ -764,7 +768,7 @@ impl Walk {
             }
             DataType::FixedSizeList(_, width) => {
                 let a = array.as_fixed_size_list();
-                let start = a.value_offset(index) as usize;
+                let start = a.value_offset_at(index);
                 self.list_len(
                     array,
                     index,

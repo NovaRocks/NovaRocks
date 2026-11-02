@@ -343,7 +343,7 @@ fn admit_statistics_scan_binding(
                         planning_lease: planning_lease.clone(),
                     },
                 )]),
-                admitted_change_scans: BTreeMap::new(),
+                prepared_source_reads: BTreeMap::new(),
             })
         })
         .map_err(contract_violation)
@@ -806,8 +806,13 @@ mod tests {
                 ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Variant),
             ),
         ] {
-            let field = Field::new("v", carrier, true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), tag.to_owned())].into());
+            let field = Field::new("v", carrier, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
+                NR_LOGICAL_TYPE_KEY.to_owned(),
+                tag.to_owned(),
+            )]));
             assert_eq!(FunctionValueType::try_from_field(&field), Err(expected));
         }
     }

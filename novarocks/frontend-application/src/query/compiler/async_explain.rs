@@ -112,11 +112,9 @@ impl FrontendQueryCompiler {
             return self
                 .complete_async_profile(
                     &query,
-                    current_catalog,
-                    current_database,
+                    context,
                     Some(query_options_for_explain_analyze(query_options)),
                     &connector_planning_context,
-                    execution,
                     scope,
                     std::time::Instant::now(),
                     ports,
@@ -308,11 +306,9 @@ impl FrontendQueryCompiler {
     async fn complete_async_profile(
         &self,
         query: &Query,
-        current_catalog: Option<&str>,
-        current_database: &str,
+        context: &RequestContext,
         query_options: Option<QueryOptions>,
         connector_planning_context: &novarocks_spi::connector::ConnectorPlanningContext,
-        execution: &QueryExecutionContext,
         scope: &novarocks_workload_control::WorkScope,
         planning_started_at: std::time::Instant,
         ports: ExplainPreparationPorts<'_>,
@@ -320,6 +316,10 @@ impl FrontendQueryCompiler {
         Result<PreparedAsyncExplain, FrontendQueryCompilerError>,
         StatementNativeHealthFailure,
     > {
+        let execution = context.execution();
+        let current_catalog = context.session().current_catalog();
+        let current_database = context.session().current_database();
+        let family = *context.session().presentation();
         let ExplainPreparationPorts {
             provider: provider_source,
             cpu: planning_cpu,
@@ -402,8 +402,9 @@ impl FrontendQueryCompiler {
                     purpose: ReadEncodingPurpose::Profile(planning_started_at),
                     version,
                     options: query_options,
+                    family,
                     offset: 0,
-                    carrier: *self.query.static_plan_carrier(),
+                    carrier: self.query.static_plan_carrier().clone(),
                     policy: self.constant_policy(),
                     control: encoding_control,
                     #[cfg(novarocks_dev_controls)]

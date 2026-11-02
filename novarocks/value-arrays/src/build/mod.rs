@@ -387,6 +387,19 @@ impl<A: Allocator + Clone + 'static> ValueBuilder<A> {
             new_buffer_owners: owners,
         })
         .map_err(ValueFailure::Caller)?;
+        if self.layout.is_view() {
+            // Arrow already stored Arc<[Buffer]> in 58.4. Publication consumes
+            // our separately observed Vec while allocating this shared table.
+            // Admit both live blocks under the same original caller scope.
+            crate::control::shared_slice_owner::<Buffer, E>(
+                if self.rows == 0 {
+                    0
+                } else {
+                    self.regions.len()
+                },
+                observe,
+            )?;
+        }
         work(0).map_err(ValueFailure::Caller)?;
         let mut facts = self.facts();
         if self.rows == 0 {

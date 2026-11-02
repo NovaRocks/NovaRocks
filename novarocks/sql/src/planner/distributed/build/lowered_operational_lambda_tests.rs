@@ -180,8 +180,12 @@ fn nested_identity_lambda_owner() -> (SqlAuthoredPhysicalPlan, ValueType) {
     // catalog. No declaration is added and no nested runtime capability is
     // inferred from this generic source signature projection.
     let field = Arc::new(
-        Field::new("provider_leaf", DataType::Utf8, false)
-            .with_metadata([("provider.attribute".to_string(), "original-é".to_string())].into()),
+        Field::new("provider_leaf", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::<String, String>::from([(
+                "provider.attribute".to_string(),
+                "original-é".to_string(),
+            )]),
+        ),
     );
     assert_eq!(field.metadata()["provider.attribute"], "original-é");
     let parameter_type = ValueType::new(DataType::Struct(vec![field].into()), false);

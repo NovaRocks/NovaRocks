@@ -17,7 +17,7 @@
 
 use super::*;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
-use std::sync::Mutex;
+use std::{collections::HashMap, sync::Mutex};
 
 const CAUSES: [CompileControlError; 3] = [
     CompileControlError::Cancelled,
@@ -85,15 +85,15 @@ fn prefixes<T>(action: impl Fn(&mut CompileCheckpoints<'_>) -> Result<T, TypeCod
         }
     }
 }
-fn metadata() -> HashMap<String, String> {
-    HashMap::from([
+fn metadata() -> arrow::datatypes::Metadata {
+    arrow::datatypes::Metadata::from(HashMap::from([
         ("雪".into(), "snow 😀".into()),
         ("a\0".into(), "after a".into()),
         ("".into(), "empty key".into()),
         ("ä".into(), "unknown.extension".into()),
         ("a".into(), "".into()),
         ("\0".into(), "nul\0payload".into()),
-    ])
+    ]))
 }
 
 #[test]
@@ -188,7 +188,10 @@ fn strict_order_keeps_duplicates_unsorted_and_ordinary_tail_with_original_contro
 
 #[test]
 fn all_small_actual_metadata_copy_and_comparison_callbacks_keep_three_primary_causes() {
-    let source = HashMap::from([("b".into(), "雪".into()), ("a".into(), "a\0".into())]);
+    let source = arrow::datatypes::Metadata::from(HashMap::from([
+        ("b".into(), "雪".into()),
+        ("a".into(), "a\0".into()),
+    ]));
     prefixes(|w| encode_metadata(&source, w));
     prefixes(|w| copy_string("a😀雪", w));
     prefixes(|w| compare_keys("same-a", "same-b", w));
@@ -198,7 +201,7 @@ fn all_small_actual_metadata_copy_and_comparison_callbacks_keep_three_primary_ca
 #[test]
 fn empty_metadata_observes_actual_final_none_and_zero_capacity_reservations() {
     let c = Control::default();
-    let source = HashMap::new();
+    let source = arrow::datatypes::Metadata::new();
     let out = run(&c, |w| encode_metadata(&source, w)).unwrap();
     assert!(out.is_empty());
     assert_eq!(out.capacity(), 0);

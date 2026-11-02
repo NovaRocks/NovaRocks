@@ -487,6 +487,7 @@ pub struct CrossProcessRuntime {
     pub fe_http_port: u16,
     pub fe_grpc_port: u16,
     pub fe_mysql_port: u16,
+    pub fe_trino_port: u16,
 }
 
 /// Sanitized response captured from the FE management listener during a
@@ -1044,6 +1045,14 @@ impl BackendNativeFaultProxies {
             proxy.stop();
         }
         let mut failures = Vec::new();
+        if !self.root_reply_proxies.is_empty()
+            && let Err(error) =
+                RootReplyFaultProxy::retire_joined_group(self.root_reply_proxies.values())
+        {
+            failures.push(format!(
+                "retire original joined RootReply capture: {error:#}"
+            ));
+        }
         for (index, proxy) in &self.root_reply_proxies {
             let observed = proxy.control().observation();
             if !observed.shutdown_joined
@@ -1058,7 +1067,8 @@ impl BackendNativeFaultProxies {
                 || observed.failure_overflow
             {
                 failures.push(format!(
-                    "RootReply actor BE[{index}] failed its explicit join barrier"
+                    "RootReply actor BE[{index}] failed its explicit join barrier: {observed:?}; exchange={:?}",
+                    proxy.control().exchange_observation()
                 ));
             }
         }
@@ -3142,6 +3152,10 @@ pub fn render_cross_process_config(
                 "mysql_port".to_string(),
                 Value::Integer(i64::from(runtime.fe_mysql_port)),
             );
+            standalone_server.insert(
+                "trino_port".to_string(),
+                Value::Integer(i64::from(runtime.fe_trino_port)),
+            );
             // An operator declaration is refused where there is nowhere to
             // record it, so a frontend that a test may issue one to needs a
             // sink. The path is relative, which the server resolves against
@@ -3158,6 +3172,7 @@ pub fn render_cross_process_config(
                 .and_then(Value::as_table_mut)
             {
                 standalone_server.remove("mysql_port");
+                standalone_server.remove("trino_port");
             }
         }
     }
@@ -4036,6 +4051,7 @@ impl CrossProcessServerHandle {
             fe_http_port: reserved.fe_http_port.port(),
             fe_grpc_port: reserved.fe_grpc_port.port(),
             fe_mysql_port: reserved.fe_mysql_port.port(),
+            fe_trino_port: reserved.fe_trino_port.port(),
         };
         let native_proxy_config = proxy_config.clone();
         let mut native_fault_proxies = BackendNativeFaultProxies::start(
@@ -4210,6 +4226,7 @@ impl CrossProcessServerHandle {
             let _ = reserved.fe_http_port.release();
             let _ = reserved.fe_grpc_port.release();
             let _ = reserved.fe_mysql_port.release();
+            let _ = reserved.fe_trino_port.release();
             let (fe_process, fe_launch_identity) = spawn_novarocks_process(ProcessLaunch {
                 binary: &fe_binary,
                 role: "fe",
@@ -4562,6 +4579,44 @@ impl CrossProcessServerHandle {
             .get(&index)
             .map(RootReplyFaultProxy::control)
             .ok_or_else(|| anyhow::anyhow!("RootReply fault actor is not enabled for BE[{index}]"))
+    }
+
+    /// Bind BE message inspection inside an existing authenticated test session.
+    /// Live membership binds both the advertised subject and the exact process.
+    /// Call before seed or Task traffic: each live subscription keeps the decoder
+    /// chosen when its RPC starts. Binding does not begin or arm a fault capture.
+    pub fn native_exchange_fault(&self, index: usize) -> Result<RootReplyFaultControl> {
+        let session_deadline = self
+            .test_sessions
+            .as_ref()
+            .context("Exchange faults require an original test session")?
+            .deadline();
+        ensure!(
+            session_deadline > Instant::now(),
+            "Exchange fault test session has expired"
+        );
+        let control = self.native_root_reply_fault(index)?;
+        let mut peers = Vec::with_capacity(self.runtime.be.len());
+        for backend in 0..self.runtime.be.len() {
+            let endpoint = NativeEndpoint::from_host_port(
+                self.native_trust_fixture.fixture.advertise_host(),
+                self.be_grpc_ports[backend],
+            )
+            .map_err(anyhow::Error::msg)?;
+            peers.push((
+                backend,
+                NativeCallerSubject::parse(format!("be@{endpoint}")).map_err(anyhow::Error::msg)?,
+                self.backend_process_id(backend)?,
+            ));
+        }
+        control.bind_exchange_peers(peers, session_deadline)?;
+        Ok(control)
+    }
+
+    /// Read the original backend registry without synthesizing missing samples.
+    pub fn backend_exchange_flow_metrics(&self, index: usize) -> Result<String> {
+        self.ensure_be_index(index)?;
+        scrape_prometheus_metrics(self.runtime.be[index].http)
     }
 
     /// Control only the actual Data proxy for domain-isolation scenarios.
@@ -6597,9 +6652,9 @@ fn merge_safe_config_overlay(
     if overlay
         .get("standalone_server")
         .and_then(Value::as_table)
-        .is_some_and(|table| table.contains_key("mysql_port"))
+        .is_some_and(|table| table.contains_key("mysql_port") || table.contains_key("trino_port"))
     {
-        bail!("cross-process config overlay cannot modify standalone_server.mysql_port");
+        bail!("cross-process config overlay cannot modify frontend listener ports");
     }
     merge_toml_table(root, overlay);
     Ok(())
@@ -6791,6 +6846,7 @@ struct ReservedRuntimePorts {
     fe_http_port: ReservedTcpPort,
     fe_grpc_port: ReservedTcpPort,
     fe_mysql_port: ReservedTcpPort,
+    fe_trino_port: ReservedTcpPort,
 }
 
 impl ReservedRuntimePorts {
@@ -6809,6 +6865,7 @@ impl ReservedRuntimePorts {
             fe_http_port: ReservedTcpPort::new()?,
             fe_grpc_port: ReservedTcpPort::new()?,
             fe_mysql_port: ReservedTcpPort::new()?,
+            fe_trino_port: ReservedTcpPort::new()?,
         })
     }
 }
@@ -8143,6 +8200,7 @@ mod tests {
             fe_http_port: 28080,
             fe_grpc_port: 29070,
             fe_mysql_port: 29030,
+            fe_trino_port: 28081,
         }
     }
 
@@ -8163,6 +8221,7 @@ mod tests {
             fe_http_port: 28080,
             fe_grpc_port: 29070,
             fe_mysql_port: 29030,
+            fe_trino_port: 28081,
         }
     }
 
@@ -9259,7 +9318,8 @@ static_file_path = "catalogs.toml"
 
     #[test]
     fn be_config_overlay_rejects_out_of_range_index() {
-        let overrides = BTreeMap::from([(2, "[runtime]\nexchange_wait_ms = 1\n".to_string())]);
+        let overrides =
+            BTreeMap::from([(2, "[runtime]\noperator_buffer_chunks = 1\n".to_string())]);
         let error = validate_be_config_overrides(&overrides, 2)
             .expect_err("out of range config overlay must fail");
         assert!(format!("{error:#}").contains("out of bounds"));
@@ -9281,15 +9341,15 @@ static_file_path = "catalogs.toml"
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
             overlays: vec![
-                "[runtime]\nexchange_wait_ms = 11\n",
-                "[runtime]\nexchange_wait_ms = 29\n",
+                "[runtime]\noperator_buffer_chunks = 11\n",
+                "[runtime]\noperator_buffer_chunks = 29\n",
             ],
             native_trust_fixture: &fixture,
         })
         .expect("render BE config with ordered overlays");
         let rendered: Value = rendered.parse().expect("parse BE config");
         assert_eq!(
-            rendered["runtime"]["exchange_wait_ms"].as_integer(),
+            rendered["runtime"]["operator_buffer_chunks"].as_integer(),
             Some(29)
         );
     }
@@ -9322,14 +9382,17 @@ static_file_path = "catalogs.toml"
         let root = config.as_table_mut().expect("config root");
         merge_safe_config_overlay(
             root,
-            "[standalone_server]\nmv_refresh_scheduler_enabled = true\n[runtime]\nexchange_wait_ms = 42\n",
+            "[standalone_server]\nmv_refresh_scheduler_enabled = true\n[runtime]\noperator_buffer_chunks = 42\n",
         )
         .expect("merge safe overlay");
         assert_eq!(
             root["standalone_server"]["mv_refresh_scheduler_enabled"].as_bool(),
             Some(true)
         );
-        assert_eq!(root["runtime"]["exchange_wait_ms"].as_integer(), Some(42));
+        assert_eq!(
+            root["runtime"]["operator_buffer_chunks"].as_integer(),
+            Some(42)
+        );
         merge_safe_config_overlay(
             root,
             "[[connector.credentials]]\npurpose = 'object-store-data'\nname = 'test-data'\ngeneration = 'v1'\nkind = 's3'\naccess_key_id = '${ENV:SCENARIO_ACCESS_KEY}'\naccess_key_secret = '${ENV:SCENARIO_SECRET_KEY}'\n",
@@ -9357,6 +9420,7 @@ static_file_path = "catalogs.toml"
             Some(500)
         );
         assert!(merge_safe_config_overlay(root, "[standalone_server]\nmysql_port = 1\n").is_err());
+        assert!(merge_safe_config_overlay(root, "[standalone_server]\ntrino_port = 1\n").is_err());
     }
 
     #[test]

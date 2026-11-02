@@ -68,7 +68,6 @@ pub mod memory_observation;
 pub mod native_compatibility;
 pub mod native_trust;
 pub mod network;
-mod paimon_access;
 pub mod provider_manifest;
 pub mod roles;
 pub mod scan_io;

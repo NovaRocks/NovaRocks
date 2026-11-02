@@ -932,8 +932,8 @@ impl ReplyWriter<'_> {
             self.u64(gate.connection.generation())?;
             self.flag(gate.statement.is_some())?;
             if let Some(statement) = gate.statement {
-                self.put(&statement.session().connection_id().to_le_bytes())?;
-                self.u64(statement.session().session_epoch())?;
+                self.put(&gate.connection.connection_id().to_le_bytes())?;
+                self.u64(statement.session().key().get())?;
                 self.u64(statement.generation())?;
             }
             self.flag(gate.sql_sha256.is_some())?;

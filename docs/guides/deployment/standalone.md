@@ -37,7 +37,7 @@ cargo build -p novarocks-server
 
 FE 配置必须包括：
 
-- `[standalone_server].mysql_port`；
+- FE 客户端端口 `[standalone_server].mysql_port` 与 `trino_port`；
 - FE Native gRPC 的 `[server].grpc_port`；
 - FE management HTTP 的 `[server].http_port`；
 - 一个显式 `[catalog_source]`：静态部署使用随配置挂载的 snapshot；只有需要 SQL
@@ -47,6 +47,20 @@ FE 配置必须包括：
 - 与 BE 相同的 mandatory `[native_trust]` deployment id、shared secret 和 transport mode；
 - BE 会向 FE Native gRPC endpoint 自注册；`[cluster].backends` 不是 deployment 配置。
 
+Trino 入口的 FE 配置如下，省略时分别使用 `8080` 与 `300000`：
+
+```toml
+[standalone_server]
+mysql_port = 9030
+trino_port = 8080
+trino_client_timeout_ms = 300000
+user = "root"
+```
+
+`trino_client_timeout_ms` 是客户端两次查询请求之间的放弃期限，默认五分钟；针对该查询的 `HEAD` 也刷新期限。
+它不设置查询执行期限。每次 HTTP 响应另有固定 30 秒写出期限，写出失败或到期保留原页供重试；CLI 会处理分页与最后一页确认。
+Trino 与 MySQL 都固定绑定 `127.0.0.1`；`[server].host` 不扩展客户端入口的监听地址。
+
 BE 配置必须包括 Data 的 `[server].grpc_port`、显式非零 Control 的
 `[server].control_grpc_port` 与 `[server].http_port`，三个端口必须独立；Control 不从
 Data 端口推导。BE 使用 `[cluster].frontend_endpoint` 向 FE 原有 Native endpoint announce。
@@ -55,8 +69,8 @@ endpoint 的 heartbeat 必须返回完全相同的 descriptor，才允许新查�
 
 Data 与 Control 使用同一个准确 advertised host；可选 `[cluster].advertise_control_port`
 单独指定 Control 外部端口，未配置时等于显式的 Control bind 端口。若本地也使用 NAT，
-两条端口映射必须分别正确。BE 还必须配置本地 connector object-store binding。Paimon 查询要求 FE 与 BE 的 binding
-指向同一 warehouse 访问域。两份配置在同一进程共享 logging 与 data-runtime
+两条端口映射必须分别正确。BE 还必须配置本地 connector object-store binding。Paimon 读取恢复后，FE 与 BE 的 binding
+仍须指向同一 warehouse 访问域。两份配置在同一进程共享 logging 与 data-runtime
 sizing，其他 role-local 字段各自生效。
 
 两份正常角色配置都可包含 `[runtime.native_ingress]`：FE 只使用
@@ -92,17 +106,26 @@ NO_PROXY=127.0.0.1,localhost \
 NOVAROCKS_READY role=be grpc_port=9081 control_grpc_port=9082 advertise_host=127.0.0.1 pid=<pid>
 ```
 
-FE 另行打印 MySQL readiness marker；具体端口均取自各自配置：
+FE 在两个客户端监听绑定后另行打印就绪 marker；具体端口取自本次实际绑定：
 
 ```text
-NOVAROCKS_READY mysql_port=9030 pid=<pid>
+NOVAROCKS_READY mysql_port=9030 pid=<pid> trino_port=8080
 ```
 
-看到 marker 后再连接客户端：
+看到 marker 后再连接客户端。Trino CLI 使用当前 NovaRocks SQL 方言：
 
 ```bash
+trino --server http://127.0.0.1:8080 --user root --execute 'SELECT 1'
 mysql -h 127.0.0.1 -P 9030 -uroot
 ```
+
+Trino HTTP 只接受 Host 为 `localhost`、`127.0.0.1` 或 `[::1]` 的请求（可带数字端口），其他名称返回 403。
+`X-Trino-User` 必须与配置 `user` 相同，不匹配返回 401。该入口提供本机单用户访问，没有客户端 TLS 或非空认证；
+Native trust 只保护 FE/BE 的 Native 通道。`--catalog` 与 `--schema` 由 CLI 放入每条语句的请求头，`USE` / `SET` 的会话变化随响应回写。
+
+Trino 的 SQL 方言、时间语义、元数据查询、预编译语句和多语句事务没有因采用客户端协议而扩展。
+结果中的宽整数、无符号整数、opaque 与精度大于 38 的 decimal 在 Trino 呈现规划期返回不支持的具名错误。
+DDL 与会话语句返回 `updateType`；没有真实逻辑写计数时不返回 `updateCount`。
 
 ## 五个 Native／management listener surface
 
@@ -153,11 +176,14 @@ cargo run -p novarocks-server -- standalone --role all-in-one \
 ```
 
 该 fixture 为当前工作区生成一对正常 FE/BE 配置，以及 FE Native/management、BE
-Data/Control/management 五个不冲突 listener port（MySQL 端口另外配置）；不要
+Data/Control/management 五个不冲突 listener port，并另外配置 MySQL 与 Trino 客户端端口。Trino 端口通过 `NOVA_ENV_TRINO_PORT` 导出；不要
 猜测端口或重用旧的 standalone config 环境变量。
 
-Paimon 本地 fixture 和支持矩阵见 [Paimon 只读 Connector](../connectors/paimon.md)。
-当前 Server 的封闭 provider 集合只有 Iceberg 与 Paimon；旧
+当前 Server 的封闭 provider manifest 保留 Iceberg 与 Paimon。Paimon catalog 配置与
+投影保留，目录和读取操作返回 `Unsupported`，不进入 pure catalogue。恢复须等待
+paimon-rust 及其依赖支持 Arrow 60 与 zstd 0.14，并重新满足 ADR-0138 的授权读取边界；
+见 [ADR-0204](../../adr/ADR-0204-upstream-iceberg-backports-and-provider-suspension.md) 与
+[Paimon Connector（读取暂停）](../connectors/paimon.md) 中保留的历史 fixture 和支持矩阵。旧
 `[connector.starrocks]` 配置会在解析阶段明确失败。
 
 ## 停止与排障
@@ -168,7 +194,7 @@ Paimon 本地 fixture 和支持矩阵见 [Paimon 只读 Connector](../connectors
 
 | 现象 | 处理方式 |
 | --- | --- |
-| 启动前报 endpoint overlap | 为 FE MySQL、FE Native、BE Data、BE Control 与两侧 management HTTP 分配不同端口；也检查 wildcard bind。 |
+| 启动前报 endpoint overlap | 为 FE MySQL、FE Trino、FE Native、BE Data、BE Control 与两侧 management HTTP 分配不同端口；也检查 wildcard bind。 |
 | 启动前报 process configuration mismatch | 两份配置的 logging 与 data-runtime sizing 必须相同。 |
 | FE 提示缺少 StaticFile snapshot | 复制 `novarocks-catalogs.toml.example` 到 FE config 同目录，并使 `[catalog_source].static_file_path` 指向它；文件缺失不会降级为空 snapshot。 |
 | FE 提示 DynamicStateStore 缺少 StateStore | 仅在 `[catalog_source].mode = "dynamic-state-store"` 时配置 durable `[state_store]`；不要以 transient/in-memory membership 替代。 |
@@ -178,3 +204,5 @@ Paimon 本地 fixture 和支持矩阵见 [Paimon 只读 Connector](../connectors
 | Native RPC `Unauthenticated` 或 TLS handshake failure | 检查 secret/env、token clock 和双方 TLS profile；不要降级或删除 JWT 来绕过失败。 |
 | 访问 `/metrics` 得到 Native 协议错误或 404 | 改访问对应 role 的 management HTTP port，而不是 Native gRPC port。 |
 | 连接 MySQL 失败 | 等待 `NOVAROCKS_READY`，然后确认 FE 的 `[standalone_server].mysql_port`。 |
+| 连接 Trino 失败或返回 403/401 | 等待 marker 中的实际 `trino_port`；使用本机名称，核对 CLI 的 `--user` 与 `[standalone_server].user`。 |
+| Trino 查询返回 `ABANDONED_QUERY` | 客户端超过 `trino_client_timeout_ms` 没有请求该查询；检查分页消费或查询心跳，区别于原查询执行期限。 |

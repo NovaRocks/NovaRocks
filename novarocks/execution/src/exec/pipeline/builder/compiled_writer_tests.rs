@@ -88,12 +88,8 @@ use crate::runtime::fragment::exchange::{
 use crate::runtime::fragment::instance::{
     ExchangeInputAssignment, ExchangeInputAssignments, FragmentSinkAssignment,
 };
-use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
-use crate::runtime::fragment::io::{
-    ExchangeFrame, ExchangeFrameTransmitter, ExchangeReceiverFrame, ExchangeReceiverKey,
-    ExchangeReceiverPort, ExchangeTransmitRejection, FragmentIoError, FragmentIoErrorKind,
-    FragmentIoOperation, NoopFragmentEventSink,
-};
+use crate::runtime::fragment::io::exchange::test_support::{Fixture, UnitLoopback};
+use crate::runtime::fragment::io::{ExchangeFrameTransmitter, NoopFragmentEventSink};
 use crate::runtime::fragment::sink::materialize_compiled_sink;
 use crate::runtime::runtime_state::RuntimeState;
 
@@ -611,7 +607,6 @@ fn compile(package: FragmentPackage, pipeline_dop: usize, root_sink: bool) -> Ar
                     max_library_validation_work: 1 << 20,
                     max_library_validation_bytes: 1 << 20,
                 },
-                exchange_wait: Duration::from_secs(120),
             },
             &FixtureControl,
         )
@@ -692,58 +687,47 @@ impl ConnectorCommitFragmentCarrierValidator for AcceptCarriers {
 /// Delivers every encoded frame to the receiver port, as the native data
 /// plane does after its wire hop.
 struct LoopbackTransmitter {
-    port: Arc<dyn ExchangeReceiverPort>,
+    unit: Arc<UnitLoopback>,
 }
 
 impl ExchangeFrameTransmitter for LoopbackTransmitter {
-    fn transmit(&self, frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
-        self.port
-            .push(
-                ExchangeReceiverKey {
-                    fragment_instance_id: frame.destination_fragment_instance_id,
-                    node_id: frame.destination_node_id,
-                },
-                ExchangeReceiverFrame {
-                    stream: frame.stream.unwrap_or_else(|| {
-                        crate::runtime::fragment::io::exchange::fixture_stream(
-                            frame.sender_fragment_instance_id,
-                            frame.destination_fragment_instance_id,
-                            frame.destination_node_id,
-                            frame.sender_ordinal,
-                        )
-                    }),
-                    source_fragment_instance_id: frame.sender_fragment_instance_id,
-                    sender_ordinal: frame.sender_ordinal,
-                    sender_count: frame.sender_count,
-                    sender_id: frame.sender_id,
-                    backend_number: frame.backend_number,
-                    sequence: frame.sequence,
-                    eos: frame.eos,
-                    payload: frame.payload,
-                },
-            )
-            .map_err(|error| {
-                ExchangeTransmitRejection::Failed(FragmentIoError::new(
-                    FragmentIoOperation::ExchangeTransmit,
-                    FragmentIoErrorKind::RemoteRejected,
-                    error.to_string(),
-                ))
-            })
+    fn deliver_unit(
+        &self,
+        frame: crate::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+        stop: tokio_util::sync::CancellationToken,
+        activity: crate::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
+        done: crate::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+    ) {
+        self.unit.deliver_unit(frame, stop, activity, done);
     }
-}
-
-fn runtime_state() -> Arc<RuntimeState> {
-    Arc::new(RuntimeState::for_local_execution(
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(crate::runtime::mem_tracker::MemTracker::new_root(
-            "compiled writer tests",
-        )),
-        Some(crate::runtime::execution_runtime::test_execution_runtime()),
-    ))
+    fn register_unit_demands(
+        &self,
+        destination: RuntimeEndpoint,
+        entries: Vec<crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry>,
+        stop: tokio_util::sync::CancellationToken,
+        done: crate::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+    ) {
+        self.unit
+            .register_unit_demands(destination, entries, stop, done)
+    }
+    fn watch_unit_facts(
+        &self,
+        destination: RuntimeEndpoint,
+        stream: novarocks_execution_contract::ExchangeStreamIdentity,
+        wake: crate::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+    ) -> Result<(), novarocks_failure_contract::FailureFact> {
+        self.unit.watch_unit_facts(destination, stream, wake)
+    }
+    fn forget_unit_facts(&self, stream: novarocks_execution_contract::ExchangeStreamIdentity) {
+        self.unit.forget_unit_facts(stream)
+    }
+    fn schedule_unit_retry(
+        &self,
+        delay: Duration,
+        task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), novarocks_failure_contract::FailureFact> {
+        self.unit.schedule_unit_retry(delay, task)
+    }
 }
 
 fn root_of(program: &LocalProgram) -> ProgramNodeId {
@@ -786,6 +770,7 @@ fn finish_bindings(program: &LocalProgram) -> CompiledWriterBindings {
 }
 
 fn run(
+    fixture: &Fixture,
     program: &Arc<LocalProgram>,
     sink: Box<dyn OperatorFactory>,
     exchange: ExchangeBindings,
@@ -803,7 +788,7 @@ fn run(
         Some((instance.high(), instance.low())),
         None,
         pipeline_dop,
-        runtime_state(),
+        fixture.state(instance),
         Arc::new(NoopFragmentEventSink),
     )
     .map_err(|error| error.to_string())?
@@ -840,7 +825,8 @@ fn run_insert(
     writer_dop: i32,
     recorded: &Arc<Mutex<Recorded>>,
 ) -> Result<Vec<Chunk>, String> {
-    let port = in_process_test_exchange_receiver_port();
+    let fixture = Fixture::new();
+    let port = fixture.port.clone();
     let CompiledExchangeReceivers {
         registrations,
         bindings,
@@ -852,36 +838,40 @@ fn run_insert(
             ExchangeInputAssignment::new(NonZeroUsize::new(1).unwrap()),
         )])),
         Arc::clone(&port),
-        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
+        Some(&fixture.creation(FINISH_FINST)),
     )
     .expect("compiled receivers");
     for registration in registrations {
+        let key = registration.key;
         port.register(registration).expect("register receiver");
+        fixture.bind(key, &[WRITER_FINST]);
     }
-    let writer_sink = materialize_compiled_sink(
-        &insert.writer,
-        &FragmentSinkAssignment::StreamDestinations {
-            destinations: vec![
-                FragmentDestination::new(
-                    FINISH_FINST,
-                    RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
-                    WRITER_FINST,
-                    0,
-                    1,
-                )
-                .expect("destination"),
-            ],
-            sender_id: None,
-        },
-        WRITER_FINST,
-        Arc::new(LoopbackTransmitter {
-            port: Arc::clone(&port),
-        }),
-        None,
-        None,
-    )
-    .expect("compiled stream sink");
+    let writer_sink = fixture
+        .sink(
+            &insert.writer,
+            &FragmentSinkAssignment::StreamDestinations {
+                destinations: vec![
+                    FragmentDestination::new(
+                        FINISH_FINST,
+                        RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
+                        WRITER_FINST,
+                        0,
+                        1,
+                    )
+                    .expect("destination"),
+                ],
+                sender_id: None,
+            },
+            WRITER_FINST,
+            Arc::new(LoopbackTransmitter {
+                unit: fixture.transport.clone(),
+            }),
+            None,
+            None,
+        )
+        .expect("compiled stream sink");
     run(
+        &fixture,
         &insert.writer,
         writer_sink,
         ExchangeBindings::default(),
@@ -900,6 +890,7 @@ fn run_insert(
     )
     .expect("compiled result sink");
     run(
+        &fixture,
         &insert.finish,
         finish_sink,
         bindings,
@@ -1218,8 +1209,6 @@ mod statistics {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    exchange_wait_ms: 120_000,
-                    exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1024,
                     exchange_max_transmit_batched_bytes: 16 * 1024 * 1024,
                     operator_buffer_chunks: 1,
@@ -1977,6 +1966,16 @@ mod statistics {
     }
 
     fn compiled(target: u32, rows: &[(i64, Option<&str>)], writer_dop: usize) -> Compiled {
+        compiled_with_finish_package(target, rows, writer_dop, 1, |package| package)
+    }
+
+    fn compiled_with_finish_package(
+        target: u32,
+        rows: &[(i64, Option<&str>)],
+        writer_dop: usize,
+        finish_dop: usize,
+        finish_package: impl FnOnce(FragmentPackage) -> FragmentPackage,
+    ) -> Compiled {
         let catalog = theta_catalog();
         let ordinal = WriteTargetOrdinal::try_new(target).unwrap();
         let (plan, receiver) = plan(target, rows);
@@ -2005,6 +2004,8 @@ mod statistics {
             &FixtureControl,
         )
         .unwrap();
+        let finish = packages.remove(&FragmentId::new(2)).unwrap();
+        packages.insert(FragmentId::new(2), finish_package(finish));
         let provider = adapter().binding().descriptor().provider_id.clone();
         let providers = PureProviderProgramCatalog::try_new(
             &[PureProviderManifestEntry::new(
@@ -2039,7 +2040,6 @@ mod statistics {
                         root_sink_dop: root_sink.then(|| NonZeroUsize::new(1).unwrap()),
                         kernel_abi: KernelAbiVersion::CURRENT,
                         constants: constants(),
-                        exchange_wait: Duration::from_secs(120),
                     },
                     &FixtureControl,
                 )
@@ -2048,7 +2048,7 @@ mod statistics {
         };
         Compiled {
             writer: compile(FragmentId::new(1), writer_dop, false),
-            finish: compile(FragmentId::new(2), 1, true),
+            finish: compile(FragmentId::new(2), finish_dop, true),
             receiver,
         }
     }
@@ -3217,4 +3217,5 @@ mod statistics {
     // Reuse the actual checked Physical writer/finish fixture, immutable pools,
     // canonical call requests, LocalCompiler and original writer/finish bodies.
     include!("compiled_writer_root_positive_statistics_tests.rs");
+    include!("compiled_writer_logical_finish_graph_tests.rs");
 }

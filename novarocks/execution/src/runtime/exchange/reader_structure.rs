@@ -35,6 +35,9 @@ fn model_error(cause: ReaderStructureFailure<ExchangeFailure>) -> ExchangeFailur
         ReaderStructureFailure::Creator(cause) => cause,
         ReaderStructureFailure::Layout(cause) => cause.into(),
         ReaderStructureFailure::Map(cause) => cause.into(),
+        ReaderStructureFailure::BTree(cause) => {
+            ExchangeFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(cause))
+        }
         ReaderStructureFailure::Vector(novarocks_type_contract::ControlResourceError::Control(
             cause,
         )) => ConstructionFailure::Control(cause).into(),
@@ -677,7 +680,7 @@ mod tests {
             ValueKind::Nominal(ValueLogicalType::Json)
         ));
         assert!(!slot.nullable());
-        assert_eq!(slot.field().metadata().capacity(), 0);
+        assert!(slot.field().metadata().as_arc().is_none());
         #[allow(deprecated)]
         {
             assert_eq!(slot.field().dict_id(), published.field(0).dict_id());

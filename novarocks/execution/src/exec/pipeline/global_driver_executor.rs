@@ -463,6 +463,26 @@ impl DriverTask {
         self.driver.source_name()
     }
 
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn writer_diagnostic(
+        &self,
+    ) -> Option<(
+        crate::runtime::writer_diagnostics::WriterDiagnostics,
+        String,
+        String,
+    )> {
+        crate::runtime::writer_diagnostics::WriterDiagnostics::from_runtime(
+            self.fragment_ctx.runtime_state(),
+        )
+        .map(|scope| {
+            (
+                scope,
+                self.driver.source_name().to_owned(),
+                self.driver.sink_name().to_owned(),
+            )
+        })
+    }
+
     pub(crate) fn fragment_instance_id(&self) -> Option<(i64, i64)> {
         self.driver.fragment_instance_id()
     }
@@ -995,21 +1015,31 @@ fn park_pending_finish(task: DriverTask) {
     let health = control.exit_health_reporter();
     let mut slot = std::mem::ManuallyDrop::new(Some(task));
     let mut phase = ParkingPhase::new();
-    phase.roles[0].run(&control, 634, || {
-        if let Err(refusal) = scheduler.add_pending_finish(&mut slot) {
-            // Known capacity remains a typed cleanup/resource fact. An actual
-            // diagnostic callback panic is separately supervised by this role.
-            control.report_cleanup(&ExecutionFailure::from_domain(refusal));
-        }
-    });
+    phase.roles[0].run(
+        &control,
+        crate::runtime::fragment::ExecutionReason::DriverParking
+            .code()
+            .get(),
+        || {
+            if let Err(refusal) = scheduler.add_pending_finish(&mut slot) {
+                // Known capacity remains a typed cleanup/resource fact. An actual
+                // diagnostic callback panic is separately supervised by this role.
+                control.report_cleanup(&ExecutionFailure::from_domain(refusal));
+            }
+        },
+    );
     if let Some(task) = slot.take() {
         rejected_driver_reaper().enqueue(task);
     }
     // A concurrent ready worker may already have retired the original task.
     // Last control/capture Drop has its detached same-health reporter.
-    phase.roles[1].run_metadata(&health, 639, || {
-        drop(std::mem::ManuallyDrop::into_inner(control))
-    });
+    phase.roles[1].run_metadata(
+        &health,
+        crate::runtime::fragment::ExecutionReason::DriverParkingControlDrop
+            .code()
+            .get(),
+        || drop(std::mem::ManuallyDrop::into_inner(control)),
+    );
     // Captures installed above contain weak scheduler/observable state plus
     // immutable driver identity. The saved roles contain no Task/control field.
     custody.finish_parking(phase.is_unknown().then_some(phase));

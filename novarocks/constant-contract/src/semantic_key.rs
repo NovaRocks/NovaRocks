@@ -531,8 +531,12 @@ mod tests {
     fn source_field_attributes_do_not_change_typed_value_equality() {
         let left = value(Arc::new(StringArray::from(vec!["same"])), false);
         let field = Arc::new(
-            Field::new("different", DataType::Utf8, false)
-                .with_metadata([("annotation".into(), "different".into())].into()),
+            Field::new("different", DataType::Utf8, false).with_metadata(
+                std::collections::HashMap::<String, String>::from([(
+                    "annotation".into(),
+                    "different".into(),
+                )]),
+            ),
         );
         let right = ConstantPool::try_new(
             field,

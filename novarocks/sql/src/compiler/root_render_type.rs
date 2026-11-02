@@ -27,21 +27,54 @@ use novarocks_result_contract::{
 use novarocks_type_contract::{ValueKind, ValueLogicalType as V, ValueTypeRef};
 use std::mem::size_of;
 
-/// The application supplies the frontend's frozen presentation offset. No
-/// renderer consults a backend clock or infers logical domains from names.
+/// Frozen presentation input authored by the original client session.
+#[derive(Clone, Copy, Debug)]
+pub enum RenderFamilyRequest<'a> {
+    MysqlText { timezone_offset_seconds: i32 },
+    TrinoJson(&'a novarocks_result_contract::TrinoJsonFacts),
+}
+
+/// A protocol type rejection remains distinct from invalid public declarations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClientRenderSchemaError {
+    Invalid(String),
+    UnsupportedClientType { column: String, native_type: N },
+}
+impl From<String> for ClientRenderSchemaError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+impl std::fmt::Display for ClientRenderSchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => f.write_str(message),
+            Self::UnsupportedClientType {
+                column,
+                native_type,
+            } => write!(
+                f,
+                "column '{column}' has type {native_type:?}, which is unsupported by the Trino client protocol"
+            ),
+        }
+    }
+}
+impl std::error::Error for ClientRenderSchemaError {}
+
+/// The application supplies the frozen family and, for MySQL, its local offset.
 pub fn client_render_schema(
     plan: &PhysicalPlan,
-    timezone_offset_seconds: i32,
-) -> Result<ClientRenderSchema, String> {
-    client_render_schema_from_port(plan.result_port(), timezone_offset_seconds)
+    family: RenderFamilyRequest<'_>,
+) -> Result<ClientRenderSchema, ClientRenderSchemaError> {
+    client_render_schema_from_port(plan.result_port(), family)
 }
 
 pub fn client_render_schema_from_port(
     port: Option<&novarocks_physical_plan::ResultPort>,
-    timezone_offset_seconds: i32,
-) -> Result<ClientRenderSchema, String> {
+    family: RenderFamilyRequest<'_>,
+) -> Result<ClientRenderSchema, ClientRenderSchemaError> {
     let result = port.ok_or_else(invalid)?;
-    schema(&result.fields, timezone_offset_seconds)
+    family_schema(&result.fields, family)
 }
 
 fn root_domain_matches(field: &ResultField) -> bool {
@@ -58,10 +91,17 @@ fn root_domain_matches(field: &ResultField) -> bool {
             | (Domain::Percentile, V::Percentile)
     )
 }
-fn schema(fields: &[ResultField], offset: i32) -> Result<ClientRenderSchema, String> {
+// Design: ADR-0203 (docs/adr/ADR-0203-client-result-presentation-and-trino-paged-delivery.md)
+fn family_schema(
+    fields: &[ResultField],
+    family: RenderFamilyRequest<'_>,
+) -> Result<ClientRenderSchema, ClientRenderSchemaError> {
     validate_public_fields(fields)?;
-    if fields.is_empty() || fields.len() > P::MAX_COLUMNS || !(-86_399..=86_399).contains(&offset) {
-        return Err(invalid());
+    if fields.is_empty()
+        || fields.len() > P::MAX_COLUMNS
+        || matches!(family, RenderFamilyRequest::MysqlText { timezone_offset_seconds } if !(-86_399..=86_399).contains(&timezone_offset_seconds))
+    {
+        return Err(invalid().into());
     }
     let mut bounds = Bounds {
         backing: size_of::<ClientRenderSchema>(),
@@ -77,7 +117,7 @@ fn schema(fields: &[ResultField], offset: i32) -> Result<ClientRenderSchema, Str
     )?;
     for field in fields {
         if !root_domain_matches(field) {
-            return Err(invalid());
+            return Err(invalid().into());
         }
         bounds.name(field.alias.as_deref().unwrap_or(&field.name))?;
         preflight(
@@ -88,16 +128,37 @@ fn schema(fields: &[ResultField], offset: i32) -> Result<ClientRenderSchema, Str
             &mut bounds,
         )?;
     }
+    if matches!(family, RenderFamilyRequest::TrinoJson(_)) {
+        for field in fields {
+            validate_trino_type(
+                field.ty.value_type(),
+                field.ty.data_type(),
+                field.alias.as_deref().unwrap_or(&field.name),
+            )?;
+        }
+    }
     let mut columns = Vec::with_capacity(fields.len());
     for (ordinal, field) in fields.iter().enumerate() {
         columns.push(RenderColumn {
             source_ordinal: u32::try_from(ordinal).map_err(|_| limited())?,
             source_slot: None,
             name: field.alias.as_deref().unwrap_or(&field.name).to_owned(),
-            field: build(field.ty.value_type(), field.ty.data_type(), true, offset)?,
+            field: build(field.ty.value_type(), field.ty.data_type(), true, family)?,
         });
     }
-    ClientRenderSchema::try_new(columns, fields.len()).map_err(|error| error.to_string())
+    ClientRenderSchema::try_new(
+        match family {
+            RenderFamilyRequest::MysqlText { .. } => {
+                novarocks_result_contract::ClientPresentationFamily::MysqlText
+            }
+            RenderFamilyRequest::TrinoJson(facts) => {
+                novarocks_result_contract::ClientPresentationFamily::TrinoJson(*facts)
+            }
+        },
+        columns,
+        fields.len(),
+    )
+    .map_err(|error| ClientRenderSchemaError::Invalid(error.to_string()))
 }
 /// Qualify the complete public declaration without imposing a renderer's
 /// carrier profile or recovering domains from source annotations.
@@ -314,7 +375,57 @@ fn preflight(
     }
     Ok(())
 }
-fn build(value: &ValueTypeRef, layout: &D, top: bool, offset: i32) -> Result<RenderField, String> {
+fn validate_trino_type(
+    value: &ValueTypeRef,
+    layout: &D,
+    column: &str,
+) -> Result<(), ClientRenderSchemaError> {
+    match kind(value, layout)? {
+        Kind::Leaf(native_type) => {
+            if matches!(
+                native_type,
+                N::LargeInt | N::UnsignedInteger(_) | N::Opaque(_)
+            ) || matches!(native_type, N::Decimal { precision, .. } if precision > 38)
+            {
+                return Err(ClientRenderSchemaError::UnsupportedClientType {
+                    column: column.to_owned(),
+                    native_type,
+                });
+            }
+        }
+        Kind::Timestamp(_) => {}
+        Kind::List => {
+            let ValueKind::List(child) = value.kind() else {
+                return Err(invalid().into());
+            };
+            validate_trino_type(child, list_layout(layout)?.data_type(), column)?;
+        }
+        Kind::Map => {
+            let (ValueKind::Map { key, value }, D::Map(entries, false)) = (value.kind(), layout)
+            else {
+                return Err(invalid().into());
+            };
+            let (key_layout, value_layout) = super::root_scalar_type::map_children(entries)?;
+            validate_trino_type(key, key_layout.data_type(), column)?;
+            validate_trino_type(value, value_layout.data_type(), column)?;
+        }
+        Kind::Struct => {
+            let (ValueKind::Struct(fields), D::Struct(layouts)) = (value.kind(), layout) else {
+                return Err(invalid().into());
+            };
+            for (field, layout) in fields.iter().zip(layouts) {
+                validate_trino_type(field.value_type(), layout.data_type(), column)?;
+            }
+        }
+    }
+    Ok(())
+}
+fn build(
+    value: &ValueTypeRef,
+    layout: &D,
+    top: bool,
+    family: RenderFamilyRequest<'_>,
+) -> Result<RenderField, String> {
     let native_type = match kind(value, layout)? {
         Kind::Leaf(value) => value,
         Kind::Timestamp(unit) => {
@@ -334,7 +445,7 @@ fn build(value: &ValueTypeRef, layout: &D, top: bool, offset: i32) -> Result<Ren
                 child,
                 list_layout(layout)?.data_type(),
                 false,
-                offset,
+                family,
             )?))
         }
         Kind::Map => {
@@ -344,8 +455,8 @@ fn build(value: &ValueTypeRef, layout: &D, top: bool, offset: i32) -> Result<Ren
             };
             let (key_layout, value_layout) = super::root_scalar_type::map_children(entries)?;
             N::Map {
-                key: Box::new(build(key, key_layout.data_type(), false, offset)?),
-                value: Box::new(build(value, value_layout.data_type(), false, offset)?),
+                key: Box::new(build(key, key_layout.data_type(), false, family)?),
+                value: Box::new(build(value, value_layout.data_type(), false, family)?),
             }
         }
         Kind::Struct => {
@@ -356,23 +467,28 @@ fn build(value: &ValueTypeRef, layout: &D, top: bool, offset: i32) -> Result<Ren
             for (field, layout) in fields.iter().zip(layouts) {
                 out.push(NamedRenderField {
                     name: field.name().to_owned(),
-                    field: build(field.value_type(), layout.data_type(), false, offset)?,
+                    field: build(field.value_type(), layout.data_type(), false, family)?,
                 });
             }
             N::Struct(out)
         }
     };
-    let presentation = match &native_type {
-        N::Timestamp { .. } if top => R::TimestampUtcMicros,
-        N::Timestamp { .. } => R::TimestampContainerText,
-        N::Json => R::JsonText,
-        N::Variant if top => R::VariantSerializedBytes,
-        N::Variant => R::VariantJson {
+    let presentation = match family {
+        RenderFamilyRequest::TrinoJson(_) => R::TrinoValue,
+        RenderFamilyRequest::MysqlText {
             timezone_offset_seconds: offset,
+        } => match &native_type {
+            N::Timestamp { .. } if top => R::TimestampUtcMicros,
+            N::Timestamp { .. } => R::TimestampContainerText,
+            N::Json => R::JsonText,
+            N::Variant if top => R::VariantSerializedBytes,
+            N::Variant => R::VariantJson {
+                timezone_offset_seconds: offset,
+            },
+            N::Opaque(_) => R::OpaqueNull,
+            N::List(_) | N::Map { .. } | N::Struct(_) => R::MysqlContainer,
+            _ => R::ScalarText,
         },
-        N::Opaque(_) => R::OpaqueNull,
-        N::List(_) | N::Map { .. } | N::Struct(_) => R::MysqlContainer,
-        _ => R::ScalarText,
     };
     Ok(RenderField {
         nullable: value.nullable(),
@@ -386,6 +502,15 @@ mod tests {
     use novarocks_physical_plan::{ValueId, ValueType};
     use novarocks_type_contract::{ValueField, ValueLayout, ValueTypeStorageLifetime};
     use std::sync::Arc;
+    fn schema(fields: &[ResultField], offset: i32) -> Result<ClientRenderSchema, String> {
+        family_schema(
+            fields,
+            RenderFamilyRequest::MysqlText {
+                timezone_offset_seconds: offset,
+            },
+        )
+        .map_err(|error| error.to_string())
+    }
     fn output_type(name: &str, ty: ValueType, domain: Domain) -> ResultField {
         ResultField {
             name: name.into(),
@@ -672,13 +797,14 @@ mod tests {
                 .native_type,
             N::Variant
         );
-        let marked = Field::new("item", D::Binary, true).with_metadata(
-            [(
+        let marked =
+            Field::new("item", D::Binary, true).with_metadata(std::collections::HashMap::<
+                String,
+                String,
+            >::from([(
                 novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
                 "unknown-source-attribute".into(),
-            )]
-            .into(),
-        );
+            )]));
         let actual = schema(
             &[output("source", D::List(Arc::new(marked)), Domain::Plain)],
             0,
@@ -778,6 +904,305 @@ mod tests {
         );
         for ty in [uuid, fixed, union] {
             assert!(schema(&[output_type("unsupported", ty, Domain::Plain)], 0).is_err());
+        }
+    }
+
+    fn port(fields: Vec<ResultField>) -> novarocks_physical_plan::ResultPort {
+        novarocks_physical_plan::ResultPort {
+            scalar_schema: None,
+            fragment: novarocks_physical_plan::FragmentId::new(1),
+            output: novarocks_physical_plan::OutputPort {
+                node: novarocks_physical_plan::NodeId::new(1),
+                columns: fields.iter().map(|field| field.value).collect(),
+            },
+            fields: fields.into_boxed_slice(),
+        }
+    }
+
+    #[test]
+    fn same_public_port_freezes_client_family_and_every_nested_presentation() {
+        let nested = structure(&[
+            (
+                "json",
+                ValueType::try_with_logical_type(D::Utf8, false, V::Json).unwrap(),
+            ),
+            (
+                "variant",
+                ValueType::try_with_logical_type(D::LargeBinary, true, V::Variant).unwrap(),
+            ),
+            (
+                "timestamps",
+                ValueType::new(
+                    D::List(Arc::new(Field::new(
+                        "item",
+                        D::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                        false,
+                    ))),
+                    true,
+                ),
+            ),
+            (
+                "pairs",
+                ValueType::new(
+                    D::Map(
+                        Arc::new(Field::new(
+                            "entries",
+                            D::Struct(
+                                vec![
+                                    Field::new("key", D::Utf8, false),
+                                    Field::new("value", D::Decimal128(38, 6), true),
+                                ]
+                                .into(),
+                            ),
+                            false,
+                        )),
+                        false,
+                    ),
+                    true,
+                ),
+            ),
+        ]);
+        let mut aliased = output_type("source_name", nested, Domain::Plain);
+        aliased.alias = Some("display_name".into());
+        let port = port(vec![
+            output(
+                "time",
+                D::Timestamp(TimeUnit::Nanosecond, None),
+                Domain::Plain,
+            ),
+            aliased,
+            output("variant", D::LargeBinary, Domain::Variant),
+        ]);
+        let facts = novarocks_result_contract::TrinoJsonFacts {
+            parametric_datetime: true,
+            variant: true,
+            variant_binary: true,
+        };
+        let mysql = client_render_schema_from_port(
+            Some(&port),
+            RenderFamilyRequest::MysqlText {
+                timezone_offset_seconds: 28_800,
+            },
+        )
+        .unwrap();
+        let trino =
+            client_render_schema_from_port(Some(&port), RenderFamilyRequest::TrinoJson(&facts))
+                .unwrap();
+        assert_eq!(
+            mysql.family(),
+            &novarocks_result_contract::ClientPresentationFamily::MysqlText
+        );
+        assert_eq!(
+            trino.family(),
+            &novarocks_result_contract::ClientPresentationFamily::TrinoJson(facts)
+        );
+        assert_eq!(mysql.columns()[0].field.presentation, R::TimestampUtcMicros);
+        assert_eq!(mysql.columns()[1].field.presentation, R::MysqlContainer);
+        assert_eq!(
+            mysql.columns()[2].field.presentation,
+            R::VariantSerializedBytes
+        );
+        assert_eq!(trino.columns()[1].name, "display_name");
+        assert_eq!(trino.columns()[1].source_ordinal, 1);
+        fn assert_trino(field: &RenderField) {
+            assert_eq!(field.presentation, R::TrinoValue);
+            match &field.native_type {
+                N::List(child) => assert_trino(child),
+                N::Map { key, value } => {
+                    assert_trino(key);
+                    assert_trino(value);
+                }
+                N::Struct(fields) => fields.iter().for_each(|field| assert_trino(&field.field)),
+                _ => {}
+            }
+        }
+        for column in trino.columns() {
+            assert_trino(&column.field);
+        }
+        let N::Struct(fields) = &trino.columns()[1].field.native_type else {
+            panic!("struct")
+        };
+        assert_eq!(fields[0].field.native_type, N::Json);
+        assert!(!fields[0].field.nullable);
+        assert_eq!(fields[1].field.native_type, N::Variant);
+        let N::List(child) = &fields[2].field.native_type else {
+            panic!("list")
+        };
+        assert!(!child.nullable);
+        assert_eq!(
+            child.native_type,
+            N::Timestamp {
+                unit: U::Nanosecond,
+                timezone: Some("UTC".into())
+            }
+        );
+    }
+
+    #[test]
+    fn trino_d13_rejections_keep_native_type_and_aliased_output_column() {
+        let mut cases = vec![
+            (
+                ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::LargeInt)
+                    .unwrap(),
+                Domain::Plain,
+                N::LargeInt,
+            ),
+            (
+                ValueType::new(D::UInt8, true),
+                Domain::Plain,
+                N::UnsignedInteger(8),
+            ),
+            (
+                ValueType::new(D::UInt16, true),
+                Domain::Plain,
+                N::UnsignedInteger(16),
+            ),
+            (
+                ValueType::new(D::UInt32, true),
+                Domain::Plain,
+                N::UnsignedInteger(32),
+            ),
+            (
+                ValueType::new(D::UInt64, true),
+                Domain::Plain,
+                N::UnsignedInteger(64),
+            ),
+        ];
+        for (logical, domain, opaque) in [
+            (V::Hll, Domain::Hll, O::Hll),
+            (V::Bitmap, Domain::Bitmap, O::Bitmap),
+            (V::Object, Domain::Object, O::Object),
+            (V::Percentile, Domain::Percentile, O::Percentile),
+        ] {
+            cases.push((
+                ValueType::try_with_logical_type(D::Binary, true, logical).unwrap(),
+                domain,
+                N::Opaque(opaque),
+            ));
+        }
+        cases.push((
+            ValueType::new(
+                D::List(Arc::new(Field::new("item", D::Decimal256(40, 4), true))),
+                true,
+            ),
+            Domain::Plain,
+            N::Decimal {
+                bits: 256,
+                precision: 40,
+                scale: 4,
+            },
+        ));
+        let facts = novarocks_result_contract::TrinoJsonFacts::default();
+        for (ty, domain, expected) in cases {
+            for nested in [false, true] {
+                let mut field = if nested {
+                    output_type(
+                        "raw_name",
+                        structure(&[("inner", ty.clone())]),
+                        Domain::Plain,
+                    )
+                } else {
+                    output_type("raw_name", ty.clone(), domain)
+                };
+                field.alias = Some("displayed_alias".into());
+                let port = port(vec![field]);
+                assert!(
+                    client_render_schema_from_port(
+                        Some(&port),
+                        RenderFamilyRequest::MysqlText {
+                            timezone_offset_seconds: 0
+                        }
+                    )
+                    .is_ok()
+                );
+                let error = client_render_schema_from_port(
+                    Some(&port),
+                    RenderFamilyRequest::TrinoJson(&facts),
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error,
+                    ClientRenderSchemaError::UnsupportedClientType {
+                        column: "displayed_alias".into(),
+                        native_type: expected.clone(),
+                    }
+                );
+                let message = error.to_string();
+                assert!(message.contains("displayed_alias"));
+                assert!(message.contains(&format!("{expected:?}")));
+                assert!(message.contains("Trino client protocol"));
+            }
+        }
+    }
+
+    #[test]
+    fn trino_decimal_admission_uses_precision_without_changing_nested_carrier() {
+        let facts = novarocks_result_contract::TrinoJsonFacts::default();
+        for bits in [128, 256] {
+            let decimal = if bits == 128 {
+                D::Decimal128(38, 6)
+            } else {
+                D::Decimal256(38, 6)
+            };
+            let port = port(vec![output(
+                "bounded_decimal",
+                D::List(Arc::new(Field::new("item", decimal, true))),
+                Domain::Plain,
+            )]);
+            let schema =
+                client_render_schema_from_port(Some(&port), RenderFamilyRequest::TrinoJson(&facts))
+                    .unwrap();
+            let N::List(child) = &schema.columns()[0].field.native_type else {
+                panic!("list")
+            };
+            assert_eq!(
+                child.native_type,
+                N::Decimal {
+                    bits,
+                    precision: 38,
+                    scale: 6
+                }
+            );
+            assert_eq!(child.presentation, R::TrinoValue);
+        }
+    }
+
+    #[test]
+    fn client_family_preserves_existing_unsupported_declaration_errors() {
+        let facts = novarocks_result_contract::TrinoJsonFacts::default();
+        let types = [
+            ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::Uuid).unwrap(),
+            ValueType::new(
+                D::FixedSizeList(Arc::new(Field::new("item", D::Int64, true)), 2),
+                true,
+            ),
+            ValueType::new(
+                D::Union(
+                    arrow::datatypes::UnionFields::try_new(
+                        [2],
+                        [Field::new("item", D::Int64, true)],
+                    )
+                    .unwrap(),
+                    arrow::datatypes::UnionMode::Dense,
+                ),
+                true,
+            ),
+            ValueType::new(D::Decimal256(40, 4), true),
+        ];
+        for ty in types {
+            let port = port(vec![output_type("original", ty, Domain::Plain)]);
+            let mysql = client_render_schema_from_port(
+                Some(&port),
+                RenderFamilyRequest::MysqlText {
+                    timezone_offset_seconds: 0,
+                },
+            )
+            .unwrap_err();
+            let trino =
+                client_render_schema_from_port(Some(&port), RenderFamilyRequest::TrinoJson(&facts))
+                    .unwrap_err();
+            assert!(matches!(mysql, ClientRenderSchemaError::Invalid(_)));
+            assert_eq!(trino, mysql);
         }
     }
 }

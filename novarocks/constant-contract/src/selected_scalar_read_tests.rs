@@ -70,7 +70,7 @@ fn pool(array: ArrayRef, logical: ValueLogicalType) -> ConstantPool {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .chain([("provider.fact".to_owned(), "preserved".to_owned())])
-                .collect(),
+                .collect::<std::collections::HashMap<String, String>>(),
         );
     ConstantPool::try_new(
         Arc::new(field),

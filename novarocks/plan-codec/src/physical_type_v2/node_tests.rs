@@ -184,24 +184,25 @@ fn shallow_carrier_parameters_keep_original_closed_diagnostics() {
             )))
         ));
     }
-    for ty in [union([-1]), union([0, 0])] {
-        assert!(matches!(
-            run(&[ty], false, &Control::default()),
-            Err(TypeCodecError::Carrier(CarrierParameterError::Invalid(
-                "invalid or duplicate Union type id"
-            )))
-        ));
+    // The current safe SDK constructor rejects these sources before any
+    // DataType can reach the first-party shallow carrier validator.
+    for (ids, expected) in [
+        (vec![-1], "type ids must be non-negative: -1"),
+        (vec![0, 0], "duplicate type id: 0"),
+    ] {
+        let children = ids.iter().map(|_| field(DataType::Int64, false));
+        let error = UnionFields::try_new(ids.clone(), children).unwrap_err();
+        assert!(
+            matches!(error, arrow::error::ArrowError::InvalidArgumentError(actual) if actual == expected)
+        );
     }
-    assert!(matches!(
-        run(
-            &[union((0..129).map(|n| n as i8))],
-            false,
-            &Control::default()
-        ),
-        Err(TypeCodecError::Carrier(CarrierParameterError::Invalid(
-            "too many Union type ids"
-        )))
-    ));
+    let error =
+        UnionFields::try_from_fields((0..129).map(|_| field(DataType::Int64, false))).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Invalid argument error: UnionFields cannot contain more than 128 fields"
+    );
+    run(&[union(0..=127)], false, &Control::default()).unwrap();
     for (ty, message) in [
         (
             DataType::Decimal32(0, 0),
@@ -286,7 +287,9 @@ fn shallow_timezone_actual_chunk_and_ordinary_tail_prefixes_keep_three_causes() 
     // byte. A legal >256-byte zone therefore has no internal 256-unit claim.
     assert_eq!(prefixes(&[ty], false), [0, 2]);
     assert_eq!(prefixes(&[DataType::FixedSizeBinary(-1)], true), [0, 1]);
-    assert_eq!(prefixes(&[union([0, 0])], true), [0, 3]);
+    // One carrier visit plus two valid identity visits preserves the same
+    // real three-unit callback prefix; invalid identities fail at construction.
+    assert_eq!(prefixes(&[union([0, 1])], false), [0, 3]);
 }
 
 #[test]

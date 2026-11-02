@@ -493,7 +493,9 @@ mod tests {
                             fields[0]
                                 .field()
                                 .clone()
-                                .with_metadata([("logical_type".into(), "json".into())].into()),
+                                .with_metadata(std::collections::HashMap::<String, String>::from(
+                                    [("logical_type".into(), "json".into())],
+                                )),
                         )
                     }
                     4 => {
@@ -605,11 +607,10 @@ mod tests {
                 fields: vec![ConnectorWriteFieldBinding::new(
                     field(1).token(),
                     Field::new("v", DataType::Int64, false).with_metadata(
-                        [(
+                        std::collections::HashMap::<String, String>::from([(
                             "k".into(),
                             "x".repeat(crate::MAX_WRITE_RELATION_METADATA_VALUE_BYTES + 1),
-                        )]
-                        .into(),
+                        )]),
                     ),
                 )],
             },
@@ -647,7 +648,9 @@ mod tests {
     #[test]
     fn recipe_owns_bounded_field_and_metadata_backing() {
         let mut metadata = std::collections::HashMap::with_capacity(10_000);
-        metadata.insert("key".into(), "value".into());
+        let mut value = String::with_capacity(10_000);
+        value.push_str("value");
+        metadata.insert("key".into(), value);
         let mut fields = Vec::with_capacity(10_000);
         fields.push(ConnectorWriteFieldBinding::new(
             field(1).token(),
@@ -658,7 +661,11 @@ mod tests {
             unreachable!()
         };
         assert_eq!(fields.capacity(), fields.len());
-        assert!(fields[0].field().metadata().capacity() < 10);
+        assert_eq!(fields[0].field().metadata().len(), 1);
+        assert_eq!(
+            fields[0].field().metadata()["key"].capacity(),
+            "value".len()
+        );
         assert_eq!(fields[0].field().metadata()["key"], "value");
     }
 

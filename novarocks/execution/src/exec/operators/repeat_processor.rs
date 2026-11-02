@@ -1020,12 +1020,12 @@ mod typed_owner_tests {
                 ValueKind::Nominal(ValueLogicalType::Json)
             ));
             assert!(!child.nullable());
-            assert_eq!(schema.arrow_schema_ref().metadata().capacity(), 0);
-            assert_eq!(slot.field().metadata().capacity(), 0);
+            assert!(schema.arrow_schema_ref().metadata().as_arc().is_none());
+            assert!(slot.field().metadata().as_arc().is_none());
             let DataType::List(field) = slot.field().data_type() else {
                 panic!("List carrier")
             };
-            assert_eq!(field.metadata().capacity(), 0);
+            assert!(field.metadata().as_arc().is_none());
             let grouping_column = chunk.column_by_slot_id(SlotId::new(10)).unwrap();
             let groups = grouping_column
                 .as_any()

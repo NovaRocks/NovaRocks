@@ -419,7 +419,9 @@ mod tests {
             registry.terminate(
                 old,
                 ClientConnectionTerminationReason::ExplicitKillConnection {
-                    requester_connection_id: 9,
+                    requester_session:
+                        novarocks_query_application::session_control::ClientSessionKey::new(9)
+                            .expect("nonzero fixture requester"),
                 }
             ),
             ClientConnectionTerminateOutcome::Stale
@@ -430,7 +432,9 @@ mod tests {
             registry.terminate(
                 current,
                 ClientConnectionTerminationReason::ExplicitKillConnection {
-                    requester_connection_id: 9,
+                    requester_session:
+                        novarocks_query_application::session_control::ClientSessionKey::new(9)
+                            .expect("nonzero fixture requester"),
                 }
             ),
             ClientConnectionTerminateOutcome::Requested
@@ -441,7 +445,9 @@ mod tests {
                 .try_recv()
                 .expect("successor receives its signal"),
             ClientConnectionTerminationReason::ExplicitKillConnection {
-                requester_connection_id: 9,
+                requester_session:
+                    novarocks_query_application::session_control::ClientSessionKey::new(9)
+                        .expect("nonzero fixture requester"),
             }
         );
     }
@@ -452,7 +458,10 @@ mod tests {
         let mut registration = registry.register().expect("register connection");
         let target = registration.token();
         let first = ClientConnectionTerminationReason::ExplicitKillConnection {
-            requester_connection_id: 7,
+            requester_session: novarocks_query_application::session_control::ClientSessionKey::new(
+                7,
+            )
+            .expect("nonzero fixture requester"),
         };
         assert_eq!(
             registry.terminate(target, first.clone()),
@@ -478,7 +487,10 @@ mod tests {
         let target = registration.token();
         let barrier = Arc::new(Barrier::new(9));
         let workers = (0..8)
-            .map(|requester_connection_id| {
+            .map(|index| {
+                let requester_session =
+                    novarocks_query_application::session_control::ClientSessionKey::new(index + 1)
+                        .unwrap();
                 let registry = Arc::clone(&registry);
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
@@ -486,7 +498,7 @@ mod tests {
                     registry.terminate(
                         target,
                         ClientConnectionTerminationReason::ExplicitKillConnection {
-                            requester_connection_id,
+                            requester_session,
                         },
                     )
                 })

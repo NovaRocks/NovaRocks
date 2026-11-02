@@ -462,7 +462,7 @@ impl AuthorizedJob {
                 "statement_run_token": nomination.statement_run_token,
                 "frontend_process_id": nomination.frontend_process_id,
                 "connection_id": nomination.connection_id,
-                "session_epoch": nomination.session_epoch,
+                "session_key": nomination.session_key,
                 "statement_generation": nomination.statement_generation,
             },
         });
@@ -673,7 +673,7 @@ mod tests {
                 statement_run_token: "selected-statement".into(),
                 frontend_process_id: process.to_string(),
                 connection_id: 17,
-                session_epoch: 3,
+                session_key: 3,
                 statement_generation: 2,
             };
             Self {
@@ -691,7 +691,7 @@ mod tests {
                 statement_run_token: self.nomination.statement_run_token.clone(),
                 frontend_process_id: self.nomination.frontend_process_id.clone(),
                 connection_id: self.nomination.connection_id,
-                session_epoch: self.nomination.session_epoch,
+                session_key: self.nomination.session_key,
                 sql_sha256: sha2::Sha256::digest(b"ALTER TABLE orders OPTIMIZE").into(),
             }
         }
@@ -968,7 +968,7 @@ mod tests {
         controls.pin_statement_input(&original).unwrap();
         controls.pin_statement_input(&original).unwrap();
         let mut client = original.clone();
-        client.session_epoch += 1;
+        client.session_key += 1;
         let mut connection = original.clone();
         connection.connection_id += 1;
         let mut sql = original.clone();
@@ -999,10 +999,10 @@ mod tests {
         assert_eq!(controls.slots.len(), 2);
         let mut fresh = original.clone();
         fresh.statement_run_token = "fresh-statement".into();
-        fresh.session_epoch += 1;
+        fresh.session_key += 1;
         let mut fresh_nom = session.nomination.clone();
         fresh_nom.statement_run_token = fresh.statement_run_token.clone();
-        fresh_nom.session_epoch = fresh.session_epoch;
+        fresh_nom.session_key = fresh.session_key;
         controls.pin_statement_input(&fresh).unwrap();
         controls.nominate_statement(&fresh, &fresh_nom).unwrap();
         controls

@@ -48,15 +48,10 @@ pub fn undecorated_nested_type(data_type: &DataType) -> DataType {
         // string -- so it survives; everything else in the metadata is the
         // provider's bookkeeping about where the column came from.
         match source.metadata().get(crate::logical::NR_LOGICAL_TYPE_KEY) {
-            Some(logical) => Arc::new(
-                field.with_metadata(
-                    [(
-                        crate::logical::NR_LOGICAL_TYPE_KEY.to_string(),
-                        logical.clone(),
-                    )]
-                    .into(),
-                ),
-            ),
+            Some(logical) => Arc::new(field.with_metadata(std::collections::HashMap::from([(
+                crate::logical::NR_LOGICAL_TYPE_KEY.to_string(),
+                logical.clone(),
+            )]))),
             None => Arc::new(field),
         }
     }
@@ -104,13 +99,10 @@ fn with_invalid_container_marker(field: Field, has_marker: bool) -> Field {
     // The Map entries container cannot own any scalar logical domain. Keep a
     // bounded rejection witness through normalization instead of erasing it.
     if has_marker {
-        field.with_metadata(
-            [(
-                crate::logical::NR_LOGICAL_TYPE_KEY.to_owned(),
-                "invalid".to_owned(),
-            )]
-            .into(),
-        )
+        field.with_metadata(std::collections::HashMap::from([(
+            crate::logical::NR_LOGICAL_TYPE_KEY.to_owned(),
+            "invalid".to_owned(),
+        )]))
     } else {
         field
     }

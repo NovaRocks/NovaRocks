@@ -93,7 +93,7 @@ impl WorkloadControl {
         }
         self.inner.update(|state| {
             if state.ready
-                || state.closed
+                || state.root_admission_is_closed()
                 || !state.nodes.is_empty()
                 || !state.cancellations.slots.is_empty()
             {

@@ -77,8 +77,12 @@ mod tests {
         let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(11), None, Some(33), Some(44)]));
         let source: ArrayRef = Arc::new(ListArray::new(
             Arc::new(
-                Field::new("external_item", DataType::Int64, true)
-                    .with_metadata([("provider-id".into(), "external-owner".into())].into()),
+                Field::new("external_item", DataType::Int64, true).with_metadata(
+                    std::collections::HashMap::<String, String>::from([(
+                        "provider-id".into(),
+                        "external-owner".into(),
+                    )]),
+                ),
             ),
             OffsetBuffer::new(vec![0, 1, 3, 4].into()),
             values.clone(),

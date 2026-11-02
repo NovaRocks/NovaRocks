@@ -261,7 +261,7 @@ fn actual_arrow_ipc_dictionary_shared_authored_id_keeps_independent_struct_value
         assert_eq!(field.data_type(), &DataType::Utf8);
         assert_eq!(field.dict_id(), None);
         assert_eq!(field.dict_is_ordered(), None);
-        assert_eq!(field.metadata().capacity(), 0);
+        assert!(field.metadata().as_arc().is_none());
     }
     assert!(!arrow_fields_exact(
         source.field(),
@@ -285,7 +285,7 @@ fn actual_arrow_ipc_dictionary_shared_authored_id_keeps_independent_struct_value
 }
 
 #[test]
-fn actual_arrow_ipc_dictionary_bare_nested_dictionary_is_admitted_but_schema_flattens() {
+fn actual_arrow_ipc_bare_nested_dictionary_is_a_legal_constant_but_both_writers_refuse() {
     let inner: ArrayRef = Arc::new(
         DictionaryArray::<Int16Type>::try_new(
             Int16Array::from(vec![1, 0]),
@@ -312,16 +312,51 @@ fn actual_arrow_ipc_dictionary_bare_nested_dictionary_is_admitted_but_schema_fla
             .unwrap(),
         Some("inner-one")
     );
-    // This records the locked library's current capability. It does not
-    // redefine legal constants or authorize flattening in the plan codec.
-    let raw = stream(&source);
-    let mut reader = StreamReader::try_new(&raw[..], None).unwrap();
+    assert_eq!(source.field().data_type(), &original_type);
     assert_eq!(
-        reader.schema().field(0).data_type(),
-        &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
+        source
+            .value(1)
+            .unwrap()
+            .utf8_observed(CompilePhase::Validate, &TestControl)
+            .unwrap(),
+        Some("inner-zero")
     );
-    assert_ne!(reader.schema().field(0).data_type(), &original_type);
-    assert!(reader.next().unwrap().is_err());
+    // Arrow 60.1 rejects the schema before writing, rather than producing
+    // the older flattened schema whose record batch could not be decoded.
+    let batch = batch(&source);
+    let mut output = Vec::new();
+    let error = match StreamWriter::try_new(&mut output, batch.schema().as_ref()) {
+        Err(source) => source,
+        Ok(_) => panic!("direct dictionary-of-dictionary must be refused before writing"),
+    };
+    let arrow::error::ArrowError::InvalidArgumentError(message) = error else {
+        panic!("actual SDK schema rejection must remain InvalidArgumentError: {error}")
+    };
+    assert_eq!(
+        message,
+        "Arrow IPC field metadata cannot encode direct dictionary-of-dictionary values for field \"nested_bare\""
+    );
+    assert!(output.is_empty());
+
+    // This was already a first-party IPC profile refusal. ConstantPool
+    // admission above grants neither schema flattening nor a codec capability.
+    let error = novarocks_plan_codec::ipc_schema_v2::encode_single_field_schema(
+        source.field(),
+        novarocks_plan_codec::ipc_schema_v2::IpcSchemaProjectionLimits {
+            max_field_occurrences: 64,
+            max_type_occurrences: 128,
+            max_string_bytes: 4096,
+            max_flatbuffer_bytes: 64 * 1024,
+        },
+        &TestControl,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        novarocks_plan_codec::physical_type_v2::TypeCodecError::InvalidShape(
+            "direct nested dictionary has no inner IPC Field identity"
+        )
+    ));
 }
 
 #[test]

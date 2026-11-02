@@ -253,7 +253,6 @@ pub(in crate::runtime::fragment) fn sql_gather_receiver_program() -> Arc<LocalPr
                 root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
                 kernel_abi: KernelAbiVersion::CURRENT,
                 constants: policy,
-                exchange_wait: Duration::from_secs(1),
             },
             &control,
         )
