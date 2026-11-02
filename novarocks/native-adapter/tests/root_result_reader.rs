@@ -1191,7 +1191,7 @@ mod root_observation_tests {
         }
 
         fn reader(&self, fixture: &Fixture) -> NativeRootResultReader {
-            NativeRootResultReader::new(Arc::clone(&fixture.registry))
+            NativeRootResultReader::new(fixture.control.clone())
                 .with_observation_controls(Some(Arc::clone(&self.controls)))
         }
 
@@ -1234,6 +1234,7 @@ mod root_observation_tests {
         assert!(matches!(reply.reply().outcome, RootReadOutcome::End(end) if end.output_rows == 1));
         session.assert_observed_once();
         drop(reply);
+        wait_until(|| fixture.root.physical_idle());
         assert!(fixture.root.physical_idle());
     }
 
@@ -1275,6 +1276,7 @@ mod root_observation_tests {
         assert_eq!(refusal.fact(), root_refusal_fact(43));
         assert!(session.observer.is_active());
         assert!(session.role.scope().observations().is_empty());
+        wait_until(|| fixture.root.physical_idle());
         assert!(fixture.root.physical_idle());
     }
 
@@ -1294,10 +1296,25 @@ mod root_observation_tests {
         let mut read = Box::pin(reader.read(&request));
         pending(read.as_mut()).await;
         fixture.seal();
-        assert_eq!(
-            fixture.registry.context_state(fixture.context),
-            QueryContextState::Releasing
-        );
+        // Observe the original Core through an admitted control request;
+        // closing the channel alone is not a Context-state receipt. This
+        // closed-context Renew cannot extend its original lease.
+        let releasing = await_original(fixture.control.renew(
+            RenewQueryExecutionLease::new(
+                TaskOperationId::new_v7(),
+                fixture.context,
+                LeaseSequence::new(1),
+                LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+            ),
+            deadline(&fixture.control),
+        ))
+        .unwrap();
+        let WorkerContextReplyBody::Context(ack) = releasing.body() else {
+            panic!("the original closed-context Renew must return its Context receipt");
+        };
+        assert_eq!(ack.receipt.context(), fixture.context);
+        assert_eq!(ack.receipt.state(), QueryContextState::Releasing);
+        drop(releasing);
         let reply = owned(
             tokio::time::timeout(Duration::from_millis(100), read)
                 .await
@@ -1317,11 +1334,10 @@ mod root_observation_tests {
         assert!(session.role.scope().observations().is_empty());
         assert_eq!(fixture.root.snapshot().consumed_through, 1);
         drop(reply);
-        fixture.registry.advance_deadlines();
-        assert_eq!(
-            fixture.registry.context_state(fixture.context),
-            QueryContextState::TerminalRetained
-        );
+        // Join the same Release request. Its original Core terminal receipt
+        // follows actual Root/R retirement, rather than a manual global scan.
+        fixture.released();
+        wait_until(|| fixture.root.physical_idle());
         assert!(fixture.root.physical_idle());
     }
 
@@ -1338,6 +1354,7 @@ mod root_observation_tests {
         drop(reply);
         assert!(session.observer.is_active());
         assert!(session.role.scope().observations().is_empty());
+        wait_until(|| fixture.root.physical_idle());
         assert!(fixture.root.physical_idle());
     }
 

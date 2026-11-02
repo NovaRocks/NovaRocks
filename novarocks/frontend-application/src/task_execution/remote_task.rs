@@ -1705,6 +1705,7 @@ mod destination_close_tests {
                     ),
                     MonotonicInstant::ORIGIN,
                     true,
+                    None,
                 )
                 .unwrap(),
             CreateSettlement::FailedClosed(OperationOutcome::OwnerFailed)
