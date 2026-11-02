@@ -1916,7 +1916,6 @@ pub(crate) mod tests {
             target_session_id: session.role.scope().session_id().into(),
             statement_run_token: run_token.into(),
             frontend_process_id: session.role.scope().process().process_id(),
-            connection_id: 7,
             session_key: statement.session().key().get(),
             statement_generation: statement.generation(),
         }
@@ -1932,7 +1931,6 @@ pub(crate) mod tests {
             target_launch_id: session.role.scope().launch_id().into(),
             statement_run_token: nomination.statement_run_token.clone(),
             frontend_process_id: nomination.frontend_process_id.clone(),
-            connection_id: nomination.connection_id,
             session_key: nomination.session_key,
             sql_sha256: sha2::Sha256::digest(b"SELECT 1").into(),
         }
@@ -1979,18 +1977,11 @@ pub(crate) mod tests {
         controls.pin_statement_input(&pinned).unwrap();
         let mut different_client = pinned.clone();
         different_client.session_key += 1;
-        let mut different_connection = pinned.clone();
-        different_connection.connection_id += 1;
         let mut different_sql = pinned.clone();
         different_sql.sql_sha256[0] ^= 0xff;
         let mut different_launch = pinned.clone();
         different_launch.target_launch_id = "foreign-launch".into();
-        for replacement in [
-            different_client,
-            different_connection,
-            different_sql,
-            different_launch,
-        ] {
+        for replacement in [different_client, different_sql, different_launch] {
             assert!(controls.pin_statement_input(&replacement).is_err());
             assert!(
                 controls

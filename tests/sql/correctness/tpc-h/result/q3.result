@@ -1,3 +1,5 @@
+-- query 1
+-- types	integer	decimal(38, 4)	date	integer
 l_orderkey	revenue	o_orderdate	o_shippriority
 2845094	433962.5553	1995-03-06	0
 4994400	423834.7976	1995-03-09	0

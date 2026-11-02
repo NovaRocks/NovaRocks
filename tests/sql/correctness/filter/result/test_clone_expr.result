@@ -1,10 +1,12 @@
 -- query 1
+-- types	varchar	tinyint	bigint	bigint
 dt	unnest	sum(d1)	sum(d2)
 2024-07-24	1	5	5
 2024-07-24	2	5	5
 2024-07-24	3	5	5
 
 -- query 2
+-- types	varchar	tinyint	bigint	bigint
 dt	unnest	sum(d1)	sum(d2)
 2024-07-24	1	5	5
 2024-07-24	2	5	5

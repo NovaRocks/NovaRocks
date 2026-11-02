@@ -25,7 +25,7 @@ SELECT CAST(CAST(2147483648 AS DOUBLE) AS INT) IS NULL AS caught_range;
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(CAST(2147483648 AS DOUBLE) AS INT) AS narrowed;
 
 -- query 3

@@ -1,10 +1,15 @@
 -- query 2
+-- types	bigint
 snapshot_count_before_equality_delete
 1
+
 -- query 4
+-- types	bigint
 snapshot_count_after_equality_delete
 2
+
 -- query 6
+-- types	integer	double
 id	total_amount
 1	10.5
 3	30.75

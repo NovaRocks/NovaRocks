@@ -164,6 +164,7 @@ pub(super) fn for_module(
     }
     paths.extend([
         format!("tests/system-test-runner/src/scenarios/{module}.rs"),
+        "tests/trino-client/**".into(),
         "tests/cluster-harness/**".into(),
         "tests/test-support/**".into(),
         "novarocks/failpoint/**".into(),
@@ -471,6 +472,7 @@ mod tests {
         for scenario in scenarios {
             let declaration = scenario.declaration();
             for shared in [
+                "tests/trino-client/**",
                 "tests/cluster-harness/**",
                 "tests/test-support/**",
                 "novarocks/failpoint/**",

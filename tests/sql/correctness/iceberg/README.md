@@ -42,3 +42,5 @@ Required config variables follow the local `tests/sql/runner/conf/default.toml` 
 
 The runner also supports `${uuid0}` style placeholders and will auto-expand them
 per test run to avoid catalog/database/table name collisions.
+
+SQL runner 经 Trino HTTP 协议访问 FE；配置使用 `[cluster].trino_port`（生成环境为 `NOVA_ENV_TRINO_PORT`），命令行覆盖使用 `--trino-port`。golden 的类型、单元格与迁移规则见 [SQL README](../../README.md#golden-格式)。

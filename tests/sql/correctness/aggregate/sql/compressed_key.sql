@@ -77,7 +77,19 @@ set pipeline_dop=2;
 
 -- query 7
 USE ${case_db};
-select distinct c1,c2,c3,c4,c5,c6,c7,c8 from all_t0 order by 1,2,3,4,5,6,7,8 limit 100,3;
+SELECT
+  trc2_output.c1,
+  trc2_output.c2,
+  trc2_output.c3,
+  trc2_output.c4,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c6,
+  trc2_output.c7,
+  trc2_output.c8
+FROM (
+  select distinct c1,c2,c3,c4,c5,c6,c7,c8 from all_t0 order by 1,2,3,4,5,6,7,8 limit 100,3
+) AS trc2_output
+ORDER BY trc2_output.c1, trc2_output.c2, trc2_output.c3, trc2_output.c4, trc2_output.c5, trc2_output.c6, trc2_output.c7, trc2_output.c8;
 
 -- query 8
 USE ${case_db};
@@ -85,7 +97,19 @@ select distinct c9,c10,c11,c12,c13,c14,c15,c16 from all_t0 order by 1,2,3,4,5,6,
 
 -- query 9
 USE ${case_db};
-select distinct c17,c18,c19,c20,c21,c22,c23,c24 from all_t0 order by 1,2,3,4,5,6,7,8 limit 100,3;
+SELECT
+  CAST(trc2_output.c17 AS VARCHAR) AS c17,
+  trc2_output.c18,
+  trc2_output.c19,
+  trc2_output.c20,
+  trc2_output.c21,
+  trc2_output.c22,
+  trc2_output.c23,
+  trc2_output.c24
+FROM (
+  select distinct c17,c18,c19,c20,c21,c22,c23,c24 from all_t0 order by 1,2,3,4,5,6,7,8 limit 100,3
+) AS trc2_output
+ORDER BY trc2_output.c17, trc2_output.c18, trc2_output.c19, trc2_output.c20, trc2_output.c21, trc2_output.c22, trc2_output.c23, trc2_output.c24;
 
 -- query 10
 USE ${case_db};
@@ -109,7 +133,13 @@ select c4, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
 -- query 15
 USE ${case_db};
-select c5, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
+SELECT
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.`sum(c1)`
+FROM (
+  select c5, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1
+) AS trc2_output
+ORDER BY trc2_output.c5, trc2_output.`sum(c1)`;
 
 -- query 16
 USE ${case_db};
@@ -145,7 +175,13 @@ select c16, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
 
 -- query 24
 USE ${case_db};
-select c17, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1;
+SELECT
+  CAST(trc2_output.c17 AS VARCHAR) AS c17,
+  trc2_output.`sum(c1)`
+FROM (
+  select c17, sum(c1) from all_t0 group by 1 order by 1, 2 limit 3, 1
+) AS trc2_output
+ORDER BY trc2_output.c17, trc2_output.`sum(c1)`;
 
 -- query 25
 USE ${case_db};
@@ -169,7 +205,13 @@ select c4, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
 -- query 30
 USE ${case_db};
-select c5, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
+SELECT
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.`sum(c1)`
+FROM (
+  select c5, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1
+) AS trc2_output
+ORDER BY trc2_output.c5 desc, trc2_output.`sum(c1)` desc;
 
 -- query 31
 USE ${case_db};
@@ -205,7 +247,13 @@ select c16, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
 
 -- query 39
 USE ${case_db};
-select c17, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1;
+SELECT
+  CAST(trc2_output.c17 AS VARCHAR) AS c17,
+  trc2_output.`sum(c1)`
+FROM (
+  select c17, sum(c1) from all_t0 group by 1 order by 1 desc, 2 desc limit 1
+) AS trc2_output
+ORDER BY trc2_output.c17 desc, trc2_output.`sum(c1)` desc;
 
 -- query 40
 USE ${case_db};
@@ -221,7 +269,14 @@ select c3, c4, sum(c1) from all_t0 group by 1,2 order by 1, 2, 3 limit 30,1;
 
 -- query 43
 USE ${case_db};
-select c3, c5, sum(c1) from all_t0 group by 1,2 order by 1, 2, 3 limit 30,1;
+SELECT
+  trc2_output.c3,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.`sum(c1)`
+FROM (
+  select c3, c5, sum(c1) from all_t0 group by 1,2 order by 1, 2, 3 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c3, trc2_output.c5, trc2_output.`sum(c1)`;
 
 -- query 44
 USE ${case_db};
@@ -229,19 +284,77 @@ select c3, c7, sum(c1) from all_t0 group by 1,2 order by 1, 2, 3 limit 30,1;
 
 -- query 45
 USE ${case_db};
-select c1,c2,c3,c4,c5,c6,c8,sum(c1) from all_t0 group by 1,2,3,4,5,6,7 order by 1,2,3,4,5,6,7,8 limit 30, 1;
+SELECT
+  trc2_output.c1,
+  trc2_output.c2,
+  trc2_output.c3,
+  trc2_output.c4,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c6,
+  trc2_output.c8,
+  trc2_output.`sum(c1)`
+FROM (
+  select c1,c2,c3,c4,c5,c6,c8,sum(c1) from all_t0 group by 1,2,3,4,5,6,7 order by 1,2,3,4,5,6,7,8 limit 30, 1
+) AS trc2_output
+ORDER BY trc2_output.c1, trc2_output.c2, trc2_output.c3, trc2_output.c4, trc2_output.c5, trc2_output.c6, trc2_output.c8, trc2_output.`sum(c1)`;
 
 -- query 46
 USE ${case_db};
-select c1,c2,c3,c4,c5,c6,c8,c13,c14,c15,c16, sum(c1) from all_t0 group by 1,2,3,4,5,6,7,8,9,10,11 order by 1,2,3,4,5,6,7,8,9,10,11 limit 30, 1;
+SELECT
+  trc2_output.c1,
+  trc2_output.c2,
+  trc2_output.c3,
+  trc2_output.c4,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c6,
+  trc2_output.c8,
+  trc2_output.c13,
+  trc2_output.c14,
+  trc2_output.c15,
+  trc2_output.c16,
+  trc2_output.`sum(c1)`
+FROM (
+  select c1,c2,c3,c4,c5,c6,c8,c13,c14,c15,c16, sum(c1) from all_t0 group by 1,2,3,4,5,6,7,8,9,10,11 order by 1,2,3,4,5,6,7,8,9,10,11 limit 30, 1
+) AS trc2_output
+ORDER BY trc2_output.c1, trc2_output.c2, trc2_output.c3, trc2_output.c4, trc2_output.c5, trc2_output.c6, trc2_output.c8, trc2_output.c13, trc2_output.c14, trc2_output.c15, trc2_output.c16;
 
 -- query 47
 USE ${case_db};
-select c1,c2,c3,c4,c5,c6,c8,c11,c12,c13,c14,c15,c16, sum(c1) from all_t0 group by 1,2,3,4,5,6,7,8,9,10,11,12,13 order by 1,2,3,4,5,6,7,8,9,10,11,12,13 limit 30,1;
+SELECT
+  trc2_output.c1,
+  trc2_output.c2,
+  trc2_output.c3,
+  trc2_output.c4,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c6,
+  trc2_output.c8,
+  trc2_output.c11,
+  trc2_output.c12,
+  trc2_output.c13,
+  trc2_output.c14,
+  trc2_output.c15,
+  trc2_output.c16,
+  trc2_output.`sum(c1)`
+FROM (
+  select c1,c2,c3,c4,c5,c6,c8,c11,c12,c13,c14,c15,c16, sum(c1) from all_t0 group by 1,2,3,4,5,6,7,8,9,10,11,12,13 order by 1,2,3,4,5,6,7,8,9,10,11,12,13 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c1, trc2_output.c2, trc2_output.c3, trc2_output.c4, trc2_output.c5, trc2_output.c6, trc2_output.c8, trc2_output.c11, trc2_output.c12, trc2_output.c13, trc2_output.c14, trc2_output.c15, trc2_output.c16;
 
 -- query 48
 USE ${case_db};
-select c1,c2,c3,c4,c5,c6,c8, sum(c1) from all_t0 where c10 > 0 group by 1,2,3,4,5,6,7 order by 1,2,3,4,5,6,7,8 limit 1;
+SELECT
+  trc2_output.c1,
+  trc2_output.c2,
+  trc2_output.c3,
+  trc2_output.c4,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c6,
+  trc2_output.c8,
+  trc2_output.`sum(c1)`
+FROM (
+  select c1,c2,c3,c4,c5,c6,c8, sum(c1) from all_t0 where c10 > 0 group by 1,2,3,4,5,6,7 order by 1,2,3,4,5,6,7,8 limit 1
+) AS trc2_output
+ORDER BY trc2_output.c1, trc2_output.c2, trc2_output.c3, trc2_output.c4, trc2_output.c5, trc2_output.c6, trc2_output.c8, trc2_output.`sum(c1)`;
 
 -- query 49
 -- @skip_result_check=true
@@ -358,7 +471,21 @@ insert into all_numbers_t0 SELECT x%128, x%200, x%200, x%200, x%200, x%128, x%20
 
 -- query 71
 USE ${case_db};
-select distinct c17,c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9,10 limit 30,1;
+SELECT
+  CAST(trc2_output.c17 AS VARCHAR) AS c17,
+  trc2_output.c16,
+  trc2_output.c15,
+  trc2_output.c14,
+  trc2_output.c13,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c17,c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9,10 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c17, trc2_output.c16, trc2_output.c15, trc2_output.c14, trc2_output.c13, trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 72
 USE ${case_db};
@@ -378,7 +505,12 @@ select distinct c4 from all_numbers_t0 order by 1 limit 30,1;
 
 -- query 76
 USE ${case_db};
-select distinct c5 from all_numbers_t0 order by 1 limit 30,1;
+SELECT
+  CAST(trc2_output.c5 AS VARCHAR) AS c5
+FROM (
+  select distinct c5 from all_numbers_t0 order by 1 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c5;
 
 -- query 77
 USE ${case_db};
@@ -398,7 +530,12 @@ select distinct c16 from all_numbers_t0 order by 1 limit 30,1;
 
 -- query 81
 USE ${case_db};
-select distinct c17 from all_numbers_t0 order by 1 limit 30,1;
+SELECT
+  CAST(trc2_output.c17 AS VARCHAR) AS c17
+FROM (
+  select distinct c17 from all_numbers_t0 order by 1 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c17;
 
 -- query 82
 USE ${case_db};
@@ -418,27 +555,96 @@ select distinct c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4 limit 30,1;
 
 -- query 86
 USE ${case_db};
-select distinct c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5 limit 30,1;
+SELECT
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 87
 USE ${case_db};
-select distinct c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6 limit 30,1;
+SELECT
+  trc2_output.c13,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c13, trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 88
 USE ${case_db};
-select distinct c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7 limit 30,1;
+SELECT
+  trc2_output.c14,
+  trc2_output.c13,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c14, trc2_output.c13, trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 89
 USE ${case_db};
-select distinct c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8 limit 30,1;
+SELECT
+  trc2_output.c15,
+  trc2_output.c14,
+  trc2_output.c13,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c15, trc2_output.c14, trc2_output.c13, trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 90
 USE ${case_db};
-select distinct c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9 limit 30,1;
+SELECT
+  trc2_output.c16,
+  trc2_output.c15,
+  trc2_output.c14,
+  trc2_output.c13,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c16, trc2_output.c15, trc2_output.c14, trc2_output.c13, trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 91
 USE ${case_db};
-select distinct c17,c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9,10 limit 30,1;
+SELECT
+  CAST(trc2_output.c17 AS VARCHAR) AS c17,
+  trc2_output.c16,
+  trc2_output.c15,
+  trc2_output.c14,
+  trc2_output.c13,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c17,c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9,10 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c17, trc2_output.c16, trc2_output.c15, trc2_output.c14, trc2_output.c13, trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 92
 -- @skip_result_check=true
@@ -447,11 +653,29 @@ insert into all_numbers_t0 (c1, c2, c3, c4, c5, c13, c14, c15, c16, c17) values 
 
 -- query 93
 USE ${case_db};
-select distinct c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5 limit 30,1;
+SELECT
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 94
 USE ${case_db};
-select distinct c17,c16,c15,c14,c13 from all_numbers_t0 order by 1,2,3,4,5 limit 30,1;
+SELECT
+  CAST(trc2_output.c17 AS VARCHAR) AS c17,
+  trc2_output.c16,
+  trc2_output.c15,
+  trc2_output.c14,
+  trc2_output.c13
+FROM (
+  select distinct c17,c16,c15,c14,c13 from all_numbers_t0 order by 1,2,3,4,5 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c17, trc2_output.c16, trc2_output.c15, trc2_output.c14, trc2_output.c13;
 
 -- query 95
 USE ${case_db};
@@ -471,7 +695,12 @@ select distinct c4 from all_numbers_t0 order by 1 limit 30,1;
 
 -- query 99
 USE ${case_db};
-select distinct c5 from all_numbers_t0 order by 1 limit 30,1;
+SELECT
+  CAST(trc2_output.c5 AS VARCHAR) AS c5
+FROM (
+  select distinct c5 from all_numbers_t0 order by 1 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c5;
 
 -- query 100
 USE ${case_db};
@@ -491,7 +720,12 @@ select distinct c16 from all_numbers_t0 order by 1 limit 30,1;
 
 -- query 104
 USE ${case_db};
-select distinct c17 from all_numbers_t0 order by 1 limit 30,1;
+SELECT
+  CAST(trc2_output.c17 AS VARCHAR) AS c17
+FROM (
+  select distinct c17 from all_numbers_t0 order by 1 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c17;
 
 -- query 105
 USE ${case_db};
@@ -511,27 +745,96 @@ select distinct c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4 limit 30,1;
 
 -- query 109
 USE ${case_db};
-select distinct c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5 limit 30,1;
+SELECT
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 110
 USE ${case_db};
-select distinct c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6 limit 30,1;
+SELECT
+  trc2_output.c13,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c13, trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 111
 USE ${case_db};
-select distinct c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7 limit 30,1;
+SELECT
+  trc2_output.c14,
+  trc2_output.c13,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c14, trc2_output.c13, trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 112
 USE ${case_db};
-select distinct c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8 limit 30,1;
+SELECT
+  trc2_output.c15,
+  trc2_output.c14,
+  trc2_output.c13,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c15, trc2_output.c14, trc2_output.c13, trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 113
 USE ${case_db};
-select distinct c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9 limit 30,1;
+SELECT
+  trc2_output.c16,
+  trc2_output.c15,
+  trc2_output.c14,
+  trc2_output.c13,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c16, trc2_output.c15, trc2_output.c14, trc2_output.c13, trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 114
 USE ${case_db};
-select distinct c17,c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9,10 limit 30,1;
+SELECT
+  CAST(trc2_output.c17 AS VARCHAR) AS c17,
+  trc2_output.c16,
+  trc2_output.c15,
+  trc2_output.c14,
+  trc2_output.c13,
+  CAST(trc2_output.c5 AS VARCHAR) AS c5,
+  trc2_output.c4,
+  trc2_output.c3,
+  trc2_output.c2,
+  trc2_output.c1
+FROM (
+  select distinct c17,c16,c15,c14,c13,c5,c4,c3,c2,c1 from all_numbers_t0 order by 1,2,3,4,5,6,7,8,9,10 limit 30,1
+) AS trc2_output
+ORDER BY trc2_output.c17, trc2_output.c16, trc2_output.c15, trc2_output.c14, trc2_output.c13, trc2_output.c5, trc2_output.c4, trc2_output.c3, trc2_output.c2, trc2_output.c1;
 
 -- query 115
 USE ${case_db};
@@ -643,7 +946,19 @@ select distinct c9, c10, c11, c12, c13, c14, c15, c16 from all_t1 order by 1,2,3
 
 -- query 131
 USE ${case_db};
-select distinct c17, c18, c19, c20, c21, c22, c23, c24 from all_t1 order by 1,2,3,4,5,6,7,8 desc limit 1;
+SELECT
+  CAST(trc2_output.c17 AS VARCHAR) AS c17,
+  CAST(trc2_output.c18 AS VARCHAR) AS c18,
+  CAST(trc2_output.c19 AS VARCHAR) AS c19,
+  CAST(trc2_output.c20 AS VARCHAR) AS c20,
+  trc2_output.c21,
+  trc2_output.c22,
+  trc2_output.c23,
+  trc2_output.c24
+FROM (
+  select distinct c17, c18, c19, c20, c21, c22, c23, c24 from all_t1 order by 1,2,3,4,5,6,7,8 desc limit 1
+) AS trc2_output
+ORDER BY trc2_output.c17, trc2_output.c18, trc2_output.c19, trc2_output.c20, trc2_output.c21, trc2_output.c22, trc2_output.c23, trc2_output.c24 desc;
 
 -- query 132
 -- @skip_result_check=true

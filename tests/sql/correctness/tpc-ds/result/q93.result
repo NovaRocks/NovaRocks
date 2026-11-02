@@ -1,3 +1,5 @@
+-- query 1
+-- types	integer	decimal(38, 2)
 ss_customer_sk	sumsales
 213	NULL
 287	NULL

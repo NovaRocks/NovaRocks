@@ -1,19 +1,24 @@
 -- query 2
+-- types	bigint
 count(1)
 2
 
 -- query 3
+-- types	bigint
 count(1)
 2
 
 -- query 4
+-- types	bigint
 count(1)
 2
 
 -- query 5
+-- types	bigint
 count(1)
 3
 
 -- query 6
+-- types	bigint
 count(1)
 1

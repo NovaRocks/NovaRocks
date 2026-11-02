@@ -1,4 +1,5 @@
 -- query 3
+-- legacy
 id	parent_null	value_at_one
 1	1	NULL
 2	0	NULL
@@ -6,9 +7,11 @@ id	parent_null	value_at_one
 4	0	7
 
 -- query 4
+-- legacy
 rows_total	maps_present	values_present
 4	3	1
 
 -- query 5
+-- legacy
 maps_present
 3

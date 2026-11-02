@@ -492,7 +492,7 @@ prepare_runtime() {
       require_runtime_var NOVAROCKS_BE_CONFIG &&
       require_runtime_var NOVAROCKS_SQL_TEST_CONFIG &&
       require_runtime_var NOVA_ENV_RUNTIME_DIR &&
-      require_runtime_var NOVA_ENV_MYSQL_PORT &&
+      require_runtime_var NOVA_ENV_TRINO_PORT &&
       require_runtime_var NOVAROCKS_ICEBERG_REST_URI &&
       require_runtime_var NOVAROCKS_ICEBERG_REST_MV_URI &&
       require_runtime_var NOVA_ENV_REST_ENV_FILE &&
@@ -510,7 +510,7 @@ prepare_runtime() {
       echo "NOVAROCKS_BE_CONFIG=$NOVAROCKS_BE_CONFIG"
       echo "NOVAROCKS_SQL_TEST_CONFIG=$NOVAROCKS_SQL_TEST_CONFIG"
       echo "NOVA_ENV_RUNTIME_DIR=$NOVA_ENV_RUNTIME_DIR"
-      echo "NOVA_ENV_MYSQL_PORT=$NOVA_ENV_MYSQL_PORT"
+      echo "NOVA_ENV_TRINO_PORT=$NOVA_ENV_TRINO_PORT"
       echo "NOVAROCKS_ICEBERG_REST_URI=$NOVAROCKS_ICEBERG_REST_URI"
       echo "NOVAROCKS_SPARK_DEFAULTS=${NOVAROCKS_SPARK_DEFAULTS:-}"
       echo "NOVA_CI_CARGO_PROFILE=$NOVA_CI_CARGO_PROFILE"
@@ -539,7 +539,7 @@ prepare_runtime() {
   fi
 
   CI_RUNTIME_PREPARED="true"
-  ci_set_runtime_context "$NOVAROCKS_FE_CONFIG" "$NOVAROCKS_SQL_TEST_CONFIG" "$NOVA_ENV_MYSQL_PORT"
+  ci_set_runtime_context "$NOVAROCKS_FE_CONFIG" "$NOVAROCKS_SQL_TEST_CONFIG" "$NOVA_ENV_TRINO_PORT"
   ci_record_stage "prepare runtime" "PASS" "$duration" "$log_path"
   ci_render_summary "RUNNING"
 }

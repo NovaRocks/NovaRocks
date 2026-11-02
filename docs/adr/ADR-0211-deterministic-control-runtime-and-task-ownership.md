@@ -1,5 +1,5 @@
 ---
-id: ADR-0210
+id: ADR-0211
 title: "Deterministic control runtime separates task decisions, work custody and protocol retention"
 domain: [distributed-query-lifecycle, pipeline-execution, backend-architecture]
 status: active

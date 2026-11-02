@@ -1,13 +1,16 @@
 -- query 2
+-- types	integer	integer
 id	v
 1	10
 2	20
 
 -- query 4
+-- types	integer	integer
 id	v
 1	10
 2	20
 
 -- query 5
+-- types	bigint	bigint	bigint	bigint
 same_row_ids	changed_row_ids	current_rows	historical_rows
 0	2	2	2

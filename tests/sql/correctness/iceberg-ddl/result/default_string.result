@@ -1,10 +1,12 @@
 -- query 8
+-- types	integer	varchar	varchar	varchar	varchar	varchar
 id	name	tag	empty_v	unicode_v	special_v
-1	alice	default		日本語	a,b\nc
-2	bob	default		日本語	a,b\nc
+1	alice	default	""	日本語	"a,b\nc"
+2	bob	default	""	日本語	"a,b\nc"
 
 -- query 10
+-- types	integer	varchar	varchar	varchar	varchar	varchar
 id	name	tag	empty_v	unicode_v	special_v
-1	alice	default		日本語	a,b\nc
-2	bob	default		日本語	a,b\nc
-3	charlie	default		日本語	a,b\nc
+1	alice	default	""	日本語	"a,b\nc"
+2	bob	default	""	日本語	"a,b\nc"
+3	charlie	default	""	日本語	"a,b\nc"

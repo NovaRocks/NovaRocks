@@ -1,103 +1,129 @@
 -- query 1
+-- types	varchar
 typeof(CAST(1 AS tinyint))
 tinyint
 
 -- query 2
+-- types	varchar
 typeof(CAST(1 AS smallint))
 smallint
 
 -- query 3
+-- types	varchar
 typeof(CAST(1 AS INT))
 int
 
 -- query 4
+-- types	varchar
 typeof(CAST(1 AS bigint))
 bigint
 
 -- query 5
+-- types	varchar
 typeof(CAST(1 AS LARGEINT))
 largeint
 
 -- query 6
+-- types	varchar
 typeof(CAST(1 AS DECIMAL128(19,2)))
 decimal128(19, 2)
 
 -- query 7
+-- types	varchar
 typeof(CAST(1 AS double))
 double
 
 -- query 8
+-- types	varchar
 typeof(CAST(1 AS float))
 float
 
 -- query 9
+-- types	varchar
 typeof(CAST(1 AS boolean))
 boolean
 
 -- query 10
+-- types	varchar
 typeof(CAST(1 AS char))
 char
 
 -- query 11
+-- types	varchar
 typeof(CAST(1 AS VARCHAR(65533)))
 varchar
 
 -- query 12
+-- types	varchar
 typeof(CAST(1 AS varchar))
 varchar
 
 -- query 13
+-- types	varchar
 typeof(CAST('s' AS VARBINARY))
 varbinary
 
 -- query 14
+-- types	varchar
 typeof(CAST('2023-03-07' AS date))
 date
 
 -- query 15
+-- types	varchar
 typeof(CAST('2023-03-07 11:22:33' AS datetime))
 datetime
 
 -- query 16
+-- types	varchar
 typeof([1, 2, 3])
 array<tinyint>
 
 -- query 17
+-- legacy
 typeof(get_json_object('{"k1":1, "k2":"v2"}', '$.k1'))
 varchar
 
 -- query 18
+-- legacy
 typeof(map{1:'apple',2:'orange',3:'pear'})
 map<tinyint,varchar>
 
 -- query 19
+-- legacy
 typeof(row(1, 2, 3, 4))
 struct<col1 tinyint, col2 tinyint, col3 tinyint, col4 tinyint>
 
 -- query 20
+-- types	varchar
 typeof(bitmap_empty())
 bitmap
 
 -- query 21
+-- types	varchar
 typeof(hll_empty())
 hll
 
 -- query 22
+-- types	varchar
 typeof(parse_json('{"a": 1, "b": true}'))
 json
 
 -- query 23
+-- types	varchar
 typeof(NULL)
 null_type
 
 -- query 25
+-- types	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar
 typeof(c1)	typeof(c2)	typeof(c3)	typeof(c4)	typeof(c5)	typeof(c6)	typeof(c7)	typeof(c8)	typeof(c9)	typeof(c10)	typeof(c11)	typeof(c12)	typeof(c13)	typeof(c14)	typeof(c15)	typeof(c16)	typeof(c17)	typeof(c18)	typeof(c19)	typeof(c20)
 tinyint	smallint	int	bigint	largeint	decimal128(19, 2)	decimal128(38, 9)	decimal128(38, 9)	boolean	varchar	varchar	varchar	varbinary	date	datetime	array<int>	varchar	map<int,varchar>	struct<col1 int, col2 int, col3 int, col4 int>	varchar
 
 -- query 28
+-- legacy
 typeof(user_id)
 varbinary
 
 -- query 31
+-- types	varchar
 typeof(uv_set)
 varbinary

@@ -1,303 +1,379 @@
 -- query 1
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 YEAR, ceil)
 NULL
 
 -- query 2
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 MONTH, ceil)
 NULL
 
 -- query 3
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 DAY, ceil)
 NULL
 
 -- query 4
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 QUARTER, ceil)
 NULL
 
 -- query 5
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 WEEK, ceil)
 NULL
 
 -- query 6
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 HOUR, ceil)
 NULL
 
 -- query 7
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 MINUTE, ceil)
 NULL
 
 -- query 8
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 SECOND, ceil)
 NULL
 
 -- query 9
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 YEAR)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 10
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 MONTH)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 11
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 DAY)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 12
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 QUARTER)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 13
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 WEEK)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 14
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 HOUR)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 15
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 MINUTE)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 16
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 SECOND)
-1974-06-25 21:49:23
+1974-06-25 21:49:23.000000
 
 -- query 22
+-- types	timestamp(6)
 time_slice('9999-12-31', INTERVAL 5 YEAR, ceil)
 NULL
 
 -- query 23
+-- types	timestamp(6)
 time_slice('9999-12-31', INTERVAL 5 MONTH, ceil)
 NULL
 
 -- query 24
+-- types	timestamp(6)
 time_slice('9999-12-31', INTERVAL 5 DAY, ceil)
 NULL
 
 -- query 25
+-- types	timestamp(6)
 time_slice('9999-12-31', INTERVAL 5 QUARTER, ceil)
 NULL
 
 -- query 26
+-- types	timestamp(6)
 time_slice('9999-12-31', INTERVAL 5 WEEK, ceil)
 NULL
 
 -- query 27
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 YEAR)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 28
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 MONTH)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 29
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 DAY)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 30
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 QUARTER)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 31
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 WEEK)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 38
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 YEAR, ceil)
 NULL
 
 -- query 39
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 MONTH, ceil)
 NULL
 
 -- query 40
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 DAY, ceil)
 NULL
 
 -- query 41
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 QUARTER, ceil)
 NULL
 
 -- query 42
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 WEEK, ceil)
 NULL
 
 -- query 43
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 HOUR, ceil)
 NULL
 
 -- query 44
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 MINUTE, ceil)
 NULL
 
 -- query 45
+-- types	timestamp(6)
 time_slice('9999-12-31 23:59:59', INTERVAL 5 SECOND, ceil)
 NULL
 
 -- query 46
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 YEAR)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 47
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 MONTH)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 48
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 DAY)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 49
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 QUARTER)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 50
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 WEEK)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 51
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 HOUR)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 52
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 MINUTE)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 53
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 SECOND)
-1974-06-25 21:49:23
+1974-06-25 21:49:23.000000
 
 -- query 59
+-- types	timestamp(6)
 time_slice('9999-12-31', INTERVAL 5 YEAR, ceil)
 NULL
 
 -- query 60
+-- types	timestamp(6)
 time_slice('9999-12-31', INTERVAL 5 MONTH, ceil)
 NULL
 
 -- query 61
+-- types	timestamp(6)
 time_slice('9999-12-31', INTERVAL 5 DAY, ceil)
 NULL
 
 -- query 62
+-- types	timestamp(6)
 time_slice('9999-12-31', INTERVAL 5 QUARTER, ceil)
 NULL
 
 -- query 63
+-- types	timestamp(6)
 time_slice('9999-12-31', INTERVAL 5 WEEK, ceil)
 NULL
 
 -- query 64
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 YEAR)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 65
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 MONTH)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 66
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 DAY)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 67
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 QUARTER)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 68
+-- types	timestamp(6)
 time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 WEEK)
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 75
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1 MILLISECOND)
-2023-10-31 23:59:59
+2023-10-31 23:59:59.000000
 
 -- query 76
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1 MILLISECOND, ceil)
 2023-10-31 23:59:59.001000
 
 -- query 77
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 17 MILLISECOND)
 2023-10-31 23:59:58.984000
 
 -- query 78
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 17 MILLISECOND, ceil)
 2023-10-31 23:59:59.001000
 
 -- query 79
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1000 MILLISECOND)
-2023-10-31 23:59:59
+2023-10-31 23:59:59.000000
 
 -- query 80
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1000 MILLISECOND, ceil)
-2023-11-01 00:00:00
+2023-11-01 00:00:00.000000
 
 -- query 81
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1001 MILLISECOND)
 2023-10-31 23:59:58.976000
 
 -- query 82
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1001 MILLISECOND, ceil)
 2023-10-31 23:59:59.977000
 
 -- query 83
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 86400000 MILLISECOND)
-2023-10-31 00:00:00
+2023-10-31 00:00:00.000000
 
 -- query 84
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 86400000 MILLISECOND, ceil)
-2023-11-01 00:00:00
+2023-11-01 00:00:00.000000
 
 -- query 85
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 172800000 MILLISECOND)
-2023-10-30 00:00:00
+2023-10-30 00:00:00.000000
 
 -- query 86
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 172800000 MILLISECOND, ceil)
-2023-11-01 00:00:00
+2023-11-01 00:00:00.000000
 
 -- query 87
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1 MICROSECOND)
-2023-10-31 23:59:59
+2023-10-31 23:59:59.000000
 
 -- query 88
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1 MICROSECOND, ceil)
 2023-10-31 23:59:59.000001
 
 -- query 89
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 17 MICROSECOND)
 2023-10-31 23:59:58.999997
 
 -- query 90
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 17 MICROSECOND, ceil)
 2023-10-31 23:59:59.000014
 
 -- query 91
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1000 MICROSECOND)
-2023-10-31 23:59:59
+2023-10-31 23:59:59.000000
 
 -- query 92
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1000 MICROSECOND, ceil)
 2023-10-31 23:59:59.001000
 
 -- query 93
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1001 MICROSECOND)
 2023-10-31 23:59:58.999023
 
 -- query 94
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1001 MICROSECOND, ceil)
 2023-10-31 23:59:59.000024
 
 -- query 95
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1000000 MICROSECOND)
-2023-10-31 23:59:59
+2023-10-31 23:59:59.000000
 
 -- query 96
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1000000 MICROSECOND, ceil)
-2023-11-01 00:00:00
+2023-11-01 00:00:00.000000
 
 -- query 97
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1000001 MICROSECOND)
 2023-10-31 23:59:58.329764
 
 -- query 98
+-- types	timestamp(6)
 time_slice('2023-10-31 23:59:59', INTERVAL 1000001 MICROSECOND, ceil)
 2023-10-31 23:59:59.329765

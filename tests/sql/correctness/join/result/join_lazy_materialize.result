@@ -1,15 +1,19 @@
 -- query 15
+-- types	integer	integer	integer	integer	integer	integer	integer	integer	integer	integer
 t1_c1	t1_c2	t1_c3	t1_c4	t1_c5	t2_c1	t2_c2	t2_c3	t2_c4	t2_c5
 4	44	444	4444	44444	4	33	333	333	33333
 
 -- query 16
+-- types	integer	integer	integer	integer
 t1_c3	t1_c4	t2_c3	t2_c4
 444	4444	333	333
 
 -- query 17
+-- types	integer	integer	integer	integer
 t1_c3	t1_c4	t2_c3	t2_c4
 
 -- query 18
+-- types	integer	integer	integer	integer
 t1_c3	t1_c4	t2_c3	t2_c4
 444	4444	333	333
 NULL	NULL	444	444
@@ -18,6 +22,7 @@ NULL	NULL	666	6666
 NULL	NULL	777	7777
 
 -- query 20
+-- types	integer	integer	integer	integer	integer	integer	integer	integer	integer	integer
 t1_c1	t1_c2	t1_c3	t1_c4	t1_c5	t2_c1	t2_c2	t2_c3	t2_c4	t2_c5
 1	11	111	1111	11111	NULL	NULL	NULL	NULL	NULL
 2	22	222	2222	22222	NULL	NULL	NULL	NULL	NULL
@@ -26,6 +31,7 @@ t1_c1	t1_c2	t1_c3	t1_c4	t1_c5	t2_c1	t2_c2	t2_c3	t2_c4	t2_c5
 5	55	555	5555	55555	NULL	NULL	NULL	NULL	NULL
 
 -- query 21
+-- types	integer	integer	integer	integer
 t1_c3	t1_c4	t2_c3	t2_c4
 111	1111	NULL	NULL
 222	2222	NULL	NULL
@@ -34,6 +40,7 @@ t1_c3	t1_c4	t2_c3	t2_c4
 555	5555	NULL	NULL
 
 -- query 22
+-- types	integer	integer	integer	integer
 t1_c3	t1_c4	t2_c3	t2_c4
 111	1111	NULL	NULL
 222	2222	NULL	NULL
@@ -42,17 +49,21 @@ t1_c3	t1_c4	t2_c3	t2_c4
 555	5555	NULL	NULL
 
 -- query 23
+-- types	integer	integer	integer	integer	integer	integer	integer	integer	integer	integer
 t1_c1	t1_c2	t1_c3	t1_c4	t1_c5	t2_c1	t2_c2	t2_c3	t2_c4	t2_c5
 4	44	444	4444	44444	4	33	333	3333	33333
 
 -- query 24
+-- types	integer	integer	integer	integer
 t1_c3	t1_c4	t2_c3	t2_c4
 444	4444	333	3333
 
 -- query 25
+-- types	integer	integer	integer	integer
 t1_c3	t1_c4	t2_c3	t2_c4
 
 -- query 26
+-- types	integer	integer	integer	integer
 t1_c3	t1_c4	t2_c3	t2_c4
 444	4444	333	3333
 NULL	NULL	444	4444
@@ -61,6 +72,7 @@ NULL	NULL	777	NULL
 NULL	NULL	666	6666
 
 -- query 28
+-- types	integer	integer	integer	integer	integer	integer	integer	integer	integer	integer
 t1_c1	t1_c2	t1_c3	t1_c4	t1_c5	t2_c1	t2_c2	t2_c3	t2_c4	t2_c5
 1	11	111	1111	11111	NULL	NULL	NULL	NULL	NULL
 2	22	222	2222	22222	NULL	NULL	NULL	NULL	NULL
@@ -69,6 +81,7 @@ t1_c1	t1_c2	t1_c3	t1_c4	t1_c5	t2_c1	t2_c2	t2_c3	t2_c4	t2_c5
 5	55	555	5555	55555	NULL	NULL	NULL	NULL	NULL
 
 -- query 29
+-- types	integer	integer	integer	integer
 t1_c3	t1_c4	t2_c3	t2_c4
 111	1111	NULL	NULL
 222	2222	NULL	NULL
@@ -77,6 +90,7 @@ NULL	3333	NULL	NULL
 555	5555	NULL	NULL
 
 -- query 30
+-- types	integer	integer	integer	integer
 t1_c3	t1_c4	t2_c3	t2_c4
 111	1111	NULL	NULL
 222	2222	NULL	NULL

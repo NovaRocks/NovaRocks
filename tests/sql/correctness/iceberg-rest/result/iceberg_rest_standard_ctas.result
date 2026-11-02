@@ -1,4 +1,5 @@
 -- query 5
+-- types	integer	varchar
 id	uname
 1	ALICE
 2	BOB

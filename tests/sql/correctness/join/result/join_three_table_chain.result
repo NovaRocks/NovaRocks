@@ -1,3 +1,5 @@
+-- query 10
+-- types	integer	varchar	varchar
 id	av	cv
 1	A1	C10
 2	A2	C20

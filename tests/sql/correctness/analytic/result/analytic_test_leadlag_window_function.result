@@ -1,23 +1,29 @@
 -- query 2
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 sum(wv)	avg(wv)	min(wv)	max(wv)
 87093.00000	13.97737120847	1.00000	124.00000
 
 -- query 3
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 sum(wv)	avg(wv)	min(wv)	max(wv)
 87093.00000	13.97737120847	1.00000	124.00000
 
 -- query 4
+-- legacy
 sum(wv)	avg(wv)	min(wv)	max(wv)
 82872.00000	13.28076923077	-1.00000	124.00000
 
 -- query 5
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 sum(wv)	avg(wv)	min(wv)	max(wv)
 87020.00000	13.96565559300	1.00000	124.00000
 
 -- query 6
+-- types	decimal(38, 5)	decimal(38, 11)	decimal(18, 5)	decimal(18, 5)
 sum(wv)	avg(wv)	min(wv)	max(wv)
 87020.00000	13.96565559300	1.00000	124.00000
 
 -- query 7
+-- legacy
 sum(wv)	avg(wv)	min(wv)	max(wv)
 82126.00000	13.16121794872	-1.00000	124.00000

@@ -1,3 +1,5 @@
+-- query 3
+-- legacy
 grp	ts	sess_id
 A	1	1
 A	3	1

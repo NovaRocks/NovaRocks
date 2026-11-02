@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	decimal(38, 2)	decimal(38, 2)	decimal(38, 2)	decimal(38, 2)	decimal(38, 2)	decimal(38, 2)	decimal(38, 2)
 s_store_name	s_store_id	sun_sales	mon_sales	tue_sales	wed_sales	thu_sales	fri_sales	sat_sales
 able	AAAAAAAACAAAAAAA	517884.59	469230.50	505832.67	443696.30	479716.97	462447.50	503064.60
 ation	AAAAAAAAHAAAAAAA	508811.68	474290.02	448808.84	492870.99	498127.64	474355.89	505906.68

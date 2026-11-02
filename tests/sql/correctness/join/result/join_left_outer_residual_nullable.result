@@ -1,3 +1,5 @@
+-- query 7
+-- types	integer	integer	integer	varchar
 id	lv	rv	flag
 1	5	7	Y
 2	8	NULL	NULL

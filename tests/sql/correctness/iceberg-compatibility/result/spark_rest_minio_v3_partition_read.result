@@ -1,3 +1,5 @@
+-- query 2
+-- types	varchar	bigint	bigint
 region	cnt	total_metric
 apac	2	100
 us	2	40

@@ -1,16 +1,19 @@
 -- query 1
+-- legacy
 applied
 {101:20,102:40}
 
 -- query 2
+-- legacy
 keyed
 {101:10,102:20}
 
 -- query 3
+-- legacy
 valued
 {1:20,2:40}
 
 -- query 4
+-- legacy
 sz
 2
-

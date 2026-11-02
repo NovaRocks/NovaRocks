@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	varchar	varchar	decimal(38, 8)	decimal(38, 8)	decimal(38, 8)	decimal(38, 8)	decimal(38, 8)	decimal(38, 8)	decimal(38, 8)
 i_item_id	ca_country	ca_state	ca_county	agg1	agg2	agg3	agg4	agg5	agg6	agg7
 NULL	NULL	NULL	NULL	49.79514416	101.83250760	277.25586626	51.32211845	-240.15964340	1957.46774194	2.97496206
 AAAAAAAAAABAAAAA	NULL	NULL	NULL	60.00000000	109.08000000	5242.27000000	98.17000000	-1714.87000000	1930.00000000	0.00000000

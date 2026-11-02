@@ -1,8 +1,10 @@
 -- query 2
+-- types	bigint
 cnt
 4
 
 -- query 3
+-- types	bigint	bigint	integer
 id	user_id	score
 1	10	100
 3	30	300

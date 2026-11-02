@@ -1,39 +1,49 @@
 -- query 3
+-- types	bigint
 percentile_disc(v1, 0.5)
 NULL
 
 -- query 4
+-- types	bigint
 percentile_cont(v1, 0.5)
 NULL
 
 -- query 5
+-- types	bigint
 percentile_disc_lc(v1, 0.5)
 NULL
 
 -- query 6
+-- types	bigint	bigint
 max(v1)	min(v1)
 NULL	NULL
 
 -- query 7
+-- types	bigint	bigint
 max(v1)	count(*)
 NULL	0
 
 -- query 8
+-- types	bigint
 count(v1)
 0
 
 -- query 9
+-- types	bigint
 count(*)
 0
 
 -- query 10
+-- types	bigint
 count(DISTINCT v1)
 0
 
 -- query 13
+-- types	varchar
 max(c2)
 NULL
 
 -- query 14
+-- types	varchar
 min(c2)
 NULL

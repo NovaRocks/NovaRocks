@@ -1,10 +1,12 @@
 -- query 5
+-- types	varchar	bigint
 city	total_sales
 a	26
 b	12
 c	14
 
 -- query 7
+-- types	varchar	bigint
 city	total_sales
 a	26
 b	12

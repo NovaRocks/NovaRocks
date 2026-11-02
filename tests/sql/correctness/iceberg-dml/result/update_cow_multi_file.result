@@ -1,16 +1,20 @@
 -- query 2
+-- types	bigint
 snaps_before
 2
 
 -- query 4
+-- types	bigint
 snaps_after
 3
 
 -- query 5
+-- types	bigint	varchar
 id	v
 1	a_updated
 2	b_updated
 
 -- query 6
+-- types	bigint	bigint
 distinct_row_ids	total_rows
 2	2

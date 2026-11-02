@@ -1,4 +1,5 @@
 -- query 4
+-- legacy
 id	result
 1	[0,null]
 2	NULL
@@ -12,6 +13,7 @@ id	result
 10	[null]
 
 -- query 5
+-- legacy
 id	result
 1	[1,0]
 2	NULL
@@ -25,6 +27,7 @@ id	result
 10	[1,1]
 
 -- query 6
+-- legacy
 id	result
 1	[1,null]
 2	NULL
@@ -38,6 +41,7 @@ id	result
 10	[1,1,null]
 
 -- query 7
+-- legacy
 id	result
 1	[1,2,null]
 2	[null,3]
@@ -51,6 +55,7 @@ id	result
 10	[50,70,null]
 
 -- query 8
+-- legacy
 id	result
 1	[1,2]
 2	[5,3]
@@ -64,6 +69,7 @@ id	result
 10	[50,70]
 
 -- query 9
+-- legacy
 id	result
 1	[1,2,null]
 2	[5,null,3]
@@ -77,6 +83,7 @@ id	result
 10	[50,70,null]
 
 -- query 10
+-- legacy
 id	result
 1	[200,null]
 2	[500,400,null]
@@ -90,6 +97,7 @@ id	result
 10	[750,850,null]
 
 -- query 11
+-- legacy
 id	result
 1	[100,200]
 2	[500,400]
@@ -103,6 +111,7 @@ id	result
 10	[750,850]
 
 -- query 12
+-- legacy
 id	result
 1	[100,200,null]
 2	[500,400,null]
@@ -116,6 +125,7 @@ id	result
 10	[750,850,null]
 
 -- query 13
+-- legacy
 id	result
 1	[10,20,null]
 2	[40,null]
@@ -129,6 +139,7 @@ id	result
 10	[300,400,null]
 
 -- query 14
+-- legacy
 id	result
 1	[10,20]
 2	[50,40]
@@ -142,6 +153,7 @@ id	result
 10	[300,400]
 
 -- query 15
+-- legacy
 id	result
 1	[10,20,null]
 2	[50,40,null]
@@ -155,6 +167,7 @@ id	result
 10	[300,400,null]
 
 -- query 16
+-- legacy
 id	result
 1	[1000,2000,null]
 2	[5000,null,3000]
@@ -168,6 +181,7 @@ id	result
 10	[10000,null,12000]
 
 -- query 17
+-- legacy
 id	result
 1	[1000,2000]
 2	[5000,3000]
@@ -181,6 +195,7 @@ id	result
 10	[10000,12000]
 
 -- query 18
+-- legacy
 id	result
 1	[1000,2000,null]
 2	[5000,null,3000]
@@ -194,6 +209,7 @@ id	result
 10	[10000,null,12000]
 
 -- query 19
+-- legacy
 id	result
 1	[null,null]
 2	[987654321987654321,null,null]
@@ -207,6 +223,7 @@ id	result
 10	[789012345678901234,null,null]
 
 -- query 20
+-- legacy
 id	result
 1	[1234567890123456789]
 2	[987654321987654321]
@@ -220,6 +237,7 @@ id	result
 10	[789012345678901234]
 
 -- query 21
+-- legacy
 id	result
 1	[1234567890123456789,null,null]
 2	[987654321987654321,null,null]
@@ -233,6 +251,7 @@ id	result
 10	[789012345678901234,null,null]
 
 -- query 22
+-- legacy
 id	result
 1	[89012.34,null]
 2	[56789.01,null,45678.12]
@@ -246,6 +265,7 @@ id	result
 10	[78901.23,null,67890.12]
 
 -- query 23
+-- legacy
 id	result
 1	[12345.67,89012.34]
 2	[56789.01,45678.12]
@@ -259,6 +279,7 @@ id	result
 10	[78901.23,67890.12]
 
 -- query 24
+-- legacy
 id	result
 1	[12345.67,89012.34,null]
 2	[null,45678.12]
@@ -272,6 +293,7 @@ id	result
 10	[78901.23,null,67890.12]
 
 -- query 25
+-- legacy
 id	result
 1	[678.90,null]
 2	[345.67,null,234.56]
@@ -285,6 +307,7 @@ id	result
 10	[567.89,null,456.78]
 
 -- query 26
+-- legacy
 id	result
 1	[123.45,678.90]
 2	[345.67,234.56]
@@ -298,6 +321,7 @@ id	result
 10	[567.89,456.78]
 
 -- query 27
+-- legacy
 id	result
 1	[123.45,678.90,null]
 2	[345.67,null,234.56]
@@ -311,6 +335,7 @@ id	result
 10	[null,456.78]
 
 -- query 28
+-- legacy
 id	result
 1	[9876543.21,null]
 2	[56789012.34,null,34567890.12]
@@ -324,6 +349,7 @@ id	result
 10	[null,9876543.21]
 
 -- query 29
+-- legacy
 id	result
 1	[12345678.90,9876543.21]
 2	[56789012.34,34567890.12]
@@ -337,6 +363,7 @@ id	result
 10	[12345678.90,9876543.21]
 
 -- query 30
+-- legacy
 id	result
 1	[12345678.90,9876543.21,null]
 2	[56789012.34,null,34567890.12]
@@ -350,6 +377,7 @@ id	result
 10	[12345678.90,null,9876543.21]
 
 -- query 31
+-- legacy
 id	result
 1	[null,null]
 2	[2345678901.2345678901,null,null]
@@ -363,6 +391,7 @@ id	result
 10	[null,null]
 
 -- query 32
+-- legacy
 id	result
 1	[1234567890.1234567890]
 2	[2345678901.2345678901]
@@ -376,6 +405,7 @@ id	result
 10	[1234567890.1234567890]
 
 -- query 33
+-- legacy
 id	result
 1	[1234567890.1234567890,null,null]
 2	[2345678901.2345678901,null,null]
@@ -389,6 +419,7 @@ id	result
 10	[1234567890.1234567890,null,null]
 
 -- query 34
+-- legacy
 id	result
 1	[1.2300000190734863,4.559999942779541,null]
 2	[2.3399999141693115,null,1.2300000190734863]
@@ -402,6 +433,7 @@ id	result
 10	[null,1.1100000143051147,2.2200000286102295]
 
 -- query 35
+-- legacy
 id	result
 1	[1.23,4.56]
 2	[2.34,1.23]
@@ -415,6 +447,7 @@ id	result
 10	[1.11,2.22]
 
 -- query 36
+-- legacy
 id	result
 1	[1.2300000190734863,4.559999942779541,null]
 2	[2.3399999141693115,null,1.2300000190734863]
@@ -428,6 +461,7 @@ id	result
 10	[null,1.1100000143051147,2.2200000286102295]
 
 -- query 37
+-- legacy
 id	result
 1	[789.012,null]
 2	[234.567,null]
@@ -441,6 +475,7 @@ id	result
 10	[777.888,999,null]
 
 -- query 38
+-- legacy
 id	result
 1	[123.456,789.012]
 2	[234.567,123.456]
@@ -454,6 +489,7 @@ id	result
 10	[777.888,999]
 
 -- query 39
+-- legacy
 id	result
 1	[123.456,789.012,null]
 2	[234.567,null,123.456]
@@ -467,6 +503,7 @@ id	result
 10	[777.888,999,null]
 
 -- query 40
+-- legacy
 id	result
 1	[null,"starrocks"]
 2	[null,"array","test"]
@@ -480,6 +517,7 @@ id	result
 10	["blueberry","cherry",null]
 
 -- query 41
+-- legacy
 id	result
 1	["hello","starrocks"]
 2	["array","test"]
@@ -493,6 +531,7 @@ id	result
 10	["blueberry","cherry"]
 
 -- query 42
+-- legacy
 id	result
 1	["hello",null]
 2	[null,"array","test"]
@@ -506,6 +545,7 @@ id	result
 10	["blueberry","cherry",null]
 
 -- query 43
+-- legacy
 id	result
 1	["2025-01-02",null]
 2	[null,"2024-12-31","2024-12-30"]
@@ -519,6 +559,7 @@ id	result
 10	["2025-01-17","2025-01-18",null]
 
 -- query 44
+-- legacy
 id	result
 1	["2025-01-01","2025-01-02"]
 2	["2024-12-31","2024-12-30"]
@@ -532,6 +573,7 @@ id	result
 10	["2025-01-17","2025-01-18"]
 
 -- query 45
+-- legacy
 id	result
 1	["2025-01-01","2025-01-02",null]
 2	[null,"2024-12-31","2024-12-30"]
@@ -545,6 +587,7 @@ id	result
 10	["2025-01-17","2025-01-18",null]
 
 -- query 46
+-- legacy
 id	result
 1	[null,"2025-01-02 14:00:00"]
 2	["2024-12-31 23:59:59","2024-12-30 12:00:00",null]
@@ -558,6 +601,7 @@ id	result
 10	[null,"2025-01-17 10:00:00","2025-01-18 20:00:00"]
 
 -- query 47
+-- legacy
 id	result
 1	["2025-01-01 12:00:00","2025-01-02 14:00:00"]
 2	["2024-12-31 23:59:59","2024-12-30 12:00:00"]
@@ -571,6 +615,7 @@ id	result
 10	["2025-01-17 10:00:00","2025-01-18 20:00:00"]
 
 -- query 48
+-- legacy
 id	result
 1	["2025-01-01 12:00:00",null,"2025-01-02 14:00:00"]
 2	["2024-12-31 23:59:59","2024-12-30 12:00:00",null]

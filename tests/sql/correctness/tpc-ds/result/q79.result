@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	varchar	integer	decimal(38, 2)	decimal(38, 2)
 c_last_name	c_first_name	substr(s_city, 1, 30)	ss_ticket_number	amt	profit
 NULL	NULL	Fairview	158139	3721.39	-23039.01
 NULL	NULL	Fairview	30114	165.75	-17434.48

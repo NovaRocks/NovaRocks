@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	bigint
 o_orderpriority	order_count
 1-URGENT	10345
 2-HIGH	10423

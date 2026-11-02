@@ -1,2 +1,4 @@
+-- query 1
+-- types	decimal(10, 2)	decimal(10, 2)	decimal(10, 2)	decimal(10, 2)
 empty_dec	blank_dec	zero_dec	null_dec
 NULL	NULL	0.00	NULL

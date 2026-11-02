@@ -1,10 +1,12 @@
 -- query 4
+-- types	bigint	bigint
 id	value
 1	10
 2	20
 3	30
 
 -- query 7
+-- types	bigint	bigint
 id	value
 1	10
 2	20

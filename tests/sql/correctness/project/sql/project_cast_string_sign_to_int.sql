@@ -34,7 +34,7 @@ select cast('-' as int);
 select cast('-' as bigint);
 
 -- query 5
-select cast('-' as largeint);
+select CAST(cast('-' as largeint) AS VARCHAR) AS `CAST('-' AS LARGEINT)`;
 
 -- query 6
 select cast('+' as tinyint);
@@ -49,4 +49,4 @@ select cast('+' as int);
 select cast('+' as bigint);
 
 -- query 10
-select cast('+' as largeint);
+select CAST(cast('+' as largeint) AS VARCHAR) AS `CAST('+' AS LARGEINT)`;

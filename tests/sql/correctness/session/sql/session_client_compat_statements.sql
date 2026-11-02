@@ -25,8 +25,8 @@
 -- succeed, and none of them may disturb the session that follows.
 --
 -- The contract worth protecting is user-observable: typed session statements
--- preserve their independent scopes, accepted compatibility forms, catalog
--- context, and user-variable values while the connection remains usable.
+-- preserve their independent scopes, accepted compatibility forms and catalog
+-- context while the session remains usable.
 
 -- query 1
 -- @skip_result_check=true
@@ -88,38 +88,24 @@ SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
 USE default;
 
 -- query 15
--- @skip_result_check=true
-SET @session_expression = 1 + 2;
-
--- query 16
-SELECT @session_expression;
-
--- query 17
--- @skip_result_check=true
-SET @session_query = (SELECT 4);
-
--- query 18
-SELECT @session_query;
-
--- query 19
 SELECT 1;
 
--- query 20
+-- query 16
 -- An unknown GLOBAL variable is tolerated without leaking its scope to the
 -- following independently-scoped, recognized assignment.
 -- @skip_result_check=true
 SET GLOBAL sqlp9_unknown_scope_probe=1, query_timeout=1;
 
--- query 21
+-- query 17
 -- @skip_result_check=true
 SET query_timeout = 0;
 
--- query 22
+-- query 18
 -- The only supported autocommit mode is the truthful default: each statement
 -- publishes at its own frontier. These spellings must not open a transaction.
 -- @skip_result_check=true
 SET autocommit = ON;
 
--- query 23
+-- query 19
 -- @skip_result_check=true
 SET @@session.autocommit = TRUE;

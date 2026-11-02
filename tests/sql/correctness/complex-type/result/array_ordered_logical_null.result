@@ -1,19 +1,24 @@
 -- query 1
+-- types	array(tinyint)
 ties
 [30,10,20]
 
 -- query 2
+-- types	array(tinyint)
 refined
 [10,20,30]
 
 -- query 3
+-- types	array(tinyint)
 trailing_null_key
 [10,20,30]
 
 -- query 4
+-- legacy
 sorted	smallest	largest
 [null,null,null]	NULL	NULL
 
 -- query 5
+-- types	array(tinyint)
 null_value_moves
 [8,7,null]

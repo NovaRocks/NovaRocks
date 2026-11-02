@@ -1,15 +1,19 @@
 -- query 8
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 39	487758dabc82e041c3050f8b895ecbc8
 
 -- query 9
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 40	487758dabc82e041c3050f8b895ecbc8
 
 -- query 10
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 42	a613d9cefc453b9deda3447b62de3619
 
 -- query 11
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 51	487758dabc82e041c3050f8b895ecbc8

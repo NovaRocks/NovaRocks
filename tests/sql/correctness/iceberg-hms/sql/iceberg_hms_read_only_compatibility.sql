@@ -23,7 +23,7 @@
 
 -- query 1
 -- @result_contains=HMS_PREPARE_OK
-shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-hms/fixture.py" prepare iru7_${uuid0}
+shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-hms/fixture.py" verify-prepared iru7_${uuid0} --receipt ${hms_prepared_input_receipt}
 
 -- query 2
 -- @skip_result_check=true
@@ -71,10 +71,12 @@ SELECT id, p FROM ice_hms_${uuid0}.iru7_${uuid0}.v2 FOR VERSION AS OF 'kept_tag'
 
 -- query 11
 -- @skip_result_check=true
-SET @hms_first_snapshot = (SELECT snapshot_id FROM ice_hms_${uuid0}.iru7_${uuid0}.v2$snapshots ORDER BY committed_at LIMIT 1);
+-- @result_rows_where=snapshot_id=${hms_first_snapshot_id}
+-- @result_rows_count=1
+SELECT snapshot_id FROM ice_hms_${uuid0}.iru7_${uuid0}.v2$snapshots ORDER BY committed_at LIMIT 1;
 
 -- query 12
-SELECT id, p FROM ice_hms_${uuid0}.iru7_${uuid0}.v2 FOR VERSION AS OF @hms_first_snapshot ORDER BY id;
+SELECT id, p FROM ice_hms_${uuid0}.iru7_${uuid0}.v2 FOR VERSION AS OF ${hms_first_snapshot_id} ORDER BY id;
 
 -- query 13
 -- @result_contains=INVENTORY_CAPTURED
@@ -230,28 +232,28 @@ ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 REWRITE MANIFESTS;
 -- Governed preparation preserves the original HMS refusal through its safe typed projection.
 -- @expect_sql_code=query.execution.unsupported
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.unsupported] table-maintenance original operation failed
+-- @expect_error=[query.execution.unsupported] table-maintenance original operation failed
 ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 44
 -- Rewrite data files
 -- @expect_sql_code=query.execution.unsupported
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.unsupported] table-maintenance original operation failed
+-- @expect_error=[query.execution.unsupported] table-maintenance original operation failed
 CALL ice_hms_${uuid0}.system.rewrite_data_files(table => 'iru7_${uuid0}.v3', options => map('rewrite-all','true'));
 
 -- query 45
 -- Rewrite position deletes
 -- @expect_sql_code=query.execution.unsupported
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.unsupported] table-maintenance original operation failed
+-- @expect_error=[query.execution.unsupported] table-maintenance original operation failed
 CALL ice_hms_${uuid0}.system.rewrite_position_delete_files(table => 'iru7_${uuid0}.v2', options => map('rewrite-all','true'));
 
 -- query 46
 -- Optimize admission
 -- @expect_sql_code=query.execution.unsupported
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.unsupported] table-maintenance original operation failed
+-- @expect_error=[query.execution.unsupported] table-maintenance original operation failed
 ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v3 OPTIMIZE;
 
 -- query 47

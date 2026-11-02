@@ -1,4 +1,5 @@
 -- query 2
+-- types	bigint	integer	varchar
 id	p	value
 7	1	old7
 8	1	new8
@@ -6,6 +7,7 @@ id	p	value
 10	1	old10
 
 -- query 3
+-- types	bigint	integer	varchar
 id	p	value
 7	1	new7
 8	1	new8
@@ -13,6 +15,7 @@ id	p	value
 10	1	old10
 
 -- query 4
+-- types	bigint	integer	varchar
 id	p	value
 7	1	old7
 8	1	new8

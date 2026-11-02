@@ -1,7 +1,9 @@
 -- query 11
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 broadcast_anyof	20	54400
 
 -- query 14
+-- types	varchar	bigint	bigint
 scenario	row_count	id_sum
 broadcast_anyof	20	54400

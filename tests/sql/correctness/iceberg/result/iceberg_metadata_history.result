@@ -1,7 +1,9 @@
 -- query 5
+-- types	bigint
 n_history
 2
 
 -- query 6
+-- types	bigint
 n_ancestors
 2

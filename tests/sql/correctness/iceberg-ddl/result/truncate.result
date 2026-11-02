@@ -1,59 +1,73 @@
 -- query 3
+-- types	bigint
 n
 3
 
 -- query 5
+-- types	bigint
 n
 0
 
 -- query 7
+-- types	integer	varchar
 id	v
 10	after
 
 -- query 10
+-- types	bigint
 n
 3
 
 -- query 12
+-- types	bigint
 n
 0
 
 -- query 14
+-- types	integer	varchar
 id	v
 42	reborn
 
 -- query 16
+-- types	bigint
 n
 0
 
 -- query 18
+-- types	bigint
 n
 0
 
 -- query 20
+-- types	integer	varchar
 id	v
 1	first
 
 -- query 25
+-- types	integer	varchar
 id	v
 1	main_a
 2	main_b
 3	dev_only
 
 -- query 27
+-- types	bigint
 n
 0
 
 -- query 28
+-- types	integer	varchar
 id	v
 1	main_a
 2	main_b
 
 -- query 33
+-- types	integer	varchar
 id	v
 1	a
 4	d
 
 -- query 35
+-- types	bigint
 n
 0

@@ -1,16 +1,19 @@
 -- query 8
+-- legacy
 map2	map2
 {0:["1","2"]}	{0:["1","2"]}
 {1:[]}	{1:[]}
 {}	{}
 
 -- query 9
+-- legacy
 map3	map3
 {"1":{1:"abc"}}	{"1":{1:"abc"}}
 {}	{}
 {"3":{3:"a33c"}}	{"3":{3:"a33c"}}
 
 -- query 10
+-- legacy
 map5	map5
 {0:{"c":1,"b":"a"}}	{0:{"c":1,"b":"a"}}
 {}	{}
@@ -20,12 +23,14 @@ map5	map5
 {3:{"c":3,"b":"a"}}	{3:{"c":3,"b":"a"}}
 
 -- query 11
+-- legacy
 map0	map0
 {0:"ab"}	{0:"ab"}
 {}	{}
 {3:""}	{3:""}
 
 -- query 12
+-- legacy
 map1	map1
 {0.000:"ab"}	{0.000:"ab"}
 {}	{}
@@ -35,6 +40,7 @@ map1	map1
 {3.000:""}	{3.000:""}
 
 -- query 16
+-- legacy
 map3	map3
 {"1":{1:"abc"}}	{"1":{1:"abc"}}
 {"11":{1:"abc"},"":{2:null}}	{"11":{1:"abc"},"":{2:null}}
@@ -43,6 +49,7 @@ map3	map3
 NULL	NULL
 
 -- query 17
+-- legacy
 map5	map5
 {0:{"c":1,"b":"a"}}	{0:{"c":1,"b":"a"}}
 {}	{}
@@ -53,6 +60,7 @@ map5	map5
 NULL	NULL
 
 -- query 18
+-- legacy
 map5	map5
 NULL	NULL
 {0:{"c":1,"b":"a"}}	{0:{"c":1,"b":"a"}}
@@ -63,27 +71,32 @@ NULL	NULL
 {3:{"c":3,"b":"a"}}	{3:{"c":3,"b":"a"}}
 
 -- query 19
+-- legacy
 map3
 {"1":{1:"abc"}}
 {}
 {"3":{3:"a33c"}}
 
 -- query 20
+-- legacy
 map0
 {1:null}
 NULL
 
 -- query 21
+-- legacy
 map1
 NULL
 
 -- query 22
+-- legacy
 map3
 {"1":{1:"abc"}}
 {}
 {"3":{3:"a33c"}}
 
 -- query 23
+-- legacy
 map5
 {0:{"c":1,"b":"a"}}
 {}
@@ -91,9 +104,11 @@ map5
 {3:{"c":3,"b":"a"}}
 
 -- query 24
+-- legacy
 map5
 
 -- query 25
+-- legacy
 pk	membership
 0	1
 1	NULL
@@ -102,6 +117,7 @@ pk	membership
 4	NULL
 
 -- query 26
+-- legacy
 pk	membership
 0	1
 1	1
@@ -110,6 +126,7 @@ pk	membership
 4	NULL
 
 -- query 27
+-- legacy
 pk	membership
 0	0
 1	NULL
@@ -118,6 +135,7 @@ pk	membership
 4	NULL
 
 -- query 28
+-- legacy
 pk	membership
 0	0
 1	0
@@ -126,6 +144,7 @@ pk	membership
 4	NULL
 
 -- query 29
+-- legacy
 pk	membership
 0	0
 1	0
@@ -134,6 +153,7 @@ pk	membership
 4	NULL
 
 -- query 30
+-- legacy
 map2	map2
 {0:["1","2"]}	{0:["1","2"]}
 {1:[]}	{1:[]}
@@ -141,12 +161,14 @@ map2	map2
 {3:["3",null]}	{3:["3",null]}
 
 -- query 31
+-- legacy
 map2	map2
 {0:["1","2"]}	{0:["1","2"]}
 {1:[]}	{1:[]}
 {}	{}
 
 -- query 32
+-- legacy
 pk	eq	ne	safe	nested_eq	nested_safe
 0	1	0	1	1	1
 1	1	0	1	NULL	1
@@ -155,6 +177,7 @@ pk	eq	ne	safe	nested_eq	nested_safe
 4	NULL	NULL	1	NULL	1
 
 -- query 33
+-- legacy
 probe_pk	build_pk
 1	1
 1	2

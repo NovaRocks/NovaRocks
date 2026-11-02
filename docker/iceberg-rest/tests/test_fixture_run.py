@@ -2,6 +2,7 @@
 # contributor license agreements. See the NOTICE file for additional
 # information. Licensed under the Apache License, Version 2.0.
 import json
+import hashlib
 import contextlib
 import io
 from dataclasses import replace
@@ -524,6 +525,45 @@ class RunTests(unittest.TestCase):
             backend.healthy.assert_called_once()
             backend.settle_operations.assert_not_called()
 
+    def test_inventory_timeout_requires_fresh_complete_readonly_admission(self):
+        import machine_runtime as machine
+        for pending in (False, True):
+            with self.subTest(pending_mutation=pending), patch.dict(os.environ, {}, clear=True):
+                admitted = self.sweep_input()
+                clock = [100.0]
+                budget = replace(admitted, deadline=410.0, monotonic=lambda: clock[0])
+                original = budget.as_dict()
+                readiness, backend = self.ready_owner()
+                backend.unsettled_operations.return_value = [("unknown", {"phase": "command-unknown"})] if pending else []
+                saved = (readiness.base / "state.json").read_bytes()
+                sweep = Mock()
+
+                def inventory_timeout(**kwargs):
+                    self.assertEqual(kwargs["deadline"], 105.0)
+                    clock[0] = 105.0
+                    raise machine.SweepInventoryTimeout()
+
+                sweep.sweep.side_effect = inventory_timeout
+                with patch.object(machine.time, "monotonic", side_effect=lambda: clock[0]), \
+                        patch.object(fixture_run, "admit", return_value=({}, self.manifest, budget)), \
+                        patch.object(machine, "MachineOwner", side_effect=[sweep, readiness]):
+                    if pending:
+                        with self.assertRaisesRegex(fixture_runtime.RuntimeFailure, "MachineUnavailable") as caught:
+                            fixture_run.startup_sweep(self.env, budget=budget)
+                        self.assertEqual(caught.exception.report["errors"][-1]["operation"], "startup-admission")
+                        backend.healthy.assert_not_called()
+                    else:
+                        report = fixture_run.startup_sweep(self.env, budget=budget)
+                        self.assertTrue(report["pending"])
+                        self.assertFalse(report["complete"])
+                        self.assertTrue(report["admission_complete"])
+                        self.assertEqual(report["errors"], [{"operation": "startup-sweep-inventory", "code": "ScratchSweepTimeout"}])
+                        backend.healthy.assert_called_once()
+                backend.unsettled_operations.assert_called_once()
+                backend.settle_operations.assert_not_called()
+                self.assertEqual(budget.as_dict(), original)
+                self.assertEqual((readiness.base / "state.json").read_bytes(), saved)
+
     def test_untyped_machine_maintaining_never_becomes_pending_readiness(self):
         with patch.dict(os.environ, {}, clear=True):
             budget = self.sweep_input()
@@ -702,6 +742,268 @@ class RunTests(unittest.TestCase):
         self.env.write_text("export NOVA_ENV_ID='$(exit 9)'\nunset OLD\n")
         self.assertEqual(fixture_run.env_values(self.env)["NOVA_ENV_ID"], "$(exit 9)")
 
+    def _settlement_export_fact(self, returncode=0):
+        return dict(child_waited=True, returncode=returncode,
+                    cleanup_failed=False, never_started=False)
+
+    def _settlement_export_responses(self, fact, *, cli_code=0, settle_code=0, remove_code=0):
+        # Only the existing communicate boundary is mocked. No Docker or
+        # replacement owner/settlement state machine is implemented here.
+        raw = fact if isinstance(fact, bytes) else json.dumps(fact).encode()
+        return [subprocess.CompletedProcess([], 0, b"exact-spark", b""),
+                subprocess.CompletedProcess([], cli_code, b"original-output", b"original-error"),
+                subprocess.CompletedProcess([], settle_code, raw, b""),
+                subprocess.CompletedProcess([], remove_code, b"", b"")]
+
+    def test_settlement_export_preserves_original_success_and_safe_projection(self):
+        receipt = self.root / "settlement.json"
+        fact = self._settlement_export_fact()
+        # The export must project the original admission, not trust extra
+        # identity-shaped fields from an untyped remote JSON object.
+        fact.update(context={"foreign": True}, container_id="foreign-container",
+                    unexpected_private="do-not-export-remote-extra")
+        responses = self._settlement_export_responses(fact)
+        arguments = ["-p", "fixed", "exec", "-T", "-e", "FLAG=do-not-export-env",
+                     "spark", "bash", "-lc", "printf do-not-export-payload"]
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+                fixture_run, "communicate", side_effect=responses) as run:
+            original = fixture_run.admit(self.env)[2].as_dict()
+            result = fixture_run.compose(self.env, arguments, data=b"do-not-export-stdin",
+                                         capture=True, settlement_receipt=receipt)
+        self.assertIs(result, responses[1])
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"original-output")
+        self.assertEqual(result.stderr, b"original-error")
+        self.assertEqual(run.call_count, 4, "export must not add a Docker operation")
+        commands = [call.args[0] for call in run.call_args_list]
+        worker = commands[1]
+        owner = worker.index(fixture_run.CONTAINER_OWNER)
+        folder = worker[owner + 1]
+        self.assertEqual(worker[owner - 3:owner], ["exact-spark", "python3", "-c"])
+        self.assertEqual(worker[-3:], ["bash", "-lc", "printf do-not-export-payload"])
+        self.assertEqual(json.loads(worker[owner + 4]), original)
+        self.assertEqual(worker[owner + 2], str(original["deadline_unix_ms"] / 1000))
+        settle = commands[2]
+        self.assertEqual(settle[:4], ["docker", "exec", "-i", "exact-spark"])
+        index = settle.index(fixture_run.CONTAINER_SETTLE)
+        self.assertEqual(settle[index + 1], folder)
+        self.assertEqual(settle[index + 2], worker[owner + 2])
+        self.assertEqual(json.loads(settle[index + 3]), original)
+        self.assertEqual(commands[3], ["docker", "exec", "-i", "exact-spark", "rm", "-rf", folder])
+        exported = json.loads(receipt.read_text())
+        self.assertEqual(set(exported), {"schema", "context", "container_id", "owner_folder",
+            "payload_sha256", "child_waited", "returncode", "cleanup_failed", "never_started",
+            "cli_returncode", "temporary_owner_removed"})
+        self.assertEqual(exported["schema"], "fixture-compose-settlement-v1")
+        self.assertEqual(exported["context"], original)
+        self.assertEqual(exported["container_id"], "exact-spark")
+        self.assertEqual(exported["owner_folder"], folder)
+        self.assertTrue(folder.startswith("/tmp/novarocks-fixture-run-" + original["identity"]["run_id"] + "-"))
+        self.assertEqual(exported["payload_sha256"], hashlib.sha256(
+            b'["bash","-lc","printf do-not-export-payload"]').hexdigest())
+        self.assertIs(exported["child_waited"], True)
+        self.assertEqual(exported["returncode"], 0)
+        self.assertEqual(exported["cli_returncode"], 0)
+        self.assertIs(exported["cleanup_failed"], False)
+        self.assertIs(exported["never_started"], False)
+        self.assertIs(exported["temporary_owner_removed"], True)
+        self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+        for private in ["do-not-export-env", "do-not-export-payload", "do-not-export-stdin",
+                        "do-not-export-remote-extra", "original-output", "original-error"]:
+            self.assertNotIn(private, receipt.read_text())
+
+    def test_settlement_export_retains_matching_nonzero_and_signaled_exit(self):
+        for remote, cli in [(9, 9), (-15, 143)]:
+            with self.subTest(remote=remote, cli=cli):
+                receipt = self.root / ("failed-" + str(cli) + ".json")
+                responses = self._settlement_export_responses(
+                    self._settlement_export_fact(remote), cli_code=cli)
+                with patch.dict(os.environ, {}, clear=True), patch.object(
+                        fixture_run, "communicate", side_effect=responses) as run:
+                    result = fixture_run.compose(self.env, ["exec", "-T", "spark", "false"],
+                                                 capture=True, settlement_receipt=receipt)
+                self.assertIs(result, responses[1])
+                self.assertEqual(result.returncode, cli)
+                exported = json.loads(receipt.read_text())
+                self.assertEqual(exported["returncode"], remote)
+                self.assertEqual(exported["cli_returncode"], cli)
+                self.assertIs(exported["child_waited"], True)
+                self.assertIs(exported["temporary_owner_removed"], True)
+                self.assertEqual(run.call_count, 4)
+
+    def test_settlement_export_refuses_unconfirmed_or_malformed_exit(self):
+        cases = [
+            ("settle-command-failed", self._settlement_export_fact(), 125, 0, 0, 3),
+            ("missing-settlement", b"", 0, 0, 0, 3),
+            ("malformed-json", b"not-json", 0, 0, 0, 3),
+            ("wrong-json-shape", [], 0, 0, 0, 3),
+            ("missing-exit", dict(child_waited=True), 0, 0, 0, 3),
+            ("unknown-group", dict(child_waited=False, returncode=0), 0, 0, 0, 3),
+            ("boolean-exit", dict(child_waited=True, returncode=True), 0, 0, 0, 3),
+            ("cleanup-failed", dict(child_waited=True, returncode=0, cleanup_failed=True), 0, 0, 0, 3),
+            ("cli-worker-disagree", self._settlement_export_fact(9), 0, 0, 0, 3),
+            ("tmp-removal-failed", self._settlement_export_fact(), 0, 0, 8, 4),
+        ]
+        for name, fact, settle, cli, remove, expected_calls in cases:
+            with self.subTest(name=name):
+                receipt = self.root / (name + ".json")
+                responses = self._settlement_export_responses(
+                    fact, cli_code=cli, settle_code=settle, remove_code=remove)
+                with patch.dict(os.environ, {}, clear=True), patch.object(
+                        fixture_run, "communicate", side_effect=responses) as run:
+                    with self.assertRaises(fixture_runtime.RuntimeFailure) as caught:
+                        fixture_run.compose(self.env, ["exec", "-T", "spark", "true"],
+                                            capture=True, settlement_receipt=receipt)
+                self.assertEqual(caught.exception.code, "ContainerCleanupFailed")
+                self.assertFalse(receipt.exists(), "unconfirmed settlement must not publish an exit")
+                self.assertEqual(run.call_count, expected_calls, "no retry or extra remote observation")
+
+    def test_settlement_export_preserves_transport_failure_and_unknown_cli(self):
+        for never_started in [False, True]:
+            with self.subTest(never_started=never_started):
+                receipt = self.root / ("transport-" + str(never_started) + ".json")
+                fact = self._settlement_export_fact(125 if never_started else 0)
+                fact["never_started"] = never_started
+                original_error = subprocess.TimeoutExpired(["original-worker"], 1)
+                responses = self._settlement_export_responses(fact)
+                responses[1] = original_error
+                with patch.dict(os.environ, {}, clear=True), patch.object(
+                        fixture_run, "communicate", side_effect=responses) as run:
+                    with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                        fixture_run.compose(self.env, ["exec", "-T", "spark", "true"],
+                                            capture=True, settlement_receipt=receipt)
+                self.assertIs(caught.exception, original_error)
+                exported = json.loads(receipt.read_text())
+                self.assertIsNone(exported["cli_returncode"], "missing worker result is not CLI success")
+                self.assertEqual(exported["returncode"], fact["returncode"])
+                self.assertIs(exported["never_started"], never_started)
+                self.assertIs(exported["temporary_owner_removed"], not never_started)
+                self.assertEqual(run.call_count, 3 if never_started else 4)
+
+    def test_settlement_export_does_not_invent_missing_cleanup_or_start_facts(self):
+        receipt = self.root / "incomplete-control-facts.json"
+        # The old compose API accepts this minimal original result. Optional
+        # export preserves absent fields rather than manufacturing False.
+        responses = self._settlement_export_responses(dict(child_waited=True, returncode=0))
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+                fixture_run, "communicate", side_effect=responses) as run:
+            result = fixture_run.compose(self.env, ["exec", "-T", "spark", "true"],
+                                         capture=True, settlement_receipt=receipt)
+        self.assertIs(result, responses[1])
+        exported = json.loads(receipt.read_text())
+        self.assertIsNone(exported["cleanup_failed"])
+        self.assertIsNone(exported["never_started"])
+        self.assertEqual(run.call_count, 4)
+
+    def test_settlement_export_keeps_settlement_transport_unknown_unpublished(self):
+        receipt = self.root / "settlement-unknown.json"
+        original_error = subprocess.TimeoutExpired(["original-settlement"], 1)
+        responses = self._settlement_export_responses(self._settlement_export_fact())
+        responses[2] = original_error
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+                fixture_run, "communicate", side_effect=responses) as run:
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                fixture_run.compose(self.env, ["exec", "-T", "spark", "true"],
+                                    capture=True, settlement_receipt=receipt)
+        self.assertIs(caught.exception, original_error)
+        self.assertEqual(run.call_count, 3)
+        self.assertFalse(receipt.exists())
+
+    def test_settlement_export_rejects_foreign_context_storage_before_dispatch(self):
+        receipt = self.root / "foreign-context.json"
+        with patch.dict(os.environ, {}, clear=True), patch.object(fixture_run, "communicate") as run:
+            original = fixture_run.admit(self.env)[2].as_dict()
+            original_storage = os.environ[fixture_run.RUN_STORAGE_ENV]
+            os.environ.pop("NOVA_FIXTURE_RUN_CONTEXT")
+            os.environ.pop(fixture_run.RUN_STORAGE_ENV)
+            foreign = fixture_run.admit(self.env)[2].as_dict()
+            self.assertNotEqual(original["identity"], foreign["identity"])
+            # Keep a valid new context but the original owner's storage. The
+            # existing admission boundary must reject the cross-owner pair.
+            os.environ[fixture_run.RUN_STORAGE_ENV] = original_storage
+            with self.assertRaises(fixture_runtime.RuntimeFailure) as caught:
+                fixture_run.compose(self.env, ["exec", "-T", "spark", "true"],
+                                    capture=True, settlement_receipt=receipt)
+        self.assertEqual(caught.exception.code, "InvalidScratchScope")
+        run.assert_not_called()
+        self.assertFalse(receipt.exists())
+
+    def test_settlement_export_refuses_replaced_container_before_worker_start(self):
+        receipt = self.root / "wrong-container.json"
+        with patch.dict(os.environ, {}, clear=True), patch.object(fixture_run, "communicate",
+                return_value=subprocess.CompletedProcess([], 0, b"replacement-spark", b"")) as run:
+            with self.assertRaises(fixture_runtime.RuntimeFailure) as caught:
+                fixture_run.compose(self.env, ["exec", "-T", "spark", "true"],
+                                    capture=True, settlement_receipt=receipt)
+        self.assertEqual(caught.exception.code, "MachineUnavailable")
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][-3:], ["ps", "-q", "spark"])
+        self.assertFalse(receipt.exists())
+
+    def test_settlement_export_never_overwrites_an_existing_sidecar(self):
+        receipt = self.root / "existing.json"
+        original = b"immutable-original-receipt\n"
+        receipt.write_bytes(original)
+        receipt.chmod(0o640)
+        responses = self._settlement_export_responses(self._settlement_export_fact())
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+                fixture_run, "communicate", side_effect=responses) as run:
+            with self.assertRaises(FileExistsError):
+                fixture_run.compose(self.env, ["exec", "-T", "spark", "true"],
+                                    capture=True, settlement_receipt=receipt)
+        self.assertEqual(receipt.read_bytes(), original)
+        self.assertEqual(receipt.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(run.call_count, 4, "exclusive export happens after original settlement/removal")
+        self.assertEqual(run.call_args.args[0][-3:-1], ["rm", "-rf"])
+
+    def test_settlement_export_requires_admitted_exec(self):
+        receipt = self.root / "not-an-owned-exec.json"
+        original_manifest = json.loads(json.dumps(self.manifest))
+        for private, arguments in [(True, ["exec", "-T", "spark", "true"]),
+                                   (False, ["ps", "spark"])]:
+            with self.subTest(private=private):
+                self.manifest = json.loads(json.dumps(original_manifest))
+                if private:
+                    self.manifest["runtime"] = {"catalog": {"id": "private"}}
+                self.write_manifest()
+                with patch.dict(os.environ, {}, clear=True), patch.object(fixture_run, "communicate") as run:
+                    with self.assertRaises(fixture_runtime.RuntimeFailure) as caught:
+                        fixture_run.compose(self.env, arguments, capture=True, settlement_receipt=receipt)
+                self.assertEqual(caught.exception.code, "InvalidConfiguration")
+                run.assert_not_called()
+                self.assertFalse(receipt.exists())
+
+    def test_settlement_export_does_not_change_default_command_or_return(self):
+        arguments = ["-p", "fixed", "exec", "-T", "-e", "FLAG=1", "spark", "true"]
+        for code in [0, 9]:
+            with self.subTest(code=code), patch.dict(os.environ, {}, clear=True):
+                original = fixture_run.admit(self.env)[2].as_dict()
+                traces = []
+                for export in [False, True]:
+                    receipt = self.root / ("observational-" + str(code) + ".json")
+                    responses = self._settlement_export_responses(self._settlement_export_fact(code), cli_code=code)
+                    with patch.object(fixture_run, "communicate", side_effect=responses) as run:
+                        if export:
+                            result = fixture_run.compose(self.env, arguments, data=b"original-stdin",
+                                                         capture=True, settlement_receipt=receipt)
+                        else:
+                            # Deliberately omit the keyword, exercising the old API.
+                            result = fixture_run.compose(self.env, arguments, data=b"original-stdin", capture=True)
+                            self.assertFalse(receipt.exists())
+                    self.assertIs(result, responses[1])
+                    self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                     (code, b"original-output", b"original-error"))
+                    self.assertEqual(run.call_count, 4)
+                    worker = run.call_args_list[1].args[0]
+                    folder = worker[worker.index(fixture_run.CONTAINER_OWNER) + 1]
+                    traces.append([[word.replace(folder, "<ORIGINAL_OWNER_FOLDER>") for word in call.args[0]]
+                                   for call in run.call_args_list])
+                    self.assertEqual(run.call_args_list[1].kwargs["data"], b"original-stdin")
+                    self.assertTrue(run.call_args_list[1].kwargs["capture"])
+                    if export:
+                        self.assertEqual(json.loads(receipt.read_text())["context"], original)
+                self.assertEqual(traces[0], traces[1], "export cannot add/reorder/change remote commands")
+
     def test_spark_exec_preserves_flags_and_confirms_actual_wait(self):
         calls = []
         def run(command, **kwargs):
@@ -862,6 +1164,161 @@ class RunTests(unittest.TestCase):
         self.assertFalse(folders[0].exists())
         self.assertTrue(folders[1].exists())
         self.assertTrue(all(folder.exists() for folder in retained))
+
+
+class HmsPreparedInputTests(unittest.TestCase):
+    """The fixed verifier reads only hermetic files; no Spark or network."""
+
+    def setUp(self):
+        import importlib.util
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        source = Path(__file__).resolve().parents[3] / 'tests/sql/fixtures/iceberg-hms/fixture.py'
+        spec = importlib.util.spec_from_file_location('hms_fixed_verifier_for_test', source)
+        self.fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.fixture)
+        self.namespace = 'iru7_local_verifier_test'
+        self.sibling = self.namespace + '_new'
+        self.evidence = self.root / 'tests/sql/.runtime/hms-evidence' / self.namespace
+        self.evidence.mkdir(parents=True)
+        publication = self.root / 'publications'
+        publication.mkdir()
+        for name in ['env.sh', 'manifest.json', 'spark.conf', 'hms.conf']:
+            (publication / name).write_text('local verifier input only\n')
+        self.context = {'schema': 1, 'identity': {'run_id': 'local-verifier-original-run',
+                        'scope_root': 's3://local-verifier/original'}, 'deadline_unix_ms': 123456789}
+        self.storage = {'local_model_only': True, 'owner': 'original-verifier-test'}
+        environment = {'NOVA_FIXTURE_RUN_CONTEXT': json.dumps(self.context),
+            'NOVA_FIXTURE_RUN_STORAGE': json.dumps(self.storage),
+            'NOVA_ENV_REST_ENV_FILE': str(publication / 'env.sh'),
+            'NOVAROCKS_SPARK_DEFAULTS': str(publication / 'spark.conf'),
+            'NOVAROCKS_SPARK_HMS_DEFAULTS': str(publication / 'hms.conf'),
+            'NOVAROCKS_WORKSPACE_ROOT': str(self.root)}
+        self.environment = patch.dict(os.environ, environment)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        self.sources = ['tests/sql/fixtures/iceberg-hms/fixture.py',
+                        'docker/iceberg-rest/fixture_run.py', 'case.sql', 'case.result']
+        for name in self.sources:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('not executed; exact local source identity: ' + name)
+        self.intent = {'schema': 'hms-case-input-intent-v1', 'namespace': self.namespace,
+            'new_namespace': self.sibling, 'context': self.context,
+            'storage_sha256': self.fixture.canonical_sha(self.storage),
+            'publications': self.fixture.publications(),
+            'sources': {name: self.sha(self.root / name) for name in self.sources}}
+        self.write('input.intent.json', self.intent)
+        self.remote = {'schema': 'fixture-compose-settlement-v1', 'local_model_only': True,
+            'context': self.context, 'child_waited': True, 'returncode': 0,
+            'cli_returncode': 0, 'cleanup_failed': False,
+            'temporary_owner_removed': True, 'never_started': False}
+        self.write('prepare.remote.json', self.remote)
+        self.ready = {'schema': 'hms-case-input-ready-v1', 'local_model_only': True,
+            'intent_sha256': self.sha(self.evidence / 'input.intent.json'),
+            'remote_sha256': self.sha(self.evidence / 'prepare.remote.json'),
+            'publications': self.intent['publications'],
+            'facts': {'first_append': {'snapshot_id': 2**63 - 1}}}
+        self.write('input.ready.json', self.ready)
+
+    @staticmethod
+    def sha(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def write(self, name, value):
+        (self.evidence / name).write_text(json.dumps(value))
+
+    def verify(self, *, namespace=None, sibling=None, receipt=None):
+        return self.fixture.verify_prepared(self.root, self.evidence,
+            self.namespace if namespace is None else namespace,
+            self.sibling if sibling is None else sibling,
+            self.evidence / 'input.ready.json' if receipt is None else receipt)
+
+    def test_fixed_verify_prepared_cli_uses_exact_owned_receipt_without_execution(self):
+        before = {path: self.sha(path) for path in self.evidence.iterdir()}
+        output = io.StringIO()
+        argv = ['fixture.py', 'verify-prepared', self.namespace,
+                '--new-namespace', self.sibling, '--receipt', str(self.evidence / 'input.ready.json')]
+        with patch.object(sys, 'argv', argv), contextlib.redirect_stdout(output), \
+             patch.object(self.fixture, 'run_spark', side_effect=AssertionError('no Spark')) as spark, \
+             patch.object(self.fixture, 'inventory', side_effect=AssertionError('no S3')) as inventory, \
+             patch.object(subprocess, 'Popen', side_effect=AssertionError('no process')) as process:
+            self.fixture.main()
+        self.assertEqual(output.getvalue(), 'HMS_PREPARE_OK\n')
+        self.assertEqual(self.verify()['facts']['first_append']['snapshot_id'], 2**63 - 1)
+        self.assertEqual({path: self.sha(path) for path in self.evidence.iterdir()}, before)
+        spark.assert_not_called()
+        inventory.assert_not_called()
+        process.assert_not_called()
+
+    def test_foreign_receipt_path_is_rejected_before_loading_any_owner_fact(self):
+        foreign = self.root / 'foreign-ready.json'
+        foreign.write_bytes((self.evidence / 'input.ready.json').read_bytes())
+        argv = ['fixture.py', 'verify-prepared', self.namespace,
+                '--new-namespace', self.sibling, '--receipt', str(foreign)]
+        with patch.object(sys, 'argv', argv), \
+             patch.object(self.fixture, 'hms_intent', side_effect=AssertionError('foreign authority must not be loaded')) as load:
+            with self.assertRaisesRegex(RuntimeError, 'receipt path differs'):
+                self.fixture.main()
+        load.assert_not_called()
+        self.assertFalse((self.evidence / 'input.cleanup-attempt.json').exists())
+        self.assertFalse((self.evidence / 'input.cleanup.json').exists())
+
+    def test_fixed_verifier_rejects_foreign_namespace_sibling_context_and_storage(self):
+        for keyword in ['namespace', 'sibling']:
+            with self.subTest(keyword=keyword), self.assertRaisesRegex(RuntimeError, 'differs from its original owner'):
+                self.verify(**{keyword: 'iru7_foreign'})
+        for key in ['NOVA_FIXTURE_RUN_CONTEXT', 'NOVA_FIXTURE_RUN_STORAGE']:
+            with self.subTest(key=key), patch.dict(os.environ, {key: '{}'}):
+                with self.assertRaisesRegex(RuntimeError, 'differs from its original owner'):
+                    self.verify()
+
+    def test_fixed_verifier_rejects_changed_sources_without_cleanup_authority(self):
+        for name in self.sources:
+            path = self.root / name
+            original = path.read_bytes()
+            path.write_bytes(original + b'\nchanged')
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, 'input source changed'):
+                self.verify()
+            path.write_bytes(original)
+        self.assertFalse((self.evidence / 'input.cleanup-attempt.json').exists())
+
+    def test_fixed_verifier_rejects_stale_intent_remote_and_publication_facts(self):
+        for field, value, expected in [
+            ('intent_sha256', 'foreign-intent', 'intent hash changed'),
+            ('remote_sha256', 'foreign-remote', 'remote exit receipt changed'),
+            ('publications', {}, 'input publication changed'),
+        ]:
+            ready = dict(self.ready, **{field: value})
+            self.write('input.ready.json', ready)
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, expected):
+                self.verify()
+        self.assertEqual(self.sha(self.evidence / 'input.intent.json'), self.ready['intent_sha256'])
+        self.assertEqual(self.sha(self.evidence / 'prepare.remote.json'), self.ready['remote_sha256'])
+
+    def test_fixed_verifier_rejects_incomplete_or_foreign_remote_settlement(self):
+        for field, value in [
+            ('schema', 'unknown'), ('context', {}), ('child_waited', False),
+            ('returncode', 9), ('returncode', False), ('cli_returncode', 9),
+            ('cli_returncode', False), ('cleanup_failed', True),
+            ('temporary_owner_removed', False), ('never_started', True),
+        ]:
+            self.write('prepare.remote.json', dict(self.remote, **{field: value}))
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(RuntimeError, 'no successful original remote exit'):
+                self.verify()
+        self.assertFalse((self.evidence / 'input.cleanup.json').exists())
+
+    def test_fixed_verifier_requires_exact_positive_int64_including_beyond_f64(self):
+        for snapshot in [2**53 + 1, 2**63 - 1]:
+            ready = dict(self.ready, facts={'first_append': {'snapshot_id': snapshot}})
+            self.write('input.ready.json', ready)
+            self.assertEqual(self.verify()['facts']['first_append']['snapshot_id'], snapshot)
+        for snapshot in [None, False, True, 0, -1, '731', 731.5, 2**63]:
+            ready = dict(self.ready, facts={'first_append': {'snapshot_id': snapshot}})
+            self.write('input.ready.json', ready)
+            with self.subTest(snapshot=snapshot), self.assertRaisesRegex(RuntimeError, 'exact positive Int64'):
+                self.verify()
 
 
 if __name__ == "__main__":

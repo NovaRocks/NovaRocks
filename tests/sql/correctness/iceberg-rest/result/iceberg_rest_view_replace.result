@@ -1,13 +1,16 @@
 -- query 6
+-- types	integer	varchar
 id	name
 2	b
 
 -- query 8
+-- types	integer
 id
 1
 2
 
 -- query 11
+-- types	integer
 id
 1
 2

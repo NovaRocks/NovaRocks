@@ -151,15 +151,8 @@ impl ResultsWriter {
         }
         for name in [
             "NOVAROCKS_SQL_TEST_HOST",
-            "NOVAROCKS_SQL_TEST_PORT",
+            "NOVAROCKS_SQL_TEST_TRINO_PORT",
             "NOVAROCKS_SQL_TEST_USER",
-            "NOVAROCKS_SQL_TEST_PASSWORD",
-            "NOVAROCKS_SQL_TEST_MYSQL",
-            "NOVAROCKS_SQL_TEST_REF_HOST",
-            "NOVAROCKS_SQL_TEST_REF_PORT",
-            "NOVAROCKS_SQL_TEST_REF_USER",
-            "NOVAROCKS_SQL_TEST_REF_PASSWORD",
-            "NOVAROCKS_SQL_TEST_REF_MYSQL",
             "NOVAROCKS_SQL_TEST_TIMEOUT",
             "NOVAROCKS_STARTUP_TIMEOUT_SECS",
         ] {
@@ -180,9 +173,14 @@ impl ResultsWriter {
             .iter()
             .map(|(k, v)| (k, digest(v.as_bytes())))
             .collect::<BTreeMap<_, _>>();
+        let corpus_path = root.join("tests/sql/correctness/corpus.toml");
+        let corpus_session = crate::config::load_corpus_session(root)?;
+        source_hashes.insert("corpus_session", self.track_file(&corpus_path)?);
         let value = json!({"schema":1,"source_hashes":source_hashes,"configured_values":configured_values,"cluster_values":cluster_values,"environment":env,
-            "cli":{"mysql":cli.mysql,"host":cli.host,"port":cli.port,"user":cli.user,"password":cli.password.as_ref().map(|v|digest(v.as_bytes())),
-                "ref_mysql":cli.ref_mysql,"ref_host":cli.ref_host,"ref_port":cli.ref_port,"ref_user":cli.ref_user,"ref_password":cli.ref_password.as_ref().map(|v|digest(v.as_bytes()))}});
+            "client_capabilities":novarocks_test_trino_client::CLIENT_CAPABILITIES,
+            "corpus_session":corpus_session,
+            "cli":{"host":cli.host,"trino_port":cli.trino_port,"user":cli.user,
+                "convert_legacy":cli.convert_legacy,"legacy_variant_offset_seconds":cli.legacy_variant_offset_seconds}});
         let path = self.path.with_extension("effective-config.json");
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -265,9 +263,12 @@ pub(crate) fn suite_inputs(suite: &SuiteConfig) -> Result<Value> {
         Ok(json!({"case":id,"source":source,"source_sha256":hash_file(&source).ok(),"expected":expected,
             "expected_sha256":optional_hash(expected.as_deref())?}))
     }).collect::<Result<Vec<Value>>>()?;
-    let facts = json!({"manifest_sha256":optional_hash(Some(&manifest_path))?,
+    let mut facts = json!({"manifest_sha256":optional_hash(Some(&manifest_path))?,
         "init_sha256":optional_hash(suite.init_sql.as_deref())?, "cleanup_sha256":optional_hash(suite.cleanup_sql.as_deref())?,
         "env":environment(&suite.manifest)?,"declaration":suite.manifest.reuse,"cases":cases});
+    if !suite.manifest.session.is_empty() {
+        facts["session"] = json!(suite.manifest.session);
+    }
     let mut value = facts.clone();
     value["inputs_sha256"] = json!(digest(&serde_json::to_vec(&facts)?));
     value["suite"] = json!(suite.name);
@@ -280,6 +281,7 @@ fn native_suite_impact(manifest: &SuiteManifest) -> crate::suite_manifest::Impac
     let mut impact = manifest.impact.clone();
     for path in [
         "tests/sql/runner/**",
+        "tests/trino-client/**",
         "tests/cluster-harness/**",
         "tests/test-support/**",
         "novarocks/failpoint/**",
@@ -369,6 +371,7 @@ pub(crate) fn required(step: &SqlStep) -> Vec<&'static str> {
 #[derive(Default)]
 pub(crate) struct CaseEvidence {
     pub artifacts: Vec<PathBuf>,
+    pub diagnostics: Vec<Value>,
     pub executed: Vec<Value>,
     pub failure: Option<Value>,
     statement: Option<usize>,
@@ -516,6 +519,7 @@ impl SuiteRecorder {
                 oracle
             },
             evidence.failure.clone(),
+            &evidence.diagnostics,
             None,
         );
     }
@@ -524,6 +528,7 @@ impl SuiteRecorder {
         outcome: &crate::CaseOutcome,
         oracle: Value,
         failure: Option<Value>,
+        diagnostics: &[Value],
         reason: Option<&str>,
     ) {
         if !self.seen.lock().unwrap().insert(outcome.case_id.clone()) {
@@ -545,7 +550,7 @@ impl SuiteRecorder {
         };
         self.writer.observe(json!({"kind":"case","suite":self.config.name,"case":outcome.case_id,
             "lifecycle_id":self.lifecycle,"status":status,"reason":reason,"elapsed_ms":outcome.elapsed.as_millis(),
-            "oracle":oracle,"failure":failure,"artifacts":artifacts}));
+            "oracle":oracle,"failure":failure,"artifacts":artifacts,"diagnostics":diagnostics}));
     }
     pub fn load_failure(&self, failure: &crate::CaseLoadFailure) {
         let outcome = crate::CaseOutcome {
@@ -554,7 +559,7 @@ impl SuiteRecorder {
             elapsed: Default::default(),
             log: String::new(),
         };
-        self.write_case(&outcome,json!({"required":[],"executed":[],"expected_source":null}),Some(json!({"class":"load","error_code":null,"statement_index":null,"actual_digest":null,"error":failure.error})),Some("load_failed"));
+        self.write_case(&outcome,json!({"required":[],"executed":[],"expected_source":null}),Some(json!({"class":"load","error_code":null,"statement_index":null,"actual_digest":null,"error":failure.error})),&[],Some("load_failed"));
     }
     pub fn init_failed(&self, cases: &[SqlCase]) {
         for case in cases {
@@ -573,6 +578,7 @@ impl SuiteRecorder {
                 &outcome,
                 CaseEvidence::default().oracle(case, expected.as_deref()),
                 None,
+                &[],
                 Some("suite_init_failed"),
             );
         }
@@ -586,7 +592,7 @@ impl SuiteRecorder {
     ) {
         for item in &outcome.outcomes {
             if let Some(load) = ps.load_failures.iter().find(|f| f.case_id == item.case_id) {
-                self.write_case(item,json!({"required":[],"executed":[],"expected_source":null}),Some(json!({"class":"load","error_code":null,"statement_index":null,"actual_digest":null,"error":load.error})),Some("load_failed"));
+                self.write_case(item,json!({"required":[],"executed":[],"expected_source":null}),Some(json!({"class":"load","error_code":null,"statement_index":null,"actual_digest":null,"error":load.error})),&[],Some("load_failed"));
             } else if let Some(case) = ps.cases.iter().find(|c| c.case_id == item.case_id) {
                 let expected = self
                     .config
@@ -597,6 +603,7 @@ impl SuiteRecorder {
                     item,
                     CaseEvidence::default().oracle(case, expected.as_deref()),
                     None,
+                    &[],
                     (!init_errors.is_empty()).then_some("suite_init_failed"),
                 );
             }
@@ -869,7 +876,11 @@ pub(crate) fn run_record(
         "config":{"path":config,"sha256":optional_hash(config)?},"fixture_root":fixture_root,
         "topology":{"cluster_mode":match cli.cluster_mode {crate::ClusterMode::AllInOne=>"all-in-one",crate::ClusterMode::CrossProcess=>"cross-process"},"cluster_size":cli.cluster_size.unwrap_or(1),"launch_profile":match cli.cluster_launch_profile.unwrap_or(novarocks_cluster_harness::LaunchProfile::FaultScenario){novarocks_cluster_harness::LaunchProfile::FaultScenario=>"fault-scenario",novarocks_cluster_harness::LaunchProfile::Performance=>"performance"}},
         "mode":crate::mode_name(cli.mode),
-        "verification":{"verify_enabled":!cli.no_verify,"update_expected":cli.update_expected,"record_from":match cli.record_from{crate::RecordFrom::Reference=>"reference",crate::RecordFrom::Target=>"target"},"float_epsilon":cli.float_epsilon,
+        "convert_legacy":cli.convert_legacy,
+        "legacy_variant_offset_seconds":cli.legacy_variant_offset_seconds,
+        "client_capabilities":novarocks_test_trino_client::CLIENT_CAPABILITIES,
+        "corpus_session":crate::config::load_corpus_session(root)?,
+        "verification":{"verify_enabled":!cli.no_verify,"update_expected":cli.update_expected,"float_epsilon":cli.float_epsilon,
             "order_sensitive_default":cli.order_sensitive_default,"rewrite_explain_contains_as_not_contains":cli.rewrite_explain_contains_as_not_contains,
             "target_session_sql":cli.target_session_sql.iter().map(|sql|json!({"sha256":digest(sql.as_bytes())})).collect::<Vec<_>>(),"dry_run":cli.dry_run,"query_timeout_secs":cli.query_timeout},
         "selection":{"suites":suites,"only":cli.only.as_deref().unwrap_or("").split(',').filter(|s|!s.is_empty()).collect::<Vec<_>>(),"skip":cli.skip.as_deref().unwrap_or("").split(',').filter(|s|!s.is_empty()).collect::<Vec<_>>(),"sql_glob":cli.sql_glob,"limit":cli.limit,"fail_fast":cli.fail_fast,"jobs":cli.jobs}}),
@@ -920,7 +931,11 @@ mod lifecycle_tests {
         fs::create_dir(&sql_dir).unwrap();
         fs::create_dir(&result_dir).unwrap();
         fs::write(sql_dir.join("one.sql"), "select 1;").unwrap();
-        fs::write(result_dir.join("one.result"), "1\n1\n").unwrap();
+        fs::write(
+            result_dir.join("one.result"),
+            "-- query 1\n-- types\tbigint\nid\n1\n",
+        )
+        .unwrap();
         let writer = ResultsWriter::create(root, root.join("results.jsonl").to_str()).unwrap();
         let config = SuiteConfig {
             name: "unit".into(),
@@ -938,11 +953,12 @@ mod lifecycle_tests {
         let fact = suite_inputs(&config).unwrap();
         let recorder = Arc::new(SuiteRecorder::new(Arc::clone(&writer), config, fact));
         let conn = ConnectionConfig {
-            mysql: "unused".into(),
+            time_zone: "Asia/Shanghai".into(),
+
             host: "localhost".into(),
             port: "1".into(),
             user: "root".into(),
-            password: None,
+
             catalog: None,
             db: None,
         };
@@ -954,6 +970,7 @@ mod lifecycle_tests {
             },
         ));
         let ctx = SuiteRunContext {
+            case_input: None,
             fixture_storage: None,
             fixture_writers_settled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             namespace_catalogs: crate::namespace_guard::CatalogFacts::default(),
@@ -964,24 +981,22 @@ mod lifecycle_tests {
             suite_name: "unit".into(),
             controls: None,
             mode: crate::Mode::Verify,
-            record_from: crate::RecordFrom::Target,
+            convert_legacy: false,
+            legacy_variant_offset_seconds: None,
             target_conn_base: conn.clone(),
-            reference_conn_base: conn.clone(),
             target_admin_conn: conn.clone(),
-            reference_admin_conn: conn,
             result_dir: Some(result_dir),
             actual_artifact_dir: None,
             verify_enabled: true,
             query_timeout: 1,
-            reference_required: false,
             auto_case_db: false,
             order_sensitive_default: false,
             float_epsilon: None,
             preview_lines: 0,
             update_expected: false,
+            session_defaults: crate::suite_manifest::SuiteSessionDefaults::default(),
             target_session_sql: vec![],
             rewrite_explain_contains_as_not_contains: vec![],
-            marker_re: regex::Regex::new("query").unwrap(),
             fail_fast: false,
             server_handle: Arc::new(Mutex::new(Box::new(NoServer))),
             failure_artifacts: artifacts,
@@ -1014,6 +1029,55 @@ mod lifecycle_tests {
             writer,
         )
     }
+    #[test]
+    fn case_diagnostics_are_retained_outside_correctness_oracles() {
+        let dir = tempfile::tempdir().unwrap();
+        let (prepared, _) = prepared(dir.path());
+        let case = &prepared.cases[0];
+        let mut evidence = CaseEvidence::default();
+        evidence.record(&case.steps[0], "result_set", true, json!({}));
+        evidence.diagnostics.push(json!({
+            "step":1,
+            "kind":"publication_kill_query_diagnostic",
+            "retained":true,
+            "details":{"original_query_ok":false,"authorized_as_complete_R_old_input":false}
+        }));
+        prepared.ctx.results.as_ref().unwrap().case(
+            case,
+            &crate::CaseOutcome {
+                case_id: case.case_id.clone(),
+                status: CaseStatus::Pass,
+                elapsed: Default::default(),
+                log: String::new(),
+            },
+            &evidence,
+        );
+        let record = &rows(dir.path())[0];
+        assert_eq!(record["status"], "pass");
+        assert_eq!(record["failure"], Value::Null);
+        assert_eq!(record["diagnostics"], json!(evidence.diagnostics));
+        assert_eq!(record["oracle"]["executed"], json!(evidence.executed));
+        assert_eq!(record["oracle"]["executed"].as_array().unwrap().len(), 1);
+        assert_eq!(record["oracle"]["executed"][0]["kind"], "result_set");
+    }
+
+    #[test]
+    fn declared_session_defaults_are_explicit_native_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (prepared, _) = prepared(dir.path());
+        let mut suite = prepared.ctx.results.as_ref().unwrap().config.clone();
+        let absent = suite_inputs(&suite).unwrap();
+        assert!(absent.get("session").is_none());
+        suite.manifest.session.pipeline_dop = Some(5);
+        let five = suite_inputs(&suite).unwrap();
+        assert_eq!(five["session"]["pipeline_dop"], 5);
+        assert_ne!(absent["inputs_sha256"], five["inputs_sha256"]);
+        suite.manifest.session.pipeline_dop = Some(6);
+        let six = suite_inputs(&suite).unwrap();
+        assert_ne!(five["inputs_sha256"], six["inputs_sha256"]);
+        assert_eq!(five["manifest_sha256"], six["manifest_sha256"]);
+    }
+
     #[test]
     fn native_declarations_keep_suite_facts_and_cover_shared_sql_launch_owners() {
         let dir = tempfile::tempdir().unwrap();
@@ -1049,6 +1113,7 @@ mod lifecycle_tests {
             let paths = entry["impact"]["paths"].as_array().unwrap();
             for shared in [
                 "tests/sql/runner/**",
+                "tests/trino-client/**",
                 "tests/cluster-harness/**",
                 "tests/test-support/**",
                 "novarocks/failpoint/**",
@@ -1328,7 +1393,11 @@ mod lifecycle_tests {
         fs::create_dir(&sql_dir).unwrap();
         fs::create_dir(&result_dir).unwrap();
         fs::write(sql_dir.join("one.sql"), sql).unwrap();
-        fs::write(result_dir.join("one.result"), "0\n1.0\n").unwrap();
+        fs::write(
+            result_dir.join("one.result"),
+            "-- query 1\n-- types\tbigint\nid\n1\n",
+        )
+        .unwrap();
         let env_file = root.join("fixture-env.sh");
         fs::write(&env_file, "# Test-owned input; no external services.\n").unwrap();
         fs::write(
@@ -1417,30 +1486,36 @@ mod lifecycle_tests {
     }
 
     #[cfg(unix)]
-    struct MysqlSetupPeer {
+    struct TrinoSetupPeer {
         port: u16,
         stop: Arc<AtomicBool>,
         worker: Option<std::thread::JoinHandle<Vec<String>>>,
     }
     #[cfg(unix)]
-    impl MysqlSetupPeer {
+    impl TrinoSetupPeer {
         fn start() -> Self {
             use std::net::{TcpListener, TcpStream};
             use std::time::{Duration, Instant};
-            fn write_packet(peer: &mut TcpStream, sequence: u8, payload: &[u8]) {
-                peer.write_all(&(payload.len() as u32).to_le_bytes()[..3])
-                    .unwrap();
-                peer.write_all(&[sequence]).unwrap();
-                peer.write_all(payload).unwrap();
-            }
-            fn read_packet(peer: &mut TcpStream) -> Option<Vec<u8>> {
-                let mut header = [0; 4];
-                peer.read_exact(&mut header).ok()?;
-                let length = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
-                assert!(length < 65536);
-                let mut payload = vec![0; length];
-                peer.read_exact(&mut payload).unwrap();
-                Some(payload)
+            fn read_request(peer: &mut TcpStream) -> Option<(String, String)> {
+                let mut head = Vec::new();
+                let mut byte = [0];
+                while !head.ends_with(b"\r\n\r\n") {
+                    peer.read_exact(&mut byte).ok()?;
+                    head.push(byte[0]);
+                }
+                let head = String::from_utf8(head).unwrap();
+                let method = head.split_whitespace().next().unwrap().to_owned();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                peer.read_exact(&mut body).unwrap();
+                Some((method, String::from_utf8(body).unwrap()))
             }
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -1449,77 +1524,66 @@ mod lifecycle_tests {
             let stopping = Arc::clone(&stop);
             let worker = std::thread::spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(10);
+                let mut queries = Vec::new();
                 loop {
-                    let (mut peer, _) = loop {
-                        match listener.accept() {
-                            Ok(peer) => break peer,
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                if stopping.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                                    return vec![];
-                                }
-                                std::thread::sleep(Duration::from_millis(1));
-                            }
-                            Err(error) => panic!("accept test MySQL setup: {error}"),
+                    if stopping.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                        return queries;
+                    }
+                    let mut peer = match listener.accept() {
+                        Ok((peer, _)) => peer,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
                         }
+                        Err(error) => panic!("accept test Trino setup: {error}"),
                     };
-                    // Accepted sockets can inherit the listener's nonblocking mode.
                     peer.set_nonblocking(false).unwrap();
                     peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                     peer.set_write_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
-                    let capabilities = 0x0008_a201_u32;
-                    let mut greeting = b"\x0a8.0.0-test\0".to_vec();
-                    greeting.extend_from_slice(&42_u32.to_le_bytes());
-                    greeting.extend_from_slice(b"12345678\0");
-                    greeting.extend_from_slice(&(capabilities as u16).to_le_bytes());
-                    greeting.push(45);
-                    greeting.extend_from_slice(&2_u16.to_le_bytes());
-                    greeting.extend_from_slice(&((capabilities >> 16) as u16).to_le_bytes());
-                    greeting.push(21);
-                    greeting.extend_from_slice(&[0; 10]);
-                    greeting.extend_from_slice(b"abcdefghijkl\0mysql_native_password\0");
-                    write_packet(&mut peer, 0, &greeting);
-                    // A TCP reachability check may close before authenticating.
-                    // Keep accepting until the actual MySQL session arrives.
-                    if read_packet(&mut peer).is_none() {
+                    // Reachability may connect without issuing HTTP.
+                    let Some((method, sql)) = read_request(&mut peer) else {
                         continue;
-                    }
-                    const OK: &[u8] = &[0, 0, 0, 2, 0, 0, 0];
-                    const EOF: &[u8] = &[0xfe, 0, 0, 2, 0];
-                    write_packet(&mut peer, 2, OK);
-                    let mut queries = vec![];
-                    while let Some(packet) = read_packet(&mut peer) {
-                        match packet.first() {
-                            Some(1) => break,
-                            Some(3) => {
-                                let query = String::from_utf8(packet[1..].to_vec()).unwrap();
-                                if query.to_ascii_uppercase().starts_with("SELECT @@") {
-                                    // MysqlSession only needs the client's setup variable;
-                                    // the case's actual result comes from its shell step.
-                                    let mut column =
-                                        b"\x03def\x00\x00\x00\x05value\x00\x0c".to_vec();
-                                    column.extend_from_slice(&63_u16.to_le_bytes());
-                                    column.extend_from_slice(&20_u32.to_le_bytes());
-                                    column.extend_from_slice(&[8, 0, 0, 0, 0, 0]);
-                                    for (sequence, payload) in [
-                                        (1, &[1][..]),
-                                        (2, &column[..]),
-                                        (3, EOF),
-                                        (4, &b"\x0867108864"[..]),
-                                        (5, EOF),
-                                    ] {
-                                        write_packet(&mut peer, sequence, payload);
-                                    }
-                                } else {
-                                    write_packet(&mut peer, 1, OK);
-                                }
-                                queries.push(query);
-                            }
-                            Some(14) => write_packet(&mut peer, 1, OK),
-                            command => panic!("unexpected MySQL setup command {command:?}"),
+                    };
+                    let (status, body) = match method.as_str() {
+                        "POST" => {
+                            queries.push(sql);
+                            (
+                                "200 OK",
+                                format!(
+                                    r#"{{"id":"setup","nextUri":"http://127.0.0.1:{port}/next"}}"#
+                                ),
+                            )
                         }
-                    }
-                    return queries;
+                        "GET" => {
+                            let query = queries.last().expect("GET follows a submitted statement");
+                            if query.contains("trc2_http_failure") {
+                                ("503 Service Unavailable", "TrinoError { name=NOT_SUPPORTED type=USER_ERROR code=13 }: body text cannot establish a query failure".into())
+                            } else if query.contains("trc2_query_failure") {
+                                ("200 OK", r#"{"id":"setup","error":{"message":"[sql.analyze.no_table] forced ordinary query failure","errorName":"TABLE_NOT_FOUND","errorType":"USER_ERROR","errorCode":46}}"#.into())
+                            } else if query.to_ascii_uppercase().starts_with("SELECT") {
+                                let (ty, value) = if query.contains("1.05") {
+                                    ("double", "1.05")
+                                } else {
+                                    ("bigint", "1")
+                                };
+                                (
+                                    "200 OK",
+                                    format!(
+                                        r#"{{"id":"setup","columns":[{{"name":"id","type":"{ty}","typeSignature":{{"rawType":"{ty}","arguments":[]}}}}],"data":[[{value}]]}}"#
+                                    ),
+                                )
+                            } else {
+                                (
+                                    "200 OK",
+                                    r#"{"id":"setup","updateType":"SET SESSION"}"#.into(),
+                                )
+                            }
+                        }
+                        other => panic!("unexpected Trino setup method {other}"),
+                    };
+                    write!(peer,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                    peer.flush().unwrap();
                 }
             });
             Self {
@@ -1534,13 +1598,196 @@ mod lifecycle_tests {
         }
     }
     #[cfg(unix)]
-    impl Drop for MysqlSetupPeer {
+    impl Drop for TrinoSetupPeer {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
             if let Some(worker) = self.worker.take() {
                 let _ = worker.join();
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn prepared_conversion(root: &Path, peer: &TrinoSetupPeer, steps: &[&str]) -> PreparedSuite {
+        let (mut ps, _) = prepared(root);
+        ps.ctx.mode = crate::Mode::Record;
+        ps.ctx.convert_legacy = true;
+        ps.ctx.legacy_variant_offset_seconds = Some(0);
+        ps.ctx.target_conn_base.host = "127.0.0.1".into();
+        ps.ctx.target_conn_base.port = peer.port.to_string();
+        ps.ctx.target_admin_conn = ps.ctx.target_conn_base.clone();
+        ps.cases[0].steps = steps
+            .iter()
+            .enumerate()
+            .map(|(index, sql)| SqlStep {
+                query_number: index + 1,
+                sql: (*sql).into(),
+                meta: Default::default(),
+            })
+            .collect();
+        ps
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conversion_missing_source_fails_before_execution_without_creating_a_file() {
+        let root = tempfile::tempdir().unwrap();
+        let peer = TrinoSetupPeer::start();
+        let ps = prepared_conversion(root.path(), &peer, &["SELECT 1 AS id"]);
+        let path = root.path().join("result/one.result");
+        fs::remove_file(&path).unwrap();
+        let outcome = crate::run_case(&ps.ctx, &ps.cases[0], &AtomicBool::new(false));
+        assert_eq!(outcome.status, CaseStatus::Fail);
+        assert!(
+            outcome
+                .log
+                .contains("conversion requires an existing paired golden file"),
+            "{}",
+            outcome.log
+        );
+        assert!(
+            !path.exists(),
+            "missing original oracle must not produce an empty replacement"
+        );
+        assert!(
+            peer.finish().is_empty(),
+            "a missing conversion source must fail before submitting SQL"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conversion_query_failure_preserves_its_section_and_converts_a_later_success() {
+        let root = tempfile::tempdir().unwrap();
+        let peer = TrinoSetupPeer::start();
+        let ps = prepared_conversion(
+            root.path(),
+            &peer,
+            &["SELECT trc2_query_failure AS id", "SELECT 1 AS id"],
+        );
+        let path = root.path().join("result/one.result");
+        let original = "-- query 1\n-- legacy\nid\n9\n\n-- query 2\n-- legacy\nid\n1\n";
+        fs::write(&path, original).unwrap();
+        let outcome = crate::run_case(&ps.ctx, &ps.cases[0], &AtomicBool::new(false));
+        assert_eq!(
+            outcome.status,
+            CaseStatus::Fail,
+            "conversion retains the ordinary failure verdict"
+        );
+        let submitted = peer.finish();
+        assert_eq!(submitted.len(), 2, "{submitted:?}\n{}", outcome.log);
+        assert!(submitted[0].contains("trc2_query_failure"));
+        assert_eq!(submitted[1], "SELECT 1 AS id");
+        let before = crate::golden::GoldenFile::parse(original).unwrap();
+        let after = crate::golden::GoldenFile::read(&path).unwrap();
+        assert_eq!(after.sections[0], before.sections[0]);
+        assert!(
+            matches!(&after.sections[1].blocks[0], crate::golden::Block::Typed { types, names, rows } if types == &["bigint"] && names == &["id"] && rows == &[vec!["1".to_string()]])
+        );
+        let record = &rows(root.path())[0];
+        assert_eq!(record["status"], "fail");
+        assert_eq!(record["failure"]["statement_index"], 1);
+        assert!(record["oracle"]["executed"].as_array().unwrap().iter().any(
+            |oracle| oracle["step"] == 2
+                && oracle["kind"] == "legacy_conversion"
+                && oracle["outcome"] == "pass"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conversion_http_failure_stops_later_steps_even_when_its_body_mentions_trino_error() {
+        let root = tempfile::tempdir().unwrap();
+        let peer = TrinoSetupPeer::start();
+        let ps = prepared_conversion(
+            root.path(),
+            &peer,
+            &["SELECT trc2_http_failure AS id", "SELECT 1 AS id"],
+        );
+        let path = root.path().join("result/one.result");
+        let original = "-- query 1\n-- legacy\nid\n9\n\n-- query 2\n-- legacy\nid\n1\n";
+        fs::write(&path, original).unwrap();
+        let outcome = crate::run_case(&ps.ctx, &ps.cases[0], &AtomicBool::new(false));
+        assert_eq!(outcome.status, CaseStatus::Fail);
+        let submitted = peer.finish();
+        assert_eq!(
+            submitted.len(),
+            1,
+            "HTTP failure must stop the case: {submitted:?}\n{}",
+            outcome.log
+        );
+        assert!(submitted[0].contains("trc2_http_failure"));
+        assert!(
+            outcome.log.contains("TrinoHttp { status=503 }"),
+            "{}",
+            outcome.log
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+        assert!(
+            !rows(root.path())[0]["oracle"]["executed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|oracle| oracle["step"] == 2)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conversion_step_epsilon_overrides_the_suite_policy_in_both_directions() {
+        for (suite_epsilon, step_epsilon, passes) in [(0.1, 0.001, false), (0.001, 0.1, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let peer = TrinoSetupPeer::start();
+            let mut ps =
+                prepared_conversion(root.path(), &peer, &["SELECT CAST(1.05 AS DOUBLE) AS id"]);
+            ps.ctx.float_epsilon = Some(suite_epsilon);
+            ps.cases[0].steps[0].meta.float_epsilon = Some(step_epsilon);
+            let path = root.path().join("result/one.result");
+            let original = "-- query 1\n-- legacy\nid\n1.0\n";
+            fs::write(&path, original).unwrap();
+            let outcome = crate::run_case(&ps.ctx, &ps.cases[0], &AtomicBool::new(false));
+            assert_eq!(
+                outcome.status,
+                if passes {
+                    CaseStatus::Pass
+                } else {
+                    CaseStatus::Fail
+                },
+                "suite={suite_epsilon}, step={step_epsilon}: {}",
+                outcome.log
+            );
+            assert_eq!(peer.finish().len(), 1);
+            let after = crate::golden::GoldenFile::read(&path).unwrap();
+            if passes {
+                assert!(
+                    matches!(&after.sections[0].blocks[0], crate::golden::Block::Typed { types, rows, .. } if types == &["double"] && rows == &[vec!["1.05".to_string()]])
+                );
+            } else {
+                assert_eq!(fs::read_to_string(path).unwrap(), original);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_legacy_verify_records_pending_conversion_separately_from_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let peer = TrinoSetupPeer::start();
+        let mut ps = prepared_conversion(root.path(), &peer, &["SELECT 1 AS id"]);
+        ps.ctx.mode = crate::Mode::Verify;
+        ps.ctx.convert_legacy = false;
+        ps.ctx.legacy_variant_offset_seconds = None;
+        let path = root.path().join("result/one.result");
+        let original = "-- query 1\n-- legacy\nid\n1\n";
+        fs::write(&path, original).unwrap();
+        let outcome = crate::run_case(&ps.ctx, &ps.cases[0], &AtomicBool::new(false));
+        assert_eq!(outcome.status, CaseStatus::Fail);
+        assert_eq!(peer.finish().len(), 1);
+        let record = &rows(root.path())[0];
+        assert_eq!(record["failure"]["class"], "error");
+        assert_eq!(record["failure"]["reason"], "legacy_pending_conversion");
+        assert_eq!(record["failure"]["statement_index"], 1);
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 
     #[cfg(unix)]
@@ -1551,12 +1798,14 @@ mod lifecycle_tests {
             |root| {
                 use clap::Parser;
                 let (config, sql_dir, result_dir) =
-                    local_cli_inputs(root, "-- query 1\nshell: printf '1.05\\n'\n");
+                    local_cli_inputs(root, "-- query 1\nSELECT CAST(1.05 AS DOUBLE) AS id;\n");
+                let original_expected = "-- query 1\n-- types\tdouble\nid\n1.0\n";
+                fs::write(result_dir.join("one.result"), original_expected).unwrap();
                 for (name, epsilon, expected_code, status) in [
                     ("within", "0.1", 0, "pass"),
                     ("outside", "0.001", 1, "fail"),
                 ] {
-                    let peer = MysqlSetupPeer::start();
+                    let peer = TrinoSetupPeer::start();
                     let port = peer.port.to_string();
                     let path = root.join(format!("{name}.jsonl"));
                     let cli = crate::Cli::try_parse_from([
@@ -1575,8 +1824,10 @@ mod lifecycle_tests {
                         "all-in-one",
                         "--host",
                         "127.0.0.1",
-                        "--port",
+                        "--trino-port",
                         &port,
+                        "--target-session-sql",
+                        "SET pipeline_dop = 2",
                         "--float-epsilon",
                         epsilon,
                         "--failure-artifact-dir",
@@ -1589,7 +1840,7 @@ mod lifecycle_tests {
                     assert!(
                         peer.finish()
                             .iter()
-                            .any(|query| query.contains("new_planner_optimize_timeout"))
+                            .any(|query| query == "SET pipeline_dop = 2")
                     );
                     let records = fs::read_to_string(path)
                         .unwrap()
@@ -1619,7 +1870,7 @@ mod lifecycle_tests {
                 }
                 assert_eq!(
                     fs::read_to_string(result_dir.join("one.result")).unwrap(),
-                    "0\n1.0\n"
+                    original_expected
                 );
             },
         );
@@ -1678,6 +1929,8 @@ mod lifecycle_tests {
             digest(b"selected server contents")
         );
         assert_eq!(record["server"]["launched"], "novarocks-bin");
+        assert_eq!(record["convert_legacy"], false);
+        assert!(record["legacy_variant_offset_seconds"].is_null());
         fs::write(
             std::env::var("NOVAROCKS_RESULTS_RECORD_PROGRAM_OUTPUT").unwrap(),
             serde_json::to_vec(&record).unwrap(),
@@ -1690,11 +1943,19 @@ mod lifecycle_tests {
             "--cluster-mode",
             "cross-process",
             "--dry-run",
+            "--mode",
+            "record",
+            "--convert-legacy",
+            "--legacy-variant-offset-seconds",
+            "-28800",
         ])
         .unwrap();
         let record = run_record(&cli, &root, None, &["optimizer".into()], None).unwrap();
         assert_eq!(record["server"]["path"], Value::Null);
         assert_eq!(record["server"]["launched"], "external");
+        assert_eq!(record["mode"], "record");
+        assert_eq!(record["convert_legacy"], true);
+        assert_eq!(record["legacy_variant_offset_seconds"], -28800);
     }
     #[test]
     fn tracked_input_cannot_be_rebound_after_a_concurrent_change() {
@@ -1715,6 +1976,13 @@ mod lifecycle_tests {
         let dir = tempfile::tempdir().unwrap();
         let writer =
             ResultsWriter::create(dir.path(), dir.path().join("results.jsonl").to_str()).unwrap();
+        let corpus = dir.path().join("tests/sql/correctness");
+        fs::create_dir_all(&corpus).unwrap();
+        fs::write(
+            corpus.join("corpus.toml"),
+            "[session]\ntime_zone = \"Asia/Shanghai\"\n",
+        )
+        .unwrap();
         let source = dir.path().join("runner.conf");
         fs::write(&source, "password=secret").unwrap();
         let mut config = crate::types::RunnerConfig {
@@ -1722,7 +1990,19 @@ mod lifecycle_tests {
             ..crate::types::RunnerConfig::default()
         };
         config.values.insert("password".into(), "secret".into());
-        let cli = crate::Cli::try_parse_from(["sql-test", "--suite", "optimizer"]).unwrap();
+        let cli = crate::Cli::try_parse_from([
+            "sql-test",
+            "--suite",
+            "optimizer",
+            "--mode",
+            "record",
+            "--convert-legacy",
+            "--legacy-variant-offset-seconds",
+            "-28800",
+            "--trino-port",
+            "8088",
+        ])
+        .unwrap();
         let path = writer
             .capture_configuration(&cli, dir.path(), &config)
             .unwrap();
@@ -1730,6 +2010,21 @@ mod lifecycle_tests {
         assert!(!text.contains("secret"));
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["source_hashes"]["runner"], digest(b"password=secret"));
+        assert_eq!(
+            value["client_capabilities"],
+            novarocks_test_trino_client::CLIENT_CAPABILITIES
+        );
+        assert_eq!(value["corpus_session"]["time_zone"], "Asia/Shanghai");
+        assert_eq!(value["cli"]["convert_legacy"], true);
+        assert_eq!(value["cli"]["legacy_variant_offset_seconds"], -28800);
+        assert_eq!(value["cli"]["trino_port"], "8088");
+        assert_eq!(
+            value["source_hashes"]["corpus_session"],
+            hash_file(&corpus.join("corpus.toml")).unwrap()
+        );
+        assert!(value["cli"].get("mysql").is_none());
+        assert!(value["cli"].get("password").is_none());
+        assert!(value["cli"].get("ref_host").is_none());
         assert!(writer.inputs_stable());
         fs::write(source, "password=changed").unwrap();
         assert!(!writer.inputs_stable());

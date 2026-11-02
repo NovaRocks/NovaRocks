@@ -1,35 +1,44 @@
 -- query 2
+-- types	varchar	bigint
 value	rows_seen
 abcdef|ghijkl	3
 
 -- query 4
+-- types	varchar	bigint
 value	rows_seen
 abcdef|g	3
 
 -- query 6
+-- types	varchar	bigint
 value	rows_seen
 abcdef|ghijkl	3
 
 -- query 8
+-- types	varchar	bigint
 value	rows_seen
 abcd	3
 
 -- query 10
+-- types	varchar	bigint
 value	rows_seen
 abcdef|ghijkl	3
 
 -- query 12
+-- types	varchar
 value
 李
 
 -- query 14
+-- types	varchar
 value
 李
 
 -- query 16
+-- types	varchar
 value
 李四|
 
 -- query 18
+-- types	varchar
 value
 李四|王五

@@ -1,23 +1,29 @@
 -- query 3
+-- legacy
 region	mn	mx	c
 east	10.50	50.99	5
 
 -- query 4
+-- types	varchar	decimal(18, 2)	decimal(18, 2)	bigint
 region	mn	mx	c
 east	10.50	50.99	5
 
 -- query 6
+-- legacy
 region	mn	mx	c
 east	20.75	50.99	4
 
 -- query 7
+-- types	varchar	decimal(18, 2)	decimal(18, 2)	bigint
 region	mn	mx	c
 east	20.75	50.99	4
 
 -- query 9
+-- legacy
 region	mn	mx	c
 east	20.75	40.25	3
 
 -- query 10
+-- types	varchar	decimal(18, 2)	decimal(18, 2)	bigint
 region	mn	mx	c
 east	20.75	40.25	3

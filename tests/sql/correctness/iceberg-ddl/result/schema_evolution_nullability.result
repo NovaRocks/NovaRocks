@@ -1,19 +1,23 @@
 -- query 2
+-- types	integer	varchar
 id	email
 1	a@x.com
 2	b@x.com
 
 -- query 4
+-- types	integer	varchar
 id	email
 1	a@x.com
 2	b@x.com
 
 -- query 6
+-- types	integer	varchar
 id	email
 1	a@x.com
 2	b@x.com
 
 -- query 8
+-- types	integer	varchar
 id	email
 1	a@x.com
 2	b@x.com

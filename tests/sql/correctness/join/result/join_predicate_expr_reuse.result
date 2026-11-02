@@ -1,64 +1,80 @@
 -- query 7
+-- types	bigint
 count(*)
 0
 
 -- query 8
+-- types	bigint
 count(*)
 1
 
 -- query 9
+-- types	bigint
 count(*)
 0
 
 -- query 10
+-- types	bigint
 count(*)
 1
 
 -- query 11
+-- types	bigint
 count(*)
 0
 
 -- query 12
+-- types	bigint
 count(*)
 6
 
 -- query 13
+-- types	bigint
 count(*)
 0
 
 -- query 14
+-- types	bigint
 count(*)
 2
 
 -- query 15
+-- types	bigint
 count(*)
 0
 
 -- query 16
+-- legacy
 count(*)
 44
 
 -- query 17
+-- types	bigint
 count(*)
 0
 
 -- query 18
+-- types	bigint
 count(*)
 0
 
 -- query 19
+-- types	bigint
 count(*)
 0
 
 -- query 20
+-- types	bigint
 count(*)
 0
 
 -- query 21
+-- types	bigint
 count(*)
 0
 
 -- query 22
+-- legacy
 count(*)	abs(db_sqlt_55db4456f5f2bda2.pre_t0.v1)
 1	6
 1	7
@@ -66,4 +82,5 @@ count(*)	abs(db_sqlt_55db4456f5f2bda2.pre_t0.v1)
 1	9
 
 -- query 23
+-- legacy
 count(*)	abs(db_sqlt_55db4456f5f2bda2.pre_t0.v1)

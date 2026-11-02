@@ -1,2 +1,4 @@
+-- query 1
+-- types	varchar	varchar	varchar	boolean	boolean	boolean	boolean	boolean
 append_ascii	keep_existing	empty_input_kept	empty_trailing_is_null	multi_trailing_is_null	utf8_multi_byte_trailing_is_null	null_input_is_null	null_trailing_is_null
-ac	ac		1	1	1	1	1
+ac	ac	""	true	true	true	true	true

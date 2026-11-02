@@ -26,11 +26,10 @@ USE ${case_db};
 -- query 2
 -- @skip_result_check=true
 USE ${case_db};
-SET @var = array_map(x -> CAST(x AS STRING), array_generate(1, 2000000, 1));
 
 -- query 3
 USE ${case_db};
-with input as (SELECT @var AS a UNION ALL SELECT ["A", "B", "C"] AS a)
+with input as (SELECT array_map(x -> CAST(x AS STRING), array_generate(1, 2000000, 1)) AS a UNION ALL SELECT ["A", "B", "C"] AS a)
 SELECT count(*) from (select a from input group by 1) AS t;
 
 -- query 4

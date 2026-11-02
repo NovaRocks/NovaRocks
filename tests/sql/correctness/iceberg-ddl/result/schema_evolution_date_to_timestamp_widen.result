@@ -1,8 +1,10 @@
 -- query 2
+-- types	integer	date
 id	occurred_on
 1	2026-01-15
 
 -- query 4
+-- types	integer	timestamp(6)
 id	occurred_on
-1	2026-01-15 00:00:00
-2	2026-02-20 11:22:33
+1	2026-01-15 00:00:00.000000
+2	2026-02-20 11:22:33.000000

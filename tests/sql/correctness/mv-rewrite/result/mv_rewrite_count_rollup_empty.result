@@ -1,35 +1,45 @@
 -- query 9
+-- types	bigint
 c
 0
 
 -- query 10
+-- types	integer	bigint
 user_id	c
 
 -- query 11
+-- types	integer	varchar	bigint
 user_id	dt	c
 
 -- query 13
+-- types	bigint
 c
 0
 
 -- query 16
+-- types	bigint
 c
 1
 
 -- query 18
+-- types	integer	bigint
 user_id	c
 1	1
 
 -- query 20
+-- types	bigint
 c
 1
 
 -- query 21
+-- types	integer	varchar	bigint
 user_id	dt	c
 1	2023-04-13	1
 
 -- query 22
+-- types	integer	bigint
 user_id	c
 
 -- query 23
+-- types	integer	bigint
 user_id	c

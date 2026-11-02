@@ -1,23 +1,29 @@
 -- query 10
+-- types	bigint
 sum(a.l_ext)
 800
 
 -- query 11
+-- types	bigint
 sum(a.l_ext)
 800
 
 -- query 12
+-- types	bigint
 sum(l_ext)
 400
 
 -- query 13
+-- types	bigint
 sum(l_ext)
 400
 
 -- query 14
+-- types	bigint
 sum(l_ext)
 400
 
 -- query 15
+-- types	bigint
 sum(l_ext)
 400

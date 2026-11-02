@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 import os
 from pathlib import Path
 import shlex
@@ -133,18 +134,19 @@ def startup_sweep(env_file, *, budget=None):
     budget = original if original is not None else admitted
     budget.check(work=True)
     record = manifest["runtime"]["machine"]
-    from machine_runtime import MachineOwner, SweepLockTimeout
+    from machine_runtime import MachineOwner, SweepLockTimeout, SweepInventoryTimeout
     deadline = min(time.monotonic() + 5, budget.deadline - budget.cleanup_grace_seconds)
     owner = MachineOwner(record["control_root"], daemon=record["daemon_id"],
                          timeout=max(0.001, deadline - time.monotonic()))
     try:
         report = owner.sweep(deadline=deadline, expected_version=record["version"],
                              expected_generation=record["generation"])
-    except SweepLockTimeout:
-        # No GC was dispatched. Ordinary readiness is a separate read-only
+    except (SweepLockTimeout, SweepInventoryTimeout) as cause:
+        # No settlement or GC was dispatched. Readiness is a separate read-only
         # admission, bounded by its normal timeout and this same run's work end.
+        operation = "startup-sweep-lock" if isinstance(cause, SweepLockTimeout) else "startup-sweep-inventory"
         report = dict(complete=False, enumeration_complete=False, observations_unavailable=True,
-                      removed=[], errors=[dict(operation="startup-sweep-lock", code="ScratchSweepTimeout")])
+                      removed=[], errors=[dict(operation=operation, code="ScratchSweepTimeout")])
         try:
             budget.check(work=True)
             admission = MachineOwner(record["control_root"], daemon=record["daemon_id"])
@@ -358,9 +360,11 @@ def communicate(command, *, timeout, data=None, environment=None, capture=False,
         raise
 
 
-def compose(env_file, arguments, *, data=None, capture=False):
+def compose(env_file, arguments, *, data=None, capture=False, settlement_receipt=None):
     values, manifest, budget = admit(env_file)
     command = ["docker", "compose", *arguments]
+    if settlement_receipt is not None and (not budget or "exec" not in arguments):
+        raise runtime.RuntimeFailure("InvalidConfiguration", "settlement export requires an admitted exec")
     if not budget:
         # Private stacks retain their independent lifecycle and do not gain a
         # shared-machine identity or an invented shared scratch namespace.
@@ -445,6 +449,20 @@ def compose(env_file, arguments, *, data=None, capture=False):
             removed = communicate([*prefix, "rm", "-rf", folder], timeout=max(0.001, budget.remaining_seconds()), capture=True, environment=runtime.controlled_environment())
             if removed.returncode:
                 raise runtime.RuntimeFailure("ContainerCleanupFailed", "Spark temporary directory cleanup exited " + str(removed.returncode)) from primary
+        if settlement_receipt is not None:
+            # Export only already-validated original exit facts, never argv or environment.
+            receipt = {"schema": "fixture-compose-settlement-v1", "context": budget.as_dict(),
+                       "container_id": expected, "owner_folder": folder,
+                       "payload_sha256": hashlib.sha256(json.dumps(tail[service + 1:], ensure_ascii=False, separators=(",", ":")).encode()).hexdigest(),
+                       "child_waited": fact["child_waited"], "returncode": fact["returncode"],
+                       "cleanup_failed": fact.get("cleanup_failed"),
+                       "never_started": fact.get("never_started"),
+                       "cli_returncode": None if worker_result is None else worker_result.returncode,
+                       "temporary_owner_removed": not fact.get("never_started") or worker_result is not None}
+            with open(settlement_receipt, "x", encoding="utf-8") as target:
+                os.chmod(settlement_receipt, 0o600)
+                json.dump(receipt, target, sort_keys=True)
+                target.write("\n")
 
 
 
@@ -515,6 +533,7 @@ def main(argv=None):
     parser.add_argument("--env-file", required=True, type=Path)
     parser.add_argument("--fixture-budget-secs", type=int)
     parser.add_argument("--path")
+    parser.add_argument("--settlement-receipt", type=Path)
     args, rest = parser.parse_known_args(argv)
     rest = rest[1:] if rest[:1] == ["--"] else rest
     runtime.install_signal_handlers()
@@ -552,7 +571,7 @@ def main(argv=None):
         print(json.dumps(budget.as_dict(), sort_keys=True) if budget else "null")
         return 0
     if args.operation == "compose":
-        return compose(args.env_file, rest).returncode
+        return compose(args.env_file, rest, settlement_receipt=args.settlement_receipt).returncode
     environment = {**os.environ, **values}
     return communicate(rest, timeout=budget.remaining_seconds(work=True) if budget else 3600,
                        environment=environment).returncode

@@ -1,7 +1,9 @@
 -- query 8
+-- types	varchar	bigint	bigint
 mode	c	payload_sum
 rf_off	3	90
 
 -- query 10
+-- types	varchar	bigint	bigint
 mode	c	payload_sum
 rf_on	3	90

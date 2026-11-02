@@ -1,4 +1,5 @@
 -- query 6
+-- types	varchar	varchar
 name	type
 dev	BRANCH
 main	BRANCH

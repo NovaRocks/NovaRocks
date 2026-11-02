@@ -1,4 +1,5 @@
 -- query 2
+-- legacy
 c1	c2	c3	c4	c5	c6	_rowid
 1	1	1	1	1	1	1
 1	1	1	2	1	11	2
@@ -6,6 +7,7 @@ c1	c2	c3	c4	c5	c6	_rowid
 4	2	2	5	2	22	2
 
 -- query 3
+-- types	integer	integer	integer	integer	integer	integer	bigint	bigint
 c1	c2	c3	c4	c5	c6	_rowid	_sum
 1	1	1	1	1	1	1	9
 1	1	1	2	1	11	2	9
@@ -13,13 +15,15 @@ c1	c2	c3	c4	c5	c6	_rowid	_sum
 4	2	2	5	2	22	2	18
 
 -- query 4
+-- types	integer	integer	integer	integer	integer	integer	bigint	bigint	double
 c1	c2	c3	c4	c5	c6	_rowid	_sum	_avg
-1	1	1	1	1	1	1	9	1
-1	1	1	2	1	11	2	9	1
-4	2	2	4	2	2	1	18	2
-4	2	2	5	2	22	2	18	2
+1	1	1	1	1	1	1	9	1.0
+1	1	1	2	1	11	2	9	1.0
+4	2	2	4	2	2	1	18	2.0
+4	2	2	5	2	22	2	18	2.0
 
 -- query 7
+-- legacy
 k	ts	rk	uv
 1	100	1	3
 2	100	1	2

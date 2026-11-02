@@ -1,22 +1,27 @@
 -- query 4
+-- types	bigint
 n
 3
 
 -- query 5
+-- types	bigint	varchar	double
 id	region	amount
 1	us	10.5
-2	us	20
+2	us	20.0
 3	eu	30.25
 
 -- query 7
+-- types	bigint
 n
 5
 
 -- query 9
+-- types	bigint
 n
 2
 
 -- query 10
+-- types	bigint	varchar	double
 id	region	amount
-998	ap	1
-999	ap	0
+998	ap	1.0
+999	ap	0.0

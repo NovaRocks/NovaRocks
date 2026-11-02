@@ -980,6 +980,7 @@ mod tests {
         assert!(out.contains(&format!("WHERE catalog_name='{name}'")));
         assert!(out.contains("'owned' AS business"));
         let mut result = crate::types::ResultSet {
+            golden: None,
             header: vec!["c".into(), "business".into()],
             rows: vec![vec!["owned".into(), "owned".into()]],
         };
@@ -989,12 +990,14 @@ mod tests {
             "SELECT catalog_name AS x, 'owned' AS x FROM owned.information_schema.schemata;";
         assert!(s.rewrite_source(duplicate_sql).is_ok());
         let mut duplicate = crate::types::ResultSet {
+            golden: None,
             header: vec!["x".into(), "x".into()],
             rows: vec![vec!["owned".into(), "owned".into()]],
         };
         s.render_expected(duplicate_sql, &mut duplicate).unwrap();
         assert_eq!(duplicate.rows[0], vec![name.to_string(), "owned".into()]);
         let mut current = crate::types::ResultSet {
+            golden: None,
             header: vec!["x".into(), "x".into()],
             rows: vec![vec!["owned".into(), "owned".into()]],
         };
@@ -1075,12 +1078,59 @@ mod tests {
             "Scalar expression: 'table=owned.ns.t'"
         );
         let mut result = crate::types::ResultSet {
+            golden: None,
             header: vec!["data".into()],
             rows: vec![vec!["owned.ns.t".into()]],
         };
         s.render_expected("SELECT 'owned.ns.t' AS data", &mut result)
             .unwrap();
         assert_eq!(result.rows[0][0], "owned.ns.t");
+    }
+    #[test]
+    fn hms_deferred_numeric_version_cannot_borrow_an_undeclared_catalog() {
+        use novarocks_cluster_harness::fixture_run::{FixturePolicy, RunBudget, ScratchIdentity};
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../..");
+        let suites = crate::config::build_suite_configs(&repo).unwrap();
+        let suite = &suites[crate::hms_case_input::SUITE];
+        let source = std::fs::read_to_string(
+            suite
+                .sql_dir
+                .join(format!("{}.sql", crate::hms_case_input::CASE)),
+        )
+        .unwrap();
+        let bad = source.replacen(
+            "CREATE EXTERNAL CATALOG ice_hms_${uuid0}",
+            "CREATE EXTERNAL CATALOG different_${uuid0}",
+            1,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join(format!("{}.sql", crate::hms_case_input::CASE));
+        std::fs::write(&path, bad).unwrap();
+        let sources = BTreeMap::from([(crate::hms_case_input::SUITE.to_string(), vec![path])]);
+        let units = BTreeSet::from([(
+            crate::hms_case_input::SUITE.to_string(),
+            crate::hms_case_input::CASE.to_string(),
+        )]);
+        let budget = RunBudget::admit(
+            FixturePolicy::default(),
+            ScratchIdentity::create("s3://novarocks/catalog-definition-unit").unwrap(),
+            600,
+            None,
+        )
+        .unwrap();
+        let mut names =
+            crate::fixture_context::RunNames::prepare_with_case_inputs(&budget, &sources, &units)
+                .unwrap();
+        let error = names
+            .seal_catalogs(&crate::types::RunnerConfig::default(), &sources, &suites)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("actual q2 declaration"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
     #[test]
     fn actual_candidate_corpus_and_hooks_seal_without_changing_case_ordinals_or_scratch_names() {
@@ -1103,8 +1153,19 @@ mod tests {
             None,
         )
         .unwrap();
-        let mut names = crate::fixture_context::RunNames::prepare(&budget, &sources).unwrap();
-        let before: Vec<_> = names
+        let original_names = crate::fixture_context::RunNames::prepare(&budget, &sources).unwrap();
+        let case_inputs = suites
+            .iter()
+            .filter(|(_, suite)| suite.manifest.case_input.is_some())
+            .map(|(name, _)| (name.clone(), crate::hms_case_input::CASE.to_string()))
+            .collect();
+        let mut names = crate::fixture_context::RunNames::prepare_with_case_inputs(
+            &budget,
+            &sources,
+            &case_inputs,
+        )
+        .unwrap();
+        let before: Vec<_> = original_names
             .suites
             .iter()
             .map(|(name, suite)| (name.clone(), suite.cases.clone()))
@@ -1133,5 +1194,79 @@ mod tests {
         assert_eq!(vars["uuid0"].len(), 63);
         assert_eq!(vars["case_db"].len(), 63);
         assert!(names.catalogs.0.values().all(|name| name.len() == 54));
+        // The closed definition remains in the full corpus. Its q2 declaration
+        // owns the deferred q12 use; no provisional snapshot is needed to seal.
+        let hms_source = &sources[crate::hms_case_input::SUITE][0];
+        let template = std::fs::read_to_string(hms_source).unwrap();
+        let mut hms_vars = crate::extension_manifest::literal_placeholder_variables(&template);
+        names
+            .extend_suite_variables(crate::hms_case_input::SUITE, &mut hms_vars)
+            .unwrap();
+        hms_vars.insert(
+            "__hms_case_input_kind".into(),
+            crate::hms_case_input::KIND.into(),
+        );
+        let case_vars =
+            crate::config::case_placeholder_variables(&hms_vars, crate::hms_case_input::CASE)
+                .unwrap();
+        let old_catalog = format!("ice_hms_{}", case_vars["uuid0"]);
+        let sealed_catalog = names.catalogs.lookup(&old_catalog).unwrap();
+        let raw = crate::fixture_context::render_expected(&template, &case_vars);
+        let namespaces = crate::fixture_context::namespace_mapping(&raw, &case_vars).unwrap();
+        let base = format!("iru7_{}", case_vars["uuid0"]);
+        let ordinal = names.suites[crate::hms_case_input::SUITE].cases[crate::hms_case_input::CASE];
+        assert_eq!(
+            namespaces[&base],
+            crate::fixture_context::resource(&names.run_id, 'd', ordinal, 1).unwrap()
+        );
+        assert_eq!(
+            namespaces[&format!("{base}_new")],
+            crate::fixture_context::resource(&names.run_id, 'd', ordinal, 2).unwrap()
+        );
+        let meta = regex::Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap();
+        let marker = regex::Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").unwrap();
+        assert!(
+            crate::parser::load_sql_case_from_file(hms_source, &meta, &marker, &hms_vars).is_err(),
+            "the pure definition must not masquerade as fully bound executable SQL"
+        );
+        // A hermetic syntax input is not an SDK fact or a native readiness claim.
+        let syntax_warehouse = format!("{}/hms", budget.identity().scope_root);
+        hms_vars.insert("iceberg_hms_warehouse".into(), syntax_warehouse.clone());
+        hms_vars.insert("hms_first_snapshot_id".into(), "731".into());
+        hms_vars.insert(
+            "hms_prepared_input_receipt".into(),
+            "'syntax-test-only'".into(),
+        );
+        let bound = crate::parser::load_sql_case_from_file(hms_source, &meta, &marker, &hms_vars)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.steps.len(), 59);
+        assert!(
+            bound.steps[1]
+                .sql
+                .contains(&format!("CREATE EXTERNAL CATALOG {sealed_catalog}"))
+        );
+        assert!(
+            bound.steps[11]
+                .sql
+                .contains(&format!("FROM {sealed_catalog}."))
+        );
+        assert!(
+            bound.steps[11]
+                .sql
+                .contains(" FOR VERSION AS OF 731 ORDER BY id;")
+        );
+        assert!(!bound.steps[11].sql.contains("${hms_first_snapshot_id}"));
+        let expected_uri = format!("{syntax_warehouse}/iru7/{}/v1/data", namespaces[&base]);
+        assert!(
+            bound.steps[39]
+                .sql
+                .contains(&format!("ADD FILES FROM '{expected_uri}'"))
+        );
+        assert!(
+            !bound.steps[39]
+                .sql
+                .contains(&format!("/iru7/{base}/v1/data"))
+        );
     }
 }

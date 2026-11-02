@@ -1,179 +1,224 @@
 -- query 11
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 10000	10000
 
 -- query 12
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 5000	5000
 
 -- query 13
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 10000	10000
 
 -- query 14
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 10000	10000
 
 -- query 15
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 5000	5000
 
 -- query 16
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 100	100
 
 -- query 17
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 10000	10000
 
 -- query 18
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 5000	5000
 
 -- query 19
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 100	100
 
 -- query 20
+-- legacy
 count(tt1.c_string)
 10000
 
 -- query 21
+-- legacy
 count(tt1.c_string)
 5000
 
 -- query 22
+-- legacy
 count(tt1.c_string)
 100
 
 -- query 23
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 10000	10000
 
 -- query 24
+-- types	bigint	bigint
 count(tt1.k1)	count(tt2.k1)
 0	0
 
 -- query 25
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 10000	10000
 
 -- query 26
+-- legacy
 count(tt1.k1)
 10000
 
 -- query 27
+-- legacy
 count(tt1.k1)
 5000
 
 -- query 28
+-- legacy
 count(tt1.k1)
 10000
 
 -- query 29
+-- legacy
 count(tt1.k1)
 10000
 
 -- query 30
+-- legacy
 count(tt1.k1)
 5000
 
 -- query 31
+-- legacy
 count(tt1.k1)
 100
 
 -- query 32
+-- legacy
 count(tt1.k1)
 10000
 
 -- query 33
+-- legacy
 count(tt1.k1)
 5000
 
 -- query 34
+-- legacy
 count(tt1.k1)
 100
 
 -- query 35
+-- legacy
 count(tt1.c_string)
 10000
 
 -- query 36
+-- legacy
 count(tt1.c_string)
 5000
 
 -- query 37
+-- legacy
 count(tt1.c_string)
 100
 
 -- query 38
+-- legacy
 count(tt1.k1)
 10000
 
 -- query 39
+-- types	bigint
 count(tt1.k1)
 0
 
 -- query 40
+-- legacy
 count(tt1.k1)
 10000
 
 -- query 41
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 10000	10000
 
 -- query 42
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 5000	5000
 
 -- query 43
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 10000	10000
 
 -- query 44
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 10000	10000
 
 -- query 45
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 5000	5000
 
 -- query 46
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 100	100
 
 -- query 47
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 10000	10000
 
 -- query 48
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 5000	5000
 
 -- query 49
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 100	100
 
 -- query 50
+-- legacy
 count(tt1.c_string)
 10000
 
 -- query 51
+-- legacy
 count(tt1.c_string)
 5000
 
 -- query 52
+-- legacy
 count(tt1.c_string)
 100
 
 -- query 53
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 10000	10000
 
 -- query 54
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 10000	0
 
 -- query 55
+-- legacy
 count(tt1.k1)	count(tt2.k1)
 10000	10000

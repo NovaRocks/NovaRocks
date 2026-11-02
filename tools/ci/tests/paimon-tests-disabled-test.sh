@@ -63,15 +63,26 @@ grep -F 'SQL suite paimon is disabled' "$test_root/selection.log" >/dev/null
   NOVAROCKS_SQL_TEST_CONFIG=retained-sql
   NOVA_ENV_REST_ENV_FILE=retained-env
   NOVA_ENV_RUNTIME_DIR=retained-runtime
-  NOVA_ENV_MYSQL_PORT=1
+  NOVA_ENV_TRINO_PORT=1
   NOVAROCKS_ICEBERG_REST_URI=retained-rest
   NOVAROCKS_ICEBERG_REST_MV_URI=retained-mv
   NOVA_ENV_MANIFEST=retained-manifest
   prepare_runtime
   test "$NOVAROCKS_SQL_TEST_CONFIG" = retained-sql
+  test "$CI_TRINO_PORT" = 1
 ) >"$test_root/runtime.log" 2>&1
 test ! -e "$test_root/paimon-called"
 grep -F 'PAIMON_TESTS=DISABLED' "$test_root/runtime/env.log" >/dev/null
+grep -F 'NOVA_ENV_TRINO_PORT=1' "$test_root/runtime/env.log" >/dev/null
+
+# Summary reports the actual client endpoint used by SQL, rather than MySQL.
+ci_init_summary_state
+CI_RUN_DIR="$test_root/summary"
+mkdir -p "$CI_RUN_DIR"
+CI_SUMMARY="$CI_RUN_DIR/summary.md"
+ci_set_runtime_context retained-fe retained-sql 1
+ci_render_summary PASS
+grep -Fx -- '- Trino port: 1' "$CI_SUMMARY" >/dev/null
 
 code=0
 bash "$REPO_ROOT/docker/paimon-read/tests/run.sh" >"$test_root/fixture.log" 2>&1 || code=$?

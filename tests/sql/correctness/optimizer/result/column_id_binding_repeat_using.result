@@ -1,4 +1,5 @@
 -- query 7
+-- types	bigint	bigint	bigint
 g	k	cnt
 0	2	1
 0	3	1
@@ -6,23 +7,27 @@ g	k	cnt
 1	NULL	3
 
 -- query 8
+-- types	integer	varchar	varchar
 a	v	w
 2	l2	r2
 3	l3	r3
 
 -- query 9
+-- types	integer	varchar	varchar
 a	v	w
 1	l1	NULL
 2	l2	r2
 3	l3	r3
 
 -- query 10
+-- types	integer	varchar	varchar
 a	v	w
 2	l2	r2
 3	l3	r3
 4	NULL	r4
 
 -- query 11
+-- legacy
 a	v	w
 1	l1	NULL
 2	l2	r2
@@ -30,6 +35,7 @@ a	v	w
 4	NULL	r4
 
 -- query 12
+-- types	integer
 x
 2
 3

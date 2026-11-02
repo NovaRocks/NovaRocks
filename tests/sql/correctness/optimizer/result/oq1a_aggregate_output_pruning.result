@@ -1,12 +1,15 @@
 -- query 5
+-- types	bigint
 s
 60
 
 -- query 7
+-- types	bigint
 c
 3
 
 -- query 9
+-- types	bigint
 sum_a
 30
 30

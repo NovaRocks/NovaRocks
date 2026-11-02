@@ -1,4 +1,5 @@
 -- query 10
+-- types	varchar	varchar	bigint	bigint
 dt	region	c	s
 2021-08-05	east	120	120
 2021-08-05	west	120	120
@@ -8,11 +9,13 @@ dt	region	c	s
 2021-08-25	west	120	360
 
 -- query 12
+-- types	varchar	bigint	bigint
 dt	c	s
 2021-08-05	240	240
 2021-08-15	240	480
 
 -- query 14
+-- types	varchar	bigint
 dt	c
 2021-08-05	240
 2021-08-15	240
@@ -20,6 +23,7 @@ dt	c
 2021-09-01	23040
 
 -- query 17
+-- types	varchar	bigint
 region	s
 east	600
 west	600

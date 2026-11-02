@@ -1,541 +1,674 @@
 -- query 7
+-- types	tinyint	smallint	integer	bigint	varchar	date	timestamp(6)	varchar
 c1	c2	c3	c4	c5	c6	c7	c8
 NULL	161	161	161	161	NULL	NULL	161
 NULL	162	162	162	162	NULL	NULL	162
 NULL	163	163	163	163	NULL	NULL	163
 
 -- query 8
+-- types	varchar	varchar	real	double	tinyint	smallint	integer	bigint
 c9	c10	c11	c12	c13	c14	c15	c16
-10087	10087	10087	10087	7	7	7	87
-10088	10088	10088	10088	0	0	8	88
-10089	10089	10089	10089	1	1	9	89
+10087	10087	10087.0	10087.0	7	7	7	87
+10088	10088	10088.0	10088.0	0	0	8	88
+10089	10089	10089.0	10089.0	1	1	9	89
 
 -- query 9
+-- types	varchar	date	timestamp(6)	varchar	varchar	varchar	real	double
 c17	c18	c19	c20	c21	c22	c23	c24
-0	2020-02-02	2020-02-02 00:00:00	0	27800	27800	27800	27800
-0	2020-02-02	2020-02-02 00:00:00	0	2800	2800	2800	2800
-0	2020-02-02	2020-02-02 00:00:00	0	28000	28000	28000	28000
+0	2020-02-02	2020-02-02 00:00:00.000000	0	27800	27800	27800.0	27800.0
+0	2020-02-02	2020-02-02 00:00:00.000000	0	2800	2800	2800.0	2800.0
+0	2020-02-02	2020-02-02 00:00:00.000000	0	28000	28000	28000.0	28000.0
 
 -- query 10
+-- types	tinyint	bigint
 c1	sum(c1)
 NULL	NULL
 -1	-1
 0	0
 
 -- query 11
+-- types	tinyint	smallint	bigint
 c1	c2	sum(c1)
 NULL	NULL	NULL
 NULL	128	NULL
 NULL	129	NULL
 
 -- query 12
+-- types	smallint	bigint
 c2	sum(c1)
 1	150
 
 -- query 13
+-- types	integer	bigint
 c3	sum(c1)
 1	150
 
 -- query 14
+-- types	bigint	bigint
 c4	sum(c1)
 2	300
 
 -- query 15
+-- types	varchar	bigint
 c5	sum(c1)
 2	300
 
 -- query 16
+-- types	date	bigint
 c6	sum(c1)
 2000-01-03	103
 
 -- query 17
+-- types	timestamp(6)	bigint
 c7	sum(c1)
-2000-01-03 00:00:00	103
+2000-01-03 00:00:00.000000	103
 
 -- query 18
+-- types	varchar	bigint
 c8	sum(c1)
 10	1500
 
 -- query 19
+-- types	varchar	bigint
 c9	sum(c1)
 100	100
 
 -- query 20
+-- types	tinyint	bigint
 c13	sum(c1)
 2	148800
 
 -- query 21
+-- types	smallint	bigint
 c14	sum(c1)
 2	148800
 
 -- query 22
+-- types	smallint	bigint
 c14	sum(c1)
 2	148800
 
 -- query 23
+-- types	bigint	bigint
 c16	sum(c1)
 2	300
 
 -- query 24
+-- types	varchar	bigint
 c17	sum(c1)
 2	300
 
 -- query 25
+-- types	date	bigint
 c18	sum(c1)
 
 -- query 26
+-- types	timestamp(6)	bigint
 c19	sum(c1)
 
 -- query 27
+-- types	smallint	bigint
 c2	sum(c1)
 199	NULL
 
 -- query 28
+-- types	integer	bigint
 c3	sum(c1)
 199	NULL
 
 -- query 29
+-- types	bigint	bigint
 c4	sum(c1)
 199	NULL
 
 -- query 30
+-- types	varchar	bigint
 c5	sum(c1)
 199	NULL
 
 -- query 31
+-- types	date	bigint
 c6	sum(c1)
 2002-12-31	31
 
 -- query 32
+-- types	timestamp(6)	bigint
 c7	sum(c1)
-2002-12-31 00:00:00	31
+2002-12-31 00:00:00.000000	31
 
 -- query 33
+-- types	varchar	bigint
 c8	sum(c1)
 99	14850
 
 -- query 34
+-- types	varchar	bigint
 c9	sum(c1)
 9999	NULL
 
 -- query 35
+-- types	tinyint	bigint
 c13	sum(c1)
 7	160800
 
 -- query 36
+-- types	smallint	bigint
 c14	sum(c1)
 7	160800
 
 -- query 37
+-- types	smallint	bigint
 c14	sum(c1)
 7	160800
 
 -- query 38
+-- types	bigint	bigint
 c16	sum(c1)
 199	NULL
 
 -- query 39
+-- types	varchar	bigint
 c17	sum(c1)
 199	NULL
 
 -- query 40
+-- types	date	bigint
 c18	sum(c1)
 2020-02-02	1219200
 
 -- query 41
+-- types	timestamp(6)	bigint
 c19	sum(c1)
-2020-02-02 00:00:00	1219200
+2020-02-02 00:00:00.000000	1219200
 
 -- query 42
+-- types	integer	bigint	bigint
 c3	c4	sum(c1)
 28	28	4200
 
 -- query 43
+-- types	integer	varchar	bigint
 c3	c5	sum(c1)
 28	28	4200
 
 -- query 44
+-- types	integer	timestamp(6)	bigint
 c3	c7	sum(c1)
-2	2001-04-02 00:00:00	2
+2	2001-04-02 00:00:00.000000	2
 
 -- query 45
+-- types	tinyint	smallint	integer	bigint	varchar	date	varchar	bigint
 c1	c2	c3	c4	c5	c6	c8	sum(c1)
 NULL	129	129	129	129	2001-07-29	129	NULL
 
 -- query 46
+-- types	tinyint	smallint	integer	bigint	varchar	date	varchar	tinyint	smallint	integer	bigint	bigint
 c1	c2	c3	c4	c5	c6	c8	c13	c14	c15	c16	sum(c1)
 NULL	129	129	129	129	2001-03-29	129	1	1	9	129	NULL
 
 -- query 47
+-- types	tinyint	smallint	integer	bigint	varchar	date	varchar	real	double	tinyint	smallint	integer	bigint	bigint
 c1	c2	c3	c4	c5	c6	c8	c11	c12	c13	c14	c15	c16	sum(c1)
-NULL	128	128	128	128	NULL	128	7128	7128	0	0	8	128	NULL
+NULL	128	128	128	128	NULL	128	7128.0	7128.0	0	0	8	128	NULL
 
 -- query 48
+-- types	tinyint	smallint	integer	bigint	varchar	date	varchar	bigint
 c1	c2	c3	c4	c5	c6	c8	sum(c1)
 NULL	128	128	128	128	NULL	128	NULL
 
 -- query 51
+-- types	decimal(4, 2)	decimal(10, 2)	decimal(27, 9)	decimal(38, 5)
 c1	c2	c3	c4
 50.00	50.00	50.000000000	50.00000
 50.00	150.00	150.000000000	150.00000
 51.00	51.00	51.000000000	51.00000
 
 -- query 52
+-- types	decimal(4, 2)	decimal(38, 2)
 c1	sum(c1)
 0.00	0.00
 
 -- query 53
+-- types	decimal(10, 2)	decimal(38, 2)
 c2	sum(c1)
 0.00	0.00
 
 -- query 54
+-- types	decimal(27, 9)	decimal(38, 2)
 c3	sum(c1)
 0.000000000	0.00
 
 -- query 55
+-- types	decimal(38, 5)	decimal(38, 2)
 c4	sum(c1)
 0.00000	0.00
 
 -- query 56
+-- types	decimal(4, 2)	decimal(10, 2)	decimal(38, 2)
 c1	c2	sum(c1)
 0.00	0.00	0.00
 
 -- query 57
+-- types	decimal(4, 2)	decimal(27, 9)	decimal(38, 2)
 c1	c3	sum(c1)
 0.00	0.000000000	0.00
 
 -- query 58
+-- types	decimal(4, 2)	decimal(38, 5)	decimal(38, 2)
 c1	c4	sum(c1)
 0.00	0.00000	0.00
 
 -- query 59
+-- types	decimal(10, 2)	decimal(27, 9)	decimal(38, 2)
 c2	c3	sum(c1)
 0.00	0.000000000	0.00
 
 -- query 60
+-- types	decimal(10, 2)	decimal(38, 5)	decimal(38, 2)
 c2	c4	sum(c1)
 0.00	0.00000	0.00
 
 -- query 61
+-- types	decimal(27, 9)	decimal(38, 5)	decimal(38, 2)
 c3	c4	sum(c1)
 0.000000000	0.00000	0.00
 
 -- query 62
+-- types	decimal(4, 2)	decimal(10, 2)	decimal(27, 9)	decimal(38, 2)
 c1	c2	c3	sum(c1)
 0.00	0.00	0.000000000	0.00
 
 -- query 63
+-- types	decimal(4, 2)	decimal(10, 2)	decimal(38, 5)	decimal(38, 2)
 c1	c2	c4	sum(c1)
 0.00	0.00	0.00000	0.00
 
 -- query 64
+-- types	decimal(10, 2)	decimal(27, 9)	decimal(38, 5)	decimal(38, 2)
 c2	c3	c4	sum(c1)
 0.00	0.000000000	0.00000	0.00
 
 -- query 65
+-- types	decimal(4, 2)	decimal(10, 2)	decimal(27, 9)	decimal(38, 5)	decimal(38, 2)
 c1	c2	c3	c4	sum(c1)
 0.00	0.00	0.000000000	0.00000	0.00
 
 -- query 71
+-- types	varchar	bigint	integer	smallint	tinyint	varchar	bigint	integer	smallint	tinyint
 c17	c16	c15	c14	c13	c5	c4	c3	c2	c1
 1	1	1	1	97	1	1	1	1	97
 
 -- query 72
+-- types	tinyint
 c1
 28
 
 -- query 73
+-- types	smallint
 c2
 28
 
 -- query 74
+-- types	integer
 c3
 28
 
 -- query 75
+-- types	bigint
 c4
 28
 
 -- query 76
+-- types	varchar
 c5
 28
 
 -- query 77
+-- types	tinyint
 c13
 29
 
 -- query 78
+-- types	smallint
 c14
 29
 
 -- query 79
+-- types	integer
 c15
 29
 
 -- query 80
+-- types	bigint
 c16
 29
 
 -- query 81
+-- types	varchar
 c17
 29
 
 -- query 82
+-- types	tinyint
 c1
 28
 
 -- query 83
+-- types	smallint	tinyint
 c2	c1
 1	97
 
 -- query 84
+-- types	integer	smallint	tinyint
 c3	c2	c1
 1	1	97
 
 -- query 85
+-- types	bigint	integer	smallint	tinyint
 c4	c3	c2	c1
 1	1	1	97
 
 -- query 86
+-- types	varchar	bigint	integer	smallint	tinyint
 c5	c4	c3	c2	c1
 1	1	1	1	97
 
 -- query 87
+-- types	tinyint	varchar	bigint	integer	smallint	tinyint
 c13	c5	c4	c3	c2	c1
 1	25	25	25	25	1
 
 -- query 88
+-- types	smallint	tinyint	varchar	bigint	integer	smallint	tinyint
 c14	c13	c5	c4	c3	c2	c1
 1	97	1	1	1	1	97
 
 -- query 89
+-- types	integer	smallint	tinyint	varchar	bigint	integer	smallint	tinyint
 c15	c14	c13	c5	c4	c3	c2	c1
 1	1	97	1	1	1	1	97
 
 -- query 90
+-- types	bigint	integer	smallint	tinyint	varchar	bigint	integer	smallint	tinyint
 c16	c15	c14	c13	c5	c4	c3	c2	c1
 1	1	1	97	1	1	1	1	97
 
 -- query 91
+-- types	varchar	bigint	integer	smallint	tinyint	varchar	bigint	integer	smallint	tinyint
 c17	c16	c15	c14	c13	c5	c4	c3	c2	c1
 1	1	1	1	97	1	1	1	1	97
 
 -- query 93
+-- types	varchar	bigint	integer	smallint	tinyint
 c5	c4	c3	c2	c1
 1	1	1	1	97
 
 -- query 94
+-- types	varchar	bigint	integer	smallint	tinyint
 c17	c16	c15	c14	c13
 1	1	1	1	105
 
 -- query 95
+-- types	tinyint
 c1
 28
 
 -- query 96
+-- types	smallint
 c2
 28
 
 -- query 97
+-- types	integer
 c3
 28
 
 -- query 98
+-- types	bigint
 c4
 28
 
 -- query 99
+-- types	varchar
 c5
 28
 
 -- query 100
+-- types	tinyint
 c13
 29
 
 -- query 101
+-- types	smallint
 c14
 29
 
 -- query 102
+-- types	integer
 c15
 29
 
 -- query 103
+-- types	bigint
 c16
 29
 
 -- query 104
+-- types	varchar
 c17
 29
 
 -- query 105
+-- types	tinyint
 c1
 28
 
 -- query 106
+-- types	smallint	tinyint
 c2	c1
 1	97
 
 -- query 107
+-- types	integer	smallint	tinyint
 c3	c2	c1
 1	1	97
 
 -- query 108
+-- types	bigint	integer	smallint	tinyint
 c4	c3	c2	c1
 1	1	1	97
 
 -- query 109
+-- types	varchar	bigint	integer	smallint	tinyint
 c5	c4	c3	c2	c1
 1	1	1	1	97
 
 -- query 110
+-- types	tinyint	varchar	bigint	integer	smallint	tinyint
 c13	c5	c4	c3	c2	c1
 1	25	25	25	25	1
 
 -- query 111
+-- types	smallint	tinyint	varchar	bigint	integer	smallint	tinyint
 c14	c13	c5	c4	c3	c2	c1
 1	97	1	1	1	1	97
 
 -- query 112
+-- types	integer	smallint	tinyint	varchar	bigint	integer	smallint	tinyint
 c15	c14	c13	c5	c4	c3	c2	c1
 1	1	97	1	1	1	1	97
 
 -- query 113
+-- types	bigint	integer	smallint	tinyint	varchar	bigint	integer	smallint	tinyint
 c16	c15	c14	c13	c5	c4	c3	c2	c1
 1	1	1	97	1	1	1	1	97
 
 -- query 114
+-- types	varchar	bigint	integer	smallint	tinyint	varchar	bigint	integer	smallint	tinyint
 c17	c16	c15	c14	c13	c5	c4	c3	c2	c1
 1	1	1	1	97	1	1	1	1	97
 
 -- query 115
+-- types	smallint	tinyint
 c2	c1
 7	7
 
 -- query 121
+-- types	integer
 k2
 10
 
 -- query 124
+-- types	integer
 k1
 1
 
 -- query 126
+-- types	integer
 k1
 2
 1
 
 -- query 129
+-- types	tinyint	tinyint	tinyint	tinyint	smallint	smallint	smallint	smallint
 c1	c2	c3	c4	c5	c6	c7	c8
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 
 -- query 130
+-- types	integer	integer	integer	integer	bigint	bigint	bigint	bigint
 c9	c10	c11	c12	c13	c14	c15	c16
 1	1	1	1	1	1	1	1
 
 -- query 131
+-- types	varchar	varchar	varchar	varchar	date	date	date	date
 c17	c18	c19	c20	c21	c22	c23	c24
 1	1	1	1	NULL	NULL	NULL	NULL
 
 -- query 133
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 1	487758dabc82e041c3050f8b895ecbc8
 
 -- query 134
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 2	487758dabc82e041c3050f8b895ecbc8
 
 -- query 135
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 25	487758dabc82e041c3050f8b895ecbc8
 
 -- query 136
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 29	487758dabc82e041c3050f8b895ecbc8
 
 -- query 137
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 39	487758dabc82e041c3050f8b895ecbc8
 
 -- query 138
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 40	487758dabc82e041c3050f8b895ecbc8
 
 -- query 139
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 42	a613d9cefc453b9deda3447b62de3619
 
 -- query 140
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 51	487758dabc82e041c3050f8b895ecbc8
 
 -- query 141
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 52	7edd122be930f259f61890245f83cdfb
 
 -- query 142
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 53	d5094a9ad56d3b1aed1c51f5ed0db7dc
 
 -- query 143
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 54	86160c41b2b671826756bd405193a5f2
 
 -- query 144
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 55	487758dabc82e041c3050f8b895ecbc8
 
 -- query 145
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 56	487758dabc82e041c3050f8b895ecbc8
 
 -- query 146
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 57	487758dabc82e041c3050f8b895ecbc8
 
 -- query 147
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 58	487758dabc82e041c3050f8b895ecbc8
 
 -- query 148
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 59	487758dabc82e041c3050f8b895ecbc8
 
 -- query 149
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 60	487758dabc82e041c3050f8b895ecbc8
 
 -- query 150
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 61	487758dabc82e041c3050f8b895ecbc8
 
 -- query 151
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 62	487758dabc82e041c3050f8b895ecbc8
 
 -- query 152
+-- types	varchar	varchar
 test_name	result_hash
 
 -- query 153
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 90	d5094a9ad56d3b1aed1c51f5ed0db7dc
 
 -- query 154
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 93	487758dabc82e041c3050f8b895ecbc8
 
 -- query 155
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 94	487758dabc82e041c3050f8b895ecbc8
 
 -- query 156
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 95	7edd122be930f259f61890245f83cdfb
 
 -- query 157
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 96	487758dabc82e041c3050f8b895ecbc8
 
 -- query 158
+-- types	varchar	varchar
 test_name	result_hash
 Test Case 97	487758dabc82e041c3050f8b895ecbc8

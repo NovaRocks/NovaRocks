@@ -1,4 +1,5 @@
 -- query 10
+-- types	integer	integer	bigint
 lo_orderkey	lo_linenumber	c
 10000	0	60
 10000	1	60
@@ -30,6 +31,7 @@ lo_orderkey	lo_linenumber	c
 10007	4	60
 
 -- query 13
+-- types	integer	bigint
 lo_orderkey	c
 10000	48
 10001	48
@@ -41,12 +43,14 @@ lo_orderkey	c
 10007	120
 
 -- query 15
+-- types	integer	bigint
 lo_orderkey	c
 10005	300
 10006	300
 10007	300
 
 -- query 21
+-- types	integer	integer	bigint
 lo_orderkey	lo_linenumber	c
 10000	3	60
 10000	4	60
@@ -70,6 +74,7 @@ lo_orderkey	lo_linenumber	c
 10007	0	60
 
 -- query 27
+-- types	integer	bigint
 lo_orderkey	s
 10000	106480
 10001	107280
@@ -81,6 +86,7 @@ lo_orderkey	s
 10007	109680
 
 -- query 29
+-- types	integer	bigint
 lo_orderkey	s
 10000	106480
 10002	108480

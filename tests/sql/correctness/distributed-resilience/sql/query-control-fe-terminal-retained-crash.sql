@@ -73,7 +73,7 @@ INSERT INTO ${case_db}.fe_terminal_retained VALUES (3, 30, 15);
 
 -- query 5
 -- @kill_fe_after_be_log_contains=NOVAROCKS_TASK_LEASE_RENEWED
--- @expect_error=server disconnected
+-- @expect_error=Trino transport failure
 -- @be_log_count_at_least=NOVAROCKS_TASK_TERMINAL_RETAINED,1
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_LEASE_EXPIRED,3
 -- Termination completes on a backend only after its own work stops, and

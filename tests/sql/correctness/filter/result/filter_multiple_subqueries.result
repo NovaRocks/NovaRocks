@@ -1,24 +1,29 @@
 -- query 2
+-- types	bigint	bigint
 id	v
 2	20
 3	30
 
 -- query 3
+-- types	bigint	bigint
 id	v
 2	20
 3	30
 
 -- query 4
+-- types	bigint	bigint
 id	v
 2	20
 3	30
 4	40
 
 -- query 5
+-- types	bigint	bigint
 min_v	max_v
 10	50
 
 -- query 6
+-- types	bigint	bigint
 id	sv
 2	20
 3	30

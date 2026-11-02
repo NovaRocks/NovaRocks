@@ -24,6 +24,6 @@
 -- 1. Execute deterministic projection-only query (no table dependency).
 -- 2. Assert ABS result, comparison against BIGINT max, and +1 arithmetic on the same row.
 SELECT
-  ABS(-9223372036854775808) AS abs_largeint_min,
+  CAST(ABS(-9223372036854775808) AS VARCHAR) AS abs_largeint_min,
   ABS(-9223372036854775808) > 9223372036854775807 AS gt_bigint_max,
-  ABS(-9223372036854775808) + 1 AS abs_largeint_min_plus_one;
+  CAST(ABS(-9223372036854775808) + 1 AS VARCHAR) AS abs_largeint_min_plus_one;

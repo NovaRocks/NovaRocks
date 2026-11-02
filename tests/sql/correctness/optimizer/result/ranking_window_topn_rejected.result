@@ -1,13 +1,15 @@
 -- query 5
+-- types	varchar	integer	bigint	double
 region	amount	rk	avg_amt
-A	200	1	200
-A	100	2	150
-B	400	1	400
-B	300	2	350
-C	20	1	20
-C	10	2	15
+A	200	1	200.0
+A	100	2	150.0
+B	400	1	400.0
+B	300	2	350.0
+C	20	1	20.0
+C	10	2	15.0
 
 -- query 6
+-- types	varchar	integer	bigint
 region	amount	rk
 A	100	2
 A	50	3
@@ -16,11 +18,13 @@ B	150	3
 C	10	2
 
 -- query 7
+-- types	varchar	integer	bigint
 region	amount	rk
 B	400	1
 B	300	2
 
 -- query 8
+-- types	varchar	integer	bigint	bigint
 region	amount	rk_amount	rk_region
 A	200	1	1
 A	100	2	1

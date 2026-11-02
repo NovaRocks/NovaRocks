@@ -1,91 +1,112 @@
 -- query 22
+-- types	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)
 t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal	t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal
-abc	1	1	20	1.1	1.1	1	2021-01-01 00:00:00	2021-01-01	1.20	ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00	2022-01-01	1.20
-中文	1	1	20	1.1	1.1	1	2021-02-01 00:00:00	2021-01-01	1.20	ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00	2022-01-01	1.20
+abc	1	1	20	1.1	1.1	1	2021-01-01 00:00:00.000000	2021-01-01	1.20	ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00.000000	2022-01-01	1.20
+中文	1	1	20	1.1	1.1	1	2021-02-01 00:00:00.000000	2021-01-01	1.20	ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00.000000	2022-01-01	1.20
 
 -- query 23
+-- types	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)
 t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal	t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal
-abc	1	1	20	1.1	1.1	1	2021-01-01 00:00:00	2021-01-01	1.20	ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00	2022-01-01	1.20
-中文	1	1	20	1.1	1.1	1	2021-02-01 00:00:00	2021-01-01	1.20	ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00	2022-01-01	1.20
+abc	1	1	20	1.1	1.1	1	2021-01-01 00:00:00.000000	2021-01-01	1.20	ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00.000000	2022-01-01	1.20
+中文	1	1	20	1.1	1.1	1	2021-02-01 00:00:00.000000	2021-01-01	1.20	ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00.000000	2022-01-01	1.20
 
 -- query 24
+-- types	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)
 t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal	t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal
-abcd	2	2	2	1.2	1.2	10	2021-04-02 00:00:00	2021-04-02	1.25	abcd	2	2	1	1.2	1.2	10	2021-04-02 00:00:00	2021-04-02	1.25
+abcd	2	2	2	1.2	1.2	10	2021-04-02 00:00:00.000000	2021-04-02	1.25	abcd	2	2	1	1.2	1.2	10	2021-04-02 00:00:00.000000	2021-04-02	1.25
 
 -- query 25
+-- types	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)
 t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal	t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal
-abcd	2	2	2	1.2	1.2	10	2021-04-02 00:00:00	2021-04-02	1.25	abcd	2	2	1	1.2	1.2	10	2021-04-02 00:00:00	2021-04-02	1.25
+abcd	2	2	2	1.2	1.2	10	2021-04-02 00:00:00.000000	2021-04-02	1.25	abcd	2	2	1	1.2	1.2	10	2021-04-02 00:00:00.000000	2021-04-02	1.25
 
 -- query 26
+-- types	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)
 t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal	t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal
-中文	1	1	20	1.1	1.1	1	2021-02-04 00:00:00	2021-02-04	1.20	中文	21	1	21	1.1	1.1	1	2021-02-04 00:00:00	2021-02-04	1.20
-中文	1	1	20	1.1	1.1	1	2021-02-01 00:00:00	2021-01-01	1.20	中文	21	1	21	1.1	1.1	1	2021-02-04 00:00:00	2021-02-04	1.20
-abc	1	1	20	1.1	1.1	1	2021-01-01 00:00:00	2021-01-01	1.20	中文	21	1	21	1.1	1.1	1	2021-02-04 00:00:00	2021-02-04	1.20
-中文	100	100	100	100.01	100.02	1	2021-01-01 00:00:00	2021-01-01	100.25	中文	200	1	21	1.1	1.1	1	2021-02-04 00:00:00	2021-02-04	1.20
+中文	1	1	20	1.1	1.1	1	2021-02-04 00:00:00.000000	2021-02-04	1.20	中文	21	1	21	1.1	1.1	1	2021-02-04 00:00:00.000000	2021-02-04	1.20
+中文	1	1	20	1.1	1.1	1	2021-02-01 00:00:00.000000	2021-01-01	1.20	中文	21	1	21	1.1	1.1	1	2021-02-04 00:00:00.000000	2021-02-04	1.20
+abc	1	1	20	1.1	1.1	1	2021-01-01 00:00:00.000000	2021-01-01	1.20	中文	21	1	21	1.1	1.1	1	2021-02-04 00:00:00.000000	2021-02-04	1.20
+中文	100	100	100	100.01	100.02	1	2021-01-01 00:00:00.000000	2021-01-01	100.25	中文	200	1	21	1.1	1.1	1	2021-02-04 00:00:00.000000	2021-02-04	1.20
 
 -- query 27
+-- types	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)
 t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal	t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal
-中文	100	100	100	100.01	100.02	1	2021-01-01 00:00:00	2021-01-01	100.25	中文	200	1	21	1.1	1.1	1	2021-02-04 00:00:00	2021-02-04	1.20
-中文	1	1	20	1.1	1.1	1	2021-02-04 00:00:00	2021-02-04	1.20	中文	21	1	21	1.1	1.1	1	2021-02-04 00:00:00	2021-02-04	1.20
-中文	1	1	20	1.1	1.1	1	2021-02-01 00:00:00	2021-01-01	1.20	中文	21	1	21	1.1	1.1	1	2021-02-04 00:00:00	2021-02-04	1.20
-abc	1	1	20	1.1	1.1	1	2021-01-01 00:00:00	2021-01-01	1.20	中文	21	1	21	1.1	1.1	1	2021-02-04 00:00:00	2021-02-04	1.20
+中文	100	100	100	100.01	100.02	1	2021-01-01 00:00:00.000000	2021-01-01	100.25	中文	200	1	21	1.1	1.1	1	2021-02-04 00:00:00.000000	2021-02-04	1.20
+中文	1	1	20	1.1	1.1	1	2021-02-04 00:00:00.000000	2021-02-04	1.20	中文	21	1	21	1.1	1.1	1	2021-02-04 00:00:00.000000	2021-02-04	1.20
+中文	1	1	20	1.1	1.1	1	2021-02-01 00:00:00.000000	2021-01-01	1.20	中文	21	1	21	1.1	1.1	1	2021-02-04 00:00:00.000000	2021-02-04	1.20
+abc	1	1	20	1.1	1.1	1	2021-01-01 00:00:00.000000	2021-01-01	1.20	中文	21	1	21	1.1	1.1	1	2021-02-04 00:00:00.000000	2021-02-04	1.20
 
 -- query 28
+-- types	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)
 t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal	t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal
-ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00	2022-01-01	1.20	中文	1	1	20	1.1	1.1	1	2021-02-01 00:00:00	2021-01-01	1.20
-ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00	2022-01-01	1.20	abc	1	1	20	1.1	1.1	1	2021-01-01 00:00:00	2021-01-01	1.20
+ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00.000000	2022-01-01	1.20	中文	1	1	20	1.1	1.1	1	2021-02-01 00:00:00.000000	2021-01-01	1.20
+ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00.000000	2022-01-01	1.20	abc	1	1	20	1.1	1.1	1	2021-01-01 00:00:00.000000	2021-01-01	1.20
 
 -- query 29
+-- types	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)
 t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal	t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal
-ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00	2022-01-01	1.20	中文	1	1	20	1.1	1.1	1	2021-02-01 00:00:00	2021-01-01	1.20
-ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00	2022-01-01	1.20	abc	1	1	20	1.1	1.1	1	2021-01-01 00:00:00	2021-01-01	1.20
+ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00.000000	2022-01-01	1.20	中文	1	1	20	1.1	1.1	1	2021-02-01 00:00:00.000000	2021-01-01	1.20
+ab	1	-1	18	1.1	1.1	1	2022-01-01 00:00:00.000000	2022-01-01	1.20	abc	1	1	20	1.1	1.1	1	2021-01-01 00:00:00.000000	2021-01-01	1.20
 
 -- query 30
+-- types	bigint	varchar	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)
 t1d	t1a	t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal
-100	中文	中文	100	100	100	100.01	100.02	1	2021-01-01 00:00:00	2021-01-01	100.25
+100	中文	中文	100	100	100	100.01	100.02	1	2021-01-01 00:00:00.000000	2021-01-01	100.25
 
 -- query 31
+-- types	bigint	varchar	varchar	smallint	integer	bigint	real	double	bigint	timestamp(6)	date	decimal(10, 2)
 t1d	t1a	t1a	t1b	t1c	t1d	t1e	t1f	t1g	id_datetime	id_date	id_decimal
-100	中文	中文	100	100	100	100.01	100.02	1	2021-01-01 00:00:00	2021-01-01	100.25
+100	中文	中文	100	100	100	100.01	100.02	1	2021-01-01 00:00:00.000000	2021-01-01	100.25
 20	abc	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 
 -- query 32
+-- types	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6
 1	1	1	1	1	1
 
 -- query 33
+-- types	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6
 1	1	1	1	1	1
 
 -- query 34
+-- types	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6
 
 -- query 35
+-- legacy
 v1	v2	v3	v4	v5	v6
 1	1	1	NULL	NULL	NULL
 
 -- query 36
+-- types	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6
 
 -- query 37
+-- legacy
 v1	v2	v3	v4	v5	v6
 
 -- query 38
+-- types	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6
 
 -- query 39
+-- types	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6
 NULL	NULL	NULL	2	2	2
 
 -- query 40
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9
 2	2	2	2	2	2	2	2	2
 
 -- query 41
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9
 2	2	2	2	2	2	2	2	2
 
 -- query 42
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9
 0	0	0	0	0	0	NULL	NULL	NULL
 -10	-10	-10	-10	-10	-10	NULL	NULL	NULL
@@ -93,6 +114,7 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9
 2	2	2	2	2	2	2	2	2
 
 -- query 43
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9
 -10	-10	-10	-10	-10	-10	NULL	NULL	NULL
 1	1	1	1	1	1	NULL	NULL	NULL
@@ -100,11 +122,13 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9
 2	2	2	2	2	2	2	2	2
 
 -- query 44
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	2	2	2	2	2	2	2	6	3
 2	2	2	2	2	2	2	2	2	2	2	2
 
 -- query 45
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 0	0	0	0	0	0	-10	-10	-10	NULL	NULL	NULL
 0	0	0	0	0	0	0	0	0	NULL	NULL	NULL
@@ -141,6 +165,7 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	2	2	2	511	511	511	NULL	NULL	NULL
 
 -- query 46
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 NULL	NULL	NULL	75	75	75	75	75	75	75	75	75
 2	2	2	2	2	2	2	2	2	2	6	3
@@ -150,6 +175,7 @@ NULL	NULL	NULL	20	20	20	20	20	20	20	20	20
 NULL	NULL	NULL	511	511	511	511	511	511	511	511	511
 
 -- query 47
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 -10	-10	-10	-10	-10	-10	-10	-10	-10	NULL	NULL	NULL
 -10	-10	-10	-10	-10	-10	0	0	0	NULL	NULL	NULL
@@ -186,11 +212,13 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	2	2	2	511	511	511	NULL	NULL	NULL
 
 -- query 48
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	2	2	2	2	2	2	2	6	3
 2	2	2	2	2	2	2	2	2	2	2	2
 
 -- query 49
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	75	75	75
 2	2	2	2	2	2	2	2	2	2	6	3
@@ -200,6 +228,7 @@ NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	20	20	20
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	511	511	511
 
 -- query 50
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 NULL	NULL	NULL	20	20	20	20	20	20	20	20	20
 NULL	NULL	NULL	511	511	511	511	511	511	511	511	511
@@ -209,6 +238,7 @@ NULL	NULL	NULL	10	10	10	10	10	10	10	10	10
 NULL	NULL	NULL	75	75	75	75	75	75	75	75	75
 
 -- query 51
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 1	1	1	0	0	0	10	10	10	2	2	2
 1	1	1	0	0	0	20	20	20	2	2	2
@@ -240,6 +270,7 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	1	1	1	511	511	511	2	6	3
 
 -- query 52
+-- legacy
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	1	1	1	10	10	10	2	2	2
 2	2	2	1	1	1	10	10	10	2	6	3
@@ -295,6 +326,7 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 0	0	0	NULL	NULL	NULL	511	511	511	NULL	NULL	NULL
 
 -- query 53
+-- legacy
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 1	1	1	0	0	0	10	10	10	2	2	2
 1	1	1	0	0	0	20	20	20	2	2	2
@@ -419,6 +451,7 @@ NULL	NULL	NULL	-5	-20	-5	511	511	511	2	6	3
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	511	511	511
 
 -- query 54
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 1	1	1	0	0	0	-10	-10	-10	NULL	NULL	NULL
 1	1	1	0	0	0	0	0	0	NULL	NULL	NULL
@@ -458,6 +491,7 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	1	1	1	511	511	511	2	6	3
 
 -- query 55
+-- legacy
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	1	1	1	10	10	10	2	2	2
 2	2	2	1	1	1	20	20	20	2	2	2
@@ -489,6 +523,7 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 1	1	1	0	0	0	511	511	511	2	6	3
 
 -- query 56
+-- legacy
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	1	1	1	10	10	10	2	2	2
 2	2	2	1	1	1	20	20	20	2	2	2
@@ -521,6 +556,7 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	511	511	511
 
 -- query 57
+-- legacy
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 1	1	1	0	0	0	10	10	10	2	2	2
 1	1	1	0	0	0	20	20	20	2	2	2
@@ -645,10 +681,12 @@ NULL	NULL	NULL	-5	-20	-5	511	511	511	2	6	3
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	511	511	511
 
 -- query 58
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 10	10	10	10	10	10	10	10	10	10	10	10
 
 -- query 59
+-- legacy
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	75	75	75
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	-20	-5	-30
@@ -663,5 +701,6 @@ NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	10	10	10
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	2	6	3
 
 -- query 60
+-- legacy
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 511	511	511	511	511	511	511	511	511	511	511	511

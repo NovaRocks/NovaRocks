@@ -1,3 +1,5 @@
+-- query 1
+-- types	integer	varchar	varchar	bigint
 d_year	s_city	p_brand	profit
 1997	UNITED ST0	MFGR#141	6605321
 1997	UNITED ST0	MFGR#1411	205995

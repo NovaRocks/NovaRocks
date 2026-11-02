@@ -1,2 +1,4 @@
+-- query 3
+-- types	integer	integer	integer	integer
 min_qty	max_qty	min_discount	max_discount
 1	50	0	10

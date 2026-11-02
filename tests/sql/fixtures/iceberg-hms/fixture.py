@@ -51,6 +51,7 @@ action, ns, new_ns, warehouse = sys.argv[1:]
 root = warehouse.rstrip('/') + '/iru7/' + ns
 prefix = 'hms_catalog.' + ns
 if action == 'prepare':
+    first_append = None
     spark.sql("CREATE NAMESPACE " + prefix + " LOCATION '" + root + "'")
     for version in [1, 2, 3]:
         table = prefix + '.v' + str(version)
@@ -63,6 +64,16 @@ if action == 'prepare':
             spark.sql("INSERT INTO " + table + " SELECT /*+ COALESCE(1) */ * FROM VALUES (1L, 1, 'one'), (2L, 2, 'two'), (3L, 1, 'three') AS data(id, p, note)")
         else:
             spark.sql("INSERT INTO " + table + " VALUES (1, 1, 'one'), (2, 2, 'two'), (3, 1, 'three')")
+        if version == 2:
+            original = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, table)
+            original.refresh()
+            metadata = original.operations().current()
+            first = original.currentSnapshot()
+            if first is None:
+                raise RuntimeError('v2 initial append has no actual snapshot')
+            first_append = {'snapshot_id': int(first.snapshotId()),
+                            'timestamp_ms': int(first.timestampMillis()),
+                            'table_uuid': str(metadata.uuid())}
         if version > 1:
             spark.sql('DELETE FROM ' + table + ' WHERE id = 1')
             formats = {row.file_format for row in spark.sql('SELECT file_format FROM ' + table + '.files WHERE content = 1').collect()}
@@ -78,7 +89,19 @@ if action == 'prepare':
         if actual != root + '/v' + str(version):
             raise RuntimeError('actual HMS location differs from this run scratch root: ' + actual)
         locations['v' + str(version)] = actual
-    result = {'prepared': ns, 'actual_locations': locations}
+    v2 = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, prefix + '.v2')
+    v2.refresh()
+    metadata = v2.operations().current()
+    snapshots = [{'snapshot_id': int(entry.snapshotId()), 'timestamp_ms': int(entry.timestampMillis())}
+                 for entry in v2.snapshots()]
+    earliest = min(entry['timestamp_ms'] for entry in snapshots)
+    firsts = [entry for entry in snapshots if entry['timestamp_ms'] == earliest]
+    if (first_append is None or len(firsts) != 1
+            or firsts[0] != {key: first_append[key] for key in ['snapshot_id', 'timestamp_ms']}
+            or str(metadata.uuid()) != first_append['table_uuid']):
+        raise RuntimeError('v2 first append is not the unique earliest retained snapshot')
+    result = {'prepared': ns, 'actual_locations': locations, 'first_append': first_append,
+              'final_snapshots': snapshots, 'v2_table_uuid': str(metadata.uuid()), 'v2_metadata_location': metadata.metadataFileLocation()}
 elif action == 'snapshot':
     namespaces = sorted(row[0] for row in spark.sql('SHOW NAMESPACES IN hms_catalog').collect() if row[0] in [ns, new_ns])
     result = {'namespaces': namespaces, 'tables': {}, 'views': {}, 'metadata_location': {}}
@@ -112,7 +135,7 @@ spark.stop()
 '''
 
 
-def run_spark(workspace, action, namespace, *, new_namespace=None):
+def run_spark(workspace, action, namespace, *, new_namespace=None, settlement_receipt=None, input_publications=None):
     if new_namespace is None:
         new_namespace = namespace + '_new'
     required = ['NOVA_ENV_COMPOSE_ENV', 'NOVA_ENV_COMPOSE_PROJECT',
@@ -128,15 +151,26 @@ def run_spark(workspace, action, namespace, *, new_namespace=None):
                '-f', os.environ['NOVA_ENV_COMPOSE_FILE'], 'exec', '-T', 'spark']
     helper = [sys.executable, str(workspace / 'docker/iceberg-rest/fixture_run.py')]
     folder = subprocess.check_output([*helper, 'temp-dir', '--env-file', os.environ['NOVA_ENV_REST_ENV_FILE']], text=True).strip()
-    defaults = '\n'.join(Path(os.environ[key]).read_text() for key in
-                         ['NOVAROCKS_SPARK_DEFAULTS', 'NOVAROCKS_SPARK_HMS_DEFAULTS'])
+    parts = []
+    for key in ['NOVAROCKS_SPARK_DEFAULTS', 'NOVAROCKS_SPARK_HMS_DEFAULTS']:
+        path = Path(os.environ[key])
+        raw = path.read_bytes()
+        if input_publications is not None and input_publications[key] != {
+                'path': str(path), 'sha256': hashlib.sha256(raw).hexdigest()}:
+            raise RuntimeError('Spark defaults differ from the registered original input: ' + key)
+        parts.append(raw.decode().replace('\r\n', '\n').replace('\r', '\n'))
+    defaults = '\n'.join(parts)
     defaults += "\nspark.sql.catalog.hms_catalog.warehouse " + os.environ['NOVAROCKS_ICEBERG_HMS_WAREHOUSE'] + "\n"
     subprocess.run(compose + ['/bin/mkdir', '-p', folder], check=True)
     try:
         for name, content in [('fixture.py', SPARK_PROGRAM), ('spark-defaults.conf', defaults)]:
             subprocess.run(compose + ['/bin/bash', '-c', 'cat > ' + folder + '/' + name],
                            input=content, text=True, check=True)
-        output = subprocess.run(compose + ['/opt/spark/bin/spark-submit',
+        observed_compose = compose
+        if settlement_receipt is not None:
+            split = compose.index('--')
+            observed_compose = compose[:split] + ['--settlement-receipt', str(settlement_receipt)] + compose[split:]
+        output = subprocess.run(observed_compose + ['/opt/spark/bin/spark-submit',
                                  '--properties-file', folder + '/spark-defaults.conf',
                                  folder + '/fixture.py', action, namespace, new_namespace,
                                  os.environ['NOVAROCKS_ICEBERG_HMS_WAREHOUSE']],
@@ -243,17 +277,91 @@ def inventory(namespace, *, new_namespace=None):
     return objects, pages
 
 
+def canonical_sha(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                     separators=(',', ':')).encode()).hexdigest()
+
+
+def immutable_json(path, value):
+    with path.open('x', encoding='utf-8') as target:
+        os.chmod(path, 0o600)
+        json.dump(value, target, sort_keys=True, ensure_ascii=False)
+        target.write('\n')
+
+
+def hms_intent(workspace, evidence, namespace, new_namespace, *, cleanup=False):
+    intent = json.loads((evidence / 'input.intent.json').read_text())
+    if (intent['schema'] != 'hms-case-input-intent-v1'
+            or intent['namespace'] != namespace or intent['new_namespace'] != new_namespace
+            or intent['context'] != json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT'])
+            or intent['storage_sha256'] != canonical_sha(json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE']))):
+        raise RuntimeError('HMS input differs from its original owner')
+    if intent['publications'] != publications():
+        raise RuntimeError('HMS publications differ from the registered original input')
+    for name, item in intent['sources'].items():
+        if cleanup and name not in ['tests/sql/fixtures/iceberg-hms/fixture.py', 'docker/iceberg-rest/fixture_run.py']:
+            continue
+        if hashlib.sha256((workspace / name).read_bytes()).hexdigest() != item:
+            raise RuntimeError('HMS input source changed: ' + name)
+    return intent
+
+
+def publications():
+    paths = {name: Path(os.environ[name]) for name in
+             ['NOVA_ENV_REST_ENV_FILE', 'NOVAROCKS_SPARK_DEFAULTS', 'NOVAROCKS_SPARK_HMS_DEFAULTS']}
+    paths['REST_MANIFEST'] = paths['NOVA_ENV_REST_ENV_FILE'].with_name('manifest.json')
+    return {name: {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+            for name, path in paths.items()}
+
+
+def verified_settlement(path, context):
+    fact = json.loads(path.read_text())
+    if (fact['schema'] != 'fixture-compose-settlement-v1' or fact['context'] != context
+            or fact['child_waited'] is not True or type(fact['returncode']) is not int or fact['returncode'] != 0
+            or type(fact['cli_returncode']) is not int or fact['cli_returncode'] != 0
+            or fact['cleanup_failed'] is not False
+            or fact['temporary_owner_removed'] is not True or fact['never_started'] is True):
+        raise RuntimeError('HMS input has no successful original remote exit')
+    return fact
+
+
+def verify_prepared(workspace, evidence, namespace, new_namespace, receipt):
+    if receipt.resolve() != (evidence / 'input.ready.json').resolve():
+        raise RuntimeError('HMS input receipt path differs from its original namespace')
+    intent = hms_intent(workspace, evidence, namespace, new_namespace)
+    ready = json.loads(receipt.read_text())
+    if ready['intent_sha256'] != hashlib.sha256((evidence / 'input.intent.json').read_bytes()).hexdigest():
+        raise RuntimeError('HMS input intent hash changed')
+    verified_settlement(evidence / 'prepare.remote.json', intent['context'])
+    if ready['remote_sha256'] != hashlib.sha256((evidence / 'prepare.remote.json').read_bytes()).hexdigest():
+        raise RuntimeError('HMS original remote exit receipt changed')
+    if ready['publications'] != intent['publications'] or ready['publications'] != publications():
+        raise RuntimeError('HMS input publication changed')
+    snapshot = ready['facts']['first_append']['snapshot_id']
+    if type(snapshot) is not int or not 0 < snapshot <= 2**63 - 1:
+        raise RuntimeError('HMS snapshot is not an exact positive Int64')
+    return ready
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['prepare', 'before', 'after', 'cleanup'])
+    parser.add_argument('action', choices=['prepare', 'verify-prepared', 'before', 'after', 'cleanup'])
     parser.add_argument('namespace')
     parser.add_argument('--new-namespace')
+    parser.add_argument('--receipt', type=Path)
     parser.add_argument('--fixture-budget-secs', type=int, default=3600)
     arguments = parser.parse_args()
     os.environ["NOVA_FIXTURE_BUDGET_SECS"] = str(arguments.fixture_budget_secs)
     if not re.fullmatch(r'(?:iru7_[a-z0-9_]+|nr_scratch_[0-9]{13}_[0-9a-f]{32}(?:_[a-z0-9_]+)?)', arguments.namespace):
         parser.error('namespace must be an invocation-owned iru7_ identifier')
     workspace = Path(os.environ.get('NOVAROCKS_WORKSPACE_ROOT', Path(__file__).resolve().parents[4]))
+    evidence = workspace / 'tests/sql/.runtime/hms-evidence' / arguments.namespace
+    if arguments.action == 'verify-prepared':
+        if arguments.new_namespace is None or arguments.receipt is None:
+            parser.error('verify-prepared requires the original namespace pair and receipt')
+        verify_prepared(workspace, evidence, arguments.namespace, arguments.new_namespace, arguments.receipt)
+        print('HMS_PREPARE_OK')
+        return
     sys.path.insert(0, str(workspace / 'docker/iceberg-rest'))
     import fixture_run
     from scratch import resource_run
@@ -303,7 +411,33 @@ def main():
                 raise RuntimeError('before snapshot lacks the complete, paginated three-table fixture')
             print('INVENTORY_CAPTURED objects=' + str(len(objects)) + ' pages=' + str(pages))
     else:
-        run_spark(workspace, arguments.action, arguments.namespace, new_namespace=new_namespace)
+        owned = (evidence / 'input.intent.json').exists()
+        if arguments.action == 'prepare' and budget is not None and not owned:
+            raise RuntimeError('HMS preparation requires its registered case input owner')
+        intent = hms_intent(workspace, evidence, arguments.namespace, new_namespace, cleanup=arguments.action == 'cleanup') if owned else None
+        remote = evidence / (arguments.action + '.remote.json') if owned else None
+        if arguments.action == 'cleanup' and owned:
+            if (evidence / 'input.cleanup.json').exists():
+                raise RuntimeError('HMS cleanup was already observed; no repeat dispatch')
+            immutable_json(evidence / 'input.cleanup-attempt.json',
+                           {'schema': 'hms-cleanup-attempt-v1', 'intent_sha256': hashlib.sha256((evidence / 'input.intent.json').read_bytes()).hexdigest()})
+        if owned:
+            facts = run_spark(workspace, arguments.action, arguments.namespace,
+                              new_namespace=new_namespace, settlement_receipt=remote,
+                              input_publications=intent['publications'])
+        else:
+            # Private publications retain their original explicit fixture owner.
+            # They cannot produce a registered case-input Ready receipt.
+            facts = run_spark(workspace, arguments.action, arguments.namespace,
+                              new_namespace=new_namespace)
+        if arguments.action == 'prepare' and owned:
+            if publications() != intent['publications']:
+                raise RuntimeError('HMS publications changed during preparation')
+            verified_settlement(remote, intent['context'])
+            immutable_json(evidence / 'input.ready.json',
+                           {'schema': 'hms-case-input-ready-v1', 'facts': facts, 'publications': intent['publications'],
+                            'intent_sha256': hashlib.sha256((evidence / 'input.intent.json').read_bytes()).hexdigest(),
+                            'remote_sha256': hashlib.sha256(remote.read_bytes()).hexdigest()})
         if arguments.action == 'cleanup':
             # Spark PURGE owns catalog teardown. Remove only remaining objects
             # in the exact random namespace prefixes, including directory markers.
@@ -314,6 +448,14 @@ def main():
             remaining, _ = inventory(arguments.namespace, new_namespace=new_namespace)
             if remaining:
                 raise RuntimeError('private HMS fixture objects remain after cleanup')
+        if arguments.action == 'cleanup' and owned:
+            verified_settlement(remote, intent['context'])
+            immutable_json(evidence / 'input.cleanup.json',
+                           {'schema': 'hms-case-input-cleanup-v1', 'namespace': arguments.namespace,
+                            'new_namespace': new_namespace,
+                            'intent_sha256': hashlib.sha256((evidence / 'input.intent.json').read_bytes()).hexdigest(),
+                            'remote_sha256': hashlib.sha256(remote.read_bytes()).hexdigest(),
+                            'remaining_objects': remaining})
         print('HMS_' + arguments.action.upper() + '_OK')
 
 

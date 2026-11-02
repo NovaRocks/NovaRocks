@@ -17,6 +17,10 @@
 
 explicit_only = false
 
+# EXPLAIN snapshots declare their driver domain independently of host CPU count.
+[session]
+pipeline_dop = 5
+
 [impact]
 paths = [
     "novarocks/sql/src/optimizer/**",

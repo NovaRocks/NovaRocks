@@ -1,13 +1,16 @@
 -- query 1
+-- types	bigint	double
 cnt	sum_score
-9	76
+9	76.0
 
 -- query 2
+-- types	varchar	bigint	double
 country	country_cnt	score_sum
-CN	4	46
-JP	1	5
-US	4	25
+CN	4	46.0
+JP	1	5.0
+US	4	25.0
 
 -- query 3
+-- types	bigint	double
 cnt	sum_score
-4	10
+4	10.0

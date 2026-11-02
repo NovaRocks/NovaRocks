@@ -1345,3 +1345,163 @@ fn already_expired_lifetime_refuses_payload_side_effects_before_spawn() {
     );
     assert!(!written.exists());
 }
+
+#[test]
+fn cleanup_group_observation_uses_original_complete_after_work_cutoff() {
+    let directory = Directory::new();
+    let admitted = Instant::now();
+    let original_work = admitted + Duration::from_millis(5);
+    let original_complete = admitted + Duration::from_secs(4);
+    std::thread::sleep(Duration::from_millis(10));
+    assert!(Instant::now() > original_work);
+    let marker = directory.0.join("actual-cleanup-started");
+    let mut request =
+        command("printf cleanup > \"$MARKER\"; sleep 30 & printf '%s\\n' \"$!\"; exit 0");
+    request
+        .env("MARKER", &marker)
+        .observe_group_exit_until(original_complete + Duration::from_secs(20));
+    let outcome = capture_command_until(
+        request,
+        File::create(directory.0.join("stdout-consumer")).unwrap(),
+        File::create(directory.0.join("stderr-consumer")).unwrap(),
+        original_complete,
+    )
+    .unwrap();
+    assert_eq!(fs::read_to_string(marker).unwrap(), "cleanup");
+    assert!(
+        String::from_utf8_lossy(&outcome.output.stdout)
+            .trim()
+            .parse::<u32>()
+            .is_ok(),
+        "the actual same-group descendant must have started"
+    );
+    assert!(outcome.group_exit_observed());
+    assert!(!outcome.timed_out && outcome.output.status.success() && outcome.failures.is_empty());
+    let root = outcome.diagnostic_root();
+    let final_fact = final_record(root);
+    assert_eq!(final_fact["group_exit_observed"], true);
+    assert_eq!(final_fact["lifetime_expired"], false);
+    assert_eq!(final_fact["cleanup_complete"], true);
+    let text = fs::read_to_string(root.join("record.jsonl")).unwrap();
+    let pending: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert!(
+        pending["lifetime_ns"].is_null(),
+        "cleanup must not invent a work clock"
+    );
+    assert_eq!(
+        pending["group_exit_deadline_ns"], pending["deadline_ns"],
+        "a later requested observation cannot extend the original capture deadline"
+    );
+    assert!(
+        final_fact["group_exit_observed_ns"].as_u64().unwrap()
+            < pending["deadline_ns"].as_u64().unwrap()
+    );
+    outcome.release_diagnostics().unwrap();
+}
+
+#[test]
+fn ordinary_capture_does_not_infer_group_observation() {
+    let directory = Directory::new();
+    let outcome = capture_command_until(
+        command("exit 0"),
+        File::create(directory.0.join("stdout-consumer")).unwrap(),
+        File::create(directory.0.join("stderr-consumer")).unwrap(),
+        Instant::now() + Duration::from_secs(4),
+    )
+    .unwrap();
+    assert!(outcome.output.status.success());
+    assert!(!outcome.group_exit_observed());
+    let pending: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(outcome.diagnostic_root().join("record.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(pending["lifetime_ns"].is_null());
+    assert!(pending.get("group_exit_deadline_ns").is_none());
+    outcome.release_diagnostics().unwrap();
+}
+
+#[test]
+fn captured_work_expiry_keeps_actual_group_exit_and_complete_output() {
+    let directory = Directory::new();
+    let admitted = Instant::now();
+    let work = admitted + Duration::from_secs(1);
+    let complete = admitted + Duration::from_secs(4);
+    let mut request = command(
+        "trap 'exit 0' TERM; printf 'before work expiry stdout\\n'; printf 'before work expiry stderr\\n' >&2; sleep 30 & printf 'descendant=%s\\n' \"$!\"; wait",
+    );
+    request.terminate_at(work, complete);
+    let outcome = capture_command_until(
+        request,
+        File::create(directory.0.join("stdout-consumer")).unwrap(),
+        File::create(directory.0.join("stderr-consumer")).unwrap(),
+        complete,
+    )
+    .unwrap();
+    assert!(Instant::now() < complete);
+    // A cooperative native exit zero cannot erase the expired work clock.
+    assert!(outcome.output.status.success());
+    assert!(outcome.timed_out);
+    assert!(outcome.failures.iter().any(|failure| {
+        failure.contains(&novarocks_test_support::PayloadLifetimeExpired.to_string())
+    }));
+    assert!(outcome.group_exit_observed());
+    let stdout = String::from_utf8(outcome.output.stdout.clone()).unwrap();
+    assert!(stdout.starts_with("before work expiry stdout\n"));
+    let descendant = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("descendant="))
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    assert!(descendant > 0);
+    assert_eq!(outcome.output.stderr, b"before work expiry stderr\n");
+    let root = outcome.diagnostic_root().to_owned();
+    let final_fact = final_record(&root);
+    assert_eq!(final_fact["status_raw"], 0);
+    assert_eq!(final_fact["lifetime_expired"], true);
+    assert_eq!(final_fact["owner_lost"], false);
+    assert_eq!(final_fact["group_exit_observed"], true);
+    assert_eq!(final_fact["cleanup_complete"], true);
+    let events = fs::read_to_string(root.join("record.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let spawned = events
+        .iter()
+        .find(|event| event["event"] == "Spawned")
+        .unwrap();
+    assert_ne!(spawned["pid"].as_u64().unwrap(), u64::from(descendant));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "LifetimeExpired")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "Final")
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read(root.join("stdout.log")).unwrap(),
+        outcome.output.stdout
+    );
+    assert_eq!(
+        fs::read(root.join("stderr.log")).unwrap(),
+        outcome.output.stderr
+    );
+    assert!(outcome.release_diagnostics().is_err());
+    drop(outcome);
+    assert!(
+        root.exists(),
+        "work failure diagnostics must outlive capture"
+    );
+}

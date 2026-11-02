@@ -36,7 +36,7 @@ SELECT k,a+1 AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ k,a+1 AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
 
 -- query 4
@@ -47,7 +47,7 @@ SELECT -CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0))-1 AS v;
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ -CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0))-1 AS v;
 
 -- query 6
@@ -58,7 +58,7 @@ SELECT k,a*2 AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ k,a*2 AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
 
 -- query 8
@@ -69,7 +69,7 @@ SELECT k,a/b AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ k,a/b AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
 
 -- query 10
@@ -80,7 +80,7 @@ SELECT k,a%b AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ k,a%b AS v FROM ${case_db}.decimal_error_policy ORDER BY k;
 
 -- query 12
@@ -98,7 +98,7 @@ SELECT /*+ SET_VAR(sql_mode=32) */ a+1 AS v FROM ${case_db}.decimal_error_policy
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 SELECT a+1 AS v FROM ${case_db}.decimal_error_policy WHERE k=2;
 
 -- query 16
@@ -113,7 +113,7 @@ SELECT CAST(1000000000 AS DECIMAL(9,0)) AS narrowed;
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 SELECT /*+ SET_VAR(sql_mode=34359738368) */ CAST(1000000000 AS DECIMAL(9,0)) AS narrowed;
 
 -- query 19
@@ -124,7 +124,7 @@ SELECT CAST(CAST(999.995 AS DECIMAL(6,3)) AS DECIMAL(5,2)) AS carry;
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(CAST(999.995 AS DECIMAL(6,3)) AS DECIMAL(5,2)) AS carry;
 
 -- query 21
@@ -141,7 +141,7 @@ SELECT 1 AS branch,CAST(NULL AS DECIMAL(38,0)) AS v UNION ALL SELECT /*+ SET_VAR
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 SELECT CAST(1 AS DECIMAL(38,0))+1 AS v UNION ALL SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ a+1 AS v FROM ${case_db}.decimal_error_policy WHERE k=2;
 
 -- query 25
@@ -158,7 +158,7 @@ SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(12345678901234567890.12
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(CAST(12345678901234567890.1234567890 AS DECIMAL(30,10))*CAST(123456789.123456789 AS DECIMAL(18,9)) AS DECIMAL(9,0)) AS narrowed;
 
 -- query 28
@@ -177,7 +177,7 @@ SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(CAST(CAST(['1'] AS ARRA
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(CAST(1000 AS DECIMAL(4,0)) AS DECIMAL(3,0)) AS legacy_cast;
 
 -- query 32
@@ -185,7 +185,7 @@ SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ CAST(CAST(1000 AS DECIMA
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION',decimal_overflow_to_double=false) */ CAST(99999999999999999999999999999999999999 AS DECIMAL(38,0))*CAST(2 AS DECIMAL(38,0)) AS legacy_mul;
 
 -- query 33
@@ -244,7 +244,7 @@ ORDER BY r.id;
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.numeric_out_of_range
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
+-- @expect_error=[query.execution.numeric_out_of_range]
 -- The merged key preserves both input ranges; only an explicit narrowing cast overflows.
 SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(CAST(k AS DECIMAL(3,0)) AS VARCHAR) AS merged_key
 FROM (SELECT id,k FROM ${case_db}.decimal_implicit_left WHERE id=1) l

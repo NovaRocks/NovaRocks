@@ -1,179 +1,224 @@
 -- query 4
+-- types	bigint
 (40000 + 2000) + 96
 42096
 
 -- query 5
+-- types	varchar
 date_format('2020-01-01', '%Y-%m')
 2020-01
 
 -- query 6
+-- types	integer
 id
 2
 
 -- query 7
+-- types	integer
 id
 2
 
 -- query 11
+-- types	double
 1 / 0
 NULL
 
 -- query 13
+-- types	bigint
 (40000 + 2000) + 96
 42096
 
 -- query 14
+-- types	integer
 id
 2
 
 -- query 17
+-- types	varchar
 folded_upper
 MIXED
 
 -- query 18
+-- legacy
 folded_abs
 7
 
 -- query 19
+-- types	bigint
 folded_if
 10
 
 -- query 20
+-- types	bigint
 folded_coalesce
 8
 
 -- query 21
+-- types	bigint
 folded_ifnull
 9
 
 -- query 22
+-- types	bigint
 folded_nullif
 NULL
 
 -- query 23
+-- types	boolean
 folded_and
 NULL
 
 -- query 24
+-- types	boolean
 folded_or
-1
+true
 
 -- query 25
+-- types	boolean
 folded_not
 NULL
 
 -- query 26
+-- types	boolean
 folded_decimal_compare
-1
+true
 
 -- query 27
+-- types	boolean
 folded_temporal_compare
-1
+true
 
 -- query 28
+-- types	boolean
 folded_nullsafe_equal
-1
+true
 
 -- query 29
+-- types	boolean
 folded_nullsafe_distinct
-0
+false
 
 -- query 30
+-- types	tinyint
 folded_narrow
 12
 
 -- query 31
+-- types	integer
 folded_integer_parse
 42
 
 -- query 32
+-- types	date
 folded_date_parse
 2020-01-02
 
 -- query 33
+-- types	decimal(4, 2)
 folded_decimal_rounding
 12.35
 
 -- query 34
+-- types	decimal(3, 0)
 folded_decimal_overflow
 NULL
 
 -- query 36
+-- types	varchar
 folded_upper
 MIXED
 
 -- query 37
+-- legacy
 folded_abs
 7
 
 -- query 38
+-- types	bigint
 folded_if
 10
 
 -- query 39
+-- types	bigint
 folded_coalesce
 8
 
 -- query 40
+-- types	bigint
 folded_ifnull
 9
 
 -- query 41
+-- types	bigint
 folded_nullif
 NULL
 
 -- query 42
+-- types	boolean
 folded_and
 NULL
 
 -- query 43
+-- types	boolean
 folded_or
-1
+true
 
 -- query 44
+-- types	boolean
 folded_not
 NULL
 
 -- query 45
+-- types	boolean
 folded_decimal_compare
-1
+true
 
 -- query 46
+-- types	boolean
 folded_temporal_compare
-1
+true
 
 -- query 47
+-- types	boolean
 folded_nullsafe_equal
-1
+true
 
 -- query 48
+-- types	boolean
 folded_nullsafe_distinct
-0
+false
 
 -- query 49
+-- types	tinyint
 folded_narrow
 12
 
 -- query 50
+-- types	integer
 folded_integer_parse
 42
 
 -- query 51
+-- types	date
 folded_date_parse
 2020-01-02
 
 -- query 52
+-- types	decimal(4, 2)
 folded_decimal_rounding
 12.35
 
 -- query 53
+-- types	decimal(3, 0)
 folded_decimal_overflow
 NULL
 
 -- query 56
+-- types	decimal(4, 2)
 checked_decimal_rounding
 12.35
 
 -- query 60
+-- types	decimal(4, 2)
 checked_decimal_rounding
 12.35

@@ -83,7 +83,7 @@ AS SELECT region, SUM(amount) AS total FROM orders GROUP BY region;
 -- The refresh commits and the frontend dies before recording it.
 -- @kill_fe_after_mv_known_committed_before_projector_cas=true
 -- @expect_error_tier=drift
--- @expect_error=server disconnected
+-- @expect_error=Trino transport failure
 REFRESH MATERIALIZED VIEW orders_total WITH SYNC MODE;
 
 -- query 9

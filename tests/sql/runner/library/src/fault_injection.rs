@@ -27,6 +27,52 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
+/// The current statement's own cancellation capability. Each SQL step owns
+/// one slot, installed after POST and before the first execution GET.
+#[derive(Clone, Default)]
+pub(crate) struct QueryCancelSlot(Arc<Mutex<Option<novarocks_test_trino_client::CancelHandle>>>);
+
+impl QueryCancelSlot {
+    pub(crate) fn install(
+        &self,
+        handle: novarocks_test_trino_client::CancelHandle,
+    ) -> Result<(), String> {
+        *self
+            .0
+            .lock()
+            .map_err(|_| "client query cancellation slot lock poisoned")? = Some(handle);
+        Ok(())
+    }
+
+    pub(crate) fn clear(&self) -> Result<(), String> {
+        *self
+            .0
+            .lock()
+            .map_err(|_| "client query cancellation slot lock poisoned")? = None;
+        Ok(())
+    }
+
+    fn try_cancel_until(&self, deadline: Instant) -> Result<bool> {
+        let handle = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("client query cancellation slot lock poisoned"))?
+            .clone();
+        let Some(handle) = handle else {
+            return Ok(false);
+        };
+        handle.delete(deadline).map_err(anyhow::Error::new)?;
+        Ok(true)
+    }
+
+    fn cancel_until(&self, deadline: Instant) -> Result<()> {
+        if !self.try_cancel_until(deadline)? {
+            bail!("selected client query has no installed cancellation handle");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(not(test))]
 const POST_FRAGMENT_START_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -39,9 +85,8 @@ const POST_FRAGMENT_START_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RESTART_AFTER_ESTABLISH_CONTEXT: &str = "restart-after-establish-context";
 /// The token-scoped marker that rendezvous publishes.
 const TASK_ESTABLISH_CONTEXT_OBSERVED: &str = "NOVAROCKS_TASK_ESTABLISH_CONTEXT_OBSERVED";
-/// The only action the frontend phase barrier still publishes. The barrier
-/// waits for a runner-owned kill of the target query; there is no longer a
-/// coordinator-crash variant of the same marker.
+/// The frontend phase barrier retains its frozen wire action label. The runner
+/// sends client DELETE for its own Trino statement before releasing the barrier.
 const LIFECYCLE_PHASE_ACTION: &str = "kill_query";
 /// What a replaced backend process must not be found doing.
 ///
@@ -298,7 +343,7 @@ pub(crate) fn query_lifecycle_fault_step_guard(
 ) -> FaultStepGuard {
     let armed = meta.kill_fe_after_mv_known_committed_before_projector_cas
         || meta.restart_be_after_establish_context_index.is_some()
-        || meta.kill_query_after_be_log_contains.is_some()
+        || meta.cancel_query_after_be_log_contains.is_some()
         || meta.kill_fe_after_be_log_contains.is_some()
         || meta.kill_be_after_be_log_contains.is_some()
         || meta.terminal_snapshot_conflict_be_index.is_some()
@@ -321,7 +366,7 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.restart_be_delay_ms.is_some()
         || meta.kill_fe_after_mv_known_committed_before_projector_cas
         || meta.restart_be_after_establish_context_index.is_some()
-        || meta.kill_query_after_be_log_contains.is_some()
+        || meta.cancel_query_after_be_log_contains.is_some()
         || meta.kill_fe_after_be_log_contains.is_some()
         || meta.kill_be_after_be_log_contains.is_some()
         || meta.terminal_snapshot_conflict_be_index.is_some()
@@ -329,6 +374,11 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.kill_query_at_lifecycle_phase.is_some()
         || meta.kill_be_at_lifecycle_phase.is_some()
         || meta.query_control_fragment_backend_limit.is_some()
+}
+
+pub(crate) fn has_client_query_cancellation(meta: &QueryMeta) -> bool {
+    meta.cancel_query_after_be_log_contains.is_some()
+        || meta.kill_query_at_lifecycle_phase.is_some()
 }
 
 pub(crate) fn configured_query_lifecycle_faults(
@@ -385,7 +435,7 @@ pub(crate) fn apply_pre_query_with_token(
     let lifecycle_fault_count = [
         meta.kill_fe_after_mv_known_committed_before_projector_cas,
         meta.restart_be_after_establish_context_index.is_some(),
-        meta.kill_query_after_be_log_contains.is_some(),
+        meta.cancel_query_after_be_log_contains.is_some(),
         meta.kill_fe_after_be_log_contains.is_some(),
         meta.terminal_snapshot_conflict_be_index.is_some(),
         !configured_query_lifecycle_faults(meta).is_empty(),
@@ -524,7 +574,7 @@ pub(crate) fn apply_pre_query_with_token(
 pub(crate) fn execute_with_post_fragment_start_fault<T, F>(
     meta: &QueryMeta,
     server: &Arc<Mutex<Box<dyn ServerHandle>>>,
-    query_connection_id: Option<u32>,
+    query_cancel: Option<QueryCancelSlot>,
     shared_deadline: Option<Instant>,
     execute_query: F,
 ) -> Result<T>
@@ -542,13 +592,13 @@ where
             index: usize,
             pattern: String,
         },
-        KillQueryAfterBeLogContains {
+        CancelQueryAfterBeLogContains {
             pattern: String,
-            connection_id: u32,
+            cancel: QueryCancelSlot,
         },
-        KillQueryAtLifecyclePhase {
+        CancelQueryAtLifecyclePhase {
             phase: crate::types::QueryLifecyclePhase,
-            connection_id: u32,
+            cancel: QueryCancelSlot,
         },
         KillBackendAtLifecyclePhase {
             index: usize,
@@ -604,29 +654,27 @@ where
                 pattern: fault.pattern.clone(),
             }
         }),
-        meta.kill_query_after_be_log_contains
+        meta.cancel_query_after_be_log_contains
             .as_deref()
             .map(|pattern| {
-                query_connection_id
-                .map(|connection_id| PostQueryFault::KillQueryAfterBeLogContains {
-                    pattern: pattern.to_string(),
-                    connection_id,
+                query_cancel.as_ref().cloned()
+                .map(|cancel| PostQueryFault::CancelQueryAfterBeLogContains {
+                    pattern: pattern.to_string(), cancel,
                 })
                 .ok_or_else(|| anyhow::anyhow!(
-                    "kill_query_after_be_log_contains requires the target query connection id"
+                    "cancel_query_after_be_log_contains requires the target client query cancellation slot"
                 ))
             })
             .transpose()?,
         meta.kill_query_at_lifecycle_phase
             .map(|phase| {
-                query_connection_id
-                    .map(|connection_id| PostQueryFault::KillQueryAtLifecyclePhase {
-                        phase,
-                        connection_id,
+                query_cancel.as_ref().cloned()
+                    .map(|cancel| PostQueryFault::CancelQueryAtLifecyclePhase {
+                        phase, cancel,
                     })
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "kill_query_at_lifecycle_phase requires the target query connection id"
+                            "kill_query_at_lifecycle_phase requires the target client query cancellation slot"
                         )
                     })
             })
@@ -670,7 +718,7 @@ where
                     pattern,
                 }
             }
-            PostQueryFault::KillQueryAfterBeLogContains { pattern, .. }
+            PostQueryFault::CancelQueryAfterBeLogContains { pattern, .. }
             | PostQueryFault::KillFrontendAfterBeLogContains { pattern } => {
                 let counts = (0..server.be_count())
                     .map(|index| server.be_log_count(index, &pattern))
@@ -695,7 +743,7 @@ where
                     marker: TASK_ESTABLISH_CONTEXT_OBSERVED,
                 }
             }
-            PostQueryFault::KillQueryAtLifecyclePhase { phase, .. }
+            PostQueryFault::CancelQueryAtLifecyclePhase { phase, .. }
             | PostQueryFault::KillBackendAtLifecyclePhase { phase, .. } => {
                 FaultBaseline::FrontendPhase {
                     phase,
@@ -746,7 +794,7 @@ where
             maybe_cancel_query_near_deadline(
                 &worker_server,
                 &worker_fault_state,
-                query_connection_id,
+                query_cancel.as_ref(),
                 deadline,
                 &mut deadline_cancel_sent,
             )?;
@@ -822,7 +870,7 @@ where
                             maybe_cancel_query_near_deadline(
                                 &worker_server,
                                 &worker_fault_state,
-                                query_connection_id,
+                                query_cancel.as_ref(),
                                 deadline,
                                 &mut deadline_cancel_sent,
                             )?;
@@ -841,7 +889,7 @@ where
                             phase,
                             marker_count,
                         },
-                        PostQueryFault::KillQueryAtLifecyclePhase { .. }
+                        PostQueryFault::CancelQueryAtLifecyclePhase { .. }
                         | PostQueryFault::KillBackendAtLifecyclePhase { .. },
                     ) => fresh_lifecycle_phase_execution(
                         &server.fe_log_contents()?,
@@ -878,14 +926,11 @@ where
                                 deadline,
                             )?);
                         }
-                        PostQueryFault::KillQueryAfterBeLogContains { connection_id, .. } => {
-                            server.kill_query_until(connection_id, deadline)?
+                        PostQueryFault::CancelQueryAfterBeLogContains { cancel, .. } => {
+                            cancel.cancel_until(deadline)?
                         }
-                        PostQueryFault::KillQueryAtLifecyclePhase {
-                            phase,
-                            connection_id,
-                        } => {
-                            server.kill_query_until(connection_id, deadline)?;
+                        PostQueryFault::CancelQueryAtLifecyclePhase { phase, cancel } => {
+                            cancel.cancel_until(deadline)?;
                             server.release_query_lifecycle_phase_fault(phase)?;
                         }
                         PostQueryFault::KillBackendAfterBeLogContains { index, .. } => {
@@ -939,7 +984,8 @@ where
                 drop(restart_rendezvous_stream.take());
                 if matches!(
                     &fault,
-                    PostQueryFault::KillQueryAfterBeLogContains { .. }
+                    PostQueryFault::CancelQueryAfterBeLogContains { .. }
+                        | PostQueryFault::CancelQueryAtLifecyclePhase { .. }
                         | PostQueryFault::KillFrontendAfterBeLogContains { .. }
                 ) {
                     deadline_cancel_sent = true;
@@ -971,7 +1017,7 @@ where
                     maybe_cancel_query_near_deadline(
                         &worker_server,
                         &worker_fault_state,
-                        query_connection_id,
+                        query_cancel.as_ref(),
                         deadline,
                         &mut deadline_cancel_sent,
                     )?;
@@ -1012,7 +1058,7 @@ where
 fn maybe_cancel_query_near_deadline(
     server: &Arc<Mutex<Box<dyn ServerHandle>>>,
     fault_state: &ActiveQueryFaultState,
-    query_connection_id: Option<u32>,
+    query_cancel: Option<&QueryCancelSlot>,
     deadline: Instant,
     cancel_sent: &mut bool,
 ) -> Result<()> {
@@ -1026,23 +1072,22 @@ fn maybe_cancel_query_near_deadline(
     {
         return Ok(());
     }
-    let Some(connection_id) = query_connection_id else {
+    let Some(cancel) = query_cancel else {
         return Ok(());
     };
-    let mut server = server
-        .lock()
-        .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
-    if let Err(error) = server.kill_query_until(connection_id, deadline) {
-        let benign_completion_race = error.to_string().contains("has no active query")
-            || error.to_string().contains("ER_NO_SUCH_THREAD")
-            || error.to_string().contains("ERROR 1094");
-        if !benign_completion_race {
+    match cancel.try_cancel_until(deadline) {
+        Ok(false) => return Ok(()),
+        Ok(true) => {}
+        Err(error) => {
+            let server = server
+                .lock()
+                .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
             let fe = server.fe_log_contents().unwrap_or_default();
             let bes = (0..server.be_count())
                 .map(|index| server.be_log_contents(index).unwrap_or_default())
                 .collect::<Vec<_>>();
             bail!(
-                "cancel target query connection {connection_id} before shared fault deadline failed: {error:#}; fe_tail={:?}; be_tails={:?}",
+                "cancel target client query before shared fault deadline failed: {error:#}; fe_tail={:?}; be_tails={:?}",
                 log_tail(&fe),
                 bes.iter().map(|log| log_tail(log)).collect::<Vec<_>>()
             );
@@ -1846,163 +1891,258 @@ mod tests {
         );
     }
 
-    /// The BE-log marker a runner-owned KILL QUERY waits for. It is one
-    /// protocol-neutral pattern rather than a phase, so the fake only has to
-    /// answer "has this line appeared yet".
-    const KILL_QUERY_MARKER: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
+    /// A fresh BE marker protects the original query's client cancellation.
+    const CANCEL_QUERY_MARKER: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
 
-    struct KillQueryServerHandle {
-        state: Arc<(Mutex<KillQueryState>, Condvar)>,
+    struct CancelQueryServerHandle {
+        state: Arc<(Mutex<CancelQueryState>, Condvar)>,
     }
 
     #[derive(Default)]
-    struct KillQueryState {
+    struct CancelQueryState {
         marker_emitted: bool,
-        killed_connection_id: Option<u32>,
+        cancelled: bool,
     }
 
-    impl ServerHandle for KillQueryServerHandle {
+    impl ServerHandle for CancelQueryServerHandle {
         fn target_host(&self) -> Option<&str> {
             None
         }
-
         fn target_port(&self) -> Option<u16> {
             None
         }
-
         fn supports_fault_injection(&self) -> bool {
             true
         }
-
         fn be_count(&self) -> usize {
             3
         }
-
         fn be_log_count(&self, _index: usize, needle: &str) -> Result<usize> {
-            assert_eq!(needle, KILL_QUERY_MARKER);
+            assert_eq!(needle, CANCEL_QUERY_MARKER);
             Ok(usize::from(
                 self.state
                     .0
                     .lock()
-                    .expect("kill-query state")
+                    .expect("cancel-query state")
                     .marker_emitted,
             ))
         }
-
         fn be_log_contents(&self, _index: usize) -> Result<String> {
             Ok(String::new())
         }
+    }
 
-        fn kill_query(&mut self, connection_id: u32) -> Result<()> {
-            let (lock, wake) = self.state.as_ref();
-            let mut state = lock.lock().expect("kill-query state");
-            state.killed_connection_id = Some(connection_id);
-            wake.notify_all();
-            Ok(())
+    struct CancellationTestServer(Option<thread::JoinHandle<()>>);
+    impl CancellationTestServer {
+        fn join(self) {
+            drop(self);
+        }
+    }
+    impl Drop for CancellationTestServer {
+        fn drop(&mut self) {
+            if let Some(server) = self.0.take() {
+                let result = server.join();
+                if !thread::panicking() {
+                    result.expect("cancellation HTTP server exits");
+                }
+            }
         }
     }
 
-    fn kill_query_after_marker_meta() -> QueryMeta {
+    fn cancel_slot_for_test(
+        state: Arc<(Mutex<CancelQueryState>, Condvar)>,
+    ) -> (QueryCancelSlot, CancellationTestServer) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for method in ["POST", "DELETE"] {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            sleep(Duration::from_millis(1))
+                        }
+                        Err(error) => panic!("accept test cancellation request: {error}"),
+                    }
+                };
+                // The listener is nonblocking only to bound accept; read complete requests
+                // with the existing stream timeouts on every supported host.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                }
+                let header = String::from_utf8(header).unwrap();
+                let path = if method == "POST" {
+                    "/v1/statement"
+                } else {
+                    "/query/selected"
+                };
+                assert!(header.starts_with(&format!("{method} {path} HTTP/1.1\r\n")));
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                if method == "POST" {
+                    let body = format!(
+                        r#"{{"id":"20261029_120000_00001_abcde","nextUri":"http://127.0.0.1:{port}/query/selected"}}"#
+                    );
+                    write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+                } else {
+                    stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    let (lock, wake) = state.as_ref();
+                    lock.lock().unwrap().cancelled = true;
+                    wake.notify_all();
+                }
+            }
+        });
+        let server = CancellationTestServer(Some(server));
+        let client = novarocks_test_trino_client::TrinoClient::new(
+            novarocks_test_trino_client::ClientConfig {
+                host: "127.0.0.1".into(),
+                port,
+                user: "root".into(),
+                source: "fault-cancellation-test".into(),
+            },
+        )
+        .unwrap();
+        let pending = client
+            .submit(
+                &novarocks_test_trino_client::ClientSession::new("Asia/Shanghai"),
+                "SELECT 1",
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+        let slot = QueryCancelSlot::default();
+        slot.install(pending.cancel_handle()).unwrap();
+        (slot, server)
+    }
+
+    fn cancel_query_after_marker_meta() -> QueryMeta {
         QueryMeta {
-            kill_query_after_be_log_contains: Some(KILL_QUERY_MARKER.to_string()),
+            cancel_query_after_be_log_contains: Some(CANCEL_QUERY_MARKER.to_string()),
             ..QueryMeta::default()
         }
     }
 
     #[test]
-    fn kill_query_waits_for_a_fresh_marker_and_uses_a_separate_connection_id() {
-        let state = Arc::new((Mutex::new(KillQueryState::default()), Condvar::new()));
+    fn client_cancel_waits_for_a_fresh_marker_and_deletes_its_own_next_uri() {
+        let state = Arc::new((Mutex::new(CancelQueryState::default()), Condvar::new()));
         let server_handle: Arc<Mutex<Box<dyn ServerHandle>>> =
-            Arc::new(Mutex::new(Box::new(KillQueryServerHandle {
+            Arc::new(Mutex::new(Box::new(CancelQueryServerHandle {
                 state: Arc::clone(&state),
             })));
-        let meta = kill_query_after_marker_meta();
-
-        let result =
-            execute_with_post_fragment_start_fault(&meta, &server_handle, Some(41), None, || {
+        let (slot, http_server) = cancel_slot_for_test(state.clone());
+        let result = execute_with_post_fragment_start_fault(
+            &cancel_query_after_marker_meta(),
+            &server_handle,
+            Some(slot),
+            None,
+            || {
                 let (lock, wake) = state.as_ref();
-                let mut query = lock.lock().expect("kill-query state");
+                let mut query = lock.lock().unwrap();
+                assert!(!query.cancelled);
                 query.marker_emitted = true;
                 wake.notify_all();
-                query = wake
-                    .wait_while(query, |state| state.killed_connection_id.is_none())
-                    .expect("wait for KILL QUERY");
-                query.killed_connection_id
-            })
-            .expect("KILL QUERY orchestration");
-
-        assert_eq!(result, Some(41));
+                let (query, timeout) = wake
+                    .wait_timeout_while(query, Duration::from_secs(3), |query| !query.cancelled)
+                    .unwrap();
+                assert!(
+                    !timeout.timed_out(),
+                    "client DELETE must release the original query"
+                );
+                query.cancelled
+            },
+        );
+        http_server.join();
+        assert!(result.unwrap());
     }
 
     #[test]
     fn expired_shared_deadline_never_claims_a_post_query_fault() {
-        let state = Arc::new((Mutex::new(KillQueryState::default()), Condvar::new()));
+        let state = Arc::new((Mutex::new(CancelQueryState::default()), Condvar::new()));
         let server_handle: Arc<Mutex<Box<dyn ServerHandle>>> =
-            Arc::new(Mutex::new(Box::new(KillQueryServerHandle {
+            Arc::new(Mutex::new(Box::new(CancelQueryServerHandle {
                 state: Arc::clone(&state),
             })));
-        let meta = kill_query_after_marker_meta();
-
         let error = execute_with_post_fragment_start_fault(
-            &meta,
+            &cancel_query_after_marker_meta(),
             &server_handle,
-            Some(41),
+            Some(QueryCancelSlot::default()),
             Some(Instant::now()),
-            || None::<u32>,
+            || (),
         )
         .expect_err("expired deadline must fail before claiming the fault");
-
         assert!(error.to_string().contains("timed out"));
-        assert_eq!(
-            state
-                .0
-                .lock()
-                .expect("kill-query state")
-                .killed_connection_id,
-            None
-        );
+        assert!(!state.0.lock().unwrap().cancelled);
     }
 
     #[test]
-    fn deadline_cancel_accepts_no_active_query_after_concurrent_completion() {
-        struct CompletionRaceHandle;
-
-        impl ServerHandle for CompletionRaceHandle {
-            fn target_host(&self) -> Option<&str> {
-                None
-            }
-
-            fn target_port(&self) -> Option<u16> {
-                None
-            }
-
-            fn supports_fault_injection(&self) -> bool {
-                true
-            }
-
-            fn kill_query(&mut self, _connection_id: u32) -> Result<()> {
-                bail!("ERROR 1094 (HY000): connection has no active query")
-            }
-        }
-
-        let fault_state = Arc::new(ActiveQueryFaultState::new());
+    fn deadline_cancel_waits_for_the_installed_statement_handle() {
+        let state = Arc::new((Mutex::new(CancelQueryState::default()), Condvar::new()));
         let server: Arc<Mutex<Box<dyn ServerHandle>>> =
-            Arc::new(Mutex::new(Box::new(CompletionRaceHandle)));
-        let mut cancel_sent = false;
-
+            Arc::new(Mutex::new(Box::new(CancelQueryServerHandle {
+                state: Arc::clone(&state),
+            })));
+        let slot = QueryCancelSlot::default();
+        let fault_state = ActiveQueryFaultState::new();
+        let mut sent = false;
         maybe_cancel_query_near_deadline(
             &server,
-            fault_state.as_ref(),
-            Some(41),
+            &fault_state,
+            Some(&slot),
             Instant::now() + Duration::from_millis(50),
-            &mut cancel_sent,
+            &mut sent,
         )
-        .expect("concurrent query completion makes no-active-query benign");
-
-        assert!(cancel_sent);
+        .unwrap();
+        assert!(!sent, "pending POST has no cancellation capability yet");
+        let (installed, http_server) = cancel_slot_for_test(state.clone());
+        let handle = installed.0.lock().unwrap().clone().unwrap();
+        slot.install(handle).unwrap();
+        maybe_cancel_query_near_deadline(
+            &server,
+            &fault_state,
+            Some(&slot),
+            Instant::now() + Duration::from_millis(90),
+            &mut sent,
+        )
+        .unwrap();
+        http_server.join();
+        assert!(sent);
+        assert!(state.0.lock().unwrap().cancelled);
+        assert!(!fault_state.query_is_done());
+        slot.clear().unwrap();
+        sent = false;
+        maybe_cancel_query_near_deadline(
+            &server,
+            &fault_state,
+            Some(&slot),
+            Instant::now() + Duration::from_millis(50),
+            &mut sent,
+        )
+        .unwrap();
         assert!(
-            !fault_state.query_is_done(),
-            "the benign decision must not depend on the client setting query_done first"
+            !sent,
+            "completed statement clears its cancellation capability"
         );
     }
 

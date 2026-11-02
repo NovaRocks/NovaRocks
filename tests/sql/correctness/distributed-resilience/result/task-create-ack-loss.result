@@ -7,11 +7,13 @@
 -- query 4
 
 -- query 5
+-- types	bigint	bigint
 id	payload
 1	10
 2	20
 3	30
 
 -- query 6
+-- types	bigint
 total
 60

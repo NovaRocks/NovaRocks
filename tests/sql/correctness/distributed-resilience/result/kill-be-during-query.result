@@ -1,10 +1,12 @@
 -- query 1
 
 -- query 2
+-- types	bigint
 count(*)
 3
 
 -- query 3
+-- types	bigint
 count(*)
 1000000
 

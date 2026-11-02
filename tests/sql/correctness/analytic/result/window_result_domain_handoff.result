@@ -1,19 +1,23 @@
 -- query 3
+-- legacy
 id	first_variant	next_variant
 1	1	2
 2	1	NULL
 
 -- query 4
+-- legacy
 id	bitmap_state	hll_state	next_json
 1	NULL	NULL	{"a": 2}
 2	NULL	NULL	{}
 
 -- query 5
+-- legacy
 id	bitmap_values
 1	[null,null]
 2	[null,null]
 
 -- query 6
+-- legacy
 id	flattened_state	repeated_state	selected_state	zipped_state	flattened_members
 1	NULL	NULL	NULL	NULL	1
 2	NULL	NULL	NULL	NULL	2

@@ -1,38 +1,46 @@
 -- query 3
+-- types	varchar	bigint
 region	n
 eu	2
 us	2
 
 -- query 5
+-- types	varchar	bigint
 region	n
 eu	2
 us	1
 
 -- query 6
+-- types	integer	varchar
 id	region
 99	us
 
 -- query 10
+-- types	varchar	bigint
 region	n
 eu	1
 us	1
 
 -- query 14
+-- types	varchar	bigint
 region	n
 eu	1
 us	2
 
 -- query 16
+-- types	integer	varchar
 id	region
 4	eu
 99	us
 
 -- query 22
+-- types	integer	varchar
 id	region
 2	eu
 99	us
 
 -- query 23
+-- types	integer	varchar
 id	region
 1	us
 2	eu

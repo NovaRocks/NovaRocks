@@ -1,2 +1,4 @@
+-- query 7
+-- types	bigint	bigint	bigint
 projected_limit_rows	uppercase_projection_rows	dates_limit_rows
 12	10	8

@@ -1,4 +1,5 @@
 -- query 2
+-- types	bigint	decimal(9, 0)	decimal(9, 0)	decimal(9, 0)	decimal(9, 0)
 k1	CAST(c_tinyint AS DECIMAL32(9,0))	CAST(c_int AS DECIMAL32(9,0))	CAST(c_bigint AS DECIMAL32(9,0))	CAST(c_largeint AS DECIMAL32(9,0))
 1	127	NULL	NULL	NULL
 2	-128	NULL	NULL	NULL
@@ -10,6 +11,7 @@ k1	CAST(c_tinyint AS DECIMAL32(9,0))	CAST(c_int AS DECIMAL32(9,0))	CAST(c_bigint
 8	-12	-214748364	NULL	NULL
 
 -- query 3
+-- types	bigint	decimal(9, 1)	decimal(9, 1)	decimal(9, 1)	decimal(9, 1)
 k1	CAST(c_tinyint AS DECIMAL32(9,1))	CAST(c_int AS DECIMAL32(9,1))	CAST(c_bigint AS DECIMAL32(9,1))	CAST(c_largeint AS DECIMAL32(9,1))
 1	127.0	NULL	NULL	NULL
 2	-128.0	NULL	NULL	NULL
@@ -21,6 +23,7 @@ k1	CAST(c_tinyint AS DECIMAL32(9,1))	CAST(c_int AS DECIMAL32(9,1))	CAST(c_bigint
 8	-12.0	NULL	NULL	NULL
 
 -- query 4
+-- types	bigint	decimal(27, 0)	decimal(27, 0)	decimal(27, 0)	decimal(27, 0)
 k1	CAST(c_tinyint AS DECIMAL128(27,0))	CAST(c_int AS DECIMAL128(27,0))	CAST(c_bigint AS DECIMAL128(27,0))	CAST(c_largeint AS DECIMAL128(27,0))
 1	127	2147483647	9223372036854775807	NULL
 2	-128	-2147483648	-9223372036854775808	NULL
@@ -32,6 +35,7 @@ k1	CAST(c_tinyint AS DECIMAL128(27,0))	CAST(c_int AS DECIMAL128(27,0))	CAST(c_bi
 8	-12	-214748364	-922337203685477580	NULL
 
 -- query 5
+-- types	bigint	decimal(27, 1)	decimal(27, 1)	decimal(27, 1)	decimal(27, 1)
 k1	CAST(c_tinyint AS DECIMAL128(27,1))	CAST(c_int AS DECIMAL128(27,1))	CAST(c_bigint AS DECIMAL128(27,1))	CAST(c_largeint AS DECIMAL128(27,1))
 1	127.0	2147483647.0	9223372036854775807.0	NULL
 2	-128.0	-2147483648.0	-9223372036854775808.0	NULL
@@ -43,6 +47,7 @@ k1	CAST(c_tinyint AS DECIMAL128(27,1))	CAST(c_int AS DECIMAL128(27,1))	CAST(c_bi
 8	-12.0	-214748364.0	-922337203685477580.0	NULL
 
 -- query 6
+-- types	bigint	decimal(38, 0)	decimal(38, 0)	decimal(38, 0)	decimal(38, 0)
 k1	CAST(c_tinyint AS DECIMAL128(38,0))	CAST(c_int AS DECIMAL128(38,0))	CAST(c_bigint AS DECIMAL128(38,0))	CAST(c_largeint AS DECIMAL128(38,0))
 1	127	2147483647	9223372036854775807	NULL
 2	-128	-2147483648	-9223372036854775808	NULL
@@ -54,6 +59,7 @@ k1	CAST(c_tinyint AS DECIMAL128(38,0))	CAST(c_int AS DECIMAL128(38,0))	CAST(c_bi
 8	-12	-214748364	-922337203685477580	-17014118346046923173168730371588410572
 
 -- query 7
+-- types	bigint	decimal(38, 1)	decimal(38, 1)	decimal(38, 1)	decimal(38, 1)
 k1	CAST(c_tinyint AS DECIMAL128(38,1))	CAST(c_int AS DECIMAL128(38,1))	CAST(c_bigint AS DECIMAL128(38,1))	CAST(c_largeint AS DECIMAL128(38,1))
 1	127.0	2147483647.0	9223372036854775807.0	NULL
 2	-128.0	-2147483648.0	-9223372036854775808.0	NULL
@@ -65,6 +71,7 @@ k1	CAST(c_tinyint AS DECIMAL128(38,1))	CAST(c_int AS DECIMAL128(38,1))	CAST(c_bi
 8	-12.0	-214748364.0	-922337203685477580.0	NULL
 
 -- query 8
+-- types	bigint	bigint	bigint	bigint	varchar
 k1	c_tinyint * 0	c_int * 0	c_bigint * 0	c_largeint * 0
 1	0	0	0	0
 2	0	0	0	0
@@ -76,6 +83,7 @@ k1	c_tinyint * 0	c_int * 0	c_bigint * 0	c_largeint * 0
 8	0	0	0	0
 
 -- query 9
+-- types	bigint	bigint	bigint	bigint	varchar
 k1	c_tinyint * 1	c_int * 1	c_bigint * 1	c_largeint * 1
 1	127	2147483647	9223372036854775807	170141183460469231731687303715884105727
 2	-128	-2147483648	-9223372036854775808	-170141183460469231731687303715884105728
@@ -87,6 +95,7 @@ k1	c_tinyint * 1	c_int * 1	c_bigint * 1	c_largeint * 1
 8	-12	-214748364	-922337203685477580	-17014118346046923173168730371588410572
 
 -- query 10
+-- types	bigint	decimal(38, 0)	decimal(38, 0)	decimal(38, 0)	decimal(38, 0)
 k1	CAST((c_tinyint * 0) AS DECIMAL128(38,0))	CAST((c_int * 0) AS DECIMAL128(38,0))	CAST((c_bigint * 0) AS DECIMAL128(38,0))	CAST((c_largeint * 0) AS DECIMAL128(38,0))
 1	0	0	0	0
 2	0	0	0	0
@@ -98,6 +107,7 @@ k1	CAST((c_tinyint * 0) AS DECIMAL128(38,0))	CAST((c_int * 0) AS DECIMAL128(38,0
 8	0	0	0	0
 
 -- query 11
+-- types	bigint	decimal(38, 0)	decimal(38, 0)	decimal(38, 0)	decimal(38, 0)
 k1	CAST((c_tinyint * 1) AS DECIMAL128(38,0))	CAST((c_int * 1) AS DECIMAL128(38,0))	CAST((c_bigint * 1) AS DECIMAL128(38,0))	CAST((c_largeint * 1) AS DECIMAL128(38,0))
 1	127	2147483647	9223372036854775807	NULL
 2	-128	-2147483648	-9223372036854775808	NULL

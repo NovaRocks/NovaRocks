@@ -1,8 +1,10 @@
 -- query 2
+-- types	integer	decimal(10, 2)
 id	price
 1	12345.67
 
 -- query 4
+-- types	integer	decimal(20, 2)
 id	price
 1	12345.67
 2	999999999999999999.99

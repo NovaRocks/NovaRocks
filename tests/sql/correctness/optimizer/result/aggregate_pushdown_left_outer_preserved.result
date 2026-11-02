@@ -1,3 +1,5 @@
+-- query 9
+-- types	varchar
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1

@@ -1,95 +1,119 @@
 -- query 9
+-- types	integer
 percentile_cont(score, 0)
 90
 
 -- query 10
+-- types	integer
 percentile_cont(score, 0.25)
 91
 
 -- query 11
+-- types	integer
 percentile_cont(score, 0.5)
 92
 
 -- query 12
+-- types	integer
 percentile_cont(score, 0.75)
 93
 
 -- query 13
+-- types	integer
 percentile_cont(score, 1)
 94
 
 -- query 14
+-- types	date
 percentile_cont(date, 0)
 2018-01-01
 
 -- query 15
+-- types	date
 percentile_cont(date, 0.25)
 2019-01-01
 
 -- query 16
+-- types	date
 percentile_cont(date, 0.5)
 2020-01-01
 
 -- query 17
+-- types	date
 percentile_cont(date, 0.75)
 2021-01-01
 
 -- query 18
+-- types	date
 percentile_cont(date, 1)
 2022-01-01
 
 -- query 19
+-- types	timestamp(6)
 percentile_cont(datetime, 0)
-2018-01-01 00:00:01
+2018-01-01 00:00:01.000000
 
 -- query 20
+-- types	timestamp(6)
 percentile_cont(datetime, 0.25)
-2019-01-01 00:00:01
+2019-01-01 00:00:01.000000
 
 -- query 21
+-- types	timestamp(6)
 percentile_cont(datetime, 0.5)
-2020-01-01 00:00:01
+2020-01-01 00:00:01.000000
 
 -- query 22
+-- types	timestamp(6)
 percentile_cont(datetime, 0.75)
-2021-01-01 00:00:01
+2021-01-01 00:00:01.000000
 
 -- query 23
+-- types	timestamp(6)
 percentile_cont(datetime, 1)
-2022-01-01 00:00:01
+2022-01-01 00:00:01.000000
 
 -- query 24
+-- types	double
 percentile_cont(db, 0)
 11.1
 
 -- query 25
+-- types	double
 percentile_cont(db, 0.25)
 11.2
 
 -- query 26
+-- types	double
 percentile_cont(db, 0.5)
 11.3
 
 -- query 27
+-- types	double
 percentile_cont(db, 0.75)
 11.4
 
 -- query 28
+-- types	double
 percentile_cont(db, 1)
 11.5
 
 -- query 31
+-- types	double
 percentile_cont(db, CAST(1.0 AS double))
 11.5
 
 -- query 32
+-- types	double
 percentile_cont(db, CAST(0.5 AS double))
 11.3
 
 -- query 34
+-- types	bigint
 percentile_cont(1, CAST(1.0 AS double))
 1
 
 -- query 35
+-- types	bigint
 percentile_cont(1, CAST(0.5 AS double))
 1

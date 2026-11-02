@@ -1,9 +1,11 @@
 -- query 3
+-- types	integer	decimal(18, 4)	bigint	bigint	decimal(18, 4)
 grp	avg_v	ndv_k	hll_k	p50_d
 1	16.6667	3	3	0.2000
 2	150.0000	3	3	0.4500
 
 -- query 4
+-- types	integer	decimal(18, 4)	bigint
 grp	avg_v	ndv_k
 1	16.6667	3
 2	150.0000	3

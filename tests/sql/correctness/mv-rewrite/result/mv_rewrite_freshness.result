@@ -1,10 +1,12 @@
 -- query 12
+-- types	varchar	bigint
 region	s
 east	1806
 north	1800
 west	1800
 
 -- query 15
+-- types	varchar	bigint
 region	s
 east	1806
 north	1800

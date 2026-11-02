@@ -1,255 +1,319 @@
 -- query 7
+-- types	bigint
 c
 6
 
 -- query 9
+-- types	bigint
 c
 6
 
 -- query 11
+-- types	bigint
 c
 8
 
 -- query 13
+-- types	bigint
 c
 8
 
 -- query 15
+-- types	bigint
 c
 2
 
 -- query 17
+-- types	bigint
 c
 2
 
 -- query 19
+-- types	bigint
 c
 2
 
 -- query 21
+-- types	bigint
 c
 2
 
 -- query 23
+-- types	bigint
 c
 5
 
 -- query 25
+-- types	bigint
 c
 5
 
 -- query 27
+-- types	bigint
 c
 5
 
 -- query 29
+-- types	bigint
 c
 5
 
 -- query 31
+-- types	bigint
 c
 8
 
 -- query 33
+-- types	bigint
 c
 8
 
 -- query 35
+-- legacy
 c
 10
 
 -- query 37
+-- legacy
 c
 10
 
 -- query 40
+-- types	bigint
 c
 6
 
 -- query 42
+-- types	bigint
 c
 6
 
 -- query 44
+-- types	bigint
 c
 8
 
 -- query 46
+-- types	bigint
 c
 8
 
 -- query 48
+-- types	bigint
 c
 2
 
 -- query 50
+-- types	bigint
 c
 2
 
 -- query 52
+-- types	bigint
 c
 2
 
 -- query 54
+-- types	bigint
 c
 2
 
 -- query 56
+-- types	bigint
 c
 5
 
 -- query 58
+-- types	bigint
 c
 5
 
 -- query 60
+-- types	bigint
 c
 5
 
 -- query 62
+-- types	bigint
 c
 5
 
 -- query 64
+-- types	bigint
 c
 8
 
 -- query 66
+-- types	bigint
 c
 8
 
 -- query 68
+-- legacy
 c
 10
 
 -- query 70
+-- legacy
 c
 10
 
 -- query 73
+-- types	bigint
 c
 8
 
 -- query 75
+-- types	bigint
 c
 8
 
 -- query 77
+-- types	bigint
 c
 9
 
 -- query 79
+-- types	bigint
 c
 9
 
 -- query 81
+-- types	bigint
 c
 1
 
 -- query 83
+-- types	bigint
 c
 1
 
 -- query 85
+-- types	bigint
 c
 2
 
 -- query 87
+-- types	bigint
 c
 2
 
 -- query 89
+-- types	bigint
 c
 6
 
 -- query 91
+-- types	bigint
 c
 6
 
 -- query 93
+-- types	bigint
 c
 5
 
 -- query 95
+-- types	bigint
 c
 5
 
 -- query 97
+-- types	bigint
 c
 9
 
 -- query 99
+-- types	bigint
 c
 9
 
 -- query 101
+-- legacy
 c
 10
 
 -- query 103
+-- legacy
 c
 10
 
 -- query 106
+-- types	bigint
 c
 8
 
 -- query 108
+-- types	bigint
 c
 8
 
 -- query 110
+-- types	bigint
 c
 9
 
 -- query 112
+-- types	bigint
 c
 9
 
 -- query 114
+-- types	bigint
 c
 1
 
 -- query 116
+-- types	bigint
 c
 1
 
 -- query 118
+-- types	bigint
 c
 2
 
 -- query 120
+-- types	bigint
 c
 2
 
 -- query 122
+-- types	bigint
 c
 6
 
 -- query 124
+-- types	bigint
 c
 6
 
 -- query 126
+-- types	bigint
 c
 5
 
 -- query 128
+-- types	bigint
 c
 5
 
 -- query 130
+-- types	bigint
 c
 9
 
 -- query 132
+-- types	bigint
 c
 9
 
 -- query 134
+-- legacy
 c
 10
 
 -- query 136
+-- legacy
 c
 10

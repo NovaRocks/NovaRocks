@@ -28,11 +28,44 @@ use std::path::Path;
 #[serde(default, deny_unknown_fields)]
 pub struct SuiteManifest {
     pub explicit_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub case_input: Option<CaseInputRecipe>,
     pub disabled_reason: Option<String>,
     pub prepared_dataset: Option<PreparedDatasetRequirement>,
     pub heavy: Option<HeavyDeclaration>,
     pub impact: ImpactDeclaration,
     pub reuse: ReuseDeclaration,
+    #[serde(skip_serializing_if = "SuiteSessionDefaults::is_empty")]
+    pub session: SuiteSessionDefaults,
+}
+
+/// Closed fixture-owned input recipes. No commands or capture expressions are accepted.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub enum CaseInputRecipe {
+    #[serde(rename = "hms-read-only-compatibility-v1")]
+    HmsReadOnlyCompatibilityV1,
+}
+
+/// Versioned initial session inputs for every case in this suite.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SuiteSessionDefaults {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_dop: Option<u32>,
+}
+
+impl SuiteSessionDefaults {
+    pub fn is_empty(&self) -> bool {
+        self.pipeline_dop.is_none()
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.pipeline_dop != Some(0),
+            "suite session pipeline_dop must be positive"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -135,6 +168,11 @@ impl DatasetName {
 impl SuiteManifest {
     pub fn parse(content: &str) -> Result<Self> {
         let manifest: Self = toml::from_str(content).context("failed to parse suite manifest")?;
+        manifest.session.validate()?;
+        anyhow::ensure!(
+            manifest.case_input.is_none() || manifest.explicit_only,
+            "case input recipes require explicit_only = true"
+        );
         if let Some(requirement) = &manifest.prepared_dataset {
             anyhow::ensure!(
                 manifest.explicit_only,
@@ -323,6 +361,28 @@ heavy = { reason = "cost", detail = "" }
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn suite_session_defaults_are_explicit_positive_and_closed() {
+        let absent = SuiteManifest::parse("").unwrap();
+        assert!(absent.session.is_empty());
+        assert_eq!(absent.session.pipeline_dop, None);
+        for dop in [1, 5, u32::MAX] {
+            let manifest =
+                SuiteManifest::parse(&format!("[session]\npipeline_dop = {dop}\n")).unwrap();
+            assert_eq!(manifest.session.pipeline_dop, Some(dop));
+        }
+        for input in [
+            "[session]\npipeline_dop = 0\n",
+            "[session]\npipeline_dop = -1\n",
+            "[session]\npipeline_dop = 4294967296\n",
+            "[session]\npipeline_dop = 1.5\n",
+            "[session]\npipeline_dop = '5'\n",
+            "[session]\npipeline_dop = 5\nunknown = true\n",
+        ] {
+            assert!(SuiteManifest::parse(input).is_err(), "accepted {input:?}");
+        }
     }
 
     #[test]

@@ -1,2 +1,4 @@
+-- query 1
+-- types	integer	bigint	bigint
 segment	num_customers	segment_base
 11860	1	593000

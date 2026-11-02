@@ -1,4 +1,5 @@
 -- query 2
+-- types	integer	varchar	varchar	bigint	varchar
 employee_id	name	title	level	path
 1	Alicia	CEO	1	Alicia
 2	Bob	CTO	2	Alicia -> Bob
@@ -21,6 +22,7 @@ employee_id	name	title	level	path
 19	Steve	Financial Analyst	5	Alicia -> Carol -> Frank -> Kevin -> Steve
 
 -- query 3
+-- types	integer	varchar	varchar	bigint	varchar
 emp_id	emp_name	emp_title	emp_level	emp_path
 1	Alicia	CEO	1	Alicia
 2	Bob	CTO	2	Alicia -> Bob
@@ -43,6 +45,7 @@ emp_id	emp_name	emp_title	emp_level	emp_path
 19	Steve	Financial Analyst	5	Alicia -> Carol -> Frank -> Kevin -> Steve
 
 -- query 4
+-- types	bigint	bigint	bigint
 n	square	cc
 1	1	1
 2	4	8
@@ -51,6 +54,7 @@ n	square	cc
 5	25	125
 
 -- query 5
+-- types	varchar	bigint
 source	n
 cte1	1
 cte1	2
@@ -64,6 +68,7 @@ cte2	13
 cte2	14
 
 -- query 6
+-- types	integer	varchar	varchar	varchar
 employee_id	name	title	manager_name
 2	Bob	CTO	Alicia
 4	David	VP of Engineering	Bob
@@ -86,6 +91,7 @@ employee_id	name	title	manager_name
 25	Yolanda	Junior Engineer	Nancy
 
 -- query 7
+-- types	bigint	bigint
 level	employee_count
 1	1
 2	2
@@ -94,6 +100,7 @@ level	employee_count
 5	8
 
 -- query 8
+-- types	integer	varchar	bigint
 employee_id	name	level
 1	Alicia	1
 2	Bob	2
@@ -103,6 +110,7 @@ employee_id	name	level
 6	Frank	3
 
 -- query 11
+-- types	bigint	bigint
 n	fibonacci_number
 1	0
 2	1
@@ -111,6 +119,7 @@ n	fibonacci_number
 5	3
 
 -- query 12
+-- types	bigint	bigint
 n	fibonacci_number
 1	0
 2	1
@@ -124,6 +133,7 @@ n	fibonacci_number
 10	34
 
 -- query 13
+-- types	integer	varchar	varchar	bigint
 employee_id	name	title	steps
 10	Judy	Senior Engineer	0
 7	Grace	Engineering Manager	1
@@ -132,10 +142,12 @@ employee_id	name	title	steps
 1	Alicia	CEO	4
 
 -- query 15
+-- types	integer	varchar
 employee_id	name
 1	Alicia
 
 -- query 16
+-- legacy
 employee_id	name	title	steps	id
 10	Judy	Senior Engineer	0	10
 7	Grace	Engineering Manager	1	10

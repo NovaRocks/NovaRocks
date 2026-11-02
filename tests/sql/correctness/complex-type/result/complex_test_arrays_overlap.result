@@ -1,4 +1,5 @@
 -- query 12
+-- legacy
 arrays_overlap(s_1, s_1)
 1
 1
@@ -6,6 +7,7 @@ NULL
 1
 
 -- query 13
+-- legacy
 arrays_overlap(s_1, i_1)
 0
 NULL
@@ -13,6 +15,7 @@ NULL
 0
 
 -- query 14
+-- legacy
 arrays_overlap(s_1, f_1)
 0
 1
@@ -20,6 +23,7 @@ NULL
 1
 
 -- query 15
+-- legacy
 arrays_overlap(s_1, d_3)
 0
 NULL
@@ -27,6 +31,7 @@ NULL
 0
 
 -- query 16
+-- legacy
 arrays_overlap(s_1, d_6)
 0
 0
@@ -34,6 +39,7 @@ NULL
 1
 
 -- query 21
+-- legacy
 arrays_overlap(s_1, ['a', 'c', 'd'])
 1
 0
@@ -41,6 +47,7 @@ NULL
 1
 
 -- query 22
+-- legacy
 arrays_overlap(s_1, [4, 5, 2, NULL, 1])
 0
 1
@@ -48,6 +55,7 @@ NULL
 1
 
 -- query 23
+-- legacy
 arrays_overlap(s_1, NULL)
 NULL
 NULL
@@ -55,6 +63,7 @@ NULL
 NULL
 
 -- query 24
+-- legacy
 arrays_overlap(i_1, d_3)
 1
 NULL
@@ -62,6 +71,7 @@ NULL
 1
 
 -- query 25
+-- legacy
 arrays_overlap(i_1, d_4)
 1
 NULL
@@ -69,6 +79,7 @@ NULL
 1
 
 -- query 26
+-- legacy
 arrays_overlap(i_1, ['a', 'c', 'd'])
 0
 NULL
@@ -76,6 +87,7 @@ NULL
 0
 
 -- query 27
+-- legacy
 arrays_overlap(i_1, [4, 5, 2, NULL, 1])
 1
 NULL
@@ -83,6 +95,7 @@ NULL
 1
 
 -- query 28
+-- legacy
 arrays_overlap(i_1, NULL)
 NULL
 NULL
@@ -90,6 +103,7 @@ NULL
 NULL
 
 -- query 29
+-- legacy
 arrays_overlap(f_1, s_1)
 0
 1
@@ -97,6 +111,7 @@ NULL
 1
 
 -- query 30
+-- legacy
 arrays_overlap(f_1, i_1)
 1
 NULL
@@ -104,6 +119,7 @@ NULL
 1
 
 -- query 31
+-- legacy
 arrays_overlap(f_1, f_1)
 1
 1
@@ -111,6 +127,7 @@ NULL
 1
 
 -- query 32
+-- legacy
 arrays_overlap(f_1, d_4)
 1
 NULL
@@ -118,6 +135,7 @@ NULL
 1
 
 -- query 33
+-- legacy
 arrays_overlap(f_1, d_5)
 1
 1
@@ -125,6 +143,7 @@ NULL
 1
 
 -- query 38
+-- legacy
 arrays_overlap(f_1, ['a', 'c', 'd'])
 0
 0
@@ -132,6 +151,7 @@ NULL
 0
 
 -- query 39
+-- legacy
 arrays_overlap(f_1, [4, 5, 2, NULL, 1])
 1
 1
@@ -139,6 +159,7 @@ NULL
 1
 
 -- query 40
+-- legacy
 arrays_overlap(f_1, NULL)
 NULL
 NULL
@@ -146,6 +167,7 @@ NULL
 NULL
 
 -- query 41
+-- legacy
 arrays_overlap(d_1, d_1)
 1
 1
@@ -153,6 +175,7 @@ arrays_overlap(d_1, d_1)
 1
 
 -- query 42
+-- legacy
 arrays_overlap(d_1, d_2)
 1
 1
@@ -160,6 +183,7 @@ arrays_overlap(d_1, d_2)
 1
 
 -- query 47
+-- legacy
 arrays_overlap(d_1, ['a', 'c', 'd'])
 0
 0
@@ -167,6 +191,7 @@ arrays_overlap(d_1, ['a', 'c', 'd'])
 0
 
 -- query 48
+-- legacy
 arrays_overlap(d_1, [4, 5, 2, NULL, 1])
 1
 1
@@ -174,6 +199,7 @@ arrays_overlap(d_1, [4, 5, 2, NULL, 1])
 1
 
 -- query 49
+-- legacy
 arrays_overlap(d_1, NULL)
 NULL
 NULL
@@ -181,6 +207,7 @@ NULL
 NULL
 
 -- query 50
+-- legacy
 arrays_overlap(d_2, s_1)
 0
 0
@@ -188,6 +215,7 @@ NULL
 1
 
 -- query 51
+-- legacy
 arrays_overlap(d_2, d_2)
 1
 1
@@ -195,6 +223,7 @@ arrays_overlap(d_2, d_2)
 1
 
 -- query 52
+-- legacy
 arrays_overlap(d_2, d_3)
 1
 NULL
@@ -202,6 +231,7 @@ NULL
 1
 
 -- query 53
+-- legacy
 arrays_overlap(d_2, [4, 5, 2, NULL, 1])
 1
 1
@@ -209,6 +239,7 @@ arrays_overlap(d_2, [4, 5, 2, NULL, 1])
 1
 
 -- query 54
+-- legacy
 arrays_overlap(d_2, NULL)
 NULL
 NULL
@@ -216,6 +247,7 @@ NULL
 NULL
 
 -- query 55
+-- legacy
 arrays_overlap(d_3, d_3)
 1
 NULL
@@ -223,6 +255,7 @@ NULL
 1
 
 -- query 56
+-- legacy
 arrays_overlap(d_4, d_4)
 1
 NULL
@@ -230,6 +263,7 @@ NULL
 1
 
 -- query 57
+-- legacy
 arrays_overlap(d_4, d_5)
 1
 NULL
@@ -237,6 +271,7 @@ NULL
 1
 
 -- query 58
+-- legacy
 arrays_overlap(d_5, d_1)
 1
 1
@@ -244,6 +279,7 @@ NULL
 1
 
 -- query 59
+-- legacy
 arrays_overlap(d_5, d_2)
 1
 1
@@ -251,6 +287,7 @@ NULL
 1
 
 -- query 60
+-- legacy
 arrays_overlap(d_5, d_4)
 1
 NULL
@@ -258,6 +295,7 @@ NULL
 1
 
 -- query 61
+-- legacy
 arrays_overlap(d_5, d_5)
 1
 1
@@ -265,6 +303,7 @@ NULL
 1
 
 -- query 62
+-- legacy
 arrays_overlap(d_5, d_6)
 1
 1
@@ -272,6 +311,7 @@ NULL
 1
 
 -- query 64
+-- legacy
 arrays_overlap(d_6, s_1)
 0
 0
@@ -279,6 +319,7 @@ NULL
 1
 
 -- query 65
+-- legacy
 arrays_overlap(d_6, i_1)
 1
 NULL
@@ -286,6 +327,7 @@ NULL
 1
 
 -- query 66
+-- legacy
 arrays_overlap(d_6, f_1)
 1
 1
@@ -293,6 +335,7 @@ NULL
 1
 
 -- query 67
+-- legacy
 arrays_overlap(d_6, d_5)
 1
 1
@@ -300,6 +343,7 @@ NULL
 1
 
 -- query 68
+-- legacy
 arrays_overlap(d_6, d_6)
 1
 1
@@ -307,6 +351,7 @@ NULL
 1
 
 -- query 72
+-- legacy
 arrays_overlap(ai_1, ai_1)
 1
 NULL
@@ -314,6 +359,7 @@ NULL
 1
 
 -- query 73
+-- legacy
 arrays_overlap(ai_1, as_1)
 1
 NULL
@@ -321,6 +367,7 @@ NULL
 0
 
 -- query 77
+-- legacy
 arrays_overlap(as_1, ai_1)
 1
 NULL
@@ -328,6 +375,7 @@ NULL
 0
 
 -- query 78
+-- legacy
 arrays_overlap(as_1, as_1)
 1
 NULL
@@ -335,6 +383,7 @@ NULL
 1
 
 -- query 83
+-- legacy
 arrays_overlap(aas_1, aas_1)
 1
 1
@@ -342,6 +391,7 @@ NULL
 1
 
 -- query 89
+-- legacy
 arrays_overlap(aad_1, aas_1)
 0
 0
@@ -349,6 +399,7 @@ NULL
 0
 
 -- query 90
+-- legacy
 arrays_overlap(aad_1, aad_1)
 1
 1
@@ -356,6 +407,7 @@ NULL
 1
 
 -- query 93
+-- legacy
 arrays_overlap(aad_1, NULL)
 NULL
 NULL
@@ -363,6 +415,7 @@ NULL
 NULL
 
 -- query 94
+-- legacy
 arrays_overlap(['a', 'c', 'd'], s_1)
 1
 0
@@ -370,6 +423,7 @@ NULL
 1
 
 -- query 95
+-- legacy
 arrays_overlap([4, 5, 2, NULL, 1], f_1)
 1
 1
@@ -377,6 +431,7 @@ NULL
 1
 
 -- query 97
+-- legacy
 arrays_overlap([4, 5, 2, NULL, 1], ['a', 'c', 'd'])
 0
 0
@@ -384,6 +439,7 @@ arrays_overlap([4, 5, 2, NULL, 1], ['a', 'c', 'd'])
 0
 
 -- query 98
+-- legacy
 arrays_overlap([4, 5, 2, NULL, 1], [4, 5, 2, NULL, 1])
 1
 1
@@ -391,6 +447,7 @@ arrays_overlap([4, 5, 2, NULL, 1], [4, 5, 2, NULL, 1])
 1
 
 -- query 99
+-- legacy
 arrays_overlap([4, 5, 2, NULL, 1], NULL)
 NULL
 NULL
@@ -398,6 +455,7 @@ NULL
 NULL
 
 -- query 100
+-- legacy
 arrays_overlap(NULL, s_1)
 NULL
 NULL
@@ -405,6 +463,7 @@ NULL
 NULL
 
 -- query 101
+-- legacy
 arrays_overlap(NULL, i_1)
 NULL
 NULL
@@ -412,6 +471,7 @@ NULL
 NULL
 
 -- query 102
+-- legacy
 arrays_overlap(NULL, d_1)
 NULL
 NULL
@@ -419,6 +479,7 @@ NULL
 NULL
 
 -- query 103
+-- legacy
 arrays_overlap(NULL, d_2)
 NULL
 NULL
@@ -426,6 +487,7 @@ NULL
 NULL
 
 -- query 104
+-- legacy
 arrays_overlap(NULL, ai_1)
 NULL
 NULL
@@ -433,6 +495,7 @@ NULL
 NULL
 
 -- query 105
+-- legacy
 arrays_overlap(NULL, as_1)
 NULL
 NULL
@@ -440,6 +503,7 @@ NULL
 NULL
 
 -- query 106
+-- legacy
 arrays_overlap(NULL, aas_1)
 NULL
 NULL
@@ -447,6 +511,7 @@ NULL
 NULL
 
 -- query 107
+-- legacy
 arrays_overlap(NULL, aad_1)
 NULL
 NULL
@@ -454,6 +519,7 @@ NULL
 NULL
 
 -- query 108
+-- legacy
 arrays_overlap(NULL, ['a', 'c', 'd'])
 NULL
 NULL
@@ -461,6 +527,7 @@ NULL
 NULL
 
 -- query 109
+-- legacy
 arrays_overlap(NULL, [4, 5, 2, NULL, 1])
 NULL
 NULL
@@ -468,6 +535,7 @@ NULL
 NULL
 
 -- query 110
+-- legacy
 arrays_overlap(NULL, NULL)
 NULL
 NULL
@@ -475,38 +543,47 @@ NULL
 NULL
 
 -- query 111
+-- legacy
 arrays_overlap([parse_json('{"addr": 1}'), parse_json('{"addr": 2}')], [parse_json('{"addr": 2}'), parse_json('{"addr": 3}')])
 1
 
 -- query 112
+-- legacy
 arrays_overlap([parse_json('{"addr": 1}'), parse_json('{"addr": 2}')], [parse_json('{"addr": 3}'), parse_json('{"addr": 4}')])
 0
 
 -- query 113
+-- legacy
 arrays_overlap(CAST('[40360,40361]' AS ARRAY<INT>), [40360])
 1
 
 -- query 114
+-- legacy
 arrays_overlap(CAST('null' AS ARRAY<INT>), [40360])
 NULL
 
 -- query 115
+-- legacy
 arrays_overlap([map{1:2,2:3,3:4}, map{3:4,4:5}, map{3:4,4:5}, map{1:2,2:3,3:4}], [map{1:2,2:3,3:4}])
 1
 
 -- query 116
+-- legacy
 arrays_overlap([row(1, 2, 3), row(3, 4, 5), row(4, 5, 6)], [row(3, 4, 5)])
 1
 
 -- query 117
+-- legacy
 arrays_overlap([1, NULL], [4, 3])
 0
 
 -- query 118
+-- legacy
 arrays_overlap([4, 3], [1, NULL])
 0
 
 -- query 121
+-- legacy
 k1	a1	a2	arrays_overlap(ifnull(a1, []), ['a', 'c', 'b', NULL])
 1	NULL	["a","c","b",null]	0
 2	NULL	["a","c","b"]	0
@@ -514,6 +591,7 @@ k1	a1	a2	arrays_overlap(ifnull(a1, []), ['a', 'c', 'b', NULL])
 4	NULL	["a"]	0
 
 -- query 122
+-- legacy
 k1	a1	a2	arrays_overlap(['a', 'c', 'b', NULL], ifnull(a1, []))
 1	NULL	["a","c","b",null]	0
 2	NULL	["a","c","b"]	0
@@ -521,6 +599,7 @@ k1	a1	a2	arrays_overlap(['a', 'c', 'b', NULL], ifnull(a1, []))
 4	NULL	["a"]	0
 
 -- query 123
+-- legacy
 k1	a1	a2	arrays_overlap(ifnull(a1, [NULL]), ['a', 'c', 'b', NULL])
 1	NULL	["a","c","b",null]	1
 2	NULL	["a","c","b"]	1
@@ -528,6 +607,7 @@ k1	a1	a2	arrays_overlap(ifnull(a1, [NULL]), ['a', 'c', 'b', NULL])
 4	NULL	["a"]	1
 
 -- query 124
+-- legacy
 k1	a1	a2	arrays_overlap(['a', 'c', 'b', NULL], ifnull(a1, [NULL]))
 1	NULL	["a","c","b",null]	1
 2	NULL	["a","c","b"]	1
@@ -535,6 +615,7 @@ k1	a1	a2	arrays_overlap(['a', 'c', 'b', NULL], ifnull(a1, [NULL]))
 4	NULL	["a"]	1
 
 -- query 125
+-- legacy
 k1	a1	a2	arrays_overlap(ifnull(a1, NULL), ['a', 'c', 'b', NULL])
 1	NULL	["a","c","b",null]	NULL
 2	NULL	["a","c","b"]	NULL
@@ -542,6 +623,7 @@ k1	a1	a2	arrays_overlap(ifnull(a1, NULL), ['a', 'c', 'b', NULL])
 4	NULL	["a"]	NULL
 
 -- query 126
+-- legacy
 k1	a1	a2	arrays_overlap(['a', 'c', 'b', NULL], ifnull(a1, NULL))
 1	NULL	["a","c","b",null]	NULL
 2	NULL	["a","c","b"]	NULL
@@ -549,6 +631,7 @@ k1	a1	a2	arrays_overlap(['a', 'c', 'b', NULL], ifnull(a1, NULL))
 4	NULL	["a"]	NULL
 
 -- query 127
+-- legacy
 k1	a1	a2	arrays_overlap(ifnull(a1, []), a2)
 1	NULL	["a","c","b",null]	0
 2	NULL	["a","c","b"]	0
@@ -556,6 +639,7 @@ k1	a1	a2	arrays_overlap(ifnull(a1, []), a2)
 4	NULL	["a"]	0
 
 -- query 128
+-- legacy
 k1	a1	a2	arrays_overlap(a2, ifnull(a1, []))
 1	NULL	["a","c","b",null]	0
 2	NULL	["a","c","b"]	0
@@ -563,6 +647,7 @@ k1	a1	a2	arrays_overlap(a2, ifnull(a1, []))
 4	NULL	["a"]	0
 
 -- query 129
+-- legacy
 k1	a1	a2	arrays_overlap(ifnull(a1, NULL), a2)
 1	NULL	["a","c","b",null]	NULL
 2	NULL	["a","c","b"]	NULL
@@ -570,6 +655,7 @@ k1	a1	a2	arrays_overlap(ifnull(a1, NULL), a2)
 4	NULL	["a"]	NULL
 
 -- query 130
+-- legacy
 k1	a1	a2	arrays_overlap(a2, ifnull(a1, NULL))
 1	NULL	["a","c","b",null]	NULL
 2	NULL	["a","c","b"]	NULL
@@ -577,6 +663,7 @@ k1	a1	a2	arrays_overlap(a2, ifnull(a1, NULL))
 4	NULL	["a"]	NULL
 
 -- query 131
+-- legacy
 k1	a1	a2	arrays_overlap(ifnull(a1, [NULL]), a2)
 1	NULL	["a","c","b",null]	1
 2	NULL	["a","c","b"]	0
@@ -584,6 +671,7 @@ k1	a1	a2	arrays_overlap(ifnull(a1, [NULL]), a2)
 4	NULL	["a"]	0
 
 -- query 132
+-- legacy
 k1	a1	a2	arrays_overlap(a2, ifnull(a1, [NULL]))
 1	NULL	["a","c","b",null]	1
 2	NULL	["a","c","b"]	0
@@ -591,6 +679,7 @@ k1	a1	a2	arrays_overlap(a2, ifnull(a1, [NULL]))
 4	NULL	["a"]	0
 
 -- query 133
+-- legacy
 k1	a1	a2	arrays_overlap(ifnull(a1, ['a']), ifnull(a1, ['a', 'b']))
 1	NULL	["a","c","b",null]	1
 2	NULL	["a","c","b"]	1
@@ -598,6 +687,7 @@ k1	a1	a2	arrays_overlap(ifnull(a1, ['a']), ifnull(a1, ['a', 'b']))
 4	NULL	["a"]	1
 
 -- query 134
+-- legacy
 k1	a1	a2	arrays_overlap(ifnull(a1, NULL), ifnull(a1, ['a', 'b']))
 1	NULL	["a","c","b",null]	NULL
 2	NULL	["a","c","b"]	NULL
@@ -605,6 +695,7 @@ k1	a1	a2	arrays_overlap(ifnull(a1, NULL), ifnull(a1, ['a', 'b']))
 4	NULL	["a"]	NULL
 
 -- query 135
+-- legacy
 k1	a1	a2	arrays_overlap(ifnull(a1, ['a', NULL]), ifnull(a1, ['a', 'b']))
 1	NULL	["a","c","b",null]	1
 2	NULL	["a","c","b"]	1
@@ -612,6 +703,7 @@ k1	a1	a2	arrays_overlap(ifnull(a1, ['a', NULL]), ifnull(a1, ['a', 'b']))
 4	NULL	["a"]	1
 
 -- query 136
+-- legacy
 k1	a1	a2	arrays_overlap(ifnull(a1, ['a', NULL]), ifnull(a1, ['a', 'b', NULL]))
 1	NULL	["a","c","b",null]	1
 2	NULL	["a","c","b"]	1

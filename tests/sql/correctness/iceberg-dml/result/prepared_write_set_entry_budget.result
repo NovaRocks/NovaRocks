@@ -1,11 +1,14 @@
 -- query 2
+-- types	bigint
 snaps_before
 1
 
 -- query 4
+-- types	bigint	bigint
 p	v
 -1	1
 
 -- query 5
+-- types	bigint
 snaps_after
 1

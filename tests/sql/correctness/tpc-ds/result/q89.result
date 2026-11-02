@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	varchar	varchar	varchar	integer	decimal(38, 2)	decimal(38, 8)
 i_category	i_class	i_brand	s_store_name	s_company_name	d_moy	sum_sales	avg_monthly_sales
 Men	shirts	importoimporto #1	ese	Unknown	3	2070.65	5492.81750000
 Men	shirts	importoimporto #1	ought	Unknown	6	2152.15	5045.75833333

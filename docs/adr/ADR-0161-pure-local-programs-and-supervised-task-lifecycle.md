@@ -13,9 +13,9 @@ partially-superseded-by:
   - id: ADR-0198
     scope: "The read-oriented visibility/seal boundary and logical business-conclusion wording are generalized into computation readiness for all distributed intents and separate statement/domain completion; exact identity, Accepted/Installed, covered observation, frozen-semantic recovery and actual convergence remain active"
     link: "ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md"
-  - id: ADR-0210
+  - id: ADR-0211
     scope: "Worker registry implementation, control-plane scheduling and retention capacity are replaced by the deterministic runtime and Context-owned horizon retention; exact identity, Accepted/Installed, covered observation and physical convergence remain active"
-    link: "ADR-0210-deterministic-control-runtime-and-task-ownership.md"
+    link: "ADR-0211-deterministic-control-runtime-and-task-ownership.md"
 date: 2026-09-28
 provenance:
   - "discussion: 2026-09-24 pure local programs, accepted/installed creation, covered observation and normal convergence"

@@ -1,9 +1,11 @@
 -- query 2
+-- types	varchar	bigint
 region	n
 eu	2
 us	2
 
 -- query 4
+-- types	integer	varchar
 id	region
 1	us
 3	eu
@@ -11,9 +13,11 @@ id	region
 99	us
 
 -- query 5
+-- types	bigint	bigint	bigint	bigint	bigint
 same_touched_rows	changed_touched_rows	same_untouched_rows	current_us_rows	current_eu_rows
 0	1	2	2	2
 
 -- query 7
+-- types	bigint	bigint
 total_rows	distinct_row_ids
 5	5

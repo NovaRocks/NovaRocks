@@ -35,6 +35,11 @@ INSERT INTO ${case_db}.t_sort_expression_distance VALUES
   (2, 12),
   (3, 9),
   (4, 15);
+SELECT trc2_output.id AS id, trc2_output.v AS v,
+  CAST(trc2_output.dist AS VARCHAR) AS dist
+FROM (
 SELECT id, v, ABS(v - 10) AS dist
 FROM ${case_db}.t_sort_expression_distance
-ORDER BY dist ASC, id ASC;
+ORDER BY dist ASC, id ASC
+) AS trc2_output
+ORDER BY trc2_output.dist ASC, trc2_output.id ASC;

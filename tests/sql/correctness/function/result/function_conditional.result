@@ -1,4 +1,5 @@
 -- query 6
+-- legacy
 CASE i WHEN 1 THEN ai WHEN 3 THEN ass ELSE ai END
 ["1","2"]
 ["1","2"]
@@ -6,6 +7,7 @@ CASE i WHEN 1 THEN ai WHEN 3 THEN ass ELSE ai END
 NULL
 
 -- query 7
+-- legacy
 CASE i WHEN 1 THEN ai WHEN 3 THEN ass END
 ["1","2"]
 NULL
@@ -13,6 +15,7 @@ NULL
 NULL
 
 -- query 8
+-- legacy
 CASE i WHEN 1 THEN mi WHEN 3 THEN ms ELSE mi END
 {1:"1"}
 {1:"1"}
@@ -20,6 +23,7 @@ CASE i WHEN 1 THEN mi WHEN 3 THEN ms ELSE mi END
 NULL
 
 -- query 9
+-- legacy
 CASE i WHEN 1 THEN mi WHEN 3 THEN ms END
 {1:"1"}
 NULL
@@ -27,6 +31,7 @@ NULL
 NULL
 
 -- query 10
+-- legacy
 CASE WHEN i = 1 THEN ai WHEN i = 3 THEN ass END
 ["1","2"]
 NULL
@@ -34,6 +39,7 @@ NULL
 NULL
 
 -- query 11
+-- legacy
 CASE WHEN i = 1 THEN ai WHEN i = 3 THEN ass ELSE ai END
 ["1","2"]
 ["1","2"]
@@ -41,6 +47,7 @@ CASE WHEN i = 1 THEN ai WHEN i = 3 THEN ass ELSE ai END
 NULL
 
 -- query 12
+-- legacy
 CASE WHEN i = 1 THEN mi WHEN i = 3 THEN ms END
 {1:"1"}
 NULL
@@ -48,6 +55,7 @@ NULL
 NULL
 
 -- query 13
+-- legacy
 CASE WHEN i = 1 THEN mi WHEN i = 3 THEN ms ELSE ms END
 {1:"1"}
 {1:"b"}
@@ -55,6 +63,7 @@ CASE WHEN i = 1 THEN mi WHEN i = 3 THEN ms ELSE ms END
 NULL
 
 -- query 14
+-- legacy
 coalesce(ai, ass)
 ["1","2"]
 ["1","2"]
@@ -62,6 +71,7 @@ coalesce(ai, ass)
 NULL
 
 -- query 15
+-- legacy
 coalesce(mi, ms)
 {1:"1"}
 {1:"1"}
@@ -69,6 +79,7 @@ coalesce(mi, ms)
 NULL
 
 -- query 16
+-- legacy
 coalesce(NULL, ms, mi)
 {1:"1"}
 {1:"b"}
@@ -76,6 +87,7 @@ coalesce(NULL, ms, mi)
 NULL
 
 -- query 17
+-- legacy
 ifnull(ms, mi)	ms	mi
 {1:"1"}	NULL	{1:1}
 {1:"b"}	{1:"b"}	{1:1}
@@ -83,6 +95,7 @@ ifnull(ms, mi)	ms	mi
 NULL	NULL	NULL
 
 -- query 18
+-- legacy
 ifnull(ass, ai)	ass	ai
 ["1","2"]	NULL	[1,2]
 ["a","b"]	["a","b"]	[1,2]
@@ -90,6 +103,7 @@ ifnull(ass, ai)	ass	ai
 NULL	NULL	NULL
 
 -- query 19
+-- legacy
 ifnull(ai, NULL)
 [1,2]
 [1,2]
@@ -97,6 +111,7 @@ NULL
 NULL
 
 -- query 20
+-- legacy
 if(i > 2, ms, mi)
 {1:"1"}
 {1:"1"}
@@ -104,6 +119,7 @@ if(i > 2, ms, mi)
 NULL
 
 -- query 21
+-- legacy
 if(i > 2, ass, ai)
 ["1","2"]
 ["1","2"]
@@ -111,6 +127,7 @@ if(i > 2, ass, ai)
 NULL
 
 -- query 22
+-- legacy
 if(ai IS NOT NULL, map_from_arrays(['a', 'b'], [1, 2]), NULL)
 {"a":1,"b":2}
 {"a":1,"b":2}
@@ -118,6 +135,7 @@ NULL
 NULL
 
 -- query 23
+-- legacy
 nullif(ai, ass)	ai	ass
 ["1","2"]	[1,2]	NULL
 ["1","2"]	[1,2]	["a","b"]
@@ -125,6 +143,7 @@ NULL	NULL	["a","b"]
 NULL	NULL	NULL
 
 -- query 24
+-- legacy
 nullif(ms, mi)	ms	mi
 NULL	NULL	{1:1}
 {1:"b"}	{1:"b"}	{1:1}
@@ -132,6 +151,7 @@ NULL	NULL	{1:1}
 NULL	NULL	NULL
 
 -- query 25
+-- legacy
 if(i > 5, i, NULL)
 NULL
 NULL
@@ -139,6 +159,7 @@ NULL
 NULL
 
 -- query 26
+-- legacy
 i	mi	ms	mi_parent_null	ms_parent_null
 1	{1:1}	NULL	0	1
 2	{1:1}	{1:"b"}	0	0
@@ -146,5 +167,6 @@ i	mi	ms	mi_parent_null	ms_parent_null
 4	NULL	NULL	1	1
 
 -- query 27
+-- legacy
 rows_total	mi_present	ms_present	ms_nonnull_values
 4	2	2	1

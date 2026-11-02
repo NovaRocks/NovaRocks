@@ -57,7 +57,7 @@ AS SELECT k1, v1 FROM orders;
 
 -- query 2
 -- @kill_fe_after_mv_known_committed_before_projector_cas=true
--- @expect_error=server disconnected
+-- @expect_error=Trino transport failure
 REFRESH MATERIALIZED VIEW orders_mv;
 
 -- query 3

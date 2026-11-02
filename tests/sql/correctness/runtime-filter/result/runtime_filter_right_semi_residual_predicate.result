@@ -1,3 +1,5 @@
+-- query 7
+-- types	integer	integer	varchar
 k	threshold	tag
 1	5	r1_pass
 3	3	r3_pass

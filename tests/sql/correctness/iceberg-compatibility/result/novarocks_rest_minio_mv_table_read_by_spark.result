@@ -1,3 +1,5 @@
+-- query 6
+-- types	bigint	integer
 id	amount
 2	20
 3	30

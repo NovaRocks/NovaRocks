@@ -1,31 +1,39 @@
 -- query 11
+-- types	bigint	double	bigint	bigint	bigint
 count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
 40961	20480.999975586532	40961	40961	40961
 
 -- query 12
+-- types	bigint	double	bigint	bigint	bigint
 count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
 60961	30480.671904988434	60961	60961	40961
 
 -- query 13
+-- legacy
 count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
 40961	20480.999975586532	40961	40961	40961
 
 -- query 14
+-- types	bigint
 count(*)
 20000
 
 -- query 15
+-- types	bigint
 count(*)
 20000
 
 -- query 17
+-- types	bigint
 count(*)
 0
 
 -- query 20
+-- types	integer	integer	integer
 k1	k2	k3
 
 -- query 21
+-- types	integer	integer	integer
 k1	k2	k3
 1	1	1
 1	2	1
@@ -36,26 +44,31 @@ k1	k2	k3
 11	2	1
 
 -- query 22
+-- types	integer	integer	integer
 k1	k2	k3
 NULL	NULL	NULL
 2	3	NULL
 
 -- query 23
+-- types	integer	integer	integer
 k1	k2	k3
 NULL	NULL	NULL
 2	3	NULL
 2	3	2
 
 -- query 24
+-- types	integer	integer	integer
 k1	k2	k3
 NULL	NULL	NULL
 2	3	NULL
 2	3	2
 
 -- query 29
+-- types	bigint
 count(*)
 0
 
 -- query 30
+-- types	bigint
 count(*)
 0

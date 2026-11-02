@@ -1,28 +1,34 @@
 -- query 3
+-- legacy
 dist	id
 1	1
 0.929	2
 0.714	3
 
 -- query 4
+-- legacy
 dist
 1
 
 -- query 5
+-- legacy
 dist
 0.14
 
 -- query 6
+-- legacy
 dist	id
 0.08	3
 0.02	2
 0	1
 
 -- query 7
+-- legacy
 dist
 0
 
 -- query 12
+-- legacy
 id	data	sim
 1	[0.1,0.2,0.3]	1
 3	[0.15,0.25,0.32]	0.994
@@ -32,6 +38,7 @@ id	data	sim
 5	[0.25,0.12,0.13]	0.768
 
 -- query 13
+-- legacy
 id	id	data	data	sim
 1	1	[0.1,0.2,0.3]	[0.1,0.2,0.3]	1
 2	2	[0.2,0.1,0.3]	[0.2,0.1,0.3]	1
@@ -71,6 +78,7 @@ id	id	data	data	sim
 5	1	[0.25,0.12,0.13]	[0.1,0.2,0.3]	0.768
 
 -- query 14
+-- legacy
 id	id	data	data	sim
 1	1	[0.1,0.2,0.3]	[0.1,0.2,0.3]	1
 2	2	[0.2,0.1,0.3]	[0.2,0.1,0.3]	1
@@ -110,6 +118,7 @@ id	id	data	data	sim
 5	1	[0.25,0.12,0.13]	[0.1,0.2,0.3]	0.768
 
 -- query 15
+-- legacy
 id	data	sim
 6	[0.22,0.01,0.39]	0.059
 5	[0.25,0.12,0.13]	0.058

@@ -1,3 +1,5 @@
+-- query 3
+-- types	varchar	varchar	bigint
 s	is_null	c
 NULL	true	2
 a	false	2

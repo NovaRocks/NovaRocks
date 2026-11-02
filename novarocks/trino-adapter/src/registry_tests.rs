@@ -79,6 +79,7 @@ struct Captured {
 #[derive(Clone, Copy)]
 enum OutputMode {
     Rows,
+    InternalRows,
     Completion,
     InvalidHeaders,
     Failure(QueryFailureReason),
@@ -336,21 +337,37 @@ impl QuerySession for Session {
         ))
     }
     async fn execute_statement(&self, _: &str) -> Result<QuerySessionStatement, QueryServiceError> {
-        let statement = self
+        let deadline = self
             .state
-            .control
-            .begin_governed_statement_with_result(
-                self.token,
-                &self.state.host.root_admission(),
-                WorkClass::Management,
-                self.state
-                    .deadline_ms
-                    .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms)),
-                self.state.deadline_ms,
-                None,
-                ResultWindowClass::Local,
-            )
-            .unwrap();
+            .deadline_ms
+            .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+        let statement = if matches!(self.state.mode, OutputMode::InternalRows) {
+            self.state
+                .control
+                .begin_queued_governed_query_statement_with_result(
+                    self.token,
+                    &self.state.host.root_admission(),
+                    deadline,
+                    self.state.deadline_ms,
+                    None,
+                    ResultWindowClass::Internal,
+                )
+                .await
+                .unwrap()
+        } else {
+            self.state
+                .control
+                .begin_governed_statement_with_result(
+                    self.token,
+                    &self.state.host.root_admission(),
+                    WorkClass::Management,
+                    deadline,
+                    self.state.deadline_ms,
+                    None,
+                    ResultWindowClass::Local,
+                )
+                .unwrap()
+        };
         let cancellation = QueryCancellationView::governed(
             statement.cancellation().clone(),
             self.state.deadline_ms,
@@ -359,7 +376,10 @@ impl QuerySession for Session {
         // command. A held return models the original action still exiting.
         let selected_error = match self.state.mode {
             OutputMode::Failure(reason) => Some(originating_error(reason)),
-            OutputMode::Rows | OutputMode::Completion | OutputMode::InvalidHeaders => None,
+            OutputMode::Rows
+            | OutputMode::InternalRows
+            | OutputMode::Completion
+            | OutputMode::InvalidHeaders => None,
         };
         self.state.captured.lock().unwrap().push(Captured {
             scope: statement.scope().clone(),
@@ -1331,4 +1351,135 @@ async fn malformed_or_overflowing_tokens_are_not_found_without_starting_the_stat
     assert_eq!(fixture.state.opened.load(Ordering::Acquire), 0);
     assert_eq!(fixture.protocol_metrics(), (0, 0));
     fixture.registry.finalize().await;
+}
+
+#[tokio::test]
+async fn internal_root_local_rows_publish_metadata_and_preserve_original_delivery_owner() {
+    let fixture = Fixture::configured(
+        false,
+        false,
+        OutputMode::InternalRows,
+        Duration::from_secs(60),
+        None,
+    );
+    let (entry, _) = fixture.register();
+    let data = get(&fixture.registry, &entry, 0).await;
+    assert_eq!(json(&data)["columns"][0]["name"], "value");
+    assert_eq!(
+        json(&data)["data"],
+        serde_json::json!([["row-one"], ["row-two"]])
+    );
+    assert!(json(&data).get("error").is_none());
+    // The statement has original Root retention, not a newly acquired Window.
+    let window = data
+        ._window
+        .as_ref()
+        .expect("data retains its original author");
+    assert_eq!(window.class(), ResultWindowClass::Internal);
+    assert!(window.all_objects_bytes().is_err());
+    fixture.outcome(&entry).await;
+    assert!(fixture.captured().scope.check().is_ok());
+    assert_eq!(
+        fixture
+            .state
+            .host
+            .observation()
+            .snapshot()
+            .root_responsibilities,
+        1
+    );
+    assert_eq!(fixture.state.capacity.snapshot().held_positions, [0; 4]);
+    assert_eq!(fixture.state.completed.load(Ordering::Acquire), 0);
+    let token = next(&data);
+    let replay = get(&fixture.registry, &entry, 0).await;
+    assert!(Arc::ptr_eq(&data, &replay));
+    assert_eq!(bytes(&data), bytes(&replay));
+    drop(replay);
+    drop(data);
+    let terminal = get(&fixture.registry, &entry, token).await;
+    assert_eq!(json(&terminal)["stats"]["state"], "FINISHED");
+    assert!(json(&terminal).get("error").is_none());
+    fixture.assert_released().await;
+    fixture.registry.finalize().await;
+}
+
+#[tokio::test]
+async fn internal_root_page_backing_obeys_its_configured_budget_and_emits_rows() {
+    // An intentionally non-default finite budget detects a guessed V1 envelope.
+    let budget = 128 * 1024u64;
+    let host = WorkloadControl::try_new_counted(WorkloadConfig::default())
+        .unwrap()
+        .owner;
+    let capacity = host
+        .configure_result_capacity(ResultCapacityConfig {
+            all_objects_bytes: [budget; 4],
+            ..ResultCapacityConfig::V1
+        })
+        .unwrap();
+    host.mark_ready().unwrap();
+    let control = QueryControlService::new(Arc::new(QueryApplicationControl::new(
+        novarocks_types::FrontendProcessId::new_v7(),
+    )));
+    let lease = control
+        .register_session(SessionIdentity::new(
+            ClientConnectionToken::new(72, 1).unwrap(),
+            "root",
+        ))
+        .unwrap();
+    let mut owner = control
+        .begin_queued_governed_query_statement_with_result(
+            lease.token(),
+            &host.root_admission(),
+            None,
+            None,
+            None,
+            ResultWindowClass::Internal,
+        )
+        .await
+        .unwrap();
+    let window = owner.result_window_alias().unwrap();
+    assert!(window.all_objects_bytes().is_err());
+    let source_bytes = 17u64;
+    let columns_bytes = 113usize;
+    let source = crate::paging::ResultSourceBacking::Local {
+        retained_bytes: source_bytes,
+    };
+    // Refuse before allocation when source, metadata and framing leave no page.
+    assert!(PagePipeline::new(window.clone(), budget as usize, source).is_err());
+    let mut pipeline = PagePipeline::new(window, columns_bytes, source).unwrap();
+    let expected = budget as usize
+        - source_bytes as usize
+        - columns_bytes
+        - 2 * crate::paging::PAGE_ENVELOPE_RESERVE_BYTES;
+    assert_eq!(pipeline.row_limit(), expected);
+    assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    let error = pipeline
+        .append(BorrowedPayloadSpan {
+            starts_row: NonZeroU32::new((expected + 1).try_into().unwrap()),
+            bytes: b"",
+            completes_row: false,
+        })
+        .unwrap_err();
+    assert!(error.contains("exceeds the original result window"));
+    assert!(!pipeline.has_rows());
+    pipeline
+        .append(BorrowedPayloadSpan {
+            starts_row: NonZeroU32::new(3),
+            bytes: b"[7]",
+            completes_row: true,
+        })
+        .unwrap();
+    let (rows, count) = pipeline.take_rows().unwrap();
+    assert_eq!(rows.as_ref(), b"[7]");
+    assert_eq!(count, 1);
+    drop(rows);
+    drop(pipeline);
+    assert!(matches!(
+        owner.seal_success_visibility(),
+        novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome::Sealed
+    ));
+    owner.finish();
+    drop(lease);
+    assert_eq!(host.observation().snapshot().root_responsibilities, 0);
+    assert_eq!(capacity.snapshot().held_positions, [0; 4]);
 }

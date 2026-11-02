@@ -1,17 +1,21 @@
 -- query 4
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-04	54321	25	95
 
 -- query 5
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 CHINA	2022-01-02	23456	75	88
 
 -- query 6
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 UK	2022-01-04	54321	82	72
 
 -- query 7
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -47,6 +51,7 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 8
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-04	54321	25	95
@@ -55,12 +60,14 @@ JAPAN	2022-01-03	87654	125	67
 UK	2022-01-04	54321	82	72
 
 -- query 9
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-04	54321	25	95
 CHINA	2022-01-02	23456	75	88
 
 -- query 10
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	87654	125	7
 AFRICA	2022-01-02	98765	150	15
@@ -93,9 +100,11 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 11
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 12
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -132,6 +141,7 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 13
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	87654	125	7
 AFRICA	2022-01-02	98765	150	15
@@ -164,6 +174,7 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 14
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-04	54321	25	95
@@ -171,12 +182,15 @@ CHINA	2022-01-02	23456	75	88
 UK	2022-01-04	54321	82	72
 
 -- query 15
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 16
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 17
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -213,9 +227,11 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 18
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 19
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -252,9 +268,11 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 20
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 21
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -291,9 +309,11 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 22
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 23
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -330,6 +350,7 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 24
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -366,9 +387,11 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 25
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 26
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -405,6 +428,7 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 27
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -439,6 +463,7 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 28
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-04	23456	75	NULL
 JAPAN	2022-01-01	23456	75	NULL
@@ -448,6 +473,7 @@ USA	2022-01-01	87654	125	2
 USA	2022-01-03	54321	75	NULL
 
 -- query 29
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-04	23456	75	NULL
 JAPAN	2022-01-01	23456	75	NULL
@@ -455,21 +481,27 @@ USA	2022-01-01	12345	50	1
 USA	2022-01-03	54321	75	NULL
 
 -- query 30
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 31
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 32
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 33
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 34
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 35
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 USA	2022-01-01	12345	50	1
 USA	2022-01-01	87654	125	2
@@ -479,6 +511,7 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 36
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -509,6 +542,7 @@ UK	2022-01-04	67890	50	10
 UK	2022-01-04	98765	75	2
 
 -- query 37
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -539,6 +573,7 @@ UK	2022-01-04	67890	50	10
 UK	2022-01-04	98765	75	2
 
 -- query 38
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 USA	2022-01-01	12345	50	1
 USA	2022-01-01	87654	125	2
@@ -548,6 +583,7 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 39
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 USA	2022-01-01	12345	50	1
 USA	2022-01-01	87654	125	2
@@ -557,9 +593,11 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 40
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 41
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -596,18 +634,21 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 42
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-04	23456	75	NULL
 JAPAN	2022-01-01	23456	75	NULL
 USA	2022-01-03	54321	75	NULL
 
 -- query 43
+-- types	integer	bigint	bigint	bigint
 ship_mode	layer0	layer1	layer2
 75	0	0	1
 75	0	0	1
 75	0	0	1
 
 -- query 44
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -644,9 +685,11 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 45
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 46
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -683,6 +726,7 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 47
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -718,10 +762,12 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 48
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 USA	2022-01-01	12345	50	1
 
 -- query 49
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -757,12 +803,15 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 50
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 51
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 52
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -799,6 +848,7 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 53
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	87654	125	7
 AFRICA	2022-01-02	98765	150	15
@@ -816,6 +866,7 @@ USA	2022-01-01	87654	125	2
 USA	2022-01-01	98765	150	55
 
 -- query 54
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-02	87654	125	7
@@ -852,9 +903,11 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 55
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 
 -- query 56
+-- types	varchar	date	decimal(7, 0)	integer	integer
 region	order_date	income	ship_mode	ship_code
 AFRICA	2022-01-02	67890	50	100
 AFRICA	2022-01-04	23456	75	NULL
@@ -875,4 +928,5 @@ USA	2022-01-03	54321	25	5
 USA	2022-01-03	54321	75	NULL
 
 -- query 58
+-- types	varchar	varchar	varchar
 handling_department	handling_department_2	handling_department_3

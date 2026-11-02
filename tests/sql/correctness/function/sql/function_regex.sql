@@ -316,7 +316,7 @@ SELECT regexp_position(column_0, '01', 12, 2) FROM (VALUES ('2024-01-01T01:61:00
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
+-- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position(column_0, '(unclosed') FROM (VALUES ('oops')) AS tmp;
 
@@ -404,7 +404,7 @@ SELECT regexp_position('test', '[0-9]', 1, NULL);
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
+-- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position('test string', '[0-9');
 
@@ -412,7 +412,7 @@ SELECT regexp_position('test string', '[0-9');
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
+-- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position('test string', '(unclosed');
 
@@ -420,7 +420,7 @@ SELECT regexp_position('test string', '(unclosed');
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
+-- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position('test string', '?invalid');
 
@@ -428,7 +428,7 @@ SELECT regexp_position('test string', '?invalid');
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
+-- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position('test string', '*invalid');
 
@@ -436,7 +436,7 @@ SELECT regexp_position('test string', '*invalid');
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
+-- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position('test string', '+invalid');
 
@@ -444,7 +444,7 @@ SELECT regexp_position('test string', '+invalid');
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
+-- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
 SELECT regexp_position('test string', '\\');
 
@@ -541,7 +541,7 @@ select str, regex, regexp_count(str, regex) from tsc_invalid order by str, regex
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
+-- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
 select regexp_count('test string', '[0-9');
 
@@ -549,7 +549,7 @@ select regexp_count('test string', '[0-9');
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
+-- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
 select regexp_count('test string', '(unclosed');
 
@@ -557,7 +557,7 @@ select regexp_count('test string', '(unclosed');
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
+-- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
 select regexp_count('test string', '?invalid');
 
@@ -573,7 +573,7 @@ select regexp_count(NULL, '[0-9');
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
+-- @expect_error=[query.execution.invalid_data]
 USE ${case_db};
 select regexp_count('', '[0-9');
 

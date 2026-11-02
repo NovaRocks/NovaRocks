@@ -1,60 +1,75 @@
 -- query 5
+-- legacy
 map_size(map_agg(c1, c3))
 5
 
 -- query 6
+-- legacy
 map_agg(c1, c3)[1]
 11
 
 -- query 7
+-- legacy
 map_agg(c1, c3)[2]
 22
 
 -- query 8
+-- legacy
 map_agg(c1, c3)[3]
 33
 
 -- query 9
+-- legacy
 map_agg(c1, c3)[4]
 11
 
 -- query 10
+-- types	tinyint
 map_agg(c1, c3)[5]
 NULL
 
 -- query 11
+-- legacy
 map_size(map_agg(c5, c6))
 4
 
 -- query 12
+-- legacy
 map_agg(c5, c6)[1111]
 11111
 
 -- query 13
+-- legacy
 map_size(map_agg(c6, c10))
 4
 
 -- query 14
+-- legacy
 map_agg(c6, c10)[11111]
 2024-09-01 18:00:00
 
 -- query 15
+-- legacy
 map_agg(c6, c10)[22222]
 2024-09-02 11:00:00
 
 -- query 16
+-- legacy
 map_size(map_agg(c8, c5))
 4
 
 -- query 17
+-- legacy
 map_agg(c8, c5)[1.1]
 1111
 
 -- query 18
+-- legacy
 map_agg(c8, c5)[4.4]
 4444
 
 -- query 19
+-- legacy
 c11	res
 NULL	{}
 [1,2,3]	{"2024-09-01 18:00:00":[1,2,3]}
@@ -63,6 +78,7 @@ NULL	{}
 [7,7,5]	{"2024-09-04 12:00:00":[7,7,5]}
 
 -- query 20
+-- legacy
 c12	res
 NULL	{}
 {"key":5.5}	{"2024-09-01":{"key":5.5}}
@@ -71,6 +87,7 @@ NULL	{}
 {"key":666.6}	{"2024-09-03":{"key":666.6}}
 
 -- query 21
+-- legacy
 c13	res
 NULL	{}
 {"a":100,"b":"abc"}	{"2024-09-01":{"a":100,"b":"abc"}}
@@ -79,62 +96,77 @@ NULL	{}
 {"a":400,"b":"efdg"}	{"2024-09-04":{"a":400,"b":"efdg"}}
 
 -- query 23
+-- legacy
 map_size(map_agg(c1, c3))
 5
 
 -- query 24
+-- legacy
 map_agg(c1, c3)[1]
 11
 
 -- query 25
+-- legacy
 map_agg(c1, c3)[2]
 22
 
 -- query 26
+-- legacy
 map_agg(c1, c3)[3]
 33
 
 -- query 27
+-- legacy
 map_agg(c1, c3)[4]
 11
 
 -- query 28
+-- types	tinyint
 map_agg(c1, c3)[5]
 NULL
 
 -- query 29
+-- legacy
 map_size(map_agg(c5, c6))
 4
 
 -- query 30
+-- legacy
 map_agg(c5, c6)[1111]
 11111
 
 -- query 31
+-- legacy
 map_size(map_agg(c6, c10))
 4
 
 -- query 32
+-- legacy
 map_agg(c6, c10)[11111]
 2024-09-01 18:00:00
 
 -- query 33
+-- legacy
 map_agg(c6, c10)[22222]
 2024-09-02 11:00:00
 
 -- query 34
+-- legacy
 map_size(map_agg(c8, c5))
 4
 
 -- query 35
+-- legacy
 map_agg(c8, c5)[1.1]
 1111
 
 -- query 36
+-- legacy
 map_agg(c8, c5)[4.4]
 4444
 
 -- query 37
+-- legacy
 c11	res
 NULL	{}
 [1,2,3]	{"2024-09-01 18:00:00":[1,2,3]}
@@ -143,6 +175,7 @@ NULL	{}
 [7,7,5]	{"2024-09-04 12:00:00":[7,7,5]}
 
 -- query 38
+-- legacy
 c12	res
 NULL	{}
 {"key":5.5}	{"2024-09-01":{"key":5.5}}
@@ -151,6 +184,7 @@ NULL	{}
 {"key":666.6}	{"2024-09-03":{"key":666.6}}
 
 -- query 39
+-- legacy
 c13	res
 NULL	{}
 {"a":100,"b":"abc"}	{"2024-09-01":{"a":100,"b":"abc"}}

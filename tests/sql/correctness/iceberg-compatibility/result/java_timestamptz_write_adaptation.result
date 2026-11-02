@@ -1,8 +1,10 @@
 -- query 3
+-- types	integer	varchar	decimal(9, 2)	varchar	varchar
 id	instant	d	s	raw_hex
 1	2024-01-02 03:04:05.123456	12.34	東京	FF00
 2	NULL	NULL	NULL	NULL
 
 -- query 5
+-- types	integer
 id
 2

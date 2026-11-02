@@ -1,9 +1,11 @@
 -- query 8
+-- types	integer	integer
 id	k
 2	20
 4	40
 
 -- query 10
+-- types	integer	integer
 id	k
 2	20
 4	40

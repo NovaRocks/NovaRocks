@@ -1,3 +1,5 @@
+-- query 4
+-- types	varchar	bigint
 name	revenue
 apple	24
 carrot	14

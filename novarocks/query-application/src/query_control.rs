@@ -36,8 +36,14 @@ use novarocks_workload_control::{
 };
 
 // Design: ADR-0102 (docs/adr/ADR-0102-mysql-kill-connection-lifecycle-ownership.md)
+#[cfg(novarocks_dev_controls)]
+pub type ClientStatementRegistrationObserver =
+    Arc<dyn Fn(&ClientQueryId, SessionToken) + Send + Sync>;
+
 pub struct QueryApplicationControl {
     query_ids: crate::client_query_id::ClientQueryIdGenerator,
+    #[cfg(novarocks_dev_controls)]
+    client_statement_observer: std::sync::OnceLock<ClientStatementRegistrationObserver>,
     state: Mutex<QueryControlState>,
 }
 
@@ -50,14 +56,20 @@ struct QueryControlState {
     statement_sources: Box<[Option<Arc<crate::session_control::StatementActionSource>>]>,
     sessions: BTreeMap<ClientSessionKey, SessionEntry>,
     by_connection: BTreeMap<u32, ClientSessionKey>,
+    by_client_query: BTreeMap<ClientQueryId, ClientSessionKey>,
 }
 
 impl QueryControlState {
     fn remove_session(&mut self, key: ClientSessionKey) {
-        if let Some(entry) = self.sessions.remove(&key)
-            && let SessionOrigin::Connection(connection) = entry.origin
-        {
-            self.by_connection.remove(&connection.connection_id());
+        if let Some(entry) = self.sessions.remove(&key) {
+            match entry.origin {
+                SessionOrigin::Connection(connection) => {
+                    self.by_connection.remove(&connection.connection_id());
+                }
+                SessionOrigin::ClientStatement(query) => {
+                    self.by_client_query.remove(&query);
+                }
+            }
         }
     }
 }
@@ -211,8 +223,31 @@ impl QueryApplicationControl {
         Self {
             state: Mutex::new(QueryControlState::default()),
             query_ids: crate::client_query_id::ClientQueryIdGenerator::new(process),
+            #[cfg(novarocks_dev_controls)]
+            client_statement_observer: std::sync::OnceLock::new(),
         }
     }
+    /// Read the active session for this exact client statement without retaining it.
+    pub fn current_session_for_client_query(&self, query: &str) -> Option<SessionToken> {
+        let state = self.lock();
+        let key = state.by_client_query.get(query)?;
+        state
+            .sessions
+            .get(key)
+            .filter(|entry| !entry.unregister_pending)?;
+        Some(SessionToken::new(*key))
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub fn install_client_statement_observer(
+        &self,
+        observer: ClientStatementRegistrationObserver,
+    ) -> Result<(), String> {
+        self.client_statement_observer
+            .set(observer)
+            .map_err(|_| "client statement observer was already installed".into())
+    }
+
     pub fn session_geometry() -> QueryControlSessionGeometry {
         QueryControlSessionGeometry {
             owner: std::alloc::Layout::new::<Self>(),
@@ -523,6 +558,15 @@ impl QueryControlPort for QueryApplicationControl {
         }) {
             return Err(QueryControlError::ConnectionIdInUse);
         }
+        let client_query = match identity.origin() {
+            SessionOrigin::ClientStatement(query) => {
+                if state.by_client_query.contains_key(query) {
+                    return Err(QueryControlError::ClientQueryIdInUse);
+                }
+                Some(query.clone())
+            }
+            SessionOrigin::Connection(_) => None,
+        };
         state.next_session_key = state
             .next_session_key
             .checked_add(1)
@@ -532,6 +576,9 @@ impl QueryControlPort for QueryApplicationControl {
         let token = SessionToken::new(key);
         if let Some(connection) = connection {
             state.by_connection.insert(connection.connection_id(), key);
+        }
+        if let Some(query) = &client_query {
+            state.by_client_query.insert(query.clone(), key);
         }
         state.sessions.insert(
             key,
@@ -544,6 +591,15 @@ impl QueryControlPort for QueryApplicationControl {
                 registered_at: Instant::now(),
             },
         );
+        // Never call the consumer while holding the registry lock: the observer
+        // has its own journal and connection arming reads this same registry.
+        drop(state);
+        #[cfg(novarocks_dev_controls)]
+        if let Some(query) = &client_query
+            && let Some(observer) = self.client_statement_observer.get()
+        {
+            observer(query, token);
+        }
         Ok(token)
     }
 
@@ -965,6 +1021,64 @@ mod tests {
         control.unregister_session(requester);
         assert!(control.lock().sessions.is_empty());
         assert!(control.lock().by_connection.is_empty());
+    }
+
+    #[test]
+    fn client_query_session_lookup_tracks_exact_registration_and_removal() {
+        let control = QueryApplicationControl::default();
+        let query = control.mint_client_query_id();
+        assert!(
+            control
+                .current_session_for_client_query(query.as_str())
+                .is_none()
+        );
+        let token = control
+            .register_session(SessionIdentity::client_statement(query.clone(), "root"))
+            .unwrap();
+        assert_eq!(
+            control.current_session_for_client_query(query.as_str()),
+            Some(token)
+        );
+        assert_eq!(
+            control.register_session(SessionIdentity::client_statement(query.clone(), "root")),
+            Err(QueryControlError::ClientQueryIdInUse)
+        );
+        let statement = control.begin_statement(token).unwrap();
+        control.unregister_session(token);
+        assert!(
+            control
+                .current_session_for_client_query(query.as_str())
+                .is_none()
+        );
+        control.finish_statement(statement.token());
+        assert!(control.lock().by_client_query.is_empty());
+        assert!(control.lock().sessions.is_empty());
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn client_query_registration_notifies_before_first_statement_without_registry_lock() {
+        let control = Arc::new(QueryApplicationControl::default());
+        let original = Arc::downgrade(&control);
+        let observed = Arc::new(Mutex::new(None));
+        let slot = observed.clone();
+        control
+            .install_client_statement_observer(Arc::new(move |query, session| {
+                let control = original.upgrade().unwrap();
+                assert_eq!(
+                    control.current_session_for_client_query(query.as_str()),
+                    Some(session)
+                );
+                assert!(control.lock().sessions[&session.key()].active.is_none());
+                *slot.lock().unwrap() = Some((query.clone(), session));
+            }))
+            .unwrap();
+        let query = control.mint_client_query_id();
+        let token = control
+            .register_session(SessionIdentity::client_statement(query.clone(), "root"))
+            .unwrap();
+        assert_eq!(*observed.lock().unwrap(), Some((query, token)));
+        control.unregister_session(token);
     }
 
     #[test]

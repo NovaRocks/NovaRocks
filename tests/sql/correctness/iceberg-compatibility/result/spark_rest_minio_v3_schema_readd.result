@@ -1,3 +1,5 @@
+-- query 2
+-- types	bigint	varchar
 id	note
 1	NULL
 2	NULL

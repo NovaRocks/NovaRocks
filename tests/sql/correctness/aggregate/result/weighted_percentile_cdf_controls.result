@@ -1,27 +1,34 @@
 -- query 2
+-- types	bigint	bigint	bigint
 rows_seen	values_seen	weights_seen
 7	6	6
 
 -- query 3
+-- types	double
 p
 3.4000000953674316
 
 -- query 4
+-- types	array(double)
 p
-[2,2.6666667461395264,3.4000000953674316,4]
+[2.0,2.6666667461395264,3.4000000953674316,4.0]
 
 -- query 5
+-- types	boolean
 empty
-1
+true
 
 -- query 6
+-- types	boolean
 empty
-1
+true
 
 -- query 7
+-- types	boolean
 empty
-1
+true
 
 -- query 9
+-- types	double
 p
-1
+1.0

@@ -40,7 +40,7 @@ ci_init_summary_state() {
   CI_COMMIT_SHA=""
   CI_RUNTIME_CONFIG=""
   CI_SQL_CONFIG=""
-  CI_MYSQL_PORT=""
+  CI_TRINO_PORT=""
 }
 
 ci_set_repo_context() {
@@ -52,7 +52,7 @@ ci_set_repo_context() {
 ci_set_runtime_context() {
   CI_RUNTIME_CONFIG="$1"
   CI_SQL_CONFIG="$2"
-  CI_MYSQL_PORT="$3"
+  CI_TRINO_PORT="$3"
 }
 
 ci_rel_log() {
@@ -217,7 +217,7 @@ ci_render_summary() {
     printf -- "- Run dir: %s\n" "$CI_RUN_DIR"
     printf -- "- Runtime config: %s\n" "${CI_RUNTIME_CONFIG:-unknown}"
     printf -- "- SQL config: %s\n" "${CI_SQL_CONFIG:-unknown}"
-    printf -- "- MySQL port: %s\n\n" "${CI_MYSQL_PORT:-unknown}"
+    printf -- "- Trino port: %s\n\n" "${CI_TRINO_PORT:-unknown}"
 
     printf "## Stages\n\n"
     printf "| Stage | Status | Duration | Log |\n"

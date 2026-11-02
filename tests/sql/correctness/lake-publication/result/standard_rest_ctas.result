@@ -1,14 +1,17 @@
 -- query 6
+-- types	integer	varchar
 id	value
 1	alpha
 2	beta
 3	gamma
 
 -- query 8
+-- types	bigint
 n
 3
 
 -- query 11
+-- types	bigint	bigint
 id	k
 2	20
 3	30

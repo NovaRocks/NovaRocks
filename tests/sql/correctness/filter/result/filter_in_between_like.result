@@ -1,3 +1,5 @@
+-- query 4
+-- types	integer	varchar	integer
 id	name	score
 1	apple	12
 2	apricot	20

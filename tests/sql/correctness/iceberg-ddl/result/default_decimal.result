@@ -1,9 +1,11 @@
 -- query 7
+-- types	integer	varchar	decimal(10, 2)	decimal(5, 4)	decimal(20, 6)
 id	name	price	rate	big
 1	alice	9.99	0.1234	123456789.000001
 2	bob	9.99	0.1234	123456789.000001
 
 -- query 9
+-- types	integer	varchar	decimal(10, 2)	decimal(5, 4)	decimal(20, 6)
 id	name	price	rate	big
 1	alice	9.99	0.1234	123456789.000001
 2	bob	9.99	0.1234	123456789.000001

@@ -461,7 +461,6 @@ impl AuthorizedJob {
                 "target_session_id": nomination.target_session_id,
                 "statement_run_token": nomination.statement_run_token,
                 "frontend_process_id": nomination.frontend_process_id,
-                "connection_id": nomination.connection_id,
                 "session_key": nomination.session_key,
                 "statement_generation": nomination.statement_generation,
             },
@@ -672,7 +671,6 @@ mod tests {
                 target_session_id: "maintenance-session".into(),
                 statement_run_token: "selected-statement".into(),
                 frontend_process_id: process.to_string(),
-                connection_id: 17,
                 session_key: 3,
                 statement_generation: 2,
             };
@@ -690,7 +688,6 @@ mod tests {
                 target_launch_id: self.role.scope().launch_id().into(),
                 statement_run_token: self.nomination.statement_run_token.clone(),
                 frontend_process_id: self.nomination.frontend_process_id.clone(),
-                connection_id: self.nomination.connection_id,
                 session_key: self.nomination.session_key,
                 sql_sha256: sha2::Sha256::digest(b"ALTER TABLE orders OPTIMIZE").into(),
             }
@@ -969,13 +966,11 @@ mod tests {
         controls.pin_statement_input(&original).unwrap();
         let mut client = original.clone();
         client.session_key += 1;
-        let mut connection = original.clone();
-        connection.connection_id += 1;
         let mut sql = original.clone();
         sql.sql_sha256[0] ^= 0xff;
         let mut launch = original.clone();
         launch.target_launch_id = "foreign-launch".into();
-        for replacement in [client, connection, sql, launch] {
+        for replacement in [client, sql, launch] {
             assert!(controls.pin_statement_input(&replacement).is_err());
             assert!(
                 controls

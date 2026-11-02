@@ -1,2 +1,4 @@
+-- query 1
+-- types	time(6)	varchar	time(6)	time(6)	time(6)
 t0	t25	t_dt_literal	t_from_datetime	t_from_date
-00:00:00	25:00:00	NULL	01:01:01	00:00:00
+00:00:00.000000	25:00:00	NULL	01:01:01.000000	00:00:00.000000

@@ -28,7 +28,7 @@ use axum::response::IntoResponse;
 use axum::{Json, Router, routing::get};
 
 use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader;
-use crate::topology::{BackendIslandSnapshot, BackendIslandSnapshotReader};
+use crate::topology::{BackendIslandSnapshot, BackendIslandSnapshotReader, BackendTopologyRow};
 use crate::workload_lifecycle::{
     FrontendCatalogServingSnapshot, FrontendDrainServingSnapshot, FrontendServingSnapshot,
     FrontendServingSnapshotReader, FrontendWorkloadServingSnapshot,
@@ -71,6 +71,26 @@ struct FrontendIslandManagementSnapshot {
     other_island_backend_count: usize,
     unknown_or_invalid_backend_count: usize,
     ready: bool,
+}
+
+/// The management and SQL exits consume the same typed topology rows.
+#[derive(serde::Serialize)]
+struct FrontendBackendsSnapshot {
+    schema_version: u8,
+    backends: Vec<BackendTopologyRow>,
+}
+
+async fn frontend_backends(
+    State(state): State<FrontendManagementState>,
+) -> axum::response::Response {
+    match state.island_reader.backend_rows() {
+        Ok(backends) => Json(FrontendBackendsSnapshot {
+            schema_version: 1,
+            backends,
+        })
+        .into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    }
 }
 
 impl FrontendManagementSnapshot {
@@ -339,6 +359,7 @@ pub(crate) fn frontend_management_router_with_readers(
         .route("/readyz", get(readyz))
         .route("/island-readyz", get(island_readyz))
         .route("/v1/frontend/state", get(frontend_state))
+        .route("/v1/frontend/backends", get(frontend_backends))
         .route("/v1/memory/authority", get(memory_authority_snapshot))
         .route("/v1/catalogs/activity", get(catalog_activity_snapshot));
     #[cfg(novarocks_dev_controls)]
@@ -587,6 +608,10 @@ mod tests {
         fn backend_island_snapshot(&self) -> BackendIslandSnapshot {
             *self.snapshot.read().expect("test island reader lock")
         }
+
+        fn backend_rows(&self) -> Result<Vec<crate::topology::BackendTopologyRow>, String> {
+            Ok(Vec::new())
+        }
     }
 
     fn island_snapshot(
@@ -636,6 +661,181 @@ mod tests {
             #[cfg(novarocks_dev_controls)]
             None,
         )
+    }
+
+    #[test]
+    fn management_backend_projection_matches_show_backends() {
+        use novarocks_execution::task_execution::AdmissionEpochCapability;
+        use novarocks_execution_contract::{
+            BackendProcessDescriptor, BackendReportedState, RuntimeEndpoint,
+        };
+        use novarocks_query_application::api::BackendTopologyCommandPort;
+        use novarocks_types::{BackendProcessId, NativeCompatibilityId};
+
+        let service = Arc::new(crate::topology::ClusterBackendService::new_transient_for_test(1));
+        let descriptor = BackendProcessDescriptor::try_new(
+            BackendProcessId::new_v7(),
+            RuntimeEndpoint::new("127.0.0.1", 9070).unwrap(),
+            RuntimeEndpoint::new("127.0.0.1", 9071).unwrap(),
+            "test",
+            "management-build",
+            NativeCompatibilityId::new([0x71; 32]),
+            4096,
+        )
+        .unwrap();
+        service
+            .record_announce(descriptor.clone(), BackendReportedState::Running)
+            .unwrap();
+        service.record_heartbeat_success(
+            descriptor.process_id(),
+            descriptor.clone(),
+            BackendReportedState::Running,
+            2,
+            AdmissionEpochCapability::try_from_bytes([0x61; 16]).unwrap(),
+            17,
+        );
+        let sql = service.show_backends().expect("SHOW BACKENDS");
+        let app = frontend_management_router_with_readers(
+            FrontendMetricsRegistry::new().unwrap(),
+            Arc::new(FrontendServingLifecycle::new()),
+            service.clone(),
+            None,
+            test_memory_authority(),
+            None,
+            false,
+            #[cfg(novarocks_dev_controls)]
+            None,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let json: serde_json::Value = runtime.block_on(async {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/frontend/backends")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        });
+        assert_eq!(json["schema_version"], 1);
+        let backends = json["backends"].as_array().expect("backend rows");
+        assert_eq!(backends.len(), 1);
+        let backend = &backends[0];
+        let fields = [
+            "process_id",
+            "endpoint",
+            "lease_valid",
+            "identity_verified",
+            "reported_state",
+            "compatible",
+            "endpoint_owned",
+            "eligible",
+            "scheduled_fragments",
+            "last_announce_ms",
+            "last_heartbeat_ms",
+            "build_identity",
+            "native_compatibility_id",
+            "diagnostic_status",
+            "status_detail",
+        ];
+        assert_eq!(backend.as_object().unwrap().len(), fields.len());
+        for (index, field) in fields.iter().enumerate() {
+            let actual = &backend[field];
+            let text = actual
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| actual.to_string());
+            let sql_column = sql.batches[0]
+                .column(index)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            assert_eq!(text, sql_column.value(0), "field {field}");
+        }
+        assert_eq!(backend["process_id"], descriptor.process_id().to_string());
+        assert_eq!(backend["eligible"], true);
+        assert_eq!(backend["last_heartbeat_ms"], 17);
+    }
+
+    #[test]
+    fn backend_management_does_not_serve_frontend_topology() {
+        use novarocks_native_adapter::management_http::{MetricsHttpServer, RoleMetricsRenderer};
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        struct BackendMetrics;
+        impl RoleMetricsRenderer for BackendMetrics {
+            fn render_prometheus(&self) -> Result<String, String> {
+                Ok(String::new())
+            }
+            fn render_json(&self) -> Result<String, String> {
+                Ok("{}".to_string())
+            }
+        }
+        let server = MetricsHttpServer::start("127.0.0.1", 0, Arc::new(BackendMetrics))
+            .expect("backend management listener");
+        let response = (|| -> std::io::Result<String> {
+            let mut stream =
+                TcpStream::connect_timeout(&server.bound_addr(), Duration::from_secs(5))?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            stream.write_all(b"GET /v1/frontend/backends HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+            let mut response = String::new();
+            stream.read_to_string(&mut response)?;
+            Ok(response)
+        })();
+        server.stop().expect("backend management actual exit");
+        let response = response.expect("backend management response");
+        assert!(response.starts_with("HTTP/1.1 404"), "{response:?}");
+    }
+
+    #[tokio::test]
+    async fn management_backend_projection_reports_uninstalled_owner() {
+        let app = frontend_management_router_with_readers(
+            FrontendMetricsRegistry::new().unwrap(),
+            Arc::new(FrontendServingLifecycle::new()),
+            Arc::new(crate::topology::LateBoundBackendIslandSnapshotReader::new(
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            )),
+            None,
+            test_memory_authority(),
+            None,
+            false,
+            #[cfg(novarocks_dev_controls)]
+            None,
+        );
+        let mutation = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/frontend/backends")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mutation.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/frontend/backends")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     struct ActivityCatalogPort {

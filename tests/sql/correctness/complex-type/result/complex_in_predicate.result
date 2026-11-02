@@ -1,4 +1,5 @@
 -- query 2
+-- legacy
 js IN ((parse_json('{}')), (json_object('a', 1)))
 NULL
 NULL
@@ -15,6 +16,7 @@ NULL
 1
 
 -- query 3
+-- legacy
 js NOT IN ((parse_json('{}')), (json_object('a', 1)))
 NULL
 NULL
@@ -31,6 +33,7 @@ NULL
 1
 
 -- query 4
+-- legacy
 (parse_json('{}')) IN (js, (json_object('a', 1)))
 NULL
 NULL
@@ -47,6 +50,7 @@ NULL
 1
 
 -- query 5
+-- legacy
 (parse_json('{}')) NOT IN (js, (json_object('a', 1)))
 NULL
 NULL
@@ -63,6 +67,7 @@ NULL
 1
 
 -- query 6
+-- legacy
 js IN (NULL, (json_object('a', 1)))
 NULL
 NULL
@@ -79,6 +84,7 @@ NULL
 1
 
 -- query 7
+-- legacy
 js NOT IN (NULL)
 NULL
 NULL
@@ -95,6 +101,7 @@ NULL
 NULL
 
 -- query 8
+-- legacy
 NULL IN (js, (json_object('a', 1)))
 NULL
 NULL
@@ -111,6 +118,7 @@ NULL
 NULL
 
 -- query 9
+-- legacy
 NULL NOT IN (js, (json_object('a', 3)))
 NULL
 NULL
@@ -127,6 +135,7 @@ NULL
 NULL
 
 -- query 10
+-- legacy
 js IN (1, 3, (json_object('a', 2)))
 NULL
 NULL
@@ -143,6 +152,7 @@ NULL
 0
 
 -- query 11
+-- legacy
 js NOT IN (2, 3)
 NULL
 NULL
@@ -159,6 +169,7 @@ NULL
 1
 
 -- query 12
+-- legacy
 js IN (1, 3, v1, (json_object('a', 11)))
 NULL
 NULL
@@ -175,6 +186,7 @@ NULL
 0
 
 -- query 13
+-- legacy
 js NOT IN (2, 3, v1)
 NULL
 NULL
@@ -191,6 +203,7 @@ NULL
 1
 
 -- query 14
+-- legacy
 js IN ((json_object('a', 1)), (json_object('ab', 12, 'bc', 4)), (json_object('ab', 14)), (json_object('ac', 15, '6b', 46)))
 NULL
 NULL
@@ -207,6 +220,7 @@ NULL
 1
 
 -- query 15
+-- legacy
 js NOT IN ((json_object('a', 1)), (json_object('ab', 13, 'b', 4)))
 NULL
 NULL
@@ -223,6 +237,7 @@ NULL
 1
 
 -- query 16
+-- legacy
 js NOT IN (((SELECT js FROM db_sqlt_e256605e5d30a5a8.sc2 WHERE v1 > 3)))
 0
 0
@@ -239,6 +254,7 @@ NULL
 NULL
 
 -- query 17
+-- legacy
 js IN (((SELECT js FROM db_sqlt_e256605e5d30a5a8.sc2 WHERE v1 > 3)))
 1
 1
@@ -255,6 +271,7 @@ NULL
 1
 
 -- query 18
+-- legacy
 array1 IN (([]), ([1]))
 NULL
 0
@@ -271,6 +288,7 @@ NULL
 1
 
 -- query 19
+-- legacy
 array1 NOT IN (([]), ([1]))
 NULL
 1
@@ -287,6 +305,7 @@ NULL
 0
 
 -- query 20
+-- legacy
 array1 IN (([NULL]), ([]))
 NULL
 0
@@ -303,6 +322,7 @@ NULL
 1
 
 -- query 21
+-- legacy
 array1 NOT IN (([NULL]), ([3]))
 NULL
 1
@@ -319,6 +339,7 @@ NULL
 1
 
 -- query 22
+-- legacy
 array1 IN (([1, NULL, 2]), ([]))
 NULL
 0
@@ -335,6 +356,7 @@ NULL
 1
 
 -- query 23
+-- legacy
 array1 NOT IN (([1, NULL, 2]), ([]))
 NULL
 1
@@ -351,6 +373,7 @@ NULL
 0
 
 -- query 24
+-- legacy
 ([]) IN (array1)	([]) NOT IN (array1)	([NULL]) IN (array1)	([NULL]) NOT IN (array1)	([]) IN (array2)	([]) NOT IN (array2)	([NULL]) IN (array2)	([NULL]) NOT IN (array2)	([]) IN (array3)	([]) NOT IN (array3)	([NULL]) IN (array3)	([NULL]) NOT IN (array3)
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
@@ -367,6 +390,7 @@ NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
 1	0	0	1	0	1	NULL	NULL	0	1	NULL	NULL
 
 -- query 25
+-- legacy
 array2 IN (([]), ([map{}]))	array2 IN (([NULL]), ([map{1:3}]))	array2 IN (([map{1:10,3:30,2:20}]), ([map{}]))
 NULL	NULL	NULL
 0	0	0
@@ -383,6 +407,7 @@ NULL	NULL	NULL
 1	0	1
 
 -- query 26
+-- legacy
 array2 NOT IN (([]), ([map{}]))	array2 NOT IN (([NULL]), ([map{1:3}]))	array2 NOT IN (([map{1:10,3:30,2:20}]), ([map{3:3}]))
 NULL	NULL	NULL
 0	1	1
@@ -399,6 +424,7 @@ NULL	NULL	NULL
 1	1	1
 
 -- query 27
+-- legacy
 array3 IN (([]))	array3 NOT IN (([]))	array3 IN (([NULL]))	array3 NOT IN (([NULL]))	array3 IN (([row(1, 2)]), ([NULL]))	array3 NOT IN (([row(1, 2)]), ([NULL]))
 NULL	NULL	NULL	NULL	NULL	NULL
 0	1	NULL	NULL	0	1
@@ -415,6 +441,7 @@ NULL	NULL	NULL	NULL	NULL	NULL
 1	0	0	1	0	1
 
 -- query 28
+-- legacy
 array1 IN (NULL)	array1 NOT IN (NULL)	array2 IN (NULL)	array2 NOT IN (NULL)	array3 IN (NULL)	array3 NOT IN (NULL)
 NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	NULL
@@ -431,6 +458,7 @@ NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	NULL
 
 -- query 29
+-- legacy
 NULL IN (array1)	NULL NOT IN (array1)	NULL IN (array2)	NULL NOT IN (array2)	NULL IN (array3)	NULL NOT IN (array3)
 NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	NULL
@@ -447,6 +475,7 @@ NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	NULL
 
 -- query 32
+-- legacy
 map1 IN ((map{}))	map1 NOT IN ((map{}))	map2 IN ((map{}))	map2 NOT IN ((map{}))	map3 IN ((map{}))	map3 NOT IN ((map{}))
 NULL	NULL	NULL	NULL	NULL	NULL
 0	1	0	1	1	0
@@ -463,6 +492,7 @@ NULL	NULL	NULL	NULL	NULL	NULL
 1	0	0	1	0	1
 
 -- query 33
+-- legacy
 map1 IN (NULL)	map1 NOT IN (NULL)	map2 IN (NULL)	map2 NOT IN (NULL)	map3 IN (NULL)	map3 NOT IN (NULL)
 NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	NULL
@@ -479,6 +509,7 @@ NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	NULL
 
 -- query 34
+-- legacy
 NULL IN (map1)	NULL NOT IN (map1)	NULL IN (map2)	NULL NOT IN (map2)	NULL IN (map3)	NULL NOT IN (map3)
 NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	NULL
@@ -495,6 +526,7 @@ NULL	NULL	NULL	NULL	NULL	NULL
 NULL	NULL	NULL	NULL	NULL	NULL
 
 -- query 35
+-- legacy
 (map{}) IN (map1)	(map{}) NOT IN (map1)	(map{}) IN (map2)	(map{}) NOT IN (map2)	(map{}) IN (map3)	(map{}) NOT IN (map3)
 NULL	NULL	NULL	NULL	NULL	NULL
 0	1	0	1	0	1
@@ -511,6 +543,7 @@ NULL	NULL	NULL	NULL	NULL	NULL
 1	0	0	1	0	1
 
 -- query 36
+-- legacy
 map1 IN ((map{1:10,2:20,4:40}), (map{}))	map2 IN ((map{2:[2, 3, 4],1:[1, 2, 3]}), (map{2:[2, 3, 4],1:[1, 22, 3]}))	map3 NOT IN ((map{2:row(2, 4),1:row(1, 2)}), (map{2:row(2, 4),1:row(1, 22)}))
 NULL	NULL	NULL
 0	0	1
@@ -527,6 +560,7 @@ NULL	NULL	NULL
 1	0	1
 
 -- query 37
+-- legacy
 map2 NOT IN ((map{2:[2, 3, 4],1:[1, 2, 3]}), NULL)	map3 IN ((map{2:row(2, 4),1:row(1, 2)}), NULL)
 NULL	NULL
 NULL	NULL
@@ -543,6 +577,7 @@ NULL	1
 0	1
 
 -- query 38
+-- legacy
 map2 IN ((map{1:[1, 2, NULL],2:[2, 4, NULL]}), (map{2:[2, 3, 4],1:[1, 2, 3]}))
 NULL
 0
@@ -559,6 +594,7 @@ NULL
 1
 
 -- query 39
+-- legacy
 map2 NOT IN ((map{1:[1, 2, NULL],2:[2, 4, NULL]}), (map{2:[2, 3, 4],1:[1, 2, 3]}))
 NULL
 0
@@ -575,6 +611,7 @@ NULL
 1
 
 -- query 40
+-- legacy
 map1 IN ((map{'a':'b'}))
 NULL
 0
@@ -591,6 +628,7 @@ NULL
 0
 
 -- query 41
+-- legacy
 map2 IN ((map{'2':[3]}))
 NULL
 0
@@ -607,6 +645,7 @@ NULL
 0
 
 -- query 43
+-- legacy
 st1 IN (NULL)	st1 NOT IN (NULL)
 NULL	NULL
 NULL	NULL
@@ -623,6 +662,7 @@ NULL	NULL
 NULL	NULL
 
 -- query 44
+-- legacy
 NULL IN (st1)	NULL NOT IN (st1)
 NULL	NULL
 NULL	NULL
@@ -639,6 +679,7 @@ NULL	NULL
 NULL	NULL
 
 -- query 47
+-- legacy
 st1 IN ((row(1, [2, 1, 3], map{1:1,2:2}, row(3, 2))), (row(12, [2, NULL, 3], map{11:1,2:2}, row(31, 2))))
 NULL
 0
@@ -655,6 +696,7 @@ NULL
 1
 
 -- query 48
+-- legacy
 st1 NOT IN ((row(1, [2, 1, 3], map{1:1,2:2}, row(3, 2))), (row(12, [2, NULL, 3], map{11:1,2:2}, row(31, 2))))
 NULL
 0
@@ -671,6 +713,7 @@ NULL
 1
 
 -- query 49
+-- legacy
 st1 IN ((row(1, [2, 1, NULL], map{1:1,2:2}, row(1, 2))), (row(1, [2, 1, 3], map{1:1,2:2}, row(3, 2))))
 NULL
 0
@@ -687,6 +730,7 @@ NULL
 1
 
 -- query 50
+-- legacy
 st1 NOT IN ((row(1, [2, 1, 3], map{1:1,2:2}, row(1, 2))), (row(1, [2, 1, 3], map{1:1,2:2}, row(3, 2))))
 NULL
 0

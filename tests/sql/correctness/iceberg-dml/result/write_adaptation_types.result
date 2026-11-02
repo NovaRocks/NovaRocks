@@ -1,4 +1,5 @@
 -- query 2
+-- legacy
 id	raw_hex	code	label	first_hex	second_is_null	array_count	map_hex	map_count	third_string	d1	d9	d18	d38
 1	FF00	7	東京	00FF	1	2	FF00	1	東京	9	1234567.89	1234567890123456.78	123456789012345678901234567890123456.78
 2	NULL	NULL	NULL	NULL	1	0	NULL	0	NULL	NULL	NULL	NULL	NULL

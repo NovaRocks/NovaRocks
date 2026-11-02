@@ -1,4 +1,5 @@
 -- query 1
+-- types	integer	tinyint	smallint	integer
 id	t	age	i
 -129	NULL	-129	-129
 -128	-128	-128	-128
@@ -8,33 +9,41 @@ id	t	age	i
 32768	NULL	NULL	32768
 
 -- query 2
+-- types	varchar	varchar	varchar	bigint	bigint	bigint	bigint	bigint	bigint
 tiny_type	age_type	int_type	tiny_count	age_count	int_count	tiny_sum	age_sum	int_sum
 tinyint	smallint	int	2	5	6	-1	32765	65533
 
 -- query 3
+-- types	tinyint	smallint	tinyint	smallint
 tiny_overflow	small_overflow	tiny_min	small_min
 NULL	NULL	-128	-32768
 
 -- query 4
+-- types	integer
 id
 127
 
 -- query 5
+-- types	integer
 id
 32767
 
 -- query 6
+-- types	varchar	varchar	bigint	bigint
 renamed_type	reused_name_type	tiny_count	new_count
 tinyint	int	2	0
 
 -- query 8
+-- types	varchar	bigint	bigint
 tiny_type	widened_sum	tiny_count
 tinyint	-1	2
 
 -- query 10
+-- types	varchar	bigint	bigint
 tiny_type	tiny_sum	tiny_count
 tinyint	-1	2
 
 -- query 11
+-- types	varchar	bigint
 wide_type	wide_count
 bigint	0

@@ -1,14 +1,17 @@
 -- query 10
+-- types	varchar	bigint	bigint
 region	s	c
 east	1800	400
 north	1800	400
 west	1800	400
 
 -- query 12
+-- types	varchar	varchar	bigint
 region	day	s
 east	d1	800
 east	d2	1000
 
 -- query 14
+-- types	bigint
 c
 0

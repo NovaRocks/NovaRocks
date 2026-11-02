@@ -1,4 +1,5 @@
 -- query 5
+-- legacy
 array_contains([1, 2, 3, 4], 1)
 1
 1
@@ -12,6 +13,7 @@ array_contains([1, 2, 3, 4], 1)
 1
 
 -- query 6
+-- legacy
 array_position([1, 2, 3, 4], 1)
 1
 1
@@ -25,6 +27,7 @@ array_position([1, 2, 3, 4], 1)
 1
 
 -- query 7
+-- legacy
 array_contains([1, 2, 3, 4], NULL)
 0
 0
@@ -38,6 +41,7 @@ array_contains([1, 2, 3, 4], NULL)
 0
 
 -- query 8
+-- legacy
 array_position([1, 2, 3, 4], NULL)
 0
 0
@@ -51,6 +55,7 @@ array_position([1, 2, 3, 4], NULL)
 0
 
 -- query 9
+-- legacy
 array_contains([1, 2, 3, NULL], NULL)
 1
 1
@@ -64,6 +69,7 @@ array_contains([1, 2, 3, NULL], NULL)
 1
 
 -- query 10
+-- legacy
 array_position([1, 2, 3, NULL], NULL)
 4
 4
@@ -77,6 +83,7 @@ array_position([1, 2, 3, NULL], NULL)
 4
 
 -- query 11
+-- legacy
 array_contains(NULL, NULL)
 NULL
 NULL
@@ -90,6 +97,7 @@ NULL
 NULL
 
 -- query 12
+-- legacy
 array_position(NULL, NULL)
 NULL
 NULL
@@ -103,110 +111,137 @@ NULL
 NULL
 
 -- query 14
+-- legacy
 sum(array_contains(array_generate(1000), pk))
 1000
 
 -- query 15
+-- legacy
 sum(array_contains(array_generate(1000), 100))
 1001
 
 -- query 16
+-- legacy
 sum(array_position(array_generate(1000), pk))
 500500
 
 -- query 17
+-- legacy
 sum(array_position(array_generate(1000), 100))
 100100
 
 -- query 18
+-- legacy
 sum(array_contains(array_append(array_generate(1000), NULL), pk))
 1000
 
 -- query 19
+-- legacy
 sum(array_contains(array_append(array_generate(1000), NULL), NULL))
 1001
 
 -- query 20
+-- legacy
 sum(array_contains(arr_bigint, 100))
 2
 
 -- query 21
+-- legacy
 sum(array_position(arr_bigint, 100))
 101
 
 -- query 22
+-- legacy
 sum(array_contains(arr_str, md5sum(100)))
 1
 
 -- query 23
+-- legacy
 sum(array_position(arr_str, md5sum(100)))
 1
 
 -- query 24
+-- legacy
 sum(array_contains(arr_decimal, pk))
 1000
 
 -- query 25
+-- legacy
 sum(array_position(arr_decimal, pk))
 1000
 
 -- query 26
+-- legacy
 sum(array_contains(arr_decimal, 100))
 2
 
 -- query 27
+-- legacy
 sum(array_position(arr_decimal, 100))
 101
 
 -- query 29
+-- legacy
 sum(array_contains(array_repeat('abcdefg', 10000), 'abcdefg'))
 1001
 
 -- query 30
+-- legacy
 sum(array_contains(array_repeat('abcdefg', 10000), str))
 0
 
 -- query 33
+-- legacy
 array_contains(v1, 1.1)
 1
 
 -- query 34
+-- legacy
 array_contains(v2, [1.1])
 1
 
 -- query 35
+-- legacy
 array_contains(v3, [[1.1]])
 1
 
 -- query 36
+-- legacy
 array_contains(v2, v1)
 1
 
 -- query 37
+-- legacy
 array_contains(v3, v2)
 1
 
 -- query 38
+-- legacy
 array_position(v1, 1.1)
 1
 
 -- query 39
+-- legacy
 array_position(v2, [1.1])
 1
 
 -- query 40
+-- legacy
 array_position(v3, [[1.1]])
 1
 
 -- query 41
+-- legacy
 array_position(v2, v1)
 1
 
 -- query 42
+-- legacy
 array_position(v3, v2)
 1
 
 -- query 45
+-- legacy
 array_contains_all(arr_0, arr_1)
 1
 1
@@ -219,6 +254,7 @@ NULL
 1
 
 -- query 46
+-- legacy
 array_contains_all(arr_1, arr_0)
 0
 0
@@ -231,6 +267,7 @@ NULL
 1
 
 -- query 47
+-- legacy
 array_contains_all(arr_0, arr_2)
 1
 1
@@ -243,6 +280,7 @@ NULL
 1
 
 -- query 48
+-- legacy
 array_contains_all(arr_2, arr_0)
 0
 0
@@ -255,6 +293,7 @@ NULL
 0
 
 -- query 49
+-- legacy
 array_contains_all(arr_1, arr_2)
 1
 1
@@ -267,6 +306,7 @@ NULL
 1
 
 -- query 50
+-- legacy
 array_contains_all(arr_2, arr_1)
 0
 0
@@ -279,6 +319,7 @@ NULL
 0
 
 -- query 51
+-- legacy
 array_contains_all([1, 2, 3, 4], arr_0)
 1
 0
@@ -291,6 +332,7 @@ array_contains_all([1, 2, 3, 4], arr_0)
 0
 
 -- query 52
+-- legacy
 array_contains_all([1, 2, 3, 4], arr_1)
 1
 0
@@ -303,6 +345,7 @@ NULL
 0
 
 -- query 53
+-- legacy
 array_contains_all([1, 2, 3, 4, NULL], arr_1)
 1
 1
@@ -315,6 +358,7 @@ NULL
 1
 
 -- query 54
+-- legacy
 array_contains_all(arr_0, [1, NULL])
 0
 1
@@ -327,6 +371,7 @@ array_contains_all(arr_0, [1, NULL])
 1
 
 -- query 55
+-- legacy
 array_contains_all(arr_0, [])
 1
 1
@@ -339,6 +384,7 @@ array_contains_all(arr_0, [])
 1
 
 -- query 56
+-- legacy
 array_contains_all(NULL, arr_0)
 NULL
 NULL
@@ -351,6 +397,7 @@ NULL
 NULL
 
 -- query 57
+-- legacy
 array_contains_all(arr_1, NULL)
 NULL
 NULL
@@ -363,18 +410,22 @@ NULL
 NULL
 
 -- query 60
+-- legacy
 array_contains_all(array_repeat('abcdefg', 1000), array_repeat('abcdef', 2000))
 0
 
 -- query 63
+-- legacy
 array_contains_all(array_generate(1000), array_generate(2000))
 0
 
 -- query 64
+-- legacy
 array_contains_all(array_generate(2000), array_generate(1000))
 1
 
 -- query 65
+-- legacy
 array_contains_seq(arr_0, arr_1)
 1
 0
@@ -387,6 +438,7 @@ NULL
 1
 
 -- query 66
+-- legacy
 array_contains_seq(arr_1, arr_0)
 0
 0
@@ -399,6 +451,7 @@ NULL
 0
 
 -- query 67
+-- legacy
 array_contains_seq(arr_0, arr_2)
 1
 1
@@ -411,6 +464,7 @@ NULL
 1
 
 -- query 68
+-- legacy
 array_contains_seq(arr_2, arr_0)
 0
 0
@@ -423,6 +477,7 @@ NULL
 0
 
 -- query 69
+-- legacy
 array_contains_seq(arr_1, arr_2)
 1
 1
@@ -435,6 +490,7 @@ NULL
 1
 
 -- query 70
+-- legacy
 array_contains_seq(arr_2, arr_1)
 0
 0
@@ -447,6 +503,7 @@ NULL
 0
 
 -- query 71
+-- legacy
 array_contains_seq([1, 2, 3, 4], arr_0)
 1
 0
@@ -459,6 +516,7 @@ array_contains_seq([1, 2, 3, 4], arr_0)
 0
 
 -- query 72
+-- legacy
 array_contains_seq([1, 2, 3, 4], arr_1)
 1
 0
@@ -471,6 +529,7 @@ NULL
 0
 
 -- query 73
+-- legacy
 array_contains_seq([1, 2, 3, 4, NULL], arr_1)
 1
 0
@@ -483,6 +542,7 @@ NULL
 0
 
 -- query 74
+-- legacy
 array_contains_seq(arr_0, [1, NULL])
 0
 0
@@ -495,6 +555,7 @@ array_contains_seq(arr_0, [1, NULL])
 1
 
 -- query 75
+-- legacy
 array_contains_seq(arr_0, [])
 1
 1
@@ -507,6 +568,7 @@ array_contains_seq(arr_0, [])
 1
 
 -- query 76
+-- legacy
 array_contains_seq(NULL, arr_0)
 NULL
 NULL
@@ -519,6 +581,7 @@ NULL
 NULL
 
 -- query 77
+-- legacy
 array_contains_seq(arr_1, NULL)
 NULL
 NULL
@@ -531,50 +594,62 @@ NULL
 NULL
 
 -- query 78
+-- legacy
 array_contains_seq([1, 1, 2, 3], [1, 1])
 1
 
 -- query 79
+-- legacy
 array_contains_seq([1, 1, 2, 3], [1, 2])
 1
 
 -- query 80
+-- legacy
 array_contains_seq([1, 1, 2, 3], [1, 3])
 0
 
 -- query 81
+-- legacy
 array_contains_seq([1, 1, 2, 3], [2, 3])
 1
 
 -- query 82
+-- legacy
 array_contains_seq([1, 1, 2, 3], [1, 1, 2])
 1
 
 -- query 83
+-- legacy
 array_contains_seq([NULL, NULL, 1, 2], [NULL])
 1
 
 -- query 84
+-- legacy
 array_contains_seq([NULL, NULL, 1, 2], [NULL, NULL])
 1
 
 -- query 85
+-- legacy
 array_contains_seq([NULL, NULL, 1, 2], [NULL, 1])
 1
 
 -- query 86
+-- legacy
 array_contains_seq([NULL, NULL, 1, 2], [NULL, NULL, 1])
 1
 
 -- query 87
+-- legacy
 array_contains_seq([NULL, NULL, 1, 2], [NULL, 1, 2])
 1
 
 -- query 90
+-- legacy
 array_contains_seq(array_append(array_repeat(1, 1000), 2), array_append(array_repeat(1, 500), 2))
 1
 
 -- query 97
+-- legacy
 id
 1
 3
@@ -585,11 +660,13 @@ id
 9
 
 -- query 98
+-- legacy
 id
 2
 8
 
 -- query 99
+-- legacy
 id
 1
 2
@@ -603,14 +680,17 @@ id
 10
 
 -- query 100
+-- legacy
 id
 4
 
 -- query 101
+-- legacy
 id
 1
 
 -- query 102
+-- legacy
 id
 1
 2
@@ -624,14 +704,17 @@ id
 10
 
 -- query 103
+-- legacy
 id
 5
 
 -- query 104
+-- legacy
 id
 2
 
 -- query 105
+-- legacy
 id
 1
 2
@@ -645,14 +728,17 @@ id
 10
 
 -- query 106
+-- legacy
 id
 5
 
 -- query 107
+-- legacy
 id
 5
 
 -- query 108
+-- legacy
 id
 1
 2
@@ -666,14 +752,17 @@ id
 10
 
 -- query 109
+-- legacy
 id
 7
 
 -- query 110
+-- legacy
 id
 1
 
 -- query 111
+-- legacy
 id
 1
 2
@@ -687,16 +776,19 @@ id
 10
 
 -- query 112
+-- legacy
 id
 6
 
 -- query 113
+-- legacy
 id
 1
 6
 8
 
 -- query 114
+-- legacy
 id
 1
 2
@@ -710,16 +802,19 @@ id
 10
 
 -- query 115
+-- legacy
 id
 2
 3
 
 -- query 116
+-- legacy
 id
 1
 6
 
 -- query 117
+-- legacy
 id
 1
 2
@@ -733,16 +828,19 @@ id
 10
 
 -- query 118
+-- legacy
 id
 4
 10
 
 -- query 119
+-- legacy
 id
 1
 10
 
 -- query 120
+-- legacy
 id
 1
 2
@@ -756,15 +854,18 @@ id
 10
 
 -- query 121
+-- legacy
 id
 8
 
 -- query 122
+-- legacy
 id
 1
 10
 
 -- query 123
+-- legacy
 id
 1
 2
@@ -778,10 +879,12 @@ id
 10
 
 -- query 124
+-- legacy
 id
 9
 
 -- query 126
+-- legacy
 id
 1
 2
@@ -795,11 +898,13 @@ id
 10
 
 -- query 128
+-- legacy
 id
 1
 2
 
 -- query 129
+-- legacy
 id
 1
 2
@@ -813,15 +918,18 @@ id
 10
 
 -- query 130
+-- legacy
 id
 6
 9
 
 -- query 131
+-- legacy
 id
 1
 
 -- query 132
+-- legacy
 id
 1
 2
@@ -834,14 +942,17 @@ id
 10
 
 -- query 133
+-- legacy
 id
 1
 
 -- query 134
+-- legacy
 id
 1
 
 -- query 135
+-- legacy
 id
 1
 2
@@ -855,14 +966,17 @@ id
 10
 
 -- query 136
+-- legacy
 id
 8
 
 -- query 137
+-- legacy
 id
 1
 
 -- query 138
+-- legacy
 id
 1
 2
@@ -876,10 +990,12 @@ id
 10
 
 -- query 139
+-- legacy
 id
 10
 
 -- query 140
+-- legacy
 id	position
 1	1
 2	NULL
@@ -893,6 +1009,7 @@ id	position
 10	1
 
 -- query 141
+-- legacy
 id	position
 1	3
 2	NULL
@@ -906,6 +1023,7 @@ id	position
 10	3
 
 -- query 142
+-- legacy
 id	position
 1	2
 2	NULL
@@ -919,6 +1037,7 @@ id	position
 10	0
 
 -- query 143
+-- legacy
 id	position
 1	0
 2	1
@@ -932,6 +1051,7 @@ id	position
 10	0
 
 -- query 144
+-- legacy
 id	position
 1	3
 2	2
@@ -945,6 +1065,7 @@ id	position
 10	3
 
 -- query 145
+-- legacy
 id	position
 1	0
 2	0
@@ -958,6 +1079,7 @@ id	position
 10	0
 
 -- query 146
+-- legacy
 id	position
 1	1
 2	0
@@ -971,6 +1093,7 @@ id	position
 10	0
 
 -- query 147
+-- legacy
 id	position
 1	3
 2	3
@@ -984,6 +1107,7 @@ id	position
 10	3
 
 -- query 148
+-- legacy
 id	position
 1	0
 2	0
@@ -997,6 +1121,7 @@ id	position
 10	0
 
 -- query 149
+-- legacy
 id	position
 1	0
 2	1
@@ -1010,6 +1135,7 @@ id	position
 10	0
 
 -- query 150
+-- legacy
 id	position
 1	3
 2	3
@@ -1023,6 +1149,7 @@ id	position
 10	3
 
 -- query 151
+-- legacy
 id	position
 1	0
 2	0
@@ -1036,6 +1163,7 @@ id	position
 10	0
 
 -- query 152
+-- legacy
 id	position
 1	0
 2	0
@@ -1049,6 +1177,7 @@ id	position
 10	0
 
 -- query 153
+-- legacy
 id	position
 1	3
 2	2
@@ -1062,6 +1191,7 @@ id	position
 10	2
 
 -- query 154
+-- legacy
 id	position
 1	0
 2	0
@@ -1075,6 +1205,7 @@ id	position
 10	0
 
 -- query 155
+-- legacy
 id	position
 1	1
 2	0
@@ -1088,6 +1219,7 @@ id	position
 10	0
 
 -- query 156
+-- legacy
 id	position
 1	2
 2	2
@@ -1101,6 +1233,7 @@ id	position
 10	2
 
 -- query 157
+-- legacy
 id	position
 1	0
 2	0
@@ -1114,6 +1247,7 @@ id	position
 10	0
 
 -- query 158
+-- legacy
 id	position
 1	1
 2	0
@@ -1127,6 +1261,7 @@ id	position
 10	0
 
 -- query 159
+-- legacy
 id	position
 1	3
 2	2
@@ -1140,6 +1275,7 @@ id	position
 10	2
 
 -- query 160
+-- legacy
 id	position
 1	0
 2	1
@@ -1153,6 +1289,7 @@ id	position
 10	0
 
 -- query 161
+-- legacy
 id	position
 1	1
 2	0
@@ -1166,6 +1303,7 @@ id	position
 10	0
 
 -- query 162
+-- legacy
 id	position
 1	3
 2	2
@@ -1179,6 +1317,7 @@ id	position
 10	2
 
 -- query 163
+-- legacy
 id	position
 1	0
 2	0
@@ -1192,6 +1331,7 @@ id	position
 10	1
 
 -- query 164
+-- legacy
 id	position
 1	1
 2	0
@@ -1205,6 +1345,7 @@ id	position
 10	1
 
 -- query 165
+-- legacy
 id	position
 1	3
 2	2
@@ -1218,6 +1359,7 @@ id	position
 10	2
 
 -- query 166
+-- legacy
 id	position
 1	0
 2	0
@@ -1231,6 +1373,7 @@ id	position
 10	0
 
 -- query 167
+-- legacy
 id	position
 1	1
 2	0
@@ -1244,6 +1387,7 @@ id	position
 10	1
 
 -- query 168
+-- legacy
 id	position
 1	2
 2	2
@@ -1257,6 +1401,7 @@ id	position
 10	2
 
 -- query 169
+-- legacy
 id	position
 1	0
 2	0
@@ -1270,6 +1415,7 @@ id	position
 10	0
 
 -- query 170
+-- legacy
 id	position
 1	0
 2	0
@@ -1283,6 +1429,7 @@ id	position
 10	0
 
 -- query 171
+-- legacy
 id	position
 1	3
 2	2
@@ -1296,6 +1443,7 @@ id	position
 10	1
 
 -- query 172
+-- legacy
 id	position
 1	0
 2	0
@@ -1309,6 +1457,7 @@ id	position
 10	0
 
 -- query 173
+-- legacy
 id	position
 1	1
 2	3
@@ -1322,6 +1471,7 @@ id	position
 10	0
 
 -- query 174
+-- legacy
 id	position
 1	3
 2	2
@@ -1335,6 +1485,7 @@ id	position
 10	3
 
 -- query 175
+-- legacy
 id	position
 1	0
 2	0
@@ -1348,6 +1499,7 @@ id	position
 10	0
 
 -- query 176
+-- legacy
 id	position
 1	1
 2	0
@@ -1361,6 +1513,7 @@ id	position
 10	0
 
 -- query 177
+-- legacy
 id	position
 1	2
 2	1
@@ -1374,6 +1527,7 @@ id	position
 10	3
 
 -- query 178
+-- legacy
 id	position
 1	3
 2	0
@@ -1387,6 +1541,7 @@ id	position
 10	0
 
 -- query 179
+-- legacy
 id	position
 1	1
 2	0
@@ -1400,6 +1555,7 @@ id	position
 10	0
 
 -- query 180
+-- legacy
 id	position
 1	3
 2	1
@@ -1413,6 +1569,7 @@ id	position
 10	3
 
 -- query 181
+-- legacy
 id	position
 1	0
 2	0
@@ -1426,6 +1583,7 @@ id	position
 10	0
 
 -- query 182
+-- legacy
 id	position
 1	1
 2	0
@@ -1439,6 +1597,7 @@ id	position
 10	0
 
 -- query 183
+-- legacy
 id	position
 1	2
 2	3
@@ -1452,6 +1611,7 @@ id	position
 10	1
 
 -- query 184
+-- legacy
 id	position
 1	0
 2	0
@@ -1465,6 +1625,7 @@ id	position
 10	2
 
 -- query 186
+-- legacy
 id
 1
 3
@@ -1477,11 +1638,13 @@ id
 10
 
 -- query 187
+-- legacy
 id
 1
 4
 
 -- query 189
+-- legacy
 id
 1
 2
@@ -1495,6 +1658,7 @@ id
 10
 
 -- query 192
+-- legacy
 id
 1
 2
@@ -1508,10 +1672,12 @@ id
 10
 
 -- query 193
+-- legacy
 id
 1
 
 -- query 195
+-- legacy
 id
 1
 2
@@ -1525,6 +1691,7 @@ id
 10
 
 -- query 198
+-- legacy
 id
 1
 2
@@ -1538,6 +1705,7 @@ id
 10
 
 -- query 201
+-- legacy
 id
 1
 2
@@ -1551,6 +1719,7 @@ id
 10
 
 -- query 204
+-- legacy
 id
 1
 2
@@ -1564,6 +1733,7 @@ id
 10
 
 -- query 207
+-- legacy
 id
 1
 2
@@ -1577,6 +1747,7 @@ id
 10
 
 -- query 210
+-- legacy
 id
 1
 2
@@ -1590,6 +1761,7 @@ id
 10
 
 -- query 213
+-- legacy
 id
 1
 2
@@ -1603,6 +1775,7 @@ id
 10
 
 -- query 216
+-- legacy
 id
 1
 2
@@ -1616,6 +1789,7 @@ id
 10
 
 -- query 219
+-- legacy
 id
 1
 2
@@ -1629,10 +1803,12 @@ id
 10
 
 -- query 220
+-- legacy
 id
 1
 
 -- query 222
+-- legacy
 id
 1
 2
@@ -1645,6 +1821,7 @@ id
 10
 
 -- query 225
+-- legacy
 id
 1
 2
@@ -1658,6 +1835,7 @@ id
 10
 
 -- query 228
+-- legacy
 id
 1
 2
@@ -1671,6 +1849,7 @@ id
 10
 
 -- query 275
+-- legacy
 id
 1
 3
@@ -1683,6 +1862,7 @@ id
 10
 
 -- query 276
+-- legacy
 id
 1
 3
@@ -1695,112 +1875,139 @@ id
 10
 
 -- query 287
+-- legacy
 id
 4
 
 -- query 288
+-- legacy
 id
 4
 
 -- query 289
+-- legacy
 id
 4
 
 -- query 290
+-- legacy
 id
 4
 
 -- query 291
+-- legacy
 id
 4
 
 -- query 292
+-- legacy
 id
 4
 
 -- query 293
+-- legacy
 id
 4
 
 -- query 294
+-- legacy
 id
 4
 
 -- query 295
+-- legacy
 id
 4
 
 -- query 296
+-- legacy
 id
 4
 
 -- query 297
+-- legacy
 id
 4
 
 -- query 298
+-- legacy
 id
 4
 
 -- query 299
+-- legacy
 id
 4
 
 -- query 300
+-- legacy
 id
 4
 
 -- query 302
+-- legacy
 id
 1
 
 -- query 303
+-- legacy
 id
 1
 
 -- query 304
+-- legacy
 id
 1
 2
 4
 
 -- query 305
+-- legacy
 id
 1
 
 -- query 306
+-- legacy
 id
 1
 
 -- query 307
+-- legacy
 id
 2
 
 -- query 310
+-- legacy
 id
 1
 
 -- query 311
+-- legacy
 id
 1
 
 -- query 312
+-- legacy
 id
 2
 
 -- query 315
+-- legacy
 id
 1
 
 -- query 316
+-- legacy
 id
 1
 
 -- query 317
+-- legacy
 id
 2
 
 -- query 319
+-- legacy
 id	array_position(array_map, map{'a':1,'b':2})
 1	1
 2	0
@@ -1808,6 +2015,7 @@ id	array_position(array_map, map{'a':1,'b':2})
 4	0
 
 -- query 320
+-- legacy
 id	array_position(array_map, map{'c':3,'d':4})
 1	2
 2	0
@@ -1815,6 +2023,7 @@ id	array_position(array_map, map{'c':3,'d':4})
 4	0
 
 -- query 321
+-- legacy
 id	array_position(array_map, map{'x':5,'y':6})
 1	0
 2	1
@@ -1822,6 +2031,7 @@ id	array_position(array_map, map{'x':5,'y':6})
 4	0
 
 -- query 322
+-- legacy
 id	array_position(array_map, NULL)
 1	0
 2	0
@@ -1829,6 +2039,7 @@ id	array_position(array_map, NULL)
 4	0
 
 -- query 323
+-- legacy
 id	array_position(array_map, map{})
 1	0
 2	0
@@ -1836,6 +2047,7 @@ id	array_position(array_map, map{})
 4	0
 
 -- query 324
+-- legacy
 id	array_position(array_json, '{"key1": 100, "key2": 200}')
 1	1
 2	0
@@ -1843,6 +2055,7 @@ id	array_position(array_json, '{"key1": 100, "key2": 200}')
 4	0
 
 -- query 325
+-- legacy
 id	array_position(array_json, '{"key3": 300}')
 1	2
 2	0
@@ -1850,6 +2063,7 @@ id	array_position(array_json, '{"key3": 300}')
 4	0
 
 -- query 326
+-- legacy
 id	array_position(array_json, '{"key5": 500, "key6": 600}')
 1	0
 2	2
@@ -1857,6 +2071,7 @@ id	array_position(array_json, '{"key5": 500, "key6": 600}')
 4	0
 
 -- query 327
+-- legacy
 id	array_position(array_json, NULL)
 1	0
 2	0
@@ -1864,6 +2079,7 @@ id	array_position(array_json, NULL)
 4	0
 
 -- query 328
+-- legacy
 id	array_position(array_json, '{}')
 1	0
 2	0
@@ -1871,6 +2087,7 @@ id	array_position(array_json, '{}')
 4	0
 
 -- query 329
+-- legacy
 id	array_position(array_struct, row(10, 'hello'))
 1	1
 2	0
@@ -1878,6 +2095,7 @@ id	array_position(array_struct, row(10, 'hello'))
 4	0
 
 -- query 330
+-- legacy
 id	array_position(array_struct, row(20, 'world'))
 1	2
 2	0
@@ -1885,6 +2103,7 @@ id	array_position(array_struct, row(20, 'world'))
 4	0
 
 -- query 331
+-- legacy
 id	array_position(array_struct, row(40, 'database'))
 1	0
 2	2
@@ -1892,6 +2111,7 @@ id	array_position(array_struct, row(40, 'database'))
 4	0
 
 -- query 332
+-- legacy
 id	array_position(array_struct, NULL)
 1	0
 2	0
@@ -1899,13 +2119,16 @@ id	array_position(array_struct, NULL)
 4	0
 
 -- query 333
+-- legacy
 array_contains([NULL], NULL)	array_position([NULL], NULL)
 1	1
 
 -- query 337
+-- legacy
 pk	array_contains(arr_bigint, 1000)	arr_bigint
 0	0	[0,0,0,0,0,0,0,0,0,0]
 
 -- query 338
+-- legacy
 pk	array_length(arr_bigint)	arr_bigint
 0	10	[0,0,0,0,0,0,0,0,0,0]
