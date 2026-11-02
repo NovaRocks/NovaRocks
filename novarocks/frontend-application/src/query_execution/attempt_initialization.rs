@@ -1191,7 +1191,11 @@ mod tests {
                 .expect("domain source")
                 .downcast_ref::<SharedFailureCause>()
                 .expect("connector domain carrier");
-            assert_eq!(domain.downcast_ref::<SharedFailureCause>(), Some(&original));
+            assert_eq!(domain, &original);
+            assert!(std::ptr::eq(
+                domain.downcast_ref::<CompileControlError>().unwrap(),
+                original.downcast_ref::<CompileControlError>().unwrap(),
+            ));
             assert_eq!(shared.failure_fact(), fact);
             assert_ne!(fact.class(), FailureClass::Dependency);
             assert_eq!(error.compile_control_error(), None);
