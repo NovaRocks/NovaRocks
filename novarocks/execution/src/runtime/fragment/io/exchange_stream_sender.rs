@@ -47,6 +47,7 @@ use crate::runtime::fragment::ExecutionReason;
 use crate::runtime::observable::Observable;
 
 use super::ExchangeFrameTransmitter;
+use super::exchange::ExchangeNormalCloseAccepted;
 use super::exchange_unit::{
     ExchangeCallActivity, ExchangeCallOutcome, ExchangeDemandCallOutcome, ExchangeDemandEntry,
     ExchangeDemandOperation, ExchangeGrantNotice, ExchangeUnitFrame, ExchangeUnitReceiverFrame,
@@ -678,7 +679,7 @@ impl ExchangeStreamSender {
     }
 
     fn stop_outcome(self: &Arc<Self>, outcome: ExchangeDemandCallOutcome) {
-        let failure = {
+        let result = {
             let mut state = self.state.lock().expect("exchange stream sender lock");
             state.stop_active = false;
             if state.stop_obligation != ExchangeSenderStopState::Pending {
@@ -693,13 +694,13 @@ impl ExchangeStreamSender {
                     };
                     match result {
                         Ok(facts) if facts.sender_stopped || facts.receiver_closed.is_some() => {
-                            self.merge_locked(&mut state, facts).err()
+                            self.merge_locked(&mut state, facts)
                         }
-                        Ok(_) => Some(contract_failure()),
-                        Err(failure) => Some(failure),
+                        Ok(_) => Err(contract_failure()),
+                        Err(failure) => Err(failure),
                     }
                 }
-                ExchangeDemandCallOutcome::Refused(failure) => Some(failure),
+                ExchangeDemandCallOutcome::Refused(failure) => Err(failure),
                 ExchangeDemandCallOutcome::NotProcessed(_)
                 | ExchangeDemandCallOutcome::Unknown(_) => {
                     state.stop_retry_waiting = true;
@@ -725,8 +726,10 @@ impl ExchangeStreamSender {
                 }
             }
         };
-        if let Some(failure) = failure {
-            self.refuse_stop(failure);
+        match result {
+            Ok(Some(notice)) => self.transmitter.normal_close_accepted(notice),
+            Ok(None) => {}
+            Err(failure) => self.refuse_stop(failure),
         }
         self.notify();
     }
@@ -780,7 +783,7 @@ impl ExchangeStreamSender {
         &self,
         state: &mut SenderState,
         facts: ExchangeStreamFacts,
-    ) -> Result<(), FailureFact> {
+    ) -> Result<Option<ExchangeNormalCloseAccepted>, FailureFact> {
         let custody_through = self.validate_facts_locked(state, facts)?;
         let confirms_stop = facts.sender_stopped || facts.receiver_closed.is_some();
         if matches!(
@@ -820,7 +823,11 @@ impl ExchangeStreamSender {
         {
             state.stop_obligation = ExchangeSenderStopState::Confirmed;
         }
-        Ok(())
+        Ok(facts.receiver_closed.map(|_| ExchangeNormalCloseAccepted {
+            stream: self.config.stream,
+            sender_count: self.config.sender_count,
+            facts,
+        }))
     }
 
     fn observe(self: &Arc<Self>, notice: ExchangeGrantNotice) {
@@ -834,13 +841,16 @@ impl ExchangeStreamSender {
                     if let Some(sequence) = Self::oldest_offered(&state) {
                         state.replay_due.insert(sequence);
                     }
-                    Ok(())
+                    Ok(None)
                 }
             }
         };
         if let Err(failure) = result {
             self.fail(failure);
         } else {
+            if let Ok(Some(notice)) = result {
+                self.transmitter.normal_close_accepted(notice);
+            }
             let status = self.snapshot().status;
             if matches!(
                 status,

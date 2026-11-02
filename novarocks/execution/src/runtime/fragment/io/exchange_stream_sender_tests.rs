@@ -46,6 +46,8 @@ struct Scripted {
     retries: Mutex<VecDeque<Retry>>,
     stop_replies: Mutex<VecDeque<ExchangeDemandCallOutcome>>,
     demand_replies: Mutex<VecDeque<ExchangeDemandCallOutcome>>,
+    normal_closes: Mutex<Vec<ExchangeNormalCloseAccepted>>,
+    normal_close_reentry: Mutex<Option<Weak<ExchangeStreamSender>>>,
 }
 impl Scripted {
     fn granting() -> Arc<Self> {
@@ -85,6 +87,25 @@ impl Scripted {
     }
 }
 impl ExchangeFrameTransmitter for Scripted {
+    fn normal_close_accepted(&self, notice: ExchangeNormalCloseAccepted) {
+        if let Some(sender) = self
+            .normal_close_reentry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+        {
+            assert!(
+                sender.state.try_lock().is_ok(),
+                "normal close observation runs outside the sender lock"
+            );
+            let snapshot = sender.snapshot();
+            assert_eq!(snapshot.stop_obligation, ExchangeSenderStopState::Confirmed);
+            assert_eq!(notice.stream, sender.config.stream);
+            assert_eq!(notice.sender_count, sender.config.sender_count);
+        }
+        self.normal_closes.lock().unwrap().push(notice);
+    }
     fn deliver_unit(
         &self,
         frame: ExchangeUnitFrame,
@@ -502,6 +523,48 @@ fn unit_and_end_can_be_offered_before_earlier_custody() {
 
 #[test]
 fn receiver_withdrawal_obeys_delivery_requirement_and_consumed_requires_exact_end() {
+    // A receiver may withdraw before it grants any Unit. Demand replies and
+    // grant subscriptions share the same committed fact author as delivery.
+    for through_demand in [true, false] {
+        let transport = Arc::new(Scripted::default());
+        let sender = sender(
+            transport.clone(),
+            scheduler(16),
+            1,
+            ExchangeDeliveryRequirement::DemandDriven,
+        );
+        *transport.normal_close_reentry.lock().unwrap() = Some(Arc::downgrade(&sender));
+        let facts = ExchangeStreamFacts {
+            receiver_closed: Some(ExchangeUnitCloseDisposition::Withdrawn),
+            ..Default::default()
+        };
+        if through_demand {
+            transport.demand_replies.lock().unwrap().push_back(
+                ExchangeDemandCallOutcome::Observed(vec![(sender.config.stream, Ok(facts))]),
+            );
+        }
+        publish(&sender, b"one", false);
+        if !through_demand {
+            transport.notice(sender.config.stream, ExchangeGrantNotice::Facts(facts));
+        }
+        assert_eq!(
+            transport.queued(),
+            0,
+            "close before grant never delivers a Unit"
+        );
+        assert_eq!(
+            sender.snapshot().status,
+            ExchangeStreamSenderStatus::Withdrawn
+        );
+        assert_eq!(
+            *transport.normal_closes.lock().unwrap(),
+            vec![ExchangeNormalCloseAccepted {
+                stream: sender.config.stream,
+                sender_count: sender.config.sender_count,
+                facts,
+            }]
+        );
+    }
     for delivery in [
         ExchangeDeliveryRequirement::DemandDriven,
         ExchangeDeliveryRequirement::MustDrain,
@@ -521,6 +584,10 @@ fn receiver_withdrawal_obeys_delivery_requirement_and_consumed_requires_exact_en
         assert_eq!(
             sender.failure().is_some(),
             delivery == ExchangeDeliveryRequirement::MustDrain
+        );
+        assert_eq!(
+            transport.normal_closes.lock().unwrap().len(),
+            usize::from(delivery == ExchangeDeliveryRequirement::DemandDriven)
         );
         drop(call.activity);
         assert_eq!(sender.snapshot().retention.data_positions, 0);
@@ -546,6 +613,10 @@ fn receiver_withdrawal_obeys_delivery_requirement_and_consumed_requires_exact_en
         },
     }));
     assert!(sender.failure().is_some());
+    assert!(
+        transport.normal_closes.lock().unwrap().is_empty(),
+        "an invalid End cannot publish a normal-close observation"
+    );
     drop(call.activity);
 }
 
@@ -995,6 +1066,11 @@ fn validated_remote_stop_proofs_avoid_redundant_stop_without_forging_activity_ex
             facts,
         }));
         assert_eq!(
+            transport.normal_closes.lock().unwrap().len(),
+            usize::from(facts.receiver_closed.is_some()),
+            "a stop acknowledgement alone is not a receiver close"
+        );
+        assert_eq!(
             sender.snapshot().stop_obligation,
             ExchangeSenderStopState::Confirmed
         );
@@ -1194,6 +1270,7 @@ fn stop_rpc_proofs_require_the_same_delivery_end_and_custody_validation() {
             )]));
         sender.stop();
         assert_eq!(sender.failure(), Some(contract_failure()));
+        assert!(transport.normal_closes.lock().unwrap().is_empty());
         assert_eq!(
             sender.snapshot().stop_obligation,
             ExchangeSenderStopState::Refused(contract_failure())
@@ -1327,6 +1404,7 @@ fn unknown_demand_contact_requires_stop_even_after_all_local_activity_is_idle() 
         1,
         ExchangeDeliveryRequirement::DemandDriven,
     );
+    *transport.normal_close_reentry.lock().unwrap() = Some(Arc::downgrade(&sender));
     transport
         .demand_replies
         .lock()
@@ -1355,10 +1433,30 @@ fn unknown_demand_contact_requires_stop_even_after_all_local_activity_is_idle() 
         sender.snapshot().stop_obligation,
         ExchangeSenderStopState::Pending
     );
+    let facts = ExchangeStreamFacts {
+        receiver_closed: Some(ExchangeUnitCloseDisposition::Withdrawn),
+        ..Default::default()
+    };
+    transport
+        .stop_replies
+        .lock()
+        .unwrap()
+        .push_back(ExchangeDemandCallOutcome::Observed(vec![(
+            sender.config.stream,
+            Ok(facts),
+        )]));
     transport.retry();
     assert_eq!(
         sender.snapshot().stop_obligation,
         ExchangeSenderStopState::Confirmed
+    );
+    assert_eq!(
+        *transport.normal_closes.lock().unwrap(),
+        vec![ExchangeNormalCloseAccepted {
+            stream: sender.config.stream,
+            sender_count: sender.config.sender_count,
+            facts,
+        }]
     );
     let demands = transport.demands.lock().unwrap();
     assert_eq!(
