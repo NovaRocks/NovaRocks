@@ -52,7 +52,7 @@ use novarocks_types::{
     identity::{AttemptId, QueryExecutionId},
 };
 use prost::Message;
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 
 struct Control;
 impl PureCompileControl for Control {
