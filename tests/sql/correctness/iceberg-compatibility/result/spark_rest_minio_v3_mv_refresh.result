@@ -5,7 +5,7 @@ id	metric
 3	30
 
 -- query 7
--- legacy
+-- types	bigint	integer
 id	metric
 2	20
 3	30

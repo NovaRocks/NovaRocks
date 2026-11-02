@@ -1,39 +1,39 @@
 -- query 3
--- legacy
+-- types	boolean
 (round(id_double)) <=> (round(NULL))
-1
+true
 
 -- query 4
--- legacy
+-- types	boolean
 (dround(id_double)) <=> (dround(NULL))
-1
+true
 
 -- query 5
--- legacy
+-- types	boolean
 (round(id_double, id_int)) <=> (round(NULL, NULL))
-1
+true
 
 -- query 6
--- legacy
+-- types	boolean
 (round(id_double, id_int)) <=> (round(id_double, NULL))
-1
+true
 
 -- query 7
--- legacy
+-- types	boolean
 (round(id_double, id_int)) <=> (round(NULL, id_int))
-1
+true
 
 -- query 8
--- legacy
+-- types	boolean
 (dround(id_double, id_int)) <=> (dround(NULL, NULL))
-1
+true
 
 -- query 9
--- legacy
+-- types	boolean
 (dround(id_double, id_int)) <=> (dround(id_double, NULL))
-1
+true
 
 -- query 10
--- legacy
+-- types	boolean
 (dround(id_double, id_int)) <=> (dround(NULL, id_int))
-1
+true

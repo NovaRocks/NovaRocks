@@ -9,12 +9,12 @@ count(*)
 62
 
 -- query 9
--- legacy
+-- types	bigint
 count(*)
 63
 
 -- query 10
--- legacy
+-- types	bigint
 count(*)
 54
 
@@ -29,22 +29,22 @@ count(*)
 62
 
 -- query 13
--- legacy
+-- types	bigint
 count(*)
 54
 
 -- query 14
--- legacy
+-- types	bigint
 count(*)
 63
 
 -- query 15
--- legacy
+-- types	bigint
 count(*)
 63
 
 -- query 16
--- legacy
+-- types	bigint
 count(*)
 24
 
