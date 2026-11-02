@@ -48,15 +48,7 @@ mod table;
 mod tests;
 
 pub(crate) use bulk::CompleteInput;
-#[expect(
-    unused_imports,
-    reason = "Names the frozen K batch result contract even when current consumers infer its returned type."
-)]
 pub(crate) use bulk_read::BulkPresenceBatch;
-#[expect(
-    unused_imports,
-    reason = "Names the frozen K batch result contract even when current consumers infer its returned type."
-)]
 pub(crate) use bulk_read::BulkProbeBatch;
 pub(crate) use bulk_read::{BulkKey, BulkMatch, IndexView};
 #[expect(
@@ -79,11 +71,10 @@ pub(crate) use bulk_tasks::BulkReady;
     reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
 )]
 pub(crate) use bulk_tasks::Completion as BulkCompletion;
-pub(crate) use bulk_tasks::{BulkAssignments, BulkTaskGraph, Claim as BulkClaim, Task as BulkTask};
-#[expect(
-    unused_imports,
-    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
-)]
+pub(crate) use bulk_tasks::{
+    BulkAssignments, BulkTaskGraph, Claim as BulkClaim, Task as BulkTask,
+    TaskAdvance as BulkTaskAdvance,
+};
 pub(crate) use capture::CapturedPageId;
 pub(crate) use capture::{
     BulkDomain, BulkInput, CaptureBuilder, CaptureWork, EvaluatedPage, SealedCapture,

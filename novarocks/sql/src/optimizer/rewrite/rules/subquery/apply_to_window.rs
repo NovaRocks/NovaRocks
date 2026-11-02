@@ -891,6 +891,7 @@ mod tests {
     fn make_outer_join() -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Cross,
                 condition: None,
             }),
@@ -1484,6 +1485,7 @@ mod tests {
         let (pred, a_orig, _, right) = extract_filter_apply(&plan);
         let bad_left = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Cross,
                 condition: None,
             }),
@@ -1671,6 +1673,7 @@ mod tests {
         let dup_lineitem = make_outer_lineitem_scan();
         let bad_left = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Cross,
                 condition: None,
             }),

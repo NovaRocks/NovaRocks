@@ -134,6 +134,102 @@ fn checked_slot_pairs_exact_column_and_original_chunk_authority() {
 }
 
 #[test]
+fn projected_input_maps_original_slots_through_actual_sparse_domains() {
+    use super::input_source::InputColumnProjection;
+    use novarocks_type_contract::ValueTypeStorageLifetime;
+    let program = program(SeedMode::Input, false);
+    let full = input_chunk(&program, vec![Some(11), Some(42), None, Some(7)]);
+    let declared = full.chunk_schema_ref();
+    // Plain Arrow fixture metadata is outside construction qualification.
+    // Production gather funds both the original map and the compact header.
+    for ordinals in [vec![1], vec![0]] {
+        let schema = declared
+            .project_by_slots_typed(
+                &ordinals
+                    .iter()
+                    .map(|&i| declared.slots()[i].slot_id())
+                    .collect::<Vec<_>>(),
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap();
+        let compact = Chunk::try_new_with_chunk_schema(
+            full.record_batch().project(&ordinals).unwrap(),
+            Arc::new(schema),
+        )
+        .unwrap();
+        let projection = Arc::new(InputColumnProjection::from_owned(
+            ordinals.clone(),
+            ValueTypeStorageLifetime::pure(),
+        ));
+        let loan =
+            CompiledInputLoan::from_projected_chunk(&compact, &declared, &projection, &Control)
+                .unwrap();
+        assert_eq!(loan.batch().num_columns(), 1);
+        assert_eq!(loan.schema().fields().len(), 3);
+        for selected in [vec![0, 1, 2, 3], vec![1, 3], vec![]] {
+            let selection = Selection::try_sparse(4, &selected).unwrap();
+            let mut instance = evaluator(&program);
+            let actual = evaluate(&mut instance, loan, selection);
+            if ordinals == [0] {
+                assert!(matches!(
+                    actual.unwrap_err().cause(),
+                    ExecutionFailureCause::Kernel(KernelFailure::InvalidProgram(_))
+                ));
+                continue;
+            }
+            let actual = actual.unwrap();
+            let values = actual
+                .values()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let expected = selected
+                .iter()
+                .map(|&row| [Some(11), Some(42), None, Some(7)][row])
+                .collect::<Vec<_>>();
+            assert_eq!(values.iter().collect::<Vec<_>>(), expected);
+        }
+    }
+}
+
+#[test]
+fn projected_input_does_not_promote_equal_arrow_fields_to_a_logical_binding() {
+    use super::input_source::InputColumnProjection;
+    use novarocks_type_contract::{FunctionValueType, ValueLogicalType, ValueTypeStorageLifetime};
+    use novarocks_types::SlotId;
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("json", DataType::Utf8, true),
+    ]));
+    let logical =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+            .unwrap();
+    let layout = crate::exec::chunk::typed_fixture::layout(
+        Arc::clone(&schema),
+        &[SlotId::new(7)],
+        &[logical],
+    );
+    let declared = ChunkSchema::from_compiled_layout(&layout).unwrap();
+    let actual = crate::exec::chunk::typed_fixture::chunk(
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::StringArray::from(vec!["[]"]))],
+        )
+        .unwrap(),
+        &[SlotId::new(7)],
+        &[FunctionValueType::new(DataType::Utf8, true)],
+    );
+    let projection = Arc::new(InputColumnProjection::from_owned(
+        vec![0],
+        ValueTypeStorageLifetime::pure(),
+    ));
+    let actual = CompiledInputLoan::from_projected_chunk(&actual, &declared, &projection, &Control);
+    assert!(matches!(
+        actual.err().expect("logical binding was refused"),
+        KernelFailure::InvalidProgram(_)
+    ));
+}
+
+#[test]
 fn record_batch_without_chunk_and_chunk_without_authority_are_distinct() {
     let program = program(SeedMode::Input, false);
     let chunk = input_chunk(&program, vec![Some(42)]);

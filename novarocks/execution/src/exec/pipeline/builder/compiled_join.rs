@@ -17,34 +17,29 @@
 
 //! Compiled join pipelines.
 //!
-//! Both join families share one build per instance: the build input is
-//! gathered to one driver, which publishes one artifact, and the probe runs at
-//! its own pipeline width against it. Every physical distribution has already
-//! delivered this instance its whole share of both sides, so this local
-//! strategy is correct for each of them. The probe is the program's left input
-//! and the build its right input; the compiler normalized that orientation.
-//! The build pipeline is an extra pipeline that ends in its build sink.
+//! Both join families share one build per admitted instance. Actual E drivers
+//! capture input, independent F workers finalize it, Q drivers probe it, and
+//! required build-preserving output has independent T sources. The compiler
+//! normalizes the probe to the program's left input and the build to its right.
+//! Frozen physical placement and LocalCompiler admission remain authoritative.
 //!
-//! A hash join's membership runtime-filter producers observe its build keys
-//! in the build sink. The one build driver is their one local partition.
+//! Membership RF producers observe each actual E contribution. K chooses its
+//! own partitions. Only T>0 installs the original Q+T producer Handoff; T=0
+//! keeps probe and downstream fused.
+// Design: ADR-0212 (docs/adr/ADR-0212-shared-join-stages-and-exact-demand-retirement.md)
 
 use super::super::program_failure;
 use super::*;
 use crate::exec::fragment::error::FragmentBindingErrorKind;
 use crate::exec::operators::compiled_expression::root_value_type;
-use crate::exec::operators::compiled_nljoin::{
-    CompiledNlJoinPlan, CompiledNlJoinProbeProcessorFactory,
-};
 use crate::exec::operators::hashjoin::compiled_hash_join::{
-    CompiledHashJoinBuildSinkFactory, CompiledHashJoinPlan, CompiledHashJoinProbeProcessorFactory,
+    CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
+    CompiledJoinInputSinkFactory, CompiledJoinProbeProcessorFactory, CompiledJoinTailSourceFactory,
 };
 use crate::exec::operators::hashjoin::native_runtime_filter::NativeRuntimeFilterProducerFactory;
+use crate::exec::operators::{NoopSinkFactory, hashjoin::JoinParticipants};
 use novarocks_local_program::FilterProducerKind;
-
-/// Local partitions of a compiled hash join's runtime-filter producers: the
-/// build input is gathered to one driver, which publishes the instance's one
-/// build and so is the producers' only partition.
-const COMPILED_JOIN_BUILD_PARTITIONS: i32 = 1;
+use std::num::NonZeroUsize;
 
 /// The membership producers of one compiled hash join, one stream per
 /// binding over the build key it names. This milestone executes Membership
@@ -54,6 +49,7 @@ fn compiled_join_producers(
     id: ProgramNodeId,
     plan: &CompiledHashJoinPlan,
     ctx: &PipelineBuildContext,
+    input_positions: i32,
 ) -> ExecutionResult<Option<Arc<NativeRuntimeFilterProducerFactory>>> {
     let ProgramNodeKind::Join {
         runtime_filters, ..
@@ -111,7 +107,7 @@ fn compiled_join_producers(
             Ok(root_value_type(program, site)?.data_type().clone())
         },
         session,
-        COMPILED_JOIN_BUILD_PARTITIONS,
+        input_positions,
     )
     .map(|factory| Some(Arc::new(factory)))
 }
@@ -128,7 +124,6 @@ pub(super) fn build_hash_join(
 ) -> ExecutionResult<PipelineBuildResult> {
     // A refused node, or a refused runtime-filter producer, builds no driver.
     let plan = Arc::new(CompiledHashJoinPlan::try_new(program, id)?);
-    let producers = compiled_join_producers(program, id, &plan, ctx)?;
     let ProgramNodeKind::Join {
         runtime_filter_consumers,
         ..
@@ -148,49 +143,24 @@ pub(super) fn build_hash_join(
     )?;
     let probe_build = build_node(program, probe, ctx, error, ordered)?;
     let build_build = build_node(program, build, ctx, error, ordered)?;
-    let mut build_build = gather_to_one(build_build, ctx, node_id);
-    if producers.is_some() && build_build.pipeline.dop != COMPILED_JOIN_BUILD_PARTITIONS {
-        return Err(program_failure(
-            FragmentBindingErrorKind::InvalidAssignment,
-            format!(
-                "compiled hash join at local node {} builds on {} drivers, not on the one partition its runtime-filter producers declare",
-                id.index(),
-                build_build.pipeline.dop
-            ),
-        ));
-    }
-    let probe_dop = probe_build.pipeline.dop.max(1) as usize;
-    let state = Arc::new(BroadcastJoinSharedState::new(
-        node_id,
-        ctx.dep_manager.clone(),
-        probe_dop,
-    ));
+    let producers = compiled_join_producers(program, id, &plan, ctx, build_build.pipeline.dop)?;
     let mut probe_build = probe_build;
     if let Some(consumers) = consumers {
         probe_build.pipeline.factories.push(Box::new(
             crate::exec::operators::runtime_filter::NativeRuntimeFilterProcessorFactory::new_compiled(node_id, consumers)
         ));
     }
-    probe_build
-        .pipeline
-        .factories
-        .push(Box::new(CompiledHashJoinProbeProcessorFactory::new(
-            Arc::clone(program),
-            Arc::clone(&plan),
-            Arc::clone(&state),
-            Arc::clone(error),
-        )));
-    build_build
-        .pipeline
-        .factories
-        .push(Box::new(CompiledHashJoinBuildSinkFactory::new(
-            Arc::clone(program),
-            plan,
-            state,
-            Arc::clone(error),
-            producers,
-        )));
-    Ok(finish(probe_build, build_build))
+    assemble(
+        program,
+        id,
+        node_id,
+        probe_build,
+        build_build,
+        ctx,
+        error,
+        Some(plan),
+        producers,
+    )
 }
 
 pub(super) fn build_nested_loop_join(
@@ -203,42 +173,152 @@ pub(super) fn build_nested_loop_join(
     error: &Arc<RuntimeErrorState>,
     ordered: Option<&CompiledOrderedFilterContext>,
 ) -> ExecutionResult<PipelineBuildResult> {
-    let plan = Arc::new(CompiledNlJoinPlan::try_new(program, id)?);
-    let mut probe_build = build_node(program, probe, ctx, error, ordered)?;
+    let probe_build = build_node(program, probe, ctx, error, ordered)?;
     let build_build = build_node(program, build, ctx, error, ordered)?;
-    let mut build_build = gather_to_one(build_build, ctx, node_id);
-    let state = Arc::new(NlJoinSharedState::new(node_id, ctx.dep_manager.clone()));
-    probe_build
-        .pipeline
-        .factories
-        .push(Box::new(CompiledNlJoinProbeProcessorFactory::new(
-            Arc::clone(program),
-            plan,
-            Arc::clone(&state),
-            Arc::clone(error),
-        )));
-    // The nested-loop build sink evaluates nothing; it only retains rows.
-    build_build
-        .pipeline
-        .factories
-        .push(Box::new(NlJoinBuildSinkFactory::new(state)));
-    Ok(finish(probe_build, build_build))
+    assemble(
+        program,
+        id,
+        node_id,
+        probe_build,
+        build_build,
+        ctx,
+        error,
+        None,
+        None,
+    )
 }
 
-/// The probe pipeline continues; the build pipeline ends in its sink.
-fn finish(
-    mut probe_build: PipelineBuildResult,
-    mut build_build: PipelineBuildResult,
-) -> PipelineBuildResult {
-    build_build.pipeline.needs_sink = false;
-    let mut extra_pipelines = Vec::new();
-    extra_pipelines.append(&mut probe_build.extra_pipelines);
-    extra_pipelines.append(&mut build_build.extra_pipelines);
-    extra_pipelines.push(build_build.pipeline);
-    let dop = probe_build.pipeline.dop;
-    PipelineBuildResult {
-        pipeline: probe_build.pipeline,
-        extra_pipelines,
-        stream: StreamDesc::any(dop),
+fn installed_positions(dop: i32, role: &str) -> ExecutionResult<NonZeroUsize> {
+    usize::try_from(dop)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| {
+            program_failure(
+                FragmentBindingErrorKind::InvalidAssignment,
+                format!("compiled join {role} has no positive installed pipeline DOP"),
+            )
+        })
+}
+
+/// E and Q belong to the actual child pipelines. F owns independently installed
+/// cooperative work positions; K chooses P later. Only build-output joins add
+/// the original shared Q+T handoff boundary.
+#[allow(clippy::too_many_arguments)]
+fn assemble(
+    program: &Arc<LocalProgram>,
+    id: ProgramNodeId,
+    node_id: i32,
+    mut probe: PipelineBuildResult,
+    mut input: PipelineBuildResult,
+    ctx: &mut PipelineBuildContext,
+    error: &Arc<RuntimeErrorState>,
+    hash: Option<Arc<CompiledHashJoinPlan>>,
+    producers: Option<Arc<NativeRuntimeFilterProducerFactory>>,
+) -> ExecutionResult<PipelineBuildResult> {
+    let e = installed_positions(input.pipeline.dop, "E")?;
+    let q = installed_positions(probe.pipeline.dop, "Q")?;
+    let f = installed_positions(ctx.pipeline_dop, "F")?;
+    let build_output = matches!(
+        program.graph().nodes()[id.index()].kind(),
+        ProgramNodeKind::Join {
+            join_type: novarocks_local_program::JoinType::RightOuter
+                | novarocks_local_program::JoinType::FullOuter
+                | novarocks_local_program::JoinType::RightSemi
+                | novarocks_local_program::JoinType::RightAnti,
+            ..
+        } | ProgramNodeKind::NestedLoopJoin {
+            join_type: novarocks_local_program::NestedLoopJoinType::RightOuter
+                | novarocks_local_program::NestedLoopJoinType::FullOuter,
+            ..
+        }
+    );
+    let t = if build_output { f.get() } else { 0 };
+    let participants = JoinParticipants {
+        inputs: e.get(),
+        finalizers: f,
+        probes: q.get(),
+        tails: t,
+    };
+    let handoff = participants.handoff_producers()?.map(|positions| {
+        LocalExchanger::new_handoff(positions, q.get(), ctx.operator_buffer_chunks)
+    });
+    let declaration = Arc::new(match hash {
+        Some(plan) => CompiledJoinFrame::new(program.clone(), plan, participants, handoff.clone()),
+        None => {
+            CompiledJoinFrame::new_nested_loop(program.clone(), id, participants, handoff.clone())?
+        }
+    });
+    input
+        .pipeline
+        .factories
+        .push(Box::new(CompiledJoinInputSinkFactory::new(
+            declaration.clone(),
+            error.clone(),
+            producers,
+        )));
+    input.pipeline.needs_sink = false;
+    probe
+        .pipeline
+        .factories
+        .push(Box::new(CompiledJoinProbeProcessorFactory::new(
+            declaration.clone(),
+            error.clone(),
+        )));
+    let mut finalize = new_source_pipeline_with_dop(
+        ctx,
+        Box::new(CompiledJoinFinalizeSourceFactory::new(
+            declaration.clone(),
+            error.clone(),
+        )),
+        i32::try_from(f.get()).expect("F came from installed i32 DOP"),
+    );
+    finalize.factories.push(Box::new(NoopSinkFactory::new()));
+    finalize.needs_sink = false;
+    let mut extra = Vec::new();
+    extra.append(&mut probe.extra_pipelines);
+    extra.append(&mut input.extra_pipelines);
+    extra.push(input.pipeline);
+    extra.push(finalize);
+    let output_dop = probe.pipeline.dop;
+    if let Some(handoff) = handoff {
+        probe
+            .pipeline
+            .factories
+            .push(Box::new(LocalExchangeSinkFactory::new(
+                node_id,
+                handoff.clone(),
+            )));
+        probe.pipeline.needs_sink = false;
+        extra.push(probe.pipeline);
+        let mut tail = new_source_pipeline_with_dop(
+            ctx,
+            Box::new(CompiledJoinTailSourceFactory::new(
+                declaration,
+                error.clone(),
+            )),
+            i32::try_from(t).expect("T came from installed i32 DOP"),
+        );
+        tail.factories.push(Box::new(LocalExchangeSinkFactory::new(
+            node_id,
+            handoff.clone(),
+        )));
+        tail.needs_sink = false;
+        extra.push(tail);
+        let output = new_source_pipeline_with_dop(
+            ctx,
+            Box::new(LocalExchangeSourceFactory::new(node_id, 1, handoff)),
+            output_dop,
+        );
+        Ok(PipelineBuildResult {
+            pipeline: output,
+            extra_pipelines: extra,
+            stream: StreamDesc::any(output_dop),
+        })
+    } else {
+        Ok(PipelineBuildResult {
+            pipeline: probe.pipeline,
+            extra_pipelines: extra,
+            stream: StreamDesc::any(output_dop),
+        })
     }
 }

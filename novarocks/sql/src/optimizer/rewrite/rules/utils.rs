@@ -1056,6 +1056,7 @@ mod column_id_helper_tests {
         ];
         let plan = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: crate::analysis::JoinKind::Inner,
                 condition: None,
             }),
@@ -1276,6 +1277,7 @@ mod column_id_helper_tests {
     fn two_table_join(condition: Option<TypedExpr>) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: crate::analysis::JoinKind::Inner,
                 condition,
             }),
@@ -1416,6 +1418,7 @@ mod column_id_helper_tests {
         // q22 shape: same column name on both sides, distinct aliases.
         let join = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: crate::analysis::JoinKind::LeftSemi,
                 condition: Some(eq_expr(qcol("a", "k", 1), qcol("b", "k", 2))),
             }),
@@ -1439,6 +1442,7 @@ mod column_id_helper_tests {
     fn join_equi_keys_opt_disambiguates_self_join_by_qualifier() {
         let join = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: crate::analysis::JoinKind::LeftSemi,
                 condition: Some(eq_expr(qcol("a", "k", 1), qcol("b", "k", 2))),
             }),
@@ -1509,6 +1513,7 @@ mod column_id_helper_tests {
     fn join_equi_keys_classifies_alias_free_project_outputs_by_column_id() {
         let join = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: crate::analysis::JoinKind::Inner,
                 condition: Some(eq_expr(qcol("a", "k", 101), qcol("b", "k", 202))),
             }),

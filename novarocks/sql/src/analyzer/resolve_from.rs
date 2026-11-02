@@ -329,6 +329,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
             }
             current_rel = Relation::Join(Box::new(JoinRelation {
+                naa_author: None,
                 left: current_rel,
                 right: right_rel,
                 join_type: join_kind,

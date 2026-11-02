@@ -369,21 +369,23 @@ fn source(at: usize) -> p::PhysicalNode {
     let kind = match at {
         0 => p::NodeKind::HashJoin {
             kind: p::JoinKind::FullOuter,
-            keys: Box::from([
-                p::JoinKey {
-                    left: p::ExprId::new(u32::MAX),
-                    right: p::ExprId::new(7),
-                    null_safe: false,
-                },
-                p::JoinKey {
-                    left: p::ExprId::new(0),
-                    right: p::ExprId::new(7),
-                    null_safe: true,
-                },
-            ]),
+            condition: p::HashJoinCondition::Ordinary {
+                keys: Box::from([
+                    p::JoinKey {
+                        left: p::ExprId::new(u32::MAX),
+                        right: p::ExprId::new(7),
+                        null_safe: false,
+                    },
+                    p::JoinKey {
+                        left: p::ExprId::new(0),
+                        right: p::ExprId::new(7),
+                        null_safe: true,
+                    },
+                ]),
+                residual: Some(p::ExprId::new(0)),
+            },
             build_side: p::JoinSide::Right,
             distribution: p::JoinDistribution::BroadcastBuild,
-            residual: Some(p::ExprId::new(0)),
             null_extended: Box::from([p::ValueId::new(u32::MAX), p::ValueId::new(7)]),
         },
         1 => p::NodeKind::NestLoopJoin {
@@ -528,25 +530,36 @@ fn expected_property(unconstrained: bool) -> wire::PhysicalProperties {
         ordering: vec![],
     }
 }
+fn ordinary_wire_keys_mut(node: &mut wire::HashJoinNode) -> &mut Vec<wire::JoinKey> {
+    let Some(wire::hash_join_node::Condition::Ordinary(condition)) = node.condition.as_mut() else {
+        panic!("test fixture must carry the explicit ordinary condition");
+    };
+    &mut condition.keys
+}
+
 fn expected(at: usize) -> wire::PhysicalNode {
     let kind = match at {
         0 => wire::physical_node::Kind::HashJoin(wire::HashJoinNode {
             kind: wire::JoinKind::FullOuter as i32,
-            keys: vec![
-                wire::JoinKey {
-                    left_expr_id: Some(u32::MAX),
-                    right_expr_id: Some(7),
-                    null_safe: false,
+            condition: Some(wire::hash_join_node::Condition::Ordinary(
+                wire::OrdinaryHashJoinCondition {
+                    keys: vec![
+                        wire::JoinKey {
+                            left_expr_id: Some(u32::MAX),
+                            right_expr_id: Some(7),
+                            null_safe: false,
+                        },
+                        wire::JoinKey {
+                            left_expr_id: Some(0),
+                            right_expr_id: Some(7),
+                            null_safe: true,
+                        },
+                    ],
+                    residual_expr_id: Some(0),
                 },
-                wire::JoinKey {
-                    left_expr_id: Some(0),
-                    right_expr_id: Some(7),
-                    null_safe: true,
-                },
-            ],
+            )),
             build_side: wire::JoinSide::Right as i32,
             distribution: wire::JoinDistribution::BroadcastBuild as i32,
-            residual_expr_id: Some(0),
             null_extended_value_ids: vec![u32::MAX, 7],
         }),
         1 => wire::physical_node::Kind::NestLoopJoin(wire::NestLoopJoinNode {
@@ -923,6 +936,33 @@ fn relational_all_closed_join_set_and_partition_topn_enums_keep_raw_payloads() {
                     Some(wire::physical_node::Kind::NestLoopJoin(v)) => v.kind = raw as i32,
                     _ => unreachable!(),
                 };
+                if kind == p::JoinKind::NullAwareLeftAnti && at == 0 {
+                    if let p::NodeKind::HashJoin { condition, .. } = &mut node.kind {
+                        let p::HashJoinCondition::Ordinary { keys, residual } = condition.clone()
+                        else {
+                            unreachable!()
+                        };
+                        *condition = p::HashJoinCondition::NullAwareEqual {
+                            value_equal_keys: keys,
+                            scope_keys: Box::default(),
+                            eligibility: residual,
+                        };
+                    }
+                    if let Some(wire::physical_node::Kind::HashJoin(v)) = wire.kind.as_mut() {
+                        let Some(wire::hash_join_node::Condition::Ordinary(old)) =
+                            v.condition.take()
+                        else {
+                            unreachable!()
+                        };
+                        v.condition = Some(wire::hash_join_node::Condition::NullAwareEqual(
+                            wire::NullAwareEqualHashJoinCondition {
+                                value_equal_keys: old.keys,
+                                scope_keys: vec![],
+                                eligibility_expr_id: old.residual_expr_id,
+                            },
+                        ));
+                    }
+                }
                 c.arm(None);
                 assert_eq!(
                     encode_relational_node(&node, values, expressions, SOURCE, limits())
@@ -1188,7 +1228,9 @@ fn relational_unknown_enums_missing_required_payload_and_refs_fail() {
         for at in [0, 1, 2, 5, 6, 7] {
             let mut node = expected(at);
             match node.kind.as_mut() {
-                Some(wire::physical_node::Kind::HashJoin(v)) => v.keys[0].left_expr_id = None,
+                Some(wire::physical_node::Kind::HashJoin(v)) => {
+                    ordinary_wire_keys_mut(v)[0].left_expr_id = None
+                }
                 Some(wire::physical_node::Kind::NestLoopJoin(v)) => v.predicate_expr_id = Some(99),
                 Some(wire::physical_node::Kind::Sort(v)) => v.order_by[0].expr_id = None,
                 Some(wire::physical_node::Kind::Window(v)) => v.expressions[0].value_id = None,
@@ -1240,7 +1282,9 @@ fn relational_unknown_enums_missing_required_payload_and_refs_fail() {
         for at in [0, 1, 2, 5, 6] {
             let mut node = source(at);
             match &mut node.kind {
-                p::NodeKind::HashJoin { keys, .. } => keys[0].right = p::ExprId::new(99),
+                p::NodeKind::HashJoin { condition, .. } => {
+                    condition.keys_mut()[0].right = p::ExprId::new(99)
+                }
                 p::NodeKind::NestLoopJoin { predicate, .. } => {
                     *predicate = Some(p::ExprId::new(99))
                 }
@@ -1325,7 +1369,9 @@ fn relational_six_kinds_both_directions_require_all_seven_caps_and_actual_capaci
         for at in [0, 3, 5, 6, 7] {
             let mut node = expected(at);
             match node.kind.as_mut() {
-                Some(wire::physical_node::Kind::HashJoin(v)) => v.keys.reserve_exact(SOURCE),
+                Some(wire::physical_node::Kind::HashJoin(v)) => {
+                    ordinary_wire_keys_mut(v).reserve_exact(SOURCE)
+                }
                 Some(wire::physical_node::Kind::Sort(v)) => {
                     if let Some(wire::sort_mode::Kind::Analytic(partition)) =
                         v.mode.as_mut().unwrap().kind.as_mut()
@@ -1419,13 +1465,12 @@ fn relational_empty_payloads_and_optional_predicates_remain_representation_only(
             let mut node = source(at);
             match &mut node.kind {
                 p::NodeKind::HashJoin {
-                    keys,
-                    residual,
+                    condition,
                     null_extended,
                     ..
                 } => {
-                    *keys = Box::default();
-                    *residual = None;
+                    *condition.keys_mut() = Box::default();
+                    *condition.residual_mut() = None;
                     *null_extended = Box::default();
                 }
                 p::NodeKind::NestLoopJoin {
@@ -1482,3 +1527,200 @@ fn relational_empty_payloads_and_optional_predicates_remain_representation_only(
 
 #[path = "owned_tests.rs"]
 mod owned_tests;
+
+fn naa_source() -> p::PhysicalNode {
+    let mut node = source(0);
+    let p::NodeKind::HashJoin {
+        kind, condition, ..
+    } = &mut node.kind
+    else {
+        unreachable!()
+    };
+    let p::HashJoinCondition::Ordinary { keys, residual } = condition.clone() else {
+        unreachable!()
+    };
+    *kind = p::JoinKind::NullAwareLeftAnti;
+    *condition = p::HashJoinCondition::NullAwareEqual {
+        scope_keys: Box::from([keys[1].clone()]),
+        value_equal_keys: keys,
+        eligibility: residual,
+    };
+    node
+}
+
+#[test]
+fn null_aware_condition_roundtrip_preserves_independent_key_domains_and_resources() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    fixture.with_tokens(&c, |values, expressions, read| {
+        let node = naa_source();
+        c.arm(None);
+        let (wire_node, encode_facts) =
+            encode_relational_node(&node, values, expressions, SOURCE, limits()).unwrap();
+        let Some(wire::physical_node::Kind::HashJoin(join)) = wire_node.kind.as_ref() else {
+            unreachable!()
+        };
+        let Some(wire::hash_join_node::Condition::NullAwareEqual(condition)) =
+            join.condition.as_ref()
+        else {
+            unreachable!()
+        };
+        assert_eq!(condition.value_equal_keys.len(), 2);
+        assert_eq!(condition.scope_keys.len(), 1);
+        assert_eq!(condition.eligibility_expr_id, Some(0));
+        c.arm(None);
+        let (decoded, decode_facts) =
+            decode_relational_node(&wire_node, read, SOURCE, limits()).unwrap();
+        assert_eq!(decoded, node);
+        for axis in 0..7 {
+            c.arm(None);
+            assert!(matches!(
+                encode_relational_node(
+                    &node,
+                    values,
+                    expressions,
+                    SOURCE,
+                    under(exact(encode_facts), axis)
+                ),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            c.arm(None);
+            assert!(matches!(
+                decode_relational_node(&wire_node, read, SOURCE, under(exact(decode_facts), axis)),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+        }
+    });
+}
+
+#[test]
+fn null_aware_condition_missing_empty_or_mixed_roles_are_rejected_without_defaults() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    fixture.with_tokens(&c, |values, expressions, read| {
+        c.arm(None);
+        let (wire_node, _) =
+            encode_relational_node(&naa_source(), values, expressions, SOURCE, limits()).unwrap();
+        for fault in 0..6 {
+            let mut broken = wire_node.clone();
+            let Some(wire::physical_node::Kind::HashJoin(join)) = broken.kind.as_mut() else {
+                unreachable!()
+            };
+            match fault {
+                0 => join.condition = None,
+                1 => join.kind = wire::JoinKind::Inner as i32,
+                2 => {
+                    join.condition = Some(wire::hash_join_node::Condition::Ordinary(
+                        wire::OrdinaryHashJoinCondition {
+                            keys: vec![],
+                            residual_expr_id: None,
+                        },
+                    ))
+                }
+                3 => {
+                    let Some(wire::hash_join_node::Condition::NullAwareEqual(condition)) =
+                        join.condition.as_mut()
+                    else {
+                        unreachable!()
+                    };
+                    condition.value_equal_keys.clear();
+                }
+                4 => {
+                    let Some(wire::hash_join_node::Condition::NullAwareEqual(condition)) =
+                        join.condition.as_mut()
+                    else {
+                        unreachable!()
+                    };
+                    condition.scope_keys[0].left_expr_id = Some(99);
+                }
+                _ => {
+                    let Some(wire::hash_join_node::Condition::NullAwareEqual(condition)) =
+                        join.condition.as_mut()
+                    else {
+                        unreachable!()
+                    };
+                    condition.eligibility_expr_id = Some(99);
+                }
+            }
+            c.arm(None);
+            assert!(matches!(
+                decode_relational_node(&broken, read, SOURCE, limits()),
+                Err(Error::InvalidShape(_))
+            ));
+        }
+        let mut broken = naa_source();
+        let p::NodeKind::HashJoin { condition, .. } = &mut broken.kind else {
+            unreachable!()
+        };
+        *condition.keys_mut() = Box::default();
+        c.arm(None);
+        assert!(matches!(
+            encode_relational_node(&broken, values, expressions, SOURCE, limits()),
+            Err(Error::InvalidShape(_))
+        ));
+    });
+}
+
+#[test]
+fn null_aware_scope_capacity_and_complete_nested_loop_predicate_are_accounted() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    fixture.with_tokens(&c, |values, expressions, read| {
+        c.arm(None);
+        let (mut wire_node, _) =
+            encode_relational_node(&naa_source(), values, expressions, SOURCE, limits()).unwrap();
+        c.arm(None);
+        let (_, before) = decode_relational_node(&wire_node, read, SOURCE, limits()).unwrap();
+        let Some(wire::physical_node::Kind::HashJoin(join)) = wire_node.kind.as_mut() else {
+            unreachable!()
+        };
+        let Some(wire::hash_join_node::Condition::NullAwareEqual(condition)) =
+            join.condition.as_mut()
+        else {
+            unreachable!()
+        };
+        condition
+            .scope_keys
+            .reserve_exact(SOURCE / std::mem::size_of::<wire::JoinKey>() + 1);
+        c.arm(None);
+        assert!(matches!(
+            decode_relational_node(&wire_node, read, SOURCE, exact(before)),
+            Err(Error::InvalidShape(_))
+        ));
+        // Capacity belongs to the original source invoice. Supplying its
+        // actual larger backing must also satisfy the original coexistence
+        // author; it is not another allocation request by the decoder.
+        c.arm(None);
+        assert!(matches!(
+            decode_relational_node(&wire_node, read, 2 * SOURCE, exact(before)),
+            Err(Error::Control(CompileControlError::ResourceExhausted))
+        ));
+        c.arm(None);
+        assert!(decode_relational_node(&wire_node, read, 2 * SOURCE, limits()).is_ok());
+        let mut wire_node = expected(1);
+        let Some(wire::physical_node::Kind::NestLoopJoin(join)) = wire_node.kind.as_mut() else {
+            unreachable!()
+        };
+        join.kind = wire::JoinKind::NullAwareLeftAnti as i32;
+        join.predicate_expr_id = None;
+        c.arm(None);
+        assert!(matches!(
+            decode_relational_node(&wire_node, read, SOURCE, limits()),
+            Err(Error::InvalidShape(_))
+        ));
+        let mut node = source(1);
+        let p::NodeKind::NestLoopJoin {
+            kind, predicate, ..
+        } = &mut node.kind
+        else {
+            unreachable!()
+        };
+        *kind = p::JoinKind::NullAwareLeftAnti;
+        *predicate = None;
+        c.arm(None);
+        assert!(matches!(
+            encode_relational_node(&node, values, expressions, SOURCE, limits()),
+            Err(Error::InvalidShape(_))
+        ));
+    });
+}

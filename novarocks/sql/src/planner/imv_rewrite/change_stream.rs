@@ -743,6 +743,7 @@ mod tests {
         };
         let aggregate_merge_join = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::LeftOuter,
                 condition: None,
             }),
@@ -756,6 +757,7 @@ mod tests {
 
         let plain_outer_join = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::LeftOuter,
                 condition: None,
             }),
@@ -770,6 +772,7 @@ mod tests {
         let action_id = ColumnId::new_for_test(1);
         let target_and_signed = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::LeftOuter,
                 condition: None,
             }),
@@ -781,6 +784,7 @@ mod tests {
         );
         let expanded = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Cross,
                 condition: None,
             }),

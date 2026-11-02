@@ -151,7 +151,7 @@ pub(crate) fn compute_cost(
             // Apply non-equi join penalty: if the join has a residual
             // other_condition, hash probing is less efficient (StarRocks:
             // EXECUTE_COST_PENALTY = 100).
-            if j.other_condition.is_some() {
+            if j.condition.residual().is_some() {
                 cost_after_cross * NON_EQUI_JOIN_COST_PENALTY
             } else {
                 cost_after_cross
@@ -907,7 +907,7 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
     let probe_size = probe_stats.map(safe_compute_size).unwrap_or(0.0);
     let build_size = build_stats.map(safe_compute_size).unwrap_or(0.0);
     let output_size = safe_compute_size(input.own_stats);
-    let key_factor = (join.eq_conditions.len() as f64).max(1.0);
+    let key_factor = (join.condition.keys().len() as f64).max(1.0);
 
     let is_broadcast = match input.alt_kind {
         PropertyAlternativeKind::BroadcastJoin => true,
@@ -970,7 +970,7 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
         cpu_cost = finite_non_negative_cost(cpu_cost * CROSS_JOIN_COST_PENALTY);
         memory_cost = finite_non_negative_cost(memory_cost * CROSS_JOIN_COST_PENALTY);
     }
-    if join.other_condition.is_some() {
+    if join.condition.residual().is_some() {
         cpu_cost = finite_non_negative_cost(cpu_cost * NON_EQUI_JOIN_COST_PENALTY);
     }
 
@@ -1509,10 +1509,12 @@ mod tests {
         };
         Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: kind,
-            eq_conditions: eq,
-            other_condition: None,
             build_side,
             distribution: JoinDistribution::Unknown,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: eq,
+                residual: None,
+            },
         })
     }
 
@@ -1613,10 +1615,12 @@ mod tests {
 
         let broadcast_op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: eq.clone(),
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: eq.clone(),
+                residual: None,
+            },
         });
         let default_broadcast_input = broadcast_input_with_scalars(
             &broadcast_op,
@@ -2716,10 +2720,12 @@ mod tests {
         let own = stats(100_000.0, 200.0);
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         });
         let child_stats = [&probe, &build];
         let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
@@ -2801,10 +2807,12 @@ mod tests {
         let own = stats(100_000.0, 96.0);
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         });
         let options = CostOptions::default();
         let required = PhysicalPropertySet::any();
@@ -2838,10 +2846,12 @@ mod tests {
         let own = stats(100_000.0, 96.0);
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         });
         let options = CostOptions::default();
         let required = PhysicalPropertySet::any();
@@ -2873,10 +2883,12 @@ mod tests {
         let own = stats(100_000.0, 68.0);
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Colocate,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         });
         let options = CostOptions::default();
         let required = PhysicalPropertySet::any();
@@ -2916,10 +2928,12 @@ mod tests {
         let own = stats(100_000.0, 96.0);
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         });
         let required = PhysicalPropertySet::any();
         let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
@@ -2975,10 +2989,12 @@ mod tests {
         let own = stats(4_000_000.0, 80.0);
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         });
         let required = PhysicalPropertySet::any();
         let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
@@ -3030,10 +3046,12 @@ mod tests {
         let own = stats(100_000.0, 128.0);
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         });
         let options = CostOptions::default();
         let required = PhysicalPropertySet::any();
@@ -3061,10 +3079,12 @@ mod tests {
         let own = stats(100_000.0, 128.0);
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         });
         let options = CostOptions::default();
         let required = PhysicalPropertySet::any();
@@ -3101,10 +3121,12 @@ mod tests {
         let own = stats(100_000.0, 96.0);
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         });
         let options = CostOptions::default();
         let required = PhysicalPropertySet::any();
@@ -3148,17 +3170,21 @@ mod tests {
         let third_key = test_eq_condition(&mut scalars, 3, 13);
         let single_key = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![first_key.clone()],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Colocate,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![first_key.clone()],
+                residual: None,
+            },
         });
         let multi_key = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![first_key, second_key, third_key],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Colocate,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![first_key, second_key, third_key],
+                residual: None,
+            },
         });
         let options = CostOptions::default();
         let required = PhysicalPropertySet::any();
@@ -3202,10 +3228,12 @@ mod tests {
         let mut scalars = ScalarArena::new();
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![test_eq_condition(&mut scalars, 1, 11)],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Colocate,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![test_eq_condition(&mut scalars, 1, 11)],
+                residual: None,
+            },
         });
         let options = CostOptions::default();
         let required = PhysicalPropertySet::any();
@@ -3405,17 +3433,21 @@ mod tests {
 
         let shuffle = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Shuffle,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         });
         let colocate = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Colocate,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         });
         let cs = [&probe, &build];
         let c_shuffle = compute_cost(&shuffle, &own, &cs);
@@ -3430,10 +3462,12 @@ mod tests {
         let own = stats(100_000.0, 200.0);
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         });
         let child_stats = [&probe, &build];
         let left_output = PhysicalPropertySet {
@@ -3476,10 +3510,12 @@ mod tests {
         let own = stats(100_000.0, 200.0);
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         });
         let child_stats = [&probe, &build];
         let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
@@ -3549,10 +3585,12 @@ mod tests {
         .unwrap();
         let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: Some(other_condition),
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: Some(other_condition),
+            },
         });
         let child_stats = [&probe, &build];
         let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];

@@ -850,10 +850,9 @@ pub enum NodeKind {
     },
     HashJoin {
         kind: JoinKind,
-        keys: Box<[JoinKey]>,
+        condition: crate::HashJoinCondition<Box<[JoinKey]>, ExprId>,
         build_side: JoinSide,
         distribution: JoinDistribution,
-        residual: Option<ExprId>,
         null_extended: Box<[ValueId]>,
     },
     NestLoopJoin {
@@ -986,11 +985,15 @@ impl NodeKind {
                     output.extend(call.order_by.iter().map(|item| item.expr));
                 }
             }
-            Self::HashJoin { keys, residual, .. } => {
-                for key in keys {
+            Self::HashJoin { condition, .. } => {
+                for key in condition
+                    .keys()
+                    .iter()
+                    .chain(condition.scope_keys().into_iter().flatten())
+                {
                     output.extend([key.left, key.right]);
                 }
-                output.extend(*residual);
+                output.extend(*condition.residual());
             }
             Self::NestLoopJoin { predicate, .. } => output.extend(*predicate),
             Self::Sort { order_by, mode } => {

@@ -567,6 +567,12 @@ fn tag_join(
             if let Some(cond_id) = node.condition {
                 combined.extend(collect_scalar_column_id_refs(arena, cond_id));
             }
+            if let Some(author) = &node.naa_author {
+                combined.extend(collect_scalar_column_id_refs(arena, author.comparison));
+                if let Some(eligibility) = author.eligibility {
+                    combined.extend(collect_scalar_column_id_refs(arena, eligibility));
+                }
+            }
             let left_outputs = collect_output_ids_opt(expr.left());
             let right_outputs = collect_output_ids_opt(expr.right());
             let left: HashSet<ColumnId> = combined
@@ -1585,6 +1591,7 @@ mod tests {
 
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(cond),
             }),
@@ -2036,6 +2043,7 @@ mod tests {
 
         let consumer = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: None,
             }),
@@ -2362,6 +2370,7 @@ mod tests {
 
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(cond),
             }),
@@ -2410,6 +2419,7 @@ mod tests {
         let right_scan = make_scan_with_ids(&arena_rc, 4, 5, 6);
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: None,
             }),

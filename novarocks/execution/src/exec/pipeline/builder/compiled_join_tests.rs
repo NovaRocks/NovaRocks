@@ -262,7 +262,15 @@ pub(super) fn oracle(spec: Spec, left: &[Row], right: &[Row]) -> Rows {
                 let keep = if right.is_empty() {
                     true
                 } else if matches!(spec.family, Family::NestLoop) {
-                    false
+                    // The complete NL predicate is TRUE/UNKNOWN for a
+                    // suppressing pair; it has no inferred eligibility role.
+                    !right.iter().any(|r| {
+                        !spec.residual
+                            || match (l.1, r.1) {
+                                (Some(x), Some(y)) => x < y,
+                                _ => true,
+                            }
+                    })
                 } else if !spec.residual {
                     l.0.is_some() && right.iter().all(|r| r.0.is_some() && r.0 != l.0)
                 } else if l.0.is_none() {
@@ -277,7 +285,27 @@ pub(super) fn oracle(spec: Spec, left: &[Row], right: &[Row]) -> Rows {
                 }
             }
         }
-        JoinKind::FullOuter => unreachable!("not a fixture kind"),
+        JoinKind::FullOuter => {
+            // Independent physical-row oracle: every true pair, plus each
+            // unmatched occurrence on either side. Equal values stay distinct.
+            for &l in left {
+                let mut found = false;
+                for &r in right {
+                    if pair_matches(spec, l, r) {
+                        rows.push(pair(l, r));
+                        found = true;
+                    }
+                }
+                if !found {
+                    rows.push(vec![l.0, l.1, None, None]);
+                }
+            }
+            for &r in right {
+                if !left.iter().any(|&l| pair_matches(spec, l, r)) {
+                    rows.push(vec![None, None, r.0, r.1]);
+                }
+            }
+        }
     }
     rows.sort();
     rows
@@ -347,6 +375,24 @@ fn add_join(
             )
             .unwrap()
     });
+    let nested_predicate = if matches!(spec.family, Family::NestLoop)
+        && spec.kind == JoinKind::NullAwareLeftAnti
+        && residual.is_none()
+    {
+        // The existing unconditional NOT IN oracle now has an explicit
+        // complete comparison, rather than a missing predicate default.
+        Some(
+            builder
+                .add_expression(
+                    join,
+                    FunctionValueType::new(DataType::Boolean, false),
+                    ExprKind::Literal(LiteralValue::Boolean(true)),
+                )
+                .unwrap(),
+        )
+    } else {
+        residual
+    };
     let mut extend = |of: ValueId| {
         builder
             .add_value(int64(true), ValueOrigin::NullExtended { node: join, of })
@@ -358,6 +404,9 @@ fn add_join(
         (JoinKind::LeftOuter, false) => vec![l[0], l[1], extend(r[0]), extend(r[1])],
         (JoinKind::LeftOuter, true) => vec![extend(r[1]), l[0]],
         (JoinKind::RightOuter, false) => vec![extend(l[0]), extend(l[1]), r[0], r[1]],
+        (JoinKind::FullOuter, false) => {
+            vec![extend(l[0]), extend(l[1]), extend(r[0]), extend(r[1])]
+        }
         (JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti, false) => {
             l.to_vec()
         }
@@ -390,15 +439,25 @@ fn add_join(
     let kind = match spec.family {
         Family::Hash { build_side, .. } => NodeKind::HashJoin {
             kind: spec.kind,
-            keys: Box::from([key.unwrap()]),
             build_side,
             distribution: match placement {
                 Placement::Single => JoinDistribution::Singleton,
                 Placement::Broadcast => JoinDistribution::BroadcastBuild,
                 Placement::Partitioned => JoinDistribution::Partitioned,
             },
-            residual,
             null_extended,
+            condition: if spec.kind == JoinKind::NullAwareLeftAnti {
+                novarocks_physical_plan::HashJoinCondition::NullAwareEqual {
+                    value_equal_keys: Box::from([key.unwrap()]),
+                    scope_keys: Box::default(),
+                    eligibility: residual,
+                }
+            } else {
+                novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: Box::from([key.unwrap()]),
+                    residual,
+                }
+            },
         },
         Family::NestLoop => NodeKind::NestLoopJoin {
             kind: spec.kind,
@@ -407,7 +466,7 @@ fn add_join(
                 Placement::Broadcast => NestLoopJoinDistribution::BroadcastRight,
                 Placement::Partitioned => panic!("a nested-loop join is never partitioned"),
             },
-            predicate: residual,
+            predicate: nested_predicate,
             null_extended,
         },
     };
@@ -536,6 +595,14 @@ fn version() -> PlanVersionId {
 
 /// `Values(left) JOIN Values(right) -> Result` in one fragment.
 pub(super) fn single_plan(spec: Spec, left: &[Row], right: &[Row]) -> PhysicalPlan {
+    single_plan_with_dop(spec, left, right, 1)
+}
+pub(super) fn single_plan_with_dop(
+    spec: Spec,
+    left: &[Row],
+    right: &[Row],
+    pipeline_dop: u32,
+) -> PhysicalPlan {
     let mut builder = FragmentBuilder::new(SINGLE);
     let left_node = builder.reserve_node_id().unwrap();
     let left_values = values(
@@ -564,7 +631,7 @@ pub(super) fn single_plan(spec: Spec, left: &[Row], right: &[Row]) -> PhysicalPl
         .finish_definition(
             join,
             FragmentSink::Result,
-            dop(1),
+            dop(pipeline_dop),
             novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
@@ -1098,7 +1165,7 @@ fn semi_and_anti_joins_including_mirrored_right_kinds_match_the_oracle() {
         join_kind(&program),
         ProgramNodeKind::Join {
             join_type: JoinType::LeftSemi,
-            distribution_mode: JoinDistributionMode::Broadcast,
+            distribution_mode: JoinDistributionMode::SharedBuild,
             ..
         }
     ));
@@ -1306,11 +1373,13 @@ pub(super) fn overflow_plan(at: Overflow) -> PhysicalPlan {
             Distribution::Singleton,
             NodeKind::HashJoin {
                 kind: JoinKind::Inner,
-                keys: Box::from([key]),
                 build_side: JoinSide::Right,
                 distribution: JoinDistribution::Singleton,
-                residual,
                 null_extended: Box::default(),
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: Box::from([key]),
+                    residual,
+                },
             },
         )
         .unwrap();
@@ -1447,7 +1516,7 @@ fn partitioned_join_runs_each_instance_over_its_colocated_partition() {
         assert!(matches!(
             join_kind(&run.join),
             ProgramNodeKind::Join {
-                distribution_mode: JoinDistributionMode::Broadcast,
+                distribution_mode: JoinDistributionMode::SharedBuild,
                 ..
             }
         ));
@@ -1456,6 +1525,7 @@ fn partitioned_join_runs_each_instance_over_its_colocated_partition() {
 
 type StepJoinOperators = (
     Arc<LocalProgram>,
+    Box<dyn crate::exec::pipeline::operator::Operator>,
     Box<dyn crate::exec::pipeline::operator::Operator>,
     Box<dyn crate::exec::pipeline::operator::Operator>,
     crate::exec::chunk::Chunk,
@@ -1475,16 +1545,13 @@ fn schema_owner_join_operators(nested: bool) -> StepJoinOperators {
 
 fn step_join_operators(spec: Spec, left_rows: &[Row], right_rows: &[Row]) -> StepJoinOperators {
     use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::exec::operators::compiled_nljoin::{
-        CompiledNlJoinPlan, CompiledNlJoinProbeProcessorFactory,
+    use crate::exec::operators::hashjoin::{
+        JoinParticipants,
+        compiled_hash_join::{
+            CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
+            CompiledJoinInputSinkFactory, CompiledJoinProbeProcessorFactory,
+        },
     };
-    use crate::exec::operators::hashjoin::broadcast_join_shared::BroadcastJoinSharedState;
-    use crate::exec::operators::hashjoin::compiled_hash_join::{
-        CompiledHashJoinBuildSinkFactory, CompiledHashJoinPlan,
-        CompiledHashJoinProbeProcessorFactory,
-    };
-    use crate::exec::operators::{NlJoinBuildSinkFactory, NlJoinSharedState};
-    use crate::exec::pipeline::dependency::DependencyManager;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     let nested = matches!(spec.family, Family::NestLoop);
     let mut packages = packages(&single_plan(spec, left_rows, right_rows));
@@ -1515,55 +1582,46 @@ fn step_join_operators(spec: Spec, left_rows: &[Row], right_rows: &[Row]) -> Ste
     );
     let error = Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default());
     let node = novarocks_local_program::ProgramNodeId::new(ordinal);
-    let (probe, build): (
-        Box<dyn crate::exec::pipeline::operator::Operator>,
-        Box<dyn crate::exec::pipeline::operator::Operator>,
-    ) = if nested {
-        let plan = Arc::new(CompiledNlJoinPlan::try_new(&program, node).unwrap());
-        let state = Arc::new(NlJoinSharedState::new(17, DependencyManager::default()));
-        (
-            CompiledNlJoinProbeProcessorFactory::new(
-                program.clone(),
-                plan,
-                state.clone(),
-                error.clone(),
-            )
-            .create(1, 0),
-            NlJoinBuildSinkFactory::new(state).create(1, 0),
-        )
-    } else {
-        let plan = Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap());
-        let state = Arc::new(BroadcastJoinSharedState::new(
-            17,
-            DependencyManager::default(),
-            1,
-        ));
-        (
-            CompiledHashJoinProbeProcessorFactory::new(
-                program.clone(),
-                plan.clone(),
-                state.clone(),
-                error.clone(),
-            )
-            .create(1, 0),
-            CompiledHashJoinBuildSinkFactory::new(
-                program.clone(),
-                plan,
-                state,
-                error.clone(),
-                None,
-            )
-            .create(1, 0),
-        )
+    let participants = JoinParticipants {
+        inputs: 1,
+        finalizers: std::num::NonZeroUsize::MIN,
+        probes: 1,
+        tails: 0,
     };
-    (program, probe, build, input, error)
+    let declaration = Arc::new(if nested {
+        CompiledJoinFrame::new_nested_loop(program.clone(), node, participants, None).unwrap()
+    } else {
+        CompiledJoinFrame::new(
+            program.clone(),
+            Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap()),
+            participants,
+            None,
+        )
+    });
+    let probe =
+        CompiledJoinProbeProcessorFactory::new(declaration.clone(), error.clone()).create(1, 0);
+    let build =
+        CompiledJoinInputSinkFactory::new(declaration.clone(), error.clone(), None).create(1, 0);
+    let finalize = CompiledJoinFinalizeSourceFactory::new(declaration, error.clone()).create(1, 0);
+    (program, probe, build, finalize, input, error)
+}
+
+fn settle_step_build(
+    finalize: &mut dyn crate::exec::pipeline::operator::Operator,
+    runtime: &RuntimeState,
+) {
+    let mut calls = TestDriver::new(finalize, runtime);
+    assert!(
+        calls.collect_until_finished().unwrap().is_empty(),
+        "the real F emits no rows"
+    );
 }
 
 #[test]
 fn compiled_join_schema_prepare_missing_owner_precedes_build_and_input() {
     use crate::exec::pipeline::operator::ConstructionFailure;
     for nested in [false, true] {
-        let (_, mut operator, _, input, _) = schema_owner_join_operators(nested);
+        let (_, mut operator, _, _, input, _) = schema_owner_join_operators(nested);
         let first = operator.prepare().unwrap_err();
         assert!(matches!(
             first.cause(),
@@ -1582,7 +1640,7 @@ fn compiled_join_schema_prepare_keeps_first_memory_refusal_and_rolls_back() {
     use crate::exec::pipeline::operator::ConstructionFailure;
     use crate::runtime::mem_tracker::MemTracker;
     for nested in [false, true] {
-        let (_, mut operator, _, input, error) = schema_owner_join_operators(nested);
+        let (_, mut operator, _, _, input, error) = schema_owner_join_operators(nested);
         let tracker = MemTracker::new_root("join first actual schema refusal");
         operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
             tracker.clone(),
@@ -1612,7 +1670,8 @@ fn compiled_join_schema_prepare_keeps_first_memory_refusal_and_rolls_back() {
 fn compiled_join_schema_last_slot_keeps_creator_after_plan_and_operators_exit() {
     use crate::runtime::mem_tracker::MemTracker;
     for nested in [false, true] {
-        let (program, mut operator, mut build, input, error) = schema_owner_join_operators(nested);
+        let (program, mut operator, mut build, mut finalize, input, error) =
+            schema_owner_join_operators(nested);
         let weak = Arc::downgrade(&program);
         let tracker = MemTracker::new_root("join independent output schema creator");
         let runtime = RuntimeState::new(
@@ -1628,18 +1687,26 @@ fn compiled_join_schema_last_slot_keeps_creator_after_plan_and_operators_exit() 
         let factory =
             super::aggregate_fixture::runtime_construction_factory(tracker.clone(), error);
         operator.set_construction_factory(factory.clone());
-        build.set_construction_factory(factory);
+        build.set_construction_factory(factory.clone());
+        finalize.set_construction_factory(factory);
         operator.set_mem_tracker(tracker.clone());
         build.set_mem_tracker(tracker.clone());
+        finalize.set_mem_tracker(tracker.clone());
         operator.prepare().unwrap();
         build.prepare().unwrap();
+        finalize.prepare().unwrap();
         operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
         build.bind_runtime_state(&runtime).unwrap();
+        build.activate(&runtime).unwrap();
+        finalize.bind_runtime_state(&runtime).unwrap();
+        finalize.activate(&runtime).unwrap();
         {
             let mut build_calls = TestDriver::new(build.as_mut(), &runtime);
             build_calls.signal_eos().unwrap();
             assert!(build_calls.collect_until_finished().unwrap().is_empty());
         }
+        settle_step_build(finalize.as_mut(), &runtime);
         let mut processor = TestDriver::new(operator.as_mut(), &runtime);
         processor.accept_without_output(input).unwrap();
         processor.signal_eos().unwrap();
@@ -1658,6 +1725,7 @@ fn compiled_join_schema_last_slot_keeps_creator_after_plan_and_operators_exit() 
         drop(processor);
         drop(operator);
         drop(build);
+        drop(finalize);
         drop(program);
         assert!(weak.upgrade().is_none());
         drop(output);
@@ -1736,9 +1804,7 @@ fn join_nested_fixture_source(id: u32, json: bool) -> crate::exec::chunk::Chunk 
 
 #[test]
 fn compiled_join_gather_rejects_nested_domain_and_child_null_drift() {
-    use crate::exec::operators::hashjoin::{
-        JoinGatherError, gather_join_batch_typed, gather_probe_build_batches_typed,
-    };
+    use crate::exec::operators::hashjoin::{JoinGatherError, PagedJoinGather};
     use crate::runtime::mem_tracker::MemTracker;
     use novarocks_type_contract::ValueTypeStorageLifetime;
     let left = join_nested_fixture_source(901, true);
@@ -1748,9 +1814,6 @@ fn compiled_join_gather_rejects_nested_domain_and_child_null_drift() {
         tracker.clone(),
         Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
     );
-    let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::new(
-        crate::runtime::runtime_state::RuntimeErrorState::default(),
-    ));
     for (left_id, json, child_nullable) in
         [(901, false, true), (901, true, false), (903, true, true)]
     {
@@ -1765,34 +1828,12 @@ fn compiled_join_gather_rejects_nested_domain_and_child_null_drift() {
             .unwrap(),
         );
         let owner = factory.begin_typed_construction(&declared).unwrap();
-        let scratch = factory.begin_typed_construction(&declared).unwrap();
-        // Both real consumers use the same complete declaration author, before
-        // any take allocation or nullable repair can hide source drift.
         assert!(matches!(
-            gather_join_batch_typed(
-                &left,
-                &right,
-                &[0],
-                &[0],
-                &declared,
-                owner.as_ref(),
-                scratch.as_ref(),
-                &control
-            ),
-            Err(JoinGatherError::Source(_))
-        ));
-        assert!(matches!(
-            gather_probe_build_batches_typed(
-                &left,
-                &right,
-                &[0],
-                &[0],
-                &declared,
-                true,
-                false,
-                owner.as_ref(),
-                scratch.as_ref(),
-                &control
+            PagedJoinGather::new(
+                declared,
+                left.chunk_schema(),
+                right.chunk_schema(),
+                owner.as_ref()
             ),
             Err(JoinGatherError::Source(_))
         ));
@@ -1803,7 +1844,9 @@ fn compiled_join_gather_rejects_nested_domain_and_child_null_drift() {
 
 #[test]
 fn compiled_join_gather_null_extension_requires_declared_nullable_binding() {
-    use crate::exec::operators::hashjoin::{JoinGatherError, gather_left_with_null_right_typed};
+    use crate::exec::operators::hashjoin::{
+        CanonicalJoinOutput, JoinGatherError, JoinPairRow, PagedJoinGather,
+    };
     use crate::runtime::mem_tracker::MemTracker;
     use novarocks_type_contract::ValueTypeStorageLifetime;
     let left = join_nested_fixture_source(901, true);
@@ -1827,20 +1870,32 @@ fn compiled_join_gather_null_extension_requires_declared_nullable_binding() {
         .unwrap(),
     );
     let owner = factory.begin_typed_construction(&required).unwrap();
-    let scratch = factory.begin_typed_construction(&required).unwrap();
+    let rows = crate::exec::operators::hashjoin::paged_fixture_rows(
+        &right,
+        owner.as_ref(),
+        &tracker,
+        &control,
+    );
+    let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
+    let pairs = [JoinPairRow {
+        probe: Some(0),
+        build: None,
+    }];
+    let gather = PagedJoinGather::new_canonical(
+        required,
+        left.chunk_schema(),
+        right.chunk_schema(),
+        CanonicalJoinOutput::Pairs,
+        owner.as_ref(),
+    )
+    .unwrap();
     assert!(matches!(
-        gather_left_with_null_right_typed(
-            &left,
-            &[0],
-            &right.chunk_schema_ref(),
-            &required,
-            owner.as_ref(),
-            scratch.as_ref(),
-            &control
-        ),
+        gather.gather(Some(&left), &rows, &pairs, owner.as_ref(), &host, &control),
         Err(JoinGatherError::Source(_))
     ));
-    drop(scratch);
+    drop(gather);
+    drop(rows);
     drop(owner);
     let nullable = Arc::new(
         crate::exec::chunk::ChunkSchema::try_new_typed(
@@ -1853,18 +1908,23 @@ fn compiled_join_gather_null_extension_requires_declared_nullable_binding() {
         .unwrap(),
     );
     let owner = factory.begin_typed_construction(&nullable).unwrap();
-    let scratch = factory.begin_typed_construction(&nullable).unwrap();
-    let batch = gather_left_with_null_right_typed(
-        &left,
-        &[0],
-        &right.chunk_schema_ref(),
-        &nullable,
+    let rows = crate::exec::operators::hashjoin::paged_fixture_rows(
+        &right,
         owner.as_ref(),
-        scratch.as_ref(),
+        &tracker,
         &control,
+    );
+    let gather = PagedJoinGather::new_canonical(
+        nullable,
+        left.chunk_schema(),
+        right.chunk_schema(),
+        CanonicalJoinOutput::Pairs,
+        owner.as_ref(),
     )
-    .unwrap()
     .unwrap();
+    let batch = gather
+        .gather(Some(&left), &rows, &pairs, owner.as_ref(), &host, &control)
+        .unwrap();
     let chunk = batch.into_chunk(owner.as_ref()).unwrap();
     assert_eq!(chunk.record_batch().column(1).null_count(), 1);
     assert!(chunk.chunk_schema().slots()[1].typed_binding().nullable());
@@ -1882,7 +1942,8 @@ fn compiled_join_gather_null_extension_requires_declared_nullable_binding() {
             .value_type()
             .child_type_at(0)
     );
-    drop(scratch);
+    drop(gather);
+    drop(rows);
     drop(owner);
     drop(factory);
     assert!(tracker.current() > 0);
@@ -1897,7 +1958,8 @@ fn compiled_join_output_last_batch_ref_keeps_original_source_creator() {
     use crate::runtime::mem_tracker::MemTracker;
     use novarocks_type_contract::ValueTypeStorageLifetime;
     for nested in [false, true] {
-        let (program, mut operator, mut build, input, error) = schema_owner_join_operators(nested);
+        let (program, mut operator, mut build, mut finalize, input, error) =
+            schema_owner_join_operators(nested);
         let weak = Arc::downgrade(&program);
         let source_tracker = MemTracker::new_root("join input source construction");
         let source_factory = super::aggregate_fixture::runtime_construction_factory(
@@ -1935,18 +1997,26 @@ fn compiled_join_output_last_batch_ref_keeps_original_source_creator() {
         let factory =
             super::aggregate_fixture::runtime_construction_factory(tracker.clone(), error);
         operator.set_construction_factory(factory.clone());
-        build.set_construction_factory(factory);
+        build.set_construction_factory(factory.clone());
+        finalize.set_construction_factory(factory);
         operator.set_mem_tracker(tracker.clone());
         build.set_mem_tracker(tracker.clone());
+        finalize.set_mem_tracker(tracker.clone());
         operator.prepare().unwrap();
         build.prepare().unwrap();
+        finalize.prepare().unwrap();
         operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
         build.bind_runtime_state(&runtime).unwrap();
+        build.activate(&runtime).unwrap();
+        finalize.bind_runtime_state(&runtime).unwrap();
+        finalize.activate(&runtime).unwrap();
         {
             let mut build_calls = TestDriver::new(build.as_mut(), &runtime);
             build_calls.signal_eos().unwrap();
             assert!(build_calls.collect_until_finished().unwrap().is_empty());
         }
+        settle_step_build(finalize.as_mut(), &runtime);
         let mut processor = TestDriver::new(operator.as_mut(), &runtime);
         processor.accept_without_output(input).unwrap();
         processor.signal_eos().unwrap();
@@ -1963,6 +2033,7 @@ fn compiled_join_output_last_batch_ref_keeps_original_source_creator() {
         drop(processor);
         drop(operator);
         drop(build);
+        drop(finalize);
         drop(program);
         assert!(weak.upgrade().is_none());
         drop(output);
@@ -1977,7 +2048,7 @@ fn compiled_join_output_last_batch_ref_keeps_original_source_creator() {
 #[test]
 fn compiled_hash_build_prepare_missing_owner_preserves_input_and_first_cause() {
     use crate::exec::pipeline::operator::ConstructionFailure;
-    let (_, probe, mut build, input, _) = schema_owner_join_operators(false);
+    let (_, probe, mut build, _, input, _) = schema_owner_join_operators(false);
     let source = input.batch_projection();
     let rows = int64_rows(std::slice::from_ref(&input));
     let first = build.prepare().unwrap_err();
@@ -2026,17 +2097,19 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
     };
     use crate::runtime::mem_tracker::MemTracker;
     use std::num::NonZeroU64;
-    let (program, mut probe, mut build, input, error) = schema_owner_join_operators(true);
+    let (program, mut probe, mut build, mut finalize, input, error) =
+        schema_owner_join_operators(true);
     let runtime = RuntimeState::default();
     let tracker = MemTracker::new_root("nested-loop receiver steps");
     tracker.install_limit_once(64 * 1024 * 1024).unwrap();
     let factory =
         super::aggregate_fixture::runtime_construction_factory(tracker.clone(), error.clone());
-    for operator in [&mut probe, &mut build] {
+    for operator in [&mut probe, &mut build, &mut finalize] {
         operator.set_construction_factory(factory.clone());
         operator.set_mem_tracker(tracker.clone());
-        operator.bind_runtime_state(&runtime).unwrap();
         operator.prepare().unwrap();
+        operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
     }
     drop(factory);
     let original = input.columns()[0].clone();
@@ -2074,10 +2147,12 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
         );
         let build_step = build.as_mut();
         build_step.finish(&mut ctx).unwrap();
-        assert!(matches!(
-            build_step.drive(&mut ctx).unwrap().next,
-            NextStep::Finished
-        ));
+        // EOS was signalled under a zero-CPU probe turn. The real E gets
+        // ordinary driver turns to finish its own admitted work and receipt.
+        let mut build_calls = TestDriver::new(build_step, &runtime);
+        assert!(build_calls.collect_until_finished().unwrap().is_empty());
+        drop(build_calls);
+        settle_step_build(finalize.as_mut(), &runtime);
         assert_ne!(wait.observable.generation(), wait.observed_generation);
         assert!(matches!(
             step.try_push(&mut ctx, input),
@@ -2085,7 +2160,7 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
         ));
         let applied = step.drive(&mut ctx).unwrap();
         assert!(applied.output.is_none());
-        assert!(matches!(applied.next, NextStep::Runnable));
+        assert!(matches!(applied.next, NextStep::Runnable | NextStep::Yield));
         step.finish(&mut ctx).unwrap();
         let allocated = tracker.allocated();
         assert!(matches!(
@@ -2094,14 +2169,12 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
         ));
         assert_eq!(tracker.allocated(), allocated);
     }
-    turn.begin_turn(1).unwrap();
-    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&error, &mut turn, &mut value_conversions);
-    let emitted = step.drive(&mut ctx).unwrap();
-    assert!(matches!(emitted.next, NextStep::Runnable));
-    let output = emitted.output.unwrap();
+    // Drain through the original receiver under real driver turns. The oracle
+    // fixes all admitted rows, independently of the kernel's working page size.
+    let mut calls = TestDriver::new(step, &runtime);
+    let output = calls.collect_until_finished().unwrap();
     assert_eq!(
-        sorted(int64_rows(std::slice::from_ref(&output))),
+        sorted(int64_rows(&output)),
         sorted(
             LEFT_ROWS
                 .iter()
@@ -2109,12 +2182,11 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
                 .collect()
         )
     );
-    let ended = step.drive(&mut ctx).unwrap();
-    assert!(ended.output.is_none());
-    assert!(matches!(ended.next, NextStep::Finished));
-    assert!(step.drive(&mut ctx).unwrap().output.is_none());
+    assert!(calls.advance_to_boundary().unwrap().output.is_none());
+    drop(calls);
     drop(probe);
     drop(build);
+    drop(finalize);
     drop(program);
     assert!(tracker.current() > 0);
     drop(output);
@@ -2124,7 +2196,6 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
 #[test]
 fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_cursor() {
     use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::exec::operators::hashjoin::MAX_JOIN_OUTPUT_ROWS_PER_BATCH;
     use crate::exec::pipeline::{
         input::RawInput,
         step::{AdmissionNext, InputResult, NextStep},
@@ -2136,7 +2207,8 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
         .map(|value| (Some(1), Some(value)))
         .collect::<Vec<Row>>();
     let spec = Spec::hash(JoinKind::Inner, false);
-    let (program, mut probe, mut build, input, error) = step_join_operators(spec, &rows, &rows);
+    let (program, mut probe, mut build, mut finalize, input, error) =
+        step_join_operators(spec, &rows, &rows);
     let right = program
         .graph()
         .nodes()
@@ -2168,11 +2240,12 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
     tracker.install_limit_once(64 * 1024 * 1024).unwrap();
     let factory =
         super::aggregate_fixture::runtime_construction_factory(tracker.clone(), error.clone());
-    for operator in [&mut probe, &mut build] {
+    for operator in [&mut probe, &mut build, &mut finalize] {
         operator.set_construction_factory(factory.clone());
         operator.set_mem_tracker(tracker.clone());
-        operator.bind_runtime_state(&runtime).unwrap();
         operator.prepare().unwrap();
+        operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
     }
     drop(factory);
     let mut turn = TurnWork::new(NonZeroU64::new(1).unwrap(), 0);
@@ -2202,10 +2275,12 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
         ));
         assert!(build_step.drive(&mut ctx).unwrap().output.is_none());
         build_step.finish(&mut ctx).unwrap();
-        assert!(matches!(
-            build_step.drive(&mut ctx).unwrap().next,
-            NextStep::Finished
-        ));
+        // EOS was signalled under a zero-CPU probe turn. The real E gets
+        // ordinary driver turns to finish its own admitted work and receipt.
+        let mut build_calls = TestDriver::new(build_step, &runtime);
+        assert!(build_calls.collect_until_finished().unwrap().is_empty());
+        drop(build_calls);
+        settle_step_build(finalize.as_mut(), &runtime);
         assert_ne!(wait.observable.generation(), wait.observed_generation);
         assert!(matches!(
             step.try_push(&mut ctx, input),
@@ -2213,7 +2288,7 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
         ));
         let applied = step.drive(&mut ctx).unwrap();
         assert!(applied.output.is_none());
-        assert!(matches!(applied.next, NextStep::Runnable));
+        assert!(matches!(applied.next, NextStep::Runnable | NextStep::Yield));
         step.finish(&mut ctx).unwrap();
         let allocated = tracker.allocated();
         assert!(matches!(
@@ -2222,45 +2297,1144 @@ fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_curs
         ));
         assert_eq!(tracker.allocated(), allocated);
     }
-    let mut output = Vec::new();
-    for expected in [
-        MAX_JOIN_OUTPUT_ROWS_PER_BATCH,
-        rows.len() * rows.len() - MAX_JOIN_OUTPUT_ROWS_PER_BATCH,
-    ] {
-        turn.begin_turn(1).unwrap();
-        let mut value_conversions =
-            novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&error, &mut turn, &mut value_conversions);
-        let page = step.drive(&mut ctx).unwrap();
-        assert!(matches!(page.next, NextStep::Runnable));
-        let page = page.output.unwrap();
-        assert_eq!(page.len(), expected);
-        output.push(page);
-        let allocated = tracker.allocated();
-        let yielded = step.drive(&mut ctx).unwrap();
-        assert!(yielded.output.is_none());
-        assert!(matches!(yielded.next, NextStep::Yield));
-        assert_eq!(tracker.allocated(), allocated);
-    }
+    let mut calls = TestDriver::new(step, &runtime);
+    let output = calls.collect_until_finished().unwrap();
+    assert!(
+        output.len() > 1,
+        "duplicate occurrences must survive multiple transferred pages"
+    );
     assert_eq!(
         sorted(int64_rows(&output)),
         sorted(oracle(spec, &rows, &rows))
     );
-    turn.begin_turn(1).unwrap();
-    let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&error, &mut turn, &mut value_conversions);
-    let tail = step.drive(&mut ctx).unwrap();
-    assert!(tail.output.is_none());
-    assert!(matches!(tail.next, NextStep::Runnable));
-    assert!(matches!(
-        step.drive(&mut ctx).unwrap().next,
-        NextStep::Finished
-    ));
-    assert!(step.drive(&mut ctx).unwrap().output.is_none());
+    assert!(calls.advance_to_boundary().unwrap().output.is_none());
+    drop(calls);
     drop(probe);
     drop(build);
+    drop(finalize);
     drop(program);
     assert!(tracker.current() > 0);
     drop(output);
     assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn b3_finalize_sources_wait_for_exact_e_and_poll_real_k_csr_to_data_only_completion() {
+    use crate::exec::operators::hashjoin::{
+        JoinParticipants,
+        compiled_hash_join::{
+            CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
+            frame_fixture_inputs,
+        },
+    };
+    use crate::exec::pipeline::{
+        operator_factory::OperatorFactory,
+        step::{NextStep, WaitReason},
+        step_context::{StepContext, TurnWork},
+    };
+    use crate::runtime::mem_tracker::MemTracker;
+    use std::num::NonZeroU64;
+    let mut packages = packages(&single_plan_with_dop(
+        Spec::hash(JoinKind::Inner, false),
+        &LEFT_ROWS,
+        &RIGHT_ROWS,
+        3,
+    ));
+    let program = compile(packages.remove(&SINGLE).unwrap(), 3, true);
+    let node = program
+        .graph()
+        .nodes()
+        .iter()
+        .position(|node| matches!(node.kind(), ProgramNodeKind::Join { .. }))
+        .map(novarocks_local_program::ProgramNodeId::new)
+        .unwrap();
+    let plan = Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap());
+    let declaration = Arc::new(CompiledJoinFrame::new(
+        Arc::clone(&program),
+        plan,
+        JoinParticipants {
+            inputs: 2,
+            finalizers: NonZeroUsize::new(3).unwrap(),
+            probes: 2,
+            tails: 0,
+        },
+        None,
+    ));
+    let runtime = RuntimeState::default();
+    let error = runtime.error_state();
+    let tracker = MemTracker::new_root("original B3 finalize source fixture");
+    let construction = super::aggregate_fixture::runtime_construction_factory(
+        Arc::clone(&tracker),
+        Arc::clone(&error),
+    );
+    let factory =
+        CompiledJoinFinalizeSourceFactory::new(Arc::clone(&declaration), Arc::clone(&error));
+    assert!(factory.bind_pipeline_dop(2).is_err());
+    let mut operators: Vec<_> = (0..3).map(|id| factory.create(3, id)).collect();
+    let profiles = (0..3)
+        .map(|_| {
+            crate::runtime::profile::OperatorProfiles::new(
+                crate::runtime::profile::RuntimeProfile::new(format!(
+                    "COMPILED_JOIN_FINALIZE (id={})",
+                    node.index()
+                )),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (operator, profile) in operators.iter_mut().zip(&profiles) {
+        operator.set_profiles(profile.clone());
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        operator.set_construction_factory(Arc::clone(&construction));
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
+    }
+    let frame = declaration.prepared().unwrap();
+    let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+    let mut turn = TurnWork::new(NonZeroU64::MIN, 9);
+    let before = operators[0]
+        .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+        .unwrap();
+    let NextStep::Wait(wait) = before.next else {
+        panic!("missing real E receipts requires a dependency wait");
+    };
+    assert_eq!(wait.reason, WaitReason::Dependency);
+    assert!(Arc::ptr_eq(
+        &wait.observable,
+        &frame.completion.observable()
+    ));
+    assert!(before.output.is_none());
+    assert!(profiles.iter().all(|profile| {
+        profile
+            .unique
+            .counter_value_min_max("JoinKAdvanceCalls")
+            .unwrap()
+            .0
+            == 0
+    }));
+    assert!(profiles.iter().all(|profile| {
+        profile
+            .unique
+            .get_info_string("JoinFullPartitions")
+            .is_none()
+    }));
+    let observed = wait.observed_generation;
+    // The declaration/layout came through real package compilation. E data
+    // is a component fixture; this does not qualify the original Values plan.
+    frame_fixture_inputs(&frame, &program, &construction, &tracker, &error).unwrap();
+    assert_ne!(frame.completion.observable().generation(), observed);
+    let mut empty = TurnWork::new(NonZeroU64::MIN, 0);
+    assert!(matches!(
+        operators[0]
+            .drive(&mut StepContext::new(&error, &mut empty, &mut conversions))
+            .unwrap()
+            .next,
+        NextStep::Yield
+    ));
+    assert!(frame.completion.published().unwrap().is_none());
+    let mut finished = [false; 3];
+    for _ in 0..100_000 {
+        for (id, operator) in operators.iter_mut().enumerate() {
+            if finished[id] {
+                continue;
+            }
+            let mut turn = TurnWork::new(NonZeroU64::MIN, 9);
+            let step = operator
+                .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+                .unwrap();
+            assert!(
+                step.output.is_none(),
+                "finalize source emits no synthetic rows"
+            );
+            finished[id] = matches!(step.next, NextStep::Finished);
+        }
+        if finished.iter().all(|finished| *finished) {
+            break;
+        }
+    }
+    assert!(finished.iter().all(|finished| *finished));
+    let progressing = profiles
+        .iter()
+        .filter(|profile| {
+            profile
+                .unique
+                .counter_value_min_max("JoinKProgressSteps")
+                .unwrap()
+                .0
+                > 0
+        })
+        .count();
+    assert!(
+        progressing > 1,
+        "multiple installed F must perform genuine original K progress"
+    );
+    for profile in &profiles {
+        let calls = profile
+            .unique
+            .counter_value_min_max("JoinKAdvanceCalls")
+            .unwrap()
+            .0;
+        let progress = profile
+            .unique
+            .counter_value_min_max("JoinKProgressSteps")
+            .unwrap()
+            .0;
+        assert!(calls >= progress);
+        let partitions = profile
+            .unique
+            .get_info_string("JoinFullPartitions")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert!(
+            partitions > 0,
+            "P comes from the published original IndexView"
+        );
+    }
+    assert_eq!(frame.completion.published().unwrap().unwrap().rows, 600);
+    // Exercise the original native projection: it drops info strings and
+    // sums counters across drivers. P must remain the artifact's actual P,
+    // while contributors must count only F that really advanced K.
+    let task_profile = crate::runtime::profile::RuntimeProfile::new("actual task");
+    for (id, profile) in profiles.iter().enumerate() {
+        task_profile
+            .child(format!("actual driver {id}"))
+            .add_child(profile.operator.clone());
+    }
+    let projection = crate::runtime::operator_statistics::project_operator_statistics(
+        &task_profile.to_native_tree(),
+    );
+    let [statistics] = projection.statistics() else {
+        panic!("original task projection must merge copies of the same F operator");
+    };
+    let counter = |name| {
+        statistics
+            .counters()
+            .iter()
+            .find(|counter| counter.name().as_str() == name)
+            .unwrap()
+            .value()
+    };
+    let published = frame.completion.published().unwrap().unwrap();
+    let crate::exec::operators::hashjoin::BuildLookup::Ordinary(full) = &published.artifact.lookup
+    else {
+        panic!("fixture has an ordinary original K index");
+    };
+    assert_eq!(
+        counter("JoinFullPartitions"),
+        full.view.partition_count() as i64
+    );
+    assert_eq!(counter("JoinKProgressWorkers"), progressing as i64);
+    assert_eq!(counter("JoinFullDirect"), i64::from(full.view.is_direct()));
+    for operator in &mut operators {
+        operator.begin_exit().unwrap();
+        assert!(matches!(
+            operator.observe_exit().progress,
+            crate::exec::pipeline::operator::ExitProgress::Exited
+        ));
+        operator.close().unwrap();
+    }
+    assert!(runtime.error().is_none());
+}
+
+#[test]
+fn b3_finalize_source_distinguishes_normal_demand_exit_from_original_failure() {
+    use crate::exec::operators::hashjoin::{
+        JoinParticipants,
+        compiled_hash_join::{
+            CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
+            frame_fixture_inputs,
+        },
+    };
+    use crate::exec::pipeline::{
+        operator_factory::OperatorFactory,
+        shape::ControlStep,
+        step::NextStep,
+        step_context::{StepContext, TurnWork},
+    };
+    use crate::runtime::mem_tracker::MemTracker;
+    use std::num::NonZeroU64;
+    let mut packages = packages(&single_plan_with_dop(
+        Spec::hash(JoinKind::Inner, false),
+        &LEFT_ROWS,
+        &RIGHT_ROWS,
+        3,
+    ));
+    let program = compile(packages.remove(&SINGLE).unwrap(), 3, true);
+    let node = program
+        .graph()
+        .nodes()
+        .iter()
+        .position(|node| matches!(node.kind(), ProgramNodeKind::Join { .. }))
+        .map(novarocks_local_program::ProgramNodeId::new)
+        .unwrap();
+    for fail in [false, true] {
+        let plan = Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap());
+        let declaration = Arc::new(CompiledJoinFrame::new(
+            Arc::clone(&program),
+            plan,
+            JoinParticipants {
+                inputs: 2,
+                finalizers: NonZeroUsize::new(3).unwrap(),
+                probes: 2,
+                tails: 0,
+            },
+            None,
+        ));
+        let runtime = RuntimeState::default();
+        let error = runtime.error_state();
+        let tracker = MemTracker::new_root("B3 actual source exit");
+        let construction = super::aggregate_fixture::runtime_construction_factory(
+            Arc::clone(&tracker),
+            Arc::clone(&error),
+        );
+        let factory =
+            CompiledJoinFinalizeSourceFactory::new(Arc::clone(&declaration), Arc::clone(&error));
+        let mut operator = factory.create(3, 0);
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        operator.set_construction_factory(Arc::clone(&construction));
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
+        let frame = declaration.prepared().unwrap();
+        if fail {
+            frame_fixture_inputs(&frame, &program, &construction, &tracker, &error).unwrap();
+            let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+            for _ in 0..3 {
+                let mut turn = TurnWork::new(NonZeroU64::MIN, 2);
+                operator
+                    .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+                    .unwrap();
+            }
+            assert!(frame.completion.published().unwrap().is_none());
+            let original: crate::runtime::fragment::ExecutionFailure =
+                novarocks_functions::KernelFailure::DeadlineExceeded.into();
+            error.set_error(original.clone());
+            operator.on_driver_failure();
+            operator.begin_exit().unwrap();
+            let observation = operator.observe_exit();
+            assert!(matches!(
+                observation.progress,
+                crate::exec::pipeline::operator::ExitProgress::Exited
+            ));
+            assert!(
+                observation.failure.is_none(),
+                "original required failure was already reported"
+            );
+            assert_eq!(frame.completion.check().unwrap_err(), original);
+            assert_eq!(runtime.error().unwrap(), original);
+        } else {
+            frame.completion.withdraw(0).unwrap();
+            frame.completion.withdraw(1).unwrap();
+            let mut turn = TurnWork::new(NonZeroU64::MIN, 0);
+            let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+            let mut context = StepContext::new(&error, &mut turn, &mut conversions);
+            assert!(matches!(
+                operator.poll_control(&mut context).unwrap(),
+                ControlStep::Runnable
+            ));
+            let step = operator.drive(&mut context).unwrap();
+            assert!(matches!(step.next, NextStep::Finished));
+            assert!(step.output.is_none());
+            operator.begin_exit().unwrap();
+            assert!(matches!(
+                operator.observe_exit().progress,
+                crate::exec::pipeline::operator::ExitProgress::Exited
+            ));
+            assert!(frame.completion.published().unwrap().is_none());
+            assert!(runtime.error().is_none());
+        }
+        operator.close().unwrap();
+    }
+}
+
+#[test]
+fn b3_input_sinks_seal_each_real_e_and_leave_construction_to_finalize_sources() {
+    use crate::exec::operators::hashjoin::{
+        JoinParticipants,
+        compiled_hash_join::{
+            CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
+            CompiledJoinInputSinkFactory, frame_fixture_chunks,
+        },
+    };
+    use crate::exec::pipeline::{
+        operator_factory::OperatorFactory,
+        step::NextStep,
+        step_context::{StepContext, TurnWork},
+    };
+    use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::task_control::test_support::Owner;
+    use novarocks_execution_contract::{
+        TaskConclusionPort, TaskConclusionProposal, TaskFailurePhase,
+    };
+    use std::num::NonZeroU64;
+    for (nested, task_owned) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut packages = packages(&single_plan_with_dop(
+            if nested {
+                Spec::nested(JoinKind::Inner, true)
+            } else {
+                Spec::hash(JoinKind::Inner, false)
+            },
+            &LEFT_ROWS,
+            &RIGHT_ROWS,
+            3,
+        ));
+        let program = compile(packages.remove(&SINGLE).unwrap(), 3, true);
+        let node = program.graph().root();
+        for empty_second in [false, true] {
+            let participants = JoinParticipants {
+                inputs: 2,
+                finalizers: NonZeroUsize::new(3).unwrap(),
+                probes: 2,
+                tails: 0,
+            };
+            let declaration = Arc::new(if nested {
+                CompiledJoinFrame::new_nested_loop(Arc::clone(&program), node, participants, None)
+                    .unwrap()
+            } else {
+                CompiledJoinFrame::new(
+                    Arc::clone(&program),
+                    Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap()),
+                    participants,
+                    None,
+                )
+            });
+            let task_owner = task_owned.then(Owner::new);
+            let runtime = if let Some(owner) = &task_owner {
+                RuntimeState::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Arc::new(crate::runtime::runtime_state::RuntimeErrorState::for_task(
+                        Arc::new(owner.view(TaskFailurePhase::Execution)),
+                    )),
+                )
+            } else {
+                RuntimeState::default()
+            };
+            let error = runtime.error_state();
+            let tracker = MemTracker::new_root("B3 original E input operators");
+            let construction = super::aggregate_fixture::runtime_construction_factory(
+                Arc::clone(&tracker),
+                Arc::clone(&error),
+            );
+            let inputs = CompiledJoinInputSinkFactory::new(
+                Arc::clone(&declaration),
+                Arc::clone(&error),
+                None,
+            );
+            assert!(inputs.bind_pipeline_dop(1).is_err());
+            let finalize = CompiledJoinFinalizeSourceFactory::new(
+                Arc::clone(&declaration),
+                Arc::clone(&error),
+            );
+            let mut sources: Vec<_> = (0..3).map(|id| finalize.create(3, id)).collect();
+            let mut sinks: Vec<_> = (0..2).map(|id| inputs.create(2, id)).collect();
+            for operator in sources.iter_mut().chain(sinks.iter_mut()) {
+                operator.set_mem_tracker(Arc::clone(&tracker));
+                operator.set_construction_factory(Arc::clone(&construction));
+                operator.prepare().unwrap();
+                operator.bind_runtime_state(&runtime).unwrap();
+                operator.activate(&runtime).unwrap();
+            }
+            let frame = declaration.prepared().unwrap();
+            let mut chunks = frame_fixture_chunks(&program, &construction).unwrap();
+            if empty_second {
+                chunks.pop();
+            }
+            for (index, chunk) in chunks.into_iter().enumerate() {
+                let mut driver = TestDriver::new(sinks[index].as_mut(), &runtime);
+                driver.accept_without_output(chunk).unwrap();
+                driver.signal_eos().unwrap();
+                assert!(matches!(
+                    driver.advance_to_boundary().unwrap().next,
+                    NextStep::Finished
+                ));
+                assert!(
+                    frame.completion.published().unwrap().is_none(),
+                    "E finish never drives the K graph"
+                );
+            }
+            if empty_second {
+                // No input chunk, but the actual E still seals a real empty run.
+                let mut driver = TestDriver::new(sinks[1].as_mut(), &runtime);
+                driver.signal_eos().unwrap();
+                assert!(matches!(
+                    driver.advance_to_boundary().unwrap().next,
+                    NextStep::Finished
+                ));
+            }
+            assert!(frame.completion.published().unwrap().is_none());
+            let mut finished = [false; 3];
+            let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+            for _ in 0..100_000 {
+                for (id, source) in sources.iter_mut().enumerate() {
+                    if finished[id] {
+                        continue;
+                    }
+                    let mut turn = TurnWork::new(NonZeroU64::MIN, 11);
+                    let step = source
+                        .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+                        .unwrap();
+                    assert!(step.output.is_none());
+                    finished[id] = matches!(step.next, NextStep::Finished);
+                }
+                if finished.iter().all(|done| *done) {
+                    break;
+                }
+            }
+            assert!(finished.iter().all(|done| *done));
+            assert_eq!(
+                frame.completion.published().unwrap().unwrap().rows,
+                if empty_second { 300 } else { 600 }
+            );
+            if let Some(owner) = &task_owner {
+                // Close the real outstanding Q demands before accepting the
+                // Task's normal conclusion. Its stop flag is then present,
+                // but it has no originating failure to publish during exit.
+                for slot in 0..participants.probes {
+                    frame.completion.withdraw_if_pending(slot).unwrap();
+                }
+                owner.submit(TaskConclusionProposal::Succeeded);
+                assert!(error.is_stopped());
+                assert!(error.error().is_none());
+            }
+            for operator in sources.iter_mut().chain(sinks.iter_mut()) {
+                if task_owned {
+                    operator.cancel();
+                }
+                operator.begin_exit().unwrap();
+                assert!(
+                    frame.completion.check().is_ok(),
+                    "normal Task conclusion must not manufacture a join failure"
+                );
+                assert!(matches!(
+                    operator.observe_exit().progress,
+                    crate::exec::pipeline::operator::ExitProgress::Exited
+                ));
+                operator.close().unwrap();
+            }
+            assert!(runtime.error().is_none());
+        }
+    }
+}
+
+#[test]
+fn b3_input_and_finalize_operators_preserve_the_first_prepare_refusal() {
+    use crate::exec::operators::hashjoin::{
+        JoinParticipants,
+        compiled_hash_join::{
+            CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
+            CompiledJoinInputSinkFactory, frame_fixture_chunks,
+        },
+    };
+    use crate::exec::pipeline::{
+        operator::ConstructionFailure, operator_factory::OperatorFactory, test_driver::TestDriver,
+    };
+    use crate::runtime::mem_tracker::MemTracker;
+    let mut packages = packages(&single_plan(
+        Spec::hash(JoinKind::Inner, false),
+        &LEFT_ROWS,
+        &RIGHT_ROWS,
+    ));
+    let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
+    let node = program.graph().root();
+    for source in [false, true] {
+        for limited in [false, true] {
+            let declaration = Arc::new(CompiledJoinFrame::new(
+                Arc::clone(&program),
+                Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap()),
+                JoinParticipants {
+                    inputs: 1,
+                    finalizers: std::num::NonZeroUsize::MIN,
+                    probes: 1,
+                    tails: 0,
+                },
+                None,
+            ));
+            let runtime = RuntimeState::default();
+            let error = runtime.error_state();
+            let tracker = MemTracker::new_root("B3 original prepare refusal");
+            let construction = super::aggregate_fixture::runtime_construction_factory(
+                Arc::clone(&tracker),
+                Arc::clone(&error),
+            );
+            let input = frame_fixture_chunks(&program, &construction)
+                .unwrap()
+                .remove(0);
+            let mut operator = if source {
+                CompiledJoinFinalizeSourceFactory::new(Arc::clone(&declaration), Arc::clone(&error))
+                    .create(1, 0)
+            } else {
+                CompiledJoinInputSinkFactory::new(
+                    Arc::clone(&declaration),
+                    Arc::clone(&error),
+                    None,
+                )
+                .create(1, 0)
+            };
+            if limited {
+                operator.set_mem_tracker(Arc::clone(&tracker));
+                operator.set_construction_factory(Arc::clone(&construction));
+                let installed = tracker.current();
+                assert!(installed > 0);
+                tracker.install_limit_once(installed + 1).unwrap();
+            }
+            let first = operator.prepare().unwrap_err();
+            assert!(
+                matches!(
+                    first.cause(),
+                    ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+                ) == limited
+            );
+            if !limited {
+                assert!(matches!(
+                    first.cause(),
+                    ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
+                ));
+            }
+            assert_eq!(operator.prepare().unwrap_err(), first);
+            assert_eq!(operator.activate(&runtime).unwrap_err(), first);
+            let mut driver = TestDriver::new(operator.as_mut(), &runtime);
+            if source {
+                assert_eq!(driver.drive().unwrap_err(), first);
+            } else {
+                assert_eq!(driver.accept_without_output(input).unwrap_err(), first);
+                assert_eq!(driver.signal_eos().unwrap_err(), first);
+            }
+        }
+    }
+}
+
+#[test]
+fn b3_residual_gathers_only_original_referenced_columns_from_published_pages() {
+    use crate::exec::{
+        expr::compiled_program::CompiledExpressionInstance,
+        operators::{
+            compiled_expression::{RuntimeKernelControl, evaluate_projected_chunk_all},
+            hashjoin::{
+                JoinPairRow, JoinParticipants, ProjectedJoinGather,
+                compiled_hash_join::{
+                    CompiledHashJoinPlan, CompiledJoinFinalizeSourceFactory, CompiledJoinFrame,
+                    CompiledJoinInputSinkFactory, frame_fixture_chunks,
+                },
+            },
+        },
+        pipeline::operator_factory::OperatorFactory,
+    };
+    use crate::runtime::mem_tracker::MemTracker;
+    use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
+    let mut packages = packages(&single_plan_with_dop(
+        Spec::hash(JoinKind::Inner, true),
+        &LEFT_ROWS,
+        &RIGHT_ROWS,
+        3,
+    ));
+    let program = compile(packages.remove(&SINGLE).unwrap(), 3, true);
+    let node = program.graph().root();
+    let declaration = Arc::new(CompiledJoinFrame::new(
+        Arc::clone(&program),
+        Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap()),
+        JoinParticipants {
+            inputs: 2,
+            finalizers: NonZeroUsize::new(3).unwrap(),
+            probes: 1,
+            tails: 0,
+        },
+        None,
+    ));
+    let runtime = RuntimeState::default();
+    let error = runtime.error_state();
+    let tracker = MemTracker::new_root("B3 real minimal residual projection");
+    let factory = super::aggregate_fixture::runtime_construction_factory(
+        Arc::clone(&tracker),
+        Arc::clone(&error),
+    );
+    let inputs =
+        CompiledJoinInputSinkFactory::new(Arc::clone(&declaration), Arc::clone(&error), None);
+    let finalize =
+        CompiledJoinFinalizeSourceFactory::new(Arc::clone(&declaration), Arc::clone(&error));
+    let mut sources: Vec<_> = (0..3).map(|id| finalize.create(3, id)).collect();
+    let mut sinks: Vec<_> = (0..2).map(|id| inputs.create(2, id)).collect();
+    for operator in sources.iter_mut().chain(sinks.iter_mut()) {
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        operator.set_construction_factory(Arc::clone(&factory));
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&runtime).unwrap();
+        operator.activate(&runtime).unwrap();
+    }
+    for (sink, chunk) in sinks
+        .iter_mut()
+        .zip(frame_fixture_chunks(&program, &factory).unwrap())
+    {
+        let mut driver = TestDriver::new(sink.as_mut(), &runtime);
+        driver.input_without_output(chunk).unwrap();
+        driver.signal_eos().unwrap();
+        driver.advance_to_boundary().unwrap();
+    }
+    for source in &mut sources {
+        assert!(
+            TestDriver::new(source.as_mut(), &runtime)
+                .collect_until_finished()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let frame = declaration.prepared().unwrap();
+    let published = frame.completion.published().unwrap().unwrap();
+    let ProgramNodeKind::Join {
+        left_layout,
+        right_layout,
+        join_scope_layout,
+        ..
+    } = program.graph().nodes()[node.index()].kind()
+    else {
+        panic!("original join");
+    };
+    let probe_schema = factory.create_compiled_chunk_schema(left_layout).unwrap();
+    let build_schema = factory.create_compiled_chunk_schema(right_layout).unwrap();
+    let scope = factory
+        .create_compiled_chunk_schema(join_scope_layout)
+        .unwrap();
+    let owner = factory.begin_typed_construction(&scope).unwrap();
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(vec![Some(1), None, Some(9)])),
+        Arc::new(Int64Array::from(vec![Some(10), None, Some(300)])),
+    ];
+    let probe = crate::exec::chunk::Chunk::try_new_typed_with_columns_owned_observed::<
+        crate::exec::pipeline::operator::ConstructionFailure,
+        _,
+    >(
+        probe_schema.clone(),
+        columns,
+        3,
+        owner.storage_lifetime(),
+        |step| owner.observe(0, &[], step),
+    )
+    .unwrap();
+    let mut control = RuntimeKernelControl::new(Arc::clone(&error));
+    control.bind_mem_tracker(Arc::clone(&tracker));
+    control.bind_construction_factory(Arc::clone(&factory));
+    control.bind_runtime_memory(&runtime);
+    let host = control.allocator().unwrap();
+    let site = ProgramExpressionRootSite::Node {
+        node,
+        role: ProgramNodeExpressionRole::JoinResidual,
+    };
+    let mut instance = CompiledExpressionInstance::try_new_with_allocator(
+        Arc::clone(&program),
+        site,
+        &control,
+        Some(Arc::clone(&host)),
+    )
+    .unwrap();
+    let projection = ProjectedJoinGather::new(
+        scope,
+        &probe_schema,
+        &build_schema,
+        &instance,
+        owner.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(projection.projection().ordinals(), [1, 3]);
+    let pairs = [
+        JoinPairRow {
+            probe: Some(0),
+            build: Some(published.artifact.rows.row(20).unwrap()),
+        },
+        JoinPairRow {
+            probe: Some(1),
+            build: Some(published.artifact.rows.row(305).unwrap()),
+        },
+        JoinPairRow {
+            probe: Some(2),
+            build: Some(published.artifact.rows.row(70).unwrap()),
+        },
+    ];
+    let compact = projection
+        .gather(
+            &probe,
+            &published.artifact.rows,
+            &pairs,
+            owner.as_ref(),
+            &host,
+            &control,
+        )
+        .unwrap();
+    assert_eq!(compact.columns().len(), 2);
+    assert_eq!(projection.declared().slots().len(), 4);
+    let mask = evaluate_projected_chunk_all(
+        &mut instance,
+        site,
+        &compact,
+        projection.declared(),
+        projection.projection(),
+        &control,
+    )
+    .unwrap();
+    assert_eq!(
+        mask.as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(true), None, Some(false)]
+    );
+    for operator in sources.iter_mut().chain(sinks.iter_mut()) {
+        operator.begin_exit().unwrap();
+        operator.close().unwrap();
+    }
+    assert!(runtime.error().is_none());
+}
+
+#[path = "compiled_phased_join_tests.rs"]
+mod phased;
+
+#[derive(Clone, Copy)]
+enum NaaEligibilityFixture {
+    None,
+    True,
+    Unknown,
+    LateOverflow,
+}
+fn authored_naa_plan(
+    left: &[Row],
+    right: &[Row],
+    value_columns: &[(usize, bool)],
+    scope_columns: &[(usize, bool)],
+    eligibility: NaaEligibilityFixture,
+    pipeline_dop: u32,
+) -> PhysicalPlan {
+    let mut builder = FragmentBuilder::new(SINGLE);
+    let left_node = builder.reserve_node_id().unwrap();
+    let l = values(
+        &mut builder,
+        left_node,
+        &[int64(true), int64(true)],
+        &literal_rows(left),
+    );
+    let right_node = builder.reserve_node_id().unwrap();
+    let r = values(
+        &mut builder,
+        right_node,
+        &[int64(true), int64(true)],
+        &literal_rows(right),
+    );
+    let join = builder.reserve_node_id().unwrap();
+    let mut keys = |columns: &[(usize, bool)]| {
+        columns
+            .iter()
+            .map(|&(column, null_safe)| JoinKey {
+                left: builder
+                    .add_expression(join, int64(true), ExprKind::Value(l[column]))
+                    .unwrap(),
+                right: builder
+                    .add_expression(join, int64(true), ExprKind::Value(r[column]))
+                    .unwrap(),
+                null_safe,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    };
+    let value_equal_keys = keys(value_columns);
+    let scope_keys = keys(scope_columns);
+    let late_overflow = matches!(eligibility, NaaEligibilityFixture::LateOverflow);
+    let eligibility = match eligibility {
+        NaaEligibilityFixture::None => None,
+        NaaEligibilityFixture::True => Some(
+            builder
+                .add_expression(
+                    join,
+                    FunctionValueType::new(DataType::Boolean, false),
+                    ExprKind::Literal(LiteralValue::Boolean(true)),
+                )
+                .unwrap(),
+        ),
+        NaaEligibilityFixture::Unknown => Some(
+            builder
+                .add_expression(
+                    join,
+                    FunctionValueType::new(DataType::Boolean, true),
+                    ExprKind::Literal(LiteralValue::Null),
+                )
+                .unwrap(),
+        ),
+        NaaEligibilityFixture::LateOverflow => {
+            let build = overflowing(&mut builder, join, r[0]);
+            let probe = builder
+                .add_expression(join, int64(true), ExprKind::Value(l[1]))
+                .unwrap();
+            Some(
+                builder
+                    .add_expression(
+                        join,
+                        FunctionValueType::new(DataType::Boolean, true),
+                        ExprKind::Binary {
+                            left: build,
+                            op: BinaryOperator::Gt,
+                            right: probe,
+                            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+                            allow_throw_exception: None,
+                        },
+                    )
+                    .unwrap(),
+            )
+        }
+    };
+    let required =
+        [left_node, right_node].map(|node| builder.node_output_properties(node).unwrap().clone());
+    builder
+        .add_join(
+            join,
+            [left_node, right_node],
+            Box::from(required),
+            l.clone().into_boxed_slice(),
+            Distribution::Singleton,
+            NodeKind::HashJoin {
+                kind: JoinKind::NullAwareLeftAnti,
+                build_side: JoinSide::Right,
+                distribution: JoinDistribution::Singleton,
+                null_extended: Box::default(),
+                condition: novarocks_physical_plan::HashJoinCondition::NullAwareEqual {
+                    value_equal_keys,
+                    scope_keys,
+                    eligibility,
+                },
+            },
+        )
+        .unwrap();
+    let fragment = builder
+        .finish_definition(
+            join,
+            FragmentSink::Result,
+            dop(pipeline_dop),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
+    let mut plan = PlanBuilder::new(version());
+    if late_overflow {
+        plan = plan.with_semantic_parameters(
+            SemanticParameters::try_new([(
+                ALLOW.id,
+                SemanticParameterValue::AllowThrowException(true),
+            )])
+            .unwrap(),
+        );
+    }
+    plan.add_fragment(fragment).unwrap();
+    plan.set_result_port(result_port(SINGLE, join, &l)).unwrap();
+    plan.finish_observed(&FixtureControl).unwrap()
+}
+fn run_authored_naa(plan: &PhysicalPlan, dop: usize) -> Rows {
+    let mut packages = packages(plan);
+    let program = compile(packages.remove(&SINGLE).unwrap(), dop, true);
+    let output = ResultSinkHandle::new();
+    try_run(
+        &program,
+        result_sink(&program, SINGLE_FINST, &output),
+        ExchangeBindings::default(),
+        SINGLE_FINST,
+    )
+    .unwrap();
+    sorted(int64_rows(&output.take_chunks()))
+}
+#[test]
+fn b3_production_right_full_and_both_orientations_match_physical_occurrence_oracles() {
+    for side in [JoinSide::Right, JoinSide::Left] {
+        for kind in [
+            JoinKind::Inner,
+            JoinKind::LeftOuter,
+            JoinKind::RightOuter,
+            JoinKind::FullOuter,
+            JoinKind::LeftSemi,
+            JoinKind::RightSemi,
+            JoinKind::LeftAnti,
+            JoinKind::RightAnti,
+        ] {
+            for residual in [false, true] {
+                let spec = Spec {
+                    family: Family::Hash {
+                        build_side: side,
+                        null_safe: false,
+                    },
+                    kind,
+                    residual,
+                    permuted: false,
+                };
+                for (left, right) in [
+                    (&LEFT_ROWS[..], &RIGHT_ROWS[..]),
+                    (&[][..], &RIGHT_ROWS[..]),
+                    (&LEFT_ROWS[..], &[][..]),
+                    (&LEFT_ROWS[..], &[(None, Some(1)), (None, None)][..]),
+                ] {
+                    let mut packages = packages(&single_plan_with_dop(spec, left, right, 4));
+                    let program = compile(packages.remove(&SINGLE).unwrap(), 4, true);
+                    let output = ResultSinkHandle::new();
+                    try_run(
+                        &program,
+                        result_sink(&program, SINGLE_FINST, &output),
+                        ExchangeBindings::default(),
+                        SINGLE_FINST,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        sorted(int64_rows(&output.take_chunks())),
+                        oracle(spec, left, right),
+                        "{spec:?}"
+                    );
+                }
+            }
+        }
+    }
+    for kind in [JoinKind::RightOuter, JoinKind::FullOuter] {
+        let spec = Spec::nested(kind, true);
+        assert_eq!(
+            run_single(spec, &LEFT_ROWS, &RIGHT_ROWS),
+            oracle(spec, &LEFT_ROWS, &RIGHT_ROWS)
+        );
+        assert_eq!(
+            run_single(spec, &LEFT_ROWS, &[]),
+            oracle(spec, &LEFT_ROWS, &[])
+        );
+        assert_eq!(
+            run_single(spec, &[], &RIGHT_ROWS),
+            oracle(spec, &[], &RIGHT_ROWS)
+        );
+    }
+}
+#[test]
+fn b3_production_composite_scope_mixed_and_eligibility_truth_keep_original_naa_roles() {
+    let probes = [
+        (None, Some(1)),
+        (Some(2), Some(1)),
+        (Some(2), Some(9)),
+        (Some(1), None),
+        (None, None),
+    ];
+    let builds = [
+        (Some(2), Some(2)),
+        (Some(2), Some(1)),
+        (None, Some(1)),
+        (Some(1), Some(4)),
+        (None, None),
+    ];
+    for scope in [false, true] {
+        for safe in [false, true] {
+            for eligibility in [
+                NaaEligibilityFixture::None,
+                NaaEligibilityFixture::True,
+                NaaEligibilityFixture::Unknown,
+            ] {
+                let values = if scope {
+                    vec![(1, false)]
+                } else {
+                    vec![(0, false), (1, safe)]
+                };
+                let scopes = if scope { vec![(0, safe)] } else { vec![] };
+                let cmp = |a: Option<i64>, b: Option<i64>, safe: bool| match (a, b) {
+                    (Some(a), Some(b)) => Some(a == b),
+                    _ if safe => Some(a == b),
+                    _ => None,
+                };
+                let expected = probes
+                    .iter()
+                    .filter(|left| {
+                        !builds.iter().any(|right| {
+                            let columns = [left.0, left.1];
+                            let other = [right.0, right.1];
+                            if scopes.iter().any(|&(column, safe)| {
+                                cmp(columns[column], other[column], safe) != Some(true)
+                            }) {
+                                return false;
+                            }
+                            let c_false = values.iter().any(|&(column, safe)| {
+                                cmp(columns[column], other[column], safe) == Some(false)
+                            });
+                            !c_false && !matches!(eligibility, NaaEligibilityFixture::Unknown)
+                        })
+                    })
+                    .map(|row| vec![row.0, row.1])
+                    .collect::<Rows>();
+                assert_eq!(
+                    run_authored_naa(
+                        &authored_naa_plan(&probes, &builds, &values, &scopes, eligibility, 4),
+                        4
+                    ),
+                    sorted(expected)
+                );
+            }
+        }
+    }
+    let nonnull = (0..2048).map(|i| (Some(2), Some(i))).collect::<Vec<_>>();
+    assert_eq!(
+        run_authored_naa(
+            &authored_naa_plan(
+                &[(None, Some(1)), (None, Some(-1))],
+                &nonnull,
+                &[(0, false), (1, false)],
+                &[],
+                NaaEligibilityFixture::None,
+                4
+            ),
+            4
+        ),
+        vec![vec![None, Some(-1)]]
+    );
+}
+#[test]
+fn b3_naa_required_eligibility_error_keeps_sparse_original_pair_row_after_earlier_suppression() {
+    let plan = authored_naa_plan(
+        &[(None, Some(1))],
+        &[(Some(1), Some(2)), (Some(0), Some(1)), (Some(1), Some(1))],
+        &[(0, false), (1, false)],
+        &[],
+        NaaEligibilityFixture::LateOverflow,
+        1,
+    );
+    let mut packages = packages(&plan);
+    let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
+    let prepared = prepare_compiled_program_pipeline_execution(
+        program.clone(),
+        Duration::from_millis(10),
+        Box::new(ResultSinkFactory::new(ResultSinkHandle::new())),
+        ExchangeBindings::default(),
+        None,
+        1,
+        Arc::new(RuntimeState::for_local_execution(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                "NAA original sparse E row",
+            )),
+            Some(crate::runtime::execution_runtime::test_execution_runtime()),
+        )),
+        Arc::new(NoopFragmentEventSink),
+    )
+    .unwrap();
+    let failure = prepared
+        .start()
+        .join()
+        .expect_err("later E must remain required after suppression");
+    let ExecutionFailureCause::RequiredRow(required) = failure.cause() else {
+        panic!("original E row error: {failure:?}");
+    };
+    assert_eq!(
+        required.root(),
+        ProgramExpressionRootSite::Node {
+            node: program.graph().root(),
+            role: ProgramNodeExpressionRole::NaaEligibility
+        }
+    );
+    assert_eq!(
+        required.batch_row(),
+        2,
+        "C FALSE skipped row0; E keeps the original candidate-page row"
+    );
 }

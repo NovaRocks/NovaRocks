@@ -574,6 +574,7 @@ mod tests {
         });
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type,
                 condition: cond_id,
             }),
@@ -1109,6 +1110,7 @@ mod tests {
         let b = scan_opt(&[("x", DataType::Int64)]);
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Cross,
                 condition: None,
             }),

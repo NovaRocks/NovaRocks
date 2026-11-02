@@ -827,6 +827,7 @@ mod tests {
     fn join_branch() -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {

@@ -294,6 +294,7 @@ pub(crate) struct IcebergDeltaScanRelation {
 
 #[derive(Clone, Debug)]
 pub(crate) struct JoinRelation {
+    pub naa_author: Option<crate::common::naa::NaaAuthorFacts<TypedExpr>>,
     pub left: Relation,
     pub right: Relation,
     pub join_type: JoinKind,

@@ -786,14 +786,17 @@ fn runtime_filter_scan_lineage(
                     ))
                 })
                 .collect(),
-            NodeKind::HashJoin { kind, keys, .. }
-                if node.inputs.len() == 2
-                    && (kind.key_filter_reaches_side(ContractJoinSide::Left)
-                        || kind.key_filter_reaches_side(ContractJoinSide::Right)) =>
+            NodeKind::HashJoin {
+                kind, condition, ..
+            } if node.inputs.len() == 2
+                && (kind.key_filter_reaches_side(ContractJoinSide::Left)
+                    || kind.key_filter_reaches_side(ContractJoinSide::Right)) =>
             {
                 let into_left = kind.key_filter_reaches_side(ContractJoinSide::Left);
                 let into_right = kind.key_filter_reaches_side(ContractJoinSide::Right);
-                keys.iter()
+                condition
+                    .keys()
+                    .iter()
                     .enumerate()
                     .filter(|(_, key)| !key.null_safe)
                     .flat_map(move |(ordinal, key)| {
@@ -4901,13 +4904,19 @@ impl<'a> ContractLoweringVisitor<'a> {
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 2)?;
         require_output_shape("HashJoin", &plan.output_columns, &join.output_columns)?;
-        if join.eq_conditions.is_empty() {
+        if join.condition.keys().is_empty() {
             return Err(ContractLoweringError::InvalidJoin {
                 node: "HashJoin",
                 detail: "hash join has no equality keys",
             });
         }
         let kind = lower_join_kind(join.join_type);
+        if (kind == ContractJoinKind::NullAwareLeftAnti) != join.condition.is_null_aware() {
+            return Err(ContractLoweringError::InvalidJoin {
+                node: "HashJoin",
+                detail: "hash join kind and condition variant disagree",
+            });
+        }
         if kind == ContractJoinKind::Cross {
             return Err(ContractLoweringError::InvalidJoin {
                 node: "HashJoin",
@@ -4983,10 +4992,18 @@ impl<'a> ContractLoweringVisitor<'a> {
         };
 
         let node = self.fragment_mut().reserve_node_id()?;
-        let mut keys = Vec::with_capacity(join.eq_conditions.len());
-        let mut left_key_values = Vec::with_capacity(join.eq_conditions.len());
-        let mut right_key_values = Vec::with_capacity(join.eq_conditions.len());
-        for condition in &join.eq_conditions {
+        let mut keys = Vec::with_capacity(join.condition.keys().len());
+        let scope_conditions = join.condition.scope_keys().map_or(&[][..], Vec::as_slice);
+        let mut scope_keys = Vec::with_capacity(scope_conditions.len());
+        let mut left_key_values = Vec::with_capacity(join.condition.keys().len());
+        let mut right_key_values = Vec::with_capacity(join.condition.keys().len());
+        for (ordinal, condition) in join
+            .condition
+            .keys()
+            .iter()
+            .chain(scope_conditions)
+            .enumerate()
+        {
             // Both sides are read in the plan's own vocabulary, where a
             // list's element is `item` and a map's entries are `entries`/
             // `key`/`value`. One side coming from a provider and the other
@@ -5005,13 +5022,18 @@ impl<'a> ContractLoweringVisitor<'a> {
             let compared = self.common_comparison_value_type(&left_key_type, &right_key_type)?;
             let left_expr = self.cast_expression_to(node, left_expr, &compared)?;
             let right_expr = self.cast_expression_to(node, right_expr, &compared)?;
-            left_key_values.push(left_value);
-            right_key_values.push(right_value);
-            keys.push(JoinKey {
+            let key = JoinKey {
                 left: left_expr,
                 right: right_expr,
                 null_safe: condition.null_safe,
-            });
+            };
+            if ordinal < join.condition.keys().len() {
+                left_key_values.push(left_value);
+                right_key_values.push(right_value);
+                keys.push(key);
+            } else {
+                scope_keys.push(key);
+            }
         }
 
         let required_inputs = hash_join_required_inputs(HashJoinRequirement {
@@ -5025,7 +5047,8 @@ impl<'a> ContractLoweringVisitor<'a> {
         })?;
         let visible = merge_visible_columns("HashJoin", &left.columns, &right.columns)?;
         let residual = join
-            .other_condition
+            .condition
+            .residual()
             .as_ref()
             .map(|predicate| {
                 if *predicate.value_type.data_type() != DataType::Boolean {
@@ -5066,10 +5089,23 @@ impl<'a> ContractLoweringVisitor<'a> {
             output_distribution,
             NodeKind::HashJoin {
                 kind,
-                keys: keys.into_boxed_slice(),
+                condition: match &join.condition {
+                    novarocks_physical_plan::HashJoinCondition::Ordinary { .. } => {
+                        novarocks_physical_plan::HashJoinCondition::Ordinary {
+                            keys: keys.into_boxed_slice(),
+                            residual,
+                        }
+                    }
+                    novarocks_physical_plan::HashJoinCondition::NullAwareEqual { .. } => {
+                        novarocks_physical_plan::HashJoinCondition::NullAwareEqual {
+                            value_equal_keys: keys.into_boxed_slice(),
+                            scope_keys: scope_keys.into_boxed_slice(),
+                            eligibility: residual,
+                        }
+                    }
+                },
                 build_side,
                 distribution,
-                residual,
                 null_extended,
             },
         )?;
@@ -5112,12 +5148,12 @@ impl<'a> ContractLoweringVisitor<'a> {
             };
             let (expected_build_expr, expected_probe_expr) = match build_side {
                 ContractJoinSide::Left => (
-                    &join.eq_conditions[intent.expr_order].left,
-                    &join.eq_conditions[intent.expr_order].right,
+                    &join.condition.keys()[intent.expr_order].left,
+                    &join.condition.keys()[intent.expr_order].right,
                 ),
                 ContractJoinSide::Right => (
-                    &join.eq_conditions[intent.expr_order].right,
-                    &join.eq_conditions[intent.expr_order].left,
+                    &join.condition.keys()[intent.expr_order].right,
+                    &join.condition.keys()[intent.expr_order].left,
                 ),
             };
             if identity_column_ref(&intent.build_expr) != identity_column_ref(expected_build_expr)
@@ -12139,7 +12175,8 @@ fn unstatable_runtime_filters(
             for intent in &join.build_runtime_filters {
                 work.step()?;
                 let stated = if let Some(condition) = join
-                    .eq_conditions
+                    .condition
+                    .keys()
                     .get(intent.expr_order)
                     .filter(|condition| {
                         identity_column_ref(&condition.left).is_some()
@@ -14236,17 +14273,19 @@ mod tests {
             kind: PhysicalPlanKind::HashJoin(Box::new(
                 crate::planner::physical::PhysicalHashJoinNode {
                     join_type,
-                    eq_conditions: vec![crate::planner::physical::PhysicalHashJoinEqCondition {
-                        left: column_ref(&left_key),
-                        right: column_ref(&right_key),
-                        null_safe: false,
-                    }],
-                    other_condition: None,
                     build_side,
                     distribution,
                     execution_mode,
                     build_runtime_filters: Vec::new(),
                     output_columns: output_columns.clone(),
+                    condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                        keys: vec![crate::planner::physical::PhysicalHashJoinEqCondition {
+                            left: column_ref(&left_key),
+                            right: column_ref(&right_key),
+                            null_safe: false,
+                        }],
+                        residual: None,
+                    },
                 },
             )),
             children: vec![left, right],
@@ -14275,7 +14314,7 @@ mod tests {
         let PhysicalPlanKind::HashJoin(join) = &mut plan.kind else {
             unreachable!("hash_join fixture always constructs HashJoin")
         };
-        join.eq_conditions[0].null_safe = null_safe;
+        join.condition.keys_mut()[0].null_safe = null_safe;
         join.build_runtime_filters.push(
             crate::planner::physical::runtime_filter::RuntimeFilterBuildIntent {
                 filter_id,
@@ -17151,7 +17190,7 @@ mod tests {
             let PhysicalPlanKind::HashJoin(join) = &mut hash_join.kind else {
                 unreachable!("hash_join fixture always constructs HashJoin")
             };
-            join.eq_conditions[0].right = TypedExpr {
+            join.condition.keys_mut()[0].right = TypedExpr {
                 kind: ExprKind::Cast {
                     expr: Box::new(column_ref(&right)),
                     target: DataType::Int64,

@@ -66,8 +66,8 @@ pub(crate) struct PhysicalHashAggregateNode {
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalHashJoinNode {
     pub join_type: JoinKind,
-    pub eq_conditions: Vec<PhysicalHashJoinEqCondition>,
-    pub other_condition: Option<TypedExpr>,
+    pub condition:
+        novarocks_physical_plan::HashJoinCondition<Vec<PhysicalHashJoinEqCondition>, TypedExpr>,
     pub build_side: PhysicalHashJoinBuildSide,
     pub distribution: JoinDistribution,
     pub execution_mode: Option<JoinExecutionMode>,

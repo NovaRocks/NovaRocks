@@ -176,23 +176,44 @@ fn exact_field_sites_keep_repeated_definitions_and_join_demands() {
     ] {
         let join = fragment(NodeKind::HashJoin {
             kind,
-            keys: Box::from([crate::JoinKey {
-                left: expr(),
-                right: expr(),
-                null_safe: false,
-            }]),
+            condition: if kind == crate::JoinKind::NullAwareLeftAnti {
+                crate::HashJoinCondition::NullAwareEqual {
+                    value_equal_keys: Box::from([crate::JoinKey {
+                        left: expr(),
+                        right: expr(),
+                        null_safe: false,
+                    }]),
+                    scope_keys: Box::default(),
+                    eligibility: Some(expr()),
+                }
+            } else {
+                crate::HashJoinCondition::Ordinary {
+                    keys: Box::from([crate::JoinKey {
+                        left: expr(),
+                        right: expr(),
+                        null_safe: false,
+                    }]),
+                    residual: Some(expr()),
+                }
+            },
             build_side: JoinSide::Right,
             distribution: JoinDistribution::BroadcastBuild,
-            residual: Some(expr()),
             null_extended: Box::default(),
         });
         assert_eq!(
             uses(&join).sites(),
             &BTreeMap::from([
                 (
-                    site(JoinKey {
-                        key: 0,
-                        side: JoinSide::Left
+                    site(if kind == JoinKind::NullAwareLeftAnti {
+                        NaaValueEqualKey {
+                            key: 0,
+                            side: JoinSide::Left,
+                        }
+                    } else {
+                        JoinKey {
+                            key: 0,
+                            side: JoinSide::Left,
+                        }
                     }),
                     ExprUse {
                         expr: expr(),
@@ -200,9 +221,16 @@ fn exact_field_sites_keep_repeated_definitions_and_join_demands() {
                     }
                 ),
                 (
-                    site(JoinKey {
-                        key: 0,
-                        side: JoinSide::Right
+                    site(if kind == JoinKind::NullAwareLeftAnti {
+                        NaaValueEqualKey {
+                            key: 0,
+                            side: JoinSide::Right,
+                        }
+                    } else {
+                        JoinKey {
+                            key: 0,
+                            side: JoinSide::Right,
+                        }
                     }),
                     ExprUse {
                         expr: expr(),
@@ -210,7 +238,11 @@ fn exact_field_sites_keep_repeated_definitions_and_join_demands() {
                     }
                 ),
                 (
-                    site(HashJoinResidual),
+                    site(if kind == JoinKind::NullAwareLeftAnti {
+                        NaaEligibility
+                    } else {
+                        HashJoinResidual
+                    }),
                     ExprUse {
                         expr: expr(),
                         demand
@@ -1072,3 +1104,56 @@ fn positive_source_depth_matches_the_checked_invocation_depth_bound() {
 
 #[path = "../expression_site/failure_tail_tests.rs"]
 mod failure_tail_tests;
+
+#[test]
+fn naa_scope_and_value_roots_keep_separate_ordinals_and_original_value_demand() {
+    use ExpressionRootRole::*;
+    let join = fragment(NodeKind::HashJoin {
+        kind: JoinKind::NullAwareLeftAnti,
+        condition: crate::HashJoinCondition::NullAwareEqual {
+            value_equal_keys: Box::from([crate::JoinKey {
+                left: expr(),
+                right: expr(),
+                null_safe: false,
+            }]),
+            scope_keys: Box::from([crate::JoinKey {
+                left: expr(),
+                right: expr(),
+                null_safe: true,
+            }]),
+            eligibility: Some(expr()),
+        },
+        build_side: JoinSide::Right,
+        distribution: JoinDistribution::BroadcastBuild,
+        null_extended: Box::default(),
+    });
+    let roots = uses(&join);
+    for role in [
+        NaaValueEqualKey {
+            key: 0,
+            side: JoinSide::Left,
+        },
+        NaaValueEqualKey {
+            key: 0,
+            side: JoinSide::Right,
+        },
+        NaaScopeKey {
+            key: 0,
+            side: JoinSide::Left,
+        },
+        NaaScopeKey {
+            key: 0,
+            side: JoinSide::Right,
+        },
+        NaaEligibility,
+    ] {
+        assert_eq!(
+            roots.sites().get(&site(role)),
+            Some(&ExprUse {
+                expr: expr(),
+                demand: EvaluationDemand::Value
+            })
+        );
+    }
+    assert_eq!(roots.sites().len(), 5);
+}

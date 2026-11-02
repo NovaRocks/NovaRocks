@@ -180,6 +180,10 @@ impl BulkDomain {
     }
     /// The claim is private and non-Clone. Reusing a caller usize cannot create
     /// another writer for the same run, or manufacture a completed run receipt.
+    #[cfg(test)]
+    pub(crate) fn capture_claims_for_test(&self) -> ExecutionResult<usize> {
+        Ok(self.gate()?.issued)
+    }
     pub(crate) fn begin_capture(&self, work: &CaptureWork<'_>) -> ExecutionResult<CaptureBuilder> {
         let result = (|| {
             let claim = self.claim()?;
@@ -510,6 +514,11 @@ pub(crate) struct SealedCapture {
     sizing: SizingPayload,
 }
 impl SealedCapture {
+    /// Exact physical input occurrences already checked by the original seal.
+    /// This is neither an indexable-row count nor a distinct-key estimate.
+    pub(crate) fn input_rows(&self) -> usize {
+        self.counts.input_rows()
+    }
     #[cfg(test)]
     pub(super) fn pages(&self) -> &SealedPages {
         &self.directory

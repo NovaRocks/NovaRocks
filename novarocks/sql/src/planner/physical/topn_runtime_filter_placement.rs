@@ -1208,17 +1208,19 @@ mod tests {
         PhysicalPlanNode {
             kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: column(1, "key", DataType::Int64, false),
-                    right: column(2, "build_key", DataType::Int64, false),
-                    null_safe: false,
-                }],
-                other_condition: None,
                 build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
                 execution_mode: Some(JoinExecutionMode::Broadcast),
                 build_runtime_filters: Vec::new(),
                 output_columns: output_columns.clone(),
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![PhysicalHashJoinEqCondition {
+                        left: column(1, "key", DataType::Int64, false),
+                        right: column(2, "build_key", DataType::Int64, false),
+                        null_safe: false,
+                    }],
+                    residual: None,
+                },
             })),
             children: vec![probe, build],
             output_columns,
@@ -1468,17 +1470,19 @@ mod tests {
         PhysicalPlanNode {
             kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: column(1, "key", DataType::Int64, false),
-                    right: column(2, "other", DataType::Int64, false),
-                    null_safe: false,
-                }],
-                other_condition: None,
                 build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
                 execution_mode: Some(JoinExecutionMode::Broadcast),
                 build_runtime_filters: Vec::new(),
                 output_columns: output_columns.clone(),
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![PhysicalHashJoinEqCondition {
+                        left: column(1, "key", DataType::Int64, false),
+                        right: column(2, "other", DataType::Int64, false),
+                        null_safe: false,
+                    }],
+                    residual: None,
+                },
             })),
             children: vec![left, right],
             output_columns,

@@ -244,6 +244,10 @@ fn kind_of(family: Family) -> JoinKind {
 }
 
 fn fixture(case: Case) -> Fixture {
+    try_fixture(case).unwrap()
+}
+
+fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::ValidationErrors> {
     let fragment_id = FragmentId::new(41);
     let mut builder = FragmentBuilder::new(fragment_id);
     let left = values(&mut builder, LEFT, &[[1, 10], [2, 20], [3, 30]]);
@@ -331,11 +335,21 @@ fn fixture(case: Case) -> Fixture {
     let node_kind = match case.family {
         Family::Hash { build_side, .. } => NodeKind::HashJoin {
             kind,
-            keys: Box::from([key.clone().unwrap()]),
             build_side,
             distribution: JoinDistribution::Singleton,
-            residual,
             null_extended,
+            condition: if kind == JoinKind::NullAwareLeftAnti {
+                novarocks_physical_plan::HashJoinCondition::NullAwareEqual {
+                    value_equal_keys: Box::from([key.clone().unwrap()]),
+                    scope_keys: Box::default(),
+                    eligibility: residual,
+                }
+            } else {
+                novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: Box::from([key.clone().unwrap()]),
+                    residual,
+                }
+            },
         },
         Family::NestLoop { .. } => NodeKind::NestLoopJoin {
             kind,
@@ -354,26 +368,24 @@ fn fixture(case: Case) -> Fixture {
             node_kind,
         )
         .unwrap();
-    let fragment = builder
-        .finish_definition(
-            JOIN,
-            FragmentSink::Result,
-            PipelineDopDomain {
-                min: 1,
-                max: 1,
-                requires_power_of_two: false,
-            },
-            novarocks_physical_plan::StagePlacementPolicy::Singleton,
-        )
-        .unwrap();
-    Fixture {
+    let fragment = builder.finish_definition(
+        JOIN,
+        FragmentSink::Result,
+        PipelineDopDomain {
+            min: 1,
+            max: 1,
+            requires_power_of_two: false,
+        },
+        novarocks_physical_plan::StagePlacementPolicy::Singleton,
+    )?;
+    Ok(Fixture {
         package: publish(fragment),
         left,
         right,
         output,
         key,
         residual,
-    }
+    })
 }
 
 /// One eager use per actual occurrence: a value or literal leaf, or a binary
@@ -619,10 +631,7 @@ fn inner_join_with_right_build_keeps_orientation_and_publishes_canonical_output(
         left_layout,
         right_layout,
         join_scope_layout,
-        probe_keys,
-        build_keys,
-        eq_null_safe,
-        residual_predicate,
+        condition,
         runtime_filters,
         ..
     } = kind
@@ -632,9 +641,9 @@ fn inner_join_with_right_build_keeps_orientation_and_publishes_canonical_output(
     assert_eq!(*join_type, JoinType::Inner);
     assert_eq!(*left, local_of(&program, LEFT));
     assert_eq!(*right, local_of(&program, RIGHT));
-    assert_eq!((probe_keys.len(), build_keys.len()), (1, 1));
-    assert_eq!(eq_null_safe, &vec![false]);
-    assert!(residual_predicate.is_some() && runtime_filters.is_empty());
+    assert_eq!(condition.keys().len(), 1);
+    assert!(!condition.keys()[0].null_safe);
+    assert!(condition.residual_predicate().is_some() && runtime_filters.is_empty());
     // The scope is the probe slots followed by the build slots, unchanged.
     let scope = [left_layout.slots(), right_layout.slots()].concat();
     assert_eq!(join_scope_layout.slots(), scope.as_slice());
@@ -855,8 +864,7 @@ fn one_definition_shared_by_key_and_residual_keeps_a_source_per_use() {
     let program = compile(&source.package);
     let (join, kind) = join_node(&program);
     let ProgramNodeKind::Join {
-        probe_keys,
-        residual_predicate,
+        condition,
         left_layout,
         right_layout,
         ..
@@ -866,13 +874,13 @@ fn one_definition_shared_by_key_and_residual_keeps_a_source_per_use() {
     };
     let arena = program.graph().expressions();
     let Some(StaticExprKind::Lt(shared, _)) = arena
-        .node(residual_predicate.unwrap())
+        .node(condition.residual_predicate().unwrap())
         .map(|node| node.kind())
     else {
         panic!("the residual is the ordered comparison")
     };
     // One definition, two occurrences with different scopes.
-    assert_eq!(*shared, probe_keys[0]);
+    assert_eq!(*shared, condition.keys()[0].probe);
     use ProgramChannelLayoutRole as Role;
     let key = left_layout.slots()[0];
     assert_eq!(
@@ -983,6 +991,13 @@ fn nested_loop_kinds_lower_with_scope_predicates_and_singleton_mirroring() {
         (JoinKind::LeftAnti, NestedLoopJoinType::LeftAnti, LEFT),
         (JoinKind::RightSemi, NestedLoopJoinType::LeftSemi, RIGHT),
         (JoinKind::RightAnti, NestedLoopJoinType::LeftAnti, RIGHT),
+        (JoinKind::RightOuter, NestedLoopJoinType::RightOuter, LEFT),
+        (JoinKind::FullOuter, NestedLoopJoinType::FullOuter, LEFT),
+        (
+            JoinKind::NullAwareLeftAnti,
+            NestedLoopJoinType::NullAwareLeftAnti,
+            LEFT,
+        ),
     ] {
         let source = fixture(Case {
             family: Family::NestLoop { kind: physical },
@@ -1029,42 +1044,10 @@ fn nested_loop_kinds_lower_with_scope_predicates_and_singleton_mirroring() {
 #[test]
 fn unsupported_kinds_and_orientations_are_explicit_refusals() {
     let refused = [
-        // No mirror keeps a left-build null-aware anti join probe-preserving.
+        // NAA still has no build-left mirror; no role is reconstructed.
         Case {
             family: hash(JoinKind::NullAwareLeftAnti, JoinSide::Left),
             residual: Residual::None,
-            output: Output::Natural,
-        },
-        // Build-preserving kinds need merged build match flags.
-        Case {
-            family: hash(JoinKind::RightOuter, JoinSide::Right),
-            residual: Residual::None,
-            output: Output::Natural,
-        },
-        Case {
-            family: hash(JoinKind::FullOuter, JoinSide::Right),
-            residual: Residual::None,
-            output: Output::Natural,
-        },
-        Case {
-            family: hash(JoinKind::LeftSemi, JoinSide::Left),
-            residual: Residual::None,
-            output: Output::Natural,
-        },
-        // The key conjuncts of a nested-loop null-aware anti join are not
-        // separated from its residual.
-        Case {
-            family: Family::NestLoop {
-                kind: JoinKind::NullAwareLeftAnti,
-            },
-            residual: Residual::Separate,
-            output: Output::Natural,
-        },
-        Case {
-            family: Family::NestLoop {
-                kind: JoinKind::FullOuter,
-            },
-            residual: Residual::Separate,
             output: Output::Natural,
         },
     ];
@@ -1081,16 +1064,16 @@ fn unsupported_kinds_and_orientations_are_explicit_refusals() {
             "{case:?}"
         );
     }
-    // A null-aware anti join without a predicate keeps rows iff the build is
-    // empty, which needs no key split.
-    let source = fixture(Case {
+    // A full NAA predicate is now mandatory. The former absent-predicate
+    // encoding cannot manufacture an unconditional comparison on receipt.
+    let rejected = try_fixture(Case {
         family: Family::NestLoop {
             kind: JoinKind::NullAwareLeftAnti,
         },
         residual: Residual::None,
         output: Output::Natural,
     });
-    compile(&source.package);
+    assert!(rejected.is_err());
 }
 
 struct Trace {
@@ -1160,6 +1143,50 @@ fn every_join_compiler_control_prefix_refuses_with_its_own_cause() {
                 Err(FragmentCompileError::Control(actual)) if actual == cause
             ));
             assert_eq!(*control.events.lock().unwrap(), expected[..=at]);
+        }
+    }
+}
+
+#[test]
+fn build_preserving_hash_kinds_keep_frozen_output_types_in_both_orientations() {
+    for (physical, side, expected) in [
+        (JoinKind::RightOuter, JoinSide::Right, JoinType::RightOuter),
+        (JoinKind::FullOuter, JoinSide::Right, JoinType::FullOuter),
+        (JoinKind::RightSemi, JoinSide::Right, JoinType::RightSemi),
+        (JoinKind::RightAnti, JoinSide::Right, JoinType::RightAnti),
+        (JoinKind::LeftOuter, JoinSide::Left, JoinType::RightOuter),
+        (JoinKind::FullOuter, JoinSide::Left, JoinType::FullOuter),
+        (JoinKind::LeftSemi, JoinSide::Left, JoinType::RightSemi),
+        (JoinKind::LeftAnti, JoinSide::Left, JoinType::RightAnti),
+    ] {
+        for residual in [Residual::None, Residual::Separate] {
+            let source = fixture(Case {
+                family: hash(physical, side),
+                residual,
+                output: Output::Natural,
+            });
+            let program = compile(&source.package);
+            let (_, kind) = join_node(&program);
+            let ProgramNodeKind::Join {
+                join_type,
+                left_layout,
+                right_layout,
+                ..
+            } = kind
+            else {
+                unreachable!()
+            };
+            assert_eq!(*join_type, expected);
+            let root = &program.graph().nodes()[program.graph().root().index()];
+            let actual = root.output_layout().schema();
+            assert_eq!(actual.fields().len(), source.output.len());
+            for (field, value) in actual.fields().iter().zip(&source.output) {
+                let expected = &source.package.fragment().values()[value].ty;
+                assert_eq!(field.data_type(), expected.data_type());
+                assert_eq!(field.is_nullable(), expected.nullable());
+            }
+            assert_eq!(left_layout.slots().len(), 2);
+            assert_eq!(right_layout.slots().len(), 2);
         }
     }
 }

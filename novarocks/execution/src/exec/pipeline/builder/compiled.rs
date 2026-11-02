@@ -546,7 +546,7 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
     scan_bindings: ScanBindings,
     writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
     runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
-    dep_manager: DependencyManager,
+    _dep_manager: DependencyManager,
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
     _function_set: Arc<SealedExecutionFunctionSet>,
@@ -571,7 +571,6 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
     writer_bindings.validate(program)?;
     validate_compiled_runtime_filter_bindings(program, runtime_filter_session.as_ref())?;
     let mut ctx = PipelineBuildContext {
-        dep_manager,
         runtime_filter_execution: PipelineRuntimeFilterExecution {
             session: runtime_filter_session,
         },

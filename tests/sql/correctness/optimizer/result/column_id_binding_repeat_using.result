@@ -27,7 +27,7 @@ a	v	w
 4	NULL	r4
 
 -- query 11
--- legacy
+-- types	integer	varchar	varchar
 a	v	w
 1	l1	NULL
 2	l2	r2

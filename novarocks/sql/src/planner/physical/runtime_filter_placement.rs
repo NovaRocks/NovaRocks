@@ -706,7 +706,7 @@ fn push_probe_down(
 
     let descend_set = match &node.kind {
         PhysicalPlanKind::HashJoin(join) => {
-            let eq_conditions = join.eq_conditions.clone();
+            let eq_conditions = join.condition.keys().clone();
             expand_probe_set_across_join(node, &eq_conditions, &bindable)
         }
         _ => bindable.clone(),
@@ -826,7 +826,7 @@ fn place_current_node(
         if matches!(distribution, JoinDistribution::Unknown) {
             return;
         }
-        (sides, join.eq_conditions.clone(), distribution)
+        (sides, join.condition.keys().clone(), distribution)
     };
 
     let build_size = stats_compute_size(&node.children[sides.build_child].stats);
@@ -2320,8 +2320,6 @@ mod tests {
         PhysicalPlanNode {
             kind: PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
                 join_type,
-                eq_conditions,
-                other_condition: None,
                 build_side: match join_type {
                     JoinKind::RightSemi | JoinKind::RightAnti => {
                         crate::planner::physical::PhysicalHashJoinBuildSide::Left
@@ -2332,6 +2330,10 @@ mod tests {
                 execution_mode,
                 build_runtime_filters: vec![],
                 output_columns: output_columns.clone(),
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: eq_conditions,
+                    residual: None,
+                },
             })),
             children,
             output_columns,

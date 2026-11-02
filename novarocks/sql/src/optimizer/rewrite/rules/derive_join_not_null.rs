@@ -441,6 +441,7 @@ mod tests {
         });
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: jt,
                 condition,
             }),
@@ -830,6 +831,7 @@ mod tests {
         .unwrap();
         let plan = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(cond_id),
             }),

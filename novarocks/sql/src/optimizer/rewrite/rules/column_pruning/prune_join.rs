@@ -96,6 +96,7 @@ mod tests {
     fn prune_join_is_always_unchanged() {
         let expr = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: None,
             }),

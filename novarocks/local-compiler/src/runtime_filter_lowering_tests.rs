@@ -458,11 +458,13 @@ fn add_join(
             output_distribution,
             NodeKind::HashJoin {
                 kind: JoinKind::Inner,
-                keys: Box::from([key]),
                 build_side: JoinSide::Right,
                 distribution,
-                residual: None,
                 null_extended: Box::default(),
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: Box::from([key]),
+                    residual: None,
+                },
             },
         )
         .unwrap();
@@ -1019,7 +1021,7 @@ fn membership(null_semantics: FilterNullSemantics) -> StaticFilterContract {
 fn assert_producer(program: &LocalProgram, binding: u32, null_semantics: FilterNullSemantics) {
     let join = node_of(program, |kind| matches!(kind, ProgramNodeKind::Join { .. }));
     let ProgramNodeKind::Join {
-        build_keys,
+        condition,
         runtime_filters,
         ..
     } = program.graph().nodes()[join.index()].kind()
@@ -1029,7 +1031,11 @@ fn assert_producer(program: &LocalProgram, binding: u32, null_semantics: FilterN
     let [producer] = runtime_filters.as_slice() else {
         panic!("one producer: {runtime_filters:?}");
     };
-    assert_eq!(producer.expr_id, build_keys[0], "it observes build key 0");
+    assert_eq!(
+        producer.expr_id,
+        condition.keys()[0].build,
+        "it observes build key 0"
+    );
     assert_eq!(producer.key_ordinal, 0);
     assert_eq!(producer.producer.binding_id(), binding);
     assert_eq!(producer.producer.channel_id(), FILTER.get());
@@ -1274,7 +1280,7 @@ fn runtime_filter_shapes_outside_m1_are_refused_by_name() {
         matches!(kind, ProgramNodeKind::Join { .. })
     });
     let ProgramNodeKind::Join {
-        probe_keys,
+        condition,
         runtime_filter_consumers,
         ..
     } = program.graph().nodes()[join.index()].kind()
@@ -1284,7 +1290,7 @@ fn runtime_filter_shapes_outside_m1_are_refused_by_name() {
     let [consumer] = runtime_filter_consumers.as_slice() else {
         panic!("one join-owned consumer: {runtime_filter_consumers:?}");
     };
-    assert_eq!(consumer.expr_id, probe_keys[0]);
+    assert_eq!(consumer.expr_id, condition.keys()[0].probe);
     assert_eq!(consumer.key_ordinal, 0);
     assert_eq!(consumer.consumer.binding_id(), 2);
     assert_eq!(consumer.consumer.channel_id(), FILTER.get());

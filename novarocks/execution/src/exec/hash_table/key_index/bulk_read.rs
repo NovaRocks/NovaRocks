@@ -189,21 +189,39 @@ impl IndexView {
             _storage: owner.storage_lifetime(),
         })
     }
-    /// Observe the real selected production layout from owner correctness
-    /// tests without exposing geometry or a mutable strategy choice.
-    #[cfg(test)]
-    pub(crate) fn is_direct_for_test(&self) -> bool {
-        matches!(self.backend, Backend::Direct(_))
-    }
     pub(crate) fn spec(&self) -> &KeySpec {
         &self.spec
     }
-    #[expect(
-        dead_code,
-        reason = "Frozen K view purpose accessor remains available to handoff consumers."
-    )]
     pub(crate) fn purpose(&self) -> IndexPurpose {
         self.purpose
+    }
+
+    /// Observe the immutable layout already selected by original K. This
+    /// grants no strategy-selection, mutation, or scheduling authority.
+    pub(crate) fn is_direct(&self) -> bool {
+        matches!(self.backend, Backend::Direct(_))
+    }
+
+    /// Immutable local coordinates selected by this original K build. These
+    /// metadata reads do not enumerate input rows or mint new class IDs.
+    pub(crate) fn partition_count(&self) -> usize {
+        match &self.backend {
+            Backend::Empty { .. } | Backend::Direct(_) => 1,
+            Backend::Hash { partitions, .. } => partitions.len(),
+        }
+    }
+
+    pub(crate) fn key_count(&self, partition: usize) -> ExecutionResult<usize> {
+        self.ids()?;
+        match &self.backend {
+            Backend::Empty { .. } if partition == 0 => Ok(0),
+            Backend::Direct(store) if partition == 0 => store.id_count_after_fill(),
+            Backend::Hash { partitions, .. } => partitions
+                .get(partition)
+                .map(|index| index.len())
+                .ok_or_else(|| invariant(ValueViolation::Bounds)),
+            _ => Err(invariant(ValueViolation::Bounds)),
+        }
     }
     fn validate(&self, input: &PreparedKeyBatch<'_>) -> ExecutionResult<()> {
         if !self.spec.same_instance(&input.spec) {

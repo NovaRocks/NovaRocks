@@ -91,6 +91,7 @@ impl Rule for JoinCommutativity {
             // Swap children and adjust the join type.
             vec![NewExpr {
                 op: Operator::LogicalJoin(LogicalJoinOp {
+                    naa_author: None,
                     join_type: commute_join_kind(op.join_type),
                     condition: op.condition,
                 }),

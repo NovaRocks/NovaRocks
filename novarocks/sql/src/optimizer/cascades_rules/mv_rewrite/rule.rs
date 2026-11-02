@@ -1224,6 +1224,7 @@ mod tests {
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: kind,
                 condition: on,
             }),

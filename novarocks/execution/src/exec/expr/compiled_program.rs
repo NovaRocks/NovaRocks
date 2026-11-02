@@ -885,9 +885,21 @@ impl CompiledExpressionInstance {
                 return Err(invalid("actual input fields differ from the frozen root port").into());
             }
         }
-        // Validate the entire incoming port, including columns not referenced
-        // by this root. Empty selection still validates its shape and type.
-        for (ordinal, array) in input.columns().iter().enumerate() {
+        if input.is_projected() {
+            for ordinal in self.required_input_columns() {
+                work.step()?;
+                if !input.has_materialized_column(ordinal) {
+                    return Err(
+                        invalid("projected root input omits a required frozen column").into(),
+                    );
+                }
+            }
+        }
+        // Whole inputs still validate every column. An explicit projected port
+        // validates every materialized column at its original frozen ordinal;
+        // its complete logical declaration was checked above. Missing Slot
+        // materialization remains an error, including under empty selection.
+        for (ordinal, array) in input.columns_with_ordinals() {
             let ordinal = u32::try_from(ordinal).map_err(|_| KernelFailure::ResourceExhausted)?;
             let ty = channels
                 .channel_type(ProgramChannelSite::Layout {
@@ -913,6 +925,31 @@ impl CompiledExpressionInstance {
             activation,
             work,
         )
+    }
+    /// Original checked lexical Slot facts for this actual root. Repeated
+    /// occurrences may name one ordinal; consumers deduplicate coordinates.
+    /// This exposes no evaluator, value algorithm or resource authority.
+    pub(crate) fn required_input_columns(&self) -> impl Iterator<Item = usize> + '_ {
+        let checked = self.program.checked();
+        self.effects
+            .keys()
+            .flat_map(move |occurrence| {
+                checked.slots().get(occurrence).copied().into_iter().chain(
+                    checked
+                        .lambdas()
+                        .get(occurrence)
+                        .into_iter()
+                        .flat_map(|binding| binding.captures.iter().copied()),
+                )
+            })
+            .filter_map(|source| match source {
+                ProgramLexicalSource::Input(ProgramChannelSite::Layout {
+                    node,
+                    role,
+                    ordinal,
+                }) if Some((node, role)) == self.input => Some(ordinal as usize),
+                _ => None,
+            })
     }
     fn evaluate_root<'a, E: scalar_invocation::FrameFailure>(
         &mut self,

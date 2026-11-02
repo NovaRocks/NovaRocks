@@ -387,6 +387,7 @@ impl LogicalAggregateOp {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalJoinOp {
+    pub naa_author: Option<crate::common::naa::NaaAuthorFacts<ScalarId>>,
     pub join_type: JoinKind,
     pub condition: Option<ScalarId>,
 }
@@ -616,8 +617,8 @@ pub(crate) struct ImvVersionOp {
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalHashJoinOp {
     pub join_type: JoinKind,
-    pub eq_conditions: Vec<PhysicalHashJoinEqCondition>,
-    pub other_condition: Option<ScalarId>,
+    pub condition:
+        novarocks_physical_plan::HashJoinCondition<Vec<PhysicalHashJoinEqCondition>, ScalarId>,
     pub build_side: HashJoinBuildSide,
     pub distribution: JoinDistribution,
 }

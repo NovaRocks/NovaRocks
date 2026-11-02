@@ -19,6 +19,8 @@
 -- Test Objective:
 -- Derive conservative range envelopes from OR branches while preserving the
 -- original OR predicate.
+-- Preserve that original disjunction before its derived [10,40] envelope;
+-- the envelope does not authorize reordering the original evaluation.
 DROP TABLE IF EXISTS ${case_db}.residual_rng_l;
 DROP TABLE IF EXISTS ${case_db}.residual_rng_r;
 CREATE TABLE ${case_db}.residual_rng_l (k INT, score INT, payload INT);

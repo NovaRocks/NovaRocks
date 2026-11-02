@@ -68,13 +68,12 @@ use crate::runtime_filter as execution;
 
 use super::operator_factory::OperatorFactory;
 use crate::exec::node::assert::AssertNumRowsMode;
-use crate::exec::operators::hashjoin::broadcast_join_shared::BroadcastJoinSharedState;
 use crate::exec::operators::local_exchanger::{LocalExchangePartitionSpec, LocalExchanger};
 use crate::exec::operators::scan::StreamScanSourceFactory;
 use crate::exec::operators::{
     AssertNumRowsProcessorFactory, ExchangeSourceFactory, LimitProcessorFactory,
-    LocalExchangeSinkFactory, LocalExchangeSourceFactory, NlJoinBuildSinkFactory,
-    NlJoinSharedState, UnionAllSharedState, UnionAllSinkFactory, UnionAllSourceFactory,
+    LocalExchangeSinkFactory, LocalExchangeSourceFactory, UnionAllSharedState, UnionAllSinkFactory,
+    UnionAllSourceFactory,
 };
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::dependency::DependencyManager;
@@ -138,7 +137,6 @@ struct PipelineBuildResult {
 }
 
 struct PipelineBuildContext {
-    dep_manager: DependencyManager,
     runtime_filter_execution: PipelineRuntimeFilterExecution,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,

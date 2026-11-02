@@ -126,6 +126,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
 
             let (left, right) = take_binary_children(&mut join_children);
             let LogicalJoinNode {
+                naa_author,
                 join_type,
                 condition,
             } = join;
@@ -140,6 +141,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
             let left_delta_branch = normalize_branch_output(
                 LogicalPlanNode::new(
                     LogicalPlanKind::Join(LogicalJoinNode {
+                        naa_author: naa_author.clone(),
                         join_type,
                         condition: condition.clone(),
                     }),
@@ -155,6 +157,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
             let right_delta_branch = normalize_branch_output(
                 LogicalPlanNode::new(
                     LogicalPlanKind::Join(LogicalJoinNode {
+                        naa_author,
                         join_type,
                         condition,
                     }),
@@ -1313,6 +1316,7 @@ fn mark_scan(plan: LogicalPlanNode, marker: MarkerKind) -> Result<LogicalPlanNod
                 let (left, right) = take_binary_children(&mut children);
                 LogicalPlanNode::new(
                     LogicalPlanKind::Join(LogicalJoinNode {
+                        naa_author: join.naa_author,
                         join_type: join.join_type,
                         condition: join.condition,
                     }),
@@ -2253,6 +2257,7 @@ mod tests {
     fn join_over(join_type: JoinKind) -> LogicalPlanNode {
         LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type,
                 condition: Some(condition()),
             }),
@@ -2271,6 +2276,7 @@ mod tests {
         let right_key = &right_cols[0];
         LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {

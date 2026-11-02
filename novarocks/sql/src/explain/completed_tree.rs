@@ -1339,11 +1339,12 @@ impl TreeContext<'_> {
             }
             NodeKind::HashJoin {
                 kind,
-                keys,
+                condition,
                 distribution,
-                residual,
                 ..
             } => {
+                let keys = condition.keys();
+                let residual = condition.residual();
                 let equalities = joined(keys, ", ", |key, f| {
                     write!(
                         f,
@@ -1365,6 +1366,18 @@ impl TreeContext<'_> {
                         "{pad}  other: {}",
                         self.expr(fragment, *residual)
                     ))?;
+                }
+                if let Some(scope) = condition.scope_keys() {
+                    let equalities = joined(scope, ", ", |key, f| {
+                        write!(
+                            f,
+                            "{} {} {}",
+                            self.expr(fragment, key.left),
+                            if key.null_safe { "<=>" } else { "=" },
+                            self.expr(fragment, key.right)
+                        )
+                    });
+                    out.push(format_args!("{pad}  scope: [{equalities}]"))?;
                 }
             }
             NodeKind::NestLoopJoin {

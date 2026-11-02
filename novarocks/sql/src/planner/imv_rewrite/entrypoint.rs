@@ -1890,6 +1890,7 @@ pub(crate) mod tests {
             }),
             vec![LogicalPlanNode::new(
                 LogicalPlanKind::Join(LogicalJoinNode {
+                    naa_author: None,
                     join_type: JoinKind::Inner,
                     condition: Some(TypedExpr {
                         kind: ExprKind::BinaryOp {
@@ -1917,6 +1918,7 @@ pub(crate) mod tests {
         let right = project_all(join_base_scan("r", 10, 44), 10);
         let join = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {
@@ -1968,6 +1970,7 @@ pub(crate) mod tests {
         let right = project_all(join_base_scan("r", 10, 44), 10);
         let join = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {
@@ -2052,6 +2055,7 @@ pub(crate) mod tests {
         let right = project_all(join_base_scan("r", 10, 44), 10);
         let join = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {

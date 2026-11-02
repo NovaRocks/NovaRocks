@@ -414,6 +414,7 @@ mod tests {
         let right = make_scan(2, vec![]);
         let join = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Cross,
                 condition: None,
             }),
@@ -437,6 +438,7 @@ mod tests {
         let right = make_scan(1, vec![]);
         let join = LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Cross,
                 condition: None,
             }),

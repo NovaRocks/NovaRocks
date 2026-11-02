@@ -301,6 +301,16 @@ pub enum TransformInputEnd {
 }
 
 pub trait TransformKernel: Send {
+    /// Read-only receiver state from this exact wrapper. A kernel can stop
+    /// future demand only after accepted preparation has drained; an empty
+    /// kernel cursor alone is not such a proof.
+    fn poll_receiver_control(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        _receiver_empty: bool,
+    ) -> ExecutionResult<ControlStep> {
+        self.poll_control(ctx)
+    }
     fn poll_control(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
         Ok(ControlStep::Active)
     }
@@ -430,7 +440,7 @@ impl<K: TransformKernel, P: InputPreparation<K>> StepOperator for Transform<K, P
         }
         let result = self
             .kernel
-            .poll_control(ctx)
+            .poll_receiver_control(ctx, !self.receiver.is_occupied())
             .and_then(|control| match control {
                 ControlStep::Active => self.end_input_control(ctx),
                 other => Ok(other),
@@ -1104,5 +1114,61 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(operator.drive(&mut ctx).unwrap().output.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn receiver_control_observes_original_accepted_preparation_until_it_drains() {
+        struct Boundary {
+            observations: Arc<std::sync::Mutex<Vec<bool>>>,
+        }
+        impl TransformKernel for Boundary {
+            fn poll_receiver_control(
+                &mut self,
+                _: &mut StepContext<'_>,
+                empty: bool,
+            ) -> ExecutionResult<ControlStep> {
+                self.observations.lock().unwrap().push(empty);
+                Ok(ControlStep::Active)
+            }
+            fn apply(
+                &mut self,
+                _: &mut StepContext<'_>,
+                _: PreparedInput,
+            ) -> ExecutionResult<StepResult> {
+                Ok(StepResult::new(None, NextStep::NeedInput, 0))
+            }
+        }
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counts = Arc::new(Counts::default());
+        let mut operator = Transform::new(
+            Boundary {
+                observations: observations.clone(),
+            },
+            Prepare {
+                counts: counts.clone(),
+                refuse: false,
+                pause: true,
+                fail: false,
+            },
+        );
+        let control = RuntimeErrorState::default();
+        let mut turn = TurnWork::new(NonZeroU64::MIN, 10);
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
+        let mut ctx = StepContext::new(&control, &mut turn, &mut conversions);
+        operator.poll_control(&mut ctx).unwrap();
+        assert!(matches!(
+            operator.try_push(&mut ctx, RawInput::new(chunk(), None)),
+            InputResult::Accepted(_)
+        ));
+        operator.poll_control(&mut ctx).unwrap();
+        assert!(matches!(
+            operator.drive(&mut ctx).unwrap().next,
+            NextStep::Yield
+        ));
+        operator.poll_control(&mut ctx).unwrap();
+        operator.drive(&mut ctx).unwrap();
+        operator.poll_control(&mut ctx).unwrap();
+        assert_eq!(*observations.lock().unwrap(), [true, false, false, true]);
+        assert_eq!(counts.accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.prepared.load(Ordering::SeqCst), 1);
     }
 }

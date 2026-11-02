@@ -12,7 +12,7 @@ provenance:
 code-anchors:
   - "novarocks/execution/src/exec/hash_table/key_index/mod.rs (instance-local key index)"
   - "novarocks/execution/src/exec/hash_table/key_index/bulk_tasks.rs (BulkTaskGraph)"
-  - "novarocks/execution/src/exec/operators/hashjoin/join_hash_table.rs (JoinHashTable)"
+  - "novarocks/execution/src/exec/operators/hashjoin/build_csr.rs (consumer-owned physical row topology)"
 ---
 
 ## 问题

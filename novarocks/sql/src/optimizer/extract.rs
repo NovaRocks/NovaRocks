@@ -793,14 +793,16 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: left_key,
-                    right: right_key,
-                    null_safe: false,
-                }],
-                other_condition: None,
                 build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Unknown,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![PhysicalHashJoinEqCondition {
+                        left: left_key,
+                        right: right_key,
+                        null_safe: false,
+                    }],
+                    residual: None,
+                },
             }),
             children: vec![left, right],
         });
@@ -1020,10 +1022,12 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![eq_condition],
-                other_condition: None,
                 build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Unknown,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![eq_condition],
+                    residual: None,
+                },
             }),
             children: vec![left, right],
         });
@@ -1199,10 +1203,12 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![eq_condition],
-                other_condition: None,
                 build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Colocate,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![eq_condition],
+                    residual: None,
+                },
             }),
             children: vec![left, right],
         });
@@ -1391,14 +1397,16 @@ mod tests {
                 id: memo.next_expr_id(),
                 op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                     join_type,
-                    eq_conditions: vec![PhysicalHashJoinEqCondition {
-                        left: left_key,
-                        right: right_key,
-                        null_safe: false,
-                    }],
-                    other_condition: None,
                     build_side,
                     distribution: JoinDistribution::Unknown,
+                    condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                        keys: vec![PhysicalHashJoinEqCondition {
+                            left: left_key,
+                            right: right_key,
+                            null_safe: false,
+                        }],
+                        residual: None,
+                    },
                 }),
                 children: vec![left, right],
             });

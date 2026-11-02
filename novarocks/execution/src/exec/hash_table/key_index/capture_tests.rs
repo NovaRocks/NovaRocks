@@ -147,6 +147,7 @@ fn captured_pages_preserve_occurrences_exact_null_minmax_and_shared_whole_hll() 
     assert_eq!(second_id.run.index(), 1);
     let first = first.seal(&ports).unwrap();
     let second = second.seal(&ports).unwrap();
+    assert_eq!((first.input_rows(), second.input_rows()), (4, 4));
     let pages = first.pages();
     assert_eq!((pages.len(), pages.occurrences()), (1, 4));
     let page = pages.page(0).unwrap();
@@ -239,7 +240,7 @@ fn one_byte_hash_batch_per_capture_page_uses_only_selected_distinct_dictionary_b
     let capture = builder.seal(&ports).unwrap();
     assert_eq!(
         (
-            capture.counts().input_rows(),
+            capture.input_rows(),
             capture.counts().indexable_rows(),
             capture.counts().null_rows()
         ),
@@ -281,10 +282,7 @@ fn empty_run_seals_once_and_numeric_run_replay_or_missing_claim_cannot_certify_c
     let domain1 = domain(&ty, super::super::NullPolicy::Equal, &ports);
     let mut builder = domain1.begin_capture(&ports).unwrap();
     let capture = builder.seal(&ports).unwrap();
-    assert_eq!(
-        (capture.pages().len(), capture.counts().input_rows()),
-        (0, 0)
-    );
+    assert_eq!((capture.pages().len(), capture.input_rows()), (0, 0));
     let input = BulkInput::new(&domain1, vec![capture], &ports).unwrap();
     assert_eq!(input.len(), 1);
     domain1.check_failure().unwrap();

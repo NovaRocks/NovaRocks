@@ -303,6 +303,23 @@ pub(crate) fn encode_site(site: ExpressionRootSite) -> wire::RootSite {
                 JoinSide::Right => wire::JoinSide::Right as i32,
             },
         }),
+        ExpressionRootRole::NaaValueEqualKey { key, side } => {
+            Role::NaaValueEqualKey(wire::JoinKeyRoot {
+                key,
+                side: match side {
+                    JoinSide::Left => wire::JoinSide::Left as i32,
+                    JoinSide::Right => wire::JoinSide::Right as i32,
+                },
+            })
+        }
+        ExpressionRootRole::NaaScopeKey { key, side } => Role::NaaScopeKey(wire::JoinKeyRoot {
+            key,
+            side: match side {
+                JoinSide::Left => wire::JoinSide::Left as i32,
+                JoinSide::Right => wire::JoinSide::Right as i32,
+            },
+        }),
+        ExpressionRootRole::NaaEligibility => Role::NaaEligibility(wire::Empty {}),
         ExpressionRootRole::HashJoinResidual => Role::HashJoinResidual(wire::Empty {}),
         ExpressionRootRole::NestLoopPredicate => Role::NestLoopPredicate(wire::Empty {}),
         ExpressionRootRole::SortOrder { key } => Role::SortOrder(key),
@@ -376,6 +393,31 @@ pub(crate) fn decode_site(site: &wire::RootSite) -> Result<ExpressionRootSite, C
                 }
             },
         },
+        Role::NaaValueEqualKey(value) => ExpressionRootRole::NaaValueEqualKey {
+            key: value.key,
+            side: match wire::JoinSide::try_from(value.side) {
+                Ok(wire::JoinSide::Left) => JoinSide::Left,
+                Ok(wire::JoinSide::Right) => JoinSide::Right,
+                _ => {
+                    return Err(ControlCodecError::InvalidShape(
+                        "unknown or unspecified join side",
+                    ));
+                }
+            },
+        },
+        Role::NaaScopeKey(value) => ExpressionRootRole::NaaScopeKey {
+            key: value.key,
+            side: match wire::JoinSide::try_from(value.side) {
+                Ok(wire::JoinSide::Left) => JoinSide::Left,
+                Ok(wire::JoinSide::Right) => JoinSide::Right,
+                _ => {
+                    return Err(ControlCodecError::InvalidShape(
+                        "unknown or unspecified join side",
+                    ));
+                }
+            },
+        },
+        Role::NaaEligibility(_) => ExpressionRootRole::NaaEligibility,
         Role::HashJoinResidual(_) => ExpressionRootRole::HashJoinResidual,
         Role::NestLoopPredicate(_) => ExpressionRootRole::NestLoopPredicate,
         Role::SortOrder(value) => ExpressionRootRole::SortOrder { key: *value },

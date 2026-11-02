@@ -142,6 +142,7 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
         );
         let mut result = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: join.join_type,
                 condition: new_condition,
             }),
@@ -361,6 +362,7 @@ mod tests {
         });
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::LeftSemi,
                 condition: cond_id,
             }),
@@ -384,6 +386,7 @@ mod tests {
         });
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: cond_id,
             }),

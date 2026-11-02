@@ -321,23 +321,25 @@ impl BridgeCtx<'_> {
                 let execution_mode = join_execution_mode(node.execution_props.join_distribution);
                 Ok(PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
                     join_type: op.join_type,
-                    eq_conditions: op
-                        .eq_conditions
-                        .iter()
-                        .map(|cond| PhysicalHashJoinEqCondition {
-                            left: materialize(self.scalars, cond.left),
-                            right: materialize(self.scalars, cond.right),
-                            null_safe: cond.null_safe,
-                        })
-                        .collect(),
-                    other_condition: op
-                        .other_condition
-                        .map(|expr| materialize(self.scalars, expr)),
                     build_side: map_hash_join_build_side(op.build_side),
                     distribution: map_join_distribution(op.distribution.clone()),
                     execution_mode,
                     build_runtime_filters: vec![],
                     output_columns: physical_join_output_columns(op.join_type, node)?,
+                    condition: op.condition.clone().try_map(
+                        |keys| {
+                            Ok::<_, String>(
+                                keys.into_iter()
+                                    .map(|cond| PhysicalHashJoinEqCondition {
+                                        left: materialize(self.scalars, cond.left),
+                                        right: materialize(self.scalars, cond.right),
+                                        null_safe: cond.null_safe,
+                                    })
+                                    .collect(),
+                            )
+                        },
+                        |expr| Ok(materialize(self.scalars, expr)),
+                    )?,
                 })))
             }
             Operator::PhysicalNestLoopJoin(op) => {
@@ -1975,10 +1977,12 @@ mod tests {
     fn malformed_hash_join_arity_is_rejected() {
         let mut node = base_node(Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         }));
         node.children.push(raw_values_node());
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
@@ -1999,10 +2003,12 @@ mod tests {
         right.output_columns = vec![right_c.clone()];
         let mut node = base_node(Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         }));
         node.output_columns = vec![output_column(10, "stale_parent_state")];
         node.children.push(left);
@@ -2025,11 +2031,13 @@ mod tests {
             right.output_columns = vec![right_column.clone()];
             let mut node = base_node(Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type,
-                eq_conditions: vec![],
-                other_condition: None,
                 build_side: crate::optimizer::operator::exact_hash_join_build_side(join_type)
                     .expect("bridge fixture uses a legal hash join kind"),
                 distribution: JoinDistribution::Broadcast,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: vec![],
+                    residual: None,
+                },
             }));
             let mut expected_left = left_column.clone();
             let mut expected_right = right_column.clone();
@@ -2085,10 +2093,12 @@ mod tests {
         right.output_columns = vec![shared.clone()];
         let mut node = base_node(Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
             build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
+            condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                keys: vec![],
+                residual: None,
+            },
         }));
         node.output_columns = vec![shared.clone(), shared.clone()];
         node.children = vec![left, right];

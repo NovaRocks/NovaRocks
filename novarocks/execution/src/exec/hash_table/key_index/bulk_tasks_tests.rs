@@ -164,7 +164,7 @@ fn task(graph: &BulkTaskGraph, ports: &DirectWork<'_>) -> Task {
     }
 }
 fn finish(mut task: Task, ports: &DirectWork<'_>) -> Completion {
-    while !task.advance(17, ports).unwrap() {}
+    while !task.advance(17, ports).unwrap().is_done() {}
     task.finish().unwrap()
 }
 fn error<T>(result: ExecutionResult<T>) -> ExecutionFailure {
@@ -335,7 +335,45 @@ fn direct_graph_uses_multiple_real_workers_and_preserves_all_physical_occurrence
             KeyMatch::Found(ids[&value])
         );
     }
-    drop(ready);
+    let (_, assignments) = ready.into_parts();
+    let expected_ranges = expected
+        .iter()
+        .map(|(_, rows)| rows.len().div_ceil(INPUT_RANGE_ROWS))
+        .sum::<usize>();
+    assert_eq!(assignments.range_count(), expected_ranges);
+    // Completion was reversed above. Both random access forms still address
+    // the stable input coordinates, including the partial last range.
+    for ordinal in (0..assignments.range_count()).rev() {
+        let by_ordinal = assignments.range(ordinal).unwrap();
+        let by_input = assignments
+            .get(by_ordinal.page(), by_ordinal.start())
+            .unwrap();
+        let iterated = assignments.iter().nth(ordinal).unwrap();
+        assert_eq!(by_input.matches(), by_ordinal.matches());
+        assert_eq!(iterated.page(), by_ordinal.page());
+        assert_eq!(iterated.start(), by_ordinal.start());
+        assert_eq!(iterated.matches(), by_ordinal.matches());
+        assert!(
+            assignments
+                .get(by_ordinal.page(), by_ordinal.start() + 1)
+                .is_err()
+        );
+    }
+    let mut ordinal = 0;
+    for (page, rows) in &expected {
+        for start in (0..rows.len()).step_by(INPUT_RANGE_ROWS) {
+            let chunk = assignments.range(ordinal).unwrap();
+            assert_eq!(chunk.page(), *page);
+            assert_eq!(chunk.start(), start);
+            assert_eq!(
+                chunk.matches().len(),
+                INPUT_RANGE_ROWS.min(rows.len() - start)
+            );
+            ordinal += 1;
+        }
+    }
+    assert!(assignments.range(assignments.range_count()).is_err());
+    drop(assignments);
     drop(graph);
     drop(ports);
     drop(owner);
@@ -399,7 +437,7 @@ fn lost_task_or_lost_completed_output_blocks_publication_and_releases_actual_sou
         let ports = work(owner.as_ref(), &tracker, &Control);
         let (graph, _) = graph(IndexPurpose::KeyIds, &ports);
         let mut task = task(&graph, &ports);
-        assert!(!task.advance(0, &ports).unwrap());
+        assert_eq!(task.advance(0, &ports).unwrap(), TaskAdvance::Blocked);
         if completed {
             drop(finish(task, &ports));
         } else {
@@ -482,7 +520,7 @@ fn original_control_failure_in_every_direct_phase_prevents_success_and_cannot_be
             if after_progress {
                 // The small NULL task may already be completed; failing the
                 // following complete still must stop publication.
-                if task.advance(1, &controlled).unwrap() {
+                if task.advance(1, &controlled).unwrap().is_done() {
                     let mut complete = task.finish().unwrap();
                     stopped.0.store(true, Ordering::Release);
                     let cause = error(graph.complete(&mut complete, &controlled));

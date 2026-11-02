@@ -218,7 +218,7 @@ fn retains_original_interval_union(tree: &OptimizedOperatorNode) -> bool {
         let predicates = match &node.op {
             Operator::PhysicalScan(scan) => scan.predicates.clone(),
             Operator::PhysicalFilter(filter) => vec![filter.predicate],
-            Operator::PhysicalHashJoin(join) => join.other_condition.into_iter().collect(),
+            Operator::PhysicalHashJoin(join) => join.condition.residual().iter().copied().collect(),
             _ => Vec::new(),
         };
         for predicate in predicates {
@@ -260,7 +260,7 @@ fn retains_residual_or(tree: &OptimizedOperatorNode) -> bool {
         let predicates = match &node.op {
             Operator::PhysicalScan(scan) => scan.predicates.clone(),
             Operator::PhysicalFilter(filter) => vec![filter.predicate],
-            Operator::PhysicalHashJoin(join) => join.other_condition.into_iter().collect(),
+            Operator::PhysicalHashJoin(join) => join.condition.residual().iter().copied().collect(),
             _ => Vec::new(),
         };
         for predicate in predicates {
@@ -282,7 +282,7 @@ fn retains_score_join_equality(tree: &OptimizedOperatorNode) -> bool {
         let Operator::PhysicalHashJoin(join) = &node.op else {
             return;
         };
-        found |= join.eq_conditions.iter().any(|condition| {
+        found |= join.condition.keys().iter().any(|condition| {
             match (
                 score_origin(arena, condition.left),
                 score_origin(arena, condition.right),

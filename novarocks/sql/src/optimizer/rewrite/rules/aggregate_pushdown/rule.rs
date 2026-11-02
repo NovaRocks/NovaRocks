@@ -324,6 +324,7 @@ mod tests {
 
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(cond_id),
             }),

@@ -306,6 +306,11 @@ impl Scenario for NativeRootReplyRefusal {
             "unsupported frozen negative contract"
         );
         validate_suffix_freeze(&freeze, self.case)?;
+        // The baseline also opens BE Exchange subscriptions. Bind the original live
+        // roster before SQL so the existing actor owns their exact H2 cancellation.
+        for backend in 0..context.handle().be_count() {
+            context.handle().native_exchange_fault(backend)?;
+        }
         let control = context.handle().native_root_reply_fault(0)?;
         let epoch = Instant::now();
         let runtime = tokio::runtime::Builder::new_multi_thread()

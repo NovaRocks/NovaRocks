@@ -1528,13 +1528,14 @@ fn observer_primary_and_identity_cleanup_failures_are_retained_after_the_filesys
     // deliberately makes the observer's real remove_file cleanup fail.
     std::fs::remove_file(&identity_path).unwrap();
     std::fs::create_dir(&identity_path).unwrap();
-    std::fs::write(
-        directory
-            .path()
-            .join("be-0.storage-authority-close.trigger"),
-        "x".repeat(66),
-    )
-    .unwrap();
+    let trigger = directory
+        .path()
+        .join("be-0.storage-authority-close.trigger");
+    let staged = trigger.with_extension("tmp");
+    // Publish the complete invalid payload. An in-place write can expose an
+    // empty file to metadata inspection, then fail at the later read bound.
+    std::fs::write(&staged, "x".repeat(66)).unwrap();
+    std::fs::rename(staged, trigger).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     while !controls.workers_returned_for_test() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(2));

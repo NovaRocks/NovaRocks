@@ -1040,6 +1040,7 @@ mod tests {
         };
         LogicalPlanNode::new(
             LogicalPlanKind::Join(LogicalJoinNode {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(condition),
             }),

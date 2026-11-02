@@ -1194,10 +1194,14 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
         NodeKind::Project { expressions } => usage.add_items(expressions.len()),
         NodeKind::Aggregate { .. } => {}
         NodeKind::HashJoin {
-            keys,
+            condition,
             null_extended,
             ..
-        } => usage.add_item_counts([keys.len(), null_extended.len()]),
+        } => usage.add_item_counts([
+            condition.keys().len(),
+            condition.scope_keys().map_or(0, |keys| keys.len()),
+            null_extended.len(),
+        ]),
         NodeKind::NestLoopJoin { null_extended, .. } => usage.add_items(null_extended.len()),
         NodeKind::Sort { order_by, mode } => {
             usage.add_items(order_by.len());

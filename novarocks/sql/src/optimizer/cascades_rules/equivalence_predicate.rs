@@ -507,6 +507,7 @@ mod tests {
         MExpr {
             id,
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type,
                 condition: Some(condition),
             }),
@@ -563,6 +564,7 @@ mod tests {
         let group = memo.new_group(MExpr {
             id,
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: Some(condition_id),
             }),

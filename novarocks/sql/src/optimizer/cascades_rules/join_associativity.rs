@@ -241,6 +241,7 @@ impl JoinAssociativity {
         let new_inner_join = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: inner_cond,
             }),
@@ -251,6 +252,7 @@ impl JoinAssociativity {
         // New outer join: A JOIN (B JOIN C)
         vec![NewExpr {
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Inner,
                 condition: outer_cond,
             }),

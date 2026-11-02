@@ -510,6 +510,131 @@ impl Rule for ProjectToPhysical {
 
 pub(crate) struct JoinToHashJoin;
 
+type ScalarJoinCondition =
+    novarocks_physical_plan::HashJoinCondition<Vec<PhysicalHashJoinEqCondition>, ScalarId>;
+
+fn safe_key_operand(arena: &ScalarArena, expression: ScalarId) -> bool {
+    !scalar_expr::can_fail(arena, expression)
+        && !scalar_expr::contains_non_replica_deterministic_function(arena, expression)
+}
+
+/// Admit only the original NOT IN author's complete C, with its Value-demand
+/// prefix intact. A merely orientable equality in E is never a value key.
+fn null_aware_hash_condition(
+    op: &LogicalJoinOp,
+    left_ids: &HashSet<ColumnId>,
+    right_ids: &HashSet<ColumnId>,
+    arena: &mut ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarJoinCondition>, crate::compiler::SqlCompileError> {
+    let Some(author) = &op.naa_author else {
+        return Ok(None);
+    };
+    let Some(predicate) = op.condition else {
+        return Ok(None);
+    };
+    let mut prefix = predicate;
+    loop {
+        if prefix == author.comparison {
+            break;
+        }
+        match arena.node(prefix) {
+            ScalarNode::Nested(inner) => prefix = *inner,
+            ScalarNode::BinaryOp {
+                left,
+                op: BinOp::And,
+                ..
+            } => prefix = *left,
+            _ => return Ok(None),
+        }
+    }
+    let mut comparisons = Vec::new();
+    let mut comparison_rest = Vec::new();
+    collect_conjuncts(
+        arena,
+        author.comparison,
+        &mut comparisons,
+        &mut comparison_rest,
+    );
+    if comparisons.is_empty() || !comparison_rest.is_empty() {
+        return Ok(None);
+    }
+    let mut value_equal_keys = Vec::new();
+    for pair in comparisons {
+        if !safe_key_operand(arena, pair.left) || !safe_key_operand(arena, pair.right) {
+            return Ok(None);
+        }
+        let Some(pair) = orient_eq_pair(pair, arena, left_ids, right_ids)
+            .and_then(|pair| coerce_hash_join_eq_condition(arena, pair))
+        else {
+            return Ok(None);
+        };
+        value_equal_keys.push(PhysicalHashJoinEqCondition {
+            left: pair.left,
+            right: pair.right,
+            null_safe: pair.null_safe,
+        });
+    }
+    let mut scope_keys = Vec::new();
+    let mut remaining = Vec::new();
+    if let Some(eligibility) = author.eligibility {
+        let total = safe_key_operand(arena, eligibility);
+        let mut conjuncts = Vec::new();
+        scalar_expr::split_conjuncts(arena, eligibility, &mut conjuncts);
+        let mut safe_prefix = true;
+        for conjunct in conjuncts {
+            let pair = match arena.node(conjunct) {
+                ScalarNode::BinaryOp {
+                    left, op, right, ..
+                } if matches!(op, BinOp::Eq | BinOp::EqForNull) => {
+                    Some(ScalarHashJoinEqCondition {
+                        left: *left,
+                        right: *right,
+                        null_safe: *op == BinOp::EqForNull,
+                    })
+                }
+                _ => None,
+            };
+            // A nullable Value-demand prefix cannot suppress required work
+            // after UNKNOWN. A nonnullable safe prefix, or a total E, can.
+            let extracted = pair
+                .filter(|pair| {
+                    safe_key_operand(arena, pair.left)
+                        && safe_key_operand(arena, pair.right)
+                        && (total
+                            || (safe_prefix
+                                && (pair.null_safe
+                                    || (!arena.nullable(pair.left)
+                                        && !arena.nullable(pair.right)))))
+                })
+                .and_then(|pair| orient_eq_pair(pair, arena, left_ids, right_ids))
+                .and_then(|pair| coerce_hash_join_eq_condition(arena, pair));
+            if let Some(pair) = extracted {
+                scope_keys.push(PhysicalHashJoinEqCondition {
+                    left: pair.left,
+                    right: pair.right,
+                    null_safe: pair.null_safe,
+                });
+            } else {
+                remaining.push(conjunct);
+                safe_prefix = false;
+            }
+        }
+    }
+    let eligibility = if scope_keys.is_empty() {
+        author.eligibility
+    } else {
+        scalar_expr::combine_conjuncts(arena, remaining, control)?
+    };
+    Ok(Some(
+        novarocks_physical_plan::HashJoinCondition::NullAwareEqual {
+            value_equal_keys,
+            scope_keys,
+            eligibility,
+        },
+    ))
+}
+
 impl Rule for JoinToHashJoin {
     fn name(&self) -> &str {
         "JoinToHashJoin"
@@ -531,6 +656,27 @@ impl Rule for JoinToHashJoin {
         let Operator::LogicalJoin(op) = &expr.op else {
             return Ok(vec![]);
         };
+        if op.join_type == JoinKind::NullAwareLeftAnti {
+            if expr.children.len() != 2 {
+                return Ok(vec![]);
+            }
+            let left_ids = get_group_column_ids(memo, expr.children[0]);
+            let right_ids = get_group_column_ids(memo, expr.children[1]);
+            let Some(condition) =
+                null_aware_hash_condition(op, &left_ids, &right_ids, &mut memo.scalars, control)?
+            else {
+                return Ok(vec![]);
+            };
+            return Ok(vec![NewExpr {
+                op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                    join_type: op.join_type,
+                    condition,
+                    build_side: HashJoinBuildSide::Right,
+                    distribution: JoinDistribution::Unknown,
+                }),
+                children: expr.children.clone(),
+            }]);
+        }
         let (raw_eq_conds, mut other) =
             extract_eq_conditions(op.condition, &op.join_type, &mut memo.scalars, control)?;
 
@@ -606,10 +752,12 @@ impl Rule for JoinToHashJoin {
         Ok(vec![NewExpr {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: op.join_type,
-                eq_conditions,
-                other_condition,
                 build_side,
                 distribution: JoinDistribution::Unknown,
+                condition: novarocks_physical_plan::HashJoinCondition::Ordinary {
+                    keys: eq_conditions,
+                    residual: other_condition,
+                },
             }),
             children: expr.children.clone(),
         }])
@@ -654,7 +802,18 @@ impl Rule for JoinToNestLoop {
         // plan for group N".
         let (eq_conds, _) =
             extract_eq_conditions(op.condition, &op.join_type, &mut memo.scalars, control)?;
-        if !eq_conds.is_empty() && op.join_type != JoinKind::Cross && expr.children.len() == 2 {
+        if op.join_type == JoinKind::NullAwareLeftAnti && expr.children.len() == 2 {
+            let left_ids = get_group_column_ids(memo, expr.children[0]);
+            let right_ids = get_group_column_ids(memo, expr.children[1]);
+            if null_aware_hash_condition(op, &left_ids, &right_ids, &mut memo.scalars, control)?
+                .is_some()
+            {
+                return Ok(vec![]);
+            }
+        } else if !eq_conds.is_empty()
+            && op.join_type != JoinKind::Cross
+            && expr.children.len() == 2
+        {
             let left_ids = get_group_column_ids(memo, expr.children[0]);
             let right_ids = get_group_column_ids(memo, expr.children[1]);
             let has_orientable_pair = eq_conds
@@ -1845,6 +2004,7 @@ mod join_demotion_tests {
         MExpr {
             id,
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type,
                 condition,
             }),
@@ -1905,12 +2065,12 @@ mod join_demotion_tests {
 
         // ── eq_conditions: exactly one pair, (a_id, b_id) ──────────────────
         assert_eq!(
-            phys.eq_conditions.len(),
+            phys.condition.keys().len(),
             1,
             "expected 1 eq pair in eq_conditions, got {:?}",
-            phys.eq_conditions
+            phys.condition.keys()
         );
-        let eq = &phys.eq_conditions[0];
+        let eq = &phys.condition.keys()[0];
         assert!(
             !eq.null_safe,
             "regular equality should not be marked null-safe"
@@ -1930,7 +2090,8 @@ mod join_demotion_tests {
 
         // ── other_condition: the demoted (a_id = a_name) pair ───────────────
         let other = phys
-            .other_condition
+            .condition
+            .residual()
             .as_ref()
             .expect("demoted same-side pair must appear in other_condition");
         let other = mat(&memo, *other);
@@ -1993,13 +2154,13 @@ mod join_demotion_tests {
         let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
             panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
         };
-        assert_eq!(phys.eq_conditions.len(), 1);
+        assert_eq!(phys.condition.keys().len(), 1);
         assert!(
-            phys.eq_conditions[0].null_safe,
+            phys.condition.keys()[0].null_safe,
             "<=> hash join key must retain null-safe semantics"
         );
         assert!(
-            phys.other_condition.is_none(),
+            phys.condition.residual().is_none(),
             "<=> should not be left as a residual-only predicate"
         );
     }
@@ -2037,9 +2198,9 @@ mod join_demotion_tests {
         let Operator::PhysicalHashJoin(phys) = &alternatives[0].op else {
             panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
         };
-        assert_eq!(phys.eq_conditions.len(), 1);
-        let left_key = mat(&memo, phys.eq_conditions[0].left);
-        let right_key = mat(&memo, phys.eq_conditions[0].right);
+        assert_eq!(phys.condition.keys().len(), 1);
+        let left_key = mat(&memo, phys.condition.keys()[0].left);
+        let right_key = mat(&memo, phys.condition.keys()[0].right);
         assert_eq!(left_key.value_type.data_type().clone(), DataType::Int64);
         assert_eq!(right_key.value_type.data_type().clone(), DataType::Int32);
         assert!(
@@ -2051,7 +2212,7 @@ mod join_demotion_tests {
             "optimizer hash key should keep raw column refs so distribution can enforce both sides"
         );
         assert!(
-            phys.other_condition.is_none(),
+            phys.condition.residual().is_none(),
             "compatible scalar equality should not be demoted"
         );
     }
@@ -2134,14 +2295,14 @@ mod join_demotion_tests {
             panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
         };
         assert_eq!(
-            phys.eq_conditions.len(),
+            phys.condition.keys().len(),
             1,
             "only the scalar equality should remain as a hash key"
         );
-        let left_key = mat(&memo, phys.eq_conditions[0].left);
+        let left_key = mat(&memo, phys.condition.keys()[0].left);
         assert_col_id(&left_key, test_col_id("a_id"), "scalar hash key on left");
         assert!(
-            phys.other_condition.is_some(),
+            phys.condition.residual().is_some(),
             "complex equality must survive as a residual predicate"
         );
     }
@@ -2681,3 +2842,7 @@ mod two_phase_agg_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "naa_admission_tests.rs"]
+mod naa_admission_tests;

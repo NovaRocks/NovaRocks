@@ -387,6 +387,11 @@ fn render_profile_result(
             lines.push(counters);
         }
     }
+    lines.extend(
+        crate::query_execution::profile::format_join_key_work_from_profile_trees(
+            &fragment_profiles,
+        ),
+    );
     lines.extend(match formatter.plan {
         ProfilePlan::Completed { plan, annotations } => render_completed_profile(
             &plan,

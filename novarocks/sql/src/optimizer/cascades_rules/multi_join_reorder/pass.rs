@@ -346,6 +346,7 @@ mod tests {
 
     fn inner(memo: &mut Memo, cond: TypedExpr) -> LogicalJoinOp {
         LogicalJoinOp {
+            naa_author: None,
             join_type: JoinKind::Inner,
             condition: Some(
                 intern_typed(
@@ -598,6 +599,7 @@ mod tests {
         memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::LeftOuter,
                 condition: None,
             }),
@@ -631,6 +633,7 @@ mod tests {
         let root = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
+                naa_author: None,
                 join_type: JoinKind::Cross,
                 condition: None,
             }),
@@ -641,6 +644,7 @@ mod tests {
             memo.groups[root].logical_exprs.push(MExpr {
                 id,
                 op: Operator::LogicalJoin(LogicalJoinOp {
+                    naa_author: None,
                     join_type: JoinKind::Cross,
                     condition: None,
                 }),
@@ -648,6 +652,7 @@ mod tests {
             });
         }
         let op = LogicalJoinOp {
+            naa_author: None,
             join_type: JoinKind::Inner,
             condition: None,
         };

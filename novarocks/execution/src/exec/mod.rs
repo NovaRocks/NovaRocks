@@ -29,6 +29,7 @@ pub mod min_max_predicate;
 pub mod node;
 pub mod operators;
 pub mod percentile;
+pub(crate) mod phased_work;
 pub mod pipeline;
 pub mod row_position;
 pub mod runtime_filter;

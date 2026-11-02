@@ -50,6 +50,241 @@ fn capture(
     )
     .unwrap()
 }
+
+#[test]
+fn original_component_range_value_comparison_keeps_unknown_false_and_equality_modes() {
+    use arrow::datatypes::Int32Type;
+    let mut cases: Vec<(FunctionValueType, ArrayRef, ArrayRef)> = vec![
+        (
+            FunctionValueType::new(DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![None, Some(2)])),
+            Arc::new(Int64Array::from(vec![Some(2), Some(2), None])),
+        ),
+        (
+            FunctionValueType::new(DataType::Utf8, true),
+            Arc::new(StringArray::from(vec![None, Some("two")])),
+            Arc::new(StringViewArray::from(vec![Some("two"), Some("two"), None])),
+        ),
+    ];
+    cases.push((
+        FunctionValueType::new(DataType::Utf8, true),
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 1]),
+                Arc::new(StringArray::from(vec![None, Some("two")])),
+            )
+            .unwrap(),
+        ),
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 0, 1]),
+                Arc::new(StringArray::from(vec![Some("two"), None])),
+            )
+            .unwrap(),
+        ),
+    ));
+    cases.push((
+        FunctionValueType::new(
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ),
+        Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            None,
+            Some(vec![Some(2), None]),
+        ])),
+        Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(2), None]),
+            Some(vec![Some(2), None]),
+            None,
+        ])),
+    ));
+    for (case, (ty, left_value, right_value)) in cases.into_iter().enumerate() {
+        for null_safe in [false, true] {
+            let (owner, tracker) = owner_with_tracker();
+            let types = [
+                FunctionValueType::new(DataType::Int32, false),
+                ty.clone(),
+                FunctionValueType::new(DataType::Int32, false),
+            ];
+            let modes = [
+                NullPolicy::Equal,
+                if null_safe {
+                    NullPolicy::Equal
+                } else {
+                    NullPolicy::Unmatchable
+                },
+                NullPolicy::Unmatchable,
+            ];
+            let spec = KeySpec::new(&types, &modes, owner.as_ref(), &|| Ok(())).unwrap();
+            let left_arrays: Vec<ArrayRef> = vec![
+                Arc::new(Int32Array::from(vec![7, 8])),
+                Arc::clone(&left_value),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ];
+            let right_arrays: Vec<ArrayRef> = vec![
+                Arc::new(Int32Array::from(vec![999, 888, 777])),
+                Arc::clone(&right_value),
+                Arc::new(Int32Array::from(vec![1, 2, 1])),
+            ];
+            let mut right_types = types.clone();
+            if case == 1 {
+                // V can compare UTF8 and VIEW, but the incoming VIEW still
+                // has its own actual signed carrier declaration.
+                right_types[1] = FunctionValueType::new(DataType::Utf8View, true);
+            }
+            let checked_capture = |arrays: &[ArrayRef],
+                                   bindings: &[FunctionValueType],
+                                   rows: &[usize],
+                                   side| {
+                KeyInput::new_for_spec(
+                    &spec,
+                    arrays,
+                    bindings,
+                    &readable(arrays[0].len()),
+                    rows,
+                    &mut ValueConversionContext::default(),
+                    owner.as_ref(),
+                    &|| Ok(()),
+                )
+                .unwrap_or_else(|cause| {
+                    panic!("value pair fixture {case}/{null_safe}/{side} failed capture: {cause:?}")
+                })
+            };
+            let left = checked_capture(&left_arrays, &types, &[0, 1], "left");
+            let right = checked_capture(&right_arrays, &right_types, &[0, 1, 2], "right");
+            let a = PreparedKeyBatch::from_captured(
+                &spec,
+                &left,
+                AggregateAllocator::new(tracker.clone()),
+                &|| Ok(()),
+            )
+            .unwrap();
+            let b = PreparedKeyBatch::from_captured(
+                &spec,
+                &right,
+                AggregateAllocator::new(tracker),
+                &|| Ok(()),
+            )
+            .unwrap();
+            let mut actual = [Some(false); 5];
+            a.compare_value_pairs(
+                1..3,
+                &[0, 0, 1, 1, 0],
+                &b,
+                &[0, 1, 0, 1, 2],
+                &mut actual,
+                owner.as_ref(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(
+                actual,
+                [
+                    if null_safe { Some(false) } else { None },
+                    Some(false),
+                    Some(false),
+                    Some(true),
+                    if null_safe { Some(true) } else { None }
+                ]
+            );
+            // The scope prefix is excluded explicitly, never guessed by roles.
+            a.compare_value_pairs(
+                0..3,
+                &[0, 0, 1, 1, 0],
+                &b,
+                &[0, 1, 0, 1, 2],
+                &mut actual,
+                owner.as_ref(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(actual, [Some(false); 5]);
+            a.compare_value_pairs(
+                1..1,
+                &[0, 0, 1, 1, 0],
+                &b,
+                &[0, 1, 0, 1, 2],
+                &mut actual,
+                owner.as_ref(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(actual, [Some(true); 5]);
+            let original: ExecutionFailure = KernelFailure::DeadlineExceeded.into();
+            let failure = a
+                .compare_value_pairs(
+                    1..3,
+                    &[0, 0, 1, 1, 0],
+                    &b,
+                    &[0, 1, 0, 1, 2],
+                    &mut actual,
+                    owner.as_ref(),
+                    &|| Err(original.clone()),
+                )
+                .unwrap_err();
+            assert_eq!(failure, original);
+            assert_eq!(actual, [Some(true); 5]);
+        }
+    }
+}
+
+#[test]
+fn value_comparison_uses_original_native_float_canonical_equality() {
+    let (owner, tracker) = owner_with_tracker();
+    let types = [FunctionValueType::new(DataType::Float64, true)];
+    let spec = KeySpec::new(&types, &[NullPolicy::Unmatchable], owner.as_ref(), &|| {
+        Ok(())
+    })
+    .unwrap();
+    let left = capture(
+        &spec,
+        &[Arc::new(Float64Array::from(vec![
+            Some(-0.0),
+            Some(f64::from_bits(0x7ff8_0000_0000_0001)),
+            None,
+        ]))],
+        &types,
+        &[0, 1, 2],
+        owner.as_ref(),
+    );
+    let right = capture(
+        &spec,
+        &[Arc::new(Float64Array::from(vec![
+            Some(0.0),
+            Some(f64::from_bits(0x7ff8_0000_0000_0021)),
+            None,
+        ]))],
+        &types,
+        &[0, 1, 2],
+        owner.as_ref(),
+    );
+    let a = PreparedKeyBatch::from_captured(
+        &spec,
+        &left,
+        AggregateAllocator::new(tracker.clone()),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let b = PreparedKeyBatch::from_captured(
+        &spec,
+        &right,
+        AggregateAllocator::new(tracker),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let mut output = [Some(false); 3];
+    a.compare_value_pairs(
+        0..1,
+        &[0, 1, 2],
+        &b,
+        &[0, 1, 2],
+        &mut output,
+        owner.as_ref(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(output, [Some(true), Some(true), None]);
+}
 fn captured_hash(
     spec: &KeySpec,
     input: &KeyInput,
@@ -739,4 +974,237 @@ fn captured_input_mid_capture_and_loan_entry_cancellation_preserve_original_occu
         .len(),
         4
     );
+}
+
+// These metadata tests protect the B3 scope/value split at the original K
+// author. Expected NULLs come from explicit source rows, not tuple hash policy.
+#[test]
+fn component_root_null_batch_separates_scope_value_and_original_occurrence_order() {
+    let (owner, _) = owner_with_tracker();
+    let actual: [_; 2] = std::array::from_fn(|_| FunctionValueType::new(DataType::Int32, true));
+    let declared: [_; 2] = std::array::from_fn(|_| FunctionValueType::new(DataType::Int32, false));
+    let spec = KeySpec::new(&declared, &[NullPolicy::Equal; 2], owner.as_ref(), &|| {
+        Ok(())
+    })
+    .unwrap();
+    let input = capture(
+        &spec,
+        &[
+            Arc::new(Int32Array::from(vec![None, Some(1), Some(2), None])),
+            Arc::new(Int32Array::from(vec![Some(10), None, Some(20), None])),
+        ],
+        &actual,
+        &[2, 0, 1, 0, 3],
+        owner.as_ref(),
+    );
+    let mut scope = [false; 5];
+    let mut value = [false; 5];
+    let mut tuple = [false; 5];
+    input
+        .component_range_root_nulls_observed(0..1, 0..5, &mut scope, &|| Ok(()))
+        .unwrap();
+    input
+        .component_range_root_nulls_observed(1..2, 0..5, &mut value, &|| Ok(()))
+        .unwrap();
+    input
+        .component_range_root_nulls_observed(0..2, 0..5, &mut tuple, &|| Ok(()))
+        .unwrap();
+    assert_eq!(scope, [false, true, false, true, true]);
+    assert_eq!(value, [false, false, true, false, true]);
+    assert_eq!(tuple, [false, true, true, true, true]);
+    for (occurrence, expected) in tuple.into_iter().enumerate() {
+        assert_eq!(
+            input.row_has_null_observed(occurrence, &|| Ok(())).unwrap(),
+            expected
+        );
+    }
+    let mut middle = [false; 3];
+    input
+        .component_range_root_nulls_observed(1..2, 1..4, &mut middle, &|| Ok(()))
+        .unwrap();
+    assert_eq!(middle, [false, true, false]);
+}
+
+#[test]
+fn component_root_null_batch_uses_sliced_dictionary_bottom_null_without_hashing() {
+    let (owner, _) = owner_with_tracker();
+    let types = [
+        FunctionValueType::new(DataType::Int32, true),
+        FunctionValueType::new(DataType::Utf8, true),
+    ];
+    let spec = KeySpec::new(&types, &[NullPolicy::Equal; 2], owner.as_ref(), &|| Ok(())).unwrap();
+    let dictionary: ArrayRef = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![
+                Some(2),
+                Some(1),
+                None,
+                Some(0),
+                Some(2),
+                Some(3),
+                Some(0),
+            ]),
+            Arc::new(StringArray::from(vec![Some("a"), None, Some("c"), None])),
+        )
+        .unwrap(),
+    );
+    let input = capture(
+        &spec,
+        &[
+            Arc::new(Int32Array::from(vec![
+                None,
+                Some(1),
+                Some(1),
+                None,
+                Some(1),
+            ])),
+            dictionary.slice(1, 5),
+        ],
+        &types,
+        &[4, 2, 0, 4, 3, 1],
+        owner.as_ref(),
+    );
+    let hash_inits = super::super::local_hash::BYTE_HASH_INITS.with(Cell::get);
+    let mut values = [false; 6];
+    input
+        .component_range_root_nulls_observed(1..2, 0..6, &mut values, &|| Ok(()))
+        .unwrap();
+    assert_eq!(values, [true, false, true, true, false, true]);
+    assert_eq!(
+        super::super::local_hash::BYTE_HASH_INITS.with(Cell::get),
+        hash_inits
+    );
+    let mut selected = [true; 4];
+    input
+        .component_range_root_nulls_observed(1..2, 1..5, &mut selected, &|| Ok(()))
+        .unwrap();
+    assert_eq!(selected, [false, true, true, false]);
+}
+
+#[test]
+fn component_root_null_batch_keeps_normalized_complex_and_logical_null_roots() {
+    let (owner, _) = owner_with_tracker();
+    let mut declared = projected_types(false).to_vec();
+    declared.push(FunctionValueType::new(DataType::Null, true));
+    let spec = KeySpec::new(&declared, &[NullPolicy::Equal; 3], owner.as_ref(), &|| {
+        Ok(())
+    })
+    .unwrap();
+    let (mut arrays, mut actual) = mixed(true);
+    arrays.push(Arc::new(NullArray::new(4)));
+    actual.push(FunctionValueType::new(DataType::Null, true));
+    let input = capture(&spec, &arrays, &actual, &[3, 1, 0, 2, 1], owner.as_ref());
+    let mut complex = [false; 5];
+    input
+        .component_range_root_nulls_observed(1..2, 0..5, &mut complex, &|| Ok(()))
+        .unwrap();
+    assert_eq!(complex, [false, true, false, false, true]);
+    let mut logical = [false; 5];
+    input
+        .component_range_root_nulls_observed(2..3, 0..5, &mut logical, &|| Ok(()))
+        .unwrap();
+    assert_eq!(logical, [true; 5]);
+}
+
+#[test]
+fn component_root_null_batch_checks_exact_ranges_before_writing_and_accepts_empty_ranges() {
+    let (owner, _) = owner_with_tracker();
+    let types: [_; 2] = std::array::from_fn(|_| FunctionValueType::new(DataType::Int32, true));
+    let spec = KeySpec::new(&types, &[NullPolicy::Equal; 2], owner.as_ref(), &|| Ok(())).unwrap();
+    let input = capture(
+        &spec,
+        &[
+            Arc::new(Int32Array::from(vec![Some(1), None])),
+            Arc::new(Int32Array::from(vec![None, Some(2)])),
+        ],
+        &types,
+        &[1, 0, 1],
+        owner.as_ref(),
+    );
+    for (component_start, component_end, start, end, output_len) in [
+        (2, 1, 0, 1, 1),
+        (0, 3, 0, 1, 1),
+        (3, 3, 0, 1, 1),
+        (0, 1, 2, 1, 1),
+        (0, 1, 0, 4, 4),
+        (0, 1, 4, 4, 0),
+        (0, 1, 0, 2, 1),
+        (0, 1, 0, 1, 2),
+    ] {
+        let mut output = vec![true; output_len];
+        let cause = failure(input.component_range_root_nulls_observed(
+            component_start..component_end,
+            start..end,
+            &mut output,
+            &|| Ok(()),
+        ));
+        assert_value_failure(&cause, novarocks_value_arrays::ValueViolation::Bounds);
+        assert!(output.iter().all(|&value| value));
+    }
+    let mut empty_components = [true; 3];
+    input
+        .component_range_root_nulls_observed(2..2, 0..3, &mut empty_components, &|| Ok(()))
+        .unwrap();
+    assert_eq!(empty_components, [false; 3]);
+    input
+        .component_range_root_nulls_observed(0..2, 3..3, &mut [], &|| Ok(()))
+        .unwrap();
+}
+
+#[test]
+fn component_root_null_batch_preserves_original_entry_and_mid_batch_control_cause() {
+    let (owner, _) = owner_with_tracker();
+    let types: [_; 2] = std::array::from_fn(|_| FunctionValueType::new(DataType::Int32, false));
+    let spec = KeySpec::new(&types, &[NullPolicy::Equal; 2], owner.as_ref(), &|| Ok(())).unwrap();
+    let arrays: [ArrayRef; 2] = [
+        Arc::new(Int32Array::from(vec![1; 700])),
+        Arc::new(Int32Array::from(vec![2; 700])),
+    ];
+    let input = capture(
+        &spec,
+        &arrays,
+        &types,
+        &(0..700).collect::<Vec<_>>(),
+        owner.as_ref(),
+    );
+    let mut output = vec![true; 700];
+    let cause = ExecutionFailure::from(KernelFailure::Cancelled);
+    assert!(
+        failure(
+            input.component_range_root_nulls_observed(0..2, 0..700, &mut output, &|| Err(
+                cause.clone()
+            ),)
+        )
+        .same_occurrence(&cause)
+    );
+    assert!(output.iter().all(|&value| value));
+    let calls = Cell::new(0);
+    input
+        .component_range_root_nulls_observed(0..2, 0..700, &mut output, &|| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(output, vec![false; 700]);
+    assert!(calls.get() > 3);
+    let stop = calls.get() / 2;
+    calls.set(0);
+    assert!(
+        failure(
+            input.component_range_root_nulls_observed(0..2, 0..700, &mut output, &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() == stop {
+                    Err(cause.clone())
+                } else {
+                    Ok(())
+                }
+            })
+        )
+        .same_occurrence(&cause)
+    );
+    assert_eq!(calls.get(), stop);
+    input
+        .component_range_root_nulls_observed(0..2, 0..700, &mut output, &|| Ok(()))
+        .unwrap();
+    assert_eq!(output, vec![false; 700]);
 }

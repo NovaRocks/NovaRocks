@@ -3030,12 +3030,13 @@ fn render_node_contract(
         )),
         NodeKind::HashJoin {
             kind,
-            keys,
             build_side,
             distribution,
-            residual,
             null_extended,
-        } => {
+condition,
+} => {
+            let keys = condition.keys();
+            let residual = condition.residual();
             lines.push(format_args!("{pad}  join: {} JOIN", join_kind_label(*kind)));
             lines.push(format_args!(
                 "{pad}  kind={}, build-side={}, distribution={}, keys=[{}], residual={}, null-extended=[{}]",
@@ -3052,6 +3053,17 @@ fn render_node_contract(
                 format_optional_readable_expr(plan, fragment_id, fragment, *residual),
                 format_value_ids(null_extended)
             ));
+            if let Some(scope) = condition.scope_keys() {
+                lines.push(format_args!(
+                    "{pad}  scope-keys=[{}]",
+                    joined(scope, ", ", |key: &novarocks_physical_plan::JoinKey, formatter: &mut fmt::Formatter<'_>| write!(
+                        formatter, "{} {} {}",
+                        format_expr(plan, fragment_id, fragment, key.left),
+                        if key.null_safe { "<=>" } else { "=" },
+                        format_expr(plan, fragment_id, fragment, key.right)
+                    ))
+                ));
+            }
         }
         NodeKind::NestLoopJoin {
             kind,

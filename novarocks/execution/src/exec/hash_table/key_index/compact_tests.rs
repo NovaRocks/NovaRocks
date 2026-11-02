@@ -1544,7 +1544,7 @@ fn nominal_raw_bytes_follow_the_real_bulk_hash_graph_without_reframing() {
             }
             let mut next = Vec::new();
             for mut task in pending {
-                if task.advance(1, &ports).unwrap() {
+                if task.advance(1, &ports).unwrap().is_done() {
                     let mut complete = task.finish().unwrap();
                     graph.complete(&mut complete, &ports).unwrap();
                 } else {

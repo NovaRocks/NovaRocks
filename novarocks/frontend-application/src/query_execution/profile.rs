@@ -731,6 +731,71 @@ pub(crate) fn format_counter_sums_from_profile_trees(
     Some(format!("{label}: {}", parts.join(" ")))
 }
 
+/// Keep each original task/profile and operator separate: P is an artifact
+/// property and progress contributors count F within one task, not across BEs.
+/// Missing counters stay absent instead of becoming guessed zero observations.
+pub(crate) fn format_join_key_work_from_profile_trees(trees: &[RuntimeProfileTree]) -> Vec<String> {
+    fn visit(
+        node: &ProfileNode,
+        scope: &ProfileNode,
+        task_truncated: i64,
+        lines: &mut Vec<String>,
+    ) {
+        if let Some(counters) = node
+            .children
+            .iter()
+            .find(|child| child.name == OPERATOR_COUNTERS)
+        {
+            let mut parts = [
+                "JoinFullPartitions",
+                "JoinFullDirect",
+                "JoinGroupPartitions",
+                "JoinGroupDirect",
+                "JoinKAdvanceCalls",
+                "JoinKProgressSteps",
+                "JoinKProgressWorkers",
+            ]
+            .into_iter()
+            .filter_map(|name| {
+                counters
+                    .counters
+                    .iter()
+                    .find(|counter| counter.name == name)
+                    .map(|counter| format!("{name}={}", counter.value))
+            })
+            .collect::<Vec<_>>();
+            if !parts.is_empty() {
+                for (name, value) in [
+                    (
+                        OPERATOR_COUNTERS_TRUNCATED,
+                        native_counter(counters, OPERATOR_COUNTERS_TRUNCATED),
+                    ),
+                    (OPERATOR_STATISTICS_TRUNCATED, task_truncated),
+                ] {
+                    if value != 0 {
+                        parts.push(format!("{name}={value}"));
+                    }
+                }
+                lines.push(format!(
+                    "JoinKeyWork: scope={:?} operator={:?} {}",
+                    scope.name,
+                    node.name,
+                    parts.join(" ")
+                ));
+            }
+        }
+        for child in &node.children {
+            visit(child, scope, task_truncated, lines);
+        }
+    }
+    let mut lines = Vec::new();
+    for tree in trees {
+        let task_truncated = native_counter_in_node(&tree.root, OPERATOR_STATISTICS_TRUNCATED);
+        visit(&tree.root, &tree.root, task_truncated, &mut lines);
+    }
+    lines
+}
+
 /// Per-fragment attribution (W0'b): group each profile tree by the fragment's root (output)
 /// plan-node id its producer named, merging every instance of the same fragment. The renderer maps
 /// each `PLAN FRAGMENT` to the same id via `fragment.root.node_id` and prints the matching summary.
@@ -2032,6 +2097,61 @@ mod tests {
                 "TypedConnectorMetrics",
             ),
             Some("TypedConnectorMetrics: TypedConnectorPageSourcesOpened=2".to_owned()),
+        );
+    }
+
+    #[test]
+    fn join_key_work_keeps_original_task_counters_separate_and_absence_visible() {
+        use novarocks_execution::task_execution::status::OperatorCounter;
+
+        let mut builder = ProfileTerminalBuilder::new();
+        for (task, partitions, workers) in [(4, 4, 3), (5, 1, 2)] {
+            let counters = [
+                ("JoinFullPartitions", partitions),
+                ("JoinFullDirect", i64::from(partitions == 1)),
+                ("JoinKProgressWorkers", workers),
+            ]
+            .into_iter()
+            .map(|(name, value)| OperatorCounter::new(SafeDetail::new(name).unwrap(), value))
+            .collect();
+            builder
+                .apply_task_operator_statistics(
+                    &finished_task_info(
+                        2,
+                        task,
+                        vec![
+                            OperatorStatistics::new(
+                                3,
+                                SafeDetail::new("COMPILED_JOIN_FINALIZE").unwrap(),
+                            )
+                            .with_counters(counters),
+                            OperatorStatistics::new(4, SafeDetail::new("OtherOperator").unwrap()),
+                        ],
+                    ),
+                    7,
+                )
+                .unwrap();
+        }
+        let trees = builder
+            .finish()
+            .into_profiles()
+            .into_iter()
+            .map(super::FragmentProfileTree::into_tree)
+            .collect::<Vec<_>>();
+        let lines = super::format_join_key_work_from_profile_trees(&trees);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("Task (stage=2 task=4)"));
+        assert!(lines[0].contains("JoinFullPartitions=4"));
+        assert!(lines[0].contains("JoinFullDirect=0"));
+        assert!(lines[0].contains("JoinKProgressWorkers=3"));
+        assert!(lines[1].contains("Task (stage=2 task=5)"));
+        assert!(lines[1].contains("JoinFullPartitions=1"));
+        assert!(lines[1].contains("JoinFullDirect=1"));
+        assert!(lines[1].contains("JoinKProgressWorkers=2"));
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("JoinGroupPartitions"))
         );
     }
 

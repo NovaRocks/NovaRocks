@@ -37,7 +37,7 @@ use novarocks_value_arrays::{
     decode::ValueConversionContext,
     reachability::{ReachableRows, SelectionSet},
 };
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 /// SQL matching policy, independent of the signed nullable input declaration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -345,6 +345,7 @@ impl KeyInput {
     /// Observe root SQL NULL through the same already-prepared tuple author,
     /// including dictionary bottom NULL and logical NULL carriers. Occurrence
     /// coordinates retain their original source-row mapping and duplicates.
+    #[cfg(test)]
     pub(crate) fn row_has_null_observed(
         &self,
         occurrence: usize,
@@ -361,6 +362,39 @@ impl KeyInput {
         storage
             .view(self.arrays())
             .row_has_null_observed(row, checkpoint)
+    }
+    /// Observe only the requested static component range, in original
+    /// occurrence order. Output is one root-NULL OR per occurrence; an empty
+    /// component range is false. No source preparation or value copy occurs.
+    pub(crate) fn component_range_root_nulls_observed(
+        &self,
+        components: Range<usize>,
+        occurrences: Range<usize>,
+        output: &mut [bool],
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
+        checkpoint()?;
+        let ordinals = self
+            .0
+            .ordinals
+            .get(occurrences)
+            .filter(|ordinals| ordinals.len() == output.len())
+            .ok_or_else(|| invariant(ValueViolation::Bounds))?;
+        let storage = self
+            .0
+            .preparation
+            .as_ref()
+            .and_then(|p| p.projected.as_ref())
+            .map_or(&self.0.tuples, |(storage, _)| storage);
+        storage
+            .view(self.arrays())
+            .component_range_root_nulls_observed(
+                components,
+                &self.0.rows,
+                ordinals,
+                output,
+                checkpoint,
+            )
     }
     pub(crate) fn arrays(&self) -> &[ArrayRef] {
         &self.0.arrays
@@ -702,6 +736,24 @@ impl<'a> PreparedKeyBatch<'a> {
     }
     pub(crate) fn bytes(&self, column: usize) -> ExecutionResult<Option<PreparedBytes<'_>>> {
         self.preparation.bytes(column)
+    }
+
+    /// Value-demand comparison of original signed components, independent of
+    /// hash routing and the index's ordinary-NULL exclusion policy.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compare_value_pairs(
+        &self,
+        components: std::ops::Range<usize>,
+        left_rows: &[usize],
+        other: &PreparedKeyBatch<'_>,
+        right_rows: &[usize],
+        output: &mut [Option<bool>],
+        owner: &dyn InputConstructionOwner,
+        checkpoint: &dyn Fn() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
+        super::pairs::compare_value_pairs(
+            self, components, left_rows, other, right_rows, output, owner, checkpoint,
+        )
     }
 
     /// Bind a materialization subset once, borrowing the same decoded source.

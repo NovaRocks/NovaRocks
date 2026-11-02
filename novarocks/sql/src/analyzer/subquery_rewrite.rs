@@ -858,6 +858,9 @@ impl<'a> AnalyzerContext<'a> {
         if let Some(cond) = join.condition.as_ref() {
             join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
         }
+        join.naa_author = join.naa_author.take().map(|facts| {
+            facts.map(|expr| replace_placeholder_in_expr(&expr, sq_info.id, &replacement))
+        });
 
         // Expose subquery columns in the outer scope so downstream
         // references (e.g. ORDER BY on subquery column, though uncommon)
@@ -941,6 +944,9 @@ impl<'a> AnalyzerContext<'a> {
         if let Some(cond) = join.condition.as_ref() {
             join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
         }
+        join.naa_author = join.naa_author.take().map(|facts| {
+            facts.map(|expr| replace_placeholder_in_expr(&expr, sq_info.id, &replacement))
+        });
         let _ = sq_alias;
         Ok(())
     }
@@ -1033,6 +1039,9 @@ impl<'a> AnalyzerContext<'a> {
         if let Some(cond) = join.condition.as_ref() {
             join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
         }
+        join.naa_author = join.naa_author.take().map(|facts| {
+            facts.map(|expr| replace_placeholder_in_expr(&expr, sq_info.id, &replacement))
+        });
         Ok(())
     }
 
@@ -1233,6 +1242,9 @@ impl<'a> AnalyzerContext<'a> {
         if let Some(cond) = join.condition.as_ref() {
             join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
         }
+        join.naa_author = join.naa_author.take().map(|facts| {
+            facts.map(|expr| replace_placeholder_in_expr(&expr, sq_info.id, &replacement))
+        });
         Ok(())
     }
 
@@ -1295,6 +1307,7 @@ impl<'a> AnalyzerContext<'a> {
 
         let placeholder = std::mem::replace(&mut join.left, dummy_relation());
         join.left = Relation::Join(Box::new(JoinRelation {
+            naa_author: None,
             left: placeholder,
             right: sub_rel,
             join_type: JoinKind::LeftOuter,
@@ -1328,6 +1341,9 @@ impl<'a> AnalyzerContext<'a> {
         if let Some(cond) = join.condition.as_ref() {
             join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
         }
+        join.naa_author = join.naa_author.take().map(|facts| {
+            facts.map(|expr| replace_placeholder_in_expr(&expr, sq_info.id, &replacement))
+        });
         Ok(())
     }
 
@@ -1361,6 +1377,7 @@ impl<'a> AnalyzerContext<'a> {
 
         let placeholder = std::mem::replace(&mut join.left, dummy_relation());
         join.left = Relation::Join(Box::new(JoinRelation {
+            naa_author: None,
             left: placeholder,
             right: sub_rel,
             join_type: JoinKind::Cross,
@@ -1378,6 +1395,9 @@ impl<'a> AnalyzerContext<'a> {
         if let Some(cond) = join.condition.as_ref() {
             join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
         }
+        join.naa_author = join.naa_author.take().map(|facts| {
+            facts.map(|expr| replace_placeholder_in_expr(&expr, sq_info.id, &replacement))
+        });
         Ok(())
     }
 
@@ -1636,6 +1656,7 @@ impl<'a> AnalyzerContext<'a> {
         let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
 
         select.from = Some(Relation::Join(Box::new(JoinRelation {
+            naa_author: None,
             left: current_from,
             right: sub_rel,
             join_type,
@@ -1709,6 +1730,7 @@ impl<'a> AnalyzerContext<'a> {
         );
         let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
         select.from = Some(Relation::Join(Box::new(JoinRelation {
+            naa_author: None,
             left: current_from,
             right: sub_rel,
             join_type: JoinKind::LeftOuter,
@@ -1864,7 +1886,7 @@ impl<'a> AnalyzerContext<'a> {
             return self.rewrite_correlated_in_subquery(
                 select,
                 scope,
-                lhs_typed,
+                lhs_typed_list,
                 resolved_sub,
                 sq_info.id,
                 sq_info.subquery.span,
@@ -1922,18 +1944,14 @@ impl<'a> AnalyzerContext<'a> {
                 },
                 value_type: sub_col.value_type.clone(),
             };
-            // Always emit plain `Eq` as the join condition. For NOT IN, SQL's
-            // "any NULL anywhere → UNKNOWN" semantics is encoded by selecting
-            // `JoinKind::NullAwareLeftAnti` below when either operand could be
-            // NULL, rather than by wrapping the condition in IS-NULL ORs (the
-            // old form). Keeping the condition a bare `Eq` lets the Cascades
-            // implement phase extract it as a real hash-join key — without
-            // that, `c0 NOT IN (subq)` on nullable columns degraded to a
-            // NestLoopJoin and timed out on 60K×40K-scale inputs.
+            // Retain the NOT IN author's ordinary equality and its exact NULL
+            // domain. The explicit comparison role, rather than an arbitrary
+            // equality in eligibility, permits later key extraction.
+            let nullable = lhs_i.value_type.nullable() || rhs_ref.value_type.nullable();
             let eq = TypedExpr {
                 value_type: novarocks_type_contract::FunctionValueType::new(
                     DataType::Boolean,
-                    false,
+                    nullable,
                 ),
 
                 kind: ExprKind::BinaryOp {
@@ -1951,10 +1969,11 @@ impl<'a> AnalyzerContext<'a> {
             let mut acc = iter.next().expect("at least one IN column");
             for next in iter {
                 self.check_control()?;
+                let nullable = acc.value_type.nullable() || next.value_type.nullable();
                 acc = TypedExpr {
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Boolean,
-                        false,
+                        nullable,
                     ),
 
                     kind: ExprKind::BinaryOp {
@@ -2067,6 +2086,7 @@ impl<'a> AnalyzerContext<'a> {
             };
 
             let match_join = Relation::Join(Box::new(JoinRelation {
+                naa_author: None,
                 left: current_from,
                 right: sub_rel,
                 join_type: JoinKind::LeftOuter,
@@ -2075,6 +2095,7 @@ impl<'a> AnalyzerContext<'a> {
             let (joined_from, null_exists) = match null_marker {
                 Some((null_rel, null_exists)) => (
                     Relation::Join(Box::new(JoinRelation {
+                        naa_author: None,
                         left: match_join,
                         right: null_rel,
                         join_type: JoinKind::LeftOuter,
@@ -2087,6 +2108,7 @@ impl<'a> AnalyzerContext<'a> {
             let (joined_from, nonempty_exists) = match nonempty_marker {
                 Some((any_rel, any_exists)) => (
                     Relation::Join(Box::new(JoinRelation {
+                        naa_author: None,
                         left: joined_from,
                         right: any_rel,
                         join_type: JoinKind::LeftOuter,
@@ -2157,13 +2179,9 @@ impl<'a> AnalyzerContext<'a> {
                 &replacement,
             );
         } else {
-            // Standard case: SEMI / ANTI JOIN. For NOT IN, NULL handling now
-            // lives in the JoinKind itself — pick `NullAwareLeftAnti` when
-            // either side could carry NULLs so the exec layer's null-aware
-            // anti-join logic kicks in (drops every probe row if the build
-            // side has any NULL key; drops probe rows whose key is NULL).
-            // For statically non-nullable operands the regular `LeftAnti`
-            // already matches SQL semantics.
+            // Nullable NOT IN requires the complete comparison's three-valued
+            // result. In a tuple, a FALSE field still defeats UNKNOWN in
+            // another field. Nonnullable operands permit ordinary LeftAnti.
             let either_nullable = lhs_typed_list
                 .iter()
                 .zip(resolved_sub.output_columns.iter())
@@ -2187,6 +2205,12 @@ impl<'a> AnalyzerContext<'a> {
                 output_columns,
             };
             select.from = Some(Relation::Join(Box::new(JoinRelation {
+                naa_author: (join_type == JoinKind::NullAwareLeftAnti).then(|| {
+                    crate::common::naa::NaaAuthorFacts {
+                        comparison: eq_cond.clone(),
+                        eligibility: None,
+                    }
+                }),
                 left: current_from,
                 right: sub_rel,
                 join_type,
@@ -2450,7 +2474,7 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         select: &mut ResolvedSelect,
         scope: &AnalyzerScope,
-        lhs_typed: TypedExpr,
+        lhs_typed: Vec<TypedExpr>,
         resolved_sub: ResolvedQuery,
         sq_id: usize,
         subquery_span: novarocks_parser::Span,
@@ -2466,13 +2490,12 @@ impl<'a> AnalyzerContext<'a> {
             }
         };
 
-        if sub_projection.is_empty() {
+        if sub_projection.is_empty() || lhs_typed.len() != sub_projection.len() {
             return Err(AnalyzeError::invalid_query_shape(
-                "IN subquery must produce a column",
+                "correlated IN subquery comparison arity differs from its projection",
                 subquery_span,
             ));
         }
-        let rhs_expr = sub_projection[0].expr.clone();
         let sub_rel = sub_from.ok_or_else(|| {
             AnalyzeError::unsupported_query_shape(
                 "IN subquery must have a FROM clause",
@@ -2480,22 +2503,52 @@ impl<'a> AnalyzerContext<'a> {
             )
         })?;
 
-        // Keep the key condition as a plain equality so the optimizer can
-        // implement it as a hash join key. For nullable NOT IN semantics,
-        // the join type carries the null-aware anti behavior and evaluates
-        // residual correlation predicates against matching/null-key build
-        // rows.
-        let either_nullable = lhs_typed.value_type.nullable() || rhs_expr.value_type.nullable();
-        let key_cond = TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        // Preserve every comparison in tuple order. NULL in a later value
+        // component must still select NAA; retaining only the first pair
+        // changes both equality and the signed three-valued result.
+        let mut comparisons = Vec::with_capacity(lhs_typed.len());
+        let mut either_nullable = false;
+        for (left, right) in lhs_typed.into_iter().zip(sub_projection) {
+            self.check_control()?;
+            let nullable = left.value_type.nullable() || right.expr.value_type.nullable();
+            either_nullable |= nullable;
+            comparisons.push(TypedExpr {
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    nullable,
+                ),
 
-            kind: ExprKind::BinaryOp {
-                left: Box::new(lhs_typed),
-                op: BinOp::Eq,
-                right: Box::new(rhs_expr),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        };
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(left),
+                    op: BinOp::Eq,
+                    right: Box::new(right.expr),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
+            });
+        }
+        let mut comparisons = comparisons.into_iter();
+        let mut key_cond = comparisons
+            .next()
+            .expect("non-empty comparison arity was checked");
+        for right in comparisons {
+            self.check_control()?;
+            let nullable = key_cond.value_type.nullable() || right.value_type.nullable();
+            key_cond = TypedExpr {
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    nullable,
+                ),
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(key_cond),
+                    op: BinOp::And,
+                    right: Box::new(right),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                },
+            };
+        }
+        let eligibility_author = sub_filter.clone();
         let sub_filter = sub_filter
             .map(|filter| -> Result<TypedExpr, AnalyzeError> {
                 if negated && either_nullable && filter.value_type.nullable() {
@@ -2538,21 +2591,28 @@ impl<'a> AnalyzerContext<'a> {
             })
             .transpose()?;
 
+        let naa_author = (negated && either_nullable).then(|| crate::common::naa::NaaAuthorFacts {
+            comparison: key_cond.clone(),
+            eligibility: eligibility_author,
+        });
         let join_cond = match sub_filter {
-            Some(f) => Some(TypedExpr {
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    DataType::Boolean,
-                    false,
-                ),
+            Some(f) => {
+                let nullable = key_cond.value_type.nullable() || f.value_type.nullable();
+                Some(TypedExpr {
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        nullable,
+                    ),
 
-                kind: ExprKind::BinaryOp {
-                    left: Box::new(key_cond),
-                    op: BinOp::And,
-                    right: Box::new(f),
-                    decimal_overflow_policy:
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                },
-            }),
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(key_cond),
+                        op: BinOp::And,
+                        right: Box::new(f),
+                        decimal_overflow_policy:
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    },
+                })
+            }
             None => Some(key_cond),
         };
 
@@ -2568,6 +2628,7 @@ impl<'a> AnalyzerContext<'a> {
 
         let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
         select.from = Some(Relation::Join(Box::new(JoinRelation {
+            naa_author,
             left: current_from,
             right: sub_rel,
             join_type,
@@ -2672,6 +2733,7 @@ impl<'a> AnalyzerContext<'a> {
             let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
 
             select.from = Some(Relation::Join(Box::new(JoinRelation {
+                naa_author: None,
                 left: current_from,
                 right: sub_rel,
                 join_type: JoinKind::LeftOuter,
@@ -2717,6 +2779,7 @@ impl<'a> AnalyzerContext<'a> {
             let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
 
             select.from = Some(Relation::Join(Box::new(JoinRelation {
+                naa_author: None,
                 left: current_from,
                 right: sub_rel,
                 join_type: JoinKind::Cross,
@@ -2909,6 +2972,7 @@ impl<'a> AnalyzerContext<'a> {
                     self.analyze_from_with_outer(twj, Some(&current_scope))?;
                 current_scope.merge(&right_scope);
                 current_rel = Relation::Join(Box::new(JoinRelation {
+                    naa_author: None,
                     left: current_rel,
                     right: right_rel,
                     join_type: JoinKind::Cross,
@@ -4375,6 +4439,7 @@ fn attach_aux_join(
     };
     let placeholder = std::mem::replace(host_side, dummy_relation());
     *host_side = Relation::Join(Box::new(JoinRelation {
+        naa_author: None,
         left: placeholder,
         right: sub_rel,
         join_type: JoinKind::LeftOuter,

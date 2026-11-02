@@ -19,10 +19,11 @@ use super::*;
 use crate::{
     AggregateTopNFilter, BindingRequirement, BindingRequirements, CompileProfile, FilterNullOrder,
     FilterNullSemantics, FilterOrderKey, FilterProducerAtExpr, FilterProducerKind, FilterReduction,
-    FilterSortDirection, JoinDistributionMode, KernelAbiVersion, LocalProgramError, ProgramNode,
-    StaticExprKind, StaticExprNode, StaticFilterContract, StaticFilterProducer, StaticLayout,
-    StaticLiteral, StaticSinkProgram, StaticStreamBranch, StaticValues, StaticWriterProjection,
-    WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
+    FilterSortDirection, JoinDistributionMode, JoinType, KernelAbiVersion, LocalProgramError,
+    ProgramNode, StaticExprKind, StaticExprNode, StaticFilterContract, StaticFilterProducer,
+    StaticLayout, StaticLiteral, StaticSinkProgram, StaticStreamBranch, StaticValues,
+    StaticWriterProjection, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
+    WriterGroupedUnpivotPlan,
 };
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -146,14 +147,18 @@ fn metadata_source_program(
                 left: ProgramNodeId::new(0),
                 right: ProgramNodeId::new(1),
                 join_type: JoinType::Inner,
-                distribution_mode: JoinDistributionMode::Broadcast,
+                distribution_mode: JoinDistributionMode::SharedBuild,
                 left_layout: layout.clone(),
                 right_layout: layout.clone(),
                 join_scope_layout: layout.clone(),
-                probe_keys: vec![ProgramExprId::new(0)],
-                build_keys: vec![ProgramExprId::new(0)],
-                eq_null_safe: vec![false],
-                residual_predicate: None,
+                condition: crate::ProgramJoinCondition::Ordinary {
+                    keys: vec![crate::ProgramJoinKey {
+                        probe: ProgramExprId::new(0),
+                        build: ProgramExprId::new(0),
+                        null_safe: false,
+                    }],
+                    residual_predicate: None,
+                },
                 runtime_filter_consumers: vec![],
                 runtime_filters: vec![FilterProducerAtExpr {
                     expr_id: source_definition,
@@ -860,4 +865,252 @@ fn each_root_before_construction_refusal_returns_original_caller_without_tail() 
             CompileControlError::Cancelled
         ))
     ));
+}
+
+fn role_join_key(probe: usize, build: usize, null_safe: bool) -> crate::ProgramJoinKey {
+    crate::ProgramJoinKey {
+        probe: ProgramExprId::new(probe),
+        build: ProgramExprId::new(build),
+        null_safe,
+    }
+}
+fn role_naa_condition() -> crate::ProgramJoinCondition {
+    crate::ProgramJoinCondition::NullAwareEqual {
+        value_equal_keys: vec![role_join_key(0, 0, true)],
+        scope_keys: vec![role_join_key(1, 1, false), role_join_key(0, 1, true)],
+        eligibility: Some(ProgramExprId::new(2)),
+    }
+}
+fn role_join_program(
+    join_type: JoinType,
+    condition: crate::ProgramJoinCondition,
+    runtime_filters: Vec<FilterProducerAtExpr>,
+) -> Result<LocalProgramGraph, LocalProgramError> {
+    let (source, layout) = values(1);
+    let definitions = arena(vec![
+        StaticExprNode::new(
+            StaticExprKind::Literal(StaticLiteral::Int64(7)),
+            DataType::Int64,
+            None,
+        ),
+        StaticExprNode::new(
+            StaticExprKind::Literal(StaticLiteral::Int64(9)),
+            DataType::Int64,
+            None,
+        ),
+        StaticExprNode::new(
+            StaticExprKind::Literal(StaticLiteral::Bool(true)),
+            DataType::Boolean,
+            None,
+        ),
+    ]);
+    let requirements = if runtime_filters.is_empty() {
+        vec![]
+    } else {
+        vec![BindingRequirement::RuntimeFilter { binding_id: 7 }]
+    };
+    LocalProgramGraph::try_new(
+        vec![
+            ProgramNode::new(
+                10,
+                ProgramNodeKind::Values {
+                    values: source.clone(),
+                },
+                layout.clone(),
+            ),
+            ProgramNode::new(
+                11,
+                ProgramNodeKind::Values { values: source },
+                layout.clone(),
+            ),
+            ProgramNode::new(
+                20,
+                ProgramNodeKind::Join {
+                    left: ProgramNodeId::new(0),
+                    right: ProgramNodeId::new(1),
+                    join_type,
+                    distribution_mode: JoinDistributionMode::SharedBuild,
+                    left_layout: layout.clone(),
+                    right_layout: layout.clone(),
+                    join_scope_layout: layout.clone(),
+                    condition,
+                    runtime_filters,
+                    runtime_filter_consumers: vec![],
+                },
+                layout.clone(),
+            ),
+        ],
+        ProgramNodeId::new(2),
+        definitions,
+        profile(&layout),
+        BindingRequirements::try_new(requirements).unwrap(),
+    )
+}
+
+#[test]
+fn naa_value_scope_and_eligibility_keep_separate_value_roots_and_input_ports() {
+    use crate::{ProgramChannelLayoutRole as Layout, ProgramRootInput};
+    use ProgramNodeExpressionRole as Role;
+    let program =
+        role_join_program(JoinType::NullAwareLeftAnti, role_naa_condition(), vec![]).unwrap();
+    let roots = ProgramExpressionRoots::collect(&program, &Control::default()).unwrap();
+    let node = ProgramNodeId::new(2);
+    let expected = [
+        (Role::NaaValueProbeKey { key: 0 }, 0, Layout::JoinLeft),
+        (Role::NaaValueBuildKey { key: 0 }, 0, Layout::JoinRight),
+        (Role::NaaScopeProbeKey { key: 0 }, 1, Layout::JoinLeft),
+        (Role::NaaScopeBuildKey { key: 0 }, 1, Layout::JoinRight),
+        (Role::NaaScopeProbeKey { key: 1 }, 0, Layout::JoinLeft),
+        (Role::NaaScopeBuildKey { key: 1 }, 1, Layout::JoinRight),
+        (Role::NaaEligibility, 2, Layout::JoinScope),
+    ];
+    assert_eq!(roots.sites().len(), expected.len());
+    for (role, definition, layout_role) in expected {
+        let site = ProgramExpressionRootSite::Node { node, role };
+        assert_eq!(
+            roots.sites()[&site],
+            ProgramExpressionRoot {
+                definition: ProgramExprId::new(definition),
+                demand: EvaluationDemand::Value,
+            }
+        );
+        assert_eq!(
+            crate::root_input_layout(&program, site).unwrap(),
+            ProgramRootInput::Layout {
+                node,
+                role: layout_role
+            }
+        );
+    }
+}
+
+#[test]
+fn ordinary_join_residual_retains_truth_demand_and_original_roles() {
+    use ProgramNodeExpressionRole as Role;
+    let program = role_join_program(
+        JoinType::Inner,
+        crate::ProgramJoinCondition::Ordinary {
+            keys: vec![role_join_key(0, 1, false)],
+            residual_predicate: Some(ProgramExprId::new(2)),
+        },
+        vec![],
+    )
+    .unwrap();
+    let roots = ProgramExpressionRoots::collect(&program, &Control::default()).unwrap();
+    assert_eq!(roots.sites().len(), 3);
+    for (role, definition, demand) in [
+        (Role::JoinProbeKey { key: 0 }, 0, EvaluationDemand::Value),
+        (Role::JoinBuildKey { key: 0 }, 1, EvaluationDemand::Value),
+        (Role::JoinResidual, 2, EvaluationDemand::TruthOnly),
+    ] {
+        assert_eq!(
+            roots.sites()[&ProgramExpressionRootSite::Node {
+                node: ProgramNodeId::new(2),
+                role
+            }],
+            ProgramExpressionRoot {
+                definition: ProgramExprId::new(definition),
+                demand
+            }
+        );
+    }
+}
+
+#[test]
+fn naa_kind_and_closed_condition_must_agree_and_values_cannot_be_empty() {
+    let ordinary = crate::ProgramJoinCondition::Ordinary {
+        keys: vec![role_join_key(0, 0, false)],
+        residual_predicate: None,
+    };
+    let empty_values = crate::ProgramJoinCondition::NullAwareEqual {
+        value_equal_keys: vec![],
+        scope_keys: vec![role_join_key(0, 0, false)],
+        eligibility: None,
+    };
+    for (join_type, condition) in [
+        (JoinType::NullAwareLeftAnti, ordinary),
+        (JoinType::Inner, role_naa_condition()),
+        (JoinType::NullAwareLeftAnti, empty_values),
+    ] {
+        assert_eq!(
+            role_join_program(join_type, condition, vec![]).unwrap_err(),
+            LocalProgramError::InvalidNodeShape
+        );
+    }
+    let uncorrelated = crate::ProgramJoinCondition::NullAwareEqual {
+        value_equal_keys: vec![role_join_key(0, 0, false)],
+        scope_keys: vec![],
+        eligibility: None,
+    };
+    assert!(role_join_program(JoinType::NullAwareLeftAnti, uncorrelated, vec![]).is_ok());
+}
+
+#[test]
+fn every_naa_role_participates_in_expression_reference_validation() {
+    for role in 0..5 {
+        let mut condition = role_naa_condition();
+        let crate::ProgramJoinCondition::NullAwareEqual {
+            value_equal_keys,
+            scope_keys,
+            eligibility,
+        } = &mut condition
+        else {
+            unreachable!()
+        };
+        let invalid = ProgramExprId::new(999);
+        match role {
+            0 => value_equal_keys[0].probe = invalid,
+            1 => value_equal_keys[0].build = invalid,
+            2 => scope_keys[0].probe = invalid,
+            3 => scope_keys[0].build = invalid,
+            4 => *eligibility = Some(invalid),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            role_join_program(JoinType::NullAwareLeftAnti, condition, vec![]).unwrap_err(),
+            LocalProgramError::InvalidExpression
+        );
+    }
+}
+
+#[test]
+fn naa_runtime_filter_ordinals_name_value_keys_and_never_scope_keys() {
+    let original = metadata_source_program(true, false).unwrap();
+    let ProgramNodeKind::Join {
+        runtime_filters, ..
+    } = original.nodes()[2].kind()
+    else {
+        unreachable!()
+    };
+    let producer = runtime_filters[0].clone();
+    assert!(
+        role_join_program(
+            JoinType::NullAwareLeftAnti,
+            role_naa_condition(),
+            vec![producer.clone()]
+        )
+        .is_ok()
+    );
+    let mut out_of_value_domain = producer.clone();
+    out_of_value_domain.key_ordinal = 1;
+    assert_eq!(
+        role_join_program(
+            JoinType::NullAwareLeftAnti,
+            role_naa_condition(),
+            vec![out_of_value_domain]
+        )
+        .unwrap_err(),
+        LocalProgramError::InvalidNodeShape
+    );
+    let mut scope_definition = producer;
+    scope_definition.expr_id = ProgramExprId::new(1);
+    assert_eq!(
+        role_join_program(
+            JoinType::NullAwareLeftAnti,
+            role_naa_condition(),
+            vec![scope_definition]
+        )
+        .unwrap_err(),
+        LocalProgramError::InvalidNodeShape
+    );
 }

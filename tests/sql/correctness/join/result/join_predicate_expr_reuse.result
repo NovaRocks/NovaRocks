@@ -75,7 +75,7 @@ count(*)
 
 -- query 22
 -- legacy
-count(*)	abs(db_sqlt_55db4456f5f2bda2.pre_t0.v1)
+count(*)	abs(${case_db}.pre_t0.v1)
 1	6
 1	7
 1	8
@@ -83,4 +83,4 @@ count(*)	abs(db_sqlt_55db4456f5f2bda2.pre_t0.v1)
 
 -- query 23
 -- legacy
-count(*)	abs(db_sqlt_55db4456f5f2bda2.pre_t0.v1)
+count(*)	abs(${case_db}.pre_t0.v1)

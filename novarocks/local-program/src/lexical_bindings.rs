@@ -951,12 +951,18 @@ pub fn root_input_layout(
                 }
                 (
                     ProgramNodeKind::Join { .. },
-                    Role::JoinProbeKey { .. } | Role::RuntimeFilter { .. },
+                    Role::JoinProbeKey { .. }
+                    | Role::NaaValueProbeKey { .. }
+                    | Role::NaaScopeProbeKey { .. }
+                    | Role::RuntimeFilter { .. },
                 ) => (owner, Layout::JoinLeft),
-                (ProgramNodeKind::Join { .. }, Role::JoinBuildKey { .. }) => {
-                    (owner, Layout::JoinRight)
-                }
-                (ProgramNodeKind::Join { .. }, Role::JoinResidual)
+                (
+                    ProgramNodeKind::Join { .. },
+                    Role::JoinBuildKey { .. }
+                    | Role::NaaValueBuildKey { .. }
+                    | Role::NaaScopeBuildKey { .. },
+                ) => (owner, Layout::JoinRight),
+                (ProgramNodeKind::Join { .. }, Role::JoinResidual | Role::NaaEligibility)
                 | (ProgramNodeKind::NestedLoopJoin { .. }, Role::NestedLoopPredicate) => {
                     (owner, Layout::JoinScope)
                 }
