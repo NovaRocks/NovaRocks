@@ -976,6 +976,7 @@ impl ContextHostRecord {
             unresolved_revocation: false,
             create: None,
             retired_task_read: None,
+            deferred_task_read: None,
             read_payload: None,
             deferred_root: None,
             observation: None,

@@ -653,6 +653,9 @@ impl ContextHostRecord {
                     ContextDriverError::Request(super::requests::ContextRequestError::Ready(error))
                 })?;
         }
+        progress.runnable |= self
+            .advance_sealed_task_reads(budget)
+            .map_err(ContextDriverError::Request)?;
         progress.runnable |= self.advance_domain_wakes(budget);
         for _ in 0..budget {
             let Some(work) = requests.next_context_ready(self.registration()) else {

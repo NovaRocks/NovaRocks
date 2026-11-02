@@ -162,6 +162,10 @@ fn open_original(
                 body_health,
             )
             .unwrap();
+            // This producer component explicitly takes the original channel's
+            // retention responsibility. The Task stays in held preparation;
+            // this channel-local handoff does not publish Installed.
+            session.channel().mark_context_owned().unwrap();
             (session, preparation.runtime_control())
         });
     original_node.retain_root_for_teardown(Arc::clone(session.channel()));
@@ -1618,6 +1622,9 @@ async fn write_commit_without_summary_fails_instead_of_a_success_end() {
         novarocks_execution_contract::failure::domain::NATIVE.get()
     );
     assert_eq!(cause.fact().reason().code(), 206);
+    // Real producer exit proves its handoff, not the asynchronous Task
+    // owner's acceptance. Observe that original verdict before inspecting it.
+    wait_until(|| fixture.control.accepted().is_some()).await;
     let accepted = fixture
         .control
         .accepted()

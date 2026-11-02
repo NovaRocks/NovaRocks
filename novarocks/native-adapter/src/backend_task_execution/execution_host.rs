@@ -3982,7 +3982,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn closing_a_context_fences_an_installed_capability_and_any_late_install() {
+    fn normal_context_close_keeps_installed_data_and_abort_revokes_it_while_late_install_stays_fenced()
+     {
         let consumer = identity(16, 1, 1);
         let producer = identity(16, 2, 1);
         let producer_key = UniqueId::new(121, 122);
@@ -4005,21 +4006,39 @@ pub(crate) mod tests {
             .expect("a legal install");
 
         capabilities.close_context(context);
-        let claim = claim_frame(
-            &capabilities,
-            ExchangeRouteQuery {
-                stream: novarocks_execution_contract::ExchangeStreamIdentity::try_new(
-                    ExchangeSource::new(producer, producer_key, 0),
-                    consumer,
-                    kernel_key,
-                    node,
-                )
-                .unwrap(),
-                sender_count: 1,
-            },
+        let route = || ExchangeRouteQuery {
+            stream: novarocks_execution_contract::ExchangeStreamIdentity::try_new(
+                ExchangeSource::new(producer, producer_key, 0),
+                consumer,
+                kernel_key,
+                node,
+            )
+            .unwrap(),
+            sender_count: 1,
+        };
+        assert_eq!(
+            claim_frame(&capabilities, route()),
+            InboundFrameClaim::Authorized
         );
+        capabilities
+            .authorize_frame(kernel_key, node, producer_key, 0, 1)
+            .expect("normal close preserves the original installed stream");
+        let late = identity(16, 1, 2);
+        let late_key = UniqueId::new(141, 142);
+        let late_descriptor = descriptor_with(
+            late,
+            late_key,
+            1,
+            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
+        );
+        let rejection = capabilities
+            .install(Arc::new(late_descriptor.clone()))
+            .expect_err("normal close fences new receiver installation");
+        assert!(rejection.detail().as_str().contains("context closed"));
+        capabilities.abort_context(context);
+        let claim = claim_frame(&capabilities, route());
         let InboundFrameClaim::Refused(detail) = claim else {
-            panic!("a closed context must refuse its still-installed destination");
+            panic!("a true abort must refuse its still-installed destination");
         };
         assert!(
             detail.contains("data-plane admission is closed"),
@@ -4031,14 +4050,6 @@ pub(crate) mod tests {
         );
 
         capabilities.remove(&descriptor);
-        let late = identity(16, 1, 2);
-        let late_key = UniqueId::new(141, 142);
-        let late_descriptor = descriptor_with(
-            late,
-            late_key,
-            1,
-            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
-        );
         let rejection = capabilities
             .install(Arc::new(late_descriptor))
             .expect_err("a create already in flight cannot reopen a closed context");
@@ -6070,7 +6081,7 @@ pub(crate) mod tests {
         Success,
         Quiesce,
         QuiesceThenAbort,
-        BeforeStart,
+        DuringActivationCallback,
         Abort,
         Rollback,
     }
@@ -6318,6 +6329,9 @@ pub(crate) mod tests {
             FrontendProcessId::new_v7(),
             descriptor.identity().backend_process_id(),
         );
+        // A held activation callback occupies this Context's original
+        // serialized lifecycle group. Close must wait for its true return;
+        // another worker cannot bypass that same-group ordering.
         let node = NativeNodeFixture::start(
             context.backend_process_id(),
             factory_from_host(Arc::new(AcceptingContextHost {
@@ -6343,11 +6357,12 @@ pub(crate) mod tests {
         } else {
             *host.retire_pause.lock().unwrap() = Some(gate);
         }
-        let commit_gate = matches!(stop, ReceiverStop::BeforeStart).then(|| {
+        let (activation_started, activation_entered) = std::sync::mpsc::sync_channel(1);
+        let commit_gate = matches!(stop, ReceiverStop::DuringActivationCallback).then(|| {
             let gate = Arc::new(PausedRootWorker {
                 open: Mutex::new(false),
                 changed: std::sync::Condvar::new(),
-                started: Mutex::new(None),
+                started: Mutex::new(Some(activation_started)),
             });
             *host.commit_pause.lock().unwrap() = Some(gate.clone());
             CallbackPause(gate)
@@ -6396,11 +6411,14 @@ pub(crate) mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        if matches!(stop, ReceiverStop::BeforeStart) {
+        if matches!(stop, ReceiverStop::DuringActivationCallback) {
+            activation_entered
+                .recv_timeout(until.saturating_duration_since(std::time::Instant::now()))
+                .expect("the original activation callback actually entered its gate");
             assert_eq!(
                 reporter.current().unwrap().state(),
                 TaskState::Planned,
-                "actual Installed precedes the paused commit callback"
+                "actual Installed precedes the held activation callback"
             );
             assert!(
                 !reporter.convergence().unwrap().actual_stopped(),
@@ -6441,6 +6459,7 @@ pub(crate) mod tests {
         let payload = nonempty_data.then(|| receiver_data_payload(&port));
         let control = node.control.clone();
         let deadline = node.deadline();
+        let (control_started, control_polled) = std::sync::mpsc::sync_channel(1);
         let control_reply = if matches!(stop, ReceiverStop::Success) {
             if let Some(payload) = &payload {
                 let delivered = deliver(receiver_unit_frame(stream, payload.clone(), false));
@@ -6458,33 +6477,58 @@ pub(crate) mod tests {
         } else if matches!(stop, ReceiverStop::Rollback) {
             None
         } else {
-            Some(std::thread::spawn(move || match stop {
-                ReceiverStop::Abort => await_original(control.abort(
-                    novarocks_execution_contract::AbortQueryContext::new(
-                        TaskOperationId::new_v7(),
-                        context,
-                        AbortCause::QueryFailed,
-                    ),
-                    deadline,
-                )),
-                _ => await_original(control.quiesce(
-                    novarocks_execution_contract::QuiesceQueryContext::new(
-                        TaskOperationId::new_v7(),
-                        context,
-                    ),
-                    deadline,
-                )),
+            Some(std::thread::spawn(move || {
+                let mut request = Box::pin(async move {
+                    match stop {
+                        ReceiverStop::Abort => {
+                            control
+                                .abort(
+                                    novarocks_execution_contract::AbortQueryContext::new(
+                                        TaskOperationId::new_v7(),
+                                        context,
+                                        AbortCause::QueryFailed,
+                                    ),
+                                    deadline,
+                                )
+                                .await
+                        }
+                        _ => {
+                            control
+                                .quiesce(
+                                    novarocks_execution_contract::QuiesceQueryContext::new(
+                                        TaskOperationId::new_v7(),
+                                        context,
+                                    ),
+                                    deadline,
+                                )
+                                .await
+                        }
+                    }
+                });
+                let mut started = Some(control_started);
+                await_original(std::future::poll_fn(move |cx| {
+                    let result = std::future::Future::poll(request.as_mut(), cx);
+                    if let Some(started) = started.take() {
+                        let _ = started.send(());
+                    }
+                    result
+                }))
             }))
         };
         if let Some(commit_gate) = commit_gate {
+            control_polled
+                .recv_timeout(until.saturating_duration_since(std::time::Instant::now()))
+                .expect("the original Quiesce future was actually polled");
+            // Close shares the original group with this active callback. Its
+            // actual return must precede the cancellation publication.
+            drop(commit_gate);
             while !reporter.current().unwrap().state().is_cancellation() {
                 assert!(
                     std::time::Instant::now() < until,
-                    "original cancellation was not published before the start callback"
+                    "original cancellation was not published after the activation callback returned"
                 );
                 std::thread::sleep(Duration::from_millis(1));
             }
-            drop(commit_gate);
         }
         reached_retirement
             .recv_timeout(until.saturating_duration_since(std::time::Instant::now()))
@@ -6525,6 +6569,15 @@ pub(crate) mod tests {
                 ))
                 .unwrap(),
             );
+            // The RPC acknowledges the logical close decision. The original
+            // host delegate's return is the physical admission-close receipt.
+            while !host.context_abort_returned.load(Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "the original Context abort admission callback did not return"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         let until = std::time::Instant::now() + Duration::from_secs(5);
         while port.snapshot(key).is_some() {
@@ -6543,7 +6596,7 @@ pub(crate) mod tests {
             ReceiverStop::Success
                 | ReceiverStop::Quiesce
                 | ReceiverStop::QuiesceThenAbort
-                | ReceiverStop::BeforeStart
+                | ReceiverStop::DuringActivationCallback
         );
         if !matches!(stop, ReceiverStop::Rollback) {
             assert_eq!(
@@ -6712,11 +6765,11 @@ pub(crate) mod tests {
             >,
         >,
         reject_submit: AtomicBool,
-        abort_pause: Mutex<Option<Arc<PausedRootWorker>>>,
         commit_pause: Mutex<Option<Arc<PausedRootWorker>>>,
         retire_pause: Mutex<Option<Arc<PausedRootWorker>>>,
         remove_pause: Mutex<Option<Arc<PausedRootWorker>>>,
         retired_mode: Mutex<Option<novarocks_worker::TaskIngressRetirement>>,
+        context_abort_returned: AtomicBool,
     }
 
     impl CountingHost {
@@ -6728,49 +6781,12 @@ pub(crate) mod tests {
                 reads: Mutex::new(BTreeMap::new()),
                 controls: Mutex::new(BTreeMap::new()),
                 reject_submit: AtomicBool::new(false),
-                abort_pause: Mutex::new(None),
                 commit_pause: Mutex::new(None),
                 retire_pause: Mutex::new(None),
                 remove_pause: Mutex::new(None),
                 retired_mode: Mutex::new(None),
+                context_abort_returned: AtomicBool::new(false),
             }
-        }
-    }
-
-    /// Holds the real runnable's abort delegation, not a readiness callback
-    /// whose synchronous borrower can belong to another notifying thread.
-    struct PausedNativeAbort {
-        inner: Arc<dyn RunnableTask>,
-        gate: Arc<PausedRootWorker>,
-    }
-    impl std::fmt::Debug for PausedNativeAbort {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter
-                .debug_struct("PausedNativeAbort")
-                .field("inner", &self.inner)
-                .finish()
-        }
-    }
-    impl RunnableTask for PausedNativeAbort {
-        fn commit_creation(&self) {
-            self.inner.commit_creation();
-        }
-        fn cancel(&self, reason: CancelReason) {
-            self.inner.cancel(reason);
-        }
-        fn quiesce(&self) {
-            self.inner.quiesce();
-        }
-        fn abort(&self, cause: AbortCause) {
-            if let Some(sender) = self.gate.started.lock().unwrap().take() {
-                sender.send(()).unwrap();
-            }
-            let mut open = self.gate.open.lock().unwrap();
-            while !*open {
-                open = self.gate.changed.wait(open).unwrap();
-            }
-            drop(open);
-            self.inner.abort(cause);
         }
     }
 
@@ -6811,6 +6827,7 @@ pub(crate) mod tests {
     impl TaskExecutionHost for CountingHost {
         fn abort_context_admission(&self, context: QueryContextRef) {
             self.inner.abort_context_admission(context);
+            self.context_abort_returned.store(true, Ordering::Release);
         }
         fn retains_normal_close(&self, context: QueryContextRef) -> bool {
             self.inner.retains_normal_close(context)
@@ -6896,11 +6913,7 @@ pub(crate) mod tests {
                 None => inner,
             };
 
-            let gate = self.abort_pause.lock().unwrap().clone();
-            Ok(match gate {
-                Some(gate) => Arc::new(PausedNativeAbort { inner, gate }) as Arc<dyn RunnableTask>,
-                None => inner,
-            })
+            Ok(inner)
         }
 
         fn apply_task_domain(
@@ -7316,6 +7329,9 @@ pub(crate) mod tests {
             1,
             "only the winning body reaches actual Native interpretation"
         );
+        // Entering install_receiver is not the original Installed verdict.
+        // Freeze that exact read view before asking whether its winner owns Root.
+        let original_read = original_installed_read(&fixture.host, identity);
         let refused = fixture
             .begin_read(&bounded_read(
                 identity,
@@ -7327,7 +7343,6 @@ pub(crate) mod tests {
             refused.kind(),
             novarocks_worker::WorkerRootReadErrorKind::NoRoot
         );
-        let original_read = fixture.reporter(identity);
         fixture.abort();
         let until = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -7624,7 +7639,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn scalar_root_origin_is_accepted_before_its_real_producer_cleanup_notifies() {
+    fn scalar_root_origin_handoff_precedes_cleanup_and_acceptance_precedes_stop_observer() {
         use novarocks_execution_contract::task_execution::status::TerminationDetail;
         let fixture = OwnerFixture::new(91_208);
         let pause = RootWorkerPause::new(&fixture.host.inner.root_producer_pool);
@@ -7668,6 +7683,8 @@ pub(crate) mod tests {
         let notifications = Arc::new(AtomicUsize::new(0));
         let observed = notifications.clone();
         let source_for_stop = original_control.clone();
+        let status_for_stop = source.clone();
+        let session_at_cleanup = original_session.clone();
         let actual_cleanup_entered = cleanup_entered.clone();
         let stop_observer = original_control
             .stop_observable()
@@ -7693,8 +7710,14 @@ pub(crate) mod tests {
                         .originating_failure()
                         .expect("the accepted conclusion owns its original cause"),
                 );
+                let published = status_for_stop.current().unwrap();
+                assert_eq!(
+                    published.state(),
+                    TaskState::Failing,
+                    "the original failure snapshot is published before its stop observer"
+                );
                 observed.fetch_add(1, Ordering::Release);
-                stopped.send(accepted).unwrap();
+                stopped.send((accepted, published)).unwrap();
             }));
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let gate = Arc::new(PausedRootWorker {
@@ -7703,7 +7726,6 @@ pub(crate) mod tests {
             started: Mutex::new(None),
         });
         let cleanup_pause = CallbackPause(gate.clone());
-        let source_at_cleanup = source.clone();
         let weak_channel = Arc::downgrade(&channel);
         let once = std::sync::atomic::AtomicBool::new(true);
         let observer = channel.writable_observable().subscribe(Arc::new(move || {
@@ -7714,8 +7736,12 @@ pub(crate) mod tests {
             {
                 // This is the real codec's cleanup callback, while its input,
                 // cursor and producer guard have not all left the pool turn.
+                let session = session_at_cleanup
+                    .upgrade()
+                    .expect("the original Session remains alive in its actual cleanup callback");
+                let transferred = session.assert_scalar_origin_handoff_at_cleanup();
                 cleanup_entered.store(true, Ordering::Release);
-                sender.send(source_at_cleanup.current().unwrap()).unwrap();
+                sender.send(transferred).unwrap();
                 let mut open = gate.open.lock().unwrap();
                 while !*open {
                     open = gate.changed.wait(open).unwrap();
@@ -7723,8 +7749,8 @@ pub(crate) mod tests {
             }
         }));
         pause.open();
-        let at_cleanup = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
-        let accepted_at_stop = stopped_rx
+        let transferred_at_cleanup = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (accepted_at_stop, published_at_stop) = stopped_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the actual adopted runtime cut must notify its original Root observer");
         let accepted_at_cleanup = original_control
@@ -7735,6 +7761,15 @@ pub(crate) mod tests {
             "the callback and real cleanup observe the same original accepted source"
         );
         assert_eq!(notifications.load(Ordering::Acquire), 1);
+        use novarocks_execution_contract::failure::FailureProjection;
+        assert_eq!(
+            accepted_at_stop
+                .originating_failure()
+                .expect("the original accepted scalar failure")
+                .failure_fact(),
+            transferred_at_cleanup,
+            "the local handoff and later Core acceptance retain the same original failure fact"
+        );
         // All source/reentry/one-notification assertions belong to this real
         // still-live Root cleanup window. Retiring the Task later also wakes
         // stop observers; that different lifetime is not this subscription.
@@ -7758,24 +7793,20 @@ pub(crate) mod tests {
             TaskState::Failed,
             "actual codec failure must finish after cleanup"
         );
-        assert_eq!(
-            at_cleanup.state(),
-            TaskState::Failing,
-            "the actual originating codec error must reach the sole Task owner before cleanup callbacks"
-        );
-        let Some(TerminationDetail::Failed(failure)) = at_cleanup.termination() else {
+        let Some(TerminationDetail::Failed(failure)) = published_at_stop.termination() else {
             panic!("actual originating failure required");
         };
         assert_eq!(failure.category(), TaskFailureCategory::Execution);
         assert_eq!(
-            at_cleanup.termination(),
+            published_at_stop.termination(),
             terminal.termination(),
             "cleanup/stop observations cannot replace the accepted origin"
         );
     }
 
     #[test]
-    fn bounded_root_seal_preserves_worker_abort_before_runnable_fanout() {
+    fn bounded_root_seal_preserves_worker_abort_before_stop_notification_fanout() {
+        use novarocks_execution::runtime::fragment::io::RootWorkExitProgress;
         use novarocks_execution_contract::task_execution::status::TerminationDetail;
         for (query, cause) in [
             (91_205, AbortCause::QueryFailed),
@@ -7788,10 +7819,9 @@ pub(crate) mod tests {
             let fanout_gate = Arc::new(PausedRootWorker {
                 open: Mutex::new(false),
                 changed: std::sync::Condvar::new(),
-                started: Mutex::new(Some(sender)),
+                started: Mutex::new(None),
             });
             let fanout_pause = CallbackPause(fanout_gate.clone());
-            *fixture.host.abort_pause.lock().unwrap() = Some(fanout_gate);
             let root = fixture.identity(1);
             let descriptor = consistent_descriptor(root, UniqueId::new(query, 1));
             let receipt = fixture.create(
@@ -7802,7 +7832,7 @@ pub(crate) mod tests {
             let source = fixture.reporter(root);
             // Accepted and the host's receiver map precede Worker installation.
             // The original five-second observation budget covers installation
-            // and the exact abort-delegation gate; it is never restarted.
+            // and the actual stop-notification gate; it is never restarted.
             let abort_deadline = std::time::Instant::now() + Duration::from_secs(5);
             let installed = loop {
                 let current = source.current().unwrap();
@@ -7826,14 +7856,48 @@ pub(crate) mod tests {
                     source.current()
                 );
             }
-            let channel = fixture
+            let (channel, original_session) = {
+                let runtime = fixture.host.inner.task_runtime(root).unwrap();
+                (
+                    runtime.root_channel.clone().unwrap(),
+                    runtime.root_session_observation.clone().unwrap(),
+                )
+            };
+            let original_control = fixture
                 .host
-                .inner
-                .task_runtime(root)
+                .controls
+                .lock()
                 .unwrap()
-                .root_channel
-                .clone()
-                .unwrap();
+                .get(&root)
+                .cloned()
+                .expect("the original installed runtime control");
+            let notice_control = original_control.clone();
+            let notice_source = source.clone();
+            let notice_channel = Arc::downgrade(&channel);
+            let notification_exited = Arc::new(AtomicBool::new(false));
+            let callback_exited = notification_exited.clone();
+            let first_notification = AtomicBool::new(true);
+            let stop_observer = original_control
+                .stop_observable()
+                .subscribe(Arc::new(move || {
+                    if !first_notification.swap(false, Ordering::AcqRel) {
+                        return;
+                    }
+                    // Sample at the actual execution notification entry. A later
+                    // external read cannot stand in for seal/publication order.
+                    let sealed = notice_channel
+                        .upgrade()
+                        .is_some_and(|root| root.is_closed());
+                    let published = notice_source.current().unwrap();
+                    let accepted = notice_control.accepted();
+                    let stopped = notice_control.is_stopped();
+                    sender.send((sealed, published, accepted, stopped)).unwrap();
+                    let mut open = fanout_gate.open.lock().unwrap();
+                    while !*open {
+                        open = fanout_gate.changed.wait(open).unwrap();
+                    }
+                    callback_exited.store(true, Ordering::Release);
+                }));
             let control = fixture.node.control.clone();
             let original_deadline = fixture.node.deadline();
             let context = fixture.context;
@@ -7850,12 +7914,34 @@ pub(crate) mod tests {
             });
             let reached_fanout = receiver
                 .recv_timeout(abort_deadline.saturating_duration_since(std::time::Instant::now()));
-            let at_seal = source.current().unwrap();
-            let root_sealed = channel.is_closed();
-            // The actual Worker fence and seal already ran, but the wrapper
-            // has not delegated to the real NativeRunnableTask.abort yet.
+            // The callback retains its entry sample while the original
+            // physical Stop notification body remains held in the gate.
             pause.open();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let producer_exited = loop {
+                let session = original_session
+                    .upgrade()
+                    .expect("the original Stop still holds its actual Native receiver");
+                let actual = session.producer_exit_progress();
+                if actual != RootWorkExitProgress::Pending || std::time::Instant::now() >= deadline
+                {
+                    break actual;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let charged_before_stop_exit = fixture.node.control.metrics_snapshot().active_tasks;
+            // Every final assertion follows actual fan-out exit and completion
+            // cleanup, even when the intended observation would be RED.
+            // End this internal metadata loan while the original Stop body
+            // still keeps Task/Context retirement behind its actual exit.
+            let notification_still_running = !notification_exited.load(Ordering::Acquire);
+            drop(stop_observer);
+            drop(channel);
+            drop(fanout_pause);
+            // The Context's physical lifecycle jobs are serialized. Its held
+            // notification tail cannot be skipped by the same Task's finisher.
+            // Root CPU exit above is independent; terminal follows the tail.
+            // Both observations share this original five-second deadline.
             let terminal = loop {
                 let current = source.current().unwrap();
                 if current.is_terminal() || std::time::Instant::now() >= deadline {
@@ -7863,27 +7949,50 @@ pub(crate) mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(1));
             };
-            // Every final assertion follows actual fan-out exit and completion
-            // cleanup, even when the intended observation would be RED.
-            // End this internal metadata loan while the original Stop body
-            // still keeps Task/Context retirement behind its actual exit.
-            drop(channel);
-            drop(fanout_pause);
-            let abort_result = abort.join();
+            let abort_result = abort.join().map(|original| {
+                let accepted = matches!(
+                    original.body(),
+                    novarocks_worker::WorkerContextReplyBody::Context(ack)
+                        if ack.outcome == OperationOutcome::Accepted
+                );
+                // The same real R delivery must exit before Node's true join.
+                drop(original);
+                accepted
+            });
             let pool_exit = fixture.host.inner.root_producer_pool.shutdown();
             let completion_exit = fixture.host.inner.completion_supervisor.shutdown();
-            assert!(
-                reached_fanout.is_ok(),
-                "real runnable abort gate was not reached: {reached_fanout:?}; pool exit={pool_exit:?}; completion exit={completion_exit:?}"
-            );
+            // The Node owns the actual Stop call, report and capture joins.
+            // A terminal snapshot alone does not prove any of those exits.
+            drop(fixture);
+            let (root_sealed, at_seal, accepted, stopped) = reached_fanout.unwrap_or_else(|error| {
+                panic!("real stop-notification gate was not reached: {error:?}; pool exit={pool_exit:?}; completion exit={completion_exit:?}")
+            });
             assert!(
                 root_sealed,
-                "Worker must seal the real root before runnable fan-out"
+                "Worker must seal the real root before stop-notification fanout"
             );
-            let receipt = abort_result.unwrap();
+            assert!(stopped, "the original stop flag precedes its notification");
+            let accepted = accepted.expect("the original conclusion precedes stop notification");
+            assert_eq!(
+                accepted.neutral().conclusion(),
+                &novarocks_execution_contract::TaskConclusion::Terminated(
+                    TerminationDetail::Aborted(cause)
+                ),
+            );
+            assert_eq!(
+                producer_exited,
+                RootWorkExitProgress::Exited,
+                "the original Root producer exits independently of the held stop-notification tail"
+            );
+            assert_eq!(
+                charged_before_stop_exit, 1,
+                "the same Task capacity remains owned by its still-live Stop call"
+            );
             assert!(
-                matches!(receipt.body(), novarocks_worker::WorkerContextReplyBody::Context(ack) if ack.outcome == OperationOutcome::Accepted)
+                notification_still_running && notification_exited.load(Ordering::Acquire),
+                "Root CPU exit does not stand in for the real Stop notification exit"
             );
+            assert!(abort_result.unwrap(), "the original Abort was accepted");
             assert_eq!(at_seal.state(), TaskState::Aborting);
             assert_eq!(
                 at_seal.termination(),
@@ -7892,7 +8001,7 @@ pub(crate) mod tests {
             assert_eq!(
                 terminal.state(),
                 TaskState::Aborted,
-                "real driver must complete while runnable fan-out is paused: {terminal:?}"
+                "the real Task must finish after its stop-notification tail exits: {terminal:?}"
             );
             assert_eq!(
                 terminal.termination(),
@@ -8064,7 +8173,9 @@ pub(crate) mod tests {
             ) || matches!(
                 refused.channel_error(),
                 Some(novarocks_worker::root_result_channel::RootChannelError::Closed)
-            )
+            ) || (refused.kind() == novarocks_worker::WorkerRootReadErrorKind::Channel
+                && refused.closed_frontier() == Some(0)),
+            "the original seal refuses new reads without consuming the held End: {refused:?}"
         );
         drop(refused);
         drop(replay);
@@ -9370,7 +9481,7 @@ pub(crate) mod tests {
             for (ordinal, stop) in [
                 ReceiverStop::Success,
                 ReceiverStop::Quiesce,
-                ReceiverStop::BeforeStart,
+                ReceiverStop::DuringActivationCallback,
                 ReceiverStop::Abort,
                 ReceiverStop::Rollback,
             ]
@@ -10281,6 +10392,33 @@ pub(crate) mod tests {
                 *facts.0.compiled_filter_bindings.lock().unwrap(),
                 vec![BTreeSet::new()]
             );
+            // The stop callback borrows the original accepted source while
+            // execution borrowing is still open. The later retirement gate
+            // cannot authorize a fresh getter after that gate has closed.
+            let control = host
+                .controls
+                .lock()
+                .unwrap()
+                .get(&identity)
+                .cloned()
+                .unwrap();
+            let weak_control = Arc::downgrade(&control);
+            let original_at_stop = Arc::new(Mutex::new(None));
+            let captured = original_at_stop.clone();
+            let observed_stop = AtomicBool::new(false);
+            let stop_subscription = control.stop_observable().subscribe(Arc::new(move || {
+                // Closing later execution borrowing notifies this same
+                // observable again, but cannot lend the source a second time.
+                if observed_stop.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                let original = weak_control
+                    .upgrade()
+                    .and_then(|control| control.accepted())
+                    .expect("the real stop callback borrows the accepted provider source");
+                *captured.lock().unwrap() = Some(original);
+            }));
+            drop(control);
             let updated = await_original(
                 node.control.update_task(
                     context,
@@ -10333,16 +10471,11 @@ pub(crate) mod tests {
                 failure.detail().as_str(),
                 "Unexpected failure (reason 4:10) at operator 0 during Pull"
             );
-            let control = host
-                .controls
+            let accepted = original_at_stop
                 .lock()
                 .unwrap()
-                .get(&identity)
-                .cloned()
-                .expect("the original preparation lent its detached runtime control");
-            let accepted = control
-                .accepted()
-                .expect("the actual provider refusal is accepted");
+                .take()
+                .expect("the actual stop callback retained the original provider refusal");
             let original = accepted
                 .originating_failure()
                 .expect("retain the original local provider source");
@@ -10373,7 +10506,7 @@ pub(crate) mod tests {
             assert_eq!(provider.message(), "fixture page provider is never read");
             assert!(!provider.retryable_before_progress());
             drop(accepted);
-            drop(control);
+            drop(stop_subscription);
             drop(retirement);
             drop(node);
             assert!(host.inner.task_runtime(identity).is_none());
@@ -10477,7 +10610,12 @@ pub(crate) mod tests {
                 ))
                 .expect("the original abort R"),
             );
-            assert_eq!(read.current().unwrap().state(), TaskState::Aborted);
+            // Abort acknowledges its accepted close decision before the
+            // original reader and kernel finish their physical teardown.
+            let terminal = node.wait_status(context, identity, Duration::from_secs(5), |status| {
+                status.is_terminal()
+            });
+            assert_eq!(terminal.state(), TaskState::Aborted);
             drop(node);
             assert_eq!(
                 probe.closes.load(Ordering::Acquire),

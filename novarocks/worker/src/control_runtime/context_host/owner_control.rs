@@ -16,10 +16,11 @@
 // under the License.
 
 //! One prepaid, neutral parent-owner fence input. It has no callback or
-//! foreign capture. The Context's permanent metadata author remains live
-//! until this role and its actual batch have closed.
+//! foreign capture. The original process admission author remains live until
+//! this role and its actual batch have closed, including the execution-retired
+//! handoff before Root consumes the original retirement fact.
 
-use super::{ContextHostError, ContextHostRecord, TIMER};
+use super::{ContextHostError, ContextHostRecord};
 use crate::control_runtime::actors::{ContextMessage, WorkerAction, WorkerActor, WorkerMessage};
 use crate::control_runtime_policy::StorageNeed;
 use novarocks_control_runtime::{
@@ -27,7 +28,7 @@ use novarocks_control_runtime::{
     lease::WorkLease,
 };
 use novarocks_control_runtime_core::{
-    identity::{ActorId, InputId},
+    identity::{ActorId, InputId, ScopedWorkRef},
     mailbox::InputClass,
 };
 use novarocks_execution_contract::QueryContextRef;
@@ -52,7 +53,7 @@ pub(crate) struct OwnerControl {
     role: Option<InputRole<WorkerActor>>,
     input: Option<InputId>,
     delivered: bool,
-    removal_authorized: bool,
+    issuance_closed: bool,
     failed: bool,
     closed: bool,
     unresolved: Option<DriverError>,
@@ -62,6 +63,7 @@ struct OwnerBinding {
     registration: ActorRegistration,
     root: ActorId,
     context: QueryContextRef,
+    author: ScopedWorkRef,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OwnerFenceDelivery {
@@ -70,30 +72,6 @@ pub(crate) enum OwnerFenceDelivery {
     FailedOwner,
 }
 impl OwnerControl {
-    pub(super) fn detachment_source(
-        &mut self,
-    ) -> Result<Option<&mut InputRole<WorkerActor>>, DriverError> {
-        if let Some(error) = self.unresolved {
-            return Err(error);
-        }
-        if self.permit.is_some()
-            || self.input.is_some()
-            || self
-                .role
-                .as_ref()
-                .map(InputRole::in_flight)
-                .transpose()?
-                .flatten()
-                .is_some()
-        {
-            return Err(DriverError::ActorNotRetired);
-        }
-        Ok(self.role.as_mut())
-    }
-    pub(super) fn execution_detached(&mut self) {
-        self.role = None;
-        self.closed = true;
-    }
     pub(super) fn admit(
         &mut self,
         runtime: &ActorRuntime<WorkerActor>,
@@ -102,19 +80,20 @@ impl OwnerControl {
         context: QueryContextRef,
         author: &WorkLease,
     ) -> Result<(), DriverError> {
-        if !registration.matches_scope(author.scope()) {
-            return Err(DriverError::InputAuthorMismatch);
-        }
         runtime.validate_registration(registration)?;
-        let actor = registration.actor();
         self.binding = Some(OwnerBinding {
             runtime: runtime.clone(),
             registration: registration.clone(),
             root: source,
             context,
+            author: author.reference(),
         });
-        self.permit =
-            Some(runtime.reserve_admitted_input(actor, source, InputClass::Control, author)?);
+        self.permit = Some(runtime.reserve_admitted_input_for(
+            registration,
+            source,
+            InputClass::Control,
+            author,
+        )?);
         let permit = self.permit.take().expect("original parent-control input");
         match permit.into_role() {
             Ok(role) => self.role = Some(role),
@@ -153,8 +132,14 @@ impl OwnerControl {
             return Err(DriverError::PublicationTargetMismatch);
         }
         original.runtime.validate_effect_ticket(ticket)?;
-        self.removal_authorized = true;
+        self.issuance_closed = true;
         Ok(())
+    }
+    /// Called only after the host validates the exact original Root
+    /// RetireReservation effect. Root has consumed ExecutionRetired and its
+    /// serialized effect lane has handed off all earlier owner fences.
+    pub(super) fn authorize_parent_retirement(&mut self) {
+        self.issuance_closed = true;
     }
     /// No arbitrary producer ever receives this role. Closing issuance and
     /// consuming its exact neutral input is sufficient; no host body, source
@@ -168,7 +153,7 @@ impl OwnerControl {
         }
         // Empty is not proof that a live parent has no future fence to send.
         if !self.delivered
-            && !self.removal_authorized
+            && !self.issuance_closed
             && !self.failed
             && (self.role.is_some() || self.permit.is_some())
         {
@@ -226,7 +211,7 @@ impl OwnerControl {
     /// serial driver. This is not production Root removal or a Scope exit.
     #[cfg(test)]
     pub(in crate::control_runtime) fn close_for_teardown(&mut self) -> Result<bool, DriverError> {
-        self.removal_authorized = true;
+        self.issuance_closed = true;
         self.close()
     }
 }
@@ -288,7 +273,11 @@ impl ContextHostRecord {
                 ticket,
                 role,
                 WorkerMessage::Context(ContextMessage::Command {
-                    work: self.resources.roles[TIMER].work.reference(),
+                    work: source
+                        .binding
+                        .as_ref()
+                        .expect("original parent-control binding")
+                        .author,
                     request: None,
                     command: ContextInput::OwnerFenced,
                 }),

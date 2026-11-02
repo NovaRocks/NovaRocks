@@ -323,7 +323,7 @@ fn source_role(
         report,
     }
 }
-fn admitted_source_slot(
+pub(in crate::control_runtime) fn admitted_source_slot(
     scope: &ScopeHandle,
     parent: ReservationId,
 ) -> crate::control_runtime::source_positions::SourceSlotAdmission {
@@ -356,7 +356,7 @@ fn paid_ingress(
         .unwrap_or_else(|_| panic!("the original Task lifetime funded its four source positions")),
     )
 }
-fn dispose_retired_pair(
+pub(in crate::control_runtime) fn dispose_retired_pair(
     fixture: &Fixture,
     ingress: &crate::task_proposal_ingress::TaskProposalIngress,
     retired: crate::task_proposal_ingress::RetiredCut,

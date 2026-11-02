@@ -465,6 +465,12 @@ impl TaskCausalInbox {
     pub(crate) fn registration(&self) -> &ActorRegistration {
         &self.registration
     }
+    /// The original Task FIFO advances this protocol generation when its
+    /// actual abort-close input transfers. It is distinct from the runtime
+    /// scope epoch used to authenticate source/report failure consumers.
+    pub(crate) fn protocol_generation(&self) -> Generation {
+        self.generation
+    }
     pub(crate) fn rpc_input_author(&self, cut: CutId) -> Result<RuntimeInputAuthor, CausalError> {
         self.roles
             .get(&cut)
@@ -1155,6 +1161,15 @@ impl TaskCausalInbox {
                 .ok_or(CausalError::InputObservationMissing)?
                 .phase;
             if phase == InputPhase::Committed {
+                for source in delivered.sources.into_iter().flatten() {
+                    self.ingress.observe_source_core_input(
+                        source,
+                        &self.runtime,
+                        &self.registration,
+                        self.source,
+                        prefix,
+                    )?;
+                }
                 self.roles
                     .get_mut(&cut)
                     .unwrap()
@@ -1215,6 +1230,20 @@ impl TaskCausalInbox {
         cut: CutId,
         source: SourceId,
     ) -> Result<Consumption, CausalError> {
+        if !self.roles.contains_key(&cut) {
+            return Err(CausalError::UnknownRole);
+        }
+        if let Some(original) = self
+            .ingress
+            .pair_inventory(crate::task_proposal_ingress::PairRoute::Cut(cut))?
+            .into_iter()
+            .find(|position| position.source == Some(source))
+        {
+            let receipt = original.custody.core_consumption();
+            if receipt != Consumption::Pending {
+                return Ok(receipt);
+            }
+        }
         let delivered = self.source_delivery(cut, source)?;
         if delivered.source_consumption == Consumption::Pending
             && let Some(prefix) = delivered.prefix
@@ -1302,6 +1331,7 @@ impl TaskCausalInbox {
             .ok_or(CausalError::NotDelivered)?;
         // Save each exact input independently before its header can retire.
         // A committed predecessor never proves that the event was consumed.
+        let source_was_pending = delivered.source_consumption == Consumption::Pending;
         for (input, receipt) in [
             (delivered.prefix, &mut delivered.source_consumption),
             (delivered.event, &mut delivered.event_consumption),
@@ -1323,6 +1353,33 @@ impl TaskCausalInbox {
                 // The saved partial-fill/queued receipt proves no transfer.
                 None => Consumption::AbandonedByOwnerFailure,
             };
+        }
+        if source_was_pending
+            && delivered.source_consumption != Consumption::Pending
+            && let Some(prefix) = delivered.prefix
+        {
+            for source in delivered.sources.into_iter().flatten() {
+                self.ingress.observe_source_core_input(
+                    source,
+                    &self.runtime,
+                    &self.registration,
+                    self.source,
+                    prefix,
+                )?;
+            }
+        }
+        if source_was_pending
+            && delivered.source_consumption != Consumption::Pending
+            && delivered.prefix.is_none()
+        {
+            for source in delivered.sources.into_iter().flatten() {
+                self.ingress.observe_source_untransferred(
+                    source,
+                    drained,
+                    &self.runtime,
+                    &self.registration,
+                )?;
+            }
         }
         let ready = delivered.source_consumption != Consumption::Pending
             && delivered.event_consumption != Consumption::Pending;
@@ -1351,6 +1408,14 @@ impl TaskCausalInbox {
                 let cut = input.prefix.cut.expect("original queued role cut");
                 let role = self.roles.get_mut(&cut).expect("queued input role custody");
                 assert!(role.delivered.is_none());
+                for source in input.prefix.summary.candidate_sources() {
+                    self.ingress.observe_source_untransferred(
+                        source,
+                        drained,
+                        &self.runtime,
+                        &self.registration,
+                    )?;
+                }
                 role.delivered = Some(Delivered {
                     proof: None,
                     prefix: None,
@@ -1667,6 +1732,28 @@ impl TaskCausalInbox {
         let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
         self.role_env()
             .advance_source_pair_retirement(cut, role, scope)
+    }
+    /// Closed source admission permits only the existing original pair to
+    /// retire. Its saved real input receipts survive all partial deliveries.
+    pub(crate) fn observe_closed_source_pair(
+        &self,
+        route: crate::task_proposal_ingress::PairRoute,
+    ) -> Result<bool, CausalError> {
+        Ok(self
+            .role_env()
+            .advance_pair_retirement(
+                route,
+                |source| {
+                    Ok(self
+                        .ingress
+                        .source_inventory(source)
+                        .map_err(CausalError::Source)?
+                        .custody
+                        .core_consumption())
+                },
+                0,
+            )?
+            .progressed)
     }
     /// Source/capture/effect owners must first supply their true exit and all
     /// cut consumers. This wrapper only verifies/returns the original input

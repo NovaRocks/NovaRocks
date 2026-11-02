@@ -19,6 +19,7 @@
 //! reply publication and the actual external delivery exit are separate facts.
 
 pub(super) mod create_disposal;
+pub(super) mod deferred_read;
 pub(crate) mod domain;
 pub(super) mod domain_driver;
 mod endpoint;
@@ -560,6 +561,7 @@ pub(crate) struct ContextRequestCustody {
     create: Option<TaskCreateCapture>,
     rejected_domain: Option<rejected_domain_capture::RejectedDomainCapture>,
     retired_task_read: Option<Arc<super::super::lifecycle_read::TaskReadSnapshot>>,
+    deferred_task_read: Option<deferred_read::DeferredTaskRead>,
     read_payload: Option<Arc<crate::control_runtime::task_read_payload::TaskReadPayloadShared>>,
     deferred_root: Option<DeferredRootRequest>,
     observation: Option<observation::ObservationRequest>,
@@ -839,6 +841,7 @@ impl ContextRequestCustody {
                 create: None,
                 rejected_domain: None,
                 retired_task_read: None,
+                deferred_task_read: None,
                 read_payload: None,
                 deferred_root: None,
                 observation: None,
@@ -1129,6 +1132,7 @@ impl ContextRequestCustody {
     }
     fn is_refused_neutral_input(&self, error: DriverError, message: &WorkerMessage) -> bool {
         self.is_refused_root_ack(error, message)
+            || self.is_refused_deferred_task_read(error, message)
             || self.is_refused_context_control(error, message)
             || self.is_refused_create_input(error, message)
     }
@@ -1401,6 +1405,13 @@ impl ContextRequestCustody {
             if !self.exit_observed && self.authority.is_none() && self.started {
                 return Ok(false);
             }
+        }
+        if self
+            .deferred_task_read
+            .as_ref()
+            .is_some_and(|read| read.resume.is_some())
+        {
+            return Ok(false);
         }
         if self.domain.as_ref().is_some_and(|domain| !domain.retired) {
             return Ok(false);
@@ -2087,6 +2098,7 @@ impl ContextHostRecord {
         &mut self,
         work: ScopedWorkRef,
     ) -> Result<bool, ContextRequestError> {
+        self.advance_deferred_task_read(work)?;
         self.advance_observation_request(work, 1)?;
         if let Some(original) = self.resources.requests.get_mut(&work) {
             if original.observation.is_some() && !original.endpoint.external_ended() {
@@ -2170,6 +2182,7 @@ impl ContextHostRecord {
             let root_task = original.deferred_root.as_ref().map(|root| root.task);
             let input = original.request.map(|request| request.token);
             let cut = original.task_route.as_ref().map(|route| route.cut());
+            self.remove_retired_task_read_waiter(work);
             self.resources.requests.remove(&work);
             if let Some(task) = task_identity {
                 self.remove_domain_request_index(task, work);
@@ -2708,6 +2721,7 @@ impl ContextHostRecord {
             release_observation: None,
             observation: None,
             retired_task_read: None,
+            deferred_task_read: None,
             read_payload: None,
             deferred_root: Some(DeferredRootRequest {
                 task,

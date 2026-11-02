@@ -2187,10 +2187,15 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_catalog_config(novarocks_worker::CatalogManagerConfig::default())
+        }
+        fn with_catalog_config(config: novarocks_worker::CatalogManagerConfig) -> Self {
             let catalog_factory = ScriptedFactory::new();
             let filter_factory = RecordingFilterFactory::new();
-            let catalog_manager =
-                Arc::new(CatalogManager::<ConnectorExecutionRoleBinding>::default());
+            let catalog_manager = Arc::new(
+                CatalogManager::<ConnectorExecutionRoleBinding>::try_new(config)
+                    .expect("the fixture declares a valid catalog policy"),
+            );
             let factories = Arc::new(
                 ConnectorExecutionRoleBindingFactorySet::try_new([
                     Arc::clone(&catalog_factory) as Arc<dyn ConnectorExecutionRoleBindingFactory>
@@ -2441,7 +2446,12 @@ mod tests {
 
     #[test]
     fn an_inflight_materialization_keeps_its_released_instance_until_the_actual_call_clone_exits() {
-        let fixture = Fixture::new();
+        // This case observes original M/instance/lease custody, independently
+        // of the catalog owner's separately tested transient backoff policy.
+        let fixture = Fixture::with_catalog_config(novarocks_worker::CatalogManagerConfig {
+            transient_retry_cooldown: std::time::Duration::ZERO,
+            ..novarocks_worker::CatalogManagerConfig::default()
+        });
         let identity = context(91_004);
         let instance = fixture.host.clone().create_instance(identity).unwrap();
         let entered = Arc::new(Barrier::new(2));
@@ -3478,7 +3488,8 @@ mod tests {
         let context = context(1);
         let first = task_identity(context, 1);
         let second = task_identity(context, 2);
-        let original = NativeNodePreparation::with_context(
+        let execution = context.query_execution_id();
+        let original = NativeNodePreparation::with_context_each(
             context,
             fixture.host.clone(),
             ContextContents {
@@ -3488,37 +3499,39 @@ mod tests {
                 credential: credential(1, ANNOUNCED_SCOPE, live_until()),
             },
             &[first, second],
+            |ordinal, original| {
+                if ordinal == 0 {
+                    assert_eq!(
+                        fixture.host.feedback_carrier(execution),
+                        None,
+                        "an established context with no submitted task carries nothing yet"
+                    );
+                    assert!(
+                        fixture.host.bind_runtime_filter_feedback(
+                            execution,
+                            first,
+                            original.dynamic_filter_writer()
+                        ),
+                        "the first submitted task takes the carrier role"
+                    );
+                } else {
+                    assert_eq!(ordinal, 1);
+                    assert!(
+                        !fixture.host.bind_runtime_filter_feedback(
+                            execution,
+                            second,
+                            original.dynamic_filter_writer()
+                        ),
+                        "a second task must not replace the carrier"
+                    );
+                }
+                assert_eq!(
+                    fixture.host.feedback_carrier(execution),
+                    Some(first),
+                    "the carrier is first-wins, not last-writer"
+                );
+            },
         );
-        let execution = context.query_execution_id();
-        assert_eq!(
-            fixture.host.feedback_carrier(execution),
-            None,
-            "an established context with no submitted task carries nothing yet"
-        );
-
-        assert!(
-            fixture.host.bind_runtime_filter_feedback(
-                execution,
-                first,
-                original[0].dynamic_filter_writer()
-            ),
-            "the first submitted task takes the carrier role"
-        );
-        assert_eq!(fixture.host.feedback_carrier(execution), Some(first));
-        assert!(
-            !fixture.host.bind_runtime_filter_feedback(
-                execution,
-                second,
-                original[1].dynamic_filter_writer()
-            ),
-            "a second task must not replace the carrier"
-        );
-        assert_eq!(
-            fixture.host.feedback_carrier(execution),
-            Some(first),
-            "the carrier is first-wins, not last-writer"
-        );
-
         // Releasing the context drops the only strong reference to the sink,
         // so a late publication finds nothing to publish through.
         NativeNodePreparation::release_context(&original);

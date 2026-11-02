@@ -69,6 +69,9 @@ pub struct TaskRecord {
     pub loader_exited: bool,
     pub preparation_body_exited: bool,
     pub preparation_exited: bool,
+    /// Refining a live peer placeholder updates its conclusion, not the
+    /// once-only physical stop notification already owned by the host.
+    pub(crate) stop_effect_issued: bool,
     pub actual_stopped: bool,
     pub runtime_actual_stopped_received: bool,
     pub runtime_resources_converged_received: bool,
@@ -134,6 +137,7 @@ impl TaskRecord {
             loader_exited: false,
             preparation_body_exited: false,
             preparation_exited: false,
+            stop_effect_issued: false,
             actual_stopped: false,
             runtime_actual_stopped_received: false,
             runtime_resources_converged_received: false,

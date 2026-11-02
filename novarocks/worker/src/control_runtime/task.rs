@@ -1107,7 +1107,8 @@ impl TaskHostRecord {
         };
         let open = TaskOpenSummaryInbox::from_admitted(
             runtime.clone(),
-            self.actor,
+            self.resources.causal.registration().clone(),
+            self.task_source,
             self.task,
             self.resources.lifetime.work().reference(),
             self.resources.port.ingress().clone(),
@@ -2963,6 +2964,36 @@ impl TaskHostRecord {
 }
 
 impl TaskHostRecord {
+    /// Proposals already own this Task's prepaid summary input. They must
+    /// reach the Core while execution is live: stopping a failed producer
+    /// cannot depend on that producer first finishing its cleanup callback.
+    pub(crate) fn advance_open_summary(&mut self) -> Result<TaskRetirementProgress, TaskHostError> {
+        let mut progress = TaskRetirementProgress::default();
+        let Some(open) = &mut self.resources.open_summary else {
+            return Ok(progress);
+        };
+        if open.is_closed() {
+            return Ok(progress);
+        }
+        if open.is_idle().map_err(TaskHostError::OpenSummary)? {
+            progress.progressed = open
+                .deliver_next(self.resources.causal.protocol_generation())
+                .map_err(TaskHostError::OpenSummary)?
+                .is_some();
+            return Ok(progress);
+        }
+        let input = open.advance_input().map_err(TaskHostError::OpenSummary)?;
+        progress.progressed = input.progressed;
+        progress.retired_authors = input.retired_authors;
+        if !input.consumed {
+            return Ok(progress);
+        }
+        if input.input_retired {
+            open.finish_delivery().map_err(TaskHostError::OpenSummary)?;
+            progress.progressed = true;
+        }
+        Ok(progress)
+    }
     /// Visit at most one already-returned pair and one original host cut.
     /// Frozen upper bounds make continuation finite even when a producer
     /// appends new cuts. A notification during the round starts another round.

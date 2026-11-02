@@ -62,6 +62,23 @@ struct Exits {
     source_node: bool,
     unresolved: bool,
     failure_pending: bool,
+    // The real input receipt belongs to this exact original source role.
+    // It can outlive a partial summary input and follows this role into a cut.
+    core_input: Option<SourceCoreReceipt>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceCoreReceipt {
+    Input {
+        actor: novarocks_control_runtime_core::identity::ActorId,
+        input: novarocks_control_runtime_core::identity::InputId,
+        consumption: novarocks_control_runtime_core::completion::Consumption,
+    },
+    // Only the original drained failure session can save this no-transfer
+    // receipt, from its exact queued/refused original summary.
+    NotTransferred {
+        actor: novarocks_control_runtime_core::identity::ActorId,
+        generation: novarocks_control_runtime_core::identity::Generation,
+    },
 }
 struct Custody {
     task: TaskIdentity,
@@ -105,6 +122,111 @@ impl std::fmt::Debug for Marker {
 }
 impl SourceRetentionCapability for Marker {}
 impl SourceCustody {
+    pub(crate) fn observe_core_input(
+        &self,
+        runtime: &novarocks_control_runtime::driver::ActorRuntime<super::actors::WorkerActor>,
+        registration: &novarocks_control_runtime::driver::ActorRegistration,
+        source: novarocks_control_runtime_core::identity::ActorId,
+        input: novarocks_control_runtime_core::identity::InputId,
+    ) -> Result<bool, DriverError> {
+        use novarocks_control_runtime::driver::InputPhase;
+        use novarocks_control_runtime_core::completion::Consumption;
+        self.report().bind_actor_consumer(
+            runtime,
+            registration,
+            novarocks_control_runtime_core::identity::ConsumerId::new(1).unwrap(),
+        )?;
+        let actor = registration.actor();
+        let custody = runtime
+            .input_custody(actor, input)?
+            .ok_or(DriverError::UnknownInput)?;
+        if custody.source != source {
+            return Err(DriverError::PublicationTargetMismatch);
+        }
+        let phase = custody.phase;
+        let consumption = match phase {
+            InputPhase::Committed => Consumption::Consumed,
+            InputPhase::AbandonedByOwnerFailure => Consumption::AbandonedByOwnerFailure,
+            _ => return Err(DriverError::InputStillQueued),
+        };
+        let mut exits = self
+            .0
+            .exits
+            .lock()
+            .expect("original source Core input receipt");
+        let observed = SourceCoreReceipt::Input {
+            actor,
+            input,
+            consumption,
+        };
+        match exits.core_input {
+            Some(receipt) if receipt == observed => Ok(false),
+            Some(_) => Err(DriverError::PublicationTargetMismatch),
+            None => {
+                exits.core_input = Some(observed);
+                Ok(true)
+            }
+        }
+    }
+    pub(crate) fn observe_untransferred_core(
+        &self,
+        stage: &ScopePublicationsDrained<'_>,
+        runtime: &novarocks_control_runtime::driver::ActorRuntime<super::actors::WorkerActor>,
+        registration: &novarocks_control_runtime::driver::ActorRegistration,
+    ) -> Result<bool, DriverError> {
+        let actor = registration.actor();
+        stage.validate(runtime, actor)?;
+        self.report().bind_actor_consumer(
+            runtime,
+            registration,
+            novarocks_control_runtime_core::identity::ConsumerId::new(1).unwrap(),
+        )?;
+        let observed = SourceCoreReceipt::NotTransferred {
+            actor,
+            generation: stage.registration().initial_epoch(),
+        };
+        let mut exits = self
+            .0
+            .exits
+            .lock()
+            .expect("original untransferred source receipt");
+        match exits.core_input {
+            Some(receipt) if receipt == observed => Ok(false),
+            Some(_) => Err(DriverError::PublicationTargetMismatch),
+            None => {
+                exits.core_input = Some(observed);
+                Ok(true)
+            }
+        }
+    }
+    pub(crate) fn core_consumption(
+        &self,
+    ) -> novarocks_control_runtime_core::completion::Consumption {
+        use novarocks_control_runtime_core::completion::Consumption;
+        self.0
+            .exits
+            .lock()
+            .expect("original source Core input receipt")
+            .core_input
+            .map_or(Consumption::Pending, |receipt| match receipt {
+                SourceCoreReceipt::Input { consumption, .. } => consumption,
+                SourceCoreReceipt::NotTransferred { .. } => Consumption::AbandonedByOwnerFailure,
+            })
+    }
+    #[cfg(test)]
+    pub(crate) fn core_input(
+        &self,
+    ) -> Option<Option<novarocks_control_runtime_core::identity::InputId>> {
+        self.0
+            .exits
+            .lock()
+            .expect("original source Core input receipt")
+            .core_input
+            .map(|receipt| match receipt {
+                SourceCoreReceipt::Input { input, .. } => Some(input),
+                SourceCoreReceipt::NotTransferred { .. } => None,
+            })
+    }
     /// The actual financial owner; actor consumer identity is independent.
     pub(crate) fn financial_scope(&self) -> &novarocks_control_runtime::transaction::ScopeHandle {
         &self.0.scope

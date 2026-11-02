@@ -1323,13 +1323,23 @@ impl ContextHostRecord {
                 }
                 host.observe_loading_exit_report()
                     .map_err(TaskDriverError::Loading)?;
+                let open = host.advance_open_summary().map_err(|error| {
+                    tracing::error!(?task, operation = "advance_open_summary", %error,
+                            "Original Task host transition refused");
+                    TaskDriverError::Host(error)
+                })?;
+                source_progress |= open.progressed;
+                retired_authors.extend(open.retired_authors);
+                if open.progressed {
+                    host.pending_notice().pending();
+                }
                 let retirement = host.advance_production_cut().map_err(|error| {
                     tracing::error!(?task, operation = "advance_production_cut", %error,
                             "Original Task host transition refused");
                     TaskDriverError::Host(error)
                 })?;
                 retirement_runnable = retirement.runnable;
-                retired_authors = retirement.retired_authors;
+                retired_authors.extend(retirement.retired_authors);
                 request_cut = retirement.request_cut;
                 if retirement.progressed {
                     source_progress = true;
@@ -2673,7 +2683,7 @@ impl ContextHostRecord {
                     match self
                         .resources
                         .internal
-                        .finish_task_retirement(input)
+                        .finish_continuation(input)
                         .map_err(TaskDriverError::Driver)?
                     {
                         Consumption::Pending => continue,

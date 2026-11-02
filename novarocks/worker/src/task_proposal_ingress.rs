@@ -134,6 +134,9 @@ struct State {
     sources: SourcePositions,
     open: Option<SourcePositionPair>,
     spare: Option<SourcePositionPair>,
+    // The first partial handoff selects this original pair. Later partial
+    // handoffs and the next real cut keep using the same segment's pair.
+    open_in_spare: bool,
     open_consuming: bool,
     open_core_consumed: bool,
     last_source: u64,
@@ -205,6 +208,13 @@ pub(crate) struct RetiredCut {
 }
 
 impl State {
+    fn open_route(&self) -> PairRoute {
+        if self.open_in_spare {
+            PairRoute::ConsumingOpen
+        } else {
+            PairRoute::Open
+        }
+    }
     fn pair(&self, route: PairRoute) -> Result<&SourcePositionPair, IngressError> {
         match route {
             PairRoute::Open => self.open.as_ref(),
@@ -306,7 +316,8 @@ impl State {
             .validate_unclaimed_pair(cell.pair.as_ref().expect("original cut pair"))?;
         let notice = cell.rpc_retirement_notice.clone();
         let cut_pair = cell.pair.as_ref().expect("original cut pair");
-        let open_pair = self.open.as_ref().expect("original open pair");
+        let open_route = self.open_route();
+        let open_pair = self.pair(open_route)?;
         for pair in [cut_pair, open_pair] {
             for original in self.observe_owned_pair(pair)? {
                 let allowed = match &notice {
@@ -319,8 +330,12 @@ impl State {
             }
         }
         self.segments.seal_cut(cut)?;
+        // The same lock still owns both unchanged pairs. End the validation
+        // borrows before mutating the pure segment, then snapshot those exact
+        // original wake recipients before transferring either pair.
+        let cut_pair = self.cuts[&cut].pair.as_ref().expect("original cut pair");
         wakes.capture_pair(self, cut_pair);
-        wakes.capture_pair(self, open_pair);
+        wakes.capture_pair(self, self.pair(open_route)?);
         if let Some(notice) = &notice {
             for original in self.observe_owned_pair(cut_pair)? {
                 original.custody.clear_pair_retirement_notice(notice);
@@ -334,9 +349,14 @@ impl State {
             .pair
             .as_mut()
             .expect("original cut pair");
-        self.open
+        let open_pair = if self.open_in_spare {
+            &mut self.spare
+        } else {
+            &mut self.open
+        };
+        open_pair
             .as_mut()
-            .expect("original open pair")
+            .expect("original open segment pair")
             .swap_with(cut_pair)
             .expect("same original bank");
         if let Some(notice) = &notice {
@@ -359,17 +379,22 @@ impl State {
         if !self.ready(summary) {
             return Err(CutError::NotReady.into());
         }
-        self.sources
-            .validate_unclaimed_pair(self.spare.as_ref().expect("original base spare"))
-            .map_err(storage_gate)?;
+        if !self.open_in_spare {
+            self.sources
+                .validate_unclaimed_pair(self.spare.as_ref().expect("original base spare"))
+                .map_err(storage_gate)?;
+        }
         let summary = self.segments.begin_open()?;
         wakes.capture_pair(self, self.open.as_ref().expect("original open pair"));
         wakes.capture_pair(self, self.spare.as_ref().expect("original spare pair"));
-        self.open
-            .as_mut()
-            .expect("original open pair")
-            .swap_with(self.spare.as_mut().expect("original base spare"))
-            .expect("same bank");
+        if !self.open_in_spare {
+            self.open
+                .as_mut()
+                .expect("original open pair")
+                .swap_with(self.spare.as_mut().expect("original base spare"))
+                .expect("same bank");
+            self.open_in_spare = true;
+        }
         self.open_consuming = true;
         self.open_core_consumed = false;
         Ok(SummaryInput { cut: None, summary })
@@ -401,6 +426,7 @@ impl TaskProposalIngress {
                 sources,
                 open: Some(open),
                 spare: Some(spare),
+                open_in_spare: false,
                 open_consuming: false,
                 open_core_consumed: false,
                 last_source: 0,
@@ -472,9 +498,8 @@ impl TaskProposalIngress {
                 };
             }
             let key = state
-                .open
-                .as_ref()
-                .expect("original open pair")
+                .pair(state.open_route())
+                .expect("original open segment pair")
                 .keys()
                 .into_iter()
                 .find_map(|key| {
@@ -965,11 +990,14 @@ impl TaskProposalIngress {
             &state,
             state.spare.as_ref().expect("original failed spare pair"),
         );
-        let State { open, spare, .. } = &mut *state;
-        open.as_mut()
-            .expect("original failed open pair")
-            .swap_with(spare.as_mut().expect("original failed spare pair"))
-            .expect("same original source bank");
+        if !state.open_in_spare {
+            let State { open, spare, .. } = &mut *state;
+            open.as_mut()
+                .expect("original failed open pair")
+                .swap_with(spare.as_mut().expect("original failed spare pair"))
+                .expect("same original source bank");
+            state.open_in_spare = true;
+        }
         state.open_consuming = true;
         state.open_core_consumed = false;
         Ok(Some(SummaryInput { cut: None, summary }))
@@ -1070,6 +1098,41 @@ impl TaskProposalIngress {
             .expect("task proposal handoff lock")
             .sources
             .source_inventory(id)
+    }
+    /// Selection is under the original ingress fence; observing the runtime
+    /// receipt touches its real ledger only after that fence has unlocked.
+    pub(crate) fn observe_source_core_input(
+        &self,
+        source: SourceId,
+        runtime: &novarocks_control_runtime::driver::ActorRuntime<
+            crate::control_runtime::actors::WorkerActor,
+        >,
+        registration: &novarocks_control_runtime::driver::ActorRegistration,
+        task_source: novarocks_control_runtime_core::identity::ActorId,
+        input: novarocks_control_runtime_core::identity::InputId,
+    ) -> Result<bool, novarocks_control_runtime::driver::DriverError> {
+        let original = self.source_inventory(source).map_err(|_| {
+            novarocks_control_runtime::driver::DriverError::PublicationTargetMismatch
+        })?;
+        original
+            .custody
+            .observe_core_input(runtime, registration, task_source, input)
+    }
+    pub(crate) fn observe_source_untransferred(
+        &self,
+        source: SourceId,
+        stage: &crate::control_runtime::failure::ScopePublicationsDrained<'_>,
+        runtime: &novarocks_control_runtime::driver::ActorRuntime<
+            crate::control_runtime::actors::WorkerActor,
+        >,
+        registration: &novarocks_control_runtime::driver::ActorRegistration,
+    ) -> Result<bool, novarocks_control_runtime::driver::DriverError> {
+        let original = self.source_inventory(source).map_err(|_| {
+            novarocks_control_runtime::driver::DriverError::PublicationTargetMismatch
+        })?;
+        original
+            .custody
+            .observe_untransferred_core(stage, runtime, registration)
     }
     pub(crate) fn pair_inventory(
         &self,
@@ -1372,6 +1435,32 @@ impl TaskProposalIngress {
         let state = self.state.lock().expect("task proposal handoff lock");
         state.source_closed && !state.open_consuming && state.segments.open_is_empty()
     }
+    /// Only the partial input's real Core receipt and exited effects permit
+    /// its reusable input to clear. The segment's source pair stays original,
+    /// including a still-held accepted source and its unused origin position.
+    pub(crate) fn finish_open_delivery(&self) -> Result<(), IngressError> {
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        if !state.open_consuming {
+            return Err(CutError::NotReady.into());
+        }
+        if !state.open_core_consumed {
+            return Err(CutError::Consuming.into());
+        }
+        state.segments.finish_open()?;
+        state.open_consuming = false;
+        state.open_core_consumed = false;
+        Ok(())
+    }
+    pub(crate) fn finish_failed_open_delivery(&self) -> Result<(), IngressError> {
+        let mut state = self.state.lock().expect("task proposal handoff lock");
+        if !state.failed || !state.open_consuming {
+            return Err(CutError::NotReady.into());
+        }
+        state.segments.abandon_open()?;
+        state.open_consuming = false;
+        state.open_core_consumed = false;
+        Ok(())
+    }
     /// An empty source pair transfers the same untouched paid permits back
     /// to the spare. This releases neither credit nor any original source role.
     #[cfg(test)]
@@ -1446,6 +1535,7 @@ impl TaskProposalIngress {
     }
     /// A reap witness is produced outside this fence. Core acknowledgement
     /// remains an independent earlier fact; storage exit cannot manufacture it.
+    #[cfg(test)]
     pub(crate) fn finish_open_after_reap(
         &self,
         reaped: [ReapedPosition; 2],
@@ -2242,31 +2332,32 @@ mod tests {
             Err(IngressError::Cut(CutError::Consuming))
         ));
         f.ingress.open_summary_consumed().unwrap();
-        assert_eq!(
-            f.ingress.finish_open_unclaimed(),
-            Err(IngressError::Cut(CutError::ExitUnobserved)),
-            "an Accepted source is not an unused permit"
-        );
+        f.ingress.finish_open_delivery().unwrap();
         let later = f.ingress.take_next_summary().unwrap();
         assert_eq!(later.cut, Some(CutId(1)));
+        assert_eq!(
+            later.summary.candidate_sources().count(),
+            0,
+            "the real cut does not replay its earlier partial"
+        );
         f.ingress.summary_consumed(later.cut).unwrap();
         assert_eq!(
             f.ingress
-                .pair_inventory(PairRoute::ConsumingOpen)
+                .pair_inventory(PairRoute::Cut(CutId(1)))
                 .unwrap()
                 .map(|o| o.key.address()),
             old_open
         );
         assert_eq!(
             f.ingress
-                .pair_inventory(PairRoute::Open)
+                .pair_inventory(PairRoute::ConsumingOpen)
                 .unwrap()
                 .map(|o| o.key.address()),
             funded.keys.each_ref().map(|key| key.address())
         );
         assert!(
             f.ingress
-                .prepare_pair_reap(PairRoute::ConsumingOpen)
+                .prepare_pair_reap(PairRoute::Cut(CutId(1)))
                 .unwrap()
                 .into_iter()
                 .any(|probe| probe.observe_reaped().is_err())
@@ -2277,10 +2368,6 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(late);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        let reaped = f.reap(PairRoute::ConsumingOpen);
-        f.ingress
-            .finish_open_after_reap(reaped)
-            .unwrap_or_else(|_| panic!("true alias exit"));
         f.ingress.observe_cut_exit(CutId(1), true, true).unwrap();
         let reaped = f.reap(PairRoute::Cut(CutId(1)));
         let retired = f
@@ -2460,18 +2547,33 @@ mod tests {
                 .unwrap()
                 .map(|o| o.custody.report().id())
         });
-        for _ in 0..128 {
+        for partial in 0..128 {
             drop_handoff(f.ingress.submit(TaskConclusionProposal::Succeeded));
             let input = f.ingress.take_next_summary().unwrap();
             assert!(input.cut.is_none());
             assert_eq!(input.summary.candidate_sources().count(), 0);
             assert_eq!(
-                f.ingress.finish_open_unclaimed(),
+                input.summary.candidate_count(),
+                usize::from(partial == 0),
+                "partial delivery preserves the same segment's first-candidate qualification"
+            );
+            assert_eq!(
+                f.ingress.finish_open_delivery(),
                 Err(IngressError::Cut(CutError::Consuming)),
                 "storage observation cannot sign a Core acknowledgement"
             );
             f.ingress.open_summary_consumed().unwrap();
-            f.ingress.finish_open_unclaimed().unwrap();
+            f.ingress.finish_open_delivery().unwrap();
+            assert_eq!(
+                [PairRoute::Open, PairRoute::ConsumingOpen].map(|route| {
+                    f.ingress
+                        .pair_inventory(route)
+                        .unwrap()
+                        .map(|o| o.custody.report().id())
+                }),
+                [initial[1], initial[0]],
+                "only the first partial selects the segment's original pair"
+            );
             assert_eq!(f.scope.snapshot().unwrap(), before);
             assert_eq!(f.ledger.change_version(), version);
         }
@@ -2481,7 +2583,7 @@ mod tests {
                 .unwrap()
                 .map(|o| o.custody.report().id())
         });
-        assert_eq!(final_reports, initial);
+        assert_eq!(final_reports, [initial[1], initial[0]]);
         assert_eq!(f.ingress.state.lock().unwrap().sources.len(), 4);
         f.finish();
     }

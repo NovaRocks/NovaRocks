@@ -379,9 +379,20 @@ impl RetainedContext {
         self.replies
             .request_deadlines
             .insert((request.deadline, request.token));
-        self.view()
-            .terminal_command(request.token, &mut command)?
-            .emit(request.token, &mut step);
+        if let ContextCommand::AwaitTaskReadSeal { task, command } = command {
+            if let Some(outcome) = self.view().task_read_refusal(task)? {
+                step.reply(
+                    request.token,
+                    ContextReplyBody::Verdict(RequestResult::Outcome(outcome)),
+                );
+            } else {
+                self.replies.await_task_read(request.token, command)?;
+            }
+        } else {
+            self.view()
+                .terminal_command(request.token, &mut command)?
+                .emit(request.token, &mut step);
+        }
         let visited = self.replies.settle(now, &mut step);
         step.records_visited = 1 + visited + usize::from(!step.requests.is_empty());
         Ok(step)
@@ -399,7 +410,29 @@ impl RetainedContext {
         }
         let mut step = ContextStep::default();
         self.advance_time(now, &mut step)?;
+        let mut decisions_visited = 0;
         match input {
+            ContextInput::ResumeTaskRead { request, task } => {
+                if let Some((original, command)) = self.replies.take_task_read(request, task) {
+                    if self.expired || now.has_reached(original.deadline) {
+                        let body = if self.expired {
+                            ContextReplyBody::Verdict(RequestResult::Outcome(
+                                OperationOutcome::Gone,
+                            ))
+                        } else {
+                            ContextReplyBody::Verdict(RequestResult::TimeoutWhileAccepted)
+                        };
+                        self.replies
+                            .complete(request, Arc::new(body), now, &mut step);
+                    } else {
+                        let mut command = command.into_command(task);
+                        self.view()
+                            .terminal_command(request, &mut command)?
+                            .emit(request, &mut step);
+                        decisions_visited = self.replies.settle(now, &mut step);
+                    }
+                }
+            }
             ContextInput::Tick | ContextInput::NextInternal => {
                 if let Some((&token, _)) = self.replies.pending_replies.first_key_value() {
                     self.replies.flush(token, &mut step);
@@ -410,6 +443,14 @@ impl RetainedContext {
             }
             ContextInput::ContinueRequestReplies { operation } => {
                 self.replies.flush(operation, &mut step)
+            }
+            ContextInput::RequestCompleted { operation, outcome } => {
+                self.replies.complete(
+                    operation,
+                    Arc::new(ContextReplyBody::Verdict(RequestResult::Outcome(outcome))),
+                    now,
+                    &mut step,
+                );
             }
             ContextInput::ProbeEstablish {
                 context, request, ..
@@ -463,7 +504,7 @@ impl RetainedContext {
             ContextInput::OwnerFenced | ContextInput::ContinueCompaction => {}
             _ => return Err(CoreError::IllegalFact),
         }
-        step.records_visited = 1 + usize::from(!step.requests.is_empty());
+        step.records_visited = 1 + decisions_visited + usize::from(!step.requests.is_empty());
         Ok(step)
     }
     fn root_ack(

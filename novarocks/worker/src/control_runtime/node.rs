@@ -342,7 +342,8 @@ impl WorkerNodeHost {
         let Some(mut host) = address.lock() else {
             return Err(NodeHostRefusal::new("Task read Context owner", command));
         };
-        if host.has_retired_task_read(task) {
+        let awaiting_seal = host.task_read_awaits_seal(task);
+        if host.has_retired_task_read(task) || awaiting_seal {
             let (work, handle) = host
                 .admit_request(
                     &self.requests,
@@ -354,7 +355,12 @@ impl WorkerNodeHost {
                 .map_err(|original| {
                     NodeHostRefusal::new("Task sealed read R admission", original)
                 })?;
-            match host.submit_retired_task_command(work, command) {
+            let submission = if awaiting_seal {
+                host.submit_deferred_task_read(work, command)
+            } else {
+                host.submit_retired_task_command(work, command)
+            };
+            match submission {
                 Ok(()) => Ok(NodeTaskReadHandle::Sealed(handle)),
                 Err(original) => Err(NodeHostRefusal::new(
                     "Task sealed read original handoff",

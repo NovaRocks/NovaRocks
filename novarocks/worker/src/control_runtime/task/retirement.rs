@@ -100,9 +100,15 @@ impl TaskHostRecord {
             });
         let exited = TaskExecutionBorrowersExited { owner: self };
         let call = self.host_call(TaskHostCallKind::RetireBorrowing).clone();
-        let job = call
-            .take_retire_effect_job(ticket, &exited)
-            .map_err(TaskHostError::HostCall)?;
+        let job = match call.take_retire_effect_job(ticket, &exited) {
+            Ok(job) => job,
+            // A preparation refusal can finish this once-only call before
+            // its original reports and Work header retire. RetireTask still
+            // owns that inventory; wait for it instead of issuing the call
+            // again or treating physical exit as report consumption.
+            Err(TaskHostCallError::AlreadyIssued) => return Ok(None),
+            Err(error) => return Err(TaskHostError::HostCall(error)),
+        };
         Ok(Some(
             super::super::context_host::task_driver::TaskDriverHostJob::RetireExecution {
                 job,
@@ -227,6 +233,10 @@ impl TaskHostRecord {
             // handoff prove that no preparation author remains to be issued.
             return Ok(progress);
         }
+        // FinalizeTaskExecution can reach this boundary before RetireTask.
+        // Fence new RPC cuts before closing their same original source; a
+        // later stable read must wait on its original R for the real seal.
+        self.close_request_admission();
         let ingress = self.resources.port.ingress();
         ingress.seal_source_admission();
         // A buffered open summary remains a real input obligation. It must
@@ -242,7 +252,7 @@ impl TaskHostRecord {
                 return Ok(progress);
             }
             if open
-                .deliver_next(self.core_generation)
+                .deliver_next(self.resources.causal.protocol_generation())
                 .map_err(TaskHostError::OpenSummary)?
                 .is_some()
             {
@@ -264,26 +274,14 @@ impl TaskHostRecord {
             if self.normal_source_detached[index] {
                 continue;
             }
-            for holder in ingress
-                .take_unused_pair(route)
-                .map_err(|error| TaskHostError::Causal(error.into()))?
-                .into_iter()
-                .flatten()
-            {
-                holder.exit();
-                progress = true;
-            }
+            progress |= self.resources.causal.observe_closed_source_pair(route)?;
             for position in ingress
                 .pair_inventory(route)
                 .map_err(|error| TaskHostError::Causal(error.into()))?
             {
-                let phase = position.custody.phase();
-                if !position.custody.try_retire().map_err(|error| {
-                    TaskHostError::CompletionAction(CausalInputError::Role(error))
-                })? {
+                if position.custody.phase() != ExitRolePhase::Retired {
                     return Ok(progress);
                 }
-                progress |= phase != ExitRolePhase::Retired;
             }
             for position in ingress
                 .pair_inventory(route)

@@ -131,12 +131,9 @@ impl ContextHostRecord {
             Err(DriverError::ActorNotRetired) => return Ok(false),
             Err(error) => return Err(ContextHostError::Driver(error)),
         };
-        let control = match self.resources.owner_control.detachment_source() {
-            Ok(role) => role,
-            Err(DriverError::ActorNotRetired) => return Ok(false),
-            Err(error) => return Err(ContextHostError::Driver(error)),
-        };
-        let mut sources: Vec<_> = internal.into_iter().chain(control).collect();
+        // The original process-funded owner fence remains admissible until
+        // Root consumes ExecutionRetired. It is not an execution-scope source.
+        let mut sources: Vec<_> = internal.into_iter().collect();
         let mut owners: Vec<_> = self
             .resources
             .roles
@@ -153,7 +150,6 @@ impl ContextHostRecord {
             Err(error) => return Err(ContextHostError::Driver(error)),
         }
         self.resources.internal.execution_detached();
-        self.resources.owner_control.execution_detached();
         self.ledger
             .remove_scope(scope.id())
             .map_err(ContextHostError::Runtime)?;
@@ -521,6 +517,12 @@ impl ContextHostRecord {
         // The actual Root effect, not a local phase guess, authorizes this
         // remaining parent's own body/capture exit.
         if !self.resources.teardown.parent_retire_authorized {
+            return Ok(false);
+        }
+        // Retire the original owner input and its real effect batch before
+        // declaring the process admission author's body/capture exits. This
+        // source never becomes Work retained for the cold replay horizon.
+        if !self.retire_owner_control()? {
             return Ok(false);
         }
         if !self.resources.teardown.parent_exit_observed {

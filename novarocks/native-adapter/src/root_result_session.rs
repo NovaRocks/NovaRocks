@@ -854,6 +854,43 @@ impl NativeRootResultSession {
         join_root_exit_progress(pool, self.shared.authority.input_exit_progress())
     }
     #[cfg(test)]
+    pub(crate) fn assert_scalar_origin_handoff_at_cleanup(
+        &self,
+    ) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::FailureProjection;
+        let state = self
+            .shared
+            .state
+            .try_lock()
+            .expect("the actual producer releases its state before cleanup callbacks");
+        assert!(
+            state.cleanup_started,
+            "the original pool cleanup has started"
+        );
+        let failed = state
+            .failed
+            .as_ref()
+            .expect("the original scalar failure remains observable at cleanup");
+        assert_eq!(failed.phase, FailureSourcePhase::Transferred);
+        assert!(
+            failed.live_source.is_none(),
+            "the producer handed off its unique E before releasing its local input"
+        );
+        let fact = failed
+            .observation
+            .as_ref()
+            .expect("the original handoff published its neutral failure observation")
+            .fact();
+        assert_eq!(fact, RootSessionFailure::ScalarCardinality.failure_fact());
+        drop(state);
+        assert_eq!(
+            self.producer_exit_progress(),
+            RootWorkExitProgress::Pending,
+            "the actual producer has not exited at its own cleanup gate"
+        );
+        fact
+    }
+    #[cfg(test)]
     pub(crate) fn assert_scalar_origin_stop_reentry(&self, origin: &ExecutionFailure) {
         use novarocks_execution_contract::failure::FailureProjection;
         // Source projection and error-chain inspection also stay outside the
@@ -2568,9 +2605,9 @@ pub(crate) mod terminal_observation_tests {
     }
 
     #[test]
-    fn root_admission_and_finish_return_the_original_known_producer_failure() {
+    fn root_refusal_observes_stop_until_original_failure_reaches_task_owner() {
         use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
-        let fixture = Fixture::new(true);
+        let (fixture, task, _) = actual_task_fixture_with_gate(true);
         fixture.submit();
         fixture.session.shared.channel.note_rows(u64::MAX).unwrap();
         let original = fixture
@@ -2594,13 +2631,60 @@ pub(crate) mod terminal_observation_tests {
             .finish_input()
             .expect_err("original refusal at finishing");
         for error in [admission, finish] {
-            assert_eq!(error.failure_fact(), expected);
-            let retained = crate::backend_test_support::find_source::<ExecutionFailure>(&error)
-                .expect("actual retained source");
+            assert_eq!(
+                error.failure_fact().evidence(),
+                FailureEvidence::StopObservation
+            );
+            assert!(matches!(
+                crate::backend_test_support::find_source::<RootSessionFailure>(&error),
+                Some(RootSessionFailure::ProducerClosed)
+            ));
+        }
+        assert!(task.status().accepted().is_none());
+        assert_eq!(
+            fixture.session.producer_state(),
+            RootProducerState::AwaitTerminalControl
+        );
+        {
+            let state = fixture.session.state();
+            let failure = state.failed.as_ref().expect("same original failure record");
+            assert_eq!(failure.phase, FailureSourcePhase::Pending);
+            assert!(failure.observation.is_none());
+            let retained = failure
+                .live_source
+                .as_deref()
+                .expect("original source awaits its producer");
             assert!(std::ptr::eq(retained.cause(), original.cause()));
         }
+        // Release the original producer; its physical action transfers E to
+        // the same Task owner. Admission never manufactures that handoff.
         fixture.release();
+        let until = Instant::now() + WAIT;
+        let accepted = loop {
+            if let Some(accepted) = task.status().accepted() {
+                break accepted;
+            }
+            assert!(
+                Instant::now() < until,
+                "original Root failure was not accepted by its Task"
+            );
+            std::thread::yield_now();
+        };
+        let retained = accepted
+            .originating_failure()
+            .expect("same original accepted source");
+        assert_eq!(retained.failure_fact(), expected);
+        assert!(std::ptr::eq(retained.cause(), original.cause()));
         fixture.wait_terminal("aborted");
+        assert!(matches!(
+            fixture.session.producer_state(),
+            RootProducerState::Failed(observation) if observation.fact() == expected
+        ));
+        let state = fixture.session.state();
+        let failure = state.failed.as_ref().expect("same neutral failure record");
+        assert_eq!(failure.phase, FailureSourcePhase::Transferred);
+        assert!(failure.live_source.is_none());
+        assert_eq!(failure.observation.as_ref().unwrap().fact(), expected);
     }
 
     #[test]

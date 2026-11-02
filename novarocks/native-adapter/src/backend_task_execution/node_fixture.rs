@@ -271,7 +271,11 @@ impl NativeNodeFixture {
                 drop(original);
                 panic!("the actual selected frame was not accepted")
             });
+            // `required` names mandatory coverage, not an exclusive feed:
+            // CatchUp may include other Tasks in this same Context. Deliver
+            // every selected frame, but match this exact requested identity.
             if let Some(status) = status
+                && status.identity() == task
                 && accepted(&status)
             {
                 return status;
@@ -618,6 +622,18 @@ impl NativeNodePreparation {
         contents: ContextContents,
         tasks: &[TaskIdentity],
     ) -> Vec<Self> {
+        Self::with_context_each(context, factory, contents, tasks, |_, _| {})
+    }
+    /// Each Task enters its own actual preparation callback. The observer
+    /// borrows that Task's original writer while its unique gate is held;
+    /// then that callback may return before the next same-scope body runs.
+    pub fn with_context_each(
+        context: QueryContextRef,
+        factory: Arc<dyn QueryContextHostFactory>,
+        contents: ContextContents,
+        tasks: &[TaskIdentity],
+        mut observe: impl FnMut(usize, &Self),
+    ) -> Vec<Self> {
         assert!(!tasks.is_empty());
         let gates: BTreeMap<_, _> = tasks
             .iter()
@@ -638,7 +654,7 @@ impl NativeNodePreparation {
         ));
         node.establish_with(context, contents);
         let mut originals = Vec::new();
-        for &task in tasks {
+        for (ordinal, &task) in tasks.iter().enumerate() {
             let descriptor = TaskDescriptor::try_new(
                 task,
                 UniqueId::new(
@@ -701,6 +717,16 @@ impl NativeNodePreparation {
                 context,
                 writer,
             });
+            let original = originals.last().unwrap();
+            observe(ordinal, original);
+            if ordinal + 1 < tasks.len() {
+                // Preparation is serial within this original Scope even
+                // when multiple physical workers exist. Release only this
+                // entry's gate; the next entry keeps its own fresh gate.
+                let mut state = original.gate.state.lock().unwrap();
+                state.2 = true;
+                original.gate.changed.notify_all();
+            }
         }
         originals
     }

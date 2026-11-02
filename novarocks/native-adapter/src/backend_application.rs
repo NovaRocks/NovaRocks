@@ -2202,25 +2202,81 @@ mod tests {
         let carrier = protocol::FrozenFragment {
             package: vec![0; 65].into(),
         };
-        let error = crate::backend_task_execution::tests::node_fixture::await_original(
-            services.task_execution_ingress.apply_task_operations(
-                protocol::ApplyTaskOperationsRequest {
-                    operations: vec![protocol::TaskOperation {
-                        envelope: Some(protocol::TaskOperationEnvelope {
-                            operation_id: Some(encode_task_operation_id(TaskOperationId::new_v7())),
-                            max_wait_millis: 5_000,
-                        }),
-                        operation: Some(protocol::task_operation::Operation::CreateTask(
-                            protocol::CreateTaskRequest {
-                                frozen_fragment: carrier.encode_to_vec().into(),
-                                creation_metadata: metadata.encode_to_vec().into(),
-                            },
-                        )),
-                    }],
-                },
-            ),
-        )
-        .expect_err("the composed ingress gates the package carrier");
+        // Exercise the composed decoder under an actual Native ingress permit
+        // and its original arrival deadline, as the production handler does.
+        use tower::ServiceExt;
+        let raw = protocol::ApplyTaskOperationsRequest {
+            operations: vec![protocol::TaskOperation {
+                envelope: Some(protocol::TaskOperationEnvelope {
+                    operation_id: Some(encode_task_operation_id(TaskOperationId::new_v7())),
+                    max_wait_millis: 5_000,
+                }),
+                operation: Some(protocol::task_operation::Operation::CreateTask(
+                    protocol::CreateTaskRequest {
+                        frozen_fragment: carrier.encode_to_vec().into(),
+                        creation_metadata: metadata.encode_to_vec().into(),
+                    },
+                )),
+            }],
+        };
+        let result = Arc::new(std::sync::Mutex::new(None));
+        let observed = result.clone();
+        let applier = services.task_execution_ingress.clone();
+        let dispatch = tower::service_fn(move |request: axum::http::Request<axum::body::Body>| {
+            let observed = observed.clone();
+            let applier = applier.clone();
+            let raw = raw.clone();
+            async move {
+                let ownership = request
+                    .extensions()
+                    .get::<Arc<crate::native_ingress::NativeIngressOwnership>>()
+                    .expect("the original Native gate supplied ownership")
+                    .clone();
+                let timing = crate::task_protocol::TaskIngressTiming::new(
+                    ownership.arrival(),
+                    ownership.deadline(),
+                );
+                let result = applier
+                    .apply_task_operations_at(raw, timing, ownership)
+                    .await;
+                *observed.lock().unwrap() = Some(result);
+                Ok::<_, std::convert::Infallible>(axum::http::Response::new(
+                    tonic::body::empty_body(),
+                ))
+            }
+        });
+        let ingress = crate::native_ingress::NativeIngressService::new(
+            dispatch,
+            crate::native_server::NativeIngressConfig::default(),
+            "compiled-package-test",
+            false,
+            novarocks_proto_codec::native_rpc::NativeEndpointDomain::BackendData,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the Native gate uses its actual Tokio deadline");
+        let response = runtime
+            .block_on(
+                ingress.oneshot(
+                    axum::http::Request::builder()
+                        .uri(
+                            novarocks_proto_codec::native_rpc::NativeRpcMethod::ApplyTaskOperations
+                                .contract()
+                                .path,
+                        )
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .expect("the original ingress dispatch returns");
+        drop(response);
+        let error = result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the composed ingress was called")
+            .expect_err("the composed ingress gates the package carrier");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(
             error

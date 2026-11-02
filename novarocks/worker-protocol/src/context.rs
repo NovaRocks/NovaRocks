@@ -246,6 +246,12 @@ pub enum ContextCommand {
         task: TaskIdentity,
         acknowledged: Option<DomainVersion>,
     },
+    /// Register the original read R while its Task's causal admission is
+    /// closed and the original neutral read seal has not yet been published.
+    AwaitTaskReadSeal {
+        task: TaskIdentity,
+        command: TaskReadCommand,
+    },
     Subscribe {
         generation: u64,
         position: CoveredSubscriptionRequest,
@@ -277,8 +283,26 @@ impl ContextCommand {
             | Self::Cancel { task, .. }
             | Self::UpdateTask { task, .. }
             | Self::GetFinalInfo { task }
-            | Self::GetDynamicFilters { task, .. } => Some(*task),
+            | Self::GetDynamicFilters { task, .. }
+            | Self::AwaitTaskReadSeal { task, .. } => Some(*task),
             _ => None,
+        }
+    }
+}
+/// A neutral read continuation for an already registered original R. It
+/// carries no request admission, Task borrowing or read-seal authority.
+#[derive(Clone, Copy, Debug)]
+pub enum TaskReadCommand {
+    FinalInfo,
+    DynamicFilters { acknowledged: Option<DomainVersion> },
+}
+impl TaskReadCommand {
+    pub fn into_command(self, task: TaskIdentity) -> ContextCommand {
+        match self {
+            Self::FinalInfo => ContextCommand::GetFinalInfo { task },
+            Self::DynamicFilters { acknowledged } => {
+                ContextCommand::GetDynamicFilters { task, acknowledged }
+            }
         }
     }
 }
@@ -299,6 +323,12 @@ pub enum ContextInput {
     /// Transport-only neutral body. `handle_request` binds its original token;
     /// the lifecycle-only `handle` entry rejects this wrapper.
     Request(ContextCommand),
+    /// The host's original paid self-source resumes this same waiting R only
+    /// after observing its Task's actual neutral read seal.
+    ResumeTaskRead {
+        request: InputId,
+        task: TaskIdentity,
+    },
     /// A channel-locked End ACK already belongs to this original R. Its
     /// reply correlation is supplied by the actor, not by another RPC.
     RootEndAcknowledged {
@@ -1244,6 +1274,38 @@ impl LiveContextCore {
                 capacity,
                 &mut step,
             )?,
+            ContextInput::ResumeTaskRead { request, task } => {
+                if let Some((original, command)) = self.replies.take_task_read(request, task) {
+                    if self
+                        .retirement_origin
+                        .is_some_and(|origin| origin.has_expired(now))
+                    {
+                        self.complete_request(
+                            request,
+                            Arc::new(ContextReplyBody::Verdict(RequestResult::Outcome(
+                                OperationOutcome::Gone,
+                            ))),
+                            &mut step,
+                        );
+                    } else if now.has_reached(original.deadline) {
+                        self.complete_request(
+                            request,
+                            Arc::new(ContextReplyBody::Verdict(
+                                RequestResult::TimeoutWhileAccepted,
+                            )),
+                            &mut step,
+                        );
+                    } else {
+                        self.handle_command(
+                            now,
+                            request,
+                            command.into_command(task),
+                            capacity,
+                            &mut step,
+                        )?;
+                    }
+                }
+            }
             ContextInput::RootEndAcknowledged { task } => {
                 let original = root_ack_request.ok_or(CoreError::WrongIdentity)?;
                 let body = self.root_end_acknowledged(task, &mut step)?;
@@ -1979,6 +2041,19 @@ impl LiveContextCore {
         capacity: &mut impl AdmissionPort,
         step: &mut ContextStep,
     ) -> Result<(), CoreError> {
+        // Waiting is not a business read, including after Task/Context
+        // compaction. Only a validated continuation may select that read.
+        if let ContextCommand::AwaitTaskReadSeal { task, command } = command {
+            if let Some(outcome) = answers::AnswerView::from_live(self).task_read_refusal(task)? {
+                step.reply(
+                    request,
+                    ContextReplyBody::Verdict(RequestResult::Outcome(outcome)),
+                );
+            } else {
+                self.replies.await_task_read(request, command)?;
+            }
+            return Ok(());
+        }
         if self.state == QueryContextState::TerminalRetained {
             if let ContextCommand::Cancel { task, .. }
             | ContextCommand::GetFinalInfo { task }
@@ -2002,6 +2077,9 @@ impl LiveContextCore {
             return Ok(());
         }
         match command {
+            ContextCommand::AwaitTaskReadSeal { .. } => {
+                unreachable!("registered before read dispatch")
+            }
             ContextCommand::Cancel { task, reason } => {
                 if self.task_request_cut(request, task, step)? {
                     let record = self.tasks.get_mut(&task).expect("cut located task");
@@ -2749,10 +2827,13 @@ impl LiveContextCore {
                 t.state = state;
                 t.bump_version();
                 Self::publish(t, step)?;
-                step.effects.push(ContextEffect::StopTask {
-                    task,
-                    generation: self.generation,
-                });
+                if !t.stop_effect_issued {
+                    t.stop_effect_issued = true;
+                    step.effects.push(ContextEffect::StopTask {
+                        task,
+                        generation: self.generation,
+                    });
+                }
             }
         }
         Ok(())

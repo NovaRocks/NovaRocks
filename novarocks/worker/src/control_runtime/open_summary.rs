@@ -19,15 +19,16 @@
 //! only ask this custodian to inspect the existing proposal buffer; they never
 //! admit another Work, source position, cut, or runtime input role.
 
+#[cfg(test)]
+use super::source_positions::ReapedPosition;
 use super::{
     actors::{ContextMessage, WorkerActor, WorkerMessage},
     failure::ScopePublicationsDrained,
     lifecycle_read::TaskLifetime,
-    source_positions::ReapedPosition,
 };
 use crate::task_proposal_ingress::{IngressError, TaskProposalIngress};
 use novarocks_control_runtime::{
-    driver::{ActorRuntime, DriverError, InputPhase, InputRole},
+    driver::{ActorRegistration, ActorRuntime, DriverError, InputPhase, InputRole},
     transaction::RuntimeError,
 };
 use novarocks_control_runtime_core::{
@@ -61,6 +62,7 @@ pub(crate) enum OpenSummaryError {
     Busy,
     NotDelivered,
     InputObservationMissing,
+    #[cfg(test)]
     UnknownSource,
     WrongLifetime,
     WorkStillLive,
@@ -93,10 +95,19 @@ pub(crate) struct OpenSummaryFailedProgress {
     pub rejected: Option<WorkerMessage>,
 }
 
+pub(crate) struct OpenSummaryInputProgress {
+    pub progressed: bool,
+    pub consumed: bool,
+    pub input_retired: bool,
+    pub retired_authors: Vec<ScopedWorkRef>,
+}
+
 #[must_use = "The original open-summary input closes only after actual Task and source retirement"]
 pub(crate) struct TaskOpenSummaryInbox {
     runtime: ActorRuntime<WorkerActor>,
     actor: ActorId,
+    source: ActorId,
+    registration: ActorRegistration,
     task: TaskIdentity,
     work: ScopedWorkRef,
     ingress: Arc<TaskProposalIngress>,
@@ -110,7 +121,8 @@ impl TaskOpenSummaryInbox {
     /// reserves nothing and creates no alternate protocol generation state.
     pub(crate) fn from_admitted(
         runtime: ActorRuntime<WorkerActor>,
-        actor: ActorId,
+        registration: ActorRegistration,
+        source: ActorId,
         task: TaskIdentity,
         work: ScopedWorkRef,
         ingress: Arc<TaskProposalIngress>,
@@ -119,7 +131,9 @@ impl TaskOpenSummaryInbox {
         match input.in_flight() {
             Ok(None) => Ok(Self {
                 runtime,
-                actor,
+                actor: registration.actor(),
+                source,
+                registration,
                 task,
                 work,
                 ingress,
@@ -196,16 +210,89 @@ impl TaskOpenSummaryInbox {
             .ok_or(OpenSummaryError::InputObservationMissing)?
             .phase;
         if phase == InputPhase::Committed {
+            for source in delivered.sources.into_iter().flatten() {
+                self.ingress.observe_source_core_input(
+                    source,
+                    &self.runtime,
+                    &self.registration,
+                    self.source,
+                    input,
+                )?;
+            }
             self.ingress.open_summary_consumed()?;
             delivered.consumption = Consumption::Consumed;
         }
         Ok(delivered.consumption)
+    }
+    /// Advance the original input independently of execution retirement. The
+    /// actual commit releases the causal predecessor gate; actual effect and
+    /// reservation exit separately permit this same input header to retire.
+    pub(crate) fn advance_input(&mut self) -> Result<OpenSummaryInputProgress, OpenSummaryError> {
+        let before = self
+            .delivered
+            .as_ref()
+            .ok_or(OpenSummaryError::NotDelivered)?
+            .consumption;
+        let consumed = self.observe_core()? == Consumption::Consumed;
+        let mut progress = OpenSummaryInputProgress {
+            progressed: self.delivered.as_ref().unwrap().consumption != before,
+            consumed,
+            input_retired: self.input.in_flight()?.is_none(),
+            retired_authors: Vec::new(),
+        };
+        if !consumed {
+            return Ok(progress);
+        }
+        if let Some(input) = self.input.in_flight()? {
+            const AUTHOR_BOUND: usize = 2 * super::actors::ContextActor::MAX_STEP_ACTIONS + 2;
+            let authors = self
+                .runtime
+                .input_header_authors(self.actor, input, AUTHOR_BOUND)?;
+            match self.runtime.retire_input(self.actor, input) {
+                Ok(()) => {
+                    progress.progressed = true;
+                    progress.input_retired = true;
+                    progress.retired_authors = authors;
+                }
+                Err(
+                    DriverError::InputStillQueued
+                    | DriverError::EffectsRemain
+                    | DriverError::ReservationsRemain,
+                ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(progress)
+    }
+    /// A partial delivery never closes its real proposal segment. The same
+    /// pair retains its source holders and candidate qualification until a
+    /// real cut; only this input's effects and header have actually exited.
+    pub(crate) fn finish_delivery(&mut self) -> Result<(), OpenSummaryError> {
+        self.check_retirement()?;
+        self.ingress.finish_open_delivery()?;
+        self.delivered = None;
+        Ok(())
+    }
+    pub(crate) fn finish_failed_delivery(
+        &mut self,
+        stage: &ScopePublicationsDrained<'_>,
+    ) -> Result<(), OpenSummaryError> {
+        stage.validate(&self.runtime, self.actor)?;
+        self.check_retirement()?;
+        self.ingress.finish_failed_open_delivery()?;
+        self.delivered = None;
+        Ok(())
     }
     #[cfg(test)]
     pub(crate) fn source_input(
         &self,
         source: SourceId,
     ) -> Result<Option<InputId>, OpenSummaryError> {
+        if let Ok(original) = self.ingress.source_inventory(source)
+            && let Some(input) = original.custody.core_input()
+        {
+            return Ok(input);
+        }
         Ok(self.source_delivery(source)?.input)
     }
     /// Idle notification storage alone proves neither Task nor Source exit.
@@ -215,12 +302,20 @@ impl TaskOpenSummaryInbox {
     pub(crate) const fn is_closed(&self) -> bool {
         self.closed
     }
+    #[cfg(test)]
     pub(crate) fn source_core_consumption(
         &self,
         source: SourceId,
     ) -> Result<Consumption, OpenSummaryError> {
+        if let Ok(original) = self.ingress.source_inventory(source) {
+            let receipt = original.custody.core_consumption();
+            if receipt != Consumption::Pending {
+                return Ok(receipt);
+            }
+        }
         Ok(self.source_delivery(source)?.consumption)
     }
+    #[cfg(test)]
     fn source_delivery(&self, source: SourceId) -> Result<&Delivered, OpenSummaryError> {
         let delivered = self
             .delivered
@@ -248,6 +343,12 @@ impl TaskOpenSummaryInbox {
             let mut sources = [None, None];
             for (target, source) in sources.iter_mut().zip(original.summary.candidate_sources()) {
                 *target = Some(source);
+                self.ingress.observe_source_untransferred(
+                    source,
+                    drained,
+                    &self.runtime,
+                    &self.registration,
+                )?;
             }
             self.delivered = Some(Delivered {
                 input: None,
@@ -284,6 +385,25 @@ impl TaskOpenSummaryInbox {
             }
             if phase != InputPhase::AbandonedByOwnerFailure {
                 return Ok(Consumption::Pending);
+            }
+            for source in delivered.sources.into_iter().flatten() {
+                self.ingress.observe_source_core_input(
+                    source,
+                    &self.runtime,
+                    &self.registration,
+                    self.source,
+                    input,
+                )?;
+            }
+        }
+        if delivered.input.is_none() {
+            for source in delivered.sources.into_iter().flatten() {
+                self.ingress.observe_source_untransferred(
+                    source,
+                    drained,
+                    &self.runtime,
+                    &self.registration,
+                )?;
             }
         }
         self.ingress.fail();
@@ -378,6 +498,7 @@ impl TaskOpenSummaryInbox {
         self.delivered = None;
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn retire_after_reap(
         &mut self,
         reaped: [ReapedPosition; 2],
@@ -626,6 +747,317 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
+    #[test]
+    fn partials_keep_original_candidate_slots_and_a_live_source_receipt_follows_the_real_cut() {
+        use crate::control_runtime::actors::tests::{admitted_source_slot, dispose_retired_pair};
+        use crate::control_runtime::causal::CausalSourceRetirement;
+        use crate::task_proposal_ingress::CutSourceAdmission;
+        use novarocks_control_runtime_core::{
+            capacity::{ReservationResources, ResourceVector},
+            owned_storage::OwnedSlotNeed,
+            scope::WorkKind,
+        };
+        use novarocks_execution_contract::AbortCause;
+        use novarocks_worker_protocol::context::{ContextEffect, TaskCloseIntent};
+
+        fn commit(
+            f: &mut Fixture,
+            open: &mut TaskOpenSummaryInbox,
+        ) -> Vec<super::super::actors::WorkerAction> {
+            let input = open.deliver_next(generation()).unwrap().unwrap();
+            f.runtime.poll_one(Tick(2)).unwrap();
+            assert_eq!(open.observe_core().unwrap(), Consumption::Consumed);
+            let effects = f.drain(input);
+            open.finish_delivery().unwrap();
+            effects
+        }
+        struct Notice;
+        impl crate::task_port::TaskPendingNotice for Notice {
+            fn pending(&self) {}
+        }
+
+        let mut f = Fixture::new();
+        let (mut resources, mut open) = admitted(&mut f);
+        let ingress = resources.port.ingress().clone();
+        let task = resources.port.identity();
+        assert!(
+            ingress
+                .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
+                .error
+                .is_none()
+        );
+        commit(&mut f, &mut open);
+        let addresses = ingress
+            .pair_inventory(PairRoute::ConsumingOpen)
+            .unwrap()
+            .map(|p| p.key.address());
+        let roles = f.runtime.role_inventory(actor(), None, 256).unwrap().len();
+        // Multiple notification/diagnostic deliveries still belong to the
+        // original peer segment and cannot mint new first candidates.
+        for _ in 0..4 {
+            assert!(
+                ingress
+                    .submit(TaskConclusionProposal::Canceled(
+                        CancelReason::UpstreamNoLongerNeeded
+                    ))
+                    .error
+                    .is_none()
+            );
+            commit(&mut f, &mut open);
+        }
+        assert_eq!(
+            f.runtime.role_inventory(actor(), None, 256).unwrap().len(),
+            roles
+        );
+        assert_eq!(
+            ingress
+                .pair_inventory(PairRoute::ConsumingOpen)
+                .unwrap()
+                .map(|p| p.key.address()),
+            addresses
+        );
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let origin = ExecutionFailure::from_domain(Source(drops.clone()));
+        let alias = origin.clone();
+        assert!(
+            ingress
+                .submit(TaskConclusionProposal::Failed {
+                    cause: origin,
+                    phase: TaskFailurePhase::Execution
+                })
+                .error
+                .is_none()
+        );
+        let source = ingress
+            .pair_inventory(PairRoute::ConsumingOpen)
+            .unwrap()
+            .into_iter()
+            .find_map(|p| p.source)
+            .unwrap();
+        let origin_input = open.deliver_next(generation()).unwrap().unwrap();
+        f.runtime.poll_one(Tick(2)).unwrap();
+        assert_eq!(open.observe_core().unwrap(), Consumption::Consumed);
+        let effects = f.drain(origin_input);
+        assert!(effects.iter().any(|effect| matches!(effect,
+            super::super::actors::WorkerAction::Context(ContextEffect::PublishConclusion { source: Some(id), .. }) if *id == source)));
+        open.finish_delivery().unwrap();
+        assert!(
+            !ingress
+                .source_inventory(source)
+                .unwrap()
+                .custody
+                .actual_exit_ready()
+                .unwrap()
+        );
+        // The retained accepted candidate does not block later diagnostics or
+        // reset qualification: each later rich occurrence is a definite loser.
+        for _ in 0..4 {
+            let late = ingress.submit(TaskConclusionProposal::Failed {
+                cause: ExecutionFailure::from_domain(Source(Arc::new(AtomicUsize::new(0)))),
+                phase: TaskFailurePhase::Execution,
+            });
+            assert!(late.transferred && late.error.is_none() && late.discarded.is_some());
+            drop(late.discarded);
+            commit(&mut f, &mut open);
+            assert_eq!(open.source_input(source).unwrap(), Some(origin_input));
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(
+            f.runtime.role_inventory(actor(), None, 256).unwrap().len(),
+            roles
+        );
+
+        // The real Context decision schedules a close generation. This
+        // original finite close author pays for its cut and input positions.
+        let fenced = f.send(ContextInput::OwnerFenced, None, InputClass::Lifecycle, 2);
+        f.runtime.poll_one(Tick(2)).unwrap();
+        let fenced_effects = f.drain(fenced);
+        let selected_close = |effects: &[super::super::actors::WorkerAction]| {
+            effects.iter().find_map(|effect| match effect {
+                super::super::actors::WorkerAction::Context(ContextEffect::ApplyTaskClose {
+                    task: original,
+                    generation,
+                    intent,
+                }) if *original == task => Some((*generation, *intent)),
+                _ => None,
+            })
+        };
+        let (close_generation, close_intent) = match selected_close(&fenced_effects) {
+            Some(original) => original,
+            None => {
+                assert_eq!(
+                    fenced_effects
+                        .iter()
+                        .filter(|effect| matches!(
+                            effect,
+                            super::super::actors::WorkerAction::Context(
+                                ContextEffect::WakeInternal
+                            )
+                        ))
+                        .count(),
+                    1,
+                    "the Actor retains the actual close cursor behind one prepaid wake"
+                );
+                let next = f.send(ContextInput::NextInternal, None, InputClass::Lifecycle, 2);
+                f.runtime.poll_one(Tick(2)).unwrap();
+                selected_close(&f.drain(next))
+                    .expect("the real remaining close slice selects this original Task")
+            }
+        };
+        assert_eq!(
+            close_intent,
+            TaskCloseIntent::Abort(AbortCause::QueryFailed)
+        );
+        // It seals while the preceding partial runtime input is still queued.
+        let (mut author, mut capacity) = f
+            .scope
+            .reserve_child_next(
+                generation(),
+                resources.active.id(),
+                ReservationResources::new(
+                    ResourceVector::default(),
+                    OwnedSlotNeed {
+                        work_headers: 1,
+                        inputs: 2,
+                        batches: 2,
+                        effects: 2 * super::super::actors::ContextActor::MAX_STEP_ACTIONS,
+                        replies: 1,
+                        ..OwnedSlotNeed::default()
+                    },
+                ),
+                WorkKind::Cleanup,
+            )
+            .unwrap()
+            .bind(WorkKind::Cleanup)
+            .unwrap();
+        author.start().unwrap();
+        let admission = CutSourceAdmission::Fresh(std::array::from_fn(|_| {
+            admitted_source_slot(&f.scope, resources.active.id())
+        }));
+        let (cut, sender) = resources
+            .causal
+            .admit_close(
+                close_generation,
+                close_intent,
+                &author,
+                0,
+                Arc::new(Notice),
+                admission,
+            )
+            .unwrap();
+        assert!(
+            ingress
+                .submit(TaskConclusionProposal::Canceled(
+                    CancelReason::UpstreamNoLongerNeeded
+                ))
+                .error
+                .is_none()
+        );
+        let partial = open.deliver_next(generation()).unwrap().unwrap();
+        sender.send_close(close_generation, close_intent).unwrap();
+        assert!(
+            resources.causal.deliver_next().unwrap().is_none(),
+            "a real cut cannot pass an unconsumed partial input"
+        );
+        assert_eq!(
+            ingress
+                .pair_inventory(PairRoute::Cut(cut))
+                .unwrap()
+                .map(|p| p.key.address()),
+            addresses
+        );
+        f.runtime.poll_one(Tick(2)).unwrap();
+        assert_eq!(open.observe_core().unwrap(), Consumption::Consumed);
+        let delivery = resources.causal.deliver_next().unwrap().unwrap();
+        assert!(
+            delivery.prefix.is_none(),
+            "the real cut never replays earlier partial candidates"
+        );
+        assert_eq!(
+            resources
+                .causal
+                .source_core_consumption(cut, source)
+                .unwrap(),
+            Consumption::Consumed
+        );
+        assert_eq!(open.source_input(source).unwrap(), Some(origin_input));
+        f.drain(partial);
+        open.finish_delivery().unwrap();
+        f.runtime.poll_one(Tick(2)).unwrap();
+        assert_eq!(
+            resources.causal.observe_core(cut).unwrap(),
+            Consumption::Consumed
+        );
+        f.drain(delivery.event);
+        assert_eq!(resources.causal.protocol_generation(), close_generation);
+        // The next original partial uses the actual applied Task generation,
+        // even though its runtime scope/failure-consumer epoch is unchanged.
+        assert!(
+            ingress
+                .submit(TaskConclusionProposal::Canceled(
+                    CancelReason::UpstreamNoLongerNeeded
+                ))
+                .error
+                .is_none()
+        );
+        let after_close = open
+            .deliver_next(resources.causal.protocol_generation())
+            .unwrap()
+            .unwrap();
+        f.runtime.poll_one(Tick(2)).unwrap();
+        assert_eq!(open.observe_core().unwrap(), Consumption::Consumed);
+        f.drain(after_close);
+        open.finish_delivery().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        author.body_exited().unwrap();
+        author.captures_exited().unwrap();
+        ingress.observe_cut_exit(cut, true, true).unwrap();
+        assert!(
+            resources
+                .causal
+                .retire_after_exit(cut, CausalSourceRetirement::Unclaimed)
+                .is_err()
+        );
+        let retained = ingress.take_source(source).unwrap();
+        drop(retained);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "input/cut consumption cannot refund an actual source alias"
+        );
+        drop(alias);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let mut retired = None;
+        for _ in 0..32 {
+            let turn = resources
+                .causal
+                .advance_source_pair_retirement(cut, &f.scope)
+                .unwrap();
+            if let Some(reaped) = turn.reaped {
+                retired = Some(
+                    resources
+                        .causal
+                        .retire_after_exit(cut, CausalSourceRetirement::Reaped(reaped))
+                        .unwrap(),
+                );
+                break;
+            }
+        }
+        dispose_retired_pair(
+            &f,
+            &ingress,
+            retired.expect("the same source reports and headers actually retired"),
+        );
+        f.ledger.reap_scope_ready(f.scope.id(), 256).unwrap();
+        capacity
+            .release_quota(&capacity.resources().unwrap().quota)
+            .unwrap();
+        capacity.finish().unwrap();
+        drop(author);
+        finish(f, resources, open);
+    }
+
     #[test]
     fn original_source_receipt_survives_input_retirement_and_alias_pins_the_same_pair_until_reap() {
         let mut f = Fixture::new();

@@ -72,7 +72,7 @@ pub(in crate::control_runtime) struct ContextInternal {
     pending: bool,
     // The same single input is borrowed by its physical-disposal owner until
     // that owner has saved the exact Core receipt. Wake hints cannot reap it.
-    task_retirement: Option<InputId>,
+    continuation: Option<InputId>,
     source_ended: bool,
     failed: bool,
     closed: bool,
@@ -88,7 +88,7 @@ impl ContextInternal {
     pub(super) fn detachment_source(
         &mut self,
     ) -> Result<Option<&mut InputRole<WorkerActor>>, DriverError> {
-        if self.pending || self.task_retirement.is_some() || self.failed || self.permit.is_some() {
+        if self.pending || self.continuation.is_some() || self.failed || self.permit.is_some() {
             return Err(DriverError::ActorNotRetired);
         }
         if self
@@ -181,7 +181,7 @@ impl ContextInternal {
         let original = self.binding()?;
         let role = self.role.as_ref().ok_or(DriverError::UnknownRole)?;
         if let Some(input) = role.in_flight()? {
-            if self.task_retirement == Some(input) {
+            if self.continuation == Some(input) {
                 return Ok(ContextInternalAdvance::Waiting(input));
             }
             match original
@@ -227,7 +227,7 @@ impl ContextInternal {
     /// The only remaining input is the builtin supervisor, independent of
     /// this original self-source. No producer can create another callback.
     pub(super) fn ready_for_failure_tail(&self, supervisor: InputId) -> Result<bool, DriverError> {
-        if !self.failed || !self.source_ended || self.pending || self.task_retirement.is_some() {
+        if !self.failed || !self.source_ended || self.pending || self.continuation.is_some() {
             return Ok(false);
         }
         let original = self.binding()?;
@@ -261,7 +261,7 @@ impl ContextInternal {
         task: novarocks_execution_contract::TaskIdentity,
         payload: PayloadId,
     ) -> Result<Option<InputId>, DriverError> {
-        self.try_submit_task_retirement(ContextInput::RejectedCreationRetired { task, payload })
+        self.try_submit_continuation(ContextInput::RejectedCreationRetired { task, payload })
     }
     /// Accepted custody is the original RetireTask's identity and close epoch,
     /// carried only after its actual disposal and all independent tails exit.
@@ -271,22 +271,31 @@ impl ContextInternal {
         payload: PayloadId,
         close_epoch: Generation,
     ) -> Result<Option<InputId>, DriverError> {
-        self.try_submit_task_retirement(ContextInput::TaskExecutionCustodyRetired {
+        self.try_submit_continuation(ContextInput::TaskExecutionCustodyRetired {
             task,
             payload,
             close_epoch,
         })
     }
-    /// Both facts borrow the original single self-source position, in order
+    /// A real read-seal transfer releases an already registered original R.
+    /// This uses the same self-source position, never another request author.
+    pub(super) fn try_submit_task_read_resume(
+        &mut self,
+        request: InputId,
+        task: novarocks_execution_contract::TaskIdentity,
+    ) -> Result<Option<InputId>, DriverError> {
+        self.try_submit_continuation(ContextInput::ResumeTaskRead { request, task })
+    }
+    /// These continuations borrow the original single self-source position, in order
     /// with an existing hint. Busy retains the caller's same disposal owner.
-    fn try_submit_task_retirement(
+    fn try_submit_continuation(
         &mut self,
         command: ContextInput,
     ) -> Result<Option<InputId>, DriverError> {
         if self.closed || self.failed {
             return Err(DriverError::Closed);
         }
-        if self.task_retirement.is_some() {
+        if self.continuation.is_some() {
             return Ok(None);
         }
         let original = self.binding()?;
@@ -312,18 +321,18 @@ impl ContextInternal {
                 command,
             }))
             .map_err(|(error, _neutral)| error)?;
-        self.task_retirement = Some(input);
+        self.continuation = Some(input);
         Ok(Some(input))
     }
     /// Save this same input's positive consumption before actually retiring
     /// its header. Failure abandonment remains distinct from Core consumption.
-    pub(super) fn finish_task_retirement(
+    pub(super) fn finish_continuation(
         &mut self,
         input: InputId,
     ) -> Result<Consumption, DriverError> {
         let original = self.binding()?;
         let role = self.role.as_ref().ok_or(DriverError::UnknownRole)?;
-        if self.task_retirement != Some(input) || role.in_flight()? != Some(input) {
+        if self.continuation != Some(input) || role.in_flight()? != Some(input) {
             return Err(DriverError::InputAuthorMismatch);
         }
         let receipt = match original
@@ -349,7 +358,7 @@ impl ContextInternal {
             ) => return Ok(Consumption::Pending),
             Err(error) => return Err(error),
         }
-        self.task_retirement = None;
+        self.continuation = None;
         Ok(receipt)
     }
     pub(super) fn authorize_removal(
@@ -403,7 +412,7 @@ impl ContextInternal {
         if self.closed {
             return Ok(true);
         }
-        if !self.source_ended || self.pending || self.task_retirement.is_some() {
+        if !self.source_ended || self.pending || self.continuation.is_some() {
             return Ok(false);
         }
         let original = self.binding()?;

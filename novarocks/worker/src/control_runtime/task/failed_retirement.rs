@@ -839,7 +839,6 @@ impl TaskHostRecord {
         stage: &ScopePublicationsDrained<'_>,
         step: &mut FailedTaskStep,
     ) -> Result<(), TaskHostError> {
-        let ingress = self.resources.port.ingress().clone();
         if let Some(open) = &mut self.resources.open_summary {
             if open.is_closed() {
                 return Ok(());
@@ -863,87 +862,16 @@ impl TaskHostRecord {
                 });
                 return Ok(());
             }
-            if turn.consumption.is_none() {
-                return Ok(());
-            }
-            for ordinal in 0..2 {
-                let key = Self::failed_source_key(&ingress, PairRoute::ConsumingOpen, ordinal)?;
-                if let Some(source) = self.resources.causal.take_failed_source(
-                    stage,
-                    PairRoute::ConsumingOpen,
-                    ordinal,
-                )? {
-                    step.action = Some(self.failed_action(Physical::Source {
-                        key,
-                        source: Box::new(ManuallyDrop::new(source)),
-                    }));
-                    step.progressed = true;
-                    return Ok(());
-                }
-            }
-            let positions = ingress
-                .pair_inventory(PairRoute::ConsumingOpen)
-                .map_err(|error| TaskHostError::Causal(error.into()))?;
-            step.progressed |= Self::advance_source_cleanups(positions)?;
-            for holder in ingress
-                .take_unused_pair(PairRoute::ConsumingOpen)
-                .map_err(|error| TaskHostError::Causal(error.into()))?
-                .into_iter()
-                .flatten()
+            // Clear only the original partial input. Its sources keep their
+            // saved exact receipts in the original pair and retire below in
+            // final inventory, after all actual holders and aliases exit.
+            if turn.input_retired
+                && turn
+                    .consumption
+                    .is_some_and(|receipt| receipt != Consumption::Pending)
             {
-                holder.exit();
-                step.progressed = true;
-            }
-            for position in ingress
-                .pair_inventory(PairRoute::ConsumingOpen)
-                .map_err(|error| TaskHostError::Causal(error.into()))?
-            {
-                if let Some(source) = position.source {
-                    let receipt = open
-                        .source_core_consumption(source)
-                        .map_err(TaskHostError::OpenSummary)?;
-                    step.progressed |= position
-                        .custody
-                        .observe_failed_consumers(
-                            stage,
-                            self.resources.causal.runtime(),
-                            self.actor,
-                            self.core_generation,
-                            receipt,
-                        )
-                        .map_err(|error| TaskHostError::Causal(CausalError::Role(error)))?;
-                } else {
-                    let before = position.custody.phase();
-                    position
-                        .custody
-                        .try_retire()
-                        .map_err(|error| TaskHostError::Causal(CausalError::Role(error)))?;
-                    step.progressed |= before != position.custody.phase();
-                }
-            }
-            let mut reaped_count = 0;
-            for position in ingress
-                .pair_inventory(PairRoute::ConsumingOpen)
-                .map_err(|error| TaskHostError::Causal(error.into()))?
-            {
-                if reaped_count == 0 && !position.custody.reusable() {
-                    reaped_count += position.custody.financial_scope().reap_ready(1)?;
-                }
-            }
-            step.progressed |= reaped_count != 0;
-            // Source exit, adopted cleanup and its independent report/header
-            // may advance while the old batch is still live. Moving this pair
-            // remains gated by the original input and saved Core receipt.
-            if !turn.input_retired || turn.consumption == Some(Consumption::Pending) {
-                return Ok(());
-            }
-            let [a, b] = ingress
-                .prepare_pair_reap(PairRoute::ConsumingOpen)
-                .map_err(|error| TaskHostError::Causal(error.into()))?
-                .map(|probe| probe.observe_reaped());
-            if let (Ok(a), Ok(b)) = (a, b) {
-                open.retire_after_reap([a, b])
-                    .map_err(|(error, _)| TaskHostError::OpenSummary(error))?;
+                open.finish_failed_delivery(stage)
+                    .map_err(TaskHostError::OpenSummary)?;
                 step.progressed = true;
             }
         }
@@ -1045,9 +973,21 @@ impl TaskHostRecord {
                 .pair_inventory(route)
                 .map_err(|error| TaskHostError::Causal(error.into()))?
             {
-                // With open summary drained no claimed source remains here.
-                // A Pending producer must retain its position until its real
-                // binder/alias exit; it cannot be refunded as an unused slot.
+                // A completed partial input can leave its accepted source in
+                // this original pair. Preserve that input's exact receipt;
+                // source/header exit remains independent of failed teardown.
+                if position.source.is_some() {
+                    step.progressed |= position
+                        .custody
+                        .observe_failed_consumers(
+                            stage,
+                            self.resources.causal.runtime(),
+                            self.actor,
+                            self.core_generation,
+                            position.custody.core_consumption(),
+                        )
+                        .map_err(|error| TaskHostError::Causal(CausalError::Role(error)))?;
+                }
                 let before = position.custody.phase();
                 if !position
                     .custody

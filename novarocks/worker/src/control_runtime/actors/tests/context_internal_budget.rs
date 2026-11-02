@@ -186,7 +186,7 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
     sender.bind_work(producer.reference());
     // A source-free original predecessor is legal and has no rich payload
     // whose consumption proof could be inferred from another prefix.
-    h.fixture.run(
+    let peer_effects = h.fixture.run(
         ContextInput::Proposal {
             task,
             proposal: Proposal {
@@ -199,6 +199,17 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
             },
         },
         None,
+    );
+    assert_eq!(
+        peer_effects
+            .iter()
+            .filter(|effect| matches!(
+                effect,
+                WorkerAction::Context(ContextEffect::StopTask { .. })
+            ))
+            .count(),
+        0,
+        "a buffered proposal is not its first actual adjudication"
     );
     let drops = Arc::new(AtomicUsize::new(0));
     for observation in [true, false] {
@@ -383,8 +394,59 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
     assert_eq!(disposed, 1);
     assert_eq!(retained, 1);
     assert_eq!(publications, 3);
-    // The pure bound charges 15 units, including one record visit: three
-    // lease-close effects, two five-effect cuts and the original cut receipt.
+    let peer_publication = prefix_effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                WorkerAction::Context(ContextEffect::PublishConclusion {
+                    conclusion: TaskConclusion::Terminated(TerminationDetail::Aborted(
+                        AbortCause::PeerTaskFailed
+                    )),
+                    ..
+                })
+            )
+        })
+        .expect("the prefix first adjudicates its original buffered peer proposal");
+    let origin_publication = prefix_effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                WorkerAction::Context(ContextEffect::PublishConclusion {
+                    conclusion: TaskConclusion::Terminated(TerminationDetail::Failed(_)),
+                    ..
+                })
+            )
+        })
+        .expect("the same prefix then adjudicates its retained original failure");
+    assert!(peer_publication < origin_publication);
+    assert_eq!(
+        prefix_effects[peer_publication..origin_publication]
+            .iter()
+            .filter(|effect| matches!(
+                effect,
+                WorkerAction::Context(ContextEffect::StopTask { .. })
+            ))
+            .count(),
+        1,
+        "the first actual peer adjudication owns exactly one stop effect"
+    );
+    assert_eq!(
+        prefix_effects[origin_publication..]
+            .iter()
+            .filter(|effect| matches!(
+                effect,
+                WorkerAction::Context(ContextEffect::StopTask { .. })
+            ))
+            .count(),
+        0,
+        "origin refinement publishes its state without issuing a second stop"
+    );
+    // The two adjudications and terminal publication path emit nine effects,
+    // including the one first stop; a second stop would raise that total to ten.
+    // With three lease-close effects and the summary receipt, this sequence
+    // charges 14 pure units including its one original record visit.
     // The Actor removes ContinueClose and adds its one prepaid Wake; neither
     // operation removes that record visit from the output inventory twice.
     assert_eq!(
@@ -407,7 +469,7 @@ fn a_paid_source_prefix_and_remaining_close_slice_publish_one_real_internal_wake
             .count(),
         1
     );
-    assert_eq!(prefix_count, 3 + 5 + 5 + 1 - 1 + wakes);
+    assert_eq!(prefix_count, 3 + 5 + 4 + 1 - 1 + wakes);
     assert_eq!(prefix_effects.len(), prefix_count);
     assert!(no_duplicate_task_publication);
     let config = policy.context_actor(1).unwrap();

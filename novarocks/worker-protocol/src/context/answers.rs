@@ -257,6 +257,14 @@ impl<'a> AnswerView<'a> {
             None => Ok(Err(TaskControlRefusal::NotOwned.outcome())),
         }
     }
+    /// Admission checks only identity and the original Accepted decision;
+    /// this does not inspect or publish the deferred read's business facts.
+    pub(super) fn task_read_refusal(
+        &self,
+        task: TaskIdentity,
+    ) -> Result<Option<OperationOutcome>, CoreError> {
+        Ok(self.accepted_task(task)?.err())
+    }
     pub(super) fn terminal_command(
         &self,
         token: InputId,
@@ -267,6 +275,7 @@ impl<'a> AnswerView<'a> {
         let verdict =
             |outcome| Answer::body(ContextReplyBody::Verdict(RequestResult::Outcome(outcome)));
         Ok(match command {
+            ContextCommand::AwaitTaskReadSeal { .. } => return Err(CoreError::IllegalFact),
             ContextCommand::Create { task, .. } | ContextCommand::InspectCreation { task } => {
                 if task.verify_query_context(self.identity).is_err() {
                     verdict(OperationOutcome::IdentityMismatch)

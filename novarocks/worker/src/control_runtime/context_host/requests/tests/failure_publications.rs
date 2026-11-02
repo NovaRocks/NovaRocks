@@ -1068,6 +1068,13 @@ fn real_parent_fence_uses_one_prepaid_context_role_and_failed_owner_abandons_its
                 && original.class == InputClass::Control
                 && original.phase == InputPhase::Filled
         });
+    let original_parent_author = address.lock().unwrap().resources.admission.work.reference();
+    let original_headers = f
+        .runtime
+        .input_header_authors(context_actor(), input, 2)
+        .unwrap();
+    let process_author_survives_execution =
+        original_headers == [original_parent_author] && original_parent_author.scope != scope.id();
     let queued_cannot_retire = !address.lock().unwrap().retire_owner_control().unwrap();
     let one_original_position = after_first.inputs == before_actor.inputs + 1
         && after_first.roles == before_actor.roles
@@ -1150,6 +1157,10 @@ fn real_parent_fence_uses_one_prepaid_context_role_and_failed_owner_abandons_its
     assert_eq!(duplicate, OwnerFenceDelivery::AlreadyDelivered);
     assert!(unused_is_not_retired && original_queued && queued_cannot_retire);
     assert!(one_original_position && no_new_work_or_funding && no_rpc_capture);
+    assert!(
+        process_author_survives_execution,
+        "the original parent fence must retain its process payer across execution detachment"
+    );
     assert_eq!(failed_delivery, OwnerFenceDelivery::FailedOwner);
     assert!(parent_still_queued && no_refill_after_failure && still_not_consumed_by_publication);
     assert!(drained && failure_alive && abandoned);

@@ -640,9 +640,9 @@ impl super::ContextHostRecord {
         budget: usize,
     ) -> ObservationTeardownProgress {
         // The original Root RemoveHost transfer closes future control and
-        // subscription issuance. RetireReservation follows HostRemoved, so it
-        // cannot authorize the child metadata teardown which publishes that
-        // fact. The parent payment still waits for its separate retirement.
+        // subscription issuance. RetireReservation follows ExecutionRetired
+        // and retires the original parent payment; it does not authorize this
+        // later metadata teardown or close new control issuance by itself.
         if !self.resources.control_admission_closed || !self.resources.requests.is_empty() {
             return ObservationTeardownProgress::Blocked;
         }

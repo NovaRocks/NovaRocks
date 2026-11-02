@@ -110,6 +110,11 @@ impl Diagnostics {
 #[derive(Clone, Debug, Default)]
 pub struct ProposalSummary {
     next_order: u64,
+    // Partial delivery is not a causal cut. These facts outlive a drained
+    // pending delta, so it cannot grant another first-candidate position.
+    first_seen: bool,
+    originating_seen: bool,
+    pending: bool,
     first: Option<(u64, Proposal)>,
     originating: Option<(u64, Proposal)>,
     originating_diagnostic: Option<(u64, Diagnostic)>,
@@ -145,10 +150,8 @@ impl ProposalSummary {
         }
     }
     fn candidate_retention(&self, proposal: &Proposal) -> CandidateRetention {
-        let first_origin = proposal.originating()
-            && self.originating.is_none()
-            && !self.first.as_ref().is_some_and(|(_, p)| p.originating());
-        if self.first.is_none() {
+        let first_origin = proposal.originating() && !self.originating_seen;
+        if !self.first_seen {
             CandidateRetention::First {
                 originating: first_origin,
             }
@@ -178,6 +181,7 @@ impl ProposalSummary {
     pub fn push(&mut self, mut proposal: Proposal) -> Option<SourceId> {
         let retention = self.candidate_retention(&proposal);
         let order = self.order();
+        self.pending = true;
         let diagnostic = proposal.diagnostic.take();
         if matches!(
             retention,
@@ -191,10 +195,13 @@ impl ProposalSummary {
         }
         match retention {
             CandidateRetention::First { .. } => {
+                self.first_seen = true;
+                self.originating_seen |= proposal.originating();
                 self.first = Some((order, proposal));
                 None
             }
             CandidateRetention::Originating => {
+                self.originating_seen = true;
                 self.originating = Some((order, proposal));
                 None
             }
@@ -203,6 +210,7 @@ impl ProposalSummary {
     }
     pub fn cleanup(&mut self, diagnostic: Diagnostic) {
         let order = self.order();
+        self.pending = true;
         self.record_other(order, diagnostic);
     }
     pub fn candidate_count(&self) -> usize {
@@ -212,7 +220,16 @@ impl ProposalSummary {
         self.other_diagnostics.len() + usize::from(self.originating_diagnostic.is_some())
     }
     pub fn is_empty(&self) -> bool {
-        self.next_order == 0
+        !self.pending
+    }
+    /// Move only pending facts. The original segment keeps its candidate
+    /// qualification until a real causal cut seals and replaces it.
+    pub fn take_incremental(&mut self) -> Self {
+        let pending = std::mem::take(self);
+        self.next_order = pending.next_order;
+        self.first_seen = pending.first_seen;
+        self.originating_seen = pending.originating_seen;
+        pending
     }
     pub fn apply(self, mut state: ConclusionState, mut diagnostics: Diagnostics) -> SummaryResult {
         let mut candidates: Vec<_> = self.first.into_iter().chain(self.originating).collect();
@@ -409,7 +426,7 @@ impl CausalSegments {
         self.validate_open()?;
         self.consuming_open =
             Some(novarocks_control_runtime_core::completion::Consumption::Pending);
-        Ok(std::mem::take(&mut self.open))
+        Ok(self.open.take_incremental())
     }
     /// Failure teardown takes the actual never-dispatched open segment. All
     /// earlier cut holders must retire first; this is abandonment, not Core
@@ -948,6 +965,51 @@ mod tests {
                 .all(|d| d == &diagnostic(1, false))
         );
     }
+    #[test]
+    fn partial_delivery_keeps_one_segments_candidate_qualification_and_diagnostic_order() {
+        let mut cuts = CausalSegments::new(1);
+        let mut state = ConclusionState::default();
+        let mut diagnostics = Diagnostics::default();
+        let mut original = Vec::new();
+        for (ordinal, kind) in [(1, 1), (2, 3), (3, 3), (4, 2), (5, 3), (6, 3), (7, 3)] {
+            let next = proposal(kind, ordinal);
+            original.push(next.clone());
+            let discarded = cuts.push(next);
+            if kind == 3 && ordinal != 2 {
+                assert_eq!(discarded, Some(SourceId(u64::from(ordinal))));
+            } else {
+                assert_eq!(discarded, None);
+            }
+            // Match the uncompressed oracle's cleanup occurrences exactly.
+            if (ordinal - 1) % 2 == 0 {
+                cuts.cleanup(diagnostic(100 + ordinal - 1, true));
+            }
+            let result = cuts.begin_open().unwrap().apply(state, diagnostics);
+            state = result.state;
+            diagnostics = result.diagnostics;
+            cuts.observe_open_consumed().unwrap();
+            cuts.finish_open().unwrap();
+            assert!(cuts.open_is_empty());
+            assert_segment_bound(&cuts);
+        }
+        assert_eq!(
+            state.source,
+            Some(SourceId(2)),
+            "the real origin refines the live peer placeholder"
+        );
+        assert_eq!(
+            (state, diagnostics),
+            reference(
+                ConclusionState::default(),
+                Diagnostics::default(),
+                &original
+            )
+        );
+        // Only a real cut grants a new segment's first candidate position.
+        cuts.reserve_cut(CutId(1), 0).unwrap();
+        cuts.seal_cut(CutId(1)).unwrap();
+        assert_eq!(cuts.push(proposal(3, 8)), None);
+    }
     fn assert_segment_bound(cuts: &CausalSegments) {
         assert!(cuts.resident_segments() <= cuts.resident_cuts() + 2);
     }
@@ -969,7 +1031,7 @@ mod tests {
         assert_segment_bound(&cuts);
         cuts.push(input[2].clone());
         cuts.cleanup(diagnostic(102, true));
-        cuts.push(input[3].clone());
+        assert_eq!(cuts.push(input[3].clone()), Some(SourceId(4)));
         cuts.seal_cut(CutId(1)).unwrap();
         assert_eq!(cuts.resident_segments(), 3);
         assert_segment_bound(&cuts);
@@ -993,7 +1055,10 @@ mod tests {
             (result.state, result.diagnostics),
             reference(ConclusionState::default(), Diagnostics::default(), &input)
         );
-        assert_eq!(result.released, vec![SourceId(4)]);
+        assert!(
+            result.released.is_empty(),
+            "the same-segment definite loser was returned at handoff"
+        );
         cuts.finish_consume(CutId(1)).unwrap();
         assert_eq!(cuts.core_consumption(CutId(1)), Some(Consumption::Consumed));
         assert!(matches!(cuts.begin_open(), Err(CutError::Consuming)));
@@ -1174,20 +1239,24 @@ mod tests {
         );
         assert_eq!(cuts.peek_open().unwrap_err(), CutError::Consuming);
         assert_eq!(cuts.begin_open().unwrap_err(), CutError::Consuming);
-        // The unconsumable open buffer still accepts an independent proposal;
-        // peek readiness and candidate retention are distinct observations.
+        // Partial delivery does not open another candidate position in this
+        // same segment; readiness and retained-candidate qualification differ.
         let proposal = proposal(3, 3);
-        assert!(cuts.will_retain(&proposal));
-        assert_eq!(cuts.push(proposal), None);
+        assert!(!cuts.will_retain(&proposal));
+        assert_eq!(cuts.push(proposal), Some(SourceId(3)));
     }
     #[test]
     fn cut_peeks_match_fifo_and_both_consuming_gates_without_taking_a_prefix() {
         let mut cuts = CausalSegments::new(2);
-        cuts.push(proposal(3, 1));
+        cuts.push(proposal(1, 1));
         cuts.begin_open().unwrap();
         cuts.reserve_cut(CutId(1), 1).unwrap();
         cuts.reserve_cut(CutId(2), 1).unwrap();
-        cuts.push(proposal(3, 2));
+        assert_eq!(
+            cuts.push(proposal(3, 2)),
+            None,
+            "the first origin can still refine the same segment's live peer"
+        );
         cuts.seal_cut(CutId(2)).unwrap();
         cuts.push(proposal(3, 3));
         cuts.seal_cut(CutId(1)).unwrap();

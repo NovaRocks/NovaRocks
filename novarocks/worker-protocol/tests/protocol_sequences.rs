@@ -825,6 +825,28 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         !core.is_compact_retained(),
         "Task custody does not prove original Context custody exit"
     );
+    let waiting_token = InputId::new(9_000_010).unwrap();
+    let waiting_read = RequestContext {
+        author: model_request_author(waiting_token),
+        token: waiting_token,
+        operation: operation(193),
+        deadline: at(2),
+    };
+    let waiting = core
+        .handle_request(
+            at(1),
+            waiting_read,
+            ContextCommand::AwaitTaskReadSeal {
+                task: task(1),
+                command: novarocks_worker_protocol::context::TaskReadCommand::FinalInfo,
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(
+        waiting.requests.is_empty() && waiting.effects.is_empty(),
+        "a decided Task still waits for the actual read seal"
+    );
     let retired_at = at(1);
     let origin = RetentionOrigin::new(retired_at, RequestHorizon::DEFAULT);
     core.handle(
@@ -870,6 +892,69 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         }
         assert!(step.charged_work() <= core.max_step_work());
     }
+    let retained_token = InputId::new(9_000_011).unwrap();
+    let retained_read = RequestContext {
+        author: model_request_author(retained_token),
+        token: retained_token,
+        operation: operation(194),
+        deadline: at(3),
+    };
+    let waiting = core
+        .handle_request(
+            at(1),
+            retained_read,
+            ContextCommand::AwaitTaskReadSeal {
+                task: task(1),
+                command: novarocks_worker_protocol::context::TaskReadCommand::DynamicFilters {
+                    acknowledged: None,
+                },
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(waiting.requests.is_empty() && waiting.effects.is_empty());
+    let resumed = core
+        .handle(
+            at(1),
+            ContextInput::ResumeTaskRead {
+                request: retained_token,
+                task: task(1),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(resumed.requests.len(), 1);
+    assert_eq!(resumed.requests[0].request, retained_read);
+    assert_eq!(
+        resumed.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Idempotent)
+    );
+    assert_eq!(
+        core.next_deadline(),
+        Some(at(2)),
+        "compaction retains the original waiting R deadline"
+    );
+    let timed_out = core.handle(at(2), ContextInput::Tick, &mut port).unwrap();
+    assert_eq!(timed_out.requests.len(), 1);
+    assert_eq!(timed_out.requests[0].request, waiting_read);
+    assert_eq!(
+        timed_out.requests[0].result,
+        RequestResult::TimeoutWhileAccepted
+    );
+    let late = core
+        .handle(
+            at(2),
+            ContextInput::ResumeTaskRead {
+                request: waiting_token,
+                task: task(1),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(
+        late.requests.is_empty() && late.effects.is_empty(),
+        "the retired representation cannot revive an expired original R"
+    );
     let duplicate = core
         .handle(
             at(2),
@@ -5662,6 +5747,192 @@ fn a_stopped_root_success_intent_is_completed_as_the_later_cancellation_without_
 }
 
 #[test]
+fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it() {
+    use novarocks_worker_protocol::context::TaskReadCommand;
+    let (mut core, mut port) = completion_fixture();
+    let token = InputId::new(9_000_001).unwrap();
+    let original = RequestContext {
+        author: model_request_author(token),
+        token,
+        operation: operation(190),
+        deadline: at(2),
+    };
+    let waiting = core
+        .handle_request(
+            at(0),
+            original,
+            ContextCommand::AwaitTaskReadSeal {
+                task: task(1),
+                command: TaskReadCommand::DynamicFilters { acknowledged: None },
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(waiting.requests.is_empty());
+    assert!(
+        waiting.effects.is_empty(),
+        "Await never selects a business read or causal cut"
+    );
+    let wrong = core
+        .handle(
+            at(1),
+            ContextInput::ResumeTaskRead {
+                request: token,
+                task: task(2),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(wrong.requests.is_empty() && wrong.effects.is_empty());
+    let resumed = core
+        .handle(
+            at(1),
+            ContextInput::ResumeTaskRead {
+                request: token,
+                task: task(1),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(resumed.requests.len(), 1);
+    assert_eq!(resumed.requests[0].request, original);
+    assert_eq!(
+        resumed.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::Idempotent),
+        "resume reads the original frozen DynamicFilters command"
+    );
+    let repeated = core
+        .handle(
+            at(1),
+            ContextInput::ResumeTaskRead {
+                request: token,
+                task: task(1),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(repeated.requests.is_empty() && repeated.effects.is_empty());
+
+    let token = InputId::new(9_000_002).unwrap();
+    let expiring = RequestContext {
+        author: model_request_author(token),
+        token,
+        operation: operation(191),
+        deadline: at(2),
+    };
+    let waiting = core
+        .handle_request(
+            at(1),
+            expiring,
+            ContextCommand::AwaitTaskReadSeal {
+                task: task(1),
+                command: TaskReadCommand::FinalInfo,
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(waiting.requests.is_empty() && waiting.effects.is_empty());
+    let expired = core.handle(at(2), ContextInput::Tick, &mut port).unwrap();
+    assert_eq!(expired.requests.len(), 1);
+    assert_eq!(expired.requests[0].request, expiring);
+    assert_eq!(
+        expired.requests[0].result,
+        RequestResult::TimeoutWhileAccepted
+    );
+    let late = core
+        .handle(
+            at(3),
+            ContextInput::ResumeTaskRead {
+                request: token,
+                task: task(1),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(
+        late.requests.is_empty() && late.effects.is_empty(),
+        "a later seal cannot revive the expired R or select its read"
+    );
+
+    let token = InputId::new(9_000_003).unwrap();
+    let completed = RequestContext {
+        author: model_request_author(token),
+        token,
+        operation: operation(192),
+        deadline: at(5),
+    };
+    core.handle_request(
+        at(3),
+        completed,
+        ContextCommand::AwaitTaskReadSeal {
+            task: task(1),
+            command: TaskReadCommand::FinalInfo,
+        },
+        &mut port,
+    )
+    .unwrap();
+    let closed = core
+        .handle(
+            at(3),
+            ContextInput::RequestCompleted {
+                operation: token,
+                outcome: OperationOutcome::ContextTerminalReceipt,
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(closed.requests.len(), 1);
+    assert_eq!(closed.requests[0].request, completed);
+    let late = core
+        .handle(
+            at(3),
+            ContextInput::ResumeTaskRead {
+                request: token,
+                task: task(1),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(late.requests.is_empty() && late.effects.is_empty());
+    let token = InputId::new(9_000_004).unwrap();
+    let unknown = RequestContext {
+        author: model_request_author(token),
+        token,
+        operation: operation(195),
+        deadline: at(5),
+    };
+    let refused = core
+        .handle_request(
+            at(3),
+            unknown,
+            ContextCommand::AwaitTaskReadSeal {
+                task: task(2),
+                command: TaskReadCommand::FinalInfo,
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert_eq!(refused.requests.len(), 1);
+    assert_eq!(refused.requests[0].request, unknown);
+    assert_eq!(
+        refused.requests[0].result,
+        RequestResult::Outcome(OperationOutcome::InvalidStateOrRequest),
+        "an unknown Task cannot establish a deferred business read"
+    );
+    let late = core
+        .handle(
+            at(3),
+            ContextInput::ResumeTaskRead {
+                request: token,
+                task: task(2),
+            },
+            &mut port,
+        )
+        .unwrap();
+    assert!(late.requests.is_empty() && late.effects.is_empty());
+}
+
+#[test]
 fn a_peer_placeholder_refines_to_the_original_failure_before_completion_exit_and_cannot_refine_after_sealing()
  {
     use novarocks_worker_protocol::proposal_summary::{ProposalSummary, SourceId};
@@ -5684,16 +5955,24 @@ fn a_peer_placeholder_refines_to_the_original_failure_before_completion_exit_and
             ))),
         },
     );
-    completion_step(
+    let stopping = completion_step(
         &mut core,
         &mut port,
         ContextInput::Adjudicate { task: task(1) },
+    );
+    assert_eq!(
+        stopping
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect, ContextEffect::StopTask { .. }))
+            .count(),
+        1
     );
     let first = completion_failure(17);
     let expected = first.conclusion.clone();
     let mut summary = ProposalSummary::default();
     summary.push(first);
-    completion_step(
+    let refined = completion_step(
         &mut core,
         &mut port,
         ContextInput::Summary {
@@ -5702,6 +5981,13 @@ fn a_peer_placeholder_refines_to_the_original_failure_before_completion_exit_and
             cut: None,
             summary,
         },
+    );
+    assert!(
+        !refined
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ContextEffect::StopTask { .. })),
+        "the original stop call remains once-only while its conclusion refines"
     );
     assert_eq!(
         core.task(task(1)).unwrap().conclusion.source,

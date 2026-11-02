@@ -89,13 +89,36 @@ impl CausalRoleEnv<'_> {
         role: &Role,
         scope: &ScopeHandle,
     ) -> Result<CausalSourceProgress, CausalError> {
-        use novarocks_control_runtime_core::identity::ConsumerId;
         self.validate_financial_scope(role, scope)?;
+        self.advance_pair_retirement(
+            crate::task_proposal_ingress::PairRoute::Cut(cut),
+            |source| {
+                let original = self
+                    .ingress
+                    .source_inventory(source)
+                    .map_err(CausalError::Source)?;
+                let receipt = original.custody.core_consumption();
+                if receipt == Consumption::Pending {
+                    self.source_core_consumption(role, source)
+                } else {
+                    Ok(receipt)
+                }
+            },
+            2,
+        )
+    }
+    pub(super) fn advance_pair_retirement(
+        &self,
+        route: crate::task_proposal_ingress::PairRoute,
+        receipt: impl Fn(SourceId) -> Result<Consumption, CausalError>,
+        mut reap_budget: usize,
+    ) -> Result<CausalSourceProgress, CausalError> {
+        use novarocks_control_runtime_core::identity::ConsumerId;
+        self.runtime.validate_registration(self.registration)?;
         let runtime_error = |error| {
             CausalError::Role(novarocks_control_runtime::exit_role::ExitRoleError::Runtime(error))
         };
         let mut progressed = false;
-        let route = crate::task_proposal_ingress::PairRoute::Cut(cut);
         // The ingress verifies sealed/unused before moving any Available
         // holder. Its real unused Drop revokes, rather than consuming reports.
         for holder in self.ingress.take_unused_pair(route)?.into_iter().flatten() {
@@ -116,7 +139,7 @@ impl CausalRoleEnv<'_> {
                     .map_err(CausalError::Role)?
                 {
                     let core = ConsumerId::new(1).expect("original source Core consumer");
-                    let receipt = self.source_core_consumption(role, source)?;
+                    let receipt = receipt(source)?;
                     if receipt != Consumption::Pending
                         && original
                             .custody
@@ -164,13 +187,14 @@ impl CausalRoleEnv<'_> {
         }
         let originals = self.ingress.pair_inventory(route)?;
         for original in &originals {
-            if !original.custody.reusable() {
-                progressed |= original
+            if reap_budget != 0 && !original.custody.reusable() {
+                let reaped = original
                     .custody
                     .financial_scope()
                     .reap_ready(1)
-                    .map_err(runtime_error)?
-                    != 0;
+                    .map_err(runtime_error)?;
+                reap_budget -= reaped;
+                progressed |= reaped != 0;
             }
         }
         let [first, second] = self.ingress.prepare_pair_reap(route)?;

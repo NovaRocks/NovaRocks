@@ -28,9 +28,43 @@ pub(super) struct RequestState {
     pub(super) request_tasks: BTreeMap<InputId, TaskIdentity>,
     pub(super) request_deadlines: BTreeSet<(MonotonicInstant, InputId)>,
     pub(super) pending_replies: BTreeMap<InputId, PendingReply>,
+    pub(super) task_read_waiters: BTreeMap<InputId, TaskReadCommand>,
 }
 impl RequestState {
+    pub(super) fn await_task_read(
+        &mut self,
+        token: InputId,
+        command: TaskReadCommand,
+    ) -> Result<(), CoreError> {
+        if !self.requests.contains_key(&token)
+            || !self.request_tasks.contains_key(&token)
+            || self.pending_replies.contains_key(&token)
+            || self.task_read_waiters.contains_key(&token)
+        {
+            return Err(CoreError::WrongIdentity);
+        }
+        self.task_read_waiters.insert(token, command);
+        Ok(())
+    }
+    /// Absence, a different Task, or an already selected decision never
+    /// grants a late continuation permission to read or revive the old R.
+    pub(super) fn take_task_read(
+        &mut self,
+        token: InputId,
+        task: TaskIdentity,
+    ) -> Option<(RequestContext, TaskReadCommand)> {
+        if !self.task_read_waiters.contains_key(&token)
+            || self.request_tasks.get(&token) != Some(&task)
+            || self.pending_replies.contains_key(&token)
+        {
+            return None;
+        }
+        let request = *self.requests.get(&token)?;
+        let command = self.task_read_waiters.remove(&token)?;
+        Some((request, command))
+    }
     pub(super) fn remove(&mut self, token: InputId) -> Option<RequestContext> {
+        self.task_read_waiters.remove(&token);
         let request = self.requests.remove(&token)?;
         self.request_deadlines.remove(&(request.deadline, token));
         self.pending_replies.remove(&token);
@@ -67,6 +101,7 @@ impl RequestState {
         if !self.requests.contains_key(&token) {
             return;
         }
+        self.task_read_waiters.remove(&token);
         self.pending_replies
             .entry(token)
             .or_insert(PendingReply { body, settled_at });

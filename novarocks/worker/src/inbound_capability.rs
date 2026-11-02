@@ -323,7 +323,7 @@ impl TaskInboundCapabilities {
                 .map(Arc::clone)
                 .ok_or(IngressRejection::UnknownDestinationTask)?;
             if state
-                .closed_executions
+                .aborted_executions
                 .contains(&descriptor.identity().query_execution_id())
             {
                 return Err(IngressRejection::UnknownDestinationTask);
@@ -570,7 +570,7 @@ impl TaskInboundCapabilities {
             return InboundFrameClaim::NotHeld;
         };
         if state
-            .closed_executions
+            .aborted_executions
             .contains(&descriptor.identity().query_execution_id())
         {
             return InboundFrameClaim::Refused(format!(
@@ -644,6 +644,9 @@ impl TaskInboundCapabilities {
         Ok(())
     }
 
+    /// Normal closure fences new receiver installation, while an already
+    /// installed exact stream keeps its DATA permission until actual retirement.
+    /// Only abort revokes that existing data-plane permission.
     pub fn close_context(&self, context: QueryContextRef) {
         self.state
             .lock()
@@ -1217,12 +1220,38 @@ mod tests {
         let kernel = UniqueId::new(8, 9);
         let (descriptor, source) = descriptor(401, kernel);
         capabilities.install(Arc::new(descriptor.clone())).unwrap();
-        capabilities.close_normally(&descriptor, || {});
         let context = QueryContextRef::new(
             descriptor.identity().query_execution_id(),
             FrontendProcessId::new_v7(),
             descriptor.identity().backend_process_id(),
         );
+        capabilities.close_context(context);
+        assert_eq!(
+            claim(&capabilities, kernel, source, 0, 1),
+            InboundFrameClaim::Authorized,
+            "normal closure preserves this already installed exact stream"
+        );
+        capabilities
+            .authorize_frame(kernel, FragmentNodeId::new(7), source, 0, 1)
+            .expect("the same installed DATA admission remains valid");
+        let later = TaskDescriptor::try_new(
+            TaskIdentity::new(
+                context.query_execution_id(),
+                descriptor.identity().stage_id(),
+                TaskId::new(2).unwrap(),
+                context.backend_process_id(),
+            ),
+            UniqueId::new(10, 11),
+            descriptor.pipeline_dop(),
+            Vec::new(),
+            descriptor.topology().clone(),
+        )
+        .unwrap();
+        assert!(
+            capabilities.install(Arc::new(later)).is_err(),
+            "the same normal closure still fences a new destination"
+        );
+        capabilities.close_normally(&descriptor, || {});
         capabilities.abort_context(context);
         assert_eq!(
             claim(&capabilities, kernel, source, 0, 1),

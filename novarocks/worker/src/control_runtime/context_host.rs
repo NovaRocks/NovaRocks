@@ -316,6 +316,7 @@ pub(crate) struct ContextHostRecord {
     resources: ContextHostResources,
     tasks: BTreeMap<TaskIdentity, TaskHostOwner>,
     retired_task_reads: BTreeMap<TaskIdentity, Arc<super::lifecycle_read::TaskReadSnapshot>>,
+    task_read_waiters: requests::deferred_read::TaskReadWaiters,
     task_driver: task_driver::TaskDriverState,
     root_issuance_sealed: bool,
     max_live_tasks: usize,
@@ -531,7 +532,7 @@ impl ContextHostRecord {
                         .expect("original Context registration"),
                     ticket.actor,
                     context,
-                    &resources.roles[TIMER].work,
+                    &resources.admission.work,
                 )
                 .map_err(ContextHostError::Driver)?;
             resources
@@ -570,6 +571,7 @@ impl ContextHostRecord {
             resources,
             tasks: BTreeMap::new(),
             retired_task_reads: BTreeMap::new(),
+            task_read_waiters: Default::default(),
             task_driver: task_driver::TaskDriverState::new(binding.max_live_tasks),
             root_issuance_sealed: false,
             max_live_tasks: binding.max_live_tasks,
@@ -900,6 +902,7 @@ impl ContextHostRecord {
         {
             return Err(ContextHostError::WrongEffect);
         }
+        self.resources.owner_control.authorize_parent_retirement();
         self.resources.teardown.parent_retire_authorized = true;
         // The Core-consumption receipt may already have woken and parked the
         // Context before this separate Root effect is handed over.
@@ -1060,9 +1063,15 @@ impl ContextHostRecord {
         // slot. Only this real closed Task prefix permits direct RootEndAcknowledged.
         self.resources.root_reads.mark_task_retired(task);
         assert!(
-            self.retired_task_reads.insert(task, sealed_read).is_none(),
+            self.retired_task_reads
+                .insert(task, sealed_read.clone())
+                .is_none(),
             "one actual sealed read handoff per original Task"
         );
+        // Only this actual seal transfer wakes the original waiting reads.
+        // A terminal status and a closed hot request gate grant no such proof.
+        self.task_read_waiters.sealed(task, sealed_read);
+        self.notify_host_progress();
         Ok(self.remove_task_owner(task))
     }
     pub(crate) fn has_retired_task_read(&self, task: TaskIdentity) -> bool {
