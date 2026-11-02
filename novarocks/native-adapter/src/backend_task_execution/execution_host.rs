@@ -6156,7 +6156,7 @@ pub(crate) mod tests {
     #[test]
     fn native_strict_input_validation_reads_actual_data_and_empty_end_consumption() {
         use novarocks_execution::runtime::fragment::io::{
-            ExchangeReceiverKey, ExchangeReceiverRegistration,
+            ExchangeReceiverKey, ExchangeReceiverPort, ExchangeReceiverRegistration,
         };
         use novarocks_execution_contract::{
             ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeInbound, ExchangeSource,
