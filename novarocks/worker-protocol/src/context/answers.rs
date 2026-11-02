@@ -265,6 +265,30 @@ impl<'a> AnswerView<'a> {
     ) -> Result<Option<OperationOutcome>, CoreError> {
         Ok(self.accepted_task(task)?.err())
     }
+    /// A metadata inspection can refuse an update but never acquire the
+    /// original Task's causal predecessor or authorize a domain application.
+    pub(super) fn inspect_task_update_outcome(
+        &self,
+        task: TaskIdentity,
+    ) -> Result<OperationOutcome, CoreError> {
+        if task.verify_query_context(self.identity).is_err() {
+            return Ok(OperationOutcome::IdentityMismatch);
+        }
+        if !matches!(
+            self.state,
+            QueryContextState::Active | QueryContextState::Quiescing
+        ) {
+            return Ok(self.closed_outcome());
+        }
+        Ok(match self.accepted_task(task)? {
+            Err(outcome) => outcome,
+            Ok(TaskAnswerRef::Decided(_)) => OperationOutcome::TerminalRejected,
+            Ok(TaskAnswerRef::Live(record)) if record.state.is_terminal() => {
+                OperationOutcome::TerminalRejected
+            }
+            Ok(TaskAnswerRef::Live(_)) => OperationOutcome::InvalidStateOrRequest,
+        })
+    }
     pub(super) fn terminal_command(
         &self,
         token: InputId,
@@ -276,6 +300,9 @@ impl<'a> AnswerView<'a> {
             |outcome| Answer::body(ContextReplyBody::Verdict(RequestResult::Outcome(outcome)));
         Ok(match command {
             ContextCommand::AwaitTaskReadSeal { .. } => return Err(CoreError::IllegalFact),
+            ContextCommand::InspectTaskUpdate { task } => {
+                verdict(self.inspect_task_update_outcome(*task)?)
+            }
             ContextCommand::Create { task, .. } | ContextCommand::InspectCreation { task } => {
                 if task.verify_query_context(self.identity).is_err() {
                     verdict(OperationOutcome::IdentityMismatch)

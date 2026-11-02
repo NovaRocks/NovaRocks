@@ -33,6 +33,7 @@ use std::{mem::ManuallyDrop, sync::Mutex};
 
 struct State {
     authority: Option<ExitAuthority>,
+    already_started: bool,
     payload: Option<ManuallyDrop<RejectedIngressPayload>>,
     sender: Option<OwnedReturnSender<ExitAuthority>>,
     panics: Vec<PanicPayload>,
@@ -57,6 +58,7 @@ impl RejectedDomainCapture {
         original: &mut ContextRequestCustody,
         payload: RejectedIngressPayload,
         ingress: WorkerIngressResponsibility,
+        start_original: bool,
     ) -> Result<Self, SameRRawRefusal> {
         let (sender, reader) = match original.report.claim_owned_return::<ExitAuthority>() {
             Ok(original) => original,
@@ -68,17 +70,39 @@ impl RejectedDomainCapture {
                 });
             }
         };
+        if start_original {
+            if let Err(error) = original
+                .authority
+                .as_mut()
+                .expect("original inspection R authority")
+                .start()
+            {
+                // This unique return cell is still unpublished. Positively
+                // revoke it before returning the original raw; an impossible
+                // revocation failure is a runtime ledger invariant failure.
+                sender
+                    .revoke_unused()
+                    .unwrap_or_else(|_| std::process::abort());
+                return Err(SameRRawRefusal {
+                    error: ContextRequestError::Exit(error),
+                    payload,
+                    ingress,
+                });
+            }
+            original.started = true;
+        }
         // The same serial R owns the checked authority. No Work, report,
         // Source, input or financial position is admitted by this move.
         let authority = original
             .authority
             .take()
-            .expect("original unstarted domain R authority");
+            .expect("original domain R authority");
         let owner = Arc::new(Custody {
             work: original.work,
             notice: RequestNotice(original.endpoint.external().slot().clone()),
             state: Mutex::new(State {
                 authority: Some(authority),
+                already_started: original.started,
                 payload: Some(ManuallyDrop::new(payload)),
                 sender: Some(sender),
                 panics: Vec::new(),
@@ -210,7 +234,7 @@ impl RejectedDomainJob {
         (self.owner.work.scope, self.owner.work.work)
     }
     pub(crate) fn run(mut self) {
-        let (mut authority, payload, sender) = {
+        let (mut authority, already_started, payload, sender) = {
             let mut state = self
                 .owner
                 .state
@@ -218,11 +242,20 @@ impl RejectedDomainJob {
                 .expect("original domain R raw custody");
             (
                 state.authority.take().expect("same original R authority"),
+                state.already_started,
                 state.payload.take().expect("same original raw domain"),
                 state.sender.take().expect("same original authority return"),
             )
         };
-        let failure = match authority.start() {
+        // A healthy metadata R starts before its neutral Core input is filled.
+        // Its same authority still owns this later raw Drop; the failed-only
+        // path instead lends an admitted, never-started original authority.
+        let started = if already_started {
+            Ok(())
+        } else {
+            authority.start()
+        };
+        let failure = match started {
             Err(error) => {
                 self.owner
                     .state
@@ -278,6 +311,84 @@ impl Drop for RejectedDomainJob {
 }
 
 impl ContextHostRecord {
+    /// Retain a healthy metadata inspection's original rich input in the same
+    /// already-paid R. The subsequent neutral Core input can answer before
+    /// this physical Drop returns; only actual return permits R retirement.
+    pub(crate) fn capture_task_update_inspection(
+        &mut self,
+        work: ScopedWorkRef,
+        raw: UpdateTask,
+        ingress: WorkerIngressResponsibility,
+    ) -> Result<(), (ContextRequestError, UpdateTask, WorkerIngressResponsibility)> {
+        let registration = self.registration().clone();
+        let request_scope = self.request_scope().clone();
+        let runtime = self.control_runtime.clone();
+        let context = self.identity;
+        let actor = self.actor;
+        let Some(original) = self.resources.requests.get_mut(&work) else {
+            return Err((ContextRequestError::UnknownRequest, raw, ingress));
+        };
+        let task = raw.identity();
+        let metadata = original.endpoint.metadata();
+        let same_request = original.request.is_some_and(|request| {
+            request.author == work
+                && request.operation == metadata.operation
+                && request.deadline == metadata.deadline
+                && original
+                    .permit
+                    .as_ref()
+                    .is_some_and(|permit| permit.id() == request.token)
+        });
+        if original.task_update_inspection != Some(task)
+            || original.expected_task != Some(task)
+            || task.verify_query_context(context).is_err()
+            || raw.envelope().operation_id() != metadata.operation
+            || original.work != work
+            || work.scope != request_scope.id()
+            || !original.scope.same_scope(&request_scope)
+            || !original.runtime.same_runtime(&runtime)
+            || original.actor != actor
+            || !original
+                .core_consumer
+                .registration()
+                .same_registration(&registration)
+            || !same_request
+            || original.submitted
+            || original.started
+            || original.authority.is_none()
+            || original.task_route.is_some()
+            || original.domain.is_some()
+            || original.create.is_some()
+            || original.rejected_domain.is_some()
+            || original.failed_message.is_some()
+            || original.deferred_root.is_some()
+            || original.deferred_task_read.is_some()
+            || original.observation.is_some()
+            || original.read_payload.is_some()
+            || original.retired_task_read.is_some()
+            || original.unresolved_revocation
+        {
+            return Err((ContextRequestError::WrongRequest, raw, ingress));
+        }
+        // The original report's return must be claimed while this R is still
+        // queued, before starting and lending its same authority to disposal.
+        let capture = RejectedDomainCapture::new(
+            original,
+            RejectedIngressPayload::TaskDomain(raw),
+            ingress,
+            true,
+        )
+        .map_err(|original| {
+            let RejectedIngressPayload::TaskDomain(raw) = original.payload else {
+                unreachable!("same original inspection Task input");
+            };
+            (original.error, raw, original.ingress)
+        })?;
+        original.rejected_domain = Some(capture);
+        original.endpoint.external().notify();
+        Ok(())
+    }
+
     fn capture_failed_uncaptured_domain(
         &mut self,
         work: ScopedWorkRef,
@@ -347,7 +458,7 @@ impl ContextHostRecord {
         {
             return Err(refusal(ContextRequestError::WrongPhase, payload, ingress));
         }
-        let capture = RejectedDomainCapture::new(original, payload, ingress)?;
+        let capture = RejectedDomainCapture::new(original, payload, ingress, false)?;
         original.rejected_domain = Some(capture);
         original.endpoint.external().notify();
         Ok(())

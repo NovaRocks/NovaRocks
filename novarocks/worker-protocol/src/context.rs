@@ -265,6 +265,11 @@ pub enum ContextCommand {
     InspectCreation {
         task: TaskIdentity,
     },
+    /// Read only the original Task's update refusal. The host retains the rich
+    /// input in this same R; this command cannot apply or complete a domain.
+    InspectTaskUpdate {
+        task: TaskIdentity,
+    },
     Renew {
         sequence: LeaseSequence,
         valid_for: LeaseValidFor,
@@ -280,6 +285,7 @@ impl ContextCommand {
         match self {
             Self::Create { task, .. }
             | Self::InspectCreation { task }
+            | Self::InspectTaskUpdate { task }
             | Self::Cancel { task, .. }
             | Self::UpdateTask { task, .. }
             | Self::GetFinalInfo { task }
@@ -2208,6 +2214,14 @@ impl LiveContextCore {
             }
             ContextCommand::InspectCreation { task } => {
                 self.inspect_creation(request, task, step)?
+            }
+            ContextCommand::InspectTaskUpdate { task } => {
+                let outcome =
+                    answers::AnswerView::from_live(self).inspect_task_update_outcome(task)?;
+                step.reply(
+                    request,
+                    ContextReplyBody::Verdict(RequestResult::Outcome(outcome)),
+                );
             }
             ContextCommand::Renew {
                 sequence,
