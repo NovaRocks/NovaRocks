@@ -889,6 +889,7 @@ pub(super) fn compiled_fragment(
             // This fixture authors one actual non-null I64 root occurrence.
             // LocalCompiler binds its slot from the original native layout.
             let schema = ClientRenderSchema::try_new(
+                novarocks_result_contract::ClientPresentationFamily::MysqlText,
                 vec![RenderColumn {
                     source_ordinal: 0,
                     source_slot: None,
