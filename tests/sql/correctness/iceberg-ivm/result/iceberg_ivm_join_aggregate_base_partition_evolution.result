@@ -1,14 +1,17 @@
 -- query 3
+-- legacy
 region	c	s
 east	2	300
 west	1	50
 
 -- query 6
+-- legacy
 region	c	s
 east	2	300
 west	2	130
 
 -- query 7
+-- types	varchar	bigint	bigint
 region	c	s
 east	2	300
 west	2	130

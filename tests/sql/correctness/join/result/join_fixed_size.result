@@ -1,91 +1,114 @@
 -- query 9
+-- types	bigint
 count(1)
 256
 
 -- query 10
+-- types	bigint
 count(1)
 36
 
 -- query 11
+-- types	bigint
 count(1)
 3076
 
 -- query 12
+-- types	bigint
 count(1)
 3076
 
 -- query 13
+-- legacy
 count(1)
 76924
 
 -- query 14
+-- types	bigint
 count(1)
 476
 
 -- query 15
+-- types	bigint
 count(1)
 36
 
 -- query 16
+-- types	bigint
 count(1)
 40000
 
 -- query 17
+-- types	bigint
 count(1)
 2857
 
 -- query 18
+-- types	bigint
 count(1)
 40000
 
 -- query 19
+-- types	bigint
 count(1)
 0
 
 -- query 20
+-- types	bigint
 count(1)
 40000
 
 -- query 21
+-- types	bigint
 count(1)
 40000
 
 -- query 22
+-- types	bigint
 count(1)
 3739
 
 -- query 23
+-- types	bigint
 count(1)
 256
 
 -- query 24
+-- legacy
 count(1)
 79744
 
 -- query 25
+-- types	bigint
 count(1)
 40000
 
 -- query 26
+-- types	bigint
 count(1)
 2500
 
 -- query 27
+-- types	bigint
 count(1)
 40000
 
 -- query 28
+-- types	bigint
 count(1)
 40000
 
 -- query 29
+-- types	bigint
 count(1)
 2666
 
 -- query 30
+-- types	bigint
 count(1)
 2666
 
 -- query 31
+-- types	bigint
 count(1)
 3739

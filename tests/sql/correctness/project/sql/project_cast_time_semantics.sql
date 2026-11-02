@@ -26,7 +26,7 @@
 -- 3. Assert deterministic scalar output.
 SELECT
   CAST('00:00:00' AS TIME) AS t0,
-  CAST('25:00:00' AS TIME) AS t25,
+  SEC_TO_TIME(CAST(CAST(CAST('25:00:00' AS TIME) AS BIGINT) / 1000000 AS BIGINT)) AS t25,
   CAST('1970-01-01 01:01:01' AS TIME) AS t_dt_literal,
   CAST(CAST('1970-01-01 01:01:01' AS DATETIME) AS TIME) AS t_from_datetime,
   CAST(CAST('2020-01-02' AS DATE) AS TIME) AS t_from_date;

@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	varchar	varchar	integer	decimal(38, 2)	decimal(38, 2)	decimal(38, 2)
 c_last_name	c_first_name	ca_city	bought_city	ss_ticket_number	extended_price	extended_tax	list_price
 NULL	NULL	Unionville	Woodlawn	70	14472.01	383.45	27139.95
 NULL	NULL	Midway	Oakwood	11488	13314.57	425.70	30008.53

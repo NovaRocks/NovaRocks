@@ -1,9 +1,11 @@
 -- query 5
+-- types	integer	varchar	varchar
 id	name	meta
 1	alice	{"k":"v"}
 2	bob	{"k":"v"}
 
 -- query 7
+-- types	integer	varchar	varchar
 id	name	meta
 1	alice	{"k":"v"}
 2	bob	{"k":"v"}

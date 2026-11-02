@@ -1,19 +1,24 @@
 -- query 2
+-- types	bigint
 snapshot_count
 2
 
 -- query 3
+-- types	bigint
 history_count
 2
 
 -- query 4
+-- types	bigint
 n_data_files
 3
 
 -- query 5
+-- types	boolean
 has_manifests
-1
+true
 
 -- query 6
+-- types	boolean
 has_added_entries
-1
+true

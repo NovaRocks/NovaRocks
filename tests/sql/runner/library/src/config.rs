@@ -78,6 +78,10 @@ pub fn load_runner_config(path: Option<&Path>) -> Result<RunnerConfig> {
 
     if let Some(cluster) = document.get("cluster").and_then(toml::Value::as_table) {
         for (key, value) in cluster {
+            anyhow::ensure!(
+                ["host", "trino_port", "user"].contains(&key.as_str()),
+                "unknown runner cluster key: {key}"
+            );
             config
                 .cluster
                 .insert(key.clone(), toml_value_to_string(value));
@@ -711,18 +715,18 @@ pub fn resolve_target_port(cli_port: Option<&str>, runner_config: &RunnerConfig)
     if let Some(port) = cli_port.filter(|v| !v.trim().is_empty()) {
         return Ok(port.trim().to_string());
     }
-    if let Some(port) = env_optional("NOVAROCKS_SQL_TEST_PORT") {
+    if let Some(port) = env_optional("NOVAROCKS_SQL_TEST_TRINO_PORT") {
         return Ok(port);
     }
     if let Some(port) = runner_config
         .cluster
-        .get("port")
+        .get("trino_port")
         .filter(|v| !v.trim().is_empty())
     {
         return Ok(port.trim().to_string());
     }
     bail!(
-        "target port is not set; provide --port or NOVAROCKS_SQL_TEST_PORT, or configure tests/sql/runner/conf/default.toml with [cluster].port"
+        "target port is not set; provide --trino-port or NOVAROCKS_SQL_TEST_TRINO_PORT, or configure tests/sql/runner/conf/default.toml with [cluster].trino_port"
     );
 }
 
@@ -740,25 +744,6 @@ pub fn resolve_repo_root() -> Result<PathBuf> {
         "failed to resolve repo root from manifest directory {}",
         env!("CARGO_MANIFEST_DIR")
     )
-}
-
-pub fn resolve_reference_port(
-    cli_ref_port: Option<&str>,
-    target_port: &str,
-    reference_required: bool,
-) -> Result<String> {
-    if let Some(port) = cli_ref_port.filter(|v| !v.trim().is_empty()) {
-        return Ok(port.trim().to_string());
-    }
-    if let Some(port) = env_optional("NOVAROCKS_SQL_TEST_REF_PORT") {
-        return Ok(port);
-    }
-    if reference_required {
-        bail!(
-            "reference port is required for this mode; provide --ref-port or NOVAROCKS_SQL_TEST_REF_PORT"
-        );
-    }
-    Ok(target_port.to_string())
 }
 
 pub fn resolve_path(path_value: Option<&str>, base_dir: &Path) -> Option<PathBuf> {
@@ -951,7 +936,7 @@ mod tests {
             r#"
 [cluster]
 host = "127.0.0.1"
-port = "9030"
+trino_port = "9030"
 
 [env]
 iceberg_catalog_type = "hadoop"
@@ -986,7 +971,7 @@ oss_endpoint = "http://127.0.0.1:9000"
             let path = repo_root.join("tests/sql/runner/conf").join(name);
             let config = load_runner_config(Some(&path)).expect("load shipped TOML configuration");
             assert!(config.cluster.contains_key("host"), "{name}");
-            assert!(config.cluster.contains_key("port"), "{name}");
+            assert!(config.cluster.contains_key("trino_port"), "{name}");
         }
     }
 
@@ -1134,7 +1119,7 @@ oss_endpoint = "http://127.0.0.1:9000"
                 r#"
 [cluster]
 host = "127.0.0.1"
-port = "23223"
+trino_port = "23223"
 
 [env]
 fixture_env_file = {env_file:?}
@@ -1512,6 +1497,69 @@ paimon_object_store_credential_generation = "v1"
                 &BTreeMap::from([("custom".into(), vec![source])])
             )
             .is_err()
+        );
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CorpusSession {
+    pub time_zone: String,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusDeclaration {
+    session: CorpusSession,
+}
+pub(crate) fn load_corpus_session(root: &Path) -> Result<CorpusSession> {
+    let path = root.join("tests/sql/correctness/corpus.toml");
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("read corpus session declaration: {}", path.display()))?;
+    let declaration: CorpusDeclaration =
+        toml::from_str(&content).context("invalid corpus session declaration")?;
+    anyhow::ensure!(
+        !declaration.session.time_zone.trim().is_empty(),
+        "corpus time zone must be explicit"
+    );
+    Ok(declaration.session)
+}
+
+#[cfg(test)]
+mod trino_config_tests {
+    use super::*;
+    #[test]
+    fn removed_mysql_cluster_keys_fail_during_configuration_parsing() {
+        let root = tempfile::TempDir::new().unwrap();
+        let path = root.path().join("runner.toml");
+        for key in ["port", "password", "http_port"] {
+            fs::write(&path, format!("[cluster]\n{key} = '9030'\n")).unwrap();
+            assert!(
+                load_runner_config(Some(&path))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown runner cluster key")
+            );
+        }
+    }
+    #[test]
+    fn corpus_session_requires_explicit_known_declaration() {
+        let root = tempfile::TempDir::new().unwrap();
+        assert!(load_corpus_session(root.path()).is_err());
+        let dir = root.path().join("tests/sql/correctness");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corpus.toml");
+        for declaration in [
+            "[session]\n",
+            "[session]\ntime_zone = ''\n",
+            "[session]\ntime_zone = 'Asia/Shanghai'\nextra = true\n",
+        ] {
+            fs::write(&path, declaration).unwrap();
+            assert!(load_corpus_session(root.path()).is_err());
+        }
+        fs::write(&path, "[session]\ntime_zone = 'Asia/Shanghai'\n").unwrap();
+        assert_eq!(
+            load_corpus_session(root.path()).unwrap().time_zone,
+            "Asia/Shanghai"
         );
     }
 }

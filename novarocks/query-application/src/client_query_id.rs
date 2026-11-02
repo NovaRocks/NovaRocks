@@ -88,6 +88,23 @@ mod tests {
         assert!(second.as_str() > first.as_str());
     }
     #[test]
+    fn external_id_parser_requires_the_query_application_shape() {
+        let valid = ClientQueryIdGenerator::new(FrontendProcessId::new_v7()).mint();
+        assert_eq!(ClientQueryId::parse(valid.as_str()).unwrap(), valid);
+        for malformed in [
+            "",
+            "20261029_120000_00001",
+            "20261029_120000_00001_ABCDE",
+            "20261029_120000_00001_ab_cd",
+            "2026102a_120000_00001_abcde",
+            "20261029-120000_00001_abcde",
+            "20261029_120000_00001_abcde_extra",
+        ] {
+            assert!(ClientQueryId::parse(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    #[test]
     fn exhausted_or_reversed_clock_never_reuses_an_id() {
         let mut clock = (100, 99_998);
         assert_eq!(

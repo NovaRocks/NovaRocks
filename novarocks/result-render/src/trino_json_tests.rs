@@ -339,6 +339,27 @@ fn minimum_subnormals_use_java_nearest_two_digit_decimal() {
 }
 
 #[test]
+fn shortest_decimal_midpoint_ties_choose_java_even_significand() {
+    // OpenJDK 21.0.10 Float.toString: exact -1405653.25 is halfway between
+    // the two shortest round-trip decimals, and Java selects the even one.
+    let arrays: Vec<ArrayRef> = vec![Arc::new(Float32Array::from(vec![
+        f32::from_bits(0xC9AB96AA),
+        f32::from_bits(0x49AB96AA),
+    ]))];
+    assert_eq!(
+        payloads(
+            encoder(
+                arrays,
+                vec![field(N::Float32, true)],
+                TrinoJsonFacts::default()
+            ),
+            100
+        ),
+        vec!["[-1405653.2]", "[1405653.2]"]
+    );
+}
+
+#[test]
 fn temporal_units_rounding_and_timezones_are_type_owned() {
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(Time32SecondArray::from(vec![3661])),

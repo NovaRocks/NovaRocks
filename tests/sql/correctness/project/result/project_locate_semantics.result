@@ -1,2 +1,4 @@
+-- query 1
+-- types	integer	integer	integer	integer	integer
 locate_basic	instr_basic	locate_with_pos	locate_empty_needle	locate_utf8
 2	2	2	2	2

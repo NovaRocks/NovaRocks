@@ -1,3 +1,4 @@
 -- query 10
+-- types	bigint
 cnt
 500000

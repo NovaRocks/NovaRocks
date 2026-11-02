@@ -1,39 +1,49 @@
 -- query 9
+-- legacy
 assert_true((count(fp)) = 2)	assert_true((count(DISTINCT fp)) = 1)
 1	1
 
 -- query 11
+-- legacy
 assert_true((count(fp)) = 2)	assert_true((count(DISTINCT fp)) = 1)
 1	1
 
 -- query 13
+-- legacy
 assert_true((count(fp)) = 2)	assert_true((count(DISTINCT fp)) = 1)
 1	1
 
 -- query 15
+-- legacy
 assert_true((count(fp)) = 2)	assert_true((count(DISTINCT fp)) = 1)
 1	1
 
 -- query 17
+-- legacy
 assert_true((count(fp)) = 2)	assert_true((count(DISTINCT fp)) = 1)
 1	1
 
 -- query 19
+-- legacy
 assert_true((count(fp)) = 2)	assert_true((count(DISTINCT fp)) = 1)
 1	1
 
 -- query 21
+-- legacy
 assert_true((count(fp)) = 2)	assert_true((count(DISTINCT fp)) = 1)
 1	1
 
 -- query 23
+-- legacy
 assert_true((count(fp)) = 2)	assert_true((count(DISTINCT fp)) = 1)
 1	1
 
 -- query 25
+-- legacy
 assert_true((count(fp)) = 2)	assert_true((count(DISTINCT fp)) = 1)
 1	1
 
 -- query 27
+-- legacy
 assert_true((count(fp)) = 2)	assert_true((count(DISTINCT fp)) = 1)
 1	1

@@ -1,3 +1,5 @@
+-- query 7
+-- types	integer	varchar	varchar
 id	lv	rv
 2	L2	R2
 3	L3	R3

@@ -1,99 +1,115 @@
 -- query 5
+-- types	bigint
 ungrouped
 100091
 
 -- query 6
+-- types	integer	boolean
 grp	grouped_ok
-0	1
-1	1
-2	1
-3	1
-4	1
-5	1
-6	1
-7	1
+0	true
+1	true
+2	true
+3	true
+4	true
+5	true
+6	true
+7	true
 
 -- query 7
+-- types	bigint
 merged
 100091
 
 -- query 8
+-- types	bigint
 ungrouped
 100091
 
 -- query 9
+-- types	integer	boolean
 grp	grouped_ok
-0	1
-1	1
-2	1
-3	1
-4	1
-5	1
-6	1
-7	1
+0	true
+1	true
+2	true
+3	true
+4	true
+5	true
+6	true
+7	true
 
 -- query 10
+-- types	bigint
 merged
 100091
 
 -- query 11
+-- types	bigint
 ungrouped
 100091
 
 -- query 12
+-- types	integer	boolean
 grp	grouped_ok
-0	1
-1	1
-2	1
-3	1
-4	1
-5	1
-6	1
-7	1
+0	true
+1	true
+2	true
+3	true
+4	true
+5	true
+6	true
+7	true
 
 -- query 13
+-- types	bigint
 merged
 100091
 
 -- query 14
+-- types	bigint
 ungrouped
 100091
 
 -- query 15
+-- types	integer	boolean
 grp	grouped_ok
-0	1
-1	1
-2	1
-3	1
-4	1
-5	1
-6	1
-7	1
+0	true
+1	true
+2	true
+3	true
+4	true
+5	true
+6	true
+7	true
 
 -- query 16
+-- types	bigint
 merged
 100091
 
 -- query 17
+-- types	bigint
 ungrouped
 100091
 
 -- query 18
+-- types	integer	boolean
 grp	grouped_ok
-0	1
-1	1
-2	1
-3	1
-4	1
-5	1
-6	1
-7	1
+0	true
+1	true
+2	true
+3	true
+4	true
+5	true
+6	true
+7	true
 
 -- query 19
+-- types	bigint
 merged
 100091
 
 -- query 20
+-- types	integer	bigint
 grp	grouped_hll6
 0	12919
 1	12276
@@ -105,6 +121,7 @@ grp	grouped_hll6
 7	12461
 
 -- query 21
+-- types	integer	bigint
 grp	grouped_hll6
 0	12919
 1	12276

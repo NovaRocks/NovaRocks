@@ -1,24 +1,29 @@
 -- query 10
+-- types	bigint	varchar	bigint
 k3	month	sv
 0	2024-07	1600
 0	2024-08	2000
 
 -- query 13
+-- types	varchar	bigint
 month	sv
 2024-07	1600
 2024-08	2000
 
 -- query 15
+-- types	bigint	bigint
 k3	sv
 0	3600
 1	3600
 2	3600
 
 -- query 17
+-- types	bigint	bigint
 k3	sv
 1	3600
 
 -- query 20
+-- types	bigint	varchar	bigint
 k3	month	sv
 0	2024-07	1605
 0	2024-08	2000

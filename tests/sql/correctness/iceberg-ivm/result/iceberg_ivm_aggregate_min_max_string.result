@@ -1,27 +1,34 @@
 -- query 3
+-- legacy
 region	mn	mx	c
 east	apple	elderberry	6
 
 -- query 4
+-- types	varchar	varchar	varchar	bigint
 region	mn	mx	c
 east	apple	elderberry	6
 
 -- query 6
+-- legacy
 region	mn	mx	c
 east	banana	elderberry	5
 
 -- query 7
+-- types	varchar	varchar	varchar	bigint
 region	mn	mx	c
 east	banana	elderberry	5
 
 -- query 9
+-- legacy
 region	mn	mx	c
 east	banana	date	4
 
 -- query 10
+-- types	varchar	varchar	varchar	bigint
 region	mn	mx	c
 east	banana	date	4
 
 -- query 12
+-- legacy
 region	mn	mx	c
 east	banana	date	3

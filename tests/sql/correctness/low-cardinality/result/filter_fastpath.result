@@ -1,15 +1,18 @@
 -- query 3
+-- types	integer	varchar	varchar
 id	status	channel
 1	PAID	web
 5	PAID	ops
 
 -- query 4
+-- types	integer	varchar
 id	status
 1	PAID
 3	CLOSED
 5	PAID
 
 -- query 5
+-- types	integer	varchar
 id	status
 4	NULL
 6	NULL

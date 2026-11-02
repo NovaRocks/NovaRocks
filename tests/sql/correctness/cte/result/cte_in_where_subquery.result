@@ -1,59 +1,70 @@
 -- query 2
+-- types	bigint
 v1
 1
 2
 3
 
 -- query 3
+-- types	bigint
 v1
 1
 2
 3
 
 -- query 4
+-- types	bigint	bigint	bigint
 v1	v2	v3
 1	2	3
 2	3	4
 3	4	5
 
 -- query 5
+-- types	bigint
 v1
 1
 2
 3
 
 -- query 6
+-- legacy
 v1
 1
 2
 
 -- query 7
+-- legacy
 v1
 1
 2
 
 -- query 8
+-- types	bigint
 v1
 1
 2
 3
 
 -- query 9
+-- types	bigint
 v1
 1
 2
 
 -- query 10
+-- types	bigint
 v1
 3
 
 -- query 11
+-- types	bigint
 v1
 1
 2
 3
 
 -- query 12
+-- types	bigint
 v1
 2
 3

@@ -17,7 +17,6 @@
 
 use crate::cluster::{ClusterMode, ServerHandle};
 use crate::types::{QueryMeta, SqlStep};
-use crate::{Mode, RecordFrom};
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
@@ -37,24 +36,6 @@ pub(crate) fn has_directives(meta: &QueryMeta) -> bool {
 pub(crate) fn validate_mode(meta: &QueryMeta, mode: ClusterMode) -> Result<()> {
     if meta.has_be_log_directives() && mode == ClusterMode::AllInOne {
         bail!("BE log evidence directives require a runner-owned cross-process cluster");
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_execution_mode(meta: &QueryMeta, mode: Mode) -> Result<()> {
-    if has_directives(meta) && !matches!(mode, Mode::Verify | Mode::Record) {
-        bail!("BE log directives require verify or record mode (got {mode:?})");
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_record_source(
-    meta: &QueryMeta,
-    mode: Mode,
-    record_from: RecordFrom,
-) -> Result<()> {
-    if has_directives(meta) && mode == Mode::Record && record_from == RecordFrom::Reference {
-        bail!("BE log directives cannot run with record-from=reference");
     }
     Ok(())
 }
@@ -102,7 +83,7 @@ fn is_query_lifecycle_step(meta: &QueryMeta) -> bool {
     // than the short BE-log one, because the facts it waits for are published
     // by the coordinator's own lifecycle rather than by the statement.
     //
-    // `kill_query_after_be_log_contains` is deliberately NOT in the list. It
+    // `cancel_query_after_be_log_contains` is deliberately NOT in the list. It
     // waits for whatever marker the case names, which makes it
     // protocol-neutral: a case that triggers a kill from task-protocol
     // evidence and asserts task-protocol evidence would otherwise be held to
@@ -595,27 +576,6 @@ mod tests {
     }
 
     #[test]
-    fn be_log_directive_allows_record_but_rejects_diff_mode() {
-        let meta = QueryMeta {
-            be_log_contains: vec!["be_log_ingress".to_string()],
-            ..QueryMeta::default()
-        };
-
-        validate_execution_mode(&meta, Mode::Record)
-            .expect("record mode writes goldens before verify executes BE log directives");
-        let error = validate_execution_mode(&meta, Mode::Diff)
-            .expect_err("diff mode must not silently skip BE log directives");
-        assert!(
-            error
-                .to_string()
-                .contains("BE log directives require verify or record mode"),
-            "unexpected error: {error:#}"
-        );
-        validate_execution_mode(&meta, Mode::Verify)
-            .expect("verify mode must execute BE log directives");
-    }
-
-    #[test]
     fn native_cross_process_mode_allows_be_log_evidence() {
         let meta = QueryMeta {
             be_log_contains: vec!["NOVAROCKS_FAILED_FRAGMENT_REPORT_ACK".to_string()],
@@ -626,21 +586,6 @@ mod tests {
             .expect("runner-owned native BE logs must support evidence directives");
         validate_mode(&meta, ClusterMode::AllInOne)
             .expect_err("all-in-one has no runner-owned BE logs");
-    }
-
-    #[test]
-    fn be_log_directive_rejects_reference_recording() {
-        let meta = QueryMeta {
-            be_log_contains: vec!["be_log_ingress".to_string()],
-            ..QueryMeta::default()
-        };
-
-        validate_record_source(&meta, Mode::Record, RecordFrom::Target)
-            .expect("target recording can collect BE log evidence");
-        let error = validate_record_source(&meta, Mode::Record, RecordFrom::Reference)
-            .expect_err("reference recording cannot collect target BE evidence");
-
-        assert!(error.to_string().contains("record-from=reference"));
     }
 
     #[test]

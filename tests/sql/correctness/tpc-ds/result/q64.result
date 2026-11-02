@@ -1,4 +1,5 @@
 -- query 2
+-- legacy
 product_name	store_name	store_zip	b_street_number	b_street_name	b_city	b_zip	c_street_number	c_street_name	c_city	c_zip	syear	cnt	s11	s21	s31	s12	s22	s32	syear	cnt
 n stableableantiought	able	31904	987	Hillcrest 	Fairbanks	46653	216	3rd 	Reno	40344	1999	1	55.42	80.91	954.53	59.08	76.80	0.00	2000	1
 n stableableantiought	ation	31904	425	Green 	Enterprise	11757	772	Valley 	NULL	NULL	1999	1	16.24	25.17	0.00	7.92	11.80	0.00	2000	1

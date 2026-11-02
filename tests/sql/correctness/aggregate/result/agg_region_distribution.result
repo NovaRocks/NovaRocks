@@ -1,3 +1,5 @@
+-- query 3
+-- types	varchar	bigint
 c_region	customer_count
 AFRICA	2
 AMERICA	2

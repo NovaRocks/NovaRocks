@@ -1,3 +1,5 @@
+-- query 4
+-- types	integer	integer	bigint
 id	score	rk
 1	100	1
 2	95	2

@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	integer	bigint
 c_city	s_city	d_year	lo_revenue
 UNITED KI1	UNITED KI5	1992	84718410
 UNITED KI5	UNITED KI1	1992	63192921

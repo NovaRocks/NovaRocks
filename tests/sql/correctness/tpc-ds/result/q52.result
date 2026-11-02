@@ -1,3 +1,5 @@
+-- query 1
+-- types	integer	integer	varchar	decimal(38, 2)
 d_year	brand_id	brand	ext_price
 2000	2001002	amalgimporto #2	133668.20
 2000	1003001	exportiamalg #1	85038.62

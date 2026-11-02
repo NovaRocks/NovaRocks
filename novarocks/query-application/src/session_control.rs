@@ -67,6 +67,19 @@ impl ClientSessionKey {
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct ClientQueryId(pub(crate) Box<str>);
 impl ClientQueryId {
+    /// Validate the identity shape minted by Query Application at external boundaries.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let valid = value.len() == 27
+            && value.bytes().enumerate().all(|(index, byte)| match index {
+                8 | 15 | 21 => byte == b'_',
+                22..=26 => byte.is_ascii_lowercase() || byte.is_ascii_digit(),
+                _ => byte.is_ascii_digit(),
+            });
+        if !valid {
+            return Err("invalid client query id shape".into());
+        }
+        Ok(Self(value.into()))
+    }
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -249,6 +262,7 @@ impl GovernedStatementRegistration {
 pub enum QueryControlError {
     SessionIdentityExhausted,
     ConnectionIdInUse,
+    ClientQueryIdInUse,
     UnknownSession,
     StaleSession,
     StatementBusy,

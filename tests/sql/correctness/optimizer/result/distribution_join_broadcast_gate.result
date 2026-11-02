@@ -1,7 +1,9 @@
 -- query 10
+-- types	bigint
 cnt
 1000
 
 -- query 13
+-- types	bigint
 cnt
 1000

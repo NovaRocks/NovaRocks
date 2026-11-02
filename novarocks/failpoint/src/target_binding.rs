@@ -232,6 +232,56 @@ impl StatementTaskBinding {
 mod tests {
     use super::*;
     #[test]
+    fn statement_input_extends_only_the_same_internal_session_and_frontend() {
+        let process = novarocks_types::FrontendProcessId::new_v7().to_string();
+        let input = StatementInputNomination {
+            target_session_id: "role-session".into(),
+            target_launch_id: "role-launch".into(),
+            statement_run_token: "selected".into(),
+            frontend_process_id: process.clone(),
+            session_key: 7,
+            sql_sha256: [1; 32],
+        };
+        let work = StatementWorkNomination {
+            target_session_id: "role-session".into(),
+            statement_run_token: "selected".into(),
+            frontend_process_id: process,
+            session_key: 7,
+            statement_generation: 9,
+        };
+        input.validate_statement(&work).unwrap();
+        for field in 0..4 {
+            let mut other = work.clone();
+            match field {
+                0 => other.session_key += 1,
+                1 => {
+                    other.frontend_process_id =
+                        novarocks_types::FrontendProcessId::new_v7().to_string()
+                }
+                2 => other.statement_run_token.push_str("-other"),
+                _ => other.target_session_id.push_str("-other"),
+            }
+            assert!(input.validate_statement(&other).is_err());
+        }
+        assert!(
+            StatementInputNomination {
+                session_key: 0,
+                ..input
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            StatementWorkNomination {
+                statement_generation: 0,
+                ..work
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
     fn nomination_is_exact_private_and_cannot_be_republished_for_another_generation() {
         use std::os::unix::fs::DirBuilderExt;
         let root = std::env::temp_dir().join(format!("g2-target-{}", std::process::id()));
@@ -426,7 +476,6 @@ pub struct StatementWorkNomination {
     pub target_session_id: String,
     pub statement_run_token: String,
     pub frontend_process_id: String,
-    pub connection_id: u32,
     pub session_key: u64,
     pub statement_generation: u64,
 }
@@ -446,7 +495,6 @@ impl StatementWorkNomination {
         };
         if !identifier(&self.target_session_id)
             || !identifier(&self.statement_run_token)
-            || self.connection_id == 0
             || self.session_key == 0
             || self.statement_generation == 0
         {
@@ -465,7 +513,6 @@ pub struct StatementInputNomination {
     pub target_launch_id: String,
     pub statement_run_token: String,
     pub frontend_process_id: String,
-    pub connection_id: u32,
     pub session_key: u64,
     pub sql_sha256: [u8; 32],
 }
@@ -486,7 +533,6 @@ impl StatementInputNomination {
         if !identifier(&self.target_session_id)
             || !identifier(&self.target_launch_id)
             || !identifier(&self.statement_run_token)
-            || self.connection_id == 0
             || self.session_key == 0
         {
             return Err(invalid("invalid exact statement input nomination"));
@@ -502,7 +548,6 @@ impl StatementInputNomination {
         if self.target_session_id != statement.target_session_id
             || self.statement_run_token != statement.statement_run_token
             || self.frontend_process_id != statement.frontend_process_id
-            || self.connection_id != statement.connection_id
             || self.session_key != statement.session_key
         {
             return Err(invalid(

@@ -1,3 +1,5 @@
+-- query 4
+-- types	bigint	varchar	bigint
 id	name	qty
 1	apple	10
 2	banana	20

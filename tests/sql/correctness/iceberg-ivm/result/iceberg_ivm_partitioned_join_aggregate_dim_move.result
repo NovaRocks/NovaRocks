@@ -1,16 +1,19 @@
 -- query 3
+-- legacy
 region	c	s
 east	2	300
 south	1	70
 west	1	50
 
 -- query 5
+-- legacy
 region	c	s
 north	2	300
 south	1	70
 west	1	50
 
 -- query 6
+-- legacy
 region	c	s
 north	2	300
 south	1	70
@@ -21,6 +24,7 @@ south	1	70
 west	1	50
 
 -- query 8
+-- legacy
 region	c	s
 north	2	300
 south	1	70

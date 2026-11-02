@@ -1,3 +1,5 @@
+-- query 1
+-- types	bigint	integer	varchar
 lo_revenue	d_year	p_brand
 732065331	1992	MFGR#2239
 665355617	1993	MFGR#2239

@@ -377,8 +377,9 @@ pub(super) fn float32(n: f32, budget: &mut Budget) -> Result<Atom, RenderError> 
             b"\"-Infinity\""
         }));
     }
-    let decimal = atom!("{n}");
-    budget.scan(decimal.len * 3);
+    let mut decimal = atom!("{n}");
+    budget.scan(decimal.len * 6);
+    java_even_decimal(&mut decimal, f64::from(n));
     let scientific = n.abs() != 0.0 && (n.abs() < 1e-3 || n.abs() >= 1e7);
     if scientific && one_significant_digit(&decimal) {
         let mut rounded = atom!("{n:.1e}");
@@ -401,8 +402,9 @@ pub(super) fn float64(n: f64, budget: &mut Budget) -> Result<Atom, RenderError> 
             b"\"-Infinity\""
         }));
     }
-    let decimal = atom!("{n}");
-    budget.scan(decimal.len * 3);
+    let mut decimal = atom!("{n}");
+    budget.scan(decimal.len * 6);
+    java_even_decimal(&mut decimal, n);
     let scientific = n.abs() != 0.0 && (n.abs() < 1e-3 || n.abs() >= 1e7);
     if scientific && one_significant_digit(&decimal) {
         let mut rounded = atom!("{n:.1e}");
@@ -414,6 +416,71 @@ pub(super) fn float64(n: f64, budget: &mut Budget) -> Result<Atom, RenderError> 
         return Ok(rounded);
     }
     java_float(decimal, scientific)
+}
+// Rust's shortest formatter chooses the larger magnitude on a decimal tie;
+// Java specifies an even decimal significand. Only an exact midpoint changes
+// spelling. Keep the correction in the original fixed-capacity atom.
+fn java_even_decimal(decimal: &mut Atom, value: f64) {
+    let bytes = &decimal.data[..decimal.len];
+    let begin = usize::from(bytes[0] == b'-');
+    let dot = bytes.iter().position(|b| *b == b'.').unwrap_or(bytes.len());
+    let Some(first) = (begin..bytes.len()).find(|i| bytes[*i] != b'0' && bytes[*i] != b'.') else {
+        return;
+    };
+    let last = (first..bytes.len())
+        .rfind(|i| bytes[*i] != b'0' && bytes[*i] != b'.')
+        .expect("nonzero decimal");
+    if !matches!(bytes[last], b'1' | b'3' | b'5' | b'7' | b'9') {
+        return;
+    }
+    let mut coefficient = 0u64;
+    let mut length = 0;
+    for byte in &bytes[first..=last] {
+        if *byte != b'.' {
+            coefficient = coefficient * 10 + u64::from(*byte - b'0');
+            length += 1;
+        }
+    }
+    let decimal_power = dot as i32 - first as i32 - i32::from(first < dot) - length + 1;
+    let bits = value.abs().to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    let mut binary = bits & ((1u64 << 52) - 1);
+    let mut binary_power = if exponent == 0 {
+        -1074
+    } else {
+        binary |= 1u64 << 52;
+        exponent - 1075
+    };
+    if binary == 0 {
+        return;
+    }
+    binary_power += binary.trailing_zeros() as i32;
+    binary >>= binary.trailing_zeros();
+    if binary_power != decimal_power - 1 {
+        return;
+    }
+    let mut midpoint = u128::from(coefficient) * 2 - 1;
+    if decimal_power >= 0 {
+        for _ in 0..decimal_power {
+            let Some(next) = midpoint.checked_mul(5) else {
+                return;
+            };
+            midpoint = next;
+            if midpoint > u128::from(binary) {
+                return;
+            }
+        }
+    } else {
+        for _ in decimal_power..0 {
+            if !midpoint.is_multiple_of(5) {
+                return;
+            }
+            midpoint /= 5;
+        }
+    }
+    if midpoint == u128::from(binary) {
+        decimal.data[last] -= 1;
+    }
 }
 // Java selects the nearest one- or two-digit decimal when the shortest
 // round-trip has one significant digit, including MIN_VALUE subnormals.

@@ -1,3 +1,5 @@
+-- query 7
+-- types	varchar	varchar	varchar
 lk	vl	vr
 2	L2	R2
-NULL	LN	NULL
+"NULL"	LN	NULL

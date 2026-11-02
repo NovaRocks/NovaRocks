@@ -1,4 +1,5 @@
 -- query 9
+-- types	varchar
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
@@ -27,6 +28,7 @@ PLAN FRAGMENT 1
          min-max stats
 
 -- query 10
+-- types	varchar
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
@@ -66,6 +68,7 @@ PLAN FRAGMENT 2
            min-max stats
 
 -- query 11
+-- types	varchar
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
@@ -112,6 +115,7 @@ PLAN FRAGMENT 3
        min-max stats
 
 -- query 12
+-- types	varchar
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *

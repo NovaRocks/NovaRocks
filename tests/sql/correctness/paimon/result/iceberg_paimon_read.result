@@ -1,4 +1,5 @@
 -- query 4
+-- legacy
 id	note	label
 1	new-a	ice-a
 4	new-d	ice-d

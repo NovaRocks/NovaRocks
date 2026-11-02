@@ -1,3 +1,5 @@
+-- query 1
+-- types	integer	varchar	varchar	bigint
 d_year	s_nation	p_category	profit
 1997	ARGENTINA	MFGR#11	847462288
 1997	ARGENTINA	MFGR#12	896327507

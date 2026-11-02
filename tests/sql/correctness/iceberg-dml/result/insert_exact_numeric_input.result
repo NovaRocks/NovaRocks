@@ -1,8 +1,10 @@
 -- query 2
+-- types	integer	decimal(18, 9)
 id	d
 1	123456789.123456789
 
 -- query 4
+-- types	integer	decimal(18, 9)
 id	d
 1	123456789.123456789
 2	-123456789.123456789
@@ -17,16 +19,19 @@ id	d
 11	123456789.123456789
 
 -- query 5
+-- types	decimal(38, 18)
 squared
 15241578780673678.515622620750190521
 
 -- query 7
+-- types	integer	decimal(38, 10)	decimal(38, 0)
 id	d	n
 1	1234567890.1234567890	9223372036854775808
 2	-1234567890.1234567890	-9223372036854775809
 3	0.0000000001	NULL
 
 -- query 9
+-- legacy
 id	first_value	second_value	third_value	element_count	whole_null
 1	123456789.123456789	-123456789.123456789	NULL	3	0
 2	NULL	NULL	NULL	0	0
@@ -36,6 +41,7 @@ id	first_value	second_value	third_value	element_count	whole_null
 6	123456789.123456789	1.000000000	NULL	2	0
 
 -- query 10
+-- legacy
 id	first_key	first_value	entry_count	whole_null
 1	123456789.123456789	-123456789.123456789	1	0
 2	NULL	NULL	0	0
@@ -45,6 +51,7 @@ id	first_key	first_value	entry_count	whole_null
 6	NULL	NULL	NULL	1
 
 -- query 11
+-- legacy
 id	decimal_field	nested_first	nested_second	nested_count	whole_null
 1	123456789.123456789	-123456789.123456789	NULL	2	0
 2	NULL	NULL	NULL	NULL	1
@@ -54,12 +61,14 @@ id	decimal_field	nested_first	nested_second	nested_count	whole_null
 6	123456789.123456789	123456789.123456789	1.000000000	2	0
 
 -- query 13
+-- types	integer	decimal(10, 2)
 id	d
 1	1.23
 2	1.24
 3	2.50
 
 -- query 15
+-- types	integer	varchar
 id	bytes_hex
 1	FF
 2	FF00
@@ -70,17 +79,21 @@ id	bytes_hex
 7	FF00
 
 -- query 17
+-- types	integer	integer
 a	b
 2	1
 
 -- query 19
+-- types	decimal(3, 0)
 d
 1
 
 -- query 21
+-- legacy
 d
 1.00
 
 -- query 23
+-- legacy
 variant_kind	cast_text	varchar_text
 Object	values-cast	varchar-cast

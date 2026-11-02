@@ -1,10 +1,12 @@
 -- query 7
+-- types	integer	bigint
 k	c
 1	715
 2	715
 5	714
 
 -- query 9
+-- types	integer	bigint
 k	c
 1	715
 2	715

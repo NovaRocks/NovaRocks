@@ -1,2 +1,4 @@
+-- query 1
+-- types	varchar	bigint	varchar	bigint	bigint
 s_neg1	rt_neg1	s_floor_cap	rt_floor_cap	literal_neg
 -00:00:01	-1	-839:59:59	-3023999	NULL

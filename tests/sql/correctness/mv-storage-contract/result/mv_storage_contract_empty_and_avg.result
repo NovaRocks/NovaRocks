@@ -1,17 +1,21 @@
 -- query 8
+-- types	varchar	bigint
 sensor	total
 
 -- query 12
+-- types	varchar	bigint
 sensor	total
 a	30
 b	7
 
 -- query 15
+-- types	varchar	double
 sensor	mean
-a	15
-b	7
+a	15.0
+b	7.0
 
 -- query 18
+-- types	varchar	double
 sensor	mean
-a	30
-b	5
+a	30.0
+b	5.0

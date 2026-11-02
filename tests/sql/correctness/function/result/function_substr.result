@@ -1,34 +1,40 @@
 -- query 11
+-- types	varchar
 substr('', v)
 NULL
 NULL
 NULL
 
 -- query 12
+-- types	varchar
 substr('', v, id)
 NULL
 NULL
 NULL
 
 -- query 13
+-- types	varchar
 substr('STARROCKS', v, id)
 NULL
 NULL
 NULL
 
 -- query 14
+-- types	varchar
 substring('', v)
 NULL
 NULL
 NULL
 
 -- query 15
+-- types	varchar
 substring('', v, id)
 NULL
 NULL
 NULL
 
 -- query 16
+-- types	varchar
 substring('STARROCKS', v, id)
 NULL
 NULL

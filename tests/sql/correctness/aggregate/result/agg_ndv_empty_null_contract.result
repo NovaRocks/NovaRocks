@@ -1,21 +1,26 @@
 -- query 3
+-- types	bigint	bigint	bigint
 ndv_empty	approx_empty	exact_empty
 0	0	0
 
 -- query 4
+-- types	bigint	bigint	bigint
 ndv_null	approx_null	exact_null
 0	0	0
 
 -- query 5
+-- types	integer	bigint	bigint	bigint
 k	ndv_count	approx_count	exact_count
 1	0	0	0
 2	1	1	1
 3	2	2	2
 
 -- query 6
+-- types	bigint	bigint
 ndv_cast_null	approx_cast_null
 0	0
 
 -- query 7
+-- types	integer
 k
 1

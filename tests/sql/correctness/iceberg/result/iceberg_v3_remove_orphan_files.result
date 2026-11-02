@@ -1,62 +1,76 @@
 -- query 5
+-- types	bigint
 n
 3
 
 -- query 7
+-- types	integer	varchar
 id	v
 1	a
 2	b
 3	c
 
 -- query 8
+-- types	bigint
 n
 3
 
 -- query 10
+-- types	bigint
 n
 0
 
 -- query 12
+-- types	bigint
 n
 0
 
 -- query 17
+-- types	bigint
 n
 3
 
 -- query 20
+-- types	integer	varchar
 id	v
 10	x
 20	y
 30	z
 
 -- query 28
+-- types	bigint
 n
 2
 
 -- query 30
+-- types	integer	varchar
 id	v
 1	first
 2	second
 
 -- query 35
+-- types	integer	varchar
 id	v
 1	one
 2	two
 
 -- query 41
+-- types	bigint
 n
 2
 
 -- query 43
+-- types	bigint
 n
 2
 
 -- query 48
+-- types	bigint
 n
 3
 
 -- query 52
+-- types	integer	varchar
 id	v
 1	row1
 2	row2
@@ -64,5 +78,6 @@ id	v
 4	row4
 
 -- query 53
+-- types	bigint
 n
 4

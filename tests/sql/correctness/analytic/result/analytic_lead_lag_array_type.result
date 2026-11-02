@@ -1,31 +1,39 @@
 -- query 2
+-- legacy
 assert_true((count(pred)) = (count(if(pred, 1, NULL))))
 1
 
 -- query 3
+-- legacy
 assert_true((count(pred)) = (count(if(pred, 1, NULL))))
 1
 
 -- query 4
+-- legacy
 assert_true((count(pred)) = (count(if(pred, 1, NULL))))
 1
 
 -- query 5
+-- legacy
 assert_true((count(pred)) = (count(if(pred, 1, NULL))))
 1
 
 -- query 6
+-- legacy
 assert_true((count(pred)) = (count(if(pred, 1, NULL))))
 1
 
 -- query 7
+-- legacy
 assert_true((count(pred)) = (count(if(pred, 1, NULL))))
 1
 
 -- query 8
+-- legacy
 assert_true((count(pred)) = (count(if(pred, 1, NULL))))
 1
 
 -- query 9
+-- legacy
 assert_true((count(pred)) = (count(if(pred, 1, NULL))))
 1

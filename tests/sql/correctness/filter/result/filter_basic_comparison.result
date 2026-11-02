@@ -1,3 +1,5 @@
+-- query 4
+-- types	integer	integer	varchar
 id	v	name
 2	20	b
 4	30	NULL

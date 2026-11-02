@@ -84,7 +84,14 @@ SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ MIN_N(c_bigint, 3) FR
 
 -- query 8
 USE ${case_db};
-SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_largeint, 3) FROM t_without_null;
+SELECT CONCAT('[',
+              CAST(boundary_result.min_values[1] AS VARCHAR), ',',
+              CAST(boundary_result.min_values[2] AS VARCHAR), ',',
+              CAST(boundary_result.min_values[3] AS VARCHAR), ']') AS `min_n(c_largeint, 3)`
+FROM (
+  SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_largeint, 3) AS min_values
+  FROM t_without_null
+) AS boundary_result;
 
 -- query 9
 USE ${case_db};

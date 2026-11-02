@@ -3559,6 +3559,7 @@ dependencies = [
  "novarocks-secret",
  "novarocks-task-codec",
  "novarocks-test-support",
+ "novarocks-test-trino-client",
  "novarocks-types",
  "percent-encoding",
  "prost 0.13.5",
@@ -4428,14 +4429,17 @@ name = "novarocks-sql-test-library"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "chrono-tz",
  "clap",
- "mysql",
  "novarocks-cluster-harness",
  "novarocks-failpoint",
  "novarocks-fs",
  "novarocks-parser",
  "novarocks-spi",
  "novarocks-test-support",
+ "novarocks-test-trino-client",
  "novarocks-types",
  "rayon",
  "regex",
@@ -4666,6 +4670,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde_json",
+]
+
+[[package]]
+name = "novarocks-test-trino-client"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]

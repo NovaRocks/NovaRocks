@@ -1,2 +1,4 @@
+-- query 5
+-- types	boolean	boolean
 has_manifests	has_added
-1	1
+true	true

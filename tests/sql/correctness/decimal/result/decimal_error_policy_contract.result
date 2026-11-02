@@ -1,4 +1,5 @@
 -- query 2
+-- types	integer	decimal(38, 0)
 k	v
 1	2
 2	NULL
@@ -6,10 +7,12 @@ k	v
 4	1
 
 -- query 4
+-- types	decimal(38, 0)
 v
 NULL
 
 -- query 6
+-- types	integer	decimal(38, 0)
 k	v
 1	2
 2	NULL
@@ -17,6 +20,7 @@ k	v
 4	0
 
 -- query 8
+-- types	integer	decimal(38, 6)
 k	v
 1	1.000000
 2	NULL
@@ -24,6 +28,7 @@ k	v
 4	NULL
 
 -- query 10
+-- types	integer	decimal(38, 1)
 k	v
 1	0.0
 2	NULL
@@ -31,62 +36,76 @@ k	v
 4	NULL
 
 -- query 13
+-- types	decimal(38, 6)	decimal(38, 1)
 div_zero	mod_zero
 NULL	NULL
 
 -- query 14
+-- types	decimal(38, 0)
 v
 NULL
 
 -- query 17
+-- types	decimal(9, 0)
 narrowed
 NULL
 
 -- query 19
+-- types	decimal(5, 2)
 carry
 NULL
 
 -- query 21
+-- types	decimal(5, 2)
 input_null
 NULL
 
 -- query 22
+-- types	decimal(4, 2)
 rounded
 12.35
 
 -- query 23
+-- types	bigint	decimal(38, 0)
 branch	v
 1	NULL
 2	2
 
 -- query 26
+-- types	double
 promoted
-1524157876695625600000000000
+1.5241578766956256E27
 
 -- query 29
+-- legacy
 allowed_null_policy
 1
 
 -- query 30
+-- legacy
 same_physical_type
 1
 
 -- query 35
+-- types	bigint
 n
 1
 
 -- query 41
+-- types	integer	integer
 id	f
 1	1
 2	0
 
 -- query 42
+-- legacy
 left_id	right_id	merged_key
 1	10	1
 NULL	20	1000
 NULL	30	NULL
 
 -- query 44
+-- legacy
 left_id	right_id	merged_key
 2	NULL	NULL
 NULL	30	NULL

@@ -1,3 +1,5 @@
+-- query 3
+-- types	varchar	integer	integer	integer	integer
 grp	id	v	min_v	max_v
 A	1	9	3	9
 A	2	3	3	9

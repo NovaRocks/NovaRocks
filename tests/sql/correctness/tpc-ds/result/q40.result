@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	decimal(38, 2)	decimal(38, 2)
 w_state	i_item_id	sales_before	sales_after
 TN	AAAAAAAAAABDAAAA	0.00	-82.10
 TN	AAAAAAAAAACDAAAA	-216.54	158.04

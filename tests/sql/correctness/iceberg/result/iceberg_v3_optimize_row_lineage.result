@@ -1,8 +1,10 @@
 -- query 3
+-- types	bigint	bigint
 n_rows	n_unique_row_ids
 5	5
 
 -- query 4
+-- types	integer	integer
 id	v
 1	10
 2	99
@@ -11,18 +13,22 @@ id	v
 6	60
 
 -- query 5
+-- types	boolean	boolean
 multiple_data_files	has_active_delete_files
-1	1
+true	true
 
 -- query 6
+-- types	bigint
 main_matches_pre_opt
 1
 
 -- query 8
+-- types	bigint	bigint
 n_rows	n_unique_row_ids
 5	5
 
 -- query 9
+-- types	integer	integer
 id	v
 1	10
 2	99
@@ -31,21 +37,26 @@ id	v
 6	60
 
 -- query 10
+-- legacy
 rows_changed_by_optimize
 0
 
 -- query 11
+-- legacy
 baseline_rows_missing_after_optimize
 0
 
 -- query 12
+-- types	bigint
 n_replace_snapshots
 1
 
 -- query 13
+-- types	bigint
 current_replace_child_of_pre_opt
 1
 
 -- query 14
+-- types	bigint
 active_delete_files_after_optimize
 0

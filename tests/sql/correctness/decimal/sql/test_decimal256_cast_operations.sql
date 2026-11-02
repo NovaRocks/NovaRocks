@@ -174,7 +174,7 @@ SELECT
     id,
     bigint_val,
     CAST(bigint_val AS decimal(38,20)) as bigint_to_decimal256,
-    largeint_val,
+    CAST(largeint_val AS VARCHAR) AS largeint_val,
     CAST(largeint_val AS decimal(38,0)) as largeint_to_decimal256
 FROM ${case_db}.cast_test_source
 ORDER BY id;

@@ -1,3 +1,5 @@
+-- query 3
+-- types	bigint	varchar
 new_id	new_note
 11	alpha
 22	beta

@@ -1,7 +1,9 @@
 -- query 2
+-- types	bigint
 n_data_files
 12
 
 -- query 3
+-- types	bigint
 rows
 12

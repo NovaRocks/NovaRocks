@@ -1,9 +1,11 @@
 -- query 2
+-- shell
 0
 IRU9_EMPTY_INT_OK rows=0 snapshot=absent id=optional-int v=optional-variant
 IRU9_FIXTURE_COMPLETE
 
 -- query 3
+-- legacy
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
@@ -25,6 +27,7 @@ PLAN FRAGMENT 1
          min-max stats
 
 -- query 5
+-- legacy
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *

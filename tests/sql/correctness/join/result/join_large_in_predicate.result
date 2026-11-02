@@ -1,4 +1,5 @@
 -- query 18
+-- types	integer	integer	varchar
 id	int_col	value
 1	1000	value1
 2	2000	value2
@@ -6,6 +7,7 @@ id	int_col	value
 4	4000	value4
 
 -- query 19
+-- types	integer	integer	varchar
 id	int_col	value
 5	5000	value5
 6	6000	value6
@@ -19,6 +21,7 @@ id	int_col	value
 15	1500	extra1
 
 -- query 20
+-- types	integer	varchar	varchar
 id	varchar_col	category
 1	apple	food
 2	banana	food
@@ -26,6 +29,7 @@ id	varchar_col	category
 4	dog	pet
 
 -- query 21
+-- types	integer	varchar	varchar
 id	varchar_col	category
 5	elephant	wild
 6	fish	aquatic
@@ -35,10 +39,11 @@ id	varchar_col	category
 10	jungle	wild
 11	a'b	test
 12	c"d	test
-13	e\f	test
-14		test
+13	"e\\f"	test
+14	""	test
 
 -- query 22
+-- types	integer	tinyint
 id	tinyint_col
 1	10
 2	20
@@ -46,6 +51,7 @@ id	tinyint_col
 4	40
 
 -- query 23
+-- types	integer	smallint
 id	smallint_col
 1	100
 2	200
@@ -53,6 +59,7 @@ id	smallint_col
 4	400
 
 -- query 24
+-- types	integer	bigint
 id	bigint_col
 1	10000
 2	20000
@@ -60,6 +67,7 @@ id	bigint_col
 4	40000
 
 -- query 25
+-- types	integer	varchar
 id	char_col
 1	fruit
 2	fruit
@@ -71,6 +79,7 @@ id	char_col
 10	nature
 
 -- query 26
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -78,6 +87,7 @@ id	int_col
 4	4000
 
 -- query 27
+-- types	integer	varchar
 id	varchar_col
 1	apple
 2	banana
@@ -85,6 +95,7 @@ id	varchar_col
 4	dog
 
 -- query 28
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -92,6 +103,7 @@ id	int_col
 4	4000
 
 -- query 29
+-- types	integer	integer
 id	int_col
 6	6000
 7	7000
@@ -99,6 +111,7 @@ id	int_col
 9	9000
 
 -- query 30
+-- types	integer	tinyint
 id	tinyint_col
 1	10
 2	20
@@ -106,6 +119,7 @@ id	tinyint_col
 4	40
 
 -- query 31
+-- types	integer	bigint
 int_col	cnt
 1000	1
 2000	1
@@ -113,6 +127,7 @@ int_col	cnt
 4000	1
 
 -- query 32
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -120,6 +135,7 @@ id	int_col
 4	4000
 
 -- query 33
+-- types	integer	varchar
 id	varchar_col
 1	apple
 2	banana
@@ -128,6 +144,7 @@ id	varchar_col
 5	elephant
 
 -- query 34
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -146,6 +163,7 @@ id	int_col
 15	1500
 
 -- query 35
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -154,6 +172,7 @@ id	int_col
 5	5000
 
 -- query 36
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -161,6 +180,7 @@ id	int_col
 4	4000
 
 -- query 37
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -179,6 +199,7 @@ id	int_col
 15	1500
 
 -- query 38
+-- types	integer	integer
 id	int_col
 1	1000
 3	3000
@@ -193,6 +214,7 @@ id	int_col
 14	NULL
 
 -- query 39
+-- legacy
 id	int_col
 1	1000
 5	5000
@@ -203,6 +225,7 @@ id	int_col
 14	NULL
 
 -- query 40
+-- types	integer	integer
 id	int_col
 1	1000
 3	3000
@@ -214,6 +237,7 @@ id	int_col
 14	NULL
 
 -- query 41
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -222,6 +246,7 @@ id	int_col
 5	5000
 
 -- query 42
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -230,6 +255,7 @@ id	int_col
 5	5000
 
 -- query 43
+-- types	integer	integer	double
 id	int_col	avg_score
 1	1000	80.35
 2	2000	80.35
@@ -238,6 +264,7 @@ id	int_col	avg_score
 5	5000	80.35
 
 -- query 44
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -246,6 +273,7 @@ id	int_col
 5	5000
 
 -- query 45
+-- types	integer	integer
 id	int_col
 1	1000
 3	3000
@@ -256,6 +284,7 @@ id	int_col
 12	-2000
 
 -- query 46
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -274,6 +303,7 @@ id	int_col
 15	1500
 
 -- query 47
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -282,6 +312,7 @@ id	int_col
 5	5000
 
 -- query 48
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -300,6 +331,7 @@ id	int_col
 15	1500
 
 -- query 49
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -312,6 +344,7 @@ id	int_col
 13	0
 
 -- query 50
+-- types	integer	integer
 id	int_col
 1	1000
 3	3000
@@ -323,6 +356,7 @@ id	int_col
 14	NULL
 
 -- query 51
+-- types	integer	integer	varchar
 id	int_col	value
 1	1000	value1
 2	2000	value2
@@ -330,6 +364,7 @@ id	int_col	value
 4	4000	value4
 
 -- query 52
+-- types	integer	integer	varchar
 id	int_col	dim_name
 1	1000	Category A
 2	2000	Category B
@@ -337,12 +372,14 @@ id	int_col	dim_name
 4	4000	Category D
 
 -- query 53
+-- types	integer	integer	bigint
 id	int_col	bigint_col
 2	2000	20000
 3	3000	30000
 4	4000	40000
 
 -- query 54
+-- types	integer	integer	bigint
 id	int_col	rn
 1	1000	1
 2	2000	2
@@ -350,6 +387,7 @@ id	int_col	rn
 4	4000	4
 
 -- query 55
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
@@ -361,10 +399,12 @@ id	int_col
 8	8000
 
 -- query 56
+-- types	bigint	bigint	double	integer	integer
 count(*)	sum(int_col)	avg(int_col)	min(int_col)	max(int_col)
-6	21000	3500	1000	6000
+6	21000	3500.0	1000	6000
 
 -- query 57
+-- types	integer	integer	varchar
 id	int_col	value
 8	8000	value8
 7	7000	value7
@@ -373,25 +413,29 @@ id	int_col	value
 4	4000	value4
 
 -- query 58
+-- types	integer	integer
 id	int_col
 1	1000
 2	2000
 3	3000
 
 -- query 59
+-- types	integer	varchar
 id	varchar_col
 11	a'b
 12	c"d
-13	e\f
+13	"e\\f"
 
 -- query 60
+-- types	integer	varchar
 id	varchar_col
 1	apple
 2	banana
 3	carrot
-14	
+14	""
 
 -- query 61
+-- types	bigint	integer
 id	category_id
 1	1
 2	1
@@ -415,12 +459,15 @@ id	category_id
 20	5
 
 -- query 62
+-- types	integer	integer
 id	int_col
 
 -- query 63
+-- types	integer	integer
 id	int_col
 
 -- query 64
+-- types	integer	integer
 id	int_col
 5	5000
 6	6000
@@ -429,6 +476,7 @@ id	int_col
 9	9000
 
 -- query 65
+-- types	integer	integer
 id	int_col
 2	2000
 3	3000
@@ -437,6 +485,7 @@ id	int_col
 6	6000
 
 -- query 66
+-- legacy
 id	date_val
 1	2024-01-01
 2	2024-01-02
@@ -444,9 +493,11 @@ id	date_val
 4	2024-01-04
 
 -- query 67
+-- types	integer	varchar
 id	varchar_col
 
 -- query 68
+-- types	bigint	integer	varchar	double	bigint
 id	category_id	status	score	rank_in_category
 11	1	active	89.3	1
 1	1	active	85.5	2
@@ -470,6 +521,7 @@ id	category_id	status	score	rank_in_category
 15	5	inactive	59.6	4
 
 -- query 69
+-- types	integer	integer	varchar	varchar	varchar	double
 id	int_col	varchar_col	dim_name	status	score
 1	1000	apple	Category A	active	85.5
 2	2000	banana	Category B	inactive	72.3
@@ -478,6 +530,7 @@ id	int_col	varchar_col	dim_name	status	score
 5	5000	elephant	Category E	active	94.1
 
 -- query 70
+-- types	integer	integer
 id	int_col
 5	5000
 6	6000
@@ -491,6 +544,7 @@ id	int_col
 15	1500
 
 -- query 72
+-- types	integer	bigint
 dim_id	count(dim_id)
 1	1
 2	1

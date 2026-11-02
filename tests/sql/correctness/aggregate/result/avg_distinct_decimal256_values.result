@@ -1,15 +1,19 @@
 -- query 1
+-- types	varchar
 wide_distinct_avg
 3000000000000000000000000000000000000000000000000.00
 
 -- query 2
+-- types	varchar	varchar
 rounded_positive	rounded_negative
 0.00000000000000002	-0.00000000000000002
 
 -- query 3
+-- types	varchar
 bounded_distinct_avg
 9999999999999999999999999999999999999999999999999999999999999999999999999997
 
 -- query 4
+-- types	varchar
 null_distinct_avg
 NULL

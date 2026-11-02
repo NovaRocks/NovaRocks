@@ -1,17 +1,21 @@
 -- query 6
+-- legacy
 id	v
 1	aa
 2	b
 
 -- query 8
+-- legacy
 snaps_before_merge
 2
 
 -- query 10
+-- legacy
 snaps_after_merge
 3
 
 -- query 11
+-- legacy
 id	v
 1	aa
 2	bb

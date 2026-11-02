@@ -45,18 +45,39 @@ references; see the spawn-out task in the project notes.
 
 ## Running
 
-Bring up the docker fixture and standalone, then run the suite:
+以下 all-in-one 命令仅作本地 smoke；正式验收使用 cross-process 1FE+3BE。先绑定 fixture，并准备、绑定显式主 Server，然后等待本次进程的就绪标记再连接 Trino 入口：
 
 ```bash
 docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
 
-NO_PROXY=127.0.0.1,localhost \
-cargo run -p novarocks-server -- standalone --role all-in-one \
-  --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG" &
-until nc -z 127.0.0.1 "$NOVA_ENV_MYSQL_PORT"; do sleep 1; done
+mkdir -p logs
+attempt="$(mktemp -d "$PWD/logs/iceberg-rest-smoke.XXXXXX")"
+tools/ci/dev-test.sh prepare "$attempt/artifacts.json"
+source tools/ci/lib/build_capabilities.sh
+export NOVA_CI_ARTIFACT_RECEIPT="$attempt/artifacts.json"
+export NOVAROCKS_BIN="$(ci_bound_binary novarocks)"
+sql_runner="$(ci_bound_binary novarocks-sql-test)"
+server_log="$attempt/server.log"
+NO_PROXY=127.0.0.1,localhost "$NOVAROCKS_BIN" standalone --role all-in-one \
+  --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG" >"$server_log" 2>&1 &
+server_pid=$!
+trap 'kill -TERM "$server_pid" 2>/dev/null || true; wait "$server_pid"' EXIT
+for _ in $(seq 1 60); do
+  if grep -q '^NOVAROCKS_READY mysql_port=.*trino_port=' "$server_log"; then break; fi
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    cat "$server_log" >&2
+    wait "$server_pid"
+    exit 1
+  fi
+  sleep 1
+done
+grep -q '^NOVAROCKS_READY mysql_port=.*trino_port=' "$server_log" || {
+  echo "NovaRocks did not publish its readiness marker; log: $server_log" >&2
+  exit 1
+}
 
-cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
+"$sql_runner" \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-rest --mode verify
 ```
@@ -64,9 +85,9 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 To regenerate the result files after intentional behaviour changes:
 
 ```bash
-cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
+"$sql_runner" \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-  --suite iceberg-rest --mode record --record-from target
+  --suite iceberg-rest --mode record
 ```
 
 Then review the diff under `result/` and commit.
@@ -75,6 +96,8 @@ Then review the diff under `result/` and commit.
 
 Every case file uses three-part naming
 `iceberg_rest_${suite_uuid0}.<db>_${uuid0}.<tbl>_${uuid0}` so parallel runs do
-not collide. Results are recorded with `--record-from target` (the local
-NovaRocks server is the source of truth — there is no reference DB for
-NovaRocks-specific REST behaviour).
+not collide.
+
+普通 `--mode record` 从目标端录制；已有旧期望的协议迁移使用受等价约束的 `--convert-legacy`，不能靠直接重录覆盖 mismatch。格式与转换规则见 [SQL README](../../README.md#golden-格式)。
+
+SQL runner 配置使用 `[cluster].trino_port`（生成环境为 `NOVA_ENV_TRINO_PORT`），命令行覆盖使用 `--trino-port`。就绪标记仍保留 `mysql_port=` 前缀并追加本次实际 `trino_port=`；不能用端口探测代替本次进程的标记。

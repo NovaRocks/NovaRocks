@@ -81,7 +81,7 @@ ci_run_cargo_machete() {
 }
 
 ci_check_unused_dependencies() {
-  local metadata directories directory
+  local metadata directories directory lock_before lock_after code=0
   local roots=()
   metadata="$(cargo metadata --locked --no-deps --format-version 1)" || return 2
   # Scan member-owned top-level directories, excluding vendor workspaces and
@@ -106,12 +106,16 @@ print("\n".join(sorted(directories)))
   while IFS= read -r directory; do
     roots+=("$directory")
   done <<<"$directories"
-  ci_run_cargo_machete "${roots[@]}" || return $?
   # --with-metadata invokes all-features Cargo metadata internally.
-  git diff --quiet -- Cargo.lock || {
+  # Compare this invocation's input, including legitimate pending lock edits.
+  lock_before="$(python3 -c 'import hashlib, pathlib; print(hashlib.sha256(pathlib.Path("Cargo.lock").read_bytes()).hexdigest())')" || return 2
+  ci_run_cargo_machete "${roots[@]}" || code=$?
+  lock_after="$(python3 -c 'import hashlib, pathlib; print(hashlib.sha256(pathlib.Path("Cargo.lock").read_bytes()).hexdigest())')" || return 2
+  if [ "$lock_before" != "$lock_after" ]; then
     echo "error: cargo machete modified Cargo.lock" >&2
-    return 1
-  }
+    [ "$code" -ne 0 ] || code=1
+  fi
+  return "$code"
 }
 
 ci_prepare_main() {

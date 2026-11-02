@@ -1,7 +1,9 @@
 -- query 8
+-- types	bigint	bigint
 row_count	id_sum
 3	10
 
 -- query 10
+-- types	bigint	bigint
 row_count	id_sum
 3	10

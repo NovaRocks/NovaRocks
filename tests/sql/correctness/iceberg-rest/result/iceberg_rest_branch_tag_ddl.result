@@ -1,9 +1,11 @@
 -- query 7
+-- types	integer	integer
 id	v
 1	10
 2	20
 
 -- query 8
+-- types	integer	integer
 id	v
 1	10
 2	20

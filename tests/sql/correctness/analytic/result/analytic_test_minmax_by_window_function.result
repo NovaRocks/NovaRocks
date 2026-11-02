@@ -1,59 +1,74 @@
 -- query 2
+-- legacy
 count(mb)	sum(mb)
 40960	838881280
 
 -- query 3
+-- legacy
 count(mb)	sum(mb)
 40960	838881280
 
 -- query 4
+-- legacy
 count(mb)	sum(mb)
 40960	838881280
 
 -- query 5
+-- legacy
 count(mb)	max(mb)
 40960	9999
 
 -- query 6
+-- legacy
 count(mb)	max(get_json_int(mb, '$'))
 40960	40960
 
 -- query 8
+-- legacy
 count(mb)	sum(mb)
 40960	838881280
 
 -- query 9
+-- legacy
 count(mb)	sum(mb)
 40960	838881280
 
 -- query 10
+-- legacy
 count(mb)	sum(mb)
 40960	838881280
 
 -- query 11
+-- legacy
 count(mb)	max(mb)
 40960	9999
 
 -- query 12
+-- legacy
 count(mb)	max(get_json_int(mb, '$'))
 40960	40960
 
 -- query 13
+-- legacy
 count(mb)
 40960
 
 -- query 14
+-- legacy
 count(mb)
 40960
 
 -- query 15
+-- legacy
 count(mb)
 40960
 
 -- query 16
+-- legacy
 count(mb)
 40960
 
 -- query 17
+-- legacy
 count(mb)
 40960

@@ -1,2 +1,4 @@
+-- query 10
+-- types	bigint
 distinct_rows
 4

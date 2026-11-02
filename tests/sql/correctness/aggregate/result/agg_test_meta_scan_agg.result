@@ -1,95 +1,89 @@
 -- query 4
+-- types	bigint
 count(*)
 0
 
 -- query 7
+-- types	bigint
 count()
 5
 
 -- query 8
+-- types	bigint
 count(c0)
 5
 
 -- query 9
+-- types	bigint
 count(c1)
 5
 
 -- query 10
+-- types	bigint
 count(c2)
 5
 
 -- query 11
+-- types	date	date	integer	integer	bigint	bigint
 min(c0)	max(c0)	min(c1)	max(c1)	min(c2)	max(c2)
 2024-01-01	2024-01-05	1	5	1	5
 
 -- query 12
+-- types	bigint
 count(c0)
 5
 
 -- query 13
+-- types	bigint
 count(c1)
 5
 
 -- query 14
+-- types	bigint
 count(c2)
 5
 
 -- query 15
+-- types	date	date	integer	integer	bigint	bigint
 min(c0)	max(c0)	min(c1)	max(c1)	min(c2)	max(c2)
 2024-01-01	2024-01-05	1	5	1	5
 
 -- query 16
+-- types	bigint
 count(1)
 5
 
 -- query 17
+-- types	bigint
 count(*)
 5
 
--- query 31
-count(*)
-3
-
--- query 32
-count(*)
-3
-
--- query 34
-count(*)
-3
-
--- query 35
-count(*)
-3
-
--- query 37
-count(*)
-3
-
--- query 38
-count(*)
-3
-
 -- query 22
+-- types	bigint
 count(*)
 3
 
 -- query 23
+-- types	bigint
 count(*)
 3
 
 -- query 25
+-- types	bigint
 count(*)
 3
 
 -- query 26
+-- types	bigint
 count(*)
 3
 
 -- query 28
+-- types	bigint
 count(*)
 3
 
 -- query 29
+-- types	bigint
 count(*)
 3

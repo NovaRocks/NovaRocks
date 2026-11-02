@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	integer	integer	date	decimal(15, 2)	decimal(38, 2)
 c_name	c_custkey	o_orderkey	o_orderdate	o_totalprice	sum(l_quantity)
 Customer#000128120	128120	4722021	1994-04-07	544089.09	323.00
 Customer#000144617	144617	3043270	1997-02-12	530604.44	317.00

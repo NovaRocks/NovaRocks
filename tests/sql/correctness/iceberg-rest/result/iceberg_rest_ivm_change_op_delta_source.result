@@ -1,36 +1,44 @@
 -- query 3
+-- types	integer	bigint
 id	amount
 1	100
 2	40
 
 -- query 4
+-- legacy
 customer	total_amount
 Alice	100
 Bob	40
 
 -- query 6
+-- types	integer	varchar	bigint
 id	customer	amount
 1	Alice	80
 2	Bob	40
 
 -- query 8
+-- legacy
 id	amount
 1	80
 2	40
 
 -- query 9
+-- legacy
 customer	total_amount
 Alice	80
 Bob	40
 
 -- query 11
+-- types	integer	varchar	bigint
 id	customer	amount
 2	Bob	40
 
 -- query 13
+-- legacy
 id	amount
 2	40
 
 -- query 14
+-- legacy
 customer	total_amount
 Bob	40

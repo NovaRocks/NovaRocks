@@ -1,27 +1,34 @@
 -- query 4
+-- types	bigint	bigint	bigint
 count(*)	count(a.v1)	count(b.v1)
 16	16	16
 
 -- query 5
+-- types	bigint	bigint	bigint
 count(*)	count(a.v1)	count(b.v1)
 3	3	3
 
 -- query 6
+-- types	bigint	bigint	bigint
 count(*)	count(a.v1)	count(b.v1)
 5	5	3
 
 -- query 7
+-- legacy
 count(*)	count(a.v1)	count(b.v1)
 5	3	5
 
 -- query 8
+-- legacy
 count(*)	count(a.v1)	count(b.v1)
 7	5	5
 
 -- query 9
+-- types	bigint	bigint
 count(*)	count(a.v1)
 2	2
 
 -- query 10
+-- types	bigint	bigint
 count(*)	count(a.v1)
 2	2

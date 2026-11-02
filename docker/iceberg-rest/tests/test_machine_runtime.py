@@ -75,7 +75,7 @@ class Backend:
     def unsettled_operations(self, base):
         return []
 
-    def settle_operations(self, base):
+    def settle_operations(self, base, *, inventory_deadline=None):
         pass
 
     def image_id(self, reference):
@@ -1049,6 +1049,112 @@ class MachineTests(unittest.TestCase):
         self.assertEqual(self.owner.read_saved_state(), state)
         self.assertNotIn(("sweep", True), self.backend.events)
 
+    def test_sweep_expired_health_boolean_never_dispatches_gc(self):
+        state = self.start()
+        original = 190.0
+        self.backend.operation_deadline = original
+        for result in (False, True):
+            with self.subTest(health=result):
+                now = [100.0]
+                def health(record):
+                    self.assertEqual(self.backend.operation_deadline, 105.0)
+                    now[0] = 105.0
+                    return result
+                with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
+                        mock.patch.object(self.backend, "healthy", side_effect=health):
+                    self.assert_code("ScratchSweepTimeout", lambda: self.owner.sweep(deadline=105.0))
+                self.assertEqual(self.backend.operation_deadline, original)
+                self.assertEqual(self.owner.read_saved_state(), state)
+                self.assertNotIn(("sweep", True), self.backend.events)
+
+    def test_sweep_timely_unhealthy_observation_remains_a_real_failure(self):
+        state = self.start()
+        with mock.patch.object(self.backend, "healthy", return_value=False):
+            self.assert_code("MachineUnavailable", lambda: self.owner.sweep(deadline=time.monotonic()+1))
+        self.assertEqual(self.owner.read_saved_state(), state)
+        self.assertNotIn(("sweep", True), self.backend.events)
+
+    def test_slow_local_inventory_stops_before_health_or_recovery_consumes_sweep_window(self):
+        state = self.start()
+        original_deadline = 190.0
+        self.backend.operation_deadline = original_deadline
+        now = [100.0]
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            operations = base / "operations"
+            operations.mkdir()
+            settled = operations / "a.json"
+            pending = operations / "b.json"
+            settled.write_text(json.dumps({"schema": 1, "phase": "settled"}))
+            pending.write_text(json.dumps({"schema": 1, "phase": "intent"}))
+            pending_bytes = pending.read_bytes()
+            backend = machine.MachineDocker()
+            read = runtime.read_json
+
+            def slow_read(path):
+                value = read(path)
+                if Path(path) == settled:
+                    # Still inside the original sweep window, but local scanning
+                    # must leave time for the remaining external observations.
+                    now[0] = 103.0
+                return value
+
+            def inventory(unused_base, *, inventory_deadline):
+                backend.settle_operations(base, inventory_deadline=inventory_deadline)
+
+            with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
+                    mock.patch.object(runtime, "read_json", side_effect=slow_read), \
+                    mock.patch.object(self.backend, "settle_operations", side_effect=inventory), \
+                    mock.patch.object(self.backend, "healthy") as health, \
+                    mock.patch.object(backend, "command") as recovery, \
+                    mock.patch.object(runtime, "atomic_json") as write:
+                with self.assertRaises(machine.SweepInventoryTimeout):
+                    self.owner.sweep(deadline=105.0)
+                health.assert_not_called()
+                recovery.assert_not_called()
+                write.assert_not_called()
+            self.assertEqual(pending.read_bytes(), pending_bytes)
+        self.assertEqual(self.backend.operation_deadline, original_deadline)
+        self.assertEqual(self.owner.read_saved_state(), state)
+        self.assertNotIn(("sweep", True), self.backend.events)
+
+    def test_timely_inventory_does_not_shorten_the_remaining_operation_deadline(self):
+        state = self.start()
+        original_deadline = 190.0
+        self.backend.operation_deadline = original_deadline
+        now = [100.0]
+
+        def inventory(base, *, inventory_deadline):
+            self.assertLess(now[0], inventory_deadline)
+            self.assertLess(inventory_deadline, 105.0)
+            now[0] = 100.5
+
+        def health(record):
+            self.assertEqual(self.backend.operation_deadline, 105.0)
+            return True
+
+        with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(self.backend, "settle_operations", side_effect=inventory), \
+                mock.patch.object(self.backend, "healthy", side_effect=health):
+            self.assertTrue(self.owner.sweep(deadline=105.0)["complete"])
+        self.assertEqual(self.backend.operation_deadline, original_deadline)
+
+    def test_sweep_expired_health_never_defers_unsettled_operations(self):
+        state = self.start()
+        original = 190.0
+        self.backend.operation_deadline = original
+        now = [100.0]
+        def health(record):
+            now[0] = 105.0
+            return False
+        with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(self.backend, "healthy", side_effect=health), \
+                mock.patch.object(self.backend, "unsettled_operations", return_value=[("owned-journal", {"phase":"command-unknown"})]):
+            self.assert_code("MachineUnavailable", lambda: self.owner.sweep(deadline=105.0))
+        self.assertEqual(self.backend.operation_deadline, original)
+        self.assertEqual(self.owner.read_saved_state(), state)
+        self.assertNotIn(("sweep", True), self.backend.events)
+
     def test_sweep_does_not_defer_unconfirmed_timeout_or_other_failure(self):
         self.start()
         for code,evidence in (("DockerOperationTimeout",False),("DockerOperationFailed",True),
@@ -1445,6 +1551,49 @@ class DockerActivationTests(unittest.TestCase):
             barrier = self.docker.remove_rest_state(self.source)
         self.assertEqual(mutations, [["rm", *identifiers]])
         self.assertTrue(barrier["complete"])
+
+
+class BoundedOperationInventoryTest(unittest.TestCase):
+    def test_expired_inventory_never_returns_partial_mutations_or_starts_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "machine"
+            operations = base / "operations"
+            operations.mkdir(parents=True)
+            settled = operations / "a.json"
+            unknown = operations / "b.json"
+            settled.write_text(json.dumps({"schema": 1, "phase": "settled"}))
+            fact = {"schema": 1, "phase": "intent", "kind": "control",
+                    "control_root": str(base.parent), "machine": base.name}
+            unknown.write_text(json.dumps(fact))
+            original = unknown.read_bytes()
+            backend = machine.MachineDocker()
+            now = [100.0]
+            read = runtime.read_json
+
+            def slow_read(path):
+                value = read(path)
+                now[0] = 105.0
+                return value
+
+            with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
+                    mock.patch.object(runtime, "read_json", side_effect=slow_read) as observe, \
+                    mock.patch.object(runtime, "atomic_json") as write, \
+                    mock.patch.object(backend, "command") as command:
+                with self.assertRaises(machine.SweepInventoryTimeout):
+                    backend.settle_operations(base, inventory_deadline=105.0)
+                self.assertEqual(observe.call_args_list, [mock.call(settled)])
+                write.assert_not_called()
+                command.assert_not_called()
+            self.assertEqual(unknown.read_bytes(), original)
+            self.assertEqual(backend.unsettled_operations(base), [(unknown, fact)])
+
+    def test_timely_inventory_keeps_invalid_journal_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / "operations").mkdir()
+            (base / "operations" / "bad.json").write_text('{"schema":1,"phase":"invalid"}')
+            with self.assertRaisesRegex(runtime.RuntimeFailure, "RuntimeStateUnreadable"):
+                machine.MachineDocker().settle_operations(base, inventory_deadline=time.monotonic() + 30)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+-- query 2
+-- types	bigint	varchar
 a	b
 NULL	NULL
 NULL	x

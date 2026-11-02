@@ -17,9 +17,7 @@
 
 //! Exact fixture observations borrow only the original live role/log owners.
 use super::{BackendTopologyRow, process_resources};
-use super::{
-    CrossProcessServerHandle, TOPOLOGY_MYSQL_IO_TIMEOUT_CAP, query_frontend_backend_topology,
-};
+use super::{CrossProcessServerHandle, TOPOLOGY_IO_TIMEOUT_CAP, query_frontend_backend_topology};
 use anyhow::{Context, Result, ensure};
 use novarocks_types::BackendProcessId;
 use std::time::Instant;
@@ -90,17 +88,13 @@ impl CrossProcessServerHandle {
         let before = self.recheck_live_process_launch_identities()?;
         let timeout = original_deadline
             .saturating_duration_since(Instant::now())
-            .min(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP);
+            .min(TOPOLOGY_IO_TIMEOUT_CAP);
         ensure!(
             !timeout.is_zero(),
             "original root descriptor clock expired before query"
         );
-        let rows = query_frontend_backend_topology(
-            &self.mysql_user,
-            &self.target_host,
-            self.target_port,
-            timeout,
-        )?;
+        let rows =
+            query_frontend_backend_topology(&self.target_host, self.runtime.fe_http_port, timeout)?;
         ensure!(
             Instant::now() < original_deadline,
             "original root descriptor clock expired after query"

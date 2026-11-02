@@ -191,6 +191,43 @@ fn parse_publication_service_hold(raw: &str) -> anyhow::Result<PublicationServic
     })
 }
 
+#[derive(Clone, Copy)]
+enum MetadataNameBinding {
+    Bound,
+    LiteralDefinition,
+}
+
+/// A definition retains placeholder spelling; it grants no executable target.
+/// Only the preserving-placeholder source loader selects this path. Concrete
+/// names and every surrounding directive still use the ordinary SQL grammar.
+fn parse_definition_publication_catalog_fault_target(
+    raw: &str,
+) -> Result<PublicationCatalogFaultTarget> {
+    let template = Regex::new(
+        r"^(?:[A-Za-z_]|\$\{[A-Za-z0-9_.-]+\})(?:[A-Za-z0-9_]|\$\{[A-Za-z0-9_.-]+\})*$",
+    )?;
+    let mut parts = Vec::new();
+    for part in raw.split(',') {
+        let (key, value) = part.trim().split_once('=').context(
+            "publication_catalog_fault_target requires namespace=<namespace>,table=<table>",
+        )?;
+        let value = value.trim();
+        // Already quoted identifiers retain their original SQL grammar. Quote
+        // an unquoted identifier template only as a literal definition name,
+        // never by replacing a placeholder with a fabricated concrete value.
+        let value = if value.contains("${") && !value.starts_with('`') {
+            if !template.is_match(value) {
+                bail!("invalid publication_catalog_fault_target identifier template");
+            }
+            format!("`{value}`")
+        } else {
+            value.to_string()
+        };
+        parts.push(format!("{}={value}", key.trim()));
+    }
+    parse_publication_catalog_fault_target(&parts.join(","))
+}
+
 fn parse_publication_catalog_fault_target(raw: &str) -> Result<PublicationCatalogFaultTarget> {
     let mut namespace = None;
     let mut table = None;
@@ -418,6 +455,20 @@ fn parse_meta_with_sql_error_descriptors(
     meta_re: &Regex,
     sql_error_descriptors: &[SqlErrorDescriptor],
 ) -> Result<QueryMeta> {
+    parse_meta_with_name_binding(
+        lines,
+        meta_re,
+        sql_error_descriptors,
+        MetadataNameBinding::Bound,
+    )
+}
+
+fn parse_meta_with_name_binding(
+    lines: &[String],
+    meta_re: &Regex,
+    sql_error_descriptors: &[SqlErrorDescriptor],
+    name_binding: MetadataNameBinding,
+) -> Result<QueryMeta> {
     let mut meta = QueryMeta::default();
     for line in lines {
         let Some((key, raw_value)) = parse_meta_line(line, meta_re) else {
@@ -601,8 +652,14 @@ fn parse_meta_with_sql_error_descriptors(
                 if meta.publication_catalog_fault_target.is_some() {
                     bail!("duplicate publication_catalog_fault_target");
                 }
-                meta.publication_catalog_fault_target =
-                    Some(parse_publication_catalog_fault_target(&raw_value)?);
+                meta.publication_catalog_fault_target = Some(match name_binding {
+                    MetadataNameBinding::Bound => {
+                        parse_publication_catalog_fault_target(&raw_value)?
+                    }
+                    MetadataNameBinding::LiteralDefinition => {
+                        parse_definition_publication_catalog_fault_target(&raw_value)?
+                    }
+                });
             }
             "publication_catalog_fault_timing" => {
                 if meta.publication_catalog_fault_timing.is_some() {
@@ -643,11 +700,11 @@ fn parse_meta_with_sql_error_descriptors(
                 }
                 meta.kill_fe_after_be_log_contains = Some(raw_value);
             }
-            "kill_query_after_be_log_contains" => {
+            "cancel_query_after_be_log_contains" => {
                 if raw_value.is_empty() {
-                    bail!("kill_query_after_be_log_contains must not be empty");
+                    bail!("cancel_query_after_be_log_contains must not be empty");
                 }
-                meta.kill_query_after_be_log_contains = Some(raw_value);
+                meta.cancel_query_after_be_log_contains = Some(raw_value);
             }
             "terminal_snapshot_conflict_be_index" => {
                 let value = raw_value.parse::<usize>().with_context(|| {
@@ -1060,10 +1117,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .publication_catalog_concurrent_shell
             .clone()
             .or_else(|| base.publication_catalog_concurrent_shell.clone()),
-        kill_query_after_be_log_contains: override_meta
-            .kill_query_after_be_log_contains
+        cancel_query_after_be_log_contains: override_meta
+            .cancel_query_after_be_log_contains
             .clone()
-            .or_else(|| base.kill_query_after_be_log_contains.clone()),
+            .or_else(|| base.cancel_query_after_be_log_contains.clone()),
         kill_be_after_be_log_contains: override_meta
             .kill_be_after_be_log_contains
             .clone()
@@ -1171,6 +1228,14 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
 }
 
 pub fn extract_meta_and_sql(lines: &[String], meta_re: &Regex) -> Result<(QueryMeta, String)> {
+    extract_meta_and_sql_with_name_binding(lines, meta_re, MetadataNameBinding::Bound)
+}
+
+fn extract_meta_and_sql_with_name_binding(
+    lines: &[String],
+    meta_re: &Regex,
+    name_binding: MetadataNameBinding,
+) -> Result<(QueryMeta, String)> {
     let mut preface_meta_lines: Vec<String> = Vec::new();
     let mut sql_lines: Vec<String> = Vec::new();
     let mut started = false;
@@ -1190,7 +1255,15 @@ pub fn extract_meta_and_sql(lines: &[String], meta_re: &Regex) -> Result<(QueryM
         sql_lines.push(line.trim_end().to_string());
     }
 
-    let meta = parse_meta(&preface_meta_lines, meta_re)?;
+    let meta = match name_binding {
+        MetadataNameBinding::Bound => parse_meta(&preface_meta_lines, meta_re)?,
+        MetadataNameBinding::LiteralDefinition => parse_meta_with_name_binding(
+            &preface_meta_lines,
+            meta_re,
+            production_sql_error_descriptors(),
+            name_binding,
+        )?,
+    };
     let sql = sql_lines.join("\n").trim().to_string();
     Ok((meta, sql))
 }
@@ -1211,18 +1284,33 @@ pub fn load_sql_case_from_file(
         .and_then(|stem| stem.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid SQL file name: {}", sql_path.display()))?;
     let case_variables = case_placeholder_variables(variables, case_id)?;
-    load_sql_case_from_file_with_variables(sql_path, meta_re, marker_re, &case_variables)
+    load_sql_case_from_file_with_variables(
+        sql_path,
+        meta_re,
+        marker_re,
+        &case_variables,
+        MetadataNameBinding::Bound,
+    )
 }
 
 /// Load a case while preserving supplied placeholder tokens. This is used by
 /// read-only source inventories whose output must not contain run-specific IDs.
+/// Metadata identifier templates remain literal definition names. This entry
+/// point grants no runtime control authority; executable cases use the bound
+/// loader and its ordinary SQL object-name validation.
 pub fn load_sql_case_from_file_preserving_placeholders(
     sql_path: &Path,
     meta_re: &Regex,
     marker_re: &Regex,
     variables: &HashMap<String, String>,
 ) -> Result<Option<SqlCase>> {
-    load_sql_case_from_file_with_variables(sql_path, meta_re, marker_re, variables)
+    load_sql_case_from_file_with_variables(
+        sql_path,
+        meta_re,
+        marker_re,
+        variables,
+        MetadataNameBinding::LiteralDefinition,
+    )
 }
 
 fn load_sql_case_from_file_with_variables(
@@ -1230,6 +1318,7 @@ fn load_sql_case_from_file_with_variables(
     meta_re: &Regex,
     marker_re: &Regex,
     case_variables: &HashMap<String, String>,
+    name_binding: MetadataNameBinding,
 ) -> Result<Option<SqlCase>> {
     let base_name = sql_path
         .file_stem()
@@ -1280,8 +1369,9 @@ fn load_sql_case_from_file_with_variables(
     } else {
         lines.clone()
     };
-    let (file_meta, _) = extract_meta_and_sql(&file_meta_lines, meta_re)
-        .with_context(|| format!("{}: invalid file-level metadata", sql_path.display()))?;
+    let (file_meta, _) =
+        extract_meta_and_sql_with_name_binding(&file_meta_lines, meta_re, name_binding)
+            .with_context(|| format!("{}: invalid file-level metadata", sql_path.display()))?;
 
     // Detect case-level sequential flags from the native runner metadata and
     // from migrated legacy `-- name: ... @sequential` markers.
@@ -1344,9 +1434,10 @@ fn load_sql_case_from_file_with_variables(
             format!("{}-{}", base_name, query_number)
         };
 
-        let (section_meta, sql) = extract_meta_and_sql(&section, meta_re).with_context(|| {
-            format!("{} ({}): invalid metadata", sql_path.display(), section_id)
-        })?;
+        let (section_meta, sql) =
+            extract_meta_and_sql_with_name_binding(&section, meta_re, name_binding).with_context(
+                || format!("{} ({}): invalid metadata", sql_path.display(), section_id),
+            )?;
 
         if sql.is_empty() {
             continue;
@@ -1666,6 +1757,69 @@ mod opt5_directive_tests {
     }
 
     #[test]
+    fn definition_fault_targets_keep_tokens_without_weakening_bound_names() {
+        let line = "-- @publication_catalog_fault_target=namespace=ns_${uuid0},table=t_${case_id}";
+        assert!(parse_meta(&[line.into()], &meta_re()).is_err());
+        let definition = parse_meta_with_name_binding(
+            &[line.into()],
+            &meta_re(),
+            production_sql_error_descriptors(),
+            MetadataNameBinding::LiteralDefinition,
+        )
+        .unwrap();
+        assert_eq!(
+            definition.publication_catalog_fault_target,
+            Some(PublicationCatalogFaultTarget {
+                namespace: "ns_${uuid0}".into(),
+                table: "t_${case_id}".into(),
+            })
+        );
+        for raw in [
+            "namespace=ns_${uuid0};DROP TABLE x.y,table=t",
+            "namespace=ns_${uuid0}.other,table=t",
+            "namespace=ns_${uuid0}/other,table=t",
+            "namespace=ns_${uuid0,table=t",
+            "namespace=ns_${},table=t",
+            "namespace=ns_${uuid0},namespace=other,table=t",
+            "namespace=ns_${uuid0},table=*",
+        ] {
+            assert!(parse_definition_publication_catalog_fault_target(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn actual_catalog_isolation_definition_retains_every_fault_control() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../correctness/lnp-3d-mv-accelerator/sql/mv_catalog_isolation.sql");
+        let source = fs::read_to_string(&path).unwrap();
+        let variables = crate::extension_manifest::literal_placeholder_variables(&source);
+        let marker = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").unwrap();
+        let case =
+            load_sql_case_from_file_preserving_placeholders(&path, &meta_re(), &marker, &variables)
+                .unwrap()
+                .unwrap();
+        assert_eq!(case.steps.len(), 8);
+        let fault = &case.steps[1];
+        assert_eq!(fault.query_number, 2);
+        assert!(fault.meta.publication_catalog_fault.is_some());
+        assert_eq!(
+            fault.meta.publication_catalog_fault_target,
+            Some(PublicationCatalogFaultTarget {
+                namespace: "ns_${uuid0}".into(),
+                table: "a_mv".into(),
+            })
+        );
+        assert_eq!(
+            fault.meta.publication_catalog_fault_timing,
+            Some(PublicationCatalogFaultTiming::AfterFrontendExit),
+        );
+        assert!(fault.meta.restart_fe_after_step);
+        assert!(fault.meta.skip_result_check);
+        assert_eq!(fault.sql.trim(), "SELECT 1;");
+        assert!(case.steps[0].sql.contains("lnp3d_pkg_${uuid0}.ns_${uuid0}"));
+    }
+
+    #[test]
     fn publication_fault_target_uses_the_real_case_namespace_rewrite_before_parsing() {
         let dir = tempfile::tempdir().unwrap();
         let raw = "-- @sequential=true\n-- query 1\nCREATE DATABASE c.ns_${uuid0};\n-- query 2\n-- @publication_catalog_fault=table-load,corrupt-package\n-- @publication_catalog_fault_target=namespace=ns_${uuid0},table=a_mv\nSELECT 1;\n";
@@ -1965,7 +2119,7 @@ mod opt5_directive_tests {
         let lines = vec![
             "-- @kill_fe_after_mv_known_committed_before_projector_cas=true".to_string(),
             "-- @restart_be_after_establish_context_index=1".to_string(),
-            "-- @kill_query_after_be_log_contains=split_id=iceberg-metadata-0".to_string(),
+            "-- @cancel_query_after_be_log_contains=split_id=iceberg-metadata-0".to_string(),
             "-- @terminal_snapshot_conflict_be_index=2".to_string(),
             "-- @kill_query_at_lifecycle_phase=starting".to_string(),
             "-- @kill_be_at_lifecycle_phase=2,terminal-retained".to_string(),
@@ -1977,7 +2131,7 @@ mod opt5_directive_tests {
         assert!(meta.kill_fe_after_mv_known_committed_before_projector_cas);
         assert_eq!(meta.restart_be_after_establish_context_index, Some(1));
         assert_eq!(
-            meta.kill_query_after_be_log_contains.as_deref(),
+            meta.cancel_query_after_be_log_contains.as_deref(),
             Some("split_id=iceberg-metadata-0")
         );
         assert_eq!(meta.terminal_snapshot_conflict_be_index, Some(2));
@@ -2435,7 +2589,7 @@ mod opt5_directive_tests {
         let base = QueryMeta {
             kill_fe_after_mv_known_committed_before_projector_cas: true,
             restart_be_after_establish_context_index: Some(0),
-            kill_query_after_be_log_contains: Some("reader-open".to_string()),
+            cancel_query_after_be_log_contains: Some("reader-open".to_string()),
             terminal_snapshot_conflict_be_index: Some(1),
             kill_query_at_lifecycle_phase: Some(QueryLifecyclePhase::Staging),
             query_control_fragment_backend_limit: Some(2),
@@ -2445,7 +2599,7 @@ mod opt5_directive_tests {
         assert!(inherited.kill_fe_after_mv_known_committed_before_projector_cas);
         assert_eq!(inherited.restart_be_after_establish_context_index, Some(0));
         assert_eq!(
-            inherited.kill_query_after_be_log_contains.as_deref(),
+            inherited.cancel_query_after_be_log_contains.as_deref(),
             Some("reader-open")
         );
         assert_eq!(inherited.terminal_snapshot_conflict_be_index, Some(1));
@@ -2457,7 +2611,7 @@ mod opt5_directive_tests {
 
         let override_meta = QueryMeta {
             restart_be_after_establish_context_index: Some(2),
-            kill_query_after_be_log_contains: Some("metadata-open".to_string()),
+            cancel_query_after_be_log_contains: Some("metadata-open".to_string()),
             terminal_snapshot_conflict_be_index: Some(0),
             kill_query_at_lifecycle_phase: Some(QueryLifecyclePhase::Running),
             query_control_fragment_backend_limit: Some(1),
@@ -2467,7 +2621,7 @@ mod opt5_directive_tests {
         assert!(overridden.kill_fe_after_mv_known_committed_before_projector_cas);
         assert_eq!(overridden.restart_be_after_establish_context_index, Some(2));
         assert_eq!(
-            overridden.kill_query_after_be_log_contains.as_deref(),
+            overridden.cancel_query_after_be_log_contains.as_deref(),
             Some("metadata-open")
         );
         assert_eq!(overridden.terminal_snapshot_conflict_be_index, Some(0));

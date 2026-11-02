@@ -1,3 +1,5 @@
+-- query 1
+-- types	integer	varchar	decimal(38, 2)
 brand_id	brand	ext_price
 2001001	amalgimporto #1	128393.59
 5001001	amalgscholar #1	114563.05

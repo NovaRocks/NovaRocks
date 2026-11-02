@@ -1,3 +1,5 @@
+-- query 1
+-- legacy
 i_category	i_brand	cc_name	d_year	d_moy	avg_monthly_sales	sum_sales	psum	nsum
 Shoes	importoedu pack #1	North Midwest	1999	3	7101.78000000	2518.33	5264.86	3066.29
 Men	edu packimporto #1	NY Metro	1999	4	7659.24166667	3227.88	4759.01	4664.83

@@ -1,3 +1,5 @@
+-- query 1
+-- legacy
 i_category	i_brand	s_store_name	s_company_name	d_year	d_moy	avg_monthly_sales	sum_sales	psum	nsum
 Men	importoimporto #1	ese	Unknown	1999	3	5492.81750000	2070.65	3307.78	2784.11
 Music	exportischolar #1	eing	Unknown	1999	2	5134.23833333	1740.21	4401.89	2721.61

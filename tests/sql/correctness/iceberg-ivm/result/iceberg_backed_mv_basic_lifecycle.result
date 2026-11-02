@@ -1,19 +1,23 @@
 -- query 2
+-- types	integer	bigint
 k1	v2
 
 -- query 4
+-- types	integer	bigint
 k1	v2
 1	10
 2	20
 3	50
 
 -- query 7
+-- types	integer	bigint
 k1	v2
 1	10
 2	20
 3	50
 
 -- query 9
+-- legacy
 k1	v2
 1	10
 2	20
@@ -21,6 +25,7 @@ k1	v2
 4	70
 
 -- query 11
+-- types	integer	bigint
 k1	v2
 1	10
 2	20

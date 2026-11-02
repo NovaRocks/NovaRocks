@@ -1,11 +1,14 @@
 -- query 2
+-- types	bigint
 count(*)
 0
 
 -- query 4
+-- types	bigint
 count(*)
 0
 
 -- query 6
+-- types	bigint
 count(*)
 0

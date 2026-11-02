@@ -1,15 +1,19 @@
 -- query 3
+-- types	boolean	boolean	boolean	boolean	boolean
 bool_or(c0)	bool_or(c1)	bool_or(c2)	bool_or(c3)	bool_or(NULL)
 NULL	NULL	NULL	NULL	NULL
 
 -- query 5
+-- types	boolean	boolean	boolean	boolean	boolean
 bool_or(c0)	bool_or(c1)	bool_or(c2)	bool_or(c3)	bool_or(NULL)
-1	1	1	0	0
+true	true	true	false	false
 
 -- query 7
+-- types	bigint	bigint	bigint	bigint	bigint
 sum(a)	sum(b)	sum(c)	sum(d)	sum(e)
 40960	40960	40960	0	0
 
 -- query 8
+-- types	bigint
 sum(a)
 40960

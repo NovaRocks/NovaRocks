@@ -118,7 +118,7 @@ struct StatementLifecycleObservationWire {
 /// Validate attribution only. A bound journal entry is not a completion receipt.
 fn validate_statement_observation_binding(
     token: &str,
-    connection_id: u32,
+    target: &StatementObservationTarget,
     wire: &StatementLifecycleObservationWire,
 ) -> Result<()> {
     ensure!(
@@ -132,8 +132,7 @@ fn validate_statement_observation_binding(
     let parts = work_id.split(':').collect::<Vec<_>>();
     ensure!(
         parts.len() == 4
-            && parts[0] == "statement"
-            && parts[1].parse::<u32>()? == connection_id
+            && target.matches_work_id(&parts)
             && parts[2].parse::<u64>()? > 0
             && parts[3].parse::<u64>()? > 0,
         "statement observation returned a foreign or invalid statement token: {work_id}"
@@ -166,7 +165,7 @@ fn validate_statement_observation_binding(
 
 fn decode_statement_lifecycle_observation(
     token: &str,
-    connection_id: u32,
+    target: &StatementObservationTarget,
     wire: StatementLifecycleObservationWire,
 ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
     ensure!(
@@ -182,8 +181,7 @@ fn decode_statement_lifecycle_observation(
     let parts = work_id.split(':').collect::<Vec<_>>();
     ensure!(
         parts.len() == 4
-            && parts[0] == "statement"
-            && parts[1].parse::<u32>()? == connection_id
+            && target.matches_work_id(&parts)
             && parts[2].parse::<u64>()? > 0
             && parts[3].parse::<u64>()? > 0,
         "statement observation returned a foreign or invalid statement token: {work_id}"
@@ -387,7 +385,7 @@ fn query_lifecycle_structured_snapshot_from_fe(
 ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
     let timeout = deadline
         .saturating_duration_since(Instant::now())
-        .min(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP);
+        .min(TOPOLOGY_IO_TIMEOUT_CAP);
     ensure!(
         !timeout.is_zero(),
         "FE lifecycle snapshot original deadline expired"
@@ -1278,12 +1276,42 @@ pub struct QueryLifecycleAttemptTarget {
     pub attempt_id: u64,
 }
 
-/// A runner arm scoped to one connection and the exact submitted SQL bytes.
+/// A runner arm scoped to one external target and the exact submitted SQL bytes.
 /// Its identity is bound by the real statement and attempt owners in the FE.
 #[derive(Debug, Clone)]
 pub struct QueryLifecycleStatementObservation {
     token: String,
-    connection_id: u32,
+    target: StatementObservationTarget,
+}
+
+#[derive(Debug, Clone)]
+enum StatementObservationTarget {
+    Connection(u32),
+    ClientQuery(String),
+}
+
+impl StatementObservationTarget {
+    fn matches_work_id(&self, parts: &[&str]) -> bool {
+        match self {
+            Self::Connection(connection) => {
+                parts[0] == "statement" && parts[1].parse::<u32>().ok() == Some(*connection)
+            }
+            Self::ClientQuery(query) => parts[0] == "client-query" && parts[1] == query,
+        }
+    }
+}
+
+fn validate_client_query_target(query: &str) -> Result<()> {
+    ensure!(
+        query.len() == 27
+            && query.bytes().enumerate().all(|(index, byte)| match index {
+                8 | 15 | 21 => byte == b'_',
+                22..=26 => byte.is_ascii_lowercase() || byte.is_ascii_digit(),
+                _ => byte.is_ascii_digit(),
+            }),
+        "invalid client query id shape"
+    );
+    Ok(())
 }
 
 impl QueryLifecycleAttemptTarget {
@@ -1799,94 +1827,83 @@ impl BackendTopologyRow {
     }
 }
 
-fn parse_frontend_show_backends_values(values: &[String]) -> Result<BackendTopologyRow> {
-    let process_id = values
-        .first()
-        .context("SHOW BACKENDS row missing ProcessId")?
-        .clone();
-    let endpoint = values
-        .get(1)
-        .context("SHOW BACKENDS row missing Endpoint")?;
-    let (_, port) = endpoint
-        .rsplit_once(':')
-        .context("SHOW BACKENDS Endpoint must contain a port")?;
-    let grpc_port = port
-        .parse::<u16>()
-        .context("parse SHOW BACKENDS endpoint port")?;
-    let alive = values
-        .get(7)
-        .context("SHOW BACKENDS row missing Eligible")?
-        .parse::<bool>()
-        .context("parse SHOW BACKENDS Eligible")?;
-    let native_compatibility_id = values
-        .get(12)
-        .context("SHOW BACKENDS row missing NativeCompatibilityId")?
-        .clone();
-    let state = values
-        .get(13)
-        .context("SHOW BACKENDS row missing DiagnosticStatus")?
-        .clone();
-    let scheduled_fragments = values
-        .get(8)
-        .context("SHOW BACKENDS row missing ScheduledFragments")?
-        .parse::<u64>()
-        .context("parse SHOW BACKENDS ScheduledFragments")?;
-    let build_identity = values
-        .get(11)
-        .context("SHOW BACKENDS row missing BuildIdentity")?
-        .clone();
-    let status_detail = values
-        .get(14)
-        .context("SHOW BACKENDS row missing StatusDetail")?
-        .clone();
-    Ok(BackendTopologyRow {
-        process_id,
-        grpc_port,
-        state,
-        alive,
-        scheduled_fragments,
-        build_identity,
-        native_compatibility_id,
-        status_detail,
-    })
+#[derive(serde::Deserialize)]
+struct FrontendBackendTopologyWire {
+    schema_version: u8,
+    backends: Vec<FrontendBackendRowWire>,
 }
 
-fn query_frontend_backend_topology(
-    mysql_user: &str,
-    host: &str,
-    port: u16,
-    io_timeout: Duration,
+#[derive(serde::Deserialize)]
+struct FrontendBackendRowWire {
+    process_id: String,
+    endpoint: String,
+    eligible: bool,
+    scheduled_fragments: u64,
+    build_identity: String,
+    native_compatibility_id: String,
+    diagnostic_status: String,
+    status_detail: String,
+}
+
+fn decode_frontend_backend_topology(
+    wire: FrontendBackendTopologyWire,
 ) -> Result<Vec<BackendTopologyRow>> {
-    let builder = OptsBuilder::new()
-        .ip_or_hostname(Some(host))
-        .tcp_port(port)
-        .prefer_socket(false)
-        .user(Some(mysql_user))
-        // The synchronous mysql client maps macOS socket read/write timeouts
-        // to EAGAIN while decoding a valid response. The enclosing topology
-        // barrier owns the deadline; retain only a bounded connect timeout.
-        .tcp_connect_timeout(Some(io_timeout));
-    let mut conn = MysqlConn::new(builder)
-        .with_context(|| format!("connect to cross-process FE MySQL at {host}:{port}"))?;
-    let rows: Vec<mysql::Row> = conn
-        .query("SHOW BACKENDS")
-        .context("query SHOW BACKENDS from cross-process FE")?;
-    rows.into_iter()
+    ensure!(
+        wire.schema_version == 1,
+        "unsupported frontend backend topology schema"
+    );
+    wire.backends
+        .into_iter()
         .map(|row| {
-            let values = (0..15)
-                .map(|index| {
-                    row.get::<String, usize>(index)
-                        .with_context(|| format!("SHOW BACKENDS row missing column {index}"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            parse_frontend_show_backends_values(&values)
+            let (_, port) = row
+                .endpoint
+                .rsplit_once(':')
+                .context("frontend backend endpoint must contain a port")?;
+            let grpc_port = port
+                .parse::<u16>()
+                .context("parse frontend backend endpoint port")?;
+            Ok(BackendTopologyRow {
+                process_id: row.process_id,
+                grpc_port,
+                state: row.diagnostic_status,
+                alive: row.eligible,
+                scheduled_fragments: row.scheduled_fragments,
+                build_identity: row.build_identity,
+                native_compatibility_id: row.native_compatibility_id,
+                status_detail: row.status_detail,
+            })
         })
         .collect()
 }
 
+fn query_frontend_backend_topology(
+    host: &str,
+    http_port: u16,
+    io_timeout: Duration,
+) -> Result<Vec<BackendTopologyRow>> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(io_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .context("build frontend backend topology client")?
+        .get(format!("http://{host}:{http_port}/v1/frontend/backends"))
+        .send()
+        .context("read frontend backend topology projection")?;
+    ensure!(
+        response.status().is_success(),
+        "frontend backend topology returned HTTP {}",
+        response.status()
+    );
+    let wire = response
+        .json()
+        .context("decode frontend backend topology projection")?;
+    decode_frontend_backend_topology(wire)
+}
+
 const BACKEND_TOPOLOGY_TIMEOUT_CAP: Duration = Duration::from_secs(120);
-const TOPOLOGY_MYSQL_IO_TIMEOUT_CAP: Duration = Duration::from_secs(2);
-const TOPOLOGY_MYSQL_IO_TIMEOUT_MIN: Duration = Duration::from_millis(1);
+const TOPOLOGY_IO_TIMEOUT_CAP: Duration = Duration::from_secs(2);
+const TOPOLOGY_IO_TIMEOUT_MIN: Duration = Duration::from_millis(1);
 const RESOURCE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIFECYCLE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const QUERY_EXECUTION_RESOURCE_METRIC: &str = "novarocks_backend_query_execution_resources";
@@ -1967,10 +1984,10 @@ fn backend_topology_deadline(now: Instant, requested: Duration) -> Instant {
         .unwrap_or(now)
 }
 
-fn topology_mysql_io_timeout(remaining: Duration) -> Duration {
+fn topology_io_timeout(remaining: Duration) -> Duration {
     remaining
-        .min(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP)
-        .max(TOPOLOGY_MYSQL_IO_TIMEOUT_MIN)
+        .min(TOPOLOGY_IO_TIMEOUT_CAP)
+        .max(TOPOLOGY_IO_TIMEOUT_MIN)
 }
 
 fn remaining_until(deadline: Instant, operation: &str) -> Result<Duration> {
@@ -2026,7 +2043,7 @@ fn validate_live_backend_topology(
         .collect::<Vec<_>>()
         .join(",");
     bail!(
-        "SHOW BACKENDS topology is not ready: registered={} expected={}; live={} expected={}; compatibility_ids={compatibility_ids:?}; configured_ports={configured_ports:?} observed_ports={observed_ports:?}; rows=[{}]",
+        "frontend backend topology is not ready: registered={} expected={}; live={} expected={}; compatibility_ids={compatibility_ids:?}; configured_ports={configured_ports:?} observed_ports={observed_ports:?}; rows=[{}]",
         rows.len(),
         expected,
         live,
@@ -2052,9 +2069,9 @@ where
     let deadline = backend_topology_deadline(Instant::now(), timeout);
     loop {
         process_health()
-            .context("cross-process FE/BE exited before SHOW BACKENDS topology became ready")?;
+            .context("cross-process FE/BE exited before frontend backend topology became ready")?;
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let io_timeout = topology_mysql_io_timeout(remaining);
+        let io_timeout = topology_io_timeout(remaining);
         let last_observation = match query(io_timeout) {
             Ok(rows) => match validate_live_backend_topology(
                 expected_ports,
@@ -2064,14 +2081,15 @@ where
                 Ok(()) => return Ok(rows),
                 Err(error) => error.to_string(),
             },
-            Err(error) => format!("SHOW BACKENDS query failed: {error:#}"),
+            Err(error) => format!("frontend backend topology query failed: {error:#}"),
         };
 
         if Instant::now() >= deadline {
-            let process_diagnostics = process_health()
-                .context("cross-process FE/BE exited during the bounded SHOW BACKENDS query")?;
+            let process_diagnostics = process_health().context(
+                "cross-process FE/BE exited during the bounded frontend backend topology query",
+            )?;
             bail!(
-                "timed out waiting for SHOW BACKENDS {expected}/{expected} Live; last_observation={last_observation}; {}",
+                "timed out waiting for frontend backend topology {expected}/{expected} Live; last_observation={last_observation}; {}",
                 process_diagnostics
             );
         }
@@ -2084,7 +2102,6 @@ where
 }
 
 struct LiveBackendTopologyWait<'a> {
-    mysql_user: &'a str,
     runtime: &'a CrossProcessRuntime,
     expected_ports: &'a [u16],
     expected_eligible_backend_count: usize,
@@ -2101,7 +2118,7 @@ fn wait_for_live_backend_topology(
     let expected = wait.expected_eligible_backend_count;
     let allow_drained_backend_exit = expected < wait.expected_ports.len();
     let host = "127.0.0.1";
-    let port = wait.runtime.fe_mysql_port;
+    let port = wait.runtime.fe_http_port;
     let rows = wait_for_live_backend_topology_with(
         wait.expected_ports,
         wait.expected_eligible_backend_count,
@@ -2116,7 +2133,7 @@ fn wait_for_live_backend_topology(
                 allow_drained_backend_exit,
             )
         },
-        |io_timeout| query_frontend_backend_topology(wait.mysql_user, host, port, io_timeout),
+        |io_timeout| query_frontend_backend_topology(host, port, io_timeout),
         thread::sleep,
     )?;
     let diagnostics = process_runtime_diagnostics_with_drained_backends(
@@ -2140,7 +2157,7 @@ fn wait_for_live_backend_topology(
         .map(|row| row.status_detail.as_str())
         .collect::<BTreeSet<_>>();
     println!(
-        "cross-process topology barrier PASS: SHOW BACKENDS {}/{} Live; build_identities={build_identities:?}; native_compatibility_ids={native_compatibility_ids:?}; status_details={status_details:?}; {}",
+        "cross-process topology barrier PASS: frontend backend topology {}/{} Live; build_identities={build_identities:?}; native_compatibility_ids={native_compatibility_ids:?}; status_details={status_details:?}; {}",
         rows.len(),
         expected,
         diagnostics
@@ -2154,14 +2171,14 @@ fn scrape_prometheus_metrics(port: u16) -> Result<String> {
         &address
             .parse()
             .with_context(|| format!("parse metrics address {address}"))?,
-        TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
+        TOPOLOGY_IO_TIMEOUT_CAP,
     )
     .with_context(|| format!("connect metrics endpoint {address}"))?;
     stream
-        .set_read_timeout(Some(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP))
+        .set_read_timeout(Some(TOPOLOGY_IO_TIMEOUT_CAP))
         .context("set metrics read timeout")?;
     stream
-        .set_write_timeout(Some(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP))
+        .set_write_timeout(Some(TOPOLOGY_IO_TIMEOUT_CAP))
         .context("set metrics write timeout")?;
     stream
         .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
@@ -2275,7 +2292,7 @@ fn assert_role_scoped_metrics(
             None => scrape_prometheus_metrics(port),
             Some(deadline) => {
                 let timeout = remaining_until(deadline, "original role metrics deadline")?
-                    .min(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP);
+                    .min(TOPOLOGY_IO_TIMEOUT_CAP);
                 Ok(reqwest::blocking::Client::new()
                     .get(format!("http://127.0.0.1:{port}/metrics"))
                     .timeout(timeout)
@@ -2864,6 +2881,15 @@ pub trait ServerHandle: Send {
         _deadline: Instant,
     ) -> Result<QueryLifecycleStatementObservation> {
         bail!("selected statement observation is unsupported by this server mode")
+    }
+    fn arm_selected_statement_observation_for_client_query(
+        &mut self,
+        _run_token: &str,
+        _client_query_id: &str,
+        _sql: &str,
+        _deadline: Instant,
+    ) -> Result<QueryLifecycleStatementObservation> {
+        bail!("selected client query observation is unsupported by this server mode")
     }
     fn arm_selected_query_lifecycle_fault(
         &mut self,
@@ -3783,7 +3809,7 @@ impl CrossProcessServerHandle {
         );
         let timeout = deadline
             .saturating_duration_since(Instant::now())
-            .min(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP);
+            .min(TOPOLOGY_IO_TIMEOUT_CAP);
         ensure!(
             !timeout.is_zero(),
             "statement observation control deadline expired"
@@ -4315,7 +4341,6 @@ impl CrossProcessServerHandle {
 
             wait_for_live_backend_topology(
                 LiveBackendTopologyWait {
-                    mysql_user: &mysql_user,
                     runtime: &runtime,
                     expected_ports: &be_grpc_ports,
                     expected_eligible_backend_count,
@@ -4497,15 +4522,14 @@ impl CrossProcessServerHandle {
         Ok(observed)
     }
 
-    /// Read the frontend's current `SHOW BACKENDS` projection without changing
+    /// Read the frontend's current backend topology projection without changing
     /// cluster state. Scenarios use this to assert compatibility-island
     /// diagnostics after the launch barrier has completed.
     pub fn frontend_backend_topology(&self) -> Result<Vec<BackendTopologyRow>> {
         query_frontend_backend_topology(
-            &self.mysql_user,
             &self.target_host,
-            self.target_port,
-            TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
+            self.runtime.fe_http_port,
+            TOPOLOGY_IO_TIMEOUT_CAP,
         )
     }
 
@@ -4523,7 +4547,7 @@ impl CrossProcessServerHandle {
                     .cloned()
                     .with_context(|| {
                         format!(
-                            "SHOW BACKENDS has no eligible live row for launched BE[{index}] grpc_port={port}"
+                            "frontend backend topology has no eligible live row for launched BE[{index}] grpc_port={port}"
                         )
                     })
             })
@@ -4798,7 +4822,7 @@ impl CrossProcessServerHandle {
     /// same `ServerHandle::kill_fe` / `ServerHandle::restart_fe_until` paths an
     /// ordinary FE restart uses; only the store destruction is new.
     ///
-    /// The reused restart path ends in the `SHOW BACKENDS` topology barrier.
+    /// The reused restart path ends in the management backend topology barrier.
     /// Backends self-register, so the restarted FE rebuilds membership from
     /// their announcements rather than from anything the destroyed store held;
     /// the barrier therefore converges without the store contributing to it.
@@ -5244,7 +5268,6 @@ impl CrossProcessServerHandle {
         self.native_fault_proxies.disconnect_all();
         wait_for_live_backend_topology(
             LiveBackendTopologyWait {
-                mysql_user: &self.mysql_user,
                 runtime: &self.runtime,
                 expected_ports: &self.be_grpc_ports,
                 expected_eligible_backend_count: self.expected_eligible_backend_count,
@@ -5308,7 +5331,7 @@ impl ServerHandle for CrossProcessServerHandle {
     }
 
     fn target_port(&self) -> Option<u16> {
-        Some(self.target_port)
+        Some(self.runtime.fe_trino_port)
     }
 
     fn process_resource_identities(
@@ -5364,7 +5387,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 plan.domain_secret(RoleSlot::Frontend, "statement-observation", "bearer_secret")?,
                 plan.deadline(),
             ),
-            None => (None, Instant::now() + TOPOLOGY_MYSQL_IO_TIMEOUT_CAP),
+            None => (None, Instant::now() + TOPOLOGY_IO_TIMEOUT_CAP),
         };
         query_lifecycle_structured_snapshot_from_fe(
             self.runtime.fe_http_port,
@@ -5384,7 +5407,7 @@ impl ServerHandle for CrossProcessServerHandle {
         );
         let observation = QueryLifecycleStatementObservation {
             token: next_fragment_failure_token(connection_id as usize),
-            connection_id,
+            target: StatementObservationTarget::Connection(connection_id),
         };
         self.statement_observation_control(
             "arm",
@@ -5393,7 +5416,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 "connection_id": connection_id,
                 "sql_sha256": format!("{:x}", Sha256::digest(sql.as_bytes())),
             }),
-            Instant::now() + TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
+            Instant::now() + TOPOLOGY_IO_TIMEOUT_CAP,
         )?;
         Ok(observation)
     }
@@ -5426,7 +5449,7 @@ impl ServerHandle for CrossProcessServerHandle {
         );
         let observation = QueryLifecycleStatementObservation {
             token: run_token.to_owned(),
-            connection_id,
+            target: StatementObservationTarget::Connection(connection_id),
         };
         self.statement_observation_control(
             "arm",
@@ -5436,6 +5459,45 @@ impl ServerHandle for CrossProcessServerHandle {
             deadline,
         )?;
         Ok(observation)
+    }
+    fn arm_selected_statement_observation_for_client_query(
+        &mut self,
+        run_token: &str,
+        client_query_id: &str,
+        sql: &str,
+        deadline: Instant,
+    ) -> Result<QueryLifecycleStatementObservation> {
+        validate_client_query_target(client_query_id)?;
+        ensure!(
+            !sql.is_empty()
+                && !run_token.is_empty()
+                && run_token.len() <= 128
+                && run_token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+            "invalid frozen statement observation target"
+        );
+        let plan = self
+            .test_sessions
+            .as_ref()
+            .context("selected statement has no role session")?;
+        let deadline = deadline.min(plan.deadline());
+        ensure!(
+            deadline > Instant::now(),
+            "selected statement original deadline expired"
+        );
+        self.statement_observation_control(
+            "arm",
+            &serde_json::json!({
+                "run_token":run_token,"client_query_id":client_query_id,
+                "sql_sha256":format!("{:x}",Sha256::digest(sql.as_bytes()))
+            }),
+            deadline,
+        )?;
+        Ok(QueryLifecycleStatementObservation {
+            token: run_token.to_owned(),
+            target: StatementObservationTarget::ClientQuery(client_query_id.to_owned()),
+        })
     }
     fn arm_selected_query_lifecycle_fault(
         &mut self,
@@ -5538,9 +5600,9 @@ impl ServerHandle for CrossProcessServerHandle {
         loop {
             ensure!(
                 Instant::now() < deadline,
-                "timed out waiting for exact statement observation token={} connection_id={} binding={last_binding:?} latest={latest:?}",
+                "timed out waiting for exact statement observation token={} target={:?} binding={last_binding:?} latest={latest:?}",
                 observation.token,
-                observation.connection_id
+                observation.target
             );
             let value = self
                 .statement_observation_control(
@@ -5558,7 +5620,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 serde_json::from_value(value).context("decode exact statement observation")?;
             if let Some(snapshot) = decode_statement_lifecycle_observation(
                 &observation.token,
-                observation.connection_id,
+                &observation.target,
                 wire,
             )? {
                 if !require_success || snapshot.failure_fact.is_none() {
@@ -5568,9 +5630,9 @@ impl ServerHandle for CrossProcessServerHandle {
             }
             ensure!(
                 Instant::now() < deadline,
-                "timed out waiting for exact statement observation token={} connection_id={} latest={latest:?}",
+                "timed out waiting for exact statement observation token={} target={:?} latest={latest:?}",
                 observation.token,
-                observation.connection_id
+                observation.target
             );
             thread::sleep(
                 deadline
@@ -5594,7 +5656,7 @@ impl ServerHandle for CrossProcessServerHandle {
             .context("statement observation drain returned no document")?;
         let wire: StatementLifecycleObservationWire =
             serde_json::from_value(value).context("decode exact statement binding")?;
-        validate_statement_observation_binding(&observation.token, observation.connection_id, &wire)
+        validate_statement_observation_binding(&observation.token, &observation.target, &wire)
     }
 
     fn drain_query_lifecycle_statement_observation(
@@ -5604,7 +5666,7 @@ impl ServerHandle for CrossProcessServerHandle {
         self.statement_observation_control(
             "drain",
             &serde_json::json!({"run_token": observation.token}),
-            Instant::now() + TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
+            Instant::now() + TOPOLOGY_IO_TIMEOUT_CAP,
         )?;
         Ok(())
     }
@@ -5749,10 +5811,9 @@ impl ServerHandle for CrossProcessServerHandle {
         self.ensure_be_index(index)?;
         let grpc_port = self.be_grpc_ports[index];
         let rows = query_frontend_backend_topology(
-            &self.mysql_user,
             &self.target_host,
-            self.target_port,
-            TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
+            self.runtime.fe_http_port,
+            TOPOLOGY_IO_TIMEOUT_CAP,
         )?;
         rows.iter()
             .find(|row| row.grpc_port == grpc_port && row.is_eligible_live())
@@ -5764,7 +5825,7 @@ impl ServerHandle for CrossProcessServerHandle {
             .map(|row| row.process_id.clone())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "SHOW BACKENDS has no row for cross-process BE[{index}] grpc_port={grpc_port}"
+                    "frontend backend topology has no row for cross-process BE[{index}] grpc_port={grpc_port}"
                 )
             })?
             // The harness is where wire text becomes a typed fact: a caller
@@ -5772,7 +5833,7 @@ impl ServerHandle for CrossProcessServerHandle {
             // that merely look alike.
             .parse::<novarocks_types::BackendProcessId>()
             .with_context(|| {
-                format!("SHOW BACKENDS process_id for BE[{index}] is not a backend process id")
+                format!("frontend backend topology process_id for BE[{index}] is not a backend process id")
             })
     }
 
@@ -6110,7 +6171,6 @@ impl ServerHandle for CrossProcessServerHandle {
         self.be_launch_identities[index] = launch_identity;
         wait_for_live_backend_topology(
             LiveBackendTopologyWait {
-                mysql_user: &self.mysql_user,
                 runtime: &self.runtime,
                 expected_ports: &self.be_grpc_ports,
                 expected_eligible_backend_count: self.expected_eligible_backend_count,
@@ -6125,10 +6185,9 @@ impl ServerHandle for CrossProcessServerHandle {
         loop {
             let remaining = remaining_until(deadline, "BE process-identity barrier")?;
             let observed = query_frontend_backend_topology(
-                &self.mysql_user,
                 &self.target_host,
-                self.target_port,
-                topology_mysql_io_timeout(remaining),
+                self.runtime.fe_http_port,
+                topology_io_timeout(remaining),
             )
             .ok()
             .and_then(|rows| {
@@ -6188,10 +6247,9 @@ impl ServerHandle for CrossProcessServerHandle {
             .count();
         loop {
             let rows = query_frontend_backend_topology(
-                &self.mysql_user,
                 &self.target_host,
-                self.target_port,
-                topology_mysql_io_timeout(remaining_until(deadline, "drain topology query")?),
+                self.runtime.fe_http_port,
+                topology_io_timeout(remaining_until(deadline, "drain topology query")?),
             )?;
             if rows.iter().filter(|row| row.alive).count() == expected_eligible {
                 println!(
@@ -6247,8 +6305,7 @@ impl ServerHandle for CrossProcessServerHandle {
     }
 
     fn kill_query_until(&mut self, connection_id: u32, deadline: Instant) -> Result<()> {
-        let io_timeout =
-            topology_mysql_io_timeout(remaining_until(deadline, "KILL QUERY connect")?);
+        let io_timeout = topology_io_timeout(remaining_until(deadline, "KILL QUERY connect")?);
         let builder = OptsBuilder::new()
             .ip_or_hostname(Some(self.target_host.clone()))
             .tcp_port(self.target_port)
@@ -7400,11 +7457,51 @@ mod tests {
     }
 
     #[test]
+    fn statement_observation_accepts_only_the_exact_client_query_target() {
+        let query = "20261029_120000_00001_abcde";
+        validate_client_query_target(query).unwrap();
+        for invalid in [
+            "",
+            "20261029_120000_00001",
+            "20261029_120000_00001_ABCDZ",
+            "20261029_120000_00001_abcde:1",
+        ] {
+            assert!(validate_client_query_target(invalid).is_err());
+        }
+        let target = StatementObservationTarget::ClientQuery(query.into());
+        let mut value = statement_observation_json();
+        value["work_id"] = serde_json::json!(format!("client-query:{query}:1:5"));
+        let wire = serde_json::from_value(value.clone()).unwrap();
+        validate_statement_observation_binding("query-on", &target, &wire).unwrap();
+        assert!(
+            decode_statement_lifecycle_observation("query-on", &target, wire)
+                .unwrap()
+                .is_some()
+        );
+        for work_id in [
+            "statement:7:1:5".to_owned(),
+            "client-query:20261029_120000_00002_abcde:1:5".to_owned(),
+            format!("client-query:{query}:0:5"),
+            format!("client-query:{query}:1:0"),
+        ] {
+            value["work_id"] = serde_json::json!(work_id);
+            assert!(
+                validate_statement_observation_binding(
+                    "query-on",
+                    &target,
+                    &serde_json::from_value(value.clone()).unwrap()
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn statement_observation_uses_the_bound_attempt_instead_of_a_late_prior_receipt() {
         let value = statement_observation_json();
         let snapshot = decode_statement_lifecycle_observation(
             "query-on",
-            7,
+            &StatementObservationTarget::Connection(7),
             serde_json::from_value(value.clone()).unwrap(),
         )
         .unwrap()
@@ -7415,7 +7512,7 @@ mod tests {
         previous["snapshot"]["query_local_sequence"] = serde_json::json!(11);
         let error = decode_statement_lifecycle_observation(
             "query-on",
-            7,
+            &StatementObservationTarget::Connection(7),
             serde_json::from_value(previous).unwrap(),
         )
         .expect_err("a delayed preceding query must never satisfy the observation");
@@ -7435,7 +7532,7 @@ mod tests {
             assert!(
                 decode_statement_lifecycle_observation(
                     "query-on",
-                    7,
+                    &StatementObservationTarget::Connection(7),
                     serde_json::from_value(value).unwrap(),
                 )
                 .is_err(),
@@ -7449,11 +7546,20 @@ mod tests {
         let mut value = statement_observation_json();
         value["snapshot"] = serde_json::Value::Null;
         let wire = serde_json::from_value(value.clone()).unwrap();
-        validate_statement_observation_binding("query-on", 7, &wire).unwrap();
+        validate_statement_observation_binding(
+            "query-on",
+            &StatementObservationTarget::Connection(7),
+            &wire,
+        )
+        .unwrap();
         assert!(
-            decode_statement_lifecycle_observation("query-on", 7, wire)
-                .unwrap()
-                .is_none()
+            decode_statement_lifecycle_observation(
+                "query-on",
+                &StatementObservationTarget::Connection(7),
+                wire
+            )
+            .unwrap()
+            .is_none()
         );
         for (field, replacement) in [
             ("work_id", serde_json::json!("statement:8:1:5")),
@@ -7466,7 +7572,7 @@ mod tests {
             assert!(
                 validate_statement_observation_binding(
                     "query-on",
-                    7,
+                    &StatementObservationTarget::Connection(7),
                     &serde_json::from_value(foreign).unwrap()
                 )
                 .is_err()
@@ -7489,7 +7595,7 @@ mod tests {
         }
         validate_statement_observation_binding(
             "query-on",
-            7,
+            &StatementObservationTarget::Connection(7),
             &serde_json::from_value(value).unwrap(),
         )
         .unwrap();
@@ -7755,26 +7861,21 @@ mod tests {
     }
 
     #[test]
-    fn frontend_show_backends_parses_membership_diagnostics() {
-        let row = parse_frontend_show_backends_values(&[
-            "01900000-0000-7000-8000-000000000001".to_string(),
-            "127.0.0.1:19070".to_string(),
-            "true".to_string(),
-            "true".to_string(),
-            "Running".to_string(),
-            "true".to_string(),
-            "true".to_string(),
-            "true".to_string(),
-            "41".to_string(),
-            "1000".to_string(),
-            "1001".to_string(),
-            "test-build-identity".to_string(),
-            "test-native-compatibility".to_string(),
-            "Live".to_string(),
-            "".to_string(),
-        ])
-        .expect("parse frontend SHOW BACKENDS row");
-
+    fn frontend_backend_projection_parses_membership_diagnostics_by_name() {
+        let wire = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "backends": [{
+                "process_id": "01900000-0000-7000-8000-000000000001",
+                "endpoint": "127.0.0.1:19070",
+                "lease_valid": true, "identity_verified": true, "reported_state": "Running",
+                "compatible": true, "endpoint_owned": true, "eligible": true,
+                "scheduled_fragments": 41, "last_announce_ms": 1000, "last_heartbeat_ms": 1001,
+                "build_identity": "test-build-identity", "native_compatibility_id": "test-native-compatibility",
+                "diagnostic_status": "Live", "status_detail": ""
+            }]
+        })).unwrap();
+        let rows = decode_frontend_backend_topology(wire).unwrap();
+        let row = &rows[0];
         assert_eq!(row.process_id, "01900000-0000-7000-8000-000000000001");
         assert_eq!(row.grpc_port, 19070);
         assert_eq!(row.state, "Live");
@@ -7783,6 +7884,67 @@ mod tests {
         assert_eq!(row.build_identity, "test-build-identity");
         assert_eq!(row.native_compatibility_id, "test-native-compatibility");
         assert!(row.status_detail.is_empty());
+    }
+
+    #[test]
+    fn backend_topology_is_read_from_the_management_http_route() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(1))
+                    }
+                    Err(error) => panic!("accept management request: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(
+                String::from_utf8(request)
+                    .unwrap()
+                    .starts_with("GET /v1/frontend/backends HTTP/1.1\r\n")
+            );
+            let body = r#"{"schema_version":1,"backends":[]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let rows = query_frontend_backend_topology("127.0.0.1", port, Duration::from_secs(3));
+        server.join().unwrap();
+        assert!(rows.unwrap().is_empty());
+    }
+
+    #[test]
+    fn backend_topology_projection_rejects_unknown_schema_and_untyped_eligibility() {
+        let schema = FrontendBackendTopologyWire {
+            schema_version: 2,
+            backends: vec![],
+        };
+        assert!(decode_frontend_backend_topology(schema).is_err());
+        assert!(serde_json::from_value::<FrontendBackendTopologyWire>(serde_json::json!({
+            "schema_version":1,"backends":[{"process_id":"p","endpoint":"127.0.0.1:1",
+            "eligible":"true","scheduled_fragments":0,"build_identity":"b","native_compatibility_id":"c",
+            "diagnostic_status":"Live","status_detail":""}]
+        })).is_err());
     }
 
     #[test]
@@ -7926,7 +8088,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_backend_topology_is_ready_only_when_show_backends_is_empty() {
+    fn empty_backend_topology_is_ready_only_when_projection_is_empty() {
         validate_live_backend_topology(&[], 0, &[])
             .expect("an empty self-registration registry should be ready before any BE announces");
 
@@ -7973,7 +8135,7 @@ mod tests {
             io_timeouts
                 .iter()
                 .all(|timeout| *timeout > Duration::ZERO && *timeout <= Duration::from_secs(2)),
-            "unexpected per-attempt MySQL timeouts: {io_timeouts:?}"
+            "unexpected per-attempt management HTTP timeouts: {io_timeouts:?}"
         );
     }
 
@@ -7991,7 +8153,7 @@ mod tests {
 
         let message = format!("{err:#}");
         assert!(
-            message.contains("timed out waiting for SHOW BACKENDS 3/3 Live"),
+            message.contains("timed out waiting for frontend backend topology 3/3 Live"),
             "{message}"
         );
         assert!(message.contains("registered=1 expected=3"), "{message}");
@@ -8021,7 +8183,10 @@ mod tests {
         )
         .expect_err("a dead FE must fail without waiting for the topology timeout");
 
-        assert_eq!(queries, 0, "SHOW BACKENDS must not run after process exit");
+        assert_eq!(
+            queries, 0,
+            "frontend backend topology must not run after process exit"
+        );
         let message = format!("{err:#}");
         assert!(
             message.contains("FE exited status=exit status: 9"),
@@ -8072,15 +8237,15 @@ mod tests {
             Duration::from_secs(120)
         );
         assert_eq!(
-            topology_mysql_io_timeout(Duration::from_secs(30)),
+            topology_io_timeout(Duration::from_secs(30)),
             Duration::from_secs(2)
         );
         assert_eq!(
-            topology_mysql_io_timeout(Duration::from_millis(250)),
+            topology_io_timeout(Duration::from_millis(250)),
             Duration::from_millis(250)
         );
         assert_eq!(
-            topology_mysql_io_timeout(Duration::ZERO),
+            topology_io_timeout(Duration::ZERO),
             Duration::from_millis(1)
         );
         let now = Instant::now();
@@ -8455,18 +8620,24 @@ mod tests {
         assert_ne!(cluster.process_ids().frontend, before.frontend);
         assert_eq!(cluster.native_be_endpoint(1)?, endpoint);
         assert_eq!(cluster.native_be_control_endpoint(1)?, control_endpoint);
-        let mut connection = MysqlConn::new(
-            OptsBuilder::new()
-                .ip_or_hostname(Some("127.0.0.1"))
-                .tcp_port(cluster.runtime().fe_mysql_port)
-                .prefer_socket(false)
-                .user(Some(cluster.mysql_user.clone()))
-                .tcp_connect_timeout(Some(Duration::from_secs(5)))
-                .read_timeout(Some(Duration::from_secs(5)))
-                .write_timeout(Some(Duration::from_secs(5))),
+        let client = novarocks_test_trino_client::TrinoClient::new(
+            novarocks_test_trino_client::ClientConfig {
+                host: "127.0.0.1".into(),
+                port: cluster.runtime().fe_trino_port,
+                user: cluster.mysql_user.clone(),
+                source: "cluster-harness-self-test".into(),
+            },
         )?;
-        assert_eq!(connection.query_first::<u64, _>("SELECT 1")?, Some(1));
-        drop(connection);
+        let mut session = novarocks_test_trino_client::ClientSession::new("Asia/Shanghai");
+        let result = client.execute(
+            &mut session,
+            "SELECT 1",
+            Instant::now() + Duration::from_secs(5),
+        )?;
+        assert_eq!(
+            result.rows,
+            vec![vec![novarocks_test_trino_client::TrinoValue::Integer(1)]]
+        );
         cluster.shutdown()?;
         assert!(control.is_stopped());
         assert_eq!(control.active_connections(), 0);

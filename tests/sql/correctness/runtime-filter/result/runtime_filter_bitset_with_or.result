@@ -1,7 +1,9 @@
 -- query 2
+-- types	bigint
 count(1)
 0
 
 -- query 3
+-- types	bigint
 count(1)
 1

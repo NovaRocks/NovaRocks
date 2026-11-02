@@ -1,3 +1,5 @@
+-- query 1
+-- types	integer	decimal(38, 2)	decimal(38, 8)
 i_manufact_id	sum_sales	avg_quarterly_sales
 30	165.67	340.63500000
 30	247.07	340.63500000

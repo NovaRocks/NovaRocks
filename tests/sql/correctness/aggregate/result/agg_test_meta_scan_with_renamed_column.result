@@ -3,29 +3,35 @@
 -- query 2
 
 -- query 3
+-- types	bigint
 count(*)
 3
 
 -- query 4
+-- types	bigint
 count(*)
 3
 
 -- query 5
 
 -- query 6
+-- types	bigint
 count(*)
 3
 
 -- query 7
+-- types	bigint
 count(*)
 3
 
 -- query 8
 
 -- query 9
+-- types	bigint
 count(*)
 3
 
 -- query 10
+-- types	bigint
 count(*)
 3

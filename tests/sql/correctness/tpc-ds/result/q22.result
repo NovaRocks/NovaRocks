@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	varchar	varchar	double
 i_product_name	i_brand	i_class	i_category	qoh
 ationbarn station	NULL	NULL	NULL	430.3577235772358
 ationbarn station	amalgbrand #8	NULL	NULL	430.3577235772358

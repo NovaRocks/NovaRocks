@@ -1,47 +1,59 @@
 -- query 1
+-- types	timestamp(6)
 sliced
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 2
+-- types	date
 sliced
 0001-01-01
 
 -- query 3
+-- types	timestamp(6)
 sliced
-2020-01-02 00:00:00
+2020-01-02 00:00:00.000000
 
 -- query 4
+-- types	date
 sliced
 2020-01-02
 
 -- query 5
+-- types	timestamp(6)
 sliced
 2023-10-31 23:59:59.123468
 
 -- query 6
+-- types	timestamp(6)
 sliced
 NULL
 
 -- query 12
+-- types	timestamp(6)
 sliced
-0001-01-01 00:00:00
+0001-01-01 00:00:00.000000
 
 -- query 13
+-- types	date
 sliced
 0001-01-01
 
 -- query 14
+-- types	timestamp(6)
 sliced
 2023-10-31 23:59:59.123468
 
 -- query 15
+-- types	timestamp(6)
 sliced
 NULL
 
 -- query 16
+-- types	timestamp(6)
 sliced
 NULL
 
 -- query 20
+-- types	date
 sliced
 NULL

@@ -1,15 +1,19 @@
 -- query 3
+-- legacy
 region	c
 east	5
 
 -- query 5
+-- legacy
 region	c
 east	4
 
 -- query 7
+-- legacy
 region	c
 east	3
 
 -- query 8
+-- types	varchar	bigint
 region	c
 east	3

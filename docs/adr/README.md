@@ -67,6 +67,12 @@ code-anchors:
 
 ## 领域索引
 
+### sql-test-oracles
+
+领域哲学：SQL 期望分离精确类型、规范表示与答案来源；协议解码保持值，golden 只规定可逆文本，比较政策由测试领域显式拥有。迁移须证明旧期望等价，目标端补出的类型和消歧仍是 snapshot；失败、临时旧块与原生验证缺口各自保留，不能通过重录制造通过。
+
+- [ADR-0210](ADR-0210-sql-golden-is-canonical-rendering-of-typed-trino-results.md) — SQL golden 为何保存 Trino 类型化值的可逆规范文本、以旧期望证明迁移，并分离 snapshot 来源、临时旧块与客户端会话（active；实现与验证状态独立核对）
+
 ### test-capabilities
 
 领域哲学：实际 debug assertions 决定开发接缝是否编入，默认开发共用主测试图与产品装配，标准 release 排除接缝；编入的能力仍须经每个实际角色启动的有限授权，准确绑定产品 owner 签发的工作身份。来源只在薄 CLI 冻结。构建事实、权限、控制结束、helper join、角色退出与资源收敛分别取证。共享测试层只提供机械能力，领域解释和生命周期仍属于原 owner。

@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	varchar	bigint	bigint	bigint	bigint	bigint
 substr(w_warehouse_name, 1, 20)	sm_type	cc_name	30 days	31-60 days	61-90 days	91-120 days	>120 days
 NULL	EXPRESS	Mid Atlantic	1223	1314	1257	0	0
 NULL	EXPRESS	NY Metro	1274	1296	1286	0	0

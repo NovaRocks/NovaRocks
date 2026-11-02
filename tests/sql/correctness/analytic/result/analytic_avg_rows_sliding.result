@@ -1,5 +1,7 @@
+-- query 3
+-- types	varchar	integer	integer	double
 grp	ts	v	avg_win
-A	1	10	15
+A	1	10	15.0
 A	2	20	23.333333333333332
 A	3	40	46.666666666666664
-A	4	80	60
+A	4	80	60.0

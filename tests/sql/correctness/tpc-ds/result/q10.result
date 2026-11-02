@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	varchar	bigint	integer	bigint	varchar	bigint	integer	bigint	integer	bigint	integer	bigint
 cd_gender	cd_marital_status	cd_education_status	cnt1	cd_purchase_estimate	cnt2	cd_credit_rating	cnt3	cd_dep_count	cnt4	cd_dep_employed_count	cnt5	cd_dep_college_count	cnt6
 F	D	Advanced Degree	1	3000	1	High Risk	1	2	1	4	1	5	1
 F	D	Unknown	1	1500	1	Good	1	6	1	5	1	4	1

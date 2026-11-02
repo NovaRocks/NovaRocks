@@ -106,7 +106,7 @@ fn entries_for_case(suite: &str, case: SqlCase) -> Vec<ExtensionManifestEntry> {
         .collect()
 }
 
-fn literal_placeholder_variables(source: &str) -> HashMap<String, String> {
+pub(crate) fn literal_placeholder_variables(source: &str) -> HashMap<String, String> {
     let placeholder_re =
         Regex::new(r"\$\{([A-Za-z0-9_.-]+)\}").expect("literal placeholder regex must compile");
     placeholder_re
@@ -196,5 +196,29 @@ mod tests {
             render_extension_manifest(&entries),
             "# NovaRocks SQL extension manifest\n# suite\tcase\tstatement\textension\tstatement_summary\nextensions\ta_case\t1\tmaterialized view refresh\tREFRESH MATERIALIZED VIEW mv WITH SYNC MODE;\nextensions\tz_case\t1\tbranch DDL\tALTER TABLE ${case_db}.t CREATE BRANCH dev;\n"
         );
+    }
+    #[test]
+    fn manifest_derivation_accepts_unbound_fault_definitions_without_dropping_entries() {
+        let temp = tempdir().unwrap();
+        let actual = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../correctness/lnp-3d-mv-accelerator/sql/mv_catalog_isolation.sql");
+        std::fs::copy(&actual, temp.path().join("mv_catalog_isolation.sql")).unwrap();
+        std::fs::write(
+            temp.path().join("extension.sql"),
+            "-- @nova_extension=branch DDL\nALTER TABLE ${case_db}.t CREATE BRANCH dev;\n",
+        )
+        .unwrap();
+        let suites = BTreeMap::from([(
+            "definitions".to_string(),
+            suite_config("definitions", temp.path().to_path_buf()),
+        )]);
+        let entries = derive_extension_manifest(&suites, &meta_re(), &marker_re()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].case_id, "extension");
+        assert_eq!(
+            entries[0].statement_summary,
+            "ALTER TABLE ${case_db}.t CREATE BRANCH dev;"
+        );
+        assert!(render_extension_manifest(&entries).contains("${case_db}"));
     }
 }

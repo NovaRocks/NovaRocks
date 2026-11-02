@@ -1,7 +1,9 @@
 -- query 5
+-- types	boolean	boolean	boolean	boolean
 total_data_files_is_2	total_records_is_3	has_total_files_size	has_engine_name
-1	1	1	1
+true	true	true	true
 
 -- query 7
+-- types	boolean	boolean
 total_records_is_3	has_engine_name
-1	1
+true	true

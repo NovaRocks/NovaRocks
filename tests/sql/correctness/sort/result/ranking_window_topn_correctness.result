@@ -1,4 +1,5 @@
 -- query 7
+-- legacy
 grp	oid	score	rk
 A	1	400	1
 B	5	200	1
@@ -6,6 +7,7 @@ C	8	50	1
 D	10	500	1
 
 -- query 9
+-- types	varchar	integer	integer	bigint
 grp	oid	score	rk
 A	1	400	1
 B	5	200	1
@@ -13,6 +15,7 @@ C	8	50	1
 D	10	500	1
 
 -- query 11
+-- legacy
 grp	oid	score	rk
 A	1	400	1
 A	2	300	2
@@ -25,6 +28,7 @@ D	10	500	1
 D	11	400	2
 
 -- query 13
+-- types	varchar	integer	integer	bigint
 grp	oid	score	rk
 A	1	400	1
 A	2	300	2
@@ -37,6 +41,7 @@ D	10	500	1
 D	11	400	2
 
 -- query 15
+-- legacy
 grp	oid	score	drk
 A	1	400	1
 A	2	300	2
@@ -49,6 +54,7 @@ D	10	500	1
 D	11	400	2
 
 -- query 17
+-- types	varchar	integer	integer	bigint
 grp	oid	score	drk
 A	1	400	1
 A	2	300	2
@@ -61,6 +67,7 @@ D	10	500	1
 D	11	400	2
 
 -- query 19
+-- legacy
 grp	oid	score	rn
 A	1	400	1
 A	2	300	2
@@ -71,6 +78,7 @@ D	10	500	1
 D	11	400	2
 
 -- query 21
+-- types	varchar	integer	integer	bigint
 grp	oid	score	rn
 A	1	400	1
 A	2	300	2
@@ -81,35 +89,43 @@ D	10	500	1
 D	11	400	2
 
 -- query 23
+-- legacy
 grp	oid	score	rk
 D	10	500	1
 
 -- query 25
+-- types	varchar	integer	integer	bigint
 grp	oid	score	rk
 D	10	500	1
 
 -- query 27
+-- legacy
 grp	oid	score	rk
 C	8	50	1
 
 -- query 29
+-- types	varchar	integer	integer	bigint
 grp	oid	score	rk
 C	8	50	1
 
 -- query 31
+-- legacy
 top_c_score
 50
 
 -- query 33
+-- types	integer
 top_c_score
 50
 
 -- query 42
+-- types	integer	integer	integer	bigint	bigint
 grp	a	b	rka	rkb
 1	10	4	4	1
 1	20	3	3	2
 
 -- query 44
+-- types	integer	integer	integer	bigint	bigint
 grp	a	b	rka	rkb
 1	10	4	4	1
 1	20	3	3	2

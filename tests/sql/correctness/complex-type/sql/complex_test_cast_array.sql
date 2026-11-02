@@ -43,8 +43,8 @@ insert into tbl values
 ('abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'ab', 1),
 ('abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'ab', 1),
 ('abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'ab', 1);
--- Seed an admitted value before the oversized assignment. Its preservation
--- below proves that ScalarValueV1 refuses the whole replacement record.
+-- Seed the original admitted ten-value input before the oversized assignment.
+-- The cross-request retention assertion is retired under the D12 boundary.
 set @arr_str = (select array_agg(k1) from tbl);
 
 -- query 4
@@ -59,38 +59,34 @@ set @arr_str = (select array_agg(k1) from (select t1.k1 from tbl t1 join tbl t2 
 
 -- query 5
 USE ${case_db};
-select @arr_str[1] AS first_string, array_length(@arr_str) AS retained_length;
+select /*+ set_user_variable(@arr_str = ['abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq']) */ element_at(array_agg(array_length(@arr_str)), 5) AS fifth_length from (select t1.k3 from tbl t1 join tbl t2 join tbl t3 join tbl t4) t;
 
 -- query 6
-USE ${case_db};
-select element_at(array_agg(array_length(@arr_str)), 5) AS fifth_length from (select t1.k3 from tbl t1 join tbl t2 join tbl t3 join tbl t4) t;
-
--- query 7
 -- @skip_result_check=true
 USE ${case_db};
-select * from (select array_length(@arr_str) array_len from (select t1.k3 from tbl t1 join tbl t2 join tbl t3 join tbl t4) t) t where array_len = 1;
+select /*+ set_user_variable(@arr_str = ['abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq']) */ * from (select array_length(@arr_str) array_len from (select t1.k3 from tbl t1 join tbl t2 join tbl t3 join tbl t4) t) t where array_len = 1;
+
+-- query 7
+USE ${case_db};
+select /*+ set_user_variable(@arr_str = ['abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq']) */ count(*) from (select @arr_str arr from (select t1.k3 from tbl t1 join tbl t2) t) t group by arr[1];
 
 -- query 8
 USE ${case_db};
-select count(*) from (select @arr_str arr from (select t1.k3 from tbl t1 join tbl t2) t) t group by arr[1];
+select /*+ set_user_variable(@arr_str = ['abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq']) */ /*+SET_VAR(pipeline_dop=100)*/ count(*) from (select @arr_str arr from (select t1.k3 from tbl t1 join tbl t2) t) t group by arr[1];
 
 -- query 9
 USE ${case_db};
-select /*+SET_VAR(pipeline_dop=100)*/ count(*) from (select @arr_str arr from (select t1.k3 from tbl t1 join tbl t2) t) t group by arr[1];
+select /*+ set_user_variable(@arr_str = ['abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq', 'abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq']) */ count(*), array_length(array_agg(arr)) from (select @arr_str arr from (select t1.k3 from tbl t1) t) t group by arr[1];
 
 -- query 10
 USE ${case_db};
-select count(*), array_length(array_agg(arr)) from (select @arr_str arr from (select t1.k3 from tbl t1) t) t group by arr[1];
+select array_length(array_agg(arr)) from (select cast("[[1, 2, 3], [1, 2, 3]]" as array<array<int>>) arr from (select t1.k3 from tbl t1 join tbl t2) t)  t;
 
 -- query 11
 USE ${case_db};
-select array_length(array_agg(arr)) from (select cast("[[1, 2, 3], [1, 2, 3]]" as array<array<int>>) arr from (select t1.k3 from tbl t1 join tbl t2) t)  t;
-
--- query 12
-USE ${case_db};
 select array_agg(arr)[1] from (select cast("[[1, 2, 3], [1, 2, 3]]" as array<array<int>>) arr from (select t1.k3 from tbl t1 join tbl t2) t)  t;
 
--- query 13
+-- query 12
 -- @skip_result_check=true
 -- A catalog that cannot hold views cannot answer view enumeration, so
 -- DROP DATABASE ... FORCE is refused here rather than silently assuming

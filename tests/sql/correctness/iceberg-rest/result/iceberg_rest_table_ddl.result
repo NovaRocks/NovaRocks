@@ -1,5 +1,7 @@
 -- query 5
+-- types	bigint	varchar	double	date	timestamp(6)
 id	name	amount	d	ts
 
 -- query 6
+-- types	bigint	varchar	double
 id	region	amount

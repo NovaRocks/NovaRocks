@@ -1,14 +1,17 @@
 -- query 3
+-- types	varchar	bigint
 customer	amount
 A	10
 A	20
 B	30
 
 -- query 6
+-- legacy
 customer	amount
 A	20
 B	30
 
 -- query 9
+-- legacy
 customer	amount
 B	30

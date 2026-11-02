@@ -1,14 +1,17 @@
 -- query 2
+-- types	integer	bigint
 k1	v1
 1	10
 2	20
 
 -- query 5
+-- types	integer	bigint
 k1	v1
 1	10
 2	20
 
 -- query 9
+-- types	integer	bigint
 k1	v1
 1	10
 2	20

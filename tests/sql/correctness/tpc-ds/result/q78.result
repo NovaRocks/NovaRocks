@@ -1,3 +1,5 @@
+-- query 1
+-- legacy
 ss_sold_year	ss_item_sk	ss_customer_sk	ratio	store_qty	store_wholesale_cost	store_sales_price	other_chan_qty	other_chan_wholesale_cost	other_chan_sales_price
 2000	116	51507	8.91	98	45.86	80.12	11	46.07	39.52
 2000	119	51419	0.81	60	52.03	86.53	74	68.27	31.33

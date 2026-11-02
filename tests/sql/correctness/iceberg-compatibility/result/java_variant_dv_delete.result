@@ -1,12 +1,15 @@
 -- query 3
+-- types	integer
 id
 2
 3
 
 -- query 5
+-- types	integer
 id
 3
 
 -- query 7
+-- types	bigint
 remaining_rows
 0

@@ -1,7 +1,9 @@
 -- query 4
+-- types	bigint
 n_partitions
 2
 
 -- query 5
+-- types	bigint
 total_records
 3

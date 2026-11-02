@@ -1,4 +1,5 @@
 -- query 6
+-- types	varchar
 Explain String
 TABLE STATS ref=0 table=iceberg_opt.${case_db}.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
 PLAN FRAGMENT 0
@@ -22,6 +23,7 @@ PLAN FRAGMENT 1
        predicates: CAST(v AS Int64) > 10
 
 -- query 7
+-- types	varchar
 Explain String
 TABLE STATS ref=0 table=iceberg_opt.${case_db}.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
 PLAN FRAGMENT 0
@@ -56,6 +58,7 @@ PLAN FRAGMENT 2
 5:GENERATE_SERIES(1, 100, 1) stats={rows=100}
 
 -- query 8
+-- types	varchar
 Explain String
 TABLE STATS ref=0 table=iceberg_opt.${case_db}.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
 PLAN FRAGMENT 0

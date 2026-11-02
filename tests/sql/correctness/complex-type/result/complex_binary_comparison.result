@@ -1,92 +1,118 @@
 -- query 2
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 3	NULL	[{33:null},{303:301}]	[{"a":31,"b":32},{"a":null,"b":33}]	{34:43,36:13,32:null}	{303:null}	{303:{"c":31,"b":32}}	NULL
 
 -- query 3
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 4
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 5	[15,25,35,45]	[{999:550},{505:501}]	[{"a":51,"b":52},{"a":null,"b":53}]	{54:45,56:15,999:null}	{999:null}	{505:{"c":null,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":null,"s4":{"e":null,"f":550}}
 5	[15,25,35,45]	[{3:550},{505:501}]	[{"a":51,"b":52},{"a":3,"b":53}]	{54:45,56:15,3:3}	{3:[2,20,3,23]}	{505:{"c":3,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":{4:555},"s4":{"e":3,"f":550}}
 
 -- query 7
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 8
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 9
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 5	[15,25,35,45]	[{999:550},{505:501}]	[{"a":51,"b":52},{"a":null,"b":53}]	{54:45,56:15,999:null}	{999:null}	{505:{"c":null,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":null,"s4":{"e":null,"f":550}}
 
 -- query 10
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 4	[14,24,null,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{999:[4,null,41,23]}	{404:{"c":41,"b":42}}	{"s1":null,"s2":[4,null,41],"s3":{999:444},"s4":null}
 4	[14,24,3,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{3:[4,3,41,23]}	{404:{"c":41,"b":42}}	{"s1":3,"s2":[4,3,41],"s3":{3:444},"s4":{"e":110,"f":330}}
 
 -- query 11
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 12
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 1	[11,null,31,41]	[{11:110},{101:101}]	[{"a":11,"b":12},{"a":12,"b":13}]	{14:41,999:11,12:31}	{101:[1,10,11,23]}	{101:{"c":null,"b":12}}	{"s1":1,"s2":[1,10,11],"s3":{101:111,999:null},"s4":{"e":111,"f":110}}
 
 -- query 13
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 4	[14,24,null,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{999:[4,null,41,23]}	{404:{"c":41,"b":42}}	{"s1":null,"s2":[4,null,41],"s3":{999:444},"s4":null}
 4	[14,24,3,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{3:[4,3,41,23]}	{404:{"c":41,"b":42}}	{"s1":3,"s2":[4,3,41],"s3":{3:444},"s4":{"e":110,"f":330}}
 
 -- query 14
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 15
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 16
+-- legacy
 CAST((row(1, NULL)) AS struct<a INT, b ARRAY<INT>>)
 {"a":1,"b":null}
 
 -- query 17
+-- legacy
 CAST((map{1:NULL}) AS MAP<INT,ARRAY<INT>>)
 {1:null}
 
 -- query 19
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 20
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 21
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 1	[11,null,31,41]	[{11:110},{101:101}]	[{"a":11,"b":12},{"a":12,"b":13}]	{14:41,999:11,12:31}	{101:[1,10,11,23]}	{101:{"c":null,"b":12}}	{"s1":1,"s2":[1,10,11],"s3":{101:111,999:null},"s4":{"e":111,"f":110}}
 1	[11,3,31,41]	[{11:110},{101:101}]	[{"a":11,"b":12},{"a":12,"b":13}]	{14:41,3:11,12:31}	{101:[1,10,11,23]}	{101:{"c":3,"b":12}}	{"s1":1,"s2":[1,10,11],"s3":{101:111,3:3},"s4":{"e":111,"f":110}}
 
 -- query 22
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 23
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 24
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 25
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 26
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 27
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 28
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 29
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 30
+-- legacy
 array1 = ([11, NULL, 31, 41])
 NULL
 NULL
@@ -100,6 +126,7 @@ NULL
 0
 
 -- query 31
+-- legacy
 array1 = ([15, 25, 35, 45])
 0
 0
@@ -113,6 +140,7 @@ NULL
 1
 
 -- query 32
+-- legacy
 array3 = ([named_struct('a', 21, 'b', 22), NULL])
 0
 0
@@ -126,6 +154,7 @@ NULL
 0
 
 -- query 33
+-- legacy
 array3 = ([row(21, 22), NULL])
 0
 0
@@ -139,6 +168,7 @@ NULL
 0
 
 -- query 34
+-- legacy
 array2 = ([map{999:550}, map{505:501}])
 0
 0
@@ -152,6 +182,7 @@ array2 = ([map{999:550}, map{505:501}])
 0
 
 -- query 35
+-- legacy
 array2 = ([map{44:440}, map{404:401}])
 0
 0
@@ -165,6 +196,7 @@ array2 = ([map{44:440}, map{404:401}])
 0
 
 -- query 36
+-- legacy
 map1 = NULL
 NULL
 NULL
@@ -178,6 +210,7 @@ NULL
 NULL
 
 -- query 37
+-- legacy
 map1 = (map{14:41,999:11,12:31})
 1
 0
@@ -191,6 +224,7 @@ NULL
 0
 
 -- query 38
+-- legacy
 map1 = (map{44:44,46:14,42:34})
 0
 0
@@ -204,6 +238,7 @@ NULL
 0
 
 -- query 39
+-- legacy
 map1 = (map{34:43,36:13,32:NULL})
 0
 0
@@ -217,6 +252,7 @@ NULL
 0
 
 -- query 40
+-- legacy
 map2 = (map{505:[5, 50, 51, 23]})
 0
 0
@@ -230,6 +266,7 @@ map2 = (map{505:[5, 50, 51, 23]})
 0
 
 -- query 41
+-- legacy
 map2 = (map{999:NULL})
 0
 0
@@ -243,6 +280,7 @@ NULL
 0
 
 -- query 42
+-- legacy
 map2 = (map{999:[4, NULL, 41, 23]})
 0
 0
@@ -256,6 +294,7 @@ NULL
 0
 
 -- query 43
+-- legacy
 map2 = (map{101:[1, 10, 11, 23]})
 1
 1
@@ -269,6 +308,7 @@ map2 = (map{101:[1, 10, 11, 23]})
 0
 
 -- query 44
+-- legacy
 map1 = (map{46:14,42:34,44:44})
 0
 0
@@ -282,6 +322,7 @@ NULL
 0
 
 -- query 45
+-- legacy
 map1 = (map{54:45,56:15})
 0
 0
@@ -295,6 +336,7 @@ NULL
 0
 
 -- query 46
+-- legacy
 map1 = (map{999:NULL,54:45,56:15})
 0
 0
@@ -308,6 +350,7 @@ NULL
 0
 
 -- query 47
+-- legacy
 map3 = (map{505:row(NULL, 52)})
 0
 0
@@ -321,6 +364,7 @@ NULL
 NULL
 
 -- query 48
+-- legacy
 st1 = (row(2, NULL, map{202:NULL}, row(222, 220)))
 0
 0
@@ -334,6 +378,7 @@ NULL
 0
 
 -- query 49
+-- legacy
 st1 = (named_struct('s1', 5, 's2', [5, 50, 51], 's3', NULL, 's4', row(NULL, 550)))
 0
 0
@@ -347,6 +392,7 @@ NULL
 NULL
 
 -- query 50
+-- legacy
 array1 = NULL
 NULL
 NULL
@@ -360,6 +406,7 @@ NULL
 NULL
 
 -- query 51
+-- legacy
 st1 = NULL
 NULL
 NULL
@@ -373,66 +420,82 @@ NULL
 NULL
 
 -- query 52
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 1	[11,3,31,41]	[{11:110},{101:101}]	[{"a":11,"b":12},{"a":12,"b":13}]	{14:41,3:11,12:31}	{101:[1,10,11,23]}	{101:{"c":3,"b":12}}	{"s1":1,"s2":[1,10,11],"s3":{101:111,3:3},"s4":{"e":111,"f":110}}
 
 -- query 53
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 5	[15,25,35,45]	[{999:550},{505:501}]	[{"a":51,"b":52},{"a":null,"b":53}]	{54:45,56:15,999:null}	{999:null}	{505:{"c":null,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":null,"s4":{"e":null,"f":550}}
 5	[15,25,35,45]	[{3:550},{505:501}]	[{"a":51,"b":52},{"a":3,"b":53}]	{54:45,56:15,3:3}	{3:[2,20,3,23]}	{505:{"c":3,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":{4:555},"s4":{"e":3,"f":550}}
 
 -- query 54
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 2	[12,22,32,42]	[{22:220},{3:201}]	[{"a":21,"b":22},{"a":12,"b":13}]	{34:43,36:13,32:3}	{202:[2,20,3,23]}	{202:{"c":21,"b":22}}	{"s1":2,"s2":[2,3,4],"s3":{202:3},"s4":{"e":222,"f":220}}
 
 -- query 55
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 56
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 5	[15,25,35,45]	[{3:550},{505:501}]	[{"a":51,"b":52},{"a":3,"b":53}]	{54:45,56:15,3:3}	{3:[2,20,3,23]}	{505:{"c":3,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":{4:555},"s4":{"e":3,"f":550}}
 
 -- query 57
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 4	[14,24,null,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{999:[4,null,41,23]}	{404:{"c":41,"b":42}}	{"s1":null,"s2":[4,null,41],"s3":{999:444},"s4":null}
 4	[14,24,3,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{3:[4,3,41,23]}	{404:{"c":41,"b":42}}	{"s1":3,"s2":[4,3,41],"s3":{3:444},"s4":{"e":110,"f":330}}
 
 -- query 58
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 1	[11,3,31,41]	[{11:110},{101:101}]	[{"a":11,"b":12},{"a":12,"b":13}]	{14:41,3:11,12:31}	{101:[1,10,11,23]}	{101:{"c":3,"b":12}}	{"s1":1,"s2":[1,10,11],"s3":{101:111,3:3},"s4":{"e":111,"f":110}}
 
 -- query 59
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 4	[14,24,null,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{999:[4,null,41,23]}	{404:{"c":41,"b":42}}	{"s1":null,"s2":[4,null,41],"s3":{999:444},"s4":null}
 4	[14,24,3,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{3:[4,3,41,23]}	{404:{"c":41,"b":42}}	{"s1":3,"s2":[4,3,41],"s3":{3:444},"s4":{"e":110,"f":330}}
 
 -- query 60
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 2	[12,22,32,42]	[{22:220},{3:201}]	[{"a":21,"b":22},{"a":12,"b":13}]	{34:43,36:13,32:3}	{202:[2,20,3,23]}	{202:{"c":21,"b":22}}	{"s1":2,"s2":[2,3,4],"s3":{202:3},"s4":{"e":222,"f":220}}
 3	[12,22,32,42]	[{33:3},{303:301}]	[{"a":31,"b":32},{"a":3,"b":33}]	{34:43,36:13,32:3}	{303:[4,3,41,23]}	{303:{"c":31,"b":32}}	{"s1":2,"s2":[2,3,4],"s3":{201:3},"s4":{"e":222,"f":220}}
 
 -- query 61
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 62
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 4	[14,24,3,44]	[{44:440},{404:401}]	[{"a":41,"b":42},{"a":42,"b":43}]	{44:44,46:14,42:34}	{3:[4,3,41,23]}	{404:{"c":41,"b":42}}	{"s1":3,"s2":[4,3,41],"s3":{3:444},"s4":{"e":110,"f":330}}
 
 -- query 63
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 64
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 
 -- query 65
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 5	[15,25,35,45]	[{3:550},{505:501}]	[{"a":51,"b":52},{"a":3,"b":53}]	{54:45,56:15,3:3}	{3:[2,20,3,23]}	{505:{"c":3,"b":52}}	{"s1":5,"s2":[5,50,51],"s3":{4:555},"s4":{"e":3,"f":550}}
 
 -- query 66
+-- legacy
 v1	array1	array2	array3	map1	map2	map3	st1
 2	[12,22,32,42]	[{22:220},{3:201}]	[{"a":21,"b":22},{"a":12,"b":13}]	{34:43,36:13,32:3}	{202:[2,20,3,23]}	{202:{"c":21,"b":22}}	{"s1":2,"s2":[2,3,4],"s3":{202:3},"s4":{"e":222,"f":220}}
 
 -- query 68
+-- legacy
 array1 <=> ([11, NULL, 31, 41])
 1
 0
@@ -446,6 +509,7 @@ array1 <=> ([11, NULL, 31, 41])
 0
 
 -- query 69
+-- legacy
 array1 <=> ([15, 25, 35, 45])
 0
 0
@@ -459,6 +523,7 @@ array1 <=> ([15, 25, 35, 45])
 1
 
 -- query 70
+-- legacy
 array3 <=> ([named_struct('a', 21, 'b', 22), NULL])
 0
 0
@@ -472,6 +537,7 @@ array3 <=> ([named_struct('a', 21, 'b', 22), NULL])
 0
 
 -- query 71
+-- legacy
 array3 <=> ([row(21, 22), NULL])
 0
 0
@@ -485,6 +551,7 @@ array3 <=> ([row(21, 22), NULL])
 0
 
 -- query 72
+-- legacy
 array2 <=> ([map{999:550}, map{505:501}])
 0
 0
@@ -498,6 +565,7 @@ array2 <=> ([map{999:550}, map{505:501}])
 0
 
 -- query 73
+-- legacy
 array2 <=> ([map{44:440}, map{404:401}])
 0
 0
@@ -511,6 +579,7 @@ array2 <=> ([map{44:440}, map{404:401}])
 0
 
 -- query 74
+-- legacy
 map1 <=> NULL
 0
 0
@@ -524,6 +593,7 @@ map1 <=> NULL
 0
 
 -- query 75
+-- legacy
 map1 <=> (map{14:41,999:11,12:31})
 1
 0
@@ -537,6 +607,7 @@ map1 <=> (map{14:41,999:11,12:31})
 0
 
 -- query 76
+-- legacy
 map1 <=> (map{44:44,46:14,42:34})
 0
 0
@@ -550,6 +621,7 @@ map1 <=> (map{44:44,46:14,42:34})
 0
 
 -- query 77
+-- legacy
 map1 <=> (map{34:43,36:13,32:NULL})
 0
 0
@@ -563,6 +635,7 @@ map1 <=> (map{34:43,36:13,32:NULL})
 0
 
 -- query 78
+-- legacy
 map2 <=> (map{505:[5, 50, 51, 23]})
 0
 0
@@ -576,6 +649,7 @@ map2 <=> (map{505:[5, 50, 51, 23]})
 0
 
 -- query 79
+-- legacy
 map2 <=> (map{999:NULL})
 0
 0
@@ -589,6 +663,7 @@ map2 <=> (map{999:NULL})
 0
 
 -- query 80
+-- legacy
 map2 <=> (map{999:[4, NULL, 41, 23]})
 0
 0
@@ -602,6 +677,7 @@ map2 <=> (map{999:[4, NULL, 41, 23]})
 0
 
 -- query 81
+-- legacy
 map2 <=> (map{101:[1, 10, 11, 23]})
 1
 1
@@ -615,6 +691,7 @@ map2 <=> (map{101:[1, 10, 11, 23]})
 0
 
 -- query 82
+-- legacy
 map1 <=> (map{46:14,42:34,44:44})
 0
 0
@@ -628,6 +705,7 @@ map1 <=> (map{46:14,42:34,44:44})
 0
 
 -- query 83
+-- legacy
 map1 <=> (map{54:45,56:15})
 0
 0
@@ -641,6 +719,7 @@ map1 <=> (map{54:45,56:15})
 0
 
 -- query 84
+-- legacy
 map1 <=> (map{999:NULL,54:45,56:15})
 0
 0
@@ -654,6 +733,7 @@ map1 <=> (map{999:NULL,54:45,56:15})
 0
 
 -- query 85
+-- legacy
 map3 <=> (map{505:row(NULL, 52)})
 0
 0
@@ -667,6 +747,7 @@ map3 <=> (map{505:row(NULL, 52)})
 0
 
 -- query 86
+-- legacy
 st1 <=> (row(2, NULL, map{202:NULL}, row(222, 220)))
 0
 0
@@ -680,6 +761,7 @@ st1 <=> (row(2, NULL, map{202:NULL}, row(222, 220)))
 0
 
 -- query 87
+-- legacy
 st1 <=> (named_struct('s1', 5, 's2', [5, 50, 51], 's3', NULL, 's4', row(NULL, 550)))
 0
 0
@@ -693,6 +775,7 @@ st1 <=> (named_struct('s1', 5, 's2', [5, 50, 51], 's3', NULL, 's4', row(NULL, 55
 0
 
 -- query 88
+-- legacy
 array1 <=> NULL
 0
 0
@@ -706,6 +789,7 @@ array1 <=> NULL
 0
 
 -- query 89
+-- legacy
 st1 <=> NULL
 0
 0
@@ -719,6 +803,7 @@ st1 <=> NULL
 0
 
 -- query 90
+-- legacy
 array1 != ([11, NULL, 31, 41])
 NULL
 NULL
@@ -732,6 +817,7 @@ NULL
 1
 
 -- query 91
+-- legacy
 array1 != ([15, 25, 35, 45])
 1
 1
@@ -745,6 +831,7 @@ NULL
 0
 
 -- query 92
+-- legacy
 array3 != ([named_struct('a', 21, 'b', 22), NULL])
 1
 1
@@ -758,6 +845,7 @@ NULL
 1
 
 -- query 93
+-- legacy
 array3 != ([row(21, 22), NULL])
 1
 1
@@ -771,6 +859,7 @@ NULL
 1
 
 -- query 94
+-- legacy
 array2 != ([map{999:550}, map{505:501}])
 1
 1
@@ -784,6 +873,7 @@ array2 != ([map{999:550}, map{505:501}])
 1
 
 -- query 95
+-- legacy
 array2 != ([map{44:440}, map{404:401}])
 1
 1
@@ -797,6 +887,7 @@ array2 != ([map{44:440}, map{404:401}])
 1
 
 -- query 96
+-- legacy
 map1 != NULL
 NULL
 NULL
@@ -810,6 +901,7 @@ NULL
 NULL
 
 -- query 97
+-- legacy
 map1 != (map{14:41,999:11,12:31})
 0
 1
@@ -823,6 +915,7 @@ NULL
 1
 
 -- query 98
+-- legacy
 map1 != (map{44:44,46:14,42:34})
 1
 1
@@ -836,6 +929,7 @@ NULL
 1
 
 -- query 99
+-- legacy
 map1 != (map{34:43,36:13,32:NULL})
 1
 1
@@ -849,6 +943,7 @@ NULL
 1
 
 -- query 100
+-- legacy
 map2 != (map{505:[5, 50, 51, 23]})
 1
 1
@@ -862,6 +957,7 @@ map2 != (map{505:[5, 50, 51, 23]})
 1
 
 -- query 101
+-- legacy
 map2 != (map{999:NULL})
 1
 1
@@ -875,6 +971,7 @@ NULL
 1
 
 -- query 102
+-- legacy
 map2 != (map{999:[4, NULL, 41, 23]})
 1
 1
@@ -888,6 +985,7 @@ NULL
 1
 
 -- query 103
+-- legacy
 map2 != (map{101:[1, 10, 11, 23]})
 0
 0
@@ -901,6 +999,7 @@ map2 != (map{101:[1, 10, 11, 23]})
 1
 
 -- query 104
+-- legacy
 map1 != (map{46:14,42:34,44:44})
 1
 1
@@ -914,6 +1013,7 @@ NULL
 1
 
 -- query 105
+-- legacy
 map1 != (map{54:45,56:15})
 1
 1
@@ -927,6 +1027,7 @@ NULL
 1
 
 -- query 106
+-- legacy
 map1 != (map{999:NULL,54:45,56:15})
 1
 1
@@ -940,6 +1041,7 @@ NULL
 1
 
 -- query 107
+-- legacy
 map3 != (map{505:row(NULL, 52)})
 1
 1
@@ -953,6 +1055,7 @@ NULL
 NULL
 
 -- query 108
+-- legacy
 st1 != (row(2, NULL, map{202:NULL}, row(222, 220)))
 1
 1
@@ -966,6 +1069,7 @@ NULL
 1
 
 -- query 109
+-- legacy
 st1 != (named_struct('s1', 5, 's2', [5, 50, 51], 's3', NULL, 's4', row(NULL, 550)))
 1
 1
@@ -979,6 +1083,7 @@ NULL
 NULL
 
 -- query 110
+-- legacy
 array1 != NULL
 NULL
 NULL
@@ -992,6 +1097,7 @@ NULL
 NULL
 
 -- query 111
+-- legacy
 st1 != NULL
 NULL
 NULL
@@ -1005,26 +1111,32 @@ NULL
 NULL
 
 -- query 114
+-- legacy
 (map{1:1,999:2}) != (map{999:2,3:NULL})
 1
 
 -- query 115
+-- legacy
 (map{1:1,999:2}) = (map{999:2,3:NULL})
 0
 
 -- query 116
+-- legacy
 (map{1:1,999:2}) = (map{999:3,1:NULL})
 0
 
 -- query 117
+-- legacy
 (map{1:1,999:2}) != (map{999:3,1:NULL})
 1
 
 -- query 118
+-- legacy
 struct_eq	struct_ne	map_eq	map_ne	struct_unknown	struct_safe	map_safe
 0	1	0	1	NULL	1	1
 
 -- query 119
+-- legacy
 v1	eq	ne	safe
 1	NULL	NULL	1
 1	1	0	1

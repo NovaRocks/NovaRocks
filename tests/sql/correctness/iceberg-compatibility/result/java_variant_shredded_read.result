@@ -1,9 +1,11 @@
 -- query 2
+-- legacy
 id	kind	number
 1	Int32	42
 2	Null	NULL
 3	NULL	NULL
 
 -- query 3
+-- legacy
 id
 1

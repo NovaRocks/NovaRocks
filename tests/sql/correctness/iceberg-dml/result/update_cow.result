@@ -1,13 +1,16 @@
 -- query 2
+-- types	bigint	varchar
 id	v
 1	a
 2	b
 
 -- query 4
+-- types	bigint	varchar
 id	v
 1	a
 2	bb
 
 -- query 5
+-- types	bigint	bigint
 distinct_row_ids	total_rows
 2	2

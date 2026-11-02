@@ -1,4 +1,5 @@
 -- query 6
+-- types	integer	bigint
 c0	sum(c1)
 1	1
 2	2
@@ -7,6 +8,7 @@ c0	sum(c1)
 5	5
 
 -- query 8
+-- types	integer	bigint
 c0	sum(c1)
 1	1
 2	2
@@ -15,6 +17,7 @@ c0	sum(c1)
 5	5
 
 -- query 12
+-- types	integer	bigint
 c0	sum(c1)
 1	4095
 2	4094

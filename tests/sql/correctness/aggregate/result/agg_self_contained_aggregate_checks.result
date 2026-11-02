@@ -1,3 +1,5 @@
+-- query 5
+-- types	varchar	bigint
 metric	value
 customer_count	6
 lineorder_filtered_sum_revenue	600

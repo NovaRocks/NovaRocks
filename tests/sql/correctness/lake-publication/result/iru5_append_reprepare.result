@@ -1,4 +1,5 @@
 -- query 4
+-- types	bigint	varchar
 id	writer
 1	seed
 2	spark

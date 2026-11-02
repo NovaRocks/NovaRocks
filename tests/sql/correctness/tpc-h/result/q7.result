@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	varchar	integer	decimal(38, 4)
 supp_nation	cust_nation	l_year	revenue
 CANADA	IRAN	1995	51786369.9980
 CANADA	IRAN	1996	55094126.5204

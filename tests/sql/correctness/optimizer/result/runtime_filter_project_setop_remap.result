@@ -1,7 +1,9 @@
 -- query 13
+-- types	bigint
 count(*)
 3
 
 -- query 14
+-- types	bigint
 count(*)
 3

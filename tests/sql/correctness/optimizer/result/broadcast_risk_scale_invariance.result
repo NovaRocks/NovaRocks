@@ -1,8 +1,10 @@
 -- query 17
+-- types	bigint
 cnt
 10000
 
 -- query 18
+-- types	varchar
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1
@@ -49,10 +51,12 @@ PLAN FRAGMENT 2
      predicates: b.k IS NOT NULL
 
 -- query 19
+-- types	bigint
 cnt
 100000
 
 -- query 20
+-- types	varchar
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1

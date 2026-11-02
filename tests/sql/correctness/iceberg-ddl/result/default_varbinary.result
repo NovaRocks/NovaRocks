@@ -1,10 +1,12 @@
 -- query 5
+-- types	integer	varchar	varbinary
 id	name	payload
-1	alice	abc
-2	bob	abc
+1	alice	YWJj
+2	bob	YWJj
 
 -- query 7
+-- types	integer	varchar	varbinary
 id	name	payload
-1	alice	abc
-2	bob	abc
-3	charlie	abc
+1	alice	YWJj
+2	bob	YWJj
+3	charlie	YWJj

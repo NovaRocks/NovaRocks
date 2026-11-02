@@ -1,4 +1,5 @@
 -- query 2
+-- legacy
 id	metadata_hex	value_hex	whole_null
 1	0100	FF00	0
 2	NULL		0

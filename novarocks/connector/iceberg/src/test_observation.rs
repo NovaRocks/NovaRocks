@@ -99,7 +99,6 @@ fn same_nomination(a: &StatementWorkNomination, b: &StatementWorkNomination) -> 
     a.target_session_id == b.target_session_id
         && a.statement_run_token == b.statement_run_token
         && a.frontend_process_id == b.frontend_process_id
-        && a.connection_id == b.connection_id
         && a.session_key == b.session_key
         && a.statement_generation == b.statement_generation
 }
@@ -564,7 +563,6 @@ mod exact_statement_tests {
             target_session_id: "writer-session".into(),
             statement_run_token: "selected".into(),
             frontend_process_id: frontend.to_string(),
-            connection_id: 7,
             session_key: 1,
             statement_generation: 3,
         };
@@ -573,7 +571,6 @@ mod exact_statement_tests {
             target_launch_id: "writer-launch".into(),
             statement_run_token: "selected".into(),
             frontend_process_id: frontend.to_string(),
-            connection_id: 7,
             session_key: 1,
             sql_sha256: [1; 32],
         };
@@ -617,10 +614,6 @@ mod exact_statement_tests {
         let rearmed_caller = slot.clone();
         for replacement_input in [
             StatementInputNomination {
-                connection_id: 8,
-                ..input.clone()
-            },
-            StatementInputNomination {
                 session_key: 2,
                 ..input.clone()
             },
@@ -650,7 +643,6 @@ mod exact_statement_tests {
                 target_session_id: replacement_input.target_session_id.clone(),
                 statement_run_token: replacement_input.statement_run_token.clone(),
                 frontend_process_id: replacement_input.frontend_process_id.clone(),
-                connection_id: replacement_input.connection_id,
                 session_key: replacement_input.session_key,
                 statement_generation: nomination.statement_generation,
             };
@@ -682,14 +674,12 @@ mod exact_statement_tests {
         // Fresh declared permission can select a different input independently.
         let fresh_input = StatementInputNomination {
             statement_run_token: "fresh".into(),
-            connection_id: 9,
             session_key: 2,
             sql_sha256: [3; 32],
             ..input.clone()
         };
         let fresh_nomination = StatementWorkNomination {
             statement_run_token: "fresh".into(),
-            connection_id: 9,
             session_key: 2,
             ..nomination.clone()
         };

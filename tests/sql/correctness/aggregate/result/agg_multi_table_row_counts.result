@@ -1,3 +1,5 @@
+-- query 11
+-- types	varchar	bigint
 table_name	row_count
 customer	4
 dates	3

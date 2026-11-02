@@ -1,19 +1,23 @@
 -- query 4
+-- types	integer	bigint
 k	total
 5	30
 20	3
 
 -- query 7
+-- types	integer	bigint
 k	total
 5	30
 20	3
 
 -- query 9
+-- types	integer	bigint
 k	total
 5	30
 20	3
 
 -- query 12
+-- types	integer	bigint
 k	total
 5	30
 20	3

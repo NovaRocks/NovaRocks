@@ -1,3 +1,5 @@
+-- query 3
+-- types	varchar	integer	integer	bigint	bigint	bigint
 grp	id	score	rn	rnk	drnk
 A	1	100	1	1	1
 A	2	100	2	1	1

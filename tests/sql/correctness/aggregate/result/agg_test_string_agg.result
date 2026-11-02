@@ -1,8 +1,10 @@
 -- query 3
+-- types	varchar
 orgs
 NULL
 
 -- query 20
+-- types	varchar
 group_concat(DISTINCT score ORDER BY score ASC, name ASC SEPARATOR ',')
 NULL
 NULL
@@ -13,6 +15,7 @@ NULL
 99
 
 -- query 22
+-- types	varchar
 group_concat(score ORDER BY score ASC, name ASC SEPARATOR ',')
 NULL
 NULL
@@ -23,17 +26,21 @@ NULL
 99
 
 -- query 23
+-- types	varchar
 group_concat(score ORDER BY score ASC, name ASC SEPARATOR ',')
 22,78,80,90,98,98,99
 
 -- query 24
+-- types	varchar
 group_concat(name SEPARATOR ',')
 Tom,Tom
 
 -- query 25
+-- types	varchar
 group_concat(DISTINCT name SEPARATOR ',')
 Tom
 
 -- query 26
+-- types	varchar
 ordered_scores
 Tom:90,Tom:80

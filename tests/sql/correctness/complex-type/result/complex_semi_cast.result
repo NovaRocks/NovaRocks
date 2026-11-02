@@ -1,43 +1,54 @@
 -- query 2
+-- legacy
 count(1)
 2
 
 -- query 3
+-- legacy
 count(1)
 2
 
 -- query 4
+-- legacy
 count(1)
 2
 
 -- query 5
+-- legacy
 count(1)
 39999
 
 -- query 6
+-- legacy
 count(1)
 40000
 
 -- query 7
+-- legacy
 count(1)
 40000
 
 -- query 8
+-- legacy
 count(1)
 2
 
 -- query 9
+-- legacy
 count(1)
 40000
 
 -- query 10
+-- legacy
 count(1)
 2
 
 -- query 11
+-- legacy
 count(1)
 2
 
 -- query 12
+-- legacy
 count(1)
 39999

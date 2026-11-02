@@ -1,9 +1,11 @@
 -- query 5
+-- types	integer	varchar	integer
 id	region	amount
 1	us	7
 2	eu	7
 
 -- query 7
+-- types	integer	varchar	integer
 id	region	amount
 1	us	7
 2	eu	7
@@ -11,5 +13,6 @@ id	region	amount
 12	eu	7
 
 -- query 9
+-- types	bigint
 n
 4

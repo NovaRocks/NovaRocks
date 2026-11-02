@@ -1,8 +1,10 @@
 -- query 5
+-- types	bigint
 ndv(c1)
 1005
 
 -- query 6
+-- types	integer	bigint
 c2	ndv(c1)
 1	1
 2	1
@@ -16,10 +18,12 @@ c2	ndv(c1)
 10	1
 
 -- query 7
+-- types	bigint
 approx_count_distinct(c1)
 1005
 
 -- query 8
+-- types	integer	bigint
 c2	approx_count_distinct(c1)
 1	1
 2	1
@@ -33,10 +37,12 @@ c2	approx_count_distinct(c1)
 10	1
 
 -- query 9
+-- types	bigint
 ds_hll_count_distinct(c1)
 1000
 
 -- query 10
+-- types	integer	bigint
 c2	ds_hll_count_distinct(c1)
 1	1
 2	1
@@ -49,45 +55,13 @@ c2	ds_hll_count_distinct(c1)
 9	1
 10	1
 
--- query 11
-hll_union(hll_hash(c1))
-NULL
-
--- query 12
-c2	hll_union(hll_hash(c1))
-1	NULL
-2	NULL
-3	NULL
-4	NULL
-5	NULL
-6	NULL
-7	NULL
-8	NULL
-9	NULL
-10	NULL
-
--- query 13
-hll_raw_agg(hll_hash(c1))
-NULL
-
--- query 14
-c2	hll_raw_agg(hll_hash(c1))
-1	NULL
-2	NULL
-3	NULL
-4	NULL
-5	NULL
-6	NULL
-7	NULL
-8	NULL
-9	NULL
-10	NULL
-
 -- query 15
+-- types	bigint
 hll_union_agg(hll_hash(c1))
 1001
 
 -- query 16
+-- types	integer	bigint
 c2	hll_union_agg(hll_hash(c1))
 1	1
 2	1

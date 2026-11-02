@@ -275,7 +275,7 @@ impl FailureArtifactRecorder {
                 .with_context(|| format!("read failed case {}", source.display()))?,
         )?;
         if let Some(expected) = expected.filter(|p| p.is_file()) {
-            pending.write_file("expected.tsv", &fs::read_to_string(expected)?)?;
+            pending.write_bytes("expected.result", &fs::read(expected)?)?;
         }
         Ok(pending.commit())
     }
@@ -288,6 +288,27 @@ impl FailureArtifactRecorder {
         query: usize,
         execution: &crate::types::QueryExecution,
     ) -> Result<PathBuf> {
+        self.persist_actual_result(suite, case_id, query, execution, true)
+    }
+
+    pub(crate) fn persist_case_partial_result(
+        &self,
+        suite: &str,
+        case_id: &str,
+        query: usize,
+        execution: &crate::types::QueryExecution,
+    ) -> Result<PathBuf> {
+        self.persist_actual_result(suite, case_id, query, execution, false)
+    }
+
+    fn persist_actual_result(
+        &self,
+        suite: &str,
+        case_id: &str,
+        query: usize,
+        execution: &crate::types::QueryExecution,
+        complete: bool,
+    ) -> Result<PathBuf> {
         let root = self.case_artifact_root()?;
         let pending = PendingArtifactDir::create(
             &root,
@@ -298,9 +319,30 @@ impl FailureArtifactRecorder {
             &serde_json::to_string_pretty(&serde_json::json!({
                 "suite": suite, "case": case_id, "query": query,
                 "header": &execution.header, "rows": &execution.rows,
+                "complete":complete,"result_statements":&execution.result_statements,
             }))?,
         )?;
         pending.write_file("actual.txt", &execution.text_output)?;
+        let blocks = if let Some(shell) = &execution.shell_result {
+            anyhow::ensure!(
+                matches!(shell, crate::golden::Block::Shell { .. })
+                    && execution.typed_results.is_empty(),
+                "actual shell result conflicts with typed SQL results"
+            );
+            vec![shell.clone()]
+        } else {
+            crate::golden::execution::blocks_from_results(&execution.typed_results)?
+        };
+        pending.write_file(
+            "actual.result",
+            &crate::golden::GoldenFile {
+                sections: vec![crate::golden::Section {
+                    step: query,
+                    blocks,
+                }],
+            }
+            .render()?,
+        )?;
         Ok(pending.commit())
     }
 
@@ -539,6 +581,10 @@ impl PendingArtifactDir {
     }
 
     fn write_file(&self, name: &str, contents: &str) -> Result<()> {
+        self.write_bytes(name, contents.as_bytes())
+    }
+
+    fn write_bytes(&self, name: &str, contents: &[u8]) -> Result<()> {
         let mut components = Path::new(name).components();
         if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
             bail!("SQL failure artifact file name must not contain a directory: {name:?}");
@@ -551,7 +597,7 @@ impl PendingArtifactDir {
         let mut file = options
             .open(&path)
             .with_context(|| format!("create SQL failure artifact {}", path.display()))?;
-        file.write_all(contents.as_bytes())
+        file.write_all(contents)
             .with_context(|| format!("write SQL failure artifact {}", path.display()))?;
         file.sync_all()
             .with_context(|| format!("sync SQL failure artifact {}", path.display()))
@@ -1174,7 +1220,8 @@ mod tests {
         let source = temp.path().join("case.sql");
         let expected = temp.path().join("case.result");
         fs::write(&source, "SELECT missing;\n").unwrap();
-        fs::write(&expected, "answer\n42\n").unwrap();
+        let original_expected = b"answer\r\n42\r\n\n";
+        fs::write(&expected, original_expected).unwrap();
         let mut roots = Vec::new();
         for _ in 0..2 {
             let recorder = FailureArtifactRecorder::new(context(&temp.path().join("artifacts")));
@@ -1196,10 +1243,11 @@ mod tests {
                 "SELECT missing;\n"
             );
             assert_eq!(
-                fs::read_to_string(path.join("expected.tsv")).unwrap(),
-                "answer\n42\n"
+                fs::read(path.join("expected.result")).unwrap(),
+                original_expected
             );
-            assert!(!path.join("actual.tsv").exists());
+            assert!(!path.join("actual.result").exists());
+            assert_private_artifact_files(&path);
             roots.push(path.parent().unwrap().to_path_buf());
         }
         assert_ne!(roots[0], roots[1]);
@@ -1216,6 +1264,26 @@ mod tests {
         let recorder = FailureArtifactRecorder::new(context(temp.path()));
         let definition = "x".repeat(700);
         let execution = crate::types::QueryExecution {
+            shell_result: None,
+            result_statements: Vec::new(),
+            typed_results: vec![novarocks_test_trino_client::StatementResult {
+                columns: ["Name", "Definition", "Manageability"]
+                    .into_iter()
+                    .map(|name| novarocks_test_trino_client::Column {
+                        name: name.into(),
+                        type_name: "varchar".into(),
+                        type_signature: crate::golden::parse_type("varchar").unwrap(),
+                    })
+                    .collect(),
+                rows: vec![vec![
+                    novarocks_test_trino_client::TrinoValue::Text("a_mv".into()),
+                    novarocks_test_trino_client::TrinoValue::Text(definition.clone()),
+                    novarocks_test_trino_client::TrinoValue::Text("MANAGEABLE".into()),
+                ]],
+                query_id: "diagnostic-query".into(),
+                pages: 1,
+                update_type: None,
+            }],
             header: vec!["Name".into(), "Definition".into(), "Manageability".into()],
             rows: vec![vec!["a_mv".into(), definition.clone(), "MANAGEABLE".into()]],
             text_output: format!(
@@ -1246,20 +1314,129 @@ mod tests {
         assert_eq!(actual["header"][2], "Manageability");
         assert_eq!(actual["rows"][0][1], definition);
         assert_eq!(actual["rows"][0][2], "MANAGEABLE");
-        assert!(!path.join("expected.tsv").exists());
+        assert!(!path.join("expected.result").exists());
         assert!(!path.join("case.result").exists());
+        let canonical = crate::golden::GoldenFile::read(&path.join("actual.result")).unwrap();
+        assert_eq!(canonical.sections.len(), 1);
+        assert_eq!(canonical.sections[0].step, step.query_number);
+        assert_eq!(
+            canonical.sections[0].blocks,
+            vec![crate::golden::Block::Typed {
+                types: vec!["varchar".into(); 3],
+                names: vec!["Name".into(), "Definition".into(), "Manageability".into()],
+                rows: vec![vec!["a_mv".into(), definition.clone(), "MANAGEABLE".into()]],
+            }]
+        );
+        assert_private_artifact_files(&path);
         assert!(!crate::results::verify_text_assertions(&step, &execution).0);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
-            for name in ["actual.txt", "actual.json"] {
+            for name in ["actual.txt", "actual.json", "actual.result"] {
                 assert_eq!(
                     fs::metadata(path.join(name)).unwrap().permissions().mode() & 0o077,
                     0
                 );
             }
         }
+    }
+
+    fn assert_private_artifact_files(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                assert!(entry.file_type().unwrap().is_file());
+                assert_eq!(
+                    entry.metadata().unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{}",
+                    entry.path().display()
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
+    #[test]
+    fn actual_shell_artifact_preserves_its_owned_block_and_full_text() {
+        let temp = TempDir::new().unwrap();
+        let recorder = FailureArtifactRecorder::new(context(temp.path()));
+        let shell = crate::golden::Block::Shell {
+            exit: "1".into(),
+            lines: vec!["".into(), "NULL".into(), "\t雪".into(), "-- query 9".into()],
+        };
+        let execution = crate::types::QueryExecution {
+            shell_result: Some(shell.clone()),
+            result_statements: Vec::new(),
+            typed_results: Vec::new(),
+            header: vec!["1".into()],
+            rows: vec![
+                vec!["".into()],
+                vec!["NULL".into()],
+                vec!["\t雪".into()],
+                vec!["-- query 9".into()],
+            ],
+            text_output: "1\n\nNULL\n\t雪\n-- query 9\n".into(),
+            elapsed: std::time::Duration::ZERO,
+        };
+        let path = recorder
+            .persist_case_actual_result("shell", "owned-output", 4, &execution)
+            .unwrap();
+        let canonical = crate::golden::GoldenFile::read(&path.join("actual.result")).unwrap();
+        assert_eq!(
+            canonical.sections,
+            vec![crate::golden::Section {
+                step: 4,
+                blocks: vec![shell]
+            }]
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("actual.txt")).unwrap(),
+            execution.text_output
+        );
+        assert_private_artifact_files(&path);
+    }
+
+    #[test]
+    fn actual_artifact_does_not_infer_types_from_a_flat_text_view() {
+        let temp = TempDir::new().unwrap();
+        let recorder = FailureArtifactRecorder::new(context(temp.path()));
+        let execution = crate::types::QueryExecution {
+            shell_result: None,
+            result_statements: Vec::new(),
+            typed_results: Vec::new(),
+            header: vec!["untyped".into()],
+            rows: vec![vec!["42".into()]],
+            text_output: "untyped\n42".into(),
+            elapsed: std::time::Duration::ZERO,
+        };
+        let path = recorder
+            .persist_case_actual_result("diagnostic", "no-type-authority", 2, &execution)
+            .unwrap();
+        let canonical = crate::golden::GoldenFile::read(&path.join("actual.result")).unwrap();
+        assert_eq!(
+            canonical.sections,
+            vec![crate::golden::Section {
+                step: 2,
+                blocks: Vec::new()
+            }]
+        );
+        let retained: serde_json::Value =
+            serde_json::from_slice(&fs::read(path.join("actual.json")).unwrap()).unwrap();
+        assert_eq!(retained["rows"][0][0], "42");
+        assert_eq!(
+            fs::read_to_string(path.join("actual.txt")).unwrap(),
+            "untyped\n42"
+        );
+        assert_private_artifact_files(&path);
     }
 
     #[test]

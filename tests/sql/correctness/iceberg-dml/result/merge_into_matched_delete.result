@@ -1,22 +1,27 @@
 -- query 2
+-- types	bigint	varchar
 id	v
 1	a
 2	b
 3	c
 
 -- query 3
+-- types	bigint
 snaps_before
 1
 
 -- query 5
+-- legacy
 snaps_after
 2
 
 -- query 6
+-- legacy
 id	v
 1	a
 3	c
 
 -- query 7
+-- types	boolean
 row_ids_unique
-1
+true

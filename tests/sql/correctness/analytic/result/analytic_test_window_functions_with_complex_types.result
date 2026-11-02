@@ -1,4 +1,5 @@
 -- query 2
+-- legacy
 wv
 1
 1
@@ -7,6 +8,7 @@ wv
 1
 
 -- query 3
+-- legacy
 wv
 127
 127
@@ -15,6 +17,7 @@ wv
 127
 
 -- query 4
+-- legacy
 wv
 32000
 32000
@@ -23,6 +26,7 @@ wv
 32000
 
 -- query 5
+-- legacy
 wv
 2147483647
 2147483647
@@ -31,6 +35,7 @@ wv
 2147483647
 
 -- query 6
+-- legacy
 wv
 9223372036854775807
 9223372036854775807
@@ -39,6 +44,7 @@ wv
 9223372036854775807
 
 -- query 7
+-- legacy
 wv
 17014118346046923173168730371588410572
 17014118346046923173168730371588410572
@@ -47,6 +53,7 @@ wv
 17014118346046923173168730371588410572
 
 -- query 8
+-- legacy
 wv
 12345.6789
 12345.6789
@@ -55,6 +62,7 @@ wv
 12345.6789
 
 -- query 9
+-- legacy
 wv
 12345.67
 12345.67
@@ -63,6 +71,7 @@ wv
 12345.67
 
 -- query 10
+-- legacy
 wv
 123.46
 123.46
@@ -71,6 +80,7 @@ wv
 123.46
 
 -- query 11
+-- legacy
 wv
 ExampleCharData
 ExampleCharData
@@ -79,6 +89,7 @@ ExampleCharData
 ExampleCharData
 
 -- query 12
+-- legacy
 wv
 2024-01-02
 2024-01-02
@@ -87,6 +98,7 @@ wv
 2024-01-02
 
 -- query 13
+-- legacy
 wv
 2024-01-01 12:34:56
 2024-01-01 12:34:56
@@ -95,6 +107,7 @@ wv
 2024-01-01 12:34:56
 
 -- query 14
+-- legacy
 wv
 [1,0,1]
 [1,0,1]
@@ -103,6 +116,7 @@ wv
 [1,0,1]
 
 -- query 15
+-- legacy
 wv
 [1,-1,127]
 [1,-1,127]
@@ -111,6 +125,7 @@ wv
 [1,-1,127]
 
 -- query 16
+-- legacy
 wv
 [100,-100,32767]
 [100,-100,32767]
@@ -119,6 +134,7 @@ wv
 [100,-100,32767]
 
 -- query 17
+-- legacy
 wv
 [100000,-100000,2147483647]
 [100000,-100000,2147483647]
@@ -127,6 +143,7 @@ wv
 [100000,-100000,2147483647]
 
 -- query 18
+-- legacy
 wv
 [10000000000,-10000000000,9223372036854775807]
 [10000000000,-10000000000,9223372036854775807]
@@ -135,6 +152,7 @@ wv
 [10000000000,-10000000000,9223372036854775807]
 
 -- query 19
+-- legacy
 wv
 [12345678901234567890,-12345678901234567890,17014118346046923173168730371588410572]
 [12345678901234567890,-12345678901234567890,17014118346046923173168730371588410572]
@@ -143,6 +161,7 @@ wv
 [12345678901234567890,-12345678901234567890,17014118346046923173168730371588410572]
 
 -- query 20
+-- legacy
 wv
 [1.23,4.56,7.89]
 [1.23,4.56,7.89]
@@ -151,6 +170,7 @@ wv
 [1.23,4.56,7.89]
 
 -- query 21
+-- legacy
 wv
 [1.23,4.56,7.89]
 [1.23,4.56,7.89]
@@ -159,6 +179,7 @@ wv
 [1.23,4.56,7.89]
 
 -- query 22
+-- legacy
 wv
 [1.23,2.35,3.46]
 [1.23,2.35,3.46]
@@ -167,18 +188,22 @@ wv
 [1.23,2.35,3.46]
 
 -- query 23
+-- legacy
 sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
 7698522700
 
 -- query 24
+-- legacy
 sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
 9489753355
 
 -- query 25
+-- legacy
 sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
 -2908793330
 
 -- query 26
+-- legacy
 wv
 ExampleVarcharData
 ExampleVarcharData
@@ -187,6 +212,7 @@ ExampleVarcharData
 ExampleVarcharData
 
 -- query 27
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -195,6 +221,7 @@ wv
 {"key": "value"}
 
 -- query 28
+-- legacy
 wv
 MyVarbinaryData
 MyVarbinaryData
@@ -203,6 +230,7 @@ MyVarbinaryData
 MyVarbinaryData
 
 -- query 31
+-- legacy
 wv
 NULL
 NULL
@@ -211,6 +239,7 @@ NULL
 NULL
 
 -- query 32
+-- legacy
 wv
 NULL
 NULL
@@ -219,6 +248,7 @@ NULL
 NULL
 
 -- query 33
+-- legacy
 wv
 NULL
 NULL
@@ -227,6 +257,7 @@ NULL
 NULL
 
 -- query 34
+-- legacy
 wv
 NULL
 NULL
@@ -235,6 +266,7 @@ NULL
 NULL
 
 -- query 35
+-- legacy
 wv
 NULL
 NULL
@@ -243,6 +275,7 @@ NULL
 NULL
 
 -- query 36
+-- legacy
 wv
 NULL
 NULL
@@ -251,6 +284,7 @@ NULL
 NULL
 
 -- query 37
+-- legacy
 wv
 NULL
 NULL
@@ -259,6 +293,7 @@ NULL
 NULL
 
 -- query 38
+-- legacy
 wv
 NULL
 NULL
@@ -267,6 +302,7 @@ NULL
 NULL
 
 -- query 39
+-- legacy
 wv
 NULL
 {"key": "value"}
@@ -275,6 +311,7 @@ NULL
 {"key": "value"}
 
 -- query 40
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -283,6 +320,7 @@ wv
 {"key": "value"}
 
 -- query 41
+-- legacy
 wv
 NULL
 {"key": "value"}
@@ -291,6 +329,7 @@ NULL
 {"key": "value"}
 
 -- query 42
+-- legacy
 wv
 NULL
 NULL
@@ -299,6 +338,7 @@ NULL
 NULL
 
 -- query 43
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -307,6 +347,7 @@ wv
 {"key": "value"}
 
 -- query 44
+-- legacy
 wv
 NULL
 NULL
@@ -315,6 +356,7 @@ NULL
 NULL
 
 -- query 45
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -323,6 +365,7 @@ wv
 {"key": "value"}
 
 -- query 46
+-- legacy
 wv
 NULL
 NULL
@@ -331,6 +374,7 @@ NULL
 NULL
 
 -- query 47
+-- legacy
 wv
 NULL
 {"key": "value"}
@@ -339,6 +383,7 @@ NULL
 {"key": "value"}
 
 -- query 48
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -347,6 +392,7 @@ wv
 {"key": "value"}
 
 -- query 49
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -355,6 +401,7 @@ wv
 NULL
 
 -- query 50
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -363,6 +410,7 @@ wv
 NULL
 
 -- query 51
+-- legacy
 wv
 NULL
 NULL
@@ -371,6 +419,7 @@ NULL
 NULL
 
 -- query 52
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -379,6 +428,7 @@ wv
 NULL
 
 -- query 53
+-- legacy
 wv
 NULL
 NULL
@@ -387,6 +437,7 @@ NULL
 NULL
 
 -- query 54
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -395,6 +446,7 @@ wv
 NULL
 
 -- query 55
+-- legacy
 wv
 NULL
 NULL
@@ -403,6 +455,7 @@ NULL
 NULL
 
 -- query 56
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -411,6 +464,7 @@ wv
 NULL
 
 -- query 57
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -419,6 +473,7 @@ wv
 NULL
 
 -- query 58
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -427,6 +482,7 @@ wv
 NULL
 
 -- query 59
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -435,6 +491,7 @@ wv
 NULL
 
 -- query 60
+-- legacy
 wv
 NULL
 NULL
@@ -443,6 +500,7 @@ NULL
 NULL
 
 -- query 61
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -451,6 +509,7 @@ wv
 NULL
 
 -- query 62
+-- legacy
 wv
 NULL
 NULL
@@ -459,6 +518,7 @@ NULL
 NULL
 
 -- query 63
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -467,6 +527,7 @@ wv
 NULL
 
 -- query 64
+-- legacy
 wv
 NULL
 NULL
@@ -475,6 +536,7 @@ NULL
 NULL
 
 -- query 65
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -483,6 +545,7 @@ wv
 NULL
 
 -- query 66
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -491,6 +554,7 @@ wv
 NULL
 
 -- query 67
+-- legacy
 wv
 1
 0
@@ -499,6 +563,7 @@ wv
 NULL
 
 -- query 68
+-- legacy
 wv
 127
 NULL
@@ -507,6 +572,7 @@ NULL
 NULL
 
 -- query 69
+-- legacy
 wv
 32000
 32100
@@ -515,6 +581,7 @@ wv
 NULL
 
 -- query 70
+-- legacy
 wv
 2147483647
 2047483647
@@ -523,6 +590,7 @@ wv
 NULL
 
 -- query 71
+-- legacy
 wv
 9223372036854775807
 9023372036854775807
@@ -531,6 +599,7 @@ wv
 NULL
 
 -- query 72
+-- legacy
 wv
 17014118346046923173168730371588410572
 10014118346046923173168730371588410572
@@ -539,6 +608,7 @@ wv
 NULL
 
 -- query 73
+-- legacy
 wv
 12345.6789
 123450.6789
@@ -547,6 +617,7 @@ wv
 NULL
 
 -- query 74
+-- legacy
 wv
 12345.67
 123450.67
@@ -555,6 +626,7 @@ wv
 NULL
 
 -- query 75
+-- legacy
 wv
 123.46
 1230.46
@@ -563,6 +635,7 @@ wv
 NULL
 
 -- query 76
+-- legacy
 wv
 ExampleCharData
 a
@@ -571,6 +644,7 @@ a
 NULL
 
 -- query 77
+-- legacy
 wv
 2024-01-02
 2024-01-01
@@ -579,6 +653,7 @@ wv
 NULL
 
 -- query 78
+-- legacy
 wv
 2024-01-01 12:34:56
 2024-01-01 13:34:56
@@ -587,6 +662,7 @@ wv
 NULL
 
 -- query 79
+-- legacy
 wv
 [1,0,1]
 [0,0,0]
@@ -595,6 +671,7 @@ wv
 NULL
 
 -- query 80
+-- legacy
 wv
 [1,-1,127]
 [1,1,127]
@@ -603,6 +680,7 @@ wv
 NULL
 
 -- query 81
+-- legacy
 wv
 [100,-100,32767]
 [100,100,32767]
@@ -611,6 +689,7 @@ wv
 NULL
 
 -- query 82
+-- legacy
 wv
 [100000,-100000,2147483647]
 [100000,100000,2147483647]
@@ -619,6 +698,7 @@ wv
 NULL
 
 -- query 83
+-- legacy
 wv
 [10000000000,-10000000000,9223372036854775807]
 [10000000000,10000000000,9223372036854775807]
@@ -627,6 +707,7 @@ wv
 NULL
 
 -- query 84
+-- legacy
 wv
 [12345678901234567890,-12345678901234567890,17014118346046923173168730371588410572]
 [12345678901234567890,12345678901234567890,17014118346046923173168730371588410572]
@@ -635,6 +716,7 @@ wv
 NULL
 
 -- query 85
+-- legacy
 wv
 [1.23,4.56,7.89]
 [1.23,4.56,7.89]
@@ -643,6 +725,7 @@ wv
 NULL
 
 -- query 86
+-- legacy
 wv
 [1.23,4.56,7.89]
 [1.23,4.56,7.89]
@@ -651,6 +734,7 @@ wv
 NULL
 
 -- query 87
+-- legacy
 wv
 [1.23,2.35,3.46]
 [1.23,2.35,3.46]
@@ -659,18 +743,22 @@ wv
 NULL
 
 -- query 88
+-- legacy
 sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
 6158818160
 
 -- query 89
+-- legacy
 sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
 7591802684
 
 -- query 90
+-- legacy
 sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
 -2327034664
 
 -- query 91
+-- legacy
 wv
 ExampleVarcharData
 ExampleVarcharData
@@ -679,6 +767,7 @@ ExampleVarcharData
 NULL
 
 -- query 92
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -687,6 +776,7 @@ wv
 NULL
 
 -- query 93
+-- legacy
 wv
 MyVarbinaryData
 MyVarbinaryData
@@ -695,6 +785,7 @@ MyVarbinaryData
 NULL
 
 -- query 96
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -703,6 +794,7 @@ wv
 {"key": "value"}
 
 -- query 97
+-- legacy
 wv
 NULL
 {"key": "value"}
@@ -711,6 +803,7 @@ NULL
 {"key": "value"}
 
 -- query 98
+-- legacy
 wv
 NULL
 NULL
@@ -719,6 +812,7 @@ NULL
 NULL
 
 -- query 99
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -727,6 +821,7 @@ wv
 {"key": "value"}
 
 -- query 100
+-- legacy
 wv
 NULL
 NULL
@@ -735,6 +830,7 @@ NULL
 NULL
 
 -- query 101
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -743,6 +839,7 @@ wv
 {"key": "value"}
 
 -- query 102
+-- legacy
 wv
 NULL
 NULL
@@ -751,6 +848,7 @@ NULL
 NULL
 
 -- query 103
+-- legacy
 wv
 NULL
 {"key": "value"}
@@ -759,6 +857,7 @@ NULL
 {"key": "value"}
 
 -- query 104
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -767,6 +866,7 @@ wv
 {"key": "value"}
 
 -- query 105
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -775,6 +875,7 @@ wv
 {"key": "value"}
 
 -- query 106
+-- legacy
 wv
 NULL
 {"key": "value"}
@@ -783,6 +884,7 @@ NULL
 {"key": "value"}
 
 -- query 107
+-- legacy
 wv
 NULL
 NULL
@@ -791,6 +893,7 @@ NULL
 NULL
 
 -- query 108
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -799,6 +902,7 @@ wv
 {"key": "value"}
 
 -- query 109
+-- legacy
 wv
 NULL
 NULL
@@ -807,6 +911,7 @@ NULL
 NULL
 
 -- query 110
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -815,6 +920,7 @@ wv
 {"key": "value"}
 
 -- query 111
+-- legacy
 wv
 NULL
 NULL
@@ -823,6 +929,7 @@ NULL
 NULL
 
 -- query 112
+-- legacy
 wv
 NULL
 {"key": "value"}
@@ -831,6 +938,7 @@ NULL
 {"key": "value"}
 
 -- query 113
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -839,6 +947,7 @@ wv
 {"key": "value"}
 
 -- query 114
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -847,6 +956,7 @@ wv
 NULL
 
 -- query 115
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -855,6 +965,7 @@ wv
 NULL
 
 -- query 116
+-- legacy
 wv
 NULL
 NULL
@@ -863,6 +974,7 @@ NULL
 NULL
 
 -- query 117
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -871,6 +983,7 @@ wv
 NULL
 
 -- query 118
+-- legacy
 wv
 NULL
 NULL
@@ -879,6 +992,7 @@ NULL
 NULL
 
 -- query 119
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -887,6 +1001,7 @@ wv
 NULL
 
 -- query 120
+-- legacy
 wv
 NULL
 NULL
@@ -895,6 +1010,7 @@ NULL
 NULL
 
 -- query 121
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -903,6 +1019,7 @@ wv
 NULL
 
 -- query 122
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -911,6 +1028,7 @@ wv
 NULL
 
 -- query 123
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -919,6 +1037,7 @@ wv
 NULL
 
 -- query 124
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -927,6 +1046,7 @@ wv
 NULL
 
 -- query 125
+-- legacy
 wv
 NULL
 NULL
@@ -935,6 +1055,7 @@ NULL
 NULL
 
 -- query 126
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -943,6 +1064,7 @@ wv
 NULL
 
 -- query 127
+-- legacy
 wv
 NULL
 NULL
@@ -951,6 +1073,7 @@ NULL
 NULL
 
 -- query 128
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -959,6 +1082,7 @@ wv
 NULL
 
 -- query 129
+-- legacy
 wv
 NULL
 NULL
@@ -967,6 +1091,7 @@ NULL
 NULL
 
 -- query 130
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -975,6 +1100,7 @@ wv
 NULL
 
 -- query 131
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -983,6 +1109,7 @@ wv
 NULL
 
 -- query 132
+-- legacy
 wv
 0
 0
@@ -991,6 +1118,7 @@ NULL
 NULL
 
 -- query 133
+-- legacy
 wv
 NULL
 NULL
@@ -999,6 +1127,7 @@ NULL
 NULL
 
 -- query 134
+-- legacy
 wv
 32100
 32100
@@ -1007,6 +1136,7 @@ NULL
 NULL
 
 -- query 135
+-- legacy
 wv
 2047483647
 2047483647
@@ -1015,6 +1145,7 @@ NULL
 NULL
 
 -- query 136
+-- legacy
 wv
 9023372036854775807
 9023372036854775807
@@ -1023,6 +1154,7 @@ NULL
 NULL
 
 -- query 137
+-- legacy
 wv
 10014118346046923173168730371588410572
 10014118346046923173168730371588410572
@@ -1031,6 +1163,7 @@ NULL
 NULL
 
 -- query 138
+-- legacy
 wv
 123450.6789
 123450.6789
@@ -1039,6 +1172,7 @@ NULL
 NULL
 
 -- query 139
+-- legacy
 wv
 123450.67
 123450.67
@@ -1047,6 +1181,7 @@ NULL
 NULL
 
 -- query 140
+-- legacy
 wv
 1230.46
 1230.46
@@ -1055,6 +1190,7 @@ NULL
 NULL
 
 -- query 141
+-- legacy
 wv
 a
 a
@@ -1063,6 +1199,7 @@ NULL
 NULL
 
 -- query 142
+-- legacy
 wv
 2024-01-01
 2024-01-01
@@ -1071,6 +1208,7 @@ NULL
 NULL
 
 -- query 143
+-- legacy
 wv
 2024-01-01 13:34:56
 2024-01-01 13:34:56
@@ -1079,6 +1217,7 @@ NULL
 NULL
 
 -- query 144
+-- legacy
 wv
 [0,0,0]
 [0,0,0]
@@ -1087,6 +1226,7 @@ NULL
 NULL
 
 -- query 145
+-- legacy
 wv
 [1,1,127]
 [1,1,127]
@@ -1095,6 +1235,7 @@ NULL
 NULL
 
 -- query 146
+-- legacy
 wv
 [100,100,32767]
 [100,100,32767]
@@ -1103,6 +1244,7 @@ NULL
 NULL
 
 -- query 147
+-- legacy
 wv
 [100000,100000,2147483647]
 [100000,100000,2147483647]
@@ -1111,6 +1253,7 @@ NULL
 NULL
 
 -- query 148
+-- legacy
 wv
 [10000000000,10000000000,9223372036854775807]
 [10000000000,10000000000,9223372036854775807]
@@ -1119,6 +1262,7 @@ NULL
 NULL
 
 -- query 149
+-- legacy
 wv
 [12345678901234567890,12345678901234567890,17014118346046923173168730371588410572]
 [12345678901234567890,12345678901234567890,17014118346046923173168730371588410572]
@@ -1127,6 +1271,7 @@ NULL
 NULL
 
 -- query 150
+-- legacy
 wv
 [1.23,4.56,7.89]
 [1.23,4.56,7.89]
@@ -1135,6 +1280,7 @@ NULL
 NULL
 
 -- query 151
+-- legacy
 wv
 [1.23,4.56,7.89]
 [1.23,4.56,7.89]
@@ -1143,6 +1289,7 @@ NULL
 NULL
 
 -- query 152
+-- legacy
 wv
 [1.23,2.35,3.46]
 [1.23,2.35,3.46]
@@ -1151,18 +1298,22 @@ NULL
 NULL
 
 -- query 153
+-- legacy
 sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
 4619113620
 
 -- query 154
+-- legacy
 sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
 5693852013
 
 -- query 155
+-- legacy
 sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
 -1745275998
 
 -- query 156
+-- legacy
 wv
 ExampleVarcharData
 ExampleVarcharData
@@ -1171,6 +1322,7 @@ NULL
 NULL
 
 -- query 157
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -1179,6 +1331,7 @@ NULL
 NULL
 
 -- query 161
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -1187,6 +1340,7 @@ NULL
 NULL
 
 -- query 162
+-- legacy
 wv
 {"key": "value"}
 NULL
@@ -1195,6 +1349,7 @@ NULL
 NULL
 
 -- query 164
+-- legacy
 wv
 {"key": "value"}
 {"key": "value"}
@@ -1203,6 +1358,7 @@ NULL
 NULL
 
 -- query 165
+-- legacy
 wv
 {"key": "value"}
 NULL
@@ -1211,6 +1367,7 @@ NULL
 NULL
 
 -- query 167
+-- legacy
 wv
 NULL
 NULL
@@ -1219,6 +1376,7 @@ NULL
 NULL
 
 -- query 168
+-- legacy
 wv
 NULL
 NULL
@@ -1227,6 +1385,7 @@ NULL
 NULL
 
 -- query 170
+-- legacy
 wv
 NULL
 NULL
@@ -1235,6 +1394,7 @@ NULL
 NULL
 
 -- query 171
+-- legacy
 wv
 NULL
 NULL
@@ -1243,6 +1403,7 @@ NULL
 NULL
 
 -- query 173
+-- legacy
 wv
 NULL
 1
@@ -1251,6 +1412,7 @@ NULL
 0
 
 -- query 174
+-- legacy
 wv
 NULL
 127
@@ -1259,6 +1421,7 @@ NULL
 NULL
 
 -- query 175
+-- legacy
 wv
 NULL
 32000
@@ -1267,6 +1430,7 @@ NULL
 32100
 
 -- query 176
+-- legacy
 wv
 NULL
 2147483647
@@ -1275,6 +1439,7 @@ NULL
 2047483647
 
 -- query 177
+-- legacy
 wv
 NULL
 9223372036854775807
@@ -1283,6 +1448,7 @@ NULL
 9023372036854775807
 
 -- query 178
+-- legacy
 wv
 NULL
 17014118346046923173168730371588410572
@@ -1291,6 +1457,7 @@ NULL
 10014118346046923173168730371588410572
 
 -- query 179
+-- legacy
 wv
 NULL
 12345.6789
@@ -1299,6 +1466,7 @@ NULL
 123450.6789
 
 -- query 180
+-- legacy
 wv
 NULL
 12345.67
@@ -1307,6 +1475,7 @@ NULL
 123450.67
 
 -- query 181
+-- legacy
 wv
 NULL
 123.46
@@ -1315,6 +1484,7 @@ NULL
 1230.46
 
 -- query 182
+-- legacy
 wv
 NULL
 ExampleCharData
@@ -1323,6 +1493,7 @@ a
 a
 
 -- query 183
+-- legacy
 wv
 NULL
 2024-01-02
@@ -1331,6 +1502,7 @@ NULL
 2024-01-01
 
 -- query 184
+-- legacy
 wv
 NULL
 2024-01-01 12:34:56
@@ -1339,6 +1511,7 @@ NULL
 2024-01-01 13:34:56
 
 -- query 185
+-- legacy
 wv
 NULL
 [1,0,1]
@@ -1347,6 +1520,7 @@ NULL
 [0,0,0]
 
 -- query 186
+-- legacy
 wv
 NULL
 [1,-1,127]
@@ -1355,6 +1529,7 @@ NULL
 [1,1,127]
 
 -- query 187
+-- legacy
 wv
 NULL
 [100,-100,32767]
@@ -1363,6 +1538,7 @@ NULL
 [100,100,32767]
 
 -- query 188
+-- legacy
 wv
 NULL
 [100000,-100000,2147483647]
@@ -1371,6 +1547,7 @@ NULL
 [100000,100000,2147483647]
 
 -- query 189
+-- legacy
 wv
 NULL
 [10000000000,-10000000000,9223372036854775807]
@@ -1379,6 +1556,7 @@ NULL
 [10000000000,10000000000,9223372036854775807]
 
 -- query 190
+-- legacy
 wv
 NULL
 [12345678901234567890,-12345678901234567890,17014118346046923173168730371588410572]
@@ -1387,6 +1565,7 @@ NULL
 [12345678901234567890,12345678901234567890,17014118346046923173168730371588410572]
 
 -- query 191
+-- legacy
 wv
 NULL
 [1.23,4.56,7.89]
@@ -1395,6 +1574,7 @@ NULL
 [1.23,4.56,7.89]
 
 -- query 192
+-- legacy
 wv
 NULL
 [1.23,4.56,7.89]
@@ -1403,6 +1583,7 @@ NULL
 [1.23,4.56,7.89]
 
 -- query 193
+-- legacy
 wv
 NULL
 [1.23,2.35,3.46]
@@ -1411,18 +1592,22 @@ NULL
 [1.23,2.35,3.46]
 
 -- query 194
+-- legacy
 sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
 6158818160
 
 -- query 195
+-- legacy
 sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
 7591802684
 
 -- query 196
+-- legacy
 sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
 -2327034664
 
 -- query 197
+-- legacy
 wv
 NULL
 ExampleVarcharData
@@ -1431,6 +1616,7 @@ ExampleVarcharData
 ExampleVarcharData
 
 -- query 198
+-- legacy
 wv
 NULL
 {"key": "value"}
@@ -1439,6 +1625,7 @@ NULL
 {"key": "value"}
 
 -- query 202
+-- legacy
 wv
 NULL
 {"key": "value"}
@@ -1447,6 +1634,7 @@ NULL
 {"key": "value"}
 
 -- query 203
+-- legacy
 wv
 NULL
 NULL
@@ -1455,6 +1643,7 @@ NULL
 {"key": "value"}
 
 -- query 205
+-- legacy
 wv
 NULL
 {"key": "value"}
@@ -1463,6 +1652,7 @@ NULL
 {"key": "value"}
 
 -- query 206
+-- legacy
 wv
 NULL
 NULL
@@ -1471,6 +1661,7 @@ NULL
 {"key": "value"}
 
 -- query 208
+-- legacy
 wv
 NULL
 NULL
@@ -1479,6 +1670,7 @@ NULL
 NULL
 
 -- query 209
+-- legacy
 wv
 NULL
 NULL
@@ -1487,6 +1679,7 @@ NULL
 NULL
 
 -- query 211
+-- legacy
 wv
 NULL
 NULL
@@ -1495,6 +1688,7 @@ NULL
 NULL
 
 -- query 212
+-- legacy
 wv
 NULL
 NULL
@@ -1503,6 +1697,7 @@ NULL
 NULL
 
 -- query 214
+-- legacy
 k1	c1	is_null
 2024-01-01	127	0
 2024-01-02	NULL	1
@@ -1511,9 +1706,11 @@ k1	c1	is_null
 2024-01-05	NULL	1
 
 -- query 215
+-- types	tinyint	tinyint	tinyint	tinyint
 upper_valid	upper_overflow	lower_valid	lower_overflow
 127	NULL	-128	NULL
 
 -- query 216
+-- legacy
 row_count	valid_count	null_count
 5	1	4

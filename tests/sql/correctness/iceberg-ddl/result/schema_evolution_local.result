@@ -1,39 +1,46 @@
 -- query 2
+-- types	integer	real	varchar
 id	amount	note_text
 1	10.5	NULL
 2	20.25	NULL
 
 -- query 4
+-- types	integer	real	varchar
 id	amount	note_text
 1	10.5	NULL
 2	20.25	NULL
 3	30.75	new
 
 -- query 6
+-- types	integer	real	varchar
 id	total_amount	note_text
 1	10.5	NULL
 2	20.25	NULL
 3	30.75	new
 
 -- query 8
+-- types	bigint	real
 widened_id	total_amount
 10000000001	10.5
 10000000002	20.25
 10000000003	30.75
 
 -- query 10
+-- types	bigint	real
 id	total_amount
 1	10.5
 2	20.25
 3	30.75
 
 -- query 13
+-- types	bigint	real	varchar
 id	total_amount	note_text
 1	10.5	NULL
 2	20.25	NULL
 3	30.75	NULL
 
 -- query 15
+-- types	bigint	real	varchar
 id	total_amount	note_text
 1	10.5	NULL
 2	20.25	NULL

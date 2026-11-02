@@ -1,9 +1,11 @@
 -- query 4
+-- legacy
 k	c_all	s_v	a_v	a_d	mn_v	mx_v	mn_s	mx_s	mn_ts	mx_ts
 1	3	30	15	150.2500000000	10	20	apple	banana	2024-01-01 00:00:00	2024-02-01 00:00:00
 2	1	5	5	50.2500000000	5	5	cherry	cherry	2024-03-15 12:00:00	2024-03-15 12:00:00
 
 -- query 7
+-- legacy
 k	c_all	s_v	a_v	a_d	mn_v	mx_v	mn_s	mx_s	mn_ts	mx_ts
 1	4	60	20	200.4166666667	10	30	apple	date	2024-01-01 00:00:00	2024-06-01 09:00:00
 2	1	5	5	50.2500000000	5	5	cherry	cherry	2024-03-15 12:00:00	2024-03-15 12:00:00

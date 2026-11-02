@@ -1,3 +1,4 @@
 -- query 2
+-- types	bigint
 count(1)
 917490

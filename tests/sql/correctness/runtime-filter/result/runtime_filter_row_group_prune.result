@@ -1,4 +1,5 @@
 -- query 11
+-- types	integer	integer	varchar
 id	k	tag
 1	5	file0_keep
 2	15	file0_keep
@@ -7,6 +8,7 @@ id	k	tag
 5	45	file2_keep
 
 -- query 13
+-- types	integer	integer	varchar
 id	k	tag
 1	5	file0_keep
 2	15	file0_keep

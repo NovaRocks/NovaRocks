@@ -1,4 +1,5 @@
 -- query 14
+-- types	varchar
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1
@@ -61,6 +62,7 @@ PLAN FRAGMENT 3
      predicates: c.c IS NOT NULL
 
 -- query 16
+-- types	varchar
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1

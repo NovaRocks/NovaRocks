@@ -1,3 +1,5 @@
+-- query 1
+-- types	decimal(38, 8)	varchar	varchar	bigint	bigint
 gross_margin	i_category	i_class	lochierarchy	rank_within_parent
 -0.43462725	NULL	NULL	2	1
 -0.44572555	Electronics	NULL	1	1

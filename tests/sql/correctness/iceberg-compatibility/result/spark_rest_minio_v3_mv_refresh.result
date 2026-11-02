@@ -1,9 +1,11 @@
 -- query 4
+-- types	bigint	integer
 id	metric
 2	20
 3	30
 
 -- query 7
+-- legacy
 id	metric
 2	20
 3	30

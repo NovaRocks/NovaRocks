@@ -169,7 +169,6 @@ source docker/iceberg-rest/runtime/current/env.sh
 tests/sql/fixtures/benchmarks/bootstrap_benchmark_data.sh \
   --suite ssb \
   --scale 1 \
-  --mysql-port "$NOVA_ENV_MYSQL_PORT" \
   --dry-run
 ```
 

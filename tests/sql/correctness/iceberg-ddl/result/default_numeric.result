@@ -1,9 +1,11 @@
 -- query 11
+-- types	integer	varchar	smallint	integer	bigint	real	double	integer	integer
 id	name	score	salary	revenue	rating	percentage	zero_v	neg_v
 1	alice	100	50000	1000000	4.5	95.5	0	-100
 2	bob	100	50000	1000000	4.5	95.5	0	-100
 
 -- query 13
+-- types	integer	varchar	smallint	integer	bigint	real	double	integer	integer
 id	name	score	salary	revenue	rating	percentage	zero_v	neg_v
 1	alice	100	50000	1000000	4.5	95.5	0	-100
 2	bob	100	50000	1000000	4.5	95.5	0	-100

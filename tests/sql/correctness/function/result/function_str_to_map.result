@@ -1,3 +1,4 @@
 -- query 3
+-- legacy
 sum(cardinality(str_to_map(c2, ',', ':')))
 10000

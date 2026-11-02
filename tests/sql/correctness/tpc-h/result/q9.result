@@ -1,3 +1,5 @@
+-- query 1
+-- types	varchar	integer	decimal(38, 4)
 nation	o_year	sum_profit
 ALGERIA	1998	29680563.9243
 ALGERIA	1997	53596140.7166

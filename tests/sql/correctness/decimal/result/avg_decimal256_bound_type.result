@@ -1,7 +1,9 @@
 -- query 1
+-- types	varchar
 wide_avg
 2600000000000000000000000000000000000000000000000.00
 
 -- query 2
+-- types	varchar
 null_avg
 NULL

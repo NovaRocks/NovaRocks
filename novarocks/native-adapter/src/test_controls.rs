@@ -1523,7 +1523,6 @@ pub(crate) mod tests {
             target_launch_id: launch_id.into(),
             statement_run_token: nomination.statement_run_token.clone(),
             frontend_process_id: nomination.frontend_process_id.clone(),
-            connection_id: nomination.connection_id,
             session_key: nomination.session_key,
             sql_sha256: Sha256::digest(sql.as_bytes()).into(),
         }
@@ -1901,7 +1900,6 @@ pub(crate) mod tests {
             target_session_id: "retirement-fe".into(),
             statement_run_token: fixture.token.clone(),
             frontend_process_id: fixture.frontend.to_string(),
-            connection_id: 7,
             session_key: 1,
             statement_generation: 1,
         };
@@ -2424,7 +2422,6 @@ pub(crate) mod tests {
             target_session_id: "frontend-selected-writer".into(),
             statement_run_token: fixture.token.clone(),
             frontend_process_id: fixture.frontend.to_string(),
-            connection_id: 7,
             session_key: 1,
             statement_generation: 1,
         };
@@ -2705,7 +2702,6 @@ pub(crate) mod tests {
             target_session_id: "frontend-bind".into(),
             statement_run_token: fixture.token.clone(),
             frontend_process_id: fixture.frontend.to_string(),
-            connection_id: 7,
             session_key: 1,
             statement_generation: 1,
         };
@@ -2796,7 +2792,6 @@ pub(crate) mod tests {
             target_session_id: "first-fe".into(),
             statement_run_token: token.into(),
             frontend_process_id: frontend.to_string(),
-            connection_id: 19,
             session_key: 2,
             statement_generation: 3,
         };
@@ -2836,12 +2831,11 @@ pub(crate) mod tests {
                     .contains("frozen")
             );
         }
-        for field in 0..4 {
+        for field in 0..3 {
             let mut changed = a.clone();
             match field {
-                0 => changed.connection_id += 1,
-                1 => changed.session_key += 1,
-                2 => changed.frontend_process_id = FrontendProcessId::new_v7().to_string(),
+                0 => changed.session_key += 1,
+                1 => changed.frontend_process_id = FrontendProcessId::new_v7().to_string(),
                 _ => changed.target_session_id = "another-fe-session".into(),
             }
             assert!(
@@ -2906,7 +2900,6 @@ pub(crate) mod tests {
             target_session_id: "missing-receipt-fe".into(),
             statement_run_token: fixture.token.clone(),
             frontend_process_id: fixture.frontend.to_string(),
-            connection_id: 7,
             session_key: 1,
             statement_generation: 1,
         };
@@ -3302,7 +3295,6 @@ pub(crate) mod tests {
             target_session_id: "placement-fe".into(),
             statement_run_token: "selected-work".into(),
             frontend_process_id: frontend.to_string(),
-            connection_id: 19,
             session_key: 2,
             statement_generation: 3,
         };
@@ -3403,7 +3395,6 @@ pub(crate) mod tests {
             target_session_id: role.scope().session_id().into(),
             statement_run_token: "original-input".into(),
             frontend_process_id: frontend.to_string(),
-            connection_id: 7,
             session_key: 1,
             statement_generation: 1,
         };
@@ -3448,10 +3439,6 @@ pub(crate) mod tests {
         for changed in [
             replacement_input.clone(),
             different_sql.clone(),
-            StatementInputNomination {
-                connection_id: 8,
-                ..input.clone()
-            },
             StatementInputNomination {
                 target_launch_id: "another-launch".into(),
                 ..input.clone()

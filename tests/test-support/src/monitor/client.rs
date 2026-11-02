@@ -37,6 +37,7 @@ pub struct ManagedCommand {
     program: OsString,
     arguments: Vec<OsString>,
     lifetime: Option<(Instant, Instant)>,
+    group_exit_until: Option<Instant>,
 }
 
 /// The admitted payload's work clock expired, independently of its native exit.
@@ -65,6 +66,7 @@ impl ManagedCommand {
             program: program.as_ref().to_owned(),
             arguments: vec![],
             lifetime: None,
+            group_exit_until: None,
         }
     }
     /// Stop the actual payload group at the original work clock, preserving
@@ -76,6 +78,15 @@ impl ManagedCommand {
                 .map_or((work, complete), |(old_work, old_end)| {
                     (work.min(old_work), complete.min(old_end))
                 }),
+        );
+        self
+    }
+    /// Observe the same pinned process group through actual exit without adding
+    /// a payload work clock. The caller's existing complete deadline bounds it.
+    pub fn observe_group_exit_until(&mut self, complete: Instant) -> &mut Self {
+        self.group_exit_until = Some(
+            self.group_exit_until
+                .map_or(complete, |old| old.min(complete)),
         );
         self
     }
@@ -271,6 +282,11 @@ impl OwnedMonitor {
                 ))
             })
             .transpose()?;
+        let group_exit_until = match request.group_exit_until {
+            Some(at) if at >= deadline => absolute,
+            Some(at) => unix::absolute_deadline(at)?.min(absolute),
+            None => 0,
+        };
         let run = run_retention::ensure_run_retention(deadline)?;
         let gate = run.gate(deadline)?;
         let path = run.root.join("monitor").join(run_retention::unique());
@@ -306,10 +322,11 @@ impl OwnedMonitor {
         .into_iter()
         .map(|name| (name, std::env::var(name).ok()))
         .collect::<std::collections::BTreeMap<_, _>>();
-        serde_json::to_writer(
-            &mut record,
-            &serde_json::json!({"schema":1,"event":"Pending","label":label,"payload_os_hex":payload_hex,"native":native,"stdout":"stdout.log","stderr":"stderr.log","deadline_ns":absolute,"lifetime_ns":lifetime}),
-        )?;
+        let mut pending = serde_json::json!({"schema":1,"event":"Pending","label":label,"payload_os_hex":payload_hex,"native":native,"stdout":"stdout.log","stderr":"stderr.log","deadline_ns":absolute,"lifetime_ns":lifetime});
+        if group_exit_until != 0 {
+            pending["group_exit_deadline_ns"] = group_exit_until.into();
+        }
+        serde_json::to_writer(&mut record, &pending)?;
         record.write_all(b"\n")?;
         record.flush()?;
         let mut record = PendingRecord {
@@ -368,6 +385,7 @@ impl OwnedMonitor {
             .arg(absolute.to_string())
             .arg(lifetime.map_or(0, |value| value.0).to_string())
             .arg(lifetime.map_or(0, |value| value.1).to_string())
+            .arg(group_exit_until.to_string())
             .arg(&material.run.root)
             .arg("--")
             .arg(&request.program)
@@ -822,6 +840,22 @@ impl OwnedMonitor {
     }
 
     pub fn wait(&mut self, deadline: Instant) -> Result<Final> {
+        let final_record = self.wait_for_observed_exit(deadline)?;
+        if final_record.lifetime_expired {
+            return Err(PayloadLifetimeExpired.into());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "managed process completion exceeded original deadline"
+        );
+        Ok(final_record)
+    }
+
+    /// Observe the original monitor's actual exit and validate its complete
+    /// cleanup independently of whether the payload's work clock expired.
+    /// Capture consumes that failure fact with the original output; ordinary
+    /// wait still projects it as PayloadLifetimeExpired.
+    pub(crate) fn wait_for_observed_exit(&mut self, deadline: Instant) -> Result<Final> {
         let mut diagnostic = None;
         loop {
             ensure!(
@@ -848,13 +882,6 @@ impl OwnedMonitor {
                         && !final_record.owner_lost,
                     "managed process cleanup violation: {final_record:?}; diagnostics={}",
                     self.material.path.display()
-                );
-                if final_record.lifetime_expired {
-                    return Err(PayloadLifetimeExpired.into());
-                }
-                ensure!(
-                    Instant::now() < deadline,
-                    "managed process completion exceeded original deadline"
                 );
                 return Ok(final_record);
             }

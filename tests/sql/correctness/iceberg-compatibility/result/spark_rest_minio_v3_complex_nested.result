@@ -1,3 +1,5 @@
+-- query 2
+-- legacy
 id	city	tag_count	first_tag	score	first_event_weight
 1	sf	2	blue	10	3
 2	ny	1	red	20	7

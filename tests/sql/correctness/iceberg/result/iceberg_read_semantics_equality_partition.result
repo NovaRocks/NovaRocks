@@ -1,7 +1,10 @@
 -- query 2
+-- types	bigint	varchar	bigint
 id	city	amount
 1	A	10
+
 -- query 4
+-- types	bigint	varchar	bigint
 id	city	amount
 1	A	10
 2	B	25

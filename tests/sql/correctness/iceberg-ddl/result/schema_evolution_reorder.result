@@ -1,11 +1,14 @@
 -- query 2
+-- types	integer	integer	integer
 a	b	c
 1	2	3
 
 -- query 4
+-- types	integer	integer	integer
 a	b	c
 1	2	3
 
 -- query 6
+-- types	integer	integer	integer
 a	b	c
 1	2	3

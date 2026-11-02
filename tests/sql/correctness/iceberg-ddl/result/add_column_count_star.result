@@ -1,15 +1,19 @@
 -- query 2
+-- types	bigint
 row_count
 1
 
 -- query 3
+-- types	integer	integer
 k1	c1
 1	1
 
 -- query 5
+-- types	bigint
 row_count
 1
 
 -- query 6
+-- types	integer	integer	boolean
 k1	c1	b1
 1	1	NULL

@@ -1,27 +1,29 @@
 -- query 5
-first_string	retained_length
-abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq	10
-
--- query 6
+-- types	bigint
 fifth_length
 10
 
+-- query 7
+-- types	bigint
+count(*)
+100
+
 -- query 8
+-- types	bigint
 count(*)
 100
 
 -- query 9
-count(*)
-100
-
--- query 10
+-- legacy
 count(*)	array_length(array_agg(arr))
 10	10
 
--- query 11
+-- query 10
+-- legacy
 array_length(array_agg(arr))
 100
 
--- query 12
+-- query 11
+-- legacy
 array_agg(arr)[1]
 [[1,2,3],[1,2,3]]

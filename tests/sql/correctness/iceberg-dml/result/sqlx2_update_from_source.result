@@ -1,4 +1,5 @@
 -- query 3
+-- types	bigint	varchar
 id	v
 1	a
 2	bb

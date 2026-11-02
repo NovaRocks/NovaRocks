@@ -1,4 +1,5 @@
 -- query 6
+-- types	integer	bigint
 id	sum_big_value
 1	100000
 2	200000
@@ -22,6 +23,7 @@ id	sum_big_value
 20	2000000
 
 -- query 7
+-- types	integer	double
 id	sum_double_value
 1	1.23
 2	2.34
@@ -45,29 +47,31 @@ id	sum_double_value
 20	20.12
 
 -- query 8
+-- types	integer	double
 id	avg_big_value
-1	100000
-2	200000
-3	300000
-4	400000
-5	500000
-6	600000
-7	700000
-8	800000
-9	900000
-10	1000000
-11	1100000
-12	1200000
-13	1300000
-14	1400000
-15	1500000
-16	1600000
-17	1700000
-18	1800000
-19	1900000
-20	2000000
+1	100000.0
+2	200000.0
+3	300000.0
+4	400000.0
+5	500000.0
+6	600000.0
+7	700000.0
+8	800000.0
+9	900000.0
+10	1000000.0
+11	1100000.0
+12	1200000.0
+13	1300000.0
+14	1400000.0
+15	1500000.0
+16	1600000.0
+17	1700000.0
+18	1800000.0
+19	1900000.0
+20	2000000.0
 
 -- query 9
+-- types	integer	double
 id	avg_double_value
 1	1.23
 2	2.34
@@ -91,6 +95,7 @@ id	avg_double_value
 20	20.12
 
 -- query 10
+-- types	integer	bigint
 id	count_big_value
 1	1
 2	1
@@ -114,6 +119,7 @@ id	count_big_value
 20	1
 
 -- query 11
+-- types	integer	bigint
 id	count_varchar_value
 1	1
 2	1
@@ -137,6 +143,7 @@ id	count_varchar_value
 20	1
 
 -- query 12
+-- types	integer	decimal(10, 5)
 id	max_decimal_value
 1	123.45678
 2	234.56789
@@ -160,6 +167,7 @@ id	max_decimal_value
 20	2012.34567
 
 -- query 13
+-- types	integer	double
 id	max_double_value
 1	1.23
 2	2.34
@@ -183,6 +191,7 @@ id	max_double_value
 20	20.12
 
 -- query 14
+-- types	integer	double
 id	min_double_value
 1	1.23
 2	2.34
@@ -206,6 +215,7 @@ id	min_double_value
 20	20.12
 
 -- query 15
+-- types	integer	bigint
 id	min_big_value
 1	100000
 2	200000
@@ -229,6 +239,7 @@ id	min_big_value
 20	2000000
 
 -- query 16
+-- types	integer	varchar
 id	group_concat_varchar_value
 1	Test1
 2	Test2
@@ -252,6 +263,7 @@ id	group_concat_varchar_value
 20	Test20
 
 -- query 17
+-- types	integer	varchar
 id	group_concat_double_value
 1	1.23
 2	2.34
@@ -275,6 +287,7 @@ id	group_concat_double_value
 20	20.12
 
 -- query 18
+-- types	integer	bigint	double
 id	big_value	sum_double_value
 1	100000	1.23
 2	200000	2.34
@@ -298,6 +311,7 @@ id	big_value	sum_double_value
 20	2000000	20.12
 
 -- query 19
+-- types	integer	bigint	decimal(38, 11)
 id	big_value	avg_decimal_value
 1	100000	123.45678000000
 2	200000	234.56789000000
@@ -321,6 +335,7 @@ id	big_value	avg_decimal_value
 20	2000000	2012.34567000000
 
 -- query 20
+-- types	integer	bigint	bigint
 id	big_value	count_varchar_value
 1	100000	1
 2	200000	1
@@ -344,6 +359,7 @@ id	big_value	count_varchar_value
 20	2000000	1
 
 -- query 21
+-- types	integer	bigint	double
 id	big_value	max_double_value
 1	100000	1.23
 2	200000	2.34
@@ -367,6 +383,7 @@ id	big_value	max_double_value
 20	2000000	20.12
 
 -- query 22
+-- types	integer	bigint	bigint
 id	big_value	min_big_value
 1	100000	100000
 2	200000	200000
@@ -390,6 +407,7 @@ id	big_value	min_big_value
 20	2000000	2000000
 
 -- query 23
+-- types	integer	bigint	varchar
 id	big_value	group_concat_varchar_value
 1	100000	Test1
 2	200000	Test2

@@ -307,7 +307,7 @@ pub struct QueryMeta {
     /// has been applied.
     pub restart_be_after_establish_context_index: Option<usize>,
     /// Execute KILL QUERY after a new matching line is observed in a runner-owned BE log.
-    pub kill_query_after_be_log_contains: Option<String>,
+    pub cancel_query_after_be_log_contains: Option<String>,
     /// Kill one BE after a new matching line is observed in a runner-owned BE
     /// log.
     pub kill_be_after_be_log_contains: Option<KillBeAfterBeLogDirective>,
@@ -315,7 +315,7 @@ pub struct QueryMeta {
     /// runner-owned BE log.
     ///
     /// Protocol-neutral for the same reason as
-    /// `kill_query_after_be_log_contains`: the case names the point it wants
+    /// `cancel_query_after_be_log_contains`: the case names the point it wants
     /// the coordinator to die at, instead of a phase whose marker belongs to
     /// one protocol.
     pub kill_fe_after_be_log_contains: Option<String>,
@@ -580,25 +580,34 @@ pub struct SqlCase {
 
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
-    pub mysql: String,
+    pub time_zone: String,
     pub host: String,
     pub port: String,
     pub user: String,
-    pub password: Option<String>,
     pub catalog: Option<String>,
     pub db: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct QueryExecution {
+    pub shell_result: Option<crate::golden::Block>,
+    pub typed_results: Vec<novarocks_test_trino_client::StatementResult>,
+    pub result_statements: Vec<String>,
     pub header: Vec<String>,
     pub rows: Vec<Vec<String>>,
     pub text_output: String,
     pub elapsed: Duration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoldenSection {
+    pub source: crate::golden::Section,
+    pub expanded: crate::golden::Section,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResultSet {
+    pub golden: Option<GoldenSection>,
     pub header: Vec<String>,
     pub rows: Vec<Vec<String>>,
 }

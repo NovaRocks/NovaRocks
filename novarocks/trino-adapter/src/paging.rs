@@ -59,8 +59,7 @@ impl PagePipeline {
             .checked_add(columns_bytes)
             .and_then(|bytes| bytes.checked_add(2 * PAGE_ENVELOPE_RESERVE_BYTES))
             .ok_or("page source backing overflows")?;
-        let total = usize::try_from(window.all_objects_bytes().map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        let total = usize::try_from(window.payload_capacity_bytes()).map_err(|e| e.to_string())?;
         let limit = total
             .checked_sub(reserved)
             .filter(|p| *p > 0)

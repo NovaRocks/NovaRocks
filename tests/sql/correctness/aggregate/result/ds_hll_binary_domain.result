@@ -1,7 +1,9 @@
 -- query 1
+-- types	bigint	bigint	bigint	bigint
 exact_bytes	legacy_ndv	legacy_approx	ds_lgk10
 5	5	5	5
 
 -- query 2
+-- types	bigint	bigint	bigint	bigint
 exact_bytes	legacy_ndv	legacy_approx	ds_lgk10
 0	0	0	0

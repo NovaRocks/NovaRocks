@@ -1,8 +1,10 @@
 -- query 2
+-- types	integer	boolean
 id	key_is_null
-1	0
-2	1
+1	false
+2	true
 
 -- query 8
+-- types	bigint
 remaining_rows
 0

@@ -1,3 +1,4 @@
 -- query 6
+-- legacy
 array_length(array_distinct(c2))
 100000

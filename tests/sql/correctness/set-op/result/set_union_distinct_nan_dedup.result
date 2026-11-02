@@ -1,2 +1,4 @@
+-- query 1
+-- types	bigint
 distinct_nan_count
 1

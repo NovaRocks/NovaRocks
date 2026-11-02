@@ -25,6 +25,6 @@
 -- 2. Cover both negative and positive 128-bit outputs.
 -- 3. Validate NULL propagation.
 SELECT
-  md5sum_numeric('abc') AS n1,
-  md5sum_numeric('ab') AS n2,
-  md5sum_numeric(CAST(NULL AS STRING)) AS nnull;
+  CAST(md5sum_numeric('abc') AS VARCHAR) AS n1,
+  CAST(md5sum_numeric('ab') AS VARCHAR) AS n2,
+  CAST(md5sum_numeric(CAST(NULL AS STRING)) AS VARCHAR) AS nnull;
