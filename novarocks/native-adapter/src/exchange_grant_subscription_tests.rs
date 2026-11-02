@@ -811,54 +811,54 @@ impl crate::task_protocol::TaskExecutionIngress for UnusedIngress {
     ) -> Result<(), Status> {
         unreachable!()
     }
-    fn apply_task_operations(
+    async fn apply_task_operations(
         &self,
         _: wire::ApplyTaskOperationsRequest,
     ) -> Result<wire::ApplyTaskOperationsResponse, Status> {
         unreachable!()
     }
-    fn apply_task_operations_at(
+    async fn apply_task_operations_at(
         &self,
         _: wire::ApplyTaskOperationsRequest,
         _: crate::task_protocol::TaskIngressTiming,
+        _: Arc<NativeIngressOwnership>,
     ) -> Result<wire::ApplyTaskOperationsResponse, Status> {
         unreachable!()
     }
-    fn apply_task_control_operations(
+    async fn apply_task_control_operations(
         &self,
         _: wire::ApplyTaskControlOperationsRequest,
     ) -> Result<wire::ApplyTaskOperationsResponse, Status> {
         unreachable!()
     }
-    fn apply_task_control_operations_at(
+    async fn apply_task_control_operations_at(
         &self,
         _: wire::ApplyTaskControlOperationsRequest,
         _: crate::task_protocol::TaskIngressTiming,
+        _: Arc<NativeIngressOwnership>,
     ) -> Result<wire::ApplyTaskOperationsResponse, Status> {
         unreachable!()
     }
     fn subscribe_task_status(
         &self,
         _: wire::SubscribeTaskStatusRequest,
+        _: std::time::Instant,
+        _: Arc<NativeIngressOwnership>,
     ) -> Result<crate::task_protocol::TaskStatusEventStream, Status> {
         unreachable!()
     }
-    fn fetch_task_dynamic_filters(
+    async fn fetch_task_dynamic_filters(
         &self,
         _: wire::FetchTaskDynamicFiltersRequest,
+        _: std::time::Instant,
     ) -> Result<wire::FetchTaskDynamicFiltersResponse, Status> {
         unreachable!()
     }
-    fn get_final_task_info(
+    async fn get_final_task_info(
         &self,
         _: wire::GetFinalTaskInfoRequest,
+        _: std::time::Instant,
     ) -> Result<wire::GetFinalTaskInfoResponse, Status> {
-        unreachable!()
-    }
-    async fn fetch_task_result(
-        &self,
-        _: wire::FetchTaskResultRequest,
-    ) -> Result<wire::FetchResultResponse, Status> {
         unreachable!()
     }
 }
@@ -939,7 +939,6 @@ async fn authenticated_tonic_ingress_backend_service_roundtrips_all_three_unit_m
             Arc::new(novarocks_worker::WorkerDrainState::new()),
             Arc::new(UnusedIngress),
         ),
-        crate::native_control_executor::NativeControlExecutor::start(1, 4).unwrap(),
     );
     let mut server = crate::NativeRpcServerHandle::start_with_admission(
         "127.0.0.1",
@@ -1221,13 +1220,14 @@ fn real_unit_schema(
 struct RealUnitReceiverFixture {
     stream: ExchangeStreamIdentity,
     execution: Arc<novarocks_execution::runtime::execution_runtime::ExecutionRuntime>,
-    owner: Arc<novarocks_worker::TaskStatusOwner>,
+    owner: Arc<novarocks_execution::runtime::task_control::TaskExecutionControl>,
     failure: Arc<novarocks_execution::runtime::runtime_state::RuntimeErrorState>,
     factory: Arc<dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory>,
     port: Arc<novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort>,
     key: ExchangeReceiverKey,
     registry_key: novarocks_execution::runtime::exchange::ExchangeKey,
     descriptor: Arc<novarocks_execution_contract::TaskDescriptor>,
+    _preparation: crate::backend_task_execution::node_test_support::NativeNodePreparation,
 }
 
 #[cfg(novarocks_dev_controls)]
@@ -1240,12 +1240,8 @@ fn real_unit_receiver_fixture(
     };
     use novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort;
     use novarocks_execution::runtime::runtime_state::RuntimeErrorState;
-    use novarocks_execution::runtime::task_control::TaskExecutionControl;
     use novarocks_execution_contract::{
         ExchangeInbound, ExchangeTopology, TaskDescriptor, TaskFailurePhase,
-    };
-    use novarocks_worker::{
-        METRIC_PUBLISH_MIN_INTERVAL, ProcessMonotonicClock, TaskStatusOwner, TaskStatusSource,
     };
     let base = base_stream();
     let stream = ExchangeStreamIdentity::try_new(
@@ -1281,23 +1277,15 @@ fn real_unit_receiver_fixture(
         )
         .unwrap(),
     );
-    let owner = Arc::new(TaskStatusOwner::new(
+    let preparation = crate::backend_task_execution::node_test_support::NativeNodePreparation::new(
         stream.destination(),
-        Arc::new(TaskStatusSource::new()),
-        Arc::new(ProcessMonotonicClock::new()),
-        METRIC_PUBLISH_MIN_INTERVAL,
-        execution.execution_health(),
-    ));
-    owner.release_to_observers();
-    owner.note_installed();
-    let failure = Arc::new(RuntimeErrorState::for_task(Arc::new(
-        TaskExecutionControl::new(
-            stream.destination(),
-            owner.clone(),
-            TaskFailurePhase::Execution,
-        )
-        .unwrap(),
-    )));
+    );
+    let owner = Arc::new(
+        preparation
+            .execution_control()
+            .in_phase(TaskFailurePhase::Execution),
+    );
+    let failure = Arc::new(RuntimeErrorState::for_task(owner.clone()));
     let factory = novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
         novarocks_execution::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
         MemTracker::new_root("real native receiver decoder"), failure.clone(),
@@ -1354,6 +1342,7 @@ fn real_unit_receiver_fixture(
         key,
         registry_key,
         descriptor: Arc::new(descriptor),
+        _preparation: preparation,
     }
 }
 
@@ -1405,7 +1394,6 @@ fn start_real_unit_receiver_service(
             Arc::new(novarocks_worker::WorkerDrainState::new()),
             Arc::new(UnusedIngress),
         ),
-        crate::native_control_executor::NativeControlExecutor::start(1, 4).unwrap(),
     );
     let server = crate::NativeRpcServerHandle::start_with_admission(
         "127.0.0.1",
@@ -1450,9 +1438,7 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
     use novarocks_execution_contract::ordered_retained_stream::exchange::{
         ExchangeAdmissionVerdict, ExchangeUnitDemand, ExchangeUnitItem,
     };
-    use novarocks_execution_contract::{
-        ExchangeCloseDisposition, ExchangeDeliveryRequirement, TaskConclusionPort,
-    };
+    use novarocks_execution_contract::{ExchangeCloseDisposition, ExchangeDeliveryRequirement};
 
     // If an assertion unwinds, release the actual blocking handler before the
     // Native server's own Drop joins it. This does not author receiver closure.
@@ -1473,6 +1459,7 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
         key,
         registry_key,
         descriptor,
+        _preparation,
     } = real_unit_receiver_fixture(ExchangeDeliveryRequirement::MustDrain);
     let registry = execution.exchange_registry();
     let observation = Arc::new(RealUnitDecodeObservation::default());
@@ -1531,6 +1518,10 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
         assert!(owner.accepted().is_none());
         observation.hold.release();
         observation.exited.notified().await;
+        // The decoder submits to the real Context core. Its physical exit and
+        // that core's acceptance are separate facts, so observe the original
+        // stop publication before borrowing the accepted originating source.
+        assert!(owner.wait_until_stopped(Duration::from_secs(2)));
         let accepted = owner.accepted().expect("real decoder failure must reach the original Task owner despite Unknown");
         let original = accepted.originating_failure().expect("an originating decoder failure");
         let projected = failure.error().unwrap();
@@ -1556,7 +1547,7 @@ async fn authenticated_tonic_stop_before_first_demand_fences_the_real_frozen_rec
         ExchangeAdmissionVerdict, ExchangeUnitDemand, ExchangeUnitItem,
     };
     use novarocks_execution_contract::{
-        ExchangeCloseDisposition, ExchangeDeliveryRequirement, TaskConclusionPort, TaskIdentity,
+        ExchangeCloseDisposition, ExchangeDeliveryRequirement, TaskIdentity,
     };
 
     async fn demand(

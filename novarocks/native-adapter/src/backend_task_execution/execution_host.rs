@@ -6173,10 +6173,11 @@ pub(crate) mod tests {
             }
         }
         for data in [false, true] {
-            let (mut host, _) = isolated_resource_host();
-            host.exchange_receiver_port = Arc::new(
+            let execution =
+                test_execution_runtime(crate::backend_test_support::test_memory_authority());
+            let port = Arc::new(
                 novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort::new(
-                    Arc::clone(&host.execution_runtime),
+                    execution,
                 ),
             );
             let task = identity(84090 + i64::from(data), 2, 1);
@@ -6198,7 +6199,6 @@ pub(crate) mod tests {
             )
             .unwrap();
             let descriptor = descriptor_with(task, kernel, 1, topology);
-            let port = host.exchange_receiver_port.clone();
             let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
                 "strict input close fixture",
             );

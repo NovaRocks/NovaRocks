@@ -48,10 +48,10 @@ use novarocks_execution::{
             FragmentInstanceSpec, FragmentOutcome, FragmentPrepareContext, FragmentRuntimeOptions,
             FragmentSinkAssignment, RunningFragmentHandle, ScanAssignments,
             io::{
-                ExchangeFrame, ExchangeFrameTransmitter, ExchangeTransmitRejection,
-                FragmentCommitLease, FragmentCommitPort, FragmentCommitReport, FragmentIoError,
-                FragmentResultSession, FragmentResultWriter, FragmentSinkLoadStats,
-                NoopFragmentEventSink, ResultWriteSpec, TabletCommitInfo, TabletFailInfo,
+                ExchangeFrameTransmitter, FragmentCommitLease, FragmentCommitPort,
+                FragmentCommitReport, FragmentIoError, FragmentResultSession, FragmentResultWriter,
+                FragmentSinkLoadStats, NoopFragmentEventSink, ResultWriteSpec, TabletCommitInfo,
+                TabletFailInfo,
             },
             prepare_compiled_fragment,
         },
@@ -231,7 +231,6 @@ fn compiled_count_root() -> Arc<LocalProgram> {
                 pipeline_dop: NonZeroUsize::new(1).unwrap(),
                 root_sink_dop: NonZeroUsize::new(1),
                 kernel_abi: KernelAbiVersion::CURRENT,
-                exchange_wait: Duration::from_secs(1),
                 constants: novarocks_functions::ConstantPolicy {
                     max_rows: 1,
                     max_array_nodes: 1,
@@ -269,8 +268,6 @@ fn execution_runtime() -> Arc<ExecutionRuntime> {
         ExecutionRuntime::new(
             ExecutionRuntimeConfig {
                 driver_threads: 1,
-                exchange_wait_ms: 1000,
-                exchange_io_threads: 1,
                 exchange_io_max_inflight_bytes: 1024,
                 exchange_max_transmit_batched_bytes: 1024,
                 operator_buffer_chunks: 1,
@@ -482,9 +479,43 @@ impl FragmentCommitLease for CommitLease {
         Ok(())
     }
 }
+// This compiled CountOnly Root has no Exchange input or output. Like
+// Execution's result-only fixture, every active Unit operation must fail here
+// instead of manufacturing a grant, custody acknowledgement or call exit.
 impl ExchangeFrameTransmitter for Ports {
-    fn transmit(&self, _: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
-        panic!("Noop has no exchange")
+    fn deliver_unit(
+        &self,
+        _: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+        _: tokio_util::sync::CancellationToken,
+        _: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
+        _: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+    ) {
+        panic!("CountOnly Root fixture attempted Unit delivery")
+    }
+    fn register_unit_demands(
+        &self,
+        _: novarocks_execution_contract::RuntimeEndpoint,
+        _: Vec<novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDemandEntry>,
+        _: tokio_util::sync::CancellationToken,
+        _: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+    ) {
+        panic!("CountOnly Root fixture attempted demand registration")
+    }
+    fn watch_unit_facts(
+        &self,
+        _: novarocks_execution_contract::RuntimeEndpoint,
+        _: novarocks_execution_contract::ExchangeStreamIdentity,
+        _: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+    ) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
+        panic!("CountOnly Root fixture attempted grant subscription")
+    }
+    fn forget_unit_facts(&self, _: novarocks_execution_contract::ExchangeStreamIdentity) {}
+    fn schedule_unit_retry(
+        &self,
+        _: Duration,
+        _: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), novarocks_execution_contract::failure::FailureFact> {
+        panic!("CountOnly Root fixture attempted Unit retry")
     }
 }
 impl FragmentResultWriter for Ports {

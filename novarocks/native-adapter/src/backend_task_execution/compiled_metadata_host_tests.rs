@@ -47,7 +47,7 @@ use novarocks_types::{
     QueryId,
     identity::{AttemptId, QueryExecutionId},
 };
-use std::{cell::Cell, sync::Arc, time::Duration};
+use std::{cell::Cell, sync::Arc};
 
 fn preparation_identity(
     binding: &QueryMemoryBinding,
