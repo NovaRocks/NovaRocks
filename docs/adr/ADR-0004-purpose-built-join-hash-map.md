@@ -5,7 +5,7 @@ domain: [join-execution]
 status: active
 supersedes: []
 superseded-by: null
-partially-superseded-by: [ADR-0205, ADR-0210]
+partially-superseded-by: [ADR-0205, ADR-0212]
 date: 2026-07-24
 provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/368 (selection-path join core rewrite)"

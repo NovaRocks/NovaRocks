@@ -17,7 +17,7 @@
 
 //! Exact installed join participants, publication and probe completion facts.
 //! This protocol owns no scheduler, CPU position, Task verdict or row storage.
-// Design: ADR-0210 (docs/adr/ADR-0210-shared-join-stages-and-exact-demand-retirement.md)
+// Design: ADR-0212 (docs/adr/ADR-0212-shared-join-stages-and-exact-demand-retirement.md)
 
 use super::build_state::build_contract;
 use crate::{
