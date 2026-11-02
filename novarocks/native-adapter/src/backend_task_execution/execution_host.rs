@@ -2261,6 +2261,9 @@ fn native_inbound_close_facts(
         }
         closes.extend(actual);
     }
+    // Stream identity orders sources before destination nodes, so independently
+    // ordered input groups do not form the Worker's canonical complete record.
+    closes.sort_unstable_by_key(|close| close.stream);
     Ok(closes)
 }
 
@@ -6192,21 +6195,33 @@ pub(crate) mod tests {
                 ),
             );
             let task = identity(84090 + i64::from(data), 2, 1);
-            let source_task = identity(84090 + i64::from(data), 1, 1);
+
             let kernel = UniqueId::new(84090, 2);
-            let source_kernel = UniqueId::new(84090, 1);
-            let node = FragmentNodeId::new(73);
-            let source = ExchangeSource::new(source_task, source_kernel, 0);
+            // Node order deliberately opposes source order. Per-node sorting
+            // alone cannot satisfy the Worker's complete-stream contract.
+            let inputs = [(73, 3), (74, 1)].map(|(node, stage)| {
+                (
+                    FragmentNodeId::new(node),
+                    ExchangeSource::new(
+                        identity(84090 + i64::from(data), stage, 1),
+                        UniqueId::new(84090, i64::from(stage)),
+                        0,
+                    ),
+                )
+            });
             let topology = ExchangeTopology::try_new(
                 Vec::new(),
-                vec![
-                    ExchangeInbound::try_new(
-                        node,
-                        vec![source],
-                        ExchangeDeliveryRequirement::MustDrain,
-                    )
-                    .unwrap(),
-                ],
+                inputs
+                    .iter()
+                    .map(|(node, source)| {
+                        ExchangeInbound::try_new(
+                            *node,
+                            vec![*source],
+                            ExchangeDeliveryRequirement::MustDrain,
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
             )
             .unwrap();
             let descriptor = descriptor_with(task, kernel, 1, topology);
@@ -6233,70 +6248,92 @@ pub(crate) mod tests {
             )
             .unwrap();
             let schema = factory.create_compiled_chunk_schema(&declaration).unwrap();
-            let key = ExchangeReceiverKey {
-                fragment_instance_id: kernel,
-                node_id: node.get(),
-            };
-            port.register(ExchangeReceiverRegistration {
-                key,
-                expected_senders: 1,
-                expected_chunk_schema: schema.clone(),
-                column_binding:
-                    novarocks_execution::runtime::exchange::ExchangeColumnBinding::Positional,
-                creation_factory: factory,
-            })
-            .unwrap();
-            let stream = ExchangeStreamIdentity::try_new(source, task, kernel, node).unwrap();
-            let payload = if data {
-                let chunk = novarocks_execution::exec::chunk::Chunk::try_new_with_columns(
-                    schema,
-                    vec![Arc::new(arrow::array::Int64Array::from(vec![7]))],
-                )
-                .unwrap();
-                novarocks_execution::runtime::exchange::encode_chunks(&[chunk], true).unwrap()
-            } else {
-                Vec::new()
-            };
             let preparation = super::super::tests::node_fixture::NativeNodePreparation::new(task);
             let control = Arc::new(
                 novarocks_execution::runtime::runtime_state::RuntimeErrorState::for_task(
                     preparation.execution_control(),
                 ),
             );
-            port.bind_unit_receiver(key,vec![stream],control,novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64).unwrap();
-            let frame = receiver_unit_frame(stream, payload, true);
-            register_receiver_unit(port.as_ref(), key, &frame);
-            port.receive_unit(key, frame).unwrap();
-            let closes = native_inbound_close_facts(port.as_ref(), &descriptor).unwrap();
-            assert_eq!(closes[0].disposition, ExchangeCloseDisposition::Withdrawn);
-            assert!(validate_native_strict_inputs(&descriptor, &closes).is_err());
-            let receiver = port.receiver_handle(key, 1).unwrap();
-            assert!(receiver.has_output_or_finished(1));
-            assert!(
-                validate_native_strict_inputs(
-                    &descriptor,
-                    &native_inbound_close_facts(port.as_ref(), &descriptor).unwrap()
-                )
-                .is_err(),
-                "readiness cannot author consumption"
-            );
-            if data {
-                assert!(
-                    receiver.complete_input_consumption(1).is_err(),
-                    "unread DATA+End cannot be consumed"
-                );
-                assert!(matches!(
-                    receiver.try_pop_next_with_stats(1).unwrap(),
-                    Some(novarocks_execution::runtime::exchange::ExchangePopResult::Chunk(_))
-                ));
+            for (node, source) in &inputs {
+                let key = ExchangeReceiverKey {
+                    fragment_instance_id: kernel,
+                    node_id: node.get(),
+                };
+                port.register(ExchangeReceiverRegistration {
+                    key,
+                    expected_senders: 1,
+                    expected_chunk_schema: schema.clone(),
+                    column_binding:
+                        novarocks_execution::runtime::exchange::ExchangeColumnBinding::Positional,
+                    creation_factory: factory.clone(),
+                })
+                .unwrap();
+                let stream = ExchangeStreamIdentity::try_new(*source, task, kernel, *node).unwrap();
+                let payload = if data {
+                    let chunk = novarocks_execution::exec::chunk::Chunk::try_new_with_columns(
+                        schema.clone(),
+                        vec![Arc::new(arrow::array::Int64Array::from(vec![7]))],
+                    )
+                    .unwrap();
+                    novarocks_execution::runtime::exchange::encode_chunks(&[chunk], true).unwrap()
+                } else {
+                    Vec::new()
+                };
+                port.bind_unit_receiver(key,vec![stream],Arc::clone(&control),novarocks_execution_contract::native_result_support::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES as u64).unwrap();
+                let frame = receiver_unit_frame(stream, payload, true);
+                register_receiver_unit(port.as_ref(), key, &frame);
+                port.receive_unit(key, frame).unwrap();
             }
-            receiver.complete_input_consumption(1).unwrap();
+            for (node, _) in &inputs {
+                let key = ExchangeReceiverKey {
+                    fragment_instance_id: kernel,
+                    node_id: node.get(),
+                };
+                let closes = native_inbound_close_facts(port.as_ref(), &descriptor).unwrap();
+                assert!(
+                    closes
+                        .iter()
+                        .any(|close| close.disposition == ExchangeCloseDisposition::Withdrawn)
+                );
+                assert!(validate_native_strict_inputs(&descriptor, &closes).is_err());
+                let receiver = port.receiver_handle(key, 1).unwrap();
+                assert!(receiver.has_output_or_finished(1));
+                assert!(
+                    validate_native_strict_inputs(
+                        &descriptor,
+                        &native_inbound_close_facts(port.as_ref(), &descriptor).unwrap()
+                    )
+                    .is_err(),
+                    "readiness cannot author consumption"
+                );
+                if data {
+                    assert!(
+                        receiver.complete_input_consumption(1).is_err(),
+                        "unread DATA+End cannot be consumed"
+                    );
+                    assert!(matches!(
+                        receiver.try_pop_next_with_stats(1).unwrap(),
+                        Some(novarocks_execution::runtime::exchange::ExchangePopResult::Chunk(_))
+                    ));
+                }
+                receiver.complete_input_consumption(1).unwrap();
+            }
             let closes = native_inbound_close_facts(port.as_ref(), &descriptor).unwrap();
-            assert!(matches!(
-                closes[0].disposition,
+            assert_eq!(closes.len(), inputs.len());
+            assert!(closes.iter().all(|close| matches!(
+                close.disposition,
                 ExchangeCloseDisposition::Consumed { .. }
-            ));
+            )));
             validate_native_strict_inputs(&descriptor, &closes).unwrap();
+            novarocks_worker::TaskInboundCapabilities::validate_normal_close_facts(
+                &descriptor,
+                &closes,
+            )
+            .expect("actual multi-input facts must satisfy the original Worker contract");
+            let key = ExchangeReceiverKey {
+                fragment_instance_id: kernel,
+                node_id: inputs[0].0.get(),
+            };
             port.remove(key);
             assert!(
                 native_inbound_close_facts(port.as_ref(), &descriptor).is_err(),
