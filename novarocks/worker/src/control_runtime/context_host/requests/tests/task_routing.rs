@@ -54,16 +54,20 @@ fn unknown_task_request_is_refused_without_a_direct_context_request_fallback() {
 fn closed_task_admission_keeps_the_original_request_routable_until_unused_retirement() {
     let (mut f, task) = live_loading_task_fixture();
     let ready = ready(&f, 1);
+    // Quiescing closes this actor's external intake while its actual Task
+    // remains live. Domain updates keep the ordinary causal route in this
+    // window; they must neither become terminal nor use the control lane.
+    f.runtime.close_actor_admission(context_actor()).unwrap();
+    assert!(!f.runtime.snapshot(context_actor()).unwrap().external_open);
     let (work, handle) = f
         .service
         .context(f.identity)
         .unwrap()
         .lock()
         .unwrap()
-        .admit_task_request(
+        .admit_task_domain_request(
             &ready,
             task,
-            InputClass::Ordinary,
             operation(102),
             MonotonicInstant::from_origin(Duration::from_secs(5)),
         )
@@ -235,4 +239,199 @@ fn closed_task_read_keeps_one_original_r_and_expires_before_the_actual_read_seal
     assert!(host.task_read_waiters.is_empty_for_test());
     drop(host);
     finish_task_fixture(f, task);
+}
+
+#[test]
+fn task_update_inspection_wakes_pending_future_before_its_original_raw_drop() {
+    use novarocks_execution_contract::{
+        CodecOwnedContent, ContentFingerprint, DomainVersion, TaskDomainUpdate, UpdateTask,
+    };
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
+        task::{Context, Poll, Wake, Waker},
+        time::Instant,
+    };
+
+    #[derive(Debug)]
+    struct Raw {
+        entered: Arc<AtomicBool>,
+        release: Mutex<mpsc::Receiver<()>>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl CodecOwnedContent for Raw {
+        fn fingerprint(&self) -> ContentFingerprint {
+            panic!("metadata inspection must never fingerprint rich content")
+        }
+        fn encoded_len(&self) -> usize {
+            panic!("metadata inspection must never size rich content")
+        }
+    }
+    impl Drop for Raw {
+        fn drop(&mut self) {
+            self.entered.store(true, Ordering::SeqCst);
+            let _ = self.release.lock().unwrap().recv();
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct CountWake(AtomicUsize);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct Ingress;
+    impl crate::WorkerIngressBacking for Ingress {}
+
+    let mut f = original_context(1);
+    let input = model_fact(
+        &mut f,
+        ContextInput::MaterializationFinished {
+            result: Ok(crate::control_runtime::actors::tests::initial_materialized()),
+        },
+        1,
+    );
+    complete_model_effects(&mut f, input);
+    f.runtime.retire_input(context_actor(), input).unwrap();
+    let ready = ready(&f, 1);
+    let missing = task(f.identity, 1);
+    let operation = operation(124);
+    let address = f.service.context(f.identity).unwrap();
+    let root = address.lock().unwrap().control_registration.clone();
+    let (executor, ports) =
+        super::failure_publications::original_lifecycle_executor(&f.runtime, root);
+    let entered = Arc::new(AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (release, receiver) = mpsc::channel();
+    let raw = UpdateTask::try_new(
+        operation,
+        missing,
+        vec![TaskDomainUpdate::TaskDynamicFilter {
+            version: DomainVersion::FIRST,
+            payload: Arc::new(Raw {
+                entered: entered.clone(),
+                release: Mutex::new(receiver),
+                drops: drops.clone(),
+            }),
+        }],
+    )
+    .unwrap();
+    let (work, mut handle, token) = {
+        let mut host = address.lock().unwrap();
+        let (work, handle) = host
+            .admit_task_update_inspection(
+                &ready,
+                ActorId::new(91).unwrap(),
+                missing,
+                operation,
+                MonotonicInstant::from_origin(Duration::from_secs(5)),
+            )
+            .unwrap();
+        if let Err((error, raw, ingress)) = host.capture_task_update_inspection(
+            work,
+            raw,
+            crate::WorkerIngressResponsibility::from_admitted(Arc::new(Ingress)),
+        ) {
+            // A refused capture still returns the caller's actual raw. Let
+            // that destructor finish before reporting the original error.
+            let _ = release.send(());
+            drop((raw, ingress));
+            panic!("the original R capture was refused: {error:?}");
+        }
+        (work, handle, host.resources.requests[&work].request().token)
+    };
+    let wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+    let waker = Waker::from(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert!(Pin::new(&mut handle).poll(&mut cx).is_pending());
+    address
+        .lock()
+        .unwrap()
+        .submit_request(work, ContextCommand::InspectTaskUpdate { task: missing })
+        .unwrap();
+    f.runtime.poll_one(Tick(2)).unwrap();
+    address
+        .lock()
+        .unwrap()
+        .publish_request_reply(reply(&f, token))
+        .unwrap();
+
+    // Only the real notification job can wake this already-Pending Future.
+    // The bounded test-thread wait never polls it or registers a timer waker.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while wakes.0.load(Ordering::SeqCst) == 0
+        && !entered.load(Ordering::SeqCst)
+        && Instant::now() < deadline
+    {
+        address
+            .lock()
+            .unwrap()
+            .advance_request_notification(work, &ports)
+            .unwrap();
+        std::thread::yield_now();
+    }
+    let woke_before_drop = wakes.0.load(Ordering::SeqCst) > 0 && !entered.load(Ordering::SeqCst);
+    let delivered = if woke_before_drop {
+        match Pin::new(&mut handle).poll(&mut cx) {
+            Poll::Ready(Ok(delivery)) => matches!(
+                delivery.body(),
+                ContextReplyBody::Verdict(RequestResult::Outcome(
+                    OperationOutcome::InvalidStateOrRequest
+                ))
+            ),
+            _ => false,
+        }
+    } else {
+        false
+    };
+    // End the actual delivery/observer before raw disposal becomes eligible.
+    drop(handle);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+        address
+            .lock()
+            .unwrap()
+            .advance_request_notification(work, &ports)
+            .unwrap();
+        std::thread::yield_now();
+    }
+    let raw_held = entered.load(Ordering::SeqCst) && drops.load(Ordering::SeqCst) == 0;
+    let held_requests = f.ledger.used(Dimension::Requests.id());
+    let held_retirement = address.lock().unwrap().advance_request(work).unwrap();
+
+    // Clean up even when an old ordering blocks the original wake behind Drop.
+    let _ = release.send(());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut retired = false;
+    while !retired && Instant::now() < deadline {
+        let mut host = address.lock().unwrap();
+        host.advance_request_notification(work, &ports).unwrap();
+        retired = host.advance_request(work).unwrap();
+        drop(host);
+        std::thread::yield_now();
+    }
+    drop(
+        executor
+            .shutdown()
+            .unwrap_or_else(|_| panic!("the actual lifecycle executor joins")),
+    );
+    drop(ports);
+    finish(f);
+    assert!(
+        woke_before_drop,
+        "the original pending Future must receive a real wake before raw Drop"
+    );
+    assert!(
+        delivered,
+        "the original Core refusal must be ready on that wake"
+    );
+    assert!(raw_held && !held_retirement);
+    assert_eq!(held_requests, 1);
+    assert!(retired);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }

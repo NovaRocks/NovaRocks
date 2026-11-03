@@ -645,6 +645,159 @@ fn installed_and_body_exit_do_not_return_the_preparation_position() {
         && reply.body.matches(reply.result)));
 }
 #[test]
+fn task_update_inspection_reads_only_the_original_refusal_before_and_after_task_custody_exit() {
+    let mut core = core(8, 1);
+    let mut port = Port::default();
+    activate(&mut core, &mut port);
+    let mut ordinal = 9_100_000;
+    let mut inspect = |core: &mut ContextCore,
+                       port: &mut Port,
+                       identity: TaskIdentity,
+                       deadline: MonotonicInstant,
+                       expected: OperationOutcome| {
+        ordinal += 1;
+        let token = InputId::new(ordinal).unwrap();
+        let request = RequestContext {
+            author: model_request_author(token),
+            token,
+            operation: operation(190),
+            deadline,
+        };
+        let admissions = port.calls.len();
+        let step = core
+            .handle_request(
+                at(0),
+                request,
+                ContextCommand::InspectTaskUpdate { task: identity },
+                port,
+            )
+            .unwrap();
+        assert_eq!(step.requests.len(), 1);
+        assert_eq!(step.requests[0].request, request);
+        assert_eq!(step.requests[0].task, Some(identity));
+        assert_eq!(step.requests[0].result, RequestResult::Outcome(expected));
+        assert!(step.effects.is_empty(), "inspection owns no domain effect");
+        assert_eq!(port.calls.len(), admissions, "no Task admission or grant");
+    };
+    inspect(
+        &mut core,
+        &mut port,
+        task(1),
+        at(1),
+        OperationOutcome::InvalidStateOrRequest,
+    );
+    let foreign = TaskIdentity::new(
+        task(1).query_execution_id(),
+        task(1).stage_id(),
+        task(1).task_id(),
+        BackendProcessId::try_from_bytes(bytes(9)).unwrap(),
+    );
+    inspect(
+        &mut core,
+        &mut port,
+        foreign,
+        at(1),
+        OperationOutcome::IdentityMismatch,
+    );
+    create(&mut core, &mut port, 1);
+    inspect(
+        &mut core,
+        &mut port,
+        task(1),
+        at(1),
+        OperationOutcome::InvalidStateOrRequest,
+    );
+    loaded(&mut core, &mut port, 1);
+    let live_status = core.status(task(1)).unwrap().clone();
+    inspect(
+        &mut core,
+        &mut port,
+        task(1),
+        at(1),
+        OperationOutcome::InvalidStateOrRequest,
+    );
+    assert_eq!(core.status(task(1)).unwrap(), &live_status);
+    core.handle(
+        at(0),
+        ContextInput::Proposal {
+            task: task(1),
+            proposal: proposal(TaskConclusion::Terminated(TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            ))),
+        },
+        &mut port,
+    )
+    .unwrap();
+    core.handle(at(0), ContextInput::Adjudicate { task: task(1) }, &mut port)
+        .unwrap();
+    for fact in [
+        PhysicalFact::LoaderExited,
+        PhysicalFact::PreparationExited,
+        PhysicalFact::ActualStopped,
+        PhysicalFact::OutputReleased,
+        PhysicalFact::RootIdle,
+    ] {
+        core.handle(
+            at(0),
+            ContextInput::Physical {
+                task: task(1),
+                fact,
+            },
+            &mut port,
+        )
+        .unwrap();
+    }
+    core.handle(at(0), ContextInput::Finish { task: task(1) }, &mut port)
+        .unwrap();
+    inspect(
+        &mut core,
+        &mut port,
+        task(1),
+        at(1),
+        OperationOutcome::TerminalRejected,
+    );
+    inspect(
+        &mut core,
+        &mut port,
+        task(1),
+        at(0),
+        OperationOutcome::OperationTimedOut,
+    );
+    core.handle(
+        at(0),
+        ContextInput::Physical {
+            task: task(1),
+            fact: PhysicalFact::ResourcesConverged,
+        },
+        &mut port,
+    )
+    .unwrap();
+    let record = core.task(task(1)).unwrap();
+    let custody = ContextInput::TaskExecutionCustodyRetired {
+        task: task(1),
+        payload: record.payload,
+        close_epoch: record.applied_close_generation,
+    };
+    core.handle(at(0), custody, &mut port).unwrap();
+    for _ in 0..16 {
+        if core.decided_task(task(1)).is_some() {
+            break;
+        }
+        core.handle(at(0), ContextInput::NextInternal, &mut port)
+            .unwrap();
+    }
+    assert_eq!(core.state(), QueryContextState::Active);
+    assert!(core.task(task(1)).is_none() && core.decided_task(task(1)).is_some());
+    inspect(
+        &mut core,
+        &mut port,
+        task(1),
+        at(1),
+        OperationOutcome::TerminalRejected,
+    );
+}
+
+#[test]
 fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     let mut core = core(8, 1);
     let mut port = Port::default();
@@ -778,6 +931,7 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         OperationOutcome::Accepted,
         OperationOutcome::Idempotent,
         OperationOutcome::Accepted,
+        OperationOutcome::ContextTerminalReceipt,
         OperationOutcome::ContextTerminalReceipt,
         OperationOutcome::ContextTerminalReceipt,
         OperationOutcome::ContextTerminalReceipt,
@@ -1056,6 +1210,7 @@ fn terminal_context_commands() -> Vec<ContextCommand> {
             cause: AbortCause::QueryFailed,
         },
         ContextCommand::Release,
+        ContextCommand::InspectTaskUpdate { task: task(1) },
     ]
 }
 

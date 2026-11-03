@@ -443,6 +443,17 @@ impl WorkerNodeHost {
             .into(),
         }
     }
+    #[cfg(test)]
+    pub(crate) fn task_update_retirement_for_test(
+        &self,
+        context: QueryContextRef,
+        task: novarocks_execution_contract::TaskIdentity,
+    ) -> Option<(bool, bool)> {
+        task.verify_query_context(context).ok()?;
+        let address = self.directory.context(context)?;
+        let mut host = address.lock()?;
+        Some((host.task(task).is_some(), host.has_retired_task_read(task)))
+    }
     pub(crate) fn submit_task_domain(
         &self,
         context: QueryContextRef,
@@ -490,10 +501,82 @@ impl WorkerNodeHost {
                 ingress,
             ));
         }
-        let (work, handle) = match host.admit_task_request(
+        let live = match host.task_domain_uses_live_route(original.identity()) {
+            Ok(live) => live,
+            Err(ContextRequestError::OwnerFailed) => {
+                drop(host);
+                return Err(self.reject_failed_ingress(
+                    context,
+                    RejectedIngressPayload::TaskDomain(original),
+                    ingress,
+                ));
+            }
+            Err(error) => {
+                return Err(NodeHostRefusal::new(
+                    "Task domain original route",
+                    (error, original, ingress),
+                )
+                .into());
+            }
+        };
+        if !live {
+            let task = original.identity();
+            let (work, handle) = match host.admit_task_update_inspection(
+                &self.requests,
+                self.next_source(),
+                task,
+                original.envelope().operation_id(),
+                deadline,
+            ) {
+                Ok(admitted) => admitted,
+                Err(error)
+                    if error.partial.is_none()
+                        && matches!(error.error, ContextRequestError::OwnerFailed) =>
+                {
+                    drop(host);
+                    return Err(self.reject_failed_ingress(
+                        context,
+                        RejectedIngressPayload::TaskDomain(original),
+                        ingress,
+                    ));
+                }
+                Err(error) if error.partial.is_some() => {
+                    return Err(Self::reject_failed_admission_partial(
+                        &mut host,
+                        error,
+                        RejectedIngressPayload::TaskDomain(original),
+                        ingress,
+                    ));
+                }
+                Err(error) => {
+                    return Err(NodeHostRefusal::new(
+                        "Task domain original inspection R admission",
+                        (error, original, ingress),
+                    )
+                    .into());
+                }
+            };
+            if let Err((error, original, ingress)) =
+                host.capture_task_update_inspection(work, original, ingress)
+            {
+                return Err(NodeHostRefusal::new(
+                    "Task domain original inspection capture",
+                    (error, original, ingress, handle),
+                )
+                .into());
+            }
+            return match host.submit_task_update_inspection(work, task) {
+                Ok(()) => Ok(handle),
+                Err(original) => Err(NodeHostRefusal::new(
+                    "Task domain original inspection handoff",
+                    (original, handle),
+                )
+                .into()),
+            };
+        }
+        let (work, handle) = match host.admit_task_domain_request(
             &self.requests,
             original.identity(),
-            novarocks_control_runtime_core::mailbox::InputClass::Ordinary,
             original.envelope().operation_id(),
             deadline,
         ) {

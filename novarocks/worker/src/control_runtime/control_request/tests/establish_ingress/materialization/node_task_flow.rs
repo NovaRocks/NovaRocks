@@ -1924,6 +1924,154 @@ fn real_node_compiled_task_runs_and_finishes_on_one_and_two_pollers() {
     }
 }
 
+struct LateUpdateContent {
+    getters: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+    drop_entered: Arc<std::sync::atomic::AtomicBool>,
+    disposal: Arc<PreparationGate>,
+}
+impl std::fmt::Debug for LateUpdateContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LateUpdateContent")
+    }
+}
+impl novarocks_execution_contract::CodecOwnedContent for LateUpdateContent {
+    fn fingerprint(&self) -> novarocks_execution_contract::ContentFingerprint {
+        self.getters.fetch_add(1, Ordering::SeqCst);
+        novarocks_execution_contract::ContentFingerprint::from_bytes([31; 16])
+    }
+    fn encoded_len(&self) -> usize {
+        self.getters.fetch_add(1, Ordering::SeqCst);
+        1
+    }
+}
+impl Drop for LateUpdateContent {
+    fn drop(&mut self) {
+        self.drop_entered.store(true, Ordering::Release);
+        self.disposal.wait();
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn exercise_retired_task_update(
+    scene: &Scenario<TaskResources>,
+    context: QueryContextRef,
+    failures: &mut Vec<String>,
+) {
+    let task = scene.diagnostic_task.lock().unwrap().unwrap().1;
+    if !wait_until(|| {
+        scene.node.task_update_retirement_for_test(context, task) == Some((false, true))
+    }) {
+        failures.push("the original Task did not physically retire before late Update".into());
+        return;
+    }
+    let getters = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let drop_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let disposal = Arc::new(PreparationGate::default());
+    let _release = ReleasePreparationGate(disposal.clone());
+    let original = novarocks_execution_contract::UpdateTask::try_new(
+        operation_number(31),
+        task,
+        vec![TaskDomainUpdate::TaskDynamicFilter {
+            version: novarocks_execution_contract::DomainVersion::FIRST,
+            payload: Arc::new(LateUpdateContent {
+                getters: getters.clone(),
+                drops: drops.clone(),
+                drop_entered: drop_entered.clone(),
+                disposal: disposal.clone(),
+            }),
+        }],
+    )
+    .unwrap();
+    let ingress_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let ingress =
+        crate::WorkerIngressResponsibility::from_admitted(Arc::new(ComponentIngressBacking {
+            _permit: ingress_gate.clone().try_acquire_owned().unwrap(),
+        }));
+    let deadline = MonotonicInstant::from_origin(Duration::from_secs(100));
+    let submitted = scene
+        .node
+        .submit_task_domain(context, original, deadline, ingress);
+    match submitted {
+        Ok(mut handle) => {
+            let request = handle.request();
+            if request.operation != operation_number(31) || request.deadline != deadline {
+                failures.push("late Update changed its original request metadata".into());
+            }
+            let delivery = wait_delivery(&mut handle);
+            if !delivery.as_ref().is_some_and(|delivery| {
+                delivery.request() == request
+                    && matches!(
+                        delivery.body(),
+                        ContextReplyBody::Verdict(
+                            novarocks_worker_protocol::context::RequestResult::Outcome(
+                                OperationOutcome::TerminalRejected
+                            )
+                        )
+                    )
+            }) {
+                failures
+                    .push("late Update did not receive its original Core TerminalRejected".into());
+            }
+            // End the actual external delivery while the original raw destructor
+            // remains in progress. Neither the verdict nor external exit refunds R.
+            drop(delivery);
+            drop(handle);
+            if !wait_until(|| drop_entered.load(Ordering::Acquire)) {
+                failures.push("the original late Update raw destructor did not enter".into());
+            } else if scene.ledger.used(Dimension::Requests.id()) != 1
+                || ingress_gate.available_permits() != 0
+                || drops.load(Ordering::SeqCst) != 0
+            {
+                failures.push(
+                    "late Update refunded its original R/ingress before actual raw Drop".into(),
+                );
+            }
+        }
+        Err(original) => {
+            failures.push(format!(
+                "late Update was refused before its Core decision: {original:?}"
+            ));
+            // A reintroduced old admission bug returns the actual raw here.
+            // Release its destructor first, then drop those returned originals
+            // and let the same Node finish normally before asserting the failure.
+            disposal.release();
+            drop(original);
+        }
+    }
+    disposal.release();
+    if !wait_until(|| {
+        drops.load(Ordering::SeqCst) == 1
+            && scene.ledger.used(Dimension::Requests.id()) == 0
+            && ingress_gate.available_permits() == 1
+    }) {
+        failures
+            .push("late Update originals did not retire after the real destructor returned".into());
+    }
+    if getters.load(Ordering::SeqCst) != 0 {
+        failures.push("terminal inspection evaluated an unused rich domain payload".into());
+    }
+}
+
+#[test]
+fn late_update_after_real_task_retirement_keeps_core_verdict_and_original_raw_exit() {
+    let mut failures = Vec::new();
+    run_node_lifecycle_with_task(
+        1,
+        NodeClose::Release,
+        compiled_task_geometry(),
+        start_tasks,
+        |scene, context, resources| {
+            let held = exercise(scene, context, resources)?;
+            exercise_retired_task_update(scene, context, &mut failures);
+            Ok(held)
+        },
+        shutdown,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
 // These are the same two named bundle contracts moved from actors/tests.rs.
 // The actual Node now owns their RF/read gate, Core RetireTask and payment tail.
 #[test]

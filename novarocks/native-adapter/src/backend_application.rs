@@ -1480,7 +1480,7 @@ mod tests {
         };
         assert_eq!(initial.logical_live_grants, 1);
 
-        node.clock.advance(Duration::from_secs(600));
+        node.advance_clock(Duration::from_secs(600));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             if node
