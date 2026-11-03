@@ -187,6 +187,166 @@ fn cell(ty: &TypeSignature, text: &str) -> TrinoValue {
     decode_value(ty, RawValue::from_string(text.into()).unwrap().as_ref()).unwrap()
 }
 
+fn depth64_page(raw_type: &str) -> String {
+    // Original wire text: 63 containers plus an integer leaf, with a NULL
+    // sibling at every level. Do not serialize the client's typed model.
+    let mut signature = r#"{"rawType":"integer","arguments":[]}"#.to_owned();
+    let mut type_name = "integer".to_owned();
+    let mut value = "42".to_owned();
+    for _ in 0..63 {
+        match raw_type {
+            "array" => {
+                signature = format!(
+                    r#"{{"rawType":"array","arguments":[{{"kind":"TYPE","value":{signature}}}]}}"#
+                );
+                type_name = format!("array({type_name})");
+                value = format!("[{value},null]");
+            }
+            "row" => {
+                signature = format!(
+                    r#"{{"rawType":"row","arguments":[{{"kind":"NAMED_TYPE","value":{{"fieldName":{{"name":"value"}},"typeSignature":{signature}}}}},{{"kind":"NAMED_TYPE","value":{{"fieldName":{{"name":"absent"}},"typeSignature":{{"rawType":"integer","arguments":[]}}}}}}]}}"#
+                );
+                type_name = format!("row(value {type_name},absent integer)");
+                value = format!("[{value},null]");
+            }
+            "map" => {
+                signature = format!(
+                    r#"{{"rawType":"map","arguments":[{{"kind":"TYPE","value":{{"rawType":"varchar","arguments":[]}}}},{{"kind":"TYPE","value":{signature}}}]}}"#
+                );
+                type_name = format!("map(varchar,{type_name})");
+                value = format!(r#"{{"value":{value},"absent":null}}"#);
+            }
+            _ => panic!("unsupported test shape"),
+        }
+    }
+    format!(
+        r#"{{"id":"q","columns":[{{"name":"deep","type":"{type_name}","typeSignature":{signature}}}],"data":[[{value}],[null]],"nextUri":"$BASE/next/deep"}}"#
+    )
+}
+
+#[test]
+fn depth64_array_row_and_map_pages_decode_on_post_and_get() {
+    for raw_type in ["array", "row", "map"] {
+        for initial_page in [true, false] {
+            let page = Reply::json(&depth64_page(raw_type));
+            let replies = if initial_page {
+                vec![page, terminal()]
+            } else {
+                vec![queued(), page, terminal()]
+            };
+            let server = FakeServer::new(replies);
+            let pending = server
+                .client()
+                .submit(&session(), "SELECT deep", deadline())
+                .unwrap();
+            let (result, effects) = pending.run(deadline()).unwrap();
+            assert_eq!(result.query_id, "q");
+            assert_eq!(result.pages, if initial_page { 2 } else { 3 });
+            assert_eq!(effects, SessionEffects::default());
+            assert_eq!(result.columns.len(), 1);
+            assert_eq!(result.columns[0].name, "deep");
+            assert_eq!(result.rows.len(), 2);
+            assert_eq!(result.rows[0].len(), 1);
+            assert_eq!(result.rows[1], vec![TrinoValue::Null]);
+
+            // Inspect every decoded branch against the wire's independent
+            // 63-container/42/NULL oracle, including map entry order and keys.
+            let mut value = &result.rows[0][0];
+            let mut signature = &result.columns[0].type_signature;
+            for _ in 0..63 {
+                assert_eq!(signature.raw_type, raw_type);
+                match (raw_type, value) {
+                    ("array", TrinoValue::Array(children)) | ("row", TrinoValue::Row(children)) => {
+                        assert_eq!(children.len(), 2);
+                        assert_eq!(children[1], TrinoValue::Null);
+                        value = &children[0];
+                        signature = match &signature.arguments[0] {
+                            TypeArgument::Type(child) if raw_type == "array" => child,
+                            TypeArgument::NamedType(child) if raw_type == "row" => {
+                                &child.type_signature
+                            }
+                            other => panic!("unexpected signature argument: {other:?}"),
+                        };
+                    }
+                    ("map", TrinoValue::Map(entries)) => {
+                        assert_eq!(entries.len(), 2);
+                        assert_eq!(entries[0].0, TrinoValue::Text("value".into()));
+                        assert_eq!(
+                            entries[1],
+                            (TrinoValue::Text("absent".into()), TrinoValue::Null)
+                        );
+                        value = &entries[0].1;
+                        signature = signature.type_argument(1).unwrap();
+                    }
+                    other => panic!("unexpected decoded shape: {other:?}"),
+                }
+            }
+            assert_eq!(signature.raw_type, "integer");
+            assert!(signature.arguments.is_empty());
+            assert_eq!(*value, TrinoValue::Integer(42));
+            let requests = server.finish();
+            let methods = requests
+                .iter()
+                .map(|r| r.method.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                methods,
+                if initial_page {
+                    vec!["POST", "GET"]
+                } else {
+                    vec!["POST", "GET", "GET"]
+                }
+            );
+            assert_eq!(requests.last().unwrap().path, "/next/deep");
+        }
+    }
+}
+
+#[test]
+fn trailing_page_garbage_is_rejected_on_post_and_get() {
+    for suffix in [" trailing", " {}"] {
+        let malformed = format!(r#"{{"id":"q"}}{suffix}"#);
+        let server = FakeServer::new(vec![Reply::json(&malformed)]);
+        let error = server
+            .client()
+            .submit(&session(), "SELECT 1", deadline())
+            .err()
+            .expect("submission must reject trailing JSON");
+        assert!(
+            matches!(error, StatementFailure::Protocol(ref reason) if reason.contains("trailing characters")),
+            "{error:?}"
+        );
+        assert_eq!(server.finish().len(), 1);
+
+        let server = FakeServer::new(vec![
+            queued(),
+            Reply::json(&malformed),
+            Reply {
+                status: 204,
+                ..Reply::json("")
+            },
+        ]);
+        let pending = server
+            .client()
+            .submit(&session(), "SELECT 1", deadline())
+            .unwrap();
+        let error = pending.run(deadline()).unwrap_err();
+        assert!(
+            matches!(error, StatementFailure::Protocol(ref reason) if reason.contains("trailing characters")),
+            "{error:?}"
+        );
+        let requests = server.finish();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| r.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["POST", "GET", "DELETE"]
+        );
+        assert_eq!(requests[2].path, "/next/0");
+    }
+}
+
 #[test]
 fn pages_include_empty_polls_late_columns_and_the_final_acknowledgment() {
     let server = FakeServer::new(vec![

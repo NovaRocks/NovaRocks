@@ -11,3 +11,5 @@
 `schema_free_exchange_count_only`独立预期为2×2=4与两次等id匹配=2。SQL COUNT输出不证明某条边有零列；真正的零列三行shuffle/broadcast几何由原Driver生产路径测试逐单元断言，SQL实际冻结布局另行核查。
 
 `schema_free_exchange_dictionary_values`按相等id连接，独立预期就是原4行的a/a/b/SQL NULL。SQL字面值重复与wire字典消息的证明分开；实际单元内完整字典、字典ID和bare buffer别名由原Driver/decoder测试核对，原生运行还消费low-cardinality suite既有观察。
+
+分发路线使用现有 CBO 会话配置：预算为 0 的步骤排除广播，恢复原默认 1 GiB 的步骤保留广播可行性，并分别严格核对 PARTITIONED/BROADCAST 计划断言。当前表引用 hint 尚未进入逻辑 Join 约束，不能仅凭 `[shuffle]` 字面量声称实际分发。深值在右输入子查询内生成，保留原63层及结果，不在 JOIN 后才构造。多消费者 CTE 的现有 compiled 能力拒绝不属于在线 codec；这些用例以独立输入分支覆盖真实交换。

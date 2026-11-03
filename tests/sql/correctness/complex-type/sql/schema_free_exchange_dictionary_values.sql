@@ -27,6 +27,8 @@ CREATE TABLE ${case_db}.dictionary_seed (id INT NOT NULL, label STRING)
 TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.dictionary_seed VALUES (7,'a'),(19,'a'),(27,'b'),(35,NULL);
 
+SET cbo_broadcast_node_mem_budget_bytes = 0;
+
 -- query 2
 -- @order_sensitive=true
 -- @explain_contains=HASH JOIN (PARTITIONED, INNER
@@ -35,6 +37,10 @@ FROM ${case_db}.dictionary_seed l JOIN [shuffle] ${case_db}.dictionary_seed r ON
 ORDER BY l.id;
 
 -- query 3
+-- @skip_result_check=true
+SET cbo_broadcast_node_mem_budget_bytes = 1073741824;
+
+-- query 4
 -- @order_sensitive=true
 -- @explain_contains=HASH JOIN (BROADCAST, INNER
 SELECT l.id, r.label

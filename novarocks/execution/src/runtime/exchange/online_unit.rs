@@ -42,7 +42,14 @@ fn codec_error(
 ) -> ExchangeFailure {
     match error {
         CodecError::Observer(error) => error,
-        CodecError::Invalid(detail) => failure::payload(detail),
+        CodecError::Invalid(detail) => {
+            tracing::warn!(
+                operation = ?operation,
+                detail,
+                "exchange Arrow unit rejected"
+            );
+            failure::payload(detail)
+        }
         CodecError::ValueType(error) => error.into(),
         CodecError::Arrow(error) => failure::arrow(operation, error),
         CodecError::Metadata(error) => failure::metadata("verify Arrow unit message", error),
@@ -63,7 +70,14 @@ fn codec_error(
 impl From<GeometryError> for ExchangeFailure {
     fn from(error: GeometryError) -> Self {
         match error {
-            GeometryError::InvalidShape(detail) => failure::payload(detail),
+            GeometryError::InvalidShape(detail) => {
+                tracing::warn!(
+                    operation = "decode_geometry",
+                    detail,
+                    "exchange Arrow unit rejected"
+                );
+                failure::payload(detail)
+            }
             GeometryError::ResourceExhausted => {
                 ConstructionFailure::Control(CompileControlError::ResourceExhausted).into()
             }

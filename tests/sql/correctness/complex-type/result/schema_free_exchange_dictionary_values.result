@@ -6,7 +6,7 @@ id	label
 27	b
 35	NULL
 
--- query 3
+-- query 4
 -- types	integer	varchar
 id	label
 7	a

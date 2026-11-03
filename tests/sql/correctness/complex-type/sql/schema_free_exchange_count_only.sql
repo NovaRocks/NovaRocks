@@ -17,7 +17,7 @@
 
 -- @tags=complex,exchange,count-only
 -- Test Objective:
--- Preserve two source rows when unused CTE outputs are pruned, and preserve
+-- Preserve source multiplicity when unused outputs are pruned, and preserve
 -- count-only results across broadcast and explicit partitioned join paths.
 -- The real Driver unit tests additionally assert zero-column wire geometry;
 -- COUNT output alone is not evidence that a particular SQL edge has no columns.
@@ -29,10 +29,14 @@ TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.count_seed VALUES (7), (19);
 
 -- query 2
-WITH zero AS (SELECT id FROM ${case_db}.count_seed)
-SELECT COUNT(*) AS row_count FROM zero l CROSS JOIN zero r;
+SELECT COUNT(*) AS row_count
+FROM ${case_db}.count_seed l CROSS JOIN ${case_db}.count_seed r;
 
 -- query 3
+-- @skip_result_check=true
+SET cbo_broadcast_node_mem_budget_bytes = 0;
+
+-- query 4
 -- @explain_contains=HASH JOIN (PARTITIONED, INNER
 SELECT COUNT(*) AS row_count
 FROM ${case_db}.count_seed l JOIN [shuffle] ${case_db}.count_seed r ON l.id = r.id;

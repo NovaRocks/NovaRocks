@@ -25,7 +25,7 @@ use crate::{
 use arrow::{
     array::{
         Array, ArrayRef, DictionaryArray, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
-        StructArray, types::Int32Type,
+        StructArray, new_empty_array, types::Int32Type,
     },
     buffer::Buffer,
     datatypes::{DataType, Field, FieldRef, Schema},
@@ -327,19 +327,53 @@ fn permissive_carrier_flags_do_not_change_the_frozen_logical_identity() {
     assert_ne!(strict_carrier.digest(), other_declaration.digest());
 }
 #[test]
-fn zero_columns_keep_nonzero_rows_without_a_marker_column() {
-    let input = RecordBatch::try_new_with_options(
-        Arc::new(Schema::empty()),
-        vec![],
-        &RecordBatchOptions::new().with_row_count(Some(7)),
-    )
-    .unwrap();
+fn zero_columns_preserve_empty_and_nonempty_row_counts_without_a_marker_column() {
     let mut observer = Observed::default();
     let recipe = exact(&[], &mut observer);
+    for rows in [0, 1, 7] {
+        let input = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )
+        .unwrap();
+        let wire = encode_unit(&recipe, &input, &mut observer).unwrap();
+        let output = decode_unit(&recipe, &wire, &mut observer).unwrap();
+        assert_eq!(output.num_columns(), 0);
+        assert_eq!(output.num_rows(), rows);
+    }
+}
+#[test]
+fn empty_partition_keeps_declared_columns_and_does_not_change_the_recipe() {
+    let fields = vec![
+        Arc::new(Field::new("id", DataType::Int32, false)),
+        Arc::new(Field::new("text", DataType::Utf8, true)),
+    ];
+    let input = batch(
+        fields.clone(),
+        fields
+            .iter()
+            .map(|field| new_empty_array(field.data_type()))
+            .collect(),
+    );
+    let mut observer = Observed::default();
+    let recipe = exact(&fields, &mut observer);
     let wire = encode_unit(&recipe, &input, &mut observer).unwrap();
     let output = decode_unit(&recipe, &wire, &mut observer).unwrap();
-    assert_eq!(output.num_columns(), 0);
-    assert_eq!(output.num_rows(), 7);
+    assert_eq!(output.num_rows(), 0);
+    assert_eq!(output.columns(), input.columns());
+
+    let count_only = exact(&[], &mut observer);
+    assert!(matches!(
+        encode_unit(&count_only, &input, &mut observer),
+        Err(CodecError::Invalid("unit columns differ from recipe"))
+    ));
+    assert!(matches!(
+        decode_unit(&count_only, &wire, &mut observer),
+        Err(CodecError::Invalid(
+            "Arrow unit recipe digest or version differs"
+        ))
+    ));
 }
 #[test]
 fn complete_dictionaries_are_independent_in_every_unit() {

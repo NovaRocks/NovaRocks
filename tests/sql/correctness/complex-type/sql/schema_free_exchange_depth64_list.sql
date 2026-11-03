@@ -17,7 +17,7 @@
 
 -- @tags=complex,exchange,depth64
 -- Test Objective:
--- Keep a non-NULL logical-depth-64 value across a multi-consumer CTE and
+-- Keep a non-NULL logical-depth-64 value across derived input branches and
 -- explicit shuffle/broadcast joins under the real distributed topology.
 -- Storage holds only the shallow id seed; no deep Provider schema is used.
 -- Expected rows are two ids, each wrapped exactly 63 times. Row children
@@ -29,18 +29,22 @@ CREATE TABLE ${case_db}.deep_seed (id INT NOT NULL)
 TBLPROPERTIES ("format-version" = "3");
 INSERT INTO ${case_db}.deep_seed VALUES (7), (19);
 
+SET cbo_broadcast_node_mem_budget_bytes = 0;
+
 -- query 2
 -- @order_sensitive=true
 -- @explain_contains=HASH JOIN (PARTITIONED, INNER
-WITH deep AS (SELECT id, [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[id]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]] AS value FROM ${case_db}.deep_seed)
 SELECT l.id, r.value AS deep_value
-FROM deep l JOIN [shuffle] deep r ON l.id = r.id
+FROM ${case_db}.deep_seed l JOIN [shuffle] (SELECT id, [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[id]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]] AS value FROM ${case_db}.deep_seed) r ON l.id = r.id
 ORDER BY l.id;
 
 -- query 3
+-- @skip_result_check=true
+SET cbo_broadcast_node_mem_budget_bytes = 1073741824;
+
+-- query 4
 -- @order_sensitive=true
 -- @explain_contains=HASH JOIN (BROADCAST, INNER
-WITH deep AS (SELECT id, [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[id]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]] AS value FROM ${case_db}.deep_seed)
 SELECT l.id, r.value AS deep_value
-FROM deep l JOIN [broadcast] deep r ON l.id = r.id
+FROM ${case_db}.deep_seed l JOIN [broadcast] (SELECT id, [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[id]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]] AS value FROM ${case_db}.deep_seed) r ON l.id = r.id
 ORDER BY l.id;
