@@ -48,7 +48,7 @@ pub(crate) use application::{
     metadata_list_tables_with_planning_lease_async, metadata_namespace_exists_async,
     metadata_read_reference_facts_with_planning_lease_async,
     metadata_table_exists_with_planning_lease_async, query_connector_request_context_on_runtime,
-    sql_column_from_connector_binding,
+    require_current_write_authority, sql_column_from_connector_binding,
 };
 pub use unified_statistics::UnifiedStatisticsResolver;
 

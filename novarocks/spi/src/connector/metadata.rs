@@ -1349,6 +1349,9 @@ impl CatalogLayoutError {
 pub enum ConnectorTableResolution {
     StrictBaseTable,
     ProviderReadAlias,
+    /// Read-only base-table metadata at one exact snapshot. The selected
+    /// snapshot schema must be used before SQL binds columns or expands `*`.
+    HistoricalSnapshot(i64),
 }
 
 #[derive(Clone)]

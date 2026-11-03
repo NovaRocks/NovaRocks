@@ -231,9 +231,37 @@ pub struct FileReadRequest {
     pub context: FileReadContext,
 }
 
+/// How a file reader interprets optional Arrow schema metadata in a Parquet footer.
+///
+/// Table formats select this policy explicitly; it never changes raw physical
+/// facts, including field IDs or ordered key/value metadata. The version is part
+/// of the interpretation cache identity.
+// Design: ADR-0213 (docs/adr/ADR-0213-iceberg-read-interpretation-and-current-write-authority.md)
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ParquetInterpretationPolicy {
+    #[default]
+    UseArrowHint,
+    SkipArrowHint,
+}
+
+impl ParquetInterpretationPolicy {
+    pub(crate) fn cache_identity(self) -> &'static [u8] {
+        match self {
+            Self::UseArrowHint => b"arrow-hint/use/v1",
+            Self::SkipArrowHint => b"arrow-hint/skip/v1",
+        }
+    }
+
+    pub(crate) fn arrow_options(self) -> parquet::arrow::arrow_reader::ArrowReaderOptions {
+        parquet::arrow::arrow_reader::ArrowReaderOptions::new()
+            .with_skip_arrow_metadata(self == Self::SkipArrowHint)
+    }
+}
+
 /// Reader-open policy that remains local to the neutral filesystem boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileReaderOptions {
+    pub parquet_interpretation_policy: ParquetInterpretationPolicy,
     pub enable_parquet_reader_page_index: bool,
     pub coalesce_reads: bool,
     pub coalesce_max_bytes: u64,
@@ -243,6 +271,7 @@ pub struct FileReaderOptions {
 impl Default for FileReaderOptions {
     fn default() -> Self {
         Self {
+            parquet_interpretation_policy: ParquetInterpretationPolicy::UseArrowHint,
             enable_parquet_reader_page_index: false,
             coalesce_reads: true,
             coalesce_max_bytes: 8 * 1024 * 1024,

@@ -152,13 +152,13 @@ fn corrupt<T>(message: String) -> Result<T, ConnectorError> {
 
 /// Derives the planning facts exposed by `ConnectorMetadata::load_table`.
 ///
-/// The serialized metadata is parsed only inside the Iceberg provider.  The
-/// returned facts intentionally contain no table UUID, snapshot, file, or
-/// provider payload detail.
+/// The provider borrows the already-loaded table metadata. The returned facts
+/// intentionally contain no table UUID, snapshot, file, or provider payload
+/// detail.
 pub struct IcebergTablePlanningFactsInput<'a> {
     pub schema: &'a SchemaRef,
-    /// Authoritative Iceberg schema behind `schema`, used only to read each
-    /// column's write default.
+    /// Authoritative Iceberg schema behind the selected read schema. Current
+    /// metadata also uses it for write defaults and target representations.
     ///
     /// Metadata tables have a synthetic Arrow schema with no Iceberg column
     /// behind it, so they pass `None` and expose no write defaults.
@@ -167,22 +167,32 @@ pub struct IcebergTablePlanningFactsInput<'a> {
     pub hidden_columns: &'a [String],
     pub(crate) nominal_declarations:
         &'a crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
-    pub serialized_metadata: Option<&'a str>,
+    /// The already-loaded physical table facts. Retained historical schemas
+    /// must not be reparsed through a separate JSON interpretation boundary.
+    pub table_metadata: Option<&'a crate::iceberg::spec::TableMetadata>,
     pub namespace: &'a Arc<str>,
     pub instance_id: &'a ConnectorInstanceId,
     pub context: &'a ConnectorRequestContext,
 }
 
-struct TablePlanningColumns {
+struct TablePlanningColumns<'a> {
     column_facts: Vec<ConnectorTableColumnPlanningFact>,
     unique_constraints: Vec<ConnectorTableUniqueConstraint>,
     foreign_key_constraints: Vec<ConnectorTableForeignKeyConstraint>,
-    metadata: Option<crate::iceberg::spec::TableMetadata>,
+    metadata: Option<&'a crate::iceberg::spec::TableMetadata>,
 }
 
-fn table_planning_columns(
-    input: &IcebergTablePlanningFactsInput<'_>,
-) -> Result<TablePlanningColumns, ConnectorError> {
+// Design: ADR-0213 (docs/adr/ADR-0213-iceberg-read-interpretation-and-current-write-authority.md)
+#[derive(Clone, Copy)]
+enum PlanningAuthority {
+    Current,
+    HistoricalRead,
+}
+
+fn table_planning_columns<'a>(
+    input: &IcebergTablePlanningFactsInput<'a>,
+    authority: PlanningAuthority,
+) -> Result<TablePlanningColumns<'a>, ConnectorError> {
     let column_facts = input
         .schema
         .fields()
@@ -224,9 +234,22 @@ fn table_planning_columns(
             } else {
                 ConnectorTableColumnRole::Ordinary
             };
-            let write_default = iceberg_write_default(input.iceberg_schema, field.name())?;
-            let write_target_type =
-                iceberg_write_target_type(input.iceberg_schema, field.name(), field.data_type());
+            // A selected snapshot supplies read facts, never authority to
+            // write through its historical defaults or target representation.
+            let (write_default, write_target_type) = match authority {
+                PlanningAuthority::Current => {
+                    let current_schema = input.iceberg_schema.and_then(|_| {
+                        input
+                            .table_metadata
+                            .map(|metadata| metadata.current_schema().as_ref())
+                    });
+                    (
+                        iceberg_write_default(current_schema, field.name())?,
+                        iceberg_write_target_type(current_schema, field.name(), field.data_type()),
+                    )
+                }
+                PlanningAuthority::HistoricalRead => (None, None),
+            };
             Ok(ConnectorTableColumnPlanningFact::new(
                 u32::try_from(ordinal).map_err(|_| {
                     ConnectorError::new(
@@ -242,9 +265,7 @@ fn table_planning_columns(
             .with_write_target_type(write_target_type))
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
-    let metadata = input.serialized_metadata.and_then(|serialized| {
-        serde_json::from_str::<crate::iceberg::spec::TableMetadata>(serialized).ok()
-    });
+    let metadata = input.table_metadata;
     let (unique_constraints, foreign_key_constraints) = metadata
         .as_ref()
         .map(|metadata| {
@@ -272,14 +293,19 @@ pub fn table_planning_facts(
         unique_constraints,
         foreign_key_constraints,
         metadata,
-    } = table_planning_columns(&input)?;
+    } = table_planning_columns(&input, PlanningAuthority::Current)?;
     let partition_source_column_ordinals = match (metadata.as_ref(), input.iceberg_schema) {
-        (Some(metadata), Some(iceberg_schema)) => {
-            iceberg_partition_source_ordinals(metadata, iceberg_schema, input.schema)?
+        (Some(metadata), Some(_)) => {
+            iceberg_partition_source_ordinals(metadata, metadata.current_schema(), input.schema)?
+        }
+        (None, Some(_)) => {
+            return corrupt(
+                "Current Iceberg planning facts require loaded table metadata".to_owned(),
+            );
         }
         // A metadata table has no Iceberg schema behind its synthetic Arrow
         // schema, and therefore no partitioning to report.
-        _ => Vec::new(),
+        (_, None) => Vec::new(),
     };
     ConnectorTablePlanningFacts::try_new(
         input.schema,
@@ -291,12 +317,13 @@ pub fn table_planning_facts(
     )
 }
 
-/// Snapshot source columns retain complete schema/default/constraint facts,
-/// without claiming the table's Current default partition membership.
+/// Snapshot source columns retain selected read schema and constraint facts.
+/// Current write defaults, target types and partition membership are not
+/// applicable to this projection.
 pub(crate) fn snapshot_source_planning_facts(
     input: IcebergTablePlanningFactsInput<'_>,
 ) -> Result<ConnectorTablePlanningFacts, ConnectorError> {
-    let facts = table_planning_columns(&input)?;
+    let facts = table_planning_columns(&input, PlanningAuthority::HistoricalRead)?;
     ConnectorTablePlanningFacts::try_new_snapshot_source(
         input.schema,
         facts.column_facts,
@@ -562,6 +589,26 @@ mod tests {
         .expect("valid request context")
     }
 
+    fn unpartitioned_metadata(
+        schema: &crate::iceberg::spec::Schema,
+    ) -> crate::iceberg::spec::TableMetadata {
+        use crate::iceberg::spec::{FormatVersion, PartitionSpec, SortOrder, TableMetadataBuilder};
+        TableMetadataBuilder::new(
+            schema.clone(),
+            PartitionSpec::builder(Arc::new(schema.clone()))
+                .build()
+                .unwrap(),
+            SortOrder::builder().build_unbound().unwrap(),
+            "file:///planning-facts".to_owned(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata
+    }
+
     #[test]
     fn maps_frozen_iceberg_columns_without_provider_identity() {
         let mut hidden_metadata = std::collections::HashMap::new();
@@ -587,6 +634,7 @@ mod tests {
             ))])
             .build()
             .unwrap();
+        let metadata = unpartitioned_metadata(&source_schema);
         let namespace = Arc::from("db");
         let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
         let context = context();
@@ -596,7 +644,7 @@ mod tests {
             metadata_columns: &metadata_columns,
             hidden_columns: &[],
             nominal_declarations: &nominal_declarations,
-            serialized_metadata: None,
+            table_metadata: Some(&metadata),
             namespace: &namespace,
             instance_id: &instance_id,
             context: &context,
@@ -698,13 +746,14 @@ mod tests {
         let namespace = Arc::from("db");
         let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
         let context = context();
+        let metadata = iceberg_schema.map(unpartitioned_metadata);
         table_planning_facts(IcebergTablePlanningFactsInput {
             schema: arrow_schema,
             iceberg_schema,
             metadata_columns: &[],
             hidden_columns: &[],
             nominal_declarations: &BTreeMap::new(),
-            serialized_metadata: None,
+            table_metadata: metadata.as_ref(),
             namespace: &namespace,
             instance_id: &instance_id,
             context: &context,
@@ -735,24 +784,22 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_sources_preserve_defaults_and_original_default_errors() {
+    fn snapshot_sources_do_not_interpret_historical_write_defaults_or_target_types() {
         use crate::iceberg::spec::{Literal, PrimitiveType, Type};
         let namespace = Arc::from("db");
         let instance_id = ConnectorInstanceId::parse("ice").unwrap();
         let request = context();
         let nominal = BTreeMap::new();
-        for (kind, literal, arrow, expected) in [
+        for (kind, literal, arrow) in [
             (
                 Type::Primitive(PrimitiveType::String),
                 Literal::string("fallback"),
                 DataType::Utf8,
-                true,
             ),
             (
                 Type::Variant(crate::iceberg::spec::VariantType),
                 Literal::string("not-a-variant"),
-                DataType::LargeBinary,
-                false,
+                DataType::Utf8,
             ),
         ] {
             let iceberg_schema = write_default_schema(kind, literal);
@@ -766,24 +813,17 @@ mod tests {
                 metadata_columns: &[],
                 hidden_columns: &[],
                 nominal_declarations: &nominal,
-                serialized_metadata: None,
+                table_metadata: None,
                 namespace: &namespace,
                 instance_id: &instance_id,
                 context: &request,
             });
-            if expected {
-                let facts = result.unwrap();
-                assert_eq!(facts.column_facts().len(), 2);
-                assert_eq!(
-                    facts.column_facts()[0].write_default(),
-                    Some(&ConnectorColumnDefault::String(Arc::from("fallback")))
-                );
-                assert_eq!(facts.partition_source_column_ordinals(), None);
-            } else {
-                let error = result.unwrap_err();
-                assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-                assert!(error.message().contains("with_default"));
-            }
+            let facts = result.unwrap();
+            assert_eq!(facts.column_facts().len(), 2);
+            assert!(facts.column_facts().iter().all(|fact| {
+                fact.write_default().is_none() && fact.write_target_type().is_none()
+            }));
+            assert_eq!(facts.partition_source_column_ordinals(), None);
         }
     }
 
@@ -970,7 +1010,6 @@ mod tests {
         .build()
         .expect("metadata")
         .metadata;
-        let serialized = serde_json::to_string(&metadata).expect("serialize metadata");
 
         let arrow_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, true),
@@ -985,7 +1024,7 @@ mod tests {
             metadata_columns: &[],
             hidden_columns: &[],
             nominal_declarations: &BTreeMap::new(),
-            serialized_metadata: Some(&serialized),
+            table_metadata: Some(&metadata),
             namespace: &namespace,
             instance_id: &instance_id,
             context: &context,
@@ -993,6 +1032,116 @@ mod tests {
         .expect("planning facts");
 
         assert_eq!(facts.partition_source_column_ordinals(), Some(&[1][..]));
+    }
+
+    #[test]
+    fn current_physical_table_cannot_invent_partition_authority_without_metadata() {
+        let iceberg = write_target_type_schema();
+        let arrow = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let namespace = Arc::from("db");
+        let instance = ConnectorInstanceId::parse("ice").unwrap();
+        let error = table_planning_facts(IcebergTablePlanningFactsInput {
+            schema: &arrow,
+            iceberg_schema: Some(&iceberg),
+            metadata_columns: &[],
+            hidden_columns: &[],
+            nominal_declarations: &BTreeMap::new(),
+            table_metadata: None,
+            namespace: &namespace,
+            instance_id: &instance,
+            context: &context(),
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(error.message().contains("require loaded table metadata"));
+    }
+
+    #[test]
+    fn current_partition_facts_preserve_loaded_metadata_with_deep_schema_history() {
+        use crate::iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema as IcebergSchema,
+            SortOrder, StructType, TableMetadataBuilder, Transform, Type,
+        };
+        let mut deep = Type::Primitive(PrimitiveType::Int);
+        for id in (3..=65).rev() {
+            deep = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+                id,
+                format!("n{}", id - 2),
+                deep,
+            ))]));
+        }
+        let region = Arc::new(NestedField::optional(
+            1,
+            "region",
+            PrimitiveType::String.into(),
+        ));
+        let original = Arc::new(
+            IcebergSchema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    region.clone(),
+                    Arc::new(NestedField::optional(2, "deep", deep)),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition = PartitionSpec::builder(original.clone())
+            .add_partition_field("region", "region_part", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            original.as_ref().clone(),
+            partition,
+            SortOrder::builder().build_unbound().unwrap(),
+            "file:///deep-history".to_owned(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let current = IcebergSchema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![region])
+            .build()
+            .unwrap();
+        let metadata = metadata
+            .into_builder(None)
+            .add_current_schema(current)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert!(
+            metadata
+                .schemas_iter()
+                .any(|schema| schema.field_by_name("deep").is_some())
+        );
+        assert!(metadata.current_schema().field_by_name("deep").is_none());
+        // Current partition authority is defined by the loaded current schema
+        // and default spec, independently of retained historical schema depth.
+        let arrow = Arc::new(Schema::new(vec![Field::new(
+            "region",
+            DataType::Utf8,
+            true,
+        )]));
+        let namespace = Arc::from("db");
+        let instance = ConnectorInstanceId::parse("ice").unwrap();
+        let facts = table_planning_facts(IcebergTablePlanningFactsInput {
+            schema: &arrow,
+            iceberg_schema: Some(metadata.current_schema()),
+            metadata_columns: &[],
+            hidden_columns: &[],
+            nominal_declarations: &BTreeMap::new(),
+            table_metadata: Some(&metadata),
+            namespace: &namespace,
+            instance_id: &instance,
+            context: &context(),
+        })
+        .unwrap();
+        assert_eq!(facts.partition_source_column_ordinals(), Some(&[0][..]));
     }
 
     #[test]
@@ -1032,7 +1181,6 @@ mod tests {
         .build()
         .expect("metadata")
         .metadata;
-        let serialized = serde_json::to_string(&metadata).expect("serialize metadata");
 
         // The frozen Arrow schema is missing the partition source column, which
         // is an inconsistent table rather than an unpartitioned one.
@@ -1050,7 +1198,7 @@ mod tests {
             metadata_columns: &[],
             hidden_columns: &[],
             nominal_declarations: &BTreeMap::new(),
-            serialized_metadata: Some(&serialized),
+            table_metadata: Some(&metadata),
             namespace: &namespace,
             instance_id: &instance_id,
             context: &context,

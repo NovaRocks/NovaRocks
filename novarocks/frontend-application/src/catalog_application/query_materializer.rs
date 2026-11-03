@@ -34,7 +34,6 @@ use crate::catalog_application::query_bindings::{
 use crate::catalog_application::query_catalog::{
     CatalogResolutionError, CatalogResolutionResult, ConnectorQueryTableMaterialization,
     QueryCatalogService, load_connector_table_alias_materialization_with_lease_typed,
-    load_connector_table_materialization_with_lease_typed,
 };
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::catalog::{
@@ -829,7 +828,10 @@ impl CatalogServiceMaterializer<'_> {
                     .unwrap_or((&relation.table, None));
                 (
                     table.to_string(),
-                    novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                    snapshot.map_or(
+                        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                        novarocks_spi::connector::ConnectorTableResolution::HistoricalSnapshot,
+                    ),
                     snapshot,
                 )
             }
@@ -1123,17 +1125,20 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             crate::catalog_application::query_bindings::parse_time_travel_overlay_identity(table)
                 .map(|(base_table, snapshot_id)| (base_table, Some(snapshot_id)))
                 .unwrap_or((table, None));
-        let mut materialization = load_connector_table_materialization_with_lease_typed(
+        // SQL must see the selected snapshot's schema before it binds columns.
+        // Replacing only read_selector after a Current load leaves `*` stale.
+        let resolution = snapshot_id.map_or(
+            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            novarocks_spi::connector::ConnectorTableResolution::HistoricalSnapshot,
+        );
+        let materialization = crate::catalog_application::query_catalog::load_connector_table_materialization_with_resolution_typed(
             self.controls,
             self.connector_context.clone(),
             catalog,
             namespace,
             base_table,
+            resolution,
         )?;
-        if let Some(snapshot_id) = snapshot_id {
-            materialization.read_selector =
-                novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot_id);
-        }
         connector_query_binding_from_materialization(
             materialization,
             catalog,
@@ -1192,14 +1197,13 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
                 )
                 .map(|(base, snapshot)| (base, Some(snapshot)))
                 .unwrap_or((table, None));
-            let mut materialization = crate::catalog_application::query_catalog::load_connector_table_materialization_with_resolution_async(
+            let materialization = crate::catalog_application::query_catalog::load_connector_table_materialization_with_resolution_async(
                 self.controls, self.connector_context.clone(), catalog, namespace, base_table,
-                novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                snapshot_id.map_or(
+                    novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                    novarocks_spi::connector::ConnectorTableResolution::HistoricalSnapshot,
+                ),
             ).await?;
-            if let Some(snapshot) = snapshot_id {
-                materialization.read_selector =
-                    novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot);
-            }
             Ok(PreparedQueryTableBinding {
                 materialization,
                 catalog: catalog.to_string(),

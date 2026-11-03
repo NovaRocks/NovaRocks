@@ -378,9 +378,14 @@ fn awaited_footer_and_page_indexes_read_what_the_blocking_path_reads() {
         }
         if awaited {
             handle.block_on(async {
-                let inspection = inspect_parquet_metadata_async(file, None, context)
-                    .await
-                    .expect("inspect");
+                let inspection = inspect_parquet_metadata_async(
+                    file,
+                    None,
+                    context,
+                    novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+                )
+                .await
+                .expect("inspect");
                 let footer_reads = spawner.spawned.load(Ordering::SeqCst);
                 if page_indexes {
                     let mut reader = open_file_reader_async(request, Some(&inspection))
@@ -391,7 +396,13 @@ fn awaited_footer_and_page_indexes_read_what_the_blocking_path_reads() {
                 (footer_reads, spawner.spawned.load(Ordering::SeqCst))
             })
         } else {
-            let inspection = inspect_parquet_metadata(file, None, context).expect("inspect");
+            let inspection = inspect_parquet_metadata(
+                file,
+                None,
+                context,
+                novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+            )
+            .expect("inspect");
             let footer_reads = spawner.spawned.load(Ordering::SeqCst);
             if page_indexes {
                 let mut reader = novarocks_fs::open_file_reader_with_parquet_inspection(
@@ -427,6 +438,7 @@ fn a_decoder_request_s_ranges_run_concurrently_and_land_in_order() {
         large.file.clone(),
         None,
         request_through(&large.file, &handle, plain, None).context,
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
     )
     .expect("inspect");
     let gated = OrderedGateSpawner::new(handle.clone(), true);
@@ -483,6 +495,7 @@ fn a_failed_range_stops_its_sibling_and_the_error_wins() {
         large.file.clone(),
         None,
         request_through(&large.file, &handle, plain, None).context,
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
     )
     .expect("inspect");
     let gated = OrderedGateSpawner::new(handle.clone(), true);
@@ -543,9 +556,14 @@ fn concurrent_ranges_of_a_small_file_share_one_whole_file_read() {
     request.options.coalesce_reads = false;
     let context = request.context.clone();
     let rows = handle.block_on(async {
-        let inspection = inspect_parquet_metadata_async(fixture.file.clone(), None, context)
-            .await
-            .expect("inspect");
+        let inspection = inspect_parquet_metadata_async(
+            fixture.file.clone(),
+            None,
+            context,
+            novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+        )
+        .await
+        .expect("inspect");
         let mut reader = open_file_reader_async(request, Some(&inspection))
             .await
             .expect("open");

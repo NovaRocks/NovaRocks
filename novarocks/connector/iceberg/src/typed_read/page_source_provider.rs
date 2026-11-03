@@ -183,6 +183,7 @@ impl IcebergPreparedPageSource {
             file.clone(),
             input.clone(),
             self.context.clone(),
+            novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint,
         )
         .map_err(map_file_error)?;
         self.footers.remember(inspection.clone())?;
@@ -819,7 +820,8 @@ mod tests {
         ));
     }
 
-    /// A one-row-group file whose staged preparation reached Ready: the
+    /// A one-row-group Iceberg file with a bad final Arrow hint. Preparation
+    /// and the promoted page-index reader must retain the real field identity;
     /// preparation holds the whole file as the split's input.
     fn staged_small_file() -> (
         tokio::runtime::Runtime,
@@ -849,6 +851,10 @@ mod tests {
                 .expect("batch"),
             )
             .expect("write data");
+        writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            parquet::arrow::ARROW_SCHEMA_META_KEY.to_owned(),
+            "not-an-arrow-schema".to_owned(),
+        ));
         writer.close().expect("close writer");
         let file_size = std::fs::metadata(&path).expect("stat data file").len();
         assert!(file_size < novarocks_fs::SMALL_FILE_PROBE_MAX_BYTES);
@@ -932,7 +938,13 @@ mod tests {
         let provider = IcebergPageSourceProvider::new(
             binding,
             context,
-            IcebergPageSourceProviderOptions::with_default_budget(),
+            IcebergPageSourceProviderOptions {
+                reader_options: FileReaderOptions {
+                    enable_parquet_reader_page_index: true,
+                    ..Default::default()
+                },
+                ..IcebergPageSourceProviderOptions::with_default_budget()
+            },
         );
         let mut prepared = IcebergPreparedPageSource {
             table,
@@ -959,7 +971,29 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(prepared.failure.is_none());
-        assert!(prepared.footer.is_some());
+        let footer = prepared.footer.as_ref().expect("prepared footer");
+        assert_eq!(
+            footer.interpretation_policy(),
+            novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint,
+        );
+        assert_eq!(footer.physical_columns()[0].field_id(), Some(1));
+        assert_eq!(
+            footer
+                .schema()
+                .field(0)
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"1".to_owned()),
+        );
+        let last_hint = footer
+            .raw_metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .expect("footer metadata")
+            .iter()
+            .rfind(|entry| entry.key == parquet::arrow::ARROW_SCHEMA_META_KEY)
+            .expect("Arrow hint");
+        assert_eq!(last_hint.value.as_deref(), Some("not-an-arrow-schema"));
         assert_eq!(prepared.control.retained_input_bytes(), file_size);
         (runtime, directory, prepared, file_size)
     }

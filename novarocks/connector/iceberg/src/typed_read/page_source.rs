@@ -675,8 +675,13 @@ impl ParquetFooterCache {
         if let Some(cached) = self.lock()?.get(&key) {
             return Ok(cached.clone());
         }
-        let inspection =
-            inspect_parquet_metadata(file, None, context.clone()).map_err(map_file_error)?;
+        let inspection = inspect_parquet_metadata(
+            file,
+            None,
+            context.clone(),
+            novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint,
+        )
+        .map_err(map_file_error)?;
         self.lock()?.insert(key, inspection.clone());
         Ok(inspection)
     }
@@ -697,9 +702,14 @@ impl ParquetFooterCache {
         if let Some(cached) = self.lock()?.get(&key) {
             return Ok(cached.clone());
         }
-        let inspection = novarocks_fs::inspect_parquet_metadata_async(file, None, context.clone())
-            .await
-            .map_err(map_file_error)?;
+        let inspection = novarocks_fs::inspect_parquet_metadata_async(
+            file,
+            None,
+            context.clone(),
+            novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint,
+        )
+        .await
+        .map_err(map_file_error)?;
         self.lock()?.insert(key, inspection.clone());
         Ok(inspection)
     }
@@ -708,6 +718,13 @@ impl ParquetFooterCache {
     /// A later demanded reader reuses this exact snapshot through the normal
     /// file/domain lookup rather than issuing a second footer request.
     pub fn remember(&self, inspection: ParquetMetadataInspection) -> Result<(), ConnectorError> {
+        if inspection.interpretation_policy()
+            != novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint
+        {
+            return Err(invalid(
+                "Iceberg footer requires the provider's Arrow hint policy",
+            ));
+        }
         let key = (inspection.access_domain(), inspection.identity().clone());
         self.lock()?.entry(key).or_insert(inspection);
         Ok(())
@@ -1164,6 +1181,7 @@ pub(super) fn plan_iceberg_prepared_input(
     // An incomplete runtime filter can arrive after preparation. Page-index
     // work here would embody an early predicate decision; use conservative
     // column ranges, leaving exact pages to the active decoder.
+    reader_options = crate::file_reader::iceberg_reader_options(reader_options);
     reader_options.enable_parquet_reader_page_index = false;
     let request = FileReadRequest {
         file: file.clone(),
@@ -1863,7 +1881,7 @@ impl IcebergParquetPageSource {
                 }),
                 pages: Vec::new(),
             },
-            options: self.reader_options,
+            options: crate::file_reader::iceberg_reader_options(self.reader_options),
             cache: self.cache.clone(),
             prepared_input: self.prepared_input.take(),
             context: self.context.clone(),

@@ -187,7 +187,14 @@ impl IcebergMetadata {
     fn require_current_table_object_selector(
         &self,
         selector: ConnectorTableObjectSelector,
+        resolution: ConnectorTableResolution,
     ) -> Result<(), ConnectorError> {
+        if matches!(resolution, ConnectorTableResolution::HistoricalSnapshot(_)) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Current table object binding cannot use historical metadata",
+            ));
+        }
         match selector {
             ConnectorTableObjectSelector::Current => Ok(()),
             _ => Err(ConnectorError::new(
@@ -740,7 +747,7 @@ impl ConnectorMetadata for IcebergMetadata {
         &self,
         request: ConnectorTableObjectCaptureRequest,
     ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
-        self.require_current_table_object_selector(request.selector)?;
+        self.require_current_table_object_selector(request.selector, request.resolution)?;
         self.current_table_object_binding(request.table, request.resolution, request.context)
     }
 
@@ -755,7 +762,7 @@ impl ConnectorMetadata for IcebergMetadata {
         >,
     > {
         Box::pin(async move {
-            self.require_current_table_object_selector(request.selector)?;
+            self.require_current_table_object_selector(request.selector, request.resolution)?;
             self.current_table_object_binding_async(
                 request.table,
                 request.resolution,
@@ -769,7 +776,7 @@ impl ConnectorMetadata for IcebergMetadata {
         &self,
         request: ConnectorTableObjectRebindRequest,
     ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
-        self.require_current_table_object_selector(request.selector)?;
+        self.require_current_table_object_selector(request.selector, request.resolution)?;
         let expected_object_id = request.expected_object_id;
         let binding = self
             .current_table_object_binding(request.table, request.resolution, request.context)
@@ -803,7 +810,7 @@ impl ConnectorMetadata for IcebergMetadata {
         >,
     > {
         Box::pin(async move {
-            self.require_current_table_object_selector(request.selector)?;
+            self.require_current_table_object_selector(request.selector, request.resolution)?;
             let expected_object_id = request.expected_object_id;
             let binding = self
                 .current_table_object_binding_async(
@@ -845,7 +852,7 @@ impl ConnectorMetadata for IcebergMetadata {
         >,
     > {
         Box::pin(async move {
-            self.require_current_table_object_selector(request.selector)?;
+            self.require_current_table_object_selector(request.selector, request.resolution)?;
             let preparation = self
                 .prepare_table(ConnectorTableRequest {
                     table: request.table,
@@ -887,7 +894,9 @@ impl ConnectorMetadata for IcebergMetadata {
                 ))
             });
         }
-        if let Err(error) = self.require_current_table_object_selector(request.selector) {
+        if let Err(error) =
+            self.require_current_table_object_selector(request.selector, request.resolution)
+        {
             return Box::pin(async move { Err(error) });
         }
         let source = crate::catalog_control::statistics::scoped_cpu::scoped_capture::MetadataCaptureOriginal::new(
@@ -1003,10 +1012,14 @@ impl ConnectorMetadata for IcebergMetadata {
         self.runtime
             .control_state()
             .invalidate_table(&request.table.namespace, &table_name);
-        let snapshots = if metadata_table_type.is_none() {
-            crate::catalog::SnapshotLoading::Refs
-        } else {
+        let snapshots = if metadata_table_type.is_some()
+            || matches!(
+                request.resolution,
+                ConnectorTableResolution::HistoricalSnapshot(_)
+            ) {
             crate::catalog::SnapshotLoading::All
+        } else {
+            crate::catalog::SnapshotLoading::Refs
         };
         let loaded = self
             .runtime
@@ -1059,7 +1072,7 @@ impl IcebergMetadata {
         expected: Option<ConnectorTableObjectId>,
         cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
     ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
-        self.require_current_table_object_selector(selector)?;
+        self.require_current_table_object_selector(selector, resolution)?;
         let preparation = self
             .prepare_table(ConnectorTableRequest {
                 table,
@@ -1160,7 +1173,12 @@ impl IcebergMetadata {
         self.runtime
             .control_state()
             .invalidate_table(&request.table.namespace, &table_name);
-        let snapshots = if source_observation || metadata_table_type.is_some() {
+        let snapshots = if source_observation
+            || metadata_table_type.is_some()
+            || matches!(
+                request.resolution,
+                ConnectorTableResolution::HistoricalSnapshot(_)
+            ) {
             crate::catalog::SnapshotLoading::All
         } else {
             crate::catalog::SnapshotLoading::Refs
@@ -1265,6 +1283,13 @@ impl IcebergMetadata {
             snapshots,
             ..
         } = facts;
+        let projection = match request.resolution {
+            ConnectorTableResolution::HistoricalSnapshot(snapshot) => {
+                TableMetadataProjection::SnapshotTo(snapshot)
+            }
+            ConnectorTableResolution::StrictBaseTable
+            | ConnectorTableResolution::ProviderReadAlias => TableMetadataProjection::Current,
+        };
         build_table_metadata(
             TableMetadataBuildInput {
                 descriptor: &self.descriptor,
@@ -1274,7 +1299,7 @@ impl IcebergMetadata {
                 table_name,
                 metadata_table_type,
                 snapshots,
-                projection: TableMetadataProjection::Current,
+                projection,
             },
             creation,
         )
@@ -1282,7 +1307,8 @@ impl IcebergMetadata {
 }
 
 /// The read projection is separate from the real metadata used by control
-/// handles. Snapshot sources never supply Current write partition membership.
+/// handles. Snapshot sources never supply Current write defaults, target types
+/// or partition membership.
 #[derive(Clone, Copy)]
 pub(crate) enum TableMetadataProjection {
     Current,
@@ -1419,10 +1445,7 @@ pub(crate) fn build_table_metadata(
             metadata_columns: &payload.metadata_columns,
             hidden_columns: &payload.hidden_columns,
             nominal_declarations: &nominal_document.nominals,
-            serialized_metadata: payload
-                .table_info
-                .as_ref()
-                .and_then(|table| table.serialized_metadata.as_deref()),
+            table_metadata: Some(metadata),
             namespace: &request.table.namespace,
             instance_id: &descriptor.instance_id,
             context: &request.context,
@@ -2410,11 +2433,19 @@ fn resolve_table_request(
         parse_metadata_table_type(suffix).map(|metadata_type| (table.to_string(), metadata_type))
     });
     match (resolution, alias) {
-        (ConnectorTableResolution::StrictBaseTable, Some(_)) => Err(ConnectorError::new(
+        (
+            ConnectorTableResolution::StrictBaseTable
+            | ConnectorTableResolution::HistoricalSnapshot(_),
+            Some(_),
+        ) => Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
             "strict Iceberg table resolution does not accept metadata aliases",
         )),
-        (ConnectorTableResolution::StrictBaseTable, None) => Ok((requested.to_string(), None)),
+        (
+            ConnectorTableResolution::StrictBaseTable
+            | ConnectorTableResolution::HistoricalSnapshot(_),
+            None,
+        ) => Ok((requested.to_string(), None)),
         (ConnectorTableResolution::ProviderReadAlias, Some(alias)) => Ok((alias.0, Some(alias.1))),
         (ConnectorTableResolution::ProviderReadAlias, None) => Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
@@ -2917,6 +2948,20 @@ mod plan_splits_pruning_tests {
             alias.resolution = ConnectorTableResolution::ProviderReadAlias;
             let Err(error) = metadata.prepare_source_table(alias).await else { panic!("source observation cannot use a catalog alias"); };
             assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            let mut historical = request.clone();
+            historical.resolution = ConnectorTableResolution::HistoricalSnapshot(101);
+            let observed = metadata.prepare_table(historical.clone()).await.unwrap();
+            let facts = observed.into_facts::<IcebergPreparedTableFacts>(&metadata.descriptor.instance_id).unwrap();
+            assert_eq!(facts.snapshots, crate::catalog::SnapshotLoading::All);
+            let Err(error) = metadata.prepare_source_table(historical.clone()).await else {
+                panic!("an original Current source observation cannot become Historical");
+            };
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            let Err(error) = metadata.capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
+                table: historical.table, resolution: historical.resolution,
+                selector: ConnectorTableObjectSelector::Current, context: historical.context,
+            }).await else { panic!("a Historical schema cannot supply a Current object binding"); };
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
             let first = metadata
                 .capture_table_object_binding_async(ConnectorTableObjectCaptureRequest {
                     table: request.table.clone(),
@@ -3185,27 +3230,29 @@ mod plan_splits_pruning_tests {
             resolution: ConnectorTableResolution::StrictBaseTable,
             context: context(),
         };
-        let build = |projection| {
+        let build = |resolution| {
+            let mut request = request.clone();
+            request.resolution = resolution;
             with_pure_schema_creation(&request.context, |creation| {
-                build_table_metadata(
-                    TableMetadataBuildInput {
-                        descriptor: &provider.descriptor,
-                        incarnation: provider.incarnation,
-                        request: request.clone(),
-                        loaded: physical.clone(),
-                        table_name: "t".to_string(),
-                        metadata_table_type: None,
-                        snapshots: crate::catalog::SnapshotLoading::All,
-                        projection,
-                    },
-                    creation,
-                )
-                .map_err(metadata_creation_error)
+                provider
+                    .create_table_from_observation(
+                        IcebergPreparedTableFacts {
+                            request: request.clone(),
+                            loaded: physical.clone(),
+                            table_name: "t".to_string(),
+                            metadata_table_type: None,
+                            snapshots: crate::catalog::SnapshotLoading::All,
+                            incarnation: provider.incarnation,
+                            generation_owner: Arc::clone(&provider.generation_owner),
+                        },
+                        creation,
+                    )
+                    .map_err(metadata_creation_error)
             })
             .unwrap()
         };
-        let to = build(TableMetadataProjection::SnapshotTo(101));
-        let current = build(TableMetadataProjection::Current);
+        let to = build(ConnectorTableResolution::HistoricalSnapshot(101));
+        let current = build(ConnectorTableResolution::StrictBaseTable);
         let owner = ConnectorProviderBindingKey {
             instance_id: provider.descriptor.instance_id.clone(),
             incarnation: provider.incarnation,
@@ -3356,10 +3403,7 @@ mod plan_splits_pruning_tests {
                 .collect::<Vec<_>>(),
             [0, 1, 2, 3]
         );
-        assert_eq!(
-            to.planning_facts.column_facts()[1].write_default(),
-            Some(&ConnectorColumnDefault::String(Arc::from("old-write")))
-        );
+        assert_eq!(to.planning_facts.column_facts()[1].write_default(), None);
         assert_eq!(
             current.planning_facts.column_facts()[1].write_default(),
             Some(&ConnectorColumnDefault::String(Arc::from("new-write")))
@@ -3368,6 +3412,11 @@ mod plan_splits_pruning_tests {
         assert!(to.schema().field(1).metadata()[initial].contains("old-read"));
         assert!(current.schema().field(1).metadata()[initial].contains("old-read"));
         assert_eq!(to.planning_facts.partition_source_column_ordinals(), None);
+        assert!(
+            to.planning_facts.column_facts().iter().all(|fact| {
+                fact.write_default().is_none() && fact.write_target_type().is_none()
+            })
+        );
         assert_eq!(
             current.planning_facts.partition_source_column_ordinals(),
             Some([0].as_slice())

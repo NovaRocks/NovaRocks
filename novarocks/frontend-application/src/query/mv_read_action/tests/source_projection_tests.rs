@@ -355,29 +355,41 @@ impl SourceFixture {
             .collect();
         let schema = Arc::new(Schema::new(fields));
         let context = crate::connector::test_request_context();
-        let facts = ConnectorTablePlanningFacts::try_new_snapshot_source(
-            &schema,
-            schema
-                .fields()
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    ConnectorTableColumnPlanningFact::new(
-                        u32::try_from(i).unwrap(),
-                        ConnectorTableColumnVisibility::Sql,
-                        ConnectorTableColumnSemanticKind::None,
-                        if source && schema.field(i).name() == "_row_id" {
-                            ConnectorTableColumnRole::RowLineageSystem
-                        } else {
-                            ConnectorTableColumnRole::Ordinary
-                        },
-                    )
-                })
-                .collect(),
-            vec![],
-            vec![],
-            &context,
-        )
+        let column_facts = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                ConnectorTableColumnPlanningFact::new(
+                    u32::try_from(i).unwrap(),
+                    ConnectorTableColumnVisibility::Sql,
+                    ConnectorTableColumnSemanticKind::None,
+                    if source && schema.field(i).name() == "_row_id" {
+                        ConnectorTableColumnRole::RowLineageSystem
+                    } else {
+                        ConnectorTableColumnRole::Ordinary
+                    },
+                )
+            })
+            .collect();
+        let facts = if source {
+            ConnectorTablePlanningFacts::try_new_snapshot_source(
+                &schema,
+                column_facts,
+                vec![],
+                vec![],
+                &context,
+            )
+        } else {
+            ConnectorTablePlanningFacts::try_new(
+                &schema,
+                column_facts,
+                vec![],
+                vec![],
+                vec![],
+                &context,
+            )
+        }
         .unwrap();
         let result = crate::connector::schema_creation::declared_test_metadata_with_creation(
             ConnectorTableMetadataHeader {

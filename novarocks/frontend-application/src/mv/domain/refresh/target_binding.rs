@@ -205,6 +205,7 @@ fn mv_target_physical_write_schema(
     planning_facts: &ConnectorTablePlanningFacts,
     field_ids: &[i32],
 ) -> Result<SchemaRef, String> {
+    crate::connector::require_current_write_authority(planning_facts)?;
     let column_facts = planning_facts.column_facts();
     if !column_facts.is_empty() && column_facts.len() != read_schema.fields().len() {
         return Err(format!(
@@ -349,6 +350,28 @@ mod tests {
         assert_eq!(
             physical.metadata().get("schema-owner").map(String::as_str),
             Some("connector")
+        );
+    }
+
+    #[test]
+    fn physical_write_schema_rejects_historical_read_authority() {
+        let read_schema = Arc::new(Schema::new(vec![Field::new("k1", DataType::Int32, false)]));
+        let facts = ConnectorTablePlanningFacts::try_new_snapshot_source(
+            &read_schema,
+            vec![fact(
+                0,
+                ConnectorTableColumnVisibility::Sql,
+                ConnectorTableColumnRole::Ordinary,
+            )],
+            vec![],
+            vec![],
+            &crate::connector::test_request_context(),
+        )
+        .unwrap();
+        assert!(
+            mv_target_physical_write_schema(&read_schema, &facts, &[1])
+                .unwrap_err()
+                .contains("no current write authority")
         );
     }
 

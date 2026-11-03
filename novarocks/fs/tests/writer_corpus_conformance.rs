@@ -267,8 +267,13 @@ fn assert_writer_via_production_fs(writer: Writer) {
         task_spawner,
         range: None,
     };
-    let inspection = inspect_parquet_metadata(file.clone(), None, context.clone())
-        .expect("production FS metadata inspection");
+    let inspection = inspect_parquet_metadata(
+        file.clone(),
+        None,
+        context.clone(),
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+    )
+    .expect("production FS metadata inspection");
     assert_eq!(
         inspection
             .row_groups()
