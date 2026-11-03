@@ -834,6 +834,7 @@ def attach_entry(owner, env_id, entry, config):
             started = time.monotonic()
             deadline = started + owner.timeout
             inherited = None
+            scope = None
             raw_context = os.environ.get('NOVA_FIXTURE_RUN_CONTEXT')
             if raw_context is not None:
                 if len(raw_context) > 16384:
@@ -843,7 +844,7 @@ def attach_entry(owner, env_id, entry, config):
                 except ValueError as error:
                     raise runtime.RuntimeFailure('RunBudgetRejected', 'invalid inherited run context JSON') from error
             if inherited is not None:
-                from scratch import RunBudget, ScratchIdentity
+                from scratch import RunBudget, RunStorageScope, ScratchIdentity, RUN_STORAGE_ENV
                 if not isinstance(inherited, dict) or 'identity' not in inherited:
                     raise runtime.RuntimeFailure('RunBudgetRejected', 'attach requires the original run context')
                 saved = owner.read_saved_state()
@@ -853,13 +854,22 @@ def attach_entry(owner, env_id, entry, config):
                 budget = RunBudget.admit(saved, identity, inherited=inherited,
                                          wall_clock=time.time, monotonic=time.monotonic)
                 deadline = min(deadline, budget.deadline - budget.cleanup_grace_seconds)
+                raw_scope = os.environ.get(RUN_STORAGE_ENV)
+                if raw_scope is None or len(raw_scope) > 16384:
+                    raise runtime.RuntimeFailure('InvalidScratchScope', 'attach requires its original bounded storage scope')
+                try:
+                    scope = RunStorageScope.from_dict(json.loads(raw_scope)).validate_against(identity, saved)
+                except ValueError as error:
+                    raise runtime.RuntimeFailure('InvalidScratchScope', 'invalid inherited storage scope JSON') from error
             previous = getattr(owner.backend, 'operation_deadline', None)
             owner.backend.operation_deadline = min(previous, deadline) if previous is not None else deadline
             try:
                 # The lock protects configuration publication, not environment health.
                 with owner.operation_snapshot(deadline=deadline,
+                                          expected_generation=scope.machine['generation'] if scope else None,
                                           lock_deadline=time.monotonic() + 2) as snapshot:
                     if inherited is not None:
+                        scope.validate_against(identity, snapshot)
                         RunBudget.admit(snapshot, identity, inherited=inherited,
                                         wall_clock=time.time, monotonic=time.monotonic).check(work=True)
                     return publication.publish(entry, {'worktree': env_id, 'ready': True,
@@ -867,7 +877,7 @@ def attach_entry(owner, env_id, entry, config):
             finally:
                 owner.backend.operation_deadline = previous
         except runtime.RuntimeFailure:
-            # Failed identity/health observation also invalidates discovery.
+            # Failed operation binding also invalidates discovery.
             # Pinned immutable publications stay readable for existing owners.
             unavailable = copy.deepcopy(config)
             publication.publish(entry, {'worktree': env_id, 'ready': False,

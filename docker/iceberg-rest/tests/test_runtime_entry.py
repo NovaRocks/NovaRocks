@@ -470,6 +470,14 @@ class InheritedAttachBudgetTests(RendererCase):
         environment = {**os.environ, 'NOVAROCKS_WORKSPACE_ROOT': str(self.workspace),
             'NOVA_ENV_CONFIG_FILE': str(HERE / 'shared.env'), 'NOVA_ENV_UPDATE_CURRENT': 'false',
             'NOVA_FIXTURE_RUN_CONTEXT': raw_context}
+        try:
+            context = json.loads(raw_context)
+            if isinstance(context, dict) and 'identity' in context:
+                from scratch import RunStorageScope, ScratchIdentity
+                environment['NOVA_FIXTURE_RUN_STORAGE'] = json.dumps(RunStorageScope.from_record(
+                    ScratchIdentity.from_dict(context['identity']), self.snapshot).as_dict())
+        except (ValueError, runtime.RuntimeFailure):
+            pass
         def verified(config):
             config['fixture_inputs'].update(lock_sha256=bom()['lock_sha256'], verified=True)
             return bom()
@@ -492,6 +500,16 @@ class InheritedAttachBudgetTests(RendererCase):
         actual_entry = self.workspace / 'docker/iceberg-rest/runtime' / entry.environment_identity(self.workspace)
         self.assertIsNone(getattr(self.backend, 'operation_deadline', None))
         return code, publication.read(actual_entry), stdout.getvalue(), stderr.getvalue(), health.call_count, image_id.call_count
+
+    def test_inherited_run_cannot_attach_after_its_original_machine_generation_changed(self):
+        changed = copy.deepcopy(self.snapshot)
+        changed['generation'] = 'replacement-generation'
+        self.owner._save(changed)
+        code, published, _, stderr, operation_calls, image_calls = self.invoke(json.dumps(self.context(4)))
+        self.assertEqual(code, 1)
+        self.assertIn('InvalidScratchScope', stderr)
+        self.assertFalse(published['ready'])
+        self.assertEqual((operation_calls, image_calls), (0, 0))
 
     def test_real_cli_env_context_bounds_full_validation_without_rewriting_parent(self):
         original = self.context(4)

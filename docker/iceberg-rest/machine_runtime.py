@@ -1566,7 +1566,10 @@ class MachineOwner:
             state = self.read_saved_state()
             if not state or state["phase"] != "ready" or state["generation"] != expected_generation:
                 raise runtime.RuntimeFailure("MachineUnavailable", "consumer fixture activation is unavailable")
-            self.backend.validate_resources(state)
+            # This operation needs the original network, not unrelated services or volumes.
+            network = self.backend.own_network(state)
+            if not network or (state.get("network_id") and network["Id"] != state["network_id"]):
+                raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "consumer machine network was replaced")
             self.backend.connect(state, container, alias)
 
     def detach_consumer(self, container, expected_machine_identity):

@@ -1350,8 +1350,12 @@ class MachineTests(unittest.TestCase):
         other = machine.MachineOwner(self.owner.root, daemon="other-daemon", backend=self.backend)
         self.assert_code("RuntimeIdentityMismatch", lambda: other.activate(other.required_definition({}, bom())))
         self.assert_code("MachineUnavailable", lambda: self.attach(self.definition(), "stale"))
-        self.owner.attach_consumer("exact-container", "hms", state["generation"])
+        with mock.patch.object(self.backend, "validate_resources", side_effect=AssertionError("whole-machine scan")):
+            self.owner.attach_consumer("exact-container", "hms", state["generation"])
         self.assertEqual(self.backend.events[-1], ("connect", "exact-container", "hms"))
+        with mock.patch.object(self.backend, "own_network", return_value={"Id": "replacement-network"}):
+            self.assert_code("RuntimeIdentityMismatch", lambda: self.owner.attach_consumer(
+                "exact-container", "hms", state["generation"]))
 
     def test_credentials_remain_private_and_status_is_redacted(self):
         state = self.start()
