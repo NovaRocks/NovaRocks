@@ -4307,7 +4307,7 @@ mod tests {
             ExchangeStreamIdentity::try_new(
                 selected.source(),
                 selected.destination(),
-                selected.destination_fragment_instance_id(),
+                selected.destination_task_key(),
                 FragmentNodeId::new(selected.destination_node().get() + 1),
             )?
         };

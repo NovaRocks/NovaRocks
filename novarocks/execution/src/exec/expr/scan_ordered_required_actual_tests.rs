@@ -263,7 +263,7 @@ fn scan_ordered_required_actual_indexed_roots_and_sparse_empty_slices() {
 }
 #[test]
 fn scan_ordered_required_all_seven_actual_callback_causes_stop_and_latch() {
-    use crate::runtime::fragment::ExecutionFailureCause;
+    use crate::runtime::task::ExecutionFailureCause;
     let (program, node) = prepared_scan();
     let record = Callback::new(usize::MAX, KernelFailure::Cancelled);
     CompiledFilterConjunctionInstance::try_new(program.clone(), node, &record).unwrap();

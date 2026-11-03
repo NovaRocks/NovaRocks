@@ -32,8 +32,8 @@ use crate::state_store::execution::StateStoreOriginalOwner;
 use call::CatalogCall;
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_mv_application::{
-    activity::{MvActivityAdmissionError, MvActivityLease},
-    management::{EffectDisposition, ManagementEntranceLease},
+    activity::{MvActivityAdmissionError, MvActivityPermit},
+    management::{EffectDisposition, ManagementEntranceObligation},
     ports::{MvProviderFailure, MvProviderFailureKind},
     product::MvTarget,
     readiness::{MvKeyedDropReadiness, MvKeyedProjectionDeleteGuard},
@@ -44,12 +44,11 @@ use novarocks_query_application::{
     session_error::QueryServiceError,
 };
 use novarocks_spi::connector::{
-    ConnectorCatalogMutationLease, ConnectorCatalogMutationOperation,
-    ConnectorCatalogMutationReceiving, ConnectorControlPlanningLease,
-    ConnectorDocumentStorageLease, ConnectorError, ConnectorMutationFailure,
-    ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableObjectBinding,
-    ExternalMutationEffect, ExternalMutationFinalization, ExternalMutationOutcome,
-    KeyedDocumentObservationRequest,
+    ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceiving,
+    ConnectorCatalogMutationSession, ConnectorControlPlanningPin, ConnectorDocumentStorage,
+    ConnectorError, ConnectorMutationFailure, ConnectorMutationOperationId,
+    ConnectorRequestContext, ConnectorTableObjectBinding, ExternalMutationEffect,
+    ExternalMutationFinalization, ExternalMutationOutcome, KeyedDocumentObservationRequest,
 };
 use novarocks_workload_control::{ResultWindowAlias, WorkScope};
 use std::{
@@ -98,11 +97,11 @@ struct Body {
     context: ConnectorRequestContext,
     cancel: QueryCancellationView,
     factory: CurrentProjectionMetadataCpu,
-    activity: Option<Result<MvActivityLease, MvActivityAdmissionError>>,
-    planning: Option<ConnectorControlPlanningLease>,
+    activity: Option<Result<MvActivityPermit, MvActivityAdmissionError>>,
+    planning: Option<ConnectorControlPlanningPin>,
     binding: Option<ConnectorTableObjectBinding>,
-    documents: Option<ConnectorDocumentStorageLease>,
-    management: Option<ManagementEntranceLease>,
+    documents: Option<ConnectorDocumentStorage>,
+    management: Option<ManagementEntranceObligation>,
     // Keep a raw acquired lease/result before dropping its original wait F.
     management_failure: Option<MvProviderFailure>,
     exact_management_target: Option<novarocks_mv_application::management::ManagedMvTarget>,
@@ -160,12 +159,15 @@ impl std::fmt::Display for ExitUnproven {
 }
 impl std::error::Error for ExitUnproven {}
 
-pub(super) struct PhaseTask {
+/// Checked obligation to observe one original control phase through completion.
+/// Polling to Ready clears the original active state. Dropping an unfinished
+/// obligation poisons the same source and does not prove that phase exited.
+pub(super) struct PhaseObligation {
     source: Arc<ControlSource>,
     future: Option<OriginalFuture>,
     ready: bool,
 }
-impl PhaseTask {
+impl PhaseObligation {
     pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if self.ready {
             return Poll::Ready(());
@@ -193,7 +195,7 @@ impl PhaseTask {
         }
     }
 }
-impl Drop for PhaseTask {
+impl Drop for PhaseObligation {
     fn drop(&mut self) {
         if !self.ready {
             self.source.poisoned.store(true, Ordering::Release)
@@ -318,7 +320,7 @@ impl ControlSource {
     pub(super) fn product_target(&self) -> &MvTarget {
         &self.target
     }
-    pub(super) fn phase(self: &Arc<Self>, phase: Phase) -> PhaseTask {
+    pub(super) fn phase(self: &Arc<Self>, phase: Phase) -> PhaseObligation {
         assert!(
             !self.active.swap(true, Ordering::AcqRel),
             "one control original phase"
@@ -337,7 +339,7 @@ impl ControlSource {
             *source.response.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
             drop(operation);
         });
-        PhaseTask {
+        PhaseObligation {
             source: self.clone(),
             future: Some(future),
             ready: false,

@@ -23,7 +23,7 @@ mod native_tail {
     use crate::task_execution::protocol_facts::WriteProtocolTracker;
     use crate::task_execution::status_intake::{StatusEvent, StatusIntakeHandle};
     use novarocks_execution_contract::{
-        QueryContextRef, SafeDetail, TaskFailure, TaskFailurePhase, TaskIdentity, TaskOutputFacts,
+        ParticipationRef, SafeDetail, TaskFailure, TaskFailurePhase, TaskIdentity, TaskOutputFacts,
         TaskState, TaskStatus, TaskStatusVersion, TerminationDetail,
     };
     use novarocks_failure_contract::FailureProjection;
@@ -67,13 +67,13 @@ mod native_tail {
 
     async fn close_actor(
         mut logical: novarocks_query_application::test_support::LogicalExecutionTestHarness,
-        contexts: &[QueryContextRef],
+        participations: &[ParticipationRef],
     ) {
         logical.abandon_running_attempt();
-        for &context in contexts {
+        for &participation in participations {
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 while logical
-                    .stand_down_snapshot(context)
+                    .stand_down_snapshot(participation)
                     .await
                     .unwrap()
                     .is_none()
@@ -84,7 +84,7 @@ mod native_tail {
             .await
             .unwrap();
             logical
-                .observe_worker_process_replaced(context)
+                .observe_worker_process_replaced(participation)
                 .await
                 .unwrap();
         }
@@ -116,14 +116,14 @@ mod native_tail {
                 .iter()
                 .find(|task| task.stage_id().get() == 2)
                 .unwrap();
-            let contexts = round
+            let participations = round
                 .execution()
                 .graph()
-                .contexts()
+                .participations()
                 .copied()
                 .collect::<Vec<_>>();
             let (logical, drive, cancellation, _, _abort) =
-                terminal_regression_drive_for_contexts(contexts.clone(), false).await;
+                terminal_regression_drive_for_participations(participations.clone(), false).await;
             let plan = PlanSeal::Version(
                 novarocks_physical_plan::PlanVersionId::try_new([0x19; 16]).unwrap(),
             );
@@ -189,7 +189,7 @@ mod native_tail {
             assert!(assembled.round.accepted_root_success_sealed());
             drop(assembled);
             drop(drive);
-            close_actor(logical, &contexts).await;
+            close_actor(logical, &participations).await;
         }
     }
 
@@ -206,14 +206,14 @@ mod native_tail {
                 .map(|task| task.identity())
                 .find(|task| task.stage_id().get() == 1)
                 .unwrap();
-            let contexts = round
+            let participations = round
                 .execution()
                 .graph()
-                .contexts()
+                .participations()
                 .copied()
                 .collect::<Vec<_>>();
             let (logical, drive, cancellation, requester, _abort) =
-                terminal_regression_drive_for_contexts(contexts.clone(), false).await;
+                terminal_regression_drive_for_participations(participations.clone(), false).await;
             let source = round.take_root_status_source().unwrap();
             let mut seal = source.begin_success_seal_request().unwrap();
             round.turn().unwrap();
@@ -280,7 +280,7 @@ mod native_tail {
             assert_eq!(assembled.round.root_task(), root);
             drop(assembled);
             drop(drive);
-            close_actor(logical, &contexts).await;
+            close_actor(logical, &participations).await;
         }
     }
 
@@ -303,14 +303,14 @@ mod native_tail {
                 .unwrap()
                 .is_terminal()
         }));
-        let contexts = round
+        let participations = round
             .execution()
             .graph()
-            .contexts()
+            .participations()
             .copied()
             .collect::<Vec<_>>();
         let (logical, drive, cancellation, _, _abort) =
-            terminal_regression_drive_for_contexts(contexts.clone(), false).await;
+            terminal_regression_drive_for_participations(participations.clone(), false).await;
         let source = round.take_root_status_source().unwrap();
         let mut seal = source.begin_success_seal_request().unwrap();
         round.turn().unwrap();
@@ -338,6 +338,6 @@ mod native_tail {
         }));
         drop(assembled);
         drop(drive);
-        close_actor(logical, &contexts).await;
+        close_actor(logical, &participations).await;
     }
 }

@@ -68,7 +68,7 @@ impl<H: std::error::Error + 'static> std::error::Error for ExpressionControlCrea
     }
 }
 #[derive(Clone, Copy)]
-enum Role {
+enum CreationRetentionKind {
     Temporary,
     Retained,
 }
@@ -98,34 +98,34 @@ fn tree<K, V>(n: usize) -> Result<ControlOwnedResourceFacts, ControlResourceErro
 fn visit<D, E: From<ControlResourceError>>(
     n: usize,
     u: usize,
-    mut emit: impl FnMut(Role, Geometry) -> Result<(), E>,
+    mut emit: impl FnMut(CreationRetentionKind, Geometry) -> Result<(), E>,
 ) -> Result<(), E> {
     emit(
-        Role::Retained,
+        CreationRetentionKind::Retained,
         Geometry::Opaque(tree::<EvaluationDomainId, ExpressionEvaluationDomain>(n)?),
     )?;
     emit(
-        Role::Retained,
+        CreationRetentionKind::Retained,
         Geometry::Opaque(tree::<ExpressionUseId, ExpressionInvocation<D>>(u)?),
     )?;
     emit(
-        Role::Temporary,
+        CreationRetentionKind::Temporary,
         Geometry::Opaque(tree::<EvaluationDomainId, Vec<EvaluationDomainId>>(n)?),
     )?;
     emit(
-        Role::Temporary,
+        CreationRetentionKind::Temporary,
         Geometry::Opaque(tree::<EvaluationDomainId, usize>(n)?),
     )?;
     emit(
-        Role::Temporary,
+        CreationRetentionKind::Temporary,
         Geometry::Opaque(tree::<ExpressionUseId, usize>(u)?),
     )?;
     emit(
-        Role::Temporary,
+        CreationRetentionKind::Temporary,
         Geometry::Opaque(tree::<EvaluationDomainId, ()>(n)?),
     )?;
     emit(
-        Role::Temporary,
+        CreationRetentionKind::Temporary,
         Geometry::Opaque(tree::<ExpressionUseId, usize>(u)?),
     )?;
     // Same locked original child-Vec growth allowance; not a guessed public
@@ -138,43 +138,46 @@ fn visit<D, E: From<ControlResourceError>>(
             ..Default::default()
         })?;
     }
-    emit(Role::Temporary, Geometry::Opaque(children.facts()))?;
+    emit(
+        CreationRetentionKind::Temporary,
+        Geometry::Opaque(children.facts()),
+    )?;
     if n > 0 {
         emit(
-            Role::Temporary,
+            CreationRetentionKind::Temporary,
             Geometry::Exact(layout::<EvaluationDomainId>(n)?),
         )?;
     }
     if u > 0 {
         emit(
-            Role::Temporary,
+            CreationRetentionKind::Temporary,
             Geometry::Exact(layout::<ExpressionUseId>(u)?),
         )?;
         emit(
-            Role::Retained,
+            CreationRetentionKind::Retained,
             Geometry::Exact(layout::<ExpressionUseId>(u)?),
         )?;
         // Pure model keeps its original maximum trim; actual request uses the
         // real final length immediately before Vec::into_boxed_slice.
         emit(
-            Role::Retained,
+            CreationRetentionKind::Retained,
             Geometry::Trim(layout::<ExpressionUseId>(u)?),
         )?;
     }
     emit(
-        Role::Retained,
+        CreationRetentionKind::Retained,
         Geometry::Exact(arc::<
             ControlFlowOwned<BTreeMap<EvaluationDomainId, ExpressionEvaluationDomain>>,
         >()?),
     )?;
     emit(
-        Role::Retained,
+        CreationRetentionKind::Retained,
         Geometry::Exact(arc::<
             ControlFlowOwned<BTreeMap<ExpressionUseId, ExpressionInvocation<D>>>,
         >()?),
     )?;
     emit(
-        Role::Retained,
+        CreationRetentionKind::Retained,
         Geometry::Exact(arc::<ControlFlowOwned<Box<[ExpressionUseId]>>>()?),
     )?;
     Ok(())
@@ -221,8 +224,8 @@ pub(super) fn observe<D, H>(
             }
         }
         match role {
-            Role::Temporary => request(temporary, g),
-            Role::Retained => request(retained, g),
+            CreationRetentionKind::Temporary => request(temporary, g),
+            CreationRetentionKind::Retained => request(retained, g),
         }
         .map_err(ExpressionControlCreationFailure::Creator)
     })

@@ -338,17 +338,17 @@ mod request_context_tests {
 fn metadata_binding(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     catalog: &str,
-) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, String> {
+) -> Result<novarocks_spi::connector::ConnectorControlPlanningPin, String> {
     metadata_binding_typed(controls, catalog).map_err(|error| error.to_string())
 }
 
-/// Acquires one exact planning lease without erasing the connector's failure
+/// Acquires one exact planning pin without erasing the connector's failure
 /// category. Refresh scheduling uses this to distinguish a temporary catalog
 /// outage from a definition that cannot be refreshed.
 pub(crate) fn metadata_binding_typed(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     catalog: &str,
-) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, ConnectorError> {
+) -> Result<novarocks_spi::connector::ConnectorControlPlanningPin, ConnectorError> {
     let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| {
         ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
     })?;
@@ -383,17 +383,17 @@ pub(crate) async fn metadata_namespace_exists_async(
 /// generation. Every provider metadata entry point that can transitively load
 /// a table must use this adapter; callers may not recreate an unbound context
 /// after query admission.
-pub(crate) fn context_for_planning_lease(
-    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+pub(crate) fn context_for_planning_pin(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
 ) -> Result<ConnectorRequestContext, String> {
-    context_for_planning_lease_typed(binding, context).map_err(|error| error.to_string())
+    context_for_planning_pin_typed(binding, context).map_err(|error| error.to_string())
 }
 
 /// Attaches attempt-scoped credential collection while preserving connector
 /// error classification for lifecycle callers.
-pub(crate) fn context_for_planning_lease_typed(
-    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+pub(crate) fn context_for_planning_pin_typed(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
 ) -> Result<ConnectorRequestContext, ConnectorError> {
     if context.vended_credential_lease_sink().is_some() {
@@ -409,17 +409,17 @@ pub(crate) fn context_for_planning_lease_typed(
     }
 }
 
-/// Resolve table existence through an admission-frozen planning lease.  A
+/// Resolve table existence through an admission-frozen planning pin.  A
 /// caller that performs a table-or-view decision must retain this lease for
 /// every metadata lookup in that decision.
-pub fn metadata_table_exists_with_planning_lease(
-    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+pub fn metadata_table_exists_with_planning_pin(
+    binding: novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     namespace: &str,
     table: &str,
 ) -> Result<bool, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_lease(&binding, context)?;
+    let context = context_for_planning_pin(&binding, context)?;
     binding
         .binding()
         .metadata()
@@ -435,14 +435,14 @@ pub fn metadata_table_exists_with_planning_lease(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn metadata_table_exists_with_planning_lease_async(
-    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+pub(crate) async fn metadata_table_exists_with_planning_pin_async(
+    binding: novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     namespace: &str,
     table: &str,
 ) -> Result<bool, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_lease(&binding, context)?;
+    let context = context_for_planning_pin(&binding, context)?;
     binding
         .binding()
         .metadata()
@@ -463,13 +463,13 @@ pub(crate) async fn metadata_table_exists_with_planning_lease_async(
 /// Ordering and duplicate handling stay application-owned so providers only
 /// expose their authoritative catalog facts. The provider refuses a listing
 /// that would exceed `bound`.
-pub fn metadata_list_namespaces_with_planning_lease(
-    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+pub fn metadata_list_namespaces_with_planning_pin(
+    binding: novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     bound: novarocks_spi::connector::ConnectorListingBound,
 ) -> Result<Vec<ConnectorNamespaceIdentity>, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_lease(&binding, context)?;
+    let context = context_for_planning_pin(&binding, context)?;
     binding
         .binding()
         .metadata()
@@ -481,13 +481,13 @@ pub fn metadata_list_namespaces_with_planning_lease(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn metadata_list_namespaces_with_planning_lease_async(
-    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+pub(crate) async fn metadata_list_namespaces_with_planning_pin_async(
+    binding: novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     bound: novarocks_spi::connector::ConnectorListingBound,
 ) -> Result<Vec<ConnectorNamespaceIdentity>, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_lease(&binding, context)?;
+    let context = context_for_planning_pin(&binding, context)?;
     binding
         .binding()
         .metadata()
@@ -507,14 +507,14 @@ pub(crate) async fn metadata_list_namespaces_with_planning_lease_async(
 /// caller can only drop children it can already name, which is no help to
 /// anyone who did not create them. The provider refuses a listing that would
 /// exceed `bound`.
-pub fn metadata_list_tables_with_planning_lease(
-    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+pub fn metadata_list_tables_with_planning_pin(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     namespace: &str,
     bound: novarocks_spi::connector::ConnectorListingBound,
 ) -> Result<Vec<String>, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_lease(binding, context)?;
+    let context = context_for_planning_pin(binding, context)?;
     let mut tables = binding
         .binding()
         .metadata()
@@ -535,14 +535,14 @@ pub fn metadata_list_tables_with_planning_lease(
     Ok(tables)
 }
 
-pub(crate) async fn metadata_list_tables_with_planning_lease_async(
-    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+pub(crate) async fn metadata_list_tables_with_planning_pin_async(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     namespace: &str,
     bound: novarocks_spi::connector::ConnectorListingBound,
 ) -> Result<Vec<String>, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_lease(binding, context)?;
+    let context = context_for_planning_pin(binding, context)?;
     let mut tables = binding
         .binding()
         .metadata()
@@ -566,14 +566,14 @@ pub(crate) async fn metadata_list_tables_with_planning_lease_async(
 
 /// Read immutable branch/tag/snapshot facts through the same exact lease that
 /// admitted the table.  SQL owns the projection of these neutral facts.
-pub fn metadata_read_reference_facts_with_planning_lease(
-    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+pub fn metadata_read_reference_facts_with_planning_pin(
+    binding: novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     namespace: &str,
     table: &str,
 ) -> Result<ConnectorReadReferenceFacts, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_lease(&binding, context)?;
+    let context = context_for_planning_pin(&binding, context)?;
     binding
         .binding()
         .metadata()
@@ -588,14 +588,14 @@ pub fn metadata_read_reference_facts_with_planning_lease(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn metadata_read_reference_facts_with_planning_lease_async(
-    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+pub(crate) async fn metadata_read_reference_facts_with_planning_pin_async(
+    binding: novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     namespace: &str,
     table: &str,
 ) -> Result<ConnectorReadReferenceFacts, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_lease(&binding, context)?;
+    let context = context_for_planning_pin(&binding, context)?;
     binding
         .binding()
         .metadata()
@@ -620,21 +620,21 @@ pub fn metadata_load_table(
     resolution: ConnectorTableResolution,
 ) -> Result<(backend::ResolvedTable, Option<i32>), String> {
     let binding = metadata_binding(controls, catalog)?;
-    metadata_load_table_with_planning_lease(binding, context, namespace, table, resolution)
+    metadata_load_table_with_planning_pin(binding, context, namespace, table, resolution)
 }
 
-/// Resolve metadata through an admission-frozen planning lease.  Write
+/// Resolve metadata through an admission-frozen planning pin.  Write
 /// callers use this instead of reopening `acquire_current` after target
 /// admission.
-pub fn metadata_load_table_with_planning_lease(
-    binding: novarocks_spi::connector::ConnectorControlPlanningLease,
+pub fn metadata_load_table_with_planning_pin(
+    binding: novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     namespace: &str,
     table: &str,
     resolution: ConnectorTableResolution,
 ) -> Result<(backend::ResolvedTable, Option<i32>), String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_lease(&binding, context)?;
+    let context = context_for_planning_pin(&binding, context)?;
     let metadata = binding
         .binding()
         .metadata()
@@ -657,35 +657,35 @@ pub fn metadata_load_table_with_planning_lease(
     Ok((backend::ResolvedTable { columns }, schema_id))
 }
 
-/// Load the exact connector metadata admitted by a retained planning lease.
+/// Load the exact connector metadata admitted by a retained planning pin.
 ///
 /// Consumers that need provider-owned interpretation must pass this value to
 /// a composition-injected application port.  They must not decode the opaque
 /// table handle or reopen the current connector generation themselves.
-pub fn metadata_load_connector_table_with_planning_lease(
-    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+pub fn metadata_load_connector_table_with_planning_pin(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     namespace: &str,
     table: &str,
     resolution: ConnectorTableResolution,
 ) -> Result<novarocks_spi::connector::ConnectorTableMetadata, String> {
-    metadata_load_connector_table_with_planning_lease_typed(
+    metadata_load_connector_table_with_planning_pin_typed(
         binding, context, namespace, table, resolution,
     )
     .map_err(|error| error.to_string())
 }
 
-/// Typed counterpart of [`metadata_load_connector_table_with_planning_lease`]
+/// Typed counterpart of [`metadata_load_connector_table_with_planning_pin`]
 /// for lifecycle code that must retain retry semantics.
-pub(crate) fn metadata_load_connector_table_with_planning_lease_typed(
-    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+pub(crate) fn metadata_load_connector_table_with_planning_pin_typed(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     namespace: &str,
     table: &str,
     resolution: ConnectorTableResolution,
 ) -> Result<novarocks_spi::connector::ConnectorTableMetadata, ConnectorError> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_lease_typed(binding, context)?;
+    let context = context_for_planning_pin_typed(binding, context)?;
     binding
         .binding()
         .metadata()
@@ -931,10 +931,10 @@ pub fn connector_default_to_column_default(
     }
 }
 
-pub fn acquire_metadata_planning_lease(
+pub fn acquire_metadata_planning_pin(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     catalog: &str,
-) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, String> {
+) -> Result<novarocks_spi::connector::ConnectorControlPlanningPin, String> {
     metadata_binding(controls, catalog)
 }
 

@@ -62,22 +62,22 @@ pub(super) async fn prepare_equality_delete_statement_async(
     stmt: &AddEqualityDelete,
     target: &crate::catalog_application::resolver::TargetBackend,
     target_ref: &str,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
 ) -> Result<super::PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
     // Preserve the original MV guard before metadata loading and admission.
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context_async(
         state.mv_storage_observation().as_ref(),
-        &planning_lease,
+        &planning_pin,
         state.mv_readiness().as_ref(),
         target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Delete,
         connector_context.clone(),
     ).await?;
     let target_binding =
-        super::load_delete_target_async(target, planning_lease, connector_context).await?;
+        super::load_delete_target_async(target, planning_pin, connector_context).await?;
     let column_names = stmt
         .columns
         .iter()
@@ -89,13 +89,13 @@ pub(super) async fn prepare_equality_delete_statement_async(
         .map(|row| row.iter().map(lower_literal).collect())
         .collect::<Result<Vec<Vec<_>>, _>>()?;
     let write_lease = target_binding
-        .lease()
+        .planning_pin()
         .derive_write_lease()
         .map_err(|error| format!("derive equality-delete write lease: {error}"))?;
     let input = resolve_equality_delete_input(target_binding.metadata(), &column_names, &rows)?;
     // Keep RefHead observation on this exact generation before actual begin.
-    crate::connector::metadata_read_reference_facts_with_planning_lease_async(
-        target_binding.lease().clone(),
+    crate::connector::metadata_read_reference_facts_with_planning_pin_async(
+        target_binding.planning_pin().clone(),
         connector_context.clone(),
         &target.namespace,
         &target.table,
@@ -103,7 +103,7 @@ pub(super) async fn prepare_equality_delete_statement_async(
     .await?;
     let write_session = super::begin_delete_write_session_async(
         state,
-        target_binding.lease(),
+        target_binding.planning_pin(),
         &write_lease,
         crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
             target,
@@ -124,7 +124,7 @@ pub(super) async fn prepare_equality_delete_statement_async(
     let delete_fields = input.validate(&rows)?;
     let delete_query = build_equality_delete_sink_query(&delete_fields, &rows)?;
     let (sql_write_input, table_bindings) =
-        bind_equality_delete_write(target, target_binding.lease(), &write_session)?;
+        bind_equality_delete_write(target, target_binding.planning_pin(), &write_session)?;
     Ok(super::PreparedDeleteWrite {
         state: state.clone(),
         target: target.clone(),
@@ -183,7 +183,7 @@ fn lower_literal(expression: &novarocks_parser::ast::Expr) -> Result<Literal, St
 
 fn bind_equality_delete_write(
     target: &crate::catalog_application::resolver::TargetBackend,
-    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: &novarocks_spi::connector::ConnectorControlPlanningPin,
     write_session: &crate::query_execution::write_session::ConnectorWriteSession,
 ) -> Result<
     (
@@ -203,7 +203,7 @@ fn bind_equality_delete_write(
             target.table.clone(),
         ),
         crate::query_execution::dml::iceberg_writer::sole_session_write_target(write_session)?,
-        planning_lease.clone(),
+        planning_pin.clone(),
     )?;
     let sql_write_input = dml_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),

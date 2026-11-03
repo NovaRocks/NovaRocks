@@ -158,7 +158,7 @@ pub struct PendingCreateIntentObservation {
 impl PendingCreateIntentObservation {
     pub fn complete_keyed(
         self,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
     ) -> Result<
         (
@@ -234,7 +234,7 @@ impl PendingManagementObservation {
     /// decoded keyed views cannot mint a management admission capability.
     pub fn complete_keyed(
         self,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
     ) -> Result<
         (
@@ -254,7 +254,7 @@ impl PendingManagementObservation {
     /// the pending capability, but does not own or retire the Provider source.
     pub async fn complete_keyed_async(
         self,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
     ) -> Result<
         (
@@ -509,7 +509,7 @@ impl ManagementObservationState {
     pub fn complete_keyed_current_observation(
         &mut self,
         pending: PendingManagementObservation,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
     ) -> Result<
         (
@@ -541,7 +541,7 @@ impl ManagementObservationState {
     pub async fn complete_keyed_current_observation_async(
         &mut self,
         pending: PendingManagementObservation,
-        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
     ) -> Result<
         (

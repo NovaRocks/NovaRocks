@@ -22,8 +22,8 @@ use novarocks_control_runtime_core::identity::{
     Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, WorkId,
 };
 use novarocks_execution_contract::{
-    AbortCause, AdmissionTicketId, CancelReason, ContentFingerprint, CredentialEpoch,
-    CredentialLeaseId, FinalTaskInfo, LeaseValidFor, OperatorStatistics, QueryContextRef,
+    AbortCause, AdmissionTicketId, CancelReason, ContentFingerprint, CredentialDomainId,
+    CredentialEpoch, FinalTaskInfo, LeaseValidFor, OperatorStatistics, ParticipationRef,
     SafeDetail, TaskConclusion, TaskFailure, TaskIdentity, TaskOperationId, TaskOutputFacts,
     TaskState, TerminationDetail,
     failure::{FailureClass, FailureEvidence, FailureFact, FailureReason, domain},
@@ -32,16 +32,17 @@ use novarocks_types::identity::{
     AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
 };
 use novarocks_worker_protocol::{
-    context::{
-        ContextCommand, ContextConfig, ContextCore, ContextEffect, ContextEstablishment,
-        ContextInput, ContextMaterialized, ContextReplyBody, ContextStep, CoreError, PhysicalFact,
-        TerminalIntent, TerminalObservation, TerminalStatistics,
-    },
     control::EstablishSemanticFacts,
     creation::{
-        AdmissionNeed, AdmissionPort, AdmissionRefusal, CreationCost, PayloadId, RequestContext,
+        AdmissionNeed, AdmissionPort, AdmissionRefusal, CreationCost, PayloadId, RequestReplyTag,
     },
     lease::{LeaseBounds, MonotonicInstant},
+    participation::{
+        CoreError, ParticipationCommand, ParticipationConfig, ParticipationCore,
+        ParticipationEffect, ParticipationEstablishment, ParticipationInput,
+        ParticipationMaterialized, ParticipationReplyBody, ParticipationStep, PhysicalFact,
+        TerminalIntent, TerminalObservation, TerminalStatistics,
+    },
     proposal_summary::{Proposal, SourceId},
 };
 use std::{num::NonZeroU16, sync::Arc, time::Duration};
@@ -68,20 +69,20 @@ fn model_request_author(token: InputId) -> ScopedWorkRef {
 fn at(seconds: u64) -> MonotonicInstant {
     MonotonicInstant::from_origin(Duration::from_secs(seconds))
 }
-fn context() -> QueryContextRef {
-    QueryContextRef::new(
+fn participation() -> ParticipationRef {
+    ParticipationRef::new(
         QueryExecutionId::new(QueryId::new(7303, 7304), AttemptId::new(1).unwrap()).unwrap(),
         FrontendProcessId::try_from_bytes(bytes(1)).unwrap(),
         BackendProcessId::try_from_bytes(bytes(2)).unwrap(),
     )
 }
 fn task() -> TaskIdentity {
-    let context = context();
+    let participation = participation();
     TaskIdentity::new(
-        context.query_execution_id(),
+        participation.query_execution_id(),
         StageId::new(1).unwrap(),
         TaskId::new(1).unwrap(),
-        context.backend_process_id(),
+        participation.backend_process_id(),
     )
 }
 #[derive(Default)]
@@ -95,7 +96,7 @@ impl AdmissionPort for Port {
     }
 }
 struct Model {
-    core: ContextCore,
+    core: ParticipationCore,
     port: Port,
     now: MonotonicInstant,
     next_request: u64,
@@ -106,27 +107,27 @@ impl Model {
             catalog: ContentFingerprint::from_bytes([1; 16]),
             shared_filter: ContentFingerprint::from_bytes([2; 16]),
             query_options: ContentFingerprint::from_bytes([3; 16]),
-            credential_lease: CredentialLeaseId::new(1),
+            credential_domain_id: CredentialDomainId::new(1),
             credential_epoch: CredentialEpoch::FIRST,
             initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
         };
-        let core = ContextCore::new(
-            context(),
+        let core = ParticipationCore::new(
+            participation(),
             Generation::new(1).unwrap(),
-            ContextEstablishment {
+            ParticipationEstablishment {
                 operation: operation(2),
                 ticket: AdmissionTicketId::try_from_bytes([4; 16]).unwrap(),
                 payload: PayloadId(1),
                 semantics,
                 elected_at: at(0),
             },
-            ContextConfig {
+            ParticipationConfig {
                 max_tasks: 4,
                 max_creation_waiters: 4,
                 max_pending_requests: 16,
                 max_preparing: 1,
                 max_task_bytes: 100,
-                step_budget: ContextCore::MAX_STEP_WORK,
+                step_budget: ParticipationCore::MAX_STEP_WORK,
                 lease_bounds: LeaseBounds::DEFAULT,
                 metric_publish_interval: Duration::from_millis(100),
                 request_horizon: novarocks_worker_protocol::lease::RequestHorizon::DEFAULT,
@@ -139,19 +140,19 @@ impl Model {
             now: at(0),
             next_request: 1,
         };
-        model.apply(ContextInput::MaterializationFinished {
-            result: Ok(ContextMaterialized {
+        model.apply(ParticipationInput::MaterializationFinished {
+            result: Ok(ParticipationMaterialized {
                 initial_credential_resource: 101,
             }),
         });
         model.request(
             operation(3),
-            ContextCommand::Create {
+            ParticipationCommand::Create {
                 task: task(),
                 payload: PayloadId(3),
             },
         );
-        let mut loaded = model.apply(ContextInput::Loaded {
+        let mut loaded = model.apply(ParticipationInput::Loaded {
             task: task(),
             result: Ok(CreationCost {
                 input_retained_bytes: 1,
@@ -162,22 +163,26 @@ impl Model {
         while loaded
             .effects
             .iter()
-            .any(|effect| matches!(effect, ContextEffect::ContinueReplies { .. }))
+            .any(|effect| matches!(effect, ParticipationEffect::ContinueReplies { .. }))
         {
-            loaded = model.apply(ContextInput::ContinueReplies { task: task() });
+            loaded = model.apply(ParticipationInput::ContinueReplies { task: task() });
         }
-        model.apply(ContextInput::Installed { task: task() });
-        model.apply(ContextInput::Running { task: task() });
+        model.apply(ParticipationInput::Installed { task: task() });
+        model.apply(ParticipationInput::Running { task: task() });
         model
     }
-    fn request(&mut self, operation: TaskOperationId, command: ContextCommand) -> ContextStep {
+    fn request(
+        &mut self,
+        operation: TaskOperationId,
+        command: ParticipationCommand,
+    ) -> ParticipationStep {
         let token = InputId::new(self.next_request).unwrap();
         self.next_request += 1;
         let step = self
             .core
             .handle_request(
                 self.now,
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(token),
                     token,
                     operation,
@@ -187,38 +192,38 @@ impl Model {
                 &mut self.port,
             )
             .unwrap();
-        assert!(step.charged_work() <= ContextCore::MAX_BODY_WORK);
+        assert!(step.charged_work() <= ParticipationCore::MAX_BODY_WORK);
         step
     }
-    fn apply(&mut self, input: ContextInput) -> ContextStep {
+    fn apply(&mut self, input: ParticipationInput) -> ParticipationStep {
         let label = format!("{input:?}");
         let step = self.core.handle(self.now, input, &mut self.port).unwrap();
         assert!(
-            step.charged_work() <= ContextCore::MAX_BODY_WORK,
+            step.charged_work() <= ParticipationCore::MAX_BODY_WORK,
             "{label}: charged {}: {:?}",
             step.charged_work(),
             step.effects
         );
         step
     }
-    fn observe(&mut self, observation: TerminalObservation) -> ContextStep {
-        self.apply(ContextInput::TerminalObservation {
+    fn observe(&mut self, observation: TerminalObservation) -> ParticipationStep {
+        self.apply(ParticipationInput::TerminalObservation {
             task: task(),
             observation,
         })
     }
-    fn physical(&mut self, fact: PhysicalFact) -> ContextStep {
-        self.apply(ContextInput::Physical { task: task(), fact })
+    fn physical(&mut self, fact: PhysicalFact) -> ParticipationStep {
+        self.apply(ParticipationInput::Physical { task: task(), fact })
     }
     fn final_info(&mut self, request: u8) -> Arc<FinalTaskInfo> {
         self.request(
             operation(request),
-            ContextCommand::GetFinalInfo { task: task() },
+            ParticipationCommand::GetFinalInfo { task: task() },
         )
         .requests
         .into_iter()
         .find_map(|reply| match reply.body.as_ref() {
-            ContextReplyBody::FinalInfo(info) => {
+            ParticipationReplyBody::FinalInfo(info) => {
                 assert_eq!(reply.request.operation, operation(request));
                 assert_eq!(reply.task, Some(task()));
                 assert!(reply.body.matches(reply.result));
@@ -293,10 +298,10 @@ fn cancel() -> Proposal {
         diagnostic: None,
     }
 }
-fn has_retire(step: &ContextStep) -> bool {
+fn has_retire(step: &ParticipationStep) -> bool {
     step.effects
         .iter()
-        .any(|effect| matches!(effect, ContextEffect::RetireTask { .. }))
+        .any(|effect| matches!(effect, ParticipationEffect::RetireTask { .. }))
 }
 
 #[test]
@@ -311,12 +316,12 @@ fn a_grouped_success_waits_for_independent_exit_output_and_original_physical_gat
     assert!(!has_retire(&observed));
     assert!(!observed.effects.iter().any(|effect| matches!(
         effect,
-        ContextEffect::PublishTask {
+        ParticipationEffect::PublishTask {
             state: TaskState::Finished,
             ..
         }
     )));
-    let exited = model.apply(ContextInput::CompletionExited { task: task() });
+    let exited = model.apply(ParticipationInput::CompletionExited { task: task() });
     let record = model.core.task(task()).unwrap();
     assert_eq!(record.state, TaskState::Finished);
     assert!(record.actual_stopped && record.resources_converged);
@@ -348,7 +353,7 @@ fn a_grouped_success_waits_for_independent_exit_output_and_original_physical_gat
 #[test]
 fn final_statistics_are_sealed_while_success_is_pending_and_late_samples_cannot_replace_them() {
     let mut model = Model::new();
-    model.apply(ContextInput::OperatorStatistics {
+    model.apply(ParticipationInput::OperatorStatistics {
         task: task(),
         statistics: statistics(3),
         truncated: true,
@@ -356,7 +361,7 @@ fn final_statistics_are_sealed_while_success_is_pending_and_late_samples_cannot_
     model.observe(success(true));
     assert_eq!(model.core.task(task()).unwrap().state, TaskState::Running);
     assert!(model.core.task(task()).unwrap().statistics_sealed);
-    model.apply(ContextInput::OperatorStatistics {
+    model.apply(ParticipationInput::OperatorStatistics {
         task: task(),
         statistics: statistics(99),
         truncated: false,
@@ -365,11 +370,11 @@ fn final_statistics_are_sealed_while_success_is_pending_and_late_samples_cannot_
         model.core.task(task()).unwrap().operator_statistics,
         statistics(7)
     );
-    model.apply(ContextInput::CompletionExited { task: task() });
+    model.apply(ParticipationInput::CompletionExited { task: task() });
     let info = model.final_info(10);
     assert_eq!(info.operator_statistics(), statistics(7));
     assert!(info.operator_statistics_truncated());
-    model.apply(ContextInput::OperatorStatistics {
+    model.apply(ParticipationInput::OperatorStatistics {
         task: task(),
         statistics: statistics(123),
         truncated: false,
@@ -387,7 +392,7 @@ fn one_observation_finishes_the_existing_cancel_or_original_failure_and_keeps_fi
             cancel()
         };
         let expected = proposed.conclusion.clone();
-        model.apply(ContextInput::Proposal {
+        model.apply(ParticipationInput::Proposal {
             task: task(),
             proposal: proposed,
         });
@@ -414,14 +419,14 @@ fn one_observation_finishes_the_existing_cancel_or_original_failure_and_keeps_fi
             .position(|effect| {
                 matches!(
                     effect,
-                    ContextEffect::PublishTask {
+                    ParticipationEffect::PublishTask {
                         state: TaskState::Failed | TaskState::Canceled,
                         ..
                     }
                 )
             })
             .unwrap();
-        let output = observed.effects.iter().position(|effect| matches!(effect, ContextEffect::PublishTaskConvergence {snapshot, ..} if snapshot.output_released())).unwrap();
+        let output = observed.effects.iter().position(|effect| matches!(effect, ParticipationEffect::PublishTaskConvergence {snapshot, ..} if snapshot.output_released())).unwrap();
         assert!(terminal < output);
         let info = model.final_info(10);
         assert_eq!(info.operator_statistics(), statistics(7));
@@ -443,7 +448,7 @@ fn incomplete_positive_output_and_finish_without_a_prior_termination_are_rejecte
         let mut model = Model::new();
         let refused = model.core.handle(
             at(0),
-            ContextInput::TerminalObservation {
+            ParticipationInput::TerminalObservation {
                 task: task(),
                 observation: TerminalObservation {
                     intent,
@@ -468,7 +473,7 @@ fn an_original_terminal_observation_cannot_be_registered_twice() {
     model.observe(success(true));
     let refused = model.core.handle(
         at(0),
-        ContextInput::TerminalObservation {
+        ParticipationInput::TerminalObservation {
             task: task(),
             observation: success(true),
         },
@@ -493,20 +498,20 @@ fn lease_expiry_and_two_failure_candidates_remain_inside_the_actual_step_budget(
         for lease_expired in [false, true] {
             let mut model = Model::new();
             if prior_cancel {
-                model.apply(ContextInput::Proposal {
+                model.apply(ParticipationInput::Proposal {
                     task: task(),
                     proposal: cancel(),
                 });
-                model.apply(ContextInput::Adjudicate { task: task() });
+                model.apply(ParticipationInput::Adjudicate { task: task() });
             }
             model.other_physical_gates();
             model.physical(PhysicalFact::ActualStopped);
             model.physical(PhysicalFact::ResourcesConverged);
-            model.apply(ContextInput::Proposal {
+            model.apply(ParticipationInput::Proposal {
                 task: task(),
                 proposal: failure(11, FailureEvidence::StopObservation),
             });
-            model.apply(ContextInput::Proposal {
+            model.apply(ParticipationInput::Proposal {
                 task: task(),
                 proposal: failure(12, FailureEvidence::Originating),
             });
@@ -520,17 +525,15 @@ fn lease_expiry_and_two_failure_candidates_remain_inside_the_actual_step_budget(
             let observed = model.observe(finish(true));
             assert!(has_retire(&observed));
             if lease_expired {
-                assert!(
-                    observed.effects.iter().any(|effect| matches!(
-                        effect,
-                        ContextEffect::CloseExternalAdmission { .. }
-                    ))
-                );
+                assert!(observed.effects.iter().any(|effect| matches!(
+                    effect,
+                    ParticipationEffect::CloseExternalAdmission { .. }
+                )));
             }
             let released = observed
                 .effects
                 .iter()
-                .filter(|effect| matches!(effect, ContextEffect::DisposeSource { .. }))
+                .filter(|effect| matches!(effect, ParticipationEffect::DisposeSource { .. }))
                 .count();
             assert!(released >= 1);
             if prior_cancel {
@@ -546,7 +549,7 @@ fn the_last_retirement_requests_host_release_without_inventing_exit_in_the_group
     let mut model = Model::new();
     let close = model.request(
         operation(30),
-        ContextCommand::Abort {
+        ParticipationCommand::Abort {
             cause: AbortCause::PeerTaskFailed,
         },
     );
@@ -554,21 +557,21 @@ fn the_last_retirement_requests_host_release_without_inventing_exit_in_the_group
         !close
             .effects
             .iter()
-            .any(|effect| matches!(effect, ContextEffect::ReleaseHost { .. }))
+            .any(|effect| matches!(effect, ParticipationEffect::ReleaseHost { .. }))
     );
-    let scheduled = model.apply(ContextInput::ContinueClose);
+    let scheduled = model.apply(ParticipationInput::ContinueClose);
     let generation = scheduled
         .effects
         .iter()
         .find_map(|effect| match effect {
-            ContextEffect::ApplyTaskClose { generation, .. } => Some(*generation),
+            ParticipationEffect::ApplyTaskClose { generation, .. } => Some(*generation),
             _ => None,
         })
         .expect("the model schedules this original Task's close cut");
-    model.apply(ContextInput::ApplyTaskClose {
+    model.apply(ParticipationInput::ApplyTaskClose {
         task: task(),
         generation,
-        intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+        intent: novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
             novarocks_execution_contract::AbortCause::PeerTaskFailed,
         ),
     });
@@ -579,12 +582,12 @@ fn the_last_retirement_requests_host_release_without_inventing_exit_in_the_group
     let retire = observed
         .effects
         .iter()
-        .position(|effect| matches!(effect, ContextEffect::RetireTask { .. }))
+        .position(|effect| matches!(effect, ParticipationEffect::RetireTask { .. }))
         .unwrap();
     let release = observed
         .effects
         .iter()
-        .position(|effect| matches!(effect, ContextEffect::ReleaseHost { .. }))
+        .position(|effect| matches!(effect, ParticipationEffect::ReleaseHost { .. }))
         .unwrap();
     assert!(retire < release);
     assert!(
@@ -602,13 +605,13 @@ fn the_last_retirement_requests_host_release_without_inventing_exit_in_the_group
 fn cancellation_between_the_grouped_success_intent_and_exit_keeps_its_winning_conclusion() {
     let mut model = Model::new();
     model.observe(success(true));
-    model.apply(ContextInput::Proposal {
+    model.apply(ParticipationInput::Proposal {
         task: task(),
         proposal: cancel(),
     });
-    model.apply(ContextInput::Adjudicate { task: task() });
+    model.apply(ParticipationInput::Adjudicate { task: task() });
     assert_eq!(model.core.task(task()).unwrap().state, TaskState::Canceling);
-    model.apply(ContextInput::CompletionExited { task: task() });
+    model.apply(ParticipationInput::CompletionExited { task: task() });
     let record = model.core.task(task()).unwrap();
     assert_eq!(record.state, TaskState::Canceled);
     assert!(matches!(
@@ -634,7 +637,7 @@ fn oversized_final_statistics_are_rejected_before_observation_or_output_release(
     });
     let refused = model.core.handle(
         at(0),
-        ContextInput::TerminalObservation {
+        ParticipationInput::TerminalObservation {
             task: task(),
             observation,
         },

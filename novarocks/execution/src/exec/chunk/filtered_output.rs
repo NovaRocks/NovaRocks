@@ -25,7 +25,7 @@ use super::{
 };
 use crate::exec::arrow_work::{ArrowWorkBudget, ArrowWorkShape};
 use crate::exec::pipeline::operator::InputConstructionOwner;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, RecordBatch, RecordBatchOptions,
 };
@@ -51,7 +51,7 @@ impl std::error::Error for FilteredOutputKernelFailure {
 }
 impl novarocks_failure_contract::FailureProjection for FilteredOutputKernelFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use arrow::error::ArrowError;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let (class, reason) = match self.0 {

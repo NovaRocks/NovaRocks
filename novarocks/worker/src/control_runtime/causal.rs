@@ -19,29 +19,29 @@
 //! under the proposal handoff lock; this host custodian moves only neutral
 //! inputs to the common runtime. It never runs callbacks or source disposal.
 
-use super::actors::{ContextMessage, WorkerActor, WorkerMessage};
+use super::actors::{ParticipationMessage, WorkerActor, WorkerMessage};
 use super::causal_input::CausalInputCustody;
 use super::failure::ScopePublicationsDrained;
 use super::loading::LoaderCustody;
 use super::loading_events::LoadingAuthorReturn;
 use super::source_positions::{ReapedPosition, SourcePositionError};
-use crate::task_completion_roles::AdmittedCompletionRole;
+use crate::task_completion_set::AdmittedCompletionTransfer;
 use crate::{
     settlement::RegistrationNotice,
-    task_causal_input::CausalInputRole,
+    task_causal_input::CausalInputObligation,
     task_port::TaskPendingNotice,
     task_proposal_ingress::{
         CausalEventInput, CausalEventKind, CutSourceAdmission, IngressError, RequestMetadata,
         RetiredCut, TaskProposalIngress,
     },
 };
-use novarocks_control_runtime::driver::{
-    ActorRegistration, ActorRuntime, DriverError, InputAuthor as RuntimeInputAuthor, InputPhase,
+use novarocks_control_runtime::actor_turn::{
+    ActorRegistration, ActorRuntime, ActorTurnError, InputAuthor as RuntimeInputAuthor, InputPhase,
 };
-use novarocks_control_runtime::lease::WorkLease;
+use novarocks_control_runtime::obligation::WorkObligation;
 use novarocks_control_runtime::{completion::ReportSlot, transaction::ScopeHandle};
 use novarocks_control_runtime::{
-    exit_role::{ExitAuthority, ExitRole, ExitRolePhase},
+    exit_custody::{ExitCustody, ExitCustodyPhase, ExitObligation},
     reported_work::{ReportedWork, ReportedWorkBindingError},
 };
 use novarocks_control_runtime_core::{
@@ -56,7 +56,7 @@ use novarocks_execution_contract::{
     failure::{FailureClass, FailureFact},
 };
 use novarocks_worker_protocol::{
-    context::{ContextInput, TaskCloseIntent},
+    participation::{ParticipationInput, TaskCloseIntent},
     proposal_summary::{CutError, CutId, ProposalSummary, SourceId},
 };
 use std::{
@@ -67,8 +67,8 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CausalError {
     Cut(CutError),
-    Driver(DriverError),
-    UnknownRole,
+    ActorTurn(ActorTurnError),
+    MissingCutCustody,
     AlreadyAdmitted,
     NotDelivered,
     InputObservationMissing,
@@ -79,16 +79,16 @@ pub(crate) enum CausalError {
     InvalidRequestClass,
     RequestAdmissionClosed,
     WrongAuthor,
-    Role(novarocks_control_runtime::exit_role::ExitRoleError),
+    ExitCustody(novarocks_control_runtime::exit_custody::ExitCustodyError),
 }
 impl From<CutError> for CausalError {
     fn from(error: CutError) -> Self {
         Self::Cut(error)
     }
 }
-impl From<DriverError> for CausalError {
-    fn from(error: DriverError) -> Self {
-        Self::Driver(error)
+impl From<ActorTurnError> for CausalError {
+    fn from(error: ActorTurnError) -> Self {
+        Self::ActorTurn(error)
     }
 }
 impl From<IngressError> for CausalError {
@@ -155,7 +155,7 @@ impl std::fmt::Debug for CausalRetirementRefusal {
     }
 }
 
-#[must_use = "The original causal author must send or explicitly retire its unused role"]
+#[must_use = "The original causal author must send or explicitly retire its unused cut custody"]
 pub(crate) struct TaskCausalSender {
     ingress: Weak<TaskProposalIngress>,
     cut: CutId,
@@ -186,7 +186,7 @@ impl TaskCausalSender {
         };
         ingress
             .register_causal_event(self.cut)
-            .expect("the original admitted role seals its causal prefix once");
+            .expect("the original admitted cut seals its causal prefix once");
         self.pending.pending();
     }
     pub(super) fn send_close(
@@ -194,7 +194,7 @@ impl TaskCausalSender {
         generation: Generation,
         intent: TaskCloseIntent,
     ) -> Result<(), CausalError> {
-        let ingress = self.ingress().ok_or(CausalError::UnknownRole)?;
+        let ingress = self.ingress().ok_or(CausalError::MissingCutCustody)?;
         ingress.register_close_event(self.cut, generation, intent)?;
         self.pending.pending();
         Ok(())
@@ -208,7 +208,7 @@ impl TaskCausalSender {
             .expect("the original unused causal author is revoked once");
         self.pending.pending();
     }
-    pub(crate) fn send_input(self, input: ContextInput) -> Result<(), ContextInput> {
+    pub(crate) fn send_input(self, input: ParticipationInput) -> Result<(), ParticipationInput> {
         let Some(ingress) = self.ingress() else {
             return Err(input);
         };
@@ -226,24 +226,26 @@ impl TaskCausalSender {
 struct RpcAuthorObserver {
     binding: CausalAuthorBinding,
     request: RequestMetadata,
-    role: ExitRole,
+    exit_custody: ExitCustody,
     report: ReportSlot,
 }
 impl RpcAuthorObserver {
     fn cut_tail_ready(&self) -> Result<bool, CausalError> {
-        if self.role.phase() == ExitRolePhase::Retired {
+        if self.exit_custody.phase() == ExitCustodyPhase::Retired {
             return Ok(true);
         }
-        if self.role.phase() != ExitRolePhase::Exited
-            || !self.role.body_exited()
-            || !self.role.captures_exited()
+        if self.exit_custody.phase() != ExitCustodyPhase::Exited
+            || !self.exit_custody.body_exited()
+            || !self.exit_custody.captures_exited()
         {
             return Ok(false);
         }
         // The exact original report includes all actual consumer/return legs.
         // Its readiness does not retire the R's still-live Source children.
         self.report.retirement_ready().map_err(|error| {
-            CausalError::Role(novarocks_control_runtime::exit_role::ExitRoleError::Runtime(error))
+            CausalError::ExitCustody(
+                novarocks_control_runtime::exit_custody::ExitCustodyError::Runtime(error),
+            )
         })
     }
 }
@@ -265,7 +267,7 @@ impl std::fmt::Debug for RpcAuthorReturned {
     }
 }
 pub(crate) struct RpcInputRefusal {
-    pub input: ContextInput,
+    pub input: ParticipationInput,
     pub returned: RpcAuthorReturned,
 }
 impl std::fmt::Debug for RpcInputRefusal {
@@ -280,7 +282,7 @@ impl RpcCausalSender {
     /// authority, getter and external delivery remain with the original owner.
     pub(crate) fn send_input(
         self,
-        input: ContextInput,
+        input: ParticipationInput,
     ) -> Result<RpcAuthorReturned, RpcInputRefusal> {
         let Self { sender, original } = self;
         let returned = RpcAuthorReturned { original };
@@ -297,8 +299,8 @@ impl RpcCausalSender {
 }
 pub(crate) struct RpcAuthorAdmission {
     pub cut: CutId,
-    pub role: ExitRole,
-    pub authority: ExitAuthority,
+    pub original_exit_custody: ExitCustody,
+    pub authority: ExitObligation,
     pub sender: RpcCausalSender,
     pub input_author: RuntimeInputAuthor,
 }
@@ -313,12 +315,12 @@ pub(crate) enum RpcAuthorAdmissionError {
 pub(crate) enum RpcAuthorAdmissionRefusal {
     BeforeCut {
         error: RpcAuthorAdmissionError,
-        admitted: AdmittedCompletionRole,
+        admitted: AdmittedCompletionTransfer,
         admission: CutSourceAdmission,
     },
     BoundCut {
         error: CausalError,
-        _original_admitted: AdmittedCompletionRole,
+        _original_admitted: AdmittedCompletionTransfer,
         cut: CutId,
         _original_sender: TaskCausalSender,
     },
@@ -375,7 +377,7 @@ struct Delivered {
     event: Option<InputId>,
     event_consumption: Consumption,
     // Partial fill failure returns the precise original neutral payloads.
-    // They remain in this paid role until explicit failed-owner takeover.
+    // They remain in this funded cut until explicit failed-owner takeover.
     rejected: Option<(Option<WorkerMessage>, WorkerMessage)>,
 }
 impl Delivered {
@@ -392,16 +394,16 @@ impl Delivered {
         self.sources.contains(&Some(source))
     }
 }
-struct Role {
+struct CausalCutState {
     host_consumer_consumed: bool,
-    close_gate: Option<Arc<super::context_close::ContextCloseGate>>,
+    close_gate: Option<Arc<super::participation_close::ParticipationCloseGate>>,
     // Actual admitted producer handle; public Scope numbers do not bind the
-    // financial owner of a Context-targeted causal input.
+    // financial owner of a Participation-targeted causal input.
     financial_scope: ScopeHandle,
-    inputs: CausalInputRole<WorkerActor>,
+    inputs: CausalInputObligation<WorkerActor>,
     delivered: Option<Delivered>,
     // Reference the original custodian, not a copied consumption flag. Its
-    // report must finish before this role can discard the exact event receipt.
+    // report must finish before this cut state can discard the exact event receipt.
     input_author: Option<CausalInputCustody>,
     rpc_author: Option<Arc<RpcAuthorObserver>>,
     rpc_sender_returned: Option<RpcAuthorReturned>,
@@ -417,21 +419,21 @@ pub(crate) struct TaskCausalInbox {
     // Protocol close generation is independent of the runtime failure epoch.
     generation: Generation,
     ingress: Arc<TaskProposalIngress>,
-    roles: BTreeMap<CutId, Role>,
+    cuts: BTreeMap<CutId, CausalCutState>,
     // Exact transferred predecessor awaiting its actual Core receipts.
-    // This is one address into the original role inventory, not another cut.
+    // This is one address into the original cut inventory, not another cut.
     observing_prefix: Option<CutId>,
     health: Arc<ExecutionHealth>,
 }
 mod rpc_tail;
-use rpc_tail::CausalRoleEnv;
+use rpc_tail::CausalCutEnv;
 pub(crate) use rpc_tail::{CausalRetirementBank, RpcCausalTail, RpcTailBinding};
 
-/// The caller has already paid for this Context-local author and Source pair
+/// The caller has already paid for this Participation-local author and Source pair
 /// from the original RPC position. Neither this metadata nor admission mints
 /// a Work, a request token, or a replacement source reservation.
 pub(crate) struct TaskCausalRequest<'a> {
-    pub author: &'a WorkLease,
+    pub author: &'a WorkObligation,
     pub request: RequestMetadata,
     pub class: InputClass,
 }
@@ -447,7 +449,7 @@ impl TaskCausalInbox {
     ) -> Self {
         runtime
             .validate_registration(&registration)
-            .expect("the original Task Context registration");
+            .expect("the original Task Participation registration");
         let actor = registration.actor();
         Self {
             runtime,
@@ -457,7 +459,7 @@ impl TaskCausalInbox {
             task,
             generation,
             ingress,
-            roles: BTreeMap::new(),
+            cuts: BTreeMap::new(),
             observing_prefix: None,
             health,
         }
@@ -472,9 +474,9 @@ impl TaskCausalInbox {
         self.generation
     }
     pub(crate) fn rpc_input_author(&self, cut: CutId) -> Result<RuntimeInputAuthor, CausalError> {
-        self.roles
+        self.cuts
             .get(&cut)
-            .ok_or(CausalError::UnknownRole)?
+            .ok_or(CausalError::MissingCutCustody)?
             .inputs
             .event_author()
             .map_err(Into::into)
@@ -498,11 +500,11 @@ impl TaskCausalInbox {
         {
             return Err(CausalError::WrongTask);
         }
-        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-        if role.delivered.is_some()
-            || role.input_author.is_some()
-            || role.rpc_author.is_some()
-            || role.loader_exit.is_some()
+        let cut_state = self.cuts.get(&cut).ok_or(CausalError::MissingCutCustody)?;
+        if cut_state.delivered.is_some()
+            || cut_state.input_author.is_some()
+            || cut_state.rpc_author.is_some()
+            || cut_state.loader_exit.is_some()
         {
             return Err(CausalError::AlreadyAdmitted);
         }
@@ -549,8 +551,8 @@ impl TaskCausalInbox {
         {
             return Err(CausalError::WrongTask);
         }
-        if !self.roles.contains_key(&binding.cut) {
-            return Err(CausalError::UnknownRole);
+        if !self.cuts.contains_key(&binding.cut) {
+            return Err(CausalError::MissingCutCustody);
         }
         self.ingress
             .validate_bound_input_author(binding.cut, binding.task, binding.work)?;
@@ -563,12 +565,12 @@ impl TaskCausalInbox {
         self.validate_author_binding(binding)?;
         self.action_report_consumed(binding.task, binding.cut)
     }
-    /// The caller owns this role's original prepaid storage. Admission happens
+    /// The caller owns this cut's original prepaid storage. Admission happens
     /// before attaching its callback. A failed pure reservation rolls back only
     /// these actually unused input positions, outside the proposal lock.
     pub(crate) fn admit_settlement(
         &mut self,
-        producer: &WorkLease,
+        producer: &WorkObligation,
         consumers: u64,
         pending: Arc<dyn TaskPendingNotice>,
         admission: CutSourceAdmission,
@@ -585,20 +587,23 @@ impl TaskCausalInbox {
     pub(crate) fn bind_close_gate(
         &mut self,
         cut: CutId,
-        gate: Arc<super::context_close::ContextCloseGate>,
+        gate: Arc<super::participation_close::ParticipationCloseGate>,
     ) -> Result<(), CausalError> {
-        let role = self.roles.get_mut(&cut).ok_or(CausalError::UnknownRole)?;
-        if role.close_gate.is_some() || role.delivered.is_some() {
+        let cut_state = self
+            .cuts
+            .get_mut(&cut)
+            .ok_or(CausalError::MissingCutCustody)?;
+        if cut_state.close_gate.is_some() || cut_state.delivered.is_some() {
             return Err(CausalError::AlreadyAdmitted);
         }
-        role.close_gate = Some(gate);
+        cut_state.close_gate = Some(gate);
         Ok(())
     }
     pub(crate) fn admit_close(
         &mut self,
         generation: Generation,
         intent: TaskCloseIntent,
-        work: &WorkLease,
+        work: &WorkObligation,
         consumers: u64,
         pending: Arc<dyn TaskPendingNotice>,
         admission: CutSourceAdmission,
@@ -616,7 +621,7 @@ impl TaskCausalInbox {
     /// cannot revoke this producer's original cleanup/report obligations.
     pub(crate) fn admit_input(
         &mut self,
-        work: &WorkLease,
+        work: &WorkObligation,
         consumers: u64,
         pending: Arc<dyn TaskPendingNotice>,
         admission: CutSourceAdmission,
@@ -626,12 +631,12 @@ impl TaskCausalInbox {
     fn admit_original_author(
         &mut self,
         kind: CausalEventKind,
-        work: &WorkLease,
+        work: &WorkObligation,
         consumers: u64,
         pending: Arc<dyn TaskPendingNotice>,
         admission: CutSourceAdmission,
     ) -> Result<(CutId, TaskCausalSender), CausalAdmissionRefusal> {
-        let inputs = match CausalInputRole::reserve_admitted(
+        let inputs = match CausalInputObligation::reserve_admitted(
             &self.runtime,
             &self.registration,
             self.source,
@@ -667,7 +672,7 @@ impl TaskCausalInbox {
                 admission,
             });
         }
-        let inputs = match CausalInputRole::reserve_admitted(
+        let inputs = match CausalInputObligation::reserve_admitted(
             &self.runtime,
             &self.registration,
             self.source,
@@ -695,10 +700,10 @@ impl TaskCausalInbox {
     }
     /// One trusted whole-R entry: validate the original triple, borrow that
     /// same Work for actual actor/scope admission, then consume the unchanged
-    /// carrier into ExitRole. Callers cannot swap a role after author checking.
+    /// carrier into ExitCustody. Callers cannot swap the reported work after author checking.
     pub(crate) fn admit_rpc_author(
         &mut self,
-        admitted: AdmittedCompletionRole,
+        admitted: AdmittedCompletionTransfer,
         request: RequestMetadata,
         class: InputClass,
         consumers: u64,
@@ -711,7 +716,7 @@ impl TaskCausalInbox {
                 Err(refusal) => {
                     return Err(RpcAuthorAdmissionRefusal::BeforeCut {
                         error: RpcAuthorAdmissionError::Binding(refusal.error),
-                        admitted: AdmittedCompletionRole {
+                        admitted: AdmittedCompletionTransfer {
                             work: refusal.work,
                             capacity: refusal.capacity,
                             report: refusal.report,
@@ -736,7 +741,7 @@ impl TaskCausalInbox {
                 let (work, capacity, report) = reported.into_parts();
                 return Err(RpcAuthorAdmissionRefusal::BeforeCut {
                     error: RpcAuthorAdmissionError::Causal(refusal.error),
-                    admitted: AdmittedCompletionRole {
+                    admitted: AdmittedCompletionTransfer {
                         work,
                         capacity,
                         report,
@@ -751,7 +756,7 @@ impl TaskCausalInbox {
                 let (work, capacity, report) = reported.into_parts();
                 return Err(RpcAuthorAdmissionRefusal::BoundCut {
                     error,
-                    _original_admitted: AdmittedCompletionRole {
+                    _original_admitted: AdmittedCompletionTransfer {
                         work,
                         capacity,
                         report,
@@ -768,7 +773,7 @@ impl TaskCausalInbox {
                     let (work, capacity, report) = reported.into_parts();
                     return Err(RpcAuthorAdmissionRefusal::BoundCut {
                         error,
-                        _original_admitted: AdmittedCompletionRole {
+                        _original_admitted: AdmittedCompletionTransfer {
                             work,
                             capacity,
                             report,
@@ -779,20 +784,20 @@ impl TaskCausalInbox {
                 }
             };
         let report = reported.report().clone();
-        let (role, authority) = ExitRole::from_admitted(reported);
+        let (original_exit_custody, authority) = ExitCustody::from_admitted(reported);
         let original = Arc::new(RpcAuthorObserver {
             binding,
             request,
-            role: role.clone(),
+            exit_custody: original_exit_custody.clone(),
             report,
         });
-        self.roles
+        self.cuts
             .get_mut(&cut)
             .expect("same admitted RPC cut")
             .rpc_author = Some(original.clone());
         Ok(RpcAuthorAdmission {
             cut,
-            role,
+            original_exit_custody,
             authority,
             sender: RpcCausalSender { sender, original },
             input_author,
@@ -807,18 +812,18 @@ impl TaskCausalInbox {
         let checked = (|| {
             let original = &returned.original;
             self.validate_author_binding(&original.binding)?;
-            let role = self
-                .roles
+            let cut_state = self
+                .cuts
                 .get(&original.binding.cut)
-                .ok_or(CausalError::UnknownRole)?;
-            if role
+                .ok_or(CausalError::MissingCutCustody)?;
+            if cut_state
                 .rpc_author
                 .as_ref()
                 .is_none_or(|bound| !Arc::ptr_eq(bound, original))
             {
                 return Err(CausalError::WrongAuthor);
             }
-            if role.rpc_sender_returned.is_some() {
+            if cut_state.rpc_sender_returned.is_some() {
                 return Err(CausalError::AlreadyAdmitted);
             }
             self.ingress
@@ -827,7 +832,7 @@ impl TaskCausalInbox {
         })();
         match checked {
             Ok(cut) => {
-                self.roles
+                self.cuts
                     .get_mut(&cut)
                     .expect("same original RPC sender return")
                     .rpc_sender_returned = Some(returned);
@@ -839,11 +844,11 @@ impl TaskCausalInbox {
     /// Return only the exact fill receipt of this original RPC cut. Absence
     /// means not fully delivered; it grants no token or consumption proof.
     pub(crate) fn rpc_delivery(&self, cut: CutId) -> Result<Option<CausalDelivery>, CausalError> {
-        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-        if role.rpc_author.is_none() {
+        let cut_state = self.cuts.get(&cut).ok_or(CausalError::MissingCutCustody)?;
+        if cut_state.rpc_author.is_none() {
             return Err(CausalError::WrongAuthor);
         }
-        Ok(role.delivered.as_ref().and_then(|delivered| {
+        Ok(cut_state.delivered.as_ref().and_then(|delivered| {
             delivered.event.map(|event| CausalDelivery {
                 cut,
                 prefix: delivered.prefix,
@@ -854,12 +859,12 @@ impl TaskCausalInbox {
     fn admit(
         &mut self,
         kind: CausalEventKind,
-        producer: &WorkLease,
+        producer: &WorkObligation,
         consumers: u64,
         pending: Arc<dyn TaskPendingNotice>,
         admission: CutSourceAdmission,
     ) -> Result<(CutId, TaskCausalSender), CausalAdmissionRefusal> {
-        let inputs = match CausalInputRole::reserve_admitted(
+        let inputs = match CausalInputObligation::reserve_admitted(
             &self.runtime,
             &self.registration,
             self.source,
@@ -889,7 +894,7 @@ impl TaskCausalInbox {
         consumers: u64,
         pending: Arc<dyn TaskPendingNotice>,
         admission: CutSourceAdmission,
-        mut inputs: CausalInputRole<WorkerActor>,
+        mut inputs: CausalInputObligation<WorkerActor>,
         financial_scope: &ScopeHandle,
     ) -> Result<(CutId, TaskCausalSender), CausalAdmissionRefusal> {
         let cut = match self
@@ -908,10 +913,10 @@ impl TaskCausalInbox {
             }
         };
         assert!(
-            self.roles
+            self.cuts
                 .insert(
                     cut,
-                    Role {
+                    CausalCutState {
                         host_consumer_consumed: false,
                         close_gate: None,
                         financial_scope: financial_scope.clone(),
@@ -943,18 +948,18 @@ impl TaskCausalInbox {
         if action.task() != self.task {
             return Err(CausalError::WrongTask);
         }
-        let role = self
-            .roles
+        let cut_state = self
+            .cuts
             .get_mut(&action.cut())
-            .ok_or(CausalError::UnknownRole)?;
-        if role.input_author.is_some()
-            || role.rpc_author.is_some()
-            || role.loader_exit.is_some()
-            || role.delivered.is_some()
+            .ok_or(CausalError::MissingCutCustody)?;
+        if cut_state.input_author.is_some()
+            || cut_state.rpc_author.is_some()
+            || cut_state.loader_exit.is_some()
+            || cut_state.delivered.is_some()
         {
             return Err(CausalError::AlreadyAdmitted);
         }
-        role.input_author = Some(action);
+        cut_state.input_author = Some(action);
         Ok(())
     }
     /// The exit event receipt remains with the same actual loader until its
@@ -970,18 +975,21 @@ impl TaskCausalInbox {
         }
         self.ingress
             .validate_input_author(cut, self.task, loader.work_id())?;
-        let role = self.roles.get_mut(&cut).ok_or(CausalError::UnknownRole)?;
-        if role.input_author.is_some()
-            || role.rpc_author.is_some()
-            || role.loader_exit.is_some()
-            || role.delivered.is_some()
+        let cut_state = self
+            .cuts
+            .get_mut(&cut)
+            .ok_or(CausalError::MissingCutCustody)?;
+        if cut_state.input_author.is_some()
+            || cut_state.rpc_author.is_some()
+            || cut_state.loader_exit.is_some()
+            || cut_state.delivered.is_some()
         {
             return Err(CausalError::AlreadyAdmitted);
         }
-        role.loader_exit = Some(loader);
+        cut_state.loader_exit = Some(loader);
         Ok(())
     }
-    /// This custodian is exclusive; all roles for this Task use the same
+    /// This custodian is exclusive; all cuts for this Task use the same
     /// source FIFO. A different Task has its own source and can keep advancing.
     pub(crate) fn deliver_next(&mut self) -> Result<Option<CausalDelivery>, CausalError> {
         if let Some(previous) = self.observing_prefix {
@@ -994,14 +1002,14 @@ impl TaskCausalInbox {
         }
         if let Some(cut) = self.ingress.next_event_cut()
             && self
-                .roles
+                .cuts
                 .get(&cut)
-                .and_then(|role| role.close_gate.as_ref())
+                .and_then(|cut_state| cut_state.close_gate.as_ref())
                 .is_some_and(|gate| !gate.is_completed())
         {
             // Its prefix is already sealed, so fence-caused proposals remain
             // behind this cut. Neither prefix nor close event is consumed
-            // before the original physical Context admission fence returns.
+            // before the original physical Participation admission fence returns.
             return Ok(None);
         }
         let input = match self.ingress.take_next_event(false) {
@@ -1009,47 +1017,52 @@ impl TaskCausalInbox {
             Err(IngressError::Cut(CutError::NotReady | CutError::Consuming)) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let cut = input.prefix.cut.expect("causal role owns one real cut");
-        let role = self
-            .roles
+        let cut = input.prefix.cut.expect("causal input owns one real cut");
+        let cut_state = self
+            .cuts
             .get_mut(&cut)
             .expect("original admitted causal input positions");
-        assert!(role.delivered.is_none(), "one delivery per admitted role");
+        assert!(
+            cut_state.delivered.is_none(),
+            "one delivery per admitted cut"
+        );
         let sources = Delivered::sources(&input.prefix.summary);
         let prefix = if input.prefix.summary.is_empty() {
             None
         } else {
-            Some(WorkerMessage::Context(ContextMessage::Command {
-                work: input.work,
-                request: None,
-                command: ContextInput::Summary {
-                    task: self.task,
-                    generation: self.generation,
-                    cut: Some(cut),
-                    summary: input.prefix.summary,
+            Some(WorkerMessage::Participation(
+                ParticipationMessage::Command {
+                    work: input.work,
+                    request: None,
+                    command: ParticipationInput::Summary {
+                        task: self.task,
+                        generation: self.generation,
+                        cut: Some(cut),
+                        summary: input.prefix.summary,
+                    },
                 },
-            }))
+            ))
         };
         // Neutral diagnosis at the original transfer boundary. Never format
         // the owned event or any source/connector payload on this control turn.
         let event_kind = match &input.event {
-            ContextInput::LoadedTask { .. } => "loaded-task",
-            ContextInput::Loaded { .. } => "loaded",
-            ContextInput::Physical { .. } => "physical",
-            ContextInput::InstalledTask { .. } => "installed-task",
-            ContextInput::Running { .. } => "running",
-            ContextInput::ApplyTaskClose { .. } => "apply-task-close",
-            ContextInput::RootEndAcknowledged { .. } => "root-end-acknowledged",
-            ContextInput::Request(_) => "request",
+            ParticipationInput::LoadedTask { .. } => "loaded-task",
+            ParticipationInput::Loaded { .. } => "loaded",
+            ParticipationInput::Physical { .. } => "physical",
+            ParticipationInput::InstalledTask { .. } => "installed-task",
+            ParticipationInput::Running { .. } => "running",
+            ParticipationInput::ApplyTaskClose { .. } => "apply-task-close",
+            ParticipationInput::RootEndAcknowledged { .. } => "root-end-acknowledged",
+            ParticipationInput::Request(_) => "request",
             _ => "other-lifecycle",
         };
         let physical_fact = match &input.event {
-            ContextInput::Physical { fact, .. } => Some(*fact),
+            ParticipationInput::Physical { fact, .. } => Some(*fact),
             _ => None,
         };
         let original_work = input.work;
         let next_generation = match &input.event {
-            ContextInput::ApplyTaskClose {
+            ParticipationInput::ApplyTaskClose {
                 generation,
                 intent: TaskCloseIntent::Abort(_),
                 ..
@@ -1059,17 +1072,17 @@ impl TaskCausalInbox {
         // Both prepaid input positions were bound to this same actual
         // producer Work. Keep the physical fact/report association intact;
         // an exited producer is never replaced by a new or guessed live Work.
-        let event = WorkerMessage::Context(ContextMessage::Command {
+        let event = WorkerMessage::Participation(ParticipationMessage::Command {
             work: input.work,
             request: input.request,
             command: input.event,
         });
-        match role.inputs.fill_with_receipt(prefix, event) {
+        match cut_state.inputs.fill_with_receipt(prefix, event) {
             Ok((prefix, event)) => {
                 if let Some(generation) = next_generation {
                     self.generation = generation;
                 }
-                role.delivered = Some(Delivered {
+                cut_state.delivered = Some(Delivered {
                     proof: prefix.or(Some(event)),
                     prefix,
                     sources,
@@ -1090,24 +1103,24 @@ impl TaskCausalInbox {
                     event_kind,
                     ?physical_fact,
                     error = ?failure.error,
-                    event_author = ?role.inputs.event_author().map(|author| author.work()),
-                    inputs = ?role.inputs.in_flight(),
-                    input_author = ?role.input_author.as_ref().map(|author| (
+                    event_author = ?cut_state.inputs.event_author().map(|author| author.work()),
+                    inputs = ?cut_state.inputs.in_flight(),
+                    input_author = ?cut_state.input_author.as_ref().map(|author| (
                         author.phase(), author.body_and_captures_exited(),
                     )),
-                    rpc_author = ?role.rpc_author.as_ref().map(|author| (
-                        author.role.phase(), author.role.body_exited(), author.role.captures_exited(),
+                    rpc_author = ?cut_state.rpc_author.as_ref().map(|author| (
+                        author.exit_custody.phase(), author.exit_custody.body_exited(), author.exit_custody.captures_exited(),
                     )),
-                    loader_exit = ?role.loader_exit.as_ref().map(|loader| (
+                    loader_exit = ?cut_state.loader_exit.as_ref().map(|loader| (
                         loader.phase(), loader.ready_for_exit(),
                     )),
-                    financial_scope = ?role.financial_scope.snapshot(),
-                    work_lifecycle = ?role.financial_scope.work_lifecycle(original_work.work),
+                    financial_scope = ?cut_state.financial_scope.snapshot(),
+                    work_lifecycle = ?cut_state.financial_scope.work_lifecycle(original_work.work),
                     registration = ?self.registration,
                     prefix_transferred = ?failure.predecessor_input,
                     "Original causal input transfer refused by runtime"
                 );
-                role.delivered = Some(Delivered {
+                cut_state.delivered = Some(Delivered {
                     proof: failure.predecessor_input,
                     prefix: failure.predecessor_input,
                     sources,
@@ -1127,9 +1140,9 @@ impl TaskCausalInbox {
         // Save the original event's receipt before its runtime input can be
         // retired. Prefix consumption and Source pair reuse are independent.
         let delivered = self
-            .roles
+            .cuts
             .get_mut(&cut)
-            .ok_or(CausalError::UnknownRole)?
+            .ok_or(CausalError::MissingCutCustody)?
             .delivered
             .as_mut()
             .ok_or(CausalError::NotDelivered)?;
@@ -1145,9 +1158,9 @@ impl TaskCausalInbox {
             delivered.event_consumption = Consumption::Consumed;
         }
         let delivered = self
-            .roles
+            .cuts
             .get(&cut)
-            .ok_or(CausalError::UnknownRole)?
+            .ok_or(CausalError::MissingCutCustody)?
             .delivered
             .as_ref()
             .ok_or(CausalError::NotDelivered)?;
@@ -1170,7 +1183,7 @@ impl TaskCausalInbox {
                         prefix,
                     )?;
                 }
-                self.roles
+                self.cuts
                     .get_mut(&cut)
                     .unwrap()
                     .delivered
@@ -1184,9 +1197,9 @@ impl TaskCausalInbox {
             return Ok(consumption);
         }
         let delivered = self
-            .roles
+            .cuts
             .get(&cut)
-            .ok_or(CausalError::UnknownRole)?
+            .ok_or(CausalError::MissingCutCustody)?
             .delivered
             .as_ref()
             .ok_or(CausalError::NotDelivered)?;
@@ -1230,8 +1243,8 @@ impl TaskCausalInbox {
         cut: CutId,
         source: SourceId,
     ) -> Result<Consumption, CausalError> {
-        if !self.roles.contains_key(&cut) {
-            return Err(CausalError::UnknownRole);
+        if !self.cuts.contains_key(&cut) {
+            return Err(CausalError::MissingCutCustody);
         }
         if let Some(original) = self
             .ingress
@@ -1256,9 +1269,9 @@ impl TaskCausalInbox {
     }
     fn source_delivery(&self, cut: CutId, source: SourceId) -> Result<&Delivered, CausalError> {
         let delivered = self
-            .roles
+            .cuts
             .get(&cut)
-            .ok_or(CausalError::UnknownRole)?
+            .ok_or(CausalError::MissingCutCustody)?
             .delivered
             .as_ref()
             .ok_or(CausalError::NotDelivered)?;
@@ -1272,9 +1285,9 @@ impl TaskCausalInbox {
     /// actual publication-drain authority; absence is never a consumed input.
     pub(crate) fn event_core_consumed(&self, cut: CutId) -> Result<bool, CausalError> {
         let delivered = self
-            .roles
+            .cuts
             .get(&cut)
-            .ok_or(CausalError::UnknownRole)?
+            .ok_or(CausalError::MissingCutCustody)?
             .delivered
             .as_ref()
             .ok_or(CausalError::NotDelivered)?;
@@ -1303,13 +1316,13 @@ impl TaskCausalInbox {
         if self.task != task {
             return Err(CausalError::WrongTask);
         }
-        if !self.roles.contains_key(&cut) {
-            return Err(CausalError::UnknownRole);
+        if !self.cuts.contains_key(&cut) {
+            return Err(CausalError::MissingCutCustody);
         }
         if self.ingress.event_unused(cut)? {
             return Ok(true);
         }
-        if self.roles[&cut].delivered.is_none() {
+        if self.cuts[&cut].delivered.is_none() {
             return Ok(false);
         }
         self.observe_core(cut)?;
@@ -1323,9 +1336,9 @@ impl TaskCausalInbox {
         self.validate_failure_target(drained)?;
         self.observe_core(cut)?;
         let delivered = self
-            .roles
+            .cuts
             .get_mut(&cut)
-            .ok_or(CausalError::UnknownRole)?
+            .ok_or(CausalError::MissingCutCustody)?
             .delivered
             .as_mut()
             .ok_or(CausalError::NotDelivered)?;
@@ -1405,9 +1418,9 @@ impl TaskCausalInbox {
         self.ingress.fail();
         match self.ingress.take_next_event(true) {
             Ok(input) => {
-                let cut = input.prefix.cut.expect("original queued role cut");
-                let role = self.roles.get_mut(&cut).expect("queued input role custody");
-                assert!(role.delivered.is_none());
+                let cut = input.prefix.cut.expect("original queued input cut");
+                let cut_state = self.cuts.get_mut(&cut).expect("queued input cut custody");
+                assert!(cut_state.delivered.is_none());
                 for source in input.prefix.summary.candidate_sources() {
                     self.ingress.observe_source_untransferred(
                         source,
@@ -1416,7 +1429,7 @@ impl TaskCausalInbox {
                         &self.registration,
                     )?;
                 }
-                role.delivered = Some(Delivered {
+                cut_state.delivered = Some(Delivered {
                     proof: None,
                     prefix: None,
                     sources: Delivered::sources(&input.prefix.summary),
@@ -1446,7 +1459,7 @@ impl TaskCausalInbox {
     ) -> Result<(), CausalError> {
         self.runtime.validate_registration(&self.registration)?;
         if !self.registration.matches_scope(scope) {
-            return Err(DriverError::PublicationTargetMismatch.into());
+            return Err(ActorTurnError::PublicationTargetMismatch.into());
         }
         stage.validate_scope(&self.runtime, self.actor, scope)?;
         Ok(())
@@ -1465,10 +1478,10 @@ impl TaskCausalInbox {
         if loader.identity() != self.task || loader.work_id() != binding.work {
             return Err(CausalError::WrongAuthor);
         }
-        if !loader.ready_for_exit().map_err(CausalError::Role)? {
+        if !loader.ready_for_exit().map_err(CausalError::ExitCustody)? {
             return Ok(false);
         }
-        if self.roles[&binding.cut].delivered.is_some() {
+        if self.cuts[&binding.cut].delivered.is_some() {
             return Err(CausalError::AlreadyAdmitted);
         }
         if !self.ingress.event_unused(binding.cut)? {
@@ -1479,8 +1492,8 @@ impl TaskCausalInbox {
     /// The original author body/capture exit is independent of its Core
     /// report leg. A previously Consumed report must not suppress this fact.
     fn observe_failed_author_exit(&self, cut: CutId) -> Result<(), CausalError> {
-        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-        if role
+        let cut_state = self.cuts.get(&cut).ok_or(CausalError::MissingCutCustody)?;
+        if cut_state
             .input_author
             .as_ref()
             .is_some_and(CausalInputCustody::body_and_captures_exited)
@@ -1500,11 +1513,11 @@ impl TaskCausalInbox {
         if self.ingress.event_unused(binding.cut)? {
             return Ok(Consumption::AbandonedByOwnerFailure);
         }
-        if self.roles[&binding.cut].delivered.is_none() {
+        if self.cuts[&binding.cut].delivered.is_none() {
             return Ok(Consumption::Pending);
         }
         self.abandon_core(stage, binding.cut)?;
-        Ok(self.roles[&binding.cut]
+        Ok(self.cuts[&binding.cut]
             .delivered
             .as_ref()
             .unwrap()
@@ -1529,19 +1542,19 @@ impl TaskCausalInbox {
         if budget == 0 {
             return Ok(progress);
         }
-        if !self.roles.contains_key(&cut) {
-            return Err(CausalError::UnknownRole);
+        if !self.cuts.contains_key(&cut) {
+            return Err(CausalError::MissingCutCustody);
         }
         // A normal Core consumer may already have acknowledged this report
         // before failure. Revisit the original actual author independently,
         // including after its report/Role retired, before closing this cut.
         self.observe_failed_author_exit(cut)?;
         if !self.ingress.event_unused(cut)? {
-            if self.roles[&cut].delivered.is_none() {
+            if self.cuts[&cut].delivered.is_none() {
                 return Ok(progress);
             }
             self.abandon_core(stage, cut)?;
-            let delivered = self.roles[&cut].delivered.as_ref().unwrap();
+            let delivered = self.cuts[&cut].delivered.as_ref().unwrap();
             if delivered.event_consumption == Consumption::Pending
                 || delivered.source_consumption == Consumption::Pending
             {
@@ -1550,7 +1563,7 @@ impl TaskCausalInbox {
         }
         progress.rejected = self.take_rejected(cut);
         progress.progressed = progress.rejected.is_some();
-        for input in self.roles[&cut]
+        for input in self.cuts[&cut]
             .inputs
             .in_flight()?
             .into_iter()
@@ -1561,14 +1574,14 @@ impl TaskCausalInbox {
             match self.runtime.retire_input(self.actor, input) {
                 Ok(()) => progress.progressed = true,
                 Err(
-                    DriverError::InputStillQueued
-                    | DriverError::EffectsRemain
-                    | DriverError::ReservationsRemain,
+                    ActorTurnError::InputStillQueued
+                    | ActorTurnError::EffectsRemain
+                    | ActorTurnError::ReservationsRemain,
                 ) => {}
                 Err(error) => return Err(error.into()),
             }
         }
-        if self.roles[&cut]
+        if self.cuts[&cut]
             .inputs
             .in_flight()?
             .iter()
@@ -1576,9 +1589,9 @@ impl TaskCausalInbox {
             && self.observe_effects_exited(cut)?
         {
             progress.inputs_retired = true;
-            if !self.ingress.event_unused(cut)? && !self.roles[&cut].host_consumer_consumed {
+            if !self.ingress.event_unused(cut)? && !self.cuts[&cut].host_consumer_consumed {
                 self.ingress.consume_cut(cut, 0)?;
-                self.roles.get_mut(&cut).unwrap().host_consumer_consumed = true;
+                self.cuts.get_mut(&cut).unwrap().host_consumer_consumed = true;
                 progress.progressed = true;
             }
         }
@@ -1595,8 +1608,8 @@ impl TaskCausalInbox {
         cut: CutId,
     ) -> Result<bool, CausalError> {
         self.validate_failure_target(stage)?;
-        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-        Ok(role.delivered.is_some() || self.ingress.event_unused(cut)?)
+        let cut_state = self.cuts.get(&cut).ok_or(CausalError::MissingCutCustody)?;
+        Ok(cut_state.delivered.is_some() || self.ingress.event_unused(cut)?)
     }
     /// Move one original source to its already-paid physical disposal owner.
     /// Taking a carrier grants no exit, report consumption or refund.
@@ -1608,7 +1621,7 @@ impl TaskCausalInbox {
     ) -> Result<
         Option<
             novarocks_execution_contract::RetainedTaskSource<
-                novarocks_execution::runtime::fragment::ExecutionFailure,
+                novarocks_execution::runtime::task::ExecutionFailure,
             >,
         >,
         CausalError,
@@ -1654,17 +1667,22 @@ impl TaskCausalInbox {
                         original_generation,
                         core,
                     )
-                    .map_err(CausalError::Role)?;
+                    .map_err(CausalError::ExitCustody)?;
             } else {
                 let before = original.custody.phase();
-                original.custody.try_retire().map_err(CausalError::Role)?;
+                original
+                    .custody
+                    .try_retire()
+                    .map_err(CausalError::ExitCustody)?;
                 progressed |= before != original.custody.phase();
             }
         }
         let runtime_error = |error| {
-            CausalError::Role(novarocks_control_runtime::exit_role::ExitRoleError::Runtime(error))
+            CausalError::ExitCustody(
+                novarocks_control_runtime::exit_custody::ExitCustodyError::Runtime(error),
+            )
         };
-        // The prefix pair can belong to an earlier R/Context. Each original
+        // The prefix pair can belong to an earlier R/Participation. Each original
         // Scope selects its own ledger; the current cut's payer is not a reap
         // authority for a numerically matching foreign Scope.
         let originals = self.ingress.pair_inventory(route)?;
@@ -1693,21 +1711,16 @@ impl TaskCausalInbox {
         &mut self,
         cut: CutId,
     ) -> Option<(Option<WorkerMessage>, WorkerMessage)> {
-        self.roles
-            .get_mut(&cut)?
-            .delivered
-            .as_mut()?
-            .rejected
-            .take()
+        self.cuts.get_mut(&cut)?.delivered.as_mut()?.rejected.take()
     }
     /// These exact one-shot paid input positions become idle only when their
     /// actual runtime inputs retire. Runtime retirement verifies every batch
-    /// effect and reservation handoff before clearing the same role pointer.
+    /// effect and reservation handoff before clearing the same cut pointer.
     /// This observes effects exit only; it grants neither author capture exit
     /// nor Core consumption or failed-owner publication-drain authority.
     pub(crate) fn observe_effects_exited(&self, cut: CutId) -> Result<bool, CausalError> {
-        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-        self.role_env().observe_effects_exited(cut, role)
+        let cut_state = self.cuts.get(&cut).ok_or(CausalError::MissingCutCustody)?;
+        self.cut_env().observe_effects_exited(cut, cut_state)
     }
     fn validate_cut_financial_scope(
         &self,
@@ -1715,23 +1728,23 @@ impl TaskCausalInbox {
         scope: &ScopeHandle,
     ) -> Result<(), CausalError> {
         self.runtime.validate_registration(&self.registration)?;
-        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-        if !role.financial_scope.same_scope(scope) {
+        let cut_state = self.cuts.get(&cut).ok_or(CausalError::MissingCutCustody)?;
+        if !cut_state.financial_scope.same_scope(scope) {
             return Err(CausalError::WrongAuthor);
         }
         Ok(())
     }
     /// Advance only this sealed cut's two original sources. Core receipts,
-    /// physical holder exit, role retirement and header reclamation remain
+    /// physical holder exit, cut retirement and header reclamation remain
     /// separate observations; none can stand in for another.
     pub(crate) fn advance_source_pair_retirement(
         &self,
         cut: CutId,
         scope: &ScopeHandle,
     ) -> Result<CausalSourceProgress, CausalError> {
-        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-        self.role_env()
-            .advance_source_pair_retirement(cut, role, scope)
+        let cut_state = self.cuts.get(&cut).ok_or(CausalError::MissingCutCustody)?;
+        self.cut_env()
+            .advance_source_pair_retirement(cut, cut_state, scope)
     }
     /// Closed source admission permits only the existing original pair to
     /// retire. Its saved real input receipts survive all partial deliveries.
@@ -1740,7 +1753,7 @@ impl TaskCausalInbox {
         route: crate::task_proposal_ingress::PairRoute,
     ) -> Result<bool, CausalError> {
         Ok(self
-            .role_env()
+            .cut_env()
             .advance_pair_retirement(
                 route,
                 |source| {
@@ -1763,43 +1776,43 @@ impl TaskCausalInbox {
         cut: CutId,
         retirement: CausalSourceRetirement,
     ) -> Result<RetiredCut, CausalRetirementRefusal> {
-        let Some(role) = self.roles.get_mut(&cut) else {
+        let Some(cut_state) = self.cuts.get_mut(&cut) else {
             return Err(CausalRetirementRefusal {
-                error: CausalError::UnknownRole,
+                error: CausalError::MissingCutCustody,
                 retirement,
             });
         };
-        let env = CausalRoleEnv {
+        let env = CausalCutEnv {
             runtime: &self.runtime,
             registration: &self.registration,
             actor: self.actor,
             ingress: &self.ingress,
         };
-        let retired = env.retire_after_exit(cut, role, retirement)?;
-        self.roles.remove(&cut);
+        let retired = env.retire_after_exit(cut, cut_state, retirement)?;
+        self.cuts.remove(&cut);
         if self.observing_prefix == Some(cut) {
             self.observing_prefix = None;
         }
         Ok(retired)
     }
     pub(crate) fn is_empty(&self) -> bool {
-        self.roles.is_empty()
+        self.cuts.is_empty()
     }
     pub(crate) fn last_cut(&self) -> Option<CutId> {
-        self.roles.last_key_value().map(|(cut, _)| *cut)
+        self.cuts.last_key_value().map(|(cut, _)| *cut)
     }
     pub(crate) fn host_input_inventory(
         &self,
         cut: CutId,
     ) -> Result<[Option<InputId>; 2], CausalError> {
-        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-        Ok(role.inputs.in_flight()?)
+        let cut_state = self.cuts.get(&cut).ok_or(CausalError::MissingCutCustody)?;
+        Ok(cut_state.inputs.in_flight()?)
     }
-    /// Walk only the original finite role inventory. A notification does not
+    /// Walk only the original finite cut inventory. A notification does not
     /// identify a cut and must never synthesize its ID from issuance order.
     pub(crate) fn cut_inventory(&self, after: Option<CutId>, limit: usize) -> Vec<CutId> {
         use std::ops::Bound::{Excluded, Unbounded};
-        self.roles
+        self.cuts
             .range((after.map_or(Unbounded, Excluded), Unbounded))
             .take(limit)
             .map(|(cut, _)| *cut)
@@ -1812,8 +1825,8 @@ mod tests;
 
 impl TaskCausalInbox {
     pub(crate) fn trace_drain_inventory(&self, budget: usize) {
-        for (cut, role) in self.roles.iter().take(budget) {
-            let delivered = role.delivered.as_ref().map(|d| {
+        for (cut, cut_state) in self.cuts.iter().take(budget) {
+            let delivered = cut_state.delivered.as_ref().map(|d| {
                 (
                     d.prefix,
                     d.event,
@@ -1837,7 +1850,7 @@ impl TaskCausalInbox {
                         )
                     })
                 });
-            let inputs = role.inputs.in_flight().map(|inputs| {
+            let inputs = cut_state.inputs.in_flight().map(|inputs| {
                 inputs.map(|input| {
                     input.map(|input| {
                         (
@@ -1850,20 +1863,20 @@ impl TaskCausalInbox {
             });
             tracing::debug!(pid = std::process::id(), task = ?self.task, ?cut,
                 ?delivered, ?sources, ?inputs,
-                input_author = ?role.input_author.as_ref().map(|a| (a.phase(), a.actual_exit_ready())),
-                rpc_author = ?role.rpc_author.as_ref().map(|a| a.role.phase()),
-                host_consumed = role.host_consumer_consumed, unused = ?self.ingress.event_unused(*cut),
+                input_author = ?cut_state.input_author.as_ref().map(|a| (a.phase(), a.actual_exit_ready())),
+                rpc_author = ?cut_state.rpc_author.as_ref().map(|a| a.exit_custody.phase()),
+                host_consumed = cut_state.host_consumer_consumed, unused = ?self.ingress.event_unused(*cut),
                 "Worker original causal cut inventory at process drain");
         }
     }
     /// This owner records the original event receipt before retiring either
     /// of its actual input headers. RPC cuts remain with their original R.
     pub(crate) fn retire_host_headers(&mut self, cut: CutId) -> Result<bool, CausalError> {
-        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-        if role.rpc_author.is_some() {
+        let cut_state = self.cuts.get(&cut).ok_or(CausalError::MissingCutCustody)?;
+        if cut_state.rpc_author.is_some() {
             return Ok(false);
         }
-        if let Some(author) = &role.input_author {
+        if let Some(author) = &cut_state.input_author {
             if !author.body_and_captures_exited() {
                 return Ok(false);
             }
@@ -1871,21 +1884,21 @@ impl TaskCausalInbox {
         }
         let unused = self.ingress.event_unused(cut)?;
         if !unused {
-            if role.delivered.is_none() {
+            if cut_state.delivered.is_none() {
                 return Ok(false);
             }
             if self.observe_core(cut)? == Consumption::Pending || !self.event_core_consumed(cut)? {
                 return Ok(false);
             }
         }
-        let in_flight = self.roles[&cut].inputs.in_flight()?;
+        let in_flight = self.cuts[&cut].inputs.in_flight()?;
         for input in in_flight.into_iter().flatten() {
             match self.runtime.retire_input(self.actor, input) {
                 Ok(()) => {}
                 Err(
-                    DriverError::InputStillQueued
-                    | DriverError::EffectsRemain
-                    | DriverError::ReservationsRemain,
+                    ActorTurnError::InputStillQueued
+                    | ActorTurnError::EffectsRemain
+                    | ActorTurnError::ReservationsRemain,
                 ) => return Ok(false),
                 Err(error) => return Err(error.into()),
             }
@@ -1893,9 +1906,9 @@ impl TaskCausalInbox {
         if !self.observe_effects_exited(cut)? {
             return Ok(false);
         }
-        if !unused && !self.roles[&cut].host_consumer_consumed {
+        if !unused && !self.cuts[&cut].host_consumer_consumed {
             self.ingress.consume_cut(cut, 0)?;
-            self.roles
+            self.cuts
                 .get_mut(&cut)
                 .expect("original cut")
                 .host_consumer_consumed = true;
@@ -1905,11 +1918,11 @@ impl TaskCausalInbox {
     /// Positive receipt for this original RPC queued item taken by the real
     /// failed owner before either of its runtime inputs ever transferred.
     pub(crate) fn rpc_abandoned_before_fill(&self, cut: CutId) -> Result<bool, CausalError> {
-        let role = self.roles.get(&cut).ok_or(CausalError::UnknownRole)?;
-        if role.rpc_author.is_none() {
+        let cut_state = self.cuts.get(&cut).ok_or(CausalError::MissingCutCustody)?;
+        if cut_state.rpc_author.is_none() {
             return Ok(false);
         }
-        let Some(delivered) = &role.delivered else {
+        let Some(delivered) = &cut_state.delivered else {
             return Ok(false);
         };
         Ok(delivered.proof.is_none()
@@ -1922,9 +1935,9 @@ impl TaskCausalInbox {
     }
     pub(crate) fn rpc_cut(&self, cut: CutId) -> Result<bool, CausalError> {
         Ok(self
-            .roles
+            .cuts
             .get(&cut)
-            .ok_or(CausalError::UnknownRole)?
+            .ok_or(CausalError::MissingCutCustody)?
             .rpc_author
             .is_some())
     }
@@ -1934,24 +1947,28 @@ impl TaskCausalInbox {
 impl TaskCausalInbox {
     pub(crate) fn print_neutral_inventory(&self) {
         eprintln!(
-            "causal metadata observing_prefix={:?} roles={}",
+            "causal metadata observing_prefix={:?} cuts={}",
             self.observing_prefix,
-            self.roles.len()
+            self.cuts.len()
         );
-        for (cut, role) in &self.roles {
+        for (cut, cut_state) in &self.cuts {
             eprintln!(
                 "causal cut={cut:?} inputs={:?} input_author={:?} loader_exit={:?} rpc={:?} unused={:?} core={:?} host_consumer={}",
-                role.inputs.in_flight(),
-                role.input_author
+                cut_state.inputs.in_flight(),
+                cut_state
+                    .input_author
                     .as_ref()
                     .map(|author| (author.phase(), author.actual_exit_ready())),
-                role.loader_exit.as_ref().map(|loader| loader.phase()),
-                role.rpc_author.as_ref().map(|author| author.role.phase()),
+                cut_state.loader_exit.as_ref().map(|loader| loader.phase()),
+                cut_state
+                    .rpc_author
+                    .as_ref()
+                    .map(|author| author.exit_custody.phase()),
                 self.ingress.event_unused(*cut),
                 self.ingress.cut_consumption(*cut),
-                role.host_consumer_consumed
+                cut_state.host_consumer_consumed
             );
-            if let Some(delivered) = &role.delivered {
+            if let Some(delivered) = &cut_state.delivered {
                 eprintln!(
                     "causal delivery cut={cut:?} prefix={:?} event={:?} event_consumption={:?} source_consumption={:?} sources={:?} rejected={}",
                     delivered.prefix,

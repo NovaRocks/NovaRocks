@@ -18,7 +18,7 @@
 use super::*;
 use crate::exec::pipeline::builder::compiled_statistics_writer_fixture;
 use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
-use crate::runtime::fragment::ExecutionFailureCause;
+use crate::runtime::task::ExecutionFailureCause;
 use novarocks_local_program::{PreparedWriterAggregateCall, PreparedWriterAggregateCalls};
 
 #[derive(Debug)]
@@ -156,9 +156,9 @@ fn plan_tree_prepared_partial_and_last_independent_schema_keep_actual_creation()
     operator.prepare().unwrap();
     operator.bind_runtime_state(&source.state).unwrap();
     let error = source.state.error_state();
-    let mut work = crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
+    let mut work = crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 0);
     let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&error, &mut work, &mut value_conversions);
+    let mut ctx = DriverStep::new(&error, &mut work, &mut value_conversions);
     let step = operator.as_mut();
     assert!(matches!(step.initial_step(), NextStep::NeedInput));
     step.finish(&mut ctx).unwrap();
@@ -290,7 +290,7 @@ fn plan_tree_prepared_partial_preserves_first_memory_and_original_caller_without
     let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
         novarocks_functions::KernelDiagnostic::new("original writer preparation stop"),
     ))
-    .at_operator(2, crate::runtime::fragment::PipelineOperation::Admission);
+    .at_operator(2, crate::runtime::task::PipelineOperation::Admission);
     source.state.error_state().set_error(original.clone());
     let before = source.tracker.allocated();
     let failure = CompiledWriterPartialFactory::create_prepared_in(
@@ -303,7 +303,7 @@ fn plan_tree_prepared_partial_preserves_first_memory_and_original_caller_without
     .err()
     .expect("original caller refusal stays primary");
     assert_eq!(failure.cause(), original.cause());
-    assert_eq!(failure.context(), original.context());
+    assert_eq!(failure.site(), original.site());
     assert_eq!(
         source.tracker.allocated(),
         before,

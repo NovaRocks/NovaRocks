@@ -23,8 +23,8 @@ use novarocks_spi::connector::ConnectorOutputMemoryToken;
 
 use crate::runtime::mem_tracker::MemTracker;
 
-use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
 use crate::runtime::mem_tracker::MemoryAccountingFailure;
+use crate::runtime::task::{ExecutionFailure, ExecutionReason, ExecutionResult};
 
 #[derive(Debug)]
 enum ChunkChargeFailure {
@@ -152,26 +152,26 @@ pub(crate) fn record_batch_shared_owner_bytes(batch: &RecordBatch, owner: &Recor
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ChunkMemoryLease {
-    owner: ChunkMemoryLeaseOwner,
+pub(crate) struct ChunkMemoryCharge {
+    owner: ChunkMemoryChargeOwner,
 }
 
 #[derive(Clone, Debug)]
-enum ChunkMemoryLeaseOwner {
+enum ChunkMemoryChargeOwner {
     Native(Arc<ChunkAccounting>),
     Connector(Arc<Mutex<ConnectorOutputMemoryToken>>),
 }
 
-impl ChunkMemoryLease {
+impl ChunkMemoryCharge {
     pub(super) fn native(accounting: Arc<ChunkAccounting>) -> Self {
         Self {
-            owner: ChunkMemoryLeaseOwner::Native(accounting),
+            owner: ChunkMemoryChargeOwner::Native(accounting),
         }
     }
 
     pub(super) fn connector(output_memory: Arc<Mutex<ConnectorOutputMemoryToken>>) -> Self {
         Self {
-            owner: ChunkMemoryLeaseOwner::Connector(output_memory),
+            owner: ChunkMemoryChargeOwner::Connector(output_memory),
         }
     }
 
@@ -185,7 +185,7 @@ impl ChunkMemoryLease {
         connector_retained_bytes: usize,
     ) -> ExecutionResult<Option<TransferredChunkBytes>> {
         match &self.owner {
-            ChunkMemoryLeaseOwner::Native(accounting) => {
+            ChunkMemoryChargeOwner::Native(accounting) => {
                 let Some(tracker) = tracker else {
                     return Ok(None);
                 };
@@ -217,7 +217,7 @@ impl ChunkMemoryLease {
                     Arc::clone(tracker),
                 )))
             }
-            ChunkMemoryLeaseOwner::Connector(output_memory) => {
+            ChunkMemoryChargeOwner::Connector(output_memory) => {
                 // A connector reservation may move only when this chunk is its
                 // sole owner. Shared clones keep the reservation where it is
                 // and let the writer use the existing per-batch fallback.
@@ -254,8 +254,8 @@ impl ChunkMemoryLease {
 
     pub(crate) fn tracker(&self) -> Option<Arc<MemTracker>> {
         match &self.owner {
-            ChunkMemoryLeaseOwner::Native(accounting) => Some(accounting.tracker()),
-            ChunkMemoryLeaseOwner::Connector(_) => None,
+            ChunkMemoryChargeOwner::Native(accounting) => Some(accounting.tracker()),
+            ChunkMemoryChargeOwner::Connector(_) => None,
         }
     }
 }
@@ -314,8 +314,8 @@ impl TransferredChunkBytes {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .shrink_to(*retained_bytes)
-            .map_err(|cause| crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
-                crate::runtime::fragment::connector_failure::ConnectorOperation::ShrinkOutputReservation, cause).into())
+            .map_err(|cause| crate::runtime::task::connector_failure::ConnectorCallFailure::new(
+                crate::runtime::task::connector_failure::ConnectorOperation::ShrinkOutputReservation, cause).into())
     }
 }
 

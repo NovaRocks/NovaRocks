@@ -25,7 +25,7 @@ use super::{
     hash_layout::HashLayout,
     table::{IntegerHashCosts, integer_hash_costs},
 };
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 use std::num::NonZeroUsize;
 
 #[derive(Clone, Copy, Debug)]

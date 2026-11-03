@@ -302,7 +302,7 @@ async fn original_settlement_crosses_wire_after_last_result_window_alias_exits()
 #[tokio::test(flavor = "multi_thread")]
 async fn unpublished_paid_input_withdrawal_recycles_queue_but_keeps_retained_payload() {
     use crate::task_execution::intent::TaskOperationSink;
-    use novarocks_resource_contract::ExistingOwnerRetentionLease;
+    use novarocks_resource_contract::ExistingOwnerRetentionPin;
     use novarocks_workload_control::WorkloadShutdownError;
 
     let backend = BackendProcessId::new_v7();
@@ -344,7 +344,7 @@ async fn unpublished_paid_input_withdrawal_recycles_queue_but_keeps_retained_pay
     // The existing fixture has exactly 128 Custody QueueRecords. Exceed that
     // total without changing any limit: a leaked queued record eventually
     // prevents a later paid preparation, even though no request was published.
-    let mut retained_input: Option<(Box<[u8; 16]>, ExistingOwnerRetentionLease)> = None;
+    let mut retained_input: Option<(Box<[u8; 16]>, ExistingOwnerRetentionPin)> = None;
     for ordinal in 0..129u32 {
         let intent = update_intent(ordinal + 1, backend, 1);
         let request = intent

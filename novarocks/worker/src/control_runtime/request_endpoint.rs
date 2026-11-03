@@ -24,7 +24,7 @@ use novarocks_control_runtime::{
     publication::PublishedReply,
     reply_notification::{ReplyNotificationError, ReplyNotificationJob, ReplyObserver},
 };
-use novarocks_worker_protocol::creation::RequestContext;
+use novarocks_worker_protocol::creation::RequestReplyTag;
 use std::{
     future::Future,
     pin::Pin,
@@ -36,7 +36,7 @@ use std::{
 /// role exist. The PublishedReply belongs to that caller's actual Scope; this
 /// shared mechanical spine does not choose a Root or Context owner for it.
 /// H is the caller's frozen neutral header, not a factory for input identity.
-pub(super) struct RequestEndpoint<B, H: Copy = RequestContext> {
+pub(super) struct RequestEndpoint<B, H: Copy = RequestReplyTag> {
     pub(super) request: H,
     pub(super) ready: ControlRequestReady,
     pub(super) reply: PublishedReply<B>,
@@ -54,12 +54,12 @@ impl<B, H: Copy> RequestEndpoint<B, H> {
 /// This handle cannot be cloned. Cancellation ends only the external wait;
 /// the original custodian keeps its actual work, publication and exit duties.
 #[must_use = "Take the original reply or end only this external wait"]
-pub(crate) struct RequestHandle<B, H: Copy = RequestContext> {
+pub(crate) struct RequestExternalWait<B, H: Copy = RequestReplyTag> {
     pub(super) endpoint: Arc<RequestEndpoint<B, H>>,
     pub(super) active: bool,
     pub(super) observer: Option<ReplyObserver<WorkerActor>>,
 }
-impl<B, H: Copy> RequestHandle<B, H> {
+impl<B, H: Copy> RequestExternalWait<B, H> {
     #[cfg(test)]
     pub(crate) fn request(&self) -> H {
         self.endpoint.request
@@ -77,7 +77,7 @@ impl<B, H: Copy> RequestHandle<B, H> {
         })
     }
 }
-impl<B, H: Copy> Drop for RequestHandle<B, H> {
+impl<B, H: Copy> Drop for RequestExternalWait<B, H> {
     fn drop(&mut self) {
         if self.active {
             drop(self.observer.take());
@@ -89,7 +89,7 @@ impl<B, H: Copy> Drop for RequestHandle<B, H> {
 /// Taking the outbox moves the same endpoint's external exit obligation to
 /// this one delivery. It supplies no Core, source or physical Work exit fact.
 #[must_use = "The actual sender retains delivery custody until it really ends"]
-pub(crate) struct RequestDelivery<B, H: Copy = RequestContext> {
+pub(crate) struct RequestDelivery<B, H: Copy = RequestReplyTag> {
     endpoint: Arc<RequestEndpoint<B, H>>,
     body: Option<Arc<B>>,
     observer: Option<ReplyObserver<WorkerActor>>,
@@ -123,7 +123,7 @@ pub(crate) enum RequestAwaitError {
     AlreadyTaken,
     Notification(ReplyNotificationError),
 }
-impl<B, H: Copy> Future for RequestHandle<B, H> {
+impl<B, H: Copy> Future for RequestExternalWait<B, H> {
     type Output = Result<RequestDelivery<B, H>, RequestAwaitError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -200,7 +200,7 @@ pub(crate) fn notification_submit_busy(error: &super::host_executor::HostSubmitE
     matches!(
         error,
         super::host_executor::HostSubmitError::Queue(
-            FairQueueError::Full | FairQueueError::ContextFull | FairQueueError::DuplicateWork
+            FairQueueError::Full | FairQueueError::GroupFull | FairQueueError::DuplicateWork
         )
     )
 }

@@ -140,7 +140,7 @@ pub(crate) fn encode_native_submission(
                     .ok_or("native submission instance ordinal exceeds the kernel's width")?;
                 Ok(ValidatedNativeSubmission::new(
                     placement.backend_idx,
-                    placement.finst_id,
+                    placement.task_key,
                     view.execution_id(),
                     Arc::clone(artifact),
                     NativePlacementAssignment::new(

@@ -147,8 +147,8 @@ async fn freeze_mv_rewrite_definition_async(
     let target = projection.facts.target();
     let target_catalog = target.catalog().ok_or("MV rewrite target has no catalog")?;
     let planning =
-        crate::connector::acquire_metadata_planning_lease(connector_control, target_catalog)?;
-    let context = crate::connector::context_for_planning_lease(&planning, context.clone())?;
+        crate::connector::acquire_metadata_planning_pin(connector_control, target_catalog)?;
+    let context = crate::connector::context_for_planning_pin(&planning, context.clone())?;
     let documents = planning
         .derive_document_storage_lease()
         .map_err(|error| error.to_string())?;
@@ -318,9 +318,8 @@ async fn freeze_base_table_state_async(
     table: &TableIdentity,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<SqlMvRewriteBaseTableFacts, String> {
-    let lease =
-        crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
-    let context = crate::connector::context_for_planning_lease(&lease, context.clone())?;
+    let lease = crate::connector::acquire_metadata_planning_pin(connector_control, &table.catalog)?;
+    let context = crate::connector::context_for_planning_pin(&lease, context.clone())?;
     let metadata = crate::connector::schema_creation::load_frontend_table_async(
         lease.binding().metadata().as_ref(),
         novarocks_spi::connector::ConnectorTableRequest {

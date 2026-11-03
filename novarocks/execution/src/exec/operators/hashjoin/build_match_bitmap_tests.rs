@@ -39,7 +39,7 @@ fn initializer(
     )
     .unwrap()
 }
-fn claim(init: &Arc<BuildMatchBitmapInit>, creator: &dyn InputConstructionOwner) -> InitLease {
+fn claim(init: &Arc<BuildMatchBitmapInit>, creator: &dyn InputConstructionOwner) -> InitObligation {
     match init.claim(creator, &Control).unwrap() {
         BitmapInitClaim::Range(lease) => lease,
         _ => panic!("expected a real initialization range"),
@@ -159,7 +159,7 @@ fn exact_word_domain_zero_and_pending_initialization_cannot_escape_as_ready() {
     let mut right_lease = claim(&right, owner.as_ref());
     // Only this private test can attempt the cross-owner lease substitution.
     // Validation must fail before either allocation is written.
-    std::mem::swap(&mut left_lease.lease, &mut right_lease.lease);
+    std::mem::swap(&mut left_lease.obligation, &mut right_lease.obligation);
     assert!(left_lease.initialize(1, &Control).is_err());
     assert!(right_lease.initialize(1, &Control).is_err());
     assert!(left.try_freeze().is_err());

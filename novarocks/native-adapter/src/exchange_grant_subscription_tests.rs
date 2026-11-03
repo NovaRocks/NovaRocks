@@ -17,12 +17,12 @@
 
 use super::*;
 use novarocks_execution::runtime::exchange::{
-    ExchangeFailure, ExchangeReceiverHandle, ExchangeReceiverSnapshot,
-};
-use novarocks_execution::runtime::fragment::io::{
-    ExchangeReceiverKey, ExchangeReceiverRegistration, UnavailableExchangeReceiverPort,
+    ExchangeFailure, ExchangeReceiverPin, ExchangeReceiverSnapshot,
 };
 use novarocks_execution::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::task::io::{
+    ExchangeReceiverKey, ExchangeReceiverRegistration, UnavailableExchangeReceiverPort,
+};
 use novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitSequence;
 use novarocks_execution_contract::{ExchangeSource, FragmentNodeId};
 use novarocks_types::UniqueId;
@@ -92,9 +92,9 @@ impl ExchangeReceiverPort for TestPort {
     fn register_unit_demand(
         &self,
         _: ExchangeReceiverKey,
-        entry: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDemandEntry,
+        entry: novarocks_execution::runtime::task::io::exchange_unit::ExchangeDemandEntry,
     ) -> Result<ExchangeStreamObservation, FailureFact> {
-        use novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeDemandOperation;
+        use novarocks_execution::runtime::task::io::exchange_unit::ExchangeDemandOperation;
         let facts = {
             let mut states = self.states.lock().unwrap();
             let facts = states.entry(entry.stream).or_default();
@@ -116,9 +116,9 @@ impl ExchangeReceiverPort for TestPort {
     fn receive_unit(
         &self,
         _: ExchangeReceiverKey,
-        frame: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame,
+        frame: novarocks_execution::runtime::task::io::exchange_unit::ExchangeUnitReceiverFrame,
     ) -> Result<
-        novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitReceipt,
+        novarocks_execution::runtime::task::io::exchange_unit::ExchangeUnitReceipt,
         FailureFact,
     > {
         assert!(
@@ -136,7 +136,7 @@ impl ExchangeReceiverPort for TestPort {
             facts.custody_through = frame.item.sequence().get();
             *facts
         };
-        Ok(novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitReceipt {
+        Ok(novarocks_execution::runtime::task::io::exchange_unit::ExchangeUnitReceipt {
             verdict: novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeAdmissionVerdict::Applied, facts,
         })
     }
@@ -175,13 +175,13 @@ impl ExchangeReceiverPort for TestPort {
 
     fn cancel(&self, _: ExchangeReceiverKey) {}
     fn remove(&self, _: ExchangeReceiverKey) {}
-    fn cancel_fragment(&self, _: UniqueId) {}
-    fn receiver_handle(
+    fn cancel_task(&self, _: UniqueId) {}
+    fn receiver_pin(
         &self,
         key: ExchangeReceiverKey,
         count: usize,
-    ) -> Result<ExchangeReceiverHandle, ExchangeFailure> {
-        UnavailableExchangeReceiverPort.receiver_handle(key, count)
+    ) -> Result<ExchangeReceiverPin, ExchangeFailure> {
+        UnavailableExchangeReceiverPort.receiver_pin(key, count)
     }
     fn stream_close_facts(
         &self,
@@ -214,11 +214,11 @@ fn sibling(base: ExchangeStreamIdentity, node: usize) -> ExchangeStreamIdentity 
     ExchangeStreamIdentity::try_new(
         ExchangeSource::new(
             base.source().task(),
-            base.source().fragment_instance_id(),
+            base.source().task_key(),
             base.source().sender_ordinal(),
         ),
         base.destination(),
-        base.destination_fragment_instance_id(),
+        base.destination_task_key(),
         FragmentNodeId::new(node as i32),
     )
     .unwrap()
@@ -599,7 +599,7 @@ fn installed_plane(
     .unwrap();
     let descriptor = TaskDescriptor::try_new(
         stream.destination(),
-        stream.destination_fragment_instance_id(),
+        stream.destination_task_key(),
         std::num::NonZeroUsize::new(1).unwrap(),
         Vec::new(),
         topology,
@@ -624,13 +624,9 @@ fn worker_exact_route_authorizes_unit_piggyback_demand_and_stop_roundtrips() {
     };
     let base = base_stream();
     let stream = ExchangeStreamIdentity::try_new(
-        ExchangeSource::new(
-            base.source().task(),
-            base.source().fragment_instance_id(),
-            0,
-        ),
+        ExchangeSource::new(base.source().task(), base.source().task_key(), 0),
         base.destination(),
-        base.destination_fragment_instance_id(),
+        base.destination_task_key(),
         base.destination_node(),
     )
     .unwrap();
@@ -894,13 +890,9 @@ async fn authenticated_tonic_ingress_backend_service_roundtrips_all_three_unit_m
     use novarocks_proto_codec::native_rpc::NativeEndpointDomain;
     let base = base_stream();
     let stream = ExchangeStreamIdentity::try_new(
-        ExchangeSource::new(
-            base.source().task(),
-            base.source().fragment_instance_id(),
-            0,
-        ),
+        ExchangeSource::new(base.source().task(), base.source().task_key(), 0),
         base.destination(),
-        base.destination_fragment_instance_id(),
+        base.destination_task_key(),
         base.destination_node(),
     )
     .unwrap();
@@ -940,7 +932,7 @@ async fn authenticated_tonic_ingress_backend_service_roundtrips_all_three_unit_m
             Arc::new(UnusedIngress),
         ),
     );
-    let mut server = crate::NativeRpcServerHandle::start_with_admission(
+    let mut server = crate::NativeRpcListener::start_with_admission(
         "127.0.0.1",
         0,
         service,
@@ -1024,20 +1016,20 @@ async fn authenticated_tonic_ingress_backend_service_roundtrips_all_three_unit_m
         let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let exit_flag = exited.clone();
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
-        let activity = novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeCallActivity::new(move || {
+        let activity = novarocks_execution::runtime::task::io::exchange_unit::ExchangeCallActivity::new(move || {
             exit_flag.store(true, Ordering::Release); let _ = exit_tx.send(());
         });
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        transmitter.deliver_unit(novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitFrame {
+        transmitter.deliver_unit(novarocks_execution::runtime::task::io::exchange_unit::ExchangeUnitFrame {
             destination: RuntimeEndpoint::from_socket_addr(server.bound_addr()),
-            receiver: novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeUnitReceiverFrame {
+            receiver: novarocks_execution::runtime::task::io::exchange_unit::ExchangeUnitReceiverFrame {
                 stream, sender_count: 1, sender_id: 0, backend_number: 0, item: ExchangeUnitItem::End(ExchangeUnitSequence::try_new(2).unwrap()), payload: Bytes::new(), next_demand: None,
             },
         }, CancellationToken::new(), activity, Box::new(move |outcome| { let _ = done_tx.send((outcome, exited.load(Ordering::Acquire))); }));
         hold.entered.notified().await;
         let (outcome, released_at_notification) = done_rx.await.unwrap();
         hold.release();
-        assert!(matches!(outcome, novarocks_execution::runtime::fragment::io::exchange_unit::ExchangeCallOutcome::Unknown(_)));
+        assert!(matches!(outcome, novarocks_execution::runtime::task::io::exchange_unit::ExchangeCallOutcome::Unknown(_)));
         assert!(!released_at_notification);
         exit_rx.await.unwrap();
 
@@ -1061,7 +1053,7 @@ async fn authenticated_tonic_ingress_backend_service_roundtrips_all_three_unit_m
                 stream.source(), destination, UniqueId::new(91844, i64::from(ordinal)), stream.destination_node(),
             ).unwrap();
             let descriptor = TaskDescriptor::try_new(
-                destination, closed.destination_fragment_instance_id(), std::num::NonZeroUsize::new(1).unwrap(),
+                destination, closed.destination_task_key(), std::num::NonZeroUsize::new(1).unwrap(),
                 Vec::new(), ExchangeTopology::try_new(Vec::new(), vec![ExchangeInbound::try_new(
                     closed.destination_node(), vec![closed.source()], delivery,
                 ).unwrap()]).unwrap(),
@@ -1223,7 +1215,7 @@ struct RealUnitReceiverFixture {
     owner: Arc<novarocks_execution::runtime::task_control::TaskExecutionControl>,
     failure: Arc<novarocks_execution::runtime::runtime_state::RuntimeErrorState>,
     factory: Arc<dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory>,
-    port: Arc<novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort>,
+    port: Arc<novarocks_execution::runtime::task::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort>,
     key: ExchangeReceiverKey,
     registry_key: novarocks_execution::runtime::exchange::ExchangeKey,
     descriptor: Arc<novarocks_execution_contract::TaskDescriptor>,
@@ -1238,20 +1230,16 @@ fn real_unit_receiver_fixture(
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntime, ExecutionRuntimeConfig,
     };
-    use novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort;
     use novarocks_execution::runtime::runtime_state::RuntimeErrorState;
+    use novarocks_execution::runtime::task::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort;
     use novarocks_execution_contract::{
         ExchangeInbound, ExchangeTopology, TaskDescriptor, TaskFailurePhase,
     };
     let base = base_stream();
     let stream = ExchangeStreamIdentity::try_new(
-        ExchangeSource::new(
-            base.source().task(),
-            base.source().fragment_instance_id(),
-            0,
-        ),
+        ExchangeSource::new(base.source().task(), base.source().task_key(), 0),
         base.destination(),
-        base.destination_fragment_instance_id(),
+        base.destination_task_key(),
         base.destination_node(),
     )
     .unwrap();
@@ -1292,7 +1280,7 @@ fn real_unit_receiver_fixture(
     ).unwrap();
     let port = Arc::new(ExecutionRuntimeExchangeReceiverPort::new(execution.clone()));
     let key = ExchangeReceiverKey {
-        fragment_instance_id: stream.destination_fragment_instance_id(),
+        task_key: stream.destination_task_key(),
         node_id: stream.destination_node().get(),
     };
     port.register({
@@ -1311,13 +1299,13 @@ fn real_unit_receiver_fixture(
     port.bind_unit_receiver(key, vec![stream], failure.clone(), 64 * 1024 * 1024)
         .unwrap();
     let registry_key = ExchangeKey {
-        finst_id_hi: key.fragment_instance_id.high(),
-        finst_id_lo: key.fragment_instance_id.low(),
+        task_key_hi: key.task_key.high(),
+        task_key_lo: key.task_key.low(),
         node_id: key.node_id,
     };
     let descriptor = TaskDescriptor::try_new(
         stream.destination(),
-        key.fragment_instance_id,
+        key.task_key,
         std::num::NonZeroUsize::new(1).unwrap(),
         Vec::new(),
         ExchangeTopology::try_new(
@@ -1351,10 +1339,10 @@ fn real_unit_receiver_fixture(
 #[cfg(novarocks_dev_controls)]
 fn start_real_unit_receiver_service(
     stream: ExchangeStreamIdentity,
-    port: Arc<novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort>,
+    port: Arc<novarocks_execution::runtime::task::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort>,
     descriptor: Arc<novarocks_execution_contract::TaskDescriptor>,
 ) -> (
-    crate::NativeRpcServerHandle,
+    crate::NativeRpcListener,
     Arc<NativeRpcClient>,
     Arc<novarocks_worker::TaskInboundCapabilities>,
 ) {
@@ -1397,7 +1385,7 @@ fn start_real_unit_receiver_service(
             Arc::new(UnusedIngress),
         ),
     );
-    let server = crate::NativeRpcServerHandle::start_with_admission(
+    let server = crate::NativeRpcListener::start_with_admission(
         "127.0.0.1",
         0,
         service,
@@ -1470,7 +1458,7 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
     registry
         .install_test_observer(registry_key, observation.clone())
         .unwrap();
-    let receiver = port.receiver_handle(key, 1).unwrap();
+    let receiver = port.receiver_pin(key, 1).unwrap();
     // Keep the receiver's valid NRU1 header and recipe digest, but give its
     // Int64 decoder an actual Int32 batch body. With no Schema message, the
     // four-byte values buffer must fail the receiver's eight-byte geometry
@@ -1586,7 +1574,7 @@ async fn authenticated_tonic_stop_before_first_demand_fences_the_real_frozen_rec
     let fixture = real_unit_receiver_fixture(ExchangeDeliveryRequirement::DemandDriven);
     let stream = fixture.stream;
     let registry = fixture.execution.exchange_registry();
-    let receiver = fixture.port.receiver_handle(fixture.key, 1).unwrap();
+    let receiver = fixture.port.receiver_pin(fixture.key, 1).unwrap();
     let (mut server, client, capabilities) =
         start_real_unit_receiver_service(stream, fixture.port.clone(), fixture.descriptor.clone());
     let result = tokio::time::timeout(Duration::from_secs(8), async {
@@ -1629,8 +1617,8 @@ async fn authenticated_tonic_stop_before_first_demand_fences_the_real_frozen_rec
             original.backend_process_id(),
         );
         let foreign = ExchangeStreamIdentity::try_new(
-            ExchangeSource::new(foreign_task, stream.source().fragment_instance_id(), stream.source().sender_ordinal()),
-            stream.destination(), stream.destination_fragment_instance_id(), stream.destination_node(),
+            ExchangeSource::new(foreign_task, stream.source().task_key(), stream.source().sender_ordinal()),
+            stream.destination(), stream.destination_task_key(), stream.destination_node(),
         ).unwrap();
         for absent in [foreign, sibling(stream, stream.destination_node().get() as usize + 1)] {
             assert!(demand(&client, absent, codec::ExchangeDemandOperation::StopSender).await.is_err());

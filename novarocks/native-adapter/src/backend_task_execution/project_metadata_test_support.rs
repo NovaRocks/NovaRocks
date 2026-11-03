@@ -24,12 +24,12 @@ use super::{
 use novarocks_execution::{
     exec::{chunk::ChunkSchemaRef, operators::CompiledProjectProcessorFactory},
     runtime::{
-        fragment::ExecutionResult,
         preparation_metadata::{
             CompiledSchemaSite, PreparationMetadataFailure, prepare_operator_schema_for_test,
         },
         query_memory::QueryMemoryBinding,
         runtime_state::RuntimeErrorState,
+        task::ExecutionResult,
     },
 };
 use novarocks_local_program::LocalProgram;

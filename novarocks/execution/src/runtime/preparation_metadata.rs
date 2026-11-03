@@ -18,7 +18,7 @@
 //! Borrowed preparation port at the original compiled schema birth sites.
 //! An implementation qualifies the complete operation before consuming its
 //! ONE original body. This trusted port is not a public provenance issuer.
-use crate::{exec::chunk::ChunkSchemaRef, runtime::fragment::ExecutionResult};
+use crate::{exec::chunk::ChunkSchemaRef, runtime::task::ExecutionResult};
 use novarocks_local_program::{LocalProgram, ProgramNodeId, StaticLayout};
 use std::sync::Arc;
 
@@ -118,7 +118,7 @@ impl novarocks_failure_contract::FailureProjection for PreparationMetadataFailur
         match self {
             Self::MissingCompiledSite => novarocks_failure_contract::FailureFact::new(
                 novarocks_failure_contract::FailureClass::Invariant,
-                crate::runtime::fragment::ExecutionReason::MissingCompiledSchemaSite.reason(),
+                crate::runtime::task::ExecutionReason::MissingCompiledSchemaSite.reason(),
             ),
             Self::Request(cause) => cause.failure_fact(),
             Self::SchemaRequest(cause) => cause.failure_fact(),

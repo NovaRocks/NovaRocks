@@ -24,7 +24,7 @@ use crate::control_runtime::{
     task::{TaskHostBinding, TaskHostRecord},
     task_host_call::{HOST_CALL_STORAGE, TaskHostCallKind},
 };
-use novarocks_control_runtime::exit_role::ExitRolePhase;
+use novarocks_control_runtime::exit_custody::ExitCustodyPhase;
 use std::sync::Arc;
 
 #[test]
@@ -36,7 +36,7 @@ fn original_host_reports_retire_independently_before_the_same_task_returns_its_p
     assert_eq!(original.storage, 1);
     assert_eq!(original.unresolved, 0);
     let create = f.send(
-        ContextInput::Request(ContextCommand::Create {
+        ParticipationInput::Request(ParticipationCommand::Create {
             task,
             payload: PayloadId(1),
         }),
@@ -48,7 +48,9 @@ fn original_host_reports_retire_independently_before_the_same_task_returns_its_p
     let action = f.runtime.ready_effects(actor(), create, 15).unwrap()[0];
     let ticket = f.runtime.take_effect(actor(), create, action).unwrap();
     let reservation = match ticket.effect {
-        WorkerAction::Context(ContextEffect::LoadInput { reservation, .. }) => reservation,
+        WorkerAction::Participation(ParticipationEffect::LoadInput { reservation, .. }) => {
+            reservation
+        }
         _ => panic!("the original elected Task's actual LoadInput effect"),
     };
     let task_work = ticket.descriptor.work;
@@ -60,7 +62,7 @@ fn original_host_reports_retire_independently_before_the_same_task_returns_its_p
         &ticket,
         &TaskHostBinding {
             registration: f.registration.clone(),
-            context: f.identity,
+            participation: f.identity,
             task_source: ActorId::new(2).unwrap(),
             protocol_generation: generation(),
             max_cuts: 1,
@@ -69,7 +71,7 @@ fn original_host_reports_retire_independently_before_the_same_task_returns_its_p
                 novarocks_execution::runtime::execution_health::ExecutionHealth::default(),
             ),
         },
-        &f.roles[0].0,
+        &f.obligation_pairs[0].0,
     )
     .unwrap_or_else(|refusal| panic!("the original host bootstrap succeeds: {:?}", refusal.error));
     let mut resources = host.into_resources();
@@ -82,7 +84,7 @@ fn original_host_reports_retire_independently_before_the_same_task_returns_its_p
     assert!(resources.pending_loading.is_none());
     assert!(resources.preparation.is_none());
     assert!(resources.preparation_remainder.is_none());
-    assert!(resources.accepted_role_storage.is_none());
+    assert!(resources.accepted_completion_storage.is_none());
     assert!(resources.pending_preparation_adoption.is_none());
     assert!(resources.completion.is_none());
     assert!(resources.completion_action.is_none());
@@ -98,7 +100,7 @@ fn original_host_reports_retire_independently_before_the_same_task_returns_its_p
         .zip([TaskHostCallKind::Stop, TaskHostCallKind::RetireBorrowing])
     {
         assert_eq!(call.kind(), kind);
-        assert_eq!(call.phase(), ExitRolePhase::Admitted);
+        assert_eq!(call.phase(), ExitCustodyPhase::Admitted);
         assert_eq!(call.key().0, f.scope.id());
         assert!(!call.is_retired());
         assert!(call.poll_return().unwrap().is_none());
@@ -135,7 +137,7 @@ fn original_host_reports_retire_independently_before_the_same_task_returns_its_p
     assert!(!resources.lifetime.actual_exit_ready().unwrap());
     assert!(matches!(
         f.runtime.take_step_reservation(&ticket, reservation),
-        Err(DriverError::UnknownReservation)
+        Err(ActorTurnError::UnknownReservation)
     ));
     f.runtime.effect_completed(ticket).unwrap();
     f.drain(create);
@@ -152,7 +154,7 @@ fn original_host_reports_retire_independently_before_the_same_task_returns_its_p
         }
         assert!(retired && call.is_retired());
         assert!(call.retire_unused(&f.ledger).unwrap());
-        assert_eq!(call.phase(), ExitRolePhase::Retired);
+        assert_eq!(call.phase(), ExitCustodyPhase::Retired);
         assert_eq!(resources.active.resources().unwrap(), retained_active);
         assert_eq!(
             f.scope.snapshot().unwrap().storage,

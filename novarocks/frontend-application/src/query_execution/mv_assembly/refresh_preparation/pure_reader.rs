@@ -122,7 +122,7 @@ async fn prepare_refresh_inner(
     let instance_id = ConnectorInstanceId::parse(catalog)
         .map_err(|error| PreparationError::user(error.to_string()))?;
     let observed_binding = match retained_repartition_target.as_ref() {
-        Some(retained) => execution_binding_key_for_target(retained.binding.lease()),
+        Some(retained) => execution_binding_key_for_target(retained.binding.planning_pin()),
         None => source
             .connector_control()
             .observe_current_binding(&instance_id)
@@ -356,7 +356,7 @@ async fn retain_exact_repartition_target(
     validate_retained_target_identity(&target, binding.identity())?;
     let schema_validation = crate::mv::domain::storage_observation::observe_schema_validation(
         source.storage_observation(),
-        binding.lease(),
+        binding.planning_pin(),
         binding.metadata(),
         connector_context.clone(),
     )
@@ -522,7 +522,7 @@ async fn prepare_managed_repartition_transition(
     .map_err(|error| error.to_string())?;
     let write_lease = retained_target
         .binding
-        .lease()
+        .planning_pin()
         .derive_write_lease()
         .map_err(PreparationError::from)?;
     let preview = write_lease
@@ -574,13 +574,13 @@ async fn prepare_frontend_first_refresh_write(
     if let Some(retained) = retained_repartition_target {
         validate_retained_target_identity(&target, retained.binding.identity())?;
     }
-    let planning_lease = match retained_repartition_target {
-        Some(retained) => retained.binding.lease().clone(),
+    let planning_pin = match retained_repartition_target {
+        Some(retained) => retained.binding.planning_pin().clone(),
         None => {
             crate::connector::metadata_binding_typed(source.connector_control(), &target.catalog)?
         }
     };
-    let write_lease = planning_lease
+    let write_lease = planning_pin
         .derive_write_lease()
         .map_err(PreparationError::from)?;
     if !write_lease.matches_provider_binding_key(&observed_binding) {
@@ -604,7 +604,7 @@ async fn prepare_frontend_first_refresh_write(
     let mut admitted_publication = io
         .admit(
             source,
-            &planning_lease,
+            &planning_pin,
             &projection,
             attempt.publication_id,
             &connector_context,
@@ -651,7 +651,7 @@ async fn prepare_frontend_first_refresh_write(
                         namespace: target.namespace.clone(),
                         table: target.table.clone(),
                     },
-                    planning_lease.clone(),
+                    planning_pin.clone(),
                     &connector_context,
                 )
                 .await?;
@@ -665,7 +665,7 @@ async fn prepare_frontend_first_refresh_write(
             loaded_target_schema_validation =
                 crate::mv::domain::storage_observation::observe_schema_validation(
                     source.storage_observation(),
-                    target_binding.lease(),
+                    target_binding.planning_pin(),
                     target_binding.metadata(),
                     connector_context.clone(),
                 )
@@ -1023,12 +1023,12 @@ async fn prepare_metadata_only_publication(
         table: contract.target.name.clone(),
     };
     let projection = io.definition(source, &target).await?;
-    let planning_lease =
+    let planning_pin =
         crate::connector::metadata_binding_typed(source.connector_control(), &target.catalog)?;
     let admitted = io
         .admit(
             source,
-            &planning_lease,
+            &planning_pin,
             &projection,
             attempt.publication_id,
             connector_context,
@@ -1080,7 +1080,7 @@ async fn prepare_metadata_only_publication(
                 namespace: target.namespace.clone(),
                 table: target.table.clone(),
             },
-            planning_lease.clone(),
+            planning_pin.clone(),
             connector_context,
         )
         .await?;
@@ -1269,7 +1269,7 @@ async fn prepare_frontend_incremental_write(
     let target_schema_validation =
         crate::mv::domain::storage_observation::observe_schema_validation(
             source.storage_observation(),
-            target_binding.lease(),
+            target_binding.planning_pin(),
             target_binding.metadata(),
             connector_context.clone(),
         )
@@ -1404,7 +1404,7 @@ async fn prepare_frontend_incremental_write(
         let admitted_publication = io
             .admit(
                 source,
-                target_binding.lease(),
+                target_binding.planning_pin(),
                 rewrite.mv_definition.as_ref(),
                 attempt.publication_id,
                 &connector_context,
@@ -1581,7 +1581,7 @@ async fn prepare_frontend_incremental_write(
     let admitted_publication = io
         .admit(
             source,
-            target_binding.lease(),
+            target_binding.planning_pin(),
             rewrite.mv_definition.as_ref(),
             attempt.publication_id,
             &connector_context,

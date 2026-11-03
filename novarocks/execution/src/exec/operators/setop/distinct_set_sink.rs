@@ -32,7 +32,7 @@ use crate::exec::operators::compiled_expression::RuntimeKernelControl;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, OperatorLifecycle,
 };
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -40,10 +40,10 @@ use std::sync::Arc;
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::{PreparedInput, RawInput},
     shape::{SinkKernel, SinkStep, Transform},
     step::{AdmissionNext, NextStep, WaitFact, WaitReason},
-    step_context::StepContext,
 };
 use crate::runtime::mem_tracker::MemTracker;
 
@@ -127,7 +127,7 @@ impl<S: DistinctSetSemantics> InputEncodingPolicy for DistinctSetSinkOperator<S>
 impl<S: DistinctSetSemantics> SinkKernel for DistinctSetSinkOperator<S> {
     fn admission(
         &self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         _: &RawInput,
     ) -> ExecutionResult<Option<AdmissionNext>> {
         let observable = self.state.controller().observable();
@@ -144,7 +144,7 @@ impl<S: DistinctSetSemantics> SinkKernel for DistinctSetSinkOperator<S> {
     }
     fn consume(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<SinkStep> {
         let chunk = input.into_uncovered_chunk()?;
@@ -183,7 +183,7 @@ impl<S: DistinctSetSemantics> SinkKernel for DistinctSetSinkOperator<S> {
         }
         Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<SinkStep> {
         self.state.finish_stage(self.stage)?;
         Ok(SinkStep::new(NextStep::Finished, 0))
     }

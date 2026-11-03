@@ -2985,7 +2985,7 @@ fn typed_statement_result_window_class(statement: &ParsedStatement) -> ResultWin
 
 #[cfg(test)]
 async fn consume_governed_scalar_stream(
-    execution: &mut novarocks_query_application::api::ExecutionHandle,
+    execution: &mut novarocks_query_application::api::ExecutionOutputObligation,
     stream: novarocks_query_application::api::QueryResultStream,
     scalar_schema: Option<&novarocks_result_contract::ScalarSchema>,
 ) -> Result<String, QueryServiceError> {
@@ -3390,7 +3390,7 @@ mod tests {
         fields: Vec<ResultField>,
     ) -> (
         ResultStreamTestProducer,
-        novarocks_query_application::api::ExecutionHandle,
+        novarocks_query_application::api::ExecutionOutputObligation,
         novarocks_query_application::test_support::TestResultDeliveryReceipt,
     ) {
         let (producer, execution, _resources, receipt) = ResultStreamTestProducer::open(
@@ -3532,7 +3532,7 @@ mod tests {
 
     fn relayed_scalar_fixture() -> (
         ResultStreamTestProducer,
-        novarocks_query_application::api::ExecutionHandle,
+        novarocks_query_application::api::ExecutionOutputObligation,
         novarocks_query_application::test_support::TestResultDeliveryReceipt,
         novarocks_types::QueryExecutionId,
         novarocks_result_contract::ScalarSchema,

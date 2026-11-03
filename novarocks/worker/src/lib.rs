@@ -69,7 +69,7 @@ mod settlement;
 pub mod sink_commit;
 mod task_causal_input;
 mod task_completion;
-mod task_completion_roles;
+mod task_completion_set;
 mod task_conclusion;
 mod task_creation_cost;
 mod task_creation_gate;
@@ -88,7 +88,8 @@ pub use task_preparation::{
 mod task_preparation_limits;
 mod task_reporter;
 pub use host::{
-    TaskPreparationContext, TaskPreparationRoles, TaskPreparationRolesTaken, TaskPreparationView,
+    TaskPreparationCapture, TaskPreparationCaptureTaken, TaskPreparationContext,
+    TaskPreparationView,
 };
 pub mod typed_connector_runtime;
 pub mod typed_page_source;
@@ -114,54 +115,56 @@ pub mod runtime_filter {
 
 pub use admission_epoch::WorkerAdmissionEpochAuthority;
 pub use catalog_manager::{
-    CatalogLeaseSnapshot, CatalogManager, CatalogManagerError, CatalogPruneResult,
+    CatalogManager, CatalogManagerError, CatalogPinSnapshot, CatalogPruneResult,
     ConnectorExecutionRoleBindingFactorySet,
 };
 pub use catalog_manager_config::{CatalogManagerConfig, DEFAULT_MAX_RETAINED_CATALOGS};
 pub use clock::{ManualClock, ProcessMonotonicClock, WorkerMonotonicClock};
-pub use control_runtime::context_host::observation::{
-    ObservationProjection, ObservationProjectionError,
-};
 pub use control_runtime::lifecycle_read::TaskReadError;
 pub use control_runtime::node_api::{
-    WorkerCancelOutcome, WorkerContextDelivery, WorkerContextReplyBody, WorkerControlDelivery,
-    WorkerControlReplyBody, WorkerCreateDelivery, WorkerCreateReply, WorkerIngressBacking,
-    WorkerIngressResponsibility, WorkerMonotonicInstant, WorkerRequestError, WorkerRequestRefusal,
-    WorkerRequestResult, WorkerRootDelivery, WorkerRootRead, WorkerRootReadError,
-    WorkerRootReadErrorKind, WorkerTaskControl, WorkerTaskDelivery,
+    WorkerCancelOutcome, WorkerControlDelivery, WorkerControlReplyBody, WorkerCreateDelivery,
+    WorkerCreateReply, WorkerIngressBacking, WorkerIngressResponsibility, WorkerMonotonicInstant,
+    WorkerParticipationDelivery, WorkerParticipationReplyBody, WorkerRequestError,
+    WorkerRequestRefusal, WorkerRequestResult, WorkerRootDelivery, WorkerRootRead,
+    WorkerRootReadError, WorkerRootReadErrorKind, WorkerTaskControl, WorkerTaskDelivery,
 };
 pub use control_runtime::node_bootstrap::{
-    NODE_CONTEXT_STEP_BUDGET, NODE_CONTROL_STEP_BUDGET, NodeAdmissionTicketConfig,
-    NodeContextCoreConfig, NodeControlConfig, NodeWorkers, WorkerNodeConfig, WorkerNodeRuntime,
-    WorkerNodeShutdownError, WorkerNodeStartRefusal,
+    NODE_CONTROL_STEP_BUDGET, NODE_PARTICIPATION_STEP_BUDGET, NodeAdmissionTicketConfig,
+    NodeControlConfig, NodeParticipationCoreConfig, NodeWorkers, WorkerNodeConfig,
+    WorkerNodeRuntime, WorkerNodeShutdownError, WorkerNodeStartRefusal,
 };
 pub use control_runtime::node_geometry::{NodeGeometry, NodeGeometryError, NodeGeometryInputs};
 pub use control_runtime::node_metrics::{
-    WorkerAdmissionSnapshot, WorkerCapacityRefusalKind, WorkerContextRetentionSnapshot,
-    WorkerControlPlanePhase, WorkerControlPlaneSnapshot, WorkerControlPlaneTimerSnapshot,
-    WorkerControlPlaneWorkerSnapshot, WorkerExecutionQuiescenceSnapshot, WorkerNodeMetricsSnapshot,
-    WorkerPreparationObservationError, WorkerPreparationSnapshot, WorkerProtocolRetentionSnapshot,
-    WorkerRuntimeInputClass, WorkerRuntimeInventory, WorkerRuntimeInventoryPage,
-    WorkerRuntimeObservationError, WorkerRuntimeObservationSnapshot,
+    WorkerAdmissionSnapshot, WorkerCapacityRefusalKind, WorkerControlPlanePhase,
+    WorkerControlPlaneSnapshot, WorkerControlPlaneTimerSnapshot, WorkerControlPlaneWorkerSnapshot,
+    WorkerExecutionQuiescenceSnapshot, WorkerNodeMetricsSnapshot,
+    WorkerParticipationRetentionSnapshot, WorkerPreparationObservationError,
+    WorkerPreparationSnapshot, WorkerProtocolRetentionSnapshot, WorkerRuntimeInputClass,
+    WorkerRuntimeInventory, WorkerRuntimeInventoryPage, WorkerRuntimeObservationError,
+    WorkerRuntimeObservationSnapshot,
 };
 pub use control_runtime::operator_statistics::{
     StatisticsSubmission, TaskStatisticsFinalizer, TaskStatisticsProducer,
 };
+pub use control_runtime::participation_host::observation::{
+    ObservationProjection, ObservationProjectionError,
+};
 pub use convergence::{
     TaskConvergence, TaskConvergenceAdvance, TaskConvergenceRejection, TaskConvergenceSnapshot,
 };
-pub use credential_slot::QueryContextCredentialSlot;
+pub use credential_slot::ParticipationCredentialSlot;
 pub use domain::{
-    DomainPolicyRejection, QueryContextDomains, TaskDomains, commit_task_domain_updates,
+    DomainPolicyRejection, ParticipationDomains, TaskDomains, commit_task_domain_updates,
     plan_task_domain_updates, task_domain_reaches_execution, validate_task_domain_membership,
 };
 pub use drain::WorkerDrainState;
 #[cfg(novarocks_dev_controls)]
 pub use host::TestTaskUpdateConsumptionReservation;
 pub use host::{
-    FrozenCodecContent, HostRejection, PreparationControlLoan, PreparedTaskInstallation,
-    QueryContextHost, QueryContextHostFactory, QueryContextHostInstance, ReleasedContextEvidence,
-    RunnableTask, SharedFactsRequest, TaskExecutionHost, TaskIngressRetirement,
+    FrozenCodecContent, HostRejection, ParticipationHost, ParticipationHostFactory,
+    ParticipationHostInstance, PreparationControlLoan, PreparedTaskInstallation,
+    ReleasedParticipationEvidence, RunnableTask, SharedFactsRequest, TaskExecutionHost,
+    TaskIngressRetirement,
 };
 pub use inbound_capability::{
     InboundFrameAdmission, InboundFrameClaim, InboundFrameDelivery, InboundRetentionSnapshot,
@@ -170,9 +173,10 @@ pub use inbound_capability::{
 pub use ingress::{IngressRejection, authorize_inbound_frame};
 pub use lease::{InstalledLease, LeaseBounds, LeaseProgression, MonotonicInstant, RequestHorizon};
 pub use lifecycle::{
-    ContextOperationKind, ContextTransition, LatchOutcome, OperationAdmission, QueryContextEvent,
-    RootDrainAction, TaskTransition, TerminationLatch, classify_context_transition,
-    classify_operation_admission, classify_root_drain, classify_task_transition,
+    LatchOutcome, OperationAdmission, ParticipationEvent, ParticipationOperationKind,
+    ParticipationTransition, RootDrainAction, TaskTransition, TerminationLatch,
+    classify_operation_admission, classify_participation_transition, classify_root_drain,
+    classify_task_transition,
 };
 pub use novarocks_control_runtime::history::{
     HistoryCapture as WorkerHistoryCapture, HistorySlice as WorkerHistorySlice,
@@ -181,22 +185,22 @@ pub use novarocks_control_runtime_core::history::EffectHistoryPhase as WorkerEff
 pub use novarocks_control_runtime_core::history::HistoryFact as WorkerHistoryFact;
 pub use novarocks_execution_contract::AdmissionEpochCapability;
 pub use novarocks_worker_protocol::admission::AdmissionTicketObservation as NodeAdmissionTicketObservation;
-pub use novarocks_worker_protocol::context::{
-    TerminalIntent as TaskTerminalIntent, TerminalObservation as TaskTerminalObservation,
-    TerminalStatistics as TaskTerminalStatistics,
-};
 pub use novarocks_worker_protocol::observation::{
     CoveredObservationBookmark as NodeCoveredObservationBookmark,
     CoveredObservationFact as NodeCoveredObservationFact,
     CoveredObservationFrame as NodeCoveredObservationFrame,
     CoveredSubscriptionRequest as NodeCoveredSubscriptionRequest,
 };
+pub use novarocks_worker_protocol::participation::{
+    TerminalIntent as TaskTerminalIntent, TerminalObservation as TaskTerminalObservation,
+    TerminalStatistics as TaskTerminalStatistics,
+};
 
 pub use operation::OperationWaitCaps;
 pub use receipt::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
-    FinalTaskInfoOutcome, OperationReceipt, QueryContextOutcome, QuiesceQueryContextOutcome,
-    ReleaseAcknowledgement, ReleaseQueryContextOutcome, TaskDynamicFilterRead, UpdateTaskOutcome,
+    FinalTaskInfoOutcome, OperationReceipt, ParticipationOutcome, QuiesceParticipationOutcome,
+    ReleaseAcknowledgement, ReleaseParticipationOutcome, TaskDynamicFilterRead, UpdateTaskOutcome,
 };
 pub use reliable_transport::{
     ReliableTransportAckOutcome, ReliableTransportFailOpenReason, ReliableTransportFailureOutcome,
@@ -212,7 +216,7 @@ pub use task_completion::{
 };
 pub use task_creation_gate::{NoopTaskCreationGate, TaskCreationGate};
 pub use task_diagnostics::{
-    PreparedCleanupDiagnostic, TaskDiagnosticRole, TaskSecondaryDiagnostic,
+    PreparedCleanupDiagnostic, TaskDiagnosticKind, TaskSecondaryDiagnostic,
     TaskSecondaryDiagnosticsSnapshot,
 };
 pub use task_domain_execution::{

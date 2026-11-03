@@ -58,7 +58,7 @@ enum SessionState {
     Finished,
 }
 
-struct LeaseInner {
+struct ReadSessionInner {
     session: Arc<dyn ConnectorReadSession>,
     start_context: ConnectorRequestContext,
     cleanup_timeout: Duration,
@@ -68,11 +68,11 @@ struct LeaseInner {
 /// A cloneable FE-local lease whose provider side effects remain at-most-once.
 #[must_use = "a prepared connector read session must be finished or aborted on drop"]
 #[derive(Clone)]
-pub struct ConnectorReadSessionLease {
-    inner: Arc<LeaseInner>,
+pub struct SharedConnectorReadSession {
+    inner: Arc<ReadSessionInner>,
 }
 
-impl ConnectorReadSessionLease {
+impl SharedConnectorReadSession {
     pub fn try_new(
         session: Arc<dyn ConnectorReadSession>,
         start_context: ConnectorRequestContext,
@@ -85,7 +85,7 @@ impl ConnectorReadSessionLease {
             ));
         }
         Ok(Self {
-            inner: Arc::new(LeaseInner {
+            inner: Arc::new(ReadSessionInner {
                 session,
                 start_context,
                 cleanup_timeout,
@@ -160,7 +160,7 @@ impl ConnectorReadSessionLease {
     }
 }
 
-impl fmt::Debug for ConnectorReadSessionLease {
+impl fmt::Debug for SharedConnectorReadSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self
             .inner
@@ -169,13 +169,13 @@ impl fmt::Debug for ConnectorReadSessionLease {
             .map(|state| *state)
             .unwrap_or(SessionState::Finished);
         formatter
-            .debug_struct("ConnectorReadSessionLease")
+            .debug_struct("SharedConnectorReadSession")
             .field("state", &state)
             .finish()
     }
 }
 
-impl Drop for ConnectorReadSessionLease {
+impl Drop for SharedConnectorReadSession {
     fn drop(&mut self) {
         if Arc::strong_count(&self.inner) == 1 {
             let _ = self.finish(ConnectorReadSessionOutcome::Aborted);
@@ -221,8 +221,8 @@ mod tests {
         }
     }
 
-    fn lease(session: Arc<Session>) -> ConnectorReadSessionLease {
-        ConnectorReadSessionLease::try_new(
+    fn lease(session: Arc<Session>) -> SharedConnectorReadSession {
+        SharedConnectorReadSession::try_new(
             session,
             ConnectorRequestContext::try_new(
                 Instant::now() + Duration::from_secs(10),

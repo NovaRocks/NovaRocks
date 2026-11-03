@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
-use novarocks_execution::runtime::fragment::FragmentTerminalFact;
+use novarocks_execution::runtime::task::LocalTaskTerminalFact;
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc};
@@ -106,10 +106,10 @@ impl novarocks_execution_contract::failure::FailureProjection for CompletionRese
 
 /// Called at most once, borrowing the slot's fact and its captured owners.
 /// The slot retains the action until its separately supervised destruction.
-pub type TaskCompletionAction = Box<dyn FnMut(&FragmentTerminalFact) + Send + 'static>;
+pub type TaskCompletionAction = Box<dyn FnMut(&LocalTaskTerminalFact) + Send + 'static>;
 /// One terminal callback receives its original observation authority once.
 pub type TaskTerminalCallback =
-    Box<dyn FnMut(&FragmentTerminalFact, crate::TaskTerminalPermit) + Send + 'static>;
+    Box<dyn FnMut(&LocalTaskTerminalFact, crate::TaskTerminalPermit) + Send + 'static>;
 /// The Task's original terminal callback and its preissued observation role.
 /// Refusal returns this same object; attachment alone invokes no callback.
 pub struct TaskTerminalAction {
@@ -138,7 +138,7 @@ impl TaskTerminalAction {
             .expect("original terminal observation")
             .bind();
     }
-    pub(crate) fn invoke(&mut self, fact: &FragmentTerminalFact) -> bool {
+    pub(crate) fn invoke(&mut self, fact: &LocalTaskTerminalFact) -> bool {
         let observation = self
             .observation
             .take()
@@ -171,7 +171,7 @@ impl CompletionAction {
         }
     }
 
-    fn invoke(&mut self, fact: &FragmentTerminalFact) -> bool {
+    fn invoke(&mut self, fact: &LocalTaskTerminalFact) -> bool {
         match self {
             Self::Standalone(action) => {
                 action(fact);
@@ -199,7 +199,7 @@ enum CompletionPhase {
 
 struct CompletionWork {
     action: Option<CompletionAction>,
-    fact: Option<FragmentTerminalFact>,
+    fact: Option<LocalTaskTerminalFact>,
     reporter: Option<crate::TaskStatusReporter>,
     // The original independently admitted sender outlives this work's own
     // reporter capture. It is never obtained from a callback-time factory.
@@ -333,7 +333,7 @@ impl CompletionShared {
         }
     }
 
-    fn publish(&self, identity: TaskIdentity, ticket: &Arc<()>, fact: FragmentTerminalFact) {
+    fn publish(&self, identity: TaskIdentity, ticket: &Arc<()>, fact: LocalTaskTerminalFact) {
         let enqueue = {
             let mut state = self.state.lock().expect(COMPLETION_STATE_LOCK);
             let Some(slot) = state.slots.get_mut(&identity) else {
@@ -343,7 +343,7 @@ impl CompletionShared {
                 return;
             }
             if fact.query_id() != identity.query_execution_id().query_id()
-                || fact.fragment_instance_id() != slot.expected_fragment
+                || fact.task_key() != slot.expected_fragment
             {
                 Self::fail_locked(
                     &mut state,
@@ -503,7 +503,7 @@ pub struct TaskCompletionSignal {
     shared: std::sync::Weak<CompletionShared>,
 }
 impl TaskCompletionSignal {
-    pub fn publish(&self, fact: FragmentTerminalFact) {
+    pub fn publish(&self, fact: LocalTaskTerminalFact) {
         if let Some(shared) = self.shared.upgrade() {
             shared.publish(self.identity, &self.ticket, fact);
         }
@@ -589,7 +589,7 @@ impl TaskCompletionReservation {
             shared: Arc::downgrade(&self.shared),
         }
     }
-    pub fn publish(&self, fact: FragmentTerminalFact) {
+    pub fn publish(&self, fact: LocalTaskTerminalFact) {
         self.signal().publish(fact);
     }
     pub fn commit_creation(&self) -> TaskCompletionSignal {
@@ -1001,8 +1001,8 @@ impl Drop for TaskCompletionSupervisor {
 mod admitted_exit_tests {
     use super::*;
     use crate::task_lifecycle::{CompletionExitCapability, CompletionExitNotice};
-    use novarocks_execution::runtime::fragment::{
-        ExecutionFailure, FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
+    use novarocks_execution::runtime::task::{
+        ExecutionFailure, LocalTaskExecutionError, LocalTaskExecutionErrorKind, LocalTaskOutcome,
     };
     use novarocks_execution_contract::failure::{
         FailureClass, FailureFact, FailureProjection, FailureReason, domain,
@@ -1088,7 +1088,7 @@ mod admitted_exit_tests {
         outcome: &Arc<AtomicUsize>,
         expected_mask: usize,
     ) -> CompletionExitNotice {
-        CompletionExitNotice::from_admitted_role(
+        CompletionExitNotice::from_admitted_capability(
             identity(),
             Box::new(Exit {
                 mask: mask.clone(),
@@ -1117,11 +1117,11 @@ mod admitted_exit_tests {
                 let _ = &capture;
                 assert!(!panic_body, "original completion action panic");
             }))),
-            fact: Some(FragmentTerminalFact::new(
+            fact: Some(LocalTaskTerminalFact::new(
                 QueryId::new(107001, 107002),
                 UniqueId::new(107003, 107004),
-                FragmentOutcome::Failed(FragmentExecutionError::from_failure(
-                    FragmentExecutionErrorKind::Pipeline,
+                LocalTaskOutcome::Failed(LocalTaskExecutionError::from_failure(
+                    LocalTaskExecutionErrorKind::Pipeline,
                     failure,
                 )),
                 None,
@@ -1149,7 +1149,7 @@ mod admitted_exit_tests {
             release: std::sync::mpsc::Receiver<()>,
         }
         impl GatedAction {
-            fn run(&mut self, fact: &FragmentTerminalFact) {
+            fn run(&mut self, fact: &LocalTaskTerminalFact) {
                 self.inner.as_mut().unwrap()(fact);
             }
         }
@@ -1286,7 +1286,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use novarocks_execution::runtime::fragment::{FragmentOutcome, FragmentTerminalFact};
+    use novarocks_execution::runtime::task::{LocalTaskOutcome, LocalTaskTerminalFact};
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_types::UniqueId;
     use novarocks_types::identity::{
@@ -1315,11 +1315,11 @@ mod tests {
         )
     }
 
-    fn terminal(identity: TaskIdentity, fragment: UniqueId) -> FragmentTerminalFact {
-        FragmentTerminalFact::new(
+    fn terminal(identity: TaskIdentity, fragment: UniqueId) -> LocalTaskTerminalFact {
+        LocalTaskTerminalFact::new(
             identity.query_execution_id().query_id(),
             fragment,
-            FragmentOutcome::Succeeded,
+            LocalTaskOutcome::Succeeded,
             None,
         )
     }

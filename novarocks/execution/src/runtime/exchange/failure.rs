@@ -16,7 +16,7 @@
 // under the License.
 //! Facts authored by the exchange operation that owns the failure.
 use crate::exec::pipeline::operator::ConstructionFailure;
-use crate::runtime::fragment::{ExecutionFailure, SharedDomainFailure};
+use crate::runtime::task::{ExecutionFailure, SharedDomainFailure};
 use novarocks_failure_contract::{
     BoundedDetail, FailureClass, FailureFact, FailureProjection, FailureReason,
     RepresentationBoundary, RepresentationFacts, RepresentationLayout, domain,

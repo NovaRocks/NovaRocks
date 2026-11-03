@@ -20,7 +20,7 @@ use super::native_sql_controls::SelectedStatement;
 use crate::{actors::mysql as mysql_actor, scenario::ScenarioContext};
 use anyhow::{Context, Result};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::{QueryLifecycleStatementObservation, ServerHandle};
+use novarocks_cluster_harness::{QueryLifecycleStatementObservation, TestClusterOwner};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;

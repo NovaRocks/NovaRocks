@@ -28,7 +28,7 @@ use super::{
     statistics::BuildRangeStats,
     vector,
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use novarocks_type_contract::ValueTypeStorageLifetime;
 use novarocks_value_arrays::ValueViolation;
 use std::sync::Arc;

@@ -30,7 +30,7 @@ use crate::api::{
 };
 
 use super::{
-    ActorCommand, ActorReply, AttemptLedgers, DeferredInternalDelivery, DeliveryPermit,
+    ActorCommand, ActorReply, AttemptLedgers, DeferredInternalDelivery, DeliveryObligation,
     EstablishIssueError, InFlightResult, LogicalConclusion, LogicalExecutionActorError,
     LogicalExecutionState, PendingResult, PermitLifetime, ResultRuntime, ResultSlot,
     ResultTransport, conclude_result_failure, identity_of, logical_owner_failure, request,
@@ -342,7 +342,7 @@ pub(super) fn try_accept(
     let activation = record.source.activation;
     let readiness = attempts
         .get_mut(&activation.execution())
-        .ok_or(EstablishIssueError::UnknownContext)
+        .ok_or(EstablishIssueError::UnknownParticipation)
         .and_then(AttemptLedgers::ensure_success_ready);
     match readiness {
         Err(EstablishIssueError::EstablishNotSettled) => return,
@@ -655,7 +655,7 @@ pub(super) struct PendingEnd {
 pub(super) struct EndInFlight {
     source: Arc<InternalConsumerSeal>,
     end: RootResultEnd,
-    permit: DeliveryPermit<()>,
+    permit: DeliveryObligation<()>,
     pub(super) receipt: ResultDeliveryReceipt,
     pub(super) checked: InternalEndAcknowledgement,
     pub(super) reply: ActorReply<()>,

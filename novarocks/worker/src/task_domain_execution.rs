@@ -201,7 +201,7 @@ fn rejection_from_host(rejection: HostRejection) -> DomainExecutionRejection {
 mod tests {
     #[test]
     fn domain_projection_execution_host_source_survives_the_domain_boundary() {
-        use novarocks_execution::runtime::fragment::ExecutionFailure;
+        use novarocks_execution::runtime::task::ExecutionFailure;
         use novarocks_execution_contract::{OperationOutcome, TaskFailureCategory};
         use std::error::Error;
         let original =

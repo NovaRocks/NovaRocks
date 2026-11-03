@@ -3,9 +3,9 @@ mod exact_mysql_fixture_clock;
 use anyhow::{Context, Result, bail};
 pub(crate) use exact_mysql_fixture_clock::ExactMysqlPrelaunchClock;
 use novarocks_cluster_harness::{
-    CrossProcessChildEnvironment, CrossProcessConfigOverlay, CrossProcessNativeFaultProxyConfig,
-    CrossProcessRootReplyFaultConfig, CrossProcessServerHandle, LaunchProfile, NativeTrustFixture,
-    ServerHandle,
+    CrossProcessChildEnvironment, CrossProcessCluster, CrossProcessConfigOverlay,
+    CrossProcessNativeFaultProxyConfig, CrossProcessRootReplyFaultConfig, LaunchProfile,
+    NativeTrustFixture, TestClusterOwner,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -190,7 +190,7 @@ pub struct ScenarioLaunchConfig {
 pub struct ScenarioContext {
     build: crate::build_information::BuildInformation,
     name: &'static str,
-    handle: CrossProcessServerHandle,
+    handle: CrossProcessCluster,
     scenario_root: PathBuf,
     deadline: Instant,
     exact_mysql_clock: Option<ExactMysqlPrelaunchClock>,
@@ -276,7 +276,7 @@ pub struct ScenarioPhaseObservation {
 
 pub(crate) struct ScenarioContextParams {
     pub name: &'static str,
-    pub handle: CrossProcessServerHandle,
+    pub handle: CrossProcessCluster,
     pub scenario_root: PathBuf,
     pub timeout: Duration,
     pub original_deadline: Instant,
@@ -331,7 +331,7 @@ impl ScenarioContext {
         self.name
     }
 
-    pub fn handle(&mut self) -> &mut CrossProcessServerHandle {
+    pub fn handle(&mut self) -> &mut CrossProcessCluster {
         &mut self.handle
     }
 
@@ -583,7 +583,7 @@ impl ScenarioContext {
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
-        ServerHandle::shutdown(&mut self.handle)
+        TestClusterOwner::shutdown(&mut self.handle)
     }
 
     /// Launch a peer native cluster for a focused multi-cluster scenario.
@@ -593,7 +593,7 @@ impl ScenarioContext {
         &self,
         name: &str,
         launch_config: ScenarioLaunchConfig,
-    ) -> Result<CrossProcessServerHandle> {
+    ) -> Result<CrossProcessCluster> {
         self.launch_peer_cluster_inner(name, launch_config, None)
     }
 
@@ -602,7 +602,7 @@ impl ScenarioContext {
         name: &str,
         launch_config: ScenarioLaunchConfig,
         plan: novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan,
-    ) -> Result<CrossProcessServerHandle> {
+    ) -> Result<CrossProcessCluster> {
         self.launch_peer_cluster_inner(name, launch_config, Some(plan))
     }
 
@@ -611,7 +611,7 @@ impl ScenarioContext {
         name: &str,
         launch_config: ScenarioLaunchConfig,
         plan: Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>,
-    ) -> Result<CrossProcessServerHandle> {
+    ) -> Result<CrossProcessCluster> {
         anyhow::ensure!(
             Instant::now() < self.deadline,
             "original scenario deadline expired before peer launch"
@@ -644,8 +644,8 @@ impl ScenarioContext {
             native_trust_fixture: launch_config.native_trust_fixture,
         };
         let mut handle = match plan {
-            Some(plan) => CrossProcessServerHandle::launch_with_test_sessions(options, plan)?,
-            None => CrossProcessServerHandle::launch(options)?,
+            Some(plan) => CrossProcessCluster::launch_with_test_sessions(options, plan)?,
+            None => CrossProcessCluster::launch(options)?,
         };
         let evidence = (|| -> Result<()> {
             fs::write(

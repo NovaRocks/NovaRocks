@@ -29,7 +29,6 @@
 //! neutral Rust type.
 
 pub mod budget;
-pub mod context_convergence;
 pub mod creation;
 pub mod descriptor;
 pub mod domain;
@@ -38,6 +37,7 @@ pub mod exchange_unit_codec;
 pub mod identity;
 pub mod lease;
 pub mod operation;
+pub mod participation_convergence;
 pub mod resource_preflight;
 pub mod status;
 
@@ -74,20 +74,20 @@ mod tests {
     use super::creation::{decode_static_package, encode_creation_metadata, take_task_assignment};
     use super::descriptor::{decode_task_descriptor, decode_topology, encode_topology};
     use super::identity::{
-        decode_query_context_ref, decode_task_identity, encode_admission_ticket_id,
-        encode_query_context_ref, encode_task_identity,
+        decode_participation_ref, decode_task_identity, encode_admission_ticket_id,
+        encode_participation_ref, encode_task_identity,
     };
     use super::lease::{
         LeaseGrant, decode_lease_grant, decode_lease_receipt, encode_lease_grant,
         encode_lease_receipt,
     };
     use super::operation::{
-        DecodedOperation, DecodedUpdateQueryContext, decode_get_final_task_info, decode_operation,
+        DecodedOperation, DecodedUpdateParticipation, decode_get_final_task_info, decode_operation,
         decode_operation_batch, decode_operation_outcome,
-        decode_query_context_admission_ticket_ack, decode_receipt_batch,
-        encode_acquire_query_context_admission_ticket, encode_get_final_task_info,
-        encode_operation_outcome, encode_query_context_admission_ticket_ack,
-        encode_query_context_state,
+        decode_participation_admission_ticket_ack, decode_receipt_batch,
+        encode_acquire_participation_admission_ticket, encode_get_final_task_info,
+        encode_operation_outcome, encode_participation_admission_ticket_ack,
+        encode_participation_state,
     };
     use super::status::{decode_task_status, encode_task_status};
     use novarocks_execution_contract::task_execution::creation::FrozenBytes;
@@ -95,20 +95,21 @@ mod tests {
         CredentialEpoch, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId,
     };
     use novarocks_execution_contract::task_execution::identity::{
-        AdmissionEpochCapability, AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
+        AdmissionEpochCapability, AdmissionTicketId, ParticipationRef, TaskIdentity,
+        TaskOperationId,
     };
     use novarocks_execution_contract::task_execution::lease::{
         LeaseReceipt, LeaseSequence, LeaseValidFor,
     };
     use novarocks_execution_contract::task_execution::operation::{
-        AcquireQueryContextAdmissionTicket, OperationKind, OperationOutcome,
-        QueryContextAdmissionTicketReceipt, ReleaseOutcome,
+        AcquireParticipationAdmissionTicket, OperationKind, OperationOutcome,
+        ParticipationAdmissionTicketReceipt, ReleaseOutcome,
     };
     use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, SafeDetail, TaskFailure, TaskOutputFacts, TaskState, TaskStatus,
         TaskStatusVersion, TerminationDetail,
     };
-    use novarocks_execution_contract::task_execution::transition::QueryContextState;
+    use novarocks_execution_contract::task_execution::transition::ParticipationState;
     use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
     use novarocks_proto_models::{catalog, common, filter, novarocks};
     use novarocks_types::NativeCompatibilityId;
@@ -140,8 +141,8 @@ mod tests {
         )
     }
 
-    fn context(process: BackendProcessId) -> QueryContextRef {
-        QueryContextRef::new(execution(), FrontendProcessId::new_v7(), process)
+    fn participation(process: BackendProcessId) -> ParticipationRef {
+        ParticipationRef::new(execution(), FrontendProcessId::new_v7(), process)
     }
 
     /// A descriptor and an envelope that actually pair.
@@ -207,12 +208,12 @@ mod tests {
     }
 
     fn creation_metadata(
-        query_context: QueryContextRef,
+        target_participation: ParticipationRef,
         descriptor: novarocks::TaskDescriptor,
         assignment: novarocks::TaskAssignment,
     ) -> novarocks::CreationMetadata {
         novarocks::CreationMetadata {
-            query_context: Some(encode_query_context_ref(query_context)),
+            participation: Some(encode_participation_ref(target_participation)),
             descriptor: Some(descriptor),
             initial_domains: Vec::new(),
             assignment: Some(assignment),
@@ -221,12 +222,12 @@ mod tests {
 
     fn create_request(
         process: BackendProcessId,
-        query_context: QueryContextRef,
+        target_participation: ParticipationRef,
     ) -> novarocks::CreateTaskRequest {
         novarocks::CreateTaskRequest {
             frozen_fragment: frozen_fragment(4).encode_to_vec().into(),
             creation_metadata: creation_metadata(
-                query_context,
+                target_participation,
                 simple_descriptor(process),
                 simple_assignment(),
             )
@@ -254,7 +255,7 @@ mod tests {
     fn simple_descriptor(process: BackendProcessId) -> novarocks::TaskDescriptor {
         novarocks::TaskDescriptor {
             identity: Some(encode_task_identity(identity(2, 3, process))),
-            fragment_instance_id: Some(unique(7, 8)),
+            task_key: Some(unique(7, 8)),
             pipeline_dop: 4,
             split_plan_nodes: vec![10, 11],
             topology: Some(novarocks::TaskExchangeTopology::default()),
@@ -267,7 +268,7 @@ mod tests {
     #[test]
     fn a_create_carries_its_static_bytes_unread_to_the_creation_winner() {
         let process = backend();
-        let mut create = create_request(process, context(process));
+        let mut create = create_request(process, participation(process));
         // A truncated field that prost itself refuses as a FrozenFragment.
         create.frozen_fragment = prost::bytes::Bytes::from_static(&[0x0a, 0x80]);
         let received = create.frozen_fragment.clone();
@@ -292,7 +293,7 @@ mod tests {
         let process = backend();
         let operations = (0..2)
             .map(|index| {
-                let mut request = create_request(process, context(process));
+                let mut request = create_request(process, participation(process));
                 let mut metadata =
                     novarocks::CreationMetadata::decode(request.creation_metadata.clone()).unwrap();
                 metadata.descriptor.as_mut().unwrap().identity =
@@ -349,11 +350,11 @@ mod tests {
     /// A create is identified by the task identity it names, never by the
     /// bytes it arrived in. The same metadata in another legal protobuf
     /// representation -- fields in another order, an unknown field appended --
-    /// decodes to the same identity, context and descriptor.
+    /// decodes to the same identity, participation and descriptor.
     #[test]
     fn a_create_decodes_the_same_identity_from_any_legal_representation() {
         let process = backend();
-        let canonical = create_request(process, context(process));
+        let canonical = create_request(process, participation(process));
         let metadata = novarocks::CreationMetadata::decode(canonical.creation_metadata.as_ref())
             .expect("canonical metadata");
         let mut reordered = Vec::new();
@@ -365,7 +366,7 @@ mod tests {
             (2, metadata.descriptor.as_ref().map(Message::encode_to_vec)),
             (
                 1,
-                metadata.query_context.as_ref().map(Message::encode_to_vec),
+                metadata.participation.as_ref().map(Message::encode_to_vec),
             ),
         ] {
             let encoded = encoded.expect("present field");
@@ -389,7 +390,10 @@ mod tests {
         })
         .expect("a legal alternate representation");
         assert_eq!(first.request().identity(), second.request().identity());
-        assert_eq!(first.request().context(), second.request().context());
+        assert_eq!(
+            first.request().participation(),
+            second.request().participation()
+        );
         assert_eq!(first.descriptor(), second.descriptor());
     }
 
@@ -407,7 +411,7 @@ mod tests {
         let create = novarocks::CreateTaskRequest {
             frozen_fragment: frozen_fragment(4).encode_to_vec().into(),
             creation_metadata: creation_metadata(
-                context(process),
+                participation(process),
                 simple_descriptor(process),
                 assignment.clone(),
             )
@@ -429,7 +433,7 @@ mod tests {
             creation_metadata: novarocks::CreationMetadata {
                 assignment: None,
                 ..creation_metadata(
-                    context(process),
+                    participation(process),
                     simple_descriptor(process),
                     simple_assignment(),
                 )
@@ -514,23 +518,23 @@ mod tests {
     }
 
     #[test]
-    fn a_context_reference_round_trips_with_its_frontend_fence() {
-        let value = context(backend());
-        let encoded = encode_query_context_ref(value);
+    fn a_participation_reference_round_trips_with_its_frontend_fence() {
+        let value = participation(backend());
+        let encoded = encode_participation_ref(value);
         assert_eq!(
-            decode_query_context_ref(&encoded, FieldPath::root("query_context")),
+            decode_participation_ref(&encoded, FieldPath::root("participation")),
             Ok(value)
         );
-        let missing_frontend = novarocks::QueryContextRef {
+        let missing_frontend = novarocks::ParticipationRef {
             frontend_process_id: None,
             ..encoded
         };
         assert_eq!(
-            decode_query_context_ref(&missing_frontend, FieldPath::root("query_context"))
+            decode_participation_ref(&missing_frontend, FieldPath::root("participation"))
                 .expect_err("the frontend fence is required")
                 .path()
                 .to_string(),
-            "query_context.frontend_process_id"
+            "participation.frontend_process_id"
         );
     }
 
@@ -547,7 +551,7 @@ mod tests {
             Ok(grant)
         );
 
-        let zero = novarocks::QueryExecutionLeaseGrant {
+        let zero = novarocks::ParticipationLeaseGrant {
             sequence: 1,
             valid_for_millis: 0,
         };
@@ -571,7 +575,7 @@ mod tests {
             Ok(receipt)
         );
 
-        let zero_effective = novarocks::QueryExecutionLeaseReceipt {
+        let zero_effective = novarocks::ParticipationLeaseReceipt {
             effective_valid_for_millis: 0,
             ..encoded
         };
@@ -591,7 +595,7 @@ mod tests {
                 partitioning: novarocks::ExchangePartitioning::Hash as i32,
                 destinations: vec![novarocks::TaskExchangeDestination {
                     task: Some(encode_task_identity(identity(3, 1, process))),
-                    fragment_instance_id: Some(unique(3, 1)),
+                    task_key: Some(unique(3, 1)),
                     endpoint: Some(novarocks::QueryControlEndpoint {
                         host: "127.0.0.1".to_owned(),
                         port: 9060,
@@ -607,12 +611,12 @@ mod tests {
                 sources: vec![
                     novarocks::TaskExchangeSource {
                         task: Some(encode_task_identity(identity(1, 1, process))),
-                        fragment_instance_id: Some(unique(1, 1)),
+                        task_key: Some(unique(1, 1)),
                         sender_ordinal: 0,
                     },
                     novarocks::TaskExchangeSource {
                         task: Some(encode_task_identity(identity(1, 2, process))),
-                        fragment_instance_id: Some(unique(1, 2)),
+                        task_key: Some(unique(1, 2)),
                         sender_ordinal: 1,
                     },
                 ],
@@ -634,7 +638,7 @@ mod tests {
             assert_eq!(encode_topology(&decoded), changed);
         }
         assert_eq!(
-            decoded.outbound()[0].destinations()[0].fragment_instance_id(),
+            decoded.outbound()[0].destinations()[0].task_key(),
             novarocks_types::UniqueId::new(3, 1)
         );
         assert_eq!(decoded.inbound()[0].expected_sender_count().get(), 2);
@@ -670,7 +674,7 @@ mod tests {
             .sources
             .push(novarocks::TaskExchangeSource {
                 task: Some(encode_task_identity(identity(1, 1, process))),
-                fragment_instance_id: Some(unique(1, 1)),
+                task_key: Some(unique(1, 1)),
                 sender_ordinal: 0,
             });
         assert_eq!(
@@ -706,10 +710,7 @@ mod tests {
         let descriptor =
             decode_task_descriptor(&wire, FieldPath::root("descriptor")).expect("legal descriptor");
         assert_eq!(descriptor.identity(), identity(2, 3, process));
-        assert_eq!(
-            descriptor.fragment_instance_id(),
-            novarocks_types::UniqueId::new(7, 8)
-        );
+        assert_eq!(descriptor.task_key(), novarocks_types::UniqueId::new(7, 8));
         assert_eq!(descriptor.pipeline_dop().get(), 4);
         assert!(descriptor.accepts_split_plan_node(PlanNodeId::new(10).expect("nonnegative")));
         assert!(!descriptor.accepts_split_plan_node(PlanNodeId::new(12).expect("nonnegative")));
@@ -741,7 +742,7 @@ mod tests {
         );
 
         let mut no_kernel_key = wire;
-        no_kernel_key.fragment_instance_id = None;
+        no_kernel_key.task_key = None;
         assert_eq!(
             decode_task_descriptor(&no_kernel_key, FieldPath::root("descriptor"))
                 .expect_err("the kernel key is required")
@@ -760,7 +761,7 @@ mod tests {
         let target = identity(3, 1, process);
         let descriptor = novarocks::TaskDescriptor {
             identity: Some(encode_task_identity(identity(2, 3, process))),
-            fragment_instance_id: Some(unique(7, 8)),
+            task_key: Some(unique(7, 8)),
             pipeline_dop: 1,
             split_plan_nodes: Vec::new(),
             topology: Some(novarocks::TaskExchangeTopology {
@@ -770,7 +771,7 @@ mod tests {
                     partitioning: novarocks::ExchangePartitioning::Random as i32,
                     destinations: vec![novarocks::TaskExchangeDestination {
                         task: Some(encode_task_identity(target)),
-                        fragment_instance_id: Some(unique(3, 1)),
+                        task_key: Some(unique(3, 1)),
                         endpoint: Some(novarocks::QueryControlEndpoint {
                             host: "127.0.0.1".to_owned(),
                             port: 9060,
@@ -787,7 +788,7 @@ mod tests {
             novarocks::CreateTaskRequest {
                 frozen_fragment: frozen_fragment(1).encode_to_vec().into(),
                 creation_metadata: creation_metadata(
-                    context(process),
+                    participation(process),
                     descriptor,
                     novarocks::TaskAssignment {
                         sink_edge_ids,
@@ -1082,8 +1083,8 @@ mod tests {
 
     #[test]
     fn an_absent_state_has_no_wire_form_and_every_worker_outcome_round_trips() {
-        assert_eq!(encode_query_context_state(QueryContextState::Absent), None);
-        assert!(encode_query_context_state(QueryContextState::Active).is_some());
+        assert_eq!(encode_participation_state(ParticipationState::Absent), None);
+        assert!(encode_participation_state(ParticipationState::Active).is_some());
         for outcome in [
             OperationOutcome::OwnerFailed,
             OperationOutcome::Accepted,
@@ -1091,12 +1092,12 @@ mod tests {
             OperationOutcome::OperationTimedOut,
             OperationOutcome::IdentityMismatch,
             OperationOutcome::CompatibilityMismatch,
-            OperationOutcome::ContextNotEstablished,
-            OperationOutcome::ContextConflict,
+            OperationOutcome::ParticipationNotEstablished,
+            OperationOutcome::ParticipationConflict,
             OperationOutcome::DomainConflict,
             OperationOutcome::LeaseExpired,
             OperationOutcome::ReleaseNotReady,
-            OperationOutcome::ContextTerminalReceipt,
+            OperationOutcome::ParticipationTerminalReceipt,
             OperationOutcome::InvalidStateOrRequest,
             OperationOutcome::TerminalRejected,
             OperationOutcome::Gone,
@@ -1149,9 +1150,9 @@ mod tests {
     fn envelope(kind: OperationKind) -> (TaskOperationId, novarocks::TaskOperationEnvelope) {
         let id = TaskOperationId::new_v7();
         let millis = match kind {
-            OperationKind::AcquireQueryContextAdmissionTicket
+            OperationKind::AcquireParticipationAdmissionTicket
             | OperationKind::CreateTask
-            | OperationKind::UpdateQueryContext => 15_000,
+            | OperationKind::UpdateParticipation => 15_000,
             _ => 5_000,
         };
         (
@@ -1165,19 +1166,19 @@ mod tests {
 
     #[test]
     fn admission_ticket_request_and_receipt_round_trip_the_exact_grant() {
-        let query_context = context(backend());
+        let target_participation = participation(backend());
         let valid_for = LeaseValidFor::new(Duration::from_secs(12)).expect("representable");
         let native_compatibility_id = NativeCompatibilityId::new([0x47; 32]);
         let admission_epoch_capability =
             AdmissionEpochCapability::try_from_bytes([0x51; 16]).expect("nonzero epoch");
-        let request = AcquireQueryContextAdmissionTicket::new(
+        let request = AcquireParticipationAdmissionTicket::new(
             TaskOperationId::new_v7(),
-            query_context,
+            target_participation,
             valid_for,
             native_compatibility_id,
             admission_epoch_capability,
         );
-        let wire = encode_acquire_query_context_admission_ticket(request);
+        let wire = encode_acquire_participation_admission_ticket(request);
         let decoded = decode_operation_batch(
             &novarocks::ApplyTaskOperationsRequest {
                 operations: vec![wire.clone()],
@@ -1186,11 +1187,11 @@ mod tests {
             FieldPath::root("batch"),
         )
         .expect("the acquisition request is legal");
-        let DecodedOperation::AcquireQueryContextAdmissionTicket(decoded_request) = decoded[0]
+        let DecodedOperation::AcquireParticipationAdmissionTicket(decoded_request) = decoded[0]
         else {
             panic!("fixture carries an admission ticket acquisition");
         };
-        assert_eq!(decoded_request.context(), query_context);
+        assert_eq!(decoded_request.participation(), target_participation);
         assert_eq!(decoded_request.valid_for(), valid_for);
         assert_eq!(
             decoded_request.native_compatibility_id(),
@@ -1202,8 +1203,9 @@ mod tests {
         );
 
         let mut missing_epoch = wire.clone();
-        let Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(acquire)) =
-            missing_epoch.operation.as_mut()
+        let Some(novarocks::task_operation::Operation::AcquireParticipationAdmissionTicket(
+            acquire,
+        )) = missing_epoch.operation.as_mut()
         else {
             panic!("fixture carries an admission ticket acquisition");
         };
@@ -1222,8 +1224,9 @@ mod tests {
         );
 
         let mut zero_epoch = wire.clone();
-        let Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(acquire)) =
-            zero_epoch.operation.as_mut()
+        let Some(novarocks::task_operation::Operation::AcquireParticipationAdmissionTicket(
+            acquire,
+        )) = zero_epoch.operation.as_mut()
         else {
             panic!("fixture carries an admission ticket acquisition");
         };
@@ -1243,8 +1246,9 @@ mod tests {
         );
 
         let mut missing_compatibility = wire.clone();
-        let Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(acquire)) =
-            missing_compatibility.operation.as_mut()
+        let Some(novarocks::task_operation::Operation::AcquireParticipationAdmissionTicket(
+            acquire,
+        )) = missing_compatibility.operation.as_mut()
         else {
             panic!("fixture carries an admission ticket acquisition");
         };
@@ -1263,8 +1267,9 @@ mod tests {
         );
 
         let mut malformed_compatibility = wire.clone();
-        let Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(acquire)) =
-            malformed_compatibility.operation.as_mut()
+        let Some(novarocks::task_operation::Operation::AcquireParticipationAdmissionTicket(
+            acquire,
+        )) = malformed_compatibility.operation.as_mut()
         else {
             panic!("fixture carries an admission ticket acquisition");
         };
@@ -1285,12 +1290,13 @@ mod tests {
         );
 
         let ticket_id = AdmissionTicketId::try_from_bytes([0x54; 16]).expect("nonzero ticket");
-        let receipt = QueryContextAdmissionTicketReceipt::new(ticket_id, query_context, valid_for);
-        let wire_ack = encode_query_context_admission_ticket_ack(receipt);
-        let decoded_receipt = decode_query_context_admission_ticket_ack(
+        let receipt =
+            ParticipationAdmissionTicketReceipt::new(ticket_id, target_participation, valid_for);
+        let wire_ack = encode_participation_admission_ticket_ack(receipt);
+        let decoded_receipt = decode_participation_admission_ticket_ack(
             &wire_ack,
             request,
-            FieldPath::root("receipt.query_context_admission_ticket"),
+            FieldPath::root("receipt.participation_admission_ticket"),
         )
         .expect("the acknowledgement binds the exact request");
         assert_eq!(decoded_receipt, receipt);
@@ -1298,10 +1304,10 @@ mod tests {
         let mut zero_ticket = wire_ack.clone();
         zero_ticket.ticket_id = Some(novarocks::AdmissionTicketId { value: vec![0; 16] });
         assert_eq!(
-            decode_query_context_admission_ticket_ack(
+            decode_participation_admission_ticket_ack(
                 &zero_ticket,
                 request,
-                FieldPath::root("receipt.query_context_admission_ticket"),
+                FieldPath::root("receipt.participation_admission_ticket"),
             )
             .expect_err("an all-zero ticket nonce must fail")
             .kind(),
@@ -1309,39 +1315,39 @@ mod tests {
         );
 
         let other_valid_for = LeaseValidFor::new(Duration::from_secs(13)).expect("representable");
-        let wrong_validity = AcquireQueryContextAdmissionTicket::new(
+        let wrong_validity = AcquireParticipationAdmissionTicket::new(
             request.envelope().operation_id(),
-            query_context,
+            target_participation,
             other_valid_for,
             native_compatibility_id,
             admission_epoch_capability,
         );
         assert_eq!(
-            decode_query_context_admission_ticket_ack(
+            decode_participation_admission_ticket_ack(
                 &wire_ack,
                 wrong_validity,
-                FieldPath::root("receipt.query_context_admission_ticket"),
+                FieldPath::root("receipt.participation_admission_ticket"),
             )
             .expect_err("a receipt for different requested validity must fail")
             .kind(),
             &ProtocolErrorKind::InvalidValue
         );
 
-        let other_context = context(BackendProcessId::new_v7());
-        let wrong_context = AcquireQueryContextAdmissionTicket::new(
+        let other_participation = participation(BackendProcessId::new_v7());
+        let wrong_participation = AcquireParticipationAdmissionTicket::new(
             request.envelope().operation_id(),
-            other_context,
+            other_participation,
             valid_for,
             native_compatibility_id,
             admission_epoch_capability,
         );
         assert_eq!(
-            decode_query_context_admission_ticket_ack(
+            decode_participation_admission_ticket_ack(
                 &wire_ack,
-                wrong_context,
-                FieldPath::root("receipt.query_context_admission_ticket"),
+                wrong_participation,
+                FieldPath::root("receipt.participation_admission_ticket"),
             )
-            .expect_err("a receipt for another context must fail")
+            .expect_err("a receipt for another participation must fail")
             .kind(),
             &ProtocolErrorKind::InvalidValue
         );
@@ -1357,7 +1363,7 @@ mod tests {
                 novarocks::TaskOperation {
                     envelope: Some(create_envelope),
                     operation: Some(novarocks::task_operation::Operation::CreateTask(
-                        create_request(process, context(process)),
+                        create_request(process, participation(process)),
                     )),
                 },
                 novarocks::TaskOperation {
@@ -1494,28 +1500,28 @@ mod tests {
     fn an_establish_must_carry_lease_sequence_zero() {
         let process = backend();
         let ticket_id = AdmissionTicketId::try_from_bytes([0x55; 16]).expect("nonzero ticket");
-        let (_, envelope_value) = envelope(OperationKind::UpdateQueryContext);
+        let (_, envelope_value) = envelope(OperationKind::UpdateParticipation);
         let establish = |sequence: u64,
                          descriptors: usize|
          -> novarocks::ApplyTaskOperationsRequest {
             novarocks::ApplyTaskOperationsRequest {
                 operations: vec![novarocks::TaskOperation {
                     envelope: Some(envelope_value.clone()),
-                    operation: Some(novarocks::task_operation::Operation::UpdateQueryContext(
-                        novarocks::UpdateQueryContextRequest {
+                    operation: Some(novarocks::task_operation::Operation::UpdateParticipation(
+                        novarocks::UpdateParticipationRequest {
                             command: Some(
-                                novarocks::update_query_context_request::Command::Establish(
-                                    novarocks::EstablishQueryContextRequest {
-                                        query_context: Some(encode_query_context_ref(context(
-                                            process,
-                                        ))),
+                                novarocks::update_participation_request::Command::Establish(
+                                    novarocks::EstablishParticipationRequest {
+                                        participation: Some(encode_participation_ref(
+                                            participation(process),
+                                        )),
                                         catalog_set: Some(catalog::CatalogSet::default()),
                                         initial_runtime_filter: Some(
                                             novarocks::RuntimeFilterContribution::default(),
                                         ),
                                         initial_credential: Some(
-                                            novarocks::QueryContextCredentialDomain {
-                                                lease_id: 1,
+                                            novarocks::ParticipationCredentialDomain {
+                                                credential_domain_id: 1,
                                                 epoch: 1,
                                                 descriptors: vec![
                                                     credential_descriptor(1);
@@ -1523,7 +1529,7 @@ mod tests {
                                                 ],
                                             },
                                         ),
-                                        initial_lease: Some(novarocks::QueryExecutionLeaseGrant {
+                                        initial_lease: Some(novarocks::ParticipationLeaseGrant {
                                             sequence,
                                             valid_for_millis: 30_000,
                                         }),
@@ -1551,7 +1557,7 @@ mod tests {
             FieldPath::root("batch"),
         )
         .expect("sequence zero with matched descriptors is the legal shape");
-        let DecodedOperation::UpdateQueryContext(DecodedUpdateQueryContext::Establish(request)) =
+        let DecodedOperation::UpdateParticipation(DecodedUpdateParticipation::Establish(request)) =
             &decoded[0]
         else {
             panic!("fixture carries an establish");
@@ -1564,12 +1570,12 @@ mod tests {
         assert_eq!(request.admission_ticket_id(), ticket_id);
 
         let mut missing_ticket = establish(0, 1);
-        let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
+        let Some(novarocks::task_operation::Operation::UpdateParticipation(update)) =
             missing_ticket.operations[0].operation.as_mut()
         else {
-            panic!("fixture carries an update query context");
+            panic!("fixture carries an update participation");
         };
-        let Some(novarocks::update_query_context_request::Command::Establish(establish_request)) =
+        let Some(novarocks::update_participation_request::Command::Establish(establish_request)) =
             update.command.as_mut()
         else {
             panic!("fixture carries an establish");
@@ -1584,16 +1590,16 @@ mod tests {
         assert_eq!(error.kind(), &ProtocolErrorKind::MissingField);
         assert_eq!(
             error.path().to_string(),
-            "batch.operations[0].update_query_context.establish.admission_ticket_id"
+            "batch.operations[0].update_participation.establish.admission_ticket_id"
         );
 
         let mut missing_compatibility = establish(0, 1);
-        let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
+        let Some(novarocks::task_operation::Operation::UpdateParticipation(update)) =
             missing_compatibility.operations[0].operation.as_mut()
         else {
-            panic!("fixture carries an update query context");
+            panic!("fixture carries an update participation");
         };
-        let Some(novarocks::update_query_context_request::Command::Establish(establish_request)) =
+        let Some(novarocks::update_participation_request::Command::Establish(establish_request)) =
             update.command.as_mut()
         else {
             panic!("fixture carries an establish");
@@ -1608,17 +1614,17 @@ mod tests {
         assert_eq!(error.kind(), &ProtocolErrorKind::MissingField);
         assert_eq!(
             error.path().to_string(),
-            "batch.operations[0].update_query_context.establish.native_compatibility_id"
+            "batch.operations[0].update_participation.establish.native_compatibility_id"
         );
 
         for invalid_len in [31, 33] {
             let mut invalid_compatibility = establish(0, 1);
-            let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
+            let Some(novarocks::task_operation::Operation::UpdateParticipation(update)) =
                 invalid_compatibility.operations[0].operation.as_mut()
             else {
-                panic!("fixture carries an update query context");
+                panic!("fixture carries an update participation");
             };
-            let Some(novarocks::update_query_context_request::Command::Establish(
+            let Some(novarocks::update_participation_request::Command::Establish(
                 establish_request,
             )) = update.command.as_mut()
             else {
@@ -1636,7 +1642,7 @@ mod tests {
             assert_eq!(error.kind(), &ProtocolErrorKind::InvalidValue);
             assert_eq!(
                 error.path().to_string(),
-                "batch.operations[0].update_query_context.establish.native_compatibility_id.value"
+                "batch.operations[0].update_participation.establish.native_compatibility_id.value"
             );
             assert!(
                 error.detail().contains(&format!("got {invalid_len}")),
@@ -1645,12 +1651,12 @@ mod tests {
             );
         }
         let mut missing_options = establish(0, 1);
-        let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
+        let Some(novarocks::task_operation::Operation::UpdateParticipation(update)) =
             missing_options.operations[0].operation.as_mut()
         else {
-            panic!("fixture carries an update query context");
+            panic!("fixture carries an update participation");
         };
-        let Some(novarocks::update_query_context_request::Command::Establish(establish_request)) =
+        let Some(novarocks::update_participation_request::Command::Establish(establish_request)) =
             update.command.as_mut()
         else {
             panic!("fixture carries an establish");
@@ -1665,7 +1671,7 @@ mod tests {
             .expect_err("query options are an immutable establish fact")
             .path()
             .to_string(),
-            "batch.operations[0].update_query_context.establish.query_options"
+            "batch.operations[0].update_participation.establish.query_options"
         );
         assert_eq!(
             decode_operation_batch(
@@ -1695,23 +1701,23 @@ mod tests {
     #[test]
     fn credential_material_never_reaches_a_rendering_or_an_error() {
         let process = backend();
-        let (_, envelope_value) = envelope(OperationKind::UpdateQueryContext);
+        let (_, envelope_value) = envelope(OperationKind::UpdateParticipation);
         let request = novarocks::ApplyTaskOperationsRequest {
             operations: vec![novarocks::TaskOperation {
                 envelope: Some(envelope_value),
-                operation: Some(novarocks::task_operation::Operation::UpdateQueryContext(
-                    novarocks::UpdateQueryContextRequest {
+                operation: Some(novarocks::task_operation::Operation::UpdateParticipation(
+                    novarocks::UpdateParticipationRequest {
                         command: Some(
-                            novarocks::update_query_context_request::Command::AdvanceDomain(
-                                novarocks::AdvanceQueryContextDomainRequest {
-                                    query_context: Some(encode_query_context_ref(context(
+                            novarocks::update_participation_request::Command::AdvanceDomain(
+                                novarocks::AdvanceParticipationDomainRequest {
+                                    participation: Some(encode_participation_ref(participation(
                                         process,
                                     ))),
-                                    domain: Some(novarocks::QueryContextDomainUpdate {
+                                    domain: Some(novarocks::ParticipationDomainUpdate {
                                         domain: Some(
-                                            novarocks::query_context_domain_update::Domain::Credential(
-                                                novarocks::QueryContextCredentialDomain {
-                                                    lease_id: 1,
+                                            novarocks::participation_domain_update::Domain::Credential(
+                                                novarocks::ParticipationCredentialDomain {
+                                                    credential_domain_id: 1,
                                                     epoch: 2,
                                                     descriptors: vec![credential_descriptor(2)],
                                                 },
@@ -1730,10 +1736,13 @@ mod tests {
                 .expect("legal advance");
         let sentinel = SECRET_SENTINEL;
         match &decoded[0] {
-            DecodedOperation::UpdateQueryContext(command) => {
-                assert!(!command.may_create(), "an advance never creates a context");
+            DecodedOperation::UpdateParticipation(command) => {
+                assert!(
+                    !command.may_create(),
+                    "an advance never creates a participation"
+                );
                 let neutral = match command {
-                    super::operation::DecodedUpdateQueryContext::AdvanceDomain {
+                    super::operation::DecodedUpdateParticipation::AdvanceDomain {
                         domain, ..
                     } => domain.as_neutral(),
                     _ => panic!("expected an advance"),
@@ -1746,7 +1755,10 @@ mod tests {
                 assert!(rendered.contains("<redacted>"), "{rendered}");
                 assert!(rendered.contains("epoch"), "{rendered}");
             }
-            other => panic!("expected a context update, got kind {:?}", other.kind()),
+            other => panic!(
+                "expected a participation update, got kind {:?}",
+                other.kind()
+            ),
         }
     }
 
@@ -1994,21 +2006,21 @@ mod tests {
     }
 
     #[test]
-    fn a_create_whose_context_names_another_backend_fails_closed() {
+    fn a_create_whose_participation_names_another_backend_fails_closed() {
         let process = backend();
         let (_, envelope_value) = envelope(OperationKind::CreateTask);
         let request = novarocks::ApplyTaskOperationsRequest {
             operations: vec![novarocks::TaskOperation {
                 envelope: Some(envelope_value),
                 operation: Some(novarocks::task_operation::Operation::CreateTask(
-                    create_request(process, context(backend())),
+                    create_request(process, participation(backend())),
                 )),
             }],
         };
         assert!(
             decode_operation_batch(&request, TransportBudget::DEFAULT, FieldPath::root("batch"))
                 .is_err(),
-            "a create must address the context of its own backend"
+            "a create must address the participation of its own backend"
         );
     }
 
@@ -2155,14 +2167,14 @@ mod tests {
             "Create cannot be disguised as a small control command"
         );
 
-        let (_, update_envelope) = envelope(OperationKind::UpdateQueryContext);
+        let (_, update_envelope) = envelope(OperationKind::UpdateParticipation);
         let advance = novarocks::TaskOperation {
             envelope: Some(update_envelope.clone()),
-            operation: Some(novarocks::task_operation::Operation::UpdateQueryContext(
-                novarocks::UpdateQueryContextRequest {
+            operation: Some(novarocks::task_operation::Operation::UpdateParticipation(
+                novarocks::UpdateParticipationRequest {
                     command: Some(
-                        novarocks::update_query_context_request::Command::AdvanceDomain(
-                            novarocks::AdvanceQueryContextDomainRequest::default(),
+                        novarocks::update_participation_request::Command::AdvanceDomain(
+                            novarocks::AdvanceParticipationDomainRequest::default(),
                         ),
                     ),
                 },
@@ -2174,11 +2186,11 @@ mod tests {
         );
         let renewal = novarocks::TaskOperation {
             envelope: Some(update_envelope),
-            operation: Some(novarocks::task_operation::Operation::UpdateQueryContext(
-                novarocks::UpdateQueryContextRequest {
+            operation: Some(novarocks::task_operation::Operation::UpdateParticipation(
+                novarocks::UpdateParticipationRequest {
                     command: Some(
-                        novarocks::update_query_context_request::Command::RenewLease(
-                            novarocks::RenewQueryExecutionLeaseRequest::default(),
+                        novarocks::update_participation_request::Command::RenewLease(
+                            novarocks::RenewParticipationLeaseRequest::default(),
                         ),
                     ),
                 },
@@ -2197,27 +2209,27 @@ mod tests {
     fn what_the_frontend_encodes_is_what_the_backend_decodes() {
         use super::operation::{
             encode_cancel_task, encode_create_task, encode_operation_batch,
-            encode_release_query_context, encode_renew_lease,
+            encode_release_participation, encode_renew_lease,
         };
         use novarocks_execution_contract::task_execution::operation::{
-            CancelTask, CreateTask, ReleaseQueryContext, RenewQueryExecutionLease,
+            CancelTask, CreateTask, ReleaseParticipation, RenewParticipationLease,
         };
 
         let process = backend();
         let identity = identity(2, 3, process);
-        let context = context(process);
+        let participation = participation(process);
 
         let wire_descriptor = simple_descriptor(process);
         let descriptor = decode_task_descriptor(&wire_descriptor, FieldPath::root("d"))
             .expect("legal descriptor");
 
         let create_id = TaskOperationId::new_v7();
-        let create = CreateTask::try_new(create_id, context, descriptor, Vec::new())
-            .expect("matching context");
+        let create = CreateTask::try_new(create_id, participation, descriptor, Vec::new())
+            .expect("matching participation");
         let frozen_fragment = FrozenBytes::freeze(frozen_fragment(4).encode_to_vec().into());
         let creation_metadata = FrozenBytes::freeze(
             encode_creation_metadata(
-                context,
+                participation,
                 create.descriptor(),
                 simple_assignment(),
                 Vec::new(),
@@ -2228,21 +2240,21 @@ mod tests {
         let cancel_id = TaskOperationId::new_v7();
         let cancel = CancelTask::new(cancel_id, identity, CancelReason::UpstreamNoLongerNeeded);
         let renew_id = TaskOperationId::new_v7();
-        let renew = RenewQueryExecutionLease::new(
+        let renew = RenewParticipationLease::new(
             renew_id,
-            context,
+            participation,
             LeaseSequence::new(1),
             LeaseValidFor::new(Duration::from_secs(5)).expect("representable"),
         );
         let release_id = TaskOperationId::new_v7();
-        let release = ReleaseQueryContext::new(release_id, context);
+        let release = ReleaseParticipation::new(release_id, participation);
 
         let batch = encode_operation_batch(
             vec![
                 encode_create_task(create.envelope(), &frozen_fragment, &creation_metadata),
                 encode_cancel_task(cancel),
                 encode_renew_lease(&renew),
-                encode_release_query_context(release),
+                encode_release_participation(release),
             ],
             TransportBudget::DEFAULT,
         )
@@ -2268,14 +2280,14 @@ mod tests {
             vec![
                 OperationKind::CreateTask,
                 OperationKind::CancelTask,
-                OperationKind::UpdateQueryContext,
-                OperationKind::ReleaseQueryContext,
+                OperationKind::UpdateParticipation,
+                OperationKind::ReleaseParticipation,
             ]
         );
         match &decoded[0] {
             DecodedOperation::CreateTask(create) => {
                 assert_eq!(create.descriptor().identity(), identity);
-                assert_eq!(create.request().context(), context);
+                assert_eq!(create.request().participation(), participation);
                 assert!(
                     create
                         .input()
@@ -2292,11 +2304,14 @@ mod tests {
             other => panic!("expected a create, got {other:?}"),
         }
         match &decoded[2] {
-            DecodedOperation::UpdateQueryContext(command) => {
-                assert!(!command.may_create(), "a renewal never creates a context");
-                assert_eq!(command.context(), context);
+            DecodedOperation::UpdateParticipation(command) => {
+                assert!(
+                    !command.may_create(),
+                    "a renewal never creates a participation"
+                );
+                assert_eq!(command.participation(), participation);
             }
-            other => panic!("expected a context update, got {other:?}"),
+            other => panic!("expected a participation update, got {other:?}"),
         }
     }
 
@@ -2327,23 +2342,23 @@ mod tests {
 
     #[test]
     fn a_credential_receipt_reports_its_lease_and_epoch() {
-        use super::operation::encode_query_context_domain_receipt;
+        use super::operation::encode_participation_domain_receipt;
         use novarocks_execution_contract::task_execution::domain::{
-            CredentialLeaseId, DomainProgression,
+            CredentialDomainId, DomainProgression,
         };
-        use novarocks_execution_contract::task_execution::operation::QueryContextDomainReceipt;
+        use novarocks_execution_contract::task_execution::operation::ParticipationDomainReceipt;
 
-        let receipt = QueryContextDomainReceipt::Credential {
-            lease_id: CredentialLeaseId::new(7),
+        let receipt = ParticipationDomainReceipt::Credential {
+            credential_domain_id: CredentialDomainId::new(7),
             accepted_epoch: CredentialEpoch::new(4).expect("nonzero"),
             progression: DomainProgression::Apply,
         };
         let encoded =
-            encode_query_context_domain_receipt(&receipt).expect("an applied receipt encodes");
+            encode_participation_domain_receipt(&receipt).expect("an applied receipt encodes");
         match encoded.receipt.expect("a receipt body") {
-            novarocks::query_context_domain_receipt::Receipt::Credential(credential) => {
+            novarocks::participation_domain_receipt::Receipt::Credential(credential) => {
                 assert_eq!(
-                    credential.lease_id, 7,
+                    credential.credential_domain_id, 7,
                     "the lease must be reported, not zero"
                 );
                 assert_eq!(credential.accepted_epoch, 4);
@@ -2409,14 +2424,14 @@ mod tests {
     #[test]
     fn every_accepted_domain_receipt_survives_a_round_trip() {
         use super::operation::{
-            decode_query_context_domain_receipt, decode_task_domain_receipt,
-            encode_query_context_domain_receipt, encode_task_domain_receipt,
+            decode_participation_domain_receipt, decode_task_domain_receipt,
+            encode_participation_domain_receipt, encode_task_domain_receipt,
         };
         use novarocks_execution_contract::task_execution::domain::{
-            CredentialLeaseId, DomainProgression, SplitSequence, SplitWatermark,
+            CredentialDomainId, DomainProgression, SplitSequence, SplitWatermark,
         };
         use novarocks_execution_contract::task_execution::operation::{
-            PlanNodeSplitReceipt, QueryContextDomainReceipt, TaskDomainReceipt,
+            ParticipationDomainReceipt, PlanNodeSplitReceipt, TaskDomainReceipt,
         };
 
         let progressions = [
@@ -2464,28 +2479,31 @@ mod tests {
                 assert_eq!(decoded, case, "a task domain receipt lost information");
             }
 
-            let context_cases = vec![
-                QueryContextDomainReceipt::CatalogBinding {
+            let participation_cases = vec![
+                ParticipationDomainReceipt::CatalogBinding {
                     accepted_version: Some(DomainVersion::new(2).expect("nonzero")),
                     progression,
                 },
-                QueryContextDomainReceipt::SharedDynamicFilter {
+                ParticipationDomainReceipt::SharedDynamicFilter {
                     accepted_version: None,
                     progression,
                 },
-                QueryContextDomainReceipt::Credential {
-                    lease_id: CredentialLeaseId::new(7),
+                ParticipationDomainReceipt::Credential {
+                    credential_domain_id: CredentialDomainId::new(7),
                     accepted_epoch: CredentialEpoch::new(4).expect("nonzero"),
                     progression,
                 },
             ];
-            for case in context_cases {
+            for case in participation_cases {
                 let encoded =
-                    encode_query_context_domain_receipt(&case).expect("an applied receipt encodes");
+                    encode_participation_domain_receipt(&case).expect("an applied receipt encodes");
                 let decoded =
-                    decode_query_context_domain_receipt(&encoded, FieldPath::root("receipt"))
+                    decode_participation_domain_receipt(&encoded, FieldPath::root("receipt"))
                         .expect("decodes");
-                assert_eq!(decoded, case, "a context domain receipt lost information");
+                assert_eq!(
+                    decoded, case,
+                    "a participation domain receipt lost information"
+                );
             }
         }
 
@@ -2507,14 +2525,14 @@ mod tests {
     #[test]
     fn a_conflicting_domain_never_ships_inside_an_applied_acknowledgement() {
         use super::operation::{
-            encode_create_task_ack, encode_query_context_domain_receipt,
+            encode_create_task_ack, encode_participation_domain_receipt,
             encode_task_domain_receipt, encode_update_task_ack,
         };
         use novarocks_execution_contract::task_execution::domain::{
             DomainConflict, DomainProgression,
         };
         use novarocks_execution_contract::task_execution::operation::{
-            CreateTaskReceipt, QueryContextDomainReceipt, TaskDomainReceipt, UpdateTaskReceipt,
+            CreateTaskReceipt, ParticipationDomainReceipt, TaskDomainReceipt, UpdateTaskReceipt,
         };
 
         // A conflicting domain refuses its whole operation, so no ack body can
@@ -2535,13 +2553,13 @@ mod tests {
                 encode_task_domain_receipt(&task).is_none(),
                 "{conflict:?} must not encode as an accepted task domain"
             );
-            let context = QueryContextDomainReceipt::CatalogBinding {
+            let participation = ParticipationDomainReceipt::CatalogBinding {
                 accepted_version: None,
                 progression: DomainProgression::Conflict(conflict),
             };
             assert!(
-                encode_query_context_domain_receipt(&context).is_none(),
-                "{conflict:?} must not encode as an accepted context domain"
+                encode_participation_domain_receipt(&participation).is_none(),
+                "{conflict:?} must not encode as an accepted participation domain"
             );
 
             // And the refusal must propagate: an ack whose domain list cannot
@@ -2569,11 +2587,11 @@ mod tests {
     #[test]
     fn an_acknowledgement_for_another_task_is_not_this_task_s_proof() {
         use super::operation::{
-            decode_create_task_ack, decode_query_context_ack, decode_update_task_ack,
-            encode_create_task_ack, encode_query_context_ack, encode_update_task_ack,
+            decode_create_task_ack, decode_participation_ack, decode_update_task_ack,
+            encode_create_task_ack, encode_participation_ack, encode_update_task_ack,
         };
         use novarocks_execution_contract::task_execution::operation::{
-            CreateTaskReceipt, QueryContextReceipt, UpdateTaskReceipt,
+            CreateTaskReceipt, ParticipationReceipt, UpdateTaskReceipt,
         };
 
         let process = backend();
@@ -2608,41 +2626,41 @@ mod tests {
             &ProtocolErrorKind::InvalidValue
         );
 
-        let my_context = context(process);
-        let their_context = context(process);
-        let ack = encode_query_context_ack(
-            &QueryContextReceipt::new(their_context, QueryContextState::Active),
+        let my_participation = participation(process);
+        let their_participation = participation(process);
+        let ack = encode_participation_ack(
+            &ParticipationReceipt::new(their_participation, ParticipationState::Active),
             None,
         )
         .expect("an active receipt encodes");
         assert_eq!(
-            decode_query_context_ack(&ack, my_context, FieldPath::root("ack"))
-                .expect_err("a context acknowledgement for another context is refused")
+            decode_participation_ack(&ack, my_participation, FieldPath::root("ack"))
+                .expect_err("a participation acknowledgement for another participation is refused")
                 .kind(),
             &ProtocolErrorKind::InvalidValue
         );
         let (receipt, cause) =
-            decode_query_context_ack(&ack, their_context, FieldPath::root("ack"))
+            decode_participation_ack(&ack, their_participation, FieldPath::root("ack"))
                 .expect("its own acknowledgement decodes");
-        assert_eq!(receipt.state(), QueryContextState::Active);
-        assert!(cause.is_none(), "an active context has no cause");
+        assert_eq!(receipt.state(), ParticipationState::Active);
+        assert!(cause.is_none(), "an active participation has no cause");
     }
 
     #[test]
     fn quiesce_control_and_membership_round_trip() {
         use super::operation::{
             DecodedOperation, decode_control_operation_batch, decode_quiesce_ack,
-            encode_control_operation_batch, encode_quiesce_ack, encode_quiesce_query_context,
+            encode_control_operation_batch, encode_quiesce_ack, encode_quiesce_participation,
         };
         use novarocks_execution_contract::task_execution::operation::{
-            QuiesceQueryContext, QuiesceQueryContextReceipt,
+            QuiesceParticipation, QuiesceParticipationReceipt,
         };
 
         let backend = backend();
-        let context = context(backend);
-        let request = QuiesceQueryContext::new(TaskOperationId::new_v7(), context);
+        let participation = participation(backend);
+        let request = QuiesceParticipation::new(TaskOperationId::new_v7(), participation);
         let batch = encode_control_operation_batch(
-            vec![encode_quiesce_query_context(request)],
+            vec![encode_quiesce_participation(request)],
             TransportBudget::DEFAULT,
         )
         .expect("quiesce is a small control");
@@ -2653,11 +2671,15 @@ mod tests {
         )
         .expect("control decodes");
         assert!(
-            matches!(&decoded[0], DecodedOperation::QuiesceQueryContext(value) if value.context() == context)
+            matches!(&decoded[0], DecodedOperation::QuiesceParticipation(value) if value.participation() == participation)
         );
 
-        let receipt =
-            QuiesceQueryContextReceipt::new(context, 1, Vec::new(), QueryContextState::Quiescing);
+        let receipt = QuiesceParticipationReceipt::new(
+            participation,
+            1,
+            Vec::new(),
+            ParticipationState::Quiescing,
+        );
         let wire = encode_quiesce_ack(&receipt).expect("closing state encodes");
         assert_eq!(
             decode_quiesce_ack(&wire, FieldPath::root("ack")).expect("receipt decodes"),
@@ -3280,15 +3302,15 @@ mod tests {
     #[test]
     fn quiesce_wire_rejects_invalid_fence_state_and_membership() {
         use super::operation::{decode_quiesce_ack, encode_quiesce_ack};
-        use novarocks_execution_contract::task_execution::operation::QuiesceQueryContextReceipt;
+        use novarocks_execution_contract::task_execution::operation::QuiesceParticipationReceipt;
         let process = backend();
-        let ctx = context(process);
+        let participation_ref = participation(process);
         let task = identity(2, 3, process);
-        let wire = encode_quiesce_ack(&QuiesceQueryContextReceipt::new(
-            ctx,
+        let wire = encode_quiesce_ack(&QuiesceParticipationReceipt::new(
+            participation_ref,
             1,
             vec![task],
-            QueryContextState::Quiescing,
+            ParticipationState::Quiescing,
         ))
         .unwrap();
         assert!(decode_quiesce_ack(&wire, FieldPath::root("valid")).is_ok());
@@ -3296,7 +3318,7 @@ mod tests {
         invalid.fence_version = 0;
         assert!(decode_quiesce_ack(&invalid, FieldPath::root("zero_fence")).is_err());
         invalid = wire.clone();
-        invalid.state = novarocks::QueryContextState::Active as i32;
+        invalid.state = novarocks::ParticipationState::Active as i32;
         assert!(decode_quiesce_ack(&invalid, FieldPath::root("active_fence")).is_err());
         invalid = wire.clone();
         invalid
@@ -3309,40 +3331,41 @@ mod tests {
         invalid = wire;
         invalid.accepted_tasks = vec![
             invalid.accepted_tasks[0].clone();
-            TransportBudget::DEFAULT.max_tasks_per_context() + 1
+            TransportBudget::DEFAULT.max_tasks_per_participation() + 1
         ];
         assert!(decode_quiesce_ack(&invalid, FieldPath::root("oversized_membership")).is_err());
     }
 
     #[test]
-    fn a_terminated_context_reports_why_rather_than_dropping_it() {
+    fn a_terminated_participation_reports_why_rather_than_dropping_it() {
         use super::operation::{
-            decode_query_context_ack, decode_release_ack, encode_query_context_ack,
+            decode_participation_ack, decode_release_ack, encode_participation_ack,
             encode_release_ack,
         };
-        use novarocks_execution_contract::task_execution::operation::QueryContextReceipt;
+        use novarocks_execution_contract::task_execution::operation::ParticipationReceipt;
 
-        // The cause is the only statement of why a context the frontend still
+        // The cause is the only statement of why a participation the frontend still
         // believed in is gone. Validating and discarding it would leave the
         // frontend with a terminal state and no reason.
         let process = backend();
-        let ctx = context(process);
-        let ack = encode_query_context_ack(
-            &QueryContextReceipt::new(ctx, QueryContextState::TerminalRetained),
+        let participation_ref = participation(process);
+        let ack = encode_participation_ack(
+            &ParticipationReceipt::new(participation_ref, ParticipationState::TerminalRetained),
             Some(AbortCause::LeaseExpired),
         )
         .expect("a terminally retained receipt encodes");
         let (receipt, cause) =
-            decode_query_context_ack(&ack, ctx, FieldPath::root("ack")).expect("decodes");
-        assert_eq!(receipt.state(), QueryContextState::TerminalRetained);
+            decode_participation_ack(&ack, participation_ref, FieldPath::root("ack"))
+                .expect("decodes");
+        assert_eq!(receipt.state(), ParticipationState::TerminalRetained);
         assert_eq!(cause, Some(AbortCause::LeaseExpired));
 
         // The release acknowledgement answers the same question, so it must
         // not be the one path that validates the cause and throws it away.
         let mut release = encode_release_ack(
-            ctx,
+            participation_ref,
             ReleaseOutcome::AlreadyTerminal,
-            QueryContextState::TerminalRetained,
+            ParticipationState::TerminalRetained,
             None,
         )
         .expect("a terminally retained release encodes");
@@ -3351,7 +3374,7 @@ mod tests {
         ));
         let decoded = decode_release_ack(&release, FieldPath::root("ack")).expect("decodes");
         let (acked, outcome, state, cause) = (
-            decoded.context,
+            decoded.participation,
             decoded.outcome,
             decoded.state,
             decoded.termination_cause,
@@ -3394,9 +3417,9 @@ mod tests {
         )
         .expect("the sealed contribution satisfies the terminal contract");
         let carried = encode_release_ack(
-            ctx,
+            participation_ref,
             ReleaseOutcome::Released,
-            QueryContextState::TerminalRetained,
+            ParticipationState::TerminalRetained,
             Some(&sealed),
         )
         .expect("a release carrying a contribution encodes");
@@ -3418,9 +3441,9 @@ mod tests {
             decode_release_ack(&malformed, FieldPath::root("ack")).is_err(),
             "an empty telemetry oneof is neither available nor unavailable"
         );
-        assert_eq!(acked, ctx);
+        assert_eq!(acked, participation_ref);
         assert_eq!(outcome, ReleaseOutcome::AlreadyTerminal);
-        assert_eq!(state, QueryContextState::TerminalRetained);
+        assert_eq!(state, ParticipationState::TerminalRetained);
         assert_eq!(cause, Some(AbortCause::LeaseExpired));
     }
 }

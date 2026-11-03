@@ -219,7 +219,7 @@ pub(crate) fn finish_frozen_mv_rewrite_context_original(
     }
     let target_schema = crate::mv::domain::storage_observation::observe_schema_validation(
         ports.storage_observation(),
-        target_binding.lease(),
+        target_binding.planning_pin(),
         target_binding.metadata(),
         connector_context.clone(),
     )

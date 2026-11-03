@@ -23,7 +23,7 @@
 
 use crate::ids::{AccountId, AccountKind, ConfigVersion, PolicyVersion};
 use crate::sync::{Arc, Ordering};
-use crate::{AccountHandle, account::Path, domain::Domain};
+use crate::{Account, account::Path, domain::Domain};
 use std::time::Instant;
 
 /// One account's ledger facts and the quality of its live observation.
@@ -174,18 +174,18 @@ impl PressureProjection {
 // outside the gate's scope, so a final account/domain drop always occurs after
 // gate release and cannot recursively acquire its own observation gate.
 struct ObservationMembers {
-    accounts: Vec<AccountHandle>,
+    accounts: Vec<Account>,
     domains: Vec<Arc<Domain>>,
 }
 impl ObservationMembers {
-    fn reserve(account: &AccountHandle) -> Self {
+    fn reserve(account: &Account) -> Self {
         let domain_capacity = account.0.shared.domains.lock().unwrap().records.len();
         Self {
             accounts: Vec::with_capacity(account.0.shared.max_accounts as usize),
             domains: Vec::with_capacity(domain_capacity),
         }
     }
-    fn capture(&mut self, account: &AccountHandle) {
+    fn capture(&mut self, account: &Account) {
         let shared = &account.0.shared;
         {
             let registry = shared.accounts.lock().unwrap();
@@ -194,7 +194,7 @@ impl ObservationMembers {
                     .records
                     .iter()
                     .take(registry.upper)
-                    .filter_map(|r| r.as_ref().and_then(|r| r.upgrade()).map(AccountHandle)),
+                    .filter_map(|r| r.as_ref().and_then(|r| r.upgrade()).map(Account)),
             );
         }
         {
@@ -214,11 +214,11 @@ impl ObservationMembers {
     }
 }
 
-pub(crate) fn account_snapshot(account: &AccountHandle) -> AccountSnapshot {
+pub(crate) fn account_snapshot(account: &Account) -> AccountSnapshot {
     capture(account).0
 }
 
-fn capture(account: &AccountHandle) -> (AccountSnapshot, PressureProjection) {
+fn capture(account: &Account) -> (AccountSnapshot, PressureProjection) {
     let started = Instant::now();
     let mut members = ObservationMembers::reserve(account);
     let path = Path::new(account);
@@ -242,8 +242,8 @@ fn capture(account: &AccountHandle) -> (AccountSnapshot, PressureProjection) {
 }
 
 fn capture_locked(
-    account: &AccountHandle,
-    root: &AccountHandle,
+    account: &Account,
+    root: &Account,
     members: &ObservationMembers,
     started: Instant,
 ) -> (AccountSnapshot, PressureProjection) {

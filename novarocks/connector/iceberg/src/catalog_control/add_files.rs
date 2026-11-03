@@ -1024,7 +1024,7 @@ mod tests {
     use crate::access_binding::IcebergReadBinding;
     use crate::resources::IcebergCatalogRuntime;
     use crate::schema_mapping::canonical_name_mapping;
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
 
     fn catalog_runtime() -> (tokio::runtime::Runtime, IcebergCatalogRuntime) {
         let owner = tokio::runtime::Runtime::new().expect("runtime");
@@ -1060,7 +1060,7 @@ mod tests {
             object_store_config,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(owner.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(owner.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(owner.handle().clone())),
         )
     }
 

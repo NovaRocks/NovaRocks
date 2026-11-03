@@ -63,22 +63,20 @@ use super::aggregate_fixture::PreparedUnitRecording;
 use super::family_fixture::{FixtureControl, cell, constant_policy, int64, values};
 use crate::exec::chunk::Chunk;
 use crate::exec::fragment::program::FragmentNodeId;
-use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use crate::runtime::fragment::exchange::{
+use crate::runtime::endpoint::{TaskDestination, RuntimeEndpoint};
+use crate::runtime::task::exchange::{
     CompiledExchangeReceivers, materialize_compiled_exchange_receivers,
 };
-use crate::runtime::fragment::instance::{
-    ExchangeInputAssignment, ExchangeInputAssignments, FragmentSinkAssignment,
+use crate::runtime::task::instance::{
+    ExchangeInputAssignment, ExchangeInputAssignments, TaskSinkAssignment,
 };
-use crate::runtime::fragment::io::exchange::test_support::{Fixture, UnitLoopback};
-use crate::runtime::fragment::io::{
-    ExchangeFrameTransmitter, ExchangeReceiverPort, NoopFragmentEventSink,
-};
-use crate::runtime::fragment::sink::materialize_compiled_sink;
+use crate::runtime::task::io::exchange::test_support::{Fixture, UnitLoopback};
+use crate::runtime::task::io::{ExchangeFrameTransmitter, ExchangeReceiverPort, NoopTaskEventSink};
+use crate::runtime::task::sink::materialize_compiled_sink;
 
 const SOURCE: FragmentId = FragmentId::new(1);
 const PARTIAL: FragmentId = FragmentId::new(2);
@@ -603,15 +601,15 @@ impl RecordingTransmitter {
 impl ExchangeFrameTransmitter for RecordingTransmitter {
     fn deliver_unit(
         &self,
-        frame: crate::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+        frame: crate::runtime::task::io::exchange_unit::ExchangeUnitFrame,
         stop: tokio_util::sync::CancellationToken,
-        activity: crate::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
-        done: crate::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
+        done: crate::runtime::task::io::exchange_unit::ExchangeDeliveryCallback,
     ) {
         let mut carried = Vec::new();
         if !frame.receiver.payload.is_empty() {
             let key = (
-                frame.receiver.stream.source().fragment_instance_id(),
+                frame.receiver.stream.source().task_key(),
                 frame.receiver.stream.destination_node().get(),
             );
             let recording = self
@@ -629,8 +627,8 @@ impl ExchangeFrameTransmitter for RecordingTransmitter {
             .lock()
             .unwrap()
             .entry((
-                frame.receiver.stream.source().fragment_instance_id(),
-                frame.receiver.stream.destination_fragment_instance_id(),
+                frame.receiver.stream.source().task_key(),
+                frame.receiver.stream.destination_task_key(),
             ))
             .or_default()
             .extend(carried);
@@ -639,9 +637,9 @@ impl ExchangeFrameTransmitter for RecordingTransmitter {
     fn register_unit_demands(
         &self,
         destination: RuntimeEndpoint,
-        entries: Vec<crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry>,
+        entries: Vec<crate::runtime::task::io::exchange_unit::ExchangeDemandEntry>,
         stop: tokio_util::sync::CancellationToken,
-        done: crate::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+        done: crate::runtime::task::io::exchange_unit::ExchangeDemandCallback,
     ) {
         self.unit
             .register_unit_demands(destination, entries, stop, done)
@@ -650,7 +648,7 @@ impl ExchangeFrameTransmitter for RecordingTransmitter {
         &self,
         destination: RuntimeEndpoint,
         stream: novarocks_execution_contract::ExchangeStreamIdentity,
-        wake: crate::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+        wake: crate::runtime::task::io::exchange_unit::ExchangeGrantWake,
     ) -> Result<(), novarocks_failure_contract::FailureFact> {
         self.unit.watch_unit_facts(destination, stream, wake)
     }
@@ -699,7 +697,7 @@ fn run(
         Some((instance.high(), instance.low())),
         dop,
         fixture.state(instance),
-        Arc::new(NoopFragmentEventSink),
+        Arc::new(NoopTaskEventSink),
     )
     .expect("compiled split fragment prepares drivers")
     .start()
@@ -744,13 +742,8 @@ fn register(
     bindings
 }
 
-fn destination(
-    instance: UniqueId,
-    sender: UniqueId,
-    ordinal: u32,
-    count: u32,
-) -> FragmentDestination {
-    FragmentDestination::new(
+fn destination(instance: UniqueId, sender: UniqueId, ordinal: u32, count: u32) -> TaskDestination {
+    TaskDestination::new(
         instance,
         RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
         sender,
@@ -764,7 +757,7 @@ fn stream_sink(
     fixture: &Fixture,
     program: &Arc<LocalProgram>,
     instance: UniqueId,
-    destinations: Vec<FragmentDestination>,
+    destinations: Vec<TaskDestination>,
     transmitter: &Arc<RecordingTransmitter>,
 ) -> Box<dyn OperatorFactory> {
     let (node, recording) = PreparedUnitRecording::new(program, fixture.creation(instance));
@@ -780,7 +773,7 @@ fn stream_sink(
     fixture
         .sink(
             program,
-            &FragmentSinkAssignment::StreamDestinations {
+            &TaskSinkAssignment::StreamDestinations {
                 destinations,
                 sender_id: None,
             },
@@ -882,12 +875,12 @@ fn run_split(keys: &[Key], limit: u64, offset: u64) -> SplitRun {
         run(&fixture, &partial, sink, bindings, instance);
     }
 
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let sink = materialize_compiled_sink(
         &last,
-        &FragmentSinkAssignment::None,
+        &TaskSinkAssignment::None,
         FINAL_FINST,
-        crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+        crate::runtime::task::io::exchange::discard_exchange_transmitter(),
         Some(Box::new(ResultSinkFactory::new(output.clone()))),
         None,
     )

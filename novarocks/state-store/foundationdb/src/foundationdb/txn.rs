@@ -32,7 +32,7 @@ use super::commit::{PreparedCommit, supervise_commit};
 use super::metrics::{ProviderMetrics, ProviderOperation, ProviderOutcome};
 use super::range::range_page;
 use super::{classify_native_read_error, record_provider_error_metric};
-use crate::runtime::OperationHandle;
+use crate::runtime::FoundationDbOperationPermit;
 use novarocks_state_store_api::{
     AttemptId, CommitOutcome, Key, Precondition, RangePage, RangeRequest, ReadTransaction,
     StateRecord, StateStoreError, StateStoreErrorKind, StateStoreLimits, Value, VersionToken,
@@ -67,7 +67,7 @@ pub(super) struct FoundationDbReadTransaction {
     limits: StateStoreLimits,
     deadline: Instant,
     metrics: Arc<ProviderMetrics>,
-    _operation: OperationHandle,
+    _operation: FoundationDbOperationPermit,
 }
 
 pub(super) struct FoundationDbWriteTransaction {
@@ -77,7 +77,7 @@ pub(super) struct FoundationDbWriteTransaction {
     limits: StateStoreLimits,
     deadline: Instant,
     metrics: Arc<ProviderMetrics>,
-    operation: OperationHandle,
+    operation: FoundationDbOperationPermit,
     /// The one write this transaction is authorised to make.
     ///
     /// It is consumed by [`PreparedCommit`], which is why a prepared commit is
@@ -104,9 +104,9 @@ impl FoundationDbStateStore {
     ) -> Result<FoundationDbReadTransaction, StateStoreError> {
         let started = StdInstant::now();
         let result = (|| {
-            let operation = self.lease.acquire_operation()?;
+            let operation = self.database_registration.acquire_operation()?;
             let deadline = Instant::now() + self.limits.transaction_deadline;
-            let database = self.lease.database()?;
+            let database = self.database_registration.database()?;
             let transaction = create_raw_transaction(database.as_ref(), &self.limits, deadline)?;
             Ok(FoundationDbReadTransaction {
                 transaction: Some(transaction),
@@ -127,10 +127,10 @@ impl FoundationDbStateStore {
     ) -> Result<FoundationDbWriteTransaction, StateStoreError> {
         let started = StdInstant::now();
         let result = (|| {
-            let operation = self.lease.acquire_operation()?;
+            let operation = self.database_registration.acquire_operation()?;
             let budget = TransactionBudget::new(self.limits.clone(), self.codec.root().len())?;
             let deadline = Instant::now() + self.limits.transaction_deadline;
-            let database = self.lease.database()?;
+            let database = self.database_registration.database()?;
             let transaction = create_raw_transaction(database.as_ref(), &self.limits, deadline)?;
             Ok(FoundationDbWriteTransaction {
                 database,

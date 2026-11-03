@@ -18,13 +18,15 @@
 #![cfg(not(loom))]
 
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::{
+        ActorRuntime, ActorTurnError, InputAuthor, MetadataConsumption, TimerSourceState,
+    },
     completion::ReportSlot,
-    driver::{ActorRuntime, DriverError, InputAuthor, MetadataConsumption, TimerSourceState},
-    exit_role::ExitRole,
+    exit_custody::ExitCustody,
     publication::{PublishedReply, PublishedSnapshot},
     reported_work::ReportedWork,
-    transaction::{RoleSpec, RuntimeError, RuntimeLedger, ScopeParentAdmission},
+    transaction::{DeclaredInput, RuntimeError, RuntimeLedger, ScopeParentAdmission},
 };
 use novarocks_control_runtime_core::{
     capacity::{CapacityError, ReservationResources, ResourceVector},
@@ -89,7 +91,7 @@ fn original_inventory_births_one_real_child_and_waits_for_its_capture_and_report
     let refusal = scope.reserve_child_from(
         &mut funding,
         &parent,
-        RoleSpec {
+        DeclaredInput {
             generation: generation(),
             kind: WorkKind::Cleanup,
             resources: child_resources(3),
@@ -108,7 +110,7 @@ fn original_inventory_births_one_real_child_and_waits_for_its_capture_and_report
         .reserve_child_from(
             &mut funding,
             &parent,
-            RoleSpec {
+            DeclaredInput {
                 generation: generation(),
                 kind: WorkKind::Cleanup,
                 resources: child_resources(1),
@@ -119,7 +121,7 @@ fn original_inventory_births_one_real_child_and_waits_for_its_capture_and_report
     assert_eq!(scope.snapshot().unwrap().work, 2);
     assert_eq!(ledger.used(dimension()), 1);
     let child_report = child.report().clone();
-    let (child_role, child_authority) = ExitRole::from_admitted(child);
+    let (child_role, child_authority) = ExitCustody::from_admitted(child);
     let report = ReportSlot::reserve_next(
         &mut funding,
         generation(),
@@ -128,7 +130,7 @@ fn original_inventory_births_one_real_child_and_waits_for_its_capture_and_report
     )
     .unwrap();
     let parent = ReportedWork::try_new(parent, funding, report.clone()).unwrap();
-    let (parent_role, parent_authority) = ExitRole::from_admitted(parent);
+    let (parent_role, parent_authority) = ExitCustody::from_admitted(parent);
     scope.close_external().unwrap();
     parent_authority.exited().unwrap();
     report.consume(consumer()).unwrap();
@@ -177,7 +179,7 @@ fn a_bound_cut_keeps_its_original_scope_after_the_reported_work_and_quota_exit()
     )
     .unwrap();
     let (role, authority) =
-        ExitRole::from_admitted(ReportedWork::try_new(work, funding, report.clone()).unwrap());
+        ExitCustody::from_admitted(ReportedWork::try_new(work, funding, report.clone()).unwrap());
     scope.close_external().unwrap();
     authority.exited().unwrap();
     report.consume(consumer()).unwrap();
@@ -230,7 +232,7 @@ impl Actor for DelayedRequestActor {
         _: Tick,
         _: InputEnvelope,
         input: Self::Input,
-        step: &mut StepContext<'_, Self::Effect>,
+        step: &mut ActorStep<'_, Self::Effect>,
     ) {
         match input {
             DelayedRequestInput::HotSourcePanic => {
@@ -299,7 +301,7 @@ impl Actor for DelayedRequestActor {
         _: ScopeId,
         _: Generation,
         _: InputEnvelope,
-        step: &mut StepContext<'_, Self::Effect>,
+        step: &mut ActorStep<'_, Self::Effect>,
     ) {
         // Only the hot branch has an original failure Cleanup author. The
         // retained branch must never invoke this hook with its Root Scope.
@@ -317,7 +319,7 @@ fn original_process_request_survives_context_exit_and_retained_timer_without_bor
 }
 
 fn original_hot_failure_detaches_to_the_same_custodian() {
-    use novarocks_control_runtime::driver::FailureSourceState;
+    use novarocks_control_runtime::actor_turn::FailureSourceState;
 
     let ledger = RuntimeLedger::new(quota());
     let process = ledger.open_scope_next(None, generation()).unwrap();
@@ -400,13 +402,13 @@ fn original_hot_failure_detaches_to_the_same_custodian() {
     let mut source = runtime
         .reserve_admitted_input_for(&registration, actor, InputClass::Control, &metadata[0].0)
         .unwrap()
-        .into_role()
+        .into_standing_input()
         .unwrap();
     let permit = runtime
         .reserve_admitted_input_for(&registration, actor, InputClass::Ordinary, &request)
         .unwrap();
     let reply = PublishedReply::new_for_input(&permit.author().unwrap());
-    let (request_role, mut request_body) = ExitRole::from_admitted(
+    let (request_role, mut request_body) = ExitCustody::from_admitted(
         ReportedWork::try_new(request, request_funding, request_report.clone()).unwrap(),
     );
     request_body.start().unwrap();
@@ -444,7 +446,7 @@ fn original_hot_failure_detaches_to_the_same_custodian() {
     assert_eq!(before.work, 3);
     assert_eq!(
         host.detach_failed_execution_for_custodian(&proof, &process, &mut owners),
-        Err(DriverError::FailurePublicationRequired)
+        Err(ActorTurnError::FailurePublicationRequired)
     );
     assert_eq!(execution.snapshot().unwrap(), before);
     let mut session = runtime
@@ -454,7 +456,7 @@ fn original_hot_failure_detaches_to_the_same_custodian() {
     assert_eq!(reply.take_once().as_deref(), Some(&99));
     assert_eq!(
         host.detach_failed_execution_for_custodian(&proof, &process, &mut owners),
-        Err(DriverError::FailurePublicationRequired)
+        Err(ActorTurnError::FailurePublicationRequired)
     );
     session.finish().unwrap();
     runtime.retire_input(actor, failed_input).unwrap();
@@ -466,7 +468,7 @@ fn original_hot_failure_detaches_to_the_same_custodian() {
     runtime.retire_input(actor, supervisor).unwrap();
     assert_eq!(
         host.detach_failed_execution_for_custodian(&proof, &process, &mut owners),
-        Err(DriverError::ActorNotRetired)
+        Err(ActorTurnError::ActorNotRetired)
     );
     assert_eq!(execution.snapshot().unwrap(), before);
     assert!(registration.execution_attached());
@@ -479,7 +481,7 @@ fn original_hot_failure_detaches_to_the_same_custodian() {
     source.close_after_exit().unwrap();
     assert_eq!(
         host.detach_failed_execution_for_custodian(&proof, &process, &mut owners),
-        Err(DriverError::ActorNotRetired)
+        Err(ActorTurnError::ActorNotRetired)
     );
     assert_eq!(execution.snapshot().unwrap(), before);
     let payload = runtime.take_failure_payload(actor).unwrap().unwrap();
@@ -490,7 +492,7 @@ fn original_hot_failure_detaches_to_the_same_custodian() {
     drop(payload);
     assert_eq!(
         host.detach_execution_with_metadata(&process, &mut owners),
-        Err(DriverError::ActorNotRetired)
+        Err(ActorTurnError::ActorNotRetired)
     );
     host.detach_failed_execution_for_custodian(&proof, &process, &mut owners)
         .unwrap();
@@ -676,7 +678,7 @@ fn original_retained_request_flow(failed_source: bool) {
     let mut metadata_source = runtime
         .reserve_admitted_input_for(&registration, actor, InputClass::Control, &metadata_work)
         .unwrap()
-        .into_role()
+        .into_standing_input()
         .unwrap();
     let metadata_source_author = metadata_source.author().unwrap();
 
@@ -699,17 +701,17 @@ fn original_retained_request_flow(failed_source: bool) {
     let wrong_reply = PublishedReply::new_for_input(&other_author);
     other.revoke_unused().unwrap();
     // This actual second input is authored by the same process Work, before
-    // that lease moves to its ExitRole. It grants no new Work or execution debt.
+    // that lease moves to its ExitCustody. It grants no new Work or execution debt.
     let mut failure_input = failed_source.then(|| {
         runtime
             .reserve_admitted_input_for(&registration, actor, InputClass::Control, &request)
             .unwrap()
     });
-    let (request_role, mut request_body) = ExitRole::from_admitted(
+    let (request_role, mut request_body) = ExitCustody::from_admitted(
         ReportedWork::try_new(request, request_funding, request_report.clone()).unwrap(),
     );
     request_body.start().unwrap();
-    let (context_role, mut context_body) = ExitRole::from_admitted(
+    let (context_role, mut context_body) = ExitCustody::from_admitted(
         ReportedWork::try_new(context_work, context_funding, context_report.clone()).unwrap(),
     );
     context_body.start().unwrap();
@@ -741,7 +743,7 @@ fn original_retained_request_flow(failed_source: bool) {
             &mut [(&mut metadata_work, &mut metadata_bundle)],
             &mut [&mut metadata_source],
         ),
-        Err(DriverError::ActorNotRetired)
+        Err(ActorTurnError::ActorNotRetired)
     );
     assert_eq!(execution.snapshot().unwrap(), before_detach);
     assert_eq!(
@@ -772,18 +774,21 @@ fn original_retained_request_flow(failed_source: bool) {
         &mut [&mut metadata_source],
     )
     .unwrap();
-    // Absence of the actual header plus this same WorkLease's successful exit
+    // Absence of the actual header plus this same WorkObligation's successful exit
     // observation checks both the ledger commit and the owner's local flags.
     assert!(metadata_retirement.is_retired());
     assert!(metadata_work.actual_exit_ready().unwrap());
     assert!(metadata_bundle.is_released());
-    assert_eq!(metadata_source.in_flight(), Err(DriverError::UnknownRole));
+    assert_eq!(
+        metadata_source.in_flight(),
+        Err(ActorTurnError::UnknownStandingInput)
+    );
     assert_eq!(
         metadata_source
             .fill(DelayedRequestInput::SourcePanic)
             .unwrap_err()
             .0,
-        DriverError::UnknownRole
+        ActorTurnError::UnknownStandingInput
     );
     assert_eq!(
         metadata_bundle.resources().unwrap(),
@@ -826,7 +831,7 @@ fn original_retained_request_flow(failed_source: bool) {
     let (error, original_value) = runtime
         .commit_reply(&delayed, &wrong_reply, value.clone())
         .unwrap_err();
-    assert_eq!(error, DriverError::PublicationTargetMismatch);
+    assert_eq!(error, ActorTurnError::PublicationTargetMismatch);
     assert!(Arc::ptr_eq(&value, &original_value));
     assert!(!wrong_reply.is_committed());
     runtime
@@ -839,7 +844,7 @@ fn original_retained_request_flow(failed_source: bool) {
         .unwrap();
     assert_eq!(
         runtime.retire_input(actor, tick),
-        Err(DriverError::MetadataStillPending)
+        Err(ActorTurnError::MetadataStillPending)
     );
     let notice = host.take_metadata(tick).unwrap().unwrap();
     assert_eq!(*notice.value(), DelayedRequestEffect::RetainedNotice(73));
@@ -919,7 +924,7 @@ fn original_retained_request_flow(failed_source: bool) {
             DelayedRequestInput::Metadata(73),
         )
         .unwrap_err();
-    assert_eq!(error, DriverError::InputCapacity);
+    assert_eq!(error, ActorTurnError::InputCapacity);
     assert!(matches!(
         original_metadata,
         DelayedRequestInput::Metadata(73)
@@ -967,12 +972,12 @@ fn original_retained_request_flow(failed_source: bool) {
         original_report
             .bind_actor_consumer(&runtime, &destination, consumer())
             .unwrap_err(),
-        DriverError::PublicationTargetMismatch
+        ActorTurnError::PublicationTargetMismatch
     );
     let original_consumer = original_report
         .bind_actor_consumer(&runtime, &registration, consumer())
         .unwrap();
-    let (report_role, mut report_body) = ExitRole::from_admitted(
+    let (report_role, mut report_body) = ExitCustody::from_admitted(
         ReportedWork::try_new(report_work, report_funding, original_report.clone()).unwrap(),
     );
     report_body.start().unwrap();
@@ -981,7 +986,7 @@ fn original_retained_request_flow(failed_source: bool) {
     assert_eq!(ledger.used(dimension()), 2);
     assert_eq!(
         runtime.failure_proof_for(&registration).unwrap_err(),
-        DriverError::ActorNotRetired
+        ActorTurnError::ActorNotRetired
     );
     if let Some(original) = failure_input.take() {
         let failed = original.fill(DelayedRequestInput::SourcePanic).unwrap();
@@ -1031,7 +1036,7 @@ fn original_retained_request_flow(failed_source: bool) {
             runtime
                 .arm_failed_custodian_deadline(&proof, Tick(21))
                 .unwrap_err(),
-            DriverError::CustodianDeadlineMismatch
+            ActorTurnError::CustodianDeadlineMismatch
         );
         assert_eq!(runtime.next_deadline(), Some(Tick(20)));
         assert_eq!(runtime.advance_time(Tick(19), 1).unwrap(), 0);
@@ -1068,7 +1073,7 @@ fn original_retained_request_flow(failed_source: bool) {
         // overwrite the same oncecell, and refusal returns the exact new value.
         let attempted = Arc::new(99);
         let (error, original) = session.commit_reply(&reply, attempted.clone()).unwrap_err();
-        assert_eq!(error, DriverError::ReplyAlreadyCommitted);
+        assert_eq!(error, ActorTurnError::ReplyAlreadyCommitted);
         assert!(Arc::ptr_eq(&original, &attempted));
         assert!(reply.is_committed());
         assert!(reply.take_once().is_none());
@@ -1086,7 +1091,7 @@ fn original_retained_request_flow(failed_source: bool) {
             runtime
                 .claim_actor_failure_publication(&proof, &destination_work)
                 .unwrap_err(),
-            DriverError::FailurePublicationAlreadyClaimed
+            ActorTurnError::FailurePublicationAlreadyClaimed
         );
         // Closing publication neither fails the Root financial Scope nor
         // observes the Cleanup's independent body, captures or report exit.
@@ -1133,7 +1138,7 @@ fn original_retained_request_flow(failed_source: bool) {
                 InputClass::Control,
             )
             .err(),
-        Some(DriverError::InputCapacity)
+        Some(ActorTurnError::InputCapacity)
     );
     let host = runtime.claim_host_actor().unwrap();
     assert!(host.matches_registration(&registration));
@@ -1150,7 +1155,7 @@ fn original_retained_request_flow(failed_source: bool) {
     let (error, notice) = runtime
         .metadata_completed_for(&registration, notice)
         .unwrap_err();
-    assert_eq!(error, DriverError::MetadataStillPending);
+    assert_eq!(error, ActorTurnError::MetadataStillPending);
     host.release(false).unwrap();
     assert!(runtime.poll_one(Tick(10)).unwrap());
     assert_eq!(delivery.consumption(), MetadataConsumption::Consumed);
@@ -1220,7 +1225,7 @@ fn original_retained_request_flow(failed_source: bool) {
             runtime
                 .arm_failed_custodian_deadline(proof, Tick(20))
                 .unwrap_err(),
-            DriverError::Closed
+            ActorTurnError::Closed
         );
         host
     } else {
@@ -1244,7 +1249,7 @@ fn original_retained_request_flow(failed_source: bool) {
             runtime
                 .arm_failed_custodian_deadline(proof, Tick(20))
                 .unwrap_err(),
-            DriverError::UnknownActor
+            ActorTurnError::UnknownActor
         );
     }
     assert!(retired.deadline.is_none());

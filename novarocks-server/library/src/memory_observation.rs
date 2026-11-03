@@ -426,9 +426,9 @@ mod tests {
     #[test]
     fn the_installed_allocator_preserves_tail_format_and_alignment() {
         use novarocks_memory::attribution::binding;
-        use novarocks_memory::lane::{RecordRef, ResponsibilityClass, StoreHandle};
+        use novarocks_memory::lane::{RecordRef, RecordStorePin, ResponsibilityClass};
         use std::alloc::{GlobalAlloc, Layout};
-        let owner = StoreHandle::global()
+        let owner = RecordStorePin::global()
             .acquire(
                 7,
                 ResponsibilityClass::Service,
@@ -469,16 +469,16 @@ mod tests {
     #[test]
     fn the_installed_allocator_resize_keeps_source_and_handles_threshold_crossings() {
         use novarocks_memory::attribution::binding;
-        use novarocks_memory::lane::{RecordRef, ResponsibilityClass, StoreHandle};
+        use novarocks_memory::lane::{RecordRef, RecordStorePin, ResponsibilityClass};
         use std::alloc::{GlobalAlloc, Layout};
-        let first = StoreHandle::global()
+        let first = RecordStorePin::global()
             .acquire(
                 7,
                 ResponsibilityClass::Service,
                 novarocks_memory::lane::RecordRegion::Observation,
             )
             .unwrap();
-        let second = StoreHandle::global()
+        let second = RecordStorePin::global()
             .acquire(
                 8,
                 ResponsibilityClass::Service,

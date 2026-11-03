@@ -599,7 +599,7 @@ async fn internal_production_opening_cancellation_preserves_original_mio_child_a
         .with_catalog_properties(properties.clone())
         .unwrap(),
     );
-    let planning = spi::ConnectorControlPlanningLease::new(binding, || {});
+    let planning = spi::ConnectorControlPlanningPin::new(binding, || {});
     let adapter = Arc::new(ReadRuntimeAdapter::new(provider.clone()));
     let metadata: Arc<dyn read::ConnectorReadMetadata> = adapter.clone();
     let splits: Arc<dyn read::ConnectorReadSplitManager> = adapter.clone();

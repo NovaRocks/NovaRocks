@@ -30,7 +30,7 @@
 #[cfg(test)]
 use crate::exec::pipeline::operator::ExitProgress;
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StreamStepContract(novarocks_failure_contract::BoundedDetail);
@@ -44,7 +44,7 @@ impl novarocks_failure_contract::FailureProjection for StreamStepContract {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::ExchangeStreamContract.reason(),
+            crate::runtime::task::ExecutionReason::ExchangeStreamContract.reason(),
         )
     }
 }
@@ -68,7 +68,7 @@ impl std::error::Error for StreamPartitionArrowFailure {
 }
 impl novarocks_failure_contract::FailureProjection for StreamPartitionArrowFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use arrow::error::ArrowError;
         use novarocks_failure_contract::{
             FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
@@ -138,7 +138,7 @@ impl novarocks_failure_contract::FailureProjection for StreamDictionaryKeyFailur
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::ExchangeDictionaryKey.reason(),
+            crate::runtime::task::ExecutionReason::ExchangeDictionaryKey.reason(),
         )
     }
 }
@@ -164,7 +164,7 @@ impl novarocks_failure_contract::FailureProjection for PartitionRowExtent {
         };
         FailureFact::new(
             FailureClass::Representation,
-            crate::runtime::fragment::ExecutionReason::ExchangePartitionRowExtent.reason(),
+            crate::runtime::task::ExecutionReason::ExchangePartitionRowExtent.reason(),
         )
         .with_representation(RepresentationFacts {
             boundary: RepresentationBoundary::SingleOutput,
@@ -195,15 +195,15 @@ use crate::exec::operators::compiled_expression::{
     RuntimeKernelControl, evaluate_all, evaluate_selected, instances as compiled_instances,
     root_value_type,
 };
-use crate::runtime::endpoint::FragmentDestination;
-use crate::runtime::fragment::io::exchange_retained_payload::ExchangeRetainedPayload;
-use crate::runtime::fragment::io::exchange_sender_group::{ExchangeSenderGroup, GroupPublication};
-use crate::runtime::fragment::io::exchange_stream_sender::ExchangeStreamSenderConfig;
-use crate::runtime::fragment::io::{
+use crate::runtime::endpoint::TaskDestination;
+use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
+use crate::runtime::task::io::exchange_retained_payload::ExchangeRetainedPayload;
+use crate::runtime::task::io::exchange_sender_group::{ExchangeSenderGroup, GroupPublication};
+use crate::runtime::task::io::exchange_stream_sender::ExchangeStreamSenderConfig;
+use crate::runtime::task::io::{
     EdgeSendGate, EdgeSendState, ExchangeDestinationKey, ExchangeEdgeGates,
     ExchangeFrameTransmitter,
 };
-use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::task_execution::domain::ExchangeEdgeId;
 use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::datatypes::DataType;
@@ -219,11 +219,11 @@ use std::sync::{Mutex, OnceLock};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::{PreparedInput, RawInput},
     operator::{ExitObservation, FinishWatch, InputEncodingPolicy, Operator},
     shape::{ControlStep, SinkKernel, SinkStep, Transform},
     step::{AdmissionNext, NextStep, WaitFact, WaitReason},
-    step_context::StepContext,
 };
 use crate::runtime::profile::{ProfileUnit, clamp_u128_to_i64};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
@@ -241,24 +241,24 @@ static DATA_STREAM_PAYLOAD_IDENTITIES: OnceLock<Mutex<Vec<(UniqueId, i32, bool)>
     dead_code,
     reason = "Retained for distributed sink end-of-stream assertions."
 )]
-pub(crate) fn take_eos_be_number_for_test(fragment_instance_id: UniqueId) -> Option<i32> {
+pub(crate) fn take_eos_be_number_for_test(task_key: UniqueId) -> Option<i32> {
     let mut identities = DATA_STREAM_PAYLOAD_IDENTITIES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .expect("data stream payload identity lock");
     let position = identities
         .iter()
-        .position(|(finst_id, _, eos)| *finst_id == fragment_instance_id && *eos)?;
+        .position(|(recorded_task_key, _, eos)| *recorded_task_key == task_key && *eos)?;
     Some(identities.swap_remove(position).1)
 }
 
 #[cfg(test)]
-fn record_payload_identity_for_test(fragment_instance_id: UniqueId, be_number: i32, eos: bool) {
+fn record_payload_identity_for_test(task_key: UniqueId, be_number: i32, eos: bool) {
     DATA_STREAM_PAYLOAD_IDENTITIES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .expect("data stream payload identity lock")
-        .push((fragment_instance_id, be_number, eos));
+        .push((task_key, be_number, eos));
 }
 
 fn should_log_need_input() -> bool {
@@ -288,7 +288,7 @@ mod data_stream_sink_hash_partition {
         is_low_cardinality_exchange_dictionary, partition_arrow, stream_contract,
     };
     use crate::exec::hash_table::hash::{canonical_f32_bits, canonical_f64_bits};
-    use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+    use crate::runtime::task::{ExecutionFailure, ExecutionResult};
     use arrow::array::{
         Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
         DictionaryArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array,
@@ -1164,7 +1164,7 @@ mod data_stream_sink_hash_partition {
         rows: &[u32],
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
         checkpoint: &dyn Fn() -> ExecutionResult<()>,
-    ) -> crate::runtime::fragment::ExecutionResult<Chunk> {
+    ) -> crate::runtime::task::ExecutionResult<Chunk> {
         use crate::exec::pipeline::operator::ConstructionFailure;
         checkpoint()?;
         let owner = factory.begin_input_construction(source)?;
@@ -1184,7 +1184,7 @@ mod data_stream_sink_hash_partition {
                 units: rows.len(),
             },
         )?;
-        let output = take_partition_rows_with::<crate::runtime::fragment::ExecutionFailure>(
+        let output = take_partition_rows_with::<crate::runtime::task::ExecutionFailure>(
             source,
             rows,
             |source, columns, row_count| {
@@ -1422,7 +1422,7 @@ fn selected_partition_rows(
     mask: &BooleanArray,
     payload_rows: usize,
     owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
-    ctx: &StepContext<'_>,
+    ctx: &DriverStep<'_>,
 ) -> ExecutionResult<Vec<usize>> {
     if mask.len() != payload_rows {
         return Err(stream_contract(
@@ -1451,7 +1451,7 @@ fn instance_partition_rows(
     input_rows: usize,
     destinations: usize,
     bypass_cursor: &mut usize,
-    ctx: &mut StepContext<'_>,
+    ctx: &mut DriverStep<'_>,
 ) -> ExecutionResult<Vec<Vec<u32>>> {
     use crate::exec::hash_table::partition_keys::{
         native_tuple_hashes_observed, require_non_null_keys,
@@ -1564,7 +1564,7 @@ pub struct DataStreamSinkFactory {
     name: String,
     init_error: Option<ExecutionFailure>,
     input: DataStreamSinkFactoryInput,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     sender_id: Option<i32>,
     transmitter: Arc<dyn ExchangeFrameTransmitter>,
     plan_node_id: i32,
@@ -1578,7 +1578,7 @@ pub struct DataStreamSinkFactory {
 impl DataStreamSinkFactory {
     pub fn new(
         input: DataStreamSinkFactoryInput,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         sender_id: Option<i32>,
         plan_node_id: i32,
         transmitter: Arc<dyn ExchangeFrameTransmitter>,
@@ -1596,7 +1596,7 @@ impl DataStreamSinkFactory {
             name,
             init_error,
             input,
-            fragment_instance_id,
+            task_key,
             sender_id,
             transmitter,
             plan_node_id,
@@ -1701,7 +1701,7 @@ impl OperatorFactory for DataStreamSinkFactory {
 
         let sender_id = self
             .sender_id
-            .unwrap_or((self.fragment_instance_id.low() as i32) & 0x7fffffff);
+            .unwrap_or((self.task_key.low() as i32) & 0x7fffffff);
         // Initial value only; overwritten by bind_runtime_state /
         // sync_be_number from RuntimeState.backend_num (the FE-assigned instance
         // index) before the sink sends. At instance 0 this stays 0.
@@ -1715,15 +1715,12 @@ impl OperatorFactory for DataStreamSinkFactory {
                 .destinations
                 .iter()
                 .take(3)
-                .map(|d| format_uuid(d.finst_id().high(), d.finst_id().low()))
+                .map(|d| format_uuid(d.task_key().high(), d.task_key().low()))
                 .collect::<Vec<_>>()
                 .join(",");
             debug!(
-                "DataStreamSink created: finst={} plan_node_id={} dest_node_id={} part_type={} dop={} sender_id={} be_number={} destinations={} dest_preview=[{}]",
-                format_uuid(
-                    self.fragment_instance_id.high(),
-                    self.fragment_instance_id.low()
-                ),
+                "DataStreamSink created: task_key={} plan_node_id={} dest_node_id={} part_type={} dop={} sender_id={} be_number={} destinations={} dest_preview=[{}]",
+                format_uuid(self.task_key.high(), self.task_key.low()),
                 self.plan_node_id,
                 self.input.dest_node_id,
                 part_type,
@@ -1742,7 +1739,7 @@ impl OperatorFactory for DataStreamSinkFactory {
         Box::new(Transform::hydrating(DataStreamSinkOperator {
             name: self.name.clone(),
             input: self.input.clone(),
-            fragment_instance_id: self.fragment_instance_id,
+            task_key: self.task_key,
             transmitter: Arc::clone(&self.transmitter),
             init_error,
             driver_id,
@@ -1811,7 +1808,7 @@ enum PayloadEnqueue {
 struct DataStreamSinkOperator {
     name: String,
     input: DataStreamSinkFactoryInput,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     transmitter: Arc<dyn ExchangeFrameTransmitter>,
     init_error: Option<ExecutionFailure>,
     driver_id: i32,
@@ -1991,11 +1988,8 @@ impl OperatorLifecycle for DataStreamSinkOperator {
         // The factory's shared stream owner registers the one gate observable
         // while binding. Every driver observes that same state transition.
         tracing::debug!(
-            "DataStreamSink registered driver: finst={} driver_id={} dest_node_id={} sender_id={} remaining_drivers={}",
-            format_uuid(
-                self.fragment_instance_id.high(),
-                self.fragment_instance_id.low()
-            ),
+            "DataStreamSink registered driver: task_key={} driver_id={} dest_node_id={} sender_id={} remaining_drivers={}",
+            format_uuid(self.task_key.high(), self.task_key.low()),
             self.driver_id,
             self.input.dest_node_id,
             self.sender_id,
@@ -2057,8 +2051,8 @@ impl DataStreamSinkOperator {
     fn emit_writer_diagnostic(&self, event: &str) {
         if let Some(scope) = &self.writer_diagnostics {
             scope.emit(event, || format!(
-                "finst={:?} driver_id={} dest_node={} finishing={} aborting={} exiting={} finished={} finish_counted={} last_driver={} remaining_drivers={} end_sent={} pending_chunks={} pending_payloads={} sender_state={}",
-                self.fragment_instance_id, self.driver_id, self.input.dest_node_id,
+                "task_key={:?} driver_id={} dest_node={} finishing={} aborting={} exiting={} finished={} finish_counted={} last_driver={} remaining_drivers={} end_sent={} pending_chunks={} pending_payloads={} sender_state={}",
+                self.task_key, self.driver_id, self.input.dest_node_id,
                 self.finishing.load(Ordering::Acquire), self.aborting.load(Ordering::Acquire), self.exiting,
                 self.finished.load(Ordering::Acquire), self.finish_counted.load(Ordering::Acquire),
                 self.finish_completed_set.load(Ordering::Acquire), self.finish_state.remaining_drivers.load(Ordering::Acquire),
@@ -2069,9 +2063,9 @@ impl DataStreamSinkOperator {
     }
     fn stream_for_destination(
         &self,
-        destination: &FragmentDestination,
+        destination: &TaskDestination,
     ) -> ExecutionResult<novarocks_execution_contract::ExchangeStreamIdentity> {
-        if destination.source_finst_id() != self.fragment_instance_id {
+        if destination.source_task_key() != self.task_key {
             return Err(stream_contract(
                 "exchange destination has another source fragment instance",
             ));
@@ -2089,11 +2083,11 @@ impl DataStreamSinkOperator {
         novarocks_execution_contract::ExchangeStreamIdentity::try_new(
             novarocks_execution_contract::ExchangeSource::new(
                 source,
-                destination.source_finst_id(),
+                destination.source_task_key(),
                 destination.sender_ordinal(),
             ),
             target,
-            *destination.finst_id(),
+            *destination.task_key(),
             novarocks_execution_contract::FragmentNodeId::new(self.input.dest_node_id),
         )
         .map_err(stream_contract)
@@ -2115,12 +2109,12 @@ impl DataStreamSinkOperator {
     /// what keeps a decision about one edge away from another's destinations.
     fn destination_gate(
         &self,
-        dest: &FragmentDestination,
+        dest: &TaskDestination,
     ) -> ExecutionResult<Option<Arc<EdgeSendGate>>> {
         let Some(gates) = self.edge_gates.as_ref() else {
             return Ok(None);
         };
-        let key = ExchangeDestinationKey::new(*dest.finst_id(), self.input.dest_node_id);
+        let key = ExchangeDestinationKey::new(*dest.task_key(), self.input.dest_node_id);
         gates
             .gate_for_destination(key)
             .cloned()
@@ -2266,12 +2260,9 @@ impl DataStreamSinkOperator {
         use tracing::debug;
         let retained_bytes = self.send_group.retained_payload_bytes();
         debug!(
-            "DataStreamSink need_input blocked: reason={} finst={} driver_id={} sender_id={} pending_chunk_bytes={} pending_chunks={} pending_payloads={} pending_payload_bytes={} retained_payload_bytes={} finishing={} send_idle={}",
+            "DataStreamSink need_input blocked: reason={} task_key={} driver_id={} sender_id={} pending_chunk_bytes={} pending_chunks={} pending_payloads={} pending_payload_bytes={} retained_payload_bytes={} finishing={} send_idle={}",
             reason,
-            format_uuid(
-                self.fragment_instance_id.high(),
-                self.fragment_instance_id.low()
-            ),
+            format_uuid(self.task_key.high(), self.task_key.low()),
             self.driver_id,
             self.sender_id,
             self.pending_chunk_bytes_total(),
@@ -2351,11 +2342,8 @@ impl DataStreamSinkOperator {
                 // that finished with its seal unsent is indistinguishable
                 // from one that never got that far.
                 tracing::debug!(
-                    "DataStreamSink finished: finst={} driver_id={} dest_node_id={} sender_id={} end_of_stream_sent={} last_driver={}",
-                    format_uuid(
-                        self.fragment_instance_id.high(),
-                        self.fragment_instance_id.low()
-                    ),
+                    "DataStreamSink finished: task_key={} driver_id={} dest_node_id={} sender_id={} end_of_stream_sent={} last_driver={}",
+                    format_uuid(self.task_key.high(), self.task_key.low()),
                     self.driver_id,
                     self.input.dest_node_id,
                     self.sender_id,
@@ -2390,7 +2378,7 @@ impl DataStreamSinkOperator {
         }
     }
 
-    fn destinations(&self) -> &[FragmentDestination] {
+    fn destinations(&self) -> &[TaskDestination] {
         &self.input.destinations
     }
 
@@ -2399,13 +2387,13 @@ impl DataStreamSinkOperator {
     /// In bucket shuffle joins, FE creates one destination per bucket of the probe-side table.
     /// When predicates prune away all tablets in some buckets, FE still emits destination entries
     /// to keep the bucket index ↔ destination index mapping correct for the hash partitioner,
-    /// but marks them with `fragment_instance_id.lo == -1` and an invalid (zero) port.
+    /// but marks them with `task_key.lo == -1` and an invalid (zero) port.
     /// No fragment instance runs for these buckets, so the sender must skip them entirely:
     /// no data buffering, no serialization, no EOS packet.
     /// StarRocks BE applies the same `lo == -1` check in DataStreamSender::send_chunk(),
     /// ExchangeSinkOperator::push_chunk(), and Channel::close().
-    fn is_pseudo_destination(dest: &FragmentDestination) -> bool {
-        dest.finst_id().low() == -1
+    fn is_pseudo_destination(dest: &TaskDestination) -> bool {
+        dest.task_key().low() == -1
     }
 
     /// Evaluate applicability once over the original payload. Only its TRUE
@@ -2413,7 +2401,7 @@ impl DataStreamSinkOperator {
     /// original payload position without reading a target key.
     fn compiled_partition_keys(
         &mut self,
-        ctx: &StepContext<'_>,
+        ctx: &DriverStep<'_>,
         chunk: &Chunk,
     ) -> ExecutionResult<Option<CompiledPartitionBatch>> {
         let Some(state) = self.compiled_partition.as_mut() else {
@@ -2513,12 +2501,12 @@ impl DataStreamSinkOperator {
 
     fn partition_chunk(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         chunk: &Chunk,
         compiled_keys: Option<&CompiledPartitionBatch>,
     ) -> ExecutionResult<Vec<Vec<Chunk>>> {
         // Get destinations first to avoid borrowing self
-        let dests: Vec<FragmentDestination> = self.destinations().to_vec();
+        let dests: Vec<TaskDestination> = self.destinations().to_vec();
         if dests.is_empty() {
             return Ok(vec![]);
         }
@@ -2635,7 +2623,7 @@ impl DataStreamSinkOperator {
 
     fn try_enqueue_payload(
         &mut self,
-        dest: &FragmentDestination,
+        dest: &TaskDestination,
         pending: PendingPayload,
     ) -> ExecutionResult<PayloadEnqueue> {
         let stream = self.stream_for_destination(dest)?;
@@ -2684,11 +2672,7 @@ impl DataStreamSinkOperator {
                     pending.payload.transfer_to(tracker.clone());
                 }
                 #[cfg(test)]
-                record_payload_identity_for_test(
-                    self.fragment_instance_id,
-                    pending.be_number,
-                    pending.eos,
-                );
+                record_payload_identity_for_test(self.task_key, pending.be_number, pending.eos);
                 Ok(PayloadEnqueue::Enqueued)
             }
         }
@@ -2697,7 +2681,7 @@ impl DataStreamSinkOperator {
     fn transmit_partition(
         &mut self,
         _dest_idx: usize,
-        dest: &FragmentDestination,
+        dest: &TaskDestination,
         chunks: &[Chunk],
         eos: bool,
     ) -> ExecutionResult<PayloadEnqueue> {
@@ -2705,11 +2689,11 @@ impl DataStreamSinkOperator {
 
         self.init_profile_if_needed();
 
-        let dest_finst_id = UniqueId::new(dest.finst_id().high(), dest.finst_id().low());
+        let dest_finst_id = UniqueId::new(dest.task_key().high(), dest.task_key().low());
 
         let row_count: usize = chunks.iter().map(|c| c.len()).sum();
         debug!(
-            "DataStreamSink::transmit_partition: dest_finst={} node_id={} sender_id={} chunks={} rows={} eos={}",
+            "DataStreamSink::transmit_partition: destination_task_key={} node_id={} sender_id={} chunks={} rows={} eos={}",
             dest_finst_id,
             self.input.dest_node_id,
             self.sender_id,
@@ -2805,14 +2789,14 @@ impl DataStreamSinkOperator {
         match self.try_enqueue_payload(dest, payload)? {
             PayloadEnqueue::Enqueued => {
                 debug!(
-                    "DataStreamSink::transmit_partition enqueued: dest_finst={} node_id={} eos={} bytes={}",
+                    "DataStreamSink::transmit_partition enqueued: destination_task_key={} node_id={} eos={} bytes={}",
                     dest_finst_id, self.input.dest_node_id, eos, payload_bytes
                 );
                 Ok(PayloadEnqueue::Enqueued)
             }
             PayloadEnqueue::Discarded => {
                 debug!(
-                    "DataStreamSink::transmit_partition discarded: dest_finst={} node_id={} eos={} bytes={} reason=destination_cancelled_normally",
+                    "DataStreamSink::transmit_partition discarded: destination_task_key={} node_id={} eos={} bytes={} reason=destination_cancelled_normally",
                     dest_finst_id, self.input.dest_node_id, eos, payload_bytes
                 );
                 Ok(PayloadEnqueue::Discarded)
@@ -2852,16 +2836,16 @@ impl DataStreamSinkOperator {
             .clone()
             .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
         let mut work =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
         self.buffer_chunk_with_keys(&mut ctx, chunk, None)
     }
 
     fn buffer_chunk_with_keys(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         chunk: Chunk,
         compiled_keys: Option<CompiledPartitionBatch>,
     ) -> ExecutionResult<()> {
@@ -2924,7 +2908,7 @@ impl DataStreamSinkOperator {
 
     fn flush_pending(&mut self, force: bool) -> ExecutionResult<()> {
         self.ensure_pending_buffers_initialized();
-        let dests: Vec<FragmentDestination> = self.destinations().to_vec();
+        let dests: Vec<TaskDestination> = self.destinations().to_vec();
         for (i, dest) in dests.iter().enumerate() {
             if Self::is_pseudo_destination(dest) {
                 continue;
@@ -3014,7 +2998,7 @@ impl DataStreamSinkOperator {
             return Ok(());
         }
         self.ensure_pending_buffers_initialized();
-        let dests: Vec<FragmentDestination> = self.destinations().to_vec();
+        let dests: Vec<TaskDestination> = self.destinations().to_vec();
         let mut sealed = 0_usize;
         let mut skipped = 0_usize;
         for (i, dest) in dests.iter().enumerate() {
@@ -3049,7 +3033,7 @@ impl DataStreamSinkOperator {
                 Some(EdgeSendState::AwaitingPermission) => {
                     return Err(stream_contract(format_args!(
                         "exchange send EOS reached destination {} whose edge is still awaiting permission",
-                        dest.finst_id()
+                        dest.task_key()
                     )));
                 }
                 None | Some(EdgeSendState::Open) => {}
@@ -3068,11 +3052,8 @@ impl DataStreamSinkOperator {
         // than the intent to send.
         self.end_of_stream_sent.store(true, Ordering::SeqCst);
         tracing::debug!(
-            "DataStreamSink end-of-stream sent: finst={} driver_id={} dest_node_id={} sender_id={} sealed={} skipped={}",
-            format_uuid(
-                self.fragment_instance_id.high(),
-                self.fragment_instance_id.low()
-            ),
+            "DataStreamSink end-of-stream sent: task_key={} driver_id={} dest_node_id={} sender_id={} sealed={} skipped={}",
+            format_uuid(self.task_key.high(), self.task_key.low()),
             self.driver_id,
             self.input.dest_node_id,
             self.sender_id,
@@ -3154,11 +3135,8 @@ impl DataStreamSinkOperator {
         self.finishing.store(true, Ordering::Release);
 
         debug!(
-            "DataStreamSink set_finishing: finst={} driver_id={} dest_node_id={} sender_id={} be_number={} destinations={} pending_dests={} pending_chunk_bytes_total={} pending_payload_bytes_total={}",
-            format_uuid(
-                self.fragment_instance_id.high(),
-                self.fragment_instance_id.low()
-            ),
+            "DataStreamSink set_finishing: task_key={} driver_id={} dest_node_id={} sender_id={} be_number={} destinations={} pending_dests={} pending_chunk_bytes_total={} pending_payload_bytes_total={}",
+            format_uuid(self.task_key.high(), self.task_key.low()),
             self.driver_id,
             self.input.dest_node_id,
             self.sender_id,
@@ -3175,11 +3153,8 @@ impl DataStreamSinkOperator {
         // waiting on one of these, and without both halves it cannot be told
         // apart from a sink whose edge opened but whose data never drained.
         debug!(
-            "DataStreamSink finishing gates: finst={} driver_id={} dest_node_id={} edges={:?} destination_gates={:?} awaits_permission={} has_pending_data={}",
-            format_uuid(
-                self.fragment_instance_id.high(),
-                self.fragment_instance_id.low()
-            ),
+            "DataStreamSink finishing gates: task_key={} driver_id={} dest_node_id={} edges={:?} destination_gates={:?} awaits_permission={} has_pending_data={}",
+            format_uuid(self.task_key.high(), self.task_key.low()),
             self.driver_id,
             self.input.dest_node_id,
             self.edge_gates
@@ -3189,7 +3164,7 @@ impl DataStreamSinkOperator {
                 .iter()
                 .enumerate()
                 .map(|(idx, dest)| (
-                    dest.finst_id().low(),
+                    dest.task_key().low(),
                     Self::is_pseudo_destination(dest),
                     self.destination_state_at(idx)
                 ))
@@ -3230,11 +3205,8 @@ impl DataStreamSinkOperator {
             completed_set
         };
         debug!(
-            "DataStreamSink finishing progressed: finst={} driver_id={} dest_node_id={} sender_id={} last_driver={} (only last driver sends EOS)",
-            format_uuid(
-                self.fragment_instance_id.high(),
-                self.fragment_instance_id.low()
-            ),
+            "DataStreamSink finishing progressed: task_key={} driver_id={} dest_node_id={} sender_id={} last_driver={} (only last driver sends EOS)",
+            format_uuid(self.task_key.high(), self.task_key.low()),
             self.driver_id,
             self.input.dest_node_id,
             self.sender_id,
@@ -3298,7 +3270,7 @@ impl SinkKernel for DataStreamSinkOperator {
     fn control_observable(&self) -> Option<Arc<Observable>> {
         Some(self.send_observable.clone())
     }
-    fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         if let Some(error) = self.current_error() {
             return Err(error);
         }
@@ -3314,7 +3286,7 @@ impl SinkKernel for DataStreamSinkOperator {
     }
     fn admission(
         &self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         _: &RawInput,
     ) -> ExecutionResult<Option<AdmissionNext>> {
         if !self.prepared {
@@ -3337,7 +3309,7 @@ impl SinkKernel for DataStreamSinkOperator {
     }
     fn consume(
         &mut self,
-        _ctx: &mut StepContext<'_>,
+        _ctx: &mut DriverStep<'_>,
         chunk: PreparedInput,
     ) -> ExecutionResult<SinkStep> {
         let generation = self.send_observable.generation();
@@ -3368,7 +3340,7 @@ impl SinkKernel for DataStreamSinkOperator {
         self.flush_pending(false)?;
         Ok(SinkStep::new(self.next_work(generation), rows))
     }
-    fn poll(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+    fn poll(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<SinkStep> {
         let generation = self.send_observable.generation();
         if !ctx.work().try_consume(1) {
             return Ok(SinkStep::new(NextStep::Yield, 0));
@@ -3383,7 +3355,7 @@ impl SinkKernel for DataStreamSinkOperator {
         }
         Ok(SinkStep::new(self.next_work(generation), 0))
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<SinkStep> {
         self.finishing.store(true, Ordering::Release);
         SinkKernel::poll(self, ctx)
     }
@@ -3731,7 +3703,7 @@ mod created_partition_regressions {
         let source = input();
         let factory = factory();
         let state = RuntimeState::default();
-        let original = crate::runtime::fragment::ExecutionFailure::from(
+        let original = crate::runtime::task::ExecutionFailure::from(
             novarocks_functions::KernelFailure::Operational(
                 novarocks_functions::KernelDiagnostic::new("partition fragment failed"),
             ),

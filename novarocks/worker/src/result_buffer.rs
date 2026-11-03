@@ -22,11 +22,11 @@ use std::time::Duration;
 use crate::result_batch::{FetchResult, ResultBatch};
 use bytes::Bytes;
 use novarocks_execution::runtime::exchange::BoundedExchangePayload;
-use novarocks_execution::runtime::fragment::io::{
-    ResultAbort, ResultWriteAdmission, ResultWriteCredit,
-};
 use novarocks_execution::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use novarocks_execution::runtime::observable::Observable;
+use novarocks_execution::runtime::task::io::{
+    ResultAbort, ResultWriteAdmission, ResultWriteCredit,
+};
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use novarocks_execution_contract::task_execution::operation::ResultByteLimit;
 use novarocks_types::UniqueId;
@@ -40,7 +40,7 @@ enum ResultBufferMode {
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ResultBufferKey {
-    LegacyFragment(UniqueId),
+    LegacyTaskKey(UniqueId),
     Task(TaskIdentity),
 }
 
@@ -143,7 +143,7 @@ pub enum ResultPublication {
 ///
 /// The handle owns producer publication. A later task/context retirement may
 /// still discard a finished but unacknowledged result and return its credits.
-pub struct ResultBufferWriteHandle {
+pub struct ResultBufferWriteObligation {
     key: ResultBufferKey,
     mode: ResultBufferMode,
     state: Mutex<ResultBufferWriteState>,
@@ -382,7 +382,7 @@ impl Drop for ResultConstructionScope {
     }
 }
 
-impl ResultBufferWriteHandle {
+impl ResultBufferWriteObligation {
     pub fn open(
         key: ResultBufferKey,
         typed: bool,
@@ -800,30 +800,30 @@ fn typed_fetch_result_bytes(result: &TypedFetchResult) -> usize {
     result.payload.len()
 }
 
-struct ResultCtx {
+struct ResultBufferRegistry {
     mu: Mutex<HashMap<ResultBufferKey, BufferControlBlock>>,
     cvar: Condvar,
 }
 
-static CTX: OnceLock<ResultCtx> = OnceLock::new();
+static REGISTRY: OnceLock<ResultBufferRegistry> = OnceLock::new();
 
-fn ctx() -> &'static ResultCtx {
-    CTX.get_or_init(|| ResultCtx {
+fn registry() -> &'static ResultBufferRegistry {
+    REGISTRY.get_or_init(|| ResultBufferRegistry {
         mu: Mutex::new(HashMap::new()),
         cvar: Condvar::new(),
     })
 }
 
 fn notify_waiters() {
-    ctx().cvar.notify_all();
+    registry().cvar.notify_all();
 }
 
 #[allow(
     dead_code,
     reason = "Legacy fragment-addressed insertion remains for compatibility adapters and tests."
 )]
-pub(crate) fn insert(finst_id: UniqueId, result: FetchResult) -> ResultPublication {
-    insert_with_credit(ResultBufferKey::LegacyFragment(finst_id), result, None)
+pub(crate) fn insert(task_key: UniqueId, result: FetchResult) -> ResultPublication {
+    insert_with_credit(ResultBufferKey::LegacyTaskKey(task_key), result, None)
 }
 
 fn insert_with_credit(
@@ -831,7 +831,7 @@ fn insert_with_credit(
     result: FetchResult,
     result_credit: Option<ResultWriteCredit>,
 ) -> ResultPublication {
-    let c = ctx();
+    let c = registry();
     let mut publication = ResultPublication::NoChange;
     {
         let mut guard = c.mu.lock().expect("ctx lock");
@@ -856,9 +856,9 @@ fn insert_with_credit(
     dead_code,
     reason = "Legacy fragment-addressed insertion remains for compatibility adapters and tests."
 )]
-pub fn insert_typed(finst_id: UniqueId, payload: Vec<u8>) -> Result<ResultPublication, String> {
+pub fn insert_typed(task_key: UniqueId, payload: Vec<u8>) -> Result<ResultPublication, String> {
     insert_typed_with_credit(
-        ResultBufferKey::LegacyFragment(finst_id),
+        ResultBufferKey::LegacyTaskKey(task_key),
         Bytes::from(payload),
         None,
     )
@@ -877,7 +877,7 @@ pub(crate) fn insert_typed_with_credit(
     payload: Bytes,
     result_credit: Option<ResultWriteCredit>,
 ) -> Result<ResultPublication, String> {
-    let c = ctx();
+    let c = registry();
     let changed = {
         let mut guard = c.mu.lock().expect("ctx lock");
         let block = guard.entry(key).or_insert_with(BufferControlBlock::new);
@@ -905,8 +905,8 @@ pub(crate) fn insert_typed_with_credit(
     dead_code,
     reason = "Legacy fragment-addressed completion remains for compatibility adapters and tests."
 )]
-pub(crate) fn close_ok(finst_id: UniqueId) -> ResultPublication {
-    close_ok_for_key(ResultBufferKey::LegacyFragment(finst_id))
+pub(crate) fn close_ok(task_key: UniqueId) -> ResultPublication {
+    close_ok_for_key(ResultBufferKey::LegacyTaskKey(task_key))
 }
 
 #[cfg(any(test, novarocks_dev_controls))]
@@ -915,7 +915,7 @@ pub fn close_task_ok(identity: TaskIdentity) -> ResultPublication {
 }
 
 fn close_ok_for_key(key: ResultBufferKey) -> ResultPublication {
-    let c = ctx();
+    let c = registry();
     let mut publication = ResultPublication::NoChange;
     let changed = {
         let mut guard = c.mu.lock().expect("ctx lock");
@@ -935,12 +935,12 @@ fn close_ok_for_key(key: ResultBufferKey) -> ResultPublication {
     dead_code,
     reason = "Legacy fragment-addressed failure remains for compatibility adapters and tests."
 )]
-pub(crate) fn close_error(finst_id: UniqueId, message: String) -> ResultPublication {
-    close_error_for_key(ResultBufferKey::LegacyFragment(finst_id), message)
+pub(crate) fn close_error(task_key: UniqueId, message: String) -> ResultPublication {
+    close_error_for_key(ResultBufferKey::LegacyTaskKey(task_key), message)
 }
 
 fn close_error_for_key(key: ResultBufferKey, message: String) -> ResultPublication {
-    let c = ctx();
+    let c = registry();
     let mut publication = ResultPublication::NoChange;
     let changed = {
         let mut guard = c.mu.lock().expect("ctx lock");
@@ -962,16 +962,16 @@ fn close_error_for_key(key: ResultBufferKey, message: String) -> ResultPublicati
     dead_code,
     reason = "Legacy result cancellation remains available to protocol adapters outside this target."
 )]
-pub(crate) fn cancel(finst_id: UniqueId) -> ResultPublication {
-    cancel_with_message(finst_id, "Cancelled".to_string())
+pub(crate) fn cancel(task_key: UniqueId) -> ResultPublication {
+    cancel_with_message(task_key, "Cancelled".to_string())
 }
 
-fn cancel_with_message(finst_id: UniqueId, message: String) -> ResultPublication {
-    cancel_with_message_for_key(ResultBufferKey::LegacyFragment(finst_id), message)
+fn cancel_with_message(task_key: UniqueId, message: String) -> ResultPublication {
+    cancel_with_message_for_key(ResultBufferKey::LegacyTaskKey(task_key), message)
 }
 
 fn cancel_with_message_for_key(key: ResultBufferKey, message: String) -> ResultPublication {
-    let c = ctx();
+    let c = registry();
     let mut publication = ResultPublication::NoChange;
     let changed = {
         let mut guard = c.mu.lock().expect("ctx lock");
@@ -994,11 +994,11 @@ fn cancel_with_message_for_key(key: ResultBufferKey, message: String) -> ResultP
     dead_code,
     reason = "Legacy sender creation remains available to protocol adapters outside this target."
 )]
-pub(crate) fn create_sender(finst_id: UniqueId) {
-    let c = ctx();
+pub(crate) fn create_sender(task_key: UniqueId) {
+    let c = registry();
     let mut guard = c.mu.lock().expect("ctx lock");
     let block = guard
-        .entry(ResultBufferKey::LegacyFragment(finst_id))
+        .entry(ResultBufferKey::LegacyTaskKey(task_key))
         .or_insert_with(BufferControlBlock::new);
     block.fail_mode_mismatch(ResultBufferMode::Legacy);
 }
@@ -1007,26 +1007,26 @@ pub(crate) fn create_sender(finst_id: UniqueId) {
     dead_code,
     reason = "Legacy fallible sender creation remains available to protocol adapters outside this target."
 )]
-pub(crate) fn try_create_sender(finst_id: UniqueId) -> Result<(), String> {
-    try_create_sender_with_mode(finst_id, ResultBufferMode::Legacy)
+pub(crate) fn try_create_sender(task_key: UniqueId) -> Result<(), String> {
+    try_create_sender_with_mode(task_key, ResultBufferMode::Legacy)
 }
 
 #[allow(
     dead_code,
     reason = "Typed sender creation remains available to protocol adapters outside this target."
 )]
-pub(crate) fn create_typed_sender(finst_id: UniqueId) {
-    let c = ctx();
+pub(crate) fn create_typed_sender(task_key: UniqueId) {
+    let c = registry();
     let mut guard = c.mu.lock().expect("ctx lock");
     let block = guard
-        .entry(ResultBufferKey::LegacyFragment(finst_id))
+        .entry(ResultBufferKey::LegacyTaskKey(task_key))
         .or_insert_with(BufferControlBlock::new);
     block.fail_mode_mismatch(ResultBufferMode::Typed);
 }
 
 #[cfg(any(test, novarocks_dev_controls))]
 pub fn create_task_typed_sender(identity: TaskIdentity) {
-    let c = ctx();
+    let c = registry();
     let mut guard = c.mu.lock().expect("ctx lock");
     let block = guard
         .entry(ResultBufferKey::Task(identity))
@@ -1038,19 +1038,19 @@ pub fn create_task_typed_sender(identity: TaskIdentity) {
     dead_code,
     reason = "Typed fallible sender creation remains available to protocol adapters outside this target."
 )]
-pub(crate) fn try_create_typed_sender(finst_id: UniqueId) -> Result<(), String> {
-    try_create_sender_with_mode(finst_id, ResultBufferMode::Typed)
+pub(crate) fn try_create_typed_sender(task_key: UniqueId) -> Result<(), String> {
+    try_create_sender_with_mode(task_key, ResultBufferMode::Typed)
 }
 
-fn try_create_sender_with_mode(finst_id: UniqueId, mode: ResultBufferMode) -> Result<(), String> {
-    try_create_sender_with_key_mode(ResultBufferKey::LegacyFragment(finst_id), mode)
+fn try_create_sender_with_mode(task_key: UniqueId, mode: ResultBufferMode) -> Result<(), String> {
+    try_create_sender_with_key_mode(ResultBufferKey::LegacyTaskKey(task_key), mode)
 }
 
 fn try_create_sender_with_key_mode(
     key: ResultBufferKey,
     mode: ResultBufferMode,
 ) -> Result<(), String> {
-    let c = ctx();
+    let c = registry();
     let mut guard = c.mu.lock().expect("ctx lock");
     if guard.contains_key(&key) {
         return Err(format!("result buffer already registered for {key:?}"));
@@ -1062,8 +1062,8 @@ fn try_create_sender_with_key_mode(
 }
 
 #[cfg(any(test, novarocks_dev_controls))]
-pub fn discard(finst_id: UniqueId) -> ResultPublication {
-    discard_key(ResultBufferKey::LegacyFragment(finst_id))
+pub fn discard(task_key: UniqueId) -> ResultPublication {
+    discard_key(ResultBufferKey::LegacyTaskKey(task_key))
 }
 
 pub fn discard_task(identity: TaskIdentity) -> ResultPublication {
@@ -1075,7 +1075,7 @@ pub fn discard_task(identity: TaskIdentity) -> ResultPublication {
 /// context or the task retention fence.
 pub fn retire_task_result(identity: TaskIdentity) -> ResultPublication {
     let key = ResultBufferKey::Task(identity);
-    let c = ctx();
+    let c = registry();
     let removed = {
         let mut guard = c.mu.lock().expect("ctx lock");
         match guard.get(&key) {
@@ -1103,7 +1103,7 @@ pub fn replays_task_terminal_ack(
     let Some(acknowledged) = acknowledged_packet_seq else {
         return false;
     };
-    ctx()
+    registry()
         .mu
         .lock()
         .expect("ctx lock")
@@ -1113,7 +1113,7 @@ pub fn replays_task_terminal_ack(
 }
 
 fn discard_key(key: ResultBufferKey) -> ResultPublication {
-    let c = ctx();
+    let c = registry();
     let removed = c.mu.lock().expect("ctx lock").remove(&key);
     if let Some(block) = removed.as_ref() {
         block.typed_change.notify_one();
@@ -1126,24 +1126,24 @@ fn discard_key(key: ResultBufferKey) -> ResultPublication {
     dead_code,
     reason = "Legacy registration inspection remains available to protocol adapters outside this target."
 )]
-pub(crate) fn is_registered(finst_id: UniqueId) -> bool {
-    ctx()
+pub(crate) fn is_registered(task_key: UniqueId) -> bool {
+    registry()
         .mu
         .lock()
         .expect("ctx lock")
-        .contains_key(&ResultBufferKey::LegacyFragment(finst_id))
+        .contains_key(&ResultBufferKey::LegacyTaskKey(task_key))
 }
 
 #[allow(
     dead_code,
     reason = "Legacy fragment-addressed accounting remains for compatibility adapters."
 )]
-pub(crate) fn set_mem_tracker(finst_id: UniqueId, tracker: Arc<MemTracker>) {
-    set_mem_tracker_for_key(ResultBufferKey::LegacyFragment(finst_id), tracker)
+pub(crate) fn set_mem_tracker(task_key: UniqueId, tracker: Arc<MemTracker>) {
+    set_mem_tracker_for_key(ResultBufferKey::LegacyTaskKey(task_key), tracker)
 }
 
 fn set_mem_tracker_for_key(key: ResultBufferKey, tracker: Arc<MemTracker>) {
-    let c = ctx();
+    let c = registry();
     let mut guard = c.mu.lock().expect("ctx lock");
     let block = guard.entry(key).or_insert_with(BufferControlBlock::new);
     block.mem_tracker = Some(Arc::clone(&tracker));
@@ -1159,11 +1159,11 @@ fn set_mem_tracker_for_key(key: ResultBufferKey, tracker: Arc<MemTracker>) {
     dead_code,
     reason = "Legacy EOS templates remain available to protocol adapters outside this target."
 )]
-pub(crate) fn set_eos_template(finst_id: UniqueId, template: ResultBatch) {
-    let c = ctx();
+pub(crate) fn set_eos_template(task_key: UniqueId, template: ResultBatch) {
+    let c = registry();
     let mut guard = c.mu.lock().expect("ctx lock");
     let block = guard
-        .entry(ResultBufferKey::LegacyFragment(finst_id))
+        .entry(ResultBufferKey::LegacyTaskKey(task_key))
         .or_insert_with(BufferControlBlock::new);
     block.fail_mode_mismatch(ResultBufferMode::Legacy);
     block.eos_template = Some(template);
@@ -1200,9 +1200,9 @@ pub enum TryFetchTypedResult {
 )]
 fn try_fetch_inner(
     guard: &mut HashMap<ResultBufferKey, BufferControlBlock>,
-    finst_id: UniqueId,
+    task_key: UniqueId,
 ) -> TryFetchResult {
-    let key = ResultBufferKey::LegacyFragment(finst_id);
+    let key = ResultBufferKey::LegacyTaskKey(task_key);
     let Some(block) = guard.get_mut(&key) else {
         return TryFetchResult::Error(FetchError {
             kind: FetchErrorKind::NotFound,
@@ -1372,10 +1372,10 @@ fn try_fetch_typed_inner(
     dead_code,
     reason = "Legacy fetch polling remains available to protocol adapters outside this target."
 )]
-pub fn try_fetch(finst_id: UniqueId) -> TryFetchResult {
-    let c = ctx();
+pub fn try_fetch(task_key: UniqueId) -> TryFetchResult {
+    let c = registry();
     let mut guard = c.mu.lock().expect("ctx lock");
-    try_fetch_inner(&mut guard, finst_id)
+    try_fetch_inner(&mut guard, task_key)
 }
 
 /// Long-poll variant of `try_fetch`.
@@ -1392,12 +1392,12 @@ pub fn try_fetch(finst_id: UniqueId) -> TryFetchResult {
     dead_code,
     reason = "Legacy long-poll fetching remains available to protocol adapters outside this target."
 )]
-pub(crate) fn wait_fetch(finst_id: UniqueId, max_wait_ms: i64) -> TryFetchResult {
-    let c = ctx();
+pub(crate) fn wait_fetch(task_key: UniqueId, max_wait_ms: i64) -> TryFetchResult {
+    let c = registry();
     let mut guard = c.mu.lock().expect("ctx lock");
 
     // Check immediately under the lock before deciding whether to wait.
-    let initial = try_fetch_inner(&mut guard, finst_id);
+    let initial = try_fetch_inner(&mut guard, task_key);
     if !matches!(initial, TryFetchResult::NotReady) || max_wait_ms <= 0 {
         return initial;
     }
@@ -1417,7 +1417,7 @@ pub(crate) fn wait_fetch(finst_id: UniqueId, max_wait_ms: i64) -> TryFetchResult
             c.cvar.wait_timeout(guard, remaining).expect("condvar wait");
 
         // Re-check state while still holding the newly re-acquired lock.
-        let result = try_fetch_inner(&mut guard2, finst_id);
+        let result = try_fetch_inner(&mut guard2, task_key);
         if !matches!(result, TryFetchResult::NotReady) {
             return result;
         }
@@ -1440,7 +1440,7 @@ async fn wait_fetch_typed_for_key(
     let deadline = tokio::time::Instant::now() + max_wait;
     loop {
         let (result, change) = {
-            let c = ctx();
+            let c = registry();
             let mut guard = c.mu.lock().expect("ctx lock");
             let change = guard.get(&key).map(|block| Arc::clone(&block.typed_change));
             (
@@ -1484,12 +1484,12 @@ pub async fn wait_fetch_task_typed(
 
 #[cfg(test)]
 async fn wait_fetch_typed(
-    finst_id: UniqueId,
+    task_key: UniqueId,
     acknowledged_packet_seq: Option<i64>,
     max_wait: Duration,
 ) -> TryFetchTypedResult {
     wait_fetch_typed_for_key(
-        ResultBufferKey::LegacyFragment(finst_id),
+        ResultBufferKey::LegacyTaskKey(task_key),
         acknowledged_packet_seq,
         max_wait,
         ResultByteLimit::new(u64::MAX).expect("the test fetch limit is nonzero"),
@@ -1504,7 +1504,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use novarocks_execution::runtime::exchange::encode_chunks_bounded_with_creation;
-    use novarocks_execution::runtime::fragment::io::ResultAbort;
+    use novarocks_execution::runtime::task::io::ResultAbort;
     use novarocks_types::SlotId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId as NativeQueryId, StageId, TaskId,
@@ -1562,16 +1562,16 @@ mod tests {
 
     #[test]
     fn actual_reservation_refusal_keeps_cap_scope_source_and_never_mutates_or_invents_a_wait() {
-        use novarocks_execution::runtime::fragment::{
+        use novarocks_execution::runtime::task::{
             ExecutionFailure,
-            io::{FragmentIoError, FragmentIoErrorKind, FragmentIoOperation},
+            io::{TaskIoError, TaskIoErrorKind, TaskIoOperation},
         };
         use novarocks_execution_contract::failure::{
             FailureClass, FailureProjection, ResourceScope,
         };
         use std::error::Error;
         let budget = ResultRetainedBudget::new(NonZeroUsize::new(8).unwrap());
-        let handle = ResultBufferWriteHandle::open(
+        let handle = ResultBufferWriteObligation::open(
             ResultBufferKey::Task(test_task_identity(730_201)),
             true,
             NonZeroUsize::new(6).unwrap(),
@@ -1594,9 +1594,9 @@ mod tests {
         assert_eq!(resource.committed, None);
         assert_eq!(resource.live, None);
         assert_eq!(budget.retained_bytes_for_test(), 4);
-        let io = FragmentIoError::from_domain(
-            FragmentIoOperation::ResultWrite,
-            FragmentIoErrorKind::Unavailable,
+        let io = TaskIoError::from_domain(
+            TaskIoOperation::ResultWrite,
+            TaskIoErrorKind::Unavailable,
             refused,
         );
         let outer = ExecutionFailure::from_domain(io);
@@ -1646,7 +1646,7 @@ mod tests {
     fn process_only_and_task_reservations_contend_in_the_same_budget() {
         let budget = ResultRetainedBudget::new(NonZeroUsize::new(12).unwrap());
         let identity = test_task_identity(730);
-        let handle = ResultBufferWriteHandle::open(
+        let handle = ResultBufferWriteObligation::open(
             ResultBufferKey::Task(identity),
             true,
             NonZeroUsize::new(8).unwrap(),
@@ -1694,7 +1694,7 @@ mod tests {
         let pool = granted_result_credit(budget.try_reserve_process(4).unwrap());
         for seed in [731, 732] {
             let identity = test_task_identity(seed);
-            let handle = ResultBufferWriteHandle::open(
+            let handle = ResultBufferWriteObligation::open(
                 ResultBufferKey::Task(identity),
                 true,
                 NonZeroUsize::new(8).unwrap(),
@@ -1761,7 +1761,7 @@ mod tests {
     fn process_and_task_credit_shrink_to_zero_then_drop_is_a_no_op() {
         let budget = ResultRetainedBudget::new(NonZeroUsize::new(10).unwrap());
         let identity = test_task_identity(733);
-        let handle = ResultBufferWriteHandle::open(
+        let handle = ResultBufferWriteObligation::open(
             ResultBufferKey::Task(identity),
             true,
             NonZeroUsize::new(6).unwrap(),
@@ -1873,7 +1873,7 @@ mod tests {
         .unwrap();
         let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
         Chunk::try_new_typed_with_columns_observed::<
-            novarocks_execution::runtime::fragment::ExecutionFailure,
+            novarocks_execution::runtime::task::ExecutionFailure,
             _,
         >(
             schema,
@@ -1910,9 +1910,9 @@ mod tests {
 
     #[test]
     fn fragment_result_session_writes_twenty_plus_seventeen_rows_and_finishes_once() {
-        let finst_id = UniqueId::new(9901, 9902);
-        let handle = ResultBufferWriteHandle::open(
-            ResultBufferKey::LegacyFragment(finst_id),
+        let task_key = UniqueId::new(9901, 9902);
+        let handle = ResultBufferWriteObligation::open(
+            ResultBufferKey::LegacyTaskKey(task_key),
             false,
             test_result_cap(),
             test_result_budget(),
@@ -1943,13 +1943,13 @@ mod tests {
         handle.finish().expect("finish once");
         handle.finish().expect("repeated finish is idempotent");
 
-        let TryFetchResult::Ready(first) = try_fetch(finst_id) else {
+        let TryFetchResult::Ready(first) = try_fetch(task_key) else {
             panic!("expected first result batch");
         };
-        let TryFetchResult::Ready(second) = try_fetch(finst_id) else {
+        let TryFetchResult::Ready(second) = try_fetch(task_key) else {
             panic!("expected second result batch");
         };
-        let TryFetchResult::Ready(eos) = try_fetch(finst_id) else {
+        let TryFetchResult::Ready(eos) = try_fetch(task_key) else {
             panic!("expected eos");
         };
         assert_eq!(first.result_batch.rows.len(), 20);
@@ -1959,9 +1959,9 @@ mod tests {
 
     #[test]
     fn fragment_result_session_abort_is_idempotent_and_rejects_late_write() {
-        let finst_id = UniqueId::new(9903, 9904);
-        let handle = ResultBufferWriteHandle::open(
-            ResultBufferKey::LegacyFragment(finst_id),
+        let task_key = UniqueId::new(9903, 9904);
+        let handle = ResultBufferWriteObligation::open(
+            ResultBufferKey::LegacyTaskKey(task_key),
             false,
             test_result_cap(),
             test_result_budget(),
@@ -1986,7 +1986,7 @@ mod tests {
                 })
                 .is_err()
         );
-        let TryFetchResult::Error(error) = try_fetch(finst_id) else {
+        let TryFetchResult::Error(error) = try_fetch(task_key) else {
             panic!("expected cancelled result");
         };
         assert!(matches!(error.kind, FetchErrorKind::Cancelled));
@@ -1994,9 +1994,9 @@ mod tests {
 
     #[test]
     fn publication_outcomes_distinguish_data_terminal_and_removed_state() {
-        let finst_id = UniqueId::new(9909, 9910);
-        let handle = ResultBufferWriteHandle::open(
-            ResultBufferKey::LegacyFragment(finst_id),
+        let task_key = UniqueId::new(9909, 9910);
+        let handle = ResultBufferWriteObligation::open(
+            ResultBufferKey::LegacyTaskKey(task_key),
             false,
             test_result_cap(),
             test_result_budget(),
@@ -2024,8 +2024,8 @@ mod tests {
         );
 
         let rolled_back = UniqueId::new(9911, 9912);
-        let handle = ResultBufferWriteHandle::open(
-            ResultBufferKey::LegacyFragment(rolled_back),
+        let handle = ResultBufferWriteObligation::open(
+            ResultBufferKey::LegacyTaskKey(rolled_back),
             false,
             test_result_cap(),
             test_result_budget(),
@@ -2041,9 +2041,9 @@ mod tests {
 
     #[test]
     fn fragment_result_session_failure_preserves_execution_error() {
-        let finst_id = UniqueId::new(9907, 9908);
-        let handle = ResultBufferWriteHandle::open(
-            ResultBufferKey::LegacyFragment(finst_id),
+        let task_key = UniqueId::new(9907, 9908);
+        let handle = ResultBufferWriteObligation::open(
+            ResultBufferKey::LegacyTaskKey(task_key),
             false,
             test_result_cap(),
             test_result_budget(),
@@ -2058,7 +2058,7 @@ mod tests {
             ResultPublication::TerminalReady
         );
 
-        let TryFetchResult::Error(error) = try_fetch(finst_id) else {
+        let TryFetchResult::Error(error) = try_fetch(task_key) else {
             panic!("expected failed result");
         };
         assert_eq!(
@@ -2069,9 +2069,9 @@ mod tests {
 
     #[test]
     fn fragment_result_session_late_abort_discards_finished_result() {
-        let finst_id = UniqueId::new(9905, 9906);
-        let handle = ResultBufferWriteHandle::open(
-            ResultBufferKey::LegacyFragment(finst_id),
+        let task_key = UniqueId::new(9905, 9906);
+        let handle = ResultBufferWriteObligation::open(
+            ResultBufferKey::LegacyTaskKey(task_key),
             false,
             test_result_cap(),
             test_result_budget(),
@@ -2094,7 +2094,7 @@ mod tests {
             ResultPublication::Removed
         );
 
-        let TryFetchResult::Error(error) = try_fetch(finst_id) else {
+        let TryFetchResult::Error(error) = try_fetch(task_key) else {
             panic!("late abort must revoke a finished result");
         };
         assert!(matches!(error.kind, FetchErrorKind::NotFound));
@@ -2102,11 +2102,11 @@ mod tests {
 
     #[test]
     fn cancel_is_observable() {
-        let finst_id = UniqueId::new(42, 7);
-        create_sender(finst_id);
-        assert_eq!(cancel(finst_id), ResultPublication::TerminalReady);
+        let task_key = UniqueId::new(42, 7);
+        create_sender(task_key);
+        assert_eq!(cancel(task_key), ResultPublication::TerminalReady);
 
-        let TryFetchResult::Error(err) = try_fetch(finst_id) else {
+        let TryFetchResult::Error(err) = try_fetch(task_key) else {
             panic!("expected cancel error");
         };
         assert!(matches!(err.kind, FetchErrorKind::Cancelled));
@@ -2114,14 +2114,14 @@ mod tests {
 
     #[test]
     fn close_error_is_observable() {
-        let finst_id = UniqueId::new(1, 2);
-        create_sender(finst_id);
+        let task_key = UniqueId::new(1, 2);
+        create_sender(task_key);
         assert_eq!(
-            close_error(finst_id, "boom".to_string()),
+            close_error(task_key, "boom".to_string()),
             ResultPublication::TerminalReady
         );
 
-        let TryFetchResult::Error(err) = try_fetch(finst_id) else {
+        let TryFetchResult::Error(err) = try_fetch(task_key) else {
             panic!("expected close_error");
         };
         assert!(matches!(err.kind, FetchErrorKind::Failed));
@@ -2130,10 +2130,10 @@ mod tests {
 
     #[test]
     fn try_fetch_returns_batches_in_order_and_then_eos() {
-        let finst_id = UniqueId::new(7, 9);
-        create_sender(finst_id);
+        let task_key = UniqueId::new(7, 9);
+        create_sender(task_key);
         insert(
-            finst_id,
+            task_key,
             FetchResult {
                 packet_seq: 0,
                 eos: false,
@@ -2141,37 +2141,37 @@ mod tests {
             },
         );
         insert(
-            finst_id,
+            task_key,
             FetchResult {
                 packet_seq: 0,
                 eos: false,
                 result_batch: ResultBatch::new(vec![b"b".to_vec()], false, 0, None),
             },
         );
-        close_ok(finst_id);
+        close_ok(task_key);
 
-        let TryFetchResult::Ready(first) = try_fetch(finst_id) else {
+        let TryFetchResult::Ready(first) = try_fetch(task_key) else {
             panic!("expected first batch");
         };
         assert_eq!(first.packet_seq, 0);
         assert!(!first.eos);
         assert_eq!(first.result_batch.rows, vec![b"a".to_vec()]);
 
-        let TryFetchResult::Ready(second) = try_fetch(finst_id) else {
+        let TryFetchResult::Ready(second) = try_fetch(task_key) else {
             panic!("expected second batch");
         };
         assert_eq!(second.packet_seq, 1);
         assert!(!second.eos);
         assert_eq!(second.result_batch.rows, vec![b"b".to_vec()]);
 
-        let TryFetchResult::Ready(eos) = try_fetch(finst_id) else {
+        let TryFetchResult::Ready(eos) = try_fetch(task_key) else {
             panic!("expected eos");
         };
         assert_eq!(eos.packet_seq, 2);
         assert!(eos.eos);
         assert!(eos.result_batch.rows.is_empty());
 
-        let TryFetchResult::Error(err) = try_fetch(finst_id) else {
+        let TryFetchResult::Error(err) = try_fetch(task_key) else {
             panic!("expected terminal not found after eos");
         };
         assert!(matches!(err.kind, FetchErrorKind::NotFound));
@@ -2179,12 +2179,12 @@ mod tests {
 
     #[test]
     fn not_ready_transitions_to_ready_after_insert() {
-        let finst_id = UniqueId::new(70, 90);
-        create_sender(finst_id);
-        assert!(matches!(try_fetch(finst_id), TryFetchResult::NotReady));
+        let task_key = UniqueId::new(70, 90);
+        create_sender(task_key);
+        assert!(matches!(try_fetch(task_key), TryFetchResult::NotReady));
 
         insert(
-            finst_id,
+            task_key,
             FetchResult {
                 packet_seq: 0,
                 eos: false,
@@ -2192,7 +2192,7 @@ mod tests {
             },
         );
 
-        let TryFetchResult::Ready(batch) = try_fetch(finst_id) else {
+        let TryFetchResult::Ready(batch) = try_fetch(task_key) else {
             panic!("expected ready batch");
         };
         assert_eq!(batch.packet_seq, 0);
@@ -2201,22 +2201,22 @@ mod tests {
 
     #[test]
     fn wait_fetch_with_zero_max_wait_returns_not_ready_immediately() {
-        let finst_id = UniqueId::new(601, 602);
-        create_sender(finst_id);
+        let task_key = UniqueId::new(601, 602);
+        create_sender(task_key);
         // Empty open buffer with max_wait_ms=0 must return NotReady instantly.
-        assert!(matches!(wait_fetch(finst_id, 0), TryFetchResult::NotReady));
+        assert!(matches!(wait_fetch(task_key, 0), TryFetchResult::NotReady));
     }
 
     #[test]
     fn wait_fetch_returns_ready_after_delayed_insert() {
-        let finst_id = UniqueId::new(603, 604);
-        create_sender(finst_id);
+        let task_key = UniqueId::new(603, 604);
+        create_sender(task_key);
 
         // Insert from a background thread after 20 ms.
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             insert(
-                finst_id,
+                task_key,
                 FetchResult {
                     packet_seq: 0,
                     eos: false,
@@ -2225,7 +2225,7 @@ mod tests {
             );
         });
 
-        let result = wait_fetch(finst_id, 1000);
+        let result = wait_fetch(task_key, 1000);
         assert!(
             matches!(result, TryFetchResult::Ready(_)),
             "wait_fetch should return Ready after delayed insert; got: {result:?}"
@@ -2234,14 +2234,14 @@ mod tests {
 
     #[tokio::test]
     async fn typed_fetch_replays_until_ack_and_releases_eof_on_final_ack() {
-        let finst_id = UniqueId::new(701, 702);
-        create_typed_sender(finst_id);
-        insert_typed(finst_id, vec![1, 2, 3]).expect("insert first typed payload");
-        insert_typed(finst_id, vec![4, 5]).expect("insert second typed payload");
-        close_ok(finst_id);
+        let task_key = UniqueId::new(701, 702);
+        create_typed_sender(task_key);
+        insert_typed(task_key, vec![1, 2, 3]).expect("insert first typed payload");
+        insert_typed(task_key, vec![4, 5]).expect("insert second typed payload");
+        close_ok(task_key);
 
         let TryFetchTypedResult::Ready(first) =
-            wait_fetch_typed(finst_id, None, Duration::ZERO).await
+            wait_fetch_typed(task_key, None, Duration::ZERO).await
         else {
             panic!("expected first typed payload");
         };
@@ -2250,7 +2250,7 @@ mod tests {
         assert_eq!(first.payload, Bytes::from_static(&[1, 2, 3]));
 
         let TryFetchTypedResult::Ready(replayed) =
-            wait_fetch_typed(finst_id, None, Duration::ZERO).await
+            wait_fetch_typed(task_key, None, Duration::ZERO).await
         else {
             panic!("expected exact replay of the first typed payload");
         };
@@ -2263,7 +2263,7 @@ mod tests {
         );
 
         let TryFetchTypedResult::Ready(second) =
-            wait_fetch_typed(finst_id, Some(first.packet_seq), Duration::ZERO).await
+            wait_fetch_typed(task_key, Some(first.packet_seq), Duration::ZERO).await
         else {
             panic!("expected second typed payload");
         };
@@ -2272,7 +2272,7 @@ mod tests {
         assert_eq!(second.payload, Bytes::from_static(&[4, 5]));
 
         let TryFetchTypedResult::Ready(eos) =
-            wait_fetch_typed(finst_id, Some(second.packet_seq), Duration::ZERO).await
+            wait_fetch_typed(task_key, Some(second.packet_seq), Duration::ZERO).await
         else {
             panic!("expected typed eos");
         };
@@ -2281,11 +2281,11 @@ mod tests {
         assert!(eos.payload.is_empty());
 
         assert!(matches!(
-            wait_fetch_typed(finst_id, Some(eos.packet_seq), Duration::ZERO).await,
+            wait_fetch_typed(task_key, Some(eos.packet_seq), Duration::ZERO).await,
             TryFetchTypedResult::EndAcknowledged
         ));
         assert!(matches!(
-            wait_fetch_typed(finst_id, Some(eos.packet_seq), Duration::ZERO).await,
+            wait_fetch_typed(task_key, Some(eos.packet_seq), Duration::ZERO).await,
             TryFetchTypedResult::EndAcknowledged
         ));
     }
@@ -2293,7 +2293,7 @@ mod tests {
     #[tokio::test]
     async fn acknowledged_task_eos_replays_until_controlled_cleanup() {
         let identity = test_task_identity(721);
-        let handle = ResultBufferWriteHandle::open(
+        let handle = ResultBufferWriteObligation::open(
             ResultBufferKey::Task(identity),
             true,
             test_result_cap(),
@@ -2341,7 +2341,7 @@ mod tests {
     async fn task_retirement_discards_finished_unacknowledged_output_and_credit() {
         let identity = test_task_identity(722);
         let cap = NonZeroUsize::new(8).expect("nonzero cap");
-        let handle = ResultBufferWriteHandle::open(
+        let handle = ResultBufferWriteObligation::open(
             ResultBufferKey::Task(identity),
             true,
             cap,
@@ -2373,7 +2373,7 @@ mod tests {
     async fn task_fetch_limit_refuses_without_delivering_or_releasing_the_retained_packet() {
         let identity = test_task_identity(723);
         let retained_cap = NonZeroUsize::new(8).expect("nonzero cap");
-        let handle = ResultBufferWriteHandle::open(
+        let handle = ResultBufferWriteObligation::open(
             ResultBufferKey::Task(identity),
             true,
             retained_cap,
@@ -2418,19 +2418,19 @@ mod tests {
 
     #[tokio::test]
     async fn typed_fetch_rejects_future_and_skipping_acknowledgements() {
-        let finst_id = UniqueId::new(707, 708);
-        create_typed_sender(finst_id);
-        insert_typed(finst_id, vec![1]).expect("insert first typed payload");
-        insert_typed(finst_id, vec![2]).expect("insert second typed payload");
+        let task_key = UniqueId::new(707, 708);
+        create_typed_sender(task_key);
+        insert_typed(task_key, vec![1]).expect("insert first typed payload");
+        insert_typed(task_key, vec![2]).expect("insert second typed payload");
 
         let TryFetchTypedResult::Ready(first) =
-            wait_fetch_typed(finst_id, None, Duration::ZERO).await
+            wait_fetch_typed(task_key, None, Duration::ZERO).await
         else {
             panic!("expected first packet");
         };
         assert_eq!(first.packet_seq, 0);
         let TryFetchTypedResult::Error(error) =
-            wait_fetch_typed(finst_id, Some(1), Duration::ZERO).await
+            wait_fetch_typed(task_key, Some(1), Duration::ZERO).await
         else {
             panic!("future acknowledgement must fail closed");
         };
@@ -2444,16 +2444,16 @@ mod tests {
         let stream_cap = NonZeroUsize::new(8).expect("nonzero stream cap");
         let process_budget =
             ResultRetainedBudget::new(NonZeroUsize::new(12).expect("nonzero process cap"));
-        let first = ResultBufferWriteHandle::open(
-            ResultBufferKey::LegacyFragment(first_id),
+        let first = ResultBufferWriteObligation::open(
+            ResultBufferKey::LegacyTaskKey(first_id),
             true,
             stream_cap,
             Arc::clone(&process_budget),
             None,
         )
         .expect("open first stream");
-        let second = ResultBufferWriteHandle::open(
-            ResultBufferKey::LegacyFragment(second_id),
+        let second = ResultBufferWriteObligation::open(
+            ResultBufferKey::LegacyTaskKey(second_id),
             true,
             stream_cap,
             Arc::clone(&process_budget),
@@ -2496,10 +2496,10 @@ mod tests {
 
     #[test]
     fn typed_write_retains_backing_capacity_credit_beyond_visible_length() {
-        let finst_id = UniqueId::new(719, 720);
+        let task_key = UniqueId::new(719, 720);
         let cap = NonZeroUsize::new(64 * 1024).expect("nonzero cap");
-        let handle = ResultBufferWriteHandle::open(
-            ResultBufferKey::LegacyFragment(finst_id),
+        let handle = ResultBufferWriteObligation::open(
+            ResultBufferKey::LegacyTaskKey(task_key),
             true,
             cap,
             ResultRetainedBudget::new(cap),
@@ -2538,10 +2538,10 @@ mod tests {
 
     #[test]
     fn single_result_reservation_above_stream_cap_fails_closed() {
-        let finst_id = UniqueId::new(713, 714);
+        let task_key = UniqueId::new(713, 714);
         let cap = NonZeroUsize::new(8).expect("nonzero cap");
-        let handle = ResultBufferWriteHandle::open(
-            ResultBufferKey::LegacyFragment(finst_id),
+        let handle = ResultBufferWriteObligation::open(
+            ResultBufferKey::LegacyTaskKey(task_key),
             true,
             cap,
             ResultRetainedBudget::new(cap),
@@ -2554,7 +2554,7 @@ mod tests {
         assert_eq!(
             error,
             ResultReservationError::StreamLimit {
-                key: ResultBufferKey::LegacyFragment(finst_id),
+                key: ResultBufferKey::LegacyTaskKey(task_key),
                 requested: 9,
                 limit: 8
             }
@@ -2564,10 +2564,10 @@ mod tests {
 
     #[test]
     fn cancellation_releases_retained_credit_and_wakes_capacity_waiters() {
-        let finst_id = UniqueId::new(715, 716);
+        let task_key = UniqueId::new(715, 716);
         let cap = NonZeroUsize::new(8).expect("nonzero cap");
-        let handle = ResultBufferWriteHandle::open(
-            ResultBufferKey::LegacyFragment(finst_id),
+        let handle = ResultBufferWriteObligation::open(
+            ResultBufferKey::LegacyTaskKey(task_key),
             true,
             cap,
             ResultRetainedBudget::new(cap),
@@ -2597,9 +2597,9 @@ mod tests {
 
     #[tokio::test]
     async fn typed_async_wait_is_woken_by_cancellation() {
-        let finst_id = UniqueId::new(717, 718);
-        create_typed_sender(finst_id);
-        let wait = wait_fetch_typed(finst_id, None, Duration::from_secs(5));
+        let task_key = UniqueId::new(717, 718);
+        create_typed_sender(task_key);
+        let wait = wait_fetch_typed(task_key, None, Duration::from_secs(5));
         tokio::pin!(wait);
         assert!(
             tokio::time::timeout(Duration::from_millis(1), wait.as_mut())
@@ -2608,7 +2608,7 @@ mod tests {
             "empty result stream should park"
         );
 
-        cancel_with_message(finst_id, "cancelled while parked".to_string());
+        cancel_with_message(task_key, "cancelled while parked".to_string());
         let result = tokio::time::timeout(Duration::from_secs(1), wait)
             .await
             .expect("cancellation wakes the async fetch");
@@ -2620,11 +2620,11 @@ mod tests {
 
     #[test]
     fn typed_sender_rejects_legacy_fetch() {
-        let finst_id = UniqueId::new(703, 704);
-        create_typed_sender(finst_id);
-        insert_typed(finst_id, vec![9]).expect("insert typed payload");
+        let task_key = UniqueId::new(703, 704);
+        create_typed_sender(task_key);
+        insert_typed(task_key, vec![9]).expect("insert typed payload");
 
-        let TryFetchResult::Error(err) = try_fetch(finst_id) else {
+        let TryFetchResult::Error(err) = try_fetch(task_key) else {
             panic!("expected mode mismatch error");
         };
         assert!(matches!(err.kind, FetchErrorKind::Failed));
@@ -2634,10 +2634,10 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_sender_rejects_typed_fetch() {
-        let finst_id = UniqueId::new(705, 706);
-        create_sender(finst_id);
+        let task_key = UniqueId::new(705, 706);
+        create_sender(task_key);
         insert(
-            finst_id,
+            task_key,
             FetchResult {
                 packet_seq: 0,
                 eos: false,
@@ -2646,7 +2646,7 @@ mod tests {
         );
 
         let TryFetchTypedResult::Error(err) =
-            wait_fetch_typed(finst_id, None, Duration::ZERO).await
+            wait_fetch_typed(task_key, None, Duration::ZERO).await
         else {
             panic!("expected mode mismatch error");
         };

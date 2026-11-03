@@ -29,9 +29,9 @@ use std::sync::{
 use tokio::io::DuplexStream;
 
 fn root() -> TaskIdentity {
-    let wire = super::super::parse_created_line(concat!(
-        "NOVAROCKS_TASK_CREATE_APPLIED execution_id=-7:23:2 stage=9 task=17 ",
-        "backend=019a0203-0405-7000-8000-000000000001"
+    let wire = super::super::parse_created_line(&format!(
+        "{} execution_id=-7:23:2 stage=9 task=17 backend=019a0203-0405-7000-8000-000000000001",
+        novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED
     ))
     .unwrap();
     novarocks_task_codec::identity::decode_task_identity(
@@ -323,8 +323,8 @@ async fn original_h2_recvstream_holds_credit_and_original_encoded_owner_until_ac
     let held = begin_with_original_io(&mut actor, client_io).await;
     let observation = actor.observe_held().await;
     let owned_while_held = !dropped.load(Ordering::SeqCst);
-    let driver_was_live = actor
-        .driver
+    let connection_was_live = actor
+        .connection_job
         .as_ref()
         .is_some_and(|handle| !handle.is_finished());
     let settled = actor.settle().await;
@@ -337,12 +337,12 @@ async fn original_h2_recvstream_holds_credit_and_original_encoded_owner_until_ac
     assert!(held.withheld_stream_credit_bytes >= held.received_bytes as usize);
     assert_eq!(held.released_stream_credit_bytes, 0);
     assert!(!held.reply_fully_decoded);
-    assert!(owned_while_held && driver_was_live);
+    assert!(owned_while_held && connection_was_live);
     assert!(matches!(
-        settled.observation.driver_exit,
-        DriverExit::AbortedAndJoined | DriverExit::Closed
+        settled.observation.connection_exit,
+        ConnectionExit::AbortedAndJoined | ConnectionExit::Closed
     ));
-    assert!(actor.driver.is_none());
+    assert!(actor.connection_job.is_none());
     assert!(actor.response.is_none());
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     assert!(dropped.load(Ordering::SeqCst));
@@ -352,7 +352,7 @@ async fn original_h2_recvstream_holds_credit_and_original_encoded_owner_until_ac
     }
 }
 #[tokio::test]
-async fn dropped_borrowed_start_keeps_the_same_original_driver_for_failed_actual_cleanup() {
+async fn dropped_borrowed_start_keeps_the_same_original_connection_job_for_failed_actual_cleanup() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let server = tokio::spawn(async move {
@@ -367,14 +367,14 @@ async fn dropped_borrowed_start_keeps_the_same_original_driver_for_failed_actual
         begin_with_original_io(&mut actor, client_io),
     )
     .await;
-    let installed = actor.driver.is_some();
+    let installed = actor.connection_job.is_some();
     let cleaned = actor.settle().await;
     server.abort();
     let joined = server.await;
     assert!(timed.is_err() && installed);
     let error = cleaned.unwrap_err();
     assert_eq!(error.observation.phase, Phase::Settled);
-    assert!(actor.driver.is_none());
+    assert!(actor.connection_job.is_none());
     assert!(error.observation.abort_requested);
     if let Err(error) = joined {
         assert!(error.is_cancelled());
@@ -404,21 +404,21 @@ async fn expired_original_clock_still_joins_but_cannot_mint_success() {
     held.unwrap();
     let error = result.unwrap_err();
     assert_eq!(error.class, FailureClass::Clock);
-    assert!(actor.driver.is_none() && dropped.load(Ordering::SeqCst));
+    assert!(actor.connection_job.is_none() && dropped.load(Ordering::SeqCst));
     assert_eq!(error.observation.phase, Phase::Settled);
 }
 #[tokio::test]
-async fn actual_original_driver_panic_source_is_owned_and_not_formatted() {
+async fn actual_original_connection_job_panic_source_is_owned_and_not_formatted() {
     let mut actor = actor(Instant::now() + Duration::from_secs(5));
     actor.phase = Phase::Held;
-    actor.driver = Some(tokio::spawn(async {
-        panic!("host synthetic original driver panic");
+    actor.connection_job = Some(tokio::spawn(async {
+        panic!("host synthetic original connection job panic");
         #[allow(unreachable_code)]
         Ok(())
     }));
-    actor.driver_exit = DriverExit::Live;
+    actor.connection_exit = ConnectionExit::Live;
     // Observe the same original task's completed result through the actor.
-    // This fault-injection task is not a BE or an H2-driver Native claim.
+    // This fault-injection task is not a BE or an H2-connection job Native claim.
     tokio::task::yield_now().await;
     let observed = actor.observe_held().await;
     let cleaned = actor.settle().await;
@@ -435,21 +435,21 @@ async fn actual_original_driver_panic_source_is_owned_and_not_formatted() {
         "original held root response failed; actual sources retained"
     );
     assert!(cleaned.is_err());
-    assert!(actor.driver.is_none());
+    assert!(actor.connection_job.is_none());
 }
 #[tokio::test]
-async fn already_finished_original_driver_is_failure_even_after_successful_actual_join() {
+async fn already_finished_original_connection_job_is_failure_even_after_successful_actual_join() {
     let mut actor = actor(Instant::now() + Duration::from_secs(5));
     actor.phase = Phase::Held;
-    actor.driver = Some(tokio::spawn(async { Ok(()) }));
-    actor.driver_exit = DriverExit::Live;
+    actor.connection_job = Some(tokio::spawn(async { Ok(()) }));
+    actor.connection_exit = ConnectionExit::Live;
     tokio::task::yield_now().await;
     let actual = actor.settle().await;
     assert!(actual.is_err());
-    assert!(actor.driver.is_none());
+    assert!(actor.connection_job.is_none());
     assert_eq!(
-        actual.unwrap_err().observation.driver_exit,
-        DriverExit::Closed
+        actual.unwrap_err().observation.connection_exit,
+        ConnectionExit::Closed
     );
 }
 
@@ -489,7 +489,7 @@ async fn deterministic_borrowed_settle_cancel_keeps_original_handle_and_retry_st
         .await
         // Leaving this scope drops only the borrowed settle future.
     };
-    let handle_still_owned = actor.driver.is_some();
+    let handle_still_owned = actor.connection_job.is_some();
     let interrupted_phase = actor.phase;
     let abort_had_been_requested = actor.abort_requested;
     let retry = actor.settle().await;
@@ -508,9 +508,9 @@ async fn deterministic_borrowed_settle_cancel_keeps_original_handle_and_retry_st
         Some(FailureClass::Transition)
     );
     assert_eq!(failure.observation.phase, Phase::Settled);
-    assert!(actor.driver.is_none() && dropped.load(Ordering::SeqCst));
+    assert!(actor.connection_job.is_none() && dropped.load(Ordering::SeqCst));
     assert!(matches!(
-        failure.observation.driver_exit,
-        DriverExit::AbortedAndJoined | DriverExit::Closed
+        failure.observation.connection_exit,
+        ConnectionExit::AbortedAndJoined | ConnectionExit::Closed
     ));
 }

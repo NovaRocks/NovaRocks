@@ -22,8 +22,8 @@ mod router_runtime_tests {
     use crate::exec::pipeline::binding::ScanBindings;
     use crate::exec::pipeline::executor::prepare_compiled_program_with_sink_materializer;
     use crate::runtime::exchange::{ExchangeColumnBinding, ExchangePopResult};
-    use crate::runtime::fragment::io::{ExchangeReceiverKey, ExchangeReceiverRegistration};
-    use crate::runtime::fragment::sink::materialize_compiled_sink_for_pipeline;
+    use crate::runtime::task::io::{ExchangeReceiverKey, ExchangeReceiverRegistration};
+    use crate::runtime::task::sink::materialize_compiled_sink_for_pipeline;
     use novarocks_physical_plan as p;
     use novarocks_spi::connector::{
         ConnectorRowMutationEffect as Effect, ConnectorWriteFieldToken, ConnectorWriteRouteId,
@@ -534,7 +534,7 @@ mod router_runtime_tests {
         for (index, branch) in branches.iter().enumerate() {
             let instance = UniqueId::new(0x762, index as i64 + 1);
             let key = ExchangeReceiverKey {
-                fragment_instance_id: instance,
+                task_key: instance,
                 node_id: branch.dest_node_id(),
             };
             let layout = if index == *summary_branch as usize {
@@ -562,7 +562,7 @@ mod router_runtime_tests {
             groups.push(vec![fixture.destination(instance, SOURCE, 0, 1)]);
             keys.push(key);
         }
-        let assignment = FragmentSinkAssignment::DestinationGroups {
+        let assignment = TaskSinkAssignment::DestinationGroups {
             groups,
             sender_id: None,
         };
@@ -592,7 +592,7 @@ mod router_runtime_tests {
             )
             .expect("the Router binds its original checked ExchangeSource input");
             let input_key = ExchangeReceiverKey {
-                fragment_instance_id: SOURCE,
+                task_key: SOURCE,
                 node_id: i32::try_from(receiver.get()).unwrap(),
             };
             for registration in materialized.registrations {
@@ -600,9 +600,9 @@ mod router_runtime_tests {
                 port.register(registration).unwrap();
                 fixture.bind(key, &[UPSTREAM]);
             }
-            let assignment = FragmentSinkAssignment::StreamDestinations {
+            let assignment = TaskSinkAssignment::StreamDestinations {
                 destinations: vec![
-                    FragmentDestination::new(
+                    TaskDestination::new(
                         SOURCE,
                         RuntimeEndpoint::new("127.0.0.1", 9030).unwrap(),
                         UPSTREAM,
@@ -673,12 +673,12 @@ mod router_runtime_tests {
             },
             bindings,
             ScanBindings::default(),
-            crate::runtime::fragment::CompiledWriterBindings::default(),
-            finst(SOURCE),
+            crate::runtime::task::CompiledWriterBindings::default(),
+            task_key(SOURCE),
             None,
             4,
             Arc::clone(&state),
-            Arc::new(NoopFragmentEventSink),
+            Arc::new(NoopTaskEventSink),
             None,
         )
         .expect("the actual computing graph binds its Router and independent summary together");
@@ -709,7 +709,7 @@ mod router_runtime_tests {
         }
         let mut outputs = Vec::new();
         for key in &keys {
-            let stream = fixture.stream(SOURCE, key.fragment_instance_id, key.node_id, 0);
+            let stream = fixture.stream(SOURCE, key.task_key, key.node_id, 0);
             assert!(
                 matches!(
                     port.stream_close_facts(*key, &[stream]).unwrap()[0].disposition,
@@ -717,9 +717,9 @@ mod router_runtime_tests {
                 ),
                 "the source Task join does not consume downstream output"
             );
-            let handle = port.receiver_handle(*key, 1).unwrap();
+            let receiver_pin = port.receiver_pin(*key, 1).unwrap();
             let mut chunks = Vec::new();
-            while let ExchangePopResult::Chunk(chunk) = handle
+            while let ExchangePopResult::Chunk(chunk) = receiver_pin
                 .try_pop_next_with_stats(1)
                 .unwrap()
                 .expect("joined sender must have delivered data and EOS")
@@ -733,7 +733,7 @@ mod router_runtime_tests {
                 ),
                 "reading DATA and End alone does not forge the input owner's completion"
             );
-            handle.complete_input_consumption(1).unwrap();
+            receiver_pin.complete_input_consumption(1).unwrap();
             let close = port.stream_close_facts(*key, &[stream]).unwrap();
             assert!(matches!(
                 close[0].disposition,

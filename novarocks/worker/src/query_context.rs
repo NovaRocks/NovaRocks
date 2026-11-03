@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
-use novarocks_memory::{AccountHandle, AccountKind, CapacityError, ExternalRef, MemoryAuthority};
+use novarocks_execution::runtime::task::io::ExchangeReceiverPort;
+use novarocks_memory::{Account, AccountKind, CapacityError, ExternalRef, MemoryAuthority};
 use novarocks_types::{QueryId, UniqueId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -82,16 +82,16 @@ impl QueryExecutionKey {
 #[derive(Clone, Debug)]
 pub struct QueryMemoryAccount {
     execution: QueryExecutionKey,
-    account: AccountHandle,
+    account: Account,
 }
 impl QueryMemoryAccount {
     pub const fn execution(&self) -> QueryExecutionKey {
         self.execution
     }
-    pub fn account(&self) -> &AccountHandle {
+    pub fn account(&self) -> &Account {
         &self.account
     }
-    pub fn into_account(self) -> AccountHandle {
+    pub fn into_account(self) -> Account {
         self.account
     }
 }
@@ -257,7 +257,7 @@ pub(crate) struct QueryContext {
     /// releases their payload, and funded retirement needs teardown evidence.
     /// Native admission always asks its explicitly supplied authority for this
     /// account, regardless of whether a local policy limit was supplied.
-    mem_account: Option<AccountHandle>,
+    mem_account: Option<Account>,
     cleanup_leases: Vec<QueryCleanupLease>,
 }
 
@@ -631,7 +631,7 @@ impl QueryContextManager {
         &self,
         execution: QueryExecutionKey,
         authority: &Arc<MemoryAuthority>,
-    ) -> Result<AccountHandle, String> {
+    ) -> Result<Account, String> {
         self.ensure_query_memory_account(execution, authority)
             .map(QueryMemoryAccount::into_account)
             .map_err(|error| error.to_string())
@@ -875,11 +875,11 @@ impl QueryContextManager {
         guard.context(execution).map(QueryContext::mem_tracker)
     }
 
-    pub(crate) fn register_finst(&self, finst_id: UniqueId, query_id: QueryId) {
+    pub(crate) fn register_finst(&self, task_key: UniqueId, query_id: QueryId) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         guard
             .finst_to_query
-            .insert(finst_id, QueryExecutionKey::native(query_id));
+            .insert(task_key, QueryExecutionKey::native(query_id));
     }
 
     /// Associates a fragment with the application-owned exchange capability
@@ -887,19 +887,19 @@ impl QueryContextManager {
     /// under the manager lock, then invokes it only after releasing the lock.
     pub(crate) fn register_exchange_receiver_port(
         &self,
-        finst_id: UniqueId,
+        task_key: UniqueId,
         port: Arc<dyn ExchangeReceiverPort>,
     ) {
         self.inner
             .lock()
             .expect("query context manager lock")
             .exchange_receiver_ports
-            .insert(finst_id, port);
+            .insert(task_key, port);
     }
 
     pub fn register_native_finst_execution(
         &self,
-        finst_id: UniqueId,
+        task_key: UniqueId,
         execution: QueryExecutionKey,
     ) -> Result<(), QueryContextRegistrationError> {
         if execution.native_attempt_id().is_none() {
@@ -909,7 +909,7 @@ impl QueryContextManager {
         if !guard.active.contains_key(&execution) {
             return Err(QueryContextRegistrationError::MissingRequiredContext);
         }
-        guard.finst_to_query.insert(finst_id, execution);
+        guard.finst_to_query.insert(task_key, execution);
         Ok(())
     }
 
@@ -918,31 +918,31 @@ impl QueryContextManager {
         I: IntoIterator<Item = UniqueId>,
     {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        for finst_id in finst_ids {
+        for task_key in finst_ids {
             guard
                 .finst_to_query
-                .insert(finst_id, QueryExecutionKey::native(query_id));
+                .insert(task_key, QueryExecutionKey::native(query_id));
         }
     }
 
     /// Returns the owning query for a fragment instance when it is still registered.
-    pub fn query_id_by_finst(&self, finst_id: UniqueId) -> Option<QueryId> {
+    pub fn query_id_by_finst(&self, task_key: UniqueId) -> Option<QueryId> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
         guard
             .finst_to_query
-            .get(&finst_id)
+            .get(&task_key)
             .map(|execution| execution.query_id())
     }
 
-    pub(crate) fn query_execution_by_finst(&self, finst_id: UniqueId) -> Option<QueryExecutionKey> {
+    pub(crate) fn query_execution_by_finst(&self, task_key: UniqueId) -> Option<QueryExecutionKey> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard.finst_to_query.get(&finst_id).copied()
+        guard.finst_to_query.get(&task_key).copied()
     }
 
-    pub(crate) fn unregister_finst(&self, finst_id: UniqueId) {
+    pub(crate) fn unregister_finst(&self, task_key: UniqueId) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard.finst_to_query.remove(&finst_id);
-        guard.exchange_receiver_ports.remove(&finst_id);
+        guard.finst_to_query.remove(&task_key);
+        guard.exchange_receiver_ports.remove(&task_key);
     }
 
     /// Undo the registration performed before a native worker reports readiness.
@@ -954,28 +954,28 @@ impl QueryContextManager {
     pub(crate) fn rollback_pre_ready_native_fragment(
         &self,
         query_id: QueryId,
-        finst_id: UniqueId,
+        task_key: UniqueId,
     ) -> bool {
-        self.rollback_pre_ready(QueryExecutionKey::native(query_id), finst_id, true)
+        self.rollback_pre_ready(QueryExecutionKey::native(query_id), task_key, true)
     }
 
     pub fn rollback_pre_ready_native_fragment_execution(
         &self,
         execution: QueryExecutionKey,
-        finst_id: UniqueId,
+        task_key: UniqueId,
     ) -> bool {
-        self.rollback_pre_ready(execution, finst_id, false)
+        self.rollback_pre_ready(execution, task_key, false)
     }
 
     fn rollback_pre_ready(
         &self,
         execution: QueryExecutionKey,
-        finst_id: UniqueId,
+        task_key: UniqueId,
         release_exchange_port: bool,
     ) -> bool {
         let removed = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            if guard.finst_to_query.get(&finst_id) != Some(&execution) {
+            if guard.finst_to_query.get(&task_key) != Some(&execution) {
                 return false;
             }
             let Some(context) = guard.active.get(&execution) else {
@@ -984,9 +984,9 @@ impl QueryContextManager {
             if context.num_fragments == 0 || context.num_active_fragments == 0 {
                 return false;
             }
-            guard.finst_to_query.remove(&finst_id);
+            guard.finst_to_query.remove(&task_key);
             if release_exchange_port {
-                guard.exchange_receiver_ports.remove(&finst_id);
+                guard.exchange_receiver_ports.remove(&task_key);
             }
             let remove_empty_context = {
                 let context = guard
@@ -1010,18 +1010,18 @@ impl QueryContextManager {
         true
     }
 
-    pub fn unregister_finst_execution(&self, finst_id: UniqueId, execution: QueryExecutionKey) {
+    pub fn unregister_finst_execution(&self, task_key: UniqueId, execution: QueryExecutionKey) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        if guard.finst_to_query.get(&finst_id) != Some(&execution) {
+        if guard.finst_to_query.get(&task_key) != Some(&execution) {
             return;
         }
-        guard.finst_to_query.remove(&finst_id);
-        guard.exchange_receiver_ports.remove(&finst_id);
+        guard.finst_to_query.remove(&task_key);
+        guard.exchange_receiver_ports.remove(&task_key);
     }
 
-    pub(crate) fn get_query_timeout_by_finst(&self, finst_id: UniqueId) -> Option<Duration> {
+    pub(crate) fn get_query_timeout_by_finst(&self, task_key: UniqueId) -> Option<Duration> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
-        let execution = *guard.finst_to_query.get(&finst_id)?;
+        let execution = *guard.finst_to_query.get(&task_key)?;
         guard.context(execution).map(|ctx| ctx.query_expire)
     }
 
@@ -1076,8 +1076,8 @@ impl QueryContextManager {
             let finsts = guard
                 .finst_to_query
                 .iter()
-                .filter_map(|(finst_id, execution)| {
-                    (execution.query_id() == query_id).then_some(*finst_id)
+                .filter_map(|(task_key, execution)| {
+                    (execution.query_id() == query_id).then_some(*task_key)
                 })
                 .collect::<Vec<_>>();
             let exchange_ports = finsts
@@ -1095,8 +1095,8 @@ impl QueryContextManager {
         {
             std::panic::resume_unwind(payload);
         }
-        for (fragment_instance_id, port) in exchange_ports {
-            port.cancel_fragment(fragment_instance_id);
+        for (task_key, port) in exchange_ports {
+            port.cancel_task(task_key);
         }
         finsts
     }
@@ -1114,8 +1114,8 @@ impl QueryContextManager {
             let finsts = guard
                 .finst_to_query
                 .iter()
-                .filter_map(|(finst_id, execution)| {
-                    (execution.query_id() == query_id).then_some(*finst_id)
+                .filter_map(|(task_key, execution)| {
+                    (execution.query_id() == query_id).then_some(*task_key)
                 })
                 .collect::<Vec<_>>();
             let exchange_ports = finsts
@@ -1135,8 +1135,8 @@ impl QueryContextManager {
         if let Err(payload) = cancellation_unwind {
             std::panic::resume_unwind(payload);
         }
-        for (fragment_instance_id, port) in exchange_ports {
-            port.cancel_fragment(fragment_instance_id);
+        for (task_key, port) in exchange_ports {
+            port.cancel_task(task_key);
         }
         finsts
     }
@@ -1158,7 +1158,7 @@ impl QueryContextManager {
             let finsts = guard
                 .finst_to_query
                 .iter()
-                .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
+                .filter_map(|(task_key, current)| (*current == execution).then_some(*task_key))
                 .collect::<Vec<_>>();
             let detached_native_context = (execution.native_attempt_id().is_some()
                 && finsts.is_empty()
@@ -1179,13 +1179,13 @@ impl QueryContextManager {
         finsts
     }
 
-    pub(crate) fn cancel_finst(&self, finst_id: UniqueId, err: String) -> FinstCancelResult {
-        self.cancel_finst_internal(finst_id, err, || {})
+    pub(crate) fn cancel_finst(&self, task_key: UniqueId, err: String) -> FinstCancelResult {
+        self.cancel_finst_internal(task_key, err, || {})
     }
 
     fn cancel_finst_internal<F>(
         &self,
-        finst_id: UniqueId,
+        task_key: UniqueId,
         err: String,
         binding_observer: F,
     ) -> FinstCancelResult
@@ -1194,7 +1194,7 @@ impl QueryContextManager {
     {
         let collected = {
             let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            let Some(execution) = guard.finst_to_query.get(&finst_id).copied() else {
+            let Some(execution) = guard.finst_to_query.get(&task_key).copied() else {
                 return FinstCancelResult {
                     query_id: None,
                     finsts: Vec::new(),
@@ -1211,7 +1211,7 @@ impl QueryContextManager {
             let finsts = guard
                 .finst_to_query
                 .iter()
-                .filter_map(|(finst_id, current)| (*current == execution).then_some(*finst_id))
+                .filter_map(|(task_key, current)| (*current == execution).then_some(*task_key))
                 .collect::<Vec<_>>();
             let exchange_ports = finsts
                 .iter()
@@ -1230,8 +1230,8 @@ impl QueryContextManager {
         if let Err(payload) = cancellation_unwind {
             std::panic::resume_unwind(payload);
         }
-        for (fragment_instance_id, port) in exchange_ports {
-            port.cancel_fragment(fragment_instance_id);
+        for (task_key, port) in exchange_ports {
+            port.cancel_task(task_key);
         }
         if finsts.is_empty() {
             return FinstCancelResult {
@@ -1248,27 +1248,27 @@ impl QueryContextManager {
     #[cfg(test)]
     fn cancel_finst_with_binding_observer<F>(
         &self,
-        finst_id: UniqueId,
+        task_key: UniqueId,
         err: String,
         binding_observer: F,
     ) -> FinstCancelResult
     where
         F: FnOnce(),
     {
-        self.cancel_finst_internal(finst_id, err, binding_observer)
+        self.cancel_finst_internal(task_key, err, binding_observer)
     }
 
     /// A sender's exchange RPC failed. Map the finst to its query and cancel
     /// the whole query so blocked receivers abort instead of timing out.
-    pub(crate) fn propagate_sender_error(&self, finst_id: UniqueId, err: String) -> Vec<UniqueId> {
-        let result = self.cancel_finst(finst_id, format!("exchange send failed: {err}"));
+    pub(crate) fn propagate_sender_error(&self, task_key: UniqueId, err: String) -> Vec<UniqueId> {
+        let result = self.cancel_finst(task_key, format!("exchange send failed: {err}"));
         match result.query_id {
             Some(_) => result.finsts,
-            None => vec![finst_id],
+            None => vec![task_key],
         }
     }
 
-    pub(crate) fn finish_fragment(&self, query_id: QueryId) {
+    pub(crate) fn finish_task(&self, query_id: QueryId) {
         self.finish_fragment_internal(query_id)
     }
 
@@ -1316,7 +1316,7 @@ impl QueryContextManager {
 
 #[cfg(test)]
 mod fragment_cancellation_boundary_tests {
-    use novarocks_execution::exec::pipeline::global_driver_executor::FragmentCompletion;
+    use novarocks_execution::exec::pipeline::global_driver_executor::DriverGroupCompletion;
     use novarocks_types::UniqueId;
 
     use super::{QueryContextManager, QueryId};
@@ -1325,18 +1325,18 @@ mod fragment_cancellation_boundary_tests {
     fn query_cancellation_returns_routes_without_aborting_fragment_local_completion() {
         let manager = QueryContextManager::new_for_test();
         let query_id = QueryId::new(86_101, 86_102);
-        let finst_id = UniqueId::new(86_103, 86_104);
-        let completion = FragmentCompletion::new(
+        let task_key = UniqueId::new(86_103, 86_104);
+        let completion = DriverGroupCompletion::new(
             1,
             std::sync::Arc::new(
                 novarocks_execution::runtime::runtime_state::RuntimeErrorState::default(),
             ),
         );
-        manager.register_finst(finst_id, query_id);
+        manager.register_finst(task_key, query_id);
 
         assert_eq!(
             manager.cancel_query(query_id, "query owner cancellation".to_string()),
-            vec![finst_id]
+            vec![task_key]
         );
         assert!(
             !completion.should_abort(),
@@ -1531,7 +1531,7 @@ mod native_lifecycle_cleanup_tests {
             Duration::from_secs(5),
         )
         .expect("create native context");
-        for finst_id in [first, second] {
+        for task_key in [first, second] {
             mgr.get_or_register_native(
                 query_id,
                 false,
@@ -1539,7 +1539,7 @@ mod native_lifecycle_cleanup_tests {
                 Duration::from_secs(5),
             )
             .expect("register native fragment");
-            mgr.register_finst(finst_id, query_id);
+            mgr.register_finst(task_key, query_id);
         }
 
         let execution = QueryExecutionKey::native(query_id);
@@ -1555,7 +1555,7 @@ mod native_lifecycle_cleanup_tests {
             .expect("remaining fragment query")
             .total_fragments = Some(1);
 
-        mgr.finish_fragment(query_id);
+        mgr.finish_task(query_id);
         mgr.unregister_finst(first);
         assert_eq!(mgr.fragment_counts_for_test(execution), None);
         assert_eq!(mgr.query_id_by_finst(first), None);

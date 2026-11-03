@@ -21,8 +21,8 @@ use std::{
 };
 
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorErrorKind, ConnectorReadSelector,
-    ConnectorSemanticFact, ConnectorTableHandle,
+    ConnectorControlPlanningPin, ConnectorErrorKind, ConnectorReadSelector, ConnectorSemanticFact,
+    ConnectorTableHandle,
 };
 use novarocks_sql::binding::{SqlTableBindingAllocator, SqlTableBindingId, SqlTableBindingScopeId};
 
@@ -226,14 +226,14 @@ impl ExactBindingReceiptStore {
         &self,
         binding: SqlTableBindingId,
         object: [&str; 3],
-        planning_lease: &ConnectorControlPlanningLease,
+        planning_pin: &ConnectorControlPlanningPin,
         table: &ConnectorTableHandle,
         selector: ConnectorReadSelector,
     ) -> Result<(), String> {
         if !binding.belongs_to(self.scope) {
             return Err("exact binding receipt token belongs to another query".to_string());
         }
-        let descriptor = planning_lease.binding().descriptor();
+        let descriptor = planning_pin.binding().descriptor();
         if table.owner() != &descriptor.instance_id {
             return Err(
                 "exact binding receipt table handle belongs to another Connector instance"
@@ -249,11 +249,11 @@ impl ExactBindingReceiptStore {
             .ok_or_else(|| "exact binding receipt object path is invalid".to_string())?;
         let catalog_generation = CatalogGeneration::try_new(
             format("connector-control-runtime/v1")?,
-            planning_lease.control_runtime_id().to_bytes(),
+            planning_pin.control_runtime_id().to_bytes(),
         )
         .ok_or_else(|| "Connector control generation fact is invalid".to_string())?;
 
-        let semantic_revision = match planning_lease
+        let semantic_revision = match planning_pin
             .binding()
             .metadata()
             .exact_semantic_revision(table, selector)
@@ -285,7 +285,7 @@ impl ExactBindingReceiptStore {
             object_identity,
             data_version,
         };
-        planning_lease
+        planning_pin
             .binding()
             .catalog_properties()
             .map_err(|error| error.to_string())?;
@@ -300,12 +300,12 @@ impl ExactBindingReceiptStore {
         &self,
         binding: SqlTableBindingId,
         object: [&str; 3],
-        planning_lease: &ConnectorControlPlanningLease,
+        planning_pin: &ConnectorControlPlanningPin,
     ) -> Result<(), String> {
         if !binding.belongs_to(self.scope) {
             return Err("exact binding receipt token belongs to another query".to_string());
         }
-        let descriptor = planning_lease.binding().descriptor();
+        let descriptor = planning_pin.binding().descriptor();
         let provider = descriptor.provider_id.as_str();
         let format = |kind: &str| {
             ProviderFactFormat::try_new(provider, kind)
@@ -315,7 +315,7 @@ impl ExactBindingReceiptStore {
             .ok_or_else(|| "exact binding receipt object path is invalid".to_string())?;
         let catalog_generation = CatalogGeneration::try_new(
             format("connector-control-runtime/v1")?,
-            planning_lease.control_runtime_id().to_bytes(),
+            planning_pin.control_runtime_id().to_bytes(),
         )
         .ok_or_else(|| "Connector control generation fact is invalid".to_string())?;
         let receipt = ExactObjectBinding {
@@ -324,7 +324,7 @@ impl ExactBindingReceiptStore {
             object_identity: None,
             data_version: None,
         };
-        planning_lease
+        planning_pin
             .binding()
             .catalog_properties()
             .map_err(|error| error.to_string())?;

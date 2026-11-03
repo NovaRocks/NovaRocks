@@ -17,7 +17,9 @@
 
 //! Rewrite's typed facade over the SAME original serial creator slot.
 use super::*;
-use novarocks_spi::connector::{ConnectorDistributedRewriteLease, RewriteCpuInput, RewriteCpuPort};
+use novarocks_spi::connector::{
+    RewriteCpuInput, RewriteCpuPort, SharedConnectorDistributedRewrite,
+};
 
 type RewriteCpuPorts = (
     Arc<dyn RewriteCpuPort>,
@@ -44,8 +46,8 @@ impl InternalResultCpu {
         &self,
         scope: &WorkScope,
         window: ResultWindowAlias,
-        lease: &ConnectorDistributedRewriteLease,
-        write: &novarocks_catalog_application::ConnectorWriteStackLease,
+        lease: &SharedConnectorDistributedRewrite,
+        write: &novarocks_catalog_application::ConnectorWriteStackPin,
         cancellation: QueryCancellationView,
         runtime: tokio::runtime::Handle,
         wake: Arc<dyn StatusIntakeWake>,
@@ -108,7 +110,7 @@ impl InternalResultCpu {
         &self,
         scope: &WorkScope,
         window: ResultWindowAlias,
-        planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+        planning: &novarocks_spi::connector::ConnectorControlPlanningPin,
         cancellation: QueryCancellationView,
         runtime: tokio::runtime::Handle,
         wake: Arc<dyn StatusIntakeWake>,
@@ -155,7 +157,7 @@ impl InternalResultCpu {
         &self,
         scope: &WorkScope,
         window: ResultWindowAlias,
-        planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+        planning: &novarocks_spi::connector::ConnectorControlPlanningPin,
         io: Arc<crate::query_execution::maintenance::io_admission::MetadataIoAdmission>,
         obligation: novarocks_spi::connector::ConnectorRequestContext,
         runtime: tokio::runtime::Handle,
@@ -202,7 +204,7 @@ impl InternalResultCpu {
         &self,
         scope: &WorkScope,
         window: ResultWindowAlias,
-        lease: &novarocks_spi::connector::ConnectorCleanupMaintenanceLease,
+        lease: &novarocks_spi::connector::ConnectorCleanupMaintenanceSession,
         cancellation: QueryCancellationView,
         runtime: tokio::runtime::Handle,
         wake: Arc<dyn StatusIntakeWake>,
@@ -237,7 +239,7 @@ impl InternalResultCpu {
         &self,
         scope: &WorkScope,
         window: ResultWindowAlias,
-        lease: &ConnectorDistributedRewriteLease,
+        lease: &SharedConnectorDistributedRewrite,
         cancellation: QueryCancellationView,
         runtime: tokio::runtime::Handle,
         wake: Arc<dyn StatusIntakeWake>,

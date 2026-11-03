@@ -23,10 +23,10 @@ pub(crate) struct WorkerPreparationMemoryControl<'a> {
     pub(crate) preparation: &'a PreparationControlLoan<'a>,
 }
 impl SynchronousPreparationControl for WorkerPreparationMemoryControl<'_> {
-    fn checkpoint(&self) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+    fn checkpoint(&self) -> novarocks_execution::runtime::task::ExecutionResult<()> {
         self.preparation.checkpoint()
     }
-    fn wait(&self) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+    fn wait(&self) -> novarocks_execution::runtime::task::ExecutionResult<()> {
         self.preparation.wait()
     }
 }

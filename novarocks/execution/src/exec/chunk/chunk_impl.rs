@@ -41,7 +41,7 @@ use novarocks_type_contract::ValueTypeStorageLifetime;
 use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
 use novarocks_types::SlotId;
 
-use super::memory::{ChunkAccounting, ChunkMemoryLease, chunk_bytes_i64, record_batch_bytes};
+use super::memory::{ChunkAccounting, ChunkMemoryCharge, chunk_bytes_i64, record_batch_bytes};
 use super::schema::execution_carrier_matches_layout_observed;
 use super::schema::{
     ChunkSchema, ChunkSchemaRef, align_chunk_schema_to_batch, align_chunk_schema_to_columns,
@@ -51,12 +51,14 @@ use super::typed_array_normalization::{
     ArrayNormalizationStep, normalize_execution_array_observed,
 };
 
+/// Shared charge for original chunk buffers and retained source backing.
+/// Cloning shares the existing charge; the final backing owner releases it.
 #[derive(Clone)]
-enum ChunkAccountingHandle {
+enum ChunkAccountingCharge {
     WholeBatch(Arc<ChunkAccounting>),
     AdditionalBuffers(super::AdditionalBufferLedger),
 }
-impl std::fmt::Debug for ChunkAccountingHandle {
+impl std::fmt::Debug for ChunkAccountingCharge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::WholeBatch(owner) => std::fmt::Debug::fmt(owner, f),
@@ -71,7 +73,7 @@ impl std::fmt::Debug for ChunkAccountingHandle {
 pub struct Chunk {
     batch: Arc<RecordBatch>,
     chunk_schema: ChunkSchemaRef,
-    accounting: Option<ChunkAccountingHandle>,
+    accounting: Option<ChunkAccountingCharge>,
     /// A provider reservation that already charges the Arrow buffers in this
     /// chunk to the admitted fragment hierarchy.
     ///
@@ -93,7 +95,7 @@ pub struct Chunk {
 pub struct ChunkBatchProjection {
     batch: Arc<RecordBatch>,
     chunk_schema: ChunkSchemaRef,
-    accounting: Option<ChunkAccountingHandle>,
+    accounting: Option<ChunkAccountingCharge>,
     connector_output_memory: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
     array_type_storage: ValueTypeStorageLifetime,
     construction_storage: ValueTypeStorageLifetime,
@@ -104,7 +106,7 @@ pub struct ChunkBatchProjection {
 // references and finite creation holds. It carries no query/context capability.
 struct ChunkSourceStorageHold {
     _schema: ChunkSchemaRef,
-    _accounting: Option<ChunkAccountingHandle>,
+    _accounting: Option<ChunkAccountingCharge>,
     _connector_output_memory: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
     _array_type_storage: ValueTypeStorageLifetime,
     _construction_storage: ValueTypeStorageLifetime,
@@ -169,8 +171,8 @@ impl ChunkBatchProjection {
 impl Chunk {
     pub(crate) fn source_authority(&self) -> super::ChunkSourceAuthorityRef<'_> {
         match self.accounting.as_ref() {
-            Some(ChunkAccountingHandle::AdditionalBuffers(ledger)) => ledger.source_authority(),
-            Some(ChunkAccountingHandle::WholeBatch(owner)) => {
+            Some(ChunkAccountingCharge::AdditionalBuffers(ledger)) => ledger.source_authority(),
+            Some(ChunkAccountingCharge::WholeBatch(owner)) => {
                 super::ChunkSourceAuthorityRef::from_attached(
                     Some(owner),
                     self.connector_output_memory.as_ref(),
@@ -586,7 +588,7 @@ impl Chunk {
         chunk_schema: ChunkSchemaRef,
         metadata: super::OutputColumnMetadata,
         owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
-    ) -> crate::runtime::fragment::ExecutionResult<Self> {
+    ) -> crate::runtime::task::ExecutionResult<Self> {
         struct UnpublishedColumns {
             batch: RecordBatch,
             metadata: super::OutputColumnMetadata,
@@ -644,10 +646,10 @@ impl Chunk {
         inspection.charge(std::mem::size_of::<Self>())?;
         inspection.charge_arc(self.batch.as_ref())?;
         match &self.accounting {
-            Some(ChunkAccountingHandle::WholeBatch(accounting)) => {
+            Some(ChunkAccountingCharge::WholeBatch(accounting)) => {
                 inspection.charge_arc(accounting.as_ref())?
             }
-            Some(ChunkAccountingHandle::AdditionalBuffers(ledger)) => {
+            Some(ChunkAccountingCharge::AdditionalBuffers(ledger)) => {
                 inspection.charge(ledger.holder_bytes().map_err(|_| {
                     super::root_schema_backing::RootSchemaBackingError::UnsupportedType
                 })?)?
@@ -704,7 +706,7 @@ impl Chunk {
             !self.chunk_schema.is_typed()
                 && !matches!(
                     self.accounting,
-                    Some(ChunkAccountingHandle::AdditionalBuffers(_))
+                    Some(ChunkAccountingCharge::AdditionalBuffers(_))
                 ),
             "typed chunk slicing requires a supplied creation lifetime and observer"
         );
@@ -717,7 +719,7 @@ impl Chunk {
             construction_storage: ValueTypeStorageLifetime::pure(),
             output_column_metadata: self.output_column_metadata.clone(),
         };
-        if let Some(ChunkAccountingHandle::WholeBatch(accounting)) = self.accounting.as_ref() {
+        if let Some(ChunkAccountingCharge::WholeBatch(accounting)) = self.accounting.as_ref() {
             let tracker = accounting.tracker();
             out.transfer_to(&tracker);
         }
@@ -849,7 +851,7 @@ impl Chunk {
 
     pub fn transfer_to(&mut self, tracker: &Arc<MemTracker>) {
         if let Some(accounting) = self.accounting.as_ref() {
-            if let ChunkAccountingHandle::WholeBatch(accounting) = accounting {
+            if let ChunkAccountingCharge::WholeBatch(accounting) = accounting {
                 accounting.transfer_to(tracker);
             }
             return;
@@ -861,7 +863,7 @@ impl Chunk {
         if bytes <= 0 {
             return;
         }
-        self.accounting = Some(ChunkAccountingHandle::WholeBatch(Arc::new(
+        self.accounting = Some(ChunkAccountingCharge::WholeBatch(Arc::new(
             ChunkAccounting::new(bytes, tracker),
         )));
     }
@@ -876,10 +878,10 @@ impl Chunk {
     ) -> Result<(), crate::runtime::mem_tracker::MemTrackerLimitExceeded> {
         if let Some(accounting) = self.accounting.as_ref() {
             return match accounting {
-                ChunkAccountingHandle::WholeBatch(accounting) => {
+                ChunkAccountingCharge::WholeBatch(accounting) => {
                     accounting.try_transfer_to_typed(tracker)
                 }
-                ChunkAccountingHandle::AdditionalBuffers(_) => Ok(()),
+                ChunkAccountingCharge::AdditionalBuffers(_) => Ok(()),
             };
         }
         if self.connector_output_memory.is_some() {
@@ -890,38 +892,38 @@ impl Chunk {
             return Ok(());
         }
         let result = tracker.consume_and_check_limit_typed(bytes);
-        self.accounting = Some(ChunkAccountingHandle::WholeBatch(Arc::new(
+        self.accounting = Some(ChunkAccountingCharge::WholeBatch(Arc::new(
             ChunkAccounting::from_charged(bytes, tracker),
         )));
         result
     }
 
     #[cfg(test)]
-    pub(crate) fn memory_lease(&self) -> Option<ChunkMemoryLease> {
+    pub(crate) fn memory_lease(&self) -> Option<ChunkMemoryCharge> {
         match self.accounting.as_ref()? {
-            ChunkAccountingHandle::WholeBatch(accounting) => {
-                Some(ChunkMemoryLease::native(Arc::clone(accounting)))
+            ChunkAccountingCharge::WholeBatch(accounting) => {
+                Some(ChunkMemoryCharge::native(Arc::clone(accounting)))
             }
-            ChunkAccountingHandle::AdditionalBuffers(_) => None,
+            ChunkAccountingCharge::AdditionalBuffers(_) => None,
         }
     }
 
     /// Moves this chunk's accounting owner without cloning it. Consumers that
     /// retain only a zero-copy projection can then split the projected bytes
     /// from the unprojected remainder exactly.
-    pub(crate) fn take_memory_lease(&mut self) -> Option<ChunkMemoryLease> {
+    pub(crate) fn take_memory_lease(&mut self) -> Option<ChunkMemoryCharge> {
         if matches!(
             self.accounting,
-            Some(ChunkAccountingHandle::AdditionalBuffers(_))
+            Some(ChunkAccountingCharge::AdditionalBuffers(_))
         ) {
             return None;
         }
-        if let Some(ChunkAccountingHandle::WholeBatch(accounting)) = self.accounting.take() {
-            return Some(ChunkMemoryLease::native(accounting));
+        if let Some(ChunkAccountingCharge::WholeBatch(accounting)) = self.accounting.take() {
+            return Some(ChunkMemoryCharge::native(accounting));
         }
         let output_memory = self.connector_output_memory.take()?;
         if Arc::strong_count(&output_memory) == 1 {
-            return Some(ChunkMemoryLease::connector(output_memory));
+            return Some(ChunkMemoryCharge::connector(output_memory));
         }
         // A clone or slice still owns the same provider reservation. Keep this
         // chunk attached as well so the shared charge cannot disappear while
@@ -947,7 +949,7 @@ impl Chunk {
                 ),
             ));
         }
-        self.accounting = Some(ChunkAccountingHandle::AdditionalBuffers(ledger));
+        self.accounting = Some(ChunkAccountingCharge::AdditionalBuffers(ledger));
         Ok(())
     }
 
@@ -1104,7 +1106,7 @@ mod dictionary_validation_tests {
         for keys in [vec![-1, 1], vec![2, 1], vec![0, -1], vec![0, 2]] {
             let keys = Int32Array::from(keys);
             let error = validate_dictionary_rows_observed::<
-                crate::runtime::fragment::ExecutionFailure,
+                crate::runtime::task::ExecutionFailure,
                 _,
             >(&source, &keys, &values, &mut |_| Ok(()))
             .unwrap_err();
@@ -1127,7 +1129,7 @@ mod dictionary_validation_tests {
             Arc::new(StructArray::try_new(fields.into(), vec![dictionary.clone()], None).unwrap());
         let mut visited = Vec::new();
         let nulls = validate_encoded_keys_and_root_nulls_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(
             &parent,
@@ -1148,7 +1150,7 @@ mod dictionary_validation_tests {
         assert!(!nulls);
         assert_eq!(visited, vec![2]);
         let nulls = validate_encoded_keys_and_root_nulls_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(&dictionary, &mut |_| Ok(()), 1, &mut 0)
         .unwrap();
@@ -1198,7 +1200,7 @@ mod shared_batch_projection_tests {
         let array_storage = ValueTypeStorageLifetime::held(Arc::new(Hold(drops.clone())));
         let original: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
         let chunk = Chunk::try_new_typed_with_columns_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(schema(), vec![original.clone()], 2, |_| Ok(()))
         .unwrap();
@@ -1227,7 +1229,7 @@ mod shared_batch_projection_tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let storage = ValueTypeStorageLifetime::held(Arc::new(Hold(drops.clone())));
         let mut chunk = Chunk::try_new_typed_with_columns_owned_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(
             schema(),
@@ -1238,7 +1240,7 @@ mod shared_batch_projection_tests {
         )
         .unwrap();
         let tracker = MemTracker::new_root("source-values-fixture");
-        chunk.accounting = Some(ChunkAccountingHandle::WholeBatch(Arc::new(
+        chunk.accounting = Some(ChunkAccountingCharge::WholeBatch(Arc::new(
             ChunkAccounting::new(12, &tracker),
         )));
         let neutral = chunk
@@ -1262,7 +1264,7 @@ mod shared_batch_projection_tests {
         let mut batches = Vec::new();
         for value in [1, 2, 3] {
             let mut chunk = Chunk::try_new_typed_with_columns_owned_observed::<
-                crate::runtime::fragment::ExecutionFailure,
+                crate::runtime::task::ExecutionFailure,
                 _,
             >(
                 schema(),
@@ -1272,7 +1274,7 @@ mod shared_batch_projection_tests {
                 |_| Ok(()),
             )
             .unwrap();
-            chunk.accounting = Some(ChunkAccountingHandle::WholeBatch(Arc::new(
+            chunk.accounting = Some(ChunkAccountingCharge::WholeBatch(Arc::new(
                 ChunkAccounting::new(4, &tracker),
             )));
             batches.push(Arc::downgrade(&chunk.batch));
@@ -1304,7 +1306,7 @@ mod shared_batch_projection_tests {
     #[test]
     fn neutral_source_storage_refusal_keeps_original_charge_and_arrays() {
         let mut chunk = Chunk::try_new_typed_with_columns_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(
             schema(),
@@ -1314,7 +1316,7 @@ mod shared_batch_projection_tests {
         )
         .unwrap();
         let tracker = MemTracker::new_root("source-values-refusal");
-        chunk.accounting = Some(ChunkAccountingHandle::WholeBatch(Arc::new(
+        chunk.accounting = Some(ChunkAccountingCharge::WholeBatch(Arc::new(
             ChunkAccounting::new(4, &tracker),
         )));
         assert!(matches!(
@@ -1336,7 +1338,7 @@ mod shared_batch_projection_tests {
         let storage = ValueTypeStorageLifetime::held(Arc::new(Hold(drops.clone())));
         let mut wrapper_requests = 0;
         let mut source = Chunk::try_new_typed_with_columns_owned_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(
             schema(),
@@ -1391,7 +1393,7 @@ mod shared_batch_projection_tests {
         let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
         let original = array.to_data();
         let result = Chunk::try_new_typed_with_columns_owned_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(
             schema(),
@@ -1400,7 +1402,7 @@ mod shared_batch_projection_tests {
             ValueTypeStorageLifetime::pure(),
             |step| {
                 if matches!(step, ArrayNormalizationStep::CreateRecordBatchWrapper) {
-                    Err(crate::runtime::fragment::ExecutionFailure::from(
+                    Err(crate::runtime::task::ExecutionFailure::from(
                         novarocks_functions::KernelFailure::Cancelled,
                     ))
                 } else {
@@ -1410,7 +1412,7 @@ mod shared_batch_projection_tests {
         );
         assert_eq!(
             result.unwrap_err(),
-            crate::runtime::fragment::ExecutionFailure::from(
+            crate::runtime::task::ExecutionFailure::from(
                 novarocks_functions::KernelFailure::Cancelled
             )
         );
@@ -1571,7 +1573,7 @@ mod shared_batch_projection_tests {
             );
             assert_eq!(
                 fact.reason(),
-                crate::runtime::fragment::ExecutionReason::ChunkBatchOccurrence.reason()
+                crate::runtime::task::ExecutionReason::ChunkBatchOccurrence.reason()
             );
             let mut original: &dyn std::error::Error = &cause;
             loop {
@@ -1594,11 +1596,10 @@ mod shared_batch_projection_tests {
         let creation =
             ValueTypeStorageLifetime::held(Arc::new(Hold(Arc::new(AtomicUsize::new(0)))));
         let batch = RecordBatch::try_new(schema.arrow_schema_ref(), vec![array.clone()]).unwrap();
-        let refusal = ConstructionFailure::Caller(Box::new(
-            crate::runtime::fragment::ExecutionFailure::from(
+        let refusal =
+            ConstructionFailure::Caller(Box::new(crate::runtime::task::ExecutionFailure::from(
                 novarocks_functions::KernelFailure::Cancelled,
-            ),
-        ));
+            )));
         let result = Chunk::try_new_typed_record_batch_owned_observed::<ConstructionFailure, _, _>(
             batch,
             schema,
@@ -1638,7 +1639,7 @@ mod shared_batch_projection_tests {
             drops: drops.clone(),
         }));
         let result = Chunk::try_new_typed_with_columns_owned_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(schema(), vec![array], 3, storage, |_| Ok(()));
         assert!(result.is_err());
@@ -1674,11 +1675,11 @@ mod shared_batch_projection_tests {
             drops: drops.clone(),
         }));
         let result = Chunk::try_new_typed_with_columns_owned_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(schema(), vec![array], 2, storage, |step| {
             if matches!(step, ArrayNormalizationStep::CreateRecordBatchWrapper) {
-                Err(crate::runtime::fragment::ExecutionFailure::from(
+                Err(crate::runtime::task::ExecutionFailure::from(
                     novarocks_functions::KernelFailure::Cancelled,
                 ))
             } else {
@@ -1687,7 +1688,7 @@ mod shared_batch_projection_tests {
         });
         assert_eq!(
             result.unwrap_err(),
-            crate::runtime::fragment::ExecutionFailure::from(
+            crate::runtime::task::ExecutionFailure::from(
                 novarocks_functions::KernelFailure::Cancelled
             )
         );
@@ -1799,7 +1800,7 @@ mod shared_batch_projection_tests {
         for refused_constructor in 0..4 {
             let owner = factory.begin_input_construction(&source).unwrap();
             let refusal = ConstructionFailure::Caller(Box::new(
-                crate::runtime::fragment::ExecutionFailure::from(
+                crate::runtime::task::ExecutionFailure::from(
                     novarocks_functions::KernelFailure::Cancelled,
                 ),
             ));
@@ -1946,7 +1947,7 @@ impl std::fmt::Display for ChunkAccessFailure {
 impl std::error::Error for ChunkAccessFailure {}
 impl novarocks_failure_contract::FailureProjection for ChunkAccessFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match self {
             Self::MissingSlot { .. } => ExecutionReason::ChunkMissingSlot,
@@ -1955,7 +1956,7 @@ impl novarocks_failure_contract::FailureProjection for ChunkAccessFailure {
         FailureFact::new(FailureClass::Invariant, reason.reason())
     }
 }
-impl From<ChunkAccessFailure> for crate::runtime::fragment::ExecutionFailure {
+impl From<ChunkAccessFailure> for crate::runtime::task::ExecutionFailure {
     fn from(cause: ChunkAccessFailure) -> Self {
         Self::from_domain(cause)
     }

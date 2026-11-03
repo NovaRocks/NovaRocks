@@ -28,15 +28,15 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{SinkKernel, SinkStep, Transform},
     step::NextStep,
-    step_context::StepContext,
 };
 
 /// Factory for terminal sinks that consume input without producing downstream output.
@@ -87,7 +87,7 @@ impl InputEncodingPolicy for NoopSinkOperator {}
 impl SinkKernel for NoopSinkOperator {
     fn consume(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<SinkStep> {
         let chunk = input.into_uncovered_chunk()?;

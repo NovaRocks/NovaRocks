@@ -369,7 +369,7 @@ fn json_object_actual_runtime_frame_uses_same_task_binding_and_fails_missing_the
             assert!(live(&snapshots(&records, &binding)).0 > 0);
         } else {
             use novarocks_execution::runtime::{
-                fragment::ExecutionFailureCause, scalar_memory::RuntimeScalarMemoryRefusal,
+                scalar_memory::RuntimeScalarMemoryRefusal, task::ExecutionFailureCause,
             };
             assert!(matches!(
                 result.unwrap_err().cause(),

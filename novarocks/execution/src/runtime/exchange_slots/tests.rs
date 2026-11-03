@@ -62,7 +62,7 @@ fn registration(query: i64, ordinal: u32, senders: u32) -> ExchangeSlotRegistrat
         .collect();
     ExchangeSlotRegistration {
         task: destination,
-        fragment_instance_id: kernel,
+        task_key: kernel,
         node,
         streams,
         grantable_unit_bytes: 64,
@@ -89,13 +89,13 @@ fn claim(
     stream: ExchangeStreamIdentity,
     n: u64,
     end: bool,
-) -> ExchangeSlotDecodeLease {
+) -> ExchangeDecodeSlotPermit {
     match instance.begin_admission(stream, unit(n, end)).unwrap() {
         ExchangeSlotAdmission::Decode(lease) => lease,
         other => panic!("expected one decode lease, got {other:?}"),
     }
 }
-fn commit(lease: ExchangeSlotDecodeLease) -> ExchangeSlotDecodeResult {
+fn commit(lease: ExchangeDecodeSlotPermit) -> ExchangeSlotDecodeResult {
     lease.finish_with(|result| result).unwrap()
 }
 fn transfer(instance: &ExchangeSlotInstance, stream: ExchangeStreamIdentity, n: u64) {
@@ -588,7 +588,7 @@ fn listener_callbacks_reenter_reads_and_retain_the_final_close_facts() {
             };
             let _ = registry.snapshot();
             let instance = registry.get(ExchangeReceiverKey {
-                fragment_instance_id: observation.stream.destination_fragment_instance_id(),
+                task_key: observation.stream.destination_task_key(),
                 node_id: observation.stream.destination_node().get(),
             });
             if observation.facts.receiver_closed.is_some() {

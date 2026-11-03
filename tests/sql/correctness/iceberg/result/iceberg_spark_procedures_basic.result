@@ -1,20 +1,20 @@
--- query 2
+-- query 3
 -- types	integer	integer
 rewritten_manifests_count	added_manifests_count
 2	1
 
--- query 3
+-- query 4
 -- types	integer	integer	bigint	bigint
 rewritten_delete_files_count	added_delete_files_count	rewritten_bytes_count	added_bytes_count
 0	0	0	0
 
--- query 5
+-- query 6
 -- types	integer	integer
 id	amount
 1	10
 2	20
 
--- query 6
+-- query 7
 -- types	bigint	bigint	bigint	bigint	bigint	bigint
 deleted_data_files_count	deleted_position_delete_files_count	deleted_equality_delete_files_count	deleted_manifest_files_count	deleted_manifest_lists_count	deleted_statistics_files_count
 NULL	NULL	NULL	NULL	NULL	NULL

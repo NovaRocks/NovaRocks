@@ -18,7 +18,7 @@
 //! Finite declarations for the existing admitted M07 fixture owners.
 use crate::scenario::ScenarioContext;
 use anyhow::{Result, ensure};
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
 use novarocks_failpoint::session::DomainGrant;
 use serde_json::json;
@@ -87,7 +87,7 @@ pub(in crate::scenarios) fn fixture_plan(
             frontend_grants.push(grant(
                 "native-observation",
                 &format!("bind-{token}-be-{index}"),
-                json!({"action":"bind-grpc-fragment", "root":root,
+                json!({"action":"bind-task-protocol", "root":root,
                     "backend_index":index, "statement_run_token":token,
                     "target_session_id":backend.session_id,
                     "target_process_receipt":backend.process_receipt}),
@@ -98,7 +98,7 @@ pub(in crate::scenarios) fn fixture_plan(
                 // Existing log readers retain their stricter byte, line and
                 // task-marker bounds. This bounds all events for this one
                 // actual statement, including lease and terminal observations.
-                json!({"action":"grpc-fragment", "root":root,
+                json!({"action":novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), "root":root,
                     "backend_index":index, "statement_run_token":token,
                     "target_session_id":backend.session_id, "max_events":256}),
             ));
@@ -228,7 +228,10 @@ mod tests {
             let grants = backend["grants"].as_array().unwrap();
             assert_eq!(grants.len(), 1);
             assert_eq!(grants[0]["domain"], "native-observation");
-            assert_eq!(grants[0]["action"], "grpc-fragment");
+            assert_eq!(
+                grants[0]["action"],
+                novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str()
+            );
         }
     }
 
@@ -294,7 +297,7 @@ mod tests {
         assert_eq!(
             grants
                 .iter()
-                .filter(|grant| grant["action"] == "bind-grpc-fragment")
+                .filter(|grant| grant["action"] == "bind-task-protocol")
                 .count(),
             6
         );

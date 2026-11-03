@@ -18,7 +18,7 @@
 //! Typed pins in the original prepaid ClaimRecord; no new holder allocation.
 use super::*;
 use crate::WorkloadProgressNotification;
-use novarocks_resource_contract::{ExistingOwnerRetentionLease, RetentionOwner, RetentionPinError};
+use novarocks_resource_contract::{ExistingOwnerRetentionPin, RetentionOwner, RetentionPinError};
 
 #[derive(Clone, Copy)]
 pub(super) enum ClaimCustody {
@@ -550,10 +550,10 @@ pub struct NativeAsyncActionGrant {
     pin: OriginalPin,
 }
 impl NativeAsyncActionGrant {
-    pub fn retain_protocol_tail(&self) -> Result<ExistingOwnerRetentionLease, RetentionPinError> {
+    pub fn retain_protocol_tail(&self) -> Result<ExistingOwnerRetentionPin, RetentionPinError> {
         let mut pin = self.pin.try_clone()?;
         let key = pin.key.take().ok_or(RetentionPinError::Released)?;
-        Ok(ExistingOwnerRetentionLease::from_existing_pin(
+        Ok(ExistingOwnerRetentionPin::from_existing_pin(
             Arc::clone(&pin.inner) as Arc<dyn RetentionOwner>,
             key,
         ))
@@ -624,10 +624,10 @@ pub struct NativeQueuedInputGrant {
     pin: OriginalPin,
 }
 impl NativeQueuedInputGrant {
-    pub fn retain_payload(&self) -> Result<ExistingOwnerRetentionLease, RetentionPinError> {
+    pub fn retain_payload(&self) -> Result<ExistingOwnerRetentionPin, RetentionPinError> {
         let mut pin = self.pin.try_clone()?;
         let key = pin.key.take().ok_or(RetentionPinError::Released)?;
-        Ok(ExistingOwnerRetentionLease::from_existing_pin(
+        Ok(ExistingOwnerRetentionPin::from_existing_pin(
             Arc::clone(&pin.inner) as Arc<dyn RetentionOwner>,
             key,
         ))
@@ -788,9 +788,9 @@ impl RetainedPayloadAlias {
     }
     /// Move this exact already-counted pin, without another Arc allocation or
     /// count increment. Neither the original owner nor its key is exposed.
-    pub fn into_retention(mut self) -> ExistingOwnerRetentionLease {
+    pub fn into_retention(mut self) -> ExistingOwnerRetentionPin {
         let key = self.pin.key.take().expect("live original payload pin");
-        ExistingOwnerRetentionLease::from_existing_pin(
+        ExistingOwnerRetentionPin::from_existing_pin(
             Arc::clone(&self.pin.inner) as Arc<dyn RetentionOwner>,
             key,
         )

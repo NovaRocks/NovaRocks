@@ -15,55 +15,62 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The Worker host owner holds the actual Context and Task inventories.
+//! The Worker host owner holds the actual Participation and Task inventories.
 //! Protocol decisions and synchronous admission stay in the registered actors;
 //! host executors borrow no mutable Core and never hold this owner while
 //! invoking a provider. Transport facades and driver composition use this same
 //! inventory. This module does not make bootstrap equivalent to Active or exit.
 
 mod directory;
-pub(crate) use directory::{ContextDirectory, ContextHostAddress};
+pub(crate) use directory::{ParticipationDirectory, ParticipationHostAddress};
 
 #[cfg(test)]
-use novarocks_control_runtime::driver::DriverError;
+use novarocks_control_runtime::actor_turn::ActorTurnError;
 
 use super::{
     actors::{WorkerAction, WorkerActor},
-    context_executors::{ContextExecutorStartError, ContextExecutorStartRefusal, ContextExecutors},
-    context_host::{ContextHostBinding, ContextHostError, ContextHostRecord, ContextHostRefusal},
     host_executor::HostExecutorLimits,
+    participation_executors::{
+        ParticipationExecutorStartError, ParticipationExecutorStartRefusal, ParticipationExecutors,
+    },
+    participation_host::{
+        ParticipationHostBinding, ParticipationHostError, ParticipationHostRecord,
+        ParticipationHostRefusal,
+    },
     process_control::RegisteredControl,
 };
 use novarocks_control_runtime::{
-    driver::{ActorRuntime, EffectTicket},
-    lease::WorkChildAuthority,
+    actor_turn::{ActorRuntime, EffectTicket},
+    obligation::WorkChildAuthority,
     transaction::RuntimeLedger,
 };
 use novarocks_control_runtime_core::identity::ActorId;
-use novarocks_execution_contract::QueryContextRef;
+use novarocks_execution_contract::ParticipationRef;
 use novarocks_worker_protocol::control::ControlEffect;
 
 #[derive(Debug)]
 pub(crate) enum ServiceHostError {
     #[cfg(test)]
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
     WrongEffect,
-    ContextAlreadyOwned,
+    ParticipationAlreadyOwned,
     ActorAlreadyOwned,
-    Context(ContextHostRefusal),
+    Participation(ParticipationHostRefusal),
 }
 
 impl std::fmt::Display for ServiceHostError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             #[cfg(test)]
-            Self::Driver(error) => write!(f, "Worker service driver failed: {error}"),
+            Self::ActorTurn(error) => write!(f, "Worker service driver failed: {error}"),
             Self::WrongEffect => f.write_str("Worker service received a different effect"),
-            Self::ContextAlreadyOwned => f.write_str("Worker service already owns this Context"),
+            Self::ParticipationAlreadyOwned => {
+                f.write_str("Worker service already owns this Participation")
+            }
             Self::ActorAlreadyOwned => f.write_str("Worker service already owns this actor"),
-            Self::Context(original) => write!(
+            Self::Participation(original) => write!(
                 f,
-                "Worker service Context admission failed: {}",
+                "Worker service Participation admission failed: {}",
                 original.error
             ),
         }
@@ -84,9 +91,9 @@ pub(crate) struct WorkerService {
     ledger: RuntimeLedger,
     control: ActorId,
     process_source_parent: WorkChildAuthority,
-    directory: ContextDirectory,
+    directory: ParticipationDirectory,
     request_positions: usize,
-    context_executors_started: bool,
+    participation_executors_started: bool,
 }
 impl WorkerService {
     pub(super) fn from_registered_control(registered: RegisteredControl) -> Self {
@@ -106,7 +113,7 @@ impl WorkerService {
         runtime: ActorRuntime<WorkerActor>,
         ledger: RuntimeLedger,
         control: ActorId,
-        actual_root_parent: &novarocks_control_runtime::lease::WorkLease,
+        actual_root_parent: &novarocks_control_runtime::obligation::WorkObligation,
     ) -> Self {
         let process_source_parent = actual_root_parent
             .child_authority()
@@ -121,12 +128,12 @@ impl WorkerService {
         process_source_parent: WorkChildAuthority,
     ) -> Self {
         Self {
-            context_executors_started: false,
+            participation_executors_started: false,
             runtime,
             ledger,
             control,
             process_source_parent,
-            directory: ContextDirectory::default(),
+            directory: ParticipationDirectory::default(),
             request_positions,
         }
     }
@@ -136,19 +143,19 @@ impl WorkerService {
     pub(crate) fn runtime(&self) -> &ActorRuntime<WorkerActor> {
         &self.runtime
     }
-    pub(crate) fn start_context_executors(
+    pub(crate) fn start_participation_executors(
         &mut self,
         materialization: HostExecutorLimits,
         cleanup: HostExecutorLimits,
         capacity: super::task_capacity::TaskCapacitySignal,
-    ) -> Result<ContextExecutors, ContextExecutorStartRefusal> {
-        if std::mem::replace(&mut self.context_executors_started, true) {
-            return Err(ContextExecutorStartRefusal {
-                error: ContextExecutorStartError::AlreadyStarted,
+    ) -> Result<ParticipationExecutors, ParticipationExecutorStartRefusal> {
+        if std::mem::replace(&mut self.participation_executors_started, true) {
+            return Err(ParticipationExecutorStartRefusal {
+                error: ParticipationExecutorStartError::AlreadyStarted,
                 owner: None,
             });
         }
-        ContextExecutors::start(
+        ParticipationExecutors::start(
             self.runtime.clone(),
             self.control,
             materialization,
@@ -157,37 +164,37 @@ impl WorkerService {
         )
     }
 
-    /// Take only a real committed Materialize effect's original Context guard.
+    /// Take only a real committed Materialize effect's original Participation guard.
     /// A refusal after binding returns the same partial resource inventory;
     /// the caller must retain it in its actual failure/cleanup owner. Shared
     /// admission-binding invariants are process failures, not query refusals.
-    pub(crate) fn adopt_context(
+    pub(crate) fn adopt_participation(
         &mut self,
         ticket: &EffectTicket<WorkerAction>,
-        binding: ContextHostBinding,
+        binding: ParticipationHostBinding,
     ) -> Result<(), ServiceHostError> {
-        let context = match &ticket.effect {
+        let participation = match &ticket.effect {
             WorkerAction::Control {
-                effect: ControlEffect::Materialize { context, .. },
+                effect: ControlEffect::Materialize { participation, .. },
                 ..
-            } if ticket.actor == self.control => *context,
+            } if ticket.actor == self.control => *participation,
             _ => return Err(ServiceHostError::WrongEffect),
         };
         // Registration and publication are one directory transaction. A host
         // poller cannot resolve the newly registered actor before its original
-        // Context cell has been published here.
+        // Participation cell has been published here.
         let mut directory = self.directory.state();
-        if directory.contexts.contains_key(&context)
+        if directory.participations.contains_key(&participation)
             || directory
                 .executions
-                .contains_key(&context.query_execution_id())
+                .contains_key(&participation.query_execution_id())
         {
-            return Err(ServiceHostError::ContextAlreadyOwned);
+            return Err(ServiceHostError::ParticipationAlreadyOwned);
         }
         if directory.actors.contains_key(&binding.actor) || binding.actor == self.control {
             return Err(ServiceHostError::ActorAlreadyOwned);
         }
-        let mut host = ContextHostRecord::adopt_with_routes(
+        let mut host = ParticipationHostRecord::adopt_with_routes(
             &self.runtime,
             &self.ledger,
             ticket,
@@ -195,56 +202,64 @@ impl WorkerService {
             self.request_positions,
             self.process_source_parent.clone(),
         )
-        .map_err(ServiceHostError::Context)?;
+        .map_err(ServiceHostError::Participation)?;
         if let Err(error) = host.register_ready() {
             let (resources, tasks) = host.into_resources();
             assert!(tasks.is_empty(), "a bootstrap has not captured Task work");
-            return Err(ServiceHostError::Context(ContextHostRefusal {
-                error: ContextHostError::Ready(error),
+            return Err(ServiceHostError::Participation(ParticipationHostRefusal {
+                error: ParticipationHostError::Ready(error),
                 resources: Some(Box::new(resources)),
             }));
         }
-        assert_eq!(host.identity(), context);
+        assert_eq!(host.identity(), participation);
         assert!(
             directory
                 .executions
-                .insert(context.query_execution_id(), context)
+                .insert(participation.query_execution_id(), participation)
                 .is_none()
         );
-        assert!(directory.actors.insert(host.actor(), context).is_none());
         assert!(
             directory
-                .contexts
-                .insert(context, ContextHostAddress::new(host))
+                .actors
+                .insert(host.actor(), participation)
+                .is_none()
+        );
+        assert!(
+            directory
+                .participations
+                .insert(participation, ParticipationHostAddress::new(host))
                 .is_none()
         );
         Ok(())
     }
 
-    pub(crate) fn directory(&self) -> ContextDirectory {
+    pub(crate) fn directory(&self) -> ParticipationDirectory {
         self.directory.clone()
     }
-    pub(crate) fn context(&self, context: QueryContextRef) -> Option<ContextHostAddress> {
-        self.directory.context(context)
+    pub(crate) fn participation(
+        &self,
+        participation: ParticipationRef,
+    ) -> Option<ParticipationHostAddress> {
+        self.directory.participation(participation)
     }
     /// Move the original owner for component tests which directly hold its
     /// removal effect. The returned owner retains all physical obligations.
     #[cfg(test)]
-    pub(crate) fn take_removing_context(
+    pub(crate) fn take_removing_participation(
         &mut self,
         ticket: &EffectTicket<WorkerAction>,
-    ) -> Result<Option<ContextHostRecord>, ServiceHostError> {
+    ) -> Result<Option<ParticipationHostRecord>, ServiceHostError> {
         self.runtime
             .validate_effect_ticket(ticket)
-            .map_err(ServiceHostError::Driver)?;
-        let context = match &ticket.effect {
+            .map_err(ServiceHostError::ActorTurn)?;
+        let participation = match &ticket.effect {
             WorkerAction::Control {
-                effect: ControlEffect::RemoveHost { context },
+                effect: ControlEffect::RemoveHost { participation },
                 ..
-            } if ticket.actor == self.control => *context,
+            } if ticket.actor == self.control => *participation,
             _ => return Err(ServiceHostError::WrongEffect),
         };
-        let Some(address) = self.context(context) else {
+        let Some(address) = self.participation(participation) else {
             return Ok(None);
         };
         let owner = address.take();

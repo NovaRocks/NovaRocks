@@ -31,7 +31,7 @@ struct Starting {
     engine: RequestScopedMaintenanceEngine,
     target: MaintenanceTarget,
     intent: RewriteIntent,
-    lease: ConnectorDistributedRewriteLease,
+    rewrite: SharedConnectorDistributedRewrite,
     product: Arc<TableMaintenanceProduct>,
     dependencies: Vec<novarocks_spi::connector::SharedDependency>,
     #[cfg(novarocks_dev_controls)]
@@ -40,7 +40,7 @@ struct Starting {
 // The F borrows this exact immutable input; cancellation never moves its
 // unique target/product facts into an otherwise unobserved async frame.
 struct DirectInput {
-    lease: ConnectorDistributedRewriteLease,
+    rewrite: SharedConnectorDistributedRewrite,
     engine: RequestScopedMaintenanceEngine,
     target: MaintenanceTarget,
     intent: RewriteIntent,
@@ -115,16 +115,16 @@ pub(crate) fn prepare(
     }
     let identity = RequestScopedMaintenanceEngine::target_identity(&target)
         .map_err(TerminalError::pre_dispatch_failed)?;
-    let lease = kernel
+    let rewrite = kernel
         .connector_control()
         .acquire_current_distributed_rewrite(&identity.instance_id)
         .map_err(TerminalError::from_original_cause)?;
-    let mut dependencies = lease
+    let mut dependencies = rewrite
         .planning_initial_dependencies()
         .map_err(TerminalError::from_original_cause)?;
     let write = kernel
         .typed_connector_control()
-        .acquire_exact_write_stack(lease.planning_lease().control_runtime_id())
+        .acquire_exact_write_stack(rewrite.planning_pin().control_runtime_id())
         .map_err(TerminalError::from_original_cause)?;
     extend_original_dependencies(
         &mut dependencies,
@@ -145,7 +145,7 @@ pub(crate) fn prepare(
             engine,
             target,
             intent,
-            lease,
+            rewrite,
             product,
             dependencies,
             #[cfg(novarocks_dev_controls)]
@@ -181,7 +181,7 @@ async fn run_direct_product(
         .engine
         .reject_direct_rewrite_on_mv_governed(
             &input.target,
-            &input.lease.planning_lease(),
+            &input.rewrite.planning_pin(),
             binding_cpu,
         )
         .await
@@ -262,7 +262,7 @@ impl DirectRewriteAction {
         let domain = form_original_domain(
             original.engine.clone(),
             owner.scope().clone(),
-            original.lease.clone(),
+            original.rewrite.clone(),
             io.clone(),
             &original.target,
             #[cfg(novarocks_dev_controls)]
@@ -275,7 +275,7 @@ impl DirectRewriteAction {
             .engine
             .clone();
         let input = Arc::new(DirectInput {
-            lease: original.lease.clone(),
+            rewrite: original.rewrite.clone(),
             engine: retained_engine,
             target: original.target.clone(),
             intent: original.intent.clone(),

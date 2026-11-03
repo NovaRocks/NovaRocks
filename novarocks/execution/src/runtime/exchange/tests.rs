@@ -67,11 +67,11 @@ use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_types::{SlotId, UniqueId};
 use std::io::Write as _;
 
-use crate::runtime::fragment::io::exchange_unit::{
+use crate::runtime::runtime_state::RuntimeErrorState;
+use crate::runtime::task::io::exchange_unit::{
     ExchangeAdmissionVerdict, ExchangeDemandEntry, ExchangeDemandOperation, ExchangeUnitDemand,
     ExchangeUnitItem, ExchangeUnitReceiverFrame,
 };
-use crate::runtime::runtime_state::RuntimeErrorState;
 use crate::runtime::task_control::test_support::Owner;
 use bytes::Bytes;
 use novarocks_execution_contract::ordered_retained_stream::exchange::ExchangeUnitSequence;
@@ -84,7 +84,7 @@ use novarocks_types::{StageId, TaskId};
 /// Explicit fixture declarations author these values; production never learns
 /// semantics from a first payload or Arrow annotations.
 pub(super) fn online_unit_as(chunk: &Chunk, expected: &ChunkSchemaRef) -> Vec<u8> {
-    let factory = crate::runtime::fragment::exchange::test_receiver_creation_factory();
+    let factory = crate::runtime::task::exchange::test_receiver_creation_factory();
     let owner = factory.begin_typed_construction(expected).unwrap();
     let wire = ExchangeWireMeta {
         slot_ids_by_index: chunk
@@ -152,7 +152,7 @@ fn compiled_recipe_ignores_root_aliases_but_preserves_logical_nullability() {
         )
         .unwrap()
     };
-    let factory = crate::runtime::fragment::exchange::test_receiver_creation_factory();
+    let factory = crate::runtime::task::exchange::test_receiver_creation_factory();
     let sender_schema = factory
         .create_compiled_chunk_schema(&layout("sender_id", 17, 101, false))
         .unwrap();
@@ -239,11 +239,11 @@ fn required_wire_schema(nullable: bool) -> ChunkSchemaRef {
 fn receiver_uses_required_wire_recipe_and_nullable_local_schema() {
     let wire = required_wire_schema(false);
     let local = required_wire_schema(true);
-    let factory = crate::runtime::fragment::exchange::test_receiver_creation_factory();
+    let factory = crate::runtime::task::exchange::test_receiver_creation_factory();
     let registry = Arc::new(ExecutionExchangeRegistry::default());
     let key = ExchangeKey {
-        finst_id_hi: 88011,
-        finst_id_lo: 88012,
+        task_key_hi: 88011,
+        task_key_lo: 88012,
         node_id: 3,
     };
     registry
@@ -257,7 +257,7 @@ fn receiver_uses_required_wire_recipe_and_nullable_local_schema() {
     fixture.register(&frame);
     fixture.receive(frame).unwrap();
     let decoded = fixture
-        .handle()
+        .receiver_pin()
         .try_pop_next_with_stats(1)
         .unwrap()
         .unwrap();
@@ -280,11 +280,11 @@ fn receiver_uses_required_wire_recipe_and_nullable_local_schema() {
 fn receiver_rejects_narrowing_before_registration_and_changed_duplicate_wire() {
     let required = required_wire_schema(false);
     let nullable = required_wire_schema(true);
-    let factory = crate::runtime::fragment::exchange::test_receiver_creation_factory();
+    let factory = crate::runtime::task::exchange::test_receiver_creation_factory();
     let registry = ExecutionExchangeRegistry::default();
     let key = ExchangeKey {
-        finst_id_hi: 88013,
-        finst_id_lo: 88014,
+        task_key_hi: 88013,
+        task_key_lo: 88014,
         node_id: 3,
     };
     let error = registry
@@ -376,8 +376,8 @@ fn first_and_later_recipe_construction_refusals_leave_no_receiver() {
         });
         let registry = ExecutionExchangeRegistry::default();
         let key = ExchangeKey {
-            finst_id_hi: 88015,
-            finst_id_lo: refuse_at as i64,
+            task_key_hi: 88015,
+            task_key_lo: refuse_at as i64,
             node_id: 3,
         };
         let error = registry
@@ -439,7 +439,7 @@ impl UnitFixture {
         Self::with_factory(
             schema,
             senders,
-            crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+            crate::runtime::task::exchange::test_receiver_creation_factory(),
         )
     }
     fn with_factory(
@@ -460,8 +460,8 @@ impl UnitFixture {
         .unwrap();
         let registry = Arc::new(ExecutionExchangeRegistry::with_flow_limits(limits));
         let key = ExchangeKey {
-            finst_id_hi: 88001,
-            finst_id_lo: 88002,
+            task_key_hi: 88001,
+            task_key_lo: 88002,
             node_id: 3,
         };
         registry
@@ -498,7 +498,7 @@ impl UnitFixture {
                         ordinal as u32,
                     ),
                     destination,
-                    UniqueId::new(key.finst_id_hi, key.finst_id_lo),
+                    UniqueId::new(key.task_key_hi, key.task_key_lo),
                     FragmentNodeId::new(key.node_id),
                 )
                 .unwrap()
@@ -573,15 +573,13 @@ impl UnitFixture {
     fn receive(
         &self,
         frame: ExchangeUnitReceiverFrame,
-    ) -> Result<
-        crate::runtime::fragment::io::exchange_unit::ExchangeUnitReceipt,
-        super::ExchangeFailure,
-    > {
+    ) -> Result<crate::runtime::task::io::exchange_unit::ExchangeUnitReceipt, super::ExchangeFailure>
+    {
         self.registry.receive_unit(self.key, frame)
     }
-    fn handle(&self) -> super::ExchangeReceiverHandle {
+    fn receiver_pin(&self) -> super::ExchangeReceiverPin {
         self.registry
-            .get_receiver_handle(self.key, self.streams.len())
+            .get_receiver_pin(self.key, self.streams.len())
             .unwrap()
     }
     fn slots(&self) -> crate::runtime::exchange_slots::ExchangeSlotInstance {
@@ -1365,8 +1363,8 @@ fn m07_root_ipc_preserves_large_string_dictionary_without_changing_exchange_admi
         decoded[0].columns()[0].data_type()
     );
     let key = ExchangeKey {
-        finst_id_hi: 1703,
-        finst_id_lo: 1704,
+        task_key_hi: 1703,
+        task_key_lo: 1704,
         node_id: 78,
     };
     register_expected_chunk_schema(
@@ -1388,8 +1386,8 @@ fn m07_root_ipc_preserves_large_string_dictionary_without_changing_exchange_admi
 #[test]
 fn decode_chunks_for_sender_preserves_dictionary_carrier_with_logical_expected_schema() {
     let key = ExchangeKey {
-        finst_id_hi: 1701,
-        finst_id_lo: 1702,
+        task_key_hi: 1701,
+        task_key_lo: 1702,
         node_id: 77,
     };
     let chunk = dictionary_status_chunk(
@@ -1499,8 +1497,8 @@ fn encode_chunks_round_trip_zero_column_row_count() {
 #[test]
 fn encode_chunks_normalizes_runtime_nullable_widening() {
     let key = ExchangeKey {
-        finst_id_hi: 299,
-        finst_id_lo: 300,
+        task_key_hi: 299,
+        task_key_lo: 300,
         node_id: 27,
     };
     let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
@@ -1620,8 +1618,8 @@ fn decode_root_result_chunks_rejects_decimal_precision_drift() {
 #[test]
 fn decode_chunks_for_sender_rejects_decimal_precision_drift() {
     let key = ExchangeKey {
-        finst_id_hi: 601,
-        finst_id_lo: 602,
+        task_key_hi: 601,
+        task_key_lo: 602,
         node_id: 33,
     };
     let expected_schema = Arc::new(
@@ -1839,8 +1837,8 @@ fn native_exchange_publication_retains_descriptor_metadata_ownership() {
     assert!(borrowed_root_chunk_storage(&original, limits).is_err());
     let payload = online_unit(&[original], true).unwrap();
     let key = ExchangeKey {
-        finst_id_hi: 91_735,
-        finst_id_lo: 91_736,
+        task_key_hi: 91_735,
+        task_key_lo: 91_736,
         node_id: 73,
     };
     let expected = plain_declaration(&expected);
@@ -1851,7 +1849,7 @@ fn native_exchange_publication_retains_descriptor_metadata_ownership() {
             1,
             (Arc::clone(&expected)).clone(),
             Arc::clone(&expected),
-            crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+            crate::runtime::task::exchange::test_receiver_creation_factory(),
         )
         .unwrap();
     let decoded = registry
@@ -2011,8 +2009,8 @@ fn encode_chunks_rejects_slot_id_mismatch() {
 #[test]
 fn decode_chunks_for_sender_uses_slot_id_map_without_field_metadata() {
     let key = ExchangeKey {
-        finst_id_hi: 99,
-        finst_id_lo: 100,
+        task_key_hi: 99,
+        task_key_lo: 100,
         node_id: 7,
     };
 
@@ -2051,8 +2049,8 @@ fn decode_chunks_for_sender_uses_slot_id_map_without_field_metadata() {
 #[test]
 fn decode_chunks_for_sender_rejects_partial_expected_schema_match() {
     let key = ExchangeKey {
-        finst_id_hi: 1099,
-        finst_id_lo: 1100,
+        task_key_hi: 1099,
+        task_key_lo: 1100,
         node_id: 77,
     };
     let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
@@ -2091,8 +2089,8 @@ fn decode_chunks_for_sender_rejects_partial_expected_schema_match() {
 #[test]
 fn decode_chunks_for_sender_accepts_runtime_nullable_widening() {
     let key = ExchangeKey {
-        finst_id_hi: 199,
-        finst_id_lo: 200,
+        task_key_hi: 199,
+        task_key_lo: 200,
         node_id: 17,
     };
     let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
@@ -2149,8 +2147,8 @@ fn decode_chunks_for_sender_rejects_numeric_for_opaque_descriptor() {
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 
     let key = ExchangeKey {
-        finst_id_hi: 501,
-        finst_id_lo: 502,
+        task_key_hi: 501,
+        task_key_lo: 502,
         node_id: 31,
     };
 
@@ -2197,8 +2195,8 @@ fn decode_chunks_for_sender_rejects_numeric_for_opaque_descriptor() {
 #[test]
 fn decode_chunks_for_sender_decodes_with_wire_meta_before_schema_registration() {
     let key = ExchangeKey {
-        finst_id_hi: 201,
-        finst_id_lo: 202,
+        task_key_hi: 201,
+        task_key_lo: 202,
         node_id: 19,
     };
     let payload = online_unit(&[exchange_test_chunk("_cse_0")], true).expect("encode");
@@ -2234,7 +2232,8 @@ fn installed_expected_schema_retags_queued_wire_chunks() {
     let frame = f.frame(0, 1, online_unit(&[source], true).unwrap(), false);
     f.register(&frame);
     f.receive(frame).unwrap();
-    let Some(ExchangePopResult::Chunk(chunk)) = f.handle().try_pop_next_with_stats(1).unwrap()
+    let Some(ExchangePopResult::Chunk(chunk)) =
+        f.receiver_pin().try_pop_next_with_stats(1).unwrap()
     else {
         panic!("expected queued chunk")
     };
@@ -2250,7 +2249,8 @@ fn installed_expected_schema_preserves_queued_zero_column_row_count() {
     let frame = f.frame(0, 1, online_unit(&[chunk], true).unwrap(), false);
     f.register(&frame);
     f.receive(frame).unwrap();
-    let Some(ExchangePopResult::Chunk(chunk)) = f.handle().try_pop_next_with_stats(1).unwrap()
+    let Some(ExchangePopResult::Chunk(chunk)) =
+        f.receiver_pin().try_pop_next_with_stats(1).unwrap()
     else {
         panic!("expected queued zero-column chunk")
     };
@@ -2402,8 +2402,8 @@ fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
     let registry = Arc::new(ExecutionExchangeRegistry::default());
 
     let positional = ExchangeKey {
-        finst_id_hi: 601,
-        finst_id_lo: 602,
+        task_key_hi: 601,
+        task_key_lo: 602,
         node_id: 3,
     };
     registry
@@ -2413,7 +2413,7 @@ fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
             (Arc::clone(&expected)).clone(),
             Arc::clone(&expected),
             ExchangeColumnBinding::Positional,
-            crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+            crate::runtime::task::exchange::test_receiver_creation_factory(),
         )
         .expect("register positional receiver");
     let decoded = registry
@@ -2452,16 +2452,17 @@ fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
             (Arc::clone(&expected)).clone(),
             Arc::clone(&expected),
             ExchangeColumnBinding::Positional,
-            crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+            crate::runtime::task::exchange::test_receiver_creation_factory(),
         )
         .expect("late positional registration");
     let unit = UnitFixture::bind_registered(registry.clone(), late, 1);
     let frame = unit.frame(0, 1, payload.clone(), false);
     unit.register(&frame);
     unit.receive(frame).unwrap();
-    let handle = unit.handle();
-    let Some(ExchangePopResult::Chunk(retagged)) =
-        handle.try_pop_next_with_stats(1).expect("pop queued chunk")
+    let receiver_pin = unit.receiver_pin();
+    let Some(ExchangePopResult::Chunk(retagged)) = receiver_pin
+        .try_pop_next_with_stats(1)
+        .expect("pop queued chunk")
     else {
         panic!("expected the queued chunk");
     };
@@ -2482,7 +2483,7 @@ fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
             1,
             expected.clone(),
             expected.clone(),
-            crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+            crate::runtime::task::exchange::test_receiver_creation_factory(),
         )
         .unwrap();
     let decoded = registry
@@ -2497,7 +2498,7 @@ fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
                 1,
                 (expected).clone(),
                 expected,
-                crate::runtime::fragment::exchange::test_receiver_creation_factory()
+                crate::runtime::task::exchange::test_receiver_creation_factory()
             )
             .unwrap_err()
             .to_string()
@@ -2636,12 +2637,17 @@ fn native_exchange_decode_failure_does_not_advance_and_unit_replays_are_idempote
     assert_eq!(reordered.receive(second).unwrap().facts.custody_through, 0);
     assert!(
         reordered
-            .handle()
+            .receiver_pin()
             .try_pop_next_with_stats(1)
             .unwrap()
             .is_none()
     );
-    assert!(reordered.handle().complete_input_consumption(1).is_err());
+    assert!(
+        reordered
+            .receiver_pin()
+            .complete_input_consumption(1)
+            .is_err()
+    );
     assert_eq!(reordered.receive(first).unwrap().facts.custody_through, 2);
     assert_eq!(
         reordered
@@ -2689,28 +2695,29 @@ fn native_exchange_consumed_requires_source_exhaustion_and_retains_final_data_en
     let stream = frame.stream;
     f.register(&frame);
     f.receive(frame).unwrap();
-    let handle = f.handle();
-    assert!(handle.has_output_or_finished(1));
+    let receiver_pin = f.receiver_pin();
+    assert!(receiver_pin.has_output_or_finished(1));
     assert_eq!(
         f.registry.stream_close_facts(f.key, &[stream]).unwrap()[0].disposition,
         ExchangeCloseDisposition::Withdrawn
     );
-    assert!(handle.complete_input_consumption(1).is_err());
-    let Some(SourcedExchangePopResult::Chunk(data)) = handle.try_pop_sourced_with_stats(1).unwrap()
+    assert!(receiver_pin.complete_input_consumption(1).is_err());
+    let Some(SourcedExchangePopResult::Chunk(data)) =
+        receiver_pin.try_pop_sourced_with_stats(1).unwrap()
     else {
         panic!("source data is retained")
     };
     assert_eq!(data.source(), Some(stream.source()));
     assert_eq!(data.len(), chunk.len());
     assert!(matches!(
-        handle.try_pop_sourced_with_stats(1).unwrap(),
+        receiver_pin.try_pop_sourced_with_stats(1).unwrap(),
         Some(SourcedExchangePopResult::Finished(_))
     ));
     assert_eq!(
         f.registry.stream_close_facts(f.key, &[stream]).unwrap()[0].disposition,
         ExchangeCloseDisposition::Withdrawn
     );
-    handle.complete_input_consumption(1).unwrap();
+    receiver_pin.complete_input_consumption(1).unwrap();
     assert_eq!(
         f.registry.stream_close_facts(f.key, &[stream]).unwrap()[0].disposition,
         ExchangeCloseDisposition::Consumed {
@@ -2730,7 +2737,7 @@ fn native_exchange_empty_end_is_consumed_only_at_input_exhaustion() {
         f.registry.stream_close_facts(f.key, &[stream]).unwrap()[0].disposition,
         ExchangeCloseDisposition::Withdrawn
     );
-    f.handle().complete_input_consumption(1).unwrap();
+    f.receiver_pin().complete_input_consumption(1).unwrap();
     assert_eq!(
         f.registry.stream_close_facts(f.key, &[stream]).unwrap()[0].disposition,
         ExchangeCloseDisposition::Consumed {
@@ -2850,7 +2857,7 @@ fn paused_decoder_fixture(
     let (entered, observed) = std::sync::mpsc::channel();
     let (release, released) = std::sync::mpsc::channel();
     let factory = Arc::new(PausedDecoderFactory {
-        inner: crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+        inner: crate::runtime::task::exchange::test_receiver_creation_factory(),
         armed: std::sync::atomic::AtomicBool::new(false),
         entered,
         release: std::sync::Mutex::new(released),
@@ -2867,7 +2874,7 @@ fn paused_decoder_fixture(
             .decode_chunks_for_sender(
                 f.key,
                 ExchangeSenderIdentity::native(
-                    stream.source().fragment_instance_id(),
+                    stream.source().task_key(),
                     stream.source().sender_ordinal(),
                 ),
                 &full,

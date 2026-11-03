@@ -207,11 +207,11 @@ fn ds_hll_local_stage_after_actual_partial_and_final_cancel_first_cause_no_repla
         processor.input_without_output(first.clone()).unwrap();
         assert!(tracker.current() > 0);
         let originating =
-            crate::runtime::fragment::ExecutionFailure::from(KernelFailure::ResourceExhausted);
+            crate::runtime::task::ExecutionFailure::from(KernelFailure::ResourceExhausted);
         phase.error.set_error(originating.clone());
         let primary = processor.input_without_output(first.clone()).unwrap_err();
         assert!(primary.same_occurrence(&originating));
-        assert_eq!(primary.context(), originating.context());
+        assert_eq!(primary.site(), originating.site());
         // The local driver preserves its already known originating cause.
         assert!(phase.error.error().unwrap().same_occurrence(&originating));
         assert_eq!(tracker.current(), creator_bytes);

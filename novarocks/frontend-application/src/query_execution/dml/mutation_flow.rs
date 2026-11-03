@@ -155,7 +155,7 @@ enum DmlRowMutationEffectSet {
 /// statement opens its write session or activates its copy-on-write plan.
 #[derive(Clone)]
 pub(crate) struct DmlChangeStreamPreparations {
-    _lease: novarocks_spi::connector::ConnectorWriteLease,
+    _write: novarocks_spi::connector::ConnectorWrite,
     preparation: novarocks_spi::connector::ConnectorRowMutationPreparation,
 }
 
@@ -178,7 +178,7 @@ impl DmlChangeStreamPreparations {
         let (lease, preparation) =
             target.prepare_row_mutation(target_ref, operation_id, intent, context)?;
         Ok(Self {
-            _lease: lease,
+            _write: lease,
             preparation,
         })
     }
@@ -190,11 +190,11 @@ impl DmlChangeStreamPreparations {
     /// than asking the provider again, so one statement never carries two base
     /// versions or two digests.
     const fn from_signed(
-        lease: novarocks_spi::connector::ConnectorWriteLease,
+        lease: novarocks_spi::connector::ConnectorWrite,
         preparation: novarocks_spi::connector::ConnectorRowMutationPreparation,
     ) -> Self {
         Self {
-            _lease: lease,
+            _write: lease,
             preparation,
         }
     }
@@ -319,7 +319,7 @@ fn change_stream_routed_targets(
 fn bind_change_stream_routes(
     target: &crate::catalog_application::resolver::TargetBackend,
     write_session: &ConnectorWriteSession,
-    write_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    write_planning_pin: &novarocks_spi::connector::ConnectorControlPlanningPin,
     table_bindings: &QueryTableBindingStore,
 ) -> Result<
     (
@@ -347,7 +347,7 @@ fn bind_change_stream_routes(
                 target.table.clone(),
             ),
             write_target,
-            write_planning_lease.clone(),
+            write_planning_pin.clone(),
         )?;
         let mode = match write_target.input() {
             ConnectorWriteInputShape::Data { .. } => DmlWriteSinkMode::Data,
@@ -541,7 +541,7 @@ pub(crate) struct PreparedUpdateMutation {
     pub(crate) target_columns: Vec<novarocks_types::schema::ColumnDef>,
     pub(crate) target_ref: String,
     /// The one exact connector generation admitted with this statement.
-    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    pub(crate) planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     /// The one write lease this statement will use, derived once here.
     ///
     /// `derive_write_lease` mints a fresh fence cell on every call, so deriving
@@ -549,7 +549,7 @@ pub(crate) struct PreparedUpdateMutation {
     /// through. Deriving once at preparation lets the coordinator establish the
     /// external fence before any writer is dispatched, and staging reuses the
     /// same authority.
-    pub(crate) write_lease: novarocks_spi::connector::ConnectorWriteLease,
+    pub(crate) write: novarocks_spi::connector::ConnectorWrite,
     pub(crate) cow_preparations: Option<DmlChangeStreamPreparations>,
     pub(crate) mor_preparations: Option<DmlChangeStreamPreparations>,
     /// The physical route the provider signed for this statement. Kept as the
@@ -569,7 +569,7 @@ pub(crate) struct PreparedMergeMutation {
     /// See [`PreparedUpdateMutation::mode`].
     pub(crate) table_write_mode: novarocks_spi::connector::ConnectorRowMutationStrategy,
     /// The one exact connector generation admitted with this statement.
-    pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    pub(crate) planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     /// The one write lease this statement will use, derived once here.
     ///
     /// `derive_write_lease` mints a fresh fence cell on every call, so deriving
@@ -577,7 +577,7 @@ pub(crate) struct PreparedMergeMutation {
     /// through. Deriving once at preparation lets the coordinator establish the
     /// external fence before any writer is dispatched, and staging reuses the
     /// same authority.
-    pub(crate) write_lease: novarocks_spi::connector::ConnectorWriteLease,
+    pub(crate) write: novarocks_spi::connector::ConnectorWrite,
     pub(crate) cow_preparations: Option<DmlChangeStreamPreparations>,
     pub(crate) mor_preparations: Option<DmlChangeStreamPreparations>,
     pub(crate) insert_columns_resolved: Option<MergeInsertColumns>,
@@ -859,7 +859,7 @@ fn finish_update_mutation_preparation(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
 ) -> Result<PreparedUpdateMutation, String> {
-    let planning_lease = target_binding.lease().clone();
+    let planning_pin = target_binding.planning_pin().clone();
     // Validate assignments against the Provider's exact target declaration.
     // Partition columns are ordinary target values: the signed strategy keeps
     // old-file deletion separate from partitioning the replacement after-image.
@@ -906,7 +906,7 @@ fn finish_update_mutation_preparation(
         } else {
             None
         };
-    let write_lease = planning_lease
+    let write = planning_pin
         .derive_write_lease()
         .map_err(|error| format!("derive UPDATE write lease: {error}"))?;
     Ok(PreparedUpdateMutation {
@@ -915,8 +915,8 @@ fn finish_update_mutation_preparation(
         target,
         target_columns,
         target_ref,
-        planning_lease,
-        write_lease,
+        planning_pin,
+        write,
         cow_preparations,
         mor_preparations,
         mode,
@@ -926,7 +926,7 @@ fn finish_update_mutation_preparation(
 }
 
 /// Resolve and validate MERGE without materializing source rows, registering a
-/// cohort, or creating a staging artifact. It retains one exact planning lease
+/// cohort, or creating a staging artifact. It retains one exact planning pin
 /// for every later read or writer admission.
 pub(super) fn resolve_merge_target(
     state: &DmlExecutionKernel,
@@ -979,7 +979,7 @@ fn finish_merge_mutation_preparation(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
 ) -> Result<PreparedMergeMutation, String> {
-    let planning_lease = target_binding.lease().clone();
+    let planning_pin = target_binding.planning_pin().clone();
     // The clause composition is a statement fact; what it implies physically is
     // not. A MERGE that can delete matched rows needs merge-on-read even on a
     // copy-on-write table, and that rule now lives with the provider, which
@@ -1039,7 +1039,7 @@ fn finish_merge_mutation_preparation(
     } else {
         None
     };
-    let write_lease = planning_lease
+    let write = planning_pin
         .derive_write_lease()
         .map_err(|error| format!("derive MERGE write lease: {error}"))?;
     Ok(PreparedMergeMutation {
@@ -1049,8 +1049,8 @@ fn finish_merge_mutation_preparation(
         target_columns,
         target_ref,
         table_write_mode,
-        planning_lease,
-        write_lease,
+        planning_pin,
+        write,
         cow_preparations,
         mor_preparations,
         insert_columns_resolved,
@@ -1331,8 +1331,8 @@ fn begin_cow_write_session(
     target: &crate::catalog_application::resolver::TargetBackend,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
     selection: novarocks_spi::connector::ConnectorRowMutationSelection,
-    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
-    write_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    write: &novarocks_spi::connector::ConnectorWrite,
+    write_planning_pin: &novarocks_spi::connector::ConnectorControlPlanningPin,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Arc<ConnectorWriteSession>, CowFailure> {
@@ -1341,7 +1341,7 @@ fn begin_cow_write_session(
         target,
         preparation,
         selection,
-        write_planning_lease,
+        write_planning_pin,
         execution,
         connector_context,
     )?;
@@ -1351,8 +1351,8 @@ fn begin_cow_write_session(
     ));
     let result = futures::executor::block_on(
         crate::query_execution::write_session::begin_cow_connector_write_session_async_in(
-            input.lease,
-            write_lease,
+            input.write_stack_pin,
+            write,
             input.request,
             input.original,
             &receiving,
@@ -1364,7 +1364,7 @@ fn begin_cow_write_session(
 }
 
 struct CowBeginInput {
-    lease: novarocks_catalog_application::ConnectorWriteStackLease,
+    write_stack_pin: novarocks_catalog_application::ConnectorWriteStackPin,
     request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
     original: novarocks_spi::connector::ConnectorOriginalResultScope,
 }
@@ -1374,7 +1374,7 @@ fn prepare_cow_begin_input(
     target: &crate::catalog_application::resolver::TargetBackend,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
     selection: novarocks_spi::connector::ConnectorRowMutationSelection,
-    write_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    write_planning_pin: &novarocks_spi::connector::ConnectorControlPlanningPin,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<CowBeginInput, CowFailure> {
@@ -1443,8 +1443,8 @@ fn prepare_cow_begin_input(
             context: connector_context.clone(),
         };
         Ok(CowBeginInput {
-            lease: state.typed_connector_control()
-                .acquire_exact_write_stack(write_planning_lease.control_runtime_id())
+            write_stack_pin: state.typed_connector_control()
+                .acquire_exact_write_stack(write_planning_pin.control_runtime_id())
                 .map_err(CowFailure::lease)?,
             request,
             original: original_scope,
@@ -1486,7 +1486,7 @@ struct CowTargetWritePlan {
 struct CowUpdateDistributedWrite {
     targets: Vec<CowTargetWritePlan>,
     write_session: Arc<ConnectorWriteSession>,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
 }
 
 /// Compile one query per sealed target of an already-opened copy-on-write
@@ -1554,7 +1554,7 @@ fn build_cow_update_distributed_write(
     constant_policy: novarocks_functions::ConstantPolicy,
     compile_control: &dyn novarocks_type_contract::PureCompileControl,
     target: &crate::catalog_application::resolver::TargetBackend,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
     write_session: Arc<ConnectorWriteSession>,
 ) -> Result<CowUpdateDistributedWrite, crate::dml::error::DmlExecutionError> {
@@ -1697,7 +1697,7 @@ fn build_cow_update_distributed_write(
                             "copy-on-write source lost its original provider read receipt",
                         ))
                     })?),
-                    planning_lease: planning_lease.clone(),
+                    planning_pin: planning_pin.clone(),
                     _original: Some(original.clone()),
                 };
                 (
@@ -1744,7 +1744,7 @@ fn build_cow_update_distributed_write(
     Ok(CowUpdateDistributedWrite {
         targets,
         write_session,
-        planning_lease,
+        planning_pin,
     })
 }
 
@@ -2153,7 +2153,7 @@ fn build_cow_rewrite_query(
 fn prepare_cow_target_binding(
     target: &crate::catalog_application::resolver::TargetBackend,
     plan: &CowTargetWritePlan,
-    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: &novarocks_spi::connector::ConnectorControlPlanningPin,
     write_session: &Arc<ConnectorWriteSession>,
 ) -> Result<
     (
@@ -2194,7 +2194,7 @@ fn prepare_cow_target_binding(
             target.table.clone(),
         ),
         write_target,
-        planning_lease.clone(),
+        planning_pin.clone(),
     )?;
     let sink_mode = match &plan.input {
         novarocks_spi::connector::ConnectorWriteInputShape::Data { .. } => DmlWriteSinkMode::Data,
@@ -5139,7 +5139,7 @@ mod tests {
             }
             fn cleanup_responsibility(
                 &self,
-                _commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle,
+                _commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitSession,
             ) -> Result<
                 novarocks_spi::connector::ConnectorMetadataCleanupResponsibility,
                 novarocks_spi::connector::ConnectorError,
@@ -5378,7 +5378,7 @@ mod tests {
                 // This is the actual accepted request -> retained result alias cut.
                 // No binding, window alias, or test guard is retained by this port.
                 ws::ConnectorWriteSessionPlan::try_copy_on_write(
-                    self.adapter.wrap_commit_handle(FakeRowMutationCommit),
+                    self.adapter.wrap_commit_session(FakeRowMutationCommit),
                     vec![target],
                     selection.clone(),
                     match_contract.clone(),
@@ -5412,8 +5412,8 @@ mod tests {
             entered: Arc<Mutex<Vec<[usize; 4]>>>,
         ) -> (
             novarocks_catalog_application::ConnectorControlHost,
-            spi::ConnectorControlPlanningLease,
-            novarocks_catalog_application::ConnectorWriteStackLease,
+            spi::ConnectorControlPlanningPin,
+            novarocks_catalog_application::ConnectorWriteStackPin,
             spi::CatalogProperties,
         ) {
             cow_consumer_generation_with_begin_failure(fixture, capacity, entered, None, None)
@@ -5427,8 +5427,8 @@ mod tests {
             capture: Option<Arc<Mutex<Option<ws::ConnectorWriteBeginRequest>>>>,
         ) -> (
             novarocks_catalog_application::ConnectorControlHost,
-            spi::ConnectorControlPlanningLease,
-            novarocks_catalog_application::ConnectorWriteStackLease,
+            spi::ConnectorControlPlanningPin,
+            novarocks_catalog_application::ConnectorWriteStackPin,
             spi::CatalogProperties,
         ) {
             let generic_seed =
@@ -5517,7 +5517,7 @@ mod tests {
             binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
             context: spi::ConnectorRequestContext,
         ) -> spi::ConnectorRowMutationSelection {
-            use novarocks_execution::runtime::fragment::ExecutionFailure;
+            use novarocks_execution::runtime::task::ExecutionFailure;
             use novarocks_native_adapter::root_cow_selection_codec::{
                 CowSelectionEncoder, CowSelectionTotals,
             };
@@ -5718,9 +5718,8 @@ mod tests {
                         Some(captured.clone()),
                     );
                 let host = Arc::new(host);
-                let write_lease = planning.derive_write_lease().unwrap();
-                let same_runtime = write_lease.control_runtime_id()
-                    == planning.control_runtime_id()
+                let write = planning.derive_write_lease().unwrap();
+                let same_runtime = write.control_runtime_id() == planning.control_runtime_id()
                     && stack.control_runtime_id() == planning.control_runtime_id();
                 let registry: Arc<dyn spi::ConnectorControlRegistry> = Arc::new(
                     crate::query_execution::compiler::TestConnectorControlRegistry::default(),
@@ -5767,7 +5766,7 @@ mod tests {
                     &iceberg_target(),
                     &fixture.preparation,
                     selection,
-                    &write_lease,
+                    &write,
                     &planning,
                     &execution,
                     &context,
@@ -5855,7 +5854,7 @@ mod tests {
                 drop(entered);
                 drop(execution);
                 drop(state);
-                drop(write_lease);
+                drop(write);
                 drop(stack);
                 drop(properties);
                 drop(planning);
@@ -5904,9 +5903,10 @@ mod tests {
             let business_digest = fixture.selection.digest();
             let owned_source = selection.has_owned_sources();
             let entered = Arc::new(Mutex::new(Vec::new()));
-            let (host, planning, write_lease, properties) =
+            let (host, planning, connector_write, properties) =
                 cow_consumer_generation(&fixture, &capacity, entered.clone());
-            let same_runtime = planning.control_runtime_id() == write_lease.control_runtime_id();
+            let same_runtime =
+                planning.control_runtime_id() == connector_write.control_runtime_id();
             let request_fields = |fields: &[spi::ConnectorWriteFieldBinding]| {
                 fields
                     .iter()
@@ -5958,7 +5958,7 @@ mod tests {
             );
             let session = futures::executor::block_on(
                 crate::query_execution::write_session::begin_cow_connector_write_session_async_in(
-                    write_lease,
+                    connector_write,
                     &planning.derive_write_lease().unwrap(),
                     begin_request,
                     original,
@@ -6133,7 +6133,7 @@ mod tests {
     }
 
     impl novarocks_spi::connector::write_stack::ProviderWriteRuntime for FakeRowMutationProvider {
-        type CommitHandle = FakeRowMutationCommit;
+        type CommitSession = FakeRowMutationCommit;
         type WriterHandle = FakeRowMutationWriter;
         type CommitFragment = FakeRowMutationFragment;
 
@@ -6324,7 +6324,7 @@ mod tests {
         }
         fn cleanup_responsibility(
             &self,
-            _commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle,
+            _commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitSession,
         ) -> Result<
             novarocks_spi::connector::ConnectorMetadataCleanupResponsibility,
             novarocks_spi::connector::ConnectorError,
@@ -6540,7 +6540,7 @@ mod tests {
             novarocks_spi::connector::ConnectorError,
         > {
             novarocks_spi::connector::write_stack::ConnectorWriteSessionPlan::try_new(
-                self.adapter.wrap_commit_handle(FakeRowMutationCommit),
+                self.adapter.wrap_commit_session(FakeRowMutationCommit),
                 vec![
                     mor_branch(&self.adapter, MOR_DELETE_ORDINAL, self.routed)?,
                     mor_branch(&self.adapter, MOR_DATA_ORDINAL, self.routed)?,

@@ -23,12 +23,12 @@ use super::ndv_filter_actual_sql_source_tests::sql_source_with_columns;
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};
 use crate::runtime::{
-    fragment::ExecutionFailureCause,
     query_memory::QueryMemoryBinding,
     runtime_state::RuntimeState,
     scalar_memory::{
         RuntimeScalarMemoryJournal, RuntimeScalarMemoryRefusal, RuntimeScalarMemoryScope,
     },
+    task::ExecutionFailureCause,
 };
 use arrow::{
     array::{Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array},

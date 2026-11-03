@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_execution_contract::{QueryContextState, TaskState, TerminationDetail};
+use novarocks_execution_contract::{ParticipationState, TaskState, TerminationDetail};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaskTransition {
@@ -131,7 +131,7 @@ impl TerminationLatch {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum QueryContextEvent {
+pub enum ParticipationEvent {
     Establish,
     EstablishCompleted,
     Quiesce,
@@ -143,58 +143,60 @@ pub enum QueryContextEvent {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ContextTransition {
-    Apply(QueryContextState),
+pub enum ParticipationTransition {
+    Apply(ParticipationState),
     Idempotent,
     LostToRelease,
     AlreadyTerminal,
     Illegal,
 }
 
-pub fn classify_context_transition(
-    state: QueryContextState,
-    event: QueryContextEvent,
-) -> ContextTransition {
-    use QueryContextEvent as Event;
-    use QueryContextState as State;
+pub fn classify_participation_transition(
+    state: ParticipationState,
+    event: ParticipationEvent,
+) -> ParticipationTransition {
+    use ParticipationEvent as Event;
+    use ParticipationState as State;
 
     match (state, event) {
-        (State::Absent, Event::Establish) => ContextTransition::Apply(State::Establishing),
-        (State::Absent, Event::Abort) => ContextTransition::Apply(State::TerminalRetained),
-        (State::Establishing, Event::EstablishCompleted) => ContextTransition::Apply(State::Active),
+        (State::Absent, Event::Establish) => ParticipationTransition::Apply(State::Establishing),
+        (State::Absent, Event::Abort) => ParticipationTransition::Apply(State::TerminalRetained),
+        (State::Establishing, Event::EstablishCompleted) => {
+            ParticipationTransition::Apply(State::Active)
+        }
         (State::Absent | State::Establishing | State::Active, Event::Quiesce) => {
-            ContextTransition::Apply(State::Quiescing)
+            ParticipationTransition::Apply(State::Quiescing)
         }
-        (State::Quiescing, Event::Quiesce) => ContextTransition::Idempotent,
+        (State::Quiescing, Event::Quiesce) => ParticipationTransition::Idempotent,
         (State::Quiescing, Event::Establish | Event::EstablishCompleted) => {
-            ContextTransition::AlreadyTerminal
+            ParticipationTransition::AlreadyTerminal
         }
-        (State::Quiescing, Event::Release) => ContextTransition::Apply(State::Releasing),
-        (State::Quiescing, Event::Abort) => ContextTransition::Apply(State::Aborting),
-        (State::Establishing, Event::Abort) => ContextTransition::Apply(State::Aborting),
-        (State::Establishing, Event::Establish) => ContextTransition::Idempotent,
-        (State::Active, Event::Release) => ContextTransition::Apply(State::Releasing),
-        (State::Active, Event::Abort) => ContextTransition::Apply(State::Aborting),
+        (State::Quiescing, Event::Release) => ParticipationTransition::Apply(State::Releasing),
+        (State::Quiescing, Event::Abort) => ParticipationTransition::Apply(State::Aborting),
+        (State::Establishing, Event::Abort) => ParticipationTransition::Apply(State::Aborting),
+        (State::Establishing, Event::Establish) => ParticipationTransition::Idempotent,
+        (State::Active, Event::Release) => ParticipationTransition::Apply(State::Releasing),
+        (State::Active, Event::Abort) => ParticipationTransition::Apply(State::Aborting),
         (State::Active, Event::Establish | Event::EstablishCompleted) => {
-            ContextTransition::Idempotent
+            ParticipationTransition::Idempotent
         }
         (State::Releasing, Event::ReleaseCompleted) => {
-            ContextTransition::Apply(State::TerminalRetained)
+            ParticipationTransition::Apply(State::TerminalRetained)
         }
-        (State::Releasing, Event::Release) => ContextTransition::Idempotent,
-        (State::Releasing, Event::Abort) => ContextTransition::LostToRelease,
+        (State::Releasing, Event::Release) => ParticipationTransition::Idempotent,
+        (State::Releasing, Event::Abort) => ParticipationTransition::LostToRelease,
         (State::Aborting, Event::AbortCompleted) => {
-            ContextTransition::Apply(State::TerminalRetained)
+            ParticipationTransition::Apply(State::TerminalRetained)
         }
-        (State::Aborting, Event::Abort) => ContextTransition::Idempotent,
-        (State::TerminalRetained, Event::Reap) => ContextTransition::Apply(State::Gone),
-        (State::TerminalRetained, _) | (State::Gone, _) => ContextTransition::AlreadyTerminal,
-        _ => ContextTransition::Illegal,
+        (State::Aborting, Event::Abort) => ParticipationTransition::Idempotent,
+        (State::TerminalRetained, Event::Reap) => ParticipationTransition::Apply(State::Gone),
+        (State::TerminalRetained, _) | (State::Gone, _) => ParticipationTransition::AlreadyTerminal,
+        _ => ParticipationTransition::Illegal,
     }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ContextOperationKind {
+pub enum ParticipationOperationKind {
     CreateTask,
     AdvanceDomain,
     RenewLease,
@@ -210,36 +212,36 @@ pub enum OperationAdmission {
 }
 
 pub fn classify_operation_admission(
-    state: QueryContextState,
-    kind: ContextOperationKind,
+    state: ParticipationState,
+    kind: ParticipationOperationKind,
 ) -> OperationAdmission {
     match state {
-        QueryContextState::Absent | QueryContextState::Establishing => match kind {
-            ContextOperationKind::CreateTask => OperationAdmission::WaitForCreationGate,
+        ParticipationState::Absent | ParticipationState::Establishing => match kind {
+            ParticipationOperationKind::CreateTask => OperationAdmission::WaitForCreationGate,
             _ => OperationAdmission::NotEstablished,
         },
-        QueryContextState::Active => OperationAdmission::Admit,
-        QueryContextState::Quiescing if kind == ContextOperationKind::RenewLease => {
+        ParticipationState::Active => OperationAdmission::Admit,
+        ParticipationState::Quiescing if kind == ParticipationOperationKind::RenewLease => {
             OperationAdmission::Admit
         }
-        QueryContextState::Releasing
-        | QueryContextState::Quiescing
-        | QueryContextState::Aborting
-        | QueryContextState::TerminalRetained => OperationAdmission::TerminalReceipt,
-        QueryContextState::Gone => OperationAdmission::Gone,
+        ParticipationState::Releasing
+        | ParticipationState::Quiescing
+        | ParticipationState::Aborting
+        | ParticipationState::TerminalRetained => OperationAdmission::TerminalReceipt,
+        ParticipationState::Gone => OperationAdmission::Gone,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextOperationKind, ContextTransition, LatchOutcome, OperationAdmission,
-        QueryContextEvent, RootDrainAction, TaskTransition, TerminationLatch,
-        classify_context_transition, classify_operation_admission, classify_root_drain,
+        LatchOutcome, OperationAdmission, ParticipationEvent, ParticipationOperationKind,
+        ParticipationTransition, RootDrainAction, TaskTransition, TerminationLatch,
+        classify_operation_admission, classify_participation_transition, classify_root_drain,
         classify_task_transition,
     };
     use novarocks_execution_contract::{
-        AbortCause, QueryContextState, SafeDetail, TaskFailure, TaskState, TerminationDetail,
+        AbortCause, ParticipationState, SafeDetail, TaskFailure, TaskState, TerminationDetail,
     };
 
     #[test]
@@ -311,22 +313,25 @@ mod tests {
     }
 
     #[test]
-    fn context_creation_gate_and_retirement_are_worker_decisions() {
+    fn participation_creation_gate_and_retirement_are_worker_decisions() {
         assert_eq!(
-            classify_context_transition(QueryContextState::Absent, QueryContextEvent::Establish),
-            ContextTransition::Apply(QueryContextState::Establishing)
+            classify_participation_transition(
+                ParticipationState::Absent,
+                ParticipationEvent::Establish
+            ),
+            ParticipationTransition::Apply(ParticipationState::Establishing)
         );
         assert_eq!(
             classify_operation_admission(
-                QueryContextState::Establishing,
-                ContextOperationKind::CreateTask
+                ParticipationState::Establishing,
+                ParticipationOperationKind::CreateTask
             ),
             OperationAdmission::WaitForCreationGate
         );
         assert_eq!(
             classify_operation_admission(
-                QueryContextState::TerminalRetained,
-                ContextOperationKind::RenewLease
+                ParticipationState::TerminalRetained,
+                ParticipationOperationKind::RenewLease
             ),
             OperationAdmission::TerminalReceipt
         );

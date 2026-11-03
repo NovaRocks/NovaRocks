@@ -20,11 +20,11 @@
 use super::window_fixture::{Call, Shape, compile, installed_catalog, package};
 use super::*;
 use crate::exec::chunk::ChunkSchema;
-use crate::runtime::fragment::{ExecutionFailureCause, ExecutionResult};
 use crate::runtime::preparation_memory::PreparationMemoryRefusal;
 use crate::runtime::preparation_metadata::{
     CompiledSchemaPreparationScope, CompiledSchemaSite, PreparationMetadataFailure,
 };
+use crate::runtime::task::{ExecutionFailureCause, ExecutionResult};
 use novarocks_failure_contract::FailureProjection;
 use novarocks_local_program::StaticLayout;
 
@@ -150,10 +150,10 @@ fn graph(
     );
     crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
         Arc::clone(program), std::time::Duration::from_millis(10),
-        Box::new(crate::exec::operators::ResultSinkFactory::new(crate::exec::operators::ResultSinkHandle::new())),
+        Box::new(crate::exec::operators::ResultSinkFactory::new(crate::exec::operators::ResultSinkBuffer::new())),
         ExchangeBindings::default(), ScanBindings::default(),
-        crate::runtime::fragment::CompiledWriterBindings::default(), None, None, 1, state,
-        Arc::new(crate::runtime::fragment::io::NoopFragmentEventSink), Some(host),
+        crate::runtime::task::CompiledWriterBindings::default(), None, None, 1, state,
+        Arc::new(crate::runtime::task::io::NoopTaskEventSink), Some(host),
     )
 }
 

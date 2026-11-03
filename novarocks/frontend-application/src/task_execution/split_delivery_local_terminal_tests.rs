@@ -82,7 +82,7 @@ mod split_delivery_local_terminal_tests {
         let scan = ScanNodeKey::new(LEAF_FRAGMENT, SCAN_NODE);
         let target = AssignmentTarget {
             backend_idx: 0,
-            fragment_instance_id: original.fragment_instance_id(),
+            task_key: original.task_key(),
         };
         let bridge = SplitDeliveryBridge::for_graph(graph);
         let mut driver = SplitAssignmentDriver::new(
@@ -296,7 +296,7 @@ mod split_delivery_local_terminal_tests {
                 .graph()
                 .task(leaf)
                 .unwrap()
-                .fragment_instance_id();
+                .task_key();
             let (round, status, acks, creates) = round_waiting_on_creates(harness);
             let mut round = round.observing(bridge.clone());
             for create in &creates {
@@ -370,7 +370,7 @@ mod split_delivery_local_terminal_tests {
             assert!(!round.execution().normal_drain_started());
             let target = AssignmentTarget {
                 backend_idx: 0,
-                fragment_instance_id: leaf_kernel,
+                task_key: leaf_kernel,
             };
             let scan = ScanNodeKey::new(LEAF_FRAGMENT, SCAN_NODE);
             let mut driver = SplitAssignmentDriver::new(
@@ -390,10 +390,10 @@ mod split_delivery_local_terminal_tests {
             let targets = round
                 .execution()
                 .graph()
-                .contexts()
-                .map(|&context| {
+                .participations()
+                .map(|&participation| {
                     NativeAttemptConvergenceTarget::new(
-                        context,
+                        participation,
                         novarocks_execution::runtime::endpoint::RuntimeEndpoint::new(
                             "127.0.0.1",
                             1,

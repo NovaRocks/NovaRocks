@@ -49,7 +49,7 @@ impl NCodecBudgetPolicyV1 {
 const FORMAT_STRING_PEAK: usize = 86;
 const FORMAT_STRING_CAPACITY: usize = 78;
 
-pub(super) struct NCodecLease {
+pub(super) struct NCodecReservation {
     // Body text is destroyed before this inline lease. Keep the OWN loan until
     // after the library loan; neither field creates new host authority backing.
     _library: OpaqueReservation,
@@ -75,16 +75,16 @@ fn flush(work: &mut ScalarWork<'_, '_>) -> Result<(), KernelFailure> {
     work.flush()
 }
 impl NCodecResources for BoundNCodecResources<'_> {
-    type Lease = NCodecLease;
+    type Reservation = NCodecReservation;
 
     fn before_decimal256_format(
         &mut self,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self::Lease, KernelFailure> {
+    ) -> Result<Self::Reservation, KernelFailure> {
         flush(work)?;
         let returned_string = self.reserve(FORMAT_STRING_PEAK)?;
         let library = self.reserve(NCodecBudgetPolicyV1::FORMAT_INVOICE)?;
-        Ok(NCodecLease {
+        Ok(NCodecReservation {
             _library: library,
             _returned_string: Some(returned_string),
         })
@@ -107,11 +107,11 @@ impl NCodecResources for BoundNCodecResources<'_> {
         &mut self,
         text_bytes: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self::Lease, KernelFailure> {
+    ) -> Result<Self::Reservation, KernelFailure> {
         flush(work)?;
         let bytes = NCodecBudgetPolicyV1::parse_invoice(text_bytes)?;
         let library = self.reserve(bytes)?;
-        Ok(NCodecLease {
+        Ok(NCodecReservation {
             _library: library,
             _returned_string: None,
         })
@@ -184,12 +184,12 @@ pub(super) struct BoundNSortResources<'a> {
     pub(super) allocator: &'a HostAggregateAllocator,
 }
 impl super::aggregate_n_core::NSortResources for BoundNSortResources<'_> {
-    type Lease = OpaqueReservation;
+    type Reservation = OpaqueReservation;
     fn before_sort(
         &mut self,
         len: usize,
         _work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self::Lease, KernelFailure> {
+    ) -> Result<Self::Reservation, KernelFailure> {
         BoundNCodecResources {
             charge: self.charge,
             allocator: self.allocator,

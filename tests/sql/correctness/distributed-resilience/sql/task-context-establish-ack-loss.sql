@@ -17,7 +17,7 @@
 
 -- @sequential=true
 
--- One dropped EstablishQueryContext acknowledgement must cost nothing but a
+-- One dropped EstablishParticipation acknowledgement must cost nothing but a
 -- resend. The operation applies on the backend and the frontend never learns
 -- of it, which is exactly the unknown outcome the protocol's per-domain
 -- progression exists to survive: the resend is recognised as an identical
@@ -50,23 +50,23 @@ INSERT INTO ${case_db}.ack_loss VALUES (2, 20);
 INSERT INTO ${case_db}.ack_loss VALUES (3, 30);
 
 -- query 5
--- @query_lifecycle_fault=establish-context-ack-drop,1
+-- @query_lifecycle_fault=establish-participation-ack-drop,1
 -- @result_contains=1	10
 -- @result_contains=2	20
 -- @result_contains=3	30
--- @be_log_count_at_least=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED,3
--- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED,3
--- @be_log_count_at_least=NOVAROCKS_TASK_CONTEXT_ESTABLISH_IDEMPOTENT,1
+-- @be_log_count_at_least=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED,3
+-- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED,3
+-- @be_log_count_at_least=NOVAROCKS_PARTICIPATION_ESTABLISH_IDEMPOTENT,1
 SELECT id, payload
 FROM ${case_db}.ack_loss
 ORDER BY id;
 
 -- query 6
--- @query_lifecycle_fault=establish-context-ack-drop,2
+-- @query_lifecycle_fault=establish-participation-ack-drop,2
 -- @result_contains=60
--- @be_log_count_at_least=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED,3
--- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED,3
--- @be_log_count_at_least=NOVAROCKS_TASK_CONTEXT_ESTABLISH_IDEMPOTENT,1
+-- @be_log_count_at_least=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED,3
+-- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED,3
+-- @be_log_count_at_least=NOVAROCKS_PARTICIPATION_ESTABLISH_IDEMPOTENT,1
 SELECT SUM(left_side.payload) AS total
 FROM ${case_db}.ack_loss left_side
 JOIN ${case_db}.ack_loss right_side

@@ -40,17 +40,14 @@ pub use attachment::{
     CatalogAttachmentErrorKind, CatalogAttachmentRepository, CatalogAttachmentVersioned,
     CatalogAttachmentWakeup, CatalogAttachmentWakeupSignal,
 };
-pub use control_host::{
-    ConnectorControlHost, ConnectorControlRetirement, ConnectorWriteStackLease,
-};
+pub use control_host::{ConnectorControlHost, ConnectorControlRetirement, ConnectorWriteStackPin};
 pub use desired_state::{
     CatalogDesiredStateEntry, CatalogDesiredStateSnapshot, CatalogDesiredStateSnapshotIdentity,
     CatalogDesiredStateSource, CatalogDesiredStateSourceInput, CatalogDesiredStateSourceMode,
     CatalogLogicalConfig, CatalogSourceEntryIdentity, CatalogSqlMutationAdmission,
 };
 pub use generation::{
-    CatalogGenerationError, CatalogGenerationLease, CatalogGenerationOwner,
-    PreparedCatalogGeneration,
+    CatalogGenerationError, CatalogGenerationOwner, CatalogGenerationPin, PreparedCatalogGeneration,
 };
 pub use service::{
     CatalogApplicationService, CatalogMaterializationConfig, CatalogProjectionCounts,

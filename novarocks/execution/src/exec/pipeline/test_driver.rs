@@ -22,16 +22,16 @@
 //! own this helper; it uses no external process, fixture or production hook.
 
 use super::{
+    driver_step::{DEFAULT_TURN_WORK_UNITS, DriverStep, TurnWork},
     input::RawInput,
     operator::Operator,
     step::{AdmissionNext, InputResult, NextStep, StepResult},
-    step_context::{DEFAULT_TURN_WORK_UNITS, StepContext, TurnWork},
 };
 use crate::{
     exec::chunk::Chunk,
     runtime::{
-        fragment::{ExecutionFailure, ExecutionResult},
         runtime_state::{RuntimeErrorState, RuntimeState},
+        task::{ExecutionFailure, ExecutionResult},
     },
 };
 use std::sync::Arc;
@@ -68,7 +68,7 @@ impl<'a, O: Operator + ?Sized> TestDriver<'a, O> {
         if let Some(original) = &self.failure {
             return original.clone();
         }
-        StepContext::new(&self.control, &mut self.turn, &mut self.value_conversions)
+        DriverStep::new(&self.control, &mut self.turn, &mut self.value_conversions)
             .report_failure(failure.clone());
         self.value_conversions.clear();
         self.failure = Some(failure.clone());
@@ -95,7 +95,7 @@ impl<'a, O: Operator + ?Sized> TestDriver<'a, O> {
             self.next_turn();
         }
         let result = self.operator.try_push(
-            &mut StepContext::new(&self.control, &mut self.turn, &mut self.value_conversions),
+            &mut DriverStep::new(&self.control, &mut self.turn, &mut self.value_conversions),
             input,
         );
         match &result {
@@ -118,7 +118,7 @@ impl<'a, O: Operator + ?Sized> TestDriver<'a, O> {
         if self.turn_pending {
             self.next_turn();
         }
-        let result = match self.operator.drive(&mut StepContext::new(
+        let result = match self.operator.drive(&mut DriverStep::new(
             &self.control,
             &mut self.turn,
             &mut self.value_conversions,
@@ -140,7 +140,7 @@ impl<'a, O: Operator + ?Sized> TestDriver<'a, O> {
         if self.turn_pending {
             self.next_turn();
         }
-        if let Err(failure) = self.operator.finish(&mut StepContext::new(
+        if let Err(failure) = self.operator.finish(&mut DriverStep::new(
             &self.control,
             &mut self.turn,
             &mut self.value_conversions,

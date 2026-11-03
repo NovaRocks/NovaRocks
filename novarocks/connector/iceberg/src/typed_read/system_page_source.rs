@@ -2940,8 +2940,8 @@ mod tests {
 
     use arrow::array::{ListArray, MapArray};
     use novarocks_fs::{
-        FileCancellation, FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime,
-        TokioFileTaskSpawner,
+        FileCancellation, FileIoRuntime, FileIoSpawner, FsAccessResolver, TokioFileIoRuntime,
+        TokioFileIoSpawner,
     };
     use novarocks_spi::connector::read_stack::SchemaTableName;
 
@@ -2953,7 +2953,7 @@ mod tests {
     use crate::typed_read::system_table::{
         IcebergSystemTableReferenceParams, SystemManifestSplitParams, TrinoManifestFileParams,
     };
-    use crate::typed_read::test_spawners::{GatedTaskSpawner, route_reads_through};
+    use crate::typed_read::test_spawners::{GatedFileIoSpawner, route_reads_through};
     use crate::typed_read::test_streams::DrivenStream;
 
     use super::*;
@@ -2965,19 +2965,19 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let file_runtime: Arc<dyn FileIoRuntime> =
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
-        let task_spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let io_spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
         let binding = IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
             Arc::clone(&file_runtime),
-            Arc::clone(&task_spawner),
+            Arc::clone(&io_spawner),
         );
         let context = FileReadContext {
             cancellation: FileCancellation::new(),
             deadline: Some(Instant::now() + Duration::from_secs(60)),
             runtime: file_runtime,
-            task_spawner,
+            io_spawner,
             range: None,
         };
         (runtime, binding, context)
@@ -5205,11 +5205,11 @@ mod tests {
         attempts: std::sync::atomic::AtomicUsize,
     }
 
-    impl FileTaskSpawner for ManifestReadFailureSpawner {
+    impl FileIoSpawner for ManifestReadFailureSpawner {
         fn spawn(
             &self,
-            _task: novarocks_fs::FileTaskFuture,
-        ) -> novarocks_fs::FileResult<novarocks_fs::FileTask> {
+            _task: novarocks_fs::FileIoFuture,
+        ) -> novarocks_fs::FileResult<novarocks_fs::FileIoJob> {
             self.attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(novarocks_fs::FileError::new(self.kind, self.message))
@@ -5435,7 +5435,7 @@ mod tests {
         let expected =
             files_pages(&runtime, &provider(&binding, &context), &split, &columns).expect("pages");
 
-        let spawner = GatedTaskSpawner::closed(runtime.handle().clone());
+        let spawner = GatedFileIoSpawner::closed(runtime.handle().clone());
         let task_operations =
             route_reads_through(&mut context, spawner.clone(), runtime.handle().clone());
         let budget = ConnectorPollBudget::new();

@@ -45,7 +45,7 @@ impl WriteStatementFamily for DeleteFamily {
             &input.statement,
             &input.target,
             &input.reference,
-            input.lease.clone(),
+            input.planning_pin.clone(),
             input.execution.clone(),
             &input.context,
             input.operation_id,
@@ -75,7 +75,7 @@ struct PreparationInput {
     reference: String,
     context: ConnectorRequestContext,
     execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     begin_receiving: Arc<WriteBeginReceiving>,
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
 }
@@ -95,13 +95,13 @@ pub(crate) fn prepare(
         input.context.session().current_catalog(),
         input.context.session().current_database(),
     )?;
-    let lease = crate::connector::acquire_metadata_planning_lease(
+    let planning_pin = crate::connector::acquire_metadata_planning_pin(
         kernel.connector_control().as_ref(),
         &target.catalog,
     )?;
     let stack = kernel
         .typed_connector_control()
-        .acquire_exact_write_stack(lease.control_runtime_id())
+        .acquire_exact_write_stack(planning_pin.control_runtime_id())
         .map_err(|e| e.to_string())?;
     let profile = stack.session().io_profile().map_err(|e| e.to_string())?;
     drop(stack);
@@ -151,7 +151,7 @@ pub(crate) fn prepare(
         reference,
         context: context.clone(),
         execution: input.context.execution().clone(),
-        lease,
+        planning_pin,
         begin_receiving: Arc::clone(&begin_receiving),
         operation_id: novarocks_spi::connector::ConnectorWriteOperationId::from(publication_id),
     });

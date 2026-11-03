@@ -39,7 +39,7 @@ use crate::provider_binding::IcebergInstanceDistribution;
 use crate::resources::IcebergMetadataResources;
 use crate::typed_boundary::{IcebergTypedBoundary, IcebergTypedRequestControlFactory};
 use novarocks_spi::connector::read_stack::{
-    ConnectorReadMetadata, ConnectorReadRegistrationLease, ConnectorReadRequestControlFactory,
+    ConnectorReadMetadata, ConnectorReadRegistrationPin, ConnectorReadRequestControlFactory,
     ConnectorReadSplitManager,
 };
 use novarocks_spi::connector::{
@@ -67,7 +67,7 @@ pub type IcebergReadControlInstaller = Arc<
             Arc<dyn ConnectorReadSplitManager>,
             Arc<dyn ConnectorReadWireEncoder>,
             Arc<dyn ConnectorReadRequestControlFactory>,
-        ) -> Result<Arc<dyn ConnectorReadRegistrationLease>, ConnectorError>
+        ) -> Result<Arc<dyn ConnectorReadRegistrationPin>, ConnectorError>
         + Send
         + Sync,
 >;
@@ -457,8 +457,8 @@ fn unavailable(error: String) -> ConnectorError {
 mod tests {
     use std::sync::{Arc, Mutex, Weak};
 
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
-    use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
+    use novarocks_spi::connector::read_stack::ConnectorReadRegistrationPin;
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
         CatalogProperties, CatalogProperty, CatalogVersion, ConnectorInstanceId,
@@ -550,9 +550,9 @@ mod tests {
         factory_request(factory, "ice", properties)
     }
 
-    struct TestReadRegistrationLease;
+    struct TestReadRegistrationPin;
 
-    impl ConnectorReadRegistrationLease for TestReadRegistrationLease {}
+    impl ConnectorReadRegistrationPin for TestReadRegistrationPin {}
 
     #[test]
     fn factory_request_rejects_duplicate_properties_before_provider_construction() {
@@ -587,7 +587,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
@@ -614,7 +614,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
@@ -669,7 +669,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
@@ -719,7 +719,7 @@ mod tests {
             Some(config.clone()),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
@@ -786,7 +786,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
@@ -884,10 +884,10 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let observed_key = Arc::new(Mutex::new(None));
-        let observed_lease: Arc<Mutex<Option<Weak<dyn ConnectorReadRegistrationLease>>>> =
+        let observed_lease: Arc<Mutex<Option<Weak<dyn ConnectorReadRegistrationPin>>>> =
             Arc::new(Mutex::new(None));
         let key_sink = Arc::clone(&observed_key);
         let lease_sink = Arc::clone(&observed_lease);
@@ -902,8 +902,8 @@ mod tests {
                 assert_eq!(codec.owner(), handle.catalog_name().as_str());
                 let _ = (metadata, splits, request_factory);
                 *key_sink.lock().expect("key lock") = Some(handle);
-                let lease: Arc<dyn ConnectorReadRegistrationLease> =
-                    Arc::new(TestReadRegistrationLease);
+                let lease: Arc<dyn ConnectorReadRegistrationPin> =
+                    Arc::new(TestReadRegistrationPin);
                 *lease_sink.lock().expect("lease lock") = Some(Arc::downgrade(&lease));
                 Ok(lease)
             },
@@ -962,7 +962,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
@@ -1012,7 +1012,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
@@ -1069,7 +1069,7 @@ mod tests {
             ),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let template = crate::access_binding::IcebergReadBinding::with_metadata_credential_resolver(
             resources,
@@ -1124,7 +1124,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
@@ -1161,7 +1161,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
@@ -1194,7 +1194,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
@@ -1236,7 +1236,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let coordination =
             Arc::new(crate::catalog::table_coordination::IcebergTableCoordination::default());

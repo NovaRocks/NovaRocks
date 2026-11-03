@@ -36,7 +36,7 @@ pub struct DecidedTask {
 impl DecidedTask {
     pub(crate) fn compose_status(
         &self,
-    ) -> Result<novarocks_execution_contract::TaskStatus, crate::context::CoreError> {
+    ) -> Result<novarocks_execution_contract::TaskStatus, crate::participation::CoreError> {
         crate::task::compose_status(
             self.status.identity(),
             self.status.version().get(),
@@ -73,7 +73,7 @@ impl DecidedTask {
 /// collections, tree nodes and allocator overhead are explicitly unmeasured.
 /// This observation grants neither Work nor a retention/physical-exit proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RetainedContextInventory {
+pub struct RetainedParticipationInventory {
     pub decided_task_records: usize,
     pub metadata_bytes_estimate: Option<usize>,
 }
@@ -103,11 +103,11 @@ impl RetentionOrigin {
     }
 }
 
-/// Provenance of the original Context retirement, independent of its time.
+/// Provenance of the original Participation retirement, independent of its time.
 /// These plain identities grant no Work, failure, input or publication right.
 /// Worker constructs OwnerFailure only from the actual ActorFailureProof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ContextRetirementIdentity {
+pub enum ParticipationRetirementIdentity {
     Protocol {
         close_epoch: novarocks_control_runtime_core::identity::Generation,
     },
@@ -117,7 +117,7 @@ pub enum ContextRetirementIdentity {
         failed_epoch: novarocks_control_runtime_core::identity::Generation,
     },
 }
-impl ContextRetirementIdentity {
+impl ParticipationRetirementIdentity {
     /// This checks neutral chronology only; it does not authenticate a runtime.
     pub fn is_valid(self) -> bool {
         match self {

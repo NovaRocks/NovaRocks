@@ -34,8 +34,8 @@ use super::contribution::{
     visit_borrowed_ordered_bound,
 };
 use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec};
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use crate::runtime::tracked_state_allocator::expression_allocation_host;
 
 struct ByteBacking {

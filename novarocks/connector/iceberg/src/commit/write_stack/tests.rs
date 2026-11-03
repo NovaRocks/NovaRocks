@@ -32,7 +32,7 @@ use arrow::array::{Int8Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
-    FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+    FileIoRuntime, FileIoSpawner, FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner,
 };
 use novarocks_spi::connector::write_stack::session::{
     ConnectorWriteRouteFacts, ConnectorWriteSelectionBindingRole, ConnectorWriteSessionFlavor,
@@ -61,9 +61,9 @@ use crate::commit::write_stack::control::{
 };
 use crate::commit::write_stack::copy_on_write::{IcebergCowBranchInput, IcebergCowBranchRecipe};
 use crate::commit::write_stack::domain::{
-    IcebergCommitFragment, IcebergCommitHandle, IcebergDataFileArtifact, IcebergEmptyWriteDecision,
-    IcebergPositionDeleteFileArtifact, IcebergWriteBranch, IcebergWriteFlavor,
-    IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
+    IcebergCommitFragment, IcebergDataFileArtifact, IcebergEmptyWriteDecision,
+    IcebergPositionDeleteFileArtifact, IcebergWriteBranch, IcebergWriteCommitSession,
+    IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
 };
 use crate::commit::write_stack::flavor::{
     IcebergFrozenRewriteBranch, IcebergSessionFlavorPlan, plan_copy_on_write_branches,
@@ -122,10 +122,9 @@ fn local_binding() -> (IcebergReadBinding, tokio::runtime::Runtime) {
     let runtime = tokio::runtime::Runtime::new().expect("build Tokio runtime");
     let file_runtime: Arc<dyn FileIoRuntime> =
         Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
-    let task_spawner: Arc<dyn FileTaskSpawner> =
-        Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
-    let binding =
-        IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, task_spawner);
+    let io_spawner: Arc<dyn FileIoSpawner> =
+        Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
+    let binding = IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, io_spawner);
     (binding, runtime)
 }
 
@@ -454,7 +453,7 @@ fn another_catalog_generation_cannot_recover_a_fragment() {
 // Prepared-set validation and the single-commit latch.
 // -------------------------------------------------------------------------
 
-fn dv_session() -> (IcebergCommitHandle, IcebergWriteAdapter) {
+fn dv_session() -> (IcebergWriteCommitSession, IcebergWriteAdapter) {
     let (handle, _plans) = plan_write_session(
         IcebergWriteSessionId::new(),
         IcebergWriteSessionPlanInput {
@@ -1010,7 +1009,7 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
 
 fn flavor_session(
     plan: IcebergSessionFlavorPlan,
-) -> (IcebergCommitHandle, Vec<IcebergWriteTargetPlan>) {
+) -> (IcebergWriteCommitSession, Vec<IcebergWriteTargetPlan>) {
     plan_branch_session(
         IcebergWriteSessionId::new(),
         IcebergBranchSessionPlanInput {
@@ -1181,8 +1180,8 @@ fn cow_rewrite_source(
 }
 
 /// A sealed copy-on-write session holding exactly these frozen branches.
-fn cow_handle(branches: &[IcebergCowBranchInput]) -> IcebergCommitHandle {
-    IcebergCommitHandle::try_new_sealed(
+fn cow_handle(branches: &[IcebergCowBranchInput]) -> IcebergWriteCommitSession {
+    IcebergWriteCommitSession::try_new_sealed(
         IcebergWriteSessionId::new(),
         table_facts(),
         IcebergWriteFlavor::RowMutationCopyOnWrite,
@@ -1242,7 +1241,7 @@ fn written_data_file(path: &str) -> crate::commit::WrittenFile {
 /// provider attached is asserted where SQL would read it.
 fn neutral_plan(
     adapter: &IcebergWriteAdapter,
-    sealed: (IcebergCommitHandle, Vec<IcebergWriteTargetPlan>),
+    sealed: (IcebergWriteCommitSession, Vec<IcebergWriteTargetPlan>),
 ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
     let (handle, targets) = sealed;
     session_plan_from_targets(adapter, handle, targets, None, None)
@@ -1250,7 +1249,7 @@ fn neutral_plan(
 
 fn neutral_cow_plan(
     adapter: &IcebergWriteAdapter,
-    sealed: (IcebergCommitHandle, Vec<IcebergWriteTargetPlan>),
+    sealed: (IcebergWriteCommitSession, Vec<IcebergWriteTargetPlan>),
     old_files: &[&str],
 ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
     let (handle, targets) = sealed;
@@ -2238,7 +2237,7 @@ fn only_a_rewrite_session_carries_a_frozen_rewrite_file_set() {
     );
     assert!(crate::commit::write_stack::control::selected_rewrite_files(&append).is_none());
 
-    let error = IcebergCommitHandle::try_new_sealed(
+    let error = IcebergWriteCommitSession::try_new_sealed(
         IcebergWriteSessionId::new(),
         table_facts(),
         IcebergWriteFlavor::Append,
@@ -3038,7 +3037,7 @@ pub(super) fn unreachable_rest_runtime() -> (
         None,
         FsAccessResolver::new(),
         Arc::new(TokioFileIoRuntime::new(handle.clone())),
-        Arc::new(TokioFileTaskSpawner::new(handle.clone())),
+        Arc::new(TokioFileIoSpawner::new(handle.clone())),
     );
     let runtime = crate::metadata_context::IcebergMetadataContext::try_new(
         crate::catalog_control::IcebergCatalogControlState::new(configuration),
@@ -3211,7 +3210,7 @@ fn a_staged_finish_seals_its_artifacts_without_committing() {
 
     let outcome = control
         .finish_write(ConnectorWriteFinishRequest {
-            commit: plan.commit_handle(),
+            commit: plan.commit_session(),
             prepared: set,
             statistics: Vec::new(),
             publication:
@@ -3236,7 +3235,7 @@ fn a_staged_finish_seals_its_artifacts_without_committing() {
     // receipt for the same sealed artifacts.
     control
         .finish_write(ConnectorWriteFinishRequest {
-            commit: plan.commit_handle(),
+            commit: plan.commit_session(),
             prepared: prepared(&adapter, Vec::new(), &[ordinal(0)]),
             statistics: Vec::new(),
             publication:
@@ -3285,7 +3284,7 @@ fn an_empty_staged_write_seals_rather_than_settling_as_unchanged() {
 
     let outcome = control
         .finish_write(ConnectorWriteFinishRequest {
-            commit: plan.commit_handle(),
+            commit: plan.commit_session(),
             prepared: prepared(&adapter, Vec::new(), &[ordinal(0)]),
             statistics: Vec::new(),
             publication:
@@ -3907,7 +3906,7 @@ impl FrozenRewriteLake {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(executor.handle().clone())),
         );
         let resources =
             crate::resources::IcebergMetadataResources::new(binding, executor.handle().clone());
@@ -4139,7 +4138,7 @@ impl FrozenRewriteLake {
         let result = self
             .control
             .finish_write(ConnectorWriteFinishRequest {
-                commit: session.commit_handle(),
+                commit: session.commit_session(),
                 prepared,
                 statistics: Vec::new(),
                 publication: ConnectorWriteFinishPublication::None,
@@ -4374,7 +4373,10 @@ fn distributed_rewrite_replaces_only_frozen_inputs_and_rejects_concurrent_commit
         for (target, cohort) in session.targets().iter().zip(plan.cohorts()) {
             assert_eq!(target.rewrite_group_digest(), Some(cohort.group_digest()));
         }
-        let handle = lake.adapter.commit_handle(session.commit_handle()).unwrap();
+        let handle = lake
+            .adapter
+            .commit_session(session.commit_session())
+            .unwrap();
         let selected = crate::commit::write_stack::control::selected_rewrite_files(handle).unwrap();
         let content = plan
             .frozen()
@@ -4401,7 +4403,7 @@ fn distributed_rewrite_replaces_only_frozen_inputs_and_rejects_concurrent_commit
         let result = lake
             .control
             .finish_write(ConnectorWriteFinishRequest {
-                commit: session.commit_handle(),
+                commit: session.commit_session(),
                 prepared,
                 statistics: Vec::new(),
                 publication: ConnectorWriteFinishPublication::None,
@@ -4579,7 +4581,7 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
         let result = lake
             .control
             .finish_write(ConnectorWriteFinishRequest {
-                commit: session.commit_handle(),
+                commit: session.commit_session(),
                 prepared: set,
                 statistics: Vec::new(),
                 publication: ConnectorWriteFinishPublication::None,
@@ -4721,7 +4723,7 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
         .control
         .abort_write(
             novarocks_spi::connector::write_stack::ConnectorWriteSessionAbortRequest {
-                commit: writer.commit_handle(),
+                commit: writer.commit_session(),
                 production: novarocks_spi::connector::write_stack::ConnectorWriteAbortProduction::NotStarted,
                 context: request_context(),
                 received: None,
@@ -4897,7 +4899,7 @@ fn project_prepared_managed_rows(
     )?;
     let expected = handle.expected_targets();
     let adapter = adapter("unit", 1);
-    let commit = adapter.wrap_commit_handle(handle);
+    let commit = adapter.wrap_commit_session(handle);
     // Accepted input rows are deliberately unrelated to the artifact counts.
     let prepared = ConnectorPreparedWriteSet::try_new(
         u64::MAX,
@@ -4919,7 +4921,7 @@ fn project_prepared_managed_rows(
     );
     let result = control.prepared_logical_row_change(&commit, &prepared, &request_context());
     assert!(matches!(
-        adapter.commit_handle(&commit)?.state()?,
+        adapter.commit_session(&commit)?.state()?,
         IcebergWriteSessionState::Active
     ));
     result
@@ -5291,7 +5293,7 @@ fn prepared_logical_rows_require_exact_adapter_and_live_context_and_exclude_ordi
         .unwrap(),
     );
     let adapter = adapter("unit", 1);
-    let commit = adapter.wrap_commit_handle(ordinary);
+    let commit = adapter.wrap_commit_session(ordinary);
     let empty = ConnectorPreparedWriteSet::try_new(99, vec![], &[ordinal(0)]).unwrap();
     assert_eq!(
         control
@@ -5307,7 +5309,7 @@ fn prepared_logical_rows_require_exact_adapter_and_live_context_and_exclude_ordi
         .unwrap(),
     );
     let foreign_adapter = self::adapter("unit", 2);
-    let foreign = foreign_adapter.wrap_commit_handle(other);
+    let foreign = foreign_adapter.wrap_commit_session(other);
     assert_eq!(
         control
             .prepared_logical_row_change(&foreign, &empty, &request_context())
@@ -5469,7 +5471,7 @@ fn async_write_control_commits_real_files_without_a_catalog_join_bridge() {
         .block_on(
             lake.control
                 .finish_write_async(ConnectorWriteFinishRequestRef {
-                commit: session.commit_handle(),
+                commit: session.commit_session(),
                 prepared: &prepared,
                 statistics: &statistics,
                 publication: &publication,
@@ -5497,7 +5499,7 @@ fn async_write_control_commits_real_files_without_a_catalog_join_bridge() {
     assert_eq!(lake.rows(), vec![7, 9]);
     assert_eq!(
         lake.control
-            .cleanup_responsibility(session.commit_handle())
+            .cleanup_responsibility(session.commit_session())
             .unwrap(),
         novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Disposed
     );
@@ -5554,7 +5556,7 @@ fn async_finish_first_poll_cancellation_is_authoritatively_uncommitted() {
     let future = lake
         .control
         .finish_write_async(ConnectorWriteFinishRequestRef {
-            commit: session.commit_handle(),
+            commit: session.commit_session(),
             prepared: &prepared,
             statistics: &statistics,
             publication: &publication,
@@ -5579,7 +5581,10 @@ fn async_finish_first_poll_cancellation_is_authoritatively_uncommitted() {
         matches!(cleanup, ExternalMutationFinalization::Failed(_)),
         "received files are not an empty cleanup inventory"
     );
-    let handle = lake.adapter.commit_handle(session.commit_handle()).unwrap();
+    let handle = lake
+        .adapter
+        .commit_session(session.commit_session())
+        .unwrap();
     assert!(matches!(
         handle.state().unwrap(),
         IcebergWriteSessionState::KnownUncommitted { .. }
@@ -5592,7 +5597,7 @@ fn async_finish_first_poll_cancellation_is_authoritatively_uncommitted() {
     assert!(lake.rows().is_empty());
     assert_eq!(
         lake.control
-            .cleanup_responsibility(session.commit_handle())
+            .cleanup_responsibility(session.commit_session())
             .unwrap(),
         novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained
     );
@@ -5623,7 +5628,7 @@ fn cancelled_abort_retires_only_the_proven_unstarted_empty_session() {
         .executor
         .block_on(lake.control.abort_write_async(
             novarocks_spi::connector::write_stack::ConnectorWriteSessionAbortRequest {
-                commit: session.commit_handle(),
+                commit: session.commit_session(),
                 context,
                 production: P::NotStarted,
                 received: None,
@@ -5638,7 +5643,7 @@ fn cancelled_abort_retires_only_the_proven_unstarted_empty_session() {
     ));
     assert_eq!(
         lake.control
-            .cleanup_responsibility(session.commit_handle())
+            .cleanup_responsibility(session.commit_session())
             .unwrap(),
         novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Disposed
     );
@@ -5661,7 +5666,7 @@ fn cancelled_abort_retires_only_the_proven_unstarted_empty_session() {
         .executor
         .block_on(lake.control.abort_write_async(
             novarocks_spi::connector::write_stack::ConnectorWriteSessionAbortRequest {
-                commit: unproven.commit_handle(),
+                commit: unproven.commit_session(),
                 context: request_context(),
                 production: P::Unproven,
                 received: None,
@@ -5676,7 +5681,7 @@ fn cancelled_abort_retires_only_the_proven_unstarted_empty_session() {
     ));
     assert_eq!(
         lake.control
-            .cleanup_responsibility(unproven.commit_handle())
+            .cleanup_responsibility(unproven.commit_session())
             .unwrap(),
         novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Retained
     );
@@ -5693,7 +5698,7 @@ fn sealed_writer_output_for_abort(
         ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterPhysicalContext,
     };
     let execution = super::execution::IcebergWriteStackExecution::new(
-        session.commit_handle().binding().catalog_handle().clone(),
+        session.commit_session().binding().catalog_handle().clone(),
         lake.adapter.clone(),
         lake.runtime.resources().planning_binding().clone(),
     );
@@ -5773,7 +5778,7 @@ fn complete_received_abort_deletes_only_the_actual_sealed_writer_output() {
     // A prepared set by itself is not a cleanup handoff.
     let rejected = lake.executor.block_on(lake.control.abort_write_async(
         ConnectorWriteSessionAbortRequest {
-            commit: session.commit_handle(),
+            commit: session.commit_session(),
             context: request_context(),
             production: P::Unproven,
             received: Some(&received),
@@ -5782,7 +5787,7 @@ fn complete_received_abort_deletes_only_the_actual_sealed_writer_output() {
     assert!(rejected.is_err());
     assert!(matches!(
         lake.adapter
-            .commit_handle(session.commit_handle())
+            .commit_session(session.commit_session())
             .unwrap()
             .state()
             .unwrap(),
@@ -5802,7 +5807,7 @@ fn complete_received_abort_deletes_only_the_actual_sealed_writer_output() {
         .block_on(
             lake.control
                 .abort_write_async(ConnectorWriteSessionAbortRequest {
-                    commit: session.commit_handle(),
+                    commit: session.commit_session(),
                     context,
                     production: P::CompleteReceived,
                     received: Some(&received),
@@ -5822,7 +5827,10 @@ fn complete_received_abort_deletes_only_the_actual_sealed_writer_output() {
     );
     assert!(survivor.is_file(), "cleanup never scans for other objects");
     assert!(lake.rows().is_empty(), "abort did not publish a snapshot");
-    let handle = lake.adapter.commit_handle(session.commit_handle()).unwrap();
+    let handle = lake
+        .adapter
+        .commit_session(session.commit_session())
+        .unwrap();
     assert_eq!(
         handle.cleanup_responsibility(),
         novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Disposed
@@ -5870,7 +5878,7 @@ fn complete_received_first_poll_refusal_cleans_same_output_without_publication()
     let future = lake
         .control
         .finish_write_async(ConnectorWriteFinishRequestRef {
-            commit: session.commit_handle(),
+            commit: session.commit_session(),
             prepared: &received,
             statistics: &[],
             publication: &publication,
@@ -5895,7 +5903,7 @@ fn complete_received_first_poll_refusal_cleans_same_output_without_publication()
     assert!(lake.rows().is_empty());
     assert_eq!(
         lake.adapter
-            .commit_handle(session.commit_handle())
+            .commit_session(session.commit_session())
             .unwrap()
             .cleanup_responsibility(),
         novarocks_spi::connector::ConnectorMetadataCleanupResponsibility::Disposed
@@ -5930,7 +5938,7 @@ fn failed_received_cleanup_keeps_exact_remaining_object_and_retained_responsibil
         .block_on(
             lake.control
                 .abort_write_async(ConnectorWriteSessionAbortRequest {
-                    commit: session.commit_handle(),
+                    commit: session.commit_session(),
                     context: request_context(),
                     production: P::CompleteReceived,
                     received: Some(&received),
@@ -5943,7 +5951,10 @@ fn failed_received_cleanup_keeps_exact_remaining_object_and_retained_responsibil
             cleanup: ExternalMutationFinalization::Failed(_)
         }
     ));
-    let handle = lake.adapter.commit_handle(session.commit_handle()).unwrap();
+    let handle = lake
+        .adapter
+        .commit_session(session.commit_session())
+        .unwrap();
     let Some(crate::commit::model::IcebergCleanupReport::Partial { remaining, .. }) =
         handle.early_cleanup_report_for_test()
     else {
@@ -6368,13 +6379,14 @@ fn an_empty_finish_cannot_replace_an_original_terminal_or_inflight_fact() {
 #[test]
 fn borrowed_provider_finish_and_abort_preserve_the_winning_terminal_fact() {
     use novarocks_spi::connector::write_stack::{
-        ConnectorWriteAbortProduction, ConnectorWriteCommitHandle, ConnectorWriteFinishPublication,
-        ConnectorWriteFinishRequestRef, ConnectorWriteSessionAbortRequest,
+        ConnectorWriteAbortProduction, ConnectorWriteCommitSession,
+        ConnectorWriteFinishPublication, ConnectorWriteFinishRequestRef,
+        ConnectorWriteSessionAbortRequest,
     };
 
     fn finish(
         control: &crate::commit::write_stack::control::IcebergWriteSessionControl,
-        commit: &ConnectorWriteCommitHandle,
+        commit: &ConnectorWriteCommitSession,
         prepared: &ConnectorPreparedWriteSet,
     ) -> Result<
         ExternalMutationOutcome<novarocks_spi::connector::ConnectorWriteReceipt>,
@@ -6391,7 +6403,7 @@ fn borrowed_provider_finish_and_abort_preserve_the_winning_terminal_fact() {
     }
     fn abort(
         control: &crate::commit::write_stack::control::IcebergWriteSessionControl,
-        commit: &ConnectorWriteCommitHandle,
+        commit: &ConnectorWriteCommitSession,
     ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
         futures::executor::block_on(
             control.abort_write_async(ConnectorWriteSessionAbortRequest {
@@ -6414,12 +6426,12 @@ fn borrowed_provider_finish_and_abort_preserve_the_winning_terminal_fact() {
         runtime,
     );
     // Two controlled orders and one simultaneous start use the same borrowed
-    // public commit handle. No clone or alternative execution owner is made.
+    // public commit session. No clone or alternative execution owner is made.
     for order in 0..3 {
         let (handle, adapter) = dv_session();
         let prepared =
             ConnectorPreparedWriteSet::try_new(0, Vec::new(), &handle.expected_targets()).unwrap();
-        let commit = adapter.wrap_commit_handle(handle);
+        let commit = adapter.wrap_commit_session(handle);
         let start = std::sync::Barrier::new(3);
         let (finished, aborted) = std::thread::scope(|scope| {
             let (finish_done, wait_finish) = std::sync::mpsc::sync_channel::<()>(0);
@@ -6453,7 +6465,7 @@ fn borrowed_provider_finish_and_abort_preserve_the_winning_terminal_fact() {
             start.wait();
             (first.join().unwrap(), second.join().unwrap())
         });
-        let original = adapter.commit_handle(&commit).unwrap();
+        let original = adapter.commit_session(&commit).unwrap();
         match finished {
             Ok(ExternalMutationOutcome::KnownCommitted {
                 effect, receipt, ..

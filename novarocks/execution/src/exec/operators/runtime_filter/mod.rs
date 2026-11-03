@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -28,15 +28,15 @@ use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{DriverBlockDeadline, Operator, forward_observable};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::fragment::io::{FragmentEvent, FragmentEventSink, NoopFragmentEventSink};
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::io::{NoopTaskEventSink, TaskEvent, TaskEventSink};
 use crate::runtime_filter::RuntimeFilterExecutionContract;
 use arrow::array::ArrayRef;
 use arrow::compute::filter_record_batch;
 
 mod compiled;
 mod compiled_ordered;
-pub(crate) use compiled_ordered::{CompiledOrderedScanDriver, CompiledOrderedScanFactory};
+pub(crate) use compiled_ordered::{CompiledOrderedScanEvaluator, CompiledOrderedScanFactory};
 mod live_cursor;
 #[cfg(test)]
 mod live_cursor_tests;
@@ -65,7 +65,7 @@ impl novarocks_failure_contract::FailureProjection for FilterArrowFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::FilterArrowApplication.reason(),
+            crate::runtime::task::ExecutionReason::FilterArrowApplication.reason(),
         )
     }
 }
@@ -297,7 +297,7 @@ impl RuntimeFilterConsumerState {
             );
             match execution::RuntimeFilterSession::subscribe(session.as_ref(), request) {
                 Ok(execution::RuntimeFilterBindOutcome::Bound(
-                    execution::RuntimeFilterSubscriptionHandle::Blocking(subscription),
+                    execution::RuntimeFilterSubscriptionPin::Blocking(subscription),
                 )) if matches!(
                     binding.contract.activation(),
                     execution::ConsumerActivation::BlockingSnapshot
@@ -310,7 +310,7 @@ impl RuntimeFilterConsumerState {
                     binding.state = NativeConsumerBindingState::BoundBlocking(subscription);
                 }
                 Ok(execution::RuntimeFilterBindOutcome::Bound(
-                    execution::RuntimeFilterSubscriptionHandle::Live(subscription),
+                    execution::RuntimeFilterSubscriptionPin::Live(subscription),
                 )) if matches!(
                     binding.contract.activation(),
                     execution::ConsumerActivation::NonBlockingLive {
@@ -483,12 +483,12 @@ impl RuntimeFilterConsumerState {
         &self,
         chunk: Chunk,
         keys: &mut K,
-        event_sink: Option<&Arc<dyn FragmentEventSink>>,
+        event_sink: Option<&Arc<dyn TaskEventSink>>,
     ) -> ExecutionResult<Option<Chunk>> {
         let (output, effects) = self.apply_chunk_inner(chunk, keys)?;
         if let Some(event_sink) = event_sink {
             for effect in effects {
-                event_sink.record(FragmentEvent::RuntimeFilterRowEffect(effect));
+                event_sink.record(TaskEvent::RuntimeFilterRowEffect(effect));
             }
         }
         Ok(output)
@@ -750,7 +750,7 @@ impl RuntimeFilterProcessorConsumers {
     fn apply_chunk_observed(
         &mut self,
         chunk: Chunk,
-        event_sink: Option<&Arc<dyn FragmentEventSink>>,
+        event_sink: Option<&Arc<dyn TaskEventSink>>,
     ) -> ExecutionResult<Option<Chunk>> {
         self.state
             .apply_chunk_observed(chunk, &mut self.keys, event_sink)
@@ -793,7 +793,7 @@ impl OperatorFactory for NativeRuntimeFilterProcessorFactory {
                     state: self.consumers.state().clone(),
                     keys: self.consumers.driver_keys(),
                 },
-                event_sink: Arc::new(NoopFragmentEventSink),
+                event_sink: Arc::new(NoopTaskEventSink),
                 construction: None,
             },
         ))
@@ -803,7 +803,7 @@ impl OperatorFactory for NativeRuntimeFilterProcessorFactory {
 struct NativeRuntimeFilterProcessor {
     name: String,
     consumers: RuntimeFilterProcessorConsumers,
-    event_sink: Arc<dyn FragmentEventSink>,
+    event_sink: Arc<dyn TaskEventSink>,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
 }
 
@@ -828,7 +828,7 @@ impl OperatorLifecycle for NativeRuntimeFilterProcessor {
         &self.name
     }
 
-    fn set_fragment_event_sink(&mut self, event_sink: Arc<dyn FragmentEventSink>) {
+    fn set_task_event_sink(&mut self, event_sink: Arc<dyn TaskEventSink>) {
         self.event_sink = event_sink;
     }
 
@@ -845,7 +845,7 @@ impl crate::exec::pipeline::operator::InputEncodingPolicy for NativeRuntimeFilte
 impl crate::exec::pipeline::shape::TransformKernel for NativeRuntimeFilterProcessor {
     fn admission(
         &self,
-        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         _input: &crate::exec::pipeline::input::RawInput,
     ) -> ExecutionResult<Option<crate::exec::pipeline::step::AdmissionNext>> {
         use crate::exec::pipeline::step::{AdmissionNext, WaitFact, WaitReason};
@@ -863,7 +863,7 @@ impl crate::exec::pipeline::shape::TransformKernel for NativeRuntimeFilterProces
     }
     fn apply(
         &mut self,
-        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         input: crate::exec::pipeline::input::PreparedInput,
     ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
         let chunk = input.into_uncovered_chunk()?;
@@ -1465,7 +1465,7 @@ mod tests {
     }
 
     struct SubscriptionSession {
-        outcome: execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
+        outcome: execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionPin>,
         calls: Arc<AtomicUsize>,
     }
 
@@ -1474,7 +1474,7 @@ mod tests {
             &self,
             _: execution::RuntimeFilterProducerOpenRequest,
         ) -> Result<
-            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterProducerHandle>,
+            execution::RuntimeFilterBindOutcome<execution::SharedRuntimeFilterProducer>,
             execution::RuntimeFilterContractViolation,
         > {
             Err(execution::RuntimeFilterContractViolation::new(
@@ -1487,24 +1487,22 @@ mod tests {
             &self,
             _: execution::RuntimeFilterSubscriptionRequest,
         ) -> Result<
-            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
+            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionPin>,
             execution::RuntimeFilterContractViolation,
         > {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match &self.outcome {
                 execution::RuntimeFilterBindOutcome::Bound(handle) => match handle {
-                    execution::RuntimeFilterSubscriptionHandle::Blocking(subscription) => {
+                    execution::RuntimeFilterSubscriptionPin::Blocking(subscription) => {
                         Ok(execution::RuntimeFilterBindOutcome::Bound(
-                            execution::RuntimeFilterSubscriptionHandle::Blocking(Arc::clone(
+                            execution::RuntimeFilterSubscriptionPin::Blocking(Arc::clone(
                                 subscription,
                             )),
                         ))
                     }
-                    execution::RuntimeFilterSubscriptionHandle::Live(subscription) => {
+                    execution::RuntimeFilterSubscriptionPin::Live(subscription) => {
                         Ok(execution::RuntimeFilterBindOutcome::Bound(
-                            execution::RuntimeFilterSubscriptionHandle::Live(Arc::clone(
-                                subscription,
-                            )),
+                            execution::RuntimeFilterSubscriptionPin::Live(Arc::clone(subscription)),
                         ))
                     }
                 },
@@ -1519,7 +1517,7 @@ mod tests {
             _: execution::RuntimeFilterFinalDomainOpenRequest,
         ) -> Result<
             execution::RuntimeFilterBindOutcome<
-                execution::RuntimeFilterFinalDomainCompletionHandle,
+                execution::SharedRuntimeFilterFinalDomainCompletion,
             >,
             execution::RuntimeFilterContractViolation,
         > {
@@ -1668,7 +1666,7 @@ mod tests {
         let session: execution::RuntimeFilterSessionRef = Arc::new(SubscriptionSession {
             calls: Arc::new(AtomicUsize::new(0)),
             outcome: execution::RuntimeFilterBindOutcome::Bound(
-                execution::RuntimeFilterSubscriptionHandle::Blocking(Arc::new(
+                execution::RuntimeFilterSubscriptionPin::Blocking(Arc::new(
                     PublishedSubscription::new(snapshot),
                 )),
             ),
@@ -1820,7 +1818,7 @@ mod tests {
         let session: execution::RuntimeFilterSessionRef = Arc::new(SubscriptionSession {
             calls: Arc::new(AtomicUsize::new(0)),
             outcome: execution::RuntimeFilterBindOutcome::Bound(
-                execution::RuntimeFilterSubscriptionHandle::Blocking(subscription),
+                execution::RuntimeFilterSubscriptionPin::Blocking(subscription),
             ),
         });
         RuntimeState::default().with_runtime_filter_session(Some(session))
@@ -2014,7 +2012,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SourceKernel for QueueSource {
         fn poll_output(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             let generation = self.observable.generation();
             let mut queue = self.chunks.lock().expect("chunks lock");
@@ -2049,7 +2047,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SinkKernel for CollectSink {
         fn consume(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             input: crate::exec::pipeline::input::PreparedInput,
         ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
             let chunk = input.into_uncovered_chunk()?;

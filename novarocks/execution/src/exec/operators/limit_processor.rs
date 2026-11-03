@@ -28,7 +28,7 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 #[cfg(test)]
 use crate::exec::chunk::Chunk;
@@ -37,10 +37,10 @@ use crate::exec::pipeline::operator::{
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{Transform, TransformKernel, TransformStart},
     step::{NextStep, StepResult},
-    step_context::StepContext,
 };
 #[cfg(test)]
 use crate::runtime::runtime_state::RuntimeState;
@@ -134,7 +134,7 @@ impl TransformKernel for LimitProcessorKernel {
     }
     fn apply(
         &mut self,
-        _ctx: &mut StepContext<'_>,
+        _ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         let chunk = input.into_uncovered_chunk()?;
@@ -253,7 +253,7 @@ mod tests {
             })
             .collect();
         let schema = Arc::new(crate::exec::chunk::ChunkSchema::try_new_typed(slots, pure).unwrap());
-        Chunk::try_new_typed_with_columns_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+        Chunk::try_new_typed_with_columns_observed::<crate::runtime::task::ExecutionFailure, _>(
             schema,
             batch.columns().to_vec(),
             rows,
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn production_steps_keep_deferred_input_raw_and_emit_the_last_batch_with_finished() {
-        use crate::exec::pipeline::{input::RawInput, step::InputResult, step_context::TurnWork};
+        use crate::exec::pipeline::{driver_step::TurnWork, input::RawInput, step::InputResult};
         use crate::runtime::runtime_state::RuntimeErrorState;
         let factory = LimitProcessorFactory::new(1, Some(4), 3);
         let mut op = factory.create(1, 0);
@@ -295,7 +295,7 @@ mod tests {
         let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 10);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut turn, &mut value_conversions);
         assert!(matches!(step.initial_step(), NextStep::NeedInput));
         assert!(matches!(
             step.try_push(&mut ctx, RawInput::for_test(make_chunk(0, 5))),
@@ -366,7 +366,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error.cause(),
-            crate::runtime::fragment::ExecutionFailureCause::Construction(
+            crate::runtime::task::ExecutionFailureCause::Construction(
                 ConstructionFailure::MissingOwner
             )
         ));

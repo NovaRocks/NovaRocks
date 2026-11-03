@@ -28,7 +28,7 @@ GROUP BY k;
 -- @skip_result_check=true
 -- @result_contains=Planning:
 -- @result_contains=Rows: 1
--- @result_contains=Profile: fragments=
+-- @result_contains=Profile: tasks=
 -- @result_contains=HASH AGGREGATE
 -- @result_contains=UNION ALL
 EXPLAIN ANALYZE SELECT k, SUM(v) AS total_v

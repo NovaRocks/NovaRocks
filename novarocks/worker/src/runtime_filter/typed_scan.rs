@@ -29,7 +29,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_execution::runtime_filter::{
     RuntimeFilterArtifactQuery, RuntimeFilterArtifactQueryError, RuntimeFilterBindOutcome,
     RuntimeFilterConsumerContract, RuntimeFilterContractViolation, RuntimeFilterSessionRef,
-    RuntimeFilterSnapshot, RuntimeFilterSubscriptionHandle, RuntimeFilterSubscriptionRequest,
+    RuntimeFilterSnapshot, RuntimeFilterSubscriptionPin, RuntimeFilterSubscriptionRequest,
 };
 use novarocks_spi::connector::ConnectorScalarValue;
 use novarocks_spi::connector::read_stack::{
@@ -88,23 +88,23 @@ pub fn typed_scan_dynamic_filter(
 }
 
 struct CoveredColumn {
-    subscription: RuntimeFilterSubscriptionHandle,
+    subscription: RuntimeFilterSubscriptionPin,
 }
 
 impl CoveredColumn {
     fn snapshot(&self) -> Option<Arc<RuntimeFilterSnapshot>> {
         match &self.subscription {
-            RuntimeFilterSubscriptionHandle::Blocking(subscription) => subscription.snapshot(),
-            RuntimeFilterSubscriptionHandle::Live(subscription) => subscription.snapshot(),
+            RuntimeFilterSubscriptionPin::Blocking(subscription) => subscription.snapshot(),
+            RuntimeFilterSubscriptionPin::Live(subscription) => subscription.snapshot(),
         }
     }
 
     fn is_complete(&self) -> bool {
         match &self.subscription {
-            RuntimeFilterSubscriptionHandle::Blocking(subscription) => {
+            RuntimeFilterSubscriptionPin::Blocking(subscription) => {
                 subscription.snapshot().is_some()
             }
-            RuntimeFilterSubscriptionHandle::Live(_) => false,
+            RuntimeFilterSubscriptionPin::Live(_) => false,
         }
     }
 }

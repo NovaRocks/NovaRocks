@@ -15,21 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Readiness FIFO metadata only. These tests use actual QueryContextRef keys
+//! Readiness FIFO metadata only. These tests use actual ParticipationRef keys
 //! and the real pure queue; popping a unit marker proves no Work/RPC/Source
 //! exit, physical Native execution or process-owner lifecycle transition.
 
 use super::*;
 use novarocks_types::{AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId};
 
-fn context(sequence: i64) -> QueryContextRef {
+fn participation(sequence: i64) -> ParticipationRef {
     let mut frontend = [1; 16];
     frontend[6] = 0x70;
     frontend[8] = 0x80;
     let mut backend = [2; 16];
     backend[6] = 0x70;
     backend[8] = 0x80;
-    QueryContextRef::new(
+    ParticipationRef::new(
         QueryExecutionId::new(QueryId::new(9471, sequence), AttemptId::new(1).unwrap()).unwrap(),
         FrontendProcessId::try_from_bytes(frontend).unwrap(),
         BackendProcessId::try_from_bytes(backend).unwrap(),
@@ -42,14 +42,14 @@ fn queue(positions: usize) -> ReadyRoutes {
 #[test]
 fn a_newly_ready_low_key_is_served_despite_continuous_fresh_higher_key_churn() {
     let mut ready = queue(2);
-    let low = context(1);
-    let previously_selected = context(100);
+    let low = participation(1);
+    let previously_selected = participation(100);
     assert!(low < previously_selected);
     ready.mark(previously_selected);
     assert_eq!(ready.pop(), Some(previously_selected));
     // The lower key only became ready after the preceding higher key ran.
     // One older ready high marker may precede it; future high keys may not.
-    ready.mark(context(101));
+    ready.mark(participation(101));
     ready.mark(low);
     let mut low_turns = 0;
     for turn in 0..2_000 {
@@ -61,8 +61,8 @@ fn a_newly_ready_low_key_is_served_despite_continuous_fresh_higher_key_churn() {
         let selected = ready.pop().unwrap(); // Exactly budget one per owner turn.
         assert_eq!(ready.queue.len(), 1);
         if turn % 2 == 0 {
-            assert_eq!(selected, context(101 + turn / 2));
-            ready.mark(context(102 + turn / 2));
+            assert_eq!(selected, participation(101 + turn / 2));
+            ready.mark(participation(102 + turn / 2));
         } else {
             assert_eq!(
                 selected, low,
@@ -81,8 +81,8 @@ fn a_newly_ready_low_key_is_served_despite_continuous_fresh_higher_key_churn() {
 
 #[test]
 fn duplicate_wakes_neither_move_an_old_marker_back_nor_move_a_newer_marker_forward() {
-    let a = context(1);
-    let b = context(2);
+    let a = participation(1);
+    let b = participation(2);
     for duplicate in [a, b] {
         let mut ready = queue(2);
         ready.mark(a);
@@ -101,15 +101,15 @@ fn duplicate_wakes_neither_move_an_old_marker_back_nor_move_a_newer_marker_forwa
 #[test]
 fn a_still_runnable_busy_owner_requeues_behind_every_already_ready_sibling() {
     let mut ready = queue(3);
-    let a = context(10);
-    let b = context(20);
-    let c = context(30);
+    let a = participation(10);
+    let b = participation(20);
+    let c = participation(30);
     ready.mark(a);
     ready.mark(b);
     ready.mark(c);
     assert_eq!(ready.pop(), Some(a));
     // Only the selected metadata marker finished. The actual Root owner
-    // requeues after finding the original Context route still runnable.
+    // requeues after finding the original Participation route still runnable.
     ready.mark(a);
     ready.mark(a);
     assert_eq!(ready.pop(), Some(b));
@@ -121,8 +121,8 @@ fn a_still_runnable_busy_owner_requeues_behind_every_already_ready_sibling() {
 #[test]
 fn canceling_the_last_request_forgets_the_marker_and_later_readiness_is_a_fresh_tail() {
     let mut ready = queue(2);
-    let a = context(1);
-    let b = context(2);
+    let a = participation(1);
+    let b = participation(2);
     ready.mark(a);
     ready.mark(b);
     ready.forget(a);
@@ -138,8 +138,8 @@ fn canceling_the_last_request_forgets_the_marker_and_later_readiness_is_a_fresh_
     assert!(ready.is_empty());
     assert_eq!(ready.pop(), None);
     // Removal means actual metadata removal, not a forever allocated key.
-    let c = context(3);
-    let d = context(4);
+    let c = participation(3);
+    let d = participation(4);
     ready.mark(c);
     ready.mark(d);
     assert_eq!(ready.pop(), Some(c));
@@ -148,12 +148,12 @@ fn canceling_the_last_request_forgets_the_marker_and_later_readiness_is_a_fresh_
 }
 
 #[test]
-fn fixed_two_position_inventory_is_reused_across_thousands_of_distinct_contexts() {
+fn fixed_two_position_inventory_is_reused_across_thousands_of_distinct_participations() {
     let mut ready = queue(2);
     for round in 0..4_096 {
-        let a = context(3 * round + 1);
-        let b = context(3 * round + 2);
-        let c = context(3 * round + 3);
+        let a = participation(3 * round + 1);
+        let b = participation(3 * round + 2);
+        let c = participation(3 * round + 3);
         ready.mark(a);
         ready.mark(b);
         ready.forget(a);

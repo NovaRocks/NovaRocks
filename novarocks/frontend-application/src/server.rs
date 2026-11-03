@@ -1218,7 +1218,7 @@ async fn run_client_listeners_with_supervision<F>(
     native_trust: Arc<NativeTrust>,
     listeners: ClientListenerInputs,
     shutdown: F,
-    report_server: &mut crate::native::report_server::FrontendReportServerHandle,
+    report_server: &mut crate::native::report_server::FrontendReportListener,
     management_server: &mut FrontendManagementServer,
     host: &FrontendApplicationHost,
     drain_timeout: Duration,
@@ -1235,7 +1235,7 @@ where
         query_control,
         client_connections,
     } = listeners;
-    let mut trino_server = novarocks_trino_adapter::TrinoServerHandle::bind(
+    let mut trino_server = novarocks_trino_adapter::TrinoListener::bind(
         &trino_listener,
         server_version.clone(),
         host.serving_lifecycle().admission(),
@@ -1414,7 +1414,8 @@ fn emit_frontend_mysql_ready(bind_addr: std::net::SocketAddr, user: &str, trino_
     // mysql port alone cannot distinguish a freshly-bound server from a
     // pre-existing process that already owned the port.
     println!(
-        "NOVAROCKS_READY mysql_port={} pid={} trino_port={}",
+        "{} mysql_port={} pid={} trino_port={}",
+        novarocks_failpoint::observation_marker::READY,
         bind_addr.port(),
         std::process::id(),
         trino_port
@@ -1422,9 +1423,9 @@ fn emit_frontend_mysql_ready(bind_addr: std::net::SocketAddr, user: &str, trino_
 }
 
 async fn wait_for_frontend_listener_failure(
-    report_server: &mut crate::native::report_server::FrontendReportServerHandle,
+    report_server: &mut crate::native::report_server::FrontendReportListener,
     management_server: &mut FrontendManagementServer,
-    trino_server: &mut novarocks_trino_adapter::TrinoServerHandle,
+    trino_server: &mut novarocks_trino_adapter::TrinoListener,
     host: &FrontendApplicationHost,
 ) -> String {
     loop {

@@ -46,14 +46,17 @@ fn one_original_source_loan_excludes_disposal_and_restores_on_return_or_unwind()
             .clone();
         let loan = owner.take_materialization().unwrap();
         let gate = Gate::new();
-        let same_context = Arc::new(AtomicBool::new(false));
-        let context = f.context;
+        let same_participation = Arc::new(AtomicBool::new(false));
+        let participation = f.participation;
         let worker = {
             let gate = gate.clone();
-            let same_context = same_context.clone();
+            let same_participation = same_participation.clone();
             thread::spawn(move || {
                 catch_unwind(AssertUnwindSafe(move || {
-                    same_context.store(loan.shared_facts().context() == context, Ordering::SeqCst);
+                    same_participation.store(
+                        loan.shared_facts().participation() == participation,
+                        Ordering::SeqCst,
+                    );
                     gate.entered.wait();
                     gate.resume.wait();
                     assert!(!panic_in_host, "symbolic borrowed host invocation panic");
@@ -80,7 +83,7 @@ fn one_original_source_loan_excludes_disposal_and_restores_on_return_or_unwind()
         drop(next_loan);
         let source_exited_on_return = owner.try_close().unwrap();
         let fee_after_return = f.ledger.used(Dimension::Requests.id());
-        let role_after_return = f.root.resources().requests[&input].role.phase();
+        let role_after_return = f.root.resources().requests[&input].exit_custody.phase();
         let disposal = direct
             .or(withdrawal)
             .or_else(|| f.root.begin_unsubmitted_withdrawal(input).unwrap())
@@ -91,7 +94,7 @@ fn one_original_source_loan_excludes_disposal_and_restores_on_return_or_unwind()
         f.finish();
 
         assert!(projected);
-        assert!(same_context.load(Ordering::SeqCst));
+        assert!(same_participation.load(Ordering::SeqCst));
         assert!(direct_excluded);
         assert!(withdrawal_excluded);
         assert_eq!(retired_during_loan, 0);
@@ -104,7 +107,7 @@ fn one_original_source_loan_excludes_disposal_and_restores_on_return_or_unwind()
         assert_eq!(fee_after_return, 1);
         assert_eq!(
             role_after_return,
-            novarocks_control_runtime::exit_role::ExitRolePhase::Started
+            novarocks_control_runtime::exit_custody::ExitCustodyPhase::Started
         );
         assert!(disposed);
         assert_eq!(retired, 1);
@@ -148,9 +151,9 @@ fn an_unsubmitted_request_rejects_a_real_non_materialize_ticket_without_losing_i
         .submit_request(
             other,
             ControlInput::Acquire {
-                request: AcquireQueryContextAdmissionTicket::new(
+                request: AcquireParticipationAdmissionTicket::new(
                     other_operation,
-                    f.context,
+                    f.participation,
                     LeaseValidFor::new(Duration::from_secs(6)).unwrap(),
                     NativeCompatibilityId::new([3; 32]),
                     f.capability,
@@ -167,7 +170,7 @@ fn an_unsubmitted_request_rejects_a_real_non_materialize_ticket_without_losing_i
         Err(ControlRequestError::WrongEffect)
     );
     let loan = owner.take_materialization().unwrap();
-    let source_unchanged = loan.shared_facts().context() == f.context;
+    let source_unchanged = loan.shared_facts().participation() == f.participation;
     drop(loan);
     let reference = crate::control_runtime::effect_dispatch::EffectRef {
         input: body.input,

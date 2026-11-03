@@ -28,7 +28,7 @@ pub mod test_support {
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::ConnectorExecutionReadBinding;
     use novarocks_spi::connector::read_stack::ConnectorValueType;
-    use novarocks_worker::read_attempt::TypedReadAttemptContext;
+    use novarocks_worker::read_attempt::TaskReadBindingRegistry;
 
     pub fn encoded_payload(
         category: novarocks_spi::connector::ConnectorCodecCategory,
@@ -459,7 +459,7 @@ pub mod test_support {
         )
         .expect("execution id");
         let queues = novarocks_execution::connector::SplitQueueRegistry::new().open_attempt(
-            novarocks_execution::connector::TaskAttemptKey::new(
+            novarocks_execution::connector::SplitQueueKey::new(
                 execution_id,
                 novarocks_types::UniqueId::new(9, 1),
             ),
@@ -496,7 +496,7 @@ pub mod test_support {
             queues,
             session,
             std::sync::Arc::new(|| Ok(None)),
-            std::sync::Arc::new(TypedReadAttemptContext::new()),
+            std::sync::Arc::new(TaskReadBindingRegistry::new()),
             std::sync::Arc::new(NoVendedStorageResolver),
             novarocks_worker::ScanStreamHost::new(
                 novarocks_worker::ScanPreparationConfig::default(),
@@ -552,7 +552,7 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
     use tokio_stream::Stream;
 
-    use novarocks_execution::connector::TaskAttemptSplitQueues;
+    use novarocks_execution::connector::SplitQueues;
     use novarocks_execution::exec::node::scan::{BoundScanRanges, ScanOp, ScanSource};
     use novarocks_execution::runtime::profile::RuntimeProfile;
     use novarocks_spi::connector::ConnectorRequestContext;
@@ -563,7 +563,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow::array::{ArrayRef, Int64Array};
-    use novarocks_execution::connector::{SplitQueueConfig, SplitQueueRegistry, TaskAttemptKey};
+    use novarocks_execution::connector::{SplitQueueConfig, SplitQueueKey, SplitQueueRegistry};
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_codec::connector_read::ConnectorReadDecoder;
     use novarocks_proto_codec::connector_read::ConnectorTableScanSource;
@@ -865,10 +865,10 @@ mod tests {
         ReceivedReadSplit::new(evidence.sequence_id(), evidence.plan_node_id(), split)
     }
 
-    fn attempt_queues() -> Arc<TaskAttemptSplitQueues<ReceivedReadSplit>> {
+    fn attempt_queues() -> Arc<SplitQueues<ReceivedReadSplit>> {
         let registry = SplitQueueRegistry::new();
         registry.open_attempt(
-            TaskAttemptKey::new(
+            SplitQueueKey::new(
                 QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).expect("attempt"))
                     .expect("execution id"),
                 UniqueId::new(3, 4),
@@ -1076,19 +1076,19 @@ mod tests {
     #[derive(Default)]
     struct TestSourceReports {
         runtime: novarocks_execution::runtime::runtime_state::RuntimeErrorState,
-        cleanup: Mutex<Vec<novarocks_execution::runtime::fragment::ExecutionFailure>>,
+        cleanup: Mutex<Vec<novarocks_execution::runtime::task::ExecutionFailure>>,
     }
-    impl novarocks_execution::runtime::fragment::ExecutionFailureReporter for TestSourceReports {
-        fn report_failure(&self, cause: novarocks_execution::runtime::fragment::ExecutionFailure) {
+    impl novarocks_execution::runtime::task::ExecutionFailureReporter for TestSourceReports {
+        fn report_failure(&self, cause: novarocks_execution::runtime::task::ExecutionFailure) {
             self.runtime.set_error(cause);
         }
-        fn report_cleanup(&self, cause: &novarocks_execution::runtime::fragment::ExecutionFailure) {
+        fn report_cleanup(&self, cause: &novarocks_execution::runtime::task::ExecutionFailure) {
             self.cleanup.lock().unwrap().push(cause.clone());
             self.runtime.report_cleanup(cause);
         }
         fn report_unresolved_exit(
             &self,
-            cause: &novarocks_execution::runtime::fragment::ExecutionFailure,
+            cause: &novarocks_execution::runtime::task::ExecutionFailure,
         ) {
             self.runtime.report_unresolved_exit(cause);
         }
@@ -1102,7 +1102,7 @@ mod tests {
     }
     type ObservedTestOutput = std::pin::Pin<Box<ObservedTestStream>>;
     impl tokio_stream::Stream for ObservedTestStream {
-        type Item = novarocks_execution::runtime::fragment::ExecutionResult<
+        type Item = novarocks_execution::runtime::task::ExecutionResult<
             novarocks_execution::exec::chunk::Chunk,
         >;
         fn poll_next(
@@ -1138,7 +1138,7 @@ mod tests {
     }
     fn close_observed(
         stream: ObservedTestOutput,
-    ) -> ObservedTestFuture<novarocks_execution::runtime::fragment::ExecutionResult<()>> {
+    ) -> ObservedTestFuture<novarocks_execution::runtime::task::ExecutionResult<()>> {
         let this = *std::pin::Pin::into_inner(stream);
         let close = novarocks_execution::exec::node::scan::ScanChunkStream::close(
             this.stream,
@@ -1168,7 +1168,7 @@ mod tests {
         stream: &mut ObservedTestOutput,
         budget: &ConnectorPollBudget,
     ) -> Option<
-        novarocks_execution::runtime::fragment::ExecutionResult<
+        novarocks_execution::runtime::task::ExecutionResult<
             novarocks_execution::exec::chunk::Chunk,
         >,
     > {
@@ -1192,7 +1192,7 @@ mod tests {
 
     fn stream_source_with(
         provider: Arc<dyn ConnectorReadPageSourceProvider>,
-        queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
+        queues: Arc<SplitQueues<ReceivedReadSplit>>,
         request: ConnectorRequestContext,
     ) -> TypedConnectorScanSource {
         TypedConnectorScanSource::new(
@@ -1675,7 +1675,7 @@ mod tests {
 
     #[test]
     fn normal_split_cleanup_does_not_replace_required_work_or_end_later_split_data() {
-        use novarocks_execution::runtime::fragment::{
+        use novarocks_execution::runtime::task::{
             ExecutionFailureCause, connector_failure::ConnectorOperation,
         };
         let queues = attempt_queues();

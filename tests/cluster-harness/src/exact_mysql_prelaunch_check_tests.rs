@@ -79,13 +79,11 @@ fn denied_prepared_config_precedes_every_role_spawn(live_fences: bool) -> Result
         Err(OriginalPrelaunchRefusal.into())
     };
     let result = if live_fences {
-        CrossProcessServerHandle::launch_with_held_live_source_checks(
-            options,
-            &prepared,
-            &|_, _| anyhow::bail!("log owner observed after refused preparation"),
-        )
+        CrossProcessCluster::launch_with_held_live_source_checks(options, &prepared, &|_, _| {
+            anyhow::bail!("log owner observed after refused preparation")
+        })
     } else {
-        CrossProcessServerHandle::launch_with_exact_mysql_prelaunch_check(options, &prepared)
+        CrossProcessCluster::launch_with_exact_mysql_prelaunch_check(options, &prepared)
     };
     let error = match result {
         Ok(mut unexpected) => {

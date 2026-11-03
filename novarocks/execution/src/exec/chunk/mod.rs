@@ -50,7 +50,7 @@ pub use hydrate::dictionary_hydration_required_observed;
 pub use hydrate::hydrate_dictionary_columns_owned_observed;
 pub use memory::record_batch_bytes;
 pub(crate) use memory::{
-    ChunkMemoryLease, TransferredChunkBytes, record_batch_additional_bytes,
+    ChunkMemoryCharge, TransferredChunkBytes, record_batch_additional_bytes,
     record_batch_additional_bytes_observed, record_batch_shared_owner_bytes,
 };
 pub(crate) use output_metadata::OutputColumnMetadata;

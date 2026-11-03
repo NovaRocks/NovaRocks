@@ -31,7 +31,7 @@ use super::*;
 use crate::exec::chunk::ChunkSchema;
 use crate::exec::operators::compiled_aggregate::CompiledAggregateProcessorFactory;
 use crate::exec::pipeline::test_driver::TestDriver;
-use crate::runtime::fragment::ExecutionFailureCause;
+use crate::runtime::task::ExecutionFailureCause;
 use arrow::array::ArrayRef;
 use arrow::array::{
     BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Int8Array, Int16Array,
@@ -255,7 +255,7 @@ fn fixture_with_source_parameters(
         assert!(!n_lists && !independent_n_limits);
         assert_eq!(key_types, &[FunctionValueType::new(DataType::Utf8, true)]);
         let (columns, read) =
-            crate::runtime::fragment::scan::compiled_fixture::add_typed_scan_with_residual(
+            crate::runtime::task::scan::compiled_fixture::add_typed_scan_with_residual(
                 &mut builder,
                 source,
                 &types,
@@ -511,7 +511,7 @@ fn fixture_with_source_parameters(
             &catalog,
             2,
             true,
-            &crate::runtime::fragment::scan::compiled_fixture::providers(),
+            &crate::runtime::task::scan::compiled_fixture::providers(),
         )
     } else {
         let package = packages(&plan, &catalog)

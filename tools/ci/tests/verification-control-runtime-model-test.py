@@ -88,7 +88,7 @@ print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 0 filt
         evidence = self.evidence()
         self.assertTrue(evidence['complete'])
         self.assertTrue(evidence['sources_stable'])
-        targets = ['concurrency_loom', 'continuation_loom', 'exit_role_loom', 'failure_publication_loom', 'read_resource_loom']
+        targets = ['concurrency_loom', 'continuation_loom', 'exit_custody_loom', 'failure_publication_loom', 'read_resource_loom']
         self.assertEqual([item['target'] for item in evidence['targets']], targets)
         commands = [json.loads(line) for line in (self.root / 'commands.jsonl').read_text().splitlines()]
         self.assertEqual(len(commands), len(targets))

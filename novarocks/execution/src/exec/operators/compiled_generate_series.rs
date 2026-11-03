@@ -28,13 +28,13 @@ use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{Transform, TransformKernel},
     step::{NextStep, StepResult},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use novarocks_functions::{
@@ -344,7 +344,7 @@ impl InputEncodingPolicy for CompiledGenerateSeriesProcessor {}
 impl TransformKernel for CompiledGenerateSeriesProcessor {
     fn apply(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         let chunk = input.into_uncovered_chunk()?;
@@ -375,7 +375,7 @@ impl TransformKernel for CompiledGenerateSeriesProcessor {
             }
         }
     }
-    fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.alive()?;
         if let Err(cause) = self.control.checkpoint(0) {
             self.failed = true;
@@ -432,7 +432,7 @@ impl TransformKernel for CompiledGenerateSeriesProcessor {
         };
         Ok(StepResult::new(Some(output), next, 0))
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.alive()?;
         Ok(StepResult::new(None, NextStep::Finished, 0))
     }

@@ -251,17 +251,17 @@ impl NativeRpcMethod {
 pub fn operation_method(kind: OperationShape, only_close_destinations: bool) -> NativeRpcMethod {
     use NativeRpcMethod::{ApplyTaskControlOperations, ApplyTaskOperations};
     match kind {
-        OperationShape::RenewQueryExecutionLease
+        OperationShape::RenewParticipationLease
         | OperationShape::CancelTask
-        | OperationShape::AbortQueryContext
-        | OperationShape::QuiesceQueryContext
-        | OperationShape::ReleaseQueryContext => ApplyTaskControlOperations,
+        | OperationShape::AbortParticipation
+        | OperationShape::QuiesceParticipation
+        | OperationShape::ReleaseParticipation => ApplyTaskControlOperations,
         OperationShape::UpdateTask if only_close_destinations => ApplyTaskControlOperations,
-        OperationShape::AcquireQueryContextAdmissionTicket
-        | OperationShape::EstablishQueryContext
+        OperationShape::AcquireParticipationAdmissionTicket
+        | OperationShape::EstablishParticipation
         | OperationShape::CreateTask
         | OperationShape::UpdateTask
-        | OperationShape::AdvanceQueryContextDomain => ApplyTaskOperations,
+        | OperationShape::AdvanceParticipationDomain => ApplyTaskOperations,
         OperationShape::FetchTaskDynamicFilters => NativeRpcMethod::FetchTaskDynamicFilters,
         OperationShape::GetFinalTaskInfo => NativeRpcMethod::GetFinalTaskInfo,
     }
@@ -386,11 +386,11 @@ mod tests {
     #[test]
     fn new_work_and_mixed_updates_never_use_urgent_control() {
         for kind in [
-            OperationShape::AcquireQueryContextAdmissionTicket,
-            OperationShape::EstablishQueryContext,
+            OperationShape::AcquireParticipationAdmissionTicket,
+            OperationShape::EstablishParticipation,
             OperationShape::CreateTask,
             OperationShape::UpdateTask,
-            OperationShape::AdvanceQueryContextDomain,
+            OperationShape::AdvanceParticipationDomain,
         ] {
             assert_eq!(
                 operation_method(kind, false),
@@ -402,7 +402,7 @@ mod tests {
             NativeRpcMethod::ApplyTaskControlOperations
         );
         assert_eq!(
-            operation_method(OperationShape::AbortQueryContext, false),
+            operation_method(OperationShape::AbortParticipation, false),
             NativeRpcMethod::ApplyTaskControlOperations
         );
     }

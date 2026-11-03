@@ -495,6 +495,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：Rust 的普通分配失败会终止进程，所以可恢复的容量控制只能建立在**比单次分配更粗的事前授权**上——先取额度、再分配、最后结算，且授予额度内的结算不会因容量失败。一个进程一个权威，账户成严格树，账户对父级持有的份额**就是**它的承诺；已下放的独立域内 funded 步骤不触父/root；补额修改在足够的父级余额停止，祖先增长资格门仍须握手。配置目标与历史债务独立。归属绑定在稳定 allocation origin，真实退出后残留交同分支祖先，物理释放以前仍计费。覆盖是**两级**且诚实的：硬治理覆盖声明的对象集合，其余由进程分配观测按 headroom 预算测量并列出盲区——不冒充按查询精确归属，也不承诺避免所有物理 OOM。授权、实际分配、共享持有、回收估计与物理压力是五个必须分别表达、永不相加的事实。本领域与 `runtime-role` 的工作治理是同一进程内的两半：ADR-0147 拥有责任、scope、阶段准入与取消，本领域拥有容量机制本身，并回答 ADR-0147 重评估条件 2 点名的「扩展真实内存来源与强制接入」。
 
+- [ADR-0216](ADR-0216-execution-vocabulary-participation-task-and-handles.md) — 执行词汇为何把协议记录叫 Participation、协议实例叫 Task，并且只把会到期的授予叫 Lease（active）
 - ADR-0148 — 为何采用唯一的非等待进程容量权威（active；旧余额、Arrow charge 与仲裁框架由 ADR-0166 替换，观察责任保留；全局 allocator 归属由 ADR-0167 部分替换）
 - ADR-0167 — 尺寸分段归属为何用尾部身份与计数/槽 pin 保活，并分开来源、当前责任与资金授权（active；整体替换 ADR-0166，部分替换 ADR-0148/0163 的全局计数器前提；观测 owner 的覆盖失败、容量分区、future 作用域与角色诊断由 ADR-0197 部分替代，资金与存活协议保留）
 - [ADR-0197](ADR-0197-observation-owner-shards-and-coverage-shadow.md) — 观测 owner 为何整组发布分片、在覆盖不可用时遮蔽外层，并隔离资金记录容量（active；部分替代 ADR-0167 规则 1、3、5、10）

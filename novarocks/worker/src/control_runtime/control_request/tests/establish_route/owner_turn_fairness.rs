@@ -19,9 +19,9 @@
 
 use super::*;
 use crate::control_runtime::{
-    establish_executors::EstablishExecutors, process_control::RootHostCell,
+    establish_executors::EstablishExecutors, process_control::ControlHostCell,
 };
-use novarocks_control_runtime::driver::{ActorHostTurn, ActorRegistration};
+use novarocks_control_runtime::actor_turn::{ActorHostTurn, ActorRegistration};
 use std::num::NonZeroUsize;
 
 struct PoolJoin(Option<EstablishExecutors>);
@@ -65,15 +65,17 @@ fn root_turn(
 fn probe_in_handoff_order(f: &mut RouteFixture, input: InputId) -> EstablishReplayResult {
     let runtime = f.f.runtime.clone();
     for claimed in 0..=2 {
-        let host_address = f.f.root.service().context(f.f.context).unwrap();
+        let host_address = f.f.root.service().participation(f.f.participation).unwrap();
         let mut host = host_address.lock().unwrap();
         host.dispatch.index_committed(&runtime, 64).unwrap();
         if let Some(probe) = host.dispatch.take_ready(&runtime, 64).unwrap() {
             let result = match &probe.effect {
-                WorkerAction::Context(ContextEffect::EstablishProbed {
-                    request, result, ..
+                WorkerAction::Participation(ParticipationEffect::EstablishProbed {
+                    request,
+                    result,
+                    ..
                 }) if request.token == input => result.clone(),
-                _ => panic!("the actual Context probe follows route handoff order"),
+                _ => panic!("the actual Participation probe follows route handoff order"),
             };
             drop(host);
             f.assert_original_probe_author(&probe, input);
@@ -103,7 +105,7 @@ fn finish_conflict_return(
     let reply = f.f.root.take_control_effect(64).unwrap().unwrap();
     assert!(matches!(&reply.effect, WorkerAction::ControlReply(reply)
         if reply.request.token == input
-            && reply.result == RequestResult::Outcome(OperationOutcome::ContextConflict)));
+            && reply.result == RequestResult::Outcome(OperationOutcome::ParticipationConflict)));
     let disposal =
         f.f.root
             .begin_rejected_ingress_disposal(&reply)
@@ -128,7 +130,7 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
     let (second, second_handle, second_getters, second_drops) = f.begin_route(op(13), 100, None);
     // These are genuine deferred handoffs. Their Root inputs can retire while
     // the original RPCs still own their sources and wait for the actual actor.
-    assert!(f.f.runtime.snapshot(context_actor()).is_err());
+    assert!(f.f.runtime.snapshot(participation_actor()).is_err());
     assert_eq!(f.f.root.reap_ready_requests(32).unwrap(), 0);
     assert!(f.f.runtime.input_custody(actor(), first).unwrap().is_none());
     assert!(
@@ -168,11 +170,11 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
             .unwrap()
             .is_none()
     );
-    f.adopt_pending_context();
+    f.adopt_pending_participation();
     let replies_before = f.f.ledger.used(Dimension::Requests.id());
     let registration = f.f.root.registration().clone();
     let runtime = f.f.runtime.clone();
-    let cell = Arc::new(RootHostCell::new(f.f.root));
+    let cell = Arc::new(ControlHostCell::new(f.f.root));
     let turn = root_turn(&runtime, &registration);
     let first_turn = cell.advance_ready(&turn, &handles, None, 1).unwrap();
     let second_turn = cell.advance_ready(&turn, &handles, None, 1).unwrap();
@@ -189,23 +191,23 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
     let retired_original = !f.f.root.resources().requests.contains_key(&withdrawn)
         && f.f.ledger.used(Dimension::Requests.id()) + 1 == replies_before;
     {
-        let original_address = f.f.root.service().context(f.f.context).unwrap();
-        let mut original_context = original_address.lock().unwrap();
-        let routes = &original_context.resources_for_test().routes;
+        let original_address = f.f.root.service().participation(f.f.participation).unwrap();
+        let mut original_participation = original_address.lock().unwrap();
+        let routes = &original_participation.resources_for_test().routes;
         assert_eq!(routes.len(), 2);
         assert!(routes.contains_key(&first) && routes.contains_key(&second));
     }
     // Preserve the same physical pools until their real joins. This test does
-    // not fabricate a getter, a Context decision or a Source exit from counts.
+    // not fabricate a getter, a Participation decision or a Source exit from counts.
     drop(handles);
     pools.join();
     assert!(
-        matches!(probe_in_handoff_order(&mut f, first), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
+        matches!(probe_in_handoff_order(&mut f, first), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ParticipationConflict)
     );
     assert!(
         f.f.root
             .service()
-            .context(f.f.context)
+            .participation(f.f.participation)
             .unwrap()
             .lock()
             .unwrap()
@@ -214,12 +216,12 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
     );
     finish_conflict_return(&mut f, first, first_handle, first_getters, first_drops);
     assert!(
-        matches!(probe_in_handoff_order(&mut f, second), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
+        matches!(probe_in_handoff_order(&mut f, second), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ParticipationConflict)
     );
     assert!(
         f.f.root
             .service()
-            .context(f.f.context)
+            .participation(f.f.participation)
             .unwrap()
             .lock()
             .unwrap()
@@ -232,22 +234,22 @@ fn ready_routes_cannot_consume_the_original_request_retirement_allowance() {
 }
 
 #[test]
-fn a_real_context_lock_wait_releases_root_inventory_but_keeps_the_original_host_turn() {
+fn a_real_participation_lock_wait_releases_root_inventory_but_keeps_the_original_host_turn() {
     use std::{sync::mpsc, time::Instant};
     let mut f = RouteFixture::with_geometry(2, StorageNeed::default(), true);
     let (input, handle, getters, drops) = f.begin_route(op(12), 100, None);
-    f.adopt_pending_context();
+    f.adopt_pending_participation();
     let runtime = f.f.runtime.clone();
     let registration = f.f.root.registration().clone();
-    let address = f.f.root.service().context(f.f.context).unwrap();
-    let mut context_guard = address.lock().unwrap();
-    let context_scope = context_guard
+    let address = f.f.root.service().participation(f.f.participation).unwrap();
+    let mut participation_guard = address.lock().unwrap();
+    let participation_scope = participation_guard
         .resources_for_test()
         .scope
         .as_ref()
         .unwrap()
         .clone();
-    let before = context_scope.snapshot().unwrap();
+    let before = participation_scope.snapshot().unwrap();
     let owner = match f
         .f
         .root
@@ -262,7 +264,7 @@ fn a_real_context_lock_wait_releases_root_inventory_but_keeps_the_original_host_
     };
     let handles = owner.handles().unwrap();
     let mut pools = PoolJoin(Some(owner));
-    let cell = Arc::new(RootHostCell::new(f.f.root));
+    let cell = Arc::new(ControlHostCell::new(f.f.root));
     let turn = root_turn(&runtime, &registration);
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let (done_tx, done_rx) = mpsc::sync_channel(1);
@@ -285,17 +287,18 @@ fn a_real_context_lock_wait_releases_root_inventory_but_keeps_the_original_host_
         if let Some(root) = cell.try_lock() {
             let original = root.resources().requests.get(&input).unwrap();
             // The actual Root return role exists only after original-R
-            // preparation, before any target Context input can be bound.
+            // preparation, before any target Participation input can be bound.
             // Its prepaid financial leg is already on the original Root.
-            if original.route_return_role().is_some() && original.pending_route().is_none() {
+            if original.route_return_input_id().is_some() && original.pending_route().is_none() {
                 root_was_free_after_prepare = true;
                 break;
             }
         }
         thread::yield_now();
     }
-    let still_waiting_for_context = matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
-    let context_unchanged_while_blocked = context_scope.snapshot().unwrap() == before;
+    let still_waiting_for_participation =
+        matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    let participation_unchanged_while_blocked = participation_scope.snapshot().unwrap() == before;
     let mut other_turns = Vec::new();
     let mut no_second_root_turn = true;
     while let Some(other) = runtime.claim_host_actor() {
@@ -307,7 +310,7 @@ fn a_real_context_lock_wait_releases_root_inventory_but_keeps_the_original_host_
     }
     // Always release the real mutex before asserting/receiving/joining. A
     // regression holding Root across bind can thus unwind with full cleanup.
-    drop(context_guard);
+    drop(participation_guard);
     let returned = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
     let progress = worker.join().unwrap().unwrap();
     f.f.root = Arc::try_unwrap(cell)
@@ -317,7 +320,7 @@ fn a_real_context_lock_wait_releases_root_inventory_but_keeps_the_original_host_
     drop(handles);
     pools.join();
     assert!(
-        matches!(probe_in_handoff_order(&mut f, input), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ContextConflict)
+        matches!(probe_in_handoff_order(&mut f, input), EstablishReplayResult::Decided(ack) if ack.outcome == OperationOutcome::ParticipationConflict)
     );
     assert!(
         address
@@ -329,8 +332,8 @@ fn a_real_context_lock_wait_releases_root_inventory_but_keeps_the_original_host_
     finish_conflict_return(&mut f, input, handle, getters, drops);
     f.finish_model_refusal();
     assert!(started && returned);
-    assert!(root_was_free_after_prepare && still_waiting_for_context);
-    assert!(context_unchanged_while_blocked);
+    assert!(root_was_free_after_prepare && still_waiting_for_participation);
+    assert!(participation_unchanged_while_blocked);
     assert!(no_second_root_turn);
     assert_eq!(progress.routed, 1);
 }

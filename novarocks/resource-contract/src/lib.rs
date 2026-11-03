@@ -21,7 +21,7 @@
 //! governance consumes that fact without resolving catalog names or DNS aliases.
 
 mod retention;
-pub use retention::{ExistingOwnerRetentionLease, RetentionOwner, RetentionPinError};
+pub use retention::{ExistingOwnerRetentionPin, RetentionOwner, RetentionPinError};
 
 use std::{fmt, sync::Arc};
 

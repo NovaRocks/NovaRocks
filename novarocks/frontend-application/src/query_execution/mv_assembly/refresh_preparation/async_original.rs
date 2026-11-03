@@ -363,7 +363,7 @@ pub(crate) async fn capture_catalog(
             OriginalCatalogLookup::Metadata(lookup) => {
                 let observed = io
                     .metadata(
-                        &lookup.lease,
+                        &lookup.planning_pin,
                         input.context.clone(),
                         &lookup.namespace,
                         &lookup.physical_table,

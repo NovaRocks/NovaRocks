@@ -113,9 +113,8 @@ impl ConnectorVariantPathTransform {
         &self,
         chunk: novarocks_execution::exec::chunk::Chunk,
         factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<
-        novarocks_execution::exec::chunk::Chunk,
-    > {
+    ) -> novarocks_execution::runtime::task::ExecutionResult<novarocks_execution::exec::chunk::Chunk>
+    {
         use novarocks_execution::exec::pipeline::operator::ConstructionFailure;
         let owner = factory.begin_input_construction(&chunk)?;
         enum MatchFailure {
@@ -168,10 +167,10 @@ impl ConnectorVariantPathTransform {
                 })
                 .map_err(|error| match error {
                     MatchFailure::Creator(error) => {
-                        novarocks_execution::runtime::fragment::ExecutionFailure::from(error)
+                        novarocks_execution::runtime::task::ExecutionFailure::from(error)
                     }
                     MatchFailure::Type(error) => {
-                        novarocks_execution::runtime::fragment::ExecutionFailure::from(
+                        novarocks_execution::runtime::task::ExecutionFailure::from(
                             ConstructionFailure::InvalidSource(format!(
                                 "variant read binding is invalid: {error:?}"
                             )),
@@ -193,7 +192,7 @@ impl ConnectorVariantPathTransform {
         // independently of the output Chunk's retained construction scope.
         let path_owner = factory.begin_input_construction(&chunk)?;
         let batch=novarocks_execution::exec::variant_read::materialize_variant_path_columns_owned(chunk.record_batch(),self.read_schema.slot_ids(),self.output_schema.slot_ids(),&self.specs,self.output_schema.arrow_schema_ref(),owner.as_ref(),path_owner.as_ref()).map_err(|error|match error{
-            novarocks_execution::exec::variant_read::VariantMaterializationFailure::Construction(error)=>novarocks_execution::runtime::fragment::ExecutionFailure::from(error),
+            novarocks_execution::exec::variant_read::VariantMaterializationFailure::Construction(error)=>novarocks_execution::runtime::task::ExecutionFailure::from(error),
             novarocks_execution::exec::variant_read::VariantMaterializationFailure::Evaluation(error)=>error,
         })?;
         drop(path_owner);
@@ -220,9 +219,8 @@ impl ConnectorBatchTransform for ConnectorVariantPathTransform {
         &self,
         chunk: novarocks_execution::exec::chunk::Chunk,
         factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<
-        novarocks_execution::exec::chunk::Chunk,
-    > {
+    ) -> novarocks_execution::runtime::task::ExecutionResult<novarocks_execution::exec::chunk::Chunk>
+    {
         self.apply(chunk, factory)
     }
 }

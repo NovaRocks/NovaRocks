@@ -19,8 +19,8 @@
 //! This is cold start/rejection ownership, not a driver-step scheduling layer.
 
 use super::*;
-use crate::runtime::fragment::ExecutionReason;
 use crate::runtime::runtime_state::RuntimeErrorState;
+use crate::runtime::task::ExecutionReason;
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection, FailureReason};
 use std::{any::Any, mem::ManuallyDrop, num::NonZeroU16};
 
@@ -167,24 +167,24 @@ impl Phase {
 }
 
 enum Work {
-    Prepared(Box<ManuallyDrop<DriverTask>>),
+    Prepared(Box<ManuallyDrop<DriverRunner>>),
     Retiring(Box<Retirement>),
     Transferred,
 }
 struct Slot {
     work: Work,
     attachment: Phase,
-    activation: Option<ManuallyDrop<Arc<FragmentCompletion>>>,
+    activation: Option<ManuallyDrop<Arc<DriverGroupCompletion>>>,
     activation_held: bool,
     activate: Phase,
     activate_drop: Phase,
     activate_control_drop: Phase,
 }
 impl Slot {
-    fn new(task: DriverTask) -> Self {
-        let activation = task.completion.clone();
+    fn new(runner: DriverRunner) -> Self {
+        let activation = runner.completion.clone();
         Self {
-            work: Work::Prepared(Box::new(ManuallyDrop::new(task))),
+            work: Work::Prepared(Box::new(ManuallyDrop::new(runner))),
             attachment: Phase::new(),
             activation: Some(ManuallyDrop::new(activation)),
             activation_held: false,
@@ -224,7 +224,7 @@ pub(super) struct BatchOwner {
     count: usize,
 }
 impl DriverBatch {
-    pub(crate) fn new(tasks: Vec<DriverTask>) -> Self {
+    pub(crate) fn new(tasks: Vec<DriverRunner>) -> Self {
         let count = tasks.len();
         Self {
             inner: Arc::new(BatchOwner {
@@ -236,7 +236,7 @@ impl DriverBatch {
                     busy: 0,
                     slots: tasks
                         .into_iter()
-                        .map(|task| Some(Slot::new(task)))
+                        .map(|runner| Some(Slot::new(runner)))
                         .collect(),
                     metadata: std::array::from_fn(|_| Some(Phase::new())),
                     initial_failure: None,
@@ -260,7 +260,7 @@ impl DriverBatch {
             .iter()
             .filter_map(Option::as_ref)
             .find_map(|slot| match &slot.work {
-                Work::Prepared(task) => Some(task.completion.control.clone()),
+                Work::Prepared(runner) => Some(runner.completion.control.clone()),
                 Work::Retiring(r) => r.completion.as_ref().map(|c| c.control.clone()),
                 Work::Transferred => None,
             })
@@ -432,27 +432,27 @@ impl DriverBatch {
     pub(crate) fn borrow_prepared<T: Copy>(
         &self,
         index: usize,
-        action: impl FnOnce(&DriverTask) -> T,
+        action: impl FnOnce(&DriverRunner) -> T,
     ) -> Option<T> {
         let loan = self.inner.loan(index)?;
-        let Work::Prepared(task) = &loan.slot.as_ref()?.work else {
+        let Work::Prepared(runner) = &loan.slot.as_ref()?.work else {
             return None;
         };
-        Some(action(task))
+        Some(action(runner))
     }
-    pub(crate) fn attach(&self, index: usize, attach: impl FnOnce(&DriverTask)) {
+    pub(crate) fn attach(&self, index: usize, attach: impl FnOnce(&DriverRunner)) {
         let Some(mut loan) = self.inner.loan(index) else {
             return;
         };
         let slot = loan.slot.as_mut().expect("original slot loan");
-        let Work::Prepared(task) = &slot.work else {
+        let Work::Prepared(runner) = &slot.work else {
             return;
         };
-        let control = task.completion.control.clone();
+        let control = runner.completion.control.clone();
         slot.attachment.run(
             &control,
             ExecutionReason::DriverStartAttachment.code().get(),
-            || attach(task),
+            || attach(runner),
         );
         let unknown = slot.attachment.unknown;
         drop(loan);
@@ -475,7 +475,7 @@ impl DriverBatch {
     /// phase. The queue lock covers only pure ownership moves and Core counters.
     pub(crate) fn move_to_queue(
         &self,
-        queue: &mut VecDeque<DriverTask>,
+        queue: &mut VecDeque<DriverRunner>,
         shared: &Arc<ExecutorShared>,
     ) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -486,14 +486,14 @@ impl DriverBatch {
                 continue;
             };
             if matches!(slot.work, Work::Prepared(_)) {
-                let Work::Prepared(task) = std::mem::replace(&mut slot.work, Work::Transferred)
+                let Work::Prepared(runner) = std::mem::replace(&mut slot.work, Work::Transferred)
                 else {
                     unreachable!("matched original prepared slot")
                 };
-                let mut task = ManuallyDrop::into_inner(*task);
-                task.lease = Some(ExecutorTaskLease::acquire(shared));
-                task.mark_queued();
-                queue.push_back(task);
+                let mut runner = ManuallyDrop::into_inner(*runner);
+                runner.driver_live_guard = Some(LiveDriverGuard::acquire(shared));
+                runner.mark_queued();
+                queue.push_back(runner);
             }
             if slot.empty() && !slot.attachment.unknown {
                 *entry = None;
@@ -604,11 +604,12 @@ impl BatchOwner {
         };
         let slot = loan.slot.as_mut().expect("original slot loan");
         if matches!(slot.work, Work::Prepared(_)) {
-            let Work::Prepared(task) = std::mem::replace(&mut slot.work, Work::Transferred) else {
+            let Work::Prepared(runner) = std::mem::replace(&mut slot.work, Work::Transferred)
+            else {
                 unreachable!("matched original prepared slot")
             };
             slot.work = Work::Retiring(Box::new(Retirement::new(
-                ManuallyDrop::into_inner(*task),
+                ManuallyDrop::into_inner(*runner),
                 shutdown_failure,
             )));
         }
@@ -686,9 +687,9 @@ pub(crate) enum Poll {
 
 pub(crate) struct Retirement {
     driver: Option<ManuallyDrop<PipelineDriver>>,
-    completion: Option<ManuallyDrop<Arc<FragmentCompletion>>>,
-    context: Option<ManuallyDrop<Arc<FragmentContext>>>,
-    lease: Option<ManuallyDrop<Option<ExecutorTaskLease>>>,
+    completion: Option<ManuallyDrop<Arc<DriverGroupCompletion>>>,
+    context: Option<ManuallyDrop<Arc<TaskContext>>>,
+    live_guard: Option<ManuallyDrop<Option<LiveDriverGuard>>>,
     phases: [Phase; 13],
     control: Option<ManuallyDrop<Arc<RuntimeErrorState>>>,
     health: crate::runtime::task_control::ExecutionExitReporter,
@@ -702,16 +703,16 @@ pub(crate) struct Retirement {
     unresolved: bool,
 }
 impl Retirement {
-    fn new(task: DriverTask, shutdown_failure: bool) -> Self {
-        let DriverTask {
+    fn new(runner: DriverRunner, shutdown_failure: bool) -> Self {
+        let DriverRunner {
             driver,
             completion,
-            fragment_ctx,
-            lease,
+            task_ctx,
+            driver_live_guard,
             time_slice,
             queued_at,
-        } = task;
-        let scheduler = fragment_ctx.event_scheduler();
+        } = runner;
+        let scheduler = task_ctx.event_scheduler();
         let custody = driver.exit_custody();
         let control = completion.control.clone();
         let health = control.exit_health_reporter();
@@ -726,30 +727,30 @@ impl Retirement {
             last: false,
             driver: Some(ManuallyDrop::new(driver)),
             completion: Some(ManuallyDrop::new(completion)),
-            context: Some(ManuallyDrop::new(fragment_ctx)),
-            lease: Some(ManuallyDrop::new(lease)),
+            context: Some(ManuallyDrop::new(task_ctx)),
+            live_guard: Some(ManuallyDrop::new(driver_live_guard)),
             phases: std::array::from_fn(|_| Phase::new()),
             shutdown_failure,
             unresolved: false,
         }
     }
-    pub(super) fn on_worker_shutdown(task: DriverTask) -> Option<DriverTask> {
-        Self::on_worker_inner(task, true, None, true)
+    pub(super) fn on_worker_shutdown(runner: DriverRunner) -> Option<DriverRunner> {
+        Self::on_worker_inner(runner, true, None, true)
     }
     pub(super) fn on_worker(
-        task: DriverTask,
+        runner: DriverRunner,
         abort: bool,
         proposal: Option<ExecutionFailure>,
-    ) -> Option<DriverTask> {
-        Self::on_worker_inner(task, abort, proposal, false)
+    ) -> Option<DriverRunner> {
+        Self::on_worker_inner(runner, abort, proposal, false)
     }
     fn on_worker_inner(
-        task: DriverTask,
+        runner: DriverRunner,
         abort: bool,
         proposal: Option<ExecutionFailure>,
         shutdown_failure: bool,
-    ) -> Option<DriverTask> {
-        let mut retirement = Self::new(task, shutdown_failure);
+    ) -> Option<DriverRunner> {
+        let mut retirement = Self::new(runner, shutdown_failure);
         retirement.proposal = proposal.map(ManuallyDrop::new);
         if retirement.proposal.is_none() && !shutdown_failure {
             retirement.phases[0].started = true;
@@ -764,9 +765,9 @@ impl Retirement {
             Poll::Pending if retirement.can_return_pending() => Some(retirement.into_pending()),
             progress => {
                 let custody = retirement.custody.clone();
-                custody.retain_task_exit(retirement);
+                custody.retain_driver_exit(retirement);
                 if progress == Poll::Pending {
-                    rejected_driver_reaper().enqueue_entry(ReaperEntry::Task(custody));
+                    rejected_driver_reaper().enqueue_entry(ReaperEntry::Driver(custody));
                 }
                 None
             }
@@ -776,23 +777,23 @@ impl Retirement {
         self.driver.is_some()
             && self.context.is_some()
             && self.completion.is_some()
-            && self.lease.is_some()
+            && self.live_guard.is_some()
             && self.proposal.is_none()
             && !self.phases.iter().any(|phase| phase.unknown)
             && !self.phases[3].started
             && !self.phases[4].started
             && !self.phases[5].started
     }
-    fn into_pending(mut self) -> DriverTask {
+    fn into_pending(mut self) -> DriverRunner {
         assert!(
             self.can_return_pending(),
             "only intact healthy original holders transfer"
         );
-        let task = DriverTask {
+        let runner = DriverRunner {
             driver: ManuallyDrop::into_inner(self.driver.take().unwrap()),
             completion: ManuallyDrop::into_inner(self.completion.take().unwrap()),
-            fragment_ctx: ManuallyDrop::into_inner(self.context.take().unwrap()),
-            lease: ManuallyDrop::into_inner(self.lease.take().unwrap()),
+            task_ctx: ManuallyDrop::into_inner(self.context.take().unwrap()),
+            driver_live_guard: ManuallyDrop::into_inner(self.live_guard.take().unwrap()),
             time_slice: self.time_slice,
             queued_at: self.queued_at,
         };
@@ -800,7 +801,7 @@ impl Retirement {
         // the same exact context/control. No foreign capture can retire here.
         drop(ManuallyDrop::into_inner(self.control.take().unwrap()));
         drop(ManuallyDrop::into_inner(self.scheduler.take().unwrap()));
-        task
+        runner
     }
     pub(crate) fn tick(&mut self) -> Poll {
         if self.unresolved {
@@ -845,7 +846,7 @@ impl Retirement {
                     .code()
                     .get(),
                 || {
-                    driver.cancel_for_fragment_abort();
+                    driver.cancel_for_task_abort();
                 },
             );
         }
@@ -918,11 +919,11 @@ impl Retirement {
             self.unresolved = true;
             return Poll::Unresolved;
         }
-        if let Some(lease) = self.lease.take() {
+        if let Some(driver_live_guard) = self.live_guard.take() {
             self.phases[5].run(
                 control,
                 ExecutionReason::DriverRetirementLeaseDrop.code().get(),
-                || drop(ManuallyDrop::into_inner(lease)),
+                || drop(ManuallyDrop::into_inner(driver_live_guard)),
             );
         }
         if self.phases[5].unknown {
@@ -1000,19 +1001,19 @@ pub(super) enum ReaperEntry {
         owner: Arc<BatchOwner>,
         shutdown_failure: bool,
     },
-    Task(Arc<super::super::driver_retirement::DriverExitCustody>),
+    Driver(Arc<super::super::driver_retirement::DriverExitCustody>),
 }
 impl ReaperEntry {
-    pub(super) fn from_pending(task: DriverTask) -> Self {
-        let mut retirement = Retirement::new(task, false);
+    pub(super) fn from_pending(runner: DriverRunner) -> Self {
+        let mut retirement = Retirement::new(runner, false);
         retirement.phases[0].started = true;
         retirement.phases[0].returned = true;
         // This is already PendingFinish, never a new cancellation author.
         retirement.phases[1].started = true;
         retirement.phases[1].returned = true;
         let custody = retirement.custody.clone();
-        custody.retain_task_exit(retirement);
-        Self::Task(custody)
+        custody.retain_driver_exit(retirement);
+        Self::Driver(custody)
     }
     pub(super) fn poll(&self) -> Poll {
         match self {
@@ -1020,7 +1021,7 @@ impl ReaperEntry {
                 owner,
                 shutdown_failure,
             } => owner.poll_batch(*shutdown_failure),
-            Self::Task(custody) => custody.poll_task_exit(),
+            Self::Driver(custody) => custody.poll_driver_exit(),
         }
     }
 }
@@ -1029,14 +1030,14 @@ impl ReaperEntry {
 mod tests {
     use super::*;
     use crate::exec::pipeline::{
+        driver_step::DriverStep,
         operator::{FinishWatch, OperatorLifecycle},
         shape::{Source, SourceKernel},
         step::{NextStep, StepResult},
-        step_context::StepContext,
     };
     use crate::runtime::{
-        fragment::io::{FragmentEvent, FragmentEventSink},
         runtime_state::RuntimeState,
+        task::io::{TaskEvent, TaskEventSink},
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1086,8 +1087,8 @@ mod tests {
         unknown: bool,
         control: Arc<RuntimeErrorState>,
     }
-    impl FragmentEventSink for StorageSink {
-        fn record(&self, _: FragmentEvent) {}
+    impl TaskEventSink for StorageSink {
+        fn record(&self, _: TaskEvent) {}
     }
     impl Drop for StorageSink {
         fn drop(&mut self) {
@@ -1135,12 +1136,12 @@ mod tests {
         }
     }
     impl SourceKernel for Kernel {
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             Ok(StepResult::new(None, NextStep::Finished, 0))
         }
     }
     struct Fixture {
-        task: DriverTask,
+        runner: DriverRunner,
         storage: Weak<Data>,
         data_drops: Arc<AtomicUsize>,
         kernel_drops: Arc<AtomicUsize>,
@@ -1151,7 +1152,7 @@ mod tests {
     }
     fn fixture(
         id: i32,
-        completion: Arc<FragmentCompletion>,
+        completion: Arc<DriverGroupCompletion>,
         unknown: bool,
         pending: bool,
     ) -> Fixture {
@@ -1159,7 +1160,7 @@ mod tests {
     }
     fn fixture_options(
         id: i32,
-        completion: Arc<FragmentCompletion>,
+        completion: Arc<DriverGroupCompletion>,
         unknown: bool,
         pending: bool,
         gate: Option<ContextGate>,
@@ -1182,13 +1183,13 @@ mod tests {
             dropped: data_drops.clone(),
         });
         let storage = Arc::downgrade(&data);
-        let sink: Arc<dyn FragmentEventSink> = Arc::new(StorageSink {
+        let sink: Arc<dyn TaskEventSink> = Arc::new(StorageSink {
             gate,
             data: Some(data),
             unknown,
             control,
         });
-        let context = Arc::new(FragmentContext::new_report_neutral(
+        let context = Arc::new(TaskContext::new_report_neutral(
             None,
             runtime.clone(),
             Some((4300, id.into())),
@@ -1215,7 +1216,7 @@ mod tests {
             Some((4300, id.into())),
         );
         Fixture {
-            task: DriverTask::new(driver, completion, context, Duration::from_millis(1)),
+            runner: DriverRunner::new(driver, completion, context, Duration::from_millis(1)),
             storage,
             data_drops,
             kernel_drops,
@@ -1230,9 +1231,9 @@ mod tests {
     fn actual_worker_receipt_before_start_activation_is_preserved() {
         let executor = Arc::new(GlobalDriverExecutor::new(1));
         let control = Arc::new(RuntimeErrorState::default());
-        let completion = FragmentCompletion::new_prepared(1, control);
+        let completion = DriverGroupCompletion::new_prepared(1, control);
         let Fixture {
-            task,
+            runner,
             storage,
             data_drops,
             kernel_drops,
@@ -1242,7 +1243,7 @@ mod tests {
         *executor.start_activation_gate.lock().unwrap() = Some(gate.clone());
         let submitter = {
             let executor = executor.clone();
-            thread::spawn(move || executor.submit(vec![task]))
+            thread::spawn(move || executor.submit(vec![runner]))
         };
         // Real worker processing, last kernel/context storage Drop and the real
         // worker receipt run while only start activation is held. No count is edited.
@@ -1270,16 +1271,16 @@ mod tests {
         let original: ExecutionFailure =
             novarocks_functions::KernelFailure::ResourceExhausted.into();
         control.set_error(original.clone());
-        let completion = FragmentCompletion::new(2, control.clone());
+        let completion = DriverGroupCompletion::new(2, control.clone());
         let Fixture {
-            task: first,
+            runner: first,
             storage: held,
             data_drops: held_drops,
             kernel_drops: first_kernel,
             ..
         } = fixture(1, completion.clone(), true, false);
         let Fixture {
-            task: second,
+            runner: second,
             storage: released,
             data_drops: second_drops,
             kernel_drops: second_kernel,
@@ -1314,7 +1315,7 @@ mod tests {
         let Work::Retiring(unknown) = &state.slots[0].as_ref().unwrap().work else {
             panic!("original unknown slot retains its retirement")
         };
-        assert!(unknown.unresolved && unknown.completion.is_some() && unknown.lease.is_some());
+        assert!(unknown.unresolved && unknown.completion.is_some() && unknown.live_guard.is_some());
         assert!(
             state.slots[1].is_none(),
             "healthy sibling's original cell actually retired"
@@ -1328,14 +1329,14 @@ mod tests {
         control
             .stop_observable()
             .add_observer(Arc::new(|| panic!("actual stop notification")));
-        let completion = FragmentCompletion::new_prepared(1, control.clone());
+        let completion = DriverGroupCompletion::new_prepared(1, control.clone());
         let Fixture {
-            task,
+            runner,
             storage,
             data_drops,
             ..
         } = fixture(1, completion.clone(), false, false);
-        let batch = DriverBatch::new(vec![task]);
+        let batch = DriverBatch::new(vec![runner]);
         let original: ExecutionFailure =
             novarocks_functions::KernelFailure::ResourceExhausted.into();
         let proposal = batch.install_initial_failure(original.clone());
@@ -1373,15 +1374,15 @@ mod tests {
     fn another_batch_activation_cannot_release_an_inflight_original_start_hold() {
         let executor = Arc::new(GlobalDriverExecutor::new(1));
         let control = Arc::new(RuntimeErrorState::default());
-        let completion = FragmentCompletion::new_prepared(2, control);
+        let completion = DriverGroupCompletion::new_prepared(2, control);
         let Fixture {
-            task: first,
+            runner: first,
             data_drops: first_data,
             kernel_drops: first_kernel,
             ..
         } = fixture(1, completion.clone(), false, false);
         let Fixture {
-            task: second,
+            runner: second,
             data_drops: second_data,
             kernel_drops: second_kernel,
             ..
@@ -1457,7 +1458,7 @@ mod tests {
         }
     }
     impl SourceKernel for CleanupDependency {
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             panic!("a rejected original driver must only drain")
         }
     }
@@ -1470,11 +1471,11 @@ mod tests {
     }
     fn dependency_task(
         id: i32,
-        completion: Arc<FragmentCompletion>,
+        completion: Arc<DriverGroupCompletion>,
         dependency: Option<Arc<AtomicBool>>,
         release_all: Arc<AtomicBool>,
         minimum_observations: usize,
-    ) -> (DriverTask, CleanupProbe) {
+    ) -> (DriverRunner, CleanupProbe) {
         let runtime = Arc::new(RuntimeState::new(
             None,
             None,
@@ -1485,7 +1486,7 @@ mod tests {
             None,
             completion.control.clone(),
         ));
-        let context = Arc::new(FragmentContext::new(
+        let context = Arc::new(TaskContext::new(
             None,
             runtime.clone(),
             Some((4301, id.into())),
@@ -1524,7 +1525,7 @@ mod tests {
             Some((4301, id.into())),
         );
         (
-            DriverTask::new(driver, completion, context, Duration::from_millis(1)),
+            DriverRunner::new(driver, completion, context, Duration::from_millis(1)),
             probe,
         )
     }
@@ -1546,21 +1547,21 @@ mod tests {
         let original: ExecutionFailure =
             novarocks_functions::KernelFailure::ResourceExhausted.into();
         control.set_error(original.clone());
-        let completion = FragmentCompletion::new(N, control.clone());
+        let completion = DriverGroupCompletion::new(N, control.clone());
         let release_all = Arc::new(AtomicBool::new(false));
         let (tail, tail_probe) =
             dependency_task(N as i32, completion.clone(), None, release_all.clone(), 6);
         let mut tasks = Vec::with_capacity(N);
         let mut probes = Vec::with_capacity(N);
         for index in 0..N - 1 {
-            let (task, probe) = dependency_task(
+            let (runner, probe) = dependency_task(
                 index as i32,
                 completion.clone(),
                 Some(tail_probe.closed.clone()),
                 release_all.clone(),
                 0,
             );
-            tasks.push(task);
+            tasks.push(runner);
             probes.push(probe);
         }
         tasks.push(tail);
@@ -1599,7 +1600,7 @@ mod tests {
         for _ in 0..N {
             let control = Arc::new(RuntimeErrorState::default());
             control.set_error(original.clone());
-            completions.push(FragmentCompletion::new(1, control));
+            completions.push(DriverGroupCompletion::new(1, control));
         }
         let (tail, tail_probe) = dependency_task(
             N as i32,
@@ -1611,14 +1612,14 @@ mod tests {
         let mut tasks = Vec::with_capacity(N);
         let mut probes = Vec::with_capacity(N);
         for (index, completion) in completions.iter().enumerate().take(N - 1) {
-            let (task, probe) = dependency_task(
+            let (runner, probe) = dependency_task(
                 index as i32,
                 completion.clone(),
                 Some(tail_probe.closed.clone()),
                 release_all.clone(),
                 0,
             );
-            tasks.push(task);
+            tasks.push(runner);
             probes.push(probe);
         }
         tasks.push(tail);
@@ -1627,8 +1628,8 @@ mod tests {
             let executor = executor.clone();
             thread::spawn(move || {
                 let mut all_refused = true;
-                for task in tasks {
-                    all_refused &= !executor.submit(vec![task]);
+                for runner in tasks {
+                    all_refused &= !executor.submit(vec![runner]);
                 }
                 all_refused
             })
@@ -1665,10 +1666,10 @@ mod tests {
     fn healthy_worker_keeps_original_lease_until_context_drop_really_returns() {
         let executor = GlobalDriverExecutor::new(1);
         let control = Arc::new(RuntimeErrorState::default());
-        let completion = FragmentCompletion::new(2, control);
+        let completion = DriverGroupCompletion::new(2, control);
         let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
         let Fixture {
-            task: first,
+            runner: first,
             storage,
             data_drops,
             ..
@@ -1681,13 +1682,13 @@ mod tests {
             None,
         );
         let Fixture {
-            task: second,
+            runner: second,
             data_drops: sibling_drop,
             ..
         } = fixture(2, completion.clone(), false, false);
         assert!(executor.submit(vec![first, second]));
         let entered = until(|| gate.0.lock().unwrap().0);
-        let original_owned = executor.shared.live_tasks.load(Ordering::SeqCst) == 2
+        let original_owned = executor.shared.live_drivers.load(Ordering::SeqCst) == 2
             && completion.remaining_drivers() == 2
             && completion.stopped_fact().is_none()
             && storage.upgrade().is_some()
@@ -1717,30 +1718,30 @@ mod tests {
         let original: ExecutionFailure =
             novarocks_functions::KernelFailure::ResourceExhausted.into();
         control.set_error(original.clone());
-        let completion = FragmentCompletion::new(2, control.clone());
+        let completion = DriverGroupCompletion::new(2, control.clone());
         let Fixture {
-            mut task,
+            mut runner,
             storage,
             data_drops,
             ..
         } = fixture(1, completion.clone(), true, false);
-        task.lease = Some(ExecutorTaskLease::acquire(&shared));
-        let returned = catch_unwind(AssertUnwindSafe(|| task.driver_finished())).is_ok();
-        let original_kept = shared.live_tasks.load(Ordering::SeqCst) == 1
+        runner.driver_live_guard = Some(LiveDriverGuard::acquire(&shared));
+        let returned = catch_unwind(AssertUnwindSafe(|| runner.driver_finished())).is_ok();
+        let original_kept = shared.live_drivers.load(Ordering::SeqCst) == 1
             && completion.remaining_drivers() == 2
             && completion.stopped_fact().is_none()
             && storage.upgrade().is_some()
             && data_drops.load(Ordering::SeqCst) == 0;
         let Fixture {
-            mut task,
+            mut runner,
             data_drops: sibling_drop,
             ..
         } = fixture(2, completion.clone(), false, false);
-        task.lease = Some(ExecutorTaskLease::acquire(&shared));
-        task.driver_finished();
+        runner.driver_live_guard = Some(LiveDriverGuard::acquire(&shared));
+        runner.driver_finished();
         assert!(returned && original_kept);
         assert_eq!(sibling_drop.load(Ordering::SeqCst), 1);
-        assert_eq!(shared.live_tasks.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.live_drivers.load(Ordering::SeqCst), 1);
         assert_eq!(completion.remaining_drivers(), 1);
         assert!(completion.stopped_fact().is_none());
         assert!(control.error().unwrap().same_occurrence(&original));
@@ -1758,36 +1759,36 @@ mod tests {
     fn typed_park_capacity_refusal_keeps_real_input_until_close_and_worker_progresses() {
         let executor = GlobalDriverExecutor::new(1);
         let control = Arc::new(RuntimeErrorState::default());
-        let completion = FragmentCompletion::new(2, control.clone());
+        let completion = DriverGroupCompletion::new(2, control.clone());
         let observable = Arc::new(Observable::try_bounded(1).unwrap());
         observable.add_observer(Arc::new(|| {}));
         let Fixture {
-            mut task,
+            mut runner,
             storage,
             data_drops,
             pending,
             ..
         } = fixture_options(1, completion.clone(), false, true, None, Some(observable));
         let typed_refusal = matches!(
-            task.refresh_pending_finish_wait(),
+            runner.refresh_pending_finish_wait(),
             Err(crate::runtime::observable::ObservableCapacityError::CapacityExceeded)
         );
         let Fixture {
-            task: second,
+            runner: second,
             data_drops: sibling_drop,
             ..
         } = fixture(2, completion.clone(), false, false);
-        assert!(executor.submit(vec![task, second]));
+        assert!(executor.submit(vec![runner, second]));
         // Context payload Drop precedes the same task's lease and completion
         // receipt. Wait for that real retirement before inspecting both slots.
         let sibling_progress = until(|| {
             sibling_drop.load(Ordering::SeqCst) == 1
-                && executor.shared.live_tasks.load(Ordering::SeqCst) == 1
+                && executor.shared.live_drivers.load(Ordering::SeqCst) == 1
                 && completion.remaining_drivers() == 1
         });
         let original_owned = data_drops.load(Ordering::SeqCst) == 0
             && storage.upgrade().is_some()
-            && executor.shared.live_tasks.load(Ordering::SeqCst) == 1
+            && executor.shared.live_drivers.load(Ordering::SeqCst) == 1
             && completion.remaining_drivers() == 1
             && completion.stopped_fact().is_none();
         let no_fabricated_failure =
@@ -1875,7 +1876,7 @@ mod tests {
             health: health.clone(),
             secondary_unknown,
         }));
-        let completion = FragmentCompletion::new(1, control.clone());
+        let completion = DriverGroupCompletion::new(1, control.clone());
         let receipt = Arc::new(AtomicUsize::new(0));
         let observed_reason = Arc::new(Mutex::new(None));
         {
@@ -1887,7 +1888,7 @@ mod tests {
             });
         }
         let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
-        let Fixture { task: first, .. } = fixture_options(
+        let Fixture { runner: first, .. } = fixture_options(
             1,
             completion.clone(),
             false,
@@ -1900,9 +1901,9 @@ mod tests {
         drop(control);
         drop(completion);
         let sibling_control = Arc::new(RuntimeErrorState::default());
-        let sibling_completion = FragmentCompletion::new(1, sibling_control);
+        let sibling_completion = DriverGroupCompletion::new(1, sibling_control);
         let Fixture {
-            task: sibling,
+            runner: sibling,
             data_drops: sibling_drop,
             ..
         } = fixture(2, sibling_completion.clone(), false, false);

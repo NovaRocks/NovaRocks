@@ -17,12 +17,12 @@
 
 //! Exact fixture observations borrow only the original live role/log owners.
 use super::{BackendTopologyRow, process_resources};
-use super::{CrossProcessServerHandle, TOPOLOGY_IO_TIMEOUT_CAP, query_frontend_backend_topology};
+use super::{CrossProcessCluster, TOPOLOGY_IO_TIMEOUT_CAP, query_frontend_backend_topology};
 use anyhow::{Context, Result, ensure};
 use novarocks_types::BackendProcessId;
 use std::time::Instant;
 
-impl CrossProcessServerHandle {
+impl CrossProcessCluster {
     /// One original FE durable snapshot, checked before and after the caller's visit.
     pub fn with_original_frontend_log_snapshot<T>(
         &self,

@@ -30,7 +30,9 @@ use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::native_root_reply_fault::{
     RootReplyFaultBounds, RootReplyFaultObservation, RootReplyMutation,
 };
-use novarocks_cluster_harness::{CrossProcessRootReplyFaultConfig, LaunchProfile, ServerHandle};
+use novarocks_cluster_harness::{
+    CrossProcessRootReplyFaultConfig, LaunchProfile, TestClusterOwner,
+};
 use novarocks_execution_contract::identity::TaskIdentity;
 use novarocks_proto_codec::FieldPath;
 use novarocks_task_codec::budget::TransportBudget;
@@ -48,9 +50,9 @@ const CAPTURE: Duration = Duration::from_secs(5);
 const CLIENT: Duration = Duration::from_secs(20);
 const LOG_CAP: usize = 2 * 1024 * 1024;
 const METRIC_CAP: usize = 1024 * 1024;
-const CREATE: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
-const ESTABLISH: &str = "NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED";
-const PREPARED_ROOT: &str = "NOVAROCKS_TASK_PREPARED_CLIENT_ROOT";
+const CREATE: &str = novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED;
+const ESTABLISH: &str = novarocks_failpoint::observation_marker::PARTICIPATION_ESTABLISH_APPLIED;
+const PREPARED_ROOT: &str = novarocks_failpoint::observation_marker::TASK_PREPARED_CLIENT_ROOT;
 // Observation storage bound only; this does not change TaskGraph or admission caps.
 const MARKERS_PER_BACKEND: usize = 8;
 const SQL: &str = "SELECT REPEAT('x',64) AS payload";
@@ -255,7 +257,7 @@ impl Scenario for NativeRootReplyRefusal {
                 sql: SQL.into(),
                 faults: Vec::new(),
                 observations: (0..cluster_size)
-                    .map(|index| (index, "grpc-fragment", Some(1)))
+                    .map(|index| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), Some(1)))
                     .collect(),
             }],
             &[],
@@ -905,7 +907,7 @@ fn independent_target(
         task.backend_process_id() == processes[occupied] && tasks.contains(&(occupied, task)),
         "prepared root is not an exact created task on its actual backend"
     );
-    let contexts: Vec<_> = markers
+    let participation_markers: Vec<_> = markers
         .iter()
         .enumerate()
         .flat_map(|(be, lines)| {
@@ -916,12 +918,12 @@ fn independent_target(
         })
         .collect();
     ensure!(
-        contexts.len()
+        participation_markers.len()
             == participating
                 .iter()
                 .filter(|participates| **participates)
                 .count(),
-        "participating backends lack exactly one fresh context each"
+        "participating backends lack exactly one fresh participation each"
     );
     let expected = format!(
         "execution_id={}:{}:{}",
@@ -929,18 +931,18 @@ fn independent_target(
         execution.query_id().low(),
         execution.attempt_id().get()
     );
-    let mut seen_context = [false; 3];
+    let mut seen_participations = [false; 3];
     let mut frontend = None;
-    for (be, line) in contexts {
+    for (be, line) in participation_markers {
         ensure!(
-            participating[be] && !seen_context[be],
-            "duplicate context or context outside participating backend"
+            participating[be] && !seen_participations[be],
+            "duplicate participation or participation outside participating backend"
         );
-        seen_context[be] = true;
+        seen_participations[be] = true;
         let fields: Vec<_> = line.split(' ').collect();
         ensure!(
             fields.len() == 4 && fields[0] == ESTABLISH && fields[1] == expected,
-            "context establish execution differs from SQL task execution"
+            "participation establish execution differs from SQL task execution"
         );
         let frontend_text = fields[2]
             .strip_prefix("frontend=")
@@ -949,24 +951,24 @@ fn independent_target(
         ensure!(
             observed_frontend.to_string() == frontend_text
                 && fields[3] == format!("backend={}", processes[be]),
-            "context establish has noncanonical frontend or different backend UUID"
+            "participation establish has noncanonical frontend or different backend UUID"
         );
         if let Some(frontend) = frontend {
             ensure!(
                 frontend == observed_frontend,
-                "fresh contexts span multiple frontend UUIDs"
+                "fresh participations span multiple frontend UUIDs"
             );
         } else {
             frontend = Some(observed_frontend);
         }
     }
     ensure!(
-        seen_context == participating,
-        "fresh context membership differs from task membership"
+        seen_participations == participating,
+        "fresh participation membership differs from task membership"
     );
     Ok((
         task,
-        frontend.context("missing independent frontend context identity")?,
+        frontend.context("missing independent frontend participation identity")?,
     ))
 }
 fn census(
@@ -1264,20 +1266,22 @@ mod root_reply_predicate_tests {
         assert!(independent_target(&before, &after, 0, &processes).is_err());
     }
     #[test]
-    fn context_membership_execution_and_full_frontend_must_match() {
+    fn participation_membership_execution_and_full_frontend_must_match() {
         let (before, after, processes) = identity_oracle_fixture(true);
         for mode in 0..5 {
             let mut changed = after.clone();
-            let context = changed[2]
+            let participation_marker = changed[2]
                 .lines()
                 .find(|line| line.starts_with(ESTABLISH))
-                .expect("context")
+                .expect("participation marker")
                 .to_owned();
             match mode {
-                0 => changed[2] = changed[2].replace(&(context.clone() + "\n"), ""),
-                1 => changed[2].push_str(&(context.clone() + "\n")),
+                0 => changed[2] = changed[2].replace(&(participation_marker.clone() + "\n"), ""),
+                1 => changed[2].push_str(&(participation_marker.clone() + "\n")),
                 2 => changed[0].push_str(
-                    &(context.replace(&processes[2].to_string(), &processes[0].to_string()) + "\n"),
+                    &(participation_marker
+                        .replace(&processes[2].to_string(), &processes[0].to_string())
+                        + "\n"),
                 ),
                 3 => changed[2] = changed[2].replace("8000-000000000004", "8000-000000000005"),
                 _ => changed = replace_marker(&after, ESTABLISH, "-7:23:2", "-7:24:2"),

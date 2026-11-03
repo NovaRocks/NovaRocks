@@ -152,7 +152,7 @@ fn release_destination() -> novarocks::TaskExchangeDestination {
             task_id: 1,
             backend_process_id: Some(release_backend_process_id()),
         }),
-        fragment_instance_id: Some(id(3, 4)),
+        task_key: Some(id(3, 4)),
         endpoint: Some(novarocks::QueryControlEndpoint {
             host: "10.0.0.8".to_string(),
             port: 8060,
@@ -184,7 +184,7 @@ fn release_backend_process_id() -> novarocks::BackendProcessId {
 
 fn release_creation_metadata() -> novarocks::CreationMetadata {
     novarocks::CreationMetadata {
-        query_context: Some(novarocks::QueryContextRef {
+        participation: Some(novarocks::ParticipationRef {
             query_execution_id: Some(release_query_execution_id()),
             frontend_process_id: Some(novarocks::FrontendProcessId {
                 value: vec![1, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2],
@@ -198,7 +198,7 @@ fn release_creation_metadata() -> novarocks::CreationMetadata {
                 task_id: 1,
                 backend_process_id: Some(release_backend_process_id()),
             }),
-            fragment_instance_id: Some(id(3, 4)),
+            task_key: Some(id(3, 4)),
             pipeline_dop: 8,
             split_plan_nodes: vec![11],
             topology: Some(novarocks::TaskExchangeTopology {
@@ -270,11 +270,11 @@ fn release_create_task_carrier_fixtures_decode() {
         .expect("CreationMetadata fixture decodes");
     assert_eq!(fragment.package.as_ref(), b"opaque release package");
     assert_eq!(
-        metadata.query_context.as_ref().unwrap().query_execution_id,
+        metadata.participation.as_ref().unwrap().query_execution_id,
         Some(release_query_execution_id())
     );
     assert_eq!(
-        metadata.descriptor.as_ref().unwrap().fragment_instance_id,
+        metadata.descriptor.as_ref().unwrap().task_key,
         Some(id(3, 4))
     );
     let assignment = metadata
@@ -400,7 +400,7 @@ fn release_create_task_carrier_fixtures_decode() {
     let endpoint = destination.endpoint.as_ref().expect("destination endpoint");
     assert_eq!(endpoint.host, "10.0.0.8");
     assert_eq!(endpoint.port, 8060);
-    assert_eq!(destination.fragment_instance_id, Some(id(3, 4)));
+    assert_eq!(destination.task_key, Some(id(3, 4)));
     assert_eq!(destination.task.as_ref().unwrap().stage_id, 2);
     assert!(
         scan_ranges
@@ -418,13 +418,13 @@ fn release_create_task_carrier_fixtures_decode() {
 /// remaining carrier.
 #[test]
 fn release_query_options_fixture_round_trips_through_establish() {
-    let establish = novarocks::EstablishQueryContextRequest {
+    let establish = novarocks::EstablishParticipationRequest {
         query_options: Some(release_query_options()),
         ..Default::default()
     };
     let decoded =
-        novarocks::EstablishQueryContextRequest::decode(establish.encode_to_vec().as_slice())
-            .expect("EstablishQueryContextRequest fixture decodes");
+        novarocks::EstablishParticipationRequest::decode(establish.encode_to_vec().as_slice())
+            .expect("EstablishParticipationRequest fixture decodes");
     assert_eq!(decoded.query_options, Some(release_query_options()));
 }
 

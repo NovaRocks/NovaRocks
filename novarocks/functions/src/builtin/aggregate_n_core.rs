@@ -38,12 +38,12 @@ pub type DecodedNValue<A: ScalarStateAllocator> =
 /// Source-qualified consumers provide an owned scope around the original sort.
 /// This interface does not itself grant memory or cover other N operations.
 pub trait NSortResources {
-    type Lease;
+    type Reservation;
     fn before_sort(
         &mut self,
         len: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self::Lease, crate::KernelFailure>;
+    ) -> Result<Self::Reservation, crate::KernelFailure>;
 
     /// Optional source work around a reached comparison. The normal scalar
     /// comparator produces a partial-order value without allocating a diagnostic;
@@ -51,13 +51,13 @@ pub trait NSortResources {
     fn before_comparison(
         &mut self,
         _work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Option<Self::Lease>, crate::KernelFailure> {
+    ) -> Result<Option<Self::Reservation>, crate::KernelFailure> {
         Ok(None)
     }
 }
 struct NoopSortResources;
 impl NSortResources for NoopSortResources {
-    type Lease = ();
+    type Reservation = ();
     fn before_sort(
         &mut self,
         _len: usize,
@@ -69,11 +69,11 @@ impl NSortResources for NoopSortResources {
 /// A reached decimal codec call owns its external scope until the original
 /// call and its temporary output end. Default callers add no observations.
 pub trait NCodecResources {
-    type Lease;
+    type Reservation;
     fn before_decimal256_format(
         &mut self,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self::Lease, crate::KernelFailure>;
+    ) -> Result<Self::Reservation, crate::KernelFailure>;
     fn after_decimal256_format(
         &mut self,
         _text: &str,
@@ -86,7 +86,7 @@ pub trait NCodecResources {
         &mut self,
         text_bytes: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self::Lease, crate::KernelFailure>;
+    ) -> Result<Self::Reservation, crate::KernelFailure>;
     fn after_decimal256_parse(
         &mut self,
         _work: &mut ScalarWork<'_, '_>,
@@ -96,7 +96,7 @@ pub trait NCodecResources {
 }
 struct NoopCodecResources;
 impl NCodecResources for NoopCodecResources {
-    type Lease = ();
+    type Reservation = ();
     fn before_decimal256_format(
         &mut self,
         _work: &mut ScalarWork<'_, '_>,

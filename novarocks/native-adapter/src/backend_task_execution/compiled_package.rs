@@ -616,7 +616,7 @@ impl PureCompileControl for TaskPreparationControl {
             .checkpoint()
             .map_err(|error| {
                 CompileControlError::Source(
-                    novarocks_execution::runtime::fragment::SharedDomainFailure::new(error),
+                    novarocks_execution::runtime::task::SharedDomainFailure::new(error),
                 )
             })?;
         if self.stop.is_stopped() {

@@ -19,21 +19,21 @@
 //! their original cursors; publication consumes actual K Ready and CSR barriers.
 
 use super::{
-    build_csr::{BuildCsr, CsrBuilder, CsrClaim, CsrLease, CsrProgress},
+    build_csr::{BuildCsr, CsrBuilder, CsrClaim, CsrObligation, CsrProgress},
     build_pages::{BuildRows, CapturedInputRun, ProjectionKind},
     build_state::build_contract,
-    csr_slots::{SlotsLease, SlotsProgress},
+    csr_slots::{SlotsObligation, SlotsProgress},
     join_completion::funded_shared,
     key_build_worker::{KeyBuildWorker, KeyWorkerStep},
 };
 use crate::{
     exec::{
-        hash_table::key_index::{BulkDomain, BulkTaskGraph, BulkWork, IndexPurpose, IndexView},
-        pipeline::step_context::TurnWork,
+        hash_table::key_index::{BulkBuildGraph, BulkDomain, BulkWork, IndexPurpose, IndexView},
+        pipeline::driver_step::TurnWork,
     },
     runtime::{
-        fragment::{ExecutionFailure, ExecutionFailureCause, ExecutionResult},
         observable::Observable,
+        task::{ExecutionFailure, ExecutionFailureCause, ExecutionResult},
     },
 };
 use novarocks_functions::KernelFailure;
@@ -50,7 +50,7 @@ pub(crate) struct IndexedBuild {
     pub(crate) ordinary_nulls: Option<BuildCsr>,
 }
 enum Phase {
-    Keys(Arc<BulkTaskGraph>),
+    Keys(Arc<BulkBuildGraph>),
     Csr {
         view: Arc<IndexView>,
         build: Arc<CsrBuilder>,
@@ -95,8 +95,8 @@ pub(crate) struct ProjectionWorker {
     csr: Option<CsrWork>,
 }
 enum CsrWork {
-    Initialize(SlotsLease),
-    Range(CsrLease),
+    Initialize(SlotsObligation),
+    Range(CsrObligation),
 }
 impl ProjectionBuild {
     /// Caller is the original sole begin-lease author. All input runs must
@@ -118,7 +118,7 @@ impl ProjectionBuild {
             live_slots,
             changed,
         } = workers;
-        let graph = BulkTaskGraph::begin(
+        let graph = BulkBuildGraph::begin(
             capture.into_complete(domain, purpose, work)?,
             positions,
             live_slots,
@@ -127,7 +127,7 @@ impl ProjectionBuild {
         Self::from_graph(graph, rows, projection, positions, changed, work)
     }
     fn from_graph(
-        graph: BulkTaskGraph,
+        graph: BulkBuildGraph,
         rows: Arc<BuildRows>,
         projection: ProjectionKind,
         workers: NonZeroUsize,
@@ -254,7 +254,7 @@ impl ProjectionBuild {
     }
     fn keys_ready(
         &self,
-        graph: &Arc<BulkTaskGraph>,
+        graph: &Arc<BulkBuildGraph>,
         work: &BulkWork<'_>,
     ) -> ExecutionResult<ProjectionStep> {
         {

@@ -42,7 +42,7 @@ pub trait OperatorFactory: Send + Sync {
     /// Freeze the actual built pipeline geometry before any driver is
     /// instantiated. Host-owned bounded sinks use this to count completion
     /// after sort/gather collapse without guessing the configured DOP.
-    fn bind_pipeline_dop(&self, _dop: i32) -> crate::runtime::fragment::ExecutionResult<()> {
+    fn bind_pipeline_dop(&self, _dop: i32) -> crate::runtime::task::ExecutionResult<()> {
         Ok(())
     }
 

@@ -168,7 +168,7 @@ impl OperatorLifecycle for CountMergeSource {
 impl crate::exec::pipeline::shape::SourceKernel for CountMergeSource {
     fn poll_output(
         &mut self,
-        _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
     ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
         panic!("the activation failure must prevent payload work");
     }
@@ -186,7 +186,7 @@ fn original_count_overflow_real_driver_owner_stops_without_replay_and_releases_b
     let activations = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
     let runtime = Arc::new(RuntimeState::default());
-    let fragment = Arc::new(FragmentContext::new(
+    let fragment = Arc::new(TaskContext::new(
         None,
         runtime.clone(),
         Some((39001, 39002)),
@@ -194,8 +194,8 @@ fn original_count_overflow_real_driver_owner_stops_without_replay_and_releases_b
         None,
         None,
     ));
-    let completion = FragmentCompletion::new(1, runtime.error_state());
-    let task = DriverTask::new(
+    let completion = DriverGroupCompletion::new(1, runtime.error_state());
+    let task = DriverRunner::new(
         PipelineDriver::new(
             1,
             vec![Box::new(crate::exec::pipeline::shape::Source::new(

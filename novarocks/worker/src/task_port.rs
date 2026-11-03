@@ -29,11 +29,11 @@ use std::{
 
 #[cfg(test)]
 use novarocks_control_runtime::transaction::ScopeHandle;
-use novarocks_control_runtime::{driver::ActorRegistration, publication::PublishedSnapshot};
+use novarocks_control_runtime::{actor_turn::ActorRegistration, publication::PublishedSnapshot};
 use novarocks_execution::runtime::{
     execution_health::{ExecutionExitOrigin, ExecutionHealth},
-    fragment::ExecutionFailure,
     observable::Observable,
+    task::ExecutionFailure,
 };
 use novarocks_execution_contract::{
     AcceptedConclusion, AcceptedTaskConclusion, ConclusionSourceError, RetainedTaskSource,
@@ -670,10 +670,10 @@ impl novarocks_execution::runtime::task_control::TaskExecutionPort for TaskExecu
 mod tests {
     use super::*;
     use novarocks_control_runtime::{
-        actor::{Actor, ActorConfig, StepContext},
+        actor::{Actor, ActorConfig, ActorStep},
+        actor_turn::ActorRuntime,
         completion::ReportSlot,
-        driver::ActorRuntime,
-        lease::{ReservationBundle, WorkLease},
+        obligation::{ReservationObligation, WorkObligation},
         transaction::RuntimeLedger,
     };
     use novarocks_control_runtime_core::{
@@ -696,7 +696,7 @@ mod tests {
 
     use crate::{
         control_runtime::source_positions::{ReapedPosition, SourcePositionPhase},
-        task_completion_roles::AdmittedCompletionRole,
+        task_completion_set::AdmittedCompletionTransfer,
         task_proposal_ingress::PairRoute,
     };
 
@@ -721,7 +721,7 @@ mod tests {
             _: Tick,
             _: InputEnvelope,
             work: novarocks_control_runtime_core::identity::ScopedWorkRef,
-            step: &mut StepContext<'_, ()>,
+            step: &mut ActorStep<'_, ()>,
         ) {
             step.effect(
                 EffectDescriptor {
@@ -737,14 +737,14 @@ mod tests {
         fn next_deadline(&self) -> Option<Tick> {
             None
         }
-        fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {}
+        fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {}
     }
     struct Fixture {
         ledger: RuntimeLedger,
         scope: ScopeHandle,
         runtime: ActorRuntime<Publisher>,
-        work: WorkLease,
-        capacity: ReservationBundle,
+        work: WorkObligation,
+        capacity: ReservationObligation,
         port: Arc<TaskRuntimePort>,
         wakes: Arc<AtomicUsize>,
         open_consuming: AtomicBool,
@@ -813,12 +813,12 @@ mod tests {
             } else {
                 WorkKind::Cleanup
             };
-            let role = admitted_source(&scope, capacity.id(), kind);
+            let completion_transfer = admitted_source(&scope, capacity.id(), kind);
             crate::control_runtime::source_positions::SourceSlotAdmission::from_admitted(
-                crate::control_runtime::admitted_role::adopt_reported_work(
-                    role.work,
-                    role.capacity,
-                    role.report,
+                crate::control_runtime::reported_work_admission::adopt_reported_work(
+                    completion_transfer.work,
+                    completion_transfer.capacity,
+                    completion_transfer.report,
                 ),
             )
             .unwrap()
@@ -838,7 +838,7 @@ mod tests {
         if refuse_first_source_start {
             // This is a genuine start refusal on the selected paid original,
             // rather than an impossible disagreement between its Work phase
-            // and the ExitRole constructor's actual phase observation.
+            // and the ExitCustody constructor's actual phase observation.
             scope.request_stop().unwrap();
         }
         Fixture {
@@ -859,7 +859,7 @@ mod tests {
         scope: &ScopeHandle,
         parent: novarocks_control_runtime_core::identity::ReservationId,
         kind: WorkKind,
-    ) -> AdmittedCompletionRole {
+    ) -> AdmittedCompletionTransfer {
         let generation = scope.gates().unwrap().generation;
         let mut guard = scope
             .reserve_child_next(
@@ -885,7 +885,7 @@ mod tests {
         )
         .unwrap();
         let (work, capacity) = guard.bind(kind).unwrap();
-        AdmittedCompletionRole {
+        AdmittedCompletionTransfer {
             work,
             capacity,
             report,
@@ -1286,7 +1286,7 @@ mod tests {
         assert_eq!(actual.status(), initial.status());
         assert!(actual.accepted().is_none());
         let entry = actual.secondary_diagnostics().entries().next().unwrap();
-        assert_eq!(entry.role(), crate::TaskDiagnosticRole::Cleanup);
+        assert_eq!(entry.kind(), crate::TaskDiagnosticKind::Cleanup);
         assert_eq!(entry.phase(), diagnostic.phase);
         assert_eq!(entry.fact(), diagnostic.fact);
         assert_eq!(entry.detail(), diagnostic.detail.as_str());
@@ -1836,14 +1836,14 @@ mod tests {
                     assert_eq!(source.phase, SourcePositionPhase::Pending);
                     assert_eq!(
                         source.custody.phase(),
-                        novarocks_control_runtime::exit_role::ExitRolePhase::Unresolved
+                        novarocks_control_runtime::exit_custody::ExitCustodyPhase::Unresolved
                     );
                     panic!("controlled failure of the binder's original pending notice");
                 }
                 assert_eq!(source.phase, SourcePositionPhase::Abandoned);
                 assert_eq!(
                     source.custody.phase(),
-                    novarocks_control_runtime::exit_role::ExitRolePhase::Unresolved
+                    novarocks_control_runtime::exit_custody::ExitCustodyPhase::Unresolved
                 );
                 assert!(!source.custody.actual_exit_ready().unwrap());
                 self.observed_after_unwind.store(true, Ordering::SeqCst);
@@ -1861,7 +1861,7 @@ mod tests {
         assert_eq!(before[0].phase, SourcePositionPhase::Available);
         assert_eq!(
             before[0].custody.phase(),
-            novarocks_control_runtime::exit_role::ExitRolePhase::Admitted
+            novarocks_control_runtime::exit_custody::ExitCustodyPhase::Admitted
         );
         assert!(f.scope.gates().unwrap().stopped);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1900,11 +1900,11 @@ mod tests {
         f.runtime.seal_actor(actor()).unwrap();
         assert_eq!(
             f.runtime.failure_source_state(actor()).unwrap(),
-            novarocks_control_runtime::driver::FailureSourceState::ClosedDrained
+            novarocks_control_runtime::actor_turn::FailureSourceState::ClosedDrained
         );
         assert_eq!(
             f.runtime.timer_source_state(actor()).unwrap(),
-            novarocks_control_runtime::driver::TimerSourceState::ClosedDrained
+            novarocks_control_runtime::actor_turn::TimerSourceState::ClosedDrained
         );
         assert_eq!(f.ledger.unresolved_work(), unresolved);
         assert_eq!(f.scope.snapshot().unwrap(), scope);

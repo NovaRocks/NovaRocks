@@ -23,7 +23,6 @@
 //! scheduler, or execution-kernel implementation.
 
 pub mod conclusion;
-pub mod context_convergence;
 pub mod creation;
 pub mod descriptor;
 pub mod domain;
@@ -35,6 +34,7 @@ pub mod membership;
 pub mod native_result_support;
 pub mod operation;
 pub mod ordered_retained_stream;
+pub mod participation_convergence;
 pub mod root_lifetime;
 pub mod status;
 pub mod task_convergence;
@@ -42,8 +42,8 @@ pub mod transition;
 
 /// Stable namespace used by protocol codecs and role applications.
 pub mod task_execution {
-    pub mod context_convergence {
-        pub use crate::context_convergence::*;
+    pub mod participation_convergence {
+        pub use crate::participation_convergence::*;
     }
     pub mod creation {
         pub use crate::creation::*;
@@ -78,7 +78,6 @@ pub mod task_execution {
 }
 
 pub use conclusion::*;
-pub use context_convergence::*;
 pub use creation::*;
 pub use descriptor::*;
 pub use domain::*;
@@ -89,6 +88,7 @@ pub use lease::*;
 pub use membership::*;
 pub use novarocks_failure_contract as failure;
 pub use operation::*;
+pub use participation_convergence::*;
 pub use status::*;
 pub use task_convergence::*;
 pub use transition::*;

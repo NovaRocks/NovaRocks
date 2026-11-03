@@ -76,7 +76,8 @@ fn write_marker(output: &mut impl Write, frontend: FrontendProcessId) -> io::Res
         let mut cursor = io::Cursor::new(&mut bytes[..]);
         writeln!(
             cursor,
-            "NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_FE frontend_process_id={frontend}"
+            "{} frontend_process_id={frontend}",
+            novarocks_failpoint::observation_marker::MEM_1_M07_ROOT_OBSERVATION_FE
         )?;
         cursor.position() as usize
     };

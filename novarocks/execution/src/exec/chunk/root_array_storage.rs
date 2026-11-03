@@ -57,7 +57,7 @@ impl std::fmt::Display for RootArrayStorageError {
 impl std::error::Error for RootArrayStorageError {}
 impl novarocks_failure_contract::FailureProjection for RootArrayStorageError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let (class, reason) = match self {
             Self::UnsupportedCarrier => {

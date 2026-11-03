@@ -17,14 +17,14 @@
 
 //! The frontend-only external write session.
 //!
-//! One `begin_write` atomically returns a frontend-only commit handle and the
+//! One `begin_write` atomically returns a frontend-only commit session and the
 //! complete set of logical writer handles the sealed plan may use. There is no
 //! separate prepare, activate, or placement-dependent planning step: a writer
 //! recipe is a property of the logical target, not of where the plan happens to
 //! run.
 //!
 //! Only the frontend, holding its exact control generation, may finish, abort,
-//! or reconcile a write. A backend has no commit handle and no catalog
+//! or reconcile a write. A backend has no commit session and no catalog
 //! mutation capability at all.
 
 use std::sync::Arc;
@@ -40,7 +40,7 @@ use crate::connector::row_mutation::{
 };
 use crate::connector::write_stack::prepared::ConnectorPreparedWriteSet;
 use crate::connector::write_stack::runtime::{
-    ConnectorWriteBinding, ConnectorWriteCommitHandle, ConnectorWriterHandle,
+    ConnectorWriteBinding, ConnectorWriteCommitSession, ConnectorWriterHandle,
 };
 use crate::connector::write_stack::target::{WriteTargetOrdinal, validate_dense_target_ordinals};
 use crate::connector::{
@@ -1121,7 +1121,7 @@ impl ConnectorWriteTargetPlan {
 /// sealed logical target map.
 #[derive(Debug)]
 pub struct ConnectorWriteSessionPlan {
-    commit: ConnectorWriteCommitHandle,
+    commit: ConnectorWriteCommitSession,
     targets: Vec<ConnectorWriteTargetPlan>,
     copy_on_write: Option<ConnectorWriteCopyOnWriteRoutingPlan>,
 }
@@ -1144,18 +1144,18 @@ impl ConnectorWriteCopyOnWriteRoutingPlan {
 
 impl ConnectorWriteSessionPlan {
     /// Targets must be dense from zero and must all belong to the same exact
-    /// provider generation as the commit handle. A disagreement here means the
+    /// provider generation as the commit session. A disagreement here means the
     /// session and the plan could name different runtimes, so it fails before
     /// any fragment is encoded.
     pub fn try_new(
-        commit: ConnectorWriteCommitHandle,
+        commit: ConnectorWriteCommitSession,
         targets: Vec<ConnectorWriteTargetPlan>,
     ) -> Result<Self, ConnectorError> {
         Self::try_with_copy_on_write(commit, targets, None)
     }
 
     pub fn try_copy_on_write(
-        commit: ConnectorWriteCommitHandle,
+        commit: ConnectorWriteCommitSession,
         targets: Vec<ConnectorWriteTargetPlan>,
         selection: ConnectorRowMutationSelection,
         match_contract: ConnectorMutationMatchContract,
@@ -1171,7 +1171,7 @@ impl ConnectorWriteSessionPlan {
     }
 
     fn try_with_copy_on_write(
-        commit: ConnectorWriteCommitHandle,
+        commit: ConnectorWriteCommitSession,
         targets: Vec<ConnectorWriteTargetPlan>,
         copy_on_write: Option<ConnectorWriteCopyOnWriteRoutingPlan>,
     ) -> Result<Self, ConnectorError> {
@@ -1244,7 +1244,7 @@ impl ConnectorWriteSessionPlan {
         self.commit.binding()
     }
 
-    pub const fn commit_handle(&self) -> &ConnectorWriteCommitHandle {
+    pub const fn commit_session(&self) -> &ConnectorWriteCommitSession {
         &self.commit
     }
 
@@ -1264,7 +1264,7 @@ impl ConnectorWriteSessionPlan {
             .collect()
     }
 
-    pub fn into_parts(self) -> (ConnectorWriteCommitHandle, Vec<ConnectorWriteTargetPlan>) {
+    pub fn into_parts(self) -> (ConnectorWriteCommitSession, Vec<ConnectorWriteTargetPlan>) {
         (self.commit, self.targets)
     }
 }
@@ -1373,11 +1373,11 @@ fn validate_copy_on_write_routing(
 
 /// Commit one complete prepared write set.
 ///
-/// The commit handle is borrowed, never moved: a frontend session keeps it for
+/// The commit session is borrowed, never moved: a frontend session keeps it for
 /// a possible abort or reconcile, and nothing else in the process can take
 /// ownership of it.
 pub struct ConnectorWriteFinishRequest<'a> {
-    pub commit: &'a ConnectorWriteCommitHandle,
+    pub commit: &'a ConnectorWriteCommitSession,
     pub prepared: ConnectorPreparedWriteSet,
     pub statistics: Vec<WriteStatisticsArtifact>,
     pub publication: ConnectorWriteFinishPublication,
@@ -1387,7 +1387,7 @@ pub struct ConnectorWriteFinishRequest<'a> {
 /// Borrowed view of the original stable finish packet. Polling or dropping a
 /// Provider future cannot destroy the caller's admitted input or authority.
 pub struct ConnectorWriteFinishRequestRef<'a> {
-    pub commit: &'a ConnectorWriteCommitHandle,
+    pub commit: &'a ConnectorWriteCommitSession,
     pub prepared: &'a ConnectorPreparedWriteSet,
     pub statistics: &'a [WriteStatisticsArtifact],
     pub publication: &'a ConnectorWriteFinishPublication,
@@ -1423,7 +1423,7 @@ pub enum ConnectorWriteAbortProduction {
 }
 
 pub struct ConnectorWriteSessionAbortRequest<'a> {
-    pub commit: &'a ConnectorWriteCommitHandle,
+    pub commit: &'a ConnectorWriteCommitSession,
     pub context: ConnectorRequestContext,
     pub production: ConnectorWriteAbortProduction,
     /// Borrow only the original stable, complete received union. The Provider
@@ -1433,7 +1433,7 @@ pub struct ConnectorWriteSessionAbortRequest<'a> {
 
 /// Resolve a commit whose external outcome is unknown.
 pub struct ConnectorWriteSessionReconcileRequest<'a> {
-    pub commit: &'a ConnectorWriteCommitHandle,
+    pub commit: &'a ConnectorWriteCommitSession,
     pub evidence: ExternalMutationEvidence,
     pub context: ConnectorRequestContext,
 }
@@ -1497,7 +1497,7 @@ pub trait ConnectorWriteControl: Send + Sync {
     /// Business completion, timeout and a lost waiter never prove disposal.
     fn cleanup_responsibility(
         &self,
-        commit: &ConnectorWriteCommitHandle,
+        commit: &ConnectorWriteCommitSession,
     ) -> Result<crate::connector::ConnectorMetadataCleanupResponsibility, ConnectorError>;
 
     /// Observe only a finite finalization context already received by this
@@ -1505,7 +1505,7 @@ pub trait ConnectorWriteControl: Send + Sync {
     /// deadline/stop. None is absence, not permission to use business control.
     fn existing_finalization_context(
         &self,
-        _commit: &ConnectorWriteCommitHandle,
+        _commit: &ConnectorWriteCommitSession,
     ) -> Result<Option<ConnectorRequestContext>, ConnectorError> {
         Ok(None)
     }
@@ -1634,7 +1634,7 @@ pub trait ConnectorWriteControl: Send + Sync {
     /// file record totals and writer input counts are not substitutes.
     fn prepared_logical_row_change(
         &self,
-        _commit: &ConnectorWriteCommitHandle,
+        _commit: &ConnectorWriteCommitSession,
         _prepared: &ConnectorPreparedWriteSet,
         _context: &ConnectorRequestContext,
     ) -> Result<Option<super::prepared::ConnectorWriteRowChange>, ConnectorError> {
@@ -1858,7 +1858,7 @@ mod tests {
     }
 
     impl ProviderWriteRuntime for FakeProvider {
-        type CommitHandle = Value;
+        type CommitSession = Value;
         type WriterHandle = Value;
         type CommitFragment = Value;
 
@@ -2328,13 +2328,13 @@ mod tests {
     #[test]
     fn a_session_routes_every_branch_or_none() {
         let adapter = adapter();
-        let commit = adapter.wrap_commit_handle(Value);
+        let commit = adapter.wrap_commit_session(Value);
 
         // None routed: an ordinary write.
         assert!(ConnectorWriteSessionPlan::try_new(commit, vec![target(&adapter, 0)]).is_ok());
 
         // All routed: a row mutation.
-        let commit = adapter.wrap_commit_handle(Value);
+        let commit = adapter.wrap_commit_session(Value);
         assert!(
             ConnectorWriteSessionPlan::try_new(
                 commit,
@@ -2347,7 +2347,7 @@ mod tests {
         );
 
         // Half routed: SQL would have nowhere to send the rest.
-        let commit = adapter.wrap_commit_handle(Value);
+        let commit = adapter.wrap_commit_session(Value);
         assert_eq!(
             ConnectorWriteSessionPlan::try_new(
                 commit,
@@ -2365,7 +2365,7 @@ mod tests {
     #[test]
     fn two_branches_cannot_share_a_route_key() {
         let adapter = adapter();
-        let commit = adapter.wrap_commit_handle(Value);
+        let commit = adapter.wrap_commit_session(Value);
         assert_eq!(
             ConnectorWriteSessionPlan::try_new(
                 commit,
@@ -2596,7 +2596,7 @@ mod tests {
         .with_route(route)
         .with_routing_proof(proof);
         ConnectorWriteSessionPlan::try_copy_on_write(
-            adapter.wrap_commit_handle(Value),
+            adapter.wrap_commit_session(Value),
             vec![target],
             selection,
             cow_contract(),
@@ -2631,7 +2631,7 @@ mod tests {
         .with_routing_proof(proof);
         assert_eq!(
             ConnectorWriteSessionPlan::try_copy_on_write(
-                adapter.wrap_commit_handle(Value),
+                adapter.wrap_commit_session(Value),
                 vec![target],
                 selection,
                 cow_contract(),

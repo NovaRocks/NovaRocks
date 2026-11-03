@@ -42,7 +42,7 @@ use super::execution::QueryTaskExecution;
 use super::graph::build_task_graph_from_manifest;
 use super::intent::TaskOperationSink;
 use super::round::{AcknowledgementObserver, TaskRound};
-use super::sources::{AttemptEstablishFacts, SubmissionFragmentPlans};
+use super::sources::{AttemptEstablishFacts, SubmissionTaskPlans};
 use super::split_transport::SplitDeliveryBridge;
 use super::status_intake::{NotifyWake, ObservationIntake, StatusIntake, StatusIntakeWake};
 use crate::native::data_runtime::FrontendDataRuntime;
@@ -99,7 +99,7 @@ pub(crate) struct ManifestAssembledRound {
 enum PendingPreReadyObservation {
     TransportUnknown(novarocks_types::BackendProcessId),
     RejectedIdentity {
-        context: novarocks_execution_contract::QueryContextRef,
+        participation: novarocks_execution_contract::ParticipationRef,
         operation_id: novarocks_execution_contract::TaskOperationId,
         kind: novarocks_execution_contract::OperationKind,
     },
@@ -144,18 +144,18 @@ pub(crate) fn assemble_manifest_round(
         .summary_sources()
         .map(|(task, _)| task)
         .collect::<std::collections::BTreeSet<_>>();
-    let mut plans = SubmissionFragmentPlans::index_manifest(submissions, manifest)?;
+    let mut plans = SubmissionTaskPlans::index_manifest(submissions, manifest)?;
     let graph = build_task_graph_from_manifest(manifest, &mut plans, transport.transport_budget)?;
     let split_delivery = SplitDeliveryBridge::for_graph(&graph);
     let connector_blocking_io = transport.data_runtime.connector_blocking_io().clone();
     let convergence_source = Arc::clone(&transport.convergence_source);
 
-    let mut backends = Vec::with_capacity(manifest.contexts().len());
+    let mut backends = Vec::with_capacity(manifest.participations().len());
     let mut admission_epochs = BTreeMap::new();
     let mut preparing_positions = BTreeMap::new();
-    let mut convergence_targets = Vec::with_capacity(manifest.contexts().len());
-    for context in manifest.contexts() {
-        let backend = context.backend();
+    let mut convergence_targets = Vec::with_capacity(manifest.participations().len());
+    for participation in manifest.participations() {
+        let backend = participation.backend();
         if backend.native_compatibility_id() != transport.wire.native_compatibility_id {
             return Err(TaskExecutionError::Schedule(format!(
                 "manifest backend {} compatibility differs from the attempt wire identity",
@@ -168,7 +168,7 @@ pub(crate) fn assemble_manifest_round(
             backend.target().descriptor().preparing_positions(),
         );
         convergence_targets.push(NativeAttemptConvergenceTarget::new(
-            context.context(),
+            participation.participation(),
             backend.endpoint().clone(),
         ));
         if admission_epochs
@@ -308,7 +308,7 @@ impl ManifestAssembledRound {
 
     pub(crate) fn install_profile_diagnostics(
         &mut self,
-        transport: Arc<dyn crate::native::fragment_transport::TaskResultTransport>,
+        transport: Arc<dyn crate::native::task_result_transport::TaskResultTransport>,
     ) -> Result<super::profile_diagnostics::ProfileDiagnosticObserver, TaskExecutionError> {
         if self.profile_diagnostics.is_some() {
             return Err(TaskExecutionError::Schedule(
@@ -394,7 +394,7 @@ impl ManifestAssembledRound {
                 Some(PendingPreReadyObservation::TransportUnknown(*backend))
             }
             TaskExecutionError::PreReadyEstablishRejected {
-                context,
+                participation,
                 operation_id,
                 rejection:
                     novarocks_execution_contract::operation::OperationResult::Verdict {
@@ -404,17 +404,17 @@ impl ManifestAssembledRound {
             } if self
                 .round
                 .execution()
-                .rejected_establish_observation_remaining(*context, *operation_id)
+                .rejected_establish_observation_remaining(*participation, *operation_id)
                 .is_some_and(|remaining| !remaining.is_zero()) =>
             {
                 Some(PendingPreReadyObservation::RejectedIdentity {
-                    context: *context,
+                    participation: *participation,
                     operation_id: *operation_id,
-                    kind: novarocks_execution_contract::OperationKind::UpdateQueryContext,
+                    kind: novarocks_execution_contract::OperationKind::UpdateParticipation,
                 })
             }
             TaskExecutionError::OperationFailed {
-                context,
+                participation,
                 operation_id,
                 kind: novarocks_execution_contract::OperationKind::CreateTask,
                 rejection:
@@ -425,11 +425,11 @@ impl ManifestAssembledRound {
             } if self
                 .round
                 .execution()
-                .rejected_create_observation_remaining(*context, *operation_id)
+                .rejected_create_observation_remaining(*participation, *operation_id)
                 .is_some_and(|remaining| !remaining.is_zero()) =>
             {
                 Some(PendingPreReadyObservation::RejectedIdentity {
-                    context: *context,
+                    participation: *participation,
                     operation_id: *operation_id,
                     kind: novarocks_execution_contract::OperationKind::CreateTask,
                 })
@@ -474,23 +474,24 @@ impl ManifestAssembledRound {
         let backend = match observation {
             PendingPreReadyObservation::TransportUnknown(backend) => backend,
             PendingPreReadyObservation::RejectedIdentity {
-                context,
+                participation,
                 operation_id,
                 kind,
             } => {
                 // Both paths retain their original horizon on the Task clock.
-                // Create uses the existing effective context lease captured at
+                // Create uses the existing effective participation lease captured at
                 // its exact rejection, never a newly started grace interval.
                 let within_horizon = |this: &Self| {
                     let execution = this.round.execution();
                     match kind {
-                        novarocks_execution_contract::OperationKind::UpdateQueryContext => {
-                            execution
-                                .rejected_establish_observation_remaining(context, operation_id)
+                        novarocks_execution_contract::OperationKind::UpdateParticipation => {
+                            execution.rejected_establish_observation_remaining(
+                                participation,
+                                operation_id,
+                            )
                         }
-                        novarocks_execution_contract::OperationKind::CreateTask => {
-                            execution.rejected_create_observation_remaining(context, operation_id)
-                        }
+                        novarocks_execution_contract::OperationKind::CreateTask => execution
+                            .rejected_create_observation_remaining(participation, operation_id),
                         _ => None,
                     }
                     .is_some_and(|remaining| !remaining.is_zero())
@@ -501,7 +502,7 @@ impl ManifestAssembledRound {
                 }
                 if let Some(replacement) = self
                     .convergence
-                    .replacement_process(context.backend_process_id())
+                    .replacement_process(participation.backend_process_id())
                 {
                     // The observation cannot cross the original horizon while
                     // querying the registry and then authorize a late retry.
@@ -511,7 +512,7 @@ impl ManifestAssembledRound {
                         }) = self.pending_terminal.as_mut()
                         && let Ok(witness) = novarocks_query_application::api::
                             PreReadyProcessReplacementWitness::try_new(
-                                failure.input(), context, operation_id, replacement,
+                                failure.input(), participation, operation_id, replacement,
                             )
                     {
                         // Rejection keeps the same original failure in place.
@@ -823,10 +824,10 @@ impl ManifestAssembledRound {
     }
 
     #[cfg(test)]
-    fn context_convergence(
+    fn participation_convergence(
         &self,
-    ) -> Option<Box<[novarocks_query_application::api::NativeContextConvergence]>> {
-        self.convergence.observed_contexts(&self.round)
+    ) -> Option<Box<[novarocks_query_application::api::NativeParticipationConvergence]>> {
+        self.convergence.observed_participations(&self.round)
     }
 }
 
@@ -878,11 +879,11 @@ mod tests {
     use novarocks_coordination_contract::AttemptFailureClass;
     use novarocks_query_application::api::{BackendProcessObservation, QueryExecutionErrorKind};
 
-    fn protocol_context(
+    fn protocol_participation(
         backend: novarocks_types::BackendProcessId,
-    ) -> novarocks_execution_contract::QueryContextRef {
+    ) -> novarocks_execution_contract::ParticipationRef {
         use novarocks_types::{AttemptId, FrontendProcessId, QueryExecutionId, QueryId};
-        novarocks_execution_contract::QueryContextRef::new(
+        novarocks_execution_contract::ParticipationRef::new(
             QueryExecutionId::new(QueryId::new(31, 32), AttemptId::new(1).unwrap()).unwrap(),
             FrontendProcessId::new_v7(),
             backend,
@@ -968,11 +969,11 @@ mod tests {
         let targets = round
             .execution()
             .graph()
-            .contexts()
+            .participations()
             .copied()
-            .map(|context| {
+            .map(|participation| {
                 NativeAttemptConvergenceTarget::new(
-                    context,
+                    participation,
                     novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 1)
                         .unwrap(),
                 )
@@ -1036,22 +1037,22 @@ mod tests {
         assembled.converge_unstarted().await.unwrap();
         let facts = assembled
             .convergence
-            .observed_contexts(&assembled.round)
+            .observed_participations(&assembled.round)
             .unwrap();
         let expected = assembled
             .round
             .execution()
             .graph()
-            .contexts()
+            .participations()
             .copied()
             .collect::<Vec<_>>();
         assert!(!expected.is_empty());
         assert_eq!(facts.len(), expected.len());
-        for (fact, context) in facts.iter().zip(expected) {
-            assert_eq!(fact.context(), context);
+        for (fact, participation) in facts.iter().zip(expected) {
+            assert_eq!(fact.participation(), participation);
             assert_eq!(
                 fact.kind(),
-                novarocks_query_application::api::NativeContextConvergenceKind::NeverEstablished
+                novarocks_query_application::api::NativeParticipationConvergenceKind::NeverEstablished
             );
         }
         drop(assembled);
@@ -1085,8 +1086,12 @@ mod tests {
         use crate::query_execution::split_assignment_round::failure_observation_plan;
         use std::sync::atomic::Ordering;
         let round = super::super::tests::manifest_unstarted_regression_fixture();
-        let context = *round.execution().graph().contexts().next().unwrap();
-        assert!(round.execution().context_never_established(context));
+        let participation = *round.execution().graph().participations().next().unwrap();
+        assert!(
+            round
+                .execution()
+                .participation_never_established(participation)
+        );
         let mut assembled = unstarted_close_round(round);
         let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let mut executors =
@@ -1095,12 +1100,12 @@ mod tests {
             );
         let (release, released) = std::sync::mpsc::channel();
         let (plan, enumerations, closes) = failure_observation_plan(
-            context.query_execution_id(),
+            participation.query_execution_id(),
             data_runtime.connector_blocking_io().clone(),
             Some(released),
         );
         let guard = assembled
-            .install_split_assignment(context.query_execution_id(), plan, data_runtime)
+            .install_split_assignment(participation.query_execution_id(), plan, data_runtime)
             .unwrap();
         assembled.round.seal_pumps();
         let (_control, root, _cancellation) = unstarted_close_cancellation();
@@ -1132,17 +1137,17 @@ mod tests {
             assembled
                 .round
                 .execution()
-                .context_never_established(context)
+                .participation_never_established(participation)
         );
         let facts = assembled
             .convergence
-            .observed_contexts(&assembled.round)
+            .observed_participations(&assembled.round)
             .unwrap();
         assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].context(), context);
+        assert_eq!(facts[0].participation(), participation);
         assert_eq!(
             facts[0].kind(),
-            novarocks_query_application::api::NativeContextConvergenceKind::NeverEstablished
+            novarocks_query_application::api::NativeParticipationConvergenceKind::NeverEstablished
         );
         assert_eq!(enumerations.load(Ordering::SeqCst), 0);
         assert_eq!(closes.load(Ordering::SeqCst), 1);
@@ -1166,14 +1171,18 @@ mod tests {
     #[tokio::test]
     async fn unstarted_round_refuses_a_real_original_admission_ticket() {
         let (round, _) = super::super::tests::pre_ready_observation_round();
-        let context = *round.execution().graph().contexts().next().unwrap();
-        assert!(!round.execution().context_never_established(context));
+        let participation = *round.execution().graph().participations().next().unwrap();
+        assert!(
+            !round
+                .execution()
+                .participation_never_established(participation)
+        );
         let mut assembled = unstarted_close_round(round);
         let (_control, root, _cancellation) = unstarted_close_cancellation();
         let failure = assembled.converge_unstarted().await.unwrap_err();
         assert_eq!(
             failure.detail(),
-            "Native dormant cleanup requires every exact context to be never established"
+            "Native dormant cleanup requires every exact participation to be never established"
         );
         let same_failure = assembled.converge_unstarted().await.unwrap_err();
         assert!(std::ptr::eq(failure.cause(), same_failure.cause()));
@@ -1182,7 +1191,7 @@ mod tests {
             !assembled
                 .round
                 .execution()
-                .context_never_established(context)
+                .participation_never_established(participation)
         );
         // No Worker/remote closure is minted and the original round stays here.
         drop(failure);
@@ -1192,7 +1201,7 @@ mod tests {
     }
 
     async fn terminal_regression_drive(
-        context: novarocks_execution_contract::QueryContextRef,
+        participation: novarocks_execution_contract::ParticipationRef,
     ) -> (
         novarocks_query_application::test_support::LogicalExecutionTestHarness,
         NativeAttemptDrive,
@@ -1200,11 +1209,11 @@ mod tests {
         novarocks_workload_control::WorkCancellationRequester,
         super::super::abort_effect::NativeAbortEffectIntake,
     ) {
-        terminal_regression_drive_with_recovery(context, false).await
+        terminal_regression_drive_with_recovery(participation, false).await
     }
 
     async fn terminal_regression_drive_with_recovery(
-        context: novarocks_execution_contract::QueryContextRef,
+        participation: novarocks_execution_contract::ParticipationRef,
         recovery: bool,
     ) -> (
         novarocks_query_application::test_support::LogicalExecutionTestHarness,
@@ -1213,11 +1222,11 @@ mod tests {
         novarocks_workload_control::WorkCancellationRequester,
         super::super::abort_effect::NativeAbortEffectIntake,
     ) {
-        terminal_regression_drive_for_contexts(vec![context], recovery).await
+        terminal_regression_drive_for_participations(vec![participation], recovery).await
     }
 
-    async fn terminal_regression_drive_for_contexts(
-        contexts: Vec<novarocks_execution_contract::QueryContextRef>,
+    async fn terminal_regression_drive_for_participations(
+        participations: Vec<novarocks_execution_contract::ParticipationRef>,
         recovery: bool,
     ) -> (
         novarocks_query_application::test_support::LogicalExecutionTestHarness,
@@ -1226,10 +1235,12 @@ mod tests {
         novarocks_workload_control::WorkCancellationRequester,
         super::super::abort_effect::NativeAbortEffectIntake,
     ) {
-        let context = *contexts.first().expect("the original graph has contexts");
+        let participation = *participations
+            .first()
+            .expect("the original graph has participations");
         use novarocks_coordination_contract::ExecutionEffect;
         use novarocks_query_application::coordination::{
-            AbortQueryContextEffectPort, LogicalExecutionActorConfig,
+            AbortParticipationEffectPort, LogicalExecutionActorConfig,
         };
         use novarocks_query_application::test_support::LogicalExecutionTestHarness;
         use novarocks_workload_control::{
@@ -1264,9 +1275,9 @@ mod tests {
             // Install the real read output contract as well as recovery policy.
             // The harness owns its output and retires it through finish_until.
             LogicalExecutionActorConfig::read_only_pre_visibility_recovery_rows(
-                context.query_execution_id(),
+                participation.query_execution_id(),
                 NonZeroUsize::new(2).unwrap(),
-                contexts.clone(),
+                participations.clone(),
                 NonZeroUsize::new(2).unwrap(),
                 NonZeroUsize::new(2).unwrap(),
                 std::num::NonZeroU32::new(2).unwrap(),
@@ -1292,10 +1303,10 @@ mod tests {
             )
         } else {
             LogicalExecutionActorConfig::single_attempt_completion(
-                context.query_execution_id(),
+                participation.query_execution_id(),
                 ExecutionEffect::None,
                 NonZeroUsize::new(2).unwrap(),
-                contexts.clone(),
+                participations.clone(),
                 NonZeroUsize::new(2).unwrap(),
                 NonZeroUsize::new(2).unwrap(),
                 governed.owner,
@@ -1303,15 +1314,15 @@ mod tests {
             )
         }
         .unwrap()
-        .with_abort_query_context_effect_port(
-            adapter as Arc<dyn AbortQueryContextEffectPort>,
+        .with_abort_participation_effect_port(
+            adapter as Arc<dyn AbortParticipationEffectPort>,
             NonZeroUsize::new(2).unwrap(),
         );
         let mut logical = LogicalExecutionTestHarness::install(
             tokio::runtime::Handle::current(),
             config,
-            context.query_execution_id(),
-            contexts.clone(),
+            participation.query_execution_id(),
+            participations.clone(),
         )
         .unwrap();
         logical.activate_initial().await.unwrap();
@@ -1366,8 +1377,8 @@ mod tests {
     fn abort_closure_is_not_worker_exit_and_only_the_original_receipt_closes_resources() {
         use super::super::status_intake::{ObservationFrame, ObservationIntakeEntry};
         use novarocks_execution_contract::{
-            QueryContextConvergenceReceipt, QueryContextConvergenceState,
-            QueryContextConvergenceVersion,
+            ParticipationConvergenceReceipt, ParticipationConvergenceState,
+            ParticipationConvergenceVersion,
         };
         use novarocks_task_codec::operation::{CoveredStatusStreamEvent, CoveredStatusStreamFact};
         struct CurrentProcess;
@@ -1384,7 +1395,7 @@ mod tests {
             }
         }
         let (round, _) = super::super::tests::manifest_terminal_regression_fixture();
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
         let (_, actor_gate, _) = ActorGatedTaskOperationSink::pair(
             Arc::new(BackpressuredGateTransport),
@@ -1395,7 +1406,7 @@ mod tests {
             &round,
             Arc::new(CurrentProcess),
             vec![NativeAttemptConvergenceTarget::new(
-                context,
+                participation,
                 novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 1)
                     .unwrap(),
             )],
@@ -1422,32 +1433,32 @@ mod tests {
         assembled
             .round
             .execution_mut()
-            .observe_actor_abort_context_closed(context)
+            .observe_actor_abort_participation_closed(participation)
             .unwrap();
         assert!(
             assembled
                 .round
                 .execution()
-                .owner(context)
+                .owner(participation)
                 .unwrap()
                 .is_released()
         );
-        assert!(assembled.context_convergence().is_none());
-        assert!(!assembled.round.execution().worker_contexts_stopped());
-        let receipt = QueryContextConvergenceReceipt::new(
-            context,
-            QueryContextConvergenceVersion::FIRST,
-            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+        assert!(assembled.participation_convergence().is_none());
+        assert!(!assembled.round.execution().worker_participations_stopped());
+        let receipt = ParticipationConvergenceReceipt::new(
+            participation,
+            ParticipationConvergenceVersion::FIRST,
+            ParticipationConvergenceState::WorkerStoppedAndParticipationFenced,
         );
         assembled
             .round
             .execution_mut()
             .apply_covered_entries(vec![ObservationIntakeEntry::Frame(Box::new(
                 ObservationFrame::Covered {
-                    context,
+                    participation,
                     generation: 1,
                     event: CoveredStatusStreamEvent {
-                        fact: CoveredStatusStreamFact::ContextConvergence(receipt),
+                        fact: CoveredStatusStreamFact::ParticipationConvergence(receipt),
                         source_revision: None,
                     },
                 },
@@ -1457,11 +1468,11 @@ mod tests {
             assembled
                 .round
                 .execution()
-                .context_convergence_receipt(context),
+                .participation_convergence_receipt(participation),
             Some(receipt)
         );
-        assert!(assembled.round.execution().worker_contexts_stopped());
-        assert_eq!(assembled.context_convergence().unwrap().len(), 1);
+        assert!(assembled.round.execution().worker_participations_stopped());
+        assert_eq!(assembled.participation_convergence().unwrap().len(), 1);
     }
 
     #[derive(Clone)]
@@ -1482,7 +1493,7 @@ mod tests {
         round: TaskRound,
         observation: BackendProcessObservation,
     ) -> ManifestAssembledRound {
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
         let (_, actor_gate, _) = ActorGatedTaskOperationSink::pair(
             Arc::new(BackpressuredGateTransport),
@@ -1493,7 +1504,7 @@ mod tests {
             &round,
             Arc::new(ReleaseJoinObservation(observation)),
             vec![NativeAttemptConvergenceTarget::new(
-                context,
+                participation,
                 novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 1)
                     .unwrap(),
             )],
@@ -1523,31 +1534,31 @@ mod tests {
     fn publish_release_join_exit(assembled: &mut ManifestAssembledRound) {
         use super::super::status_intake::{ObservationFrame, ObservationIntakeEntry};
         use novarocks_execution_contract::{
-            QueryContextConvergenceReceipt, QueryContextConvergenceState,
-            QueryContextConvergenceVersion,
+            ParticipationConvergenceReceipt, ParticipationConvergenceState,
+            ParticipationConvergenceVersion,
         };
         use novarocks_task_codec::operation::{CoveredStatusStreamEvent, CoveredStatusStreamFact};
-        let context = *assembled
+        let participation = *assembled
             .round
             .execution()
             .graph()
-            .contexts()
+            .participations()
             .next()
             .unwrap();
-        let receipt = QueryContextConvergenceReceipt::new(
-            context,
-            QueryContextConvergenceVersion::FIRST,
-            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+        let receipt = ParticipationConvergenceReceipt::new(
+            participation,
+            ParticipationConvergenceVersion::FIRST,
+            ParticipationConvergenceState::WorkerStoppedAndParticipationFenced,
         );
         assembled
             .round
             .execution_mut()
             .apply_covered_entries(vec![ObservationIntakeEntry::Frame(Box::new(
                 ObservationFrame::Covered {
-                    context,
+                    participation,
                     generation: 1,
                     event: CoveredStatusStreamEvent {
-                        fact: CoveredStatusStreamFact::ContextConvergence(receipt),
+                        fact: CoveredStatusStreamFact::ParticipationConvergence(receipt),
                         source_revision: None,
                     },
                 },
@@ -1559,7 +1570,8 @@ mod tests {
     fn completed_convergence_joins_covered_exit_and_original_release_in_both_orders() {
         use super::super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
         use novarocks_execution_contract::{
-            OperationKind, OperationOutcome, QueryContextReceipt, QueryContextState, ReleaseOutcome,
+            OperationKind, OperationOutcome, ParticipationReceipt, ParticipationState,
+            ReleaseOutcome,
         };
         let expected = super::super::tests::fixture_runtime_filter_contribution();
         let mut outcomes = Vec::new();
@@ -1567,43 +1579,43 @@ mod tests {
             let (round, acks, release) =
                 super::super::tests::manifest_normal_release_ack_regression_fixture();
             let mut assembled = release_join_round(round, BackendProcessObservation::Current);
-            let context = *assembled
+            let participation = *assembled
                 .round
                 .execution()
                 .graph()
-                .contexts()
+                .participations()
                 .next()
                 .unwrap();
-            let OperationIntent::ReleaseQueryContext(request) = &release else {
+            let OperationIntent::ReleaseParticipation(request) = &release else {
                 unreachable!()
             };
             let ack = OperationAcknowledgement::new(
                 release.operation_id(),
-                OperationKind::ReleaseQueryContext,
+                OperationKind::ReleaseParticipation,
                 OperationOutcome::Accepted,
                 AckPayload::Release {
-                    receipt: QueryContextReceipt::new(
-                        request.context(),
-                        QueryContextState::TerminalRetained,
+                    receipt: ParticipationReceipt::new(
+                        request.participation(),
+                        ParticipationState::TerminalRetained,
                     ),
                     outcome: ReleaseOutcome::Released,
                     runtime_filter: Some(expected.clone()),
                 },
             );
-            assert!(assembled.context_convergence().is_none());
+            assert!(assembled.participation_convergence().is_none());
             if covered_first {
                 publish_release_join_exit(&mut assembled);
-                assert!(assembled.round.execution().worker_contexts_stopped());
+                assert!(assembled.round.execution().worker_participations_stopped());
                 assert!(
                     !assembled
                         .round
                         .execution()
-                        .owner(context)
+                        .owner(participation)
                         .unwrap()
                         .is_released()
                 );
                 assert!(
-                    assembled.context_convergence().is_none(),
+                    assembled.participation_convergence().is_none(),
                     "physical exit must not discard the pending Release acknowledgement"
                 );
                 acks.publish(ack);
@@ -1615,27 +1627,27 @@ mod tests {
                     assembled
                         .round
                         .execution()
-                        .owner(context)
+                        .owner(participation)
                         .unwrap()
                         .is_released()
                 );
-                assert!(!assembled.round.execution().worker_contexts_stopped());
+                assert!(!assembled.round.execution().worker_participations_stopped());
                 assert!(
-                    assembled.context_convergence().is_none(),
+                    assembled.participation_convergence().is_none(),
                     "Release acknowledgement is not physical exit evidence"
                 );
                 publish_release_join_exit(&mut assembled);
             }
-            assert_eq!(assembled.context_convergence().unwrap().len(), 1);
+            assert_eq!(assembled.participation_convergence().unwrap().len(), 1);
             let contributions = assembled
                 .round
                 .execution()
                 .released_runtime_filter_contributions();
             assert!(contributions.is_complete());
-            assert_eq!(contributions.contexts(), 1);
+            assert_eq!(contributions.participations(), 1);
             assert_eq!(
                 contributions.contributions(),
-                &[(context.backend_process_id(), expected.clone())]
+                &[(participation.backend_process_id(), expected.clone())]
             );
             outcomes.push(
                 contributions
@@ -1656,11 +1668,11 @@ mod tests {
         let (round, _acks, _release) =
             super::super::tests::manifest_normal_release_ack_regression_fixture();
         let mut assembled = release_join_round(round, BackendProcessObservation::Current);
-        let context = *assembled
+        let participation = *assembled
             .round
             .execution()
             .graph()
-            .contexts()
+            .participations()
             .next()
             .unwrap();
         assembled.convergence.begin(
@@ -1673,11 +1685,11 @@ mod tests {
             !assembled
                 .round
                 .execution()
-                .owner(context)
+                .owner(participation)
                 .unwrap()
                 .is_released()
         );
-        assert_eq!(assembled.context_convergence().unwrap().len(), 1);
+        assert_eq!(assembled.participation_convergence().unwrap().len(), 1);
         let contributions = assembled
             .round
             .execution()
@@ -1688,7 +1700,7 @@ mod tests {
 
     #[test]
     fn exact_process_replacement_does_not_wait_for_release_or_invent_a_contribution() {
-        use novarocks_query_application::api::NativeContextConvergenceKind;
+        use novarocks_query_application::api::NativeParticipationConvergenceKind;
         for covered_first in [false, true] {
             let (round, _acks, _release) =
                 super::super::tests::manifest_normal_release_ack_regression_fixture();
@@ -1701,11 +1713,11 @@ mod tests {
             if covered_first {
                 publish_release_join_exit(&mut assembled);
             }
-            let convergence = assembled.context_convergence().unwrap();
+            let convergence = assembled.participation_convergence().unwrap();
             assert_eq!(convergence.len(), 1);
             assert_eq!(
                 convergence[0].kind(),
-                NativeContextConvergenceKind::WorkerProcessReplaced
+                NativeParticipationConvergenceKind::WorkerProcessReplaced
             );
             let contributions = assembled
                 .round
@@ -1724,9 +1736,9 @@ mod tests {
             [(true, false), (false, false), (true, true)]
         {
             let (mut round, acks) = super::super::tests::manifest_terminal_regression_fixture();
-            let context = *round.execution().graph().contexts().next().unwrap();
+            let participation = *round.execution().graph().participations().next().unwrap();
             let (mut logical, drive, cancellation, requester, _abort_intake) =
-                terminal_regression_drive(context).await;
+                terminal_regression_drive(participation).await;
             let source = round.take_root_status_source().unwrap();
             let mut reply = source.begin_success_seal_request().unwrap();
             if accept_before_error {
@@ -1749,12 +1761,12 @@ mod tests {
                 use super::super::intent::{DispatchBatch, OperationIntent, TaskOperationSubmit};
                 use crate::task_protocol_config::DispatchLane;
                 use novarocks_execution::task_execution::{
-                    AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, LeaseValidFor,
+                    AcquireParticipationAdmissionTicket, AdmissionEpochCapability, LeaseValidFor,
                 };
-                let operation = OperationIntent::AcquireQueryContextAdmissionTicket(
-                    AcquireQueryContextAdmissionTicket::new(
+                let operation = OperationIntent::AcquireParticipationAdmissionTicket(
+                    AcquireParticipationAdmissionTicket::new(
                         TaskOperationId::new_v7(),
-                        context,
+                        participation,
                         LeaseValidFor::new(std::time::Duration::from_secs(30)).unwrap(),
                         novarocks_types::NativeCompatibilityId::new([0x41; 32]),
                         AdmissionEpochCapability::try_from_bytes([9; 16]).unwrap(),
@@ -1762,7 +1774,7 @@ mod tests {
                 );
                 let bytes = operation.queue_request().queued_bytes();
                 let batch = DispatchBatch::test_fixture(
-                    context.backend_process_id(),
+                    participation.backend_process_id(),
                     DispatchLane::Lifecycle,
                     vec![operation],
                     bytes,
@@ -1797,10 +1809,10 @@ mod tests {
                 round
                     .execution()
                     .graph()
-                    .contexts()
-                    .map(|&context| {
+                    .participations()
+                    .map(|&participation| {
                         NativeAttemptConvergenceTarget::new(
-                            context,
+                            participation,
                             novarocks_execution::runtime::endpoint::RuntimeEndpoint::new(
                                 "127.0.0.1",
                                 1,
@@ -1850,7 +1862,7 @@ mod tests {
             logical.abandon_running_attempt();
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 while logical
-                    .stand_down_snapshot(context)
+                    .stand_down_snapshot(participation)
                     .await
                     .unwrap()
                     .is_none()
@@ -1863,7 +1875,7 @@ mod tests {
             // This closes only the fixture actor's residual scope during
             // explicit teardown, after the terminal assertions above.
             logical
-                .observe_worker_process_replaced(context)
+                .observe_worker_process_replaced(participation)
                 .await
                 .unwrap();
             logical
@@ -1907,7 +1919,9 @@ mod tests {
     #[test]
     fn pre_ready_establish_rejection_retains_its_protocol_fact() {
         let terminal = task_protocol_failure(TaskExecutionError::PreReadyEstablishRejected {
-            context: protocol_context(novarocks_types::identity::BackendProcessId::new_v7()),
+            participation: protocol_participation(
+                novarocks_types::identity::BackendProcessId::new_v7(),
+            ),
             operation_id: novarocks_execution_contract::TaskOperationId::new_v7(),
             rejection: novarocks_execution_contract::operation::OperationResult::Verdict {
                 outcome:
@@ -1927,7 +1941,7 @@ mod tests {
         let backend = novarocks_types::identity::BackendProcessId::new_v7();
         let NativeAttemptTerminal::Failed(failure) =
             task_protocol_failure(TaskExecutionError::PreReadyEstablishRejected {
-                context: protocol_context(backend),
+                participation: protocol_participation(backend),
                 operation_id: novarocks_execution_contract::TaskOperationId::new_v7(),
                 rejection: novarocks_execution_contract::operation::OperationResult::Verdict {
                     outcome: novarocks_execution_contract::OperationOutcome::IdentityMismatch,
@@ -2024,7 +2038,7 @@ mod tests {
         let backend = round
             .execution()
             .graph()
-            .contexts()
+            .participations()
             .next()
             .unwrap()
             .backend_process_id();
@@ -2040,7 +2054,7 @@ mod tests {
         source: Arc<dyn novarocks_query_application::api::BackendProcessObservationPort>,
         error: TaskExecutionError,
     ) -> ManifestAssembledRound {
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
         let (_, actor_gate, _) = ActorGatedTaskOperationSink::pair(
             Arc::new(BackpressuredGateTransport),
@@ -2051,7 +2065,7 @@ mod tests {
             &round,
             source,
             vec![NativeAttemptConvergenceTarget::new(
-                context,
+                participation,
                 novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("127.0.0.1", 1)
                     .unwrap(),
             )],
@@ -2110,9 +2124,9 @@ mod tests {
         }
         let (mut round, clock, acks, admission, ticket, establish) =
             super::super::tests::pre_ready_original_establish_requests();
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let (logical, drive, cancellation, requester, abort) =
-            terminal_regression_drive_with_recovery(context, recovery).await;
+            terminal_regression_drive_with_recovery(participation, recovery).await;
         let issue = drive.begin_admission_issue(admission).await.unwrap();
         drive
             .settle_admission_issue(
@@ -2139,7 +2153,7 @@ mod tests {
         acks.publish(
             super::super::intent::OperationAcknowledgement::worker_receipt(
                 operation_id,
-                OperationKind::UpdateQueryContext,
+                OperationKind::UpdateParticipation,
                 OperationOutcome::IdentityMismatch,
                 super::super::intent::AckPayload::None,
             ),
@@ -2198,13 +2212,13 @@ mod tests {
         } else {
             super::super::tests::pre_ready_original_create_refusal()
         };
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let (logical, drive, cancellation, requester, abort) =
-            terminal_regression_drive_with_recovery(context, recovery).await;
+            terminal_regression_drive_with_recovery(participation, recovery).await;
         let mut native_compatibility_id = None;
         for (intent, ack) in trace {
             match intent {
-                super::super::intent::OperationIntent::AcquireQueryContextAdmissionTicket(
+                super::super::intent::OperationIntent::AcquireParticipationAdmissionTicket(
                     request,
                 ) => {
                     let super::super::intent::AckPayload::AdmissionTicket(ticket) = ack.payload()
@@ -2226,18 +2240,18 @@ mod tests {
                         .await
                         .unwrap();
                 }
-                super::super::intent::OperationIntent::EstablishQueryContext(request) => {
-                    let context = request.context();
+                super::super::intent::OperationIntent::EstablishParticipation(request) => {
+                    let participation = request.participation();
                     let operation_id = request.envelope().operation_id();
                     let parent = logical
-                        .establish_snapshot(context)
+                        .establish_snapshot(participation)
                         .await
                         .unwrap()
-                        .expect("the original admission owns this context");
+                        .expect("the original admission owns this participation");
                     // Unknown replay re-signs QA's retained original request;
                     // it cannot authorize a fresh payload or operation.
                     let issue = if parent.identity().is_some() {
-                        drive.reauthorize_establish(context).await.unwrap()
+                        drive.reauthorize_establish(participation).await.unwrap()
                     } else {
                         drive
                             .authorize_establish(
@@ -2248,7 +2262,7 @@ mod tests {
                             .await
                             .unwrap()
                     };
-                    assert_eq!(issue.identity().context(), context);
+                    assert_eq!(issue.identity().participation(), participation);
                     assert_eq!(issue.identity().operation_id(), operation_id);
                     assert_eq!(
                         issue
@@ -2257,7 +2271,7 @@ mod tests {
                         EstablishIssueSubmit::Accepted
                     );
                 }
-                _ => panic!("startup trace contains only original context operations"),
+                _ => panic!("startup trace contains only original participation operations"),
             }
         }
         (
@@ -2282,10 +2296,10 @@ mod tests {
         {
             let (round, _clock, error, logical, drive, cancellation, requester, _abort) =
                 original_rejected_create_drive(case != 1, establish_unknown).await;
-            let context = *round.execution().graph().contexts().next().unwrap();
+            let participation = *round.execution().graph().participations().next().unwrap();
             let original = error.preparation_input();
             let source = Arc::new(PendingProcessObservation::new(
-                context.backend_process_id(),
+                participation.backend_process_id(),
                 BackendProcessObservation::Unobservable,
             ));
             let mut assembled = pending_pre_ready_round_with_failure(round, source.clone(), error);
@@ -2330,7 +2344,7 @@ mod tests {
             }
             drop(assembled);
             drop(drive);
-            finish_pending_actor(logical, context).await;
+            finish_pending_actor(logical, participation).await;
         }
     }
 
@@ -2345,7 +2359,7 @@ mod tests {
         {
             let (round, clock, error, logical, drive, _cancellation, _requester, _abort) =
                 original_rejected_create_drive(true, true).await;
-            let context = *round.execution().graph().contexts().next().unwrap();
+            let participation = *round.execution().graph().participations().next().unwrap();
             let original = error.preparation_input();
             let TaskExecutionError::OperationFailed { operation_id, .. } = &error else {
                 panic!("original Create rejection")
@@ -2353,11 +2367,11 @@ mod tests {
             assert_eq!(
                 round
                     .execution()
-                    .rejected_create_observation_remaining(context, *operation_id),
+                    .rejected_create_observation_remaining(participation, *operation_id),
                 Some(std::time::Duration::from_secs(7)),
             );
             let source = Arc::new(PendingProcessObservation::new(
-                context.backend_process_id(),
+                participation.backend_process_id(),
                 state,
             ));
             let mut assembled = pending_pre_ready_round_with_failure(round, source.clone(), error);
@@ -2389,7 +2403,7 @@ mod tests {
             assert!(!assembled.pending_pre_ready_must_wait());
             drop(assembled);
             drop(drive);
-            finish_pending_actor(logical, context).await;
+            finish_pending_actor(logical, participation).await;
         }
     }
 
@@ -2400,10 +2414,10 @@ mod tests {
             BackendProcessObservation::Unobservable,
         ] {
             let (round, clock, error, _) = super::super::tests::pre_ready_original_create_refusal();
-            let context = *round.execution().graph().contexts().next().unwrap();
+            let participation = *round.execution().graph().participations().next().unwrap();
             let original = error.preparation_input();
             let source = Arc::new(PendingProcessObservation::new(
-                context.backend_process_id(),
+                participation.backend_process_id(),
                 state,
             ));
             let mut assembled = pending_pre_ready_round_with_failure(round, source.clone(), error);
@@ -2432,10 +2446,10 @@ mod tests {
     async fn rejected_establish_waits_for_exact_replacement_without_rewriting_failure() {
         let (round, error, logical, drive, cancellation, _, _abort) =
             original_rejected_establish_drive(true).await;
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let original = error.preparation_input();
         let source = Arc::new(PendingProcessObservation::new(
-            context.backend_process_id(),
+            participation.backend_process_id(),
             BackendProcessObservation::Unobservable,
         ));
         let mut assembled = pending_pre_ready_round_with_failure(round, source.clone(), error);
@@ -2465,21 +2479,24 @@ mod tests {
         let witness = failure
             .pre_ready_replacement()
             .expect("separate positive process fact");
-        assert_eq!(witness.context(), context);
-        assert_ne!(witness.replacement_process(), context.backend_process_id());
+        assert_eq!(witness.participation(), participation);
+        assert_ne!(
+            witness.replacement_process(),
+            participation.backend_process_id()
+        );
         drop(assembled);
         drop(drive);
-        finish_pending_actor(logical, context).await;
+        finish_pending_actor(logical, participation).await;
     }
 
     #[tokio::test]
     async fn rejected_establish_no_recovery_does_not_observe_or_delay_the_original_failure() {
         let (round, error, logical, drive, cancellation, _, _abort) =
             original_rejected_establish_drive(false).await;
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let original = error.preparation_input();
         let source = Arc::new(PendingProcessObservation::new(
-            context.backend_process_id(),
+            participation.backend_process_id(),
             BackendProcessObservation::Unobservable,
         ));
         let mut assembled = pending_pre_ready_round_with_failure(round, source.clone(), error);
@@ -2506,7 +2523,7 @@ mod tests {
         assert_eq!(source.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         drop(assembled);
         drop(drive);
-        finish_pending_actor(logical, context).await;
+        finish_pending_actor(logical, participation).await;
     }
 
     #[tokio::test]
@@ -2514,10 +2531,10 @@ mod tests {
         for stop_before_run in [false, true] {
             let (round, error, logical, drive, cancellation, requester, _abort) =
                 original_rejected_establish_drive(true).await;
-            let context = *round.execution().graph().contexts().next().unwrap();
+            let participation = *round.execution().graph().participations().next().unwrap();
             let original = error.preparation_input();
             let source = Arc::new(PendingProcessObservation::new(
-                context.backend_process_id(),
+                participation.backend_process_id(),
                 BackendProcessObservation::Unobservable,
             ));
             let mut assembled = pending_pre_ready_round_with_failure(round, source.clone(), error);
@@ -2564,7 +2581,7 @@ mod tests {
             }
             drop(assembled);
             drop(drive);
-            finish_pending_actor(logical, context).await;
+            finish_pending_actor(logical, participation).await;
         }
     }
 
@@ -2572,16 +2589,16 @@ mod tests {
     fn rejected_establish_expiry_cannot_observe_or_authorize_replacement() {
         let (round, clock, error) =
             super::super::tests::pre_ready_identity_rejected_observation_round();
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let original = error.preparation_input();
         let source = Arc::new(PendingProcessObservation::new(
-            context.backend_process_id(),
+            participation.backend_process_id(),
             BackendProcessObservation::Replaced {
                 current_process: novarocks_types::BackendProcessId::new_v7(),
             },
         ));
         let mut assembled = pending_pre_ready_round_with_failure(round, source.clone(), error);
-        clock.advance(super::super::context_owner::ADMISSION_TICKET_VALID_FOR);
+        clock.advance(super::super::participation_owner::ADMISSION_TICKET_VALID_FOR);
         assert!(!assembled.pending_pre_ready_must_wait());
         assert_eq!(source.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let NativeAttemptTerminal::Failed(failure) =
@@ -2606,7 +2623,7 @@ mod tests {
             let backend = round
                 .execution()
                 .graph()
-                .contexts()
+                .participations()
                 .next()
                 .unwrap()
                 .backend_process_id();
@@ -2621,7 +2638,7 @@ mod tests {
             let replaced = matches!(state, BackendProcessObservation::Replaced { .. });
             assert_eq!(assembled.pending_pre_ready_must_wait(), !replaced);
             if !replaced {
-                clock.advance(super::super::context_owner::ADMISSION_TICKET_VALID_FOR);
+                clock.advance(super::super::participation_owner::ADMISSION_TICKET_VALID_FOR);
                 assert!(!assembled.pending_pre_ready_must_wait());
             }
             let Some(NativeAttemptTerminal::Failed(failure)) =
@@ -2644,7 +2661,7 @@ mod tests {
             let backend = round
                 .execution()
                 .graph()
-                .contexts()
+                .participations()
                 .next()
                 .unwrap()
                 .backend_process_id();
@@ -2676,12 +2693,12 @@ mod tests {
 
     async fn finish_pending_actor(
         mut logical: novarocks_query_application::test_support::LogicalExecutionTestHarness,
-        context: novarocks_execution_contract::QueryContextRef,
+        participation: novarocks_execution_contract::ParticipationRef,
     ) {
         logical.abandon_running_attempt();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while logical
-                .stand_down_snapshot(context)
+                .stand_down_snapshot(participation)
                 .await
                 .unwrap()
                 .is_none()
@@ -2692,7 +2709,7 @@ mod tests {
         .await
         .unwrap();
         logical
-            .observe_worker_process_replaced(context)
+            .observe_worker_process_replaced(participation)
             .await
             .unwrap();
         logical
@@ -2705,11 +2722,12 @@ mod tests {
     async fn pending_unknown_without_query_deadline_observes_replacement_before_original_ticket_expiry()
      {
         let (round, _) = super::super::tests::pre_ready_observation_round();
-        let context = *round.execution().graph().contexts().next().unwrap();
-        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        let participation = *round.execution().graph().participations().next().unwrap();
+        let (logical, drive, cancellation, _, _abort) =
+            terminal_regression_drive(participation).await;
         assert_eq!(cancellation.deadline(), None);
         let source = Arc::new(PendingProcessObservation::new(
-            context.backend_process_id(),
+            participation.backend_process_id(),
             BackendProcessObservation::Unobservable,
         ));
         let mut assembled = pending_pre_ready_round(round, source.clone());
@@ -2741,20 +2759,20 @@ mod tests {
         assert_eq!(
             failure.topology_requirement(),
             novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
-                context.backend_process_id()
+                participation.backend_process_id()
             )
         );
         drop(assembled);
         drop(drive);
-        finish_pending_actor(logical, context).await;
+        finish_pending_actor(logical, participation).await;
     }
 
     #[tokio::test]
     async fn pending_unknown_cancellation_returns_original_owner_without_waiting_for_replacement() {
         let (round, _) = super::super::tests::pre_ready_observation_round();
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let (logical, drive, cancellation, requester, _abort) =
-            terminal_regression_drive(context).await;
+            terminal_regression_drive(participation).await;
         let mut assembled = pending_pre_ready_round(round, Arc::new(UnusedConvergenceSource));
         requester.request(CancellationReason::Requested).unwrap();
         let terminal = assembled
@@ -2770,17 +2788,18 @@ mod tests {
         assert_eq!(failure.class(), AttemptFailureClass::Cancelled);
         drop(assembled);
         drop(drive);
-        finish_pending_actor(logical, context).await;
+        finish_pending_actor(logical, participation).await;
     }
 
     #[tokio::test]
     async fn pending_unknown_without_query_deadline_stops_at_original_ticket_horizon() {
         let (round, clock) = super::super::tests::pre_ready_observation_round();
-        let context = *round.execution().graph().contexts().next().unwrap();
-        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        let participation = *round.execution().graph().participations().next().unwrap();
+        let (logical, drive, cancellation, _, _abort) =
+            terminal_regression_drive(participation).await;
         assert_eq!(cancellation.deadline(), None);
         let source = Arc::new(PendingProcessObservation::new(
-            context.backend_process_id(),
+            participation.backend_process_id(),
             BackendProcessObservation::Current,
         ));
         let mut assembled = pending_pre_ready_round(round, source.clone());
@@ -2788,7 +2807,7 @@ mod tests {
             while source.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
             }
-            clock.advance(super::super::context_owner::ADMISSION_TICKET_VALID_FOR);
+            clock.advance(super::super::participation_owner::ADMISSION_TICKET_VALID_FOR);
         };
         let (terminal, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             tokio::join!(
@@ -2812,7 +2831,7 @@ mod tests {
         );
         drop(assembled);
         drop(drive);
-        finish_pending_actor(logical, context).await;
+        finish_pending_actor(logical, participation).await;
     }
 
     #[tokio::test]
@@ -2824,11 +2843,12 @@ mod tests {
         use std::time::Duration;
 
         let (round, clock) = super::super::tests::pre_ready_observation_round();
-        let context = *round.execution().graph().contexts().next().unwrap();
-        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        let participation = *round.execution().graph().participations().next().unwrap();
+        let (logical, drive, cancellation, _, _abort) =
+            terminal_regression_drive(participation).await;
         assert_eq!(cancellation.deadline(), None);
         let process = Arc::new(PendingProcessObservation::new(
-            context.backend_process_id(),
+            participation.backend_process_id(),
             BackendProcessObservation::Current,
         ));
         let mut assembled = pending_pre_ready_round(round, process.clone());
@@ -2847,12 +2867,12 @@ mod tests {
             );
         let (release, released) = std::sync::mpsc::channel();
         let (plan, enumerations, closes) = failure_observation_plan(
-            context.query_execution_id(),
+            participation.query_execution_id(),
             data_runtime.connector_blocking_io().clone(),
             Some(released),
         );
         let guard = assembled
-            .install_split_assignment(context.query_execution_id(), plan, data_runtime)
+            .install_split_assignment(participation.query_execution_id(), plan, data_runtime)
             .unwrap();
         let original_source = guard.failure_source();
         assembled.round.begin_input_close();
@@ -2872,7 +2892,7 @@ mod tests {
             while process.calls.load(Ordering::SeqCst) <= calls_after_close {
                 tokio::task::yield_now().await;
             }
-            clock.advance(super::super::context_owner::ADMISSION_TICKET_VALID_FOR);
+            clock.advance(super::super::participation_owner::ADMISSION_TICKET_VALID_FOR);
         };
         let (terminal, ()) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(
@@ -2933,7 +2953,7 @@ mod tests {
         assert!(assembled.round.take_pump_close_error().is_none());
         drop(assembled);
         drop(drive);
-        finish_pending_actor(logical, context).await;
+        finish_pending_actor(logical, participation).await;
         executors.shutdown().await;
     }
 
@@ -2948,8 +2968,9 @@ mod tests {
         use std::time::Duration;
 
         let (round, _) = super::super::tests::pre_ready_observation_round();
-        let context = *round.execution().graph().contexts().next().unwrap();
-        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        let participation = *round.execution().graph().participations().next().unwrap();
+        let (logical, drive, cancellation, _, _abort) =
+            terminal_regression_drive(participation).await;
         let mut assembled = pending_pre_ready_round(round, Arc::new(UnusedConvergenceSource));
         assembled.pending_terminal = None;
         assembled.pending_pre_ready = None;
@@ -2959,12 +2980,12 @@ mod tests {
                 data_runtime.connector_blocking_io(),
             );
         let (plan, enumerations, closes) = failure_observation_plan(
-            context.query_execution_id(),
+            participation.query_execution_id(),
             data_runtime.connector_blocking_io().clone(),
             None,
         );
         let guard = assembled
-            .install_split_assignment(context.query_execution_id(), plan, data_runtime)
+            .install_split_assignment(participation.query_execution_id(), plan, data_runtime)
             .unwrap();
         let original_source = guard.failure_source();
         assert!(original_source.failure().is_none());
@@ -3036,15 +3057,16 @@ mod tests {
         assert_eq!(published, original);
         drop(assembled);
         drop(drive);
-        finish_pending_actor(logical, context).await;
+        finish_pending_actor(logical, participation).await;
         executors.shutdown().await;
     }
 
     #[tokio::test]
     async fn pending_unknown_cannot_hide_an_accepted_originating_task_failure() {
         let round = super::super::tests::manifest_originating_failure_observation_round();
-        let context = *round.execution().graph().contexts().next().unwrap();
-        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        let participation = *round.execution().graph().participations().next().unwrap();
+        let (logical, drive, cancellation, _, _abort) =
+            terminal_regression_drive(participation).await;
         let mut assembled = pending_pre_ready_round(round, Arc::new(UnusedConvergenceSource));
         let root = assembled.round.execution().graph().root_identity();
         let terminal = assembled
@@ -3071,7 +3093,7 @@ mod tests {
         assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
         drop(assembled);
         drop(drive);
-        finish_pending_actor(logical, context).await;
+        finish_pending_actor(logical, participation).await;
     }
 
     #[test]
@@ -3081,7 +3103,7 @@ mod tests {
             let backend = round
                 .execution()
                 .graph()
-                .contexts()
+                .participations()
                 .next()
                 .unwrap()
                 .backend_process_id();
@@ -3124,7 +3146,7 @@ mod tests {
         assert!(matches!(
             error,
             TaskExecutionError::QueueResidenceExpired {
-                kind: novarocks_execution_contract::OperationKind::UpdateQueryContext,
+                kind: novarocks_execution_contract::OperationKind::UpdateParticipation,
                 ..
             }
         ));
@@ -3173,10 +3195,11 @@ mod tests {
             }
         }
         let (round, clock) = super::super::tests::pre_ready_observation_round();
-        let context = *round.execution().graph().contexts().next().unwrap();
-        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        let participation = *round.execution().graph().participations().next().unwrap();
+        let (logical, drive, cancellation, _, _abort) =
+            terminal_regression_drive(participation).await;
         let source = Arc::new(ClosedProcessObservation {
-            expected: context.backend_process_id(),
+            expected: participation.backend_process_id(),
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let mut assembled = pending_pre_ready_round(round, source.clone());
@@ -3184,7 +3207,7 @@ mod tests {
             while source.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
             }
-            clock.advance(super::super::context_owner::ADMISSION_TICKET_VALID_FOR);
+            clock.advance(super::super::participation_owner::ADMISSION_TICKET_VALID_FOR);
         };
         let (terminal, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             tokio::join!(
@@ -3208,16 +3231,16 @@ mod tests {
         );
         drop(assembled);
         drop(drive);
-        finish_pending_actor(logical, context).await;
+        finish_pending_actor(logical, participation).await;
     }
     #[tokio::test]
     async fn pending_receiver_definitive_error_keeps_normal_priority_over_cancel_view() {
         use novarocks_execution_contract::failure::FailureProjection;
         use novarocks_query_application::execution_error::QueryFailureReason;
         let round = super::super::tests::pre_ready_invalid_ack_observation_round();
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let (logical, drive, cancellation, requester, _abort) =
-            terminal_regression_drive(context).await;
+            terminal_regression_drive(participation).await;
         let mut assembled = pending_pre_ready_round(round, Arc::new(UnusedConvergenceSource));
         requester.request(CancellationReason::Requested).unwrap();
         // The receiver sees a genuine protocol invariant in this same turn.
@@ -3240,7 +3263,7 @@ mod tests {
         assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
         drop(assembled);
         drop(drive);
-        finish_pending_actor(logical, context).await;
+        finish_pending_actor(logical, participation).await;
     }
 
     #[tokio::test]
@@ -3258,10 +3281,10 @@ mod tests {
                     observation_first,
                     state,
                 );
-                let context = *round.execution().graph().contexts().next().unwrap();
+                let participation = *round.execution().graph().participations().next().unwrap();
                 let root = round.execution().graph().root_identity();
                 let (logical, drive, cancellation, _, _abort) =
-                    terminal_regression_drive(context).await;
+                    terminal_regression_drive(participation).await;
                 let mut assembled =
                     pending_pre_ready_round(round, Arc::new(UnusedConvergenceSource));
                 // This is an ordinary active attempt, not the special pending
@@ -3312,7 +3335,7 @@ mod tests {
                 );
                 drop(assembled);
                 drop(drive);
-                finish_pending_actor(logical, context).await;
+                finish_pending_actor(logical, participation).await;
             }
         }
     }
@@ -3324,7 +3347,7 @@ mod tests {
             native::task_transport::SubscriptionState, task_protocol_config::DispatchLane,
         };
         use novarocks_execution_contract::{
-            AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, LeaseValidFor,
+            AcquireParticipationAdmissionTicket, AdmissionEpochCapability, LeaseValidFor,
             TaskOperationId,
         };
         use novarocks_query_application::execution_error::ExecutionFailureInput;
@@ -3334,18 +3357,18 @@ mod tests {
         ] {
             let round =
                 super::super::tests::manifest_task_and_subscription_failure_round(true, state);
-            let context = *round.execution().graph().contexts().next().unwrap();
+            let participation = *round.execution().graph().participations().next().unwrap();
             let (logical, drive, cancellation, _, _abort) =
-                terminal_regression_drive(context).await;
+                terminal_regression_drive(participation).await;
             let (sink, actor_gate, _) = ActorGatedTaskOperationSink::pair(
                 Arc::new(BackpressuredGateTransport),
                 Arc::new(super::super::status_intake::CountingWake::default()),
                 novarocks_types::NativeCompatibilityId::new([0x41; 32]),
             );
-            let operation = OperationIntent::AcquireQueryContextAdmissionTicket(
-                AcquireQueryContextAdmissionTicket::new(
+            let operation = OperationIntent::AcquireParticipationAdmissionTicket(
+                AcquireParticipationAdmissionTicket::new(
                     TaskOperationId::new_v7(),
-                    context,
+                    participation,
                     LeaseValidFor::new(std::time::Duration::from_secs(30)).unwrap(),
                     novarocks_types::NativeCompatibilityId::new([0x41; 32]),
                     AdmissionEpochCapability::try_from_bytes([9; 16]).unwrap(),
@@ -3355,7 +3378,7 @@ mod tests {
             let bytes = operation.queue_request().queued_bytes();
             let TaskOperationSubmit::Backpressured(retained) =
                 sink.try_submit(DispatchBatch::test_fixture(
-                    context.backend_process_id(),
+                    participation.backend_process_id(),
                     DispatchLane::Lifecycle,
                     vec![operation],
                     bytes,
@@ -3401,7 +3424,7 @@ mod tests {
             assert!(assembled.actor_gate.prepare_convergence());
             drop(assembled);
             drop(drive);
-            finish_pending_actor(logical, context).await;
+            finish_pending_actor(logical, participation).await;
         }
     }
 
@@ -3416,8 +3439,9 @@ mod tests {
             false,
             SubscriptionState::ProcessMismatch,
         );
-        let context = *round.execution().graph().contexts().next().unwrap();
-        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        let participation = *round.execution().graph().participations().next().unwrap();
+        let (logical, drive, cancellation, _, _abort) =
+            terminal_regression_drive(participation).await;
         let mut assembled = pending_pre_ready_round(round, Arc::new(UnusedConvergenceSource));
         assembled.pending_terminal = None;
         assembled.pending_pre_ready = None;
@@ -3446,7 +3470,7 @@ mod tests {
         assert_eq!(failure.input().site(), ExecutionFailureSite::Coordinator);
         drop(assembled);
         drop(drive);
-        finish_pending_actor(logical, context).await;
+        finish_pending_actor(logical, participation).await;
     }
 
     #[tokio::test]
@@ -3457,9 +3481,10 @@ mod tests {
         };
         let round =
             super::super::round::pending_task_failure_then_invalid_covered_frame_round().await;
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let root = round.execution().graph().root_identity();
-        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        let (logical, drive, cancellation, _, _abort) =
+            terminal_regression_drive(participation).await;
         let mut assembled = pending_pre_ready_round(round, Arc::new(UnusedConvergenceSource));
         let terminal = assembled
             .run(
@@ -3500,7 +3525,7 @@ mod tests {
         assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
         drop(assembled);
         drop(drive);
-        finish_pending_actor(logical, context).await;
+        finish_pending_actor(logical, participation).await;
     }
 
     #[derive(Debug)]
@@ -3568,7 +3593,7 @@ mod tests {
     fn answer_original_worker_intents(
         worker: &super::super::tests::RecordingSink,
         acks: &crate::native::task_transport::TaskAckIntakeHandle,
-        unknown_target: Option<novarocks_execution_contract::QueryContextRef>,
+        unknown_target: Option<novarocks_execution_contract::ParticipationRef>,
         transport: &OriginalSelectiveTransport,
         late: &mut Option<super::super::intent::OperationAcknowledgement>,
     ) {
@@ -3576,12 +3601,12 @@ mod tests {
         for (_, intents) in worker.take() {
             for intent in intents {
                 let reply = match &intent {
-                    OperationIntent::AcquireQueryContextAdmissionTicket(_) => {
+                    OperationIntent::AcquireParticipationAdmissionTicket(_) => {
                         super::super::tests::admission_ack(&intent)
                     }
-                    OperationIntent::EstablishQueryContext(request) => {
+                    OperationIntent::EstablishParticipation(request) => {
                         let known = super::super::tests::establish_ack(&intent);
-                        if unknown_target == Some(request.context()) {
+                        if unknown_target == Some(request.participation()) {
                             if let Some(original) = late.as_ref() {
                                 assert_eq!(original.operation_id(), known.operation_id());
                             }
@@ -3630,39 +3655,41 @@ mod tests {
                     Arc::clone(&transport) as Arc<dyn TaskOperationSink>,
                 );
             let root = round.root_task();
-            let contexts = round
+            let participations = round
                 .execution()
                 .graph()
-                .contexts()
+                .participations()
                 .copied()
                 .collect::<Vec<_>>();
-            let target = *contexts
+            let target = *participations
                 .iter()
-                .rfind(|context| context.backend_process_id() != root.backend_process_id())
+                .rfind(|participation| {
+                    participation.backend_process_id() != root.backend_process_id()
+                })
                 .unwrap();
             *transport.target.lock().unwrap() = Some((
                 target.backend_process_id(),
                 if mode == 0 {
-                    OperationKind::AcquireQueryContextAdmissionTicket
+                    OperationKind::AcquireParticipationAdmissionTicket
                 } else {
-                    OperationKind::UpdateQueryContext
+                    OperationKind::UpdateParticipation
                 },
             ));
             transport
                 .block
                 .store(mode != 2, std::sync::atomic::Ordering::SeqCst);
             let (mut logical, drive, cancellation, _, _abort) =
-                terminal_regression_drive_for_contexts(contexts.clone(), false).await;
+                terminal_regression_drive_for_participations(participations.clone(), false).await;
             let source = round.take_root_status_source().unwrap();
             let split_delivery = SplitDeliveryBridge::for_graph(round.execution().graph());
             let convergence = NativeAttemptConvergenceOwner::new(
                 &round,
                 Arc::new(UnusedConvergenceSource),
-                contexts
+                participations
                     .iter()
-                    .map(|&context| {
+                    .map(|&participation| {
                         NativeAttemptConvergenceTarget::new(
-                            context,
+                            participation,
                             novarocks_execution::runtime::endpoint::RuntimeEndpoint::new(
                                 "127.0.0.1",
                                 1,
@@ -3720,7 +3747,7 @@ mod tests {
                         .execution()
                         .graph()
                         .tasks()
-                        .filter(|task| task.context() != target)
+                        .filter(|task| task.participation() != target)
                         .all(|task| {
                             assembled
                                 .round
@@ -3837,7 +3864,7 @@ mod tests {
                 // The snapshot names the latest replay, captured by the gate
                 // but never sent by its inner transport. Convergence marks
                 // that replay DefinitelyUnsent; the older unknown send still
-                // requires the original ticket/context Abort responsibility.
+                // requires the original ticket/participation Abort responsibility.
                 tokio::time::timeout_at(deadline, async {
                     loop {
                         if logical.establish_snapshot(target).await.unwrap().is_some_and(|snapshot| {
@@ -3867,24 +3894,24 @@ mod tests {
             drop(assembled);
             drop(drive);
             logical.abandon_running_attempt();
-            for &context in &contexts {
+            for &participation in &participations {
                 while logical
-                    .stand_down_snapshot(context)
+                    .stand_down_snapshot(participation)
                     .await
                     .unwrap()
                     .is_none()
                 {
                     tokio::task::yield_now().await;
                 }
-                if context == target {
+                if participation == target {
                     let closure = logical
-                        .stand_down_snapshot(context)
+                        .stand_down_snapshot(participation)
                         .await
                         .unwrap()
                         .unwrap()
                         .closure();
                     assert_ne!(closure,
-                        novarocks_query_application::coordination::ContextClosureState::NoRemoteResponsibility,
+                        novarocks_query_application::coordination::ParticipationClosureState::NoRemoteResponsibility,
                         "local gate closure cannot turn a pending admission or held ticket into NoGrant");
                     assert!(
                         !closure.residual_resource_settled(),
@@ -3892,7 +3919,7 @@ mod tests {
                     );
                 }
                 logical
-                    .observe_worker_process_replaced(context)
+                    .observe_worker_process_replaced(participation)
                     .await
                     .unwrap();
             }
@@ -3920,7 +3947,7 @@ mod tests {
             } else {
                 assert!(
                     !target_established,
-                    "an unsent or unobserved late carrier cannot fabricate an established context"
+                    "an unsent or unobserved late carrier cannot fabricate an established participation"
                 );
             }
             assert!(

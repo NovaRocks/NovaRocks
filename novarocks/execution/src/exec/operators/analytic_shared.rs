@@ -24,7 +24,7 @@ mod analytic_failure;
 mod analytic_input_stages;
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 use analytic_failure::contract as analytic_contract;
 use arrow::array::{Array, ArrayRef, UInt32Builder};
 use arrow::compute::take;

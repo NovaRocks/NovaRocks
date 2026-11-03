@@ -24,7 +24,7 @@ use crate::{
         hash_table::hash::{canonical_f32_bits, canonical_f64_bits},
         pipeline::operator::InputConstructionOwner,
     },
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use arrow::{
     array::*,

@@ -27,8 +27,8 @@ use bytes::{Bytes, BytesMut};
 use novarocks_spi::connector::StorageAccessDomainId;
 
 use crate::{
-    BoundFile, DataCacheContext, FileCancellation, FileError, FileErrorKind, FileIdentity,
-    FileIoRuntime, FileResult, FileTaskSpawner, PhysicalPruning, ScanPredicate,
+    BoundFile, DataCachePolicy, FileCancellation, FileError, FileErrorKind, FileIdentity,
+    FileIoRuntime, FileIoSpawner, FileResult, PhysicalPruning, ScanPredicate,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,7 +79,7 @@ pub struct FileReadContext {
     pub cancellation: FileCancellation,
     pub deadline: Option<Instant>,
     pub runtime: Arc<dyn FileIoRuntime>,
-    pub task_spawner: Arc<dyn FileTaskSpawner>,
+    pub io_spawner: Arc<dyn FileIoSpawner>,
     /// The shared scan I/O an execution-attempt read goes through, bound to
     /// the source the read is for. Without it a read goes straight to the
     /// object store.
@@ -226,7 +226,7 @@ pub struct FileReadRequest {
     pub predicates: Vec<ScanPredicate>,
     pub pruning: PhysicalPruning,
     pub options: FileReaderOptions,
-    pub cache: Option<DataCacheContext>,
+    pub cache: Option<DataCachePolicy>,
     pub prepared_input: Option<PreparedFileInput>,
     pub context: FileReadContext,
 }

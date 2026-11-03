@@ -70,7 +70,7 @@ struct State {
 /// An exact reservation in its issuing StockCore's embedded kernel.
 /// The caller must retain that exact StockCore; tokens do not own allocations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct NativeConnectionKeyToken {
+pub(crate) struct NativeConnectionKeySlot {
     index: usize,
     generation: u64,
 }
@@ -125,7 +125,7 @@ fn same_lane(first: InlineNativeChannelIdentity, second: InlineNativeChannelIden
 }
 
 impl State {
-    fn row(&self, token: NativeConnectionKeyToken) -> io::Result<Row> {
+    fn row(&self, token: NativeConnectionKeySlot) -> io::Result<Row> {
         self.rows
             .get(token.index)
             .copied()
@@ -203,7 +203,7 @@ impl NativeConnectionKeyCapacity {
     pub(crate) fn claim(
         &self,
         key: InlineNativeChannelIdentity,
-    ) -> io::Result<NativeConnectionKeyToken> {
+    ) -> io::Result<NativeConnectionKeySlot> {
         let limits = limits(key)?;
         let mut state = self.lock()?;
         if !state.admits_peer(key)
@@ -226,11 +226,11 @@ impl NativeConnectionKeyCapacity {
             generation,
             phase: Phase::Connecting,
         };
-        Ok(NativeConnectionKeyToken { index, generation })
+        Ok(NativeConnectionKeySlot { index, generation })
     }
 
     /// Publish Live only when its lane has room. Retirement cannot be undone.
-    pub(crate) fn install(&self, token: NativeConnectionKeyToken) -> io::Result<()> {
+    pub(crate) fn install(&self, token: NativeConnectionKeySlot) -> io::Result<()> {
         let mut state = self.lock()?;
         let row = state.row(token)?;
         if row.phase == Phase::Live {
@@ -250,7 +250,7 @@ impl NativeConnectionKeyCapacity {
     /// Move to Closing only when there is a closing position. Otherwise retain
     /// the original live/connecting charge until actual exit, without waiting.
     /// Repeated retirement is idempotent for the same still-active token.
-    pub(crate) fn retire(&self, token: NativeConnectionKeyToken) -> io::Result<()> {
+    pub(crate) fn retire(&self, token: NativeConnectionKeySlot) -> io::Result<()> {
         let mut state = self.lock()?;
         let row = state.row(token)?;
         let fallback = match row.phase {
@@ -271,7 +271,7 @@ impl NativeConnectionKeyCapacity {
 
     /// Clear the physical position only after its last original owner exits.
     /// Old or already-exited tokens cannot mutate a replacement generation.
-    pub(crate) fn exit(&self, token: NativeConnectionKeyToken) -> io::Result<()> {
+    pub(crate) fn exit(&self, token: NativeConnectionKeySlot) -> io::Result<()> {
         let mut state = self.lock()?;
         state.row(token)?;
         state.rows[token.index].key = None;
@@ -499,7 +499,7 @@ mod tests {
             capacity.lock().unwrap().rows[new.index].key,
             Some(exchange(2, 9000))
         );
-        let invalid = NativeConnectionKeyToken {
+        let invalid = NativeConnectionKeySlot {
             index: usize::MAX,
             generation: new.generation,
         };

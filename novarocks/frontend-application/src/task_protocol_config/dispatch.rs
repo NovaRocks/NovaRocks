@@ -69,15 +69,15 @@ impl DispatchBudget {
 
     pub const fn lane_of(shape: OperationShape) -> DispatchLane {
         match shape {
-            OperationShape::CancelTask | OperationShape::QuiesceQueryContext => {
+            OperationShape::CancelTask | OperationShape::QuiesceParticipation => {
                 DispatchLane::Control
             }
-            OperationShape::AcquireQueryContextAdmissionTicket
-            | OperationShape::EstablishQueryContext
-            | OperationShape::AdvanceQueryContextDomain
-            | OperationShape::RenewQueryExecutionLease
-            | OperationShape::AbortQueryContext
-            | OperationShape::ReleaseQueryContext => DispatchLane::Lifecycle,
+            OperationShape::AcquireParticipationAdmissionTicket
+            | OperationShape::EstablishParticipation
+            | OperationShape::AdvanceParticipationDomain
+            | OperationShape::RenewParticipationLease
+            | OperationShape::AbortParticipation
+            | OperationShape::ReleaseParticipation => DispatchLane::Lifecycle,
             OperationShape::CreateTask => DispatchLane::Create,
             OperationShape::UpdateTask
             | OperationShape::FetchTaskDynamicFilters
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn lifecycle_operations_have_reserved_dispatch() {
         assert_eq!(
-            DispatchBudget::lane_of(OperationShape::ReleaseQueryContext),
+            DispatchBudget::lane_of(OperationShape::ReleaseParticipation),
             DispatchLane::Lifecycle
         );
         assert_ne!(
@@ -141,7 +141,7 @@ mod tests {
             DispatchLane::Control
         );
         assert_eq!(
-            DispatchBudget::lane_of(OperationShape::RenewQueryExecutionLease),
+            DispatchBudget::lane_of(OperationShape::RenewParticipationLease),
             DispatchLane::Lifecycle
         );
     }

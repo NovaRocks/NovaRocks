@@ -396,11 +396,14 @@ impl TaskIdentity {
     /// The frontend process id is deliberately not part of a task identity, so
     /// it is not compared here: a query context reference carries it, and the
     /// backend fences it against the context it owns.
-    pub fn verify_query_context(self, context: QueryContextRef) -> Result<(), IdentityMismatch> {
-        if self.query_execution_id != context.query_execution_id() {
+    pub fn verify_participation(
+        self,
+        participation: ParticipationRef,
+    ) -> Result<(), IdentityMismatch> {
+        if self.query_execution_id != participation.query_execution_id() {
             return Err(IdentityMismatch::new(IdentityField::QueryExecution));
         }
-        if self.backend_process_id != context.backend_process_id() {
+        if self.backend_process_id != participation.backend_process_id() {
             return Err(IdentityMismatch::new(IdentityField::BackendProcess));
         }
         Ok(())
@@ -427,13 +430,13 @@ impl fmt::Display for TaskIdentity {
 /// never establish one, so the participant set of a query is exactly the set
 /// of backends carrying at least one scheduled task.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct QueryContextRef {
+pub struct ParticipationRef {
     query_execution_id: QueryExecutionId,
     frontend_process_id: FrontendProcessId,
     backend_process_id: BackendProcessId,
 }
 
-impl QueryContextRef {
+impl ParticipationRef {
     pub const fn new(
         query_execution_id: QueryExecutionId,
         frontend_process_id: FrontendProcessId,
@@ -473,7 +476,7 @@ impl QueryContextRef {
     }
 }
 
-impl fmt::Display for QueryContextRef {
+impl fmt::Display for ParticipationRef {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
@@ -489,7 +492,7 @@ impl fmt::Display for QueryContextRef {
 mod tests {
     use super::{
         AdmissionEpochCapability, AdmissionEpochCapabilityError, AdmissionTicketId,
-        AdmissionTicketIdError, IdentityField, IdentityMismatch, QueryContextRef, TaskIdentity,
+        AdmissionTicketIdError, IdentityField, IdentityMismatch, ParticipationRef, TaskIdentity,
         TaskOperationId, TaskOperationIdError,
     };
     use novarocks_types::identity::{
@@ -584,19 +587,19 @@ mod tests {
     }
 
     #[test]
-    fn create_requires_a_context_ref_matching_query_and_backend_exactly() {
+    fn create_requires_a_participation_ref_matching_query_and_backend_exactly() {
         let backend = BackendProcessId::new_v7();
         let frontend = FrontendProcessId::new_v7();
         let task = identity(execution(1), 2, 3, backend);
-        let context = QueryContextRef::new(execution(1), frontend, backend);
+        let participation = ParticipationRef::new(execution(1), frontend, backend);
 
-        assert_eq!(task.verify_query_context(context), Ok(()));
+        assert_eq!(task.verify_participation(participation), Ok(()));
         assert_eq!(
-            task.verify_query_context(QueryContextRef::new(execution(2), frontend, backend)),
+            task.verify_participation(ParticipationRef::new(execution(2), frontend, backend)),
             Err(IdentityMismatch::new(IdentityField::QueryExecution))
         );
         assert_eq!(
-            task.verify_query_context(QueryContextRef::new(
+            task.verify_participation(ParticipationRef::new(
                 execution(1),
                 frontend,
                 BackendProcessId::new_v7()
@@ -606,7 +609,7 @@ mod tests {
         // A different frontend incarnation is fenced by the context owner, not
         // by the task identity: the task tuple never carries it.
         assert_eq!(
-            task.verify_query_context(QueryContextRef::new(
+            task.verify_participation(ParticipationRef::new(
                 execution(1),
                 FrontendProcessId::new_v7(),
                 backend
@@ -616,14 +619,14 @@ mod tests {
     }
 
     #[test]
-    fn context_ref_fences_the_frontend_incarnation() {
+    fn participation_ref_fences_the_frontend_incarnation() {
         let backend = BackendProcessId::new_v7();
         let frontend = FrontendProcessId::new_v7();
-        let base = QueryContextRef::new(execution(1), frontend, backend);
+        let base = ParticipationRef::new(execution(1), frontend, backend);
 
         assert_eq!(base.verify_matches(base), Ok(()));
         assert_eq!(
-            base.verify_matches(QueryContextRef::new(
+            base.verify_matches(ParticipationRef::new(
                 execution(1),
                 FrontendProcessId::new_v7(),
                 backend

@@ -39,12 +39,12 @@ use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{Transform, TransformKernel},
     step::{NextStep, StepResult},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 pub struct CompiledRepeatProcessorFactory {
     name: String,
@@ -229,11 +229,11 @@ impl CompiledRepeatProcessor {
             self.null_ordinals[set]
                 .iter()
                 .copied()
-                .map(Ok::<_, crate::runtime::fragment::ExecutionFailure>),
+                .map(Ok::<_, crate::runtime::task::ExecutionFailure>),
             self.grouping_values[set]
                 .iter()
                 .copied()
-                .map(Ok::<_, crate::runtime::fragment::ExecutionFailure>),
+                .map(Ok::<_, crate::runtime::task::ExecutionFailure>),
             factory.as_ref(),
             |value, rows| Arc::new(Int64Array::from_value(value, rows)),
         )
@@ -281,7 +281,7 @@ impl InputEncodingPolicy for CompiledRepeatProcessor {}
 impl TransformKernel for CompiledRepeatProcessor {
     fn apply(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         let chunk = input.into_uncovered_chunk()?;
@@ -311,7 +311,7 @@ impl TransformKernel for CompiledRepeatProcessor {
         self.next_set = 0;
         Ok(StepResult::new(None, NextStep::Runnable, rows))
     }
-    fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         let Some(input) = self.input.as_ref() else {
             return Ok(StepResult::new(None, NextStep::NeedInput, 0));
         };
@@ -326,7 +326,7 @@ impl TransformKernel for CompiledRepeatProcessor {
         };
         Ok(StepResult::new(Some(output), next, 0))
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.prepared_output()?;
         Ok(StepResult::new(None, NextStep::Finished, 0))
     }

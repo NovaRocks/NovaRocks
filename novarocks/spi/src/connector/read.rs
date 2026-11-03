@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorError, ConnectorErrorKind, ConnectorPredicateDisposition, ConnectorProviderBindingKey,
-    ConnectorReadSessionLease, ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
-    ConnectorStaticPredicate,
+    ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit, ConnectorStaticPredicate,
+    SharedConnectorReadSession,
 };
 
 const MAX_CONNECTOR_CHANGE_PARTITIONS: usize = 16_384;
@@ -690,7 +690,7 @@ pub struct ConnectorSplitPlanningResult {
     pub splits: Vec<ConnectorSplit>,
     pub metrics: ConnectorSplitPlanningMetrics,
     /// FE-local prepared remote session. It never enters any execution carrier.
-    pub session: Option<ConnectorReadSessionLease>,
+    pub session: Option<SharedConnectorReadSession>,
 }
 
 impl ConnectorSplitPlanningResult {
@@ -714,7 +714,7 @@ impl ConnectorSplitPlanningResult {
     pub fn try_new_with_session(
         splits: Vec<ConnectorSplit>,
         metrics: ConnectorSplitPlanningMetrics,
-        session: ConnectorReadSessionLease,
+        session: SharedConnectorReadSession,
     ) -> Result<Self, ConnectorError> {
         let mut result = Self::try_new(splits, metrics)?;
         result.session = Some(session);

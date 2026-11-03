@@ -715,7 +715,7 @@ pub trait ConnectorMetadataMaintenanceExecutionSource: Send + Sync {
 pub struct ConnectorMetadataMaintenanceExecution {
     source: Arc<dyn ConnectorMetadataMaintenanceExecutionSource>,
     validation: Option<(
-        ConnectorMetadataMaintenanceLease,
+        ConnectorMetadataMaintenanceSession,
         ConnectorMetadataMaintenancePlan,
     )>,
 }
@@ -820,15 +820,15 @@ pub trait ConnectorMetadataMaintenanceResolver: Send + Sync {
     fn acquire_current_metadata_maintenance(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError>;
+    ) -> Result<ConnectorMetadataMaintenanceSession, ConnectorError>;
     fn acquire_exact_metadata_maintenance(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError>;
+    ) -> Result<ConnectorMetadataMaintenanceSession, ConnectorError>;
 }
 
 #[derive(Clone)]
-pub struct ConnectorMetadataMaintenanceLease {
+pub struct ConnectorMetadataMaintenanceSession {
     descriptor: ConnectorInstanceDescriptor,
     control_runtime_id: ConnectorControlRuntimeId,
     provider_binding_key: ConnectorProviderBindingKey,
@@ -839,7 +839,7 @@ pub struct ConnectorMetadataMaintenanceLease {
 struct MaintenanceRelease {
     release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
 }
-impl ConnectorMetadataMaintenanceLease {
+impl ConnectorMetadataMaintenanceSession {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
@@ -1310,7 +1310,7 @@ mod tests {
             binding: binding.clone(),
             foreign: AtomicUsize::new(0),
         });
-        let lease = ConnectorMetadataMaintenanceLease::new(
+        let lease = ConnectorMetadataMaintenanceSession::new(
             descriptor,
             ConnectorControlRuntimeId::from_bytes([1; 16]),
             binding.incarnation,

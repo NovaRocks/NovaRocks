@@ -33,7 +33,7 @@ use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{
     LaunchProfile, QueryLifecycleFailureSite, QueryLifecycleStatementObservation,
-    QueryLifecycleStructuredSnapshot, ServerHandle, test_sessions::ClusterTestSessionPlan,
+    QueryLifecycleStructuredSnapshot, TestClusterOwner, test_sessions::ClusterTestSessionPlan,
 };
 use novarocks_execution_contract::{
     TaskFailurePhase, TaskIdentity,
@@ -50,9 +50,10 @@ use tokio::sync::oneshot;
 
 const ACTION: &str = "task-execution-failure-after-visible-prefix";
 const BEFORE_SCHEMA_ACTION: &str = "root-task-execution-failure-before-data";
-const PROPOSED: &str = "NOVAROCKS_TASK_EXECUTION_FAILURE_INJECTED";
-const ACCEPTED: &str = "NOVAROCKS_TASK_EXECUTION_FAILURE_AFTER_VISIBLE_PREFIX_ACCEPTED";
-const CREATED: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
+const PROPOSED: &str = novarocks_failpoint::observation_marker::TASK_EXECUTION_FAILURE_INJECTED;
+const ACCEPTED: &str =
+    novarocks_failpoint::observation_marker::TASK_EXECUTION_FAILURE_AFTER_VISIBLE_PREFIX_ACCEPTED;
+const CREATED: &str = novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED;
 const DETAIL: &str = "Unexpected failure (reason 13:20)";
 // The first small row is flushed while the first long row is still being
 // scanned in the renderer's Small/Count phase. Each repeated value respects
@@ -153,7 +154,7 @@ impl Scenario for ExecutionFailureScene {
                 faults: (0..3).map(|index| (index, self.stage.action())).collect(),
                 observations: (0..cluster_size)
                     .flat_map(|index| {
-                        [1, 2].map(move |attempt| (index, "grpc-fragment", Some(attempt)))
+                        [1, 2].map(move |attempt| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), Some(attempt)))
                     })
                     .collect(),
             },
@@ -478,7 +479,7 @@ fn assert_handoff_terminal_marker(
     token: &str,
     connection: u32,
 ) -> Result<()> {
-    const MARKER: &str = "NOVAROCKS_RESULT_HANDOFF_TERMINAL_OBSERVED";
+    const MARKER: &str = novarocks_failpoint::observation_marker::RESULT_HANDOFF_TERMINAL_OBSERVED;
     loop {
         let log = context.handle().fe_log_contents()?;
         let matches = log
@@ -530,7 +531,7 @@ fn expected_fact() -> FailureFact {
 
 fn assert_failed_snapshot(snapshot: &QueryLifecycleStructuredSnapshot) -> Result<TaskIdentity> {
     ensure!(
-        snapshot.attempt_id == 1 && snapshot.worker_contexts_converged,
+        snapshot.attempt_id == 1 && snapshot.worker_participations_converged,
         "failure must retain attempt 1 and positive original Worker convergence"
     );
     ensure!(
@@ -590,7 +591,7 @@ fn await_converged(
         .handle()
         .await_query_lifecycle_statement_observation(observation, success, deadline)?;
     ensure!(
-        snapshot.worker_contexts_converged,
+        snapshot.worker_participations_converged,
         "original attempt has no positive convergence proof"
     );
     Ok(snapshot)
@@ -601,7 +602,7 @@ fn assert_independent_success(
     healthy: &QueryLifecycleStructuredSnapshot,
 ) -> Result<()> {
     ensure!(
-        healthy.worker_contexts_converged
+        healthy.worker_participations_converged
             && healthy.attempt_id == 1
             && healthy.failure_fact.is_none()
             && healthy.failure_detail.is_none()
@@ -788,5 +789,5 @@ fn snapshot_evidence(snapshot: &QueryLifecycleStructuredSnapshot) -> Value {
     json!({"execution_id":snapshot.execution_id,"attempt_id":snapshot.attempt_id,
         "failure_fact":format!("{:?}",snapshot.failure_fact),
         "failure_detail":snapshot.failure_detail,"failure_site":format!("{:?}",snapshot.failure_site),
-        "worker_contexts_converged":snapshot.worker_contexts_converged})
+        "worker_participations_converged":snapshot.worker_participations_converged})
 }

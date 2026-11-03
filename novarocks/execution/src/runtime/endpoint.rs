@@ -20,24 +20,24 @@ use novarocks_execution_contract::TaskIdentity;
 use novarocks_types::UniqueId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FragmentDestination {
-    finst_id: UniqueId,
+pub struct TaskDestination {
+    task_key: UniqueId,
     endpoint: RuntimeEndpoint,
-    source_finst_id: UniqueId,
+    source_task_key: UniqueId,
     sender_ordinal: u32,
     sender_count: u32,
     task_identity: Option<TaskIdentity>,
 }
 
-impl FragmentDestination {
+impl TaskDestination {
     pub fn new(
-        finst_id: UniqueId,
+        task_key: UniqueId,
         endpoint: RuntimeEndpoint,
-        source_finst_id: UniqueId,
+        source_task_key: UniqueId,
         sender_ordinal: u32,
         sender_count: u32,
     ) -> Result<Self, String> {
-        if finst_id == UniqueId::new(0, 0) || source_finst_id == UniqueId::new(0, 0) {
+        if task_key == UniqueId::new(0, 0) || source_task_key == UniqueId::new(0, 0) {
             return Err(
                 "fragment destination requires non-zero source and destination IDs".to_string(),
             );
@@ -46,9 +46,9 @@ impl FragmentDestination {
             return Err("fragment destination sender ordinal/count is invalid".to_string());
         }
         Ok(Self {
-            finst_id,
+            task_key,
             endpoint,
-            source_finst_id,
+            source_task_key,
             sender_ordinal,
             sender_count,
             task_identity: None,
@@ -66,16 +66,16 @@ impl FragmentDestination {
         self.task_identity
     }
 
-    pub fn finst_id(&self) -> &UniqueId {
-        &self.finst_id
+    pub fn task_key(&self) -> &UniqueId {
+        &self.task_key
     }
 
     pub fn endpoint(&self) -> &RuntimeEndpoint {
         &self.endpoint
     }
 
-    pub const fn source_finst_id(&self) -> UniqueId {
-        self.source_finst_id
+    pub const fn source_task_key(&self) -> UniqueId {
+        self.source_task_key
     }
 
     pub const fn sender_ordinal(&self) -> u32 {
@@ -89,20 +89,17 @@ impl FragmentDestination {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeFilterProberDestination {
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     endpoint: RuntimeEndpoint,
 }
 
 impl RuntimeFilterProberDestination {
-    pub fn new(fragment_instance_id: UniqueId, endpoint: RuntimeEndpoint) -> Self {
-        Self {
-            fragment_instance_id,
-            endpoint,
-        }
+    pub fn new(task_key: UniqueId, endpoint: RuntimeEndpoint) -> Self {
+        Self { task_key, endpoint }
     }
 
-    pub fn fragment_instance_id(&self) -> UniqueId {
-        self.fragment_instance_id
+    pub fn task_key(&self) -> UniqueId {
+        self.task_key
     }
 
     pub fn endpoint(&self) -> &RuntimeEndpoint {

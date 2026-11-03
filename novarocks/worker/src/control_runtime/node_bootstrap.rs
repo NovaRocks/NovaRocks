@@ -21,19 +21,19 @@
 
 use super::{
     actors::{ControlActor, WorkerActor},
-    context_executors::{ContextExecutorShutdownError, ContextExecutors},
-    context_host::{TaskDriverPorts, task_driver::TaskDriverHostJob},
     establish_executors::EstablishExecutors,
     host_executor::{HostExecutor, HostExecutorLimits, HostPairShutdownError, HostShutdownError},
     loading_host_job::LoadingHostJob,
-    node::{NodeActorIds, NodeContextConfig, NodeHostRefusal, WorkerNodeHost},
+    node::{NodeActorIds, NodeHostRefusal, NodeParticipationConfig, WorkerNodeHost},
     node_geometry::{NodeGeometry, NodeGeometryError},
+    participation_executors::{ParticipationExecutorShutdownError, ParticipationExecutors},
+    participation_host::{TaskIoPorts, task_io::TaskIoHostJob},
     process_control::{ProcessControlBinding, ProcessControlOwner},
 };
-use crate::{QueryContextHostFactory, TaskExecutionHost, TaskExecutionPorts};
+use crate::{ParticipationHostFactory, TaskExecutionHost, TaskExecutionPorts};
 use novarocks_control_runtime::{
     actor::ActorConfig,
-    driver::{ActorRuntime, Clock, PollerPool},
+    actor_turn::{ActorRuntime, Clock, PollerPool},
     transaction::RuntimeLedger,
 };
 use novarocks_control_runtime_core::identity::{ActorId, Generation};
@@ -41,9 +41,9 @@ use novarocks_execution_contract::AdmissionEpochCapability;
 use novarocks_types::{BackendProcessId, NativeCompatibilityId};
 use novarocks_worker_protocol::{
     admission::AdmissionTicketConfig,
-    context::{ContextConfig, ContextCore},
     control::{ControlConfig, ControlCore},
     lease::MonotonicInstant,
+    participation::{ParticipationConfig, ParticipationCore},
 };
 use std::{
     any::Any,
@@ -54,13 +54,13 @@ use std::{
 };
 
 type LoadingPool = HostExecutor<LoadingHostJob, fn(LoadingHostJob)>;
-type TaskPool = HostExecutor<TaskDriverHostJob, fn(TaskDriverHostJob)>;
+type TaskPool = HostExecutor<TaskIoHostJob, fn(TaskIoHostJob)>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct NodeWorkers {
     pub pollers: NonZeroUsize,
-    pub context_materialization: NonZeroUsize,
-    pub context_cleanup: NonZeroUsize,
+    pub participation_materialization: NonZeroUsize,
+    pub participation_cleanup: NonZeroUsize,
     pub establish_getters: NonZeroUsize,
     pub establish_cleanup: NonZeroUsize,
     pub loading: NonZeroUsize,
@@ -72,7 +72,7 @@ pub struct NodeWorkers {
 /// capability supplies this process's issuer; its later published epoch comes
 /// from the same Root's real committed projection, never this initial value.
 pub(crate) struct NodeBootstrapConfig {
-    pub observation: super::context_host::observation::ObservationProjection,
+    pub observation: super::participation_host::observation::ObservationProjection,
     pub history: Option<novarocks_control_runtime::history::HistoryCapture>,
     pub backend: BackendProcessId,
     pub compatibility: NativeCompatibilityId,
@@ -81,11 +81,11 @@ pub(crate) struct NodeBootstrapConfig {
     pub next_actor: NonZeroU64,
     pub generation: Generation,
     pub clock: Arc<dyn Clock>,
-    pub context_factory: Arc<dyn QueryContextHostFactory>,
+    pub participation_factory: Arc<dyn ParticipationHostFactory>,
     pub execution: Arc<dyn TaskExecutionHost>,
     pub execution_ports: TaskExecutionPorts,
     pub control: ControlConfig,
-    pub context: ContextConfig,
+    pub participation: ParticipationConfig,
     pub tickets: AdmissionTicketConfig,
     pub geometry: NodeGeometry,
     pub workers: NodeWorkers,
@@ -97,7 +97,7 @@ pub(crate) enum NodeBootstrapPhase {
     Validate,
     Root,
     EstablishPools,
-    ContextPools,
+    ParticipationPools,
     CapacitySource,
     LoadingPool,
     PreparationPool,
@@ -110,7 +110,7 @@ pub(crate) enum NodeBootstrapError {
     Geometry(NodeGeometryError),
     CapacityIndex(novarocks_control_runtime::transaction::RuntimeError),
     InvalidConfiguration(&'static str),
-    Core(novarocks_worker_protocol::context::CoreError),
+    Core(novarocks_worker_protocol::participation::CoreError),
     OriginalOwner,
     Spawn(std::io::Error),
 }
@@ -175,7 +175,7 @@ struct NodeStartupState {
     ledger: Option<RuntimeLedger>,
     root: Option<ProcessControlOwner>,
     establish: Option<EstablishExecutors>,
-    contexts: Option<ContextExecutors>,
+    participations: Option<ParticipationExecutors>,
     loading: Option<LoadingPool>,
     preparation: Option<TaskPool>,
     lifecycle: Option<TaskPool>,
@@ -195,9 +195,9 @@ impl NodeStartupState {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct TaskPhysicalGeometry {
-    pub context_materialization: HostExecutorLimits,
-    pub context_cleanup: HostExecutorLimits,
+pub(crate) struct NodeExecutorGeometry {
+    pub participation_materialization: HostExecutorLimits,
+    pub participation_cleanup: HostExecutorLimits,
     pub loading: HostExecutorLimits,
     pub preparation: HostExecutorLimits,
     pub lifecycle: HostExecutorLimits,
@@ -211,32 +211,33 @@ fn mul(a: usize, b: usize) -> Result<usize, NodeGeometryError> {
 fn nz(value: usize) -> Result<NonZeroUsize, NodeGeometryError> {
     NonZeroUsize::new(value).ok_or(NodeGeometryError::InvalidBootstrapManifest)
 }
-impl TaskPhysicalGeometry {
+impl NodeExecutorGeometry {
     fn checked(config: &NodeBootstrapConfig) -> Result<Self, NodeGeometryError> {
         let g = &config.geometry;
-        let t = g.inputs.tasks_per_context.get();
+        let t = g.inputs.tasks_per_participation.get();
         let a = g.inputs.active_tasks.get();
         let p = g.inputs.preparing_tasks.get();
         let r = g.request_positions.get();
-        // Context queues share the configured ingress window, not a limit on
+        // Participation queues share the configured ingress window, not a limit on
         // live or retained directory records. Full retains the same pending
         // job. N covers actual running tails after their original report.
-        let context_limits = |workers: NonZeroUsize, roles: usize| {
+        let participation_limits = |workers: NonZeroUsize, roles: usize| {
             Ok::<_, NodeGeometryError>(HostExecutorLimits {
                 jobs: nz(add(mul(r, roles)?, workers.get())?)?,
-                per_context: nz(add(roles, workers.get())?)?,
+                per_group: nz(add(roles, workers.get())?)?,
                 workers,
             })
         };
-        let context_materialization = context_limits(config.workers.context_materialization, 1)?;
-        let context_cleanup = context_limits(config.workers.context_cleanup, 2)?;
+        let participation_materialization =
+            participation_limits(config.workers.participation_materialization, 1)?;
+        let participation_cleanup = participation_limits(config.workers.participation_cleanup, 2)?;
         let loading = HostExecutorLimits::for_loading(t, a, config.workers.loading.get())?;
-        let per_preparing = p.min(config.context.max_preparing).min(t);
+        let per_preparing = p.min(config.participation.max_preparing).min(t);
         let preparation = HostExecutorLimits {
             jobs: nz(add(p, config.workers.preparation.get())?)?,
             // Preparation membership includes the actual running body tail.
             // Its later activation uses the paid lifecycle continuation slot.
-            per_context: nz(t.min(add(per_preparing, config.workers.preparation.get())?))?,
+            per_group: nz(t.min(add(per_preparing, config.workers.preparation.get())?))?,
             workers: config.workers.preparation,
         };
         // One projection-disposal job per actual paid effect ticket. This is
@@ -264,17 +265,17 @@ impl TaskPhysicalGeometry {
             )?,
             r,
         )?;
-        let context_projection = add(
+        let participation_projection = add(
             add(
                 mul(g.inputs.policy.task_base.effects, t)?,
-                super::context_host::CONTEXT_BOOTSTRAP_STORAGE.effects,
+                super::participation_host::PARTICIPATION_BOOTSTRAP_STORAGE.effects,
             )?,
             mul(g.request_per_position.effects, r)?,
         )?;
         let local_jobs = add(
             add(
                 add(
-                    context_projection.min(projection_jobs),
+                    participation_projection.min(projection_jobs),
                     mul(fixed_task_jobs, a.min(t))?,
                 )?,
                 request_jobs,
@@ -283,15 +284,15 @@ impl TaskPhysicalGeometry {
         )?;
         let lifecycle = HostExecutorLimits {
             // R has its notification and observation bodies; a retained-root sweep has
-            // one Context effect/capture. N accounts for real running tails
+            // one Participation effect/capture. N accounts for real running tails
             // after their logical holder/role can already have retired.
             jobs: nz(add(global_jobs, config.workers.lifecycle.get())?)?,
-            per_context: nz(add(local_jobs, config.workers.lifecycle.get())?)?,
+            per_group: nz(add(local_jobs, config.workers.lifecycle.get())?)?,
             workers: config.workers.lifecycle,
         };
         Ok(Self {
-            context_materialization,
-            context_cleanup,
+            participation_materialization,
+            participation_cleanup,
             loading,
             preparation,
             lifecycle,
@@ -307,7 +308,7 @@ fn run_loading(job: LoadingHostJob) {
         std::process::abort();
     }
 }
-fn run_task(job: TaskDriverHostJob) {
+fn run_task(job: TaskIoHostJob) {
     job.run_on_host();
 }
 
@@ -324,7 +325,7 @@ pub(crate) enum NodeShutdownError {
     Loading(HostShutdownError),
     Preparation(HostShutdownError),
     Lifecycle(HostShutdownError),
-    Context(ContextExecutorShutdownError),
+    Participation(ParticipationExecutorShutdownError),
     Establish(HostPairShutdownError),
     PollersStillLive,
 }
@@ -343,8 +344,11 @@ impl std::fmt::Display for NodeShutdownError {
             Self::Lifecycle(error) => {
                 write!(f, "Worker Node lifecycle pool shutdown failed: {error:?}")
             }
-            Self::Context(error) => {
-                write!(f, "Worker Node Context pools shutdown failed: {error:?}")
+            Self::Participation(error) => {
+                write!(
+                    f,
+                    "Worker Node Participation pools shutdown failed: {error:?}"
+                )
             }
             Self::Establish(error) => write!(
                 f,
@@ -361,7 +365,7 @@ impl std::error::Error for NodeShutdownError {
             | Self::Loading(_)
             | Self::Preparation(_)
             | Self::Lifecycle(_)
-            | Self::Context(_)
+            | Self::Participation(_)
             | Self::Establish(_)
             | Self::PollersStillLive => None,
         }
@@ -376,7 +380,7 @@ impl OwnedNodeRuntime {
             ledger: None,
             root: None,
             establish: None,
-            contexts: None,
+            participations: None,
             loading: None,
             preparation: None,
             lifecycle: None,
@@ -385,13 +389,14 @@ impl OwnedNodeRuntime {
             refused: None,
         };
         let g = &state.config.geometry;
-        let invalid = if state.config.context.max_tasks != g.inputs.tasks_per_context.get()
+        let invalid = if state.config.participation.max_tasks
+            != g.inputs.tasks_per_participation.get()
             || state.config.control.max_pending_requests != g.request_positions.get()
-            || state.config.context.max_pending_requests != g.request_positions.get()
+            || state.config.participation.max_pending_requests != g.request_positions.get()
             || state.config.control.step_budget != ControlCore::MAX_STEP_WORK
-            || state.config.context.step_budget != ContextCore::MAX_STEP_WORK
-            || state.config.context.max_preparing == 0
-            || state.config.context.max_preparing > state.config.context.max_tasks
+            || state.config.participation.step_budget != ParticipationCore::MAX_STEP_WORK
+            || state.config.participation.max_preparing == 0
+            || state.config.participation.max_preparing > state.config.participation.max_tasks
             || state.config.next_actor.get() <= state.config.root_actor.get()
             || state.config.cadence.is_zero()
         {
@@ -405,7 +410,7 @@ impl OwnedNodeRuntime {
                 NodeBootstrapError::InvalidConfiguration(error),
             ));
         }
-        let physical = match TaskPhysicalGeometry::checked(&state.config) {
+        let physical = match NodeExecutorGeometry::checked(&state.config) {
             Ok(geometry) => geometry,
             Err(error) => {
                 return Err(state.refuse(
@@ -521,16 +526,16 @@ impl OwnedNodeRuntime {
             .as_mut()
             .unwrap()
             .service()
-            .start_context_executors(
-                physical.context_materialization,
-                physical.context_cleanup,
+            .start_participation_executors(
+                physical.participation_materialization,
+                physical.participation_cleanup,
                 signal.clone(),
             ) {
-            Ok(owner) => state.contexts = Some(owner),
+            Ok(owner) => state.participations = Some(owner),
             Err(original) => {
                 state.refused = Some(Box::new(original));
                 return Err(state.refuse(
-                    NodeBootstrapPhase::ContextPools,
+                    NodeBootstrapPhase::ParticipationPools,
                     NodeBootstrapError::OriginalOwner,
                 ));
             }
@@ -546,7 +551,7 @@ impl OwnedNodeRuntime {
                 ));
             }
         }
-        let runner: fn(TaskDriverHostJob) = run_task;
+        let runner: fn(TaskIoHostJob) = run_task;
         match HostExecutor::start_eligible_fifo_with_waker(
             physical.preparation,
             runner,
@@ -576,12 +581,12 @@ impl OwnedNodeRuntime {
             .as_ref()
             .and_then(EstablishExecutors::handles)
             .expect("complete original source pools");
-        let contexts = state
-            .contexts
+        let participations = state
+            .participations
             .as_ref()
-            .and_then(ContextExecutors::handles)
-            .expect("complete original Context pools");
-        let ports = TaskDriverPorts {
+            .and_then(ParticipationExecutors::handles)
+            .expect("complete original Participation pools");
+        let ports = TaskIoPorts {
             protocol_events: Some(state.config.execution_ports.clone()),
             observation: Some(state.config.observation),
             execution: Some(state.config.execution.clone()),
@@ -593,16 +598,16 @@ impl OwnedNodeRuntime {
         };
         let node = WorkerNodeHost::from_started(
             state.root.take().unwrap(),
-            contexts,
+            participations,
             ports,
             establish,
-            state.config.context_factory.clone(),
-            NodeContextConfig {
-                core: state.config.context,
+            state.config.participation_factory.clone(),
+            NodeParticipationConfig {
+                core: state.config.participation,
                 policy: state.config.geometry.inputs.policy,
                 storage: state.config.geometry.admission.clone(),
-                max_live_tasks: state.config.geometry.inputs.tasks_per_context.get(),
-                max_live_roots: state.config.geometry.inputs.tasks_per_context.get(),
+                max_live_tasks: state.config.geometry.inputs.tasks_per_participation.get(),
+                max_live_roots: state.config.geometry.inputs.tasks_per_participation.get(),
             },
             NodeActorIds::new(state.config.next_actor),
             state.config.clock.clone(),
@@ -694,11 +699,11 @@ impl OwnedNodeRuntime {
                 }
             }
         }
-        if let Some(owner) = self.state.contexts.take()
+        if let Some(owner) = self.state.participations.take()
             && let Err((error, owner)) = owner.shutdown()
         {
-            self.state.contexts = Some(owner);
-            return Err((NodeShutdownError::Context(error), self));
+            self.state.participations = Some(owner);
+            return Err((NodeShutdownError::Participation(error), self));
         }
         if let Some(owner) = self.state.establish.take()
             && let Err((error, owner)) = owner.shutdown()
@@ -734,24 +739,25 @@ impl OwnedNodeRuntime {
 // runtime registrations or a caller-created ledger.
 pub use novarocks_worker_protocol::{
     admission::AdmissionTicketConfig as NodeAdmissionTicketConfig,
-    context::ContextConfig as NodeContextCoreConfig, control::ControlConfig as NodeControlConfig,
+    control::ControlConfig as NodeControlConfig,
+    participation::ParticipationConfig as NodeParticipationCoreConfig,
 };
 pub const NODE_CONTROL_STEP_BUDGET: usize = ControlCore::MAX_STEP_WORK;
-pub const NODE_CONTEXT_STEP_BUDGET: usize = ContextCore::MAX_STEP_WORK;
+pub const NODE_PARTICIPATION_STEP_BUDGET: usize = ParticipationCore::MAX_STEP_WORK;
 
 /// The actual role composition supplies its original clock and foreign ports.
 /// Checked geometry carries no runtime authority and is revalidated at start.
 pub struct WorkerNodeConfig {
-    pub observation: super::context_host::observation::ObservationProjection,
+    pub observation: super::participation_host::observation::ObservationProjection,
     pub backend: BackendProcessId,
     pub compatibility: NativeCompatibilityId,
     pub initial_admission_epoch: AdmissionEpochCapability,
     pub clock: Arc<dyn crate::WorkerMonotonicClock>,
-    pub context_factory: Arc<dyn QueryContextHostFactory>,
+    pub participation_factory: Arc<dyn ParticipationHostFactory>,
     pub execution: Arc<dyn TaskExecutionHost>,
     pub execution_ports: TaskExecutionPorts,
     pub control: NodeControlConfig,
-    pub context: NodeContextCoreConfig,
+    pub participation: NodeParticipationCoreConfig,
     pub tickets: NodeAdmissionTicketConfig,
     pub geometry: NodeGeometry,
     pub workers: NodeWorkers,
@@ -790,7 +796,7 @@ impl WorkerNodeStartRefusal {
                 NodeBootstrapPhase::Validate => "validate",
                 NodeBootstrapPhase::Root => "root",
                 NodeBootstrapPhase::EstablishPools => "establish pools",
-                NodeBootstrapPhase::ContextPools => "context pools",
+                NodeBootstrapPhase::ParticipationPools => "participation pools",
                 NodeBootstrapPhase::CapacitySource => "capacity source",
                 NodeBootstrapPhase::LoadingPool => "loading pool",
                 NodeBootstrapPhase::PreparationPool => "preparation pool",
@@ -894,11 +900,11 @@ impl WorkerNodeRuntime {
             next_actor: NonZeroU64::new(2).expect("fresh next actor identity"),
             generation: Generation::new(1).expect("fresh Root generation"),
             clock: Arc::new(NodeClock(clock.clone())),
-            context_factory: config.context_factory,
+            participation_factory: config.participation_factory,
             execution: config.execution,
             execution_ports: config.execution_ports,
             control: config.control,
-            context: config.context,
+            participation: config.participation,
             tickets: config.tickets,
             geometry,
             workers: config.workers,

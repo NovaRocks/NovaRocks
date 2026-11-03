@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 fn producer_contract(detail: String) -> ExecutionFailure {
     execution::RuntimeFilterContractViolation::new(
         execution::RuntimeFilterContractViolationKind::ContractMismatch,
@@ -339,7 +339,7 @@ struct NativeMembershipProducerStream {
     partition_id: execution::PartitionId,
     next_sequence: u64,
     terminal: bool,
-    producer: Option<execution::RuntimeFilterProducerHandle>,
+    producer: Option<execution::SharedRuntimeFilterProducer>,
 }
 
 enum NativeMembershipSubmitOutcome {
@@ -612,11 +612,11 @@ mod tests {
             &self,
             _request: execution::RuntimeFilterProducerOpenRequest,
         ) -> Result<
-            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterProducerHandle>,
+            execution::RuntimeFilterBindOutcome<execution::SharedRuntimeFilterProducer>,
             execution::RuntimeFilterContractViolation,
         > {
             self.producer_open_count.fetch_add(1, Ordering::AcqRel);
-            let producer = self.producer.clone() as execution::RuntimeFilterProducerHandle;
+            let producer = self.producer.clone() as execution::SharedRuntimeFilterProducer;
             Ok(execution::RuntimeFilterBindOutcome::Bound(producer))
         }
 
@@ -624,7 +624,7 @@ mod tests {
             &self,
             _request: execution::RuntimeFilterSubscriptionRequest,
         ) -> Result<
-            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionHandle>,
+            execution::RuntimeFilterBindOutcome<execution::RuntimeFilterSubscriptionPin>,
             execution::RuntimeFilterContractViolation,
         > {
             Err(execution::RuntimeFilterContractViolation::new(
@@ -638,7 +638,7 @@ mod tests {
             _request: execution::RuntimeFilterFinalDomainOpenRequest,
         ) -> Result<
             execution::RuntimeFilterBindOutcome<
-                execution::RuntimeFilterFinalDomainCompletionHandle,
+                execution::SharedRuntimeFilterFinalDomainCompletion,
             >,
             execution::RuntimeFilterContractViolation,
         > {

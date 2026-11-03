@@ -45,23 +45,23 @@ type PanicPayload = ManuallyDrop<Box<dyn Any + Send>>;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HostExecutorLimits {
     pub jobs: NonZeroUsize,
-    pub per_context: NonZeroUsize,
+    pub per_group: NonZeroUsize,
     pub workers: NonZeroUsize,
 }
 impl HostExecutorLimits {
     /// Cover admitted loaders plus at most N physical running tails whose
-    /// business holders may already have exited. Per-Context Task identities
+    /// business holders may already have exited. Per-Participation Task identities
     /// are cumulative, so their original T bound still covers historical tails.
     /// This pure check can run before capturing the original runner.
     pub(crate) fn for_loading(
-        tasks_per_context: usize,
+        tasks_per_participation: usize,
         active_tasks: usize,
         workers: usize,
     ) -> Result<Self, super::node_geometry::NodeGeometryError> {
         use super::node_geometry::NodeGeometryError;
         let positive =
             |value| NonZeroUsize::new(value).ok_or(NodeGeometryError::InvalidBootstrapManifest);
-        let per_context = positive(tasks_per_context)?;
+        let per_group = positive(tasks_per_participation)?;
         let active_tasks = positive(active_tasks)?;
         let workers = positive(workers)?;
         Ok(Self {
@@ -71,7 +71,7 @@ impl HostExecutorLimits {
                     .checked_add(workers.get())
                     .ok_or(NodeGeometryError::Overflow)?,
             )?,
-            per_context,
+            per_group,
             workers,
         })
     }
@@ -80,7 +80,7 @@ impl HostExecutorLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HostSubmitError {
     Closed,
-    DriverFailed,
+    WorkerFailed,
     Queue(FairQueueError),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,7 +88,7 @@ pub(crate) enum HostShutdownError {
     /// No physical worker can drain the retained original queue.
     UndrainedAfterFailure,
     /// The queue is physically empty, but an original panic remains unknown.
-    DriverFailed,
+    WorkerFailed,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkerState {
@@ -132,7 +132,7 @@ enum NextBody<J: QueuedPreparation> {
     Wait(u64),
 }
 impl<J: QueuedPreparation> Shared<J> {
-    fn wake_driver(&self) {
+    fn wake_poller(&self) {
         // Call only after all executor/queue locks have been released. A
         // driver may immediately inspect capacity or retry its original job.
         if let Some(waker) = &self.waker {
@@ -142,7 +142,7 @@ impl<J: QueuedPreparation> Shared<J> {
     fn close_external(&self) {
         self.gate.lock().expect("host admission gate").accepting = false;
         self.ready.notify();
-        self.wake_driver();
+        self.wake_poller();
     }
     fn failed(&self) -> bool {
         self.gate
@@ -197,7 +197,7 @@ impl<J: QueuedPreparation> Shared<J> {
             gate.accepting = false;
         }
         self.ready.notify();
-        self.wake_driver();
+        self.wake_poller();
     }
     fn record_exit(&self, index: usize) {
         {
@@ -208,7 +208,7 @@ impl<J: QueuedPreparation> Shared<J> {
             }
         }
         self.ready.notify();
-        self.wake_driver();
+        self.wake_poller();
     }
 }
 
@@ -264,7 +264,7 @@ impl<J: QueuedPreparation> HostExecutorHandle<J> {
                 .iter()
                 .any(|worker| worker.state == WorkerState::Failed)
             {
-                HostSubmitError::DriverFailed
+                HostSubmitError::WorkerFailed
             } else {
                 HostSubmitError::Closed
             };
@@ -292,7 +292,7 @@ impl<J: QueuedPreparation> HostExecutorHandle<J> {
     pub(crate) fn cancel_queued(&self, scope: ScopeId, work: WorkId) -> Result<J, FairQueueError> {
         let original = self.shared.queue.cancel(scope, work)?.original;
         self.shared.ready.notify();
-        self.shared.wake_driver();
+        self.shared.wake_poller();
         Ok(original)
     }
 }
@@ -353,9 +353,9 @@ where
         let count = limits.workers.get();
         let shared = Arc::new(Shared {
             queue: if eligible_fifo {
-                PreparationQueue::eligible_fifo(limits.jobs.get(), limits.per_context.get(), count)
+                PreparationQueue::eligible_fifo(limits.jobs.get(), limits.per_group.get(), count)
             } else {
-                PreparationQueue::new(limits.jobs.get(), limits.per_context.get(), count)
+                PreparationQueue::new(limits.jobs.get(), limits.per_group.get(), count)
             },
             gate: Mutex::new(Gate {
                 accepting: true,
@@ -436,7 +436,7 @@ where
             }
         }
         if self.shared.failed() {
-            return Err((HostShutdownError::DriverFailed, self));
+            return Err((HostShutdownError::WorkerFailed, self));
         }
         let Self {
             shared,
@@ -453,7 +453,7 @@ where
     J: QueuedPreparation,
     F: Fn(J) + Send + Sync + 'static,
 {
-    let driver = catch_unwind(AssertUnwindSafe(|| {
+    let worker_result = catch_unwind(AssertUnwindSafe(|| {
         loop {
             match shared.next_body() {
                 NextBody::Run(body) => {
@@ -470,7 +470,7 @@ where
                             // membership/key and physical worker slot. An
                             // earlier business-result notice cannot do this.
                             shared.ready.notify();
-                            shared.wake_driver();
+                            shared.wake_poller();
                         }
                         Err(payload) => {
                             shared.record_failure(index, payload);
@@ -484,7 +484,7 @@ where
         }
         shared.record_exit(index);
     }));
-    if let Err(payload) = driver {
+    if let Err(payload) = worker_result {
         // Poisoned bookkeeping cannot justify local recovery or opaque Drop.
         // This is the shared-runtime invariant policy, not a Task exit fact.
         std::mem::forget(payload);
@@ -522,7 +522,7 @@ mod tests {
     fn limits(workers: usize) -> HostExecutorLimits {
         HostExecutorLimits {
             jobs: NonZeroUsize::new(16).unwrap(),
-            per_context: NonZeroUsize::new(8).unwrap(),
+            per_group: NonZeroUsize::new(8).unwrap(),
             workers: NonZeroUsize::new(workers).unwrap(),
         }
     }
@@ -552,7 +552,7 @@ mod tests {
         let limits =
             HostExecutorLimits::for_loading(17, 9, 4).expect("valid original loading geometry");
         assert_eq!(limits.jobs.get(), 13);
-        assert_eq!(limits.per_context.get(), 17);
+        assert_eq!(limits.per_group.get(), 17);
         assert_eq!(limits.workers.get(), 4);
     }
 
@@ -575,7 +575,7 @@ mod tests {
         );
         let limits = HostExecutorLimits::for_loading(usize::MAX, 1, 1)
             .expect("cumulative Task identities require no T plus one arithmetic");
-        assert_eq!(limits.per_context.get(), usize::MAX);
+        assert_eq!(limits.per_group.get(), usize::MAX);
     }
 
     #[test]
@@ -1073,7 +1073,7 @@ mod tests {
             .try_submit(job(3, 1, || panic!("failed admission")))
             .err()
             .unwrap();
-        assert_eq!(reason, HostSubmitError::DriverFailed);
+        assert_eq!(reason, HostSubmitError::WorkerFailed);
         drop(refused);
         release_tx.send(()).unwrap();
         drained_rx.recv_timeout(WAIT).unwrap();
@@ -1081,7 +1081,7 @@ mod tests {
             Err(failed) => failed,
             Ok(_) => panic!("original panic is still unknown"),
         };
-        assert_eq!(reason, HostShutdownError::DriverFailed);
+        assert_eq!(reason, HostShutdownError::WorkerFailed);
         assert!(owner.shared.queue.is_empty());
         assert!(owner.threads.is_empty());
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
@@ -1119,9 +1119,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn shared_driver_invariant_failure_is_process_fail_stop() {
+    fn shared_worker_invariant_failure_is_process_fail_stop() {
         use std::os::unix::process::ExitStatusExt;
-        const CHILD: &str = "NOVAROCKS_HOST_DRIVER_FAILURE_CHILD";
+        const CHILD: &str = "NOVAROCKS_HOST_WORKER_FAILURE_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let shared = Arc::new(Shared::<Job> {
                 queue: PreparationQueue::new(1, 1, 1),
@@ -1145,7 +1145,7 @@ mod tests {
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("control_runtime::host_executor::tests::shared_driver_invariant_failure_is_process_fail_stop")
+            .arg("control_runtime::host_executor::tests::shared_worker_invariant_failure_is_process_fail_stop")
             .arg("--nocapture")
             .env(CHILD,"1")
             .env("RUST_BACKTRACE","0")
@@ -1331,7 +1331,7 @@ mod tests {
         let executor = match HostExecutor::start_with_waker(
             HostExecutorLimits {
                 jobs: NonZeroUsize::new(2).unwrap(),
-                per_context: NonZeroUsize::new(2).unwrap(),
+                per_group: NonZeroUsize::new(2).unwrap(),
                 workers: NonZeroUsize::new(1).unwrap(),
             },
             move |original: Job| {
@@ -1471,7 +1471,7 @@ mod tests {
         // quarantined; no business Work, report or capture exit is fabricated.
         let _retained_owner = ManuallyDrop::new(owner);
         assert!(observed.empty && observed.closed && observed.failed);
-        assert_eq!(reason, HostShutdownError::DriverFailed);
+        assert_eq!(reason, HostShutdownError::WorkerFailed);
         assert!(retained_panic);
     }
 }

@@ -109,7 +109,7 @@ const DEFAULT_REPLACEMENT_RESERVATION_VALID_FOR: Duration = Duration::from_secs(
 #[cfg(test)]
 const DEFAULT_LOGICAL_EXECUTION_MAILBOX_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 #[cfg(test)]
-const DEFAULT_LOGICAL_EXECUTION_CONTEXT_ISSUE_CAPACITY: NonZeroUsize =
+const DEFAULT_LOGICAL_EXECUTION_PARTICIPATION_ISSUE_CAPACITY: NonZeroUsize =
     NonZeroUsize::new(16).unwrap();
 #[cfg(test)]
 const DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
@@ -1031,8 +1031,8 @@ impl FrontendLogicalExecutionRuntimeConfig {
         Self::new(
             LogicalExecutionSupervisorConfig::new(
                 DEFAULT_LOGICAL_EXECUTION_MAILBOX_CAPACITY,
-                DEFAULT_LOGICAL_EXECUTION_CONTEXT_ISSUE_CAPACITY,
-                DEFAULT_LOGICAL_EXECUTION_CONTEXT_ISSUE_CAPACITY,
+                DEFAULT_LOGICAL_EXECUTION_PARTICIPATION_ISSUE_CAPACITY,
+                DEFAULT_LOGICAL_EXECUTION_PARTICIPATION_ISSUE_CAPACITY,
                 LogicalExecutionRowsConfig::new(
                     DEFAULT_RESULT_DELIVERY_CAPACITY,
                     DEFAULT_LOGICAL_EXECUTION_MAX_ATTEMPTS,
@@ -1670,7 +1670,10 @@ impl FrontendApplicationHost {
             // explicitly installed, live statement observation owner.
             if owner.is_active() {
                 let namespace = host.execution_runtime_owner.namespace;
-                eprintln!("NOVAROCKS_QUERY_PROCESS_NAMESPACE query_process_namespace={namespace}");
+                eprintln!(
+                    "{} query_process_namespace={namespace}",
+                    novarocks_failpoint::observation_marker::QUERY_PROCESS_NAMESPACE
+                );
             }
         }
 
@@ -2367,9 +2370,9 @@ impl FrontendApplicationHost {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
         native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
-    ) -> Result<crate::native::report_server::FrontendReportServerHandle, FrontendApplicationError>
+    ) -> Result<crate::native::report_server::FrontendReportListener, FrontendApplicationError>
     {
-        crate::native::report_server::FrontendReportServerHandle::start(
+        crate::native::report_server::FrontendReportListener::start(
             bind_addr,
             self.backend_membership_ingress(),
             self.lifecycle_convergence_reader(),
@@ -2390,9 +2393,9 @@ impl FrontendApplicationHost {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
         native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
-    ) -> Result<crate::native::report_server::FrontendReportServerHandle, FrontendApplicationError>
+    ) -> Result<crate::native::report_server::FrontendReportListener, FrontendApplicationError>
     {
-        crate::native::report_server::FrontendReportServerHandle::start_from_host(
+        crate::native::report_server::FrontendReportListener::start_from_host(
             host,
             port,
             self.backend_membership_ingress(),

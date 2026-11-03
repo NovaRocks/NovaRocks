@@ -200,7 +200,7 @@ fn empty_keyed_finish<'a>(
     prepared: &PreparedKeyed,
 ) -> ConnectorWriteFinishRequest<'a> {
     ConnectorWriteFinishRequest {
-        commit: plan.commit_handle(),
+        commit: plan.commit_session(),
         prepared: ConnectorPreparedWriteSet::try_new(0, vec![], &plan.expected_targets()).unwrap(),
         statistics: vec![],
         publication: ConnectorWriteFinishPublication::KeyedDocuments(prepared.intent.clone()),
@@ -432,7 +432,7 @@ fn keyed_data_finish<'a>(
     assert_eq!(expected.len(), 1);
     (
         ConnectorWriteFinishRequest {
-            commit: plan.commit_handle(),
+            commit: plan.commit_session(),
             prepared: ConnectorPreparedWriteSet::try_new(
                 1,
                 vec![(expected[0], fragment)],
@@ -493,7 +493,7 @@ async fn keyed_unknown_retains_session_data_and_manifest_without_redispatch() {
     assert!(matches!(
         control
             .reconcile_write(ConnectorWriteSessionReconcileRequest {
-                commit: plan.commit_handle(),
+                commit: plan.commit_session(),
                 evidence,
                 context: context()
             })
@@ -916,7 +916,7 @@ async fn real_keyed_eager_repartition_prepares_begins_and_finishes_one_exact_pub
     let evidence = handle.recovery_evidence().unwrap();
     let reconciled = control
         .reconcile_write(ConnectorWriteSessionReconcileRequest {
-            commit: plan.commit_handle(),
+            commit: plan.commit_session(),
             evidence,
             context: context(),
         })

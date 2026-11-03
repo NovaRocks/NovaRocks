@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actor-owned query-context stand-down responsibility.
+//! Actor-owned participation stand-down responsibility.
 //!
 //! The ledger owns application semantics only. Native operation carriers,
 //! codecs, RPC retries, Worker task termination, and resource-release facts
-//! remain outside this module. A context closure state says how far the Worker
-//! context lifecycle has advanced; it is not proof that a process stopped or
+//! remain outside this module. A participation closure state says how far the Worker
+//! participation lifecycle has advanced; it is not proof that a process stopped or
 //! that all physical resources were released.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,7 +31,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use novarocks_execution_contract::{
-    QueryContextReceipt, QueryContextRef, QueryContextState, TaskOperationId,
+    ParticipationReceipt, ParticipationRef, ParticipationState, TaskOperationId,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -39,17 +39,17 @@ use novarocks_coordination_contract::{AttemptActivationIdentity, MonotonicInstan
 
 const DEFAULT_ABORT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
-/// Why the logical execution requires its remote contexts to stand down.
+/// Why the logical execution requires its remote participations to stand down.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum ContextStandDownCause {
+pub enum ParticipationStandDownCause {
     LogicalExecutionCancelled,
     LogicalExecutionFailed,
 }
 
-/// What Establish/admission currently proves about a context's remote effect.
+/// What Establish/admission currently proves about a participation's remote effect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EstablishStandDownFact {
-    /// No admission grant was ever received, so no Worker capacity or context
+    /// No admission grant was ever received, so no Worker capacity or participation
     /// can remain on behalf of this logical execution.
     NoGrant,
     /// An authorized Establish has not yet linearized to definitely-unsent or
@@ -57,20 +57,20 @@ pub(crate) enum EstablishStandDownFact {
     IssueUnsettled,
     /// A Worker admission ticket was granted. Abort remains required even if
     /// Establish was definitely unsent: Worker Abort establishes the absent
-    /// context fence and returns the ticket's reserved capacity.
+    /// participation fence and returns the ticket's reserved capacity.
     AbortRequired,
 }
 
 /// Exact, secret-free identity of one actor-owned Abort effect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AbortQueryContextIssueIdentity {
+pub struct AbortParticipationIssueIdentity {
     activation: AttemptActivationIdentity,
     operation_id: TaskOperationId,
-    context: QueryContextRef,
-    cause: ContextStandDownCause,
+    participation: ParticipationRef,
+    cause: ParticipationStandDownCause,
 }
 
-impl AbortQueryContextIssueIdentity {
+impl AbortParticipationIssueIdentity {
     pub const fn activation(self) -> AttemptActivationIdentity {
         self.activation
     }
@@ -79,11 +79,11 @@ impl AbortQueryContextIssueIdentity {
         self.operation_id
     }
 
-    pub const fn context(self) -> QueryContextRef {
-        self.context
+    pub const fn participation(self) -> ParticipationRef {
+        self.participation
     }
 
-    pub const fn cause(self) -> ContextStandDownCause {
+    pub const fn cause(self) -> ParticipationStandDownCause {
         self.cause
     }
 }
@@ -93,31 +93,31 @@ impl AbortQueryContextIssueIdentity {
 /// Frontend composition translates this value into its Native carrier. The
 /// exact allocation is retained by the actor across transport-unknown replay.
 #[derive(Debug)]
-pub struct AbortQueryContextEffectRequest {
-    identity: AbortQueryContextIssueIdentity,
+pub struct AbortParticipationEffectRequest {
+    identity: AbortParticipationIssueIdentity,
 }
 
-impl AbortQueryContextEffectRequest {
-    pub const fn identity(&self) -> AbortQueryContextIssueIdentity {
+impl AbortParticipationEffectRequest {
+    pub const fn identity(&self) -> AbortParticipationIssueIdentity {
         self.identity
     }
 }
 
-/// Worker context-lifecycle progress observed while standing down.
+/// Worker participation-lifecycle progress observed while standing down.
 ///
 /// These values do not assert Worker process exit, task-thread exit, or
 /// physical resource release. Those remain separately observed convergence
 /// facts owned by coordination and workload governance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ContextClosureState {
+pub enum ParticipationClosureState {
     /// The actor proved that no admission operation could have left Worker
-    /// capacity or a context behind. This is a local responsibility result,
+    /// capacity or a participation behind. This is a local responsibility result,
     /// not an observation that the Worker reported `Gone`.
     NoRemoteResponsibility,
     AwaitingEstablishIssue,
     AbortPending,
-    /// The actor exhausted this context's bounded Abort issue budget. The
-    /// residual supervisor must retain the exact context responsibility and
+    /// The actor exhausted this participation's bounded Abort issue budget. The
+    /// residual supervisor must retain the exact participation responsibility and
     /// may still apply later Worker or process-fence evidence.
     AbortIssueExhausted,
     Aborting,
@@ -125,19 +125,19 @@ pub enum ContextClosureState {
     TerminalRetained,
     Gone,
     /// The Registry proved actual stop together with closed normal admission
-    /// and invalidated old admission authority for this exact context.
-    WorkerStoppedAndContextFenced,
+    /// and invalidated old admission authority for this exact participation.
+    WorkerStoppedAndParticipationFenced,
     /// The Registry observed replacement of the exact Worker process named by
-    /// this context. This fences the old process identity but does not claim
+    /// this participation. This fences the old process identity but does not claim
     /// that its resources were released cleanly.
     WorkerProcessReplaced,
-    /// The coordinator stopped tracking an unreachable context after its
+    /// The coordinator stopped tracking an unreachable participation after its
     /// finite cleanup window. This is a local observation-retirement result,
     /// never a Worker stop or zero-resource fact.
     RemoteTrackingEnded,
 }
 
-impl ContextClosureState {
+impl ParticipationClosureState {
     pub const fn stand_down_responsibility_settled(self) -> bool {
         matches!(
             self,
@@ -146,7 +146,7 @@ impl ContextClosureState {
                 | Self::Releasing
                 | Self::TerminalRetained
                 | Self::Gone
-                | Self::WorkerStoppedAndContextFenced
+                | Self::WorkerStoppedAndParticipationFenced
                 | Self::WorkerProcessReplaced
                 | Self::RemoteTrackingEnded
         )
@@ -156,7 +156,7 @@ impl ContextClosureState {
         matches!(
             self,
             Self::NoRemoteResponsibility
-                | Self::WorkerStoppedAndContextFenced
+                | Self::WorkerStoppedAndParticipationFenced
                 | Self::WorkerProcessReplaced
         )
     }
@@ -164,74 +164,74 @@ impl ContextClosureState {
 
 /// Exact settlement produced by the Worker-facing Abort adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct AbortQueryContextWorkerSettlement {
-    identity: AbortQueryContextIssueIdentity,
-    receipt: QueryContextReceipt,
+struct AbortParticipationWorkerSettlement {
+    identity: AbortParticipationIssueIdentity,
+    receipt: ParticipationReceipt,
 }
 
-impl AbortQueryContextWorkerSettlement {
+impl AbortParticipationWorkerSettlement {
     fn try_new(
-        identity: AbortQueryContextIssueIdentity,
-        receipt: QueryContextReceipt,
-    ) -> Result<Self, ContextStandDownError> {
-        if receipt.context() != identity.context() {
-            return Err(ContextStandDownError::IdentityMismatch);
+        identity: AbortParticipationIssueIdentity,
+        receipt: ParticipationReceipt,
+    ) -> Result<Self, ParticipationStandDownError> {
+        if receipt.participation() != identity.participation() {
+            return Err(ParticipationStandDownError::IdentityMismatch);
         }
         if worker_closure(receipt.state()).is_none() {
-            return Err(ContextStandDownError::InvalidWorkerSettlement);
+            return Err(ParticipationStandDownError::InvalidWorkerSettlement);
         }
         Ok(Self { identity, receipt })
     }
 
-    const fn identity(&self) -> AbortQueryContextIssueIdentity {
+    const fn identity(&self) -> AbortParticipationIssueIdentity {
         self.identity
     }
 
-    fn closure(&self) -> ContextClosureState {
+    fn closure(&self) -> ParticipationClosureState {
         worker_closure(self.receipt.state()).expect("validated Abort Worker settlement")
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AbortQueryContextIssueState {
+pub enum AbortParticipationIssueState {
     IssueAuthorized,
     TransportOwned,
     DefinitelyUnsent,
     TransportUnknown,
     WorkerSettled,
     /// The effect owner observed a local protocol or dispatcher violation.
-    /// Replaying cannot repair such a violation, so the context remains a
+    /// Replaying cannot repair such a violation, so the participation remains a
     /// residual responsibility until Worker-stop or process-fence evidence.
     FailedClosed,
     AuthorizationExhausted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ContextStandDownSnapshot {
-    closure: ContextClosureState,
-    identity: Option<AbortQueryContextIssueIdentity>,
-    issue_state: Option<AbortQueryContextIssueState>,
+pub struct ParticipationStandDownSnapshot {
+    closure: ParticipationClosureState,
+    identity: Option<AbortParticipationIssueIdentity>,
+    issue_state: Option<AbortParticipationIssueState>,
 }
 
-impl ContextStandDownSnapshot {
-    pub const fn closure(self) -> ContextClosureState {
+impl ParticipationStandDownSnapshot {
+    pub const fn closure(self) -> ParticipationClosureState {
         self.closure
     }
 
-    pub const fn identity(self) -> Option<AbortQueryContextIssueIdentity> {
+    pub const fn identity(self) -> Option<AbortParticipationIssueIdentity> {
         self.identity
     }
 
-    pub const fn issue_state(self) -> Option<AbortQueryContextIssueState> {
+    pub const fn issue_state(self) -> Option<AbortParticipationIssueState> {
         self.issue_state
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ContextStandDownError {
-    DuplicateContext,
+pub enum ParticipationStandDownError {
+    DuplicateParticipation,
     ActivationExecutionMismatch,
-    UnknownContext,
+    UnknownParticipation,
     StandDownAlreadyStarted,
     StandDownNotStarted,
     EstablishIssueStillUnsettled,
@@ -249,20 +249,22 @@ pub enum ContextStandDownError {
     ResponsibilitySettlementFailed,
 }
 
-impl fmt::Display for ContextStandDownError {
+impl fmt::Display for ParticipationStandDownError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::DuplicateContext => "stand-down context set contains a duplicate identity",
-            Self::ActivationExecutionMismatch => {
-                "stand-down activation and query context name different executions"
+            Self::DuplicateParticipation => {
+                "stand-down participation set contains a duplicate identity"
             }
-            Self::UnknownContext => "stand-down event names an unknown query context",
-            Self::StandDownAlreadyStarted => "query-context stand-down was already started",
-            Self::StandDownNotStarted => "query-context stand-down has not started",
+            Self::ActivationExecutionMismatch => {
+                "stand-down activation and participation name different executions"
+            }
+            Self::UnknownParticipation => "stand-down event names an unknown participation",
+            Self::StandDownAlreadyStarted => "participation stand-down was already started",
+            Self::StandDownNotStarted => "participation stand-down has not started",
             Self::EstablishIssueStillUnsettled => {
                 "Establish issue has not linearized before stand-down"
             }
-            Self::WrongState => "query-context stand-down action is illegal in the current state",
+            Self::WrongState => "participation stand-down action is illegal in the current state",
             Self::IdentityMismatch => "stand-down event does not match its exact Abort issue",
             Self::AuthorizationGenerationExhausted => {
                 "Abort issue authorization generation is exhausted"
@@ -274,9 +276,9 @@ impl fmt::Display for ContextStandDownError {
                 "Abort issue received conflicting Worker settlements"
             }
             Self::InvalidWorkerSettlement => {
-                "Abort Worker receipt does not prove a closing context state"
+                "Abort Worker receipt does not prove a closing participation state"
             }
-            Self::ClosureRegression => "query-context closure observation regressed",
+            Self::ClosureRegression => "participation closure observation regressed",
             Self::EventCapacityOverflow => "Abort event capacity calculation overflowed",
             Self::EventChannelClosed => "Abort issue actor event channel is closed",
             Self::EffectCapacityClosed => "Abort effect-port capacity observation is closed",
@@ -290,17 +292,17 @@ impl fmt::Display for ContextStandDownError {
     }
 }
 
-impl std::error::Error for ContextStandDownError {}
+impl std::error::Error for ParticipationStandDownError {}
 
-impl novarocks_execution_contract::failure::FailureProjection for ContextStandDownError {
+impl novarocks_execution_contract::failure::FailureProjection for ParticipationStandDownError {
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
         use novarocks_execution_contract::failure::{
             FailureClass, FailureFact, FailureReason, domain,
         };
         let (class, code, observed_stop) = match self {
-            Self::DuplicateContext => (FailureClass::Invariant, 84, false),
+            Self::DuplicateParticipation => (FailureClass::Invariant, 84, false),
             Self::ActivationExecutionMismatch => (FailureClass::Invariant, 84, false),
-            Self::UnknownContext => (FailureClass::Invariant, 84, false),
+            Self::UnknownParticipation => (FailureClass::Invariant, 84, false),
             Self::IdentityMismatch => (FailureClass::Invariant, 84, false),
             Self::StandDownNotStarted => (FailureClass::Control, 85, false),
             Self::EstablishIssueStillUnsettled => (FailureClass::Control, 85, false),
@@ -326,24 +328,26 @@ impl novarocks_execution_contract::failure::FailureProjection for ContextStandDo
     }
 }
 
-impl ContextStandDownError {
+impl ParticipationStandDownError {
     /// Bounded diagnostic authored here; no foreign Display becomes safe detail.
     pub fn safe_detail(&self) -> novarocks_execution_contract::SafeDetail {
         let message = match self {
-            Self::DuplicateContext => "stand-down context set contains a duplicate identity",
-            Self::ActivationExecutionMismatch => {
-                "stand-down activation and query context name different executions"
+            Self::DuplicateParticipation => {
+                "stand-down participation set contains a duplicate identity"
             }
-            Self::UnknownContext => "stand-down event names an unknown query context",
+            Self::ActivationExecutionMismatch => {
+                "stand-down activation and participation name different executions"
+            }
+            Self::UnknownParticipation => "stand-down event names an unknown participation",
             Self::IdentityMismatch => "stand-down event does not match its exact Abort issue",
-            Self::StandDownNotStarted => "query-context stand-down has not started",
+            Self::StandDownNotStarted => "participation stand-down has not started",
             Self::EstablishIssueStillUnsettled => {
                 "Establish issue has not settled before stand-down"
             }
             Self::WrongState => {
-                "query-context stand-down action is not allowed in the current state"
+                "participation stand-down action is not allowed in the current state"
             }
-            Self::StandDownAlreadyStarted => "query-context stand-down already started",
+            Self::StandDownAlreadyStarted => "participation stand-down already started",
             Self::FutureAuthorization => {
                 "Abort event names an authorization generation not yet issued"
             }
@@ -351,9 +355,9 @@ impl ContextStandDownError {
                 "Abort issue received conflicting Worker settlements"
             }
             Self::InvalidWorkerSettlement => {
-                "Abort Worker receipt does not prove a closing context state"
+                "Abort Worker receipt does not prove a closing participation state"
             }
-            Self::ClosureRegression => "query-context closure observation regressed",
+            Self::ClosureRegression => "participation closure observation regressed",
             Self::AuthorizationGenerationExhausted => {
                 "bounded Abort authorization generation could not advance"
             }
@@ -372,13 +376,13 @@ impl ContextStandDownError {
 }
 
 #[derive(Debug)]
-struct ContextStandDownRecord {
+struct ParticipationStandDownRecord {
     activation: AttemptActivationIdentity,
-    cause: Option<ContextStandDownCause>,
-    closure: ContextClosureState,
-    request: Option<Arc<AbortQueryContextEffectRequest>>,
-    identity: Option<AbortQueryContextIssueIdentity>,
-    issue_state: Option<AbortQueryContextIssueState>,
+    cause: Option<ParticipationStandDownCause>,
+    closure: ParticipationClosureState,
+    request: Option<Arc<AbortParticipationEffectRequest>>,
+    identity: Option<AbortParticipationIssueIdentity>,
+    issue_state: Option<AbortParticipationIssueState>,
     authorization_generation: u64,
     worker_settled: bool,
     worker_branch: Option<WorkerClosureBranch>,
@@ -386,34 +390,40 @@ struct ContextStandDownRecord {
     registry_fenced: bool,
 }
 
-impl ContextStandDownRecord {
-    fn snapshot(&self) -> ContextStandDownSnapshot {
-        ContextStandDownSnapshot {
+impl ParticipationStandDownRecord {
+    fn snapshot(&self) -> ParticipationStandDownSnapshot {
+        ParticipationStandDownSnapshot {
             closure: self.closure,
             identity: self.identity,
             issue_state: self.issue_state,
         }
     }
 
-    fn require_abort(&mut self, context: QueryContextRef) {
+    fn require_abort(&mut self, participation: ParticipationRef) {
         if self.identity.is_none() {
             let Some(cause) = self.cause else {
-                if matches!(self.closure, ContextClosureState::AwaitingEstablishIssue) {
-                    self.closure = ContextClosureState::AbortPending;
+                if matches!(
+                    self.closure,
+                    ParticipationClosureState::AwaitingEstablishIssue
+                ) {
+                    self.closure = ParticipationClosureState::AbortPending;
                 }
                 return;
             };
-            let identity = AbortQueryContextIssueIdentity {
+            let identity = AbortParticipationIssueIdentity {
                 activation: self.activation,
                 operation_id: TaskOperationId::new_v7(),
-                context,
+                participation,
                 cause,
             };
             self.identity = Some(identity);
-            self.request = Some(Arc::new(AbortQueryContextEffectRequest { identity }));
+            self.request = Some(Arc::new(AbortParticipationEffectRequest { identity }));
         }
-        if matches!(self.closure, ContextClosureState::AwaitingEstablishIssue) {
-            self.closure = ContextClosureState::AbortPending;
+        if matches!(
+            self.closure,
+            ParticipationClosureState::AwaitingEstablishIssue
+        ) {
+            self.closure = ParticipationClosureState::AbortPending;
         }
     }
 }
@@ -423,13 +433,13 @@ enum AbortIssueEventKind {
     TransportOwned,
     DefinitelyUnsent,
     TransportUnknown,
-    WorkerSettled(Box<AbortQueryContextWorkerSettlement>),
+    WorkerSettled(Box<AbortParticipationWorkerSettlement>),
     FailedClosed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AbortIssueEvent {
-    identity: AbortQueryContextIssueIdentity,
+    identity: AbortParticipationIssueIdentity,
     authorization_generation: u64,
     kind: AbortIssueEventKind,
 }
@@ -437,37 +447,37 @@ struct AbortIssueEvent {
 /// Pure state owned by one logical-execution actor.
 ///
 /// The event channel is physically bounded to three fixed-size events per
-/// context and authorization: transport ownership, one transport disposition,
+/// participation and authorization: transport ownership, one transport disposition,
 /// and one possible late Worker settlement. Authorization budget exhaustion
 /// therefore applies backpressure without an unbounded task or thread queue.
 #[derive(Debug)]
-pub(crate) struct ContextStandDownLedger {
-    required_contexts: BTreeSet<QueryContextRef>,
-    max_authorizations_per_context: NonZeroUsize,
-    records: BTreeMap<QueryContextRef, ContextStandDownRecord>,
+pub(crate) struct ParticipationStandDownLedger {
+    required_participations: BTreeSet<ParticipationRef>,
+    max_authorizations_per_participation: NonZeroUsize,
+    records: BTreeMap<ParticipationRef, ParticipationStandDownRecord>,
     events: mpsc::Sender<AbortIssueEvent>,
     event_rx: mpsc::Receiver<AbortIssueEvent>,
     started: bool,
-    cause: Option<ContextStandDownCause>,
-    authorization_cursor: Option<QueryContextRef>,
+    cause: Option<ParticipationStandDownCause>,
+    authorization_cursor: Option<ParticipationRef>,
     retry_backoff: Duration,
 }
 
-impl ContextStandDownLedger {
+impl ParticipationStandDownLedger {
     pub(crate) fn new(
-        required_contexts: BTreeSet<QueryContextRef>,
-        max_authorizations_per_context: NonZeroUsize,
-    ) -> Result<Self, ContextStandDownError> {
-        let event_capacity = required_contexts
+        required_participations: BTreeSet<ParticipationRef>,
+        max_authorizations_per_participation: NonZeroUsize,
+    ) -> Result<Self, ParticipationStandDownError> {
+        let event_capacity = required_participations
             .len()
             .max(1)
-            .checked_mul(max_authorizations_per_context.get())
+            .checked_mul(max_authorizations_per_participation.get())
             .and_then(|capacity| capacity.checked_mul(3))
-            .ok_or(ContextStandDownError::EventCapacityOverflow)?;
+            .ok_or(ParticipationStandDownError::EventCapacityOverflow)?;
         let (events, event_rx) = mpsc::channel(event_capacity);
         Ok(Self {
-            required_contexts,
-            max_authorizations_per_context,
+            required_participations,
+            max_authorizations_per_participation,
             records: BTreeMap::new(),
             events,
             event_rx,
@@ -481,59 +491,61 @@ impl ContextStandDownLedger {
     pub(crate) fn begin(
         &mut self,
         activation: AttemptActivationIdentity,
-        cause: ContextStandDownCause,
-        facts: impl IntoIterator<Item = (QueryContextRef, EstablishStandDownFact)>,
-    ) -> Result<(), ContextStandDownError> {
+        cause: ParticipationStandDownCause,
+        facts: impl IntoIterator<Item = (ParticipationRef, EstablishStandDownFact)>,
+    ) -> Result<(), ParticipationStandDownError> {
         self.begin_with_cause(activation, Some(cause), facts)
     }
 
     pub(crate) fn begin_successful_cleanup(
         &mut self,
         activation: AttemptActivationIdentity,
-        facts: impl IntoIterator<Item = (QueryContextRef, EstablishStandDownFact)>,
-    ) -> Result<(), ContextStandDownError> {
+        facts: impl IntoIterator<Item = (ParticipationRef, EstablishStandDownFact)>,
+    ) -> Result<(), ParticipationStandDownError> {
         self.begin_with_cause(activation, None, facts)
     }
 
     fn begin_with_cause(
         &mut self,
         activation: AttemptActivationIdentity,
-        cause: Option<ContextStandDownCause>,
-        facts: impl IntoIterator<Item = (QueryContextRef, EstablishStandDownFact)>,
-    ) -> Result<(), ContextStandDownError> {
+        cause: Option<ParticipationStandDownCause>,
+        facts: impl IntoIterator<Item = (ParticipationRef, EstablishStandDownFact)>,
+    ) -> Result<(), ParticipationStandDownError> {
         if self.started {
-            return Err(ContextStandDownError::StandDownAlreadyStarted);
+            return Err(ParticipationStandDownError::StandDownAlreadyStarted);
         }
         let mut collected = BTreeMap::new();
-        for (context, fact) in facts {
-            if collected.insert(context, fact).is_some() {
-                return Err(ContextStandDownError::DuplicateContext);
+        for (participation, fact) in facts {
+            if collected.insert(participation, fact).is_some() {
+                return Err(ParticipationStandDownError::DuplicateParticipation);
             }
         }
         if collected
             .keys()
-            .any(|context| !self.required_contexts.contains(context))
+            .any(|participation| !self.required_participations.contains(participation))
         {
-            return Err(ContextStandDownError::UnknownContext);
+            return Err(ParticipationStandDownError::UnknownParticipation);
         }
-        if collected.len() != self.required_contexts.len() {
-            return Err(ContextStandDownError::UnknownContext);
+        if collected.len() != self.required_participations.len() {
+            return Err(ParticipationStandDownError::UnknownParticipation);
         }
-        for context in &self.required_contexts {
-            if context.query_execution_id() != activation.execution() {
-                return Err(ContextStandDownError::ActivationExecutionMismatch);
+        for participation in &self.required_participations {
+            if participation.query_execution_id() != activation.execution() {
+                return Err(ParticipationStandDownError::ActivationExecutionMismatch);
             }
             let fact = *collected
-                .get(context)
-                .ok_or(ContextStandDownError::UnknownContext)?;
+                .get(participation)
+                .ok_or(ParticipationStandDownError::UnknownParticipation)?;
             let closure = match fact {
-                EstablishStandDownFact::NoGrant => ContextClosureState::NoRemoteResponsibility,
-                EstablishStandDownFact::IssueUnsettled => {
-                    ContextClosureState::AwaitingEstablishIssue
+                EstablishStandDownFact::NoGrant => {
+                    ParticipationClosureState::NoRemoteResponsibility
                 }
-                EstablishStandDownFact::AbortRequired => ContextClosureState::AbortPending,
+                EstablishStandDownFact::IssueUnsettled => {
+                    ParticipationClosureState::AwaitingEstablishIssue
+                }
+                EstablishStandDownFact::AbortRequired => ParticipationClosureState::AbortPending,
             };
-            let mut record = ContextStandDownRecord {
+            let mut record = ParticipationStandDownRecord {
                 activation,
                 cause,
                 closure,
@@ -547,9 +559,9 @@ impl ContextStandDownLedger {
                 registry_fenced: false,
             };
             if fact == EstablishStandDownFact::AbortRequired {
-                record.require_abort(*context);
+                record.require_abort(*participation);
             }
-            self.records.insert(*context, record);
+            self.records.insert(*participation, record);
         }
         self.cause = cause;
         self.started = true;
@@ -566,26 +578,26 @@ impl ContextStandDownLedger {
 
     pub(crate) fn refresh_establish_fact(
         &mut self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         fact: EstablishStandDownFact,
-    ) -> Result<(), ContextStandDownError> {
+    ) -> Result<(), ParticipationStandDownError> {
         if !self.started {
-            return Err(ContextStandDownError::StandDownNotStarted);
+            return Err(ParticipationStandDownError::StandDownNotStarted);
         }
         let record = self
             .records
-            .get_mut(&context)
-            .ok_or(ContextStandDownError::UnknownContext)?;
-        if record.closure != ContextClosureState::AwaitingEstablishIssue {
+            .get_mut(&participation)
+            .ok_or(ParticipationStandDownError::UnknownParticipation)?;
+        if record.closure != ParticipationClosureState::AwaitingEstablishIssue {
             return Ok(());
         }
         match fact {
             EstablishStandDownFact::NoGrant => {
-                record.closure = ContextClosureState::NoRemoteResponsibility;
+                record.closure = ParticipationClosureState::NoRemoteResponsibility;
             }
             EstablishStandDownFact::IssueUnsettled => {}
             EstablishStandDownFact::AbortRequired => {
-                record.require_abort(context);
+                record.require_abort(participation);
             }
         }
         Ok(())
@@ -594,31 +606,31 @@ impl ContextStandDownLedger {
     pub(crate) fn authorize_next_at(
         &mut self,
         now: novarocks_coordination_contract::MonotonicInstant,
-    ) -> Result<Option<AbortQueryContextIssuePermit>, ContextStandDownError> {
+    ) -> Result<Option<AbortParticipationIssuePermit>, ParticipationStandDownError> {
         self.drain_events_at(now)?;
-        let contexts: Vec<_> = self
+        let participations: Vec<_> = self
             .records
             .keys()
             .copied()
-            .filter(|context| {
+            .filter(|participation| {
                 self.authorization_cursor
-                    .is_none_or(|cursor| *context > cursor)
+                    .is_none_or(|cursor| *participation > cursor)
             })
-            .chain(self.records.keys().copied().filter(|context| {
+            .chain(self.records.keys().copied().filter(|participation| {
                 self.authorization_cursor
-                    .is_some_and(|cursor| *context <= cursor)
+                    .is_some_and(|cursor| *participation <= cursor)
             }))
             .collect();
-        for context in contexts {
+        for participation in participations {
             let record = self
                 .records
-                .get_mut(&context)
-                .expect("Abort authorization context came from the same ledger");
-            if record.closure != ContextClosureState::AbortPending
+                .get_mut(&participation)
+                .expect("Abort authorization participation came from the same ledger");
+            if record.closure != ParticipationClosureState::AbortPending
                 || !matches!(
                     record.issue_state,
-                    None | Some(AbortQueryContextIssueState::DefinitelyUnsent)
-                        | Some(AbortQueryContextIssueState::TransportUnknown)
+                    None | Some(AbortParticipationIssueState::DefinitelyUnsent)
+                        | Some(AbortParticipationIssueState::TransportUnknown)
                 )
                 || record
                     .retry_not_before
@@ -626,28 +638,30 @@ impl ContextStandDownLedger {
             {
                 continue;
             }
-            if record.authorization_generation >= self.max_authorizations_per_context.get() as u64 {
-                record.issue_state = Some(AbortQueryContextIssueState::AuthorizationExhausted);
-                record.closure = ContextClosureState::AbortIssueExhausted;
+            if record.authorization_generation
+                >= self.max_authorizations_per_participation.get() as u64
+            {
+                record.issue_state = Some(AbortParticipationIssueState::AuthorizationExhausted);
+                record.closure = ParticipationClosureState::AbortIssueExhausted;
                 continue;
             }
             record.authorization_generation = record
                 .authorization_generation
                 .checked_add(1)
-                .ok_or(ContextStandDownError::AuthorizationGenerationExhausted)?;
-            record.issue_state = Some(AbortQueryContextIssueState::IssueAuthorized);
+                .ok_or(ParticipationStandDownError::AuthorizationGenerationExhausted)?;
+            record.issue_state = Some(AbortParticipationIssueState::IssueAuthorized);
             record.retry_not_before = None;
-            self.authorization_cursor = Some(context);
-            return Ok(Some(AbortQueryContextIssuePermit {
+            self.authorization_cursor = Some(participation);
+            return Ok(Some(AbortParticipationIssuePermit {
                 identity: record
                     .identity
-                    .ok_or(ContextStandDownError::IdentityMismatch)?,
+                    .ok_or(ParticipationStandDownError::IdentityMismatch)?,
                 authorization_generation: record.authorization_generation,
                 request: Some(Arc::clone(
                     record
                         .request
                         .as_ref()
-                        .ok_or(ContextStandDownError::IdentityMismatch)?,
+                        .ok_or(ParticipationStandDownError::IdentityMismatch)?,
                 )),
                 events: self.events.clone(),
             }));
@@ -658,16 +672,19 @@ impl ContextStandDownLedger {
     #[cfg(test)]
     pub(crate) fn authorize_next(
         &mut self,
-    ) -> Result<Option<AbortQueryContextIssuePermit>, ContextStandDownError> {
+    ) -> Result<Option<AbortParticipationIssuePermit>, ParticipationStandDownError> {
         self.authorize_next_at(
             novarocks_coordination_contract::MonotonicInstant::from_origin(Duration::MAX),
         )
     }
 
-    pub(crate) fn snapshot(&self, context: QueryContextRef) -> Option<ContextStandDownSnapshot> {
+    pub(crate) fn snapshot(
+        &self,
+        participation: ParticipationRef,
+    ) -> Option<ParticipationStandDownSnapshot> {
         self.records
-            .get(&context)
-            .map(ContextStandDownRecord::snapshot)
+            .get(&participation)
+            .map(ParticipationStandDownRecord::snapshot)
     }
 
     pub(crate) fn responsibility_settled(&self) -> bool {
@@ -686,7 +703,7 @@ impl ContextStandDownLedger {
                 .all(|record| record.closure.residual_resource_settled())
     }
 
-    /// Every remaining context either has positive resource-closure evidence
+    /// Every remaining participation either has positive resource-closure evidence
     /// or this coordinator has ended its finite remote observation. The latter
     /// permits FE retirement only; it deliberately does not make
     /// `residual_resource_settled` true.
@@ -694,7 +711,7 @@ impl ContextStandDownLedger {
         self.started
             && self.records.values().all(|record| {
                 record.closure.residual_resource_settled()
-                    || record.closure == ContextClosureState::RemoteTrackingEnded
+                    || record.closure == ParticipationClosureState::RemoteTrackingEnded
             })
     }
 
@@ -702,22 +719,22 @@ impl ContextStandDownLedger {
     pub(crate) fn has_unsettled_establish_issue(&self) -> bool {
         self.records
             .values()
-            .any(|record| record.closure == ContextClosureState::AwaitingEstablishIssue)
+            .any(|record| record.closure == ParticipationClosureState::AwaitingEstablishIssue)
     }
 
     pub(crate) fn observe_registry_convergence(
         &mut self,
-        context: QueryContextRef,
-        convergence: RegistryContextConvergence,
-    ) -> Result<(), ContextStandDownError> {
+        participation: ParticipationRef,
+        convergence: RegistryParticipationConvergence,
+    ) -> Result<(), ParticipationStandDownError> {
         if !self.started {
-            return Err(ContextStandDownError::StandDownNotStarted);
+            return Err(ParticipationStandDownError::StandDownNotStarted);
         }
         let record = self
             .records
-            .get_mut(&context)
-            .ok_or(ContextStandDownError::UnknownContext)?;
-        if convergence == RegistryContextConvergence::RemoteTrackingEnded
+            .get_mut(&participation)
+            .ok_or(ParticipationStandDownError::UnknownParticipation)?;
+        if convergence == RegistryParticipationConvergence::RemoteTrackingEnded
             && record.closure.residual_resource_settled()
         {
             return Ok(());
@@ -726,17 +743,17 @@ impl ContextStandDownLedger {
         record.retry_not_before = None;
         record.request = None;
         record.closure = match convergence {
-            RegistryContextConvergence::NeverEstablished => {
-                ContextClosureState::NoRemoteResponsibility
+            RegistryParticipationConvergence::NeverEstablished => {
+                ParticipationClosureState::NoRemoteResponsibility
             }
-            RegistryContextConvergence::WorkerStoppedAndContextFenced => {
-                ContextClosureState::WorkerStoppedAndContextFenced
+            RegistryParticipationConvergence::WorkerStoppedAndParticipationFenced => {
+                ParticipationClosureState::WorkerStoppedAndParticipationFenced
             }
-            RegistryContextConvergence::WorkerProcessReplaced => {
-                ContextClosureState::WorkerProcessReplaced
+            RegistryParticipationConvergence::WorkerProcessReplaced => {
+                ParticipationClosureState::WorkerProcessReplaced
             }
-            RegistryContextConvergence::RemoteTrackingEnded => {
-                ContextClosureState::RemoteTrackingEnded
+            RegistryParticipationConvergence::RemoteTrackingEnded => {
+                ParticipationClosureState::RemoteTrackingEnded
             }
         };
         Ok(())
@@ -747,7 +764,7 @@ impl ContextStandDownLedger {
     ) -> Option<novarocks_coordination_contract::MonotonicInstant> {
         self.records
             .values()
-            .filter(|record| record.closure == ContextClosureState::AbortPending)
+            .filter(|record| record.closure == ParticipationClosureState::AbortPending)
             .filter_map(|record| record.retry_not_before)
             .min()
     }
@@ -755,7 +772,7 @@ impl ContextStandDownLedger {
     pub(crate) fn drain_events_at(
         &mut self,
         now: novarocks_coordination_contract::MonotonicInstant,
-    ) -> Result<usize, ContextStandDownError> {
+    ) -> Result<usize, ParticipationStandDownError> {
         let mut applied = 0;
         loop {
             match self.event_rx.try_recv() {
@@ -765,14 +782,14 @@ impl ContextStandDownLedger {
                 }
                 Err(mpsc::error::TryRecvError::Empty) => return Ok(applied),
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return Err(ContextStandDownError::EventChannelClosed);
+                    return Err(ParticipationStandDownError::EventChannelClosed);
                 }
             }
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn drain_events(&mut self) -> Result<usize, ContextStandDownError> {
+    pub(crate) fn drain_events(&mut self) -> Result<usize, ParticipationStandDownError> {
         self.drain_events_at(novarocks_coordination_contract::MonotonicInstant::ORIGIN)
     }
 
@@ -780,12 +797,12 @@ impl ContextStandDownLedger {
     pub(crate) async fn apply_next_event(
         &mut self,
         now: impl FnOnce() -> novarocks_coordination_contract::MonotonicInstant,
-    ) -> Result<(), ContextStandDownError> {
+    ) -> Result<(), ParticipationStandDownError> {
         let event = self
             .event_rx
             .recv()
             .await
-            .ok_or(ContextStandDownError::EventChannelClosed)?;
+            .ok_or(ParticipationStandDownError::EventChannelClosed)?;
         self.apply_event(event, now())
     }
 
@@ -793,10 +810,10 @@ impl ContextStandDownLedger {
         &mut self,
         context: &mut Context<'_>,
         now: impl FnOnce() -> MonotonicInstant,
-    ) -> Poll<Result<(), ContextStandDownError>> {
+    ) -> Poll<Result<(), ParticipationStandDownError>> {
         match self.event_rx.poll_recv(context) {
             Poll::Ready(Some(event)) => Poll::Ready(self.apply_event(event, now())),
-            Poll::Ready(None) => Poll::Ready(Err(ContextStandDownError::EventChannelClosed)),
+            Poll::Ready(None) => Poll::Ready(Err(ParticipationStandDownError::EventChannelClosed)),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -805,16 +822,16 @@ impl ContextStandDownLedger {
         &mut self,
         event: AbortIssueEvent,
         now: novarocks_coordination_contract::MonotonicInstant,
-    ) -> Result<(), ContextStandDownError> {
+    ) -> Result<(), ParticipationStandDownError> {
         let record = self
             .records
-            .get_mut(&event.identity.context())
-            .ok_or(ContextStandDownError::UnknownContext)?;
+            .get_mut(&event.identity.participation())
+            .ok_or(ParticipationStandDownError::UnknownParticipation)?;
         if record.identity != Some(event.identity) {
-            return Err(ContextStandDownError::IdentityMismatch);
+            return Err(ParticipationStandDownError::IdentityMismatch);
         }
         if event.authorization_generation > record.authorization_generation {
-            return Err(ContextStandDownError::FutureAuthorization);
+            return Err(ParticipationStandDownError::FutureAuthorization);
         }
         if event.authorization_generation < record.authorization_generation {
             return match event.kind {
@@ -835,31 +852,31 @@ impl ContextStandDownLedger {
         match event.kind {
             AbortIssueEventKind::WorkerSettled(settlement) => settle_worker(record, *settlement),
             AbortIssueEventKind::TransportOwned => match record.issue_state {
-                Some(AbortQueryContextIssueState::IssueAuthorized) => {
-                    record.issue_state = Some(AbortQueryContextIssueState::TransportOwned);
+                Some(AbortParticipationIssueState::IssueAuthorized) => {
+                    record.issue_state = Some(AbortParticipationIssueState::TransportOwned);
                     Ok(())
                 }
-                Some(AbortQueryContextIssueState::TransportOwned) => Ok(()),
-                _ => Err(ContextStandDownError::WrongState),
+                Some(AbortParticipationIssueState::TransportOwned) => Ok(()),
+                _ => Err(ParticipationStandDownError::WrongState),
             },
             AbortIssueEventKind::DefinitelyUnsent => match record.issue_state {
-                Some(AbortQueryContextIssueState::IssueAuthorized)
-                | Some(AbortQueryContextIssueState::TransportOwned) => {
-                    record.issue_state = Some(AbortQueryContextIssueState::DefinitelyUnsent);
+                Some(AbortParticipationIssueState::IssueAuthorized)
+                | Some(AbortParticipationIssueState::TransportOwned) => {
+                    record.issue_state = Some(AbortParticipationIssueState::DefinitelyUnsent);
                     Ok(())
                 }
-                Some(AbortQueryContextIssueState::DefinitelyUnsent)
-                | Some(AbortQueryContextIssueState::WorkerSettled) => Ok(()),
-                _ => Err(ContextStandDownError::WrongState),
+                Some(AbortParticipationIssueState::DefinitelyUnsent)
+                | Some(AbortParticipationIssueState::WorkerSettled) => Ok(()),
+                _ => Err(ParticipationStandDownError::WrongState),
             },
             AbortIssueEventKind::TransportUnknown => match record.issue_state {
-                Some(AbortQueryContextIssueState::TransportOwned) => {
-                    record.issue_state = Some(AbortQueryContextIssueState::TransportUnknown);
+                Some(AbortParticipationIssueState::TransportOwned) => {
+                    record.issue_state = Some(AbortParticipationIssueState::TransportUnknown);
                     record.retry_not_before = Some(now.saturating_add(self.retry_backoff));
                     Ok(())
                 }
-                Some(AbortQueryContextIssueState::TransportUnknown) => Ok(()),
-                _ => Err(ContextStandDownError::WrongState),
+                Some(AbortParticipationIssueState::TransportUnknown) => Ok(()),
+                _ => Err(ParticipationStandDownError::WrongState),
             },
             AbortIssueEventKind::FailedClosed => fail_closed(record),
         }
@@ -867,35 +884,37 @@ impl ContextStandDownLedger {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegistryContextConvergence {
+pub(crate) enum RegistryParticipationConvergence {
     NeverEstablished,
-    WorkerStoppedAndContextFenced,
+    WorkerStoppedAndParticipationFenced,
     WorkerProcessReplaced,
     RemoteTrackingEnded,
 }
 
 fn settle_worker(
-    record: &mut ContextStandDownRecord,
-    settlement: AbortQueryContextWorkerSettlement,
-) -> Result<(), ContextStandDownError> {
+    record: &mut ParticipationStandDownRecord,
+    settlement: AbortParticipationWorkerSettlement,
+) -> Result<(), ParticipationStandDownError> {
     if record.identity != Some(settlement.identity()) {
-        return Err(ContextStandDownError::IdentityMismatch);
+        return Err(ParticipationStandDownError::IdentityMismatch);
     }
     let closure = settlement.closure();
     reconcile_worker_branch(record, closure)?;
     advance_closure(record, closure)?;
     record.worker_settled = true;
-    record.issue_state = Some(AbortQueryContextIssueState::WorkerSettled);
+    record.issue_state = Some(AbortParticipationIssueState::WorkerSettled);
     record.request = None;
     Ok(())
 }
 
-fn fail_closed(record: &mut ContextStandDownRecord) -> Result<(), ContextStandDownError> {
+fn fail_closed(
+    record: &mut ParticipationStandDownRecord,
+) -> Result<(), ParticipationStandDownError> {
     if record.registry_fenced || record.worker_settled {
         return Ok(());
     }
-    record.issue_state = Some(AbortQueryContextIssueState::FailedClosed);
-    record.closure = ContextClosureState::AbortIssueExhausted;
+    record.issue_state = Some(AbortParticipationIssueState::FailedClosed);
+    record.closure = ParticipationClosureState::AbortIssueExhausted;
     record.retry_not_before = None;
     record.request = None;
     Ok(())
@@ -908,17 +927,17 @@ enum WorkerClosureBranch {
 }
 
 fn reconcile_worker_branch(
-    record: &mut ContextStandDownRecord,
-    closure: ContextClosureState,
-) -> Result<(), ContextStandDownError> {
+    record: &mut ParticipationStandDownRecord,
+    closure: ParticipationClosureState,
+) -> Result<(), ParticipationStandDownError> {
     let observed = match closure {
-        ContextClosureState::Aborting => Some(WorkerClosureBranch::Aborting),
-        ContextClosureState::Releasing => Some(WorkerClosureBranch::Releasing),
+        ParticipationClosureState::Aborting => Some(WorkerClosureBranch::Aborting),
+        ParticipationClosureState::Releasing => Some(WorkerClosureBranch::Releasing),
         _ => None,
     };
     match (record.worker_branch, observed) {
         (Some(current), Some(next)) if current != next => {
-            Err(ContextStandDownError::ConflictingWorkerSettlement)
+            Err(ParticipationStandDownError::ConflictingWorkerSettlement)
         }
         (None, Some(branch)) => {
             record.worker_branch = Some(branch);
@@ -929,10 +948,10 @@ fn reconcile_worker_branch(
 }
 
 fn advance_closure(
-    record: &mut ContextStandDownRecord,
-    closure: ContextClosureState,
-) -> Result<(), ContextStandDownError> {
-    use ContextClosureState::{
+    record: &mut ParticipationStandDownRecord,
+    closure: ParticipationClosureState,
+) -> Result<(), ParticipationStandDownError> {
+    use ParticipationClosureState::{
         AbortIssueExhausted, AbortPending, Aborting, AwaitingEstablishIssue, Gone, Releasing,
         TerminalRetained,
     };
@@ -951,44 +970,44 @@ fn advance_closure(
         (TerminalRetained, Aborting | Releasing)
         | (Gone, Aborting | Releasing | TerminalRetained) => record.closure,
         (Aborting, Releasing) | (Releasing, Aborting) => {
-            return Err(ContextStandDownError::ConflictingWorkerSettlement);
+            return Err(ParticipationStandDownError::ConflictingWorkerSettlement);
         }
-        _ => return Err(ContextStandDownError::ClosureRegression),
+        _ => return Err(ParticipationStandDownError::ClosureRegression),
     };
     record.closure = next;
     Ok(())
 }
 
-fn worker_closure(state: QueryContextState) -> Option<ContextClosureState> {
+fn worker_closure(state: ParticipationState) -> Option<ParticipationClosureState> {
     match state {
-        QueryContextState::Aborting => Some(ContextClosureState::Aborting),
-        QueryContextState::Releasing => Some(ContextClosureState::Releasing),
-        QueryContextState::TerminalRetained => Some(ContextClosureState::TerminalRetained),
-        QueryContextState::Gone => Some(ContextClosureState::Gone),
-        QueryContextState::Absent
-        | QueryContextState::Establishing
-        | QueryContextState::Active
-        | QueryContextState::Quiescing => None,
+        ParticipationState::Aborting => Some(ParticipationClosureState::Aborting),
+        ParticipationState::Releasing => Some(ParticipationClosureState::Releasing),
+        ParticipationState::TerminalRetained => Some(ParticipationClosureState::TerminalRetained),
+        ParticipationState::Gone => Some(ParticipationClosureState::Gone),
+        ParticipationState::Absent
+        | ParticipationState::Establishing
+        | ParticipationState::Active
+        | ParticipationState::Quiescing => None,
     }
 }
 
 /// Result of the synchronous effect-port admission boundary.
 #[derive(Debug)]
-pub enum AbortQueryContextIssueSubmit {
+pub enum AbortParticipationIssueSubmit {
     Accepted,
-    Backpressured(AbortQueryContextIssuePermit),
+    Backpressured(AbortParticipationIssuePermit),
 }
 
 /// Query application's only dependency on Abort transport.
-pub trait AbortQueryContextEffectPort: fmt::Debug + Send + Sync {
+pub trait AbortParticipationEffectPort: fmt::Debug + Send + Sync {
     /// Monotonic capacity epoch. A Backpressured answer must eventually
     /// publish a newer value when another reservation may be attempted.
     fn subscribe_capacity(&self) -> watch::Receiver<u64>;
 
     fn try_reserve(
         &self,
-        identity: AbortQueryContextIssueIdentity,
-    ) -> AbortQueryContextEffectAdmission;
+        identity: AbortParticipationIssueIdentity,
+    ) -> AbortParticipationEffectAdmission;
 }
 
 #[cfg(test)]
@@ -999,35 +1018,35 @@ pub(crate) struct PermanentlyBackpressuredAbortEffectPort {
 
 #[cfg(test)]
 impl PermanentlyBackpressuredAbortEffectPort {
-    pub(crate) fn shared() -> Arc<dyn AbortQueryContextEffectPort> {
+    pub(crate) fn shared() -> Arc<dyn AbortParticipationEffectPort> {
         let (capacity, _) = watch::channel(0);
         Arc::new(Self { capacity })
     }
 }
 
 #[cfg(test)]
-impl AbortQueryContextEffectPort for PermanentlyBackpressuredAbortEffectPort {
+impl AbortParticipationEffectPort for PermanentlyBackpressuredAbortEffectPort {
     fn subscribe_capacity(&self) -> watch::Receiver<u64> {
         self.capacity.subscribe()
     }
 
     fn try_reserve(
         &self,
-        _identity: AbortQueryContextIssueIdentity,
-    ) -> AbortQueryContextEffectAdmission {
-        AbortQueryContextEffectAdmission::Backpressured
+        _identity: AbortParticipationIssueIdentity,
+    ) -> AbortParticipationEffectAdmission {
+        AbortParticipationEffectAdmission::Backpressured
     }
 }
 
-pub enum AbortQueryContextEffectAdmission {
-    Admitted(Box<dyn AbortQueryContextEffectReservation>),
+pub enum AbortParticipationEffectAdmission {
+    Admitted(Box<dyn AbortParticipationEffectReservation>),
     Backpressured,
     /// The role-composed effect owner is gone, so no later capacity change
     /// can make this Abort issuable.
     Closed,
 }
 
-impl fmt::Debug for AbortQueryContextEffectAdmission {
+impl fmt::Debug for AbortParticipationEffectAdmission {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Admitted(_) => formatter.write_str("Admitted(..)"),
@@ -1038,49 +1057,49 @@ impl fmt::Debug for AbortQueryContextEffectAdmission {
 }
 
 /// Capacity is reserved before this object can receive or inspect a request.
-pub trait AbortQueryContextEffectReservation: fmt::Debug + Send {
-    fn submit(self: Box<Self>, submission: AbortQueryContextEffectSubmission);
+pub trait AbortParticipationEffectReservation: fmt::Debug + Send {
+    fn submit(self: Box<Self>, submission: AbortParticipationEffectSubmission);
 }
 
 #[derive(Debug)]
 #[must_use = "an authorized Abort must enter effect-port ownership or settle definitely unsent"]
-pub struct AbortQueryContextIssuePermit {
-    identity: AbortQueryContextIssueIdentity,
+pub struct AbortParticipationIssuePermit {
+    identity: AbortParticipationIssueIdentity,
     authorization_generation: u64,
-    request: Option<Arc<AbortQueryContextEffectRequest>>,
+    request: Option<Arc<AbortParticipationEffectRequest>>,
     events: mpsc::Sender<AbortIssueEvent>,
 }
 
-impl AbortQueryContextIssuePermit {
-    pub const fn identity(&self) -> AbortQueryContextIssueIdentity {
+impl AbortParticipationIssuePermit {
+    pub const fn identity(&self) -> AbortParticipationIssueIdentity {
         self.identity
     }
 
     pub fn try_submit(
         mut self,
-        port: &dyn AbortQueryContextEffectPort,
-    ) -> Result<AbortQueryContextIssueSubmit, ContextStandDownError> {
+        port: &dyn AbortParticipationEffectPort,
+    ) -> Result<AbortParticipationIssueSubmit, ParticipationStandDownError> {
         let reservation = match port.try_reserve(self.identity) {
-            AbortQueryContextEffectAdmission::Admitted(reservation) => reservation,
-            AbortQueryContextEffectAdmission::Backpressured => {
-                return Ok(AbortQueryContextIssueSubmit::Backpressured(self));
+            AbortParticipationEffectAdmission::Admitted(reservation) => reservation,
+            AbortParticipationEffectAdmission::Backpressured => {
+                return Ok(AbortParticipationIssueSubmit::Backpressured(self));
             }
-            AbortQueryContextEffectAdmission::Closed => {
-                return Err(ContextStandDownError::EffectCapacityClosed);
+            AbortParticipationEffectAdmission::Closed => {
+                return Err(ParticipationStandDownError::EffectCapacityClosed);
             }
         };
         self.publish(AbortIssueEventKind::TransportOwned)?;
-        let submission = AbortQueryContextEffectSubmission {
+        let submission = AbortParticipationEffectSubmission {
             identity: self.identity,
             authorization_generation: self.authorization_generation,
             request: self.request.take(),
             events: self.events.clone(),
         };
         reservation.submit(submission);
-        Ok(AbortQueryContextIssueSubmit::Accepted)
+        Ok(AbortParticipationIssueSubmit::Accepted)
     }
 
-    fn publish(&self, kind: AbortIssueEventKind) -> Result<(), ContextStandDownError> {
+    fn publish(&self, kind: AbortIssueEventKind) -> Result<(), ParticipationStandDownError> {
         publish_event(
             &self.events,
             AbortIssueEvent {
@@ -1091,14 +1110,14 @@ impl AbortQueryContextIssuePermit {
         )
     }
 
-    pub(crate) fn settle_definitely_unsent(mut self) -> Result<(), ContextStandDownError> {
+    pub(crate) fn settle_definitely_unsent(mut self) -> Result<(), ParticipationStandDownError> {
         self.publish(AbortIssueEventKind::DefinitelyUnsent)?;
         self.request.take();
         Ok(())
     }
 }
 
-impl Drop for AbortQueryContextIssuePermit {
+impl Drop for AbortParticipationIssuePermit {
     fn drop(&mut self) {
         if self.request.is_some() {
             let _ = self.publish(AbortIssueEventKind::DefinitelyUnsent);
@@ -1108,19 +1127,19 @@ impl Drop for AbortQueryContextIssuePermit {
 
 #[derive(Debug)]
 #[must_use = "an effect-port-owned Abort must publish its exact settlement"]
-pub struct AbortQueryContextEffectSubmission {
-    identity: AbortQueryContextIssueIdentity,
+pub struct AbortParticipationEffectSubmission {
+    identity: AbortParticipationIssueIdentity,
     authorization_generation: u64,
-    request: Option<Arc<AbortQueryContextEffectRequest>>,
+    request: Option<Arc<AbortParticipationEffectRequest>>,
     events: mpsc::Sender<AbortIssueEvent>,
 }
 
-impl AbortQueryContextEffectSubmission {
-    pub const fn identity(&self) -> AbortQueryContextIssueIdentity {
+impl AbortParticipationEffectSubmission {
+    pub const fn identity(&self) -> AbortParticipationIssueIdentity {
         self.identity
     }
 
-    pub fn request(&self) -> &AbortQueryContextEffectRequest {
+    pub fn request(&self) -> &AbortParticipationEffectRequest {
         self.request
             .as_deref()
             .expect("live Abort effect submission retains its exact request")
@@ -1128,10 +1147,10 @@ impl AbortQueryContextEffectSubmission {
 
     pub fn transport_unknown(
         mut self,
-    ) -> Result<LateAbortQueryContextWorkerSettlement, ContextStandDownError> {
+    ) -> Result<LateAbortParticipationWorkerSettlement, ParticipationStandDownError> {
         self.publish(AbortIssueEventKind::TransportUnknown)?;
         self.request.take();
-        Ok(LateAbortQueryContextWorkerSettlement {
+        Ok(LateAbortParticipationWorkerSettlement {
             identity: self.identity,
             authorization_generation: self.authorization_generation,
             events: self.events.clone(),
@@ -1141,7 +1160,7 @@ impl AbortQueryContextEffectSubmission {
     /// The frontend dispatcher proved that this port-owned effect expired
     /// before it was released to process transport. This preserves the exact
     /// request in the actor ledger and permits the next bounded replay.
-    pub fn definitely_unsent(mut self) -> Result<(), ContextStandDownError> {
+    pub fn definitely_unsent(mut self) -> Result<(), ParticipationStandDownError> {
         let result = self.publish(AbortIssueEventKind::DefinitelyUnsent);
         self.request.take();
         result
@@ -1149,9 +1168,9 @@ impl AbortQueryContextEffectSubmission {
 
     pub fn worker_settled(
         mut self,
-        receipt: QueryContextReceipt,
-    ) -> Result<(), ContextStandDownError> {
-        let settlement = AbortQueryContextWorkerSettlement::try_new(self.identity, receipt)?;
+        receipt: ParticipationReceipt,
+    ) -> Result<(), ParticipationStandDownError> {
+        let settlement = AbortParticipationWorkerSettlement::try_new(self.identity, receipt)?;
         let result = self.publish(AbortIssueEventKind::WorkerSettled(Box::new(settlement)));
         self.request.take();
         result
@@ -1160,8 +1179,8 @@ impl AbortQueryContextEffectSubmission {
     /// A local protocol or dispatcher violation makes replay unsafe.
     ///
     /// The actor stops authorizing this issue while its residual supervisor
-    /// retains the context responsibility until exact convergence evidence.
-    pub fn fail_closed(mut self) -> Result<(), ContextStandDownError> {
+    /// retains the participation responsibility until exact convergence evidence.
+    pub fn fail_closed(mut self) -> Result<(), ParticipationStandDownError> {
         let result = self.publish(AbortIssueEventKind::FailedClosed);
         self.request.take();
         result
@@ -1174,7 +1193,7 @@ impl AbortQueryContextEffectSubmission {
         self.request.take();
     }
 
-    fn publish(&self, kind: AbortIssueEventKind) -> Result<(), ContextStandDownError> {
+    fn publish(&self, kind: AbortIssueEventKind) -> Result<(), ParticipationStandDownError> {
         publish_event(
             &self.events,
             AbortIssueEvent {
@@ -1186,7 +1205,7 @@ impl AbortQueryContextEffectSubmission {
     }
 }
 
-impl Drop for AbortQueryContextEffectSubmission {
+impl Drop for AbortParticipationEffectSubmission {
     fn drop(&mut self) {
         if self.request.is_some() {
             let _ = self.publish(AbortIssueEventKind::TransportUnknown);
@@ -1195,19 +1214,22 @@ impl Drop for AbortQueryContextEffectSubmission {
 }
 
 #[derive(Debug)]
-pub struct LateAbortQueryContextWorkerSettlement {
-    identity: AbortQueryContextIssueIdentity,
+pub struct LateAbortParticipationWorkerSettlement {
+    identity: AbortParticipationIssueIdentity,
     authorization_generation: u64,
     events: mpsc::Sender<AbortIssueEvent>,
 }
 
-impl LateAbortQueryContextWorkerSettlement {
-    pub const fn identity(&self) -> AbortQueryContextIssueIdentity {
+impl LateAbortParticipationWorkerSettlement {
+    pub const fn identity(&self) -> AbortParticipationIssueIdentity {
         self.identity
     }
 
-    pub fn worker_settled(self, receipt: QueryContextReceipt) -> Result<(), ContextStandDownError> {
-        let settlement = AbortQueryContextWorkerSettlement::try_new(self.identity, receipt)?;
+    pub fn worker_settled(
+        self,
+        receipt: ParticipationReceipt,
+    ) -> Result<(), ParticipationStandDownError> {
+        let settlement = AbortParticipationWorkerSettlement::try_new(self.identity, receipt)?;
         publish_event(
             &self.events,
             AbortIssueEvent {
@@ -1218,9 +1240,9 @@ impl LateAbortQueryContextWorkerSettlement {
         )
     }
 
-    /// A late receipt violated the exact operation/context contract.
+    /// A late receipt violated the exact operation/participation contract.
     /// Replaying the same request cannot repair that local protocol failure.
-    pub fn fail_closed(self) -> Result<(), ContextStandDownError> {
+    pub fn fail_closed(self) -> Result<(), ParticipationStandDownError> {
         publish_event(
             &self.events,
             AbortIssueEvent {
@@ -1235,10 +1257,12 @@ impl LateAbortQueryContextWorkerSettlement {
 fn publish_event(
     events: &mpsc::Sender<AbortIssueEvent>,
     event: AbortIssueEvent,
-) -> Result<(), ContextStandDownError> {
+) -> Result<(), ParticipationStandDownError> {
     events.try_send(event).map_err(|error| match error {
-        mpsc::error::TrySendError::Closed(_) => ContextStandDownError::EventChannelClosed,
-        mpsc::error::TrySendError::Full(_) => ContextStandDownError::EventBackpressureInvariant,
+        mpsc::error::TrySendError::Closed(_) => ParticipationStandDownError::EventChannelClosed,
+        mpsc::error::TrySendError::Full(_) => {
+            ParticipationStandDownError::EventBackpressureInvariant
+        }
     })
 }
 
@@ -1248,8 +1272,8 @@ mod tests {
     use std::sync::Mutex;
 
     use novarocks_execution_contract::{
-        AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
-        LeaseValidFor, OperationOutcome, QueryContextAdmissionTicketReceipt,
+        AcquireParticipationAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
+        LeaseValidFor, OperationOutcome, ParticipationAdmissionTicketReceipt,
     };
     use novarocks_types::NativeCompatibilityId;
     use novarocks_types::identity::{
@@ -1290,13 +1314,15 @@ mod tests {
         AttemptActivationIdentity::from_parts(11, execution(), 3)
     }
 
-    fn context(backend: BackendProcessId) -> QueryContextRef {
-        QueryContextRef::new(execution(), FrontendProcessId::new_v7(), backend)
+    fn participation(backend: BackendProcessId) -> ParticipationRef {
+        ParticipationRef::new(execution(), FrontendProcessId::new_v7(), backend)
     }
 
-    fn ledger(contexts: impl IntoIterator<Item = QueryContextRef>) -> ContextStandDownLedger {
-        ContextStandDownLedger::new(
-            contexts.into_iter().collect(),
+    fn ledger(
+        participations: impl IntoIterator<Item = ParticipationRef>,
+    ) -> ParticipationStandDownLedger {
+        ParticipationStandDownLedger::new(
+            participations.into_iter().collect(),
             NonZeroUsize::new(3).unwrap(),
         )
         .unwrap()
@@ -1304,7 +1330,7 @@ mod tests {
 
     #[derive(Debug)]
     struct RecordingPort {
-        submissions: Arc<Mutex<Vec<AbortQueryContextEffectSubmission>>>,
+        submissions: Arc<Mutex<Vec<AbortParticipationEffectSubmission>>>,
         backpressured: bool,
         capacity: watch::Sender<u64>,
     }
@@ -1322,28 +1348,28 @@ mod tests {
 
     #[derive(Debug)]
     struct RecordingReservation {
-        submissions: Arc<Mutex<Vec<AbortQueryContextEffectSubmission>>>,
+        submissions: Arc<Mutex<Vec<AbortParticipationEffectSubmission>>>,
     }
 
-    impl AbortQueryContextEffectReservation for RecordingReservation {
-        fn submit(self: Box<Self>, submission: AbortQueryContextEffectSubmission) {
+    impl AbortParticipationEffectReservation for RecordingReservation {
+        fn submit(self: Box<Self>, submission: AbortParticipationEffectSubmission) {
             self.submissions.lock().unwrap().push(submission);
         }
     }
 
-    impl AbortQueryContextEffectPort for RecordingPort {
+    impl AbortParticipationEffectPort for RecordingPort {
         fn subscribe_capacity(&self) -> watch::Receiver<u64> {
             self.capacity.subscribe()
         }
 
         fn try_reserve(
             &self,
-            _identity: AbortQueryContextIssueIdentity,
-        ) -> AbortQueryContextEffectAdmission {
+            _identity: AbortParticipationIssueIdentity,
+        ) -> AbortParticipationEffectAdmission {
             if self.backpressured {
-                AbortQueryContextEffectAdmission::Backpressured
+                AbortParticipationEffectAdmission::Backpressured
             } else {
-                AbortQueryContextEffectAdmission::Admitted(Box::new(RecordingReservation {
+                AbortParticipationEffectAdmission::Admitted(Box::new(RecordingReservation {
                     submissions: Arc::clone(&self.submissions),
                 }))
             }
@@ -1362,28 +1388,28 @@ mod tests {
         }
     }
 
-    impl AbortQueryContextEffectPort for ClosedPort {
+    impl AbortParticipationEffectPort for ClosedPort {
         fn subscribe_capacity(&self) -> watch::Receiver<u64> {
             self.capacity.subscribe()
         }
 
         fn try_reserve(
             &self,
-            _identity: AbortQueryContextIssueIdentity,
-        ) -> AbortQueryContextEffectAdmission {
-            AbortQueryContextEffectAdmission::Closed
+            _identity: AbortParticipationIssueIdentity,
+        ) -> AbortParticipationEffectAdmission {
+            AbortParticipationEffectAdmission::Closed
         }
     }
 
     #[test]
     fn no_grant_closes_without_abort_but_a_held_ticket_requires_abort() {
-        let no_grant = context(BackendProcessId::new_v7());
-        let ticket_held = context(BackendProcessId::new_v7());
+        let no_grant = participation(BackendProcessId::new_v7());
+        let ticket_held = participation(BackendProcessId::new_v7());
         let mut ledger = ledger([no_grant, ticket_held]);
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
+                ParticipationStandDownCause::LogicalExecutionCancelled,
                 [
                     (no_grant, EstablishStandDownFact::NoGrant),
                     (ticket_held, EstablishStandDownFact::AbortRequired),
@@ -1393,11 +1419,11 @@ mod tests {
 
         assert_eq!(
             ledger.snapshot(no_grant).unwrap().closure(),
-            ContextClosureState::NoRemoteResponsibility
+            ParticipationClosureState::NoRemoteResponsibility
         );
         assert_eq!(
             ledger.snapshot(ticket_held).unwrap().closure(),
-            ContextClosureState::AbortPending
+            ParticipationClosureState::AbortPending
         );
         assert!(ledger.authorize_next().unwrap().is_some());
         assert!(!ledger.responsibility_settled());
@@ -1405,59 +1431,60 @@ mod tests {
 
     #[test]
     fn duplicate_fact_rows_are_rejected_before_map_deduplication() {
-        let first = context(BackendProcessId::new_v7());
-        let second = context(BackendProcessId::new_v7());
+        let first = participation(BackendProcessId::new_v7());
+        let second = participation(BackendProcessId::new_v7());
         let mut ledger = ledger([first, second]);
         assert_eq!(
             ledger.begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
+                ParticipationStandDownCause::LogicalExecutionCancelled,
                 [
                     (first, EstablishStandDownFact::NoGrant),
                     (first, EstablishStandDownFact::AbortRequired),
                     (second, EstablishStandDownFact::NoGrant),
                 ],
             ),
-            Err(ContextStandDownError::DuplicateContext)
+            Err(ParticipationStandDownError::DuplicateParticipation)
         );
     }
 
     #[test]
     fn definitely_unsent_establish_still_requires_abort_for_its_ticket() {
-        let context = context(BackendProcessId::new_v7());
-        let mut ledger = ledger([context]);
+        let participation = participation(BackendProcessId::new_v7());
+        let mut ledger = ledger([participation]);
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
-                [(context, EstablishStandDownFact::AbortRequired)],
+                ParticipationStandDownCause::LogicalExecutionCancelled,
+                [(participation, EstablishStandDownFact::AbortRequired)],
             )
             .unwrap();
 
         let permit = ledger.authorize_next().unwrap().unwrap();
-        assert_eq!(permit.identity().context(), context);
+        assert_eq!(permit.identity().participation(), participation);
         drop(permit);
         ledger.drain_events().unwrap();
         assert_eq!(
-            ledger.snapshot(context).unwrap().issue_state(),
-            Some(AbortQueryContextIssueState::DefinitelyUnsent)
+            ledger.snapshot(participation).unwrap().issue_state(),
+            Some(AbortParticipationIssueState::DefinitelyUnsent)
         );
         assert!(ledger.authorize_next().unwrap().is_some());
     }
 
     #[test]
-    fn abort_authorization_is_round_robin_across_contexts() {
-        let first = context(BackendProcessId::new_v7());
-        let second = context(BackendProcessId::new_v7());
-        let contexts = BTreeSet::from([first, second]);
-        let expected_first = *contexts.first().unwrap();
-        let expected_second = *contexts.last().unwrap();
+    fn abort_authorization_is_round_robin_across_participations() {
+        let first = participation(BackendProcessId::new_v7());
+        let second = participation(BackendProcessId::new_v7());
+        let participations = BTreeSet::from([first, second]);
+        let expected_first = *participations.first().unwrap();
+        let expected_second = *participations.last().unwrap();
         let mut ledger =
-            ContextStandDownLedger::new(contexts, NonZeroUsize::new(2).unwrap()).unwrap();
+            ParticipationStandDownLedger::new(participations, NonZeroUsize::new(2).unwrap())
+                .unwrap();
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
+                ParticipationStandDownCause::LogicalExecutionCancelled,
                 [
                     (first, EstablishStandDownFact::AbortRequired),
                     (second, EstablishStandDownFact::AbortRequired),
@@ -1466,27 +1493,28 @@ mod tests {
             .unwrap();
 
         let first_issue = ledger.authorize_next().unwrap().unwrap();
-        assert_eq!(first_issue.identity().context(), expected_first);
+        assert_eq!(first_issue.identity().participation(), expected_first);
         drop(first_issue);
         ledger.drain_events().unwrap();
 
         let next = ledger.authorize_next().unwrap().unwrap();
-        assert_eq!(next.identity().context(), expected_second);
+        assert_eq!(next.identity().participation(), expected_second);
     }
 
     #[test]
     fn transport_unknown_retries_wait_for_one_aggregated_deadline() {
-        let first = context(BackendProcessId::new_v7());
-        let second = context(BackendProcessId::new_v7());
-        let contexts = BTreeSet::from([first, second]);
-        let expected_first = *contexts.first().unwrap();
-        let expected_second = *contexts.last().unwrap();
+        let first = participation(BackendProcessId::new_v7());
+        let second = participation(BackendProcessId::new_v7());
+        let participations = BTreeSet::from([first, second]);
+        let expected_first = *participations.first().unwrap();
+        let expected_second = *participations.last().unwrap();
         let mut ledger =
-            ContextStandDownLedger::new(contexts, NonZeroUsize::new(2).unwrap()).unwrap();
+            ParticipationStandDownLedger::new(participations, NonZeroUsize::new(2).unwrap())
+                .unwrap();
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
+                ParticipationStandDownCause::LogicalExecutionCancelled,
                 [
                     (first, EstablishStandDownFact::AbortRequired),
                     (second, EstablishStandDownFact::AbortRequired),
@@ -1503,7 +1531,7 @@ mod tests {
             .try_submit(&port)
             .unwrap();
         let first_submission = port.submissions.lock().unwrap().pop().unwrap();
-        assert_eq!(first_submission.identity().context(), expected_first);
+        assert_eq!(first_submission.identity().participation(), expected_first);
         let _first_late = first_submission.transport_unknown().unwrap();
         ledger.drain_events_at(now).unwrap();
 
@@ -1514,7 +1542,10 @@ mod tests {
             .try_submit(&port)
             .unwrap();
         let second_submission = port.submissions.lock().unwrap().pop().unwrap();
-        assert_eq!(second_submission.identity().context(), expected_second);
+        assert_eq!(
+            second_submission.identity().participation(),
+            expected_second
+        );
         let _second_late = second_submission.transport_unknown().unwrap();
         ledger.drain_events_at(now).unwrap();
 
@@ -1533,20 +1564,20 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .identity()
-                .context(),
+                .participation(),
             expected_first
         );
     }
 
     #[tokio::test]
     async fn retry_deadline_uses_the_clock_after_the_event_arrives() {
-        let context = context(BackendProcessId::new_v7());
-        let mut ledger = ledger([context]);
+        let participation = participation(BackendProcessId::new_v7());
+        let mut ledger = ledger([participation]);
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
-                [(context, EstablishStandDownFact::AbortRequired)],
+                ParticipationStandDownCause::LogicalExecutionCancelled,
+                [(participation, EstablishStandDownFact::AbortRequired)],
             )
             .unwrap();
         let port = RecordingPort::default();
@@ -1582,18 +1613,19 @@ mod tests {
     }
 
     #[test]
-    fn one_context_exhausting_abort_replay_does_not_block_the_next_context() {
-        let first = context(BackendProcessId::new_v7());
-        let second = context(BackendProcessId::new_v7());
-        let contexts = BTreeSet::from([first, second]);
-        let expected_first = *contexts.first().unwrap();
-        let expected_second = *contexts.last().unwrap();
+    fn one_participation_exhausting_abort_replay_does_not_block_the_next_participation() {
+        let first = participation(BackendProcessId::new_v7());
+        let second = participation(BackendProcessId::new_v7());
+        let participations = BTreeSet::from([first, second]);
+        let expected_first = *participations.first().unwrap();
+        let expected_second = *participations.last().unwrap();
         let mut ledger =
-            ContextStandDownLedger::new(contexts, NonZeroUsize::new(1).unwrap()).unwrap();
+            ParticipationStandDownLedger::new(participations, NonZeroUsize::new(1).unwrap())
+                .unwrap();
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
+                ParticipationStandDownCause::LogicalExecutionCancelled,
                 [
                     (first, EstablishStandDownFact::AbortRequired),
                     (second, EstablishStandDownFact::AbortRequired),
@@ -1602,87 +1634,89 @@ mod tests {
             .unwrap();
 
         let exhausted = ledger.authorize_next().unwrap().unwrap();
-        assert_eq!(exhausted.identity().context(), expected_first);
+        assert_eq!(exhausted.identity().participation(), expected_first);
         drop(exhausted);
         ledger.drain_events().unwrap();
 
         let next = ledger.authorize_next().unwrap().unwrap();
-        assert_eq!(next.identity().context(), expected_second);
+        assert_eq!(next.identity().participation(), expected_second);
         drop(next);
         ledger.drain_events().unwrap();
         assert!(ledger.authorize_next().unwrap().is_none());
         assert_eq!(
             ledger.snapshot(expected_first).unwrap().issue_state(),
-            Some(AbortQueryContextIssueState::AuthorizationExhausted)
+            Some(AbortParticipationIssueState::AuthorizationExhausted)
         );
         assert_eq!(
             ledger.snapshot(expected_first).unwrap().closure(),
-            ContextClosureState::AbortIssueExhausted
+            ParticipationClosureState::AbortIssueExhausted
         );
     }
 
     #[test]
     fn exact_process_replacement_settles_exhausted_residual_responsibility() {
-        let context = context(BackendProcessId::new_v7());
-        let mut ledger =
-            ContextStandDownLedger::new([context].into_iter().collect(), NonZeroUsize::MIN)
-                .unwrap();
+        let participation = participation(BackendProcessId::new_v7());
+        let mut ledger = ParticipationStandDownLedger::new(
+            [participation].into_iter().collect(),
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
-                [(context, EstablishStandDownFact::AbortRequired)],
+                ParticipationStandDownCause::LogicalExecutionCancelled,
+                [(participation, EstablishStandDownFact::AbortRequired)],
             )
             .unwrap();
         drop(ledger.authorize_next().unwrap().unwrap());
         ledger.drain_events().unwrap();
         assert!(ledger.authorize_next().unwrap().is_none());
         assert_eq!(
-            ledger.snapshot(context).unwrap().closure(),
-            ContextClosureState::AbortIssueExhausted
+            ledger.snapshot(participation).unwrap().closure(),
+            ParticipationClosureState::AbortIssueExhausted
         );
         ledger
             .observe_registry_convergence(
-                context,
-                RegistryContextConvergence::WorkerProcessReplaced,
+                participation,
+                RegistryParticipationConvergence::WorkerProcessReplaced,
             )
             .unwrap();
         assert_eq!(
-            ledger.snapshot(context).unwrap().closure(),
-            ContextClosureState::WorkerProcessReplaced
+            ledger.snapshot(participation).unwrap().closure(),
+            ParticipationClosureState::WorkerProcessReplaced
         );
         assert!(ledger.responsibility_settled());
     }
 
     #[test]
     fn authorized_establish_must_linearize_before_abort_is_minted() {
-        let context = context(BackendProcessId::new_v7());
-        let mut ledger = ledger([context]);
+        let participation = participation(BackendProcessId::new_v7());
+        let mut ledger = ledger([participation]);
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
-                [(context, EstablishStandDownFact::IssueUnsettled)],
+                ParticipationStandDownCause::LogicalExecutionCancelled,
+                [(participation, EstablishStandDownFact::IssueUnsettled)],
             )
             .unwrap();
         assert!(ledger.authorize_next().unwrap().is_none());
         assert!(ledger.has_unsettled_establish_issue());
 
         ledger
-            .refresh_establish_fact(context, EstablishStandDownFact::AbortRequired)
+            .refresh_establish_fact(participation, EstablishStandDownFact::AbortRequired)
             .unwrap();
         assert!(ledger.authorize_next().unwrap().is_some());
     }
 
     #[test]
     fn effect_port_reserves_before_receiving_the_exact_replay_request() {
-        let context = context(BackendProcessId::new_v7());
-        let mut ledger = ledger([context]);
+        let participation = participation(BackendProcessId::new_v7());
+        let mut ledger = ledger([participation]);
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionFailed,
-                [(context, EstablishStandDownFact::AbortRequired)],
+                ParticipationStandDownCause::LogicalExecutionFailed,
+                [(participation, EstablishStandDownFact::AbortRequired)],
             )
             .unwrap();
         let mut port = RecordingPort {
@@ -1692,15 +1726,15 @@ mod tests {
         let permit = ledger.authorize_next().unwrap().unwrap();
         let identity = permit.identity();
         let permit = match permit.try_submit(&port).unwrap() {
-            AbortQueryContextIssueSubmit::Backpressured(permit) => permit,
-            AbortQueryContextIssueSubmit::Accepted => panic!("backpressured port accepted Abort"),
+            AbortParticipationIssueSubmit::Backpressured(permit) => permit,
+            AbortParticipationIssueSubmit::Accepted => panic!("backpressured port accepted Abort"),
         };
         assert!(port.submissions.lock().unwrap().is_empty());
 
         port.backpressured = false;
         assert!(matches!(
             permit.try_submit(&port).unwrap(),
-            AbortQueryContextIssueSubmit::Accepted
+            AbortParticipationIssueSubmit::Accepted
         ));
         let submission = port.submissions.lock().unwrap().pop().unwrap();
         assert_eq!(submission.identity(), identity);
@@ -1709,18 +1743,18 @@ mod tests {
 
     #[test]
     fn a_closed_effect_port_fails_instead_of_waiting_for_capacity() {
-        let context = context(BackendProcessId::new_v7());
-        let mut ledger = ledger([context]);
+        let participation = participation(BackendProcessId::new_v7());
+        let mut ledger = ledger([participation]);
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
-                [(context, EstablishStandDownFact::AbortRequired)],
+                ParticipationStandDownCause::LogicalExecutionCancelled,
+                [(participation, EstablishStandDownFact::AbortRequired)],
             )
             .unwrap();
         let permit = ledger.authorize_next().unwrap().unwrap();
         let error = permit.try_submit(&ClosedPort::default()).unwrap_err();
-        assert_eq!(error, ContextStandDownError::EffectCapacityClosed);
+        assert_eq!(error, ParticipationStandDownError::EffectCapacityClosed);
         use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
         assert_eq!(
             error.failure_fact().evidence(),
@@ -1733,13 +1767,13 @@ mod tests {
 
     #[test]
     fn transport_unknown_replays_the_same_operation_and_request_allocation() {
-        let context = context(BackendProcessId::new_v7());
-        let mut ledger = ledger([context]);
+        let participation = participation(BackendProcessId::new_v7());
+        let mut ledger = ledger([participation]);
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
-                [(context, EstablishStandDownFact::AbortRequired)],
+                ParticipationStandDownCause::LogicalExecutionCancelled,
+                [(participation, EstablishStandDownFact::AbortRequired)],
             )
             .unwrap();
         let port = RecordingPort::default();
@@ -1760,13 +1794,13 @@ mod tests {
 
     #[test]
     fn terminal_worker_settlement_finishes_abort_responsibility_only() {
-        let context = context(BackendProcessId::new_v7());
-        let mut ledger = ledger([context]);
+        let participation = participation(BackendProcessId::new_v7());
+        let mut ledger = ledger([participation]);
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
-                [(context, EstablishStandDownFact::AbortRequired)],
+                ParticipationStandDownCause::LogicalExecutionCancelled,
+                [(participation, EstablishStandDownFact::AbortRequired)],
             )
             .unwrap();
         let port = RecordingPort::default();
@@ -1778,15 +1812,18 @@ mod tests {
             .unwrap();
         let submission = port.submissions.lock().unwrap().pop().unwrap();
         submission
-            .worker_settled(QueryContextReceipt::new(
-                context,
-                QueryContextState::TerminalRetained,
+            .worker_settled(ParticipationReceipt::new(
+                participation,
+                ParticipationState::TerminalRetained,
             ))
             .unwrap();
         ledger.drain_events().unwrap();
 
-        let snapshot = ledger.snapshot(context).unwrap();
-        assert_eq!(snapshot.closure(), ContextClosureState::TerminalRetained);
+        let snapshot = ledger.snapshot(participation).unwrap();
+        assert_eq!(
+            snapshot.closure(),
+            ParticipationClosureState::TerminalRetained
+        );
         assert!(ledger.responsibility_settled());
         // TerminalRetained is deliberately not an actual-stop or resource-
         // release fact; this ledger has no API that can manufacture either.
@@ -1795,21 +1832,27 @@ mod tests {
     #[test]
     fn worker_receipt_closure_accepts_all_worker_closing_states() {
         for (state, expected) in [
-            (QueryContextState::Aborting, ContextClosureState::Aborting),
-            (QueryContextState::Releasing, ContextClosureState::Releasing),
             (
-                QueryContextState::TerminalRetained,
-                ContextClosureState::TerminalRetained,
+                ParticipationState::Aborting,
+                ParticipationClosureState::Aborting,
             ),
-            (QueryContextState::Gone, ContextClosureState::Gone),
+            (
+                ParticipationState::Releasing,
+                ParticipationClosureState::Releasing,
+            ),
+            (
+                ParticipationState::TerminalRetained,
+                ParticipationClosureState::TerminalRetained,
+            ),
+            (ParticipationState::Gone, ParticipationClosureState::Gone),
         ] {
-            let context = context(BackendProcessId::new_v7());
-            let mut ledger = ledger([context]);
+            let participation = participation(BackendProcessId::new_v7());
+            let mut ledger = ledger([participation]);
             ledger
                 .begin(
                     activation(),
-                    ContextStandDownCause::LogicalExecutionCancelled,
-                    [(context, EstablishStandDownFact::AbortRequired)],
+                    ParticipationStandDownCause::LogicalExecutionCancelled,
+                    [(participation, EstablishStandDownFact::AbortRequired)],
                 )
                 .unwrap();
             let port = RecordingPort::default();
@@ -1824,24 +1867,24 @@ mod tests {
                 .unwrap()
                 .pop()
                 .unwrap()
-                .worker_settled(QueryContextReceipt::new(context, state))
+                .worker_settled(ParticipationReceipt::new(participation, state))
                 .unwrap();
             ledger.drain_events().unwrap();
 
-            assert_eq!(ledger.snapshot(context).unwrap().closure(), expected);
+            assert_eq!(ledger.snapshot(participation).unwrap().closure(), expected);
             assert!(ledger.responsibility_settled());
         }
     }
 
     #[test]
     fn late_stale_abort_reply_does_not_regress_terminal_closure() {
-        let context = context(BackendProcessId::new_v7());
-        let mut ledger = ledger([context]);
+        let participation = participation(BackendProcessId::new_v7());
+        let mut ledger = ledger([participation]);
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
-                [(context, EstablishStandDownFact::AbortRequired)],
+                ParticipationStandDownCause::LogicalExecutionCancelled,
+                [(participation, EstablishStandDownFact::AbortRequired)],
             )
             .unwrap();
         let port = RecordingPort::default();
@@ -1866,34 +1909,34 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap()
-            .worker_settled(QueryContextReceipt::new(
-                context,
-                QueryContextState::TerminalRetained,
+            .worker_settled(ParticipationReceipt::new(
+                participation,
+                ParticipationState::TerminalRetained,
             ))
             .unwrap();
         ledger.drain_events().unwrap();
 
-        late.worker_settled(QueryContextReceipt::new(
-            context,
-            QueryContextState::Aborting,
+        late.worker_settled(ParticipationReceipt::new(
+            participation,
+            ParticipationState::Aborting,
         ))
         .unwrap();
         ledger.drain_events().unwrap();
         assert_eq!(
-            ledger.snapshot(context).unwrap().closure(),
-            ContextClosureState::TerminalRetained
+            ledger.snapshot(participation).unwrap().closure(),
+            ParticipationClosureState::TerminalRetained
         );
     }
 
     #[test]
     fn late_settlement_allows_an_actor_held_replay_permit_to_close_unsent() {
-        let context = context(BackendProcessId::new_v7());
-        let mut ledger = ledger([context]);
+        let participation = participation(BackendProcessId::new_v7());
+        let mut ledger = ledger([participation]);
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
-                [(context, EstablishStandDownFact::AbortRequired)],
+                ParticipationStandDownCause::LogicalExecutionCancelled,
+                [(participation, EstablishStandDownFact::AbortRequired)],
             )
             .unwrap();
         let port = RecordingPort::default();
@@ -1908,32 +1951,35 @@ mod tests {
         ledger.drain_events().unwrap();
         let replay = ledger.authorize_next().unwrap().unwrap();
 
-        late.worker_settled(QueryContextReceipt::new(
-            context,
-            QueryContextState::TerminalRetained,
+        late.worker_settled(ParticipationReceipt::new(
+            participation,
+            ParticipationState::TerminalRetained,
         ))
         .unwrap();
         ledger.drain_events().unwrap();
         replay.settle_definitely_unsent().unwrap();
         ledger.drain_events().unwrap();
 
-        let snapshot = ledger.snapshot(context).unwrap();
-        assert_eq!(snapshot.closure(), ContextClosureState::TerminalRetained);
+        let snapshot = ledger.snapshot(participation).unwrap();
+        assert_eq!(
+            snapshot.closure(),
+            ParticipationClosureState::TerminalRetained
+        );
         assert_eq!(
             snapshot.issue_state(),
-            Some(AbortQueryContextIssueState::WorkerSettled)
+            Some(AbortParticipationIssueState::WorkerSettled)
         );
     }
 
     #[test]
     fn exact_abort_replies_cannot_switch_closure_branches() {
-        let context = context(BackendProcessId::new_v7());
-        let mut ledger = ledger([context]);
+        let participation = participation(BackendProcessId::new_v7());
+        let mut ledger = ledger([participation]);
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
-                [(context, EstablishStandDownFact::AbortRequired)],
+                ParticipationStandDownCause::LogicalExecutionCancelled,
+                [(participation, EstablishStandDownFact::AbortRequired)],
             )
             .unwrap();
         let port = RecordingPort::default();
@@ -1958,33 +2004,33 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap()
-            .worker_settled(QueryContextReceipt::new(
-                context,
-                QueryContextState::Releasing,
+            .worker_settled(ParticipationReceipt::new(
+                participation,
+                ParticipationState::Releasing,
             ))
             .unwrap();
         ledger.drain_events().unwrap();
 
-        late.worker_settled(QueryContextReceipt::new(
-            context,
-            QueryContextState::Aborting,
+        late.worker_settled(ParticipationReceipt::new(
+            participation,
+            ParticipationState::Aborting,
         ))
         .unwrap();
         assert_eq!(
             ledger.drain_events().unwrap_err(),
-            ContextStandDownError::ConflictingWorkerSettlement
+            ParticipationStandDownError::ConflictingWorkerSettlement
         );
     }
 
     #[test]
     fn terminal_closure_retains_the_first_observed_abort_branch() {
-        let context = context(BackendProcessId::new_v7());
-        let mut ledger = ledger([context]);
+        let participation = participation(BackendProcessId::new_v7());
+        let mut ledger = ledger([participation]);
         ledger
             .begin(
                 activation(),
-                ContextStandDownCause::LogicalExecutionCancelled,
-                [(context, EstablishStandDownFact::AbortRequired)],
+                ParticipationStandDownCause::LogicalExecutionCancelled,
+                [(participation, EstablishStandDownFact::AbortRequired)],
             )
             .unwrap();
         let port = RecordingPort::default();
@@ -2018,56 +2064,56 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap()
-            .worker_settled(QueryContextReceipt::new(
-                context,
-                QueryContextState::TerminalRetained,
+            .worker_settled(ParticipationReceipt::new(
+                participation,
+                ParticipationState::TerminalRetained,
             ))
             .unwrap();
         ledger.drain_events().unwrap();
 
         second_late
-            .worker_settled(QueryContextReceipt::new(
-                context,
-                QueryContextState::Aborting,
+            .worker_settled(ParticipationReceipt::new(
+                participation,
+                ParticipationState::Aborting,
             ))
             .unwrap();
         ledger.drain_events().unwrap();
         assert_eq!(
-            ledger.snapshot(context).unwrap().closure(),
-            ContextClosureState::TerminalRetained
+            ledger.snapshot(participation).unwrap().closure(),
+            ParticipationClosureState::TerminalRetained
         );
 
         first_late
-            .worker_settled(QueryContextReceipt::new(
-                context,
-                QueryContextState::Releasing,
+            .worker_settled(ParticipationReceipt::new(
+                participation,
+                ParticipationState::Releasing,
             ))
             .unwrap();
         assert_eq!(
             ledger.drain_events().unwrap_err(),
-            ContextStandDownError::ConflictingWorkerSettlement
+            ParticipationStandDownError::ConflictingWorkerSettlement
         );
     }
 
     #[tokio::test]
     async fn actor_owner_waits_for_abort_settlement_after_logical_cancellation() {
         let execution = execution();
-        let context = context(BackendProcessId::new_v7());
+        let participation = participation(BackendProcessId::new_v7());
         let port = Arc::new(RecordingPort::default());
         let (work_owner, stage) = governed_work();
         let config = crate::coordination::LogicalExecutionActorConfig::single_attempt_completion(
             execution,
             novarocks_coordination_contract::ExecutionEffect::None,
             NonZeroUsize::new(2).unwrap(),
-            vec![context],
+            vec![participation],
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             work_owner,
             stage,
         )
         .unwrap()
-        .with_abort_query_context_effect_port(
-            Arc::clone(&port) as Arc<dyn AbortQueryContextEffectPort>,
+        .with_abort_participation_effect_port(
+            Arc::clone(&port) as Arc<dyn AbortParticipationEffectPort>,
             NonZeroUsize::new(2).unwrap(),
         );
         let (owner, initial, _output) =
@@ -2076,9 +2122,9 @@ mod tests {
                 .into_parts();
         let actor = owner.actor().clone();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let admission = AcquireQueryContextAdmissionTicket::new(
+        let admission = AcquireParticipationAdmissionTicket::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
             NativeCompatibilityId::new([7; 32]),
             AdmissionEpochCapability::try_from_bytes([7; 16]).unwrap(),
@@ -2095,9 +2141,9 @@ mod tests {
                     crate::coordination::AdmissionIssueSettlement::applied(
                         pending_issue.operation_id(),
                         OperationOutcome::Accepted,
-                        QueryContextAdmissionTicketReceipt::new(
+                        ParticipationAdmissionTicketReceipt::new(
                             AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
-                            context,
+                            participation,
                             LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
                         ),
                     )
@@ -2120,26 +2166,28 @@ mod tests {
         );
         assert_eq!(
             actor
-                .stand_down_snapshot(context)
+                .stand_down_snapshot(participation)
                 .await
                 .unwrap()
                 .unwrap()
                 .closure(),
-            ContextClosureState::AbortPending
+            ParticipationClosureState::AbortPending
         );
 
         submission
-            .worker_settled(QueryContextReceipt::new(
-                context,
-                QueryContextState::TerminalRetained,
+            .worker_settled(ParticipationReceipt::new(
+                participation,
+                ParticipationState::TerminalRetained,
             ))
             .unwrap();
         loop {
             if actor
-                .stand_down_snapshot(context)
+                .stand_down_snapshot(participation)
                 .await
                 .unwrap()
-                .is_some_and(|snapshot| snapshot.closure() == ContextClosureState::TerminalRetained)
+                .is_some_and(|snapshot| {
+                    snapshot.closure() == ParticipationClosureState::TerminalRetained
+                })
             {
                 break;
             }
@@ -2152,7 +2200,7 @@ mod tests {
             "a terminal record does not prove actual stop or process replacement"
         );
         supervisor
-            .observe_worker_stopped_and_context_fenced(context)
+            .observe_worker_stopped_and_participation_fenced(participation)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), supervisor.join())
@@ -2162,15 +2210,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_with_remote_contexts_requires_an_abort_effect_port() {
+    async fn actor_with_remote_participations_requires_an_abort_effect_port() {
         let execution = execution();
-        let context = context(BackendProcessId::new_v7());
+        let participation = participation(BackendProcessId::new_v7());
         let (work_owner, stage) = governed_work();
         let config = crate::coordination::LogicalExecutionActorConfig::single_attempt_completion(
             execution,
             novarocks_coordination_contract::ExecutionEffect::None,
             NonZeroUsize::new(1).unwrap(),
-            vec![context],
+            vec![participation],
             NonZeroUsize::new(1).unwrap(),
             NonZeroUsize::new(1).unwrap(),
             work_owner,

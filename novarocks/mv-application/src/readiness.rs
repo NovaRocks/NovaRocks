@@ -29,12 +29,12 @@ use crate::repository::{
 use novarocks_spi::connector::{CatalogHandle, ConnectorRequestContext, LakePublicationId};
 use std::sync::Arc;
 use uuid::Uuid;
-pub struct MvRuntimePublicationLease {
+pub struct MvPublicationPermit {
     runtime: Arc<ProcessRuntime<MvTarget, LakePublicationId>>,
     target: MvTarget,
     publication_id: LakePublicationId,
 }
-impl Drop for MvRuntimePublicationLease {
+impl Drop for MvPublicationPermit {
     fn drop(&mut self) {
         self.runtime.finish(&self.target, self.publication_id);
     }
@@ -317,7 +317,7 @@ impl MvKeyedReadinessService {
         &self,
         target: MvTarget,
         publication_id: LakePublicationId,
-    ) -> Result<MvRuntimePublicationLease, MvRepositoryError> {
+    ) -> Result<MvPublicationPermit, MvRepositoryError> {
         self.legacy().begin_publication(target, publication_id)
     }
     #[cfg(any(test, novarocks_dev_controls))]
@@ -757,14 +757,14 @@ impl MvKeyedReadinessExecution {
         &self,
         target: MvTarget,
         publication_id: LakePublicationId,
-    ) -> Result<MvRuntimePublicationLease, MvRepositoryError> {
+    ) -> Result<MvPublicationPermit, MvRepositoryError> {
         if !self.runtime.begin(target.clone(), publication_id) {
             return Err(MvRepositoryError::new(
                 MvRepositoryErrorKind::Conflict,
                 "an MV publication is already active for this target",
             ));
         }
-        Ok(MvRuntimePublicationLease {
+        Ok(MvPublicationPermit {
             runtime: Arc::clone(&self.runtime),
             target,
             publication_id,

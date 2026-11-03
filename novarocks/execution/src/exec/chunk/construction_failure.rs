@@ -17,7 +17,7 @@
 
 //! Chunk schema construction owns its contract refusals. Dependencies keep
 //! their original facts; callback failures return unchanged to their caller.
-use crate::runtime::fragment::{ExecutionReason, SharedDomainFailure};
+use crate::runtime::task::{ExecutionReason, SharedDomainFailure};
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 use novarocks_functions::array_projection::ArrayProjectionFailure;
 use novarocks_type_contract::{
@@ -241,7 +241,7 @@ impl<E> ChunkObservationFailure<E> {
         }
     }
 }
-impl From<ChunkConstructionFailure> for crate::runtime::fragment::ExecutionFailure {
+impl From<ChunkConstructionFailure> for crate::runtime::task::ExecutionFailure {
     fn from(source: ChunkConstructionFailure) -> Self {
         Self::from_domain(source)
     }

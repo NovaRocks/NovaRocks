@@ -299,7 +299,10 @@ fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> Result<(
             // signatures in its errors. Keep this test-only marker so a system
             // scenario can distinguish fixture framing rejection from an S3
             // authorization or storage failure without exposing credentials.
-            eprintln!("NOVAROCKS_LOOPBACK_S3_REJECTED_REQUEST reason={error:#}");
+            eprintln!(
+                "{} reason={error:#}",
+                novarocks_failpoint::observation_marker::LOOPBACK_S3_REJECTED_REQUEST
+            );
             write_response(stream, 400, &[], &[])?;
             return Ok(());
         }

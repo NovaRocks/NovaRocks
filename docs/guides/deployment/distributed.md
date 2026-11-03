@@ -366,7 +366,7 @@ queued 不等于实际执行器排队，body 退出也不等于报告已消费�
 `novarocks_backend_protocol_retention{owner,resource}` 分别观察 `context`、`ticket`、
 `control` 与 `inbound` 原保管者的记录库存。`ticket_records`、`acquisition_decisions`、
 `replay_decisions` 不等同于 `logical_live_grants`；拒绝重放可有 decision 而无 ticket。
-`compact_contexts` 来自同原 Core 已提交的压缩事实；`failed_custodians` 来自实际失败
+`compact_participations` 来自同原 Core 已提交的压缩事实；`failed_custodians` 来自实际失败
 保管者，冷 Core 后失败时二者可以重叠。失败 Core 未提供的 `decided_task_records`
 明确不可用，不从目录数或 Task 地址反推。`control{directory_records}` 仅是 Root 原目录行数，
 不等同于保留 Context 数。

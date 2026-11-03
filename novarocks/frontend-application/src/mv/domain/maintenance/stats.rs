@@ -132,7 +132,7 @@ pub(crate) fn downstream_floor(
 /// generation's compaction F, including after a borrowed wait disappears.
 pub(crate) struct OriginalMaintenanceFacts {
     capture: Arc<super::super::staged_create::CurrentMetadataCapture>,
-    lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     table: ConnectorTableIdentity,
     context: novarocks_spi::connector::ConnectorRequestContext,
     first_metadata: Option<novarocks_spi::connector::ConnectorTableObjectBinding>,
@@ -154,10 +154,10 @@ impl OriginalMaintenanceFacts {
         let instance = ConnectorInstanceId::parse(&target.catalog).map_err(|error| {
             ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
         })?;
-        let lease = ConnectorControlResolver::acquire_current(controls, &instance)?;
+        let planning_pin = ConnectorControlResolver::acquire_current(controls, &instance)?;
         Ok(Self {
             capture: super::super::staged_create::CurrentMetadataCapture::new(),
-            lease,
+            planning_pin,
             table: ConnectorTableIdentity {
                 instance_id: instance,
                 namespace: target.namespace.clone().into(),
@@ -188,19 +188,19 @@ impl OriginalMaintenanceFacts {
         }
         let result = async {
             if self.first_metadata.is_none() {
-                let metadata = self.capture.capture(&self.lease, factory, ConnectorTableObjectCaptureRequest {
+                let metadata = self.capture.capture(&self.planning_pin, factory, ConnectorTableObjectCaptureRequest {
                     table: self.table.clone(), resolution: ConnectorTableResolution::StrictBaseTable,
                     selector: ConnectorTableObjectSelector::Current, context: self.context.clone(),
                 }).await.map_err(|failure| failure.into_application())?;
                 self.first_metadata = Some(metadata);
             }
             if self.observation.is_none() {
-                let cpu = factory.port_for(&self.lease).map_err(|error| {
+                let cpu = factory.port_for(&self.planning_pin).map_err(|error| {
                     let cause = novarocks_failure_contract::SharedFailureCause::new(error);
                     MvApplicationError::new(MvApplicationErrorKind::Engine, cause.detail()).with_original_failure(cause)
                 })?;
                 self.observation = Some(crate::connector::metadata_maintenance::begin_captured_max_compactable_data_files(
-                    controls, &self.lease, &self.first_metadata.as_ref().unwrap().metadata, self.context.clone(), cpu,
+                    controls, &self.planning_pin, &self.first_metadata.as_ref().unwrap().metadata, self.context.clone(), cpu,
                 ).map_err(provider)?);
             }
             if self.compactable.is_none() {
@@ -238,15 +238,15 @@ impl OriginalMaintenanceFacts {
             // Same ordering as the existing author: compaction forces the
             // Provider refresh before the maintenance metadata observation.
             if self.current_metadata.is_none() {
-                let metadata = self.capture.capture(&self.lease, factory, ConnectorTableObjectCaptureRequest {
+                let metadata = self.capture.capture(&self.planning_pin, factory, ConnectorTableObjectCaptureRequest {
                     table: self.table.clone(), resolution: ConnectorTableResolution::StrictBaseTable,
                     selector: ConnectorTableObjectSelector::Current, context: self.context.clone(),
                 }).await.map_err(|failure| failure.into_application())?;
                 self.current_metadata = Some(metadata);
             }
             let metadata = &self.current_metadata.as_ref().unwrap().metadata;
-            let observed = crate::mv::domain::storage_observation::observe_maintenance_metadata(storage, &self.lease, metadata, self.context.clone()).map_err(provider)?;
-            finish_table_stats_original(&self.lease, metadata, &observed, self.table.instance_id.as_str(), &self.table.namespace, &self.table.table, projections, compactable)
+            let observed = crate::mv::domain::storage_observation::observe_maintenance_metadata(storage, &self.planning_pin, metadata, self.context.clone()).map_err(provider)?;
+            finish_table_stats_original(&self.planning_pin, metadata, &observed, self.table.instance_id.as_str(), &self.table.namespace, &self.table.table, projections, compactable)
                 .map_err(|(_context, error)| provider(error))
         }.await;
         assert!(self.raw.is_none(), "one original maintenance facts outcome");
@@ -280,7 +280,7 @@ impl OriginalMaintenanceFacts {
 }
 
 fn finish_table_stats_original(
-    exact_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    exact_lease: &novarocks_spi::connector::ConnectorControlPlanningPin,
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
     observed: &crate::mv::domain::storage_observation::MvMaintenanceMetadataObservation,
     catalog: &str,

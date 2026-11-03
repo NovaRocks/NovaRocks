@@ -535,7 +535,7 @@ impl Error for RuntimeFilterContractViolation {
 
 impl novarocks_failure_contract::FailureProjection for RuntimeFilterContractViolationKind {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let (class, reason) = match *self {
             RuntimeFilterContractViolationKind::MissingSession => (
@@ -1103,7 +1103,9 @@ pub trait NonBlockingLiveSubscription: Send + Sync {
     fn snapshot(&self) -> Option<Arc<RuntimeFilterSnapshot>>;
     fn poll_after(&self, observed: Option<LogicalVersion>) -> LivePollOutcome;
 }
-pub enum RuntimeFilterSubscriptionHandle {
+/// Holds the exact subscription state and any charged snapshot retained by it.
+/// Publication, cancellation, and terminal outcomes use their explicit paths.
+pub enum RuntimeFilterSubscriptionPin {
     Blocking(Arc<dyn BlockingSnapshotSubscription>),
     Live(Arc<dyn NonBlockingLiveSubscription>),
 }
@@ -1131,11 +1133,14 @@ pub trait RuntimeFilterProducer: Send + Sync {
         reason: RuntimeFilterProducerFailure,
     ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation>;
 }
-pub type RuntimeFilterProducerHandle = Arc<dyn RuntimeFilterProducer>;
+/// Clones share the original producer and its retained session state.
+pub type SharedRuntimeFilterProducer = Arc<dyn RuntimeFilterProducer>;
 
-/// One-shot ownership of a FinalDomain partition. A caller must freeze a
-/// domain then close it; dropping an unclosed handle is terminal failure for
-/// the whole completion fence.
+/// One-shot ownership of a FinalDomain partition.
+///
+/// This is an unchecked obligation: every claimed partition must be sealed
+/// and closed explicitly. The current partition implementations have no Drop
+/// hook; dropping an unclosed partition neither closes it nor publishes failure.
 pub trait RuntimeFilterFinalDomainPartition: Send {
     fn seal(
         &mut self,
@@ -1143,7 +1148,7 @@ pub trait RuntimeFilterFinalDomainPartition: Send {
     ) -> Result<(), RuntimeFilterContractViolation>;
     fn close(&mut self) -> Result<(), RuntimeFilterContractViolation>;
 }
-pub type RuntimeFilterFinalDomainPartitionHandle = Box<dyn RuntimeFilterFinalDomainPartition>;
+pub type RuntimeFilterFinalDomainPartitionObligation = Box<dyn RuntimeFilterFinalDomainPartition>;
 
 /// Fragment-local FinalDomain fence capability. It exposes only local
 /// partition ownership, the frozen-domain budget, and typed terminal failure;
@@ -1155,13 +1160,14 @@ pub trait RuntimeFilterFinalDomainCompletion: Send + Sync {
     fn claim_partition(
         &self,
         partition: PartitionId,
-    ) -> Result<RuntimeFilterFinalDomainPartitionHandle, RuntimeFilterContractViolation>;
+    ) -> Result<RuntimeFilterFinalDomainPartitionObligation, RuntimeFilterContractViolation>;
     fn fail(
         &self,
         reason: RuntimeFilterProducerFailure,
     ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation>;
 }
-pub type RuntimeFilterFinalDomainCompletionHandle = Arc<dyn RuntimeFilterFinalDomainCompletion>;
+/// Clones share completion state and the same original producer ownership.
+pub type SharedRuntimeFilterFinalDomainCompletion = Arc<dyn RuntimeFilterFinalDomainCompletion>;
 
 /// A producer operation is admitted exactly once by the installed route. The
 /// result preserves terminal and replay semantics without exposing the
@@ -1193,19 +1199,19 @@ pub trait RuntimeFilterSession: Send + Sync {
     fn open_producer(
         &self,
         request: RuntimeFilterProducerOpenRequest,
-    ) -> Result<RuntimeFilterBindOutcome<RuntimeFilterProducerHandle>, RuntimeFilterContractViolation>;
+    ) -> Result<RuntimeFilterBindOutcome<SharedRuntimeFilterProducer>, RuntimeFilterContractViolation>;
     fn subscribe(
         &self,
         request: RuntimeFilterSubscriptionRequest,
     ) -> Result<
-        RuntimeFilterBindOutcome<RuntimeFilterSubscriptionHandle>,
+        RuntimeFilterBindOutcome<RuntimeFilterSubscriptionPin>,
         RuntimeFilterContractViolation,
     >;
     fn open_final_domain_completion(
         &self,
         request: RuntimeFilterFinalDomainOpenRequest,
     ) -> Result<
-        RuntimeFilterBindOutcome<RuntimeFilterFinalDomainCompletionHandle>,
+        RuntimeFilterBindOutcome<SharedRuntimeFilterFinalDomainCompletion>,
         RuntimeFilterContractViolation,
     >;
 }
@@ -1380,7 +1386,7 @@ mod tests {
         fn claim_partition(
             &self,
             partition: PartitionId,
-        ) -> Result<RuntimeFilterFinalDomainPartitionHandle, RuntimeFilterContractViolation>
+        ) -> Result<RuntimeFilterFinalDomainPartitionObligation, RuntimeFilterContractViolation>
         {
             if partition.get() >= self.0.partition_count {
                 return Err(RuntimeFilterContractViolation::new(
@@ -1415,7 +1421,7 @@ mod tests {
             &self,
             request: RuntimeFilterProducerOpenRequest,
         ) -> Result<
-            RuntimeFilterBindOutcome<RuntimeFilterProducerHandle>,
+            RuntimeFilterBindOutcome<SharedRuntimeFilterProducer>,
             RuntimeFilterContractViolation,
         > {
             if request.local_partition_count() == 0 {
@@ -1430,7 +1436,7 @@ mod tests {
             &self,
             request: RuntimeFilterSubscriptionRequest,
         ) -> Result<
-            RuntimeFilterBindOutcome<RuntimeFilterSubscriptionHandle>,
+            RuntimeFilterBindOutcome<RuntimeFilterSubscriptionPin>,
             RuntimeFilterContractViolation,
         > {
             if request.contract().binding_id().get() == 99 {
@@ -1449,7 +1455,7 @@ mod tests {
             &self,
             request: RuntimeFilterFinalDomainOpenRequest,
         ) -> Result<
-            RuntimeFilterBindOutcome<RuntimeFilterFinalDomainCompletionHandle>,
+            RuntimeFilterBindOutcome<SharedRuntimeFilterFinalDomainCompletion>,
             RuntimeFilterContractViolation,
         > {
             if request.contract().kind() != RuntimeFilterProducerKind::FinalDomain {
@@ -1505,7 +1511,7 @@ mod tests {
         let raw = RuntimeFilterMembershipSchema::from_canonical(schema.canonical_bytes(), [0; 32])
             .unwrap_err();
         assert_eq!(raw, FilterMembershipSchemaError::DigestMismatch);
-        let outer: crate::runtime::fragment::ExecutionFailure = raw.into();
+        let outer: crate::runtime::task::ExecutionFailure = raw.into();
         let fact = novarocks_failure_contract::FailureProjection::failure_fact(&outer);
         assert_eq!(fact.class(), novarocks_failure_contract::FailureClass::Data);
         assert_eq!(
@@ -1513,7 +1519,7 @@ mod tests {
             novarocks_failure_contract::domain::LOCAL_PROGRAM.get()
         );
         assert_eq!(fact.reason().code(), 102);
-        let crate::runtime::fragment::ExecutionFailureCause::RuntimeFilter(
+        let crate::runtime::task::ExecutionFailureCause::RuntimeFilter(
             RuntimeFilterFailure::Schema(original),
         ) = outer.cause()
         else {
@@ -1677,11 +1683,8 @@ mod typed_channel_identity_tests {
 pub(crate) fn producer_sequence_extent(
     binding: u32,
     current: u64,
-) -> crate::runtime::fragment::ExecutionFailure {
-    crate::runtime::fragment::ExecutionFailure::from_domain(ProducerSequenceExtent {
-        binding,
-        current,
-    })
+) -> crate::runtime::task::ExecutionFailure {
+    crate::runtime::task::ExecutionFailure::from_domain(ProducerSequenceExtent { binding, current })
 }
 
 #[derive(Debug)]
@@ -1706,7 +1709,7 @@ impl novarocks_failure_contract::FailureProjection for ProducerSequenceExtent {
         };
         FailureFact::new(
             FailureClass::Resource,
-            crate::runtime::fragment::ExecutionReason::FilterProducerSequence.reason(),
+            crate::runtime::task::ExecutionReason::FilterProducerSequence.reason(),
         )
         .with_resource(ResourceFacts {
             request_scope: Some(ResourceScope::Operator),

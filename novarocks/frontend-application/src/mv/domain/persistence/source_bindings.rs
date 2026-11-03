@@ -58,7 +58,7 @@ pub(crate) fn observe_mv_create_source_bindings_original(
             .ok_or_else(|| invalid(format!("CREATE source occurrence {} has no admitted connector binding", relation.occurrence_id().get())))?;
         let metadata = binding.source_metadata.as_ref().ok_or_else(|| invalid(format!(
             "CREATE source occurrence {} was not admitted from exact provider metadata", relation.occurrence_id().get())))?;
-        let lease = binding.admission.exact_planning_lease().map_err(invalid)?;
+        let lease = binding.admission.exact_planning_pin().map_err(invalid)?;
         let observed = observer.observe_source_schema(&lease, metadata, context.clone())
             .map_err(|error| provider(error, format!("observe CREATE source fields for {}.{}.{}",
                 relation.catalog(), relation.namespace(), relation.relation())))?;

@@ -27,15 +27,15 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::fragment::io::FragmentEventSink;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::io::TaskEventSink;
 use arrow::datatypes::DataType;
 use novarocks_types::SlotId;
 use std::sync::Arc;
@@ -190,7 +190,7 @@ pub trait OperatorLifecycle: Send {
     fn name(&self) -> &str;
 
     /// Install the owned provider handle before activation. Only the driver
-    /// replenishes the shared allowance; synchronous work borrows StepContext.
+    /// replenishes the shared allowance; synchronous work borrows DriverStep.
     fn bind_poll_budget(
         &mut self,
         _budget: novarocks_spi::connector::read_stack::ConnectorPollBudget,
@@ -245,7 +245,7 @@ pub trait OperatorLifecycle: Send {
         Ok(())
     }
 
-    fn set_fragment_event_sink(&mut self, _sink: Arc<dyn FragmentEventSink>) {}
+    fn set_task_event_sink(&mut self, _sink: Arc<dyn TaskEventSink>) {}
 
     /// End production and start outstanding owner exits exactly once. Errors
     /// from this cleanup request are diagnostics, never required-output events.
@@ -611,7 +611,7 @@ mod typed_input_construction_tests {
         )
         .unwrap();
         Chunk::try_new_typed_with_columns_owned_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(
             Arc::new(ChunkSchema::try_new_typed(vec![slot], pure.clone()).unwrap()),
@@ -644,7 +644,7 @@ mod typed_input_construction_tests {
             nested: false,
         };
         assert!(
-            matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory), &mut novarocks_value_arrays::decode::ValueConversionContext::default()), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)))
+            matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory), &mut novarocks_value_arrays::decode::ValueConversionContext::default()), Err(error) if matches!(error.cause(), crate::runtime::task::ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)))
         );
     }
     #[test]
@@ -740,7 +740,7 @@ mod typed_input_construction_tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let op = consumer(&drops, false, true);
         assert!(
-            matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory), &mut novarocks_value_arrays::decode::ValueConversionContext::default()), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::ResourceExhausted)))
+            matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory), &mut novarocks_value_arrays::decode::ValueConversionContext::default()), Err(error) if matches!(error.cause(), crate::runtime::task::ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::ResourceExhausted)))
         );
         assert_eq!(
             op.factory.as_ref().unwrap().requests.load(Ordering::SeqCst),
@@ -804,7 +804,7 @@ mod typed_input_construction_tests {
             let mut op = consumer(&drops, false, false);
             op.factory.as_mut().unwrap().control_error = Some(cause.clone());
             assert!(
-                matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory), &mut novarocks_value_arrays::decode::ValueConversionContext::default()), Err(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::Control(actual)) if *actual == cause))
+                matches!(hydrate_for_downstream_with_factory(&source, &op, op.factory.as_ref().map(|factory| factory as &dyn InputConstructionFactory), &mut novarocks_value_arrays::decode::ValueConversionContext::default()), Err(error) if matches!(error.cause(), crate::runtime::task::ExecutionFailureCause::Construction(ConstructionFailure::Control(actual)) if *actual == cause))
             );
             assert_eq!(
                 op.factory.as_ref().unwrap().begins.load(Ordering::SeqCst),

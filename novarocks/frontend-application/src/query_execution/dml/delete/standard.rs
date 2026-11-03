@@ -110,17 +110,17 @@ pub(super) async fn prepare_delete_statement_async(
     stmt: &Delete,
     target: &TargetBackend,
     target_ref: &str,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     operation_id: ConnectorWriteOperationId,
     begin_receiving: Arc<crate::query_execution::write_session::WriteBeginReceiving>,
 ) -> Result<super::PreparedDeleteWrite, crate::dml::error::DmlExecutionError> {
     let target_binding =
-        super::load_delete_target_async(target, planning_lease, connector_context).await?;
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
+        super::load_delete_target_async(target, planning_pin, connector_context).await?;
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context_async(
         state.mv_storage_observation().as_ref(),
-        target_binding.lease(),
+        target_binding.planning_pin(),
         state.mv_readiness().as_ref(),
         target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Delete,
@@ -138,7 +138,7 @@ pub(super) async fn prepare_delete_statement_async(
     let (deletion_vectors, sink_mode) = delete_write_mode(mutation.strategy())?;
     let write_session = super::begin_delete_write_session_async(
         state,
-        target_binding.lease(),
+        target_binding.planning_pin(),
         &write_lease,
         crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
             target,
@@ -159,7 +159,7 @@ pub(super) async fn prepare_delete_statement_async(
         target_ref,
         &where_sql,
         sink_mode,
-        target_binding.lease(),
+        target_binding.planning_pin(),
         &write_session,
     )?;
     Ok(super::PreparedDeleteWrite {
@@ -204,7 +204,7 @@ fn bind_delete_write(
     target_ref: &str,
     where_sql: &str,
     sink_mode: DmlWriteSinkMode,
-    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: &novarocks_spi::connector::ConnectorControlPlanningPin,
     write_session: &crate::query_execution::write_session::ConnectorWriteSession,
 ) -> Result<
     (
@@ -244,7 +244,7 @@ fn bind_delete_write(
             target.table.clone(),
         ),
         write_target,
-        planning_lease.clone(),
+        planning_pin.clone(),
     )?;
     let sql_write_input = dml_write_plan_input_for_admitted_target(
         table_bindings.as_ref(),

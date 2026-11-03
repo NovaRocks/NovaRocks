@@ -19,7 +19,7 @@ const MAX_BOUNDED_OBSERVERS: usize = 129;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ObservableCapacityError {
     InvalidCapacity,
-    Backing(crate::runtime::fragment::SharedDomainFailure),
+    Backing(crate::runtime::task::SharedDomainFailure),
     CapacityExceeded,
     BoundedRequired,
 }
@@ -45,7 +45,7 @@ impl std::error::Error for ObservableCapacityError {
 }
 impl novarocks_failure_contract::FailureProjection for ObservableCapacityError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason as R;
+        use crate::runtime::task::ExecutionReason as R;
         use novarocks_failure_contract::*;
         let (class, reason) = match self {
             Self::Backing(source) => return source.failure_fact(),
@@ -99,7 +99,7 @@ impl std::error::Error for ObservableBackingFailure {
 }
 impl novarocks_failure_contract::FailureProjection for ObservableBackingFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason as R;
+        use crate::runtime::task::ExecutionReason as R;
         use novarocks_failure_contract::*;
         let (reason, requested, limit) = match self {
             Self::Reserve { requested, .. } => {
@@ -125,7 +125,7 @@ impl novarocks_failure_contract::FailureProjection for ObservableBackingFailure 
     }
 }
 fn backing_failure(source: ObservableBackingFailure) -> ObservableCapacityError {
-    ObservableCapacityError::Backing(crate::runtime::fragment::SharedDomainFailure::new(source))
+    ObservableCapacityError::Backing(crate::runtime::task::SharedDomainFailure::new(source))
 }
 
 /// Thread-safe callback registry for execution readiness transitions.

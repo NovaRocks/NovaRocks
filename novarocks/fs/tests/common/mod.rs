@@ -27,8 +27,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
     BoundFile, FileBatch, FileBatchReader, FileBytesFuture, FileCancellation, FileFormat,
-    FileIdentity, FileIoRuntime, FileProjection, FileReadBudget, FileReadContext, FileReadRange,
-    FileReadRequest, FileResult, FileTask, FileTaskFuture, FileTaskSpawner, FileU64Future,
+    FileIdentity, FileIoFuture, FileIoJob, FileIoRuntime, FileIoSpawner, FileProjection,
+    FileReadBudget, FileReadContext, FileReadRange, FileReadRequest, FileResult, FileU64Future,
     FsAccessResolver, PhysicalPruning,
 };
 use novarocks_spi::connector::StorageAccessDomainId;
@@ -74,9 +74,9 @@ impl FileIoRuntime for TestIo {
     }
 }
 
-impl FileTaskSpawner for TestIo {
-    fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
-        Ok(FileTask::new(self.runtime.spawn(task)))
+impl FileIoSpawner for TestIo {
+    fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
+        Ok(FileIoJob::new(self.runtime.spawn(task)))
     }
 
     fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
@@ -135,7 +135,7 @@ impl Fixture {
         max_bytes: usize,
     ) -> FileReadRequest {
         let runtime: Arc<dyn FileIoRuntime> = self.io.clone();
-        let task_spawner: Arc<dyn FileTaskSpawner> = self.io.clone();
+        let io_spawner: Arc<dyn FileIoSpawner> = self.io.clone();
         FileReadRequest {
             file: self.file.clone(),
             format,
@@ -154,7 +154,7 @@ impl Fixture {
                 cancellation: FileCancellation::new(),
                 deadline: None,
                 runtime,
-                task_spawner,
+                io_spawner,
                 range: None,
             },
         }

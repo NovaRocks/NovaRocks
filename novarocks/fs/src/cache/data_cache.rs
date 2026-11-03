@@ -202,19 +202,19 @@ impl DataCacheManager {
         self.page_cache.get().cloned()
     }
 
-    pub fn external_context(&self, options: CacheOptions) -> DataCacheContext {
-        DataCacheContext::external(options)
+    pub fn external_context(&self, options: CacheOptions) -> DataCachePolicy {
+        DataCachePolicy::external(options)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DataCacheContext {
+pub struct DataCachePolicy {
     domain: CacheDomain,
     options: CacheOptions,
     external_range_options: Option<ExternalDataCacheRangeOptions>,
 }
 
-impl DataCacheContext {
+impl DataCachePolicy {
     pub fn external(options: CacheOptions) -> Self {
         Self {
             domain: CacheDomain::External,
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn external_context_applies_range_options() {
-        let ctx = DataCacheContext::external(test_cache_options());
+        let ctx = DataCachePolicy::external(test_cache_options());
         let range_options = ExternalDataCacheRangeOptions {
             modification_time: Some(123),
             enable_populate_datacache: Some(true),
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn internal_context_keeps_datacache_disabled() {
-        let ctx = DataCacheContext::internal(test_cache_options());
+        let ctx = DataCachePolicy::internal(test_cache_options());
         let io = ctx.io_options();
         assert_eq!(io.domain, CacheDomain::Internal);
         assert!(!io.enable_datacache);
@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn block_cache_result_records_metrics_via_context() {
-        let ctx = DataCacheContext::external(test_cache_options());
+        let ctx = DataCachePolicy::external(test_cache_options());
         let recorder = MockRecorder::default();
         let read = CacheBlockRead {
             bytes: Bytes::from_static(b"abc"),

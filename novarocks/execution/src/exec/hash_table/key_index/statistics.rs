@@ -24,7 +24,7 @@ use super::{
 };
 use crate::{
     exec::pipeline::operator::ConstructionFailure,
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use arrow::{
     array::{Array, PrimitiveArray},

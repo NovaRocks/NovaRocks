@@ -63,13 +63,13 @@ use super::aggregate_fixture::{
 };
 use super::family_fixture::{FixtureControl, constant_policy, int64, int64_rows};
 use crate::exec::chunk::Chunk;
-use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
-use crate::runtime::fragment::io::NoopFragmentEventSink;
-use crate::runtime::fragment::io::exchange::test_support::Fixture;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::io::NoopTaskEventSink;
+use crate::runtime::task::io::exchange::test_support::Fixture;
 
 const SOLE: FragmentId = FragmentId::new(70);
 const SOURCE: FragmentId = FragmentId::new(71);
@@ -834,7 +834,7 @@ fn single_program(rows: &[Row], spec: &Spec, sorted: bool) -> Result<Arc<LocalPr
 fn try_run_single(
     program: &Arc<LocalProgram>,
     batch_size: i32,
-) -> crate::runtime::fragment::ExecutionResult<Vec<Chunk>> {
+) -> crate::runtime::task::ExecutionResult<Vec<Chunk>> {
     let state = Arc::new(RuntimeState::for_local_execution(
         Some(QueryOptions {
             batch_size: Some(batch_size),
@@ -849,7 +849,7 @@ fn try_run_single(
         )),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ));
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let dop = i32::try_from(program.graph().profile().pipeline_dop().get()).unwrap();
     let prepared = prepare_compiled_program_pipeline_execution(
         Arc::clone(program),
@@ -859,7 +859,7 @@ fn try_run_single(
         None,
         dop,
         state,
-        Arc::new(NoopFragmentEventSink),
+        Arc::new(NoopTaskEventSink),
     )?;
     prepared.start().join()?;
     Ok(output.take_chunks())
@@ -1044,9 +1044,7 @@ fn unnest_over_a_global_sort_keeps_the_pass_through_ordering() {
 /// keeps the original expression root, selected row and pipeline operation.
 #[test]
 fn a_guarded_list_argument_preserves_its_required_project_row_error() {
-    use crate::runtime::fragment::{
-        ExecutionFailureCause, ExecutionFailureContext, PipelineOperation,
-    };
+    use crate::runtime::task::{ExecutionFailureCause, OperatorFailureSite, PipelineOperation};
     use novarocks_local_program::{ProgramExpressionRootSite, ProgramNodeExpressionRole};
     let spec = Spec {
         args: vec![Arg::Faulty(0)],
@@ -1065,8 +1063,8 @@ fn a_guarded_list_argument_preserves_its_required_project_row_error() {
     assert_eq!(exprs.len(), 2, "the key read and the guarded argument root");
     let error = try_run_single(&program, 4096).unwrap_err();
     assert_eq!(
-        error.context(),
-        Some(ExecutionFailureContext {
+        error.site(),
+        Some(OperatorFailureSite {
             operator_ordinal: 1,
             operation: PipelineOperation::Push,
         }),
@@ -1231,7 +1229,7 @@ fn unnest_at_four_drivers_keeps_every_row_and_each_parent_in_order() {
         SOURCE_FINST,
     )
     .unwrap_or_else(|error| panic!("source runs: {error}"));
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     try_run_in_fixture(
         &fixture,
         &consumer,
@@ -1269,9 +1267,9 @@ fn compiled_table_schema_prepare_and_output_last_reference_use_real_owner() {
     use crate::exec::operators::compiled_table_function::CompiledTableFunctionProcessorFactory;
     use crate::exec::pipeline::operator::ConstructionFailure;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
-    use crate::runtime::fragment::ExecutionFailureCause;
     use crate::runtime::mem_tracker::MemTracker;
     use crate::runtime::runtime_state::RuntimeErrorState;
+    use crate::runtime::task::ExecutionFailureCause;
     use arrow::array::builder::{Int64Builder, ListBuilder};
     use arrow::array::{ArrayRef, Int64Array};
     let program = single_program(&rows(), &Spec::unnest(false), false).unwrap();
@@ -1327,9 +1325,9 @@ fn compiled_table_schema_prepare_and_output_last_reference_use_real_owner() {
     drop(program);
     assert!(weak.upgrade().is_none());
     use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
         input::RawInput,
         step::{InputResult, NextStep},
-        step_context::{StepContext, TurnWork},
     };
     let state = RuntimeState::for_local_execution(
         Some(QueryOptions {
@@ -1349,7 +1347,7 @@ fn compiled_table_schema_prepare_and_output_last_reference_use_real_owner() {
     let original = duplicate.columns()[0].clone();
     let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+    let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
     let step = operator.as_mut();
     assert!(matches!(
         step.try_push(&mut ctx, RawInput::for_test(input)),
@@ -1404,9 +1402,9 @@ fn compiled_table_prepare_preserves_real_memory_refusal_before_input() {
     use crate::exec::operators::compiled_table_function::CompiledTableFunctionProcessorFactory;
     use crate::exec::pipeline::operator::ConstructionFailure;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
-    use crate::runtime::fragment::ExecutionFailureCause;
     use crate::runtime::mem_tracker::MemTracker;
     use crate::runtime::runtime_state::RuntimeErrorState;
+    use crate::runtime::task::ExecutionFailureCause;
     let program = single_program(&rows(), &Spec::unnest(false), false).unwrap();
     let factory = CompiledTableFunctionProcessorFactory::try_new(
         program.clone(),

@@ -21,10 +21,10 @@ use novarocks_control_runtime_core::identity::{
     Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, WorkId,
 };
 use novarocks_execution_contract::{
-    AbortCause, AcquireQueryContextAdmissionTicket, AdmissionTicketId, CancelReason, LeaseSequence,
-    LeaseValidFor, OperationOutcome, QueryContextRef, QueryContextState, TaskConclusion,
-    TaskIdentity, TaskOperationId, TaskOutputFacts, TaskState, TaskStatus, TaskStatusCursor,
-    TaskStatusVersion, TerminationDetail,
+    AbortCause, AcquireParticipationAdmissionTicket, AdmissionTicketId, CancelReason,
+    LeaseSequence, LeaseValidFor, OperationOutcome, ParticipationRef, ParticipationState,
+    TaskConclusion, TaskIdentity, TaskOperationId, TaskOutputFacts, TaskState, TaskStatus,
+    TaskStatusCursor, TaskStatusVersion, TerminationDetail,
 };
 use novarocks_types::{
     NativeCompatibilityId,
@@ -36,18 +36,19 @@ use novarocks_worker_protocol::{
     admission::{
         AdmissionCore, AdmissionTicketConfig, AdmissionTicketObservation, AdmissionTicketRedemption,
     },
-    context::{
-        ContextCommand, ContextConfig, ContextCore, ContextEffect, ContextEstablishment,
-        ContextEstablishmentDecision, ContextInput, ContextMaterialized, ContextReplyBody,
-        ContextRequestSettlement, ContextStep, PhysicalFact, RequestResult,
-    },
     creation::{
-        AdmissionNeed, AdmissionPort, AdmissionRefusal, CreationCost, PayloadId, RequestContext,
+        AdmissionNeed, AdmissionPort, AdmissionRefusal, CreationCost, PayloadId, RequestReplyTag,
     },
     lease::{LeaseBounds, MonotonicInstant, RequestHorizon},
     observation::{
         CoveredObservationFact, CoveredObservationFrame, CoveredSubscriptionError,
         ObservationSource, SubscriptionId,
+    },
+    participation::{
+        ParticipationCommand, ParticipationConfig, ParticipationCore, ParticipationEffect,
+        ParticipationEstablishment, ParticipationEstablishmentDecision, ParticipationInput,
+        ParticipationMaterialized, ParticipationReplyBody, ParticipationRequestSettlement,
+        ParticipationStep, PhysicalFact, RequestResult,
     },
     proposal_summary::Proposal,
     retention::RetentionOrigin,
@@ -75,15 +76,15 @@ fn at(n: u64) -> MonotonicInstant {
 fn operation(n: u8) -> TaskOperationId {
     TaskOperationId::try_from_bytes(bytes(n)).unwrap()
 }
-fn context() -> QueryContextRef {
-    QueryContextRef::new(
+fn participation() -> ParticipationRef {
+    ParticipationRef::new(
         QueryExecutionId::new(QueryId::new(7101, 7102), AttemptId::new(1).unwrap()).unwrap(),
         FrontendProcessId::try_from_bytes(bytes(1)).unwrap(),
         BackendProcessId::try_from_bytes(bytes(2)).unwrap(),
     )
 }
 fn task(n: u32) -> TaskIdentity {
-    let c = context();
+    let c = participation();
     TaskIdentity::new(
         c.query_execution_id(),
         StageId::new(1).unwrap(),
@@ -91,16 +92,16 @@ fn task(n: u32) -> TaskIdentity {
         c.backend_process_id(),
     )
 }
-fn core(max_tasks: usize, max_preparing: usize) -> ContextCore {
+fn core(max_tasks: usize, max_preparing: usize) -> ParticipationCore {
     core_with_initial_lease(max_tasks, max_preparing, at(0))
 }
 fn core_with_initial_lease(
     max_tasks: usize,
     max_preparing: usize,
     elected_at: MonotonicInstant,
-) -> ContextCore {
+) -> ParticipationCore {
     core_with_establishment(
-        ContextEstablishment {
+        ParticipationEstablishment {
             operation: operation(2),
             ticket: AdmissionTicketId::try_from_bytes([4; 16]).unwrap(),
             payload: PayloadId(1),
@@ -112,12 +113,12 @@ fn core_with_initial_lease(
     )
 }
 fn core_with_establishment(
-    establishment: ContextEstablishment,
+    establishment: ParticipationEstablishment,
     max_tasks: usize,
     max_preparing: usize,
-) -> ContextCore {
+) -> ParticipationCore {
     core_from_original_establishment(
-        context(),
+        participation(),
         Generation::new(1).unwrap(),
         establishment,
         max_tasks,
@@ -125,23 +126,23 @@ fn core_with_establishment(
     )
 }
 fn core_from_original_establishment(
-    identity: QueryContextRef,
+    identity: ParticipationRef,
     generation: Generation,
-    establishment: ContextEstablishment,
+    establishment: ParticipationEstablishment,
     max_tasks: usize,
     max_preparing: usize,
-) -> ContextCore {
-    ContextCore::new(
+) -> ParticipationCore {
+    ParticipationCore::new(
         identity,
         generation,
         establishment,
-        ContextConfig {
+        ParticipationConfig {
             max_tasks,
             max_creation_waiters: 8,
             max_pending_requests: 64,
             max_preparing,
             max_task_bytes: 100,
-            step_budget: ContextCore::MAX_STEP_WORK,
+            step_budget: ParticipationCore::MAX_STEP_WORK,
             lease_bounds: LeaseBounds::DEFAULT,
             metric_publish_interval: Duration::from_millis(100),
             request_horizon: novarocks_worker_protocol::lease::RequestHorizon::DEFAULT,
@@ -155,8 +156,8 @@ struct Port {
     next: u64,
     reject: Option<OperationOutcome>,
     typed_reject: Option<AdmissionRefusal>,
-    next_context_input: u64,
-    context_tokens: std::collections::BTreeMap<TaskOperationId, InputId>,
+    next_participation_input: u64,
+    participation_tokens: std::collections::BTreeMap<TaskOperationId, InputId>,
 }
 impl AdmissionPort for Port {
     fn try_reserve(&mut self, need: AdmissionNeed) -> Result<ReservationId, AdmissionRefusal> {
@@ -174,50 +175,50 @@ impl AdmissionPort for Port {
 
 #[derive(Debug)]
 enum FixtureInput {
-    Fact(Box<ContextInput>),
-    Rpc(TaskOperationId, Box<ContextCommand>),
+    Fact(Box<ParticipationInput>),
+    Rpc(TaskOperationId, Box<ParticipationCommand>),
 }
-impl From<ContextInput> for FixtureInput {
-    fn from(input: ContextInput) -> Self {
+impl From<ParticipationInput> for FixtureInput {
+    fn from(input: ParticipationInput) -> Self {
         Self::Fact(Box::new(input))
     }
 }
-fn rpc(operation: TaskOperationId, command: ContextCommand) -> FixtureInput {
+fn rpc(operation: TaskOperationId, command: ParticipationCommand) -> FixtureInput {
     FixtureInput::Rpc(operation, Box::new(command))
 }
 impl Port {
     fn request_token(&self, operation: TaskOperationId) -> InputId {
         *self
-            .context_tokens
+            .participation_tokens
             .get(&operation)
             .expect("the fixture issued this actual request")
     }
 }
-trait FixtureContext {
+trait FixtureParticipation {
     fn apply_fixture(
         &mut self,
         now: MonotonicInstant,
         input: impl Into<FixtureInput>,
         port: &mut Port,
-    ) -> Result<ContextStep, novarocks_worker_protocol::context::CoreError>;
+    ) -> Result<ParticipationStep, novarocks_worker_protocol::participation::CoreError>;
 }
-impl FixtureContext for ContextCore {
+impl FixtureParticipation for ParticipationCore {
     fn apply_fixture(
         &mut self,
         now: MonotonicInstant,
         input: impl Into<FixtureInput>,
         port: &mut Port,
-    ) -> Result<ContextStep, novarocks_worker_protocol::context::CoreError> {
+    ) -> Result<ParticipationStep, novarocks_worker_protocol::participation::CoreError> {
         match input.into() {
             FixtureInput::Fact(input) => self.handle(now, *input, port),
             FixtureInput::Rpc(operation, command) => {
                 // The external fixture issues every token, even for the same wire operation.
-                port.next_context_input += 1;
-                let token = InputId::new(1_000_000 + port.next_context_input).unwrap();
-                port.context_tokens.insert(operation, token);
+                port.next_participation_input += 1;
+                let token = InputId::new(1_000_000 + port.next_participation_input).unwrap();
+                port.participation_tokens.insert(operation, token);
                 self.handle_request(
                     now,
-                    RequestContext {
+                    RequestReplyTag {
                         author: model_request_author(token),
                         token,
                         operation,
@@ -238,11 +239,11 @@ fn cost() -> CreationCost {
         structural_bytes: 7,
     }
 }
-fn activate(core: &mut ContextCore, port: &mut Port) {
+fn activate(core: &mut ParticipationCore, port: &mut Port) {
     core.handle(
         at(0),
-        ContextInput::MaterializationFinished {
-            result: Ok(ContextMaterialized {
+        ParticipationInput::MaterializationFinished {
+            result: Ok(ParticipationMaterialized {
                 initial_credential_resource: 101,
             }),
         },
@@ -250,12 +251,12 @@ fn activate(core: &mut ContextCore, port: &mut Port) {
     )
     .unwrap();
 }
-fn create(core: &mut ContextCore, port: &mut Port, n: u8) {
+fn create(core: &mut ParticipationCore, port: &mut Port, n: u8) {
     core.apply_fixture(
         at(0),
         rpc(
             operation(n),
-            ContextCommand::Create {
+            ParticipationCommand::Create {
                 task: task(n.into()),
                 payload: PayloadId(n.into()),
             },
@@ -265,42 +266,42 @@ fn create(core: &mut ContextCore, port: &mut Port, n: u8) {
     .unwrap();
 }
 struct LoadedSteps {
-    steps: Vec<ContextStep>,
+    steps: Vec<ParticipationStep>,
 }
 impl LoadedSteps {
-    fn iter(&self) -> impl Iterator<Item = &ContextEffect> {
+    fn iter(&self) -> impl Iterator<Item = &ParticipationEffect> {
         self.steps.iter().flat_map(|step| &step.effects)
     }
-    fn requests(&self) -> impl Iterator<Item = &ContextRequestSettlement> {
+    fn requests(&self) -> impl Iterator<Item = &ParticipationRequestSettlement> {
         self.steps.iter().flat_map(|step| &step.requests)
     }
 }
 fn has_verdict(
-    replies: &[ContextRequestSettlement],
+    replies: &[ParticipationRequestSettlement],
     token: InputId,
     outcome: OperationOutcome,
 ) -> bool {
     replies.iter().any(|reply| reply.request.token == token
         && reply.result == RequestResult::Outcome(outcome)
-        && matches!(reply.body.as_ref(), ContextReplyBody::Verdict(value) if *value == reply.result))
+        && matches!(reply.body.as_ref(), ParticipationReplyBody::Verdict(value) if *value == reply.result))
 }
-fn assert_context_acknowledgement(
-    replies: &[ContextRequestSettlement],
+fn assert_participation_acknowledgement(
+    replies: &[ParticipationRequestSettlement],
     token: InputId,
     outcome: OperationOutcome,
-    state: QueryContextState,
+    state: ParticipationState,
     cause: Option<AbortCause>,
 ) {
     let mut matches = replies.iter().filter(|reply| reply.request.token == token);
-    let reply = matches.next().expect("the original Context reply");
+    let reply = matches.next().expect("the original Participation reply");
     assert!(matches.next().is_none(), "one reply for the original token");
     assert_eq!(reply.result, RequestResult::Outcome(outcome));
     assert!(reply.task.is_none());
-    let ContextReplyBody::Context(ack) = reply.body.as_ref() else {
-        panic!("the operation retains its complete original Context acknowledgement")
+    let ParticipationReplyBody::Participation(ack) = reply.body.as_ref() else {
+        panic!("the operation retains its complete original Participation acknowledgement")
     };
     assert_eq!(ack.outcome, outcome);
-    assert_eq!(ack.receipt.context(), context());
+    assert_eq!(ack.receipt.participation(), participation());
     assert_eq!(ack.receipt.state(), state);
     assert_eq!(ack.termination_cause, cause);
     assert_eq!(
@@ -314,7 +315,7 @@ fn assert_context_acknowledgement(
     );
 }
 fn assert_domain_reply(
-    replies: &[ContextRequestSettlement],
+    replies: &[ParticipationRequestSettlement],
     token: InputId,
     expected: &AdmissionRefusal,
 ) {
@@ -327,11 +328,11 @@ fn assert_domain_reply(
     };
     assert_eq!(reply.result, RequestResult::Outcome(outcome.outcome()));
     assert!(
-        matches!(reply.body.as_ref(), ContextReplyBody::Domain(actual) if actual.outcome == *outcome && actual.failure == *failure)
+        matches!(reply.body.as_ref(), ParticipationReplyBody::Domain(actual) if actual.outcome == *outcome && actual.failure == *failure)
     );
 }
 fn final_info_reply(
-    step: &ContextStep,
+    step: &ParticipationStep,
     token: InputId,
 ) -> std::sync::Arc<novarocks_execution_contract::FinalTaskInfo> {
     let reply = step
@@ -344,28 +345,28 @@ fn final_info_reply(
         RequestResult::Outcome(OperationOutcome::Accepted)
     );
     match reply.body.as_ref() {
-        ContextReplyBody::FinalInfo(info) => info.clone(),
+        ParticipationReplyBody::FinalInfo(info) => info.clone(),
         _ => panic!("the same request retains the original final information"),
     }
 }
-fn loaded(core: &mut ContextCore, port: &mut Port, n: u8) -> LoadedSteps {
+fn loaded(core: &mut ParticipationCore, port: &mut Port, n: u8) -> LoadedSteps {
     let mut all = Vec::new();
-    let mut input = ContextInput::Loaded {
+    let mut input = ParticipationInput::Loaded {
         task: task(n.into()),
         result: Ok(cost()),
     };
     loop {
         let step = core.handle(at(0), input, port).unwrap();
-        assert!(step.charged_work() <= ContextCore::MAX_BODY_WORK);
+        assert!(step.charged_work() <= ParticipationCore::MAX_BODY_WORK);
         let more = step
             .effects
             .iter()
-            .any(|effect| matches!(effect, ContextEffect::ContinueReplies { .. }));
+            .any(|effect| matches!(effect, ParticipationEffect::ContinueReplies { .. }));
         all.push(step);
         if !more {
             return LoadedSteps { steps: all };
         }
-        input = ContextInput::ContinueReplies {
+        input = ParticipationInput::ContinueReplies {
             task: task(n.into()),
         };
     }
@@ -391,7 +392,7 @@ fn settlement_flushes_its_predecessors_without_freezing_later_conclusions_or_cla
     let first = core
         .handle(
             at(0),
-            ContextInput::Settle {
+            ParticipationInput::Settle {
                 task: task(1),
                 work: model_request_author(InputId::new(1).unwrap()),
             },
@@ -400,7 +401,7 @@ fn settlement_flushes_its_predecessors_without_freezing_later_conclusions_or_cla
         .unwrap();
     assert_eq!(
         first.effects,
-        [ContextEffect::SettlementBarrier {
+        [ParticipationEffect::SettlementBarrier {
             task: task(1),
             work: model_request_author(InputId::new(1).unwrap()),
         }]
@@ -412,7 +413,7 @@ fn settlement_flushes_its_predecessors_without_freezing_later_conclusions_or_cla
     let queued = core
         .handle(
             at(1),
-            ContextInput::Proposal {
+            ParticipationInput::Proposal {
                 task: task(1),
                 proposal: proposal(cancellation.clone()),
             },
@@ -423,20 +424,20 @@ fn settlement_flushes_its_predecessors_without_freezing_later_conclusions_or_cla
     let second = core
         .handle(
             at(1),
-            ContextInput::Settle {
+            ParticipationInput::Settle {
                 task: task(1),
                 work: model_request_author(InputId::new(2).unwrap()),
             },
             &mut port,
         )
         .unwrap();
-    assert!(second.charged_work() <= ContextCore::MAX_BODY_WORK);
+    assert!(second.charged_work() <= ParticipationCore::MAX_BODY_WORK);
     let publication = second
         .effects
         .iter()
         .position(|effect| {
             matches!(effect,
-        ContextEffect::PublishConclusion { conclusion, .. } if conclusion == &cancellation)
+        ParticipationEffect::PublishConclusion { conclusion, .. } if conclusion == &cancellation)
         })
         .unwrap();
     let barrier = second
@@ -444,7 +445,7 @@ fn settlement_flushes_its_predecessors_without_freezing_later_conclusions_or_cla
         .iter()
         .position(|effect| {
             matches!(effect,
-        ContextEffect::SettlementBarrier { work, .. } if *work == model_request_author(InputId::new(2).unwrap()))
+        ParticipationEffect::SettlementBarrier { work, .. } if *work == model_request_author(InputId::new(2).unwrap()))
         })
         .unwrap();
     assert!(publication < barrier);
@@ -470,7 +471,7 @@ fn exact_create_replays_share_one_loader_and_reserve_the_complete_preparation_co
         at(0),
         rpc(
             operation(2),
-            ContextCommand::Create {
+            ParticipationCommand::Create {
                 task: task(1),
                 payload: PayloadId(999),
             },
@@ -487,17 +488,17 @@ fn exact_create_replays_share_one_loader_and_reserve_the_complete_preparation_co
     assert_eq!(
         effects
             .iter()
-            .filter(|e| matches!(e, ContextEffect::EnqueuePreparation { .. }))
+            .filter(|e| matches!(e, ParticipationEffect::EnqueuePreparation { .. }))
             .count(),
         1
     );
     let published = effects
         .iter()
-        .position(|e| matches!(e, ContextEffect::PublishTask { .. }))
+        .position(|e| matches!(e, ParticipationEffect::PublishTask { .. }))
         .unwrap();
     let enqueue = effects
         .iter()
-        .position(|effect| matches!(effect, ContextEffect::EnqueuePreparation { .. }))
+        .position(|effect| matches!(effect, ParticipationEffect::EnqueuePreparation { .. }))
         .unwrap();
     assert!(
         published < enqueue,
@@ -509,7 +510,7 @@ fn exact_create_replays_share_one_loader_and_reserve_the_complete_preparation_co
         .position(|step| {
             step.effects
                 .iter()
-                .any(|effect| matches!(effect, ContextEffect::EnqueuePreparation { .. }))
+                .any(|effect| matches!(effect, ParticipationEffect::EnqueuePreparation { .. }))
         })
         .unwrap();
     let replies: Vec<_> = effects
@@ -544,7 +545,7 @@ fn abort_predecessor_is_applied_before_a_late_loader_result() {
         at(0),
         rpc(
             operation(4),
-            ContextCommand::Abort {
+            ParticipationCommand::Abort {
                 cause: AbortCause::QueryFailed,
             },
         ),
@@ -560,36 +561,36 @@ fn abort_predecessor_is_applied_before_a_late_loader_result() {
     assert!(
         !effects
             .iter()
-            .any(|effect| matches!(effect, ContextEffect::CancelLoader { .. })),
+            .any(|effect| matches!(effect, ParticipationEffect::CancelLoader { .. })),
         "only the Task's ordered close cut cancels its loader"
     );
     assert!(!effects.iter().any(|effect| matches!(
         effect,
-        ContextEffect::PublishTask { .. }
-            | ContextEffect::PublishConclusion { .. }
-            | ContextEffect::PublishTaskConvergence { .. }
+        ParticipationEffect::PublishTask { .. }
+            | ParticipationEffect::PublishConclusion { .. }
+            | ParticipationEffect::PublishTaskConvergence { .. }
     )));
     assert!(core.status(task(1)).is_none());
     assert!(effects.requests().any(|reply| reply.request.token
         == port.request_token(operation(1))
-        && reply.result == RequestResult::Outcome(OperationOutcome::ContextTerminalReceipt)
+        && reply.result == RequestResult::Outcome(OperationOutcome::ParticipationTerminalReceipt)
         && reply.body.matches(reply.result)));
     assert!(!core.task(task(1)).unwrap().loader_exited);
     assert!(
         !effects
             .iter()
-            .any(|e| matches!(e, ContextEffect::RetireTask { .. }))
+            .any(|e| matches!(e, ParticipationEffect::RetireTask { .. }))
     );
     for input in [
-        ContextInput::ContinueClose,
-        ContextInput::ApplyTaskClose {
+        ParticipationInput::ContinueClose,
+        ParticipationInput::ApplyTaskClose {
             task: task(1),
             generation: Generation::new(2).unwrap(),
-            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+            intent: novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
                 novarocks_execution_contract::AbortCause::QueryFailed,
             ),
         },
-        ContextInput::Physical {
+        ParticipationInput::Physical {
             task: task(1),
             fact: PhysicalFact::LoaderExited,
         },
@@ -597,9 +598,9 @@ fn abort_predecessor_is_applied_before_a_late_loader_result() {
         let step = core.handle(at(0), input, &mut port).unwrap();
         assert!(!step.effects.iter().any(|effect| matches!(
             effect,
-            ContextEffect::PublishTask { .. }
-                | ContextEffect::PublishConclusion { .. }
-                | ContextEffect::PublishTaskConvergence { .. }
+            ParticipationEffect::PublishTask { .. }
+                | ParticipationEffect::PublishConclusion { .. }
+                | ParticipationEffect::PublishTaskConvergence { .. }
         )));
     }
     assert!(core.status(task(1)).is_none());
@@ -611,11 +612,15 @@ fn installed_and_body_exit_do_not_return_the_preparation_position() {
     activate(&mut core, &mut port);
     create(&mut core, &mut port, 1);
     loaded(&mut core, &mut port, 1);
-    core.handle(at(0), ContextInput::Installed { task: task(1) }, &mut port)
-        .unwrap();
     core.handle(
         at(0),
-        ContextInput::Physical {
+        ParticipationInput::Installed { task: task(1) },
+        &mut port,
+    )
+    .unwrap();
+    core.handle(
+        at(0),
+        ParticipationInput::Physical {
             task: task(1),
             fact: PhysicalFact::PreparationBodyExited,
         },
@@ -630,7 +635,7 @@ fn installed_and_body_exit_do_not_return_the_preparation_position() {
         && reply.body.matches(reply.result)));
     core.handle(
         at(0),
-        ContextInput::Physical {
+        ParticipationInput::Physical {
             task: task(1),
             fact: PhysicalFact::PreparationExited,
         },
@@ -650,14 +655,14 @@ fn task_update_inspection_reads_only_the_original_refusal_before_and_after_task_
     let mut port = Port::default();
     activate(&mut core, &mut port);
     let mut ordinal = 9_100_000;
-    let mut inspect = |core: &mut ContextCore,
+    let mut inspect = |core: &mut ParticipationCore,
                        port: &mut Port,
                        identity: TaskIdentity,
                        deadline: MonotonicInstant,
                        expected: OperationOutcome| {
         ordinal += 1;
         let token = InputId::new(ordinal).unwrap();
-        let request = RequestContext {
+        let request = RequestReplyTag {
             author: model_request_author(token),
             token,
             operation: operation(190),
@@ -668,7 +673,7 @@ fn task_update_inspection_reads_only_the_original_refusal_before_and_after_task_
             .handle_request(
                 at(0),
                 request,
-                ContextCommand::InspectTaskUpdate { task: identity },
+                ParticipationCommand::InspectTaskUpdate { task: identity },
                 port,
             )
             .unwrap();
@@ -719,7 +724,7 @@ fn task_update_inspection_reads_only_the_original_refusal_before_and_after_task_
     assert_eq!(core.status(task(1)).unwrap(), &live_status);
     core.handle(
         at(0),
-        ContextInput::Proposal {
+        ParticipationInput::Proposal {
             task: task(1),
             proposal: proposal(TaskConclusion::Terminated(TerminationDetail::Canceled(
                 CancelReason::UpstreamNoLongerNeeded,
@@ -728,8 +733,12 @@ fn task_update_inspection_reads_only_the_original_refusal_before_and_after_task_
         &mut port,
     )
     .unwrap();
-    core.handle(at(0), ContextInput::Adjudicate { task: task(1) }, &mut port)
-        .unwrap();
+    core.handle(
+        at(0),
+        ParticipationInput::Adjudicate { task: task(1) },
+        &mut port,
+    )
+    .unwrap();
     for fact in [
         PhysicalFact::LoaderExited,
         PhysicalFact::PreparationExited,
@@ -739,7 +748,7 @@ fn task_update_inspection_reads_only_the_original_refusal_before_and_after_task_
     ] {
         core.handle(
             at(0),
-            ContextInput::Physical {
+            ParticipationInput::Physical {
                 task: task(1),
                 fact,
             },
@@ -747,8 +756,12 @@ fn task_update_inspection_reads_only_the_original_refusal_before_and_after_task_
         )
         .unwrap();
     }
-    core.handle(at(0), ContextInput::Finish { task: task(1) }, &mut port)
-        .unwrap();
+    core.handle(
+        at(0),
+        ParticipationInput::Finish { task: task(1) },
+        &mut port,
+    )
+    .unwrap();
     inspect(
         &mut core,
         &mut port,
@@ -765,7 +778,7 @@ fn task_update_inspection_reads_only_the_original_refusal_before_and_after_task_
     );
     core.handle(
         at(0),
-        ContextInput::Physical {
+        ParticipationInput::Physical {
             task: task(1),
             fact: PhysicalFact::ResourcesConverged,
         },
@@ -773,7 +786,7 @@ fn task_update_inspection_reads_only_the_original_refusal_before_and_after_task_
     )
     .unwrap();
     let record = core.task(task(1)).unwrap();
-    let custody = ContextInput::TaskExecutionCustodyRetired {
+    let custody = ParticipationInput::TaskExecutionCustodyRetired {
         task: task(1),
         payload: record.payload,
         close_epoch: record.applied_close_generation,
@@ -783,10 +796,10 @@ fn task_update_inspection_reads_only_the_original_refusal_before_and_after_task_
         if core.decided_task(task(1)).is_some() {
             break;
         }
-        core.handle(at(0), ContextInput::NextInternal, &mut port)
+        core.handle(at(0), ParticipationInput::NextInternal, &mut port)
             .unwrap();
     }
-    assert_eq!(core.state(), QueryContextState::Active);
+    assert_eq!(core.state(), ParticipationState::Active);
     assert!(core.task(task(1)).is_none() && core.decided_task(task(1)).is_some());
     inspect(
         &mut core,
@@ -806,7 +819,7 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     loaded(&mut core, &mut port, 1);
     core.handle(
         at(0),
-        ContextInput::Proposal {
+        ParticipationInput::Proposal {
             task: task(1),
             proposal: proposal(TaskConclusion::Terminated(TerminationDetail::Canceled(
                 CancelReason::UpstreamNoLongerNeeded,
@@ -815,8 +828,12 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         &mut port,
     )
     .unwrap();
-    core.handle(at(0), ContextInput::Adjudicate { task: task(1) }, &mut port)
-        .unwrap();
+    core.handle(
+        at(0),
+        ParticipationInput::Adjudicate { task: task(1) },
+        &mut port,
+    )
+    .unwrap();
     for fact in [
         PhysicalFact::LoaderExited,
         PhysicalFact::PreparationExited,
@@ -826,7 +843,7 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     ] {
         core.handle(
             at(0),
-            ContextInput::Physical {
+            ParticipationInput::Physical {
                 task: task(1),
                 fact,
             },
@@ -834,14 +851,26 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         )
         .unwrap();
     }
-    core.handle(at(0), ContextInput::Finish { task: task(1) }, &mut port)
-        .unwrap();
-    core.apply_fixture(at(0), rpc(operation(6), ContextCommand::Quiesce), &mut port)
-        .unwrap();
-    core.handle(at(0), ContextInput::ContinueQuiesce, &mut port)
+    core.handle(
+        at(0),
+        ParticipationInput::Finish { task: task(1) },
+        &mut port,
+    )
+    .unwrap();
+    core.apply_fixture(
+        at(0),
+        rpc(operation(6), ParticipationCommand::Quiesce),
+        &mut port,
+    )
+    .unwrap();
+    core.handle(at(0), ParticipationInput::ContinueQuiesce, &mut port)
         .unwrap();
     let refused = core
-        .apply_fixture(at(0), rpc(operation(7), ContextCommand::Release), &mut port)
+        .apply_fixture(
+            at(0),
+            rpc(operation(7), ParticipationCommand::Release),
+            &mut port,
+        )
         .unwrap();
     let original = refused
         .requests
@@ -854,17 +883,17 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     );
     assert_eq!(
         original.body.as_ref(),
-        &ContextReplyBody::Release {
-            context: context(),
+        &ParticipationReplyBody::Release {
+            participation: participation(),
             release: novarocks_execution_contract::ReleaseOutcome::NotReady,
-            state: QueryContextState::Quiescing,
+            state: ParticipationState::Quiescing,
             termination_cause: None,
         }
     );
     let exited = core
         .handle(
             at(0),
-            ContextInput::Physical {
+            ParticipationInput::Physical {
                 task: task(1),
                 fact: PhysicalFact::ResourcesConverged,
             },
@@ -875,16 +904,20 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         exited
             .effects
             .iter()
-            .any(|e| matches!(e, ContextEffect::RetireTask { .. }))
+            .any(|e| matches!(e, ParticipationEffect::RetireTask { .. }))
     );
     let releasing = core
-        .apply_fixture(at(0), rpc(operation(7), ContextCommand::Release), &mut port)
+        .apply_fixture(
+            at(0),
+            rpc(operation(7), ParticipationCommand::Release),
+            &mut port,
+        )
         .unwrap();
     assert!(
         releasing
             .effects
             .iter()
-            .any(|e| matches!(e, ContextEffect::ReleaseHost { .. }))
+            .any(|e| matches!(e, ParticipationEffect::ReleaseHost { .. }))
     );
     assert!(
         releasing
@@ -894,9 +927,9 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         "the original Release reply still waits for actual HostReleased"
     );
     let released = core
-        .handle(at(0), ContextInput::HostReleased, &mut port)
+        .handle(at(0), ParticipationInput::HostReleased, &mut port)
         .unwrap();
-    assert_eq!(core.state(), QueryContextState::TerminalRetained);
+    assert_eq!(core.state(), ParticipationState::TerminalRetained);
     let original = released
         .requests
         .iter()
@@ -908,10 +941,10 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     );
     assert_eq!(
         original.body.as_ref(),
-        &ContextReplyBody::Release {
-            context: context(),
+        &ParticipationReplyBody::Release {
+            participation: participation(),
             release: novarocks_execution_contract::ReleaseOutcome::Released,
-            state: QueryContextState::TerminalRetained,
+            state: ParticipationState::TerminalRetained,
             termination_cause: None,
         }
     );
@@ -926,19 +959,19 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         OperationOutcome::Idempotent,
         OperationOutcome::Idempotent,
         OperationOutcome::Accepted,
-        OperationOutcome::ContextTerminalReceipt,
-        OperationOutcome::ContextTerminalReceipt,
+        OperationOutcome::ParticipationTerminalReceipt,
+        OperationOutcome::ParticipationTerminalReceipt,
         OperationOutcome::Accepted,
         OperationOutcome::Idempotent,
         OperationOutcome::Accepted,
-        OperationOutcome::ContextTerminalReceipt,
-        OperationOutcome::ContextTerminalReceipt,
-        OperationOutcome::ContextTerminalReceipt,
-        OperationOutcome::ContextTerminalReceipt,
-        OperationOutcome::ContextTerminalReceipt,
+        OperationOutcome::ParticipationTerminalReceipt,
+        OperationOutcome::ParticipationTerminalReceipt,
+        OperationOutcome::ParticipationTerminalReceipt,
+        OperationOutcome::ParticipationTerminalReceipt,
+        OperationOutcome::ParticipationTerminalReceipt,
     ];
     let mut bodies = Vec::new();
-    for (index, command) in terminal_context_commands().into_iter().enumerate() {
+    for (index, command) in terminal_participation_commands().into_iter().enumerate() {
         let step = core
             .apply_fixture(at(0), rpc(operation(100 + index as u8), command), &mut port)
             .unwrap();
@@ -952,7 +985,7 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     }
     core.handle(
         at(1),
-        ContextInput::TaskExecutionCustodyRetired {
+        ParticipationInput::TaskExecutionCustodyRetired {
             task: task(1),
             payload,
             close_epoch: task_epoch,
@@ -965,7 +998,7 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
             break;
         }
         let step = core
-            .handle(at(1), ContextInput::NextInternal, &mut port)
+            .handle(at(1), ParticipationInput::NextInternal, &mut port)
             .unwrap();
         assert!(step.charged_work() <= core.max_step_work());
     }
@@ -977,10 +1010,10 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     );
     assert!(
         !core.is_compact_retained(),
-        "Task custody does not prove original Context custody exit"
+        "Task custody does not prove original Participation custody exit"
     );
     let waiting_token = InputId::new(9_000_010).unwrap();
-    let waiting_read = RequestContext {
+    let waiting_read = RequestReplyTag {
         author: model_request_author(waiting_token),
         token: waiting_token,
         operation: operation(193),
@@ -990,9 +1023,9 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         .handle_request(
             at(1),
             waiting_read,
-            ContextCommand::AwaitTaskReadSeal {
+            ParticipationCommand::AwaitTaskReadSeal {
                 task: task(1),
-                command: novarocks_worker_protocol::context::TaskReadCommand::FinalInfo,
+                command: novarocks_worker_protocol::participation::TaskReadCommand::FinalInfo,
             },
             &mut port,
         )
@@ -1005,8 +1038,8 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     let origin = RetentionOrigin::new(retired_at, RequestHorizon::DEFAULT);
     core.handle(
         at(1),
-        ContextInput::ExecutionCustodyRetired {
-            context: context(),
+        ParticipationInput::ExecutionCustodyRetired {
+            participation: participation(),
             close_epoch: core.generation(),
             origin,
         },
@@ -1014,7 +1047,7 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     )
     .unwrap();
     assert!(core.is_compact_retained());
-    for (index, command) in terminal_context_commands().into_iter().enumerate() {
+    for (index, command) in terminal_participation_commands().into_iter().enumerate() {
         let step = core
             .apply_fixture(at(1), rpc(operation(120 + index as u8), command), &mut port)
             .unwrap();
@@ -1024,8 +1057,10 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
             RequestResult::Outcome(outcomes[index])
         );
         assert_eq!(step.requests[0].body, bodies[index]);
-        if let (ContextReplyBody::FinalInfo(original), ContextReplyBody::FinalInfo(same)) =
-            (bodies[index].as_ref(), step.requests[0].body.as_ref())
+        if let (
+            ParticipationReplyBody::FinalInfo(original),
+            ParticipationReplyBody::FinalInfo(same),
+        ) = (bodies[index].as_ref(), step.requests[0].body.as_ref())
         {
             assert!(
                 std::sync::Arc::ptr_eq(original, same),
@@ -1033,10 +1068,10 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
             );
         }
         if let (
-            ContextReplyBody::Quiesce {
+            ParticipationReplyBody::Quiesce {
                 receipt: original, ..
             },
-            ContextReplyBody::Quiesce { receipt: same, .. },
+            ParticipationReplyBody::Quiesce { receipt: same, .. },
         ) = (bodies[index].as_ref(), step.requests[0].body.as_ref())
         {
             assert!(
@@ -1047,7 +1082,7 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         assert!(step.charged_work() <= core.max_step_work());
     }
     let retained_token = InputId::new(9_000_011).unwrap();
-    let retained_read = RequestContext {
+    let retained_read = RequestReplyTag {
         author: model_request_author(retained_token),
         token: retained_token,
         operation: operation(194),
@@ -1057,11 +1092,12 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         .handle_request(
             at(1),
             retained_read,
-            ContextCommand::AwaitTaskReadSeal {
+            ParticipationCommand::AwaitTaskReadSeal {
                 task: task(1),
-                command: novarocks_worker_protocol::context::TaskReadCommand::DynamicFilters {
-                    acknowledged: None,
-                },
+                command:
+                    novarocks_worker_protocol::participation::TaskReadCommand::DynamicFilters {
+                        acknowledged: None,
+                    },
             },
             &mut port,
         )
@@ -1070,7 +1106,7 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     let resumed = core
         .handle(
             at(1),
-            ContextInput::ResumeTaskRead {
+            ParticipationInput::ResumeTaskRead {
                 request: retained_token,
                 task: task(1),
             },
@@ -1088,7 +1124,9 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         Some(at(2)),
         "compaction retains the original waiting R deadline"
     );
-    let timed_out = core.handle(at(2), ContextInput::Tick, &mut port).unwrap();
+    let timed_out = core
+        .handle(at(2), ParticipationInput::Tick, &mut port)
+        .unwrap();
     assert_eq!(timed_out.requests.len(), 1);
     assert_eq!(timed_out.requests[0].request, waiting_read);
     assert_eq!(
@@ -1098,7 +1136,7 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     let late = core
         .handle(
             at(2),
-            ContextInput::ResumeTaskRead {
+            ParticipationInput::ResumeTaskRead {
                 request: waiting_token,
                 task: task(1),
             },
@@ -1112,8 +1150,8 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     let duplicate = core
         .handle(
             at(2),
-            ContextInput::ExecutionCustodyRetired {
-                context: context(),
+            ParticipationInput::ExecutionCustodyRetired {
+                participation: participation(),
                 close_epoch: core.generation(),
                 origin,
             },
@@ -1124,34 +1162,36 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     assert_eq!(
         core.handle(
             at(2),
-            ContextInput::ExecutionCustodyRetired {
-                context: context(),
+            ParticipationInput::ExecutionCustodyRetired {
+                participation: participation(),
                 close_epoch: core.generation(),
                 origin: RetentionOrigin::new(at(2), RequestHorizon::DEFAULT),
             },
             &mut port,
         )
         .unwrap_err(),
-        novarocks_worker_protocol::context::CoreError::IllegalFact,
+        novarocks_worker_protocol::participation::CoreError::IllegalFact,
         "a different origin cannot restart the original retention horizon"
     );
     assert_eq!(core.next_deadline(), Some(at(121)));
     assert!(
-        core.handle(at(120), ContextInput::Tick, &mut port)
+        core.handle(at(120), ParticipationInput::Tick, &mut port)
             .unwrap()
             .effects
             .is_empty()
     );
-    let expired = core.handle(at(121), ContextInput::Tick, &mut port).unwrap();
+    let expired = core
+        .handle(at(121), ParticipationInput::Tick, &mut port)
+        .unwrap();
     assert_eq!(
         expired.effects,
-        vec![ContextEffect::Expired {
-            context: context(),
+        vec![ParticipationEffect::Expired {
+            participation: participation(),
             close_epoch: core.generation()
         }]
     );
     assert!(
-        core.handle(at(121), ContextInput::Tick, &mut port)
+        core.handle(at(121), ParticipationInput::Tick, &mut port)
             .unwrap()
             .effects
             .is_empty()
@@ -1159,7 +1199,7 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
     let gone = core
         .apply_fixture(
             at(121),
-            rpc(operation(150), ContextCommand::Release),
+            rpc(operation(150), ParticipationCommand::Release),
             &mut port,
         )
         .unwrap();
@@ -1169,48 +1209,48 @@ fn release_waits_for_each_physical_fact_and_for_actual_host_release() {
         OperationOutcome::Gone
     ));
 }
-fn terminal_context_commands() -> Vec<ContextCommand> {
+fn terminal_participation_commands() -> Vec<ParticipationCommand> {
     vec![
-        ContextCommand::Create {
+        ParticipationCommand::Create {
             task: task(1),
             payload: PayloadId(99),
         },
-        ContextCommand::InspectCreation { task: task(1) },
-        ContextCommand::Cancel {
+        ParticipationCommand::InspectCreation { task: task(1) },
+        ParticipationCommand::Cancel {
             task: task(1),
             reason: CancelReason::UpstreamNoLongerNeeded,
         },
-        ContextCommand::UpdateTask {
+        ParticipationCommand::UpdateTask {
             task: task(1),
             payload: PayloadId(99),
             updates: Vec::new(),
         },
-        ContextCommand::UpdateContext {
+        ParticipationCommand::UpdateParticipation {
             payload: PayloadId(99),
-            update: novarocks_worker_protocol::domain::ContextDomainInput::Filter {
+            update: novarocks_worker_protocol::domain::ParticipationDomainInput::Filter {
                 version: novarocks_execution_contract::DomainVersion::FIRST,
                 fingerprint: novarocks_execution_contract::ContentFingerprint::from_bytes([2; 16]),
             },
         },
-        ContextCommand::GetFinalInfo { task: task(1) },
-        ContextCommand::GetDynamicFilters {
+        ParticipationCommand::GetFinalInfo { task: task(1) },
+        ParticipationCommand::GetDynamicFilters {
             task: task(1),
             acknowledged: None,
         },
-        ContextCommand::Subscribe {
+        ParticipationCommand::Subscribe {
             generation: 7,
             position: novarocks_worker_protocol::observation::CoveredSubscriptionRequest::default(),
         },
-        ContextCommand::Renew {
+        ParticipationCommand::Renew {
             sequence: LeaseSequence::INITIAL,
             valid_for: LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
         },
-        ContextCommand::Quiesce,
-        ContextCommand::Abort {
+        ParticipationCommand::Quiesce,
+        ParticipationCommand::Abort {
             cause: AbortCause::QueryFailed,
         },
-        ContextCommand::Release,
-        ContextCommand::InspectTaskUpdate { task: task(1) },
+        ParticipationCommand::Release,
+        ParticipationCommand::InspectTaskUpdate { task: task(1) },
     ]
 }
 
@@ -1224,7 +1264,7 @@ fn current_input_time_expires_a_lease_before_a_delayed_timer_arrives() {
             at(30),
             rpc(
                 operation(7),
-                ContextCommand::Renew {
+                ParticipationCommand::Renew {
                     sequence: LeaseSequence::new(1),
                     valid_for: LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
                 },
@@ -1232,16 +1272,19 @@ fn current_input_time_expires_a_lease_before_a_delayed_timer_arrives() {
             &mut port,
         )
         .unwrap();
-    assert_eq!(core.state(), QueryContextState::Aborting);
+    assert_eq!(core.state(), ParticipationState::Aborting);
     assert_eq!(core.generation().get(), 2);
-    assert_context_acknowledgement(
+    assert_participation_acknowledgement(
         &step.requests,
         port.request_token(operation(7)),
         OperationOutcome::LeaseExpired,
-        QueryContextState::Aborting,
+        ParticipationState::Aborting,
         Some(AbortCause::LeaseExpired),
     );
-    assert!(core.handle(at(29), ContextInput::Tick, &mut port).is_err());
+    assert!(
+        core.handle(at(29), ParticipationInput::Tick, &mut port)
+            .is_err()
+    );
 }
 #[test]
 fn redemption_preserves_exact_receipts_until_explicit_close_and_replay_expiry() {
@@ -1249,9 +1292,9 @@ fn redemption_preserves_exact_receipts_until_explicit_close_and_replay_expiry() 
         AdmissionTicketAcquisitionRejection, AdmissionTicketRedemptionRejection,
     };
     let mut tickets = AdmissionCore::new(AdmissionTicketConfig::DEFAULT, [1; 8]);
-    let request = AcquireQueryContextAdmissionTicket::new(
+    let request = AcquireParticipationAdmissionTicket::new(
         operation(5),
-        context(),
+        participation(),
         LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
         NativeCompatibilityId::new([3; 32]),
         tickets.capability(),
@@ -1270,53 +1313,53 @@ fn redemption_preserves_exact_receipts_until_explicit_close_and_replay_expiry() 
         grant.receipt()
     );
     assert_eq!(
-        tickets.observe(id, context(), at(2)),
+        tickets.observe(id, participation(), at(2)),
         AdmissionTicketObservation::Issued {
             remaining: Duration::from_secs(3),
         }
     );
     assert_eq!(
-        tickets.observe(id, another_control_context(), at(2)),
-        AdmissionTicketObservation::ForeignContext
+        tickets.observe(id, another_control_participation(), at(2)),
+        AdmissionTicketObservation::ForeignParticipation
     );
     assert_eq!(
-        tickets.redeem(id, another_control_context(), at(2)),
-        Err(AdmissionTicketRedemptionRejection::ForeignContext)
+        tickets.redeem(id, another_control_participation(), at(2)),
+        Err(AdmissionTicketRedemptionRejection::ForeignParticipation)
     );
     assert!(matches!(
-        tickets.redeem(id, context(), at(2)),
+        tickets.redeem(id, participation(), at(2)),
         Ok(AdmissionTicketRedemption::Redeemed(_))
     ));
     assert_eq!(tickets.advance(at(8), 8), 0);
     assert_eq!(
-        tickets.observe(id, context(), at(8)),
+        tickets.observe(id, participation(), at(8)),
         AdmissionTicketObservation::Redeemed
     );
-    assert!(!tickets.revoke_unredeemed(context(), at(8)));
+    assert!(!tickets.revoke_unredeemed(participation(), at(8)));
     assert!(matches!(
-        tickets.redeem(id, context(), at(8)),
+        tickets.redeem(id, participation(), at(8)),
         Ok(AdmissionTicketRedemption::Replayed(receipt)) if receipt == grant.receipt()
     ));
-    assert!(tickets.close_context(context(), at(8)));
-    assert!(!tickets.close_context(context(), at(8)));
+    assert!(tickets.close_participation(participation(), at(8)));
+    assert!(!tickets.close_participation(participation(), at(8)));
     assert_eq!(
-        tickets.observe(id, context(), at(8)),
+        tickets.observe(id, participation(), at(8)),
         AdmissionTicketObservation::Closed
     );
     assert_eq!(
-        tickets.redeem(id, context(), at(127)),
+        tickets.redeem(id, participation(), at(127)),
         Err(AdmissionTicketRedemptionRejection::Closed)
     );
     assert_eq!(tickets.advance(at(127), 8), 0);
     assert_eq!(tickets.advance(at(128), 8), 1);
     assert_eq!(
-        tickets.observe(id, context(), at(128)),
+        tickets.observe(id, participation(), at(128)),
         AdmissionTicketObservation::Unknown
     );
 
-    let issued = AcquireQueryContextAdmissionTicket::new(
+    let issued = AcquireParticipationAdmissionTicket::new(
         operation(6),
-        context(),
+        participation(),
         LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
         request.native_compatibility_id(),
         tickets.capability(),
@@ -1324,11 +1367,11 @@ fn redemption_preserves_exact_receipts_until_explicit_close_and_replay_expiry() 
     let next_id = AdmissionTicketId::try_from_bytes([6; 16]).unwrap();
     tickets.acquire(issued, next_id, at(129)).unwrap();
     assert_eq!(
-        tickets.observe(next_id, context(), at(134)),
+        tickets.observe(next_id, participation(), at(134)),
         AdmissionTicketObservation::Expired
     );
     assert_eq!(
-        tickets.redeem(next_id, context(), at(134)),
+        tickets.redeem(next_id, participation(), at(134)),
         Err(AdmissionTicketRedemptionRejection::Expired)
     );
     assert_eq!(
@@ -1341,9 +1384,9 @@ fn redemption_preserves_exact_receipts_until_explicit_close_and_replay_expiry() 
         1,
         "only policy advancement commits expiration of the original grant"
     );
-    let oversized_validity = AcquireQueryContextAdmissionTicket::new(
+    let oversized_validity = AcquireParticipationAdmissionTicket::new(
         operation(7),
-        context(),
+        participation(),
         LeaseValidFor::new(Duration::from_secs(11)).unwrap(),
         request.native_compatibility_id(),
         tickets.capability(),
@@ -1364,43 +1407,43 @@ fn forgotten_admission_cannot_reissue_while_retained_replay_and_recent_capabilit
     let config =
         AdmissionTicketConfig::new(Duration::from_secs(10), Duration::from_secs(120)).unwrap();
     let mut tickets = AdmissionCore::new(config, [1; 8]);
-    let context_for = |query| {
-        QueryContextRef::new(
+    let participation_for = |query| {
+        ParticipationRef::new(
             QueryExecutionId::new(QueryId::new(query, query + 1), AttemptId::new(1).unwrap())
                 .unwrap(),
-            context().frontend_process_id(),
-            context().backend_process_id(),
+            participation().frontend_process_id(),
+            participation().backend_process_id(),
         )
     };
-    let request_for = |core: &AdmissionCore, ordinal, context, seconds| {
-        AcquireQueryContextAdmissionTicket::new(
+    let request_for = |core: &AdmissionCore, ordinal, participation, seconds| {
+        AcquireParticipationAdmissionTicket::new(
             operation(ordinal),
-            context,
+            participation,
             LeaseValidFor::new(Duration::from_secs(seconds)).unwrap(),
             NativeCompatibilityId::new([3; 32]),
             core.capability(),
         )
     };
-    let old = request_for(&tickets, 41, context_for(41), 1);
+    let old = request_for(&tickets, 41, participation_for(41), 1);
     let old_ticket = AdmissionTicketId::try_from_bytes([41; 16]).unwrap();
     tickets.acquire(old, old_ticket, at(0)).unwrap();
-    let retained = request_for(&tickets, 42, context_for(42), 10);
+    let retained = request_for(&tickets, 42, participation_for(42), 10);
     let retained_ticket = AdmissionTicketId::try_from_bytes([42; 16]).unwrap();
     let retained_receipt = tickets
         .acquire(retained, retained_ticket, at(0))
         .unwrap()
         .receipt();
     tickets
-        .redeem(retained_ticket, retained.context(), at(0))
+        .redeem(retained_ticket, retained.participation(), at(0))
         .unwrap();
-    let refused = request_for(&tickets, 43, retained.context(), 5);
+    let refused = request_for(&tickets, 43, retained.participation(), 5);
     assert_eq!(
         tickets.acquire(
             refused,
             AdmissionTicketId::try_from_bytes([43; 16]).unwrap(),
             at(0),
         ),
-        Err(Rejection::ContextAlreadyGranted)
+        Err(Rejection::ParticipationAlreadyGranted)
     );
     assert_eq!(tickets.advance(at(1), 1), 1);
     let original_inventory = tickets.retention_inventory();
@@ -1415,7 +1458,7 @@ fn forgotten_admission_cannot_reissue_while_retained_replay_and_recent_capabilit
             AdmissionTicketId::try_from_bytes([99; 16]).unwrap(),
             at(1),
         ),
-        Err(Rejection::ContextAlreadyGranted),
+        Err(Rejection::ParticipationAlreadyGranted),
         "later requests cannot replace the retained original refusal"
     );
 
@@ -1448,7 +1491,7 @@ fn forgotten_admission_cannot_reissue_while_retained_replay_and_recent_capabilit
     assert_eq!(tickets.retention_inventory().acquisition_decisions, 1);
     assert_eq!(tickets.retention_inventory().replay_decisions, 0);
     assert_eq!(
-        tickets.observe(old_ticket, old.context(), at(121)),
+        tickets.observe(old_ticket, old.participation(), at(121)),
         AdmissionTicketObservation::Unknown
     );
     assert_eq!(
@@ -1460,9 +1503,9 @@ fn forgotten_admission_cannot_reissue_while_retained_replay_and_recent_capabilit
         Err(Rejection::SealedEpoch),
         "forgotten original acquisition cannot obtain another ticket"
     );
-    let stale_new = AcquireQueryContextAdmissionTicket::new(
+    let stale_new = AcquireParticipationAdmissionTicket::new(
         operation(45),
-        context_for(45),
+        participation_for(45),
         old.valid_for(),
         old.native_compatibility_id(),
         old.admission_epoch_capability(),
@@ -1487,9 +1530,9 @@ fn forgotten_admission_cannot_reissue_while_retained_replay_and_recent_capabilit
         retained_receipt,
         "the same old capability still identifies its retained exact decision"
     );
-    let fresh = AcquireQueryContextAdmissionTicket::new(
+    let fresh = AcquireParticipationAdmissionTicket::new(
         operation(46),
-        context_for(46),
+        participation_for(46),
         old.valid_for(),
         old.native_compatibility_id(),
         recent_heartbeat,
@@ -1513,7 +1556,7 @@ fn forgotten_admission_cannot_reissue_while_retained_replay_and_recent_capabilit
         ),
         Err(Rejection::SealedEpoch)
     );
-    let replacement_request = request_for(&replacement, 48, context_for(48), 1);
+    let replacement_request = request_for(&replacement, 48, participation_for(48), 1);
     replacement
         .acquire(
             replacement_request,
@@ -1534,7 +1577,7 @@ fn status(version: u64) -> TaskStatus {
 }
 #[test]
 fn covered_selection_is_not_delivery_and_a_newer_selected_key_remains_owed() {
-    let mut source = ObservationSource::new(context(), 8, 2, 1024, 8192);
+    let mut source = ObservationSource::new(participation(), 8, 2, 1024, 8192);
     let id = SubscriptionId(1);
     source
         .publish(CoveredObservationFact::Status(status(1)), 100)
@@ -1597,7 +1640,7 @@ fn covered_selection_is_not_delivery_and_a_newer_selected_key_remains_owed() {
 
 #[test]
 fn catchup_freezes_initial_cut_before_incremental_validation_and_publication_fanout() {
-    let mut source = ObservationSource::new(context(), 8, 2, 1024, 8192);
+    let mut source = ObservationSource::new(participation(), 8, 2, 1024, 8192);
     source
         .publish(CoveredObservationFact::Status(status(1)), 100)
         .unwrap();
@@ -1654,7 +1697,7 @@ fn catchup_freezes_initial_cut_before_incremental_validation_and_publication_fan
 }
 #[test]
 fn publication_does_not_advance_a_subscriber_cut_before_bounded_fanout_visits_it() {
-    let mut source = ObservationSource::new(context(), 8, 2, 1024, 8192);
+    let mut source = ObservationSource::new(participation(), 8, 2, 1024, 8192);
     let a = SubscriptionId(1);
     let b = SubscriptionId(2);
     for id in [a, b] {
@@ -1688,7 +1731,7 @@ fn absolute_request_deadline_settles_only_reply_and_keeps_accepted_loader_owned(
     let mut core = core(8, 2);
     let mut port = Port::default();
     activate(&mut core, &mut port);
-    let request = RequestContext {
+    let request = RequestReplyTag {
         author: model_request_author(InputId::new(1).unwrap()),
         token: InputId::new(1).unwrap(),
         operation: operation(1),
@@ -1698,7 +1741,7 @@ fn absolute_request_deadline_settles_only_reply_and_keeps_accepted_loader_owned(
         .handle_request(
             at(0),
             request,
-            ContextCommand::Create {
+            ParticipationCommand::Create {
                 task: task(1),
                 payload: PayloadId(1),
             },
@@ -1708,25 +1751,27 @@ fn absolute_request_deadline_settles_only_reply_and_keeps_accepted_loader_owned(
     assert!(start.requests.is_empty());
     assert_eq!(core.next_deadline(), Some(at(2)));
     assert_eq!(port.calls.len(), 1);
-    let timeout = core.handle(at(2), ContextInput::Tick, &mut port).unwrap();
+    let timeout = core
+        .handle(at(2), ParticipationInput::Tick, &mut port)
+        .unwrap();
     assert_eq!(timeout.requests.len(), 1);
     assert_eq!(timeout.requests[0].request, request);
     assert_eq!(
         timeout.requests[0].result,
         RequestResult::TimeoutWhileAccepted
     );
-    assert_eq!(core.state(), QueryContextState::Active);
+    assert_eq!(core.state(), ParticipationState::Active);
     assert!(!core.task(task(1)).unwrap().loader_exited);
     assert!(
         !timeout
             .effects
             .iter()
-            .any(|effect| matches!(effect, ContextEffect::RetireTask { .. }))
+            .any(|effect| matches!(effect, ParticipationEffect::RetireTask { .. }))
     );
     let loaded = core
         .handle(
             at(3),
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task: task(1),
                 result: Ok(cost()),
             },
@@ -1747,14 +1792,14 @@ fn a_late_request_never_starts_work_and_same_operation_tokens_share_only_the_cre
     let mut core = core(8, 2);
     let mut port = Port::default();
     activate(&mut core, &mut port);
-    let command = || ContextCommand::Create {
+    let command = || ParticipationCommand::Create {
         task: task(1),
         payload: PayloadId(1),
     };
     let late = core
         .handle_request(
             at(1),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(1).unwrap()),
                 token: InputId::new(1).unwrap(),
                 operation: operation(1),
@@ -1772,7 +1817,7 @@ fn a_late_request_never_starts_work_and_same_operation_tokens_share_only_the_cre
     for token in 2..=3 {
         core.handle_request(
             at(1),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(token).unwrap()),
                 token: InputId::new(token).unwrap(),
                 operation: operation(1),
@@ -1787,7 +1832,7 @@ fn a_late_request_never_starts_work_and_same_operation_tokens_share_only_the_cre
     let ready = core
         .handle(
             at(2),
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task: task(1),
                 result: Ok(cost()),
             },
@@ -1797,7 +1842,7 @@ fn a_late_request_never_starts_work_and_same_operation_tokens_share_only_the_cre
     let more = core
         .handle(
             at(2),
-            ContextInput::ContinueReplies { task: task(1) },
+            ParticipationInput::ContinueReplies { task: task(1) },
             &mut port,
         )
         .unwrap();
@@ -1827,7 +1872,7 @@ fn a_late_request_never_starts_work_and_same_operation_tokens_share_only_the_cre
 
 #[test]
 fn preparation_publication_hold_defers_runtime_exit_without_requiring_the_normal_tail_to_exit() {
-    use novarocks_worker_protocol::context::PreparationExitRole;
+    use novarocks_worker_protocol::participation::PreparationExitOwner;
     let mut core = core(8, 2);
     let mut port = Port::default();
     activate(&mut core, &mut port);
@@ -1835,9 +1880,9 @@ fn preparation_publication_hold_defers_runtime_exit_without_requiring_the_normal
     loaded(&mut core, &mut port, 1);
     core.handle(
         at(0),
-        ContextInput::PreparationExitHold {
+        ParticipationInput::PreparationExitHold {
             task: task(1),
-            role: PreparationExitRole::Preparation,
+            preparation_exit_owner: PreparationExitOwner::Preparation,
             held: true,
         },
         &mut port,
@@ -1849,7 +1894,7 @@ fn preparation_publication_hold_defers_runtime_exit_without_requiring_the_normal
     ] {
         core.handle(
             at(1),
-            ContextInput::Physical {
+            ParticipationInput::Physical {
                 task: task(1),
                 fact,
             },
@@ -1863,9 +1908,9 @@ fn preparation_publication_hold_defers_runtime_exit_without_requiring_the_normal
     let exited = core
         .handle(
             at(2),
-            ContextInput::PreparationExitHold {
+            ParticipationInput::PreparationExitHold {
                 task: task(1),
-                role: PreparationExitRole::Preparation,
+                preparation_exit_owner: PreparationExitOwner::Preparation,
                 held: false,
             },
             &mut port,
@@ -1878,7 +1923,7 @@ fn preparation_publication_hold_defers_runtime_exit_without_requiring_the_normal
         exited
             .effects
             .iter()
-            .any(|effect| matches!(effect, ContextEffect::PublishTaskConvergence { .. }))
+            .any(|effect| matches!(effect, ParticipationEffect::PublishTaskConvergence { .. }))
     );
 }
 #[test]
@@ -1908,12 +1953,16 @@ fn preparation_failure_phase_is_chosen_at_the_installed_cut_by_the_core() {
         create(&mut core, &mut port, 1);
         loaded(&mut core, &mut port, 1);
         if installed {
-            core.handle(at(0), ContextInput::Installed { task: task(1) }, &mut port)
-                .unwrap();
+            core.handle(
+                at(0),
+                ParticipationInput::Installed { task: task(1) },
+                &mut port,
+            )
+            .unwrap();
         }
         core.handle(
             at(1),
-            ContextInput::PreparationBodyFailure {
+            ParticipationInput::PreparationBodyFailure {
                 task: task(1),
                 preparing: failure(TaskFailurePhase::Preparation),
                 executing: failure(TaskFailurePhase::Execution),
@@ -1946,14 +1995,14 @@ fn resources_converged_cannot_precede_the_actual_runtime_stop_receipt() {
     assert_eq!(
         core.handle(
             at(1),
-            ContextInput::Physical {
+            ParticipationInput::Physical {
                 task: task(1),
                 fact: PhysicalFact::ResourcesConverged
             },
             &mut port
         )
         .unwrap_err(),
-        novarocks_worker_protocol::context::CoreError::IllegalFact
+        novarocks_worker_protocol::participation::CoreError::IllegalFact
     );
     assert!(!core.task(task(1)).unwrap().resources_converged);
 }
@@ -1985,19 +2034,23 @@ fn a_losing_summary_releases_its_source_without_republishing_the_accepted_genera
     };
     core.handle(
         at(0),
-        ContextInput::Proposal {
+        ParticipationInput::Proposal {
             task: task(1),
             proposal: proposal(1),
         },
         &mut port,
     )
     .unwrap();
-    core.handle(at(0), ContextInput::Adjudicate { task: task(1) }, &mut port)
-        .unwrap();
+    core.handle(
+        at(0),
+        ParticipationInput::Adjudicate { task: task(1) },
+        &mut port,
+    )
+    .unwrap();
     let version = core.task(task(1)).unwrap().version;
     core.handle(
         at(1),
-        ContextInput::Proposal {
+        ParticipationInput::Proposal {
             task: task(1),
             proposal: proposal(2),
         },
@@ -2005,12 +2058,16 @@ fn a_losing_summary_releases_its_source_without_republishing_the_accepted_genera
     )
     .unwrap();
     let keep = core
-        .handle(at(1), ContextInput::Adjudicate { task: task(1) }, &mut port)
+        .handle(
+            at(1),
+            ParticipationInput::Adjudicate { task: task(1) },
+            &mut port,
+        )
         .unwrap();
     assert_eq!(core.task(task(1)).unwrap().version, version);
     assert_eq!(
         keep.effects,
-        vec![ContextEffect::DisposeSource {
+        vec![ParticipationEffect::DisposeSource {
             task: task(1),
             source: SourceId(2)
         }]
@@ -2048,7 +2105,7 @@ fn source_disposal_is_addressed_to_the_exact_task_when_occurrence_ordinals_match
             let step = core
                 .handle(
                     at(0),
-                    ContextInput::Summary {
+                    ParticipationInput::Summary {
                         task: task(u32::from(number)),
                         generation: Generation::new(1).unwrap(),
                         cut: None,
@@ -2060,14 +2117,14 @@ fn source_disposal_is_addressed_to_the_exact_task_when_occurrence_ordinals_match
             let disposed: Vec<_> = step
                 .effects
                 .into_iter()
-                .filter(|effect| matches!(effect, ContextEffect::DisposeSource { .. }))
+                .filter(|effect| matches!(effect, ParticipationEffect::DisposeSource { .. }))
                 .collect();
             if occurrence == 1 {
                 assert!(disposed.is_empty());
             } else {
                 assert_eq!(
                     disposed,
-                    vec![ContextEffect::DisposeSource {
+                    vec![ParticipationEffect::DisposeSource {
                         task: task(u32::from(number)),
                         source: SourceId(2),
                     }]
@@ -2083,13 +2140,13 @@ fn expired_create_replay_checks_the_entity_before_claiming_nothing_was_created()
     let mut port = Port::default();
     activate(&mut core, &mut port);
     create(&mut core, &mut port, 1);
-    let request = |token, operation_id| RequestContext {
+    let request = |token, operation_id| RequestReplyTag {
         author: model_request_author(InputId::new(token).unwrap()),
         token: InputId::new(token).unwrap(),
         operation: operation(operation_id),
         deadline: at(1),
     };
-    let command = || ContextCommand::Create {
+    let command = || ParticipationCommand::Create {
         task: task(1),
         payload: PayloadId(99),
     };
@@ -2102,7 +2159,7 @@ fn expired_create_replay_checks_the_entity_before_claiming_nothing_was_created()
     );
     core.handle(
         at(1),
-        ContextInput::Loaded {
+        ParticipationInput::Loaded {
             task: task(1),
             result: Ok(cost()),
         },
@@ -2131,7 +2188,7 @@ fn metric_deadline_coalesces_facts_without_expiring_the_application_lease_or_era
     let writer = TaskWriterFacts::empty().with_written(3, 99);
     core.handle(
         at(0),
-        ContextInput::Metrics {
+        ParticipationInput::Metrics {
             task: task(1),
             facts: TaskResourceFacts::empty().with_running_drivers(1),
             writer: Some(writer),
@@ -2142,7 +2199,7 @@ fn metric_deadline_coalesces_facts_without_expiring_the_application_lease_or_era
     let pending = core
         .handle(
             at(0),
-            ContextInput::Metrics {
+            ParticipationInput::Metrics {
                 task: task(1),
                 facts: TaskResourceFacts::empty().with_running_drivers(2),
                 writer: None,
@@ -2154,10 +2211,10 @@ fn metric_deadline_coalesces_facts_without_expiring_the_application_lease_or_era
     let metric_deadline = MonotonicInstant::from_origin(Duration::from_millis(100));
     assert_eq!(core.next_deadline(), Some(metric_deadline));
     let tick = core
-        .handle(metric_deadline, ContextInput::Tick, &mut port)
+        .handle(metric_deadline, ParticipationInput::Tick, &mut port)
         .unwrap();
-    assert_eq!(core.state(), QueryContextState::Active);
-    assert!(tick.effects.iter().any(|effect| matches!(effect, ContextEffect::PublishMetrics { facts, writer: Some(value), .. } if facts.running_drivers() == Some(2) && *value == writer)));
+    assert_eq!(core.state(), ParticipationState::Active);
+    assert!(tick.effects.iter().any(|effect| matches!(effect, ParticipationEffect::PublishMetrics { facts, writer: Some(value), .. } if facts.running_drivers() == Some(2) && *value == writer)));
 }
 #[test]
 fn pending_task_close_cuts_do_not_keep_an_unhandled_metric_timer_due() {
@@ -2170,7 +2227,7 @@ fn pending_task_close_cuts_do_not_keep_an_unhandled_metric_timer_due() {
     for running in [1, 2] {
         core.handle(
             at(0),
-            ContextInput::Metrics {
+            ParticipationInput::Metrics {
                 task: task(1),
                 facts: TaskResourceFacts::empty().with_running_drivers(running),
                 writer: None,
@@ -2179,7 +2236,7 @@ fn pending_task_close_cuts_do_not_keep_an_unhandled_metric_timer_due() {
         )
         .unwrap();
     }
-    let request = RequestContext {
+    let request = RequestReplyTag {
         author: model_request_author(InputId::new(77).unwrap()),
         token: InputId::new(77).unwrap(),
         operation: operation(8),
@@ -2188,20 +2245,20 @@ fn pending_task_close_cuts_do_not_keep_an_unhandled_metric_timer_due() {
     core.handle_request(
         at(0),
         request,
-        ContextCommand::Abort {
+        ParticipationCommand::Abort {
             cause: AbortCause::QueryFailed,
         },
         &mut port,
     )
     .unwrap();
     let scheduled = core
-        .handle(at(0), ContextInput::ContinueClose, &mut port)
+        .handle(at(0), ParticipationInput::ContinueClose, &mut port)
         .unwrap();
     let close_generation = scheduled
         .effects
         .iter()
         .find_map(|effect| match effect {
-            ContextEffect::ApplyTaskClose {
+            ParticipationEffect::ApplyTaskClose {
                 task: target,
                 generation,
                 ..
@@ -2211,11 +2268,13 @@ fn pending_task_close_cuts_do_not_keep_an_unhandled_metric_timer_due() {
         .expect("the original close cut is scheduled but has not been consumed");
     let due = MonotonicInstant::from_origin(Duration::from_millis(100));
     assert_eq!(core.next_deadline(), Some(due));
-    let tick = core.handle(due, ContextInput::Tick, &mut port).unwrap();
+    let tick = core
+        .handle(due, ParticipationInput::Tick, &mut port)
+        .unwrap();
     assert!(
         tick.effects
             .iter()
-            .any(|e| matches!(e, ContextEffect::PublishMetrics { .. }))
+            .any(|e| matches!(e, ParticipationEffect::PublishMetrics { .. }))
     );
     assert_eq!(
         core.next_deadline(),
@@ -2229,10 +2288,10 @@ fn pending_task_close_cuts_do_not_keep_an_unhandled_metric_timer_due() {
     let applied = core
         .handle(
             due,
-            ContextInput::ApplyTaskClose {
+            ParticipationInput::ApplyTaskClose {
                 task: task(1),
                 generation: close_generation,
-                intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                intent: novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
                     novarocks_execution_contract::AbortCause::QueryFailed,
                 ),
             },
@@ -2264,7 +2323,7 @@ fn final_info_freezes_the_real_status_writer_and_operator_facts() {
     let writer = TaskWriterFacts::empty().with_written(7, 1234);
     core.handle(
         at(0),
-        ContextInput::Metrics {
+        ParticipationInput::Metrics {
             task: task(1),
             facts: TaskResourceFacts::empty().with_cpu_time(Duration::from_millis(5)),
             writer: Some(writer),
@@ -2276,7 +2335,7 @@ fn final_info_freezes_the_real_status_writer_and_operator_facts() {
         vec![OperatorStatistics::new(1, SafeDetail::truncating("scan")).with_output_rows(7)];
     core.handle(
         at(0),
-        ContextInput::OperatorStatistics {
+        ParticipationInput::OperatorStatistics {
             task: task(1),
             statistics: statistics.clone(),
             truncated: true,
@@ -2288,7 +2347,7 @@ fn final_info_freezes_the_real_status_writer_and_operator_facts() {
         at(0),
         rpc(
             operation(2),
-            ContextCommand::Cancel {
+            ParticipationCommand::Cancel {
                 task: task(1),
                 reason: CancelReason::UpstreamNoLongerNeeded,
             },
@@ -2296,12 +2355,19 @@ fn final_info_freezes_the_real_status_writer_and_operator_facts() {
         &mut port,
     )
     .unwrap();
-    core.handle(at(0), ContextInput::Finish { task: task(1) }, &mut port)
-        .unwrap();
+    core.handle(
+        at(0),
+        ParticipationInput::Finish { task: task(1) },
+        &mut port,
+    )
+    .unwrap();
     let final_step = core
         .apply_fixture(
             at(0),
-            rpc(operation(3), ContextCommand::GetFinalInfo { task: task(1) }),
+            rpc(
+                operation(3),
+                ParticipationCommand::GetFinalInfo { task: task(1) },
+            ),
             &mut port,
         )
         .unwrap();
@@ -2310,7 +2376,7 @@ fn final_info_freezes_the_real_status_writer_and_operator_facts() {
         final_step.requests[0].request.token,
         port.request_token(operation(3))
     );
-    let ContextReplyBody::FinalInfo(info) = final_step.requests[0].body.as_ref() else {
+    let ParticipationReplyBody::FinalInfo(info) = final_step.requests[0].body.as_ref() else {
         panic!("frozen final information");
     };
     assert_eq!(info.final_status(), &core.task(task(1)).unwrap().published);
@@ -2338,12 +2404,12 @@ fn control_with_pending_limit(
     .unwrap()
 }
 fn semantics() -> novarocks_worker_protocol::control::EstablishSemanticFacts {
-    use novarocks_execution_contract::{ContentFingerprint, CredentialEpoch, CredentialLeaseId};
+    use novarocks_execution_contract::{ContentFingerprint, CredentialDomainId, CredentialEpoch};
     novarocks_worker_protocol::control::EstablishSemanticFacts {
         catalog: ContentFingerprint::from_bytes([1; 16]),
         shared_filter: ContentFingerprint::from_bytes([2; 16]),
         query_options: ContentFingerprint::from_bytes([3; 16]),
-        credential_lease: CredentialLeaseId::new(1),
+        credential_domain_id: CredentialDomainId::new(1),
         credential_epoch: CredentialEpoch::new(1).unwrap(),
         initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
     }
@@ -2354,9 +2420,9 @@ fn grant(
 ) -> AdmissionTicketId {
     use novarocks_worker_protocol::control::ControlInput;
     let ticket = AdmissionTicketId::try_from_bytes([4; 16]).unwrap();
-    let request = AcquireQueryContextAdmissionTicket::new(
+    let request = AcquireParticipationAdmissionTicket::new(
         operation(1),
-        context(),
+        participation(),
         LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
         NativeCompatibilityId::new([3; 32]),
         control.admission().capability(),
@@ -2367,11 +2433,11 @@ fn grant(
     ticket
 }
 
-fn another_control_context() -> QueryContextRef {
-    QueryContextRef::new(
+fn another_control_participation() -> ParticipationRef {
+    ParticipationRef::new(
         QueryExecutionId::new(QueryId::new(7301, 7302), AttemptId::new(1).unwrap()).unwrap(),
-        context().frontend_process_id(),
-        context().backend_process_id(),
+        participation().frontend_process_id(),
+        participation().backend_process_id(),
     )
 }
 fn active_establish_input(
@@ -2380,7 +2446,7 @@ fn active_establish_input(
 ) -> novarocks_worker_protocol::control::ControlInput {
     novarocks_worker_protocol::control::ControlInput::Establish {
         request: operation(2),
-        context: context(),
+        participation: participation(),
         ticket,
         payload: PayloadId(payload),
         semantics: semantics(),
@@ -2391,17 +2457,17 @@ fn active_establish_input(
 fn routed_establish_request(
     step: &novarocks_worker_protocol::control::ControlStep,
 ) -> (
-    QueryContextRef,
-    novarocks_worker_protocol::context::EstablishReplayRequest,
+    ParticipationRef,
+    novarocks_worker_protocol::participation::EstablishReplayRequest,
 ) {
     let routes: Vec<_> = step
         .effects
         .iter()
         .filter_map(|effect| match effect {
             novarocks_worker_protocol::control::ControlEffect::RouteEstablish {
-                context,
+                participation,
                 request,
-            } => Some((*context, *request)),
+            } => Some((*participation, *request)),
             _ => None,
         })
         .collect();
@@ -2420,14 +2486,14 @@ fn finish_routed_establish(
     route: &novarocks_worker_protocol::control::ControlStep,
     now: u64,
     decided_at: u64,
-    result: Result<OperationOutcome, novarocks_worker_protocol::context::DomainRefusal>,
+    result: Result<OperationOutcome, novarocks_worker_protocol::participation::DomainRefusal>,
 ) -> novarocks_worker_protocol::control::ControlStep {
-    let (context, request) = routed_establish_request(route);
+    let (participation, request) = routed_establish_request(route);
     let step = control
         .handle(
             at(now),
             novarocks_worker_protocol::control::ControlInput::RoutedEstablishFinished {
-                context,
+                participation,
                 request: request.request,
                 result,
                 acknowledgement: None,
@@ -2453,7 +2519,7 @@ impl ActiveControlFixture {
         let first = control
             .handle_request(
                 at(0),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(1).unwrap()),
                     token: InputId::new(1).unwrap(),
                     operation: operation(2),
@@ -2482,7 +2548,7 @@ impl ActiveControlFixture {
             .control
             .handle_request(
                 at(0),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(token).unwrap()),
                     token: InputId::new(token).unwrap(),
                     operation: operation(2),
@@ -2522,7 +2588,7 @@ impl ActiveControlFixture {
             .handle(
                 at(0),
                 novarocks_worker_protocol::control::ControlInput::EstablishmentDecided {
-                    context: context(),
+                    participation: participation(),
                     decision: active_establishment_decision(),
                 },
                 &mut self.port,
@@ -2588,7 +2654,8 @@ fn root_routes_existing_establish_fields_without_interpreting_entity_equality() 
                     novarocks_execution_contract::ContentFingerprint::from_bytes([9; 16])
             }
             4 => {
-                semantics.credential_lease = novarocks_execution_contract::CredentialLeaseId::new(2)
+                semantics.credential_domain_id =
+                    novarocks_execution_contract::CredentialDomainId::new(2)
             }
             5 => {
                 semantics.credential_epoch =
@@ -2615,7 +2682,7 @@ fn root_routes_existing_establish_fields_without_interpreting_entity_equality() 
         let (target, actual) = routed_establish_request(&routed);
         assert_eq!(actual.ticket, expected_ticket);
         assert_eq!(actual.semantics, expected_semantics);
-        assert_eq!(target, context());
+        assert_eq!(target, participation());
         assert_eq!(actual.payload, PayloadId(2));
         let completed = finish_routed_establish(
             &mut f.control,
@@ -2626,7 +2693,7 @@ fn root_routes_existing_establish_fields_without_interpreting_entity_equality() 
             Ok(if changed == 7 {
                 OperationOutcome::Idempotent
             } else {
-                OperationOutcome::ContextConflict
+                OperationOutcome::ParticipationConflict
             }),
         );
         assert_eq!(
@@ -2638,7 +2705,7 @@ fn root_routes_existing_establish_fields_without_interpreting_entity_equality() 
             RequestResult::Outcome(if changed == 7 {
                 OperationOutcome::Idempotent
             } else {
-                OperationOutcome::ContextConflict
+                OperationOutcome::ParticipationConflict
             })
         );
         f.finish_original();
@@ -2646,21 +2713,22 @@ fn root_routes_existing_establish_fields_without_interpreting_entity_equality() 
 }
 
 #[test]
-fn an_absent_other_context_cannot_reuse_a_live_creation_operation() {
+fn an_absent_other_participation_cannot_reuse_a_live_creation_operation() {
     use novarocks_worker_protocol::control::ControlInput;
     let mut f = ActiveControlFixture::new(8, 100);
     let mut candidate = active_establish_input(f.ticket, 2);
     let ControlInput::Establish {
-        context: target, ..
+        participation: target,
+        ..
     } = &mut candidate
     else {
         unreachable!()
     };
-    *target = another_control_context();
-    f.reject(2, 100, candidate, OperationOutcome::ContextConflict);
+    *target = another_control_participation();
+    f.reject(2, 100, candidate, OperationOutcome::ParticipationConflict);
     assert_eq!(
-        f.control.route(another_control_context()),
-        QueryContextState::Absent
+        f.control.route(another_control_participation()),
+        ParticipationState::Absent
     );
     f.finish_original();
 }
@@ -2669,9 +2737,9 @@ fn an_absent_other_context_cannot_reuse_a_live_creation_operation() {
 fn active_establish_cannot_be_joined_by_an_acquire_of_the_same_operation() {
     use novarocks_worker_protocol::control::ControlInput;
     let mut f = ActiveControlFixture::new(16, 100);
-    let request = AcquireQueryContextAdmissionTicket::new(
+    let request = AcquireParticipationAdmissionTicket::new(
         operation(2),
-        another_control_context(),
+        another_control_participation(),
         LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
         NativeCompatibilityId::new([3; 32]),
         f.control.admission().capability(),
@@ -2703,7 +2771,7 @@ fn same_operation_routed_requests_have_independent_results_and_settle_once() {
         RequestResult::Outcome(OperationOutcome::Accepted)
     );
     for (route, token, outcome) in [
-        (third, 3, OperationOutcome::ContextConflict),
+        (third, 3, OperationOutcome::ParticipationConflict),
         (second, 2, OperationOutcome::Idempotent),
     ] {
         let completed =
@@ -2740,7 +2808,7 @@ fn a_different_operation_routes_its_own_payload_instead_of_joining_the_directory
         .control
         .handle_request(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(2).unwrap()),
                 token: InputId::new(2).unwrap(),
                 operation: operation(3),
@@ -2757,12 +2825,12 @@ fn a_different_operation_routes_its_own_payload_instead_of_joining_the_directory
         &routed,
         0,
         0,
-        Ok(OperationOutcome::ContextConflict),
+        Ok(OperationOutcome::ParticipationConflict),
     );
     assert_eq!(completed.requests[0].request.operation, operation(3));
     assert_eq!(
         completed.requests[0].result,
-        RequestResult::Outcome(OperationOutcome::ContextConflict)
+        RequestResult::Outcome(OperationOutcome::ParticipationConflict)
     );
     f.finish_original();
 }
@@ -2801,13 +2869,13 @@ fn a_routed_conflict_does_not_take_or_replace_the_original_creation_success() {
         &route,
         0,
         0,
-        Ok(OperationOutcome::ContextConflict),
+        Ok(OperationOutcome::ParticipationConflict),
     );
     assert_eq!(conflict.requests.len(), 1);
     assert_eq!(conflict.requests[0].request.token, InputId::new(2).unwrap());
     assert_eq!(
         conflict.requests[0].result,
-        RequestResult::Outcome(OperationOutcome::ContextConflict)
+        RequestResult::Outcome(OperationOutcome::ParticipationConflict)
     );
     assert!(f.flush().requests.is_empty());
     assert_eq!(
@@ -2818,7 +2886,7 @@ fn a_routed_conflict_does_not_take_or_replace_the_original_creation_success() {
 
 #[test]
 fn existing_routes_share_the_original_r_inventory_and_overflow_is_owner_failure() {
-    use novarocks_worker_protocol::context::CoreError;
+    use novarocks_worker_protocol::participation::CoreError;
     for materialized in [false, true] {
         let mut f = ActiveControlFixture::new(1, 100);
         if materialized {
@@ -2833,7 +2901,7 @@ fn existing_routes_share_the_original_r_inventory_and_overflow_is_owner_failure(
             .control
             .handle_request(
                 at(0),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(4).unwrap()),
                     token: InputId::new(4).unwrap(),
                     operation: operation(2),
@@ -2862,10 +2930,13 @@ fn active_control_shape_dies_with_the_last_waiter_without_revoking_materializati
         expired.requests[0].result,
         RequestResult::TimeoutWhileAccepted
     );
-    assert_eq!(f.control.route(context()), QueryContextState::Establishing);
-    let request = AcquireQueryContextAdmissionTicket::new(
+    assert_eq!(
+        f.control.route(participation()),
+        ParticipationState::Establishing
+    );
+    let request = AcquireParticipationAdmissionTicket::new(
         operation(2),
-        another_control_context(),
+        another_control_participation(),
         LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
         NativeCompatibilityId::new([3; 32]),
         f.control.admission().capability(),
@@ -2874,7 +2945,7 @@ fn active_control_shape_dies_with_the_last_waiter_without_revoking_materializati
         .control
         .handle_request(
             at(1),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(2).unwrap()),
                 token: InputId::new(2).unwrap(),
                 operation: operation(2),
@@ -2902,7 +2973,7 @@ fn active_control_shape_dies_with_the_last_waiter_without_revoking_materializati
         .handle(
             at(1),
             ControlInput::EstablishmentDecided {
-                context: context(),
+                participation: participation(),
                 decision: active_establishment_decision(),
             },
             &mut f.port,
@@ -2919,9 +2990,9 @@ fn acquire_replay_uses_the_existing_identity_author_and_not_new_driver_coordinat
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
     let mut control = control();
     let mut port = Port::default();
-    let original = AcquireQueryContextAdmissionTicket::new(
+    let original = AcquireParticipationAdmissionTicket::new(
         operation(1),
-        context(),
+        participation(),
         LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
         NativeCompatibilityId::new([3; 32]),
         control.admission().capability(),
@@ -2932,9 +3003,9 @@ fn acquire_replay_uses_the_existing_identity_author_and_not_new_driver_coordinat
         if token == 2 {
             assert_ne!(capability, original.admission_epoch_capability());
         }
-        let request = AcquireQueryContextAdmissionTicket::new(
+        let request = AcquireParticipationAdmissionTicket::new(
             operation(1),
-            context(),
+            participation(),
             original.valid_for(),
             original.native_compatibility_id(),
             capability,
@@ -2942,7 +3013,7 @@ fn acquire_replay_uses_the_existing_identity_author_and_not_new_driver_coordinat
         let step = control
             .handle_request(
                 at(0),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(token).unwrap()),
                     token: InputId::new(token).unwrap(),
                     operation: operation(1),
@@ -2974,12 +3045,12 @@ fn acquire_replay_uses_the_existing_identity_author_and_not_new_driver_coordinat
         assert_eq!(step.requests[0].request.token, InputId::new(token).unwrap());
     }
     for changed in 0..3 {
-        let request = AcquireQueryContextAdmissionTicket::new(
+        let request = AcquireParticipationAdmissionTicket::new(
             operation(1),
             if changed == 0 {
-                another_control_context()
+                another_control_participation()
             } else {
-                context()
+                participation()
             },
             LeaseValidFor::new(Duration::from_secs(if changed == 1 { 4 } else { 5 })).unwrap(),
             NativeCompatibilityId::new([if changed == 2 { 9 } else { 3 }; 32]),
@@ -2988,7 +3059,7 @@ fn acquire_replay_uses_the_existing_identity_author_and_not_new_driver_coordinat
         let step = control
             .handle_request(
                 at(0),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(3 + changed).unwrap()),
                     token: InputId::new(3 + changed).unwrap(),
                     operation: operation(1),
@@ -3017,7 +3088,7 @@ fn a_new_establish_with_an_unknown_ticket_keeps_the_original_gone_verdict() {
     let step = control
         .handle_request(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(1).unwrap()),
                 token: InputId::new(1).unwrap(),
                 operation: operation(2),
@@ -3037,7 +3108,7 @@ fn a_new_establish_with_an_unknown_ticket_keeps_the_original_gone_verdict() {
         effect,
         novarocks_worker_protocol::control::ControlEffect::Materialize { .. }
     )));
-    assert_eq!(control.route(context()), QueryContextState::Absent);
+    assert_eq!(control.route(participation()), ParticipationState::Absent);
     assert!(port.calls.is_empty());
     let no_waiter = control
         .handle(
@@ -3051,18 +3122,20 @@ fn a_new_establish_with_an_unknown_ticket_keeps_the_original_gone_verdict() {
     assert!(no_waiter.requests.is_empty());
 }
 
-fn establishment_decision(step: &ContextStep) -> (Generation, ContextEstablishmentDecision) {
-    assert!(step.charged_work() <= ContextCore::MAX_BODY_WORK);
+fn establishment_decision(
+    step: &ParticipationStep,
+) -> (Generation, ParticipationEstablishmentDecision) {
+    assert!(step.charged_work() <= ParticipationCore::MAX_BODY_WORK);
     let decisions: Vec<_> = step
         .effects
         .iter()
         .filter_map(|effect| match effect {
-            ContextEffect::EstablishmentDecided {
-                context: identity,
+            ParticipationEffect::EstablishmentDecided {
+                participation: identity,
                 close_epoch,
                 decision,
             } => {
-                assert_eq!(*identity, context());
+                assert_eq!(*identity, participation());
                 Some((*close_epoch, decision.clone()))
             }
             _ => None,
@@ -3076,19 +3149,19 @@ trait EstablishmentContract {
     type Shape: std::fmt::Debug + PartialEq;
     fn contract(self) -> Self::Shape;
 }
-impl EstablishmentContract for ContextEstablishmentDecision {
+impl EstablishmentContract for ParticipationEstablishmentDecision {
     type Shape = (
-        QueryContextState,
-        Result<OperationOutcome, novarocks_worker_protocol::context::DomainRefusal>,
+        ParticipationState,
+        Result<OperationOutcome, novarocks_worker_protocol::participation::DomainRefusal>,
     );
     fn contract(self) -> Self::Shape {
         (self.state, self.outcome)
     }
 }
-impl EstablishmentContract for (Generation, ContextEstablishmentDecision) {
+impl EstablishmentContract for (Generation, ParticipationEstablishmentDecision) {
     type Shape = (
         Generation,
-        <ContextEstablishmentDecision as EstablishmentContract>::Shape,
+        <ParticipationEstablishmentDecision as EstablishmentContract>::Shape,
     );
     fn contract(self) -> Self::Shape {
         (self.0, self.1.contract())
@@ -3098,13 +3171,13 @@ fn assert_establishment_contract<T: EstablishmentContract>(actual: T, expected: 
     assert_eq!(actual.contract(), expected.contract());
 }
 
-fn active_establishment_decision() -> ContextEstablishmentDecision {
+fn active_establishment_decision() -> ParticipationEstablishmentDecision {
     let mut original = core(1, 1);
     let step = original
         .handle(
             at(0),
-            ContextInput::MaterializationFinished {
-                result: Ok(ContextMaterialized {
+            ParticipationInput::MaterializationFinished {
+                result: Ok(ParticipationMaterialized {
                     initial_credential_resource: 101,
                 }),
             },
@@ -3115,29 +3188,29 @@ fn active_establishment_decision() -> ContextEstablishmentDecision {
 }
 fn active_decision_from_original_materialization(
     step: &novarocks_worker_protocol::control::ControlStep,
-) -> (QueryContextRef, ContextEstablishmentDecision) {
+) -> (ParticipationRef, ParticipationEstablishmentDecision) {
     use novarocks_worker_protocol::control::ControlEffect;
     let mut original = step.effects.iter().filter_map(|effect| match effect {
         ControlEffect::Materialize {
-            context,
+            participation,
             generation,
             establishment,
             ..
-        } => Some((*context, *generation, *establishment)),
+        } => Some((*participation, *generation, *establishment)),
         _ => None,
     });
     let (identity, generation, establishment) =
         original.next().expect("the original Materialize handoff");
     assert!(
         original.next().is_none(),
-        "one Context per original handoff"
+        "one Participation per original handoff"
     );
     let mut core = core_from_original_establishment(identity, generation, establishment, 1, 1);
     let completed = core
         .handle(
             at(0),
-            ContextInput::MaterializationFinished {
-                result: Ok(ContextMaterialized {
+            ParticipationInput::MaterializationFinished {
+                result: Ok(ParticipationMaterialized {
                     initial_credential_resource: 101,
                 }),
             },
@@ -3145,25 +3218,27 @@ fn active_decision_from_original_materialization(
         )
         .unwrap();
     let mut decisions = completed.effects.iter().filter_map(|effect| match effect {
-        ContextEffect::EstablishmentDecided {
-            context, decision, ..
+        ParticipationEffect::EstablishmentDecided {
+            participation,
+            decision,
+            ..
         } => {
-            assert_eq!(*context, identity);
+            assert_eq!(*participation, identity);
             Some(decision.clone())
         }
         _ => None,
     });
     let decision = decisions
         .next()
-        .expect("the same original Context decided materialization");
+        .expect("the same original Participation decided materialization");
     assert!(decisions.next().is_none());
     (identity, decision)
 }
 fn closed_establishment_decision(
-    state: QueryContextState,
+    state: ParticipationState,
     outcome: OperationOutcome,
-) -> ContextEstablishmentDecision {
-    ContextEstablishmentDecision {
+) -> ParticipationEstablishmentDecision {
+    ParticipationEstablishmentDecision {
         state,
         outcome: Ok(outcome),
         acknowledgement: None,
@@ -3172,13 +3247,13 @@ fn closed_establishment_decision(
 }
 
 #[test]
-fn materialize_preserves_the_complete_original_establishment_for_the_context_core() {
-    use novarocks_execution_contract::{ContentFingerprint, CredentialEpoch, CredentialLeaseId};
+fn materialize_preserves_the_complete_original_establishment_for_the_participation_core() {
+    use novarocks_execution_contract::{ContentFingerprint, CredentialDomainId, CredentialEpoch};
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
     let mut control = control();
     let mut port = Port::default();
-    let ticket = selector_grant(&mut control, &mut port, context(), 71, 5);
-    let original = ContextEstablishment {
+    let ticket = selector_grant(&mut control, &mut port, participation(), 71, 5);
+    let original = ParticipationEstablishment {
         operation: operation(72),
         ticket,
         payload: PayloadId(901),
@@ -3186,7 +3261,7 @@ fn materialize_preserves_the_complete_original_establishment_for_the_context_cor
             catalog: ContentFingerprint::from_bytes([41; 16]),
             shared_filter: ContentFingerprint::from_bytes([42; 16]),
             query_options: ContentFingerprint::from_bytes([43; 16]),
-            credential_lease: CredentialLeaseId::new(44),
+            credential_domain_id: CredentialDomainId::new(44),
             credential_epoch: CredentialEpoch::new(45).unwrap(),
             initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(20)).unwrap(),
         },
@@ -3197,7 +3272,7 @@ fn materialize_preserves_the_complete_original_establishment_for_the_context_cor
             at(2),
             ControlInput::Establish {
                 request: original.operation,
-                context: context(),
+                participation: participation(),
                 ticket: original.ticket,
                 payload: original.payload,
                 semantics: original.semantics,
@@ -3212,50 +3287,50 @@ fn materialize_preserves_the_complete_original_establishment_for_the_context_cor
         .iter()
         .filter_map(|effect| match effect {
             ControlEffect::Materialize {
-                context,
+                participation,
                 establishment,
                 generation,
                 ..
-            } => Some((*context, *establishment, *generation)),
+            } => Some((*participation, *establishment, *generation)),
             _ => None,
         })
         .collect();
     assert_eq!(
         materializations,
-        vec![(context(), original, Generation::new(1).unwrap())]
+        vec![(participation(), original, Generation::new(1).unwrap())]
     );
     let (identity, establishment, generation) = materializations[0];
-    let mut context_core = core_with_establishment(establishment, 1, 1);
-    assert_eq!(context_core.identity(), identity);
-    assert_eq!(context_core.generation(), generation);
-    assert_eq!(context_core.establishment(), original);
-    assert_eq!(context_core.next_deadline(), Some(at(22)));
+    let mut participation_core = core_with_establishment(establishment, 1, 1);
+    assert_eq!(participation_core.identity(), identity);
+    assert_eq!(participation_core.generation(), generation);
+    assert_eq!(participation_core.establishment(), original);
+    assert_eq!(participation_core.next_deadline(), Some(at(22)));
     assert_eq!(
-        context_core
-            .handle(at(1), ContextInput::Tick, &mut port)
+        participation_core
+            .handle(at(1), ParticipationInput::Tick, &mut port)
             .unwrap_err(),
-        novarocks_worker_protocol::context::CoreError::TimeRegressed
+        novarocks_worker_protocol::participation::CoreError::TimeRegressed
     );
-    let finished = context_core
+    let finished = participation_core
         .handle(
             at(4),
-            ContextInput::MaterializationFinished {
-                result: Ok(ContextMaterialized {
+            ParticipationInput::MaterializationFinished {
+                result: Ok(ParticipationMaterialized {
                     initial_credential_resource: 101,
                 }),
             },
             &mut port,
         )
         .unwrap();
-    assert!(finished.charged_work() <= context_core.max_step_work());
-    assert_eq!(context_core.state(), QueryContextState::Active);
-    assert_eq!(context_core.establishment(), original);
+    assert!(finished.charged_work() <= participation_core.max_step_work());
+    assert_eq!(participation_core.state(), ParticipationState::Active);
+    assert_eq!(participation_core.establishment(), original);
 }
 
 #[test]
-fn matching_context_and_generation_do_not_replace_the_original_establish_header() {
-    use novarocks_execution_contract::{ContentFingerprint, CredentialEpoch, CredentialLeaseId};
-    let original = ContextEstablishment {
+fn matching_participation_and_generation_do_not_replace_the_original_establish_header() {
+    use novarocks_execution_contract::{ContentFingerprint, CredentialDomainId, CredentialEpoch};
+    let original = ParticipationEstablishment {
         operation: operation(2),
         ticket: AdmissionTicketId::try_from_bytes([4; 16]).unwrap(),
         payload: PayloadId(1),
@@ -3274,7 +3349,7 @@ fn matching_context_and_generation_do_not_replace_the_original_establish_header(
             3 => candidate.semantics.catalog = ContentFingerprint::from_bytes([9; 16]),
             4 => candidate.semantics.shared_filter = ContentFingerprint::from_bytes([9; 16]),
             5 => candidate.semantics.query_options = ContentFingerprint::from_bytes([9; 16]),
-            6 => candidate.semantics.credential_lease = CredentialLeaseId::new(2),
+            6 => candidate.semantics.credential_domain_id = CredentialDomainId::new(2),
             7 => candidate.semantics.credential_epoch = CredentialEpoch::new(2).unwrap(),
             8 => {
                 candidate.semantics.initial_lease_valid_for =
@@ -3307,7 +3382,7 @@ fn materialize_carries_the_winning_step_time_without_resetting_the_initial_lease
             at(2),
             ControlInput::Establish {
                 request: operation(2),
-                context: context(),
+                participation: participation(),
                 ticket,
                 payload: PayloadId(1),
                 semantics: semantics(),
@@ -3328,17 +3403,17 @@ fn materialize_carries_the_winning_step_time_without_resetting_the_initial_lease
     assert_eq!(establishment.elected_at, at(2));
     // The first observed driver input can be delayed; construction has no
     // independent clock or lease argument that could move the origin.
-    let mut context_core = core_with_establishment(establishment, 1, 1);
-    let delayed = context_core
-        .handle(at(19), ContextInput::Tick, &mut port)
+    let mut participation_core = core_with_establishment(establishment, 1, 1);
+    let delayed = participation_core
+        .handle(at(19), ParticipationInput::Tick, &mut port)
         .unwrap();
-    assert!(delayed.charged_work() <= context_core.max_step_work());
-    assert_eq!(context_core.next_deadline(), Some(at(32)));
-    let established = context_core
+    assert!(delayed.charged_work() <= participation_core.max_step_work());
+    assert_eq!(participation_core.next_deadline(), Some(at(32)));
+    let established = participation_core
         .handle(
             at(31),
-            ContextInput::MaterializationFinished {
-                result: Ok(ContextMaterialized {
+            ParticipationInput::MaterializationFinished {
+                result: Ok(ParticipationMaterialized {
                     initial_credential_resource: 101,
                 }),
             },
@@ -3349,12 +3424,12 @@ fn materialize_carries_the_winning_step_time_without_resetting_the_initial_lease
         establishment_decision(&established),
         (Generation::new(1).unwrap(), active_establishment_decision()),
     );
-    assert_eq!(context_core.next_deadline(), Some(at(32)));
-    let duplicate = context_core
+    assert_eq!(participation_core.next_deadline(), Some(at(32)));
+    let duplicate = participation_core
         .handle(
             at(31),
-            ContextInput::MaterializationFinished {
-                result: Ok(ContextMaterialized {
+            ParticipationInput::MaterializationFinished {
+                result: Ok(ParticipationMaterialized {
                     initial_credential_resource: 101,
                 }),
             },
@@ -3365,12 +3440,12 @@ fn materialize_carries_the_winning_step_time_without_resetting_the_initial_lease
         establishment_decision(&duplicate),
         establishment_decision(&established)
     );
-    assert_eq!(context_core.next_deadline(), Some(at(32)));
-    let expired = context_core
+    assert_eq!(participation_core.next_deadline(), Some(at(32)));
+    let expired = participation_core
         .handle(
             at(32),
-            ContextInput::MaterializationFinished {
-                result: Ok(ContextMaterialized {
+            ParticipationInput::MaterializationFinished {
+                result: Ok(ParticipationMaterialized {
                     initial_credential_resource: 101,
                 }),
             },
@@ -3382,23 +3457,23 @@ fn materialize_carries_the_winning_step_time_without_resetting_the_initial_lease
         (
             Generation::new(2).unwrap(),
             closed_establishment_decision(
-                QueryContextState::Aborting,
+                ParticipationState::Aborting,
                 OperationOutcome::LeaseExpired,
             ),
         ),
     );
-    assert_eq!(context_core.state(), QueryContextState::Aborting);
+    assert_eq!(participation_core.state(), ParticipationState::Aborting);
     assert!(
         expired
             .effects
             .iter()
-            .any(|effect| matches!(effect, ContextEffect::CloseExternalAdmission { .. }))
+            .any(|effect| matches!(effect, ParticipationEffect::CloseExternalAdmission { .. }))
     );
     assert!(!expired.effects.iter().any(|effect| matches!(
         effect,
-        ContextEffect::EstablishmentDecided {
-            decision: ContextEstablishmentDecision {
-                state: QueryContextState::Active,
+        ParticipationEffect::EstablishmentDecided {
+            decision: ParticipationEstablishmentDecision {
+                state: ParticipationState::Active,
                 ..
             },
             ..
@@ -3408,14 +3483,14 @@ fn materialize_carries_the_winning_step_time_without_resetting_the_initial_lease
 
 #[test]
 fn a_late_first_establishment_reports_expiry_and_cannot_reopen_on_repetition() {
-    let mut context_core = core_with_initial_lease(1, 1, at(2));
+    let mut participation_core = core_with_initial_lease(1, 1, at(2));
     let mut port = Port::default();
     for now in [at(32), at(33)] {
-        let closed = context_core
+        let closed = participation_core
             .handle(
                 now,
-                ContextInput::MaterializationFinished {
-                    result: Ok(ContextMaterialized {
+                ParticipationInput::MaterializationFinished {
+                    result: Ok(ParticipationMaterialized {
                         initial_credential_resource: 101,
                     }),
                 },
@@ -3427,39 +3502,39 @@ fn a_late_first_establishment_reports_expiry_and_cannot_reopen_on_repetition() {
             (
                 Generation::new(2).unwrap(),
                 closed_establishment_decision(
-                    QueryContextState::Aborting,
+                    ParticipationState::Aborting,
                     OperationOutcome::LeaseExpired,
                 ),
             ),
         );
-        assert_eq!(context_core.state(), QueryContextState::Aborting);
+        assert_eq!(participation_core.state(), ParticipationState::Aborting);
     }
     assert!(port.calls.is_empty());
 }
 
 #[test]
 fn an_abort_before_establishment_keeps_its_original_closed_outcome() {
-    let mut context_core = core(1, 1);
+    let mut participation_core = core(1, 1);
     let mut port = Port::default();
-    let aborted = context_core
+    let aborted = participation_core
         .apply_fixture(
             at(1),
             rpc(
                 operation(2),
-                ContextCommand::Abort {
+                ParticipationCommand::Abort {
                     cause: AbortCause::QueryFailed,
                 },
             ),
             &mut port,
         )
         .unwrap();
-    assert!(aborted.charged_work() <= ContextCore::MAX_BODY_WORK);
+    assert!(aborted.charged_work() <= ParticipationCore::MAX_BODY_WORK);
     for now in [at(1), at(31)] {
-        let closed = context_core
+        let closed = participation_core
             .handle(
                 now,
-                ContextInput::MaterializationFinished {
-                    result: Ok(ContextMaterialized {
+                ParticipationInput::MaterializationFinished {
+                    result: Ok(ParticipationMaterialized {
                         initial_credential_resource: 101,
                     }),
                 },
@@ -3471,52 +3546,60 @@ fn an_abort_before_establishment_keeps_its_original_closed_outcome() {
             (
                 Generation::new(2).unwrap(),
                 closed_establishment_decision(
-                    QueryContextState::Aborting,
-                    OperationOutcome::ContextTerminalReceipt,
+                    ParticipationState::Aborting,
+                    OperationOutcome::ParticipationTerminalReceipt,
                 ),
             ),
         );
-        assert_eq!(context_core.state(), QueryContextState::Aborting);
+        assert_eq!(participation_core.state(), ParticipationState::Aborting);
     }
 }
 
 #[test]
 fn quiesce_during_materialization_fences_late_establishment_and_settles_each_actual_token() {
-    let mut context_core = core(1, 1);
+    let mut participation_core = core(1, 1);
     let mut port = Port::default();
-    let quiesce = context_core
-        .apply_fixture(at(1), rpc(operation(2), ContextCommand::Quiesce), &mut port)
+    let quiesce = participation_core
+        .apply_fixture(
+            at(1),
+            rpc(operation(2), ParticipationCommand::Quiesce),
+            &mut port,
+        )
         .unwrap();
     let first_token = port.request_token(operation(2));
-    assert!(quiesce.charged_work() <= ContextCore::MAX_BODY_WORK);
-    assert_eq!(context_core.state(), QueryContextState::Quiescing);
+    assert!(quiesce.charged_work() <= ParticipationCore::MAX_BODY_WORK);
+    assert_eq!(participation_core.state(), ParticipationState::Quiescing);
     assert!(
         quiesce
             .effects
             .iter()
-            .any(|effect| matches!(effect, ContextEffect::CloseExternalAdmission { .. }))
+            .any(|effect| matches!(effect, ParticipationEffect::CloseExternalAdmission { .. }))
     );
     assert!(
         quiesce
             .effects
             .iter()
-            .any(|effect| matches!(effect, ContextEffect::ContinueQuiesce))
+            .any(|effect| matches!(effect, ParticipationEffect::ContinueQuiesce))
     );
     assert!(quiesce.requests.is_empty());
-    let waiting = context_core
-        .apply_fixture(at(1), rpc(operation(2), ContextCommand::Quiesce), &mut port)
+    let waiting = participation_core
+        .apply_fixture(
+            at(1),
+            rpc(operation(2), ParticipationCommand::Quiesce),
+            &mut port,
+        )
         .unwrap();
     let second_token = port.request_token(operation(2));
     assert_ne!(first_token, second_token);
-    assert!(waiting.charged_work() <= ContextCore::MAX_BODY_WORK);
+    assert!(waiting.charged_work() <= ParticipationCore::MAX_BODY_WORK);
     assert!(waiting.requests.is_empty());
     assert!(waiting.requests.is_empty());
     for now in [at(1), at(2)] {
-        let late = context_core
+        let late = participation_core
             .handle(
                 now,
-                ContextInput::MaterializationFinished {
-                    result: Ok(ContextMaterialized {
+                ParticipationInput::MaterializationFinished {
+                    result: Ok(ParticipationMaterialized {
                         initial_credential_resource: 101,
                     }),
                 },
@@ -3528,8 +3611,8 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
             (
                 Generation::new(1).unwrap(),
                 closed_establishment_decision(
-                    QueryContextState::Quiescing,
-                    OperationOutcome::ContextTerminalReceipt,
+                    ParticipationState::Quiescing,
+                    OperationOutcome::ParticipationTerminalReceipt,
                 ),
             ),
         );
@@ -3537,14 +3620,14 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
             !late
                 .effects
                 .iter()
-                .any(|effect| matches!(effect, ContextEffect::ReleaseHost { .. }))
+                .any(|effect| matches!(effect, ParticipationEffect::ReleaseHost { .. }))
         );
     }
     // One entity scan runs once; each continuation settles at most one actual request.
-    let completed = context_core
-        .handle(at(2), ContextInput::ContinueQuiesce, &mut port)
+    let completed = participation_core
+        .handle(at(2), ParticipationInput::ContinueQuiesce, &mut port)
         .unwrap();
-    assert!(completed.charged_work() <= ContextCore::MAX_BODY_WORK);
+    assert!(completed.charged_work() <= ParticipationCore::MAX_BODY_WORK);
     assert_eq!(completed.requests.len(), 1);
     assert_eq!(completed.requests[0].request.token, first_token);
     assert_eq!(
@@ -3555,7 +3638,7 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
         .requests
         .iter()
         .find_map(|reply| match reply.body.as_ref() {
-            ContextReplyBody::Quiesce { receipt, outcome }
+            ParticipationReplyBody::Quiesce { receipt, outcome }
                 if reply.request.token == first_token
                     && RequestResult::Outcome(*outcome) == reply.result =>
             {
@@ -3564,10 +3647,10 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
             _ => None,
         })
         .expect("the first request retains its complete neutral fence receipt");
-    let idempotent = context_core
-        .handle(at(2), ContextInput::ContinueQuiesce, &mut port)
+    let idempotent = participation_core
+        .handle(at(2), ParticipationInput::ContinueQuiesce, &mut port)
         .unwrap();
-    assert!(idempotent.charged_work() <= ContextCore::MAX_BODY_WORK);
+    assert!(idempotent.charged_work() <= ParticipationCore::MAX_BODY_WORK);
     assert_eq!(idempotent.requests.len(), 1);
     assert_eq!(idempotent.requests[0].request.token, second_token);
     assert_eq!(
@@ -3578,7 +3661,7 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
         .requests
         .iter()
         .find_map(|reply| match reply.body.as_ref() {
-            ContextReplyBody::Quiesce { receipt, outcome }
+            ParticipationReplyBody::Quiesce { receipt, outcome }
                 if reply.request.token == second_token
                     && RequestResult::Outcome(*outcome) == reply.result =>
             {
@@ -3588,7 +3671,7 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
         })
         .expect("a pending second token needs no host RPC replay");
     assert!(std::sync::Arc::ptr_eq(&first_receipt, &second_receipt));
-    assert_eq!(first_receipt.state(), QueryContextState::Quiescing);
+    assert_eq!(first_receipt.state(), ParticipationState::Quiescing);
     assert_eq!(completed.requests[0].request.operation, operation(2));
     assert_eq!(idempotent.requests[0].request.operation, operation(2));
     for step in [&quiesce, &waiting, &completed, &idempotent] {
@@ -3596,19 +3679,19 @@ fn quiesce_during_materialization_fences_late_establishment_and_settles_each_act
             !step
                 .effects
                 .iter()
-                .any(|effect| matches!(effect, ContextEffect::ReleaseHost { .. }))
+                .any(|effect| matches!(effect, ParticipationEffect::ReleaseHost { .. }))
         );
     }
-    assert_eq!(context_core.state(), QueryContextState::Quiescing);
+    assert_eq!(participation_core.state(), ParticipationState::Quiescing);
     assert!(port.calls.is_empty());
 }
 
 #[test]
-fn a_same_time_frontend_fence_defeats_either_context_establishment_delivery_order() {
+fn a_same_time_frontend_fence_defeats_either_participation_establishment_delivery_order() {
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
     for close_first in [false, true] {
         let mut control = control();
-        let mut context_core = core(1, 1);
+        let mut participation_core = core(1, 1);
         let mut port = Port::default();
         let ticket = grant(&mut control, &mut port);
         control
@@ -3616,7 +3699,7 @@ fn a_same_time_frontend_fence_defeats_either_context_establishment_delivery_orde
                 at(0),
                 ControlInput::Establish {
                     request: operation(2),
-                    context: context(),
+                    participation: participation(),
                     ticket,
                     payload: PayloadId(1),
                     semantics: semantics(),
@@ -3629,7 +3712,7 @@ fn a_same_time_frontend_fence_defeats_either_context_establishment_delivery_orde
             .handle(
                 at(1),
                 ControlInput::FenceFrontend {
-                    frontend: context().frontend_process_id(),
+                    frontend: participation().frontend_process_id(),
                 },
                 &mut port,
             )
@@ -3641,21 +3724,21 @@ fn a_same_time_frontend_fence_defeats_either_context_establishment_delivery_orde
         let close = || {
             rpc(
                 operation(3),
-                ContextCommand::Abort {
+                ParticipationCommand::Abort {
                     cause: AbortCause::QueryFailed,
                 },
             )
         };
         if close_first {
-            context_core
+            participation_core
                 .apply_fixture(at(1), close(), &mut port)
                 .unwrap();
         }
-        let decided = context_core
+        let decided = participation_core
             .handle(
                 at(1),
-                ContextInput::MaterializationFinished {
-                    result: Ok(ContextMaterialized {
+                ParticipationInput::MaterializationFinished {
+                    result: Ok(ParticipationMaterialized {
                         initial_credential_resource: 101,
                     }),
                 },
@@ -3667,15 +3750,15 @@ fn a_same_time_frontend_fence_defeats_either_context_establishment_delivery_orde
             verdict.clone(),
             if close_first {
                 closed_establishment_decision(
-                    QueryContextState::Aborting,
-                    OperationOutcome::ContextTerminalReceipt,
+                    ParticipationState::Aborting,
+                    OperationOutcome::ParticipationTerminalReceipt,
                 )
             } else {
                 active_establishment_decision()
             },
         );
         if !close_first {
-            context_core
+            participation_core
                 .apply_fixture(at(1), close(), &mut port)
                 .unwrap();
         }
@@ -3684,26 +3767,26 @@ fn a_same_time_frontend_fence_defeats_either_context_establishment_delivery_orde
             .handle(
                 at(1),
                 ControlInput::EstablishmentDecided {
-                    context: context(),
+                    participation: participation(),
                     decision: verdict,
                 },
                 &mut port,
             )
             .unwrap();
         assert!(returned.charged_work() <= control.max_step_work());
-        assert_eq!(context_core.state(), QueryContextState::Aborting);
-        assert_eq!(control.route(context()), QueryContextState::Aborting);
+        assert_eq!(participation_core.state(), ParticipationState::Aborting);
+        assert_eq!(control.route(participation()), ParticipationState::Aborting);
         assert!(!returned.effects.iter().any(|effect| matches!(
             effect,
             ControlEffect::Route {
-                state: QueryContextState::Active,
+                state: ParticipationState::Active,
                 ..
             }
         )));
         assert!(returned.effects.iter().any(|effect| matches!(
             effect,
             ControlEffect::Reply {
-                outcome: OperationOutcome::ContextTerminalReceipt,
+                outcome: OperationOutcome::ParticipationTerminalReceipt,
                 ..
             }
         )));
@@ -3711,7 +3794,7 @@ fn a_same_time_frontend_fence_defeats_either_context_establishment_delivery_orde
 }
 
 #[test]
-fn establish_reply_expiry_does_not_undo_the_redeemed_ticket_or_context_materialization() {
+fn establish_reply_expiry_does_not_undo_the_redeemed_ticket_or_participation_materialization() {
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
     let mut control = control();
     let mut port = Port::default();
@@ -3719,7 +3802,7 @@ fn establish_reply_expiry_does_not_undo_the_redeemed_ticket_or_context_materiali
     control
         .handle_request(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(1).unwrap()),
                 token: InputId::new(1).unwrap(),
                 operation: operation(2),
@@ -3727,7 +3810,7 @@ fn establish_reply_expiry_does_not_undo_the_redeemed_ticket_or_context_materiali
             },
             ControlInput::Establish {
                 request: operation(2),
-                context: context(),
+                participation: participation(),
                 ticket,
                 payload: PayloadId(1),
                 semantics: semantics(),
@@ -3743,7 +3826,10 @@ fn establish_reply_expiry_does_not_undo_the_redeemed_ticket_or_context_materiali
         expired.requests[0].result,
         RequestResult::TimeoutWhileAccepted
     );
-    assert_eq!(control.route(context()), QueryContextState::Establishing);
+    assert_eq!(
+        control.route(participation()),
+        ParticipationState::Establishing
+    );
     assert!(
         !expired
             .effects
@@ -3754,13 +3840,13 @@ fn establish_reply_expiry_does_not_undo_the_redeemed_ticket_or_context_materiali
         .handle(
             at(2),
             ControlInput::EstablishmentDecided {
-                context: context(),
+                participation: participation(),
                 decision: active_establishment_decision(),
             },
             &mut port,
         )
         .unwrap();
-    assert_eq!(control.route(context()), QueryContextState::Active);
+    assert_eq!(control.route(participation()), ParticipationState::Active);
     assert!(materialized.requests.is_empty());
     assert_eq!(port.calls.len(), 1);
 }
@@ -3774,7 +3860,7 @@ fn frontend_fence_blocks_late_materialization_and_new_entity_routing() {
         .handle(
             at(0),
             ControlInput::FenceFrontend {
-                frontend: context().frontend_process_id(),
+                frontend: participation().frontend_process_id(),
             },
             &mut f.port,
         )
@@ -3782,13 +3868,19 @@ fn frontend_fence_blocks_late_materialization_and_new_entity_routing() {
     f.control
         .handle(at(0), ControlInput::ContinueFence, &mut f.port)
         .unwrap();
-    assert_eq!(f.control.route(context()), QueryContextState::Aborting);
+    assert_eq!(
+        f.control.route(participation()),
+        ParticipationState::Aborting
+    );
     let late = f.materialized();
-    assert_eq!(f.control.route(context()), QueryContextState::Aborting);
+    assert_eq!(
+        f.control.route(participation()),
+        ParticipationState::Aborting
+    );
     assert!(late.effects.iter().all(|effect| !matches!(
         effect,
         ControlEffect::Route {
-            state: QueryContextState::Active,
+            state: ParticipationState::Active,
             ..
         }
     )));
@@ -3817,25 +3909,25 @@ fn frontend_fence_blocks_late_materialization_and_new_entity_routing() {
     assert_eq!(f.port.calls.len(), 1);
 }
 #[test]
-fn covered_reconnect_positions_validate_convergence_and_skip_known_context_receipt() {
+fn covered_reconnect_positions_validate_convergence_and_skip_known_participation_receipt() {
     use novarocks_execution_contract::{
-        QueryContextConvergenceCursor, QueryContextConvergenceReceipt,
-        QueryContextConvergenceState, QueryContextConvergenceVersion, TaskConvergenceCursor,
+        ParticipationConvergenceCursor, ParticipationConvergenceReceipt,
+        ParticipationConvergenceState, ParticipationConvergenceVersion, TaskConvergenceCursor,
         TaskConvergenceReceipt, TaskConvergenceVersion,
     };
     use novarocks_worker_protocol::observation::CoveredSubscriptionRequest;
-    let mut source = ObservationSource::new(context(), 8, 2, 1024, 8192);
+    let mut source = ObservationSource::new(participation(), 8, 2, 1024, 8192);
     let convergence =
         TaskConvergenceReceipt::actual_stopped(task(1), TaskConvergenceVersion::FIRST);
-    let context_convergence = QueryContextConvergenceReceipt::new(
-        context(),
-        QueryContextConvergenceVersion::FIRST,
-        QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+    let participation_convergence = ParticipationConvergenceReceipt::new(
+        participation(),
+        ParticipationConvergenceVersion::FIRST,
+        ParticipationConvergenceState::WorkerStoppedAndParticipationFenced,
     );
     for fact in [
         CoveredObservationFact::Status(status(1)),
         CoveredObservationFact::TaskConvergence(convergence),
-        CoveredObservationFact::ContextConvergence(context_convergence),
+        CoveredObservationFact::ParticipationConvergence(participation_convergence),
     ] {
         source.publish(fact, 100).unwrap();
         assert!(source.continue_publication(1).complete);
@@ -3851,9 +3943,9 @@ fn covered_reconnect_positions_validate_convergence_and_skip_known_context_recei
                     task(1),
                     TaskConvergenceVersion::FIRST,
                 )],
-                context: Some(QueryContextConvergenceCursor::at(
-                    context(),
-                    QueryContextConvergenceVersion::FIRST,
+                participation: Some(ParticipationConvergenceCursor::at(
+                    participation(),
+                    ParticipationConvergenceVersion::FIRST,
                 )),
                 ..CoveredSubscriptionRequest::default()
             },
@@ -3908,7 +4000,7 @@ fn covered_reconnect_positions_validate_convergence_and_skip_known_context_recei
 
 #[test]
 fn retiring_subscriber_keeps_its_bounded_storage_slot_until_incremental_cleanup_exits() {
-    let mut source = ObservationSource::new(context(), 8, 1, 1024, 8192);
+    let mut source = ObservationSource::new(participation(), 8, 1, 1024, 8192);
     source
         .publish(CoveredObservationFact::Status(status(1)), 100)
         .unwrap();
@@ -3953,7 +4045,7 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
             loaded(&mut core, &mut port, n);
             core.handle(
                 at(0),
-                ContextInput::Installed {
+                ParticipationInput::Installed {
                     task: task(n.into()),
                 },
                 &mut port,
@@ -3970,13 +4062,13 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
         let mut preceding = ProposalSummary::default();
         preceding.push(proposal(first.clone()));
         // A's preceding segment was already admitted by its driver, but has
-        // not reached the core yet. The context close only schedules its cut.
+        // not reached the core yet. The participation close only schedules its cut.
         let begin = core
             .apply_fixture(
                 at(0),
                 rpc(
                     operation(5),
-                    ContextCommand::Abort {
+                    ParticipationCommand::Abort {
                         cause: AbortCause::QueryFailed,
                     },
                 ),
@@ -3990,12 +4082,12 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
                 .any(|reply| reply.request.token == port.request_token(operation(5)))
         );
         let a = core
-            .handle(at(0), ContextInput::ContinueClose, &mut port)
+            .handle(at(0), ParticipationInput::ContinueClose, &mut port)
             .unwrap();
-        assert!(a.effects.contains(&ContextEffect::ApplyTaskClose {
+        assert!(a.effects.contains(&ParticipationEffect::ApplyTaskClose {
             task: task(1),
             generation: Generation::new(2).unwrap(),
-            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+            intent: novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
                 novarocks_execution_contract::AbortCause::QueryFailed
             ),
         }));
@@ -4003,11 +4095,13 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
             core.task(task(1)).unwrap().applied_close_generation.get(),
             1
         );
-        let b = core.handle(at(0), ContextInput::Tick, &mut port).unwrap();
-        assert!(b.effects.contains(&ContextEffect::ApplyTaskClose {
+        let b = core
+            .handle(at(0), ParticipationInput::Tick, &mut port)
+            .unwrap();
+        assert!(b.effects.contains(&ParticipationEffect::ApplyTaskClose {
             task: task(2),
             generation: Generation::new(2).unwrap(),
-            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+            intent: novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
                 novarocks_execution_contract::AbortCause::QueryFailed
             ),
         }));
@@ -4016,7 +4110,7 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
                 at(0),
                 rpc(
                     operation(6),
-                    ContextCommand::Abort {
+                    ParticipationCommand::Abort {
                         cause: AbortCause::QueryFailed,
                     },
                 ),
@@ -4027,10 +4121,10 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
         let b_applied = core
             .handle(
                 at(0),
-                ContextInput::ApplyTaskClose {
+                ParticipationInput::ApplyTaskClose {
                     task: task(2),
                     generation: Generation::new(2).unwrap(),
-                    intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                    intent: novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
                         novarocks_execution_contract::AbortCause::QueryFailed,
                     ),
                 },
@@ -4056,7 +4150,7 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
         // predecessor required before the close action can apply.
         core.handle(
             at(0),
-            ContextInput::Summary {
+            ParticipationInput::Summary {
                 task: task(1),
                 generation: Generation::new(1).unwrap(),
                 cut: None,
@@ -4072,10 +4166,10 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
         let a_applied = core
             .handle(
                 at(0),
-                ContextInput::ApplyTaskClose {
+                ParticipationInput::ApplyTaskClose {
                     task: task(1),
                     generation: Generation::new(2).unwrap(),
-                    intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                    intent: novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
                         novarocks_execution_contract::AbortCause::QueryFailed,
                     ),
                 },
@@ -4083,17 +4177,17 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
             )
             .unwrap();
         assert_eq!(core.task(task(1)).unwrap().conclusion.accepted, Some(first));
-        assert_context_acknowledgement(
+        assert_participation_acknowledgement(
             &a_applied.requests,
             port.request_token(operation(5)),
             OperationOutcome::Accepted,
-            QueryContextState::Aborting,
+            ParticipationState::Aborting,
             Some(AbortCause::QueryFailed),
         );
         assert!(!core.task(task(1)).unwrap().loader_exited);
         assert!(!core.task(task(1)).unwrap().actual_stopped);
         let replay = core
-            .handle(at(0), ContextInput::ContinueClose, &mut port)
+            .handle(at(0), ParticipationInput::ContinueClose, &mut port)
             .unwrap();
         assert!(has_verdict(
             &replay.requests,
@@ -4116,7 +4210,7 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
         });
         core.handle(
             at(0),
-            ContextInput::Summary {
+            ParticipationInput::Summary {
                 task: task(1),
                 generation: Generation::new(2).unwrap(),
                 cut: None,
@@ -4141,7 +4235,7 @@ fn task_close_cuts_do_not_overtake_old_summaries_or_serialize_other_tasks() {
     }
 }
 #[test]
-fn a_preparation_failure_before_its_ordered_close_is_not_preempted_by_context_abort() {
+fn a_preparation_failure_before_its_ordered_close_is_not_preempted_by_participation_abort() {
     use novarocks_execution_contract::{
         SafeDetail, TaskFailure, TaskFailurePhase,
         failure::{FailureClass, FailureFact, FailureReason, domain},
@@ -4169,18 +4263,18 @@ fn a_preparation_failure_before_its_ordered_close_is_not_preempted_by_context_ab
         at(0),
         rpc(
             operation(5),
-            ContextCommand::Abort {
+            ParticipationCommand::Abort {
                 cause: AbortCause::QueryFailed,
             },
         ),
         &mut port,
     )
     .unwrap();
-    core.handle(at(0), ContextInput::ContinueClose, &mut port)
+    core.handle(at(0), ParticipationInput::ContinueClose, &mut port)
         .unwrap();
     core.handle(
         at(0),
-        ContextInput::PreparationBodyFailure {
+        ParticipationInput::PreparationBodyFailure {
             task: task(1),
             preparing: projection(TaskFailurePhase::Preparation),
             executing: projection(TaskFailurePhase::Execution),
@@ -4194,10 +4288,10 @@ fn a_preparation_failure_before_its_ordered_close_is_not_preempted_by_context_ab
     );
     core.handle(
         at(0),
-        ContextInput::ApplyTaskClose {
+        ParticipationInput::ApplyTaskClose {
             task: task(1),
             generation: Generation::new(2).unwrap(),
-            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+            intent: novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
                 novarocks_execution_contract::AbortCause::QueryFailed,
             ),
         },
@@ -4238,18 +4332,18 @@ fn an_applied_close_waits_for_core_consumption_but_not_the_failure_sources_actua
         at(0),
         rpc(
             operation(5),
-            ContextCommand::Abort {
+            ParticipationCommand::Abort {
                 cause: AbortCause::QueryFailed,
             },
         ),
         &mut port,
     )
     .unwrap();
-    core.handle(at(0), ContextInput::ContinueClose, &mut port)
+    core.handle(at(0), ParticipationInput::ContinueClose, &mut port)
         .unwrap();
     core.handle(
         at(0),
-        ContextInput::Summary {
+        ParticipationInput::Summary {
             task: task(1),
             generation: Generation::new(1).unwrap(),
             cut: None,
@@ -4261,10 +4355,10 @@ fn an_applied_close_waits_for_core_consumption_but_not_the_failure_sources_actua
     let closed = core
         .handle(
             at(0),
-            ContextInput::ApplyTaskClose {
+            ParticipationInput::ApplyTaskClose {
                 task: task(1),
                 generation: Generation::new(2).unwrap(),
-                intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                intent: novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
                     novarocks_execution_contract::AbortCause::QueryFailed,
                 ),
             },
@@ -4275,15 +4369,19 @@ fn an_applied_close_waits_for_core_consumption_but_not_the_failure_sources_actua
         core.task(task(1)).unwrap().conclusion.source,
         Some(SourceId(17))
     );
-    assert!(!closed.effects.contains(&ContextEffect::DisposeSource {
-        task: task(1),
-        source: SourceId(17)
-    }));
-    assert_context_acknowledgement(
+    assert!(
+        !closed
+            .effects
+            .contains(&ParticipationEffect::DisposeSource {
+                task: task(1),
+                source: SourceId(17)
+            })
+    );
+    assert_participation_acknowledgement(
         &closed.requests,
         port.request_token(operation(5)),
         OperationOutcome::Accepted,
-        QueryContextState::Aborting,
+        ParticipationState::Aborting,
         Some(AbortCause::QueryFailed),
     );
     assert!(!core.task(task(1)).unwrap().actual_stopped);
@@ -4298,19 +4396,19 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
     loaded(&mut core, &mut port, 1);
     core.handle_request(
         at(0),
-        RequestContext {
+        RequestReplyTag {
             author: model_request_author(InputId::new(1).unwrap()),
             token: InputId::new(1).unwrap(),
             operation: operation(4),
             deadline: at(1000),
         },
-        ContextCommand::Abort {
+        ParticipationCommand::Abort {
             cause: AbortCause::QueryFailed,
         },
         &mut port,
     )
     .unwrap();
-    core.handle(at(0), ContextInput::ContinueClose, &mut port)
+    core.handle(at(0), ParticipationInput::ContinueClose, &mut port)
         .unwrap();
     for n in 0..71u8 {
         let now = u64::from(n) + 1;
@@ -4319,13 +4417,13 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
         let admitted = core
             .handle_request(
                 at(now),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(token),
                     token,
                     operation: op,
                     deadline: at(now + 1),
                 },
-                ContextCommand::Abort {
+                ParticipationCommand::Abort {
                     cause: AbortCause::QueryFailed,
                 },
                 &mut port,
@@ -4337,7 +4435,7 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
         );
         assert!(admitted.requests.is_empty());
         let timeout = core
-            .handle(at(now + 1), ContextInput::Tick, &mut port)
+            .handle(at(now + 1), ParticipationInput::Tick, &mut port)
             .unwrap();
         assert_eq!(timeout.requests.len(), 1);
         assert_eq!(timeout.requests[0].request.token, token);
@@ -4353,13 +4451,13 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
     let live = core
         .handle_request(
             at(100),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(100).unwrap()),
                 token: InputId::new(100).unwrap(),
                 operation: operation(200),
                 deadline: at(1000),
             },
-            ContextCommand::Abort {
+            ParticipationCommand::Abort {
                 cause: AbortCause::QueryFailed,
             },
             &mut port,
@@ -4369,10 +4467,10 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
     let applied = core
         .handle(
             at(100),
-            ContextInput::ApplyTaskClose {
+            ParticipationInput::ApplyTaskClose {
                 task: task(1),
                 generation: Generation::new(2).unwrap(),
-                intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+                intent: novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
                     novarocks_execution_contract::AbortCause::QueryFailed,
                 ),
             },
@@ -4387,7 +4485,7 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
     );
     assert!(!core.task(task(1)).unwrap().actual_stopped);
     let remaining = core
-        .handle(at(100), ContextInput::ContinueClose, &mut port)
+        .handle(at(100), ParticipationInput::ContinueClose, &mut port)
         .unwrap();
     assert_eq!(remaining.requests.len(), 1);
     assert_eq!(remaining.requests[0].request.operation, operation(200));
@@ -4396,7 +4494,7 @@ fn expired_repeated_abort_reply_roles_do_not_leave_ghost_waiters_behind_a_slow_t
         RequestResult::Outcome(OperationOutcome::Idempotent)
     );
     assert!(
-        core.handle(at(100), ContextInput::ContinueClose, &mut port)
+        core.handle(at(100), ParticipationInput::ContinueClose, &mut port)
             .unwrap()
             .effects
             .is_empty()
@@ -4409,33 +4507,34 @@ fn expired_creation_reply_positions_do_not_fill_the_waiter_bound_or_cancel_the_l
     activate(&mut core, &mut port);
     core.handle_request(
         at(0),
-        RequestContext {
+        RequestReplyTag {
             author: model_request_author(InputId::new(1).unwrap()),
             token: InputId::new(1).unwrap(),
             operation: operation(1),
             deadline: at(1),
         },
-        ContextCommand::Create {
+        ParticipationCommand::Create {
             task: task(1),
             payload: PayloadId(1),
         },
         &mut port,
     )
     .unwrap();
-    core.handle(at(1), ContextInput::Tick, &mut port).unwrap();
+    core.handle(at(1), ParticipationInput::Tick, &mut port)
+        .unwrap();
     for n in 0..13u8 {
         let now = u64::from(n) + 1;
         let op = operation(n + 10);
         let admitted = core
             .handle_request(
                 at(now),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(u64::from(n) + 2).unwrap()),
                     token: InputId::new(u64::from(n) + 2).unwrap(),
                     operation: op,
                     deadline: at(now + 1),
                 },
-                ContextCommand::Create {
+                ParticipationCommand::Create {
                     task: task(1),
                     payload: PayloadId(99),
                 },
@@ -4443,20 +4542,20 @@ fn expired_creation_reply_positions_do_not_fill_the_waiter_bound_or_cancel_the_l
             )
             .unwrap();
         assert!(admitted.requests.is_empty());
-        core.handle(at(now + 1), ContextInput::Tick, &mut port)
+        core.handle(at(now + 1), ParticipationInput::Tick, &mut port)
             .unwrap();
         assert!(core.task(task(1)).unwrap().waiting_replies.is_empty());
         assert!(!core.task(task(1)).unwrap().loader_exited);
     }
     core.handle_request(
         at(20),
-        RequestContext {
+        RequestReplyTag {
             author: model_request_author(InputId::new(100).unwrap()),
             token: InputId::new(100).unwrap(),
             operation: operation(50),
             deadline: at(25),
         },
-        ContextCommand::Create {
+        ParticipationCommand::Create {
             task: task(1),
             payload: PayloadId(99),
         },
@@ -4466,7 +4565,7 @@ fn expired_creation_reply_positions_do_not_fill_the_waiter_bound_or_cancel_the_l
     let loaded = core
         .handle(
             at(20),
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task: task(1),
                 result: Ok(cost()),
             },
@@ -4502,7 +4601,7 @@ fn expired_establish_routes_do_not_fill_the_request_bound_or_revoke_materializat
             .control
             .handle_request(
                 at(now),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(n + 2).unwrap()),
                     token: InputId::new(n + 2).unwrap(),
                     operation: operation(2),
@@ -4523,13 +4622,16 @@ fn expired_establish_routes_do_not_fill_the_request_bound_or_revoke_materializat
             RequestResult::TimeoutWhileAccepted
         );
         assert!(timed.effects.iter().any(|effect|matches!(effect,ControlEffect::CancelEstablishRoute{request,..} if *request==original)));
-        assert_eq!(f.control.route(context()), QueryContextState::Establishing);
+        assert_eq!(
+            f.control.route(participation()),
+            ParticipationState::Establishing
+        );
     }
     let route = f
         .control
         .handle_request(
             at(20),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(100).unwrap()),
                 token: InputId::new(100).unwrap(),
                 operation: operation(2),
@@ -4544,7 +4646,7 @@ fn expired_establish_routes_do_not_fill_the_request_bound_or_revoke_materializat
         .handle(
             at(20),
             ControlInput::EstablishmentDecided {
-                context: context(),
+                participation: participation(),
                 decision: active_establishment_decision(),
             },
             &mut f.port,
@@ -4567,7 +4669,7 @@ fn expired_establish_routes_do_not_fill_the_request_bound_or_revoke_materializat
         reply.requests[0].result,
         RequestResult::Outcome(OperationOutcome::Idempotent)
     );
-    assert_eq!(f.control.route(context()), QueryContextState::Active);
+    assert_eq!(f.control.route(participation()), ParticipationState::Active);
     assert_eq!(f.port.calls.len(), 1);
 }
 #[test]
@@ -4578,13 +4680,13 @@ fn a_creation_wait_position_survives_until_its_last_real_reply_token_exits() {
     for (token, deadline) in [(1, 1), (2, 10)] {
         core.handle_request(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(token).unwrap()),
                 token: InputId::new(token).unwrap(),
                 operation: operation(1),
                 deadline: at(deadline),
             },
-            ContextCommand::Create {
+            ParticipationCommand::Create {
                 task: task(1),
                 payload: PayloadId(1),
             },
@@ -4592,7 +4694,9 @@ fn a_creation_wait_position_survives_until_its_last_real_reply_token_exits() {
         )
         .unwrap();
     }
-    let expired = core.handle(at(1), ContextInput::Tick, &mut port).unwrap();
+    let expired = core
+        .handle(at(1), ParticipationInput::Tick, &mut port)
+        .unwrap();
     assert_eq!(expired.requests[0].request.token, InputId::new(1).unwrap());
     assert!(
         core.task(task(1))
@@ -4603,7 +4707,7 @@ fn a_creation_wait_position_survives_until_its_last_real_reply_token_exits() {
     let ready = core
         .handle(
             at(2),
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task: task(1),
                 result: Ok(cost()),
             },
@@ -4652,7 +4756,7 @@ fn typed_resource_refusal() -> AdmissionRefusal {
 }
 #[test]
 fn typed_admission_refusal_survives_loader_exit_and_exact_entity_replay() {
-    use novarocks_worker_protocol::context::DomainRefusal;
+    use novarocks_worker_protocol::participation::DomainRefusal;
     let refusal = typed_resource_refusal();
     let AdmissionRefusal::Domain(outcome, failure) = refusal.clone() else {
         unreachable!();
@@ -4663,13 +4767,13 @@ fn typed_admission_refusal_survives_loader_exit_and_exact_entity_replay() {
     activate(&mut core, &mut port);
     core.handle_request(
         at(0),
-        RequestContext {
+        RequestReplyTag {
             author: model_request_author(InputId::new(1).unwrap()),
             token: InputId::new(1).unwrap(),
             operation: operation(1),
             deadline: at(100),
         },
-        ContextCommand::Create {
+        ParticipationCommand::Create {
             task: task(1),
             payload: PayloadId(1),
         },
@@ -4680,7 +4784,7 @@ fn typed_admission_refusal_survives_loader_exit_and_exact_entity_replay() {
     let rejected = core
         .handle(
             at(1),
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task: task(1),
                 result: Ok(cost()),
             },
@@ -4694,10 +4798,10 @@ fn typed_admission_refusal_survives_loader_exit_and_exact_entity_replay() {
     );
     assert!(!rejected.effects.iter().any(|effect| matches!(
         effect,
-        ContextEffect::EnqueuePreparation { .. }
-            | ContextEffect::RetireTask { .. }
-            | ContextEffect::PublishTask { .. }
-            | ContextEffect::PublishTaskConvergence { .. }
+        ParticipationEffect::EnqueuePreparation { .. }
+            | ParticipationEffect::RetireTask { .. }
+            | ParticipationEffect::PublishTask { .. }
+            | ParticipationEffect::PublishTaskConvergence { .. }
     )));
     assert!(!core.task(task(1)).unwrap().loader_exited);
     assert!(
@@ -4711,7 +4815,7 @@ fn typed_admission_refusal_survives_loader_exit_and_exact_entity_replay() {
     let exited = core
         .handle(
             at(2),
-            ContextInput::Physical {
+            ParticipationInput::Physical {
                 task: task(1),
                 fact: PhysicalFact::LoaderExited,
             },
@@ -4720,7 +4824,7 @@ fn typed_admission_refusal_survives_loader_exit_and_exact_entity_replay() {
         .unwrap();
     assert!(exited.effects.iter().any(|effect| matches!(
         effect,
-        ContextEffect::RetireTask {
+        ParticipationEffect::RetireTask {
             preparation: None,
             ..
         }
@@ -4734,13 +4838,13 @@ fn typed_admission_refusal_survives_loader_exit_and_exact_entity_replay() {
         let replay = core
             .handle_request(
                 at(3),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(token).unwrap()),
                     token: InputId::new(token).unwrap(),
                     operation: operation(op),
                     deadline: at(deadline),
                 },
-                ContextCommand::Create {
+                ParticipationCommand::Create {
                     task: task(1),
                     payload: PayloadId(99),
                 },
@@ -4755,7 +4859,7 @@ fn typed_admission_refusal_survives_loader_exit_and_exact_entity_replay() {
         assert_eq!(replay.requests[0].request.operation, operation(op));
         assert_eq!(replay.requests[0].task, Some(task(1)));
         assert!(matches!(replay.requests[0].body.as_ref(),
-            novarocks_worker_protocol::context::ContextReplyBody::Domain(actual) if actual == &expected));
+            novarocks_worker_protocol::participation::ParticipationReplyBody::Domain(actual) if actual == &expected));
         if deadline <= 3 {
             assert!(
                 replay.effects.is_empty(),
@@ -4785,7 +4889,7 @@ fn typed_loader_failure_and_active_task_capacity_failure_preserve_their_domain_b
             at(0),
             rpc(
                 operation(1),
-                ContextCommand::Create {
+                ParticipationCommand::Create {
                     task: task(1),
                     payload: PayloadId(1),
                 },
@@ -4803,7 +4907,7 @@ fn typed_loader_failure_and_active_task_capacity_failure_preserve_their_domain_b
     let loaded = core
         .handle(
             at(0),
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task: task(1),
                 result: Err(refusal.clone()),
             },
@@ -4823,9 +4927,9 @@ fn every_control_reply_carries_its_original_body_when_a_later_decision_reuses_th
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput, ControlReplyBody};
     let mut control = control();
     let mut port = Port::default();
-    let request = AcquireQueryContextAdmissionTicket::new(
+    let request = AcquireParticipationAdmissionTicket::new(
         operation(1),
-        context(),
+        participation(),
         LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
         NativeCompatibilityId::new([3; 32]),
         control.admission().capability(),
@@ -4833,7 +4937,7 @@ fn every_control_reply_carries_its_original_body_when_a_later_decision_reuses_th
     let first = control
         .handle_request(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(1).unwrap()),
                 token: InputId::new(1).unwrap(),
                 operation: operation(1),
@@ -4859,9 +4963,9 @@ fn every_control_reply_carries_its_original_body_when_a_later_decision_reuses_th
         .unwrap();
     // Keep the earlier output unconsumed while the Core decides a conflicting
     // later input. Neither host order nor a new operation cache is an oracle.
-    let conflicting = AcquireQueryContextAdmissionTicket::new(
+    let conflicting = AcquireParticipationAdmissionTicket::new(
         operation(1),
-        context(),
+        participation(),
         LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
         NativeCompatibilityId::new([9; 32]),
         request.admission_epoch_capability(),
@@ -4869,7 +4973,7 @@ fn every_control_reply_carries_its_original_body_when_a_later_decision_reuses_th
     let next = control
         .handle_request(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(2).unwrap()),
                 token: InputId::new(2).unwrap(),
                 operation: operation(1),
@@ -4907,7 +5011,7 @@ fn a_single_task_byte_refusal_keeps_precedence_over_a_full_preparation_position(
     let rejected = core
         .handle(
             at(0),
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task: task(2),
                 result: Ok(oversized),
             },
@@ -4928,7 +5032,7 @@ fn a_single_task_byte_refusal_keeps_precedence_over_a_full_preparation_position(
     ));
 }
 #[test]
-fn typed_context_materialization_capacity_refusal_keeps_its_failure_projection() {
+fn typed_participation_materialization_capacity_refusal_keeps_its_failure_projection() {
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
     let refusal = typed_resource_refusal();
     let mut control = control();
@@ -4938,7 +5042,7 @@ fn typed_context_materialization_capacity_refusal_keeps_its_failure_projection()
     let step = control
         .handle_request(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(1).unwrap()),
                 token: InputId::new(1).unwrap(),
                 operation: operation(2),
@@ -4946,7 +5050,7 @@ fn typed_context_materialization_capacity_refusal_keeps_its_failure_projection()
             },
             ControlInput::Establish {
                 request: operation(2),
-                context: context(),
+                participation: participation(),
                 ticket,
                 payload: PayloadId(1),
                 semantics: semantics(),
@@ -4966,7 +5070,7 @@ fn typed_context_materialization_capacity_refusal_keeps_its_failure_projection()
         effect,
         ControlEffect::Materialize { .. } | ControlEffect::RetireReservation(_)
     )));
-    assert_eq!(control.route(context()), QueryContextState::Absent);
+    assert_eq!(control.route(participation()), ParticipationState::Absent);
 }
 #[test]
 fn aggregate_preparation_capacity_refusal_remains_preparation_busy() {
@@ -4978,7 +5082,7 @@ fn aggregate_preparation_capacity_refusal_remains_preparation_busy() {
     let step = core
         .handle(
             at(0),
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task: task(1),
                 result: Ok(cost()),
             },
@@ -4994,14 +5098,14 @@ fn aggregate_preparation_capacity_refusal_remains_preparation_busy() {
         !step
             .effects
             .iter()
-            .any(|effect| matches!(effect, ContextEffect::EnqueuePreparation { .. }))
+            .any(|effect| matches!(effect, ParticipationEffect::EnqueuePreparation { .. }))
     );
     assert!(!core.task(task(1)).unwrap().loader_exited);
     assert_eq!(port.calls.len(), 2);
 }
 #[test]
 fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeric_order() {
-    use novarocks_worker_protocol::context::CoreError;
+    use novarocks_worker_protocol::participation::CoreError;
     let mut core = core(8, 2);
     let mut port = Port::default();
     activate(&mut core, &mut port);
@@ -5011,13 +5115,13 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
         let step = core
             .handle_request(
                 at(0),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(token).unwrap()),
                     token: InputId::new(token).unwrap(),
                     operation: operation(op),
                     deadline: at(100),
                 },
-                ContextCommand::Create {
+                ParticipationCommand::Create {
                     task: task(number),
                     payload: PayloadId(u64::from(number)),
                 },
@@ -5029,13 +5133,13 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
     let duplicate = core
         .handle_request(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(20).unwrap()),
                 token: InputId::new(20).unwrap(),
                 operation: operation(3),
                 deadline: at(100),
             },
-            ContextCommand::Create {
+            ParticipationCommand::Create {
                 task: task(3),
                 payload: PayloadId(3),
             },
@@ -5046,13 +5150,13 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
     let independent = core
         .handle_request(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(30).unwrap()),
                 token: InputId::new(30).unwrap(),
                 operation: operation(4),
                 deadline: at(100),
             },
-            ContextCommand::Create {
+            ParticipationCommand::Create {
                 task: task(3),
                 payload: PayloadId(3),
             },
@@ -5071,7 +5175,7 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
         replies.extend(
             core.handle(
                 at(0),
-                ContextInput::Loaded {
+                ParticipationInput::Loaded {
                     task: task(number),
                     result: Ok(cost()),
                 },
@@ -5098,7 +5202,7 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
             .all(|reply| reply.result == RequestResult::Outcome(OperationOutcome::Accepted))
     );
     assert!(
-        core.handle(at(0), ContextInput::Tick, &mut port)
+        core.handle(at(0), ParticipationInput::Tick, &mut port)
             .unwrap()
             .requests
             .is_empty()
@@ -5106,18 +5210,20 @@ fn independent_creation_reply_tokens_follow_runtime_consumption_order_not_numeri
 }
 #[test]
 fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_duplicates() {
-    use novarocks_worker_protocol::{context::CoreError, control::ControlInput};
+    use novarocks_worker_protocol::{control::ControlInput, participation::CoreError};
     let mut control = control();
     let mut port = Port::default();
-    let second = QueryContextRef::new(
+    let second = ParticipationRef::new(
         QueryExecutionId::new(QueryId::new(7201, 7202), AttemptId::new(1).unwrap()).unwrap(),
-        context().frontend_process_id(),
-        context().backend_process_id(),
+        participation().frontend_process_id(),
+        participation().backend_process_id(),
     );
     let ticket_a = AdmissionTicketId::try_from_bytes([4; 16]).unwrap();
     let ticket_b = AdmissionTicketId::try_from_bytes([5; 16]).unwrap();
-    for (token, op, identity, ticket) in [(1, 1, context(), ticket_a), (2, 2, second, ticket_b)] {
-        let request = AcquireQueryContextAdmissionTicket::new(
+    for (token, op, identity, ticket) in
+        [(1, 1, participation(), ticket_a), (2, 2, second, ticket_b)]
+    {
+        let request = AcquireParticipationAdmissionTicket::new(
             operation(op),
             identity,
             LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
@@ -5127,7 +5233,7 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
         control
             .handle_request(
                 at(0),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(token).unwrap()),
                     token: InputId::new(token).unwrap(),
                     operation: operation(op),
@@ -5140,7 +5246,7 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
     }
     let establish = |op, identity, ticket, payload| ControlInput::Establish {
         request: operation(op),
-        context: identity,
+        participation: identity,
         ticket,
         payload: PayloadId(payload),
         semantics: semantics(),
@@ -5148,13 +5254,13 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
     };
     let mut materializations = Vec::new();
     for (token, op, identity, ticket, payload) in [
-        (20, 3, context(), ticket_a, 1),
+        (20, 3, participation(), ticket_a, 1),
         (10, 4, second, ticket_b, 2),
     ] {
         let step = control
             .handle_request(
                 at(0),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(token).unwrap()),
                     token: InputId::new(token).unwrap(),
                     operation: operation(op),
@@ -5170,7 +5276,7 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
     let duplicate = control
         .handle_request(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(20).unwrap()),
                 token: InputId::new(20).unwrap(),
                 operation: operation(5),
@@ -5184,7 +5290,7 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
     let mismatch = control
         .handle_request(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(30).unwrap()),
                 token: InputId::new(30).unwrap(),
                 operation: operation(6),
@@ -5198,7 +5304,7 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
     assert_eq!(
         port.calls.len(),
         2,
-        "two distinct actual context materialization roles were admitted"
+        "two distinct actual participation materialization roles were admitted"
     );
     let mut replies = Vec::new();
     for (identity, decision) in materializations {
@@ -5207,7 +5313,7 @@ fn independent_establish_reply_tokens_accept_numeric_reordering_and_reject_live_
                 .handle(
                     at(0),
                     ControlInput::EstablishmentDecided {
-                        context: identity,
+                        participation: identity,
                         decision,
                     },
                     &mut port,
@@ -5239,13 +5345,13 @@ fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata
     use novarocks_worker_protocol::control::{
         ControlConfig, ControlCore, ControlEffect, ControlInput,
     };
-    use novarocks_worker_protocol::retention::ContextRetirementIdentity;
+    use novarocks_worker_protocol::retention::ParticipationRetirementIdentity;
     // These are explicit pure caller facts, never runtime failure authority.
     for retirement in [
-        ContextRetirementIdentity::Protocol {
+        ParticipationRetirementIdentity::Protocol {
             close_epoch: Generation::new(2).unwrap(),
         },
-        ContextRetirementIdentity::OwnerFailure {
+        ParticipationRetirementIdentity::OwnerFailure {
             actor: ActorId::new(77).unwrap(),
             initial_epoch: Generation::new(1).unwrap(),
             failed_epoch: Generation::new(2).unwrap(),
@@ -5273,7 +5379,7 @@ fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata
                 at(0),
                 ControlInput::Establish {
                     request: operation(2),
-                    context: context(),
+                    participation: participation(),
                     ticket,
                     payload: PayloadId(1),
                     semantics: semantics(),
@@ -5286,7 +5392,7 @@ fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata
             .handle(
                 at(1),
                 ControlInput::EstablishmentDecided {
-                    context: context(),
+                    participation: participation(),
                     decision: active_establishment_decision(),
                 },
                 &mut port,
@@ -5295,16 +5401,18 @@ fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata
         let revoked = control
             .handle(
                 at(1),
-                ControlInput::RevokeTicket { context: context() },
+                ControlInput::RevokeTicket {
+                    participation: participation(),
+                },
                 &mut port,
             )
             .unwrap();
         assert!(
             revoked.effects.is_empty(),
-            "closing external admission cannot release a live redeemed context"
+            "closing external admission cannot release a live redeemed participation"
         );
         assert_eq!(
-            control.admission().observe(ticket, context(), at(1)),
+            control.admission().observe(ticket, participation(), at(1)),
             AdmissionTicketObservation::Redeemed
         );
         assert_eq!(
@@ -5312,8 +5420,8 @@ fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata
                 .handle(
                     at(1),
                     ControlInput::ExecutionRetired {
-                        context: context(),
-                        retirement: ContextRetirementIdentity::OwnerFailure {
+                        participation: participation(),
+                        retirement: ParticipationRetirementIdentity::OwnerFailure {
                             actor: ActorId::new(77).unwrap(),
                             initial_epoch: Generation::new(2).unwrap(),
                             failed_epoch: Generation::new(2).unwrap(),
@@ -5322,14 +5430,14 @@ fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata
                     &mut port,
                 )
                 .unwrap_err(),
-            novarocks_worker_protocol::context::CoreError::IllegalFact,
+            novarocks_worker_protocol::participation::CoreError::IllegalFact,
             "a neutral failure identity must advance its actual initial epoch"
         );
         let retained = control
             .handle(
                 at(1),
                 ControlInput::ExecutionRetired {
-                    context: context(),
+                    participation: participation(),
                     retirement,
                 },
                 &mut port,
@@ -5339,38 +5447,42 @@ fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata
         ControlEffect::RetireReservation(original) if *original == ReservationId::new(1).unwrap()
     )).count(), 1, "the real execution receipt retires the original bootstrap Work exactly once");
         assert_eq!(
-            control.admission().observe(ticket, context(), at(1)),
+            control.admission().observe(ticket, participation(), at(1)),
             AdmissionTicketObservation::Closed
         );
         let conflicting = match retirement {
-            ContextRetirementIdentity::Protocol { .. } => ContextRetirementIdentity::OwnerFailure {
-                actor: ActorId::new(77).unwrap(),
-                initial_epoch: Generation::new(1).unwrap(),
-                failed_epoch: Generation::new(2).unwrap(),
-            },
-            ContextRetirementIdentity::OwnerFailure { .. } => ContextRetirementIdentity::Protocol {
-                close_epoch: Generation::new(2).unwrap(),
-            },
+            ParticipationRetirementIdentity::Protocol { .. } => {
+                ParticipationRetirementIdentity::OwnerFailure {
+                    actor: ActorId::new(77).unwrap(),
+                    initial_epoch: Generation::new(1).unwrap(),
+                    failed_epoch: Generation::new(2).unwrap(),
+                }
+            }
+            ParticipationRetirementIdentity::OwnerFailure { .. } => {
+                ParticipationRetirementIdentity::Protocol {
+                    close_epoch: Generation::new(2).unwrap(),
+                }
+            }
         };
         assert_eq!(
             control
                 .handle(
                     at(1),
                     ControlInput::ExecutionRetired {
-                        context: context(),
+                        participation: participation(),
                         retirement: conflicting,
                     },
                     &mut port,
                 )
                 .unwrap_err(),
-            novarocks_worker_protocol::context::CoreError::IllegalFact,
+            novarocks_worker_protocol::participation::CoreError::IllegalFact,
             "retirement provenance cannot change after its first original fact"
         );
         let replay = control
             .handle(
                 at(1),
                 ControlInput::ExecutionRetired {
-                    context: context(),
+                    participation: participation(),
                     retirement,
                 },
                 &mut port,
@@ -5380,14 +5492,14 @@ fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata
             replay.effects.is_empty(),
             "the original physical receipt neither double-releases nor extends retention"
         );
-        let c = context();
-        let next = QueryContextRef::new(
+        let c = participation();
+        let next = ParticipationRef::new(
             QueryExecutionId::new(QueryId::new(7203, 7204), AttemptId::new(1).unwrap()).unwrap(),
             c.frontend_process_id(),
             c.backend_process_id(),
         );
         let next_ticket = AdmissionTicketId::try_from_bytes([5; 16]).unwrap();
-        let request = AcquireQueryContextAdmissionTicket::new(
+        let request = AcquireParticipationAdmissionTicket::new(
             operation(3),
             next,
             LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
@@ -5409,7 +5521,9 @@ fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata
         let revoked = control
             .handle(
                 at(1),
-                ControlInput::RevokeTicket { context: next },
+                ControlInput::RevokeTicket {
+                    participation: next,
+                },
                 &mut port,
             )
             .unwrap();
@@ -5421,8 +5535,8 @@ fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata
         let expiry = control
             .handle(
                 at(121),
-                ControlInput::ContextExpired {
-                    context: c,
+                ControlInput::ParticipationExpired {
+                    participation: c,
                     retirement,
                 },
                 &mut port,
@@ -5431,26 +5545,30 @@ fn actual_execution_retirement_releases_bootstrap_work_and_keeps_ticket_metadata
         assert!(
             expiry
                 .effects
-                .contains(&ControlEffect::RemoveHost { context: c })
+                .contains(&ControlEffect::RemoveHost { participation: c })
         );
         let removed = control
-            .handle(at(121), ControlInput::HostRemoved { context: c }, &mut port)
+            .handle(
+                at(121),
+                ControlInput::HostRemoved { participation: c },
+                &mut port,
+            )
             .unwrap();
         assert_eq!(
             removed.effects,
             vec![ControlEffect::Route {
-                context: c,
-                state: QueryContextState::Gone,
+                participation: c,
+                state: ParticipationState::Gone,
                 generation: Generation::new(1).unwrap(),
             },]
         );
-        assert_eq!(control.route(c), QueryContextState::Absent);
+        assert_eq!(control.route(c), ParticipationState::Absent);
     }
 }
 
 #[test]
 fn succeeded_proposal_requires_actual_stop_and_complete_output_before_handoff() {
-    use novarocks_worker_protocol::context::CoreError;
+    use novarocks_worker_protocol::participation::CoreError;
     let mut core = core(4, 1);
     let mut port = Port::default();
     activate(&mut core, &mut port);
@@ -5459,7 +5577,7 @@ fn succeeded_proposal_requires_actual_stop_and_complete_output_before_handoff() 
     for complete_output in [false, true] {
         core.handle(
             at(0),
-            ContextInput::OutputFacts {
+            ParticipationInput::OutputFacts {
                 task: task(1),
                 facts: TaskOutputFacts::new(complete_output),
             },
@@ -5469,7 +5587,7 @@ fn succeeded_proposal_requires_actual_stop_and_complete_output_before_handoff() 
         assert_eq!(
             core.handle(
                 at(0),
-                ContextInput::Proposal {
+                ParticipationInput::Proposal {
                     task: task(1),
                     proposal: proposal(TaskConclusion::Succeeded),
                 },
@@ -5484,60 +5602,64 @@ fn succeeded_proposal_requires_actual_stop_and_complete_output_before_handoff() 
     let stopped = core
         .handle(
             at(0),
-            ContextInput::Physical {
+            ParticipationInput::Physical {
                 task: task(1),
                 fact: PhysicalFact::ActualStopped,
             },
             &mut port,
         )
         .unwrap();
-    assert!(stopped.charged_work() <= ContextCore::MAX_BODY_WORK);
+    assert!(stopped.charged_work() <= ParticipationCore::MAX_BODY_WORK);
     let accepted = core
         .handle(
             at(0),
-            ContextInput::Proposal {
+            ParticipationInput::Proposal {
                 task: task(1),
                 proposal: proposal(TaskConclusion::Succeeded),
             },
             &mut port,
         )
         .unwrap();
-    assert!(accepted.charged_work() <= ContextCore::MAX_BODY_WORK);
-    core.handle(at(0), ContextInput::Adjudicate { task: task(1) }, &mut port)
-        .unwrap();
+    assert!(accepted.charged_work() <= ParticipationCore::MAX_BODY_WORK);
+    core.handle(
+        at(0),
+        ParticipationInput::Adjudicate { task: task(1) },
+        &mut port,
+    )
+    .unwrap();
     assert_eq!(
         core.task(task(1)).unwrap().conclusion.accepted,
         Some(TaskConclusion::Succeeded)
     );
 }
 
-fn completion_fixture() -> (ContextCore, Port) {
+fn completion_fixture() -> (ParticipationCore, Port) {
     let mut core = core(4, 1);
     let mut port = Port::default();
     activate(&mut core, &mut port);
     create(&mut core, &mut port, 1);
     loaded(&mut core, &mut port, 1);
     for input in [
-        ContextInput::Installed { task: task(1) },
-        ContextInput::Running { task: task(1) },
+        ParticipationInput::Installed { task: task(1) },
+        ParticipationInput::Running { task: task(1) },
     ] {
         completion_step(&mut core, &mut port, input);
     }
     (core, port)
 }
 fn completion_step(
-    core: &mut ContextCore,
+    core: &mut ParticipationCore,
     port: &mut Port,
     input: impl Into<FixtureInput>,
-) -> novarocks_worker_protocol::context::ContextStep {
+) -> novarocks_worker_protocol::participation::ParticipationStep {
     let input = input.into();
     let label = format!("{input:?}");
     let step = core.apply_fixture(at(0), input, port).unwrap();
     assert!(
-        step.charged_work() <= ContextCore::MAX_BODY_WORK,
+        step.charged_work() <= ParticipationCore::MAX_BODY_WORK,
         "{label}: actual charged work {} exceeds {}: {:?}",
         step.charged_work(),
-        ContextCore::MAX_STEP_WORK,
+        ParticipationCore::MAX_STEP_WORK,
         step.effects
     );
     step
@@ -5569,7 +5691,7 @@ fn completion_intent_waits_for_the_original_action_and_fact_exit_without_waiting
     let intent = completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: Some(TaskOutputFacts::new(true)),
         },
@@ -5585,7 +5707,7 @@ fn completion_intent_waits_for_the_original_action_and_fact_exit_without_waiting
     let exited = completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     );
     let record = core.task(task(1)).unwrap();
     assert_eq!(record.state, TaskState::Finished);
@@ -5598,14 +5720,14 @@ fn completion_intent_waits_for_the_original_action_and_fact_exit_without_waiting
         !exited
             .effects
             .iter()
-            .any(|effect| matches!(effect, ContextEffect::RetireTask { .. }))
+            .any(|effect| matches!(effect, ParticipationEffect::RetireTask { .. }))
     );
     let published = record.published.clone();
     assert!(
         completion_step(
             &mut core,
             &mut port,
-            ContextInput::CompletionExited { task: task(1) }
+            ParticipationInput::CompletionExited { task: task(1) }
         )
         .effects
         .is_empty()
@@ -5620,18 +5742,18 @@ fn completion_intent_waits_for_the_original_action_and_fact_exit_without_waiting
 
 #[test]
 fn completion_exit_can_precede_success_intent_and_later_output_facts_close_it() {
-    use novarocks_worker_protocol::context::CoreError;
+    use novarocks_worker_protocol::participation::CoreError;
     let (mut core, mut port) = completion_fixture();
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     );
     assert!(core.task(task(1)).unwrap().conclusion.accepted.is_none());
     assert_eq!(
         core.handle(
             at(0),
-            ContextInput::Proposal {
+            ParticipationInput::Proposal {
                 task: task(1),
                 proposal: proposal(TaskConclusion::Succeeded),
             },
@@ -5644,7 +5766,7 @@ fn completion_exit_can_precede_success_intent_and_later_output_facts_close_it() 
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: None,
         },
@@ -5654,7 +5776,7 @@ fn completion_exit_can_precede_success_intent_and_later_output_facts_close_it() 
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::OutputFacts {
+        ParticipationInput::OutputFacts {
             task: task(1),
             facts: TaskOutputFacts::new(true),
         },
@@ -5669,7 +5791,7 @@ fn a_true_actual_stop_fact_closes_the_intent_without_inventing_resource_converge
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: Some(TaskOutputFacts::new(true)),
         },
@@ -5677,7 +5799,7 @@ fn a_true_actual_stop_fact_closes_the_intent_without_inventing_resource_converge
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::Physical {
+        ParticipationInput::Physical {
             task: task(1),
             fact: PhysicalFact::ActualStopped,
         },
@@ -5690,18 +5812,18 @@ fn a_true_actual_stop_fact_closes_the_intent_without_inventing_resource_converge
 
 #[test]
 fn the_last_original_publication_hold_retries_success_without_waiting_for_whole_preparation() {
-    use novarocks_worker_protocol::context::PreparationExitRole;
+    use novarocks_worker_protocol::participation::PreparationExitOwner;
     let (mut core, mut port) = completion_fixture();
-    for role in [
-        PreparationExitRole::Admission,
-        PreparationExitRole::Preparation,
+    for preparation_exit_owner in [
+        PreparationExitOwner::Admission,
+        PreparationExitOwner::Preparation,
     ] {
         completion_step(
             &mut core,
             &mut port,
-            ContextInput::PreparationExitHold {
+            ParticipationInput::PreparationExitHold {
                 task: task(1),
-                role,
+                preparation_exit_owner,
                 held: true,
             },
         );
@@ -5709,7 +5831,7 @@ fn the_last_original_publication_hold_retries_success_without_waiting_for_whole_
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: Some(TaskOutputFacts::new(true)),
         },
@@ -5717,12 +5839,12 @@ fn the_last_original_publication_hold_retries_success_without_waiting_for_whole_
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     );
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::Physical {
+        ParticipationInput::Physical {
             task: task(1),
             fact: PhysicalFact::PreparationBodyExited,
         },
@@ -5732,9 +5854,9 @@ fn the_last_original_publication_hold_retries_success_without_waiting_for_whole_
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::PreparationExitHold {
+        ParticipationInput::PreparationExitHold {
             task: task(1),
-            role: PreparationExitRole::Admission,
+            preparation_exit_owner: PreparationExitOwner::Admission,
             held: false,
         },
     );
@@ -5742,9 +5864,9 @@ fn the_last_original_publication_hold_retries_success_without_waiting_for_whole_
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::PreparationExitHold {
+        ParticipationInput::PreparationExitHold {
             task: task(1),
-            role: PreparationExitRole::Preparation,
+            preparation_exit_owner: PreparationExitOwner::Preparation,
             held: false,
         },
     );
@@ -5756,12 +5878,12 @@ fn the_last_original_publication_hold_retries_success_without_waiting_for_whole_
 
 #[test]
 fn successful_root_production_waits_for_output_and_drain_reply_follows_the_terminal_publication() {
-    use novarocks_worker_protocol::context::RootDrainVerdict;
+    use novarocks_worker_protocol::participation::RootDrainVerdict;
     let (mut core, mut port) = completion_fixture();
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: None,
         },
@@ -5769,24 +5891,24 @@ fn successful_root_production_waits_for_output_and_drain_reply_follows_the_termi
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::Flushing { task: task(1) },
+        ParticipationInput::Flushing { task: task(1) },
     );
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     );
     assert_eq!(core.task(task(1)).unwrap().state, TaskState::Flushing);
     assert!(core.task(task(1)).unwrap().completion_success_pending);
     // The channel fact keeps the same original correlation even after the
     // data wait deadline. It does not re-enter business RPC admission.
-    port.next_context_input += 1;
-    let token = InputId::new(1_000_000 + port.next_context_input).unwrap();
-    port.context_tokens.insert(operation(10), token);
+    port.next_participation_input += 1;
+    let token = InputId::new(1_000_000 + port.next_participation_input).unwrap();
+    port.participation_tokens.insert(operation(10), token);
     let drained = core
         .handle_root_end_acknowledged(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(token),
                 token,
                 operation: operation(10),
@@ -5796,14 +5918,14 @@ fn successful_root_production_waits_for_output_and_drain_reply_follows_the_termi
             &mut port,
         )
         .unwrap();
-    assert!(drained.charged_work() <= ContextCore::MAX_BODY_WORK);
+    assert!(drained.charged_work() <= ParticipationCore::MAX_BODY_WORK);
     let record = core.task(task(1)).unwrap();
     assert_eq!(record.state, TaskState::Finished);
     let terminal_version = drained
         .effects
         .iter()
         .find_map(|effect| match effect {
-            ContextEffect::PublishTask {
+            ParticipationEffect::PublishTask {
                 state: TaskState::Finished,
                 snapshot,
                 version,
@@ -5824,7 +5946,7 @@ fn successful_root_production_waits_for_output_and_drain_reply_follows_the_termi
         RequestResult::Outcome(OperationOutcome::Accepted)
     );
     assert!(
-        matches!(reply.body.as_ref(), ContextReplyBody::RootDrain(RootDrainVerdict::Published(version)) if *version == terminal_version)
+        matches!(reply.body.as_ref(), ParticipationReplyBody::RootDrain(RootDrainVerdict::Published(version)) if *version == terminal_version)
     );
     assert!(record.output.responsibility_complete());
     assert!(
@@ -5839,7 +5961,7 @@ fn a_cancellation_between_success_intent_and_exit_keeps_its_conclusion_and_indep
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: Some(TaskOutputFacts::new(true)),
         },
@@ -5849,7 +5971,7 @@ fn a_cancellation_between_success_intent_and_exit_keeps_its_conclusion_and_indep
         &mut port,
         rpc(
             operation(10),
-            ContextCommand::Cancel {
+            ParticipationCommand::Cancel {
                 task: task(1),
                 reason: CancelReason::UpstreamNoLongerNeeded,
             },
@@ -5859,7 +5981,7 @@ fn a_cancellation_between_success_intent_and_exit_keeps_its_conclusion_and_indep
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     );
     let record = core.task(task(1)).unwrap();
     assert_eq!(record.state, TaskState::Canceled);
@@ -5873,7 +5995,7 @@ fn a_stopped_root_success_intent_is_completed_as_the_later_cancellation_without_
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: None,
         },
@@ -5881,7 +6003,7 @@ fn a_stopped_root_success_intent_is_completed_as_the_later_cancellation_without_
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     );
     assert_eq!(core.task(task(1)).unwrap().state, TaskState::Running);
     completion_step(
@@ -5889,7 +6011,7 @@ fn a_stopped_root_success_intent_is_completed_as_the_later_cancellation_without_
         &mut port,
         rpc(
             operation(10),
-            ContextCommand::Cancel {
+            ParticipationCommand::Cancel {
                 task: task(1),
                 reason: CancelReason::UpstreamNoLongerNeeded,
             },
@@ -5903,10 +6025,10 @@ fn a_stopped_root_success_intent_is_completed_as_the_later_cancellation_without_
 
 #[test]
 fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it() {
-    use novarocks_worker_protocol::context::TaskReadCommand;
+    use novarocks_worker_protocol::participation::TaskReadCommand;
     let (mut core, mut port) = completion_fixture();
     let token = InputId::new(9_000_001).unwrap();
-    let original = RequestContext {
+    let original = RequestReplyTag {
         author: model_request_author(token),
         token,
         operation: operation(190),
@@ -5916,7 +6038,7 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
         .handle_request(
             at(0),
             original,
-            ContextCommand::AwaitTaskReadSeal {
+            ParticipationCommand::AwaitTaskReadSeal {
                 task: task(1),
                 command: TaskReadCommand::DynamicFilters { acknowledged: None },
             },
@@ -5931,7 +6053,7 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
     let wrong = core
         .handle(
             at(1),
-            ContextInput::ResumeTaskRead {
+            ParticipationInput::ResumeTaskRead {
                 request: token,
                 task: task(2),
             },
@@ -5942,7 +6064,7 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
     let resumed = core
         .handle(
             at(1),
-            ContextInput::ResumeTaskRead {
+            ParticipationInput::ResumeTaskRead {
                 request: token,
                 task: task(1),
             },
@@ -5959,7 +6081,7 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
     let repeated = core
         .handle(
             at(1),
-            ContextInput::ResumeTaskRead {
+            ParticipationInput::ResumeTaskRead {
                 request: token,
                 task: task(1),
             },
@@ -5969,7 +6091,7 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
     assert!(repeated.requests.is_empty() && repeated.effects.is_empty());
 
     let token = InputId::new(9_000_002).unwrap();
-    let expiring = RequestContext {
+    let expiring = RequestReplyTag {
         author: model_request_author(token),
         token,
         operation: operation(191),
@@ -5979,7 +6101,7 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
         .handle_request(
             at(1),
             expiring,
-            ContextCommand::AwaitTaskReadSeal {
+            ParticipationCommand::AwaitTaskReadSeal {
                 task: task(1),
                 command: TaskReadCommand::FinalInfo,
             },
@@ -5987,7 +6109,9 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
         )
         .unwrap();
     assert!(waiting.requests.is_empty() && waiting.effects.is_empty());
-    let expired = core.handle(at(2), ContextInput::Tick, &mut port).unwrap();
+    let expired = core
+        .handle(at(2), ParticipationInput::Tick, &mut port)
+        .unwrap();
     assert_eq!(expired.requests.len(), 1);
     assert_eq!(expired.requests[0].request, expiring);
     assert_eq!(
@@ -5997,7 +6121,7 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
     let late = core
         .handle(
             at(3),
-            ContextInput::ResumeTaskRead {
+            ParticipationInput::ResumeTaskRead {
                 request: token,
                 task: task(1),
             },
@@ -6010,7 +6134,7 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
     );
 
     let token = InputId::new(9_000_003).unwrap();
-    let completed = RequestContext {
+    let completed = RequestReplyTag {
         author: model_request_author(token),
         token,
         operation: operation(192),
@@ -6019,7 +6143,7 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
     core.handle_request(
         at(3),
         completed,
-        ContextCommand::AwaitTaskReadSeal {
+        ParticipationCommand::AwaitTaskReadSeal {
             task: task(1),
             command: TaskReadCommand::FinalInfo,
         },
@@ -6029,9 +6153,9 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
     let closed = core
         .handle(
             at(3),
-            ContextInput::RequestCompleted {
+            ParticipationInput::RequestCompleted {
                 operation: token,
-                outcome: OperationOutcome::ContextTerminalReceipt,
+                outcome: OperationOutcome::ParticipationTerminalReceipt,
             },
             &mut port,
         )
@@ -6041,7 +6165,7 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
     let late = core
         .handle(
             at(3),
-            ContextInput::ResumeTaskRead {
+            ParticipationInput::ResumeTaskRead {
                 request: token,
                 task: task(1),
             },
@@ -6050,7 +6174,7 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
         .unwrap();
     assert!(late.requests.is_empty() && late.effects.is_empty());
     let token = InputId::new(9_000_004).unwrap();
-    let unknown = RequestContext {
+    let unknown = RequestReplyTag {
         author: model_request_author(token),
         token,
         operation: operation(195),
@@ -6060,7 +6184,7 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
         .handle_request(
             at(3),
             unknown,
-            ContextCommand::AwaitTaskReadSeal {
+            ParticipationCommand::AwaitTaskReadSeal {
                 task: task(2),
                 command: TaskReadCommand::FinalInfo,
             },
@@ -6077,7 +6201,7 @@ fn a_read_seal_wait_keeps_its_original_deadline_and_late_resume_cannot_revive_it
     let late = core
         .handle(
             at(3),
-            ContextInput::ResumeTaskRead {
+            ParticipationInput::ResumeTaskRead {
                 request: token,
                 task: task(2),
             },
@@ -6095,7 +6219,7 @@ fn a_peer_placeholder_refines_to_the_original_failure_before_completion_exit_and
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: None,
         },
@@ -6103,7 +6227,7 @@ fn a_peer_placeholder_refines_to_the_original_failure_before_completion_exit_and
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::Proposal {
+        ParticipationInput::Proposal {
             task: task(1),
             proposal: proposal(TaskConclusion::Terminated(TerminationDetail::Aborted(
                 AbortCause::PeerTaskFailed,
@@ -6113,13 +6237,13 @@ fn a_peer_placeholder_refines_to_the_original_failure_before_completion_exit_and
     let stopping = completion_step(
         &mut core,
         &mut port,
-        ContextInput::Adjudicate { task: task(1) },
+        ParticipationInput::Adjudicate { task: task(1) },
     );
     assert_eq!(
         stopping
             .effects
             .iter()
-            .filter(|effect| matches!(effect, ContextEffect::StopTask { .. }))
+            .filter(|effect| matches!(effect, ParticipationEffect::StopTask { .. }))
             .count(),
         1
     );
@@ -6130,7 +6254,7 @@ fn a_peer_placeholder_refines_to_the_original_failure_before_completion_exit_and
     let refined = completion_step(
         &mut core,
         &mut port,
-        ContextInput::Summary {
+        ParticipationInput::Summary {
             task: task(1),
             generation: Generation::new(1).unwrap(),
             cut: None,
@@ -6141,7 +6265,7 @@ fn a_peer_placeholder_refines_to_the_original_failure_before_completion_exit_and
         !refined
             .effects
             .iter()
-            .any(|effect| matches!(effect, ContextEffect::StopTask { .. })),
+            .any(|effect| matches!(effect, ParticipationEffect::StopTask { .. })),
         "the original stop call remains once-only while its conclusion refines"
     );
     assert_eq!(
@@ -6152,7 +6276,7 @@ fn a_peer_placeholder_refines_to_the_original_failure_before_completion_exit_and
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     );
     assert_eq!(core.task(task(1)).unwrap().state, TaskState::Failed);
     assert_eq!(
@@ -6164,17 +6288,21 @@ fn a_peer_placeholder_refines_to_the_original_failure_before_completion_exit_and
     let discarded = completion_step(
         &mut core,
         &mut port,
-        ContextInput::Summary {
+        ParticipationInput::Summary {
             task: task(1),
             generation: Generation::new(1).unwrap(),
             cut: None,
             summary: late,
         },
     );
-    assert!(discarded.effects.contains(&ContextEffect::DisposeSource {
-        task: task(1),
-        source: SourceId(18)
-    }));
+    assert!(
+        discarded
+            .effects
+            .contains(&ParticipationEffect::DisposeSource {
+                task: task(1),
+                source: SourceId(18)
+            })
+    );
     assert_eq!(
         core.task(task(1)).unwrap().conclusion.source,
         Some(SourceId(17))
@@ -6192,7 +6320,7 @@ fn both_predecessor_summaries_are_adjudicated_before_a_pending_completion_can_se
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: None,
         },
@@ -6200,12 +6328,12 @@ fn both_predecessor_summaries_are_adjudicated_before_a_pending_completion_can_se
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     );
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::Proposal {
+        ParticipationInput::Proposal {
             task: task(1),
             proposal: proposal(TaskConclusion::Terminated(TerminationDetail::Aborted(
                 AbortCause::PeerTaskFailed,
@@ -6217,7 +6345,7 @@ fn both_predecessor_summaries_are_adjudicated_before_a_pending_completion_can_se
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::Summary {
+        ParticipationInput::Summary {
             task: task(1),
             generation: Generation::new(1).unwrap(),
             cut: None,
@@ -6236,7 +6364,7 @@ fn finishing_a_prior_termination_clears_the_waiting_intent_and_late_success_neve
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: None,
         },
@@ -6246,20 +6374,24 @@ fn finishing_a_prior_termination_clears_the_waiting_intent_and_late_success_neve
         &mut port,
         rpc(
             operation(10),
-            ContextCommand::Cancel {
+            ParticipationCommand::Cancel {
                 task: task(1),
                 reason: CancelReason::UpstreamNoLongerNeeded,
             },
         ),
     );
-    completion_step(&mut core, &mut port, ContextInput::Finish { task: task(1) });
+    completion_step(
+        &mut core,
+        &mut port,
+        ParticipationInput::Finish { task: task(1) },
+    );
     assert_eq!(core.task(task(1)).unwrap().state, TaskState::Canceled);
     assert!(!core.task(task(1)).unwrap().actual_stopped);
     assert!(!core.task(task(1)).unwrap().completion_success_pending);
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: None,
         },
@@ -6267,24 +6399,24 @@ fn finishing_a_prior_termination_clears_the_waiting_intent_and_late_success_neve
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     );
     assert_eq!(core.task(task(1)).unwrap().state, TaskState::Canceled);
 }
 
 #[test]
 fn completion_intent_rejects_unowned_uninstalled_or_incomplete_positive_output_facts() {
-    use novarocks_worker_protocol::context::CoreError;
+    use novarocks_worker_protocol::participation::CoreError;
     let mut core = core(4, 1);
     let mut port = Port::default();
     activate(&mut core, &mut port);
     create(&mut core, &mut port, 1);
     for input in [
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: None,
         },
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     ] {
         assert_eq!(
             core.handle(at(0), input, &mut port).unwrap_err(),
@@ -6295,7 +6427,7 @@ fn completion_intent_rejects_unowned_uninstalled_or_incomplete_positive_output_f
     assert_eq!(
         core.handle(
             at(0),
-            ContextInput::CompletionIntent {
+            ParticipationInput::CompletionIntent {
                 task: task(1),
                 completed_output: None
             },
@@ -6307,12 +6439,12 @@ fn completion_intent_rejects_unowned_uninstalled_or_incomplete_positive_output_f
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::Installed { task: task(1) },
+        ParticipationInput::Installed { task: task(1) },
     );
     assert_eq!(
         core.handle(
             at(0),
-            ContextInput::CompletionIntent {
+            ParticipationInput::CompletionIntent {
                 task: task(1),
                 completed_output: Some(TaskOutputFacts::new(false))
             },
@@ -6355,7 +6487,7 @@ fn completion_summary_with_lease_expiry_source_release_and_task_retirement_stays
                     completion_step(
                         &mut core,
                         &mut port,
-                        ContextInput::CompletionIntent {
+                        ParticipationInput::CompletionIntent {
                             task: task(1),
                             completed_output: None,
                         },
@@ -6363,7 +6495,7 @@ fn completion_summary_with_lease_expiry_source_release_and_task_retirement_stays
                     completion_step(
                         &mut core,
                         &mut port,
-                        ContextInput::CompletionExited { task: task(1) },
+                        ParticipationInput::CompletionExited { task: task(1) },
                     );
                     for fact in [
                         PhysicalFact::LoaderExited,
@@ -6375,7 +6507,7 @@ fn completion_summary_with_lease_expiry_source_release_and_task_retirement_stays
                         completion_step(
                             &mut core,
                             &mut port,
-                            ContextInput::Physical {
+                            ParticipationInput::Physical {
                                 task: task(1),
                                 fact,
                             },
@@ -6386,7 +6518,7 @@ fn completion_summary_with_lease_expiry_source_release_and_task_retirement_stays
                             completion_step(
                                 &mut core,
                                 &mut port,
-                                ContextInput::Proposal {
+                                ParticipationInput::Proposal {
                                     task: task(1),
                                     proposal,
                                 },
@@ -6402,7 +6534,7 @@ fn completion_summary_with_lease_expiry_source_release_and_task_retirement_stays
                     let step = core
                         .handle(
                             at(31),
-                            ContextInput::Summary {
+                            ParticipationInput::Summary {
                                 task: task(1),
                                 generation: Generation::new(1).unwrap(),
                                 cut: None,
@@ -6413,7 +6545,7 @@ fn completion_summary_with_lease_expiry_source_release_and_task_retirement_stays
                         .unwrap();
                     maximum = maximum.max(step.charged_work());
                     assert!(
-                        step.charged_work() <= ContextCore::MAX_BODY_WORK,
+                        step.charged_work() <= ParticipationCore::MAX_BODY_WORK,
                         "candidate sequence {a},{b},{c},{d} charges {}: {:?}",
                         step.charged_work(),
                         step.effects
@@ -6443,7 +6575,7 @@ fn task_close_retries_a_stopped_pending_success_as_the_existing_abort() {
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: None,
         },
@@ -6451,26 +6583,26 @@ fn task_close_retries_a_stopped_pending_success_as_the_existing_abort() {
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     );
     completion_step(
         &mut core,
         &mut port,
         rpc(
             operation(10),
-            ContextCommand::Abort {
+            ParticipationCommand::Abort {
                 cause: AbortCause::PeerTaskFailed,
             },
         ),
     );
-    completion_step(&mut core, &mut port, ContextInput::ContinueClose);
+    completion_step(&mut core, &mut port, ParticipationInput::ContinueClose);
     let closed = completion_step(
         &mut core,
         &mut port,
-        ContextInput::ApplyTaskClose {
+        ParticipationInput::ApplyTaskClose {
             task: task(1),
             generation: Generation::new(2).unwrap(),
-            intent: novarocks_worker_protocol::context::TaskCloseIntent::Abort(
+            intent: novarocks_worker_protocol::participation::TaskCloseIntent::Abort(
                 novarocks_execution_contract::AbortCause::PeerTaskFailed,
             ),
         },
@@ -6481,7 +6613,7 @@ fn task_close_retries_a_stopped_pending_success_as_the_existing_abort() {
     assert!(!record.output.responsibility_complete());
     assert!(closed.effects.iter().any(|effect| matches!(
         effect,
-        ContextEffect::PublishTask {
+        ParticipationEffect::PublishTask {
             state: TaskState::Aborted,
             ..
         }
@@ -6490,12 +6622,12 @@ fn task_close_retries_a_stopped_pending_success_as_the_existing_abort() {
 
 #[test]
 fn a_root_drain_applies_its_positive_output_before_finishing_a_buffered_peer_abort() {
-    use novarocks_worker_protocol::context::RootDrainVerdict;
+    use novarocks_worker_protocol::participation::RootDrainVerdict;
     let (mut core, mut port) = completion_fixture();
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: None,
         },
@@ -6503,12 +6635,12 @@ fn a_root_drain_applies_its_positive_output_before_finishing_a_buffered_peer_abo
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     );
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::Proposal {
+        ParticipationInput::Proposal {
             task: task(1),
             proposal: proposal(TaskConclusion::Terminated(TerminationDetail::Aborted(
                 AbortCause::PeerTaskFailed,
@@ -6517,13 +6649,13 @@ fn a_root_drain_applies_its_positive_output_before_finishing_a_buffered_peer_abo
     );
     // The channel fact keeps the same original correlation even after the
     // data wait deadline. It does not re-enter business RPC admission.
-    port.next_context_input += 1;
-    let token = InputId::new(1_000_000 + port.next_context_input).unwrap();
-    port.context_tokens.insert(operation(10), token);
+    port.next_participation_input += 1;
+    let token = InputId::new(1_000_000 + port.next_participation_input).unwrap();
+    port.participation_tokens.insert(operation(10), token);
     let drained = core
         .handle_root_end_acknowledged(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(token),
                 token,
                 operation: operation(10),
@@ -6533,7 +6665,7 @@ fn a_root_drain_applies_its_positive_output_before_finishing_a_buffered_peer_abo
             &mut port,
         )
         .unwrap();
-    assert!(drained.charged_work() <= ContextCore::MAX_BODY_WORK);
+    assert!(drained.charged_work() <= ParticipationCore::MAX_BODY_WORK);
     let record = core.task(task(1)).unwrap();
     assert_eq!(record.state, TaskState::Aborted);
     assert!(
@@ -6551,7 +6683,7 @@ fn a_root_drain_applies_its_positive_output_before_finishing_a_buffered_peer_abo
         RequestResult::Outcome(OperationOutcome::Accepted)
     );
     assert!(
-        matches!(reply.body.as_ref(), ContextReplyBody::RootDrain(RootDrainVerdict::Published(version)) if *version == record.version)
+        matches!(reply.body.as_ref(), ParticipationReplyBody::RootDrain(RootDrainVerdict::Published(version)) if *version == record.version)
     );
 }
 
@@ -6563,7 +6695,7 @@ fn one_finish_with_output_event_preserves_its_causal_failure_source_and_positive
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::Proposal {
+        ParticipationInput::Proposal {
             task: task(1),
             proposal: completion_failure(77),
         },
@@ -6571,7 +6703,7 @@ fn one_finish_with_output_event_preserves_its_causal_failure_source_and_positive
     let finish = completion_step(
         &mut core,
         &mut port,
-        ContextInput::FinishWithOutput {
+        ParticipationInput::FinishWithOutput {
             task: task(1),
             output: Some(TaskOutputFacts::new(true)),
         },
@@ -6582,7 +6714,7 @@ fn one_finish_with_output_event_preserves_its_causal_failure_source_and_positive
     assert!(record.published.output().responsibility_complete());
     assert!(!record.actual_stopped && !record.resources_converged && !record.output_released);
     let published = finish.effects.iter().position(|effect| matches!(effect,
-        ContextEffect::PublishTask { task: original, state: TaskState::Failed, snapshot, .. }
+        ParticipationEffect::PublishTask { task: original, state: TaskState::Failed, snapshot, .. }
             if *original == task(1) && *snapshot == record.published
     )).expect("the original failure and output are published together");
     let finalized = finish
@@ -6590,7 +6722,7 @@ fn one_finish_with_output_event_preserves_its_causal_failure_source_and_positive
         .iter()
         .position(|effect| {
             matches!(effect,
-                ContextEffect::FinalizeTaskExecution { task: original, normally_stopped: false }
+                ParticipationEffect::FinalizeTaskExecution { task: original, normally_stopped: false }
                     if *original == task(1)
             )
         })
@@ -6602,7 +6734,7 @@ fn one_finish_with_output_event_preserves_its_causal_failure_source_and_positive
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::FinishWithOutput {
+        ParticipationInput::FinishWithOutput {
             task: task(1),
             output: None,
         },
@@ -6615,21 +6747,21 @@ fn one_finish_with_output_event_preserves_its_causal_failure_source_and_positive
 
 #[test]
 fn actual_publications_carry_each_convergence_field_and_their_exact_versions() {
-    use novarocks_worker_protocol::context::PreparationExitRole;
+    use novarocks_worker_protocol::participation::PreparationExitOwner;
     let (mut core, mut port) = completion_fixture();
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::PreparationExitHold {
+        ParticipationInput::PreparationExitHold {
             task: task(1),
-            role: PreparationExitRole::Preparation,
+            preparation_exit_owner: PreparationExitOwner::Preparation,
             held: true,
         },
     );
     let released = completion_step(
         &mut core,
         &mut port,
-        ContextInput::Physical {
+        ParticipationInput::Physical {
             task: task(1),
             fact: PhysicalFact::OutputReleased,
         },
@@ -6638,7 +6770,7 @@ fn actual_publications_carry_each_convergence_field_and_their_exact_versions() {
         .effects
         .iter()
         .find_map(|effect| match effect {
-            ContextEffect::PublishTaskConvergence {
+            ParticipationEffect::PublishTaskConvergence {
                 version, snapshot, ..
             } => {
                 assert_eq!(*version, snapshot.version());
@@ -6653,14 +6785,14 @@ fn actual_publications_carry_each_convergence_field_and_their_exact_versions() {
         released
             .effects
             .iter()
-            .filter(|e| matches!(e, ContextEffect::PublishTaskConvergence { .. }))
+            .filter(|e| matches!(e, ParticipationEffect::PublishTaskConvergence { .. }))
             .count(),
         1
     );
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: Some(TaskOutputFacts::new(true)),
         },
@@ -6668,20 +6800,20 @@ fn actual_publications_carry_each_convergence_field_and_their_exact_versions() {
     let deferred_exit = completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     );
     assert!(
         !deferred_exit
             .effects
             .iter()
-            .any(|e| matches!(e, ContextEffect::PublishTaskConvergence { .. }))
+            .any(|e| matches!(e, ParticipationEffect::PublishTaskConvergence { .. }))
     );
     let terminal = completion_step(
         &mut core,
         &mut port,
-        ContextInput::PreparationExitHold {
+        ParticipationInput::PreparationExitHold {
             task: task(1),
-            role: PreparationExitRole::Preparation,
+            preparation_exit_owner: PreparationExitOwner::Preparation,
             held: false,
         },
     );
@@ -6689,7 +6821,7 @@ fn actual_publications_carry_each_convergence_field_and_their_exact_versions() {
         .effects
         .iter()
         .find_map(|effect| match effect {
-            ContextEffect::PublishTaskConvergence {
+            ParticipationEffect::PublishTaskConvergence {
                 version, snapshot, ..
             } => {
                 assert_eq!(*version, snapshot.version());
@@ -6709,7 +6841,7 @@ fn actual_publications_carry_each_convergence_field_and_their_exact_versions() {
         .effects
         .iter()
         .find_map(|effect| match effect {
-            ContextEffect::PublishTask {
+            ParticipationEffect::PublishTask {
                 state: TaskState::Finished,
                 convergence,
                 ..
@@ -6727,7 +6859,7 @@ fn actual_publications_carry_each_convergence_field_and_their_exact_versions() {
         completion_step(
             &mut core,
             &mut port,
-            ContextInput::Physical {
+            ParticipationInput::Physical {
                 task: task(1),
                 fact,
             },
@@ -6736,7 +6868,7 @@ fn actual_publications_carry_each_convergence_field_and_their_exact_versions() {
     let retired = completion_step(
         &mut core,
         &mut port,
-        ContextInput::Physical {
+        ParticipationInput::Physical {
             task: task(1),
             fact: PhysicalFact::RootIdle,
         },
@@ -6745,7 +6877,7 @@ fn actual_publications_carry_each_convergence_field_and_their_exact_versions() {
         .effects
         .iter()
         .find_map(|effect| match effect {
-            ContextEffect::RetireTask { convergence, .. } => Some(*convergence),
+            ParticipationEffect::RetireTask { convergence, .. } => Some(*convergence),
             _ => None,
         })
         .expect("actual retirement publishes the final monotonic view");
@@ -6781,7 +6913,7 @@ fn summary_consumed_contains_the_actual_bounded_diagnostics_author_view() {
     let consumed = completion_step(
         &mut core,
         &mut port,
-        ContextInput::Summary {
+        ParticipationInput::Summary {
             task: task(1),
             generation: Generation::new(1).unwrap(),
             cut: None,
@@ -6792,7 +6924,7 @@ fn summary_consumed_contains_the_actual_bounded_diagnostics_author_view() {
         .effects
         .iter()
         .find_map(|effect| match effect {
-            ContextEffect::SummaryConsumed { diagnostics, .. } => Some(diagnostics),
+            ParticipationEffect::SummaryConsumed { diagnostics, .. } => Some(diagnostics),
             _ => None,
         })
         .expect("the existing summary receipt carries the author's bounded view");
@@ -6812,7 +6944,7 @@ fn a_shorter_operator_snapshot_replaces_counts_but_preserves_prior_truncation_in
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::OperatorStatistics {
+        ParticipationInput::OperatorStatistics {
             task: task(1),
             statistics: statistics(10),
             truncated: true,
@@ -6821,7 +6953,7 @@ fn a_shorter_operator_snapshot_replaces_counts_but_preserves_prior_truncation_in
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::OperatorStatistics {
+        ParticipationInput::OperatorStatistics {
             task: task(1),
             statistics: statistics(2),
             truncated: false,
@@ -6830,7 +6962,7 @@ fn a_shorter_operator_snapshot_replaces_counts_but_preserves_prior_truncation_in
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionIntent {
+        ParticipationInput::CompletionIntent {
             task: task(1),
             completed_output: Some(TaskOutputFacts::new(true)),
         },
@@ -6838,14 +6970,14 @@ fn a_shorter_operator_snapshot_replaces_counts_but_preserves_prior_truncation_in
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::CompletionExited { task: task(1) },
+        ParticipationInput::CompletionExited { task: task(1) },
     );
     let read = completion_step(
         &mut core,
         &mut port,
         rpc(
             operation(11),
-            ContextCommand::GetFinalInfo { task: task(1) },
+            ParticipationCommand::GetFinalInfo { task: task(1) },
         ),
     );
     let info = final_info_reply(&read, port.request_token(operation(11)));
@@ -6862,7 +6994,7 @@ fn a_shorter_operator_snapshot_replaces_counts_but_preserves_prior_truncation_in
     completion_step(
         &mut core,
         &mut port,
-        ContextInput::OperatorStatistics {
+        ParticipationInput::OperatorStatistics {
             task: task(1),
             statistics: statistics(99),
             truncated: false,
@@ -6873,15 +7005,15 @@ fn a_shorter_operator_snapshot_replaces_counts_but_preserves_prior_truncation_in
         &mut port,
         rpc(
             operation(12),
-            ContextCommand::GetFinalInfo { task: task(1) },
+            ParticipationCommand::GetFinalInfo { task: task(1) },
         ),
     );
     let later = final_info_reply(&reread, port.request_token(operation(12)));
     assert_eq!(later, info);
 }
 
-fn selector_context(query: u64, frontend: u8) -> QueryContextRef {
-    QueryContextRef::new(
+fn selector_participation(query: u64, frontend: u8) -> ParticipationRef {
+    ParticipationRef::new(
         QueryExecutionId::new(
             QueryId::new(
                 i64::try_from(query).unwrap(),
@@ -6891,22 +7023,22 @@ fn selector_context(query: u64, frontend: u8) -> QueryContextRef {
         )
         .unwrap(),
         FrontendProcessId::try_from_bytes(bytes(frontend)).unwrap(),
-        context().backend_process_id(),
+        participation().backend_process_id(),
     )
 }
 
 fn selector_grant(
     control: &mut novarocks_worker_protocol::control::ControlCore,
     port: &mut Port,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     base: u8,
     valid_for: u64,
 ) -> AdmissionTicketId {
     use novarocks_worker_protocol::control::ControlInput;
     let ticket = AdmissionTicketId::try_from_bytes([base; 16]).unwrap();
-    let request = AcquireQueryContextAdmissionTicket::new(
+    let request = AcquireParticipationAdmissionTicket::new(
         operation(base),
-        context,
+        participation,
         LeaseValidFor::new(Duration::from_secs(valid_for)).unwrap(),
         NativeCompatibilityId::new([3; 32]),
         control.admission().capability(),
@@ -6921,15 +7053,15 @@ fn selector_grant(
 fn selector_establish(
     control: &mut novarocks_worker_protocol::control::ControlCore,
     port: &mut Port,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     base: u8,
 ) -> novarocks_worker_protocol::control::ControlStep {
     use novarocks_worker_protocol::control::ControlInput;
-    let ticket = selector_grant(control, port, context, base, 5);
+    let ticket = selector_grant(control, port, participation, base, 5);
     let step = control
         .handle_request(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(u64::from(base) * 10 + 1).unwrap()),
                 token: InputId::new(u64::from(base) * 10 + 1).unwrap(),
                 operation: operation(base + 1),
@@ -6937,7 +7069,7 @@ fn selector_establish(
             },
             ControlInput::Establish {
                 request: operation(base + 1),
-                context,
+                participation,
                 ticket,
                 payload: PayloadId(u64::from(base)),
                 semantics: semantics(),
@@ -6956,15 +7088,18 @@ fn next_internal_fairly_services_fences_and_due_maintenance_without_taking_route
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
     let mut control = control();
     let mut port = Port::default();
-    let contexts = [selector_context(8101, 1), selector_context(8201, 1)];
+    let participations = [
+        selector_participation(8101, 1),
+        selector_participation(8201, 1),
+    ];
     let mut routes = Vec::new();
-    for (index, identity) in contexts.into_iter().enumerate() {
+    for (index, identity) in participations.into_iter().enumerate() {
         let base = 10 + index as u8 * 10;
         selector_establish(&mut control, &mut port, identity, base);
         let replay = control
             .handle_request(
                 at(0),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(u64::from(base) * 10 + 2).unwrap()),
                     token: InputId::new(u64::from(base) * 10 + 2).unwrap(),
                     operation: operation(base + 1),
@@ -6972,7 +7107,7 @@ fn next_internal_fairly_services_fences_and_due_maintenance_without_taking_route
                 },
                 ControlInput::Establish {
                     request: operation(base + 1),
-                    context: identity,
+                    participation: identity,
                     ticket: AdmissionTicketId::try_from_bytes([base; 16]).unwrap(),
                     payload: PayloadId(999),
                     semantics: semantics(),
@@ -6988,12 +7123,18 @@ fn next_internal_fairly_services_fences_and_due_maintenance_without_taking_route
         .handle(
             at(0),
             ControlInput::FenceFrontend {
-                frontend: contexts[0].frontend_process_id(),
+                frontend: participations[0].frontend_process_id(),
             },
             &mut port,
         )
         .unwrap();
-    selector_grant(&mut control, &mut port, selector_context(8301, 2), 30, 1);
+    selector_grant(
+        &mut control,
+        &mut port,
+        selector_participation(8301, 2),
+        30,
+        1,
+    );
     let initial_live_grants = control.admission().logical_live_grants();
     let mut expiration_position = None;
     let calls = port.calls.len();
@@ -7023,8 +7164,8 @@ fn next_internal_fairly_services_fences_and_due_maintenance_without_taking_route
         expiration_position.expect("the original ticket expiration was committed") < 4,
         "due maintenance gets a turn while the fence still has members"
     );
-    for identity in contexts {
-        assert_eq!(steps.iter().flat_map(|step|&step.effects).filter(|effect|matches!(effect,ControlEffect::AbortContext {context,..} if *context==identity)).count(),1);
+    for identity in participations {
+        assert_eq!(steps.iter().flat_map(|step|&step.effects).filter(|effect|matches!(effect,ControlEffect::AbortParticipation {participation,..} if *participation==identity)).count(),1);
     }
     for route in &routes {
         let reply = finish_routed_establish(
@@ -7068,7 +7209,7 @@ fn a_routed_deadline_cancels_only_that_route_without_a_reply_selector_loop() {
         timed.requests[0].result,
         RequestResult::TimeoutWhileAccepted
     );
-    assert_eq!(timed.effects.iter().filter(|effect|matches!(effect,ControlEffect::CancelEstablishRoute{context:target,request} if *target==context() && *request==original)).count(),1);
+    assert_eq!(timed.effects.iter().filter(|effect|matches!(effect,ControlEffect::CancelEstablishRoute{participation:target,request} if *target==participation() && *request==original)).count(),1);
     assert!(!f.control.has_internal_work());
     let idle = f
         .control
@@ -7085,7 +7226,10 @@ fn a_routed_deadline_cancels_only_that_route_without_a_reply_selector_loop() {
         Ok(OperationOutcome::Idempotent),
     );
     assert!(late.requests.is_empty());
-    assert_eq!(f.control.route(context()), QueryContextState::Establishing);
+    assert_eq!(
+        f.control.route(participation()),
+        ParticipationState::Establishing
+    );
 }
 
 #[test]
@@ -7093,21 +7237,21 @@ fn next_internal_serializes_two_frontend_fences_without_restarting_duplicates() 
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
     let mut control = control();
     let mut port = Port::default();
-    let contexts = [
-        selector_context(9101, 3),
-        selector_context(9201, 3),
-        selector_context(9301, 4),
+    let participations = [
+        selector_participation(9101, 3),
+        selector_participation(9201, 3),
+        selector_participation(9301, 4),
     ];
     let mut materializations = Vec::new();
-    for (i, context) in contexts.into_iter().enumerate() {
+    for (i, participation) in participations.into_iter().enumerate() {
         let base = 40 + i as u8 * 3;
-        let ticket = selector_grant(&mut control, &mut port, context, base, 5);
+        let ticket = selector_grant(&mut control, &mut port, participation, base, 5);
         let original = control
             .handle(
                 at(0),
                 ControlInput::Establish {
                     request: operation(base + 1),
-                    context,
+                    participation,
                     ticket,
                     payload: PayloadId(u64::from(base)),
                     semantics: semantics(),
@@ -7120,8 +7264,8 @@ fn next_internal_serializes_two_frontend_fences_without_restarting_duplicates() 
     }
     // Both ordinary FE loss facts can arrive before the first scan starts.
     for frontend in [
-        contexts[0].frontend_process_id(),
-        contexts[2].frontend_process_id(),
+        participations[0].frontend_process_id(),
+        participations[2].frontend_process_id(),
     ] {
         let queued = control
             .handle(at(0), ControlInput::FenceFrontend { frontend }, &mut port)
@@ -7135,7 +7279,7 @@ fn next_internal_serializes_two_frontend_fences_without_restarting_duplicates() 
             .handle(
                 at(0),
                 ControlInput::FenceFrontend {
-                    frontend: contexts[0].frontend_process_id(),
+                    frontend: participations[0].frontend_process_id(),
                 },
                 &mut port,
             )
@@ -7154,14 +7298,14 @@ fn next_internal_serializes_two_frontend_fences_without_restarting_duplicates() 
         effects.extend(step.effects);
     }
     assert!(!control.has_internal_work());
-    for (i, (context, decision)) in materializations.into_iter().enumerate() {
-        assert_eq!(control.route(context), QueryContextState::Aborting);
+    for (i, (participation, decision)) in materializations.into_iter().enumerate() {
+        assert_eq!(control.route(participation), ParticipationState::Aborting);
         assert_eq!(
             effects
                 .iter()
                 .filter(|effect| matches!(effect,
-                    ControlEffect::AbortContext { context: original, generation }
-                        if *original == context && *generation == Generation::new(2).unwrap()
+                    ControlEffect::AbortParticipation { participation: original, generation }
+                        if *original == participation && *generation == Generation::new(2).unwrap()
                 ))
                 .count(),
             1
@@ -7169,22 +7313,25 @@ fn next_internal_serializes_two_frontend_fences_without_restarting_duplicates() 
         let materialized = control
             .handle(
                 at(0),
-                ControlInput::EstablishmentDecided { context, decision },
+                ControlInput::EstablishmentDecided {
+                    participation,
+                    decision,
+                },
                 &mut port,
             )
             .unwrap();
         assert!(materialized.effects.iter().any(|effect| matches!(effect,
-            ControlEffect::Reply { request, outcome: OperationOutcome::ContextTerminalReceipt }
+            ControlEffect::Reply { request, outcome: OperationOutcome::ParticipationTerminalReceipt }
                 if *request == operation(41 + i as u8 * 3)
         )));
-        assert_eq!(control.route(context), QueryContextState::Aborting);
+        assert_eq!(control.route(participation), ParticipationState::Aborting);
         assert!(materialized.charged_work() <= control.max_step_work());
     }
     let calls = port.calls.len();
-    let refused_context = selector_context(9401, 4);
-    let request = AcquireQueryContextAdmissionTicket::new(
+    let refused_participation = selector_participation(9401, 4);
+    let request = AcquireParticipationAdmissionTicket::new(
         operation(60),
-        refused_context,
+        refused_participation,
         LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
         NativeCompatibilityId::new([3; 32]),
         control.admission().capability(),
@@ -7280,7 +7427,7 @@ fn next_internal_empty_frontend_fences_each_take_one_step_without_a_global_fence
 }
 
 #[test]
-fn a_routed_decision_uses_its_context_time_instead_of_root_delivery_time() {
+fn a_routed_decision_uses_its_participation_time_instead_of_root_delivery_time() {
     let mut f = ActiveControlFixture::new(4, 1);
     let route = f.request(2, 1, active_establish_input(f.ticket, 2));
     let first = f.materialized();
@@ -7314,7 +7461,7 @@ fn materialization_refusal() -> AdmissionRefusal {
                 FailureClass::Data,
                 FailureReason::new(domain::EXECUTION, std::num::NonZeroU16::new(91).unwrap()),
             ),
-            SafeDetail::truncating("context shared facts materialization rejected"),
+            SafeDetail::truncating("participation shared facts materialization rejected"),
         ),
     )
 }
@@ -7322,8 +7469,8 @@ fn materialization_refusal() -> AdmissionRefusal {
 #[test]
 fn typed_materialization_failure_is_original_and_does_not_decide_a_routed_request() {
     use novarocks_worker_protocol::{
-        context::DomainRefusal,
         control::{ControlInput, ControlReplyBody},
+        participation::DomainRefusal,
     };
     let refusal = materialization_refusal();
     let AdmissionRefusal::Domain(outcome, failure) = refusal.clone() else {
@@ -7332,11 +7479,11 @@ fn typed_materialization_failure_is_original_and_does_not_decide_a_routed_reques
     let expected = DomainRefusal { outcome, failure };
     let mut f = ActiveControlFixture::new(4, 1);
     let route = f.request(2, 1, active_establish_input(f.ticket, 2));
-    let mut context_core = core(1, 1);
-    let finished = context_core
+    let mut participation_core = core(1, 1);
+    let finished = participation_core
         .handle(
             at(0),
-            ContextInput::MaterializationFinished {
+            ParticipationInput::MaterializationFinished {
                 result: Err(refusal),
             },
             &mut f.port,
@@ -7350,7 +7497,7 @@ fn typed_materialization_failure_is_original_and_does_not_decide_a_routed_reques
         .handle(
             at(0),
             ControlInput::EstablishmentDecided {
-                context: context(),
+                participation: participation(),
                 decision,
             },
             &mut f.port,
@@ -7364,7 +7511,7 @@ fn typed_materialization_failure_is_original_and_does_not_decide_a_routed_reques
         .handle(
             at(0),
             ControlInput::EstablishmentDecided {
-                context: context(),
+                participation: participation(),
                 decision: active_establishment_decision(),
             },
             &mut f.port,
@@ -7386,7 +7533,10 @@ fn typed_materialization_failure_is_original_and_does_not_decide_a_routed_reques
         second.requests[0].result,
         RequestResult::Outcome(OperationOutcome::InvalidStateOrRequest)
     );
-    assert_eq!(f.control.route(context()), QueryContextState::Aborting);
+    assert_eq!(
+        f.control.route(participation()),
+        ParticipationState::Aborting
+    );
 }
 
 #[test]
@@ -7394,24 +7544,28 @@ fn materialization_quiesce_completion_keeps_its_won_fence_until_a_tick_upgrades_
     for failed in [false, true] {
         for now in [2, 30] {
             for tick_first in [false, true] {
-                let mut context_core = core(1, 1);
+                let mut participation_core = core(1, 1);
                 let mut port = Port::default();
-                context_core
-                    .apply_fixture(at(1), rpc(operation(2), ContextCommand::Quiesce), &mut port)
+                participation_core
+                    .apply_fixture(
+                        at(1),
+                        rpc(operation(2), ParticipationCommand::Quiesce),
+                        &mut port,
+                    )
                     .unwrap();
                 if tick_first {
-                    context_core
-                        .handle(at(now), ContextInput::Tick, &mut port)
+                    participation_core
+                        .handle(at(now), ParticipationInput::Tick, &mut port)
                         .unwrap();
                 }
-                let finished = context_core
+                let finished = participation_core
                     .handle(
                         at(now),
-                        ContextInput::MaterializationFinished {
+                        ParticipationInput::MaterializationFinished {
                             result: if failed {
                                 Err(materialization_refusal())
                             } else {
-                                Ok(ContextMaterialized {
+                                Ok(ParticipationMaterialized {
                                     initial_credential_resource: 101,
                                 })
                             },
@@ -7424,9 +7578,9 @@ fn materialization_quiesce_completion_keeps_its_won_fence_until_a_tick_upgrades_
                 assert_eq!(
                     decision.state,
                     if expired {
-                        QueryContextState::Aborting
+                        ParticipationState::Aborting
                     } else {
-                        QueryContextState::Quiescing
+                        ParticipationState::Quiescing
                     }
                 );
                 if expired && failed {
@@ -7436,7 +7590,10 @@ fn materialization_quiesce_completion_keeps_its_won_fence_until_a_tick_upgrades_
                     };
                     assert_eq!(
                         decision.outcome,
-                        Err(novarocks_worker_protocol::context::DomainRefusal { outcome, failure })
+                        Err(novarocks_worker_protocol::participation::DomainRefusal {
+                            outcome,
+                            failure
+                        })
                     );
                 } else {
                     assert_eq!(
@@ -7444,15 +7601,15 @@ fn materialization_quiesce_completion_keeps_its_won_fence_until_a_tick_upgrades_
                         Ok(if expired {
                             OperationOutcome::LeaseExpired
                         } else {
-                            OperationOutcome::ContextTerminalReceipt
+                            OperationOutcome::ParticipationTerminalReceipt
                         })
                     );
                 }
                 assert!(!finished.effects.iter().any(|effect| matches!(
                     effect,
-                    ContextEffect::EstablishmentDecided {
-                        decision: ContextEstablishmentDecision {
-                            state: QueryContextState::Active,
+                    ParticipationEffect::EstablishmentDecided {
+                        decision: ParticipationEstablishmentDecision {
+                            state: ParticipationState::Active,
                             ..
                         },
                         ..
@@ -7461,12 +7618,12 @@ fn materialization_quiesce_completion_keeps_its_won_fence_until_a_tick_upgrades_
                 if !expired {
                     // Finishing does not renew the lease. A following actual
                     // timer at its old deadline still upgrades the live fence.
-                    assert_eq!(context_core.next_deadline(), Some(at(30)));
-                    let tick = context_core
-                        .handle(at(30), ContextInput::Tick, &mut port)
+                    assert_eq!(participation_core.next_deadline(), Some(at(30)));
+                    let tick = participation_core
+                        .handle(at(30), ParticipationInput::Tick, &mut port)
                         .unwrap();
-                    assert!(tick.charged_work() <= ContextCore::MAX_BODY_WORK);
-                    assert_eq!(context_core.state(), QueryContextState::Aborting);
+                    assert!(tick.charged_work() <= ParticipationCore::MAX_BODY_WORK);
+                    assert_eq!(participation_core.state(), ParticipationState::Aborting);
                 }
             }
         }
@@ -7476,16 +7633,16 @@ fn materialization_quiesce_completion_keeps_its_won_fence_until_a_tick_upgrades_
 #[test]
 fn materialization_host_error_preserves_domain_facts_without_replacing_the_first_close_cause() {
     for expired in [false, true] {
-        let mut context_core = core(1, 1);
+        let mut participation_core = core(1, 1);
         let mut port = Port::default();
         let now = if expired { 30 } else { 1 };
         if !expired {
-            context_core
+            participation_core
                 .apply_fixture(
                     at(now),
                     rpc(
                         operation(2),
-                        ContextCommand::Abort {
+                        ParticipationCommand::Abort {
                             cause: AbortCause::QueryFailed,
                         },
                     ),
@@ -7493,10 +7650,10 @@ fn materialization_host_error_preserves_domain_facts_without_replacing_the_first
                 )
                 .unwrap();
         }
-        let error = context_core
+        let error = participation_core
             .handle(
                 at(now),
-                ContextInput::MaterializationFinished {
+                ParticipationInput::MaterializationFinished {
                     result: Err(materialization_refusal()),
                 },
                 &mut port,
@@ -7508,14 +7665,14 @@ fn materialization_host_error_preserves_domain_facts_without_replacing_the_first
         };
         assert_eq!(
             decision.outcome,
-            Err(novarocks_worker_protocol::context::DomainRefusal { outcome, failure })
+            Err(novarocks_worker_protocol::participation::DomainRefusal { outcome, failure })
         );
-        assert_eq!(decision.state, QueryContextState::Aborting);
-        let later = context_core
+        assert_eq!(decision.state, ParticipationState::Aborting);
+        let later = participation_core
             .handle(
                 at(31),
-                ContextInput::MaterializationFinished {
-                    result: Ok(ContextMaterialized {
+                ParticipationInput::MaterializationFinished {
+                    result: Ok(ParticipationMaterialized {
                         initial_credential_resource: 101,
                     }),
                 },
@@ -7527,7 +7684,7 @@ fn materialization_host_error_preserves_domain_facts_without_replacing_the_first
             Ok(if expired {
                 OperationOutcome::LeaseExpired
             } else {
-                OperationOutcome::ContextTerminalReceipt
+                OperationOutcome::ParticipationTerminalReceipt
             })
         );
     }
@@ -7544,7 +7701,7 @@ fn root_fence_blocks_late_active_without_erasing_typed_failure_or_lease_expiry()
             .handle(
                 at(0),
                 ControlInput::FenceFrontend {
-                    frontend: context().frontend_process_id(),
+                    frontend: participation().frontend_process_id(),
                 },
                 &mut f.port,
             )
@@ -7554,16 +7711,16 @@ fn root_fence_blocks_late_active_without_erasing_typed_failure_or_lease_expiry()
                 .handle(at(0), ControlInput::ContinueFence, &mut f.port)
                 .unwrap();
         }
-        let mut context_core = core(1, 1);
+        let mut participation_core = core(1, 1);
         let now = if branch == 2 { 30 } else { 0 };
-        let finished = context_core
+        let finished = participation_core
             .handle(
                 at(now),
-                ContextInput::MaterializationFinished {
+                ParticipationInput::MaterializationFinished {
                     result: if branch == 1 {
                         Err(materialization_refusal())
                     } else {
-                        Ok(ContextMaterialized {
+                        Ok(ParticipationMaterialized {
                             initial_credential_resource: 101,
                         })
                     },
@@ -7576,18 +7733,21 @@ fn root_fence_blocks_late_active_without_erasing_typed_failure_or_lease_expiry()
             .handle(
                 at(now),
                 ControlInput::EstablishmentDecided {
-                    context: context(),
+                    participation: participation(),
                     decision: establishment_decision(&finished).1,
                 },
                 &mut f.port,
             )
             .unwrap();
-        assert_eq!(f.control.route(context()), QueryContextState::Aborting);
+        assert_eq!(
+            f.control.route(participation()),
+            ParticipationState::Aborting
+        );
         assert_eq!(result.requests.len(), 1);
         assert_eq!(
             result.requests[0].result,
             RequestResult::Outcome(match branch {
-                0 => OperationOutcome::ContextTerminalReceipt,
+                0 => OperationOutcome::ParticipationTerminalReceipt,
                 1 => OperationOutcome::InvalidStateOrRequest,
                 _ => OperationOutcome::LeaseExpired,
             })
@@ -7599,7 +7759,7 @@ fn root_fence_blocks_late_active_without_erasing_typed_failure_or_lease_expiry()
         assert!(!result.effects.iter().any(|effect| matches!(
             effect,
             ControlEffect::Route {
-                state: QueryContextState::Active,
+                state: ParticipationState::Active,
                 ..
             }
         )));
@@ -7607,20 +7767,28 @@ fn root_fence_blocks_late_active_without_erasing_typed_failure_or_lease_expiry()
     }
 }
 
-fn release_while_materialization_is_outstanding(core: &mut ContextCore, port: &mut Port) {
-    core.apply_fixture(at(0), rpc(operation(70), ContextCommand::Quiesce), port)
-        .unwrap();
-    core.handle(at(0), ContextInput::ContinueQuiesce, port)
+fn release_while_materialization_is_outstanding(core: &mut ParticipationCore, port: &mut Port) {
+    core.apply_fixture(
+        at(0),
+        rpc(operation(70), ParticipationCommand::Quiesce),
+        port,
+    )
+    .unwrap();
+    core.handle(at(0), ParticipationInput::ContinueQuiesce, port)
         .unwrap();
     let releasing = core
-        .apply_fixture(at(0), rpc(operation(71), ContextCommand::Release), port)
+        .apply_fixture(
+            at(0),
+            rpc(operation(71), ParticipationCommand::Release),
+            port,
+        )
         .unwrap();
-    assert_eq!(core.state(), QueryContextState::Releasing);
+    assert_eq!(core.state(), ParticipationState::Releasing);
     assert!(
         releasing
             .effects
             .iter()
-            .any(|effect| matches!(effect, ContextEffect::ReleaseHost { .. }))
+            .any(|effect| matches!(effect, ParticipationEffect::ReleaseHost { .. }))
     );
 }
 
@@ -7629,21 +7797,21 @@ fn late_materialization_error_reports_actual_releasing_or_terminal_state_without
     use novarocks_worker_protocol::control::{ControlInput, ControlReplyBody};
     for host_released in [false, true] {
         let mut f = ActiveControlFixture::new(4, 100);
-        let mut context_core = core(1, 1);
-        release_while_materialization_is_outstanding(&mut context_core, &mut f.port);
+        let mut participation_core = core(1, 1);
+        release_while_materialization_is_outstanding(&mut participation_core, &mut f.port);
         if host_released {
             // Logical host release is an environment fact. It does not assert
             // that the separate materialization Work/report has retired.
-            context_core
-                .handle(at(0), ContextInput::HostReleased, &mut f.port)
+            participation_core
+                .handle(at(0), ParticipationInput::HostReleased, &mut f.port)
                 .unwrap();
-            assert!(!context_core.is_compact_retained());
-            let rejected = context_core
+            assert!(!participation_core.is_compact_retained());
+            let rejected = participation_core
                 .handle(
                     at(0),
-                    ContextInput::ExecutionCustodyRetired {
-                        context: context(),
-                        close_epoch: context_core.generation(),
+                    ParticipationInput::ExecutionCustodyRetired {
+                        participation: participation(),
+                        close_epoch: participation_core.generation(),
                         origin: RetentionOrigin::new(at(0), RequestHorizon::DEFAULT),
                     },
                     &mut f.port,
@@ -7651,14 +7819,14 @@ fn late_materialization_error_reports_actual_releasing_or_terminal_state_without
                 .unwrap_err();
             assert_eq!(
                 rejected,
-                novarocks_worker_protocol::context::CoreError::IllegalFact,
+                novarocks_worker_protocol::participation::CoreError::IllegalFact,
                 "HostReleased cannot invent the original unfinished M decision"
             );
         }
-        let error = context_core
+        let error = participation_core
             .handle(
                 at(1),
-                ContextInput::MaterializationFinished {
+                ParticipationInput::MaterializationFinished {
                     result: Err(materialization_refusal()),
                 },
                 &mut f.port,
@@ -7666,28 +7834,29 @@ fn late_materialization_error_reports_actual_releasing_or_terminal_state_without
             .unwrap();
         let (_, decision) = establishment_decision(&error);
         let state = if host_released {
-            QueryContextState::TerminalRetained
+            ParticipationState::TerminalRetained
         } else {
-            QueryContextState::Releasing
+            ParticipationState::Releasing
         };
         assert_eq!(decision.state, state);
-        assert_eq!(context_core.state(), state);
+        assert_eq!(participation_core.state(), state);
         assert!(!error.effects.iter().any(|effect| matches!(
             effect,
-            ContextEffect::CloseExternalAdmission { .. } | ContextEffect::ReleaseHost { .. }
+            ParticipationEffect::CloseExternalAdmission { .. }
+                | ParticipationEffect::ReleaseHost { .. }
         )));
         let result = f
             .control
             .handle(
                 at(1),
                 ControlInput::EstablishmentDecided {
-                    context: context(),
+                    participation: participation(),
                     decision,
                 },
                 &mut f.port,
             )
             .unwrap();
-        assert_eq!(f.control.route(context()), state);
+        assert_eq!(f.control.route(participation()), state);
         assert_eq!(result.requests.len(), 1);
         assert!(matches!(
             result.requests[0].body,
@@ -7698,16 +7867,17 @@ fn late_materialization_error_reports_actual_releasing_or_terminal_state_without
 }
 
 #[test]
-fn original_context_materialization_failure_keeps_its_reply_and_a_pending_route_is_independent() {
+fn original_participation_materialization_failure_keeps_its_reply_and_a_pending_route_is_independent()
+ {
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput, ControlReplyBody};
     let mut f = ActiveControlFixture::new(4, 100);
     let route = f.request(2, 100, active_establish_input(f.ticket, 2));
     let calls = f.port.calls.len();
-    let mut context_core = core(1, 1);
-    let original_m = context_core
+    let mut participation_core = core(1, 1);
+    let original_m = participation_core
         .handle(
             at(0),
-            ContextInput::MaterializationFinished {
+            ParticipationInput::MaterializationFinished {
                 result: Err(materialization_refusal()),
             },
             &mut f.port,
@@ -7719,7 +7889,7 @@ fn original_context_materialization_failure_keeps_its_reply_and_a_pending_route_
         .handle(
             at(0),
             ControlInput::EstablishmentDecided {
-                context: context(),
+                participation: participation(),
                 decision: decision.clone(),
             },
             &mut f.port,
@@ -7733,7 +7903,7 @@ fn original_context_materialization_failure_keeps_its_reply_and_a_pending_route_
         .handle(
             at(0),
             ControlInput::EstablishmentDecided {
-                context: context(),
+                participation: participation(),
                 decision,
             },
             &mut f.port,
@@ -7760,7 +7930,7 @@ fn original_context_materialization_failure_keeps_its_reply_and_a_pending_route_
     assert!(!failure.effects.iter().any(|effect| matches!(
         effect,
         ControlEffect::Route {
-            state: QueryContextState::Active,
+            state: ParticipationState::Active,
             ..
         }
     )));
@@ -7769,8 +7939,8 @@ fn original_context_materialization_failure_keeps_its_reply_and_a_pending_route_
 #[test]
 fn a_routed_typed_decision_keeps_its_own_time_without_reusing_the_creation_body() {
     use novarocks_worker_protocol::{
-        context::DomainRefusal,
         control::{ControlInput, ControlReplyBody},
+        participation::DomainRefusal,
     };
     let mut f = ActiveControlFixture::new(4, 1);
     let route = f.request(2, 1, active_establish_input(f.ticket, 2));
@@ -7803,53 +7973,54 @@ fn a_routed_typed_decision_keeps_its_own_time_without_reusing_the_creation_body(
 }
 
 #[test]
-fn original_context_expiry_and_execution_retirement_keep_one_horizon_in_either_root_order() {
+fn original_participation_expiry_and_execution_retirement_keep_one_horizon_in_either_root_order() {
     use novarocks_worker_protocol::control::{ControlEffect, ControlInput};
     for execution_first in [false, true] {
         let mut f = ActiveControlFixture::new(4, 200);
-        let mut context_core = core(1, 1);
-        release_while_materialization_is_outstanding(&mut context_core, &mut f.port);
-        context_core
-            .handle(at(0), ContextInput::HostReleased, &mut f.port)
+        let mut participation_core = core(1, 1);
+        release_while_materialization_is_outstanding(&mut participation_core, &mut f.port);
+        participation_core
+            .handle(at(0), ParticipationInput::HostReleased, &mut f.port)
             .unwrap();
-        let finished = context_core
+        let finished = participation_core
             .handle(
                 at(0),
-                ContextInput::MaterializationFinished {
+                ParticipationInput::MaterializationFinished {
                     result: Err(materialization_refusal()),
                 },
                 &mut f.port,
             )
             .unwrap();
         let decision = establishment_decision(&finished).1;
-        let close_epoch = context_core.generation();
-        let compact = context_core
+        let close_epoch = participation_core.generation();
+        let compact = participation_core
             .handle(
                 at(1),
-                ContextInput::ExecutionCustodyRetired {
-                    context: context(),
+                ParticipationInput::ExecutionCustodyRetired {
+                    participation: participation(),
                     close_epoch,
                     origin: RetentionOrigin::new(at(1), RequestHorizon::DEFAULT),
                 },
                 &mut f.port,
             )
             .unwrap();
-        assert!(context_core.is_compact_retained());
+        assert!(participation_core.is_compact_retained());
         assert!(
             !compact
                 .effects
                 .iter()
-                .any(|e| matches!(e, ContextEffect::Expired { .. }))
+                .any(|e| matches!(e, ParticipationEffect::Expired { .. }))
         );
         let decided = ControlInput::EstablishmentDecided {
-            context: context(),
+            participation: participation(),
             decision,
         };
         let retired = ControlInput::ExecutionRetired {
-            context: context(),
-            retirement: novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
-                close_epoch,
-            },
+            participation: participation(),
+            retirement:
+                novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
+                    close_epoch,
+                },
         };
         let (first, second) = if execution_first {
             (retired, decided)
@@ -7876,21 +8047,21 @@ fn original_context_expiry_and_execution_retirement_keep_one_horizon_in_either_r
                 .any(|e| matches!(e, ControlEffect::RemoveHost { .. }))
         );
         assert_eq!(
-            f.control.route(context()),
-            QueryContextState::TerminalRetained
+            f.control.route(participation()),
+            ParticipationState::TerminalRetained
         );
-        context_core
+        participation_core
             .handle(
                 at(2),
-                ContextInput::ExecutionCustodyRetired {
-                    context: context(),
+                ParticipationInput::ExecutionCustodyRetired {
+                    participation: participation(),
                     close_epoch,
                     origin: RetentionOrigin::new(at(1), RequestHorizon::DEFAULT),
                 },
                 &mut f.port,
             )
             .unwrap();
-        assert_eq!(context_core.next_deadline(), Some(at(121)));
+        assert_eq!(participation_core.next_deadline(), Some(at(121)));
         let no_root_ttl = f
             .control
             .handle(at(120), ControlInput::Tick, &mut f.port)
@@ -7901,42 +8072,42 @@ fn original_context_expiry_and_execution_retirement_keep_one_horizon_in_either_r
                 .iter()
                 .any(|e| matches!(e, ControlEffect::RemoveHost { .. }))
         );
-        let before = context_core
-            .handle(at(120), ContextInput::Tick, &mut f.port)
+        let before = participation_core
+            .handle(at(120), ParticipationInput::Tick, &mut f.port)
             .unwrap();
         assert!(
             !before
                 .effects
                 .iter()
-                .any(|e| matches!(e, ContextEffect::Expired { .. }))
+                .any(|e| matches!(e, ParticipationEffect::Expired { .. }))
         );
-        let due = context_core
-            .handle(at(121), ContextInput::Tick, &mut f.port)
+        let due = participation_core
+            .handle(at(121), ParticipationInput::Tick, &mut f.port)
             .unwrap();
-        assert_eq!(due.effects.iter().filter(|e| matches!(e, ContextEffect::Expired { context: original, close_epoch: epoch } if *original == context() && *epoch == close_epoch)).count(), 1);
+        assert_eq!(due.effects.iter().filter(|e| matches!(e, ParticipationEffect::Expired { participation: original, close_epoch: epoch } if *original == participation() && *epoch == close_epoch)).count(), 1);
         let removal = f
             .control
             .handle(
                 at(121),
-                ControlInput::ContextExpired {
-                    context: context(),
+                ControlInput::ParticipationExpired {
+                    participation: participation(),
                     retirement:
-                        novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                        novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                             close_epoch,
                         },
                 },
                 &mut f.port,
             )
             .unwrap();
-        assert_eq!(removal.effects.iter().filter(|e| matches!(e, ControlEffect::RemoveHost { context: original } if *original == context())).count(), 1);
+        assert_eq!(removal.effects.iter().filter(|e| matches!(e, ControlEffect::RemoveHost { participation: original } if *original == participation())).count(), 1);
         let duplicate = f
             .control
             .handle(
                 at(121),
-                ControlInput::ContextExpired {
-                    context: context(),
+                ControlInput::ParticipationExpired {
+                    participation: participation(),
                     retirement:
-                        novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                        novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                             close_epoch,
                         },
                 },
@@ -7948,14 +8119,16 @@ fn original_context_expiry_and_execution_retirement_keep_one_horizon_in_either_r
             .control
             .handle(
                 at(121),
-                ControlInput::HostRemoved { context: context() },
+                ControlInput::HostRemoved {
+                    participation: participation(),
+                },
                 &mut f.port,
             )
             .unwrap();
-        assert_eq!(f.control.route(context()), QueryContextState::Absent);
+        assert_eq!(f.control.route(participation()), ParticipationState::Absent);
         assert!(removed.effects.contains(&ControlEffect::Route {
-            context: context(),
-            state: QueryContextState::Gone,
+            participation: participation(),
+            state: ParticipationState::Gone,
             generation: Generation::new(1).unwrap()
         }));
         for step in [first, second, no_root_ttl, removal, duplicate, removed] {
@@ -7965,15 +8138,15 @@ fn original_context_expiry_and_execution_retirement_keep_one_horizon_in_either_r
 }
 
 #[test]
-fn materialization_decisions_reject_impossible_shapes_and_unknown_contexts() {
-    use novarocks_worker_protocol::{context::CoreError, control::ControlInput};
+fn materialization_decisions_reject_impossible_shapes_and_unknown_participations() {
+    use novarocks_worker_protocol::{control::ControlInput, participation::CoreError};
     let mut f = ActiveControlFixture::new(4, 100);
     let unknown = f
         .control
         .handle(
             at(0),
             ControlInput::EstablishmentDecided {
-                context: another_control_context(),
+                participation: another_control_participation(),
                 decision: active_establishment_decision(),
             },
             &mut f.port,
@@ -7982,22 +8155,22 @@ fn materialization_decisions_reject_impossible_shapes_and_unknown_contexts() {
     assert_eq!(unknown, CoreError::WrongIdentity);
     for (state, outcome) in [
         (
-            QueryContextState::Establishing,
+            ParticipationState::Establishing,
             Ok(OperationOutcome::Accepted),
         ),
         (
-            QueryContextState::Active,
-            Ok(OperationOutcome::ContextTerminalReceipt),
+            ParticipationState::Active,
+            Ok(OperationOutcome::ParticipationTerminalReceipt),
         ),
-        (QueryContextState::Aborting, Ok(OperationOutcome::Accepted)),
+        (ParticipationState::Aborting, Ok(OperationOutcome::Accepted)),
     ] {
         assert_eq!(
             f.control
                 .handle(
                     at(0),
                     ControlInput::EstablishmentDecided {
-                        context: context(),
-                        decision: ContextEstablishmentDecision {
+                        participation: participation(),
+                        decision: ParticipationEstablishmentDecision {
                             state,
                             outcome,
                             acknowledgement: None,
@@ -8009,25 +8182,32 @@ fn materialization_decisions_reject_impossible_shapes_and_unknown_contexts() {
                 .unwrap_err(),
             CoreError::IllegalFact
         );
-        assert_eq!(f.control.route(context()), QueryContextState::Establishing);
+        assert_eq!(
+            f.control.route(participation()),
+            ParticipationState::Establishing
+        );
     }
     f.finish_original();
 }
 
 #[test]
-fn a_quiesced_context_does_not_accept_a_success_disguised_as_host_refusal() {
-    use novarocks_worker_protocol::context::CoreError;
+fn a_quiesced_participation_does_not_accept_a_success_disguised_as_host_refusal() {
+    use novarocks_worker_protocol::participation::CoreError;
     for outcome in [OperationOutcome::Accepted, OperationOutcome::Idempotent] {
-        let mut context_core = core(1, 1);
+        let mut participation_core = core(1, 1);
         let mut port = Port::default();
-        context_core
-            .apply_fixture(at(1), rpc(operation(2), ContextCommand::Quiesce), &mut port)
+        participation_core
+            .apply_fixture(
+                at(1),
+                rpc(operation(2), ParticipationCommand::Quiesce),
+                &mut port,
+            )
             .unwrap();
         assert_eq!(
-            context_core
+            participation_core
                 .handle(
                     at(2),
-                    ContextInput::MaterializationFinished {
+                    ParticipationInput::MaterializationFinished {
                         result: Err(AdmissionRefusal::Verdict(outcome)),
                     },
                     &mut port
@@ -8035,7 +8215,7 @@ fn a_quiesced_context_does_not_accept_a_success_disguised_as_host_refusal() {
                 .unwrap_err(),
             CoreError::IllegalFact
         );
-        assert_eq!(context_core.state(), QueryContextState::Quiescing);
+        assert_eq!(participation_core.state(), ParticipationState::Quiescing);
         assert!(port.calls.is_empty());
     }
 }
@@ -8044,26 +8224,26 @@ fn a_quiesced_context_does_not_accept_a_success_disguised_as_host_refusal() {
 fn original_execution_retirement_does_not_backdate_a_delayed_materialization_reply() {
     use novarocks_worker_protocol::control::ControlInput;
     let mut f = ActiveControlFixture::new(4, 1);
-    let mut context_core = core(1, 1);
-    release_while_materialization_is_outstanding(&mut context_core, &mut f.port);
-    context_core
-        .handle(at(0), ContextInput::HostReleased, &mut f.port)
+    let mut participation_core = core(1, 1);
+    release_while_materialization_is_outstanding(&mut participation_core, &mut f.port);
+    participation_core
+        .handle(at(0), ParticipationInput::HostReleased, &mut f.port)
         .unwrap();
-    let finished = context_core
+    let finished = participation_core
         .handle(
             at(2),
-            ContextInput::MaterializationFinished {
+            ParticipationInput::MaterializationFinished {
                 result: Err(materialization_refusal()),
             },
             &mut f.port,
         )
         .unwrap();
-    let close_epoch = context_core.generation();
-    context_core
+    let close_epoch = participation_core.generation();
+    participation_core
         .handle(
             at(2),
-            ContextInput::ExecutionCustodyRetired {
-                context: context(),
+            ParticipationInput::ExecutionCustodyRetired {
+                participation: participation(),
                 close_epoch,
                 origin: RetentionOrigin::new(at(2), RequestHorizon::DEFAULT),
             },
@@ -8075,9 +8255,9 @@ fn original_execution_retirement_does_not_backdate_a_delayed_materialization_rep
         .handle(
             at(2),
             ControlInput::ExecutionRetired {
-                context: context(),
+                participation: participation(),
                 retirement:
-                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                    novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                         close_epoch,
                     },
             },
@@ -8090,7 +8270,7 @@ fn original_execution_retirement_does_not_backdate_a_delayed_materialization_rep
         .handle(
             at(3),
             ControlInput::EstablishmentDecided {
-                context: context(),
+                participation: participation(),
                 decision: establishment_decision(&finished).1,
             },
             &mut f.port,
@@ -8103,8 +8283,8 @@ fn original_execution_retirement_does_not_backdate_a_delayed_materialization_rep
         "execution retirement cannot backdate the original M decision at two"
     );
     assert_eq!(
-        f.control.route(context()),
-        QueryContextState::TerminalRetained
+        f.control.route(participation()),
+        ParticipationState::TerminalRetained
     );
     assert!(late.charged_work() <= f.control.max_step_work());
 }
@@ -8121,7 +8301,7 @@ fn creation_and_routed_request_with_deadlines(first: u64, second: u64) -> Active
         .control
         .handle_request(
             at(0),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(2).unwrap()),
                 token: InputId::new(2).unwrap(),
                 operation: operation(3),
@@ -8135,13 +8315,13 @@ fn creation_and_routed_request_with_deadlines(first: u64, second: u64) -> Active
     f
 }
 
-fn terminal_typed_establishment_decision() -> ContextEstablishmentDecision {
-    use novarocks_worker_protocol::context::DomainRefusal;
+fn terminal_typed_establishment_decision() -> ParticipationEstablishmentDecision {
+    use novarocks_worker_protocol::participation::DomainRefusal;
     let AdmissionRefusal::Domain(outcome, failure) = materialization_refusal() else {
         unreachable!()
     };
-    ContextEstablishmentDecision {
-        state: QueryContextState::TerminalRetained,
+    ParticipationEstablishmentDecision {
+        state: ParticipationState::TerminalRetained,
         outcome: Err(DomainRefusal { outcome, failure }),
         acknowledgement: None,
         decided_at: at(0),
@@ -8158,7 +8338,7 @@ fn retained_host_removal_preserves_an_independent_routed_reply_without_restartin
         .handle(
             at(0),
             ControlInput::EstablishmentDecided {
-                context: context(),
+                participation: participation(),
                 decision: terminal_typed_establishment_decision(),
             },
             &mut f.port,
@@ -8174,9 +8354,9 @@ fn retained_host_removal_preserves_an_independent_routed_reply_without_restartin
         .handle(
             at(0),
             ControlInput::ExecutionRetired {
-                context: context(),
+                participation: participation(),
                 retirement:
-                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                    novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                         close_epoch: Generation::new(2).unwrap(),
                     },
             },
@@ -8187,30 +8367,30 @@ fn retained_host_removal_preserves_an_independent_routed_reply_without_restartin
         .control
         .handle(
             at(120),
-            ControlInput::ContextExpired {
-                context: context(),
+            ControlInput::ParticipationExpired {
+                participation: participation(),
                 retirement:
-                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                    novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                         close_epoch: Generation::new(2).unwrap(),
                     },
             },
             &mut f.port,
         )
         .unwrap();
-    assert_eq!(due.effects.iter().filter(|effect|matches!(effect,ControlEffect::RemoveHost{context:target} if *target==context())).count(),1);
-    // A known original Context expiry projects Gone immediately for new R,
+    assert_eq!(due.effects.iter().filter(|effect|matches!(effect,ControlEffect::RemoveHost{participation:target} if *target==participation())).count(),1);
+    // A known original Participation expiry projects Gone immediately for new R,
     // while the independently routed original token keeps its frozen result.
     for (token, input) in [
         (
             3,
-            ControlInput::CreateWithoutContextAddress {
-                context: context(),
+            ControlInput::CreateWithoutParticipationAddress {
+                participation: participation(),
                 task: task(1),
             },
         ),
         (4, active_establish_input(f.ticket, 9)),
     ] {
-        let request = RequestContext {
+        let request = RequestReplyTag {
             author: model_request_author(InputId::new(token).unwrap()),
             token: InputId::new(token).unwrap(),
             operation: operation(2),
@@ -8228,29 +8408,31 @@ fn retained_host_removal_preserves_an_independent_routed_reply_without_restartin
         );
         assert!(reply.effects.is_empty());
     }
-    // The model reports actual Context physical removal only after its own
+    // The model reports actual Participation physical removal only after its own
     // route leg exited; a Root backchannel may still be awaiting delivery.
     let gone = f
         .control
         .handle(
             at(120),
-            ControlInput::HostRemoved { context: context() },
+            ControlInput::HostRemoved {
+                participation: participation(),
+            },
             &mut f.port,
         )
         .unwrap();
-    assert_eq!(f.control.route(context()), QueryContextState::Absent);
+    assert_eq!(f.control.route(participation()), ParticipationState::Absent);
     let second = finish_routed_establish(
         &mut f.control,
         &mut f.port,
         &route,
         121,
         1,
-        Ok(OperationOutcome::ContextTerminalReceipt),
+        Ok(OperationOutcome::ParticipationTerminalReceipt),
     );
     assert_eq!(second.requests[0].request.token, InputId::new(2).unwrap());
     assert_eq!(
         second.requests[0].result,
-        RequestResult::Outcome(OperationOutcome::ContextTerminalReceipt)
+        RequestResult::Outcome(OperationOutcome::ParticipationTerminalReceipt)
     );
     assert!(matches!(
         first.requests[0].body,
@@ -8271,7 +8453,7 @@ fn an_expired_new_r_cannot_copy_a_creation_domain_body_or_consume_another_route(
         .handle(
             at(0),
             ControlInput::EstablishmentDecided {
-                context: context(),
+                participation: participation(),
                 decision: terminal_typed_establishment_decision(),
             },
             &mut f.port,
@@ -8281,7 +8463,7 @@ fn an_expired_new_r_cannot_copy_a_creation_domain_body_or_consume_another_route(
         .control
         .handle_request(
             at(2),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(3).unwrap()),
                 token: InputId::new(3).unwrap(),
                 operation: operation(2),
@@ -8304,12 +8486,12 @@ fn an_expired_new_r_cannot_copy_a_creation_domain_body_or_consume_another_route(
         &route,
         2,
         0,
-        Ok(OperationOutcome::ContextTerminalReceipt),
+        Ok(OperationOutcome::ParticipationTerminalReceipt),
     );
     assert_eq!(original.requests[0].request.token, InputId::new(2).unwrap());
     assert_eq!(
         original.requests[0].result,
-        RequestResult::Outcome(OperationOutcome::ContextTerminalReceipt)
+        RequestResult::Outcome(OperationOutcome::ParticipationTerminalReceipt)
     );
     assert!(matches!(
         first.requests[0].body,
@@ -8327,9 +8509,9 @@ fn pending_retained_removal_and_a_routed_deadline_keep_separate_obligations() {
         .handle(
             at(0),
             ControlInput::ExecutionRetired {
-                context: context(),
+                participation: participation(),
                 retirement:
-                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                    novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                         close_epoch: Generation::new(2).unwrap(),
                     },
             },
@@ -8337,7 +8519,7 @@ fn pending_retained_removal_and_a_routed_deadline_keep_separate_obligations() {
         )
         .unwrap();
     // Advance only the independent ticket metadata deadline. It cannot
-    // substitute for ContextCore's explicit expiry notification.
+    // substitute for ParticipationCore's explicit expiry notification.
     let ticket_maintenance = f
         .control
         .handle(at(120), ControlInput::Tick, &mut f.port)
@@ -8352,10 +8534,10 @@ fn pending_retained_removal_and_a_routed_deadline_keep_separate_obligations() {
         .control
         .handle(
             at(120),
-            ControlInput::ContextExpired {
-                context: context(),
+            ControlInput::ParticipationExpired {
+                participation: participation(),
                 retirement:
-                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                    novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                         close_epoch: Generation::new(2).unwrap(),
                     },
             },
@@ -8373,14 +8555,14 @@ fn pending_retained_removal_and_a_routed_deadline_keep_separate_obligations() {
         .handle(
             at(121),
             ControlInput::EstablishmentDecided {
-                context: context(),
+                participation: participation(),
                 decision: terminal_typed_establishment_decision(),
             },
             &mut f.port,
         )
         .unwrap();
     assert_eq!(decided.requests[0].request.token, InputId::new(1).unwrap());
-    assert_eq!(decided.effects.iter().filter(|effect|matches!(effect,ControlEffect::RemoveHost{context:target} if *target==context())).count(),1);
+    assert_eq!(decided.effects.iter().filter(|effect|matches!(effect,ControlEffect::RemoveHost{participation:target} if *target==participation())).count(),1);
     let timed = f
         .control
         .handle(at(121), ControlInput::Tick, &mut f.port)
@@ -8401,7 +8583,7 @@ fn pending_retained_removal_and_a_routed_deadline_keep_separate_obligations() {
         f.control
             .next_deadline()
             .is_none_or(|deadline| deadline > at(241)),
-        "neither M nor routed timeout creates another Context deadline"
+        "neither M nor routed timeout creates another Participation deadline"
     );
     let idle = f
         .control
@@ -8414,7 +8596,7 @@ fn pending_retained_removal_and_a_routed_deadline_keep_separate_obligations() {
         &route,
         121,
         120,
-        Ok(OperationOutcome::ContextTerminalReceipt),
+        Ok(OperationOutcome::ParticipationTerminalReceipt),
     );
     assert!(late.requests.is_empty());
 }
@@ -8428,9 +8610,9 @@ fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization
         .handle(
             at(0),
             ControlInput::ExecutionRetired {
-                context: context(),
+                participation: participation(),
                 retirement:
-                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                    novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                         close_epoch: Generation::new(2).unwrap(),
                     },
             },
@@ -8459,7 +8641,7 @@ fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization
         assert_eq!(result.result, RequestResult::TimeoutWhileAccepted);
     }
     // Advance only the independent ticket metadata deadline. It cannot
-    // substitute for ContextCore's explicit expiry notification.
+    // substitute for ParticipationCore's explicit expiry notification.
     let ticket_maintenance = f
         .control
         .handle(at(120), ControlInput::Tick, &mut f.port)
@@ -8474,10 +8656,10 @@ fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization
         .control
         .handle(
             at(120),
-            ControlInput::ContextExpired {
-                context: context(),
+            ControlInput::ParticipationExpired {
+                participation: participation(),
                 retirement:
-                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                    novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                         close_epoch: Generation::new(2).unwrap(),
                     },
             },
@@ -8488,7 +8670,7 @@ fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization
         !due.effects
             .iter()
             .any(|effect| matches!(effect, ControlEffect::RemoveHost { .. })),
-        "timeout is not a Context materialization completion"
+        "timeout is not a Participation materialization completion"
     );
     assert!(!f.control.has_internal_work());
     for _ in 0..2 {
@@ -8509,7 +8691,7 @@ fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization
         .handle(
             at(121),
             ControlInput::EstablishmentDecided {
-                context: context(),
+                participation: participation(),
                 decision: terminal_typed_establishment_decision(),
             },
             &mut f.port,
@@ -8519,7 +8701,7 @@ fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization
         decided.requests.is_empty(),
         "both original RPC roles already timed out"
     );
-    assert_eq!(decided.effects.iter().filter(|effect| matches!(effect, ControlEffect::RemoveHost { context: original } if *original == context())).count(), 1);
+    assert_eq!(decided.effects.iter().filter(|effect| matches!(effect, ControlEffect::RemoveHost { participation: original } if *original == participation())).count(), 1);
     assert!(!f.control.has_internal_work());
     let idle = f
         .control
@@ -8530,11 +8712,13 @@ fn a_retained_directory_with_no_waiters_still_waits_for_its_real_materialization
         .control
         .handle(
             at(121),
-            ControlInput::HostRemoved { context: context() },
+            ControlInput::HostRemoved {
+                participation: participation(),
+            },
             &mut f.port,
         )
         .unwrap();
-    assert_eq!(f.control.route(context()), QueryContextState::Absent);
+    assert_eq!(f.control.route(participation()), ParticipationState::Absent);
     for step in [
         retained,
         first_timeout,
@@ -8560,7 +8744,7 @@ fn an_ingress_owner_failure_settles_only_its_original_token_without_business_adm
         .handle(
             at(0),
             ControlInput::FenceFrontend {
-                frontend: context().frontend_process_id(),
+                frontend: participation().frontend_process_id(),
             },
             &mut port,
         )
@@ -8568,7 +8752,7 @@ fn an_ingress_owner_failure_settles_only_its_original_token_without_business_adm
     control
         .handle(at(0), ControlInput::NextInternal, &mut port)
         .unwrap();
-    let request = RequestContext {
+    let request = RequestReplyTag {
         author: model_request_author(InputId::new(1).unwrap()),
         token: InputId::new(1).unwrap(),
         operation: operation(90),
@@ -8595,14 +8779,14 @@ fn an_ingress_owner_failure_settles_only_its_original_token_without_business_adm
     );
     assert!(port.calls.is_empty());
     assert!(!control.has_internal_work());
-    assert_eq!(control.route(context()), QueryContextState::Absent);
+    assert_eq!(control.route(participation()), ParticipationState::Absent);
 
     // The failed ingress did not leave an operation shape or directory row.
-    // This other unfenced context can use the same operation for a genuine
+    // This other unfenced participation can use the same operation for a genuine
     // independently paid acquisition, rather than joining a phantom failure.
     port.reject = None;
-    let other = selector_context(15001, 2);
-    let acquire = AcquireQueryContextAdmissionTicket::new(
+    let other = selector_participation(15001, 2);
+    let acquire = AcquireParticipationAdmissionTicket::new(
         request.operation,
         other,
         LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
@@ -8612,7 +8796,7 @@ fn an_ingress_owner_failure_settles_only_its_original_token_without_business_adm
     let accepted = control
         .handle_request(
             at(5),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(2).unwrap()),
                 token: InputId::new(2).unwrap(),
                 operation: request.operation,
@@ -8649,7 +8833,7 @@ fn an_ingress_failure_cannot_consume_an_original_creation_or_independent_routed_
                     .handle(
                         at(0),
                         ControlInput::EstablishmentDecided {
-                            context: context(),
+                            participation: participation(),
                             decision: terminal_typed_establishment_decision(),
                         },
                         &mut f.port,
@@ -8662,7 +8846,7 @@ fn an_ingress_failure_cannot_consume_an_original_creation_or_independent_routed_
             .control
             .handle_request(
                 at(2),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(3).unwrap()),
                     token: InputId::new(3).unwrap(),
                     operation: operation(2),
@@ -8684,13 +8868,16 @@ fn an_ingress_failure_cannot_consume_an_original_creation_or_independent_routed_
         );
         assert_eq!(f.port.calls.len(), calls);
         if phase == 0 {
-            assert_eq!(f.control.route(context()), QueryContextState::Establishing);
+            assert_eq!(
+                f.control.route(participation()),
+                ParticipationState::Establishing
+            );
             first = Some(
                 f.control
                     .handle(
                         at(2),
                         ControlInput::EstablishmentDecided {
-                            context: context(),
+                            participation: participation(),
                             decision: active_establishment_decision(),
                         },
                         &mut f.port,
@@ -8708,9 +8895,9 @@ fn an_ingress_failure_cannot_consume_an_original_creation_or_independent_routed_
             let AdmissionRefusal::Domain(outcome, failure) = materialization_refusal() else {
                 unreachable!()
             };
-            Err(novarocks_worker_protocol::context::DomainRefusal { outcome, failure })
+            Err(novarocks_worker_protocol::participation::DomainRefusal { outcome, failure })
         } else {
-            Ok(OperationOutcome::ContextTerminalReceipt)
+            Ok(OperationOutcome::ParticipationTerminalReceipt)
         };
         let second = finish_routed_establish(
             &mut f.control,
@@ -8740,7 +8927,7 @@ fn an_ingress_failure_cannot_consume_an_original_creation_or_independent_routed_
 
 #[test]
 fn an_ingress_failure_requires_a_valid_unique_rpc_token_and_monotonic_time() {
-    use novarocks_worker_protocol::{context::CoreError, control::ControlInput};
+    use novarocks_worker_protocol::{control::ControlInput, participation::CoreError};
     let mut f = ActiveControlFixture::new(4, 100);
     let calls = f.port.calls.len();
     assert_eq!(
@@ -8760,7 +8947,7 @@ fn an_ingress_failure_requires_a_valid_unique_rpc_token_and_monotonic_time() {
             f.control
                 .handle_request(
                     at(0),
-                    RequestContext {
+                    RequestReplyTag {
                         author: model_request_author(InputId::new(token).unwrap()),
                         token: InputId::new(token).unwrap(),
                         operation: candidate_operation,
@@ -8779,7 +8966,7 @@ fn an_ingress_failure_requires_a_valid_unique_rpc_token_and_monotonic_time() {
         .control
         .handle_request(
             at(1),
-            RequestContext {
+            RequestReplyTag {
                 author: model_request_author(InputId::new(2).unwrap()),
                 token: InputId::new(2).unwrap(),
                 operation: operation(2),
@@ -8796,7 +8983,7 @@ fn an_ingress_failure_requires_a_valid_unique_rpc_token_and_monotonic_time() {
         f.control
             .handle_request(
                 at(0),
-                RequestContext {
+                RequestReplyTag {
                     author: model_request_author(InputId::new(3).unwrap()),
                     token: InputId::new(3).unwrap(),
                     operation: operation(2),
@@ -8816,7 +9003,7 @@ fn an_ingress_failure_requires_a_valid_unique_rpc_token_and_monotonic_time() {
         .handle(
             at(1),
             ControlInput::EstablishmentDecided {
-                context: context(),
+                participation: participation(),
                 decision: active_establishment_decision(),
             },
             &mut f.port,
@@ -8832,19 +9019,19 @@ fn an_ingress_failure_requires_a_valid_unique_rpc_token_and_monotonic_time() {
 
 #[test]
 fn an_rpc_transport_wrapper_cannot_bypass_the_actual_request_envelope() {
-    use novarocks_worker_protocol::context::CoreError;
+    use novarocks_worker_protocol::participation::CoreError;
     let mut core = core(4, 1);
     let mut port = Port::default();
     activate(&mut core, &mut port);
-    let command = || ContextCommand::Create {
+    let command = || ParticipationCommand::Create {
         task: task(1),
         payload: PayloadId(1),
     };
-    let refused = core.handle(at(0), ContextInput::Request(command()), &mut port);
+    let refused = core.handle(at(0), ParticipationInput::Request(command()), &mut port);
     assert_eq!(refused.unwrap_err(), CoreError::WrongIdentity);
     assert!(port.calls.is_empty());
     assert!(core.task(task(1)).is_none());
-    let request = RequestContext {
+    let request = RequestReplyTag {
         author: model_request_author(InputId::new(71).unwrap()),
         token: InputId::new(71).unwrap(),
         operation: operation(9),
@@ -8858,7 +9045,7 @@ fn an_rpc_transport_wrapper_cannot_bypass_the_actual_request_envelope() {
     let loaded = core
         .handle(
             at(0),
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task: task(1),
                 result: Ok(cost()),
             },
@@ -8877,13 +9064,13 @@ fn the_same_wire_operation_does_not_join_distinct_tasks_or_replace_a_settled_bod
     let mut port = Port::default();
     activate(&mut core, &mut port);
     let requests = [
-        RequestContext {
+        RequestReplyTag {
             author: model_request_author(InputId::new(81).unwrap()),
             token: InputId::new(81).unwrap(),
             operation: operation(9),
             deadline: at(100),
         },
-        RequestContext {
+        RequestReplyTag {
             author: model_request_author(InputId::new(82).unwrap()),
             token: InputId::new(82).unwrap(),
             operation: operation(9),
@@ -8895,7 +9082,7 @@ fn the_same_wire_operation_does_not_join_distinct_tasks_or_replace_a_settled_bod
         core.handle_request(
             at(0),
             request,
-            ContextCommand::Create {
+            ParticipationCommand::Create {
                 task: task(n),
                 payload: PayloadId(u64::from(n)),
             },
@@ -8911,7 +9098,7 @@ fn the_same_wire_operation_does_not_join_distinct_tasks_or_replace_a_settled_bod
     let first = core
         .handle(
             at(0),
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task: task(1),
                 result: Ok(cost()),
             },
@@ -8925,7 +9112,7 @@ fn the_same_wire_operation_does_not_join_distinct_tasks_or_replace_a_settled_bod
     let second = core
         .handle(
             at(0),
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task: task(2),
                 result: Err(OperationOutcome::ResourceExhausted.into()),
             },

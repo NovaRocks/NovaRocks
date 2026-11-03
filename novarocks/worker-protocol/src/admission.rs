@@ -19,8 +19,8 @@
 //! grants confer protocol rights without reserving execution capacity.
 use crate::lease::MonotonicInstant;
 use novarocks_execution_contract::{
-    AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId, LeaseValidFor,
-    QueryContextAdmissionTicketReceipt, QueryContextRef, TaskOperationId,
+    AcquireParticipationAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
+    LeaseValidFor, ParticipationAdmissionTicketReceipt, ParticipationRef, TaskOperationId,
 };
 use novarocks_types::NativeCompatibilityId;
 use std::collections::{BTreeMap, BTreeSet};
@@ -74,7 +74,7 @@ pub enum AdmissionTicketState {
     Expired,
 }
 
-/// A read-only, context-bound view of one ticket at the worker's monotonic time.
+/// A read-only, participation-bound view of one ticket at the worker's monotonic time.
 ///
 /// This is advisory for ingress wait budgeting. Only `redeem` can decide
 /// whether a later establish actually consumes the ticket.
@@ -85,7 +85,7 @@ pub enum AdmissionTicketObservation {
     Expired,
     Closed,
     Unknown,
-    ForeignContext,
+    ForeignParticipation,
 }
 
 /// Whether an acquisition issued a new grant or replayed the original one.
@@ -99,13 +99,13 @@ pub enum AdmissionTicketProgression {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct AdmissionTicketGrant {
     progression: AdmissionTicketProgression,
-    receipt: QueryContextAdmissionTicketReceipt,
+    receipt: ParticipationAdmissionTicketReceipt,
 }
 
 impl AdmissionTicketGrant {
     const fn new(
         progression: AdmissionTicketProgression,
-        receipt: QueryContextAdmissionTicketReceipt,
+        receipt: ParticipationAdmissionTicketReceipt,
     ) -> Self {
         Self {
             progression,
@@ -117,7 +117,7 @@ impl AdmissionTicketGrant {
         self.progression
     }
 
-    pub const fn receipt(self) -> QueryContextAdmissionTicketReceipt {
+    pub const fn receipt(self) -> ParticipationAdmissionTicketReceipt {
         self.receipt
     }
 }
@@ -126,7 +126,7 @@ impl AdmissionTicketGrant {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdmissionTicketAcquisitionRejection {
     ValidityExceedsWorkerLimit,
-    ContextAlreadyGranted,
+    ParticipationAlreadyGranted,
     OperationReplayConflict,
     SealedEpoch,
     Inactive(AdmissionTicketState),
@@ -138,7 +138,9 @@ impl fmt::Display for AdmissionTicketAcquisitionRejection {
             Self::ValidityExceedsWorkerLimit => {
                 "admission ticket validity exceeds the worker limit"
             }
-            Self::ContextAlreadyGranted => "query context already has an active admission ticket",
+            Self::ParticipationAlreadyGranted => {
+                "participation already has an active admission ticket"
+            }
             Self::OperationReplayConflict => {
                 "admission ticket operation id was replayed with different content"
             }
@@ -157,8 +159,8 @@ impl std::error::Error for AdmissionTicketAcquisitionRejection {}
 /// Whether an establish consumed a grant or replayed the same redemption.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum AdmissionTicketRedemption {
-    Redeemed(QueryContextAdmissionTicketReceipt),
-    Replayed(QueryContextAdmissionTicketReceipt),
+    Redeemed(ParticipationAdmissionTicketReceipt),
+    Replayed(ParticipationAdmissionTicketReceipt),
 }
 
 /// Why a ticket cannot authorize an establish.
@@ -167,7 +169,7 @@ pub enum AdmissionTicketRedemptionRejection {
     Unknown,
     Expired,
     Closed,
-    ForeignContext,
+    ForeignParticipation,
 }
 
 impl fmt::Display for AdmissionTicketRedemptionRejection {
@@ -176,7 +178,7 @@ impl fmt::Display for AdmissionTicketRedemptionRejection {
             Self::Unknown => "establish names an unknown admission ticket",
             Self::Expired => "establish names an expired admission ticket",
             Self::Closed => "establish names a closed admission ticket",
-            Self::ForeignContext => "admission ticket belongs to a different query context",
+            Self::ForeignParticipation => "admission ticket belongs to a different participation",
         })
     }
 }
@@ -185,14 +187,14 @@ impl std::error::Error for AdmissionTicketRedemptionRejection {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AcquisitionIdentity {
-    context: QueryContextRef,
+    participation: ParticipationRef,
     valid_for: LeaseValidFor,
     compatibility: NativeCompatibilityId,
 }
-impl From<AcquireQueryContextAdmissionTicket> for AcquisitionIdentity {
-    fn from(r: AcquireQueryContextAdmissionTicket) -> Self {
+impl From<AcquireParticipationAdmissionTicket> for AcquisitionIdentity {
+    fn from(r: AcquireParticipationAdmissionTicket) -> Self {
         Self {
-            context: r.context(),
+            participation: r.participation(),
             valid_for: r.valid_for(),
             compatibility: r.native_compatibility_id(),
         }
@@ -201,14 +203,14 @@ impl From<AcquireQueryContextAdmissionTicket> for AcquisitionIdentity {
 #[derive(Clone, Copy, Debug)]
 struct TicketRecord {
     operation: TaskOperationId,
-    receipt: QueryContextAdmissionTicketReceipt,
+    receipt: ParticipationAdmissionTicketReceipt,
     state: AdmissionTicketState,
     expires_at: MonotonicInstant,
 }
 #[derive(Clone, Debug)]
 struct Decision {
     identity: AcquisitionIdentity,
-    result: Result<QueryContextAdmissionTicketReceipt, AdmissionTicketAcquisitionRejection>,
+    result: Result<ParticipationAdmissionTicketReceipt, AdmissionTicketAcquisitionRejection>,
     stamp: u64,
 }
 /// Original table inventory. Estimates cover inline keys/values only; tree
@@ -229,7 +231,7 @@ pub struct AdmissionCore {
     process_draining: bool,
     reclaim_frontier: u64,
     tickets: BTreeMap<AdmissionTicketId, TicketRecord>,
-    contexts: BTreeMap<QueryContextRef, AdmissionTicketId>,
+    participations: BTreeMap<ParticipationRef, AdmissionTicketId>,
     decisions: BTreeMap<TaskOperationId, Decision>,
     expiries: BTreeSet<(MonotonicInstant, AdmissionTicketId)>,
     retention: BTreeSet<(MonotonicInstant, TaskOperationId)>,
@@ -244,7 +246,7 @@ impl AdmissionCore {
             process_draining: false,
             reclaim_frontier: 0,
             tickets: BTreeMap::new(),
-            contexts: BTreeMap::new(),
+            participations: BTreeMap::new(),
             decisions: BTreeMap::new(),
             expiries: BTreeSet::new(),
             retention: BTreeSet::new(),
@@ -257,7 +259,7 @@ impl AdmissionCore {
     /// Issued or redeemed grants not yet closed by a committed transition.
     /// This is observation only, never a limit or execution capacity grant.
     pub fn logical_live_grants(&self) -> usize {
-        self.contexts.len()
+        self.participations.len()
     }
     pub fn retention_inventory(&self) -> AdmissionRetentionInventory {
         use std::mem::size_of;
@@ -271,9 +273,9 @@ impl AdmissionCore {
             })
             .and_then(|n| {
                 n.checked_add(
-                    self.contexts
+                    self.participations
                         .len()
-                        .checked_mul(size_of::<(QueryContextRef, AdmissionTicketId)>())?,
+                        .checked_mul(size_of::<(ParticipationRef, AdmissionTicketId)>())?,
                 )
             })
             .and_then(|n| {
@@ -313,7 +315,7 @@ impl AdmissionCore {
     }
     pub fn acquire(
         &mut self,
-        request: AcquireQueryContextAdmissionTicket,
+        request: AcquireParticipationAdmissionTicket,
         ticket: AdmissionTicketId,
         now: MonotonicInstant,
     ) -> Result<AdmissionTicketGrant, AdmissionTicketAcquisitionRejection> {
@@ -353,8 +355,8 @@ impl AdmissionCore {
         }
         let reject = if request.valid_for().get() > self.config.max_valid_for {
             Some(AdmissionTicketAcquisitionRejection::ValidityExceedsWorkerLimit)
-        } else if self.contexts.contains_key(&request.context()) {
-            Some(AdmissionTicketAcquisitionRejection::ContextAlreadyGranted)
+        } else if self.participations.contains_key(&request.participation()) {
+            Some(AdmissionTicketAcquisitionRejection::ParticipationAlreadyGranted)
         } else {
             None
         };
@@ -362,8 +364,11 @@ impl AdmissionCore {
             self.record(operation, identity, Err(e.clone()), Some(now));
             return Err(e);
         }
-        let receipt =
-            QueryContextAdmissionTicketReceipt::new(ticket, request.context(), request.valid_for());
+        let receipt = ParticipationAdmissionTicketReceipt::new(
+            ticket,
+            request.participation(),
+            request.valid_for(),
+        );
         let expires_at = now.saturating_add(request.valid_for().get());
         self.tickets.insert(
             ticket,
@@ -374,7 +379,7 @@ impl AdmissionCore {
                 expires_at,
             },
         );
-        self.contexts.insert(request.context(), ticket);
+        self.participations.insert(request.participation(), ticket);
         self.expiries.insert((expires_at, ticket));
         self.record(operation, identity, Ok(receipt), None);
         Ok(AdmissionTicketGrant::new(
@@ -386,7 +391,7 @@ impl AdmissionCore {
         &mut self,
         op: TaskOperationId,
         identity: AcquisitionIdentity,
-        result: Result<QueryContextAdmissionTicketReceipt, AdmissionTicketAcquisitionRejection>,
+        result: Result<ParticipationAdmissionTicketReceipt, AdmissionTicketAcquisitionRejection>,
         terminal: Option<MonotonicInstant>,
     ) {
         let stamp = self.next_stamp;
@@ -412,15 +417,15 @@ impl AdmissionCore {
     pub fn redeem(
         &mut self,
         ticket: AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         now: MonotonicInstant,
     ) -> Result<AdmissionTicketRedemption, AdmissionTicketRedemptionRejection> {
         let r = self
             .tickets
             .get_mut(&ticket)
             .ok_or(AdmissionTicketRedemptionRejection::Unknown)?;
-        if r.receipt.context() != context {
-            return Err(AdmissionTicketRedemptionRejection::ForeignContext);
+        if r.receipt.participation() != participation {
+            return Err(AdmissionTicketRedemptionRejection::ForeignParticipation);
         }
         if self.process_draining {
             return Err(AdmissionTicketRedemptionRejection::Closed);
@@ -440,7 +445,7 @@ impl AdmissionCore {
         }
     }
     /// Process drain closes new grant/election rights. Existing decisions
-    /// remain observable; closing a ticket never proves physical Context exit.
+    /// remain observable; closing a ticket never proves physical Participation exit.
     pub(crate) fn begin_process_drain(&mut self) {
         self.process_draining = true;
     }
@@ -464,8 +469,12 @@ impl AdmissionCore {
         self.terminal(ticket, AdmissionTicketState::Closed, now)
     }
 
-    pub fn revoke_unredeemed(&mut self, context: QueryContextRef, now: MonotonicInstant) -> bool {
-        let Some(&ticket) = self.contexts.get(&context) else {
+    pub fn revoke_unredeemed(
+        &mut self,
+        participation: ParticipationRef,
+        now: MonotonicInstant,
+    ) -> bool {
+        let Some(&ticket) = self.participations.get(&participation) else {
             return false;
         };
         if self.tickets[&ticket].state != AdmissionTicketState::Issued {
@@ -473,8 +482,12 @@ impl AdmissionCore {
         }
         self.terminal(ticket, AdmissionTicketState::Closed, now)
     }
-    pub fn close_context(&mut self, context: QueryContextRef, now: MonotonicInstant) -> bool {
-        let Some(ticket) = self.contexts.remove(&context) else {
+    pub fn close_participation(
+        &mut self,
+        participation: ParticipationRef,
+        now: MonotonicInstant,
+    ) -> bool {
+        let Some(ticket) = self.participations.remove(&participation) else {
             return false;
         };
         self.terminal(ticket, AdmissionTicketState::Closed, now)
@@ -494,7 +507,7 @@ impl AdmissionCore {
         ) {
             return false;
         }
-        self.contexts.remove(&r.receipt.context());
+        self.participations.remove(&r.receipt.participation());
         self.expiries.remove(&(r.expires_at, ticket));
         r.state = state;
         self.retention.insert((
@@ -503,7 +516,7 @@ impl AdmissionCore {
         ));
         true
     }
-    /// A bounded cursor over indexes, never a scan of every task/context.
+    /// A bounded cursor over indexes, never a scan of every task/participation.
     /// Returns the number of metadata records visited for step accounting.
     /// Ticket expiration and replay forgetting never release execution work.
     pub fn advance(&mut self, now: MonotonicInstant, budget: usize) -> usize {
@@ -548,14 +561,14 @@ impl AdmissionCore {
     pub fn observe(
         &self,
         ticket: AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         now: MonotonicInstant,
     ) -> AdmissionTicketObservation {
         let Some(r) = self.tickets.get(&ticket) else {
             return AdmissionTicketObservation::Unknown;
         };
-        if r.receipt.context() != context {
-            return AdmissionTicketObservation::ForeignContext;
+        if r.receipt.participation() != participation {
+            return AdmissionTicketObservation::ForeignParticipation;
         }
         match r.state {
             AdmissionTicketState::Issued if now.has_reached(r.expires_at) => {

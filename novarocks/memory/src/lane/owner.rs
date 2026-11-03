@@ -18,7 +18,7 @@
 //! Owner-side access responsibility, released only outside allocator hooks.
 use super::{
     record::{LaneRecord, ResponsibilityClass},
-    store::StoreHandle,
+    store::RecordStorePin,
     token::RecordRef,
 };
 
@@ -26,7 +26,7 @@ use super::{
 /// through an Arc; allocation tokens deliberately do not retain the owner.
 #[derive(Debug)]
 pub struct RecordOwner {
-    pub(crate) store: StoreHandle,
+    pub(crate) store: RecordStorePin,
     pub(crate) reference: RecordRef,
 }
 impl RecordOwner {
@@ -42,7 +42,7 @@ impl RecordOwner {
     pub fn store(&self) -> &super::store::RecordStore {
         self.store.store()
     }
-    pub fn store_handle(&self) -> &StoreHandle {
+    pub fn store_pin(&self) -> &RecordStorePin {
         &self.store
     }
     pub fn responsibility_class(&self) -> ResponsibilityClass {

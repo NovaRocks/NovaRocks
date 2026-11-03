@@ -22,7 +22,7 @@ use crate::{
 };
 use std::{marker::PhantomData, rc::Rc};
 #[derive(Debug)]
-pub struct ScopeLease {
+pub struct FundingScope {
     domain: FundingDomain,
     stock: u64,
     miss: u64,
@@ -36,7 +36,7 @@ impl FundingDomain {
         &self,
         stock_bytes: u64,
         threshold_bytes: u64,
-    ) -> Result<ScopeLease, CapacityError> {
+    ) -> Result<FundingScope, CapacityError> {
         let mut s = self.0.state.lock().unwrap();
         if self.0.lane.production_state() != crate::lane::ProductionState::Producing {
             return Err(CapacityError::Closed {
@@ -73,7 +73,7 @@ impl FundingDomain {
             .record()
             .sequence
             .fetch_add(1, Ordering::Release);
-        Ok(ScopeLease {
+        Ok(FundingScope {
             domain: self.clone(),
             stock: stock_bytes,
             miss: 0,
@@ -84,7 +84,7 @@ impl FundingDomain {
         })
     }
 }
-impl ScopeLease {
+impl FundingScope {
     /// Call only for a successful underlying allocation. Failure records no
     /// live bytes. The origin/length must accompany exactly one later free.
     pub fn record_allocation(&mut self, bytes: u64) -> FactToken {
@@ -125,7 +125,7 @@ impl ScopeLease {
         }
     }
 }
-impl Drop for ScopeLease {
+impl Drop for FundingScope {
     fn drop(&mut self) {
         if !self.ended {
             self.domain.settle();

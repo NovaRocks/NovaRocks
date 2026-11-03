@@ -44,7 +44,7 @@ use crate::exec::chunk::{ArrayNormalizationStep, Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputConstructionOwner,
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 /// The source diagnostic and creating owner's original cause stay distinct.
 enum PageConversionFailure {
@@ -166,7 +166,7 @@ impl std::error::Error for PageAdapterError {
 }
 impl novarocks_failure_contract::FailureProjection for PageAdapterError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match &self.cause {
             PageAdapterCause::Connector(error) => return error.failure_fact(),
@@ -284,30 +284,31 @@ fn convert_page(
             owner.observe(index, &[], ArrayNormalizationStep::OpaqueOperationFinished)?;
         }
     }
-    let mut chunk = if let Some(owner) = owner {
-        // The incoming Vec already belongs to the SourcePage. Only actual
-        // normalized wrappers and the new RecordBatch Arc are constructed.
-        Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
-            Arc::clone(output_schema),
-            columns,
-            positions,
-            owner.storage_lifetime(),
-            |step| owner.observe(0, &[], step),
-        )?
-    } else {
-        #[cfg(not(test))]
-        return Err(ConstructionFailure::MissingOwner.into());
-        #[cfg(test)]
-        {
-            // The explicit pure fixture path uses the same complete declaration,
-            // including row count for a zero-channel page; it never derives types.
-            Chunk::try_new_typed_with_columns_observed::<
-                crate::runtime::fragment::ExecutionFailure,
-                _,
-            >(Arc::clone(output_schema), columns, positions, |_| Ok(()))
-            .map_err(|error| PageAdapterError::new(PageAdapterCause::Chunk, error))?
-        }
-    };
+    let mut chunk =
+        if let Some(owner) = owner {
+            // The incoming Vec already belongs to the SourcePage. Only actual
+            // normalized wrappers and the new RecordBatch Arc are constructed.
+            Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+                Arc::clone(output_schema),
+                columns,
+                positions,
+                owner.storage_lifetime(),
+                |step| owner.observe(0, &[], step),
+            )?
+        } else {
+            #[cfg(not(test))]
+            return Err(ConstructionFailure::MissingOwner.into());
+            #[cfg(test)]
+            {
+                // The explicit pure fixture path uses the same complete declaration,
+                // including row count for a zero-channel page; it never derives types.
+                Chunk::try_new_typed_with_columns_observed::<
+                    crate::runtime::task::ExecutionFailure,
+                    _,
+                >(Arc::clone(output_schema), columns, positions, |_| Ok(()))
+                .map_err(|error| PageAdapterError::new(PageAdapterCause::Chunk, error))?
+            }
+        };
 
     let output_memory = if let Some(mut output_memory) = output_memory {
         output_memory.shrink_to(visible_bytes).map_err(|error| {
@@ -337,8 +338,8 @@ mod tests {
     use arrow::array::{Array, ArrayRef, Int64Array};
     use arrow::datatypes::Field;
     use novarocks_spi::connector::{
-        ConnectorError, ConnectorExecutionResources, ConnectorResourceCheckpoint,
-        ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+        ConnectorError, ConnectorExecutionResources, ConnectorReservationBackend,
+        ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLedger,
     };
     use novarocks_types::SlotId;
 
@@ -413,7 +414,7 @@ mod tests {
 
     #[test]
     fn typed_count_only_page_and_final_wrapper_refusal_use_the_actual_owner() {
-        use crate::runtime::fragment::ExecutionFailureCause;
+        use crate::runtime::task::ExecutionFailureCause;
         let tracker = MemTracker::new_root("count-only page constructor");
         let factory = actual_factory(
             &tracker,
@@ -489,22 +490,22 @@ mod tests {
             &self,
             class: ConnectorResourceClass,
             bytes: u64,
-        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
+        ) -> Result<Box<dyn ConnectorReservationBackend>, ConnectorError> {
             assert_eq!(class, ConnectorResourceClass::ReaderOutput);
             self.retained.fetch_add(bytes, Ordering::AcqRel);
-            Ok(Box::new(OutputLease {
+            Ok(Box::new(OutputReservation {
                 retained: Arc::clone(&self.retained),
                 bytes,
             }))
         }
     }
 
-    struct OutputLease {
+    struct OutputReservation {
         retained: Arc<AtomicU64>,
         bytes: u64,
     }
 
-    impl ConnectorResourceLease for OutputLease {
+    impl ConnectorReservationBackend for OutputReservation {
         fn bytes(&self) -> u64 {
             self.bytes
         }
@@ -524,7 +525,7 @@ mod tests {
         }
     }
 
-    impl Drop for OutputLease {
+    impl Drop for OutputReservation {
         fn drop(&mut self) {
             self.retained.fetch_sub(self.bytes, Ordering::AcqRel);
         }
@@ -819,7 +820,7 @@ mod failure_projection_tests {
             ))
             .into_execution();
             assert_eq!(failure.failure_fact(), expected);
-            let crate::runtime::fragment::ExecutionFailureCause::Domain(domain) = failure.cause()
+            let crate::runtime::task::ExecutionFailureCause::Domain(domain) = failure.cause()
             else {
                 panic!("page cause")
             };

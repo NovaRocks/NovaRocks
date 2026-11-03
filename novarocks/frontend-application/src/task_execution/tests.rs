@@ -40,14 +40,15 @@ use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
     AbortCause, AdmissionEpochCapability, AdmissionTicketId, CancelReason, CodecOwnedContent,
-    ConfidentialContent, ContentFingerprint, CreateTaskReceipt, CredentialEpoch, CredentialLeaseId,
-    CredentialUpdate, DomainVersion, DynamicFilterAdvertisement, EdgeOpenVersion, ExchangeEdgeId,
-    LeaseReceipt, LeaseSequence, LeaseValidFor, OperationKind, OperationOutcome, PlanNodeId,
-    PlanNodeSplitReceipt, QueryContextAdmissionTicketReceipt, QueryContextReceipt, QueryContextRef,
-    QueryContextState, QuiesceQueryContextReceipt, ReleaseOutcome, SplitAssignmentIntent,
-    SplitOffer, SplitSequence, SplitWatermark, TaskConvergenceReceipt, TaskConvergenceVersion,
-    TaskDomainReceipt, TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskOutputFacts, TaskState,
-    TaskStatus, TaskStatusVersion, TerminationDetail, UpdateTaskReceipt,
+    ConfidentialContent, ContentFingerprint, CreateTaskReceipt, CredentialDomainId,
+    CredentialEpoch, CredentialUpdate, DomainVersion, DynamicFilterAdvertisement, EdgeOpenVersion,
+    ExchangeEdgeId, LeaseReceipt, LeaseSequence, LeaseValidFor, OperationKind, OperationOutcome,
+    ParticipationAdmissionTicketReceipt, ParticipationReceipt, ParticipationRef,
+    ParticipationState, PlanNodeId, PlanNodeSplitReceipt, QuiesceParticipationReceipt,
+    ReleaseOutcome, SplitAssignmentIntent, SplitOffer, SplitSequence, SplitWatermark,
+    TaskConvergenceReceipt, TaskConvergenceVersion, TaskDomainReceipt, TaskDomainUpdate,
+    TaskIdentity, TaskOperationId, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion,
+    TerminationDetail, UpdateTaskReceipt,
 };
 use novarocks_physical_plan::PipelineDopDomain;
 use novarocks_proto_models::novarocks as wire;
@@ -65,20 +66,21 @@ use prost::Message;
 
 use super::blocking_io::ConnectorBlockingIoSupervisor;
 use super::clock::ManualClock;
-use super::context_owner::{
-    ContextEstablishFacts, ContextEstablishSource, QueryContextOwner, ReleaseSettlement,
-};
 use super::creation::tests as creation_tests;
 use super::dispatch::OperationDispatcher;
 use super::error::{CapacityBound, TaskExecutionError};
 use super::execution::QueryTaskExecution;
 use super::graph::{
-    FragmentPlanFacts, FragmentPlanSource, TaskGraph, TaskNode, build_task_graph_from_manifest,
+    TaskGraph, TaskNode, TaskPlanFacts, TaskPlanSource, build_task_graph_from_manifest,
 };
 use super::intent::{
     AckPayload, DispatchBatch, OPERATION_FIXED_BYTES, OperationAcknowledgement, OperationIntent,
     TaskOperationQueueAdmission, TaskOperationQueuePermit, TaskOperationQueueRequest,
     TaskOperationSink, TaskOperationSubmit, test_queue_permit,
+};
+use super::participation_owner::{
+    ParticipationEstablishFacts, ParticipationEstablishSource, ParticipationOwner,
+    ReleaseSettlement,
 };
 use super::remote_task::{RemoteTaskState, UpdateAdmission};
 use super::split_domain::{assignment_targets, delivery_action};
@@ -87,8 +89,8 @@ use super::status_intake::{
     CountingWake, ObservationFrame, ObservationIntakeEntry, StatusEvent, StatusIntake,
     StatusIntakeAdmission, StatusIntakeWake,
 };
-use crate::query_execution::artifact::fragment_instance_id_for_contract_test;
-use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
+use crate::query_execution::artifact::task_key_for_contract_test;
+use crate::query_execution::schedule::{SchedulingPlan, TaskPlacement};
 use crate::query_execution::split_assignment::SplitAssignmentDriverError;
 use novarocks_coordination_contract::MonotonicClock;
 
@@ -256,7 +258,7 @@ impl<'a> FakePlans<'a> {
     }
 }
 
-impl FragmentPlanSource for FakePlans<'_> {
+impl TaskPlanSource for FakePlans<'_> {
     fn control_topology_targets(&self, fragment_id: FragmentId) -> Option<Vec<StaticSinkTarget>> {
         Some(match (&self.leaf_sink, fragment_id) {
             (Some(targets), LEAF_FRAGMENT) => targets.clone(),
@@ -268,7 +270,7 @@ impl FragmentPlanSource for FakePlans<'_> {
         &mut self,
         fragment_id: FragmentId,
         instance_index: usize,
-    ) -> Result<FragmentPlanFacts, TaskExecutionError> {
+    ) -> Result<TaskPlanFacts, TaskExecutionError> {
         let placement = self
             .schedule
             .by_fragment
@@ -289,7 +291,7 @@ impl FragmentPlanSource for FakePlans<'_> {
                 .entry(fragment_id)
                 .or_insert_with(|| frozen_fragment(fragment_id, &sink, padding)),
         );
-        Ok(FragmentPlanFacts {
+        Ok(TaskPlanFacts {
             fragment,
             assignment: NativePlacementAssignment::new(
                 u32::try_from(instance_index).expect("a test instance ordinal fits"),
@@ -303,17 +305,17 @@ impl FragmentPlanSource for FakePlans<'_> {
 #[derive(Debug)]
 struct FakeEstablish;
 
-impl ContextEstablishSource for FakeEstablish {
+impl ParticipationEstablishSource for FakeEstablish {
     fn facts_for(
         &self,
-        _context: QueryContextRef,
-    ) -> Result<ContextEstablishFacts, TaskExecutionError> {
-        Ok(ContextEstablishFacts {
+        _participation: ParticipationRef,
+    ) -> Result<ParticipationEstablishFacts, TaskExecutionError> {
+        Ok(ParticipationEstablishFacts {
             catalog_binding: FakeContent::new(0xa1, 64),
             initial_runtime_filter: FakeContent::new(0xa2, 32),
             query_options: FakeContent::new(0xa3, 48),
             initial_credential: CredentialUpdate::new(
-                CredentialLeaseId::new(7),
+                CredentialDomainId::new(7),
                 CredentialEpoch::FIRST,
                 Arc::new(FakeSecret),
             ),
@@ -321,24 +323,24 @@ impl ContextEstablishSource for FakeEstablish {
     }
 }
 
-fn grant_admission(owner: &mut QueryContextOwner, now: MonotonicInstant) {
+fn grant_admission(owner: &mut ParticipationOwner, now: MonotonicInstant) {
     let intent = owner
         .admission_intent(now)
         .expect("an admission request can be built")
         .expect("the admission request is released");
-    let OperationIntent::AcquireQueryContextAdmissionTicket(request) = intent else {
+    let OperationIntent::AcquireParticipationAdmissionTicket(request) = intent else {
         unreachable!("admission releases its exact request");
     };
     owner
         .on_admission_ack(
             &OperationAcknowledgement::worker_receipt(
                 request.envelope().operation_id(),
-                OperationKind::AcquireQueryContextAdmissionTicket,
+                OperationKind::AcquireParticipationAdmissionTicket,
                 OperationOutcome::Accepted,
-                AckPayload::AdmissionTicket(QueryContextAdmissionTicketReceipt::new(
+                AckPayload::AdmissionTicket(ParticipationAdmissionTicketReceipt::new(
                     AdmissionTicketId::try_from_bytes([0x54; 16])
                         .expect("the test ticket is nonzero"),
-                    request.context(),
+                    request.participation(),
                     request.valid_for(),
                 )),
             ),
@@ -660,14 +662,14 @@ fn placements(
     fragment_id: FragmentId,
     backend_indexes: &[usize],
     scan_nodes: &[i32],
-) -> Vec<FragmentInstancePlacement> {
+) -> Vec<TaskPlacement> {
     backend_indexes
         .iter()
         .enumerate()
-        .map(|(instance_index, &backend_idx)| FragmentInstancePlacement {
+        .map(|(instance_index, &backend_idx)| TaskPlacement {
             fragment_id,
             instance_index,
-            finst_id: fragment_instance_id_for_contract_test(
+            task_key: task_key_for_contract_test(
                 execution_id().query_id(),
                 fragment_id,
                 instance_index,
@@ -712,7 +714,7 @@ fn chain_schedule(leaf_backends: &[usize], middle_backends: &[usize]) -> Schedul
     SchedulingPlan {
         root_fragment_id: ROOT_FRAGMENT,
         by_fragment,
-        root_finst_id: root.finst_id,
+        root_task_key: root.task_key,
         root_backend_idx: root.backend_idx,
     }
 }
@@ -1194,8 +1196,8 @@ impl Harness {
         let wake = Arc::new(CountingWake::default());
         let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
         let admission_epochs = graph
-            .contexts()
-            .map(|context| (context.backend_process_id(), admission_epoch()))
+            .participations()
+            .map(|participation| (participation.backend_process_id(), admission_epoch()))
             .collect::<BTreeMap<_, _>>();
         let execution = QueryTaskExecution::new(
             graph,
@@ -1237,31 +1239,31 @@ impl Harness {
             for (lane, operations) in batches {
                 let mut remaining = Vec::new();
                 for intent in operations {
-                    if let OperationIntent::AcquireQueryContextAdmissionTicket(request) = intent {
+                    if let OperationIntent::AcquireParticipationAdmissionTicket(request) = intent {
                         acquired = true;
                         let ticket_id = AdmissionTicketId::try_from_bytes([0x54; 16])
                             .expect("the test ticket is nonzero");
                         self.execution
                             .acknowledge(&OperationAcknowledgement::worker_receipt(
                                 request.envelope().operation_id(),
-                                OperationKind::AcquireQueryContextAdmissionTicket,
+                                OperationKind::AcquireParticipationAdmissionTicket,
                                 OperationOutcome::Accepted,
                                 AckPayload::AdmissionTicket(
-                                    QueryContextAdmissionTicketReceipt::new(
+                                    ParticipationAdmissionTicketReceipt::new(
                                         ticket_id,
-                                        request.context(),
+                                        request.participation(),
                                         request.valid_for(),
                                     ),
                                 ),
                             ))
                             .expect("an admission acknowledgement settles");
                     } else {
-                        if let OperationIntent::EstablishQueryContext(request) = &intent {
+                        if let OperationIntent::EstablishParticipation(request) = &intent {
                             // RecordingSink models a transport that began
                             // polling the exact RPC before its ACK arrives.
                             self.execution
                                 .establish_send_started(
-                                    request.context(),
+                                    request.participation(),
                                     request.envelope().operation_id(),
                                 )
                                 .expect("the released Establish started");
@@ -1294,31 +1296,31 @@ impl Harness {
             .collect()
     }
 
-    /// Answers one context operation with a lease of `effective`.
+    /// Answers one participation operation with a lease of `effective`.
     ///
     /// The establish and the creates of an attempt are released in the same
     /// rotation on purpose: a create may legitimately reach a backend before
     /// its establish and wait on the creation gate there.
-    fn context_ack(&mut self, intent: &OperationIntent, effective: Duration) {
-        let (context, may_create) = match intent {
-            OperationIntent::EstablishQueryContext(request) => (request.context(), true),
-            OperationIntent::UpdateQueryContext(request) => {
-                (request.context(), request.may_create())
+    fn participation_ack(&mut self, intent: &OperationIntent, effective: Duration) {
+        let (participation, may_create) = match intent {
+            OperationIntent::EstablishParticipation(request) => (request.participation(), true),
+            OperationIntent::UpdateParticipation(request) => {
+                (request.participation(), request.may_create())
             }
-            _ => unreachable!("a context intent carries its request"),
+            _ => unreachable!("a participation intent carries its request"),
         };
         let sequence = self
             .execution
-            .owner(context)
-            .expect("the context has an owner")
+            .owner(participation)
+            .expect("the participation has an owner")
             .lease_sequence();
         let sequence = if may_create {
             LeaseSequence::INITIAL
         } else {
             sequence.next().expect("the lease sequence advances")
         };
-        let receipt = QueryContextReceipt::new(context, QueryContextState::Active).with_lease(
-            LeaseReceipt::new(
+        let receipt = ParticipationReceipt::new(participation, ParticipationState::Active)
+            .with_lease(LeaseReceipt::new(
                 sequence,
                 LeaseValidFor::new(if may_create {
                     Duration::from_secs(30)
@@ -1327,16 +1329,15 @@ impl Harness {
                 })
                 .expect("a legal request"),
                 effective,
-            ),
-        );
+            ));
         self.execution
             .acknowledge(&OperationAcknowledgement::new(
                 intent.operation_id(),
-                OperationKind::UpdateQueryContext,
+                OperationKind::UpdateParticipation,
                 OperationOutcome::Accepted,
-                AckPayload::Context(receipt),
+                AckPayload::Participation(receipt),
             ))
-            .expect("a context acknowledgement settles");
+            .expect("a participation acknowledgement settles");
     }
 
     /// Answers every establish one pump released, and returns everything else
@@ -1345,8 +1346,8 @@ impl Harness {
         let released = self.released();
         let mut rest = Vec::new();
         for intent in released {
-            if matches!(intent.kind(), OperationKind::UpdateQueryContext) {
-                self.context_ack(&intent, effective);
+            if matches!(intent.kind(), OperationKind::UpdateParticipation) {
+                self.participation_ack(&intent, effective);
             } else {
                 rest.push(intent);
             }
@@ -1445,7 +1446,7 @@ impl Harness {
                     self.update_ack(intent, OperationOutcome::Accepted)
                         .expect("an update acknowledgement settles");
                 }
-                OperationKind::UpdateQueryContext => self.context_ack(intent, effective),
+                OperationKind::UpdateParticipation => self.participation_ack(intent, effective),
                 OperationKind::CancelTask => self.cancel_ack(intent),
                 kind => unreachable!("this fixture does not release {kind}"),
             }
@@ -1473,12 +1474,12 @@ impl Harness {
             .identity()
     }
 
-    /// Every backend this attempt holds a context on.
-    fn context_backends(&self) -> Vec<BackendProcessId> {
+    /// Every backend this attempt holds a participation on.
+    fn participation_backends(&self) -> Vec<BackendProcessId> {
         self.execution
             .graph()
-            .contexts()
-            .map(|context| context.backend_process_id())
+            .participations()
+            .map(|participation| participation.backend_process_id())
             .collect()
     }
 
@@ -1624,14 +1625,14 @@ fn stage_and_task_ids_follow_the_static_schedule_and_reuse_its_kernel_keys() {
     // Every kernel key is the schedule's own frozen value, not a second
     // derivation.
     for task in graph.tasks() {
-        let expected = fragment_instance_id_for_contract_test(
+        let expected = task_key_for_contract_test(
             execution_id().query_id(),
             task.fragment_id(),
             task.instance_index(),
         );
-        assert_eq!(task.fragment_instance_id(), expected);
+        assert_eq!(task.task_key(), expected);
         let descriptor = descriptor_of(&graph, task.task_id());
-        assert_eq!(descriptor.fragment_instance_id(), expected);
+        assert_eq!(descriptor.task_key(), expected);
     }
 }
 
@@ -1645,7 +1646,7 @@ fn every_destination_and_source_carries_both_addresses() {
         graph
             .task(identity.task_id())
             .expect("the destination is a graph task")
-            .fragment_instance_id()
+            .task_key()
     };
 
     for task in graph.tasks() {
@@ -1653,10 +1654,7 @@ fn every_destination_and_source_carries_both_addresses() {
         for edge in descriptor.topology().outbound() {
             assert!(!edge.destinations().is_empty());
             for destination in edge.destinations() {
-                assert_eq!(
-                    destination.fragment_instance_id(),
-                    key_of(destination.task())
-                );
+                assert_eq!(destination.task_key(), key_of(destination.task()));
                 assert_eq!(
                     destination.destination_node_id(),
                     edge.destination_node_id()
@@ -1665,7 +1663,7 @@ fn every_destination_and_source_carries_both_addresses() {
         }
         for inbound in descriptor.topology().inbound() {
             for source in inbound.sources() {
-                assert_eq!(source.fragment_instance_id(), key_of(source.task()));
+                assert_eq!(source.task_key(), key_of(source.task()));
             }
             // The producer's sender count and the consumer's expectation are
             // derived once per exchange node, so they cannot disagree; each
@@ -1697,10 +1695,10 @@ fn a_repeated_kernel_key_is_refused() {
         .by_fragment
         .get_mut(&LEAF_FRAGMENT)
         .expect("the leaf fragment is placed");
-    leaf[1].finst_id = leaf[0].finst_id;
+    leaf[1].task_key = leaf[0].task_key;
 
     let error =
-        TaskManifestBinding::protocol_collision_for_test(leaf[0].finst_id, leaf[1].finst_id)
+        TaskManifestBinding::protocol_collision_for_test(leaf[0].task_key, leaf[1].task_key)
             .expect_err("two tasks may not share one kernel key");
     assert_eq!(
         error.kind(),
@@ -1711,7 +1709,7 @@ fn a_repeated_kernel_key_is_refused() {
             .message()
             .contains("fragment-instance identity collision")
     );
-    assert!(error.message().contains(&leaf[0].finst_id.to_string()));
+    assert!(error.message().contains(&leaf[0].task_key.to_string()));
 }
 
 #[test]
@@ -1963,8 +1961,8 @@ fn a_producer_of_two_edges_opens_each_edge_at_its_own_version() {
         }
         for intent in &released {
             match intent.kind() {
-                OperationKind::UpdateQueryContext => {
-                    harness.context_ack(intent, Duration::from_secs(10));
+                OperationKind::UpdateParticipation => {
+                    harness.participation_ack(intent, Duration::from_secs(10));
                 }
                 OperationKind::CreateTask => harness
                     .create_ack(intent, OperationOutcome::Accepted)
@@ -2118,8 +2116,8 @@ fn create_not_ready_waits_for_exact_establish_ack_before_replay() {
     let released = harness.released();
     let establish = released
         .iter()
-        .find(|intent| matches!(intent.kind(), OperationKind::UpdateQueryContext))
-        .expect("the context establish was released");
+        .find(|intent| matches!(intent.kind(), OperationKind::UpdateParticipation))
+        .expect("the participation establish was released");
     let create = released
         .iter()
         .find(|intent| matches!(intent.kind(), OperationKind::CreateTask))
@@ -2134,7 +2132,7 @@ fn create_not_ready_waits_for_exact_establish_ack_before_replay() {
             .all(|intent| intent.operation_id() != create.operation_id()),
         "NotReady must not resend the large body before Establish settles"
     );
-    harness.context_ack(establish, Duration::from_secs(10));
+    harness.participation_ack(establish, Duration::from_secs(10));
     let replay = harness
         .released()
         .into_iter()
@@ -2156,7 +2154,7 @@ fn first_create_waits_for_the_exact_establish_send_start() {
         .into_iter()
         .flat_map(|(_, intents)| intents)
         .find_map(|intent| match intent {
-            OperationIntent::AcquireQueryContextAdmissionTicket(request) => Some(request),
+            OperationIntent::AcquireParticipationAdmissionTicket(request) => Some(request),
             _ => None,
         })
         .expect("admission is released first");
@@ -2164,11 +2162,11 @@ fn first_create_waits_for_the_exact_establish_send_start() {
         .execution
         .acknowledge(&OperationAcknowledgement::worker_receipt(
             admission.envelope().operation_id(),
-            OperationKind::AcquireQueryContextAdmissionTicket,
+            OperationKind::AcquireParticipationAdmissionTicket,
             OperationOutcome::Accepted,
-            AckPayload::AdmissionTicket(QueryContextAdmissionTicketReceipt::new(
+            AckPayload::AdmissionTicket(ParticipationAdmissionTicketReceipt::new(
                 AdmissionTicketId::try_from_bytes([0x54; 16]).expect("nonzero ticket"),
-                admission.context(),
+                admission.participation(),
                 admission.valid_for(),
             )),
         ))
@@ -2182,7 +2180,7 @@ fn first_create_waits_for_the_exact_establish_send_start() {
     let establish = released
         .iter()
         .find_map(|intent| match intent {
-            OperationIntent::EstablishQueryContext(request) => Some(request),
+            OperationIntent::EstablishParticipation(request) => Some(request),
             _ => None,
         })
         .expect("Establish is submitted");
@@ -2203,7 +2201,7 @@ fn first_create_waits_for_the_exact_establish_send_start() {
     assert_eq!(
         harness
             .execution
-            .owner(admission.context())
+            .owner(admission.participation())
             .unwrap()
             .create_refusal_observation_horizon(),
         None,
@@ -2212,14 +2210,14 @@ fn first_create_waits_for_the_exact_establish_send_start() {
     assert!(
         harness
             .execution
-            .establish_send_started(admission.context(), TaskOperationId::new_v7())
+            .establish_send_started(admission.participation(), TaskOperationId::new_v7())
             .is_err(),
         "a different Establish cannot open the first Create wave"
     );
     assert_eq!(
         harness
             .execution
-            .owner(admission.context())
+            .owner(admission.participation())
             .unwrap()
             .create_refusal_observation_horizon(),
         None,
@@ -2227,16 +2225,19 @@ fn first_create_waits_for_the_exact_establish_send_start() {
     );
     harness
         .execution
-        .establish_send_started(admission.context(), establish.envelope().operation_id())
+        .establish_send_started(
+            admission.participation(),
+            establish.envelope().operation_id(),
+        )
         .expect("the exact Establish has started its RPC");
     assert_eq!(
         harness
             .execution
-            .owner(admission.context())
+            .owner(admission.participation())
             .unwrap()
             .create_refusal_observation_horizon(),
         Some(
-            super::context_owner::CreateRefusalObservationHorizon::IssuedEstablish(
+            super::participation_owner::CreateRefusalObservationHorizon::IssuedEstablish(
                 MonotonicInstant::from_origin(Duration::from_secs(10)),
             )
         ),
@@ -2255,12 +2256,12 @@ fn first_create_waits_for_the_exact_establish_send_start() {
 #[test]
 fn normal_quiesce_without_any_create_fences_every_task_before_release() {
     let mut harness = Harness::new(&[0], &[0], 512);
-    let context = *harness
+    let participation = *harness
         .execution
         .graph()
-        .contexts()
+        .participations()
         .next()
-        .expect("one context");
+        .expect("one participation");
     harness.execution.begin_normal_drain();
     let first = harness.released();
     assert!(
@@ -2270,28 +2271,28 @@ fn normal_quiesce_without_any_create_fences_every_task_before_release() {
     );
     let quiesce = first
         .iter()
-        .find(|intent| intent.kind() == OperationKind::QuiesceQueryContext)
-        .expect("normal drain fences even an absent context");
+        .find(|intent| intent.kind() == OperationKind::QuiesceParticipation)
+        .expect("normal drain fences even an absent participation");
     harness
         .transport_unknown_ack(quiesce)
         .expect("an unknown fence remains replayable");
     let replay = harness
         .released()
         .into_iter()
-        .find(|intent| intent.kind() == OperationKind::QuiesceQueryContext)
+        .find(|intent| intent.kind() == OperationKind::QuiesceParticipation)
         .expect("the exact fence is replayed");
     assert_eq!(quiesce.operation_id(), replay.operation_id());
     harness
         .execution
         .acknowledge(&OperationAcknowledgement::new(
             replay.operation_id(),
-            OperationKind::QuiesceQueryContext,
+            OperationKind::QuiesceParticipation,
             OperationOutcome::Accepted,
-            AckPayload::Quiesce(QuiesceQueryContextReceipt::new(
-                context,
+            AckPayload::Quiesce(QuiesceParticipationReceipt::new(
+                participation,
                 1,
                 Vec::new(),
-                QueryContextState::Quiescing,
+                ParticipationState::Quiescing,
             )),
         ))
         .expect("the complete empty membership settles");
@@ -2310,18 +2311,18 @@ fn normal_quiesce_without_any_create_fences_every_task_before_release() {
         harness
             .released()
             .iter()
-            .any(|intent| intent.kind() == OperationKind::ReleaseQueryContext),
+            .any(|intent| intent.kind() == OperationKind::ReleaseParticipation),
         "a complete fence allows Release after local nonexistent tasks settle"
     );
 }
 
 fn covered_frame(
-    context: QueryContextRef,
+    participation: ParticipationRef,
     generation: u64,
     fact: CoveredStatusStreamFact,
 ) -> ObservationIntakeEntry {
     ObservationIntakeEntry::Frame(Box::new(ObservationFrame::Covered {
-        context,
+        participation,
         generation,
         event: CoveredStatusStreamEvent {
             fact,
@@ -2333,19 +2334,23 @@ fn covered_frame(
 #[test]
 fn covered_quiesce_receipt_preceding_lost_ack_still_allows_release() {
     let mut harness = Harness::new(&[0], &[0], 512);
-    let context = *harness.execution.graph().contexts().next().unwrap();
+    let participation = *harness.execution.graph().participations().next().unwrap();
     harness.execution.begin_normal_drain();
     let quiesce = harness
         .released()
         .into_iter()
-        .find(|intent| intent.kind() == OperationKind::QuiesceQueryContext)
-        .expect("normal drain sends the Context fence");
-    let receipt =
-        QuiesceQueryContextReceipt::new(context, 1, Vec::new(), QueryContextState::Quiescing);
+        .find(|intent| intent.kind() == OperationKind::QuiesceParticipation)
+        .expect("normal drain sends the Participation fence");
+    let receipt = QuiesceParticipationReceipt::new(
+        participation,
+        1,
+        Vec::new(),
+        ParticipationState::Quiescing,
+    );
     harness
         .execution
         .apply_covered_entries(vec![covered_frame(
-            context,
+            participation,
             1,
             CoveredStatusStreamFact::Quiesce(receipt.clone()),
         )])
@@ -2353,7 +2358,7 @@ fn covered_quiesce_receipt_preceding_lost_ack_still_allows_release() {
     assert!(
         harness
             .execution
-            .owner(context)
+            .owner(participation)
             .unwrap()
             .quiesce_acknowledged()
     );
@@ -2361,7 +2366,7 @@ fn covered_quiesce_receipt_preceding_lost_ack_still_allows_release() {
         harness
             .released()
             .iter()
-            .any(|intent| intent.kind() == OperationKind::ReleaseQueryContext),
+            .any(|intent| intent.kind() == OperationKind::ReleaseParticipation),
         "an observed complete Quiesce receipt permits Release without the lost ACK"
     );
     harness
@@ -2381,21 +2386,21 @@ fn covered_initial_unknown_does_not_retract_later_accepted_ack() {
         unreachable!()
     };
     let identity = request.identity();
-    let context = harness
+    let participation = harness
         .execution
         .graph()
         .task(identity.task_id())
         .unwrap()
-        .context();
+        .participation();
     harness
         .create_ack(&create, OperationOutcome::Accepted)
         .expect("the ACK may reach the serial owner before the initial source cut");
     harness
         .execution
         .apply_covered_entries(vec![
-            covered_frame(context, 1, CoveredStatusStreamFact::Unknown(identity)),
+            covered_frame(participation, 1, CoveredStatusStreamFact::Unknown(identity)),
             covered_frame(
-                context,
+                participation,
                 1,
                 CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
                     generation: 1,
@@ -2418,18 +2423,18 @@ fn covered_initial_unknown_does_not_retract_later_accepted_ack() {
 fn covered_gap_needs_positive_evidence_and_new_complete_catch_up() {
     let mut harness = Harness::new(&[0], &[0], 512);
     let identity = harness.execution.graph().root_identity();
-    let context = harness
+    let participation = harness
         .execution
         .graph()
         .task(identity.task_id())
         .unwrap()
-        .context();
+        .participation();
     harness
         .execution
         .apply_covered_entries(vec![
-            covered_frame(context, 1, CoveredStatusStreamFact::Gone(identity)),
+            covered_frame(participation, 1, CoveredStatusStreamFact::Gone(identity)),
             covered_frame(
-                context,
+                participation,
                 1,
                 CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
                     generation: 1,
@@ -2444,14 +2449,14 @@ fn covered_gap_needs_positive_evidence_and_new_complete_catch_up() {
     assert!(!harness.execution.covered_recovery_expired());
     assert_eq!(
         harness.execution.take_covered_reconciliations(),
-        [context].into()
+        [participation].into()
     );
 
     harness
         .execution
         .apply_covered_entries(vec![
             covered_frame(
-                context,
+                participation,
                 2,
                 CoveredStatusStreamFact::TaskConvergence(TaskConvergenceReceipt::actual_stopped(
                     identity,
@@ -2459,7 +2464,7 @@ fn covered_gap_needs_positive_evidence_and_new_complete_catch_up() {
                 )),
             ),
             covered_frame(
-                context,
+                participation,
                 2,
                 CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
                     generation: 2,
@@ -2469,7 +2474,7 @@ fn covered_gap_needs_positive_evidence_and_new_complete_catch_up() {
                 }),
             ),
             covered_frame(
-                context,
+                participation,
                 2,
                 CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
                     generation: 2,
@@ -2487,7 +2492,7 @@ fn covered_gap_needs_positive_evidence_and_new_complete_catch_up() {
     );
     let request = harness
         .execution
-        .covered_subscription_request(context, NonZeroU64::new(3).unwrap())
+        .covered_subscription_request(participation, NonZeroU64::new(3).unwrap())
         .expect("only applied entity facts enter the next request");
     assert_eq!(request.generation.get(), 3);
     assert!(
@@ -2511,9 +2516,9 @@ fn covered_gap_needs_positive_evidence_and_new_complete_catch_up() {
     harness
         .execution
         .apply_covered_entries(vec![
-            covered_frame(context, 3, CoveredStatusStreamFact::Status(terminal)),
+            covered_frame(participation, 3, CoveredStatusStreamFact::Status(terminal)),
             covered_frame(
-                context,
+                participation,
                 3,
                 CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
                     generation: 3,
@@ -2537,29 +2542,29 @@ fn quiesce_membership_preserves_lost_create_ack_cleanup() {
     let OperationIntent::CreateTask(accepted) = &creates[0] else {
         unreachable!()
     };
-    let context = *harness
+    let participation = *harness
         .execution
         .graph()
-        .contexts()
+        .participations()
         .next()
-        .expect("one context");
+        .expect("one participation");
     harness.execution.begin_normal_drain();
     let quiesce = harness
         .released()
         .into_iter()
-        .find(|intent| intent.kind() == OperationKind::QuiesceQueryContext)
-        .expect("normal drain fences the Context");
+        .find(|intent| intent.kind() == OperationKind::QuiesceParticipation)
+        .expect("normal drain fences the Participation");
     harness
         .execution
         .acknowledge(&OperationAcknowledgement::new(
             quiesce.operation_id(),
-            OperationKind::QuiesceQueryContext,
+            OperationKind::QuiesceParticipation,
             OperationOutcome::Accepted,
-            AckPayload::Quiesce(QuiesceQueryContextReceipt::new(
-                context,
+            AckPayload::Quiesce(QuiesceParticipationReceipt::new(
+                participation,
                 1,
                 vec![accepted.identity()],
-                QueryContextState::Quiescing,
+                ParticipationState::Quiescing,
             )),
         ))
         .expect("the cumulative membership replaces a missing Create ACK");
@@ -2573,7 +2578,7 @@ fn quiesce_membership_preserves_lost_create_ack_cleanup() {
         harness
             .released()
             .iter()
-            .all(|intent| intent.kind() != OperationKind::ReleaseQueryContext),
+            .all(|intent| intent.kind() != OperationKind::ReleaseParticipation),
         "an accepted member still owes actual terminal observation"
     );
     harness.publish(
@@ -2588,7 +2593,7 @@ fn quiesce_membership_preserves_lost_create_ack_cleanup() {
         harness
             .released()
             .iter()
-            .any(|intent| intent.kind() == OperationKind::ReleaseQueryContext),
+            .any(|intent| intent.kind() == OperationKind::ReleaseParticipation),
         "terminal status closes the member's remaining cleanup responsibility"
     );
 }
@@ -2604,29 +2609,29 @@ fn late_accepted_create_cannot_cross_an_excluding_quiesce_fence() {
     let OperationIntent::CreateTask(request) = &create else {
         unreachable!()
     };
-    let context = *harness
+    let participation = *harness
         .execution
         .graph()
-        .contexts()
+        .participations()
         .next()
-        .expect("one context");
+        .expect("one participation");
     harness.execution.begin_normal_drain();
     let quiesce = harness
         .released()
         .into_iter()
-        .find(|intent| intent.kind() == OperationKind::QuiesceQueryContext)
-        .expect("normal drain fences the Context");
+        .find(|intent| intent.kind() == OperationKind::QuiesceParticipation)
+        .expect("normal drain fences the Participation");
     harness
         .execution
         .acknowledge(&OperationAcknowledgement::new(
             quiesce.operation_id(),
-            OperationKind::QuiesceQueryContext,
+            OperationKind::QuiesceParticipation,
             OperationOutcome::Accepted,
-            AckPayload::Quiesce(QuiesceQueryContextReceipt::new(
-                context,
+            AckPayload::Quiesce(QuiesceParticipationReceipt::new(
+                participation,
                 1,
                 Vec::new(),
-                QueryContextState::Quiescing,
+                ParticipationState::Quiescing,
             )),
         ))
         .expect("the in-flight Create lost the fence race");
@@ -2826,10 +2831,10 @@ fn a_terminal_rejected_update_waits_for_the_task_status_authority() {
     assert_eq!(task.pending_updates(), 0);
     assert_eq!(task.discarded_updates(), 1);
     assert_eq!(task.converged_after_terminal(), 1);
-    let context = task.context();
+    let participation = task.participation();
     assert_eq!(
         harness.execution.take_status_reconciliations(),
-        [context].into_iter().collect(),
+        [participation].into_iter().collect(),
         "StopSendingAndReconcile requests an immediate status replay"
     );
 
@@ -2869,13 +2874,13 @@ fn renewal_is_scheduled_from_the_effective_duration_and_the_local_send_time() {
     let establishes = harness.released();
     let establish = establishes
         .iter()
-        .find(|intent| matches!(intent.kind(), OperationKind::UpdateQueryContext))
+        .find(|intent| matches!(intent.kind(), OperationKind::UpdateParticipation))
         .expect("an establish was released")
         .clone();
-    let OperationIntent::EstablishQueryContext(request) = &establish else {
+    let OperationIntent::EstablishParticipation(request) = &establish else {
         unreachable!("an establish intent carries its exact request");
     };
-    let context = request.context();
+    let participation = request.participation();
 
     // The response arrives one second after the request was handed over.
     harness.clock.advance(Duration::from_secs(1));
@@ -2884,10 +2889,10 @@ fn renewal_is_scheduled_from_the_effective_duration_and_the_local_send_time() {
         .execution
         .acknowledge(&OperationAcknowledgement::new(
             establish.operation_id(),
-            OperationKind::UpdateQueryContext,
+            OperationKind::UpdateParticipation,
             OperationOutcome::Accepted,
-            AckPayload::Context(
-                QueryContextReceipt::new(context, QueryContextState::Active).with_lease(
+            AckPayload::Participation(
+                ParticipationReceipt::new(participation, ParticipationState::Active).with_lease(
                     LeaseReceipt::new(
                         LeaseSequence::INITIAL,
                         LeaseValidFor::new(Duration::from_secs(30)).expect("a legal request"),
@@ -2900,8 +2905,8 @@ fn renewal_is_scheduled_from_the_effective_duration_and_the_local_send_time() {
 
     let schedule = harness
         .execution
-        .owner(context)
-        .expect("the context has an owner")
+        .owner(participation)
+        .expect("the participation has an owner")
         .renew_schedule()
         .expect("an accepted lease installs a schedule");
     assert_eq!(
@@ -2948,7 +2953,7 @@ fn a_renewal_is_not_blocked_by_an_unsettled_domain_update() {
     let released = harness.released();
     let renewals = released
         .iter()
-        .filter(|intent| matches!(intent.kind(), OperationKind::UpdateQueryContext))
+        .filter(|intent| matches!(intent.kind(), OperationKind::UpdateParticipation))
         .count();
     assert_eq!(
         renewals, 1,
@@ -2964,13 +2969,13 @@ fn a_renewal_is_not_blocked_by_an_unsettled_domain_update() {
 
 #[test]
 fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
-    let context = QueryContextRef::new(
+    let participation = ParticipationRef::new(
         execution_id(),
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
-    let mut owner = QueryContextOwner::new(
-        context,
+    let mut owner = ParticipationOwner::new(
+        participation,
         2,
         NativeCompatibilityId::new([0x41; 32]),
         admission_epoch(),
@@ -2981,7 +2986,7 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
     );
 
     let facts = FakeEstablish
-        .facts_for(context)
+        .facts_for(participation)
         .expect("the fake source has facts");
     grant_admission(&mut owner, MonotonicInstant::ORIGIN);
     let intent = owner
@@ -2989,12 +2994,12 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
         .expect("an establish is produced")
         .expect("the establish intent exists");
     owner
-        .on_context_ack(&OperationAcknowledgement::new(
+        .on_participation_ack(&OperationAcknowledgement::new(
             intent.operation_id(),
-            OperationKind::UpdateQueryContext,
+            OperationKind::UpdateParticipation,
             OperationOutcome::Accepted,
-            AckPayload::Context(
-                QueryContextReceipt::new(context, QueryContextState::Active).with_lease(
+            AckPayload::Participation(
+                ParticipationReceipt::new(participation, ParticipationState::Active).with_lease(
                     LeaseReceipt::new(
                         LeaseSequence::INITIAL,
                         LeaseValidFor::new(Duration::from_secs(30)).expect("a legal request"),
@@ -3035,26 +3040,26 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
     owner
         .on_quiesce_ack(&OperationAcknowledgement::new(
             quiesce.operation_id(),
-            OperationKind::QuiesceQueryContext,
+            OperationKind::QuiesceParticipation,
             OperationOutcome::Accepted,
-            AckPayload::Quiesce(QuiesceQueryContextReceipt::new(
-                context,
+            AckPayload::Quiesce(QuiesceParticipationReceipt::new(
+                participation,
                 1,
                 Vec::new(),
-                QueryContextState::Quiescing,
+                ParticipationState::Quiescing,
             )),
         ))
         .expect("the fence settles");
     let release = owner
         .release_intent(MonotonicInstant::ORIGIN)
-        .expect("closure and drain release the context");
+        .expect("closure and drain release the participation");
 
     let not_ready = OperationAcknowledgement::new(
         release.operation_id(),
-        OperationKind::ReleaseQueryContext,
+        OperationKind::ReleaseParticipation,
         OperationOutcome::Accepted,
         AckPayload::Release {
-            receipt: QueryContextReceipt::new(context, QueryContextState::Quiescing),
+            receipt: ParticipationReceipt::new(participation, ParticipationState::Quiescing),
             outcome: ReleaseOutcome::NotReady,
             // A backend that answers NOT_READY has sealed nothing: it is
             // still draining, so there is no terminal observation to carry.
@@ -3126,10 +3131,13 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
         .on_release_ack(
             &OperationAcknowledgement::new(
                 progress_retry.operation_id(),
-                OperationKind::ReleaseQueryContext,
+                OperationKind::ReleaseParticipation,
                 OperationOutcome::Accepted,
                 AckPayload::Release {
-                    receipt: QueryContextReceipt::new(context, QueryContextState::TerminalRetained),
+                    receipt: ParticipationReceipt::new(
+                        participation,
+                        ParticipationState::TerminalRetained,
+                    ),
                     outcome: ReleaseOutcome::Released,
                     runtime_filter: Some(fixture_runtime_filter_contribution()),
                 },
@@ -3156,18 +3164,18 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
 
 #[test]
 fn an_admission_transport_unknown_replays_exactly_and_only_the_next_turn_establishes() {
-    let context = QueryContextRef::new(
+    let participation = ParticipationRef::new(
         execution_id(),
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
     let compatibility = NativeCompatibilityId::new([0x42; 32]);
-    let mut owner = QueryContextOwner::new(context, 0, compatibility, admission_epoch());
+    let mut owner = ParticipationOwner::new(participation, 0, compatibility, admission_epoch());
     let first = owner
         .admission_intent(MonotonicInstant::ORIGIN)
         .expect("the request is legal")
         .expect("admission is required");
-    let OperationIntent::AcquireQueryContextAdmissionTicket(first_request) = first else {
+    let OperationIntent::AcquireParticipationAdmissionTicket(first_request) = first else {
         unreachable!("admission has its own operation kind");
     };
     assert_eq!(first_request.valid_for().get(), Duration::from_secs(10));
@@ -3177,7 +3185,7 @@ fn an_admission_transport_unknown_replays_exactly_and_only_the_next_turn_establi
         .on_admission_ack(
             &OperationAcknowledgement::transport_unknown(
                 first_request.envelope().operation_id(),
-                OperationKind::AcquireQueryContextAdmissionTicket,
+                OperationKind::AcquireParticipationAdmissionTicket,
             ),
             MonotonicInstant::from_origin(Duration::from_millis(1)),
         )
@@ -3186,11 +3194,14 @@ fn an_admission_transport_unknown_replays_exactly_and_only_the_next_turn_establi
         .admission_intent(MonotonicInstant::from_origin(Duration::from_millis(2)))
         .expect("the exact retry is legal")
         .expect("the exact retry is released");
-    let OperationIntent::AcquireQueryContextAdmissionTicket(second_request) = second else {
+    let OperationIntent::AcquireParticipationAdmissionTicket(second_request) = second else {
         unreachable!("admission has its own operation kind");
     };
     assert_eq!(second_request.envelope(), first_request.envelope());
-    assert_eq!(second_request.context(), first_request.context());
+    assert_eq!(
+        second_request.participation(),
+        first_request.participation()
+    );
     assert_eq!(second_request.valid_for(), first_request.valid_for());
     assert_eq!(
         second_request.native_compatibility_id(),
@@ -3203,27 +3214,29 @@ fn an_admission_transport_unknown_replays_exactly_and_only_the_next_turn_establi
         .on_admission_ack(
             &OperationAcknowledgement::worker_receipt(
                 second_request.envelope().operation_id(),
-                OperationKind::AcquireQueryContextAdmissionTicket,
+                OperationKind::AcquireParticipationAdmissionTicket,
                 OperationOutcome::Accepted,
-                AckPayload::AdmissionTicket(QueryContextAdmissionTicketReceipt::new(
+                AckPayload::AdmissionTicket(ParticipationAdmissionTicketReceipt::new(
                     ticket_id,
-                    context,
+                    participation,
                     second_request.valid_for(),
                 )),
             ),
             MonotonicInstant::from_origin(Duration::from_millis(3)),
         )
         .expect("the exact grant settles");
-    assert_eq!(owner.state(), QueryContextState::Absent);
+    assert_eq!(owner.state(), ParticipationState::Absent);
 
     let establish = owner
         .establish_intent(
-            FakeEstablish.facts_for(context).expect("frozen facts"),
+            FakeEstablish
+                .facts_for(participation)
+                .expect("frozen facts"),
             MonotonicInstant::from_origin(Duration::from_millis(4)),
         )
         .expect("the grant is current")
         .expect("the next owner turn starts establish");
-    let OperationIntent::EstablishQueryContext(request) = establish else {
+    let OperationIntent::EstablishParticipation(request) = establish else {
         unreachable!("the granted owner releases an establish");
     };
     assert_eq!(request.admission_ticket_id(), ticket_id);
@@ -3231,13 +3244,13 @@ fn an_admission_transport_unknown_replays_exactly_and_only_the_next_turn_establi
 
 #[test]
 fn an_unconsumed_expired_admission_is_reissued_after_the_worker_ticket_must_be_gone() {
-    let context = QueryContextRef::new(
+    let participation = ParticipationRef::new(
         execution_id(),
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
-    let mut owner = QueryContextOwner::new(
-        context,
+    let mut owner = ParticipationOwner::new(
+        participation,
         0,
         NativeCompatibilityId::new([0x42; 32]),
         admission_epoch(),
@@ -3257,13 +3270,15 @@ fn an_unconsumed_expired_admission_is_reissued_after_the_worker_ticket_must_be_g
     assert!(
         owner
             .establish_intent(
-                FakeEstablish.facts_for(context).expect("frozen facts"),
+                FakeEstablish
+                    .facts_for(participation)
+                    .expect("frozen facts"),
                 MonotonicInstant::from_origin(Duration::from_secs(10)),
             )
             .expect("expiry schedules a replacement grant")
             .is_none()
     );
-    assert_eq!(owner.state(), QueryContextState::Absent);
+    assert_eq!(owner.state(), ParticipationState::Absent);
     assert!(!owner.is_released());
     assert!(
         owner
@@ -3281,13 +3296,13 @@ fn an_unconsumed_expired_admission_is_reissued_after_the_worker_ticket_must_be_g
 
 #[test]
 fn a_grant_received_after_its_conservative_expiry_waits_before_reissue() {
-    let context = QueryContextRef::new(
+    let participation = ParticipationRef::new(
         execution_id(),
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
-    let mut owner = QueryContextOwner::new(
-        context,
+    let mut owner = ParticipationOwner::new(
+        participation,
         0,
         NativeCompatibilityId::new([0x42; 32]),
         admission_epoch(),
@@ -3304,7 +3319,7 @@ fn a_grant_received_after_its_conservative_expiry_waits_before_reissue() {
         )
         .expect("a late definitive grant keeps the attempt authorized");
 
-    assert_eq!(owner.state(), QueryContextState::Absent);
+    assert_eq!(owner.state(), ParticipationState::Absent);
     assert!(!owner.is_released());
     assert!(
         owner
@@ -3333,8 +3348,8 @@ fn a_late_establish_receipt_closes_a_queued_exact_replay() {
     let wake = Arc::new(CountingWake::default());
     let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
     let admission_epochs = graph
-        .contexts()
-        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .participations()
+        .map(|participation| (participation.backend_process_id(), admission_epoch()))
         .collect::<BTreeMap<_, _>>();
     let execution = QueryTaskExecution::new(
         graph,
@@ -3369,21 +3384,21 @@ fn a_late_establish_receipt_closes_a_queued_exact_replay() {
         .find(|intent| {
             matches!(
                 intent,
-                OperationIntent::AcquireQueryContextAdmissionTicket(_)
+                OperationIntent::AcquireParticipationAdmissionTicket(_)
             )
         })
-        .expect("the context admission was sent");
-    let OperationIntent::AcquireQueryContextAdmissionTicket(request) = admission else {
+        .expect("the participation admission was sent");
+    let OperationIntent::AcquireParticipationAdmissionTicket(request) = admission else {
         unreachable!()
     };
-    let ticket = QueryContextAdmissionTicketReceipt::new(
+    let ticket = ParticipationAdmissionTicketReceipt::new(
         AdmissionTicketId::try_from_bytes([0x55; 16]).unwrap(),
-        request.context(),
+        request.participation(),
         request.valid_for(),
     );
     ack_handle.publish(OperationAcknowledgement::worker_receipt(
         request.envelope().operation_id(),
-        OperationKind::AcquireQueryContextAdmissionTicket,
+        OperationKind::AcquireParticipationAdmissionTicket,
         OperationOutcome::Accepted,
         AckPayload::AdmissionTicket(ticket),
     ));
@@ -3395,37 +3410,40 @@ fn a_late_establish_receipt_closes_a_queued_exact_replay() {
         .take()
         .into_iter()
         .flat_map(|(_, operations)| operations)
-        .find(|intent| matches!(intent, OperationIntent::EstablishQueryContext(_)))
+        .find(|intent| matches!(intent, OperationIntent::EstablishParticipation(_)))
         .expect("the establish was sent");
     sink.set_submit_open(false);
     ack_handle.publish(OperationAcknowledgement::transport_unknown(
         establish.operation_id(),
-        OperationKind::UpdateQueryContext,
+        OperationKind::UpdateParticipation,
     ));
     round
         .turn()
         .expect("the exact replay remains queued under backpressure");
-    let OperationIntent::EstablishQueryContext(establish_request) = &establish else {
+    let OperationIntent::EstablishParticipation(establish_request) = &establish else {
         unreachable!()
     };
     let receipt = OperationAcknowledgement::worker_receipt(
         establish.operation_id(),
-        OperationKind::UpdateQueryContext,
+        OperationKind::UpdateParticipation,
         OperationOutcome::Accepted,
-        AckPayload::Context(
-            QueryContextReceipt::new(establish_request.context(), QueryContextState::Active)
-                .with_lease(LeaseReceipt::new(
-                    LeaseSequence::INITIAL,
-                    LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
-                    Duration::from_secs(10),
-                )),
+        AckPayload::Participation(
+            ParticipationReceipt::new(
+                establish_request.participation(),
+                ParticipationState::Active,
+            )
+            .with_lease(LeaseReceipt::new(
+                LeaseSequence::INITIAL,
+                LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
+                Duration::from_secs(10),
+            )),
         ),
     );
     ack_handle.publish(receipt);
     round
         .turn()
         .expect("the older definitive receipt closes the queued replay");
-    assert!(round.contexts_established());
+    assert!(round.participations_established());
     assert!(
         sink.take().is_empty(),
         "the definitely-unsent replay must not cross process transport"
@@ -3433,7 +3451,7 @@ fn a_late_establish_receipt_closes_a_queued_exact_replay() {
 }
 
 #[test]
-fn a_round_never_emits_establish_before_each_context_grant() {
+fn a_round_never_emits_establish_before_each_participation_grant() {
     let mut harness = Harness::new(&[0], &[0], 512);
     let first = harness
         .pump_once()
@@ -3442,31 +3460,31 @@ fn a_round_never_emits_establish_before_each_context_grant() {
         .collect::<Vec<_>>();
     assert!(first.iter().any(|intent| matches!(
         intent,
-        OperationIntent::AcquireQueryContextAdmissionTicket(_)
+        OperationIntent::AcquireParticipationAdmissionTicket(_)
     )));
     assert!(
         first
             .iter()
-            .all(|intent| !matches!(intent, OperationIntent::EstablishQueryContext(_)))
+            .all(|intent| !matches!(intent, OperationIntent::EstablishParticipation(_)))
     );
 
     for intent in first {
-        let OperationIntent::AcquireQueryContextAdmissionTicket(request) = intent else {
+        let OperationIntent::AcquireParticipationAdmissionTicket(request) = intent else {
             continue;
         };
         harness
             .execution
             .acknowledge(&OperationAcknowledgement::worker_receipt(
                 request.envelope().operation_id(),
-                OperationKind::AcquireQueryContextAdmissionTicket,
+                OperationKind::AcquireParticipationAdmissionTicket,
                 OperationOutcome::Accepted,
-                AckPayload::AdmissionTicket(QueryContextAdmissionTicketReceipt::new(
+                AckPayload::AdmissionTicket(ParticipationAdmissionTicketReceipt::new(
                     AdmissionTicketId::try_from_bytes([0x56; 16]).expect("the ticket is nonzero"),
-                    request.context(),
+                    request.participation(),
                     request.valid_for(),
                 )),
             ))
-            .expect("the context grant settles");
+            .expect("the participation grant settles");
     }
     assert!(
         harness.sink.take().is_empty(),
@@ -3480,7 +3498,7 @@ fn a_round_never_emits_establish_before_each_context_grant() {
     assert!(
         second
             .iter()
-            .any(|intent| matches!(intent, OperationIntent::EstablishQueryContext(_)))
+            .any(|intent| matches!(intent, OperationIntent::EstablishParticipation(_)))
     );
 }
 
@@ -3502,7 +3520,7 @@ fn a_release_is_withheld_until_every_expected_create_is_acknowledged() {
     assert!(
         released
             .iter()
-            .all(|intent| !matches!(intent.kind(), OperationKind::ReleaseQueryContext)),
+            .all(|intent| !matches!(intent.kind(), OperationKind::ReleaseParticipation)),
         "a release may not be sent while a legal create can still follow"
     );
 }
@@ -3528,7 +3546,7 @@ fn create_identity(intent: &OperationIntent) -> TaskIdentity {
 #[test]
 fn a_full_process_ends_the_pass_so_no_later_create_is_priced_or_reserved() {
     let mut harness = Harness::new(&[0, 1, 2], &[0], 512);
-    let backends = harness.context_backends();
+    let backends = harness.participation_backends();
     for &backend in &backends {
         harness
             .sink
@@ -4089,7 +4107,7 @@ fn strict_normal_drain_request_keeps_create_split_and_late_edge_open_until_termi
     assert!(
         still_waiting
             .iter()
-            .all(|intent| !matches!(intent, OperationIntent::QuiesceQueryContext(_)))
+            .all(|intent| !matches!(intent, OperationIntent::QuiesceParticipation(_)))
     );
     for (state, complete) in [
         (TaskState::Running, false),
@@ -4103,8 +4121,8 @@ fn strict_normal_drain_request_keeps_create_split_and_late_edge_open_until_termi
     assert!(
         closing
             .iter()
-            .any(|intent| matches!(intent, OperationIntent::QuiesceQueryContext(_))),
-        "ordinary Context closure begins only after all strict endpoints terminate"
+            .any(|intent| matches!(intent, OperationIntent::QuiesceParticipation(_))),
+        "ordinary Participation closure begins only after all strict endpoints terminate"
     );
 }
 
@@ -4969,15 +4987,25 @@ fn production_close_reducer_explores_normal_drain_and_backpressure() {
 }
 
 #[test]
-fn receiver_context_release_waits_for_exact_inbound_sender_stop() {
+fn receiver_participation_release_waits_for_exact_inbound_sender_stop() {
     let mut harness = Harness::new(&[0], &[1], 512);
     harness.settle_until_quiet(Duration::from_secs(10));
     let leaf = harness.stage_tasks(1)[0];
     let middle = harness.stage_tasks(2)[0];
     let root = harness.execution.graph().root_task();
-    let leaf_context = harness.execution.graph().task(leaf).unwrap().context();
-    let middle_context = harness.execution.graph().task(middle).unwrap().context();
-    assert_ne!(leaf_context, middle_context);
+    let leaf_participation = harness
+        .execution
+        .graph()
+        .task(leaf)
+        .unwrap()
+        .participation();
+    let middle_participation = harness
+        .execution
+        .graph()
+        .task(middle)
+        .unwrap()
+        .participation();
+    assert_ne!(leaf_participation, middle_participation);
     harness.execution.activate_covered_observation();
 
     for task in [leaf, middle, root] {
@@ -4991,32 +5019,32 @@ fn receiver_context_release_waits_for_exact_inbound_sender_stop() {
     let fences = harness
         .released()
         .into_iter()
-        .filter(|intent| intent.kind() == OperationKind::QuiesceQueryContext)
+        .filter(|intent| intent.kind() == OperationKind::QuiesceParticipation)
         .collect::<Vec<_>>();
     assert_eq!(fences.len(), 2);
     for fence in fences {
-        let OperationIntent::QuiesceQueryContext(request) = &fence else {
+        let OperationIntent::QuiesceParticipation(request) = &fence else {
             unreachable!()
         };
-        let context = request.context();
+        let participation = request.participation();
         let accepted = harness
             .execution
             .graph()
             .tasks()
-            .filter(|task| task.context() == context)
+            .filter(|task| task.participation() == participation)
             .map(|task| task.identity())
             .collect();
         harness
             .execution
             .acknowledge(&OperationAcknowledgement::new(
                 fence.operation_id(),
-                OperationKind::QuiesceQueryContext,
+                OperationKind::QuiesceParticipation,
                 OperationOutcome::Accepted,
-                AckPayload::Quiesce(QuiesceQueryContextReceipt::new(
-                    context,
+                AckPayload::Quiesce(QuiesceParticipationReceipt::new(
+                    participation,
                     1,
                     accepted,
-                    QueryContextState::Quiescing,
+                    ParticipationState::Quiescing,
                 )),
             ))
             .unwrap();
@@ -5025,14 +5053,14 @@ fn receiver_context_release_waits_for_exact_inbound_sender_stop() {
         harness
             .released()
             .iter()
-            .all(|intent| intent.kind() != OperationKind::ReleaseQueryContext),
+            .all(|intent| intent.kind() != OperationKind::ReleaseParticipation),
         "terminal status does not prove a sender has actually stopped"
     );
 
     harness
         .execution
         .apply_covered_entries(vec![covered_frame(
-            leaf_context,
+            leaf_participation,
             1,
             CoveredStatusStreamFact::TaskConvergence(TaskConvergenceReceipt::actual_stopped(
                 harness.identity(leaf),
@@ -5044,7 +5072,7 @@ fn receiver_context_release_waits_for_exact_inbound_sender_stop() {
         .released()
         .into_iter()
         .filter_map(|intent| match intent {
-            OperationIntent::ReleaseQueryContext(request) => Some(request.context()),
+            OperationIntent::ReleaseParticipation(request) => Some(request.participation()),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -5056,7 +5084,7 @@ fn receiver_context_release_waits_for_exact_inbound_sender_stop() {
     harness
         .execution
         .apply_covered_entries(vec![covered_frame(
-            middle_context,
+            middle_participation,
             1,
             CoveredStatusStreamFact::TaskConvergence(TaskConvergenceReceipt::actual_stopped(
                 harness.identity(middle),
@@ -5068,16 +5096,16 @@ fn receiver_context_release_waits_for_exact_inbound_sender_stop() {
         .released()
         .into_iter()
         .filter_map(|intent| match intent {
-            OperationIntent::ReleaseQueryContext(request) => Some(request.context()),
+            OperationIntent::ReleaseParticipation(request) => Some(request.participation()),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(released, [middle_context]);
+    assert_eq!(released, [middle_participation]);
 
     harness
         .execution
         .apply_covered_entries(vec![covered_frame(
-            leaf_context,
+            leaf_participation,
             1,
             CoveredStatusStreamFact::TaskConvergence(TaskConvergenceReceipt::actual_stopped(
                 harness.identity(root),
@@ -5089,11 +5117,11 @@ fn receiver_context_release_waits_for_exact_inbound_sender_stop() {
         .released()
         .into_iter()
         .filter_map(|intent| match intent {
-            OperationIntent::ReleaseQueryContext(request) => Some(request.context()),
+            OperationIntent::ReleaseParticipation(request) => Some(request.participation()),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(released, [leaf_context]);
+    assert_eq!(released, [leaf_participation]);
 }
 
 #[test]
@@ -5299,8 +5327,8 @@ fn process_backpressure_restores_the_exact_batch_without_in_flight_or_spin() {
     let schedule = chain_schedule(&[0], &[0]);
     let graph = build_graph(&schedule, &chain_edges(), &processes, 512).expect("legal graph");
     let admission_epochs = graph
-        .contexts()
-        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .participations()
+        .map(|participation| (participation.backend_process_id(), admission_epoch()))
         .collect::<BTreeMap<_, _>>();
     let sink = Arc::new(BackpressureOnceSink::default());
     let wake = Arc::new(CountingWake::default());
@@ -5348,8 +5376,8 @@ fn process_queue_backpressure_rolls_back_every_unadmitted_owner_transition() {
         .map(|stage| stage.stage_id())
         .collect::<Vec<_>>();
     let admission_epochs = graph
-        .contexts()
-        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .participations()
+        .map(|participation| (participation.backend_process_id(), admission_epoch()))
         .collect::<BTreeMap<_, _>>();
     let sink = Arc::new(QueueBackpressureOnceSink::default());
     let wake = Arc::new(CountingWake::default());
@@ -5406,8 +5434,8 @@ fn update_admission_execution(sink: Arc<dyn TaskOperationSink>) -> (QueryTaskExe
         .map(|task| task.task_id())
         .expect("the graph has one leaf task");
     let admission_epochs = graph
-        .contexts()
-        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .participations()
+        .map(|participation| (participation.backend_process_id(), admission_epoch()))
         .collect::<BTreeMap<_, _>>();
     let wake = Arc::new(CountingWake::default());
     let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
@@ -5599,7 +5627,7 @@ fn terminal_status_withdraws_preparing_input_before_queue_reopens() {
     assert_eq!(execution.task(leaf).unwrap().pending_updates(), 0);
     sink.set_queue_open(true);
     // Terminal task input is decided before entering the queue gate. Other
-    // original context lifecycle operations may still converge in this turn.
+    // original participation lifecycle operations may still converge in this turn.
     let attempts = sink.reserve_attempts();
     assert_eq!(
         execution
@@ -5653,8 +5681,8 @@ fn a_bounded_fan_out_stays_inside_every_lane_and_queue_bound() {
                             .create_ack(&intent, OperationOutcome::Accepted)
                             .expect("a create acknowledgement settles");
                     }
-                    OperationKind::UpdateQueryContext => {
-                        harness.context_ack(&intent, Duration::from_secs(30));
+                    OperationKind::UpdateParticipation => {
+                        harness.participation_ack(&intent, Duration::from_secs(30));
                     }
                     OperationKind::UpdateTask => {
                         harness
@@ -5709,26 +5737,26 @@ fn assert_bounds(
 }
 
 #[test]
-fn terminal_cleanup_stops_new_context_lifecycle_issuance() {
-    let context = QueryContextRef::new(
+fn terminal_cleanup_stops_new_participation_lifecycle_issuance() {
+    let participation = ParticipationRef::new(
         execution_id(),
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
     let compatibility = NativeCompatibilityId::new([0x42; 32]);
-    let mut owner = QueryContextOwner::new(context, 0, compatibility, admission_epoch());
+    let mut owner = ParticipationOwner::new(participation, 0, compatibility, admission_epoch());
     let admission = owner
         .admission_intent(MonotonicInstant::ORIGIN)
         .expect("the request is legal")
         .expect("admission is required");
-    let OperationIntent::AcquireQueryContextAdmissionTicket(request) = admission else {
+    let OperationIntent::AcquireParticipationAdmissionTicket(request) = admission else {
         unreachable!("admission has its own operation kind");
     };
     owner
         .on_admission_ack(
             &OperationAcknowledgement::transport_unknown(
                 request.envelope().operation_id(),
-                OperationKind::AcquireQueryContextAdmissionTicket,
+                OperationKind::AcquireParticipationAdmissionTicket,
             ),
             MonotonicInstant::from_origin(Duration::from_millis(1)),
         )
@@ -5747,7 +5775,7 @@ fn terminal_cleanup_stops_new_context_lifecycle_issuance() {
         owner
             .establish_intent(
                 FakeEstablish
-                    .facts_for(context)
+                    .facts_for(participation)
                     .expect("the fake source has facts"),
                 MonotonicInstant::from_origin(Duration::from_millis(2)),
             )
@@ -5766,13 +5794,13 @@ fn terminal_cleanup_stops_new_context_lifecycle_issuance() {
 
 #[test]
 fn an_initial_establish_rejection_remains_a_pre_ready_infrastructure_fact() {
-    let context = QueryContextRef::new(
+    let participation = ParticipationRef::new(
         execution_id(),
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
-    let mut owner = QueryContextOwner::new(
-        context,
+    let mut owner = ParticipationOwner::new(
+        participation,
         0,
         NativeCompatibilityId::new([0x43; 32]),
         admission_epoch(),
@@ -5781,7 +5809,7 @@ fn an_initial_establish_rejection_remains_a_pre_ready_infrastructure_fact() {
     let establish = owner
         .establish_intent(
             FakeEstablish
-                .facts_for(context)
+                .facts_for(participation)
                 .expect("the fake source has facts"),
             MonotonicInstant::ORIGIN,
         )
@@ -5789,9 +5817,9 @@ fn an_initial_establish_rejection_remains_a_pre_ready_infrastructure_fact() {
         .expect("the establish is released");
 
     let error = owner
-        .on_context_ack(&OperationAcknowledgement::new(
+        .on_participation_ack(&OperationAcknowledgement::new(
             establish.operation_id(),
-            OperationKind::UpdateQueryContext,
+            OperationKind::UpdateParticipation,
             OperationOutcome::InvalidStateOrRequest,
             AckPayload::None,
         ))
@@ -5799,26 +5827,26 @@ fn an_initial_establish_rejection_remains_a_pre_ready_infrastructure_fact() {
 
     assert!(matches!(
         error,
-        TaskExecutionError::PreReadyEstablishRejected{context: rejected_context,operation_id,rejection} if rejection.outcome()==OperationOutcome::InvalidStateOrRequest && rejected_context == context && operation_id == establish.operation_id()
+        TaskExecutionError::PreReadyEstablishRejected{participation: rejected_participation,operation_id,rejection} if rejection.outcome()==OperationOutcome::InvalidStateOrRequest && rejected_participation == participation && operation_id == establish.operation_id()
     ));
     assert!(owner.is_released());
 }
 
 #[test]
 fn an_establish_accounts_for_its_query_options_payload() {
-    let context = QueryContextRef::new(
+    let participation = ParticipationRef::new(
         execution_id(),
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
-    let mut owner = QueryContextOwner::new(
-        context,
+    let mut owner = ParticipationOwner::new(
+        participation,
         0,
         NativeCompatibilityId::new([0x41; 32]),
         admission_epoch(),
     );
     let facts = FakeEstablish
-        .facts_for(context)
+        .facts_for(participation)
         .expect("the fake source has facts");
     grant_admission(&mut owner, MonotonicInstant::ORIGIN);
     let intent = owner
@@ -5835,13 +5863,13 @@ fn an_establish_accounts_for_its_query_options_payload() {
 
 #[test]
 fn one_operation_cannot_exceed_the_queue_side_carrier_bound() {
-    let context = QueryContextRef::new(
+    let participation = ParticipationRef::new(
         execution_id(),
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
-    let mut owner = QueryContextOwner::new(
-        context,
+    let mut owner = ParticipationOwner::new(
+        participation,
         0,
         NativeCompatibilityId::new([0x42; 32]),
         admission_epoch(),
@@ -5850,7 +5878,7 @@ fn one_operation_cannot_exceed_the_queue_side_carrier_bound() {
     let intent = owner
         .establish_intent(
             FakeEstablish
-                .facts_for(context)
+                .facts_for(participation)
                 .expect("the fake source has facts"),
             MonotonicInstant::ORIGIN,
         )
@@ -5903,8 +5931,8 @@ fn a_full_target_queue_holds_later_creates_back_instead_of_being_exceeded() {
                         .create_ack(&intent, OperationOutcome::Accepted)
                         .expect("a create acknowledgement settles");
                 }
-                OperationKind::UpdateQueryContext => {
-                    harness.context_ack(&intent, Duration::from_secs(30));
+                OperationKind::UpdateParticipation => {
+                    harness.participation_ack(&intent, Duration::from_secs(30));
                 }
                 OperationKind::UpdateTask => harness
                     .update_ack(&intent, OperationOutcome::Accepted)
@@ -5961,12 +5989,12 @@ fn an_operation_that_outlives_queue_residence_fails_typed_and_rolls_back_its_own
 }
 
 #[test]
-fn queued_admission_does_not_imply_a_worker_context_or_create_send() {
+fn queued_admission_does_not_imply_a_worker_participation_or_create_send() {
     let mut pending = Harness::new(&[0], &[0], 512);
-    let contexts = pending
+    let participations = pending
         .execution
         .graph()
-        .contexts()
+        .participations()
         .copied()
         .collect::<Vec<_>>();
     let released = pending.pump_once();
@@ -5977,7 +6005,7 @@ fn queued_admission_does_not_imply_a_worker_context_or_create_send() {
             .any(|intent| {
                 matches!(
                     intent,
-                    OperationIntent::AcquireQueryContextAdmissionTicket(_)
+                    OperationIntent::AcquireParticipationAdmissionTicket(_)
                 )
             })
     );
@@ -5987,17 +6015,17 @@ fn queued_admission_does_not_imply_a_worker_context_or_create_send() {
             .flat_map(|(_, intents)| intents)
             .all(|intent| { !matches!(intent, OperationIntent::CreateTask(_)) })
     );
-    assert!(
-        contexts
-            .iter()
-            .all(|&context| pending.execution.context_never_established(context))
-    );
+    assert!(participations.iter().all(|&participation| {
+        pending
+            .execution
+            .participation_never_established(participation)
+    }));
 
     let admission = released
         .iter()
         .flat_map(|(_, intents)| intents)
         .find_map(|intent| match intent {
-            OperationIntent::AcquireQueryContextAdmissionTicket(request) => Some(request),
+            OperationIntent::AcquireParticipationAdmissionTicket(request) => Some(request),
             _ => None,
         })
         .unwrap();
@@ -6005,11 +6033,11 @@ fn queued_admission_does_not_imply_a_worker_context_or_create_send() {
         .execution
         .acknowledge(&OperationAcknowledgement::worker_receipt(
             admission.envelope().operation_id(),
-            OperationKind::AcquireQueryContextAdmissionTicket,
+            OperationKind::AcquireParticipationAdmissionTicket,
             OperationOutcome::Accepted,
-            AckPayload::AdmissionTicket(QueryContextAdmissionTicketReceipt::new(
+            AckPayload::AdmissionTicket(ParticipationAdmissionTicketReceipt::new(
                 AdmissionTicketId::try_from_bytes([0x55; 16]).unwrap(),
-                admission.context(),
+                admission.participation(),
                 admission.valid_for(),
             )),
         ))
@@ -6017,22 +6045,22 @@ fn queued_admission_does_not_imply_a_worker_context_or_create_send() {
     assert!(
         !pending
             .execution
-            .context_never_established(admission.context())
+            .participation_never_established(admission.participation())
     );
 
     let mut establishing = Harness::new(&[0], &[0], 512);
-    let contexts = establishing
+    let participations = establishing
         .execution
         .graph()
-        .contexts()
+        .participations()
         .copied()
         .collect::<Vec<_>>();
     let _ = establishing.pump();
-    assert!(
-        contexts
-            .iter()
-            .all(|&context| !establishing.execution.context_never_established(context))
-    );
+    assert!(participations.iter().all(|&participation| {
+        !establishing
+            .execution
+            .participation_never_established(participation)
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -6162,7 +6190,7 @@ fn the_split_adapter_addresses_graph_tasks_and_reuses_the_driver_retry_rule() {
     for target in &targets {
         let task = graph
             .tasks()
-            .find(|task| task.fragment_instance_id() == target.fragment_instance_id)
+            .find(|task| task.task_key() == target.task_key)
             .expect("every target addresses a graph task");
         assert_eq!(task.identity(), target.identity);
         assert_eq!(task.fragment_id(), LEAF_FRAGMENT);
@@ -6175,7 +6203,7 @@ fn the_split_adapter_addresses_graph_tasks_and_reuses_the_driver_retry_rule() {
     // verdict comes from the delivery owner rather than being restated here.
     let legacy_driver_target = crate::query_execution::split_assignment::AssignmentTarget {
         backend_idx: 0,
-        fragment_instance_id: targets[0].fragment_instance_id,
+        task_key: targets[0].task_key,
     };
     assert_eq!(
         delivery_action(&SplitAssignmentDriverError::Transport {
@@ -6242,12 +6270,12 @@ fn an_accepted_create_without_its_receipt_is_refused() {
     ));
 }
 
-/// The runner records which contexts it started subscriptions for.
+/// The runner records which participations it started subscriptions for.
 #[derive(Debug, Default)]
 struct RecordingSubscriptions {
-    ensured: Mutex<Vec<(QueryContextRef, usize)>>,
-    resubscribed: Mutex<Vec<(QueryContextRef, usize)>>,
-    stopped: Mutex<Vec<QueryContextRef>>,
+    ensured: Mutex<Vec<(ParticipationRef, usize)>>,
+    resubscribed: Mutex<Vec<(ParticipationRef, usize)>>,
+    stopped: Mutex<Vec<ParticipationRef>>,
     /// What a settled subscription reports, so a test can put a backend out
     /// of observation without a transport.
     settled: Mutex<Option<crate::native::task_transport::SubscriptionState>>,
@@ -6256,38 +6284,38 @@ struct RecordingSubscriptions {
 impl crate::task_execution::round::StatusSubscriptions for RecordingSubscriptions {
     fn ensure(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         cursors: Vec<novarocks_execution::task_execution::TaskStatusCursor>,
     ) -> Result<(), String> {
         self.ensured
             .lock()
             .expect("subscription ledger")
-            .push((context, cursors.len()));
+            .push((participation, cursors.len()));
         Ok(())
     }
 
     fn resubscribe(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         cursors: Vec<novarocks_execution::task_execution::TaskStatusCursor>,
     ) -> Result<(), String> {
         self.resubscribed
             .lock()
             .expect("resubscription ledger")
-            .push((context, cursors.len()));
+            .push((participation, cursors.len()));
         Ok(())
     }
 
-    fn stop(&self, context: QueryContextRef) {
+    fn stop(&self, participation: ParticipationRef) {
         self.stopped
             .lock()
             .expect("subscription stop ledger")
-            .push(context);
+            .push(participation);
     }
 
     fn settled_fatally(
         &self,
-        _context: QueryContextRef,
+        _participation: ParticipationRef,
     ) -> Option<crate::native::task_transport::SubscriptionState> {
         // The fake owes the trait's contract, not just its shape: a state
         // resubscribing can still repair is not something to report.
@@ -6302,7 +6330,7 @@ impl crate::task_execution::round::StatusSubscriptions for RecordingSubscription
 /// status stream before the bounded remote-convergence period starts, while
 /// leaving any already-running Worker work to its own lease and stop rules.
 #[test]
-fn terminal_cleanup_stops_status_observation_for_every_context() {
+fn terminal_cleanup_stops_status_observation_for_every_participation() {
     use crate::native::task_transport::TaskAckIntake;
     use crate::task_execution::round::TaskRound;
 
@@ -6310,7 +6338,7 @@ fn terminal_cleanup_stops_status_observation_for_every_context() {
     let mut expected = harness
         .execution
         .graph()
-        .contexts()
+        .participations()
         .copied()
         .collect::<Vec<_>>();
     expected.sort_unstable();
@@ -6409,13 +6437,13 @@ fn a_create_receipt_snapshot_older_than_the_observed_one_is_ignored_not_adopted(
 
 /// Builds the acknowledgement a released establish settles with.
 ///
-/// A fresh attempt's establish creates its context, so its lease sequence is
+/// A fresh attempt's establish creates its participation, so its lease sequence is
 /// the initial one and nothing has to be read back out of the execution.
 pub(crate) fn establish_ack(intent: &OperationIntent) -> OperationAcknowledgement {
-    let OperationIntent::EstablishQueryContext(request) = intent else {
+    let OperationIntent::EstablishParticipation(request) = intent else {
         unreachable!("an establish intent carries its exact request");
     };
-    let receipt = QueryContextReceipt::new(request.context(), QueryContextState::Active)
+    let receipt = ParticipationReceipt::new(request.participation(), ParticipationState::Active)
         .with_lease(LeaseReceipt::new(
             LeaseSequence::INITIAL,
             LeaseValidFor::new(Duration::from_secs(30)).expect("a legal request"),
@@ -6423,24 +6451,24 @@ pub(crate) fn establish_ack(intent: &OperationIntent) -> OperationAcknowledgemen
         ));
     OperationAcknowledgement::new(
         intent.operation_id(),
-        OperationKind::UpdateQueryContext,
+        OperationKind::UpdateParticipation,
         OperationOutcome::Accepted,
-        AckPayload::Context(receipt),
+        AckPayload::Participation(receipt),
     )
 }
 
 /// Builds the exact Worker acknowledgement for one released admission request.
 pub(crate) fn admission_ack(intent: &OperationIntent) -> OperationAcknowledgement {
-    let OperationIntent::AcquireQueryContextAdmissionTicket(request) = intent else {
+    let OperationIntent::AcquireParticipationAdmissionTicket(request) = intent else {
         unreachable!("an admission intent carries its exact request");
     };
     OperationAcknowledgement::worker_receipt(
         intent.operation_id(),
-        OperationKind::AcquireQueryContextAdmissionTicket,
+        OperationKind::AcquireParticipationAdmissionTicket,
         OperationOutcome::Accepted,
-        AckPayload::AdmissionTicket(QueryContextAdmissionTicketReceipt::new(
+        AckPayload::AdmissionTicket(ParticipationAdmissionTicketReceipt::new(
             AdmissionTicketId::try_from_bytes([0x54; 16]).expect("the test ticket is nonzero"),
-            request.context(),
+            request.participation(),
             request.valid_for(),
         )),
     )
@@ -6454,7 +6482,7 @@ fn released_admissions(sink: &RecordingSink) -> Vec<OperationIntent> {
         .filter(|intent| {
             matches!(
                 intent.kind(),
-                OperationKind::AcquireQueryContextAdmissionTicket
+                OperationKind::AcquireParticipationAdmissionTicket
             )
         })
         .collect()
@@ -6465,7 +6493,7 @@ fn released_establishes(sink: &RecordingSink) -> Vec<OperationIntent> {
     sink.take()
         .into_iter()
         .flat_map(|(_, operations)| operations)
-        .filter(|intent| matches!(intent.kind(), OperationKind::UpdateQueryContext))
+        .filter(|intent| matches!(intent.kind(), OperationKind::UpdateParticipation))
         .collect()
 }
 
@@ -6486,7 +6514,7 @@ pub(crate) fn accepted_create_ack(intent: &OperationIntent) -> OperationAcknowle
 }
 
 #[test]
-fn a_rejected_establish_does_not_discard_later_context_acknowledgements() {
+fn a_rejected_establish_does_not_discard_later_participation_acknowledgements() {
     use crate::native::task_transport::TaskAckIntake;
     use crate::task_execution::dispatch::DispatchOperationState;
     use crate::task_execution::round::TaskRound;
@@ -6514,15 +6542,15 @@ fn a_rejected_establish_does_not_discard_later_context_acknowledgements() {
     round.turn().expect("admission settlement");
     let establishes = released_establishes(&sink);
     assert_eq!(establishes.len(), 2);
-    let OperationIntent::EstablishQueryContext(rejected) = &establishes[0] else {
+    let OperationIntent::EstablishParticipation(rejected) = &establishes[0] else {
         unreachable!("an establish carries its request");
     };
-    let OperationIntent::EstablishQueryContext(accepted) = &establishes[1] else {
+    let OperationIntent::EstablishParticipation(accepted) = &establishes[1] else {
         unreachable!("an establish carries its request");
     };
     acks.publish(OperationAcknowledgement::new(
         establishes[0].operation_id(),
-        OperationKind::UpdateQueryContext,
+        OperationKind::UpdateParticipation,
         OperationOutcome::InvalidStateOrRequest,
         AckPayload::None,
     ));
@@ -6533,14 +6561,18 @@ fn a_rejected_establish_does_not_discard_later_context_acknowledgements() {
         Err(TaskExecutionError::PreReadyEstablishRejected { .. })
     ));
     assert_eq!(
-        round.execution().owner(accepted.context()).unwrap().state(),
-        QueryContextState::Active,
-        "a failed peer must not discard this context's definitive Worker receipt"
+        round
+            .execution()
+            .owner(accepted.participation())
+            .unwrap()
+            .state(),
+        ParticipationState::Active,
+        "a failed peer must not discard this participation's definitive Worker receipt"
     );
     assert!(
         round
             .execution()
-            .owner(rejected.context())
+            .owner(rejected.participation())
             .unwrap()
             .is_released()
     );
@@ -6579,12 +6611,12 @@ fn an_invalid_send_started_does_not_discard_later_worker_acknowledgements() {
     }
     round.turn().expect("admission settlement");
     let establishes = released_establishes(&sink);
-    let OperationIntent::EstablishQueryContext(request) = &establishes[0] else {
+    let OperationIntent::EstablishParticipation(request) = &establishes[0] else {
         unreachable!("released establish");
     };
     acks.publish_establish_send_started(
         novarocks_execution::task_execution::TaskOperationId::new_v7(),
-        request.context(),
+        request.participation(),
     );
     acks.publish(establish_ack(&establishes[0]));
     assert!(matches!(
@@ -6592,8 +6624,12 @@ fn an_invalid_send_started_does_not_discard_later_worker_acknowledgements() {
         Err(TaskExecutionError::UnknownOperation)
     ));
     assert_eq!(
-        round.execution().owner(request.context()).unwrap().state(),
-        QueryContextState::Active,
+        round
+            .execution()
+            .owner(request.participation())
+            .unwrap()
+            .state(),
+        ParticipationState::Active,
         "a malformed transport event must not discard a following Worker ownership receipt",
     );
     assert_eq!(
@@ -6608,23 +6644,26 @@ fn an_invalid_send_started_does_not_discard_later_worker_acknowledgements() {
 }
 
 /// The defect this catches: the runner subscribed to task status for every
-/// context on the same turn that merely *released* the establish, so the
+/// participation on the same turn that merely *released* the establish, so the
 /// subscription and the establish raced to the backend as two independent
-/// RPCs. A subscription that won named a query context the backend did not
+/// RPCs. A subscription that won named a participation the backend did not
 /// hold yet, the backend answered FailedPrecondition, and the frontend
-/// classifies that as fatal -- so that context was never observed again for
-/// the life of the attempt. Losing the root's context hangs the query to its
+/// classifies that as fatal -- so that participation was never observed again for
+/// the life of the attempt. Losing the root's participation hangs the query to its
 /// deadline; losing any other burns the whole drain budget.
 #[test]
-fn a_context_is_subscribed_only_after_its_own_establish_is_acknowledged() {
+fn a_participation_is_subscribed_only_after_its_own_establish_is_acknowledged() {
     use crate::native::task_transport::TaskAckIntake;
     use crate::task_execution::round::TaskRound;
 
     let processes = backends(2);
     let schedule = chain_schedule(&[0, 1], &[0]);
     let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
-    let contexts = graph.contexts().count();
-    assert!(contexts > 1, "this test needs more than one context");
+    let participations = graph.participations().count();
+    assert!(
+        participations > 1,
+        "this test needs more than one participation"
+    );
     let harness = Harness::from_graph(graph);
     let sink = Arc::clone(&harness.sink);
     let wake = Arc::clone(&harness.wake);
@@ -6643,15 +6682,15 @@ fn a_context_is_subscribed_only_after_its_own_establish_is_acknowledged() {
     let first = round.turn().expect("a turn on a fresh attempt");
     assert!(
         first.operations > 0,
-        "the first turn owes an admission request to every context"
+        "the first turn owes an admission request to every participation"
     );
     assert!(
         subscriptions.ensured.lock().expect("ledger").is_empty(),
-        "a released establish is not an acknowledged one, so no context may be subscribed yet"
+        "a released establish is not an acknowledged one, so no participation may be subscribed yet"
     );
 
     let admissions = released_admissions(&sink);
-    assert_eq!(admissions.len(), contexts);
+    assert_eq!(admissions.len(), participations);
     for intent in &admissions {
         acks.publish(admission_ack(intent));
     }
@@ -6659,14 +6698,14 @@ fn a_context_is_subscribed_only_after_its_own_establish_is_acknowledged() {
         .turn()
         .expect("admission receipts release every establish");
 
-    // Answer exactly one establish. Only that context becomes subscribable;
-    // the other is still a context its backend does not hold.
+    // Answer exactly one establish. Only that participation becomes subscribable;
+    // the other is still a participation its backend does not hold.
     let establishes = released_establishes(&sink);
-    assert_eq!(establishes.len(), contexts);
-    let OperationIntent::EstablishQueryContext(first_request) = &establishes[0] else {
+    assert_eq!(establishes.len(), participations);
+    let OperationIntent::EstablishParticipation(first_request) = &establishes[0] else {
         unreachable!("an establish carries its request");
     };
-    let established_context = first_request.context();
+    let established_participation = first_request.participation();
     acks.publish(establish_ack(&establishes[0]));
 
     round.turn().expect("a turn that settles one establish");
@@ -6676,13 +6715,13 @@ fn a_context_is_subscribed_only_after_its_own_establish_is_acknowledged() {
             .lock()
             .expect("ledger")
             .iter()
-            .map(|(context, _)| *context)
+            .map(|(participation, _)| *participation)
             .collect::<Vec<_>>(),
-        vec![established_context],
-        "exactly the acknowledged context is subscribed"
+        vec![established_participation],
+        "exactly the acknowledged participation is subscribed"
     );
 
-    // Answer the rest, and every context becomes subscribable.
+    // Answer the rest, and every participation becomes subscribable.
     for intent in &establishes[1..] {
         acks.publish(establish_ack(intent));
     }
@@ -6690,13 +6729,16 @@ fn a_context_is_subscribed_only_after_its_own_establish_is_acknowledged() {
     let ensured = subscriptions.ensured.lock().expect("ledger").clone();
     assert_eq!(
         ensured.len(),
-        1 + contexts,
-        "the acknowledged context keeps being ensured and the rest join it"
+        1 + participations,
+        "the acknowledged participation keeps being ensured and the rest join it"
     );
-    let mut subscribed: Vec<_> = ensured.iter().map(|(context, _)| *context).collect();
+    let mut subscribed: Vec<_> = ensured
+        .iter()
+        .map(|(participation, _)| *participation)
+        .collect();
     subscribed.sort_unstable();
     subscribed.dedup();
-    assert_eq!(subscribed.len(), contexts);
+    assert_eq!(subscribed.len(), participations);
 }
 
 /// The defect this catches: `SubscriptionState::is_fatal` was computed and
@@ -6784,7 +6826,7 @@ fn a_backend_whose_subscription_settled_fatally_fails_the_attempt_by_name() {
 }
 
 #[test]
-fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
+fn a_turn_starts_one_subscription_per_participation_and_reports_what_moved() {
     use crate::native::task_transport::TaskAckIntake;
     use crate::task_execution::round::TaskRound;
 
@@ -6792,11 +6834,11 @@ fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
     // what moved. What it does own is the order -- acknowledgements settle
     // before the pump, so a permit freed this turn is usable this turn rather
     // than a turn later -- and starting exactly one subscription per
-    // established context.
+    // established participation.
     let processes = backends(2);
     let schedule = chain_schedule(&[0, 1], &[0]);
     let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
-    let contexts = graph.contexts().count();
+    let participations = graph.participations().count();
     let harness = Harness::from_graph(graph);
     let sink = Arc::clone(&harness.sink);
     let wake = Arc::clone(&harness.wake);
@@ -6819,7 +6861,7 @@ fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
     let first = round.turn().expect("a turn on a fresh attempt");
     assert!(
         first.operations > 0,
-        "the first turn owes an admission request to every context"
+        "the first turn owes an admission request to every participation"
     );
     assert!(!first.is_idle());
 
@@ -6833,22 +6875,22 @@ fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
         acks.publish(establish_ack(&intent));
     }
     let settled = round.turn().expect("a turn that settles every establish");
-    assert_eq!(settled.acknowledgements, contexts);
+    assert_eq!(settled.acknowledgements, participations);
     let ensured = subscriptions.ensured.lock().expect("ledger").len();
     assert_eq!(
-        ensured, contexts,
-        "every established context needs its one subscription"
+        ensured, participations,
+        "every established participation needs its one subscription"
     );
 
     // `ensure` is idempotent, so a second turn does not start a second
-    // subscription for a context that already has one -- but the runner still
-    // calls it, because a context that lost its transport has to be restarted
+    // subscription for a participation that already has one -- but the runner still
+    // calls it, because a participation that lost its transport has to be restarted
     // by exactly this path.
     let second = round.turn().expect("a second turn");
     assert!(second.acknowledgements == 0, "nothing answered yet");
     assert_eq!(
         subscriptions.ensured.lock().expect("ledger").len(),
-        ensured + contexts
+        ensured + participations
     );
 
     // Sending establishes is neither an accepted Root seal nor a protocol tail.
@@ -6869,7 +6911,7 @@ fn a_turn_replaces_every_established_subscription_after_local_observation_loss()
     let processes = backends(2);
     let schedule = chain_schedule(&[0, 1], &[0]);
     let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
-    let contexts = graph.contexts().count();
+    let participations = graph.participations().count();
     let harness = Harness::from_graph(graph);
     let sink = Arc::clone(&harness.sink);
     let wake = Arc::clone(&harness.wake);
@@ -6888,17 +6930,17 @@ fn a_turn_replaces_every_established_subscription_after_local_observation_loss()
 
     round
         .turn()
-        .expect("a turn releases context admission requests");
+        .expect("a turn releases participation admission requests");
     for intent in released_admissions(&sink) {
         acks.publish(admission_ack(&intent));
     }
     round
         .turn()
-        .expect("admission receipts release context establishes");
+        .expect("admission receipts release participation establishes");
     for intent in released_establishes(&sink) {
         acks.publish(establish_ack(&intent));
     }
-    round.turn().expect("the contexts become established");
+    round.turn().expect("the participations become established");
 
     for _ in 0..64 {
         assert_eq!(
@@ -6918,12 +6960,12 @@ fn a_turn_replaces_every_established_subscription_after_local_observation_loss()
     let report = round
         .turn()
         .expect("observation loss replaces the subscriptions");
-    assert_eq!(report.resubscriptions, contexts);
+    assert_eq!(report.resubscriptions, participations);
     let resubscribed = subscriptions
         .resubscribed
         .lock()
         .expect("resubscription ledger");
-    assert_eq!(resubscribed.len(), contexts);
+    assert_eq!(resubscribed.len(), participations);
     assert!(
         resubscribed
             .iter()
@@ -6952,7 +6994,7 @@ fn the_two_start_gates_are_observations_of_acknowledgements_not_of_sending() {
     assert!(
         released
             .iter()
-            .any(|intent| matches!(intent.kind(), OperationKind::UpdateQueryContext)),
+            .any(|intent| matches!(intent.kind(), OperationKind::UpdateParticipation)),
         "a fresh attempt owes an establish"
     );
     let subscriptions = Arc::new(RecordingSubscriptions::default())
@@ -6965,7 +7007,7 @@ fn the_two_start_gates_are_observations_of_acknowledgements_not_of_sending() {
             Arc::clone(&subscriptions),
         );
         assert!(
-            !probe.contexts_established(),
+            !probe.participations_established(),
             "a released establish is not an acknowledged one"
         );
         assert!(!probe.tasks_created());
@@ -6974,8 +7016,8 @@ fn the_two_start_gates_are_observations_of_acknowledgements_not_of_sending() {
 
     // Answer every establish, then every create.
     for intent in &released {
-        if matches!(intent.kind(), OperationKind::UpdateQueryContext) {
-            harness.context_ack(intent, Duration::from_secs(30));
+        if matches!(intent.kind(), OperationKind::UpdateParticipation) {
+            harness.participation_ack(intent, Duration::from_secs(30));
         }
     }
     let creates = released
@@ -6992,8 +7034,8 @@ fn the_two_start_gates_are_observations_of_acknowledgements_not_of_sending() {
             Arc::clone(&subscriptions),
         );
         assert!(
-            probe.contexts_established(),
-            "every context answered its establish"
+            probe.participations_established(),
+            "every participation answered its establish"
         );
         assert!(
             !probe.tasks_created(),
@@ -7013,7 +7055,7 @@ fn the_two_start_gates_are_observations_of_acknowledgements_not_of_sending() {
         Box::new(FakeEstablish),
         subscriptions,
     );
-    assert!(probe.contexts_established());
+    assert!(probe.participations_established());
     assert!(
         probe.tasks_created(),
         "every task answered its create, so the attempt finished starting"
@@ -7334,8 +7376,8 @@ struct RecordingFilterReads {
             TaskId,
             std::collections::VecDeque<
                 Result<
-                    crate::native::fragment_transport::DynamicFilterRead,
-                    crate::native::fragment_transport::DynamicFilterReadError,
+                    crate::native::task_result_transport::DynamicFilterRead,
+                    crate::native::task_result_transport::DynamicFilterReadError,
                 >,
             >,
         >,
@@ -7348,8 +7390,8 @@ impl RecordingFilterReads {
         &self,
         task_id: TaskId,
         answer: Result<
-            crate::native::fragment_transport::DynamicFilterRead,
-            crate::native::fragment_transport::DynamicFilterReadError,
+            crate::native::task_result_transport::DynamicFilterRead,
+            crate::native::task_result_transport::DynamicFilterReadError,
         >,
     ) {
         self.answers
@@ -7371,8 +7413,8 @@ impl crate::task_execution::feedback_pump::TaskDynamicFilterReads for RecordingF
         identity: TaskIdentity,
         acknowledged: Option<DomainVersion>,
     ) -> Result<
-        crate::native::fragment_transport::DynamicFilterRead,
-        crate::native::fragment_transport::DynamicFilterReadError,
+        crate::native::task_result_transport::DynamicFilterRead,
+        crate::native::task_result_transport::DynamicFilterReadError,
     > {
         self.requested
             .lock()
@@ -7384,10 +7426,7 @@ impl crate::task_execution::feedback_pump::TaskDynamicFilterReads for RecordingF
             .get_mut(&identity.task_id())
             .and_then(std::collections::VecDeque::pop_front)
             .unwrap_or_else(|| {
-                Ok(crate::native::fragment_transport::DynamicFilterRead::new(
-                    None,
-                    Vec::new(),
-                ))
+                Ok(crate::native::task_result_transport::DynamicFilterRead::new(None, Vec::new()))
             })
     }
 }
@@ -7413,17 +7452,17 @@ async fn actor_abort_round_at_first_dispatch() -> (
     Arc<SwitchableQueueSink>,
     crate::native::task_transport::TaskAckIntakeHandle,
     novarocks_query_application::test_support::LogicalExecutionTestHarness,
-    QueryContextRef,
+    ParticipationRef,
     OperationIntent,
     Arc<ManualClock>,
 ) {
     use novarocks_coordination_contract::ExecutionEffect;
     use novarocks_execution::task_execution::{
-        AcquireQueryContextAdmissionTicket, AdmissionTicketId, LeaseValidFor,
-        QueryContextAdmissionTicketReceipt,
+        AcquireParticipationAdmissionTicket, AdmissionTicketId, LeaseValidFor,
+        ParticipationAdmissionTicketReceipt,
     };
     use novarocks_query_application::coordination::{
-        AbortQueryContextEffectPort, AdmissionIssueSettlement, LogicalExecutionActorConfig,
+        AbortParticipationEffectPort, AdmissionIssueSettlement, LogicalExecutionActorConfig,
     };
     use novarocks_query_application::test_support::LogicalExecutionTestHarness;
     use novarocks_workload_control::{
@@ -7437,10 +7476,13 @@ async fn actor_abort_round_at_first_dispatch() -> (
     let processes = backends(1);
     let schedule = chain_schedule(&[0], &[0]);
     let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
-    let exact_context = *graph.contexts().next().expect("one attempt context");
+    let exact_participation = *graph
+        .participations()
+        .next()
+        .expect("one attempt participation");
     let admission_epochs = graph
-        .contexts()
-        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .participations()
+        .map(|participation| (participation.backend_process_id(), admission_epoch()))
         .collect::<BTreeMap<_, _>>();
     let sink = Arc::new(SwitchableQueueSink::default());
     let wake = Arc::new(CountingWake::default());
@@ -7483,7 +7525,7 @@ async fn actor_abort_round_at_first_dispatch() -> (
         .find(|intent| {
             matches!(
                 intent.kind(),
-                OperationKind::AcquireQueryContextAdmissionTicket
+                OperationKind::AcquireParticipationAdmissionTicket
             )
         })
         .expect("startup releases admission");
@@ -7510,28 +7552,28 @@ async fn actor_abort_round_at_first_dispatch() -> (
         execution_id(),
         ExecutionEffect::None,
         NonZeroUsize::new(2).unwrap(),
-        vec![exact_context],
+        vec![exact_participation],
         NonZeroUsize::new(2).unwrap(),
         NonZeroUsize::new(2).unwrap(),
         governed.owner,
         execution_stage,
     )
     .expect("valid actor configuration")
-    .with_abort_query_context_effect_port(
-        Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
+    .with_abort_participation_effect_port(
+        Arc::clone(&adapter) as Arc<dyn AbortParticipationEffectPort>,
         NonZeroUsize::new(3).unwrap(),
     );
     let mut logical = LogicalExecutionTestHarness::install(
         tokio::runtime::Handle::current(),
         config,
         execution_id(),
-        vec![exact_context],
+        vec![exact_participation],
     )
     .expect("install logical execution");
     logical.activate_initial().await.expect("activate");
-    let actor_admission = AcquireQueryContextAdmissionTicket::new(
+    let actor_admission = AcquireParticipationAdmissionTicket::new(
         TaskOperationId::new_v7(),
-        exact_context,
+        exact_participation,
         LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
         NativeCompatibilityId::new([7; 32]),
         AdmissionEpochCapability::try_from_bytes([7; 16]).unwrap(),
@@ -7547,9 +7589,9 @@ async fn actor_abort_round_at_first_dispatch() -> (
             AdmissionIssueSettlement::applied(
                 pending.operation_id(),
                 OperationOutcome::Accepted,
-                QueryContextAdmissionTicketReceipt::new(
+                ParticipationAdmissionTicketReceipt::new(
                     AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
-                    exact_context,
+                    exact_participation,
                     LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
                 ),
             )
@@ -7574,7 +7616,7 @@ async fn actor_abort_round_at_first_dispatch() -> (
         .collect::<Vec<_>>();
     let first_abort = released
         .iter()
-        .find(|intent| matches!(intent.kind(), OperationKind::AbortQueryContext))
+        .find(|intent| matches!(intent.kind(), OperationKind::AbortParticipation))
         .cloned()
         .expect("first actor Abort reaches transport");
     // The logical owner has already committed to Abort. Freeze normal work
@@ -7585,22 +7627,22 @@ async fn actor_abort_round_at_first_dispatch() -> (
         sink,
         ack_handle,
         logical,
-        exact_context,
+        exact_participation,
         first_abort,
         clock,
     )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actor_abort_local_dispatch_refusal_preserves_cause_without_context_closure() {
-    use novarocks_query_application::coordination::ContextClosureState;
+async fn actor_abort_local_dispatch_refusal_preserves_cause_without_participation_closure() {
+    use novarocks_query_application::coordination::ParticipationClosureState;
     use novarocks_workload_control::WorkError;
-    let (mut round, _sink, acknowledgements, mut logical, context, abort, _clock) =
+    let (mut round, _sink, acknowledgements, mut logical, participation, abort, _clock) =
         actor_abort_round_at_first_dispatch().await;
     acknowledgements.publish(
         crate::native::apply_send_owner::canonical_dispatch_rejection_fixture(
             abort.operation_id(),
-            OperationKind::AbortQueryContext,
+            OperationKind::AbortParticipation,
             WorkError::Capacity("Native dispatch proof work"),
         ),
     );
@@ -7614,25 +7656,35 @@ async fn actor_abort_local_dispatch_refusal_preserves_cause_without_context_clos
             .actor_abort_dispatch_state(abort.operation_id()),
         Err(TaskExecutionError::UnknownOperation)
     ));
-    assert!(!round.execution().owner(context).unwrap().is_released());
+    assert!(
+        !round
+            .execution()
+            .owner(participation)
+            .unwrap()
+            .is_released()
+    );
     assert!(
         round
             .execution()
-            .context_convergence_receipt(context)
+            .participation_convergence_receipt(participation)
             .is_none()
     );
-    let snapshot = logical.stand_down_snapshot(context).await.unwrap().unwrap();
+    let snapshot = logical
+        .stand_down_snapshot(participation)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(!matches!(
         snapshot.closure(),
-        ContextClosureState::NoRemoteResponsibility
-            | ContextClosureState::TerminalRetained
-            | ContextClosureState::Gone
-            | ContextClosureState::WorkerStoppedAndContextFenced
-            | ContextClosureState::WorkerProcessReplaced
+        ParticipationClosureState::NoRemoteResponsibility
+            | ParticipationClosureState::TerminalRetained
+            | ParticipationClosureState::Gone
+            | ParticipationClosureState::WorkerStoppedAndParticipationFenced
+            | ParticipationClosureState::WorkerProcessReplaced
     ));
     // Only the fixture's independent process fence can settle the residual.
     logical
-        .observe_worker_process_replaced(context)
+        .observe_worker_process_replaced(participation)
         .await
         .unwrap();
     logical
@@ -7644,7 +7696,7 @@ async fn actor_abort_local_dispatch_refusal_preserves_cause_without_context_clos
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actor_abort_dispatch_cause_does_not_override_wrong_operation_kind() {
     use novarocks_workload_control::WorkError;
-    let (mut round, _sink, acknowledgements, mut logical, context, abort, _clock) =
+    let (mut round, _sink, acknowledgements, mut logical, participation, abort, _clock) =
         actor_abort_round_at_first_dispatch().await;
     acknowledgements.publish(
         crate::native::apply_send_owner::canonical_dispatch_rejection_fixture(
@@ -7654,15 +7706,21 @@ async fn actor_abort_dispatch_cause_does_not_override_wrong_operation_kind() {
         ),
     );
     assert!(matches!(round.turn(), Err(TaskExecutionError::Schedule(_))));
-    assert!(!round.execution().owner(context).unwrap().is_released());
+    assert!(
+        !round
+            .execution()
+            .owner(participation)
+            .unwrap()
+            .is_released()
+    );
     assert!(
         round
             .execution()
-            .context_convergence_receipt(context)
+            .participation_convergence_receipt(participation)
             .is_none()
     );
     logical
-        .observe_worker_process_replaced(context)
+        .observe_worker_process_replaced(participation)
         .await
         .unwrap();
     logical
@@ -7674,16 +7732,16 @@ async fn actor_abort_dispatch_cause_does_not_override_wrong_operation_kind() {
 #[test]
 fn terminal_cleanup_dispatches_actor_abort_without_normal_work() {
     let mut harness = Harness::new(&[0], &[0], 64);
-    let context = *harness
+    let participation = *harness
         .execution
         .graph()
-        .contexts()
+        .participations()
         .next()
-        .expect("one context");
-    let intent = OperationIntent::AbortQueryContext(
-        novarocks_execution::task_execution::AbortQueryContext::new(
+        .expect("one participation");
+    let intent = OperationIntent::AbortParticipation(
+        novarocks_execution::task_execution::AbortParticipation::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             novarocks_execution::task_execution::AbortCause::QueryFailed,
         ),
     );
@@ -7712,19 +7770,19 @@ fn terminal_cleanup_dispatches_actor_abort_without_normal_work() {
         .collect::<Vec<_>>();
     assert_eq!(submitted.len(), 1);
     assert_eq!(submitted[0].operation_id(), operation_id);
-    assert_eq!(submitted[0].kind(), OperationKind::AbortQueryContext);
+    assert_eq!(submitted[0].kind(), OperationKind::AbortParticipation);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
     use novarocks_coordination_contract::ExecutionEffect;
     use novarocks_execution::task_execution::{
-        AcquireQueryContextAdmissionTicket, AdmissionTicketId, LeaseValidFor,
-        QueryContextAdmissionTicketReceipt,
+        AcquireParticipationAdmissionTicket, AdmissionTicketId, LeaseValidFor,
+        ParticipationAdmissionTicketReceipt,
     };
     use novarocks_query_application::coordination::{
-        AbortQueryContextEffectPort, AdmissionIssueSettlement, ContextClosureState,
-        LogicalExecutionActorConfig,
+        AbortParticipationEffectPort, AdmissionIssueSettlement, LogicalExecutionActorConfig,
+        ParticipationClosureState,
     };
     use novarocks_query_application::test_support::LogicalExecutionTestHarness;
 
@@ -7740,10 +7798,13 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
     let processes = backends(1);
     let schedule = chain_schedule(&[0], &[0]);
     let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
-    let exact_context = *graph.contexts().next().expect("one attempt context");
+    let exact_participation = *graph
+        .participations()
+        .next()
+        .expect("one attempt participation");
     let admission_epochs = graph
-        .contexts()
-        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .participations()
+        .map(|participation| (participation.backend_process_id(), admission_epoch()))
         .collect::<BTreeMap<_, _>>();
     let sink = Arc::new(SwitchableQueueSink::default());
     let wake = Arc::new(TestIntakeWake::default());
@@ -7791,7 +7852,7 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         .find(|intent| {
             matches!(
                 intent.kind(),
-                OperationKind::AcquireQueryContextAdmissionTicket
+                OperationKind::AcquireParticipationAdmissionTicket
             )
         })
         .cloned()
@@ -7819,28 +7880,28 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         execution_id(),
         ExecutionEffect::None,
         NonZeroUsize::new(2).unwrap(),
-        vec![exact_context],
+        vec![exact_participation],
         NonZeroUsize::new(2).unwrap(),
         NonZeroUsize::new(2).unwrap(),
         governed.owner,
         execution_stage,
     )
     .expect("valid actor configuration")
-    .with_abort_query_context_effect_port(
-        Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
+    .with_abort_participation_effect_port(
+        Arc::clone(&adapter) as Arc<dyn AbortParticipationEffectPort>,
         NonZeroUsize::new(2).unwrap(),
     );
     let mut logical = LogicalExecutionTestHarness::install(
         tokio::runtime::Handle::current(),
         config,
         execution_id(),
-        vec![exact_context],
+        vec![exact_participation],
     )
     .expect("install logical execution");
     logical.activate_initial().await.expect("activate");
-    let actor_admission = AcquireQueryContextAdmissionTicket::new(
+    let actor_admission = AcquireParticipationAdmissionTicket::new(
         TaskOperationId::new_v7(),
-        exact_context,
+        exact_participation,
         LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
         NativeCompatibilityId::new([7; 32]),
         AdmissionEpochCapability::try_from_bytes([7; 16]).unwrap(),
@@ -7856,9 +7917,9 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
             AdmissionIssueSettlement::applied(
                 pending.operation_id(),
                 OperationOutcome::Accepted,
-                QueryContextAdmissionTicketReceipt::new(
+                ParticipationAdmissionTicketReceipt::new(
                     AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
-                    exact_context,
+                    exact_participation,
                     LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
                 ),
             )
@@ -7904,7 +7965,7 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         .collect();
     let first_abort = startup
         .iter()
-        .find(|intent| matches!(intent.kind(), OperationKind::AbortQueryContext))
+        .find(|intent| matches!(intent.kind(), OperationKind::AbortParticipation))
         .cloned()
         .expect("priority lifecycle dispatch releases the actor Abort");
     assert_eq!(startup[0].operation_id(), first_abort.operation_id());
@@ -7912,7 +7973,7 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
 
     ack_handle.publish(OperationAcknowledgement::transport_unknown(
         operation_id,
-        OperationKind::AbortQueryContext,
+        OperationKind::AbortParticipation,
     ));
     round
         .turn()
@@ -7930,8 +7991,8 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
             .flat_map(|(_, operations)| operations)
         {
             match intent.kind() {
-                OperationKind::AbortQueryContext => replay = Some(intent),
-                OperationKind::UpdateQueryContext => {
+                OperationKind::AbortParticipation => replay = Some(intent),
+                OperationKind::UpdateParticipation => {
                     ack_handle.publish(establish_ack(&intent));
                 }
                 _ => {}
@@ -7943,17 +8004,20 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         notified.await;
     };
     assert_eq!(replay.operation_id(), operation_id);
-    let OperationIntent::AbortQueryContext(first_request) = first_abort else {
+    let OperationIntent::AbortParticipation(first_request) = first_abort else {
         unreachable!()
     };
-    let OperationIntent::AbortQueryContext(replay_request) = replay else {
+    let OperationIntent::AbortParticipation(replay_request) = replay else {
         unreachable!()
     };
     assert_eq!(
         replay_request.envelope().operation_id(),
         first_request.envelope().operation_id()
     );
-    assert_eq!(replay_request.context(), first_request.context());
+    assert_eq!(
+        replay_request.participation(),
+        first_request.participation()
+    );
     assert_eq!(replay_request.cause(), first_request.cause());
 
     // A definitive receipt from the original send races with replay gen2
@@ -7962,11 +8026,11 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
     // than fail as UnknownOperation.
     ack_handle.publish(OperationAcknowledgement::worker_receipt(
         operation_id,
-        OperationKind::AbortQueryContext,
-        OperationOutcome::ContextTerminalReceipt,
-        AckPayload::Context(QueryContextReceipt::new(
-            exact_context,
-            QueryContextState::TerminalRetained,
+        OperationKind::AbortParticipation,
+        OperationOutcome::ParticipationTerminalReceipt,
+        AckPayload::Participation(ParticipationReceipt::new(
+            exact_participation,
+            ParticipationState::TerminalRetained,
         )),
     ));
     let closed = round
@@ -7976,21 +8040,21 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
     assert!(
         round
             .execution()
-            .owner(exact_context)
+            .owner(exact_participation)
             .unwrap()
             .is_released(),
-        "a definitive actor Abort receipt is positive context closure evidence"
+        "a definitive actor Abort receipt is positive participation closure evidence"
     );
     assert!(
         round
             .execution()
-            .context_convergence_receipt(exact_context)
+            .participation_convergence_receipt(exact_participation)
             .is_none(),
         "a replayed Abort receipt settles control without manufacturing actual Worker exit"
     );
     ack_handle.publish(OperationAcknowledgement::transport_unknown(
         operation_id,
-        OperationKind::AbortQueryContext,
+        OperationKind::AbortParticipation,
     ));
     let tombstoned = round
         .turn()
@@ -7998,12 +8062,12 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
     assert_eq!(tombstoned.acknowledgements, 1);
     assert_eq!(
         logical
-            .stand_down_snapshot(exact_context)
+            .stand_down_snapshot(exact_participation)
             .await
             .unwrap()
             .unwrap()
             .closure(),
-        ContextClosureState::TerminalRetained
+        ParticipationClosureState::TerminalRetained
     );
     assert_eq!(
         round.queued_abort_effects(),
@@ -8014,11 +8078,11 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         sink.take()
             .into_iter()
             .flat_map(|(_, operations)| operations)
-            .all(|intent| intent.kind() != OperationKind::AbortQueryContext),
+            .all(|intent| intent.kind() != OperationKind::AbortParticipation),
         "the settled actor must not leave another Abort in process dispatch"
     );
     logical
-        .observe_worker_stopped_and_context_fenced(exact_context)
+        .observe_worker_stopped_and_participation_fenced(exact_participation)
         .await
         .unwrap();
     logical
@@ -8029,14 +8093,14 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn definitive_late_receipt_consumes_an_adapter_queued_replay() {
-    use novarocks_query_application::coordination::ContextClosureState;
+    use novarocks_query_application::coordination::ParticipationClosureState;
 
-    let (mut round, sink, ack_handle, mut logical, exact_context, first_abort, _clock) =
+    let (mut round, sink, ack_handle, mut logical, exact_participation, first_abort, _clock) =
         actor_abort_round_at_first_dispatch().await;
     let operation_id = first_abort.operation_id();
     ack_handle.publish(OperationAcknowledgement::transport_unknown(
         operation_id,
-        OperationKind::AbortQueryContext,
+        OperationKind::AbortParticipation,
     ));
     round.turn().expect("first Abort becomes transport-unknown");
     for _ in 0..100 {
@@ -8049,11 +8113,11 @@ async fn definitive_late_receipt_consumes_an_adapter_queued_replay() {
 
     ack_handle.publish(OperationAcknowledgement::worker_receipt(
         operation_id,
-        OperationKind::AbortQueryContext,
-        OperationOutcome::ContextTerminalReceipt,
-        AckPayload::Context(QueryContextReceipt::new(
-            exact_context,
-            QueryContextState::TerminalRetained,
+        OperationKind::AbortParticipation,
+        OperationOutcome::ParticipationTerminalReceipt,
+        AckPayload::Participation(ParticipationReceipt::new(
+            exact_participation,
+            ParticipationState::TerminalRetained,
         )),
     ));
     let settled = round
@@ -8066,22 +8130,24 @@ async fn definitive_late_receipt_consumes_an_adapter_queued_replay() {
         sink.take()
             .into_iter()
             .flat_map(|(_, operations)| operations)
-            .all(|intent| intent.kind() != OperationKind::AbortQueryContext),
+            .all(|intent| intent.kind() != OperationKind::AbortParticipation),
         "a replay closed in the adapter must never reach process transport"
     );
     for _ in 0..100 {
         if logical
-            .stand_down_snapshot(exact_context)
+            .stand_down_snapshot(exact_participation)
             .await
             .unwrap()
-            .is_some_and(|snapshot| snapshot.closure() == ContextClosureState::TerminalRetained)
+            .is_some_and(|snapshot| {
+                snapshot.closure() == ParticipationClosureState::TerminalRetained
+            })
         {
             break;
         }
         tokio::task::yield_now().await;
     }
     logical
-        .observe_worker_stopped_and_context_fenced(exact_context)
+        .observe_worker_stopped_and_participation_fenced(exact_participation)
         .await
         .unwrap();
     logical
@@ -8092,14 +8158,14 @@ async fn definitive_late_receipt_consumes_an_adapter_queued_replay() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn definitive_late_receipt_cancels_a_dispatcher_queued_replay() {
-    use novarocks_query_application::coordination::ContextClosureState;
+    use novarocks_query_application::coordination::ParticipationClosureState;
 
-    let (mut round, sink, ack_handle, mut logical, exact_context, first_abort, _clock) =
+    let (mut round, sink, ack_handle, mut logical, exact_participation, first_abort, _clock) =
         actor_abort_round_at_first_dispatch().await;
     let operation_id = first_abort.operation_id();
     ack_handle.publish(OperationAcknowledgement::transport_unknown(
         operation_id,
-        OperationKind::AbortQueryContext,
+        OperationKind::AbortParticipation,
     ));
     round.turn().expect("first Abort becomes transport-unknown");
     for _ in 0..100 {
@@ -8117,7 +8183,7 @@ async fn definitive_late_receipt_cancels_a_dispatcher_queued_replay() {
         .into_iter()
         .flat_map(|(_, operations)| operations)
     {
-        if intent.kind() == OperationKind::UpdateQueryContext {
+        if intent.kind() == OperationKind::UpdateParticipation {
             ack_handle.publish(establish_ack(&intent));
         }
     }
@@ -8135,11 +8201,11 @@ async fn definitive_late_receipt_cancels_a_dispatcher_queued_replay() {
 
     ack_handle.publish(OperationAcknowledgement::worker_receipt(
         operation_id,
-        OperationKind::AbortQueryContext,
-        OperationOutcome::ContextTerminalReceipt,
-        AckPayload::Context(QueryContextReceipt::new(
-            exact_context,
-            QueryContextState::TerminalRetained,
+        OperationKind::AbortParticipation,
+        OperationOutcome::ParticipationTerminalReceipt,
+        AckPayload::Participation(ParticipationReceipt::new(
+            exact_participation,
+            ParticipationState::TerminalRetained,
         )),
     ));
     let settled = round
@@ -8160,22 +8226,24 @@ async fn definitive_late_receipt_cancels_a_dispatcher_queued_replay() {
         sink.take()
             .into_iter()
             .flat_map(|(_, operations)| operations)
-            .all(|intent| intent.kind() != OperationKind::AbortQueryContext),
+            .all(|intent| intent.kind() != OperationKind::AbortParticipation),
         "the cancelled dispatcher replay must never reach process transport"
     );
     for _ in 0..100 {
         if logical
-            .stand_down_snapshot(exact_context)
+            .stand_down_snapshot(exact_participation)
             .await
             .unwrap()
-            .is_some_and(|snapshot| snapshot.closure() == ContextClosureState::TerminalRetained)
+            .is_some_and(|snapshot| {
+                snapshot.closure() == ParticipationClosureState::TerminalRetained
+            })
         {
             break;
         }
         tokio::task::yield_now().await;
     }
     logical
-        .observe_worker_stopped_and_context_fenced(exact_context)
+        .observe_worker_stopped_and_participation_fenced(exact_participation)
         .await
         .unwrap();
     logical
@@ -8187,15 +8255,15 @@ async fn definitive_late_receipt_cancels_a_dispatcher_queued_replay() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_actor_abort_expiry_returns_definitely_unsent_for_bounded_replay() {
     use novarocks_query_application::coordination::{
-        AbortQueryContextIssueState, ContextClosureState,
+        AbortParticipationIssueState, ParticipationClosureState,
     };
 
-    let (mut round, sink, ack_handle, mut logical, exact_context, first_abort, clock) =
+    let (mut round, sink, ack_handle, mut logical, exact_participation, first_abort, clock) =
         actor_abort_round_at_first_dispatch().await;
     let operation_id = first_abort.operation_id();
     ack_handle.publish(OperationAcknowledgement::transport_unknown(
         operation_id,
-        OperationKind::AbortQueryContext,
+        OperationKind::AbortParticipation,
     ));
     round.turn().expect("first Abort becomes transport-unknown");
     for _ in 0..100 {
@@ -8211,7 +8279,7 @@ async fn queued_actor_abort_expiry_returns_definitely_unsent_for_bounded_replay(
         .into_iter()
         .flat_map(|(_, operations)| operations)
     {
-        if intent.kind() == OperationKind::UpdateQueryContext {
+        if intent.kind() == OperationKind::UpdateParticipation {
             ack_handle.publish(establish_ack(&intent));
         }
     }
@@ -8228,20 +8296,20 @@ async fn queued_actor_abort_expiry_returns_definitely_unsent_for_bounded_replay(
     assert!(matches!(
         error,
         TaskExecutionError::QueueResidenceExpired {
-            kind: OperationKind::AbortQueryContext,
+            kind: OperationKind::AbortParticipation,
             ..
         }
     ));
     for _ in 0..100 {
         if round.queued_abort_effects() == 1
             && logical
-                .stand_down_snapshot(exact_context)
+                .stand_down_snapshot(exact_participation)
                 .await
                 .unwrap()
                 .is_some_and(|snapshot| {
-                    snapshot.closure() == ContextClosureState::AbortPending
+                    snapshot.closure() == ParticipationClosureState::AbortPending
                         && snapshot.issue_state()
-                            == Some(AbortQueryContextIssueState::TransportOwned)
+                            == Some(AbortParticipationIssueState::TransportOwned)
                 })
         {
             break;
@@ -8254,7 +8322,7 @@ async fn queued_actor_abort_expiry_returns_definitely_unsent_for_bounded_replay(
         "definitely-unsent returns the exact Abort to bounded actor replay"
     );
     logical
-        .observe_worker_process_replaced(exact_context)
+        .observe_worker_process_replaced(exact_participation)
         .await
         .unwrap();
     logical
@@ -8358,29 +8426,31 @@ fn round_waiting_on_creates_with_establish_delivery(
             .collect::<Vec<_>>();
         for intent in released {
             match intent.kind() {
-                OperationKind::AcquireQueryContextAdmissionTicket => {
+                OperationKind::AcquireParticipationAdmissionTicket => {
                     let ack = admission_ack(&intent);
                     if let Some(trace) = trace.as_deref_mut() {
                         trace.push((intent.clone(), ack.clone()));
                     }
                     acks.publish(ack);
                 }
-                OperationKind::UpdateQueryContext => {
+                OperationKind::UpdateParticipation => {
                     let ack = if acknowledge_establish {
                         establish_ack(&intent)
                     } else {
-                        let OperationIntent::EstablishQueryContext(request) = &intent else {
-                            unreachable!("startup context operation is its original Establish")
+                        let OperationIntent::EstablishParticipation(request) = &intent else {
+                            unreachable!(
+                                "startup participation operation is its original Establish"
+                            )
                         };
                         // RecordingSink starts this exact released RPC; the
                         // original intake reports the send before its outcome.
                         acks.publish_establish_send_started(
                             intent.operation_id(),
-                            request.context(),
+                            request.participation(),
                         );
                         OperationAcknowledgement::transport_unknown(
                             intent.operation_id(),
-                            OperationKind::UpdateQueryContext,
+                            OperationKind::UpdateParticipation,
                         )
                     };
                     if let Some(trace) = trace.as_deref_mut() {
@@ -8437,7 +8507,7 @@ pub(crate) fn manifest_normal_release_ack_with_actor_facts_fixture() -> (
 }
 
 /// Replays only accepted original fixture facts through QA's public test seam.
-/// No operation, ticket, context or payload is regenerated here.
+/// No operation, ticket, participation or payload is regenerated here.
 #[cfg(novarocks_dev_controls)]
 pub(crate) async fn settle_original_actor_establish_facts(
     logical: &novarocks_query_application::test_support::LogicalExecutionTestHarness,
@@ -8447,7 +8517,7 @@ pub(crate) async fn settle_original_actor_establish_facts(
     for (intent, ack) in facts {
         assert_eq!(intent.operation_id(), ack.operation_id());
         match intent {
-            OperationIntent::AcquireQueryContextAdmissionTicket(request) => {
+            OperationIntent::AcquireParticipationAdmissionTicket(request) => {
                 let AckPayload::AdmissionTicket(ticket) = ack.payload() else {
                     panic!("original admission ACK has its ticket")
                 };
@@ -8460,13 +8530,13 @@ pub(crate) async fn settle_original_actor_establish_facts(
                     .unwrap();
                 assert!(
                     admission
-                        .insert(request.context(), (request, settlement))
+                        .insert(request.participation(), (request, settlement))
                         .is_none()
                 );
             }
-            OperationIntent::EstablishQueryContext(request) => {
+            OperationIntent::EstablishParticipation(request) => {
                 let (original, settlement) = admission
-                    .remove(&request.context())
+                    .remove(&request.participation())
                     .expect("original admission preceded this Establish");
                 tokio::time::timeout(
                     Duration::from_secs(10),
@@ -8562,7 +8632,7 @@ fn manifest_normal_release_ack_fixture(
     );
     let release = tail
         .complete(&mut round, &acks)
-        .expect("normal completion releases its original context");
+        .expect("normal completion releases its original participation");
     (round, acks, release, clock, protocol, facts)
 }
 
@@ -8767,12 +8837,12 @@ impl ManifestReleaseTail {
             assert_eq!(scope.cancellation().unwrap().reason(), Some(reason.clone()));
             assert!(round.execution().selected_task_failure().is_none());
         }
-        let context = *round
+        let participation = *round
             .execution()
             .graph()
-            .contexts()
+            .participations()
             .next()
-            .expect("one backend context");
+            .expect("one backend participation");
         let mut controlled_actor_abort = None;
         for identity in self.upstream {
             if round
@@ -8826,10 +8896,10 @@ impl ManifestReleaseTail {
                     ),
                     "success drain cannot issue a new Create or Update"
                 );
-                if intent.kind() == OperationKind::ReleaseQueryContext {
+                if intent.kind() == OperationKind::ReleaseParticipation {
                     releases.push(intent);
-                } else if let OperationIntent::AbortQueryContext(request) = &intent {
-                    assert_eq!(request.context(), context);
+                } else if let OperationIntent::AbortParticipation(request) = &intent {
+                    assert_eq!(request.participation(), participation);
                     if original_control.is_some() {
                         assert_eq!(
                             round
@@ -8853,20 +8923,20 @@ impl ManifestReleaseTail {
                     // acknowledgement intake. This is not Worker-exit proof.
                     acks.publish(OperationAcknowledgement::worker_receipt(
                         intent.operation_id(),
-                        OperationKind::AbortQueryContext,
-                        OperationOutcome::ContextTerminalReceipt,
-                        AckPayload::Context(QueryContextReceipt::new(
-                            request.context(),
-                            QueryContextState::TerminalRetained,
+                        OperationKind::AbortParticipation,
+                        OperationOutcome::ParticipationTerminalReceipt,
+                        AckPayload::Participation(ParticipationReceipt::new(
+                            request.participation(),
+                            ParticipationState::TerminalRetained,
                         )),
                     ));
-                } else if intent.kind() == OperationKind::QuiesceQueryContext {
-                    let context = *round
+                } else if intent.kind() == OperationKind::QuiesceParticipation {
+                    let participation = *round
                         .execution()
                         .graph()
-                        .contexts()
+                        .participations()
                         .next()
-                        .expect("one backend context");
+                        .expect("one backend participation");
                     let mut accepted = round
                         .execution()
                         .graph()
@@ -8876,13 +8946,13 @@ impl ManifestReleaseTail {
                     accepted.sort();
                     acks.publish(OperationAcknowledgement::new(
                         intent.operation_id(),
-                        OperationKind::QuiesceQueryContext,
+                        OperationKind::QuiesceParticipation,
                         OperationOutcome::Accepted,
-                        AckPayload::Quiesce(QuiesceQueryContextReceipt::new(
-                            context,
+                        AckPayload::Quiesce(QuiesceParticipationReceipt::new(
+                            participation,
                             1,
                             accepted,
-                            QueryContextState::Quiescing,
+                            ParticipationState::Quiescing,
                         )),
                     ));
                 }
@@ -8891,7 +8961,10 @@ impl ManifestReleaseTail {
                 break;
             }
         }
-        let owner = round.execution().owner(context).expect("the context owner");
+        let owner = round
+            .execution()
+            .owner(participation)
+            .expect("the participation owner");
         assert!(
             owner.creates_closed(),
             "all creates settled before the seal"
@@ -8908,7 +8981,7 @@ impl ManifestReleaseTail {
             );
             assert!(
                 owner.is_released(),
-                "the exact actor Abort receipt must settle the context"
+                "the exact actor Abort receipt must settle the participation"
             );
         }
         if owner.is_released() {
@@ -8924,7 +8997,7 @@ impl ManifestReleaseTail {
         assert_eq!(
             releases.len(),
             1,
-            "the drained context must be released: owner={owner:?}, queued_actor_aborts={}",
+            "the drained participation must be released: owner={owner:?}, queued_actor_aborts={}",
             round.queued_abort_effects()
         );
         releases.pop()
@@ -9039,13 +9112,13 @@ fn manifest_pending_release_fixture_with_writers(
         .into_iter()
         .flat_map(|(_, operations)| operations)
     {
-        if let OperationIntent::EstablishQueryContext(_) = intent {
+        if let OperationIntent::EstablishParticipation(_) = intent {
             let ack = establish_ack(&intent);
             facts.push((intent.clone(), ack.clone()));
             acks.publish(ack);
         }
     }
-    round.turn().expect("the context establish settles");
+    round.turn().expect("the participation establish settles");
     sink.take();
 
     let root = round.root_task();
@@ -9091,18 +9164,18 @@ fn manifest_pending_release_fixture_with_writers(
 #[test]
 fn completed_convergence_releases_after_delayed_upstream_terminal_status() {
     let (mut round, acks, release) = manifest_normal_release_ack_regression_fixture();
-    let context = *round.execution().graph().contexts().next().unwrap();
-    let OperationIntent::ReleaseQueryContext(request) = &release else {
+    let participation = *round.execution().graph().participations().next().unwrap();
+    let OperationIntent::ReleaseParticipation(request) = &release else {
         unreachable!("the operation was selected by kind");
     };
     acks.publish(OperationAcknowledgement::new(
         release.operation_id(),
-        OperationKind::ReleaseQueryContext,
+        OperationKind::ReleaseParticipation,
         OperationOutcome::Accepted,
         AckPayload::Release {
-            receipt: QueryContextReceipt::new(
-                request.context(),
-                QueryContextState::TerminalRetained,
+            receipt: ParticipationReceipt::new(
+                request.participation(),
+                ParticipationState::TerminalRetained,
             ),
             outcome: ReleaseOutcome::Released,
             runtime_filter: None,
@@ -9116,27 +9189,27 @@ fn completed_convergence_releases_after_delayed_upstream_terminal_status() {
     assert!(
         round
             .execution()
-            .context_convergence_receipt(context)
+            .participation_convergence_receipt(participation)
             .is_none()
     );
     assert!(
-        !round.execution().worker_contexts_stopped(),
+        !round.execution().worker_participations_stopped(),
         "Task terminals, output exit and Release ACK do not prove actual Worker exit"
     );
-    let receipt = novarocks_execution_contract::QueryContextConvergenceReceipt::new(
-        context,
-        novarocks_execution_contract::QueryContextConvergenceVersion::FIRST,
-        novarocks_execution_contract::QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+    let receipt = novarocks_execution_contract::ParticipationConvergenceReceipt::new(
+        participation,
+        novarocks_execution_contract::ParticipationConvergenceVersion::FIRST,
+        novarocks_execution_contract::ParticipationConvergenceState::WorkerStoppedAndParticipationFenced,
     );
     round
         .execution_mut()
         .apply_covered_entries(vec![covered_frame(
-            context,
+            participation,
             1,
-            CoveredStatusStreamFact::ContextConvergence(receipt),
+            CoveredStatusStreamFact::ParticipationConvergence(receipt),
         )])
         .unwrap();
-    assert!(round.execution().worker_contexts_stopped());
+    assert!(round.execution().worker_participations_stopped());
 }
 
 #[test]
@@ -9751,10 +9824,12 @@ fn the_feedback_reader_ingests_each_task_version_once_and_keeps_a_cursor_per_tas
     let domain = exact_domain(41);
     reads.script(
         first,
-        Ok(crate::native::fragment_transport::DynamicFilterRead::new(
-            Some(DomainVersion::new(1).expect("nonzero")),
-            vec![feedback_envelope(7, [9; 32], domain.clone())],
-        )),
+        Ok(
+            crate::native::task_result_transport::DynamicFilterRead::new(
+                Some(DomainVersion::new(1).expect("nonzero")),
+                vec![feedback_envelope(7, [9; 32], domain.clone())],
+            ),
+        ),
     );
     let mut pump = DynamicFilterFeedbackPump::new(
         Arc::clone(&feedback),
@@ -9794,10 +9869,12 @@ fn the_feedback_reader_ingests_each_task_version_once_and_keeps_a_cursor_per_tas
     // admission treats as idempotent rather than as a conflicting winner.
     reads.script(
         second,
-        Ok(crate::native::fragment_transport::DynamicFilterRead::new(
-            Some(DomainVersion::new(1).expect("nonzero")),
-            vec![feedback_envelope(7, [9; 32], domain.clone())],
-        )),
+        Ok(
+            crate::native::task_result_transport::DynamicFilterRead::new(
+                Some(DomainVersion::new(1).expect("nonzero")),
+                vec![feedback_envelope(7, [9; 32], domain.clone())],
+            ),
+        ),
     );
     harness.publish_with_filters(
         second,
@@ -9819,7 +9896,7 @@ fn the_feedback_reader_ingests_each_task_version_once_and_keeps_a_cursor_per_tas
 
 #[test]
 fn a_refused_dynamic_filter_read_fails_the_attempt_and_a_lost_one_is_retried() {
-    use crate::native::fragment_transport::DynamicFilterReadError;
+    use crate::native::task_result_transport::DynamicFilterReadError;
     use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
     use crate::task_execution::feedback_pump::DynamicFilterFeedbackPump;
     use crate::task_execution::round::TurnPump;
@@ -9978,10 +10055,10 @@ fn root_success_seal_stops_ordinary_pumps_in_its_own_turn() {
         .expect("the seal cut freezes ordinary pumps before the rest of its turn");
     assert_eq!(reply.try_recv().unwrap(), Ok(()));
     assert!(round.root_success_sealed());
-    for &context in round.execution().graph().contexts() {
+    for &participation in round.execution().graph().participations() {
         assert_eq!(
             round.classify_covered_subscription_state(
-                context,
+                participation,
                 crate::native::task_transport::SubscriptionState::BudgetExhausted
             ),
             None,
@@ -9989,7 +10066,7 @@ fn root_success_seal_stops_ordinary_pumps_in_its_own_turn() {
         );
         assert_eq!(
             round.classify_covered_subscription_state(
-                context,
+                participation,
                 crate::native::task_transport::SubscriptionState::ConnectionLossExhausted
             ),
             None,
@@ -10010,7 +10087,7 @@ fn covered_exhaustion_fails_only_still_required_work_without_timing_healthy_task
 
     let harness = Harness::new(&[1], &[0], 64);
     let leaf = harness.stage_tasks(1)[0];
-    let leaf_context = harness.execution.task(leaf).unwrap().context();
+    let leaf_participation = harness.execution.task(leaf).unwrap().participation();
     let clock = Arc::clone(&harness.clock);
     let (mut round, _, acks, creates) = round_waiting_on_creates(harness);
     for create in &creates {
@@ -10024,19 +10101,22 @@ fn covered_exhaustion_fails_only_still_required_work_without_timing_healthy_task
         SubscriptionState::Resubscribing,
     ] {
         assert_eq!(
-            round.classify_covered_subscription_state(leaf_context, state),
+            round.classify_covered_subscription_state(leaf_participation, state),
             None
         );
     }
     assert!(!round.accepted_root_success_sealed());
     assert_eq!(
-        round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
+        round.classify_covered_subscription_state(
+            leaf_participation,
+            SubscriptionState::BudgetExhausted
+        ),
         Some(SubscriptionState::BudgetExhausted),
         "a still-required leaf losing bounded transport recovery must reach the original failure owner"
     );
     assert_eq!(
         round.classify_covered_subscription_state(
-            leaf_context,
+            leaf_participation,
             SubscriptionState::ConnectionLossExhausted
         ),
         Some(SubscriptionState::ConnectionLossExhausted),
@@ -10048,7 +10128,7 @@ fn covered_exhaustion_fails_only_still_required_work_without_timing_healthy_task
         SubscriptionState::QueryMismatch,
     ] {
         assert_eq!(
-            round.classify_covered_subscription_state(leaf_context, state),
+            round.classify_covered_subscription_state(leaf_participation, state),
             Some(state)
         );
     }
@@ -10061,7 +10141,7 @@ fn covered_exhaustion_of_a_stood_down_unknown_leaf_belongs_to_drain() {
     let harness = Harness::new(&[1], &[0], 64);
     let leaf = harness.stage_tasks(1)[0];
     let leaf_identity = harness.execution.task(leaf).unwrap().identity();
-    let leaf_context = harness.execution.task(leaf).unwrap().context();
+    let leaf_participation = harness.execution.task(leaf).unwrap().participation();
     let (mut round, _, _, _) = round_waiting_on_creates(harness);
     assert!(
         !round
@@ -10071,12 +10151,15 @@ fn covered_exhaustion_of_a_stood_down_unknown_leaf_belongs_to_drain() {
             .create_ownership_proven()
     );
     assert_eq!(
-        round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
+        round.classify_covered_subscription_state(
+            leaf_participation,
+            SubscriptionState::BudgetExhausted
+        ),
         Some(SubscriptionState::BudgetExhausted)
     );
     assert_eq!(
         round.classify_covered_subscription_state(
-            leaf_context,
+            leaf_participation,
             SubscriptionState::ConnectionLossExhausted
         ),
         Some(SubscriptionState::ConnectionLossExhausted)
@@ -10090,40 +10173,49 @@ fn covered_exhaustion_of_a_stood_down_unknown_leaf_belongs_to_drain() {
         "stand-down is not synthetic Worker-stop evidence"
     );
     assert_eq!(
-        round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
+        round.classify_covered_subscription_state(
+            leaf_participation,
+            SubscriptionState::BudgetExhausted
+        ),
         None
     );
     assert_eq!(
         round.classify_covered_subscription_state(
-            leaf_context,
+            leaf_participation,
             SubscriptionState::ConnectionLossExhausted
         ),
         None
     );
-    let root_context = round
+    let root_participation = round
         .execution()
         .task(round.root_task().task_id())
         .unwrap()
-        .context();
+        .participation();
     assert_eq!(
-        round.classify_covered_subscription_state(root_context, SubscriptionState::BudgetExhausted),
+        round.classify_covered_subscription_state(
+            root_participation,
+            SubscriptionState::BudgetExhausted
+        ),
         Some(SubscriptionState::BudgetExhausted)
     );
     assert_eq!(
         round.classify_covered_subscription_state(
-            root_context,
+            root_participation,
             SubscriptionState::ConnectionLossExhausted
         ),
         Some(SubscriptionState::ConnectionLossExhausted)
     );
     round.begin_terminal_cleanup();
     assert_eq!(
-        round.classify_covered_subscription_state(root_context, SubscriptionState::BudgetExhausted),
+        round.classify_covered_subscription_state(
+            root_participation,
+            SubscriptionState::BudgetExhausted
+        ),
         None
     );
     assert_eq!(
         round.classify_covered_subscription_state(
-            root_context,
+            root_participation,
             SubscriptionState::ConnectionLossExhausted
         ),
         None
@@ -10140,7 +10232,11 @@ fn covered_exhaustion_respects_exact_root_evidence_before_seal() {
     }
     round.turn().unwrap();
     let root = round.root_task();
-    let context = round.execution().task(root.task_id()).unwrap().context();
+    let participation = round
+        .execution()
+        .task(root.task_id())
+        .unwrap()
+        .participation();
     for (version, state) in [(2, TaskState::Running), (3, TaskState::Flushing)] {
         status.publish(StatusEvent::Published(Box::new(
             TaskStatus::try_new(
@@ -10159,7 +10255,7 @@ fn covered_exhaustion_respects_exact_root_evidence_before_seal() {
         SubscriptionState::ConnectionLossExhausted,
     ] {
         assert_eq!(
-            round.classify_covered_subscription_state(context, state),
+            round.classify_covered_subscription_state(participation, state),
             Some(state),
             "the exact Root terminal evidence is still missing"
         );
@@ -10180,7 +10276,7 @@ fn covered_exhaustion_respects_exact_root_evidence_before_seal() {
         SubscriptionState::ConnectionLossExhausted,
     ] {
         assert_eq!(
-            round.classify_covered_subscription_state(context, state),
+            round.classify_covered_subscription_state(participation, state),
             None,
             "accepted complete Root evidence survives disconnect; data delivery has its own QA owner"
         );
@@ -10198,7 +10294,7 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
     for result_consumer in [false, true] {
         let harness = Harness::new(&[1], &[0], 64);
         let leaf = harness.stage_tasks(1)[0];
-        let leaf_context = harness.execution.task(leaf).unwrap().context();
+        let leaf_participation = harness.execution.task(leaf).unwrap().participation();
         let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
         let source = result_consumer.then(|| round.take_root_status_source().unwrap());
         if result_consumer {
@@ -10209,10 +10305,14 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
         }
         round.turn().unwrap();
         let root = round.root_task();
-        let root_context = round.execution().task(root.task_id()).unwrap().context();
+        let root_participation = round
+            .execution()
+            .task(root.task_id())
+            .unwrap()
+            .participation();
         assert_eq!(
             round.classify_covered_subscription_state(
-                root_context,
+                root_participation,
                 SubscriptionState::BudgetExhausted
             ),
             Some(SubscriptionState::BudgetExhausted),
@@ -10220,7 +10320,7 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
         );
         assert_eq!(
             round.classify_covered_subscription_state(
-                root_context,
+                root_participation,
                 SubscriptionState::ConnectionLossExhausted
             ),
             Some(SubscriptionState::ConnectionLossExhausted),
@@ -10256,7 +10356,7 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
         );
         assert_eq!(
             round.classify_covered_subscription_state(
-                leaf_context,
+                leaf_participation,
                 SubscriptionState::BudgetExhausted
             ),
             (!result_consumer).then_some(SubscriptionState::BudgetExhausted),
@@ -10264,7 +10364,7 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
         );
         assert_eq!(
             round.classify_covered_subscription_state(
-                leaf_context,
+                leaf_participation,
                 SubscriptionState::ConnectionLossExhausted
             ),
             (!result_consumer).then_some(SubscriptionState::ConnectionLossExhausted),
@@ -10272,7 +10372,7 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
         );
         assert_eq!(
             round.classify_covered_subscription_state(
-                leaf_context,
+                leaf_participation,
                 SubscriptionState::ProcessMismatch
             ),
             Some(SubscriptionState::ProcessMismatch),
@@ -10285,7 +10385,7 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
             assert!(round.root_success_sealed());
             assert_eq!(
                 round.classify_covered_subscription_state(
-                    leaf_context,
+                    leaf_participation,
                     SubscriptionState::ConnectionLossExhausted
                 ),
                 None,
@@ -10301,7 +10401,7 @@ fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() 
 
     let harness = Harness::new(&[1], &[0], 64);
     let leaf = harness.stage_tasks(1)[0];
-    let leaf_context = harness.execution.task(leaf).unwrap().context();
+    let leaf_participation = harness.execution.task(leaf).unwrap().participation();
     let leaf_identity = harness.execution.task(leaf).unwrap().identity();
     let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
     let source = round.take_root_status_source().unwrap();
@@ -10322,12 +10422,15 @@ fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() 
     )));
     round.turn().unwrap();
     assert_eq!(
-        round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
+        round.classify_covered_subscription_state(
+            leaf_participation,
+            SubscriptionState::BudgetExhausted
+        ),
         None
     );
     assert_eq!(
         round.classify_covered_subscription_state(
-            leaf_context,
+            leaf_participation,
             SubscriptionState::ConnectionLossExhausted
         ),
         None
@@ -10356,13 +10459,16 @@ fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() 
     round.turn().unwrap();
     assert_eq!(round.failure_cause(), Some(&failure));
     assert_eq!(
-        round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
+        round.classify_covered_subscription_state(
+            leaf_participation,
+            SubscriptionState::BudgetExhausted
+        ),
         Some(SubscriptionState::BudgetExhausted),
         "an accepted failure cannot be hidden by the completed root"
     );
     assert_eq!(
         round.classify_covered_subscription_state(
-            leaf_context,
+            leaf_participation,
             SubscriptionState::ConnectionLossExhausted
         ),
         Some(SubscriptionState::ConnectionLossExhausted),
@@ -10395,12 +10501,12 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
             .find(|task| task.identity() != root)
             .unwrap()
             .identity();
-        let context = round
+        let participation = round
             .execution()
             .graph()
             .task(missing.task_id())
             .unwrap()
-            .context();
+            .participation();
         for (version, state, output) in [
             (2, TaskState::Running, false),
             (3, TaskState::Flushing, false),
@@ -10421,9 +10527,9 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
         round
             .execution_mut()
             .apply_covered_entries(vec![
-                covered_frame(context, 1, CoveredStatusStreamFact::Gone(missing)),
+                covered_frame(participation, 1, CoveredStatusStreamFact::Gone(missing)),
                 covered_frame(
-                    context,
+                    participation,
                     1,
                     CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
                         generation: 1,
@@ -10434,7 +10540,7 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
             .unwrap();
         assert_eq!(
             round.classify_covered_subscription_state(
-                context,
+                participation,
                 crate::native::task_transport::SubscriptionState::BudgetExhausted
             ),
             None,
@@ -10442,7 +10548,7 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
         );
         assert_eq!(
             round.classify_covered_subscription_state(
-                context,
+                participation,
                 crate::native::task_transport::SubscriptionState::ConnectionLossExhausted
             ),
             None,
@@ -10459,9 +10565,9 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
         round
             .execution_mut()
             .apply_covered_entries(vec![
-                covered_frame(context, 2, CoveredStatusStreamFact::Unknown(missing)),
+                covered_frame(participation, 2, CoveredStatusStreamFact::Unknown(missing)),
                 covered_frame(
-                    context,
+                    participation,
                     2,
                     CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
                         generation: 2,
@@ -10469,7 +10575,7 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
                     }),
                 ),
                 covered_frame(
-                    context,
+                    participation,
                     2,
                     CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
                         generation: 2,
@@ -10494,7 +10600,7 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
                 .enumerate()
                 .map(|(index, state)| {
                     covered_frame(
-                        context,
+                        participation,
                         3,
                         CoveredStatusStreamFact::Status(
                             TaskStatus::try_new(
@@ -10512,7 +10618,7 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
                 });
             let mut entries = facts.collect::<Vec<_>>();
             entries.push(covered_frame(
-                context,
+                participation,
                 3,
                 CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
                     generation: 3,
@@ -10586,12 +10692,17 @@ fn covered_terminal_gap_inherits_existing_debt_and_positive_evidence_discharges_
     harness.settle_until_quiet(Duration::from_secs(10));
     let root = harness.execution.graph().root_task();
     let identity = harness.identity(root);
-    let context = harness.execution.graph().task(root).unwrap().context();
+    let participation = harness
+        .execution
+        .graph()
+        .task(root)
+        .unwrap()
+        .participation();
     harness
         .execution
         .apply_covered_entries(vec![
             covered_frame(
-                context,
+                participation,
                 1,
                 CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
                     generation: 1,
@@ -10599,7 +10710,7 @@ fn covered_terminal_gap_inherits_existing_debt_and_positive_evidence_discharges_
                 }),
             ),
             covered_frame(
-                context,
+                participation,
                 1,
                 CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
                     generation: 1,
@@ -10618,9 +10729,9 @@ fn covered_terminal_gap_inherits_existing_debt_and_positive_evidence_discharges_
     harness
         .execution
         .apply_covered_entries(vec![
-            covered_frame(context, 2, CoveredStatusStreamFact::Gone(identity)),
+            covered_frame(participation, 2, CoveredStatusStreamFact::Gone(identity)),
             covered_frame(
-                context,
+                participation,
                 2,
                 CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
                     generation: 2,
@@ -10628,7 +10739,7 @@ fn covered_terminal_gap_inherits_existing_debt_and_positive_evidence_discharges_
                 }),
             ),
             covered_frame(
-                context,
+                participation,
                 2,
                 CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
                     generation: 2,
@@ -10658,9 +10769,9 @@ fn covered_terminal_gap_inherits_existing_debt_and_positive_evidence_discharges_
     harness
         .execution
         .apply_covered_entries(vec![
-            covered_frame(context, 3, CoveredStatusStreamFact::Status(terminal)),
+            covered_frame(participation, 3, CoveredStatusStreamFact::Status(terminal)),
             covered_frame(
-                context,
+                participation,
                 3,
                 CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
                     generation: 3,
@@ -10683,12 +10794,17 @@ fn actual_gap_inherits_old_debt_but_settled_debt_does_not_age_a_new_gap() {
         harness.settle_until_quiet(Duration::from_secs(10));
         let root = harness.execution.graph().root_task();
         let identity = harness.identity(root);
-        let context = harness.execution.graph().task(root).unwrap().context();
+        let participation = harness
+            .execution
+            .graph()
+            .task(root)
+            .unwrap()
+            .participation();
         harness
             .execution
             .apply_covered_entries(vec![
                 covered_frame(
-                    context,
+                    participation,
                     1,
                     CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
                         generation: 1,
@@ -10696,7 +10812,7 @@ fn actual_gap_inherits_old_debt_but_settled_debt_does_not_age_a_new_gap() {
                     }),
                 ),
                 covered_frame(
-                    context,
+                    participation,
                     1,
                     CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
                         generation: 1,
@@ -10712,7 +10828,7 @@ fn actual_gap_inherits_old_debt_but_settled_debt_does_not_age_a_new_gap() {
             harness
                 .execution
                 .apply_covered_entries(vec![covered_frame(
-                    context,
+                    participation,
                     1,
                     CoveredStatusStreamFact::Bookmark(CoveredObservationBookmark {
                         generation: 1,
@@ -10726,7 +10842,7 @@ fn actual_gap_inherits_old_debt_but_settled_debt_does_not_age_a_new_gap() {
         harness
             .execution
             .apply_covered_entries(vec![covered_frame(
-                context,
+                participation,
                 2,
                 CoveredStatusStreamFact::Gone(identity),
             )])
@@ -10757,7 +10873,11 @@ fn exercise_covered_installed_retiring_unknown_create(unknown_first: bool) {
     let leaf_tasks = harness.stage_tasks(1);
     let target = harness.identity(leaf_tasks[0]);
     let backend = target.backend_process_id();
-    let context = harness.execution.task(target.task_id()).unwrap().context();
+    let participation = harness
+        .execution
+        .task(target.task_id())
+        .unwrap()
+        .participation();
     let initial = creates_of(harness.establish_all(Duration::from_secs(10)));
     assert_eq!(
         initial
@@ -10824,7 +10944,7 @@ fn exercise_covered_installed_retiring_unknown_create(unknown_first: bool) {
     harness
         .execution
         .apply_covered_entries(vec![covered_frame(
-            context,
+            participation,
             1,
             CoveredStatusStreamFact::Status(installed),
         )])
@@ -10945,8 +11065,8 @@ fn accepted_preparing_tasks_retain_deployment_window_after_rpc_settlement() {
                     {
                         accepted.push(identity);
                     }
-                } else if intent.kind() == OperationKind::UpdateQueryContext {
-                    harness.context_ack(&intent, Duration::from_secs(10));
+                } else if intent.kind() == OperationKind::UpdateParticipation {
+                    harness.participation_ack(&intent, Duration::from_secs(10));
                 } else if intent.kind() == OperationKind::UpdateTask {
                     harness
                         .update_ack(&intent, OperationOutcome::Accepted)
@@ -10982,8 +11102,8 @@ fn accepted_preparing_tasks_retain_deployment_window_after_rpc_settlement() {
                 OperationKind::UpdateTask => harness
                     .update_ack(&intent, OperationOutcome::Accepted)
                     .unwrap(),
-                OperationKind::UpdateQueryContext => {
-                    harness.context_ack(&intent, Duration::from_secs(10))
+                OperationKind::UpdateParticipation => {
+                    harness.participation_ack(&intent, Duration::from_secs(10))
                 }
                 _ => panic!("unexpected normal operation"),
             }
@@ -11016,8 +11136,8 @@ fn incompatible_advertised_preparation_capacity_is_refused_without_negotiating_w
     let schedule = chain_schedule(&[0], &[0]);
     let graph = build_graph(&schedule, &chain_edges(), &processes, 512).unwrap();
     let epochs = graph
-        .contexts()
-        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .participations()
+        .map(|participation| (participation.backend_process_id(), admission_epoch()))
         .collect::<BTreeMap<_, _>>();
     let sink = Arc::new(RecordingSink::default());
     let capacities = epochs.keys().map(|&process| (process, 2)).collect();
@@ -11104,7 +11224,7 @@ fn preparation_failure_in_create_ack_freezes_admission_before_any_stream_repeat(
 pub(crate) fn covered_loopback_recovery_round() -> (
     crate::task_execution::round::TaskRound,
     Arc<ManualClock>,
-    QueryContextRef,
+    ParticipationRef,
     TaskIdentity,
 ) {
     let harness = Harness::new(&[0], &[0], 64);
@@ -11122,12 +11242,12 @@ pub(crate) fn covered_loopback_recovery_round() -> (
         .find(|task| task.identity() != root)
         .unwrap()
         .identity();
-    let context = round
+    let participation = round
         .execution()
         .graph()
         .task(missing.task_id())
         .unwrap()
-        .context();
+        .participation();
     let identities = round
         .execution()
         .graph()
@@ -11159,9 +11279,9 @@ pub(crate) fn covered_loopback_recovery_round() -> (
     round
         .execution_mut()
         .apply_covered_entries(vec![
-            covered_frame(context, 1, CoveredStatusStreamFact::Gone(missing)),
+            covered_frame(participation, 1, CoveredStatusStreamFact::Gone(missing)),
             covered_frame(
-                context,
+                participation,
                 1,
                 CoveredStatusStreamFact::CatchUpComplete(CoveredCatchUpComplete {
                     generation: 1,
@@ -11175,7 +11295,7 @@ pub(crate) fn covered_loopback_recovery_round() -> (
     round.execution_mut().take_covered_reconciliations();
     round.execution_mut().begin_normal_drain();
     round.turn().unwrap(); // Issue the exact Context Quiesce before its receipt.
-    (round, clock, context, missing)
+    (round, clock, participation, missing)
 }
 
 #[test]
@@ -11214,17 +11334,21 @@ fn revoked_result_control_uses_one_deadline_even_without_eos_or_after_root_finis
         assert!(first.try_recv().unwrap().is_ok());
         assert!(round.execution().result_terminal_control_required());
         assert!(!round.root_success_sealed());
-        let root_context = round.execution().task(root.task_id()).unwrap().context();
+        let root_participation = round
+            .execution()
+            .task(root.task_id())
+            .unwrap()
+            .participation();
         assert_eq!(
             round.classify_covered_subscription_state(
-                root_context,
+                root_participation,
                 crate::native::task_transport::SubscriptionState::BudgetExhausted
             ),
             Some(crate::native::task_transport::SubscriptionState::BudgetExhausted)
         );
         assert_eq!(
             round.classify_covered_subscription_state(
-                root_context,
+                root_participation,
                 crate::native::task_transport::SubscriptionState::ConnectionLossExhausted
             ),
             Some(crate::native::task_transport::SubscriptionState::ConnectionLossExhausted)
@@ -11353,8 +11477,8 @@ type EstablishObservationFixture = (
     Arc<RecordingSink>,
     OperationIntent,
     Arc<RecordingSubscriptions>,
-    novarocks_execution::task_execution::AcquireQueryContextAdmissionTicket,
-    QueryContextAdmissionTicketReceipt,
+    novarocks_execution::task_execution::AcquireParticipationAdmissionTicket,
+    ParticipationAdmissionTicketReceipt,
 );
 
 fn original_establish_observation_round_with_requests() -> EstablishObservationFixture {
@@ -11376,7 +11500,7 @@ fn original_establish_observation_round_with_requests() -> EstablishObservationF
     round.turn().unwrap();
     let admissions = released_admissions(&sink);
     assert_eq!(admissions.len(), 1);
-    let OperationIntent::AcquireQueryContextAdmissionTicket(admission) = &admissions[0] else {
+    let OperationIntent::AcquireParticipationAdmissionTicket(admission) = &admissions[0] else {
         unreachable!()
     };
     let admission = *admission;
@@ -11427,7 +11551,7 @@ pub(crate) fn pre_ready_identity_rejected_observation_round()
     clock.advance(Duration::from_secs(3));
     acks.publish(OperationAcknowledgement::worker_receipt(
         establish.operation_id(),
-        OperationKind::UpdateQueryContext,
+        OperationKind::UpdateParticipation,
         OperationOutcome::IdentityMismatch,
         AckPayload::None,
     ));
@@ -11448,13 +11572,13 @@ pub(crate) fn pre_ready_original_establish_requests() -> (
     TaskRoundForTest,
     Arc<ManualClock>,
     crate::native::task_transport::TaskAckIntakeHandle,
-    novarocks_execution::task_execution::AcquireQueryContextAdmissionTicket,
-    QueryContextAdmissionTicketReceipt,
-    Arc<novarocks_execution::task_execution::EstablishQueryContext>,
+    novarocks_execution::task_execution::AcquireParticipationAdmissionTicket,
+    ParticipationAdmissionTicketReceipt,
+    Arc<novarocks_execution::task_execution::EstablishParticipation>,
 ) {
     let (round, clock, acks, _, establish, _, admission, ticket) =
         original_establish_observation_round_with_requests();
-    let OperationIntent::EstablishQueryContext(request) = establish else {
+    let OperationIntent::EstablishParticipation(request) = establish else {
         unreachable!()
     };
     (round, clock, acks, admission, ticket, request)
@@ -11464,7 +11588,7 @@ pub(crate) fn pre_ready_original_establish_requests() -> (
 fn rejected_establish_preserves_only_its_original_ticket_observation_horizon() {
     let (round, clock, error) = pre_ready_identity_rejected_observation_round();
     let TaskExecutionError::PreReadyEstablishRejected {
-        context,
+        participation,
         operation_id,
         ..
     } = error
@@ -11473,29 +11597,30 @@ fn rejected_establish_preserves_only_its_original_ticket_observation_horizon() {
     };
     let execution = round.execution();
     assert_eq!(
-        execution.pre_ready_observation_remaining(context.backend_process_id()),
+        execution.pre_ready_observation_remaining(participation.backend_process_id()),
         None
     );
     assert_eq!(
-        execution.rejected_establish_observation_remaining(context, operation_id),
-        Some(super::context_owner::ADMISSION_TICKET_VALID_FOR - Duration::from_secs(3))
+        execution.rejected_establish_observation_remaining(participation, operation_id),
+        Some(super::participation_owner::ADMISSION_TICKET_VALID_FOR - Duration::from_secs(3))
     );
     assert_eq!(
-        execution.rejected_establish_observation_remaining(context, TaskOperationId::new_v7()),
+        execution
+            .rejected_establish_observation_remaining(participation, TaskOperationId::new_v7()),
         None
     );
-    let foreign = QueryContextRef::new(
-        context.query_execution_id(),
+    let foreign = ParticipationRef::new(
+        participation.query_execution_id(),
         FrontendProcessId::new_v7(),
-        context.backend_process_id(),
+        participation.backend_process_id(),
     );
     assert_eq!(
         execution.rejected_establish_observation_remaining(foreign, operation_id),
         None
     );
-    clock.advance(super::context_owner::ADMISSION_TICKET_VALID_FOR);
+    clock.advance(super::participation_owner::ADMISSION_TICKET_VALID_FOR);
     assert_eq!(
-        execution.rejected_establish_observation_remaining(context, operation_id),
+        execution.rejected_establish_observation_remaining(participation, operation_id),
         Some(Duration::ZERO)
     );
 }
@@ -11504,25 +11629,29 @@ fn rejected_establish_preserves_only_its_original_ticket_observation_horizon() {
 fn locally_rejected_establish_has_no_worker_replacement_observation() {
     let (mut round, _, acks, _, establish, _) = original_establish_observation_round();
     let original = super::error::local_protocol_refusal(
-        OperationKind::UpdateQueryContext,
+        OperationKind::UpdateParticipation,
         OperationOutcome::IdentityMismatch,
     );
     acks.publish(OperationAcknowledgement::local_refusal(
         establish.operation_id(),
-        OperationKind::UpdateQueryContext,
+        OperationKind::UpdateParticipation,
         original.clone(),
     ));
     let error = round.receive_without_dispatch().unwrap_err();
     assert_eq!(error, TaskExecutionError::Execution(original));
-    let context = *round.execution().graph().contexts().next().unwrap();
+    let participation = *round.execution().graph().participations().next().unwrap();
     assert_eq!(
         round
             .execution()
-            .rejected_establish_observation_remaining(context, establish.operation_id()),
+            .rejected_establish_observation_remaining(participation, establish.operation_id()),
         None
     );
     assert!(
-        !round.execution().owner(context).unwrap().is_released(),
+        !round
+            .execution()
+            .owner(participation)
+            .unwrap()
+            .is_released(),
         "a local refusal cannot supply a Worker exit receipt"
     );
 }
@@ -11543,7 +11672,7 @@ fn pre_ready_observation_keeps_original_ticket_expiry_across_unknown_replay() {
     let backend = round
         .execution()
         .graph()
-        .contexts()
+        .participations()
         .next()
         .unwrap()
         .backend_process_id();
@@ -11551,11 +11680,14 @@ fn pre_ready_observation_keeps_original_ticket_expiry_across_unknown_replay() {
         .execution()
         .pre_ready_observation_remaining(backend)
         .unwrap();
-    assert_eq!(original, super::context_owner::ADMISSION_TICKET_VALID_FOR);
+    assert_eq!(
+        original,
+        super::participation_owner::ADMISSION_TICKET_VALID_FOR
+    );
     clock.advance(Duration::from_secs(3));
     acks.publish(OperationAcknowledgement::transport_unknown(
         establish.operation_id(),
-        OperationKind::UpdateQueryContext,
+        OperationKind::UpdateParticipation,
     ));
     let report = round.receive_without_dispatch().unwrap();
     assert_eq!(report.acknowledgements, 1);
@@ -11617,18 +11749,18 @@ fn receiver_only_turn_settles_original_establish_ack_without_create_or_input_wor
         sink.take().is_empty(),
         "no create/update/lifecycle work is sent"
     );
-    let context = *round.execution().graph().contexts().next().unwrap();
+    let participation = *round.execution().graph().participations().next().unwrap();
     assert!(
         round
             .execution()
-            .owner(context)
+            .owner(participation)
             .unwrap()
             .establish_acknowledged()
     );
     assert_eq!(
         round
             .execution()
-            .pre_ready_observation_remaining(context.backend_process_id()),
+            .pre_ready_observation_remaining(participation.backend_process_id()),
         None
     );
     assert_eq!(subscriptions.ensured.lock().unwrap().len(), 1);
@@ -11661,7 +11793,7 @@ pub(crate) fn manifest_originating_failure_observation_round() -> TaskRoundForTe
 #[test]
 fn pending_receiver_dispatches_only_owned_actor_abort_and_preserves_backpressure() {
     let mut harness = Harness::new(&[0], &[0], 64);
-    let context = *harness.execution.graph().contexts().next().unwrap();
+    let participation = *harness.execution.graph().participations().next().unwrap();
     // Retain a real ordinary admission behind the urgent Abort in the same
     // lifecycle lane. A filtered control dispatch may not release it.
     harness
@@ -11675,9 +11807,9 @@ fn pending_receiver_dispatches_only_owned_actor_abort_and_preserves_backpressure
     let ordinary_queued = harness.execution.dispatcher().queued_items();
     assert_eq!(ordinary_queued, 1);
     let abort =
-        OperationIntent::AbortQueryContext(novarocks_execution_contract::AbortQueryContext::new(
+        OperationIntent::AbortParticipation(novarocks_execution_contract::AbortParticipation::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             AbortCause::QueryFailed,
         ));
     let operation_id = abort.operation_id();
@@ -11708,7 +11840,7 @@ fn pending_receiver_dispatches_only_owned_actor_abort_and_preserves_backpressure
         .collect::<Vec<_>>();
     assert_eq!(operations.len(), 1);
     assert_eq!(operations[0].operation_id(), operation_id);
-    assert_eq!(operations[0].kind(), OperationKind::AbortQueryContext);
+    assert_eq!(operations[0].kind(), OperationKind::AbortParticipation);
     assert_eq!(
         harness.execution.dispatcher().queued_items(),
         ordinary_queued
@@ -11736,7 +11868,7 @@ pub(crate) fn pre_ready_expired_replay_observation_round() -> (TaskRoundForTest,
         .insert(DispatchLane::Lifecycle);
     acks.publish(OperationAcknowledgement::transport_unknown(
         establish.operation_id(),
-        OperationKind::UpdateQueryContext,
+        OperationKind::UpdateParticipation,
     ));
     round.turn().unwrap();
     assert!(sink.take().is_empty());
@@ -11749,13 +11881,13 @@ pub(crate) fn pre_ready_expired_replay_observation_round() -> (TaskRoundForTest,
 
 #[test]
 fn an_adopted_replacement_ticket_does_not_mint_an_original_observation_clock() {
-    let context = QueryContextRef::new(
+    let participation = ParticipationRef::new(
         execution_id(),
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
-    let mut owner = QueryContextOwner::new(
-        context,
+    let mut owner = ParticipationOwner::new(
+        participation,
         0,
         NativeCompatibilityId::new([0x41; 32]),
         admission_epoch(),
@@ -11763,9 +11895,9 @@ fn an_adopted_replacement_ticket_does_not_mint_an_original_observation_clock() {
     let received_at = MonotonicInstant::from_origin(Duration::from_secs(100));
     owner
         .adopt_replacement_admission(
-            QueryContextAdmissionTicketReceipt::new(
+            ParticipationAdmissionTicketReceipt::new(
                 AdmissionTicketId::try_from_bytes([0x54; 16]).unwrap(),
-                context,
+                participation,
                 LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
             ),
             received_at,
@@ -11776,7 +11908,7 @@ fn an_adopted_replacement_ticket_does_not_mint_an_original_observation_clock() {
     // so receipt observation cannot grant another process-evidence window.
     assert!(
         owner
-            .establish_intent(FakeEstablish.facts_for(context).unwrap(), received_at)
+            .establish_intent(FakeEstablish.facts_for(participation).unwrap(), received_at)
             .unwrap()
             .is_some()
     );
@@ -12374,7 +12506,7 @@ fn actual_batch_limit_keeps_unselected_sources_and_restores_the_same_head() {
         original.max_query_backend_queued_bytes(),
         original.max_backend_queued_operations(),
         original.max_backend_queued_bytes(),
-        original.max_tasks_per_context(),
+        original.max_tasks_per_participation(),
         original.max_active_tasks_per_backend(),
         original.frontend_queue_residence(),
     )
@@ -12520,7 +12652,7 @@ pub(crate) fn manifest_task_and_subscription_failure_round(
 }
 
 #[test]
-fn sealed_result_withdrawals_use_exact_graph_demands_without_settling_contexts() {
+fn sealed_result_withdrawals_use_exact_graph_demands_without_settling_participations() {
     let mut harness = Harness::new(&[1], &[2], 512);
     let root = harness.execution.graph().root_identity();
     let activation = novarocks_coordination_contract::AttemptActivationIdentity::from_parts(
@@ -12531,24 +12663,24 @@ fn sealed_result_withdrawals_use_exact_graph_demands_without_settling_contexts()
     assert!(
         harness
             .execution
-            .result_context_withdrawals(activation)
+            .result_participation_withdrawals(activation)
             .is_empty()
     );
     harness.publish(root.task_id(), TaskState::Finished, None, true);
     assert!(
         harness
             .execution
-            .result_context_withdrawals(activation)
+            .result_participation_withdrawals(activation)
             .is_empty()
     );
     let original = harness
         .execution
         .graph()
-        .contexts()
-        .map(|&context| {
-            let owner = harness.execution.owner(context).unwrap();
+        .participations()
+        .map(|&participation| {
+            let owner = harness.execution.owner(participation).unwrap();
             (
-                context,
+                participation,
                 (
                     owner.state(),
                     owner.establish_acknowledged(),
@@ -12558,23 +12690,25 @@ fn sealed_result_withdrawals_use_exact_graph_demands_without_settling_contexts()
         })
         .collect::<BTreeMap<_, _>>();
     harness.execution.begin_normal_drain();
-    let facts = harness.execution.result_context_withdrawals(activation);
+    let facts = harness
+        .execution
+        .result_participation_withdrawals(activation);
     assert_eq!(facts.len(), 2);
     for fact in facts {
         assert_eq!(fact.activation(), activation);
         assert_eq!(fact.root(), root);
         assert_ne!(
-            fact.context().backend_process_id(),
+            fact.participation().backend_process_id(),
             root.backend_process_id()
         );
-        let owner = harness.execution.owner(fact.context()).unwrap();
+        let owner = harness.execution.owner(fact.participation()).unwrap();
         assert_eq!(
             (
                 owner.state(),
                 owner.establish_acknowledged(),
                 owner.is_released()
             ),
-            original[&fact.context()]
+            original[&fact.participation()]
         );
         assert!(!owner.establish_acknowledged());
         assert!(!owner.is_released());
@@ -12587,13 +12721,13 @@ fn sealed_result_withdrawals_use_exact_graph_demands_without_settling_contexts()
     assert!(
         harness
             .execution
-            .result_context_withdrawals(foreign)
+            .result_participation_withdrawals(foreign)
             .is_empty()
     );
 }
 
 #[test]
-fn normal_stand_down_without_finished_root_does_not_withdraw_result_contexts() {
+fn normal_stand_down_without_finished_root_does_not_withdraw_result_participations() {
     let mut harness = Harness::new(&[1], &[2], 512);
     let root = harness.execution.graph().root_identity();
     let activation = novarocks_coordination_contract::AttemptActivationIdentity::from_parts(
@@ -12605,7 +12739,7 @@ fn normal_stand_down_without_finished_root_does_not_withdraw_result_contexts() {
     assert!(
         harness
             .execution
-            .result_context_withdrawals(activation)
+            .result_participation_withdrawals(activation)
             .is_empty()
     );
 }
@@ -12688,7 +12822,7 @@ pub(crate) fn manifest_original_gated_round_fixture(
 
 mod owner_failed_actor_abort;
 
-/// Same admitted context, original released Create, and real Worker refusal.
+/// Same admitted participation, original released Create, and real Worker refusal.
 /// The trace lets Manifest tests present the original Establish to QA as well.
 pub(crate) fn pre_ready_original_create_refusal() -> (
     TaskRoundForTest,
@@ -12729,11 +12863,11 @@ pub(crate) fn pre_ready_original_unknown_establish_create_refusal() -> (
     let mut trace = Vec::new();
     let (mut round, _, acks, creates) =
         round_waiting_on_creates_with_establish_delivery(harness, Some(&mut trace), false);
-    let context = *round.execution().graph().contexts().next().unwrap();
+    let participation = *round.execution().graph().participations().next().unwrap();
     assert_eq!(
         round
             .execution()
-            .pre_ready_observation_remaining(context.backend_process_id()),
+            .pre_ready_observation_remaining(participation.backend_process_id()),
         Some(Duration::from_secs(10)),
         "Unknown keeps the original admission horizon, without claiming a Worker lease"
     );
@@ -12747,8 +12881,8 @@ pub(crate) fn pre_ready_original_unknown_establish_create_refusal() -> (
     ));
     let error = round.receive_without_dispatch().unwrap_err();
     assert!(matches!(&error, TaskExecutionError::OperationFailed {
-        context: observed, operation_id, kind: OperationKind::CreateTask, ..
-    } if *observed == context && *operation_id == create.operation_id()));
+        participation: observed, operation_id, kind: OperationKind::CreateTask, ..
+    } if *observed == participation && *operation_id == create.operation_id()));
     (round, clock, error, trace)
 }
 
@@ -12756,7 +12890,7 @@ pub(crate) fn pre_ready_original_unknown_establish_create_refusal() -> (
 fn rejected_create_observation_keeps_submitted_unknown_establish_horizon() {
     let (mut round, clock, error, trace) = pre_ready_original_unknown_establish_create_refusal();
     let TaskExecutionError::OperationFailed {
-        context,
+        participation,
         operation_id,
         ..
     } = error
@@ -12766,7 +12900,9 @@ fn rejected_create_observation_keeps_submitted_unknown_establish_horizon() {
     let establish = trace
         .iter()
         .find_map(|(intent, _)| match intent {
-            OperationIntent::EstablishQueryContext(request) if request.context() == context => {
+            OperationIntent::EstablishParticipation(request)
+                if request.participation() == participation =>
+            {
                 Some(intent.clone())
             }
             _ => None,
@@ -12775,7 +12911,7 @@ fn rejected_create_observation_keeps_submitted_unknown_establish_horizon() {
     assert_eq!(
         round
             .execution()
-            .rejected_create_observation_remaining(context, operation_id),
+            .rejected_create_observation_remaining(participation, operation_id),
         Some(Duration::from_secs(7)),
         "the actual submitted parent qualifies before its Applied acknowledgement"
     );
@@ -12792,24 +12928,24 @@ fn rejected_create_observation_keeps_submitted_unknown_establish_horizon() {
     assert_eq!(
         round
             .execution()
-            .rejected_create_observation_remaining(context, operation_id),
+            .rejected_create_observation_remaining(participation, operation_id),
         Some(Duration::from_secs(7)),
     );
     clock.advance(Duration::from_secs(8));
     assert_eq!(
         round
             .execution()
-            .rejected_create_observation_remaining(context, operation_id),
+            .rejected_create_observation_remaining(participation, operation_id),
         Some(Duration::ZERO),
         "late receipt never creates a fresh observation interval"
     );
 }
 
 #[test]
-fn rejected_create_observation_keeps_exact_operation_context_and_effective_lease() {
+fn rejected_create_observation_keeps_exact_operation_participation_and_effective_lease() {
     let (round, clock, error, _) = pre_ready_original_create_refusal();
     let TaskExecutionError::OperationFailed {
-        context,
+        participation,
         operation_id,
         ..
     } = error
@@ -12818,21 +12954,21 @@ fn rejected_create_observation_keeps_exact_operation_context_and_effective_lease
     };
     let execution = round.execution();
     assert_eq!(
-        execution.pre_ready_observation_remaining(context.backend_process_id()),
+        execution.pre_ready_observation_remaining(participation.backend_process_id()),
         None
     );
     assert_eq!(
-        execution.rejected_create_observation_remaining(context, operation_id),
+        execution.rejected_create_observation_remaining(participation, operation_id),
         Some(Duration::from_secs(27)),
     );
     assert_eq!(
-        execution.rejected_create_observation_remaining(context, TaskOperationId::new_v7()),
+        execution.rejected_create_observation_remaining(participation, TaskOperationId::new_v7()),
         None
     );
-    let foreign = QueryContextRef::new(
-        context.query_execution_id(),
+    let foreign = ParticipationRef::new(
+        participation.query_execution_id(),
         FrontendProcessId::new_v7(),
-        context.backend_process_id(),
+        participation.backend_process_id(),
     );
     assert_eq!(
         execution.rejected_create_observation_remaining(foreign, operation_id),
@@ -12840,7 +12976,7 @@ fn rejected_create_observation_keeps_exact_operation_context_and_effective_lease
     );
     clock.advance(Duration::from_secs(28));
     assert_eq!(
-        execution.rejected_create_observation_remaining(context, operation_id),
+        execution.rejected_create_observation_remaining(participation, operation_id),
         Some(Duration::ZERO)
     );
 }
@@ -12850,7 +12986,7 @@ fn create_observation_requires_the_original_worker_identity_refusal() {
     for case in 0..5 {
         let harness = Harness::new(&[0], &[0], 64);
         let (mut round, _, acks, creates) = round_waiting_on_creates(harness);
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let operation = creates[0].operation_id();
         let ack = match case {
             0 => OperationAcknowledgement::worker_receipt(
@@ -12868,7 +13004,7 @@ fn create_observation_requires_the_original_worker_identity_refusal() {
             2 => OperationAcknowledgement::worker_receipt(
                 operation,
                 OperationKind::CreateTask,
-                OperationOutcome::ContextConflict,
+                OperationOutcome::ParticipationConflict,
                 AckPayload::None,
             ),
             3 => OperationAcknowledgement::transport_unknown(operation, OperationKind::CreateTask),
@@ -12897,7 +13033,7 @@ fn create_observation_requires_the_original_worker_identity_refusal() {
         assert_eq!(
             round
                 .execution()
-                .rejected_create_observation_remaining(context, operation),
+                .rejected_create_observation_remaining(participation, operation),
             None,
             "case {case}"
         );

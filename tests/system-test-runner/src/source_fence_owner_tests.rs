@@ -67,7 +67,27 @@ impl Write for PipeOutput {
     fn flush(&mut self) -> io::Result<()> {
         let line = &self.bytes[self.flushed..];
         self.flushed = self.bytes.len();
-        if line.starts_with(b"NOVAROCKS_MEM_1_M07_HELD_LIVE_FENCE ") {
+        if line.starts_with(
+            &const {
+                let marker =
+                    novarocks_failpoint::observation_marker::MEM_1_M07_HELD_LIVE_FENCE.as_bytes();
+                let suffix = b" ";
+                let mut bytes = [0;
+                    novarocks_failpoint::observation_marker::MEM_1_M07_HELD_LIVE_FENCE.len()
+                        + b" ".len()];
+                let mut index = 0;
+                while index < marker.len() {
+                    bytes[index] = marker[index];
+                    index += 1;
+                }
+                let mut suffix_index = 0;
+                while suffix_index < suffix.len() {
+                    bytes[index + suffix_index] = suffix[suffix_index];
+                    suffix_index += 1;
+                }
+                bytes
+            },
+        ) {
             assert_eq!(line.last(), Some(&b'\n'));
             self.ack_writes += 1;
             match self.ack {
@@ -144,14 +164,18 @@ fn actual_three_ack_bytes_and_four_original_owner_lines_match_collector_literals
     );
     assert_eq!(
         output.bytes,
-        concat!(
-            "NOVAROCKS_MEM_1_M07_HELD_LIVE_FENCE phase=prepared sequence=1\n",
-            "NOVAROCKS_MEM_1_M07_HELD_LIVE_LOG_OWNER role=fe dev=7 ino=1\n",
-            "NOVAROCKS_MEM_1_M07_HELD_LIVE_LOG_OWNER role=be-0 dev=7 ino=2\n",
-            "NOVAROCKS_MEM_1_M07_HELD_LIVE_LOG_OWNER role=be-1 dev=7 ino=3\n",
-            "NOVAROCKS_MEM_1_M07_HELD_LIVE_LOG_OWNER role=be-2 dev=7 ino=4\n",
-            "NOVAROCKS_MEM_1_M07_HELD_LIVE_FENCE phase=baseline sequence=2 sizes=0,7,2097152\n",
-            "NOVAROCKS_MEM_1_M07_HELD_LIVE_FENCE phase=target sequence=3 sizes=12,8,2097152\n",
+        format!(
+            concat!(
+                "{fence} phase=prepared sequence=1\n",
+                "{owner} role=fe dev=7 ino=1\n",
+                "{owner} role=be-0 dev=7 ino=2\n",
+                "{owner} role=be-1 dev=7 ino=3\n",
+                "{owner} role=be-2 dev=7 ino=4\n",
+                "{fence} phase=baseline sequence=2 sizes=0,7,2097152\n",
+                "{fence} phase=target sequence=3 sizes=12,8,2097152\n",
+            ),
+            fence = novarocks_failpoint::observation_marker::MEM_1_M07_HELD_LIVE_FENCE,
+            owner = novarocks_failpoint::observation_marker::MEM_1_M07_HELD_LIVE_LOG_OWNER,
         )
         .as_bytes()
     );
@@ -262,7 +286,25 @@ fn live_pipe_without_ack_expires_on_the_original_clock_and_preserves_failure() {
     assert_eq!(output.ack_writes, 1);
     assert_eq!(
         output.bytes,
-        b"NOVAROCKS_MEM_1_M07_HELD_LIVE_FENCE phase=prepared sequence=1\n"
+        &const {
+            let marker =
+                novarocks_failpoint::observation_marker::MEM_1_M07_HELD_LIVE_FENCE.as_bytes();
+            let suffix = b" phase=prepared sequence=1\n";
+            let mut bytes = [0; novarocks_failpoint::observation_marker::MEM_1_M07_HELD_LIVE_FENCE
+                .len()
+                + b" phase=prepared sequence=1\n".len()];
+            let mut index = 0;
+            while index < marker.len() {
+                bytes[index] = marker[index];
+                index += 1;
+            }
+            let mut suffix_index = 0;
+            while suffix_index < suffix.len() {
+                bytes[index + suffix_index] = suffix[suffix_index];
+                suffix_index += 1;
+            }
+            bytes
+        }
     );
     let first = Arc::clone(&owner.first_failure.as_ref().unwrap().0);
     owner.prepared_with(&mut output, deadline()).unwrap_err();

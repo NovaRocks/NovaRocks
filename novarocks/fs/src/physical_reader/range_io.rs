@@ -178,9 +178,9 @@ fn filled(output: Vec<Option<Bytes>>) -> FileResult<Vec<Bytes>> {
 mod tests {
     use super::*;
     use crate::{
-        FileCancellation, FileIdentity, FileIoRuntime, FileRangeScope, FileRangeService,
-        FileReadContext, FileTaskSpawner, FsAccessResolver, PreparedFileInput, TokioFileIoRuntime,
-        TokioFileTaskSpawner,
+        FileCancellation, FileIdentity, FileIoRuntime, FileIoSpawner, FileRangeScope,
+        FileRangeService, FileReadContext, FsAccessResolver, PreparedFileInput, TokioFileIoRuntime,
+        TokioFileIoSpawner,
     };
     use bytes::BytesMut;
     use novarocks_spi::connector::StorageAccessDomainId;
@@ -281,7 +281,7 @@ mod tests {
             cancellation: FileCancellation::new(),
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())) as Arc<dyn FileIoRuntime>,
-            task_spawner: Arc::new(TokioFileTaskSpawner::new(handle)) as Arc<dyn FileTaskSpawner>,
+            io_spawner: Arc::new(TokioFileIoSpawner::new(handle)) as Arc<dyn FileIoSpawner>,
             range: None,
         };
         let reader = BoundChunkReader::new(
@@ -340,7 +340,7 @@ mod tests {
             .build()
             .expect("runtime");
         let handle = runtime.handle().clone();
-        let spawner = Arc::new(TokioFileTaskSpawner::new(handle.clone()));
+        let spawner = Arc::new(TokioFileIoSpawner::new(handle.clone()));
         let service = FileRangeService::new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
@@ -359,7 +359,7 @@ mod tests {
                 cancellation: FileCancellation::new(),
                 deadline: None,
                 runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())),
-                task_spawner: spawner,
+                io_spawner: spawner,
                 range: Some(service.bind(
                     FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap(),
                     novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
@@ -401,7 +401,7 @@ mod tests {
             .build()
             .expect("runtime");
         let handle = runtime.handle().clone();
-        let spawner = Arc::new(TokioFileTaskSpawner::new(handle.clone()));
+        let spawner = Arc::new(TokioFileIoSpawner::new(handle.clone()));
         let service = FileRangeService::new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
@@ -416,7 +416,7 @@ mod tests {
                 cancellation: FileCancellation::new(),
                 deadline: None,
                 runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())),
-                task_spawner: spawner,
+                io_spawner: spawner,
                 range: Some(service.bind(
                     FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap(),
                     novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),

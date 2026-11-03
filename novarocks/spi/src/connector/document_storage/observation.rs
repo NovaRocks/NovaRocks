@@ -279,7 +279,7 @@ pub struct ConnectorDocumentDiscoveryPage {
     next_cursor: Option<Bytes>,
     completeness: ConnectorDocumentDiscoveryCompleteness,
     request_digest: [u8; 32],
-    lease_witness: Option<[u8; 32]>,
+    storage_witness: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for ConnectorDocumentDiscoveryPage {
@@ -351,7 +351,7 @@ impl ConnectorDocumentDiscoveryPage {
             next_cursor,
             completeness,
             request_digest: request.request_digest(),
-            lease_witness: None,
+            storage_witness: None,
         })
     }
 
@@ -388,7 +388,7 @@ impl ConnectorDocumentDiscoveryPage {
     }
 
     pub(crate) fn seal_for(&mut self, request: &ConnectorDocumentDiscoveryRequest) {
-        self.lease_witness = Some(request.request_digest());
+        self.storage_witness = Some(request.request_digest());
     }
 
     pub fn try_next_request(
@@ -396,7 +396,7 @@ impl ConnectorDocumentDiscoveryPage {
         previous: &ConnectorDocumentDiscoveryRequest,
         context: ConnectorRequestContext,
     ) -> Result<Option<ConnectorDocumentDiscoveryRequest>, ConnectorError> {
-        if self.lease_witness != Some(previous.request_digest()) {
+        if self.storage_witness != Some(previous.request_digest()) {
             return Err(invalid(
                 "document discovery page was not validated by its exact storage lease",
             ));

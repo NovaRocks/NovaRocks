@@ -1372,13 +1372,13 @@ mod tests {
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::resources::IcebergMetadataResources;
 
-    trait LeaseExecutionForTest {
+    trait MaintenanceExecuteForTest {
         async fn execute(
             &self,
             request: ConnectorMetadataMaintenanceExecuteRequest,
         ) -> Result<ConnectorMetadataMaintenanceOutcome, ConnectorError>;
     }
-    impl LeaseExecutionForTest for novarocks_spi::connector::ConnectorMetadataMaintenanceLease {
+    impl MaintenanceExecuteForTest for novarocks_spi::connector::ConnectorMetadataMaintenanceSession {
         async fn execute(
             &self,
             request: ConnectorMetadataMaintenanceExecuteRequest,
@@ -1419,7 +1419,7 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(
                 executor.handle().clone(),
             )),
-            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+            Arc::new(novarocks_fs::TokioFileIoSpawner::new(
                 executor.handle().clone(),
             )),
         );
@@ -2158,7 +2158,7 @@ mod tests {
     }
     fn real_maintenance_lease(
         adapter: IcebergMetadataMaintenanceAdapter,
-    ) -> novarocks_spi::connector::ConnectorMetadataMaintenanceLease {
+    ) -> novarocks_spi::connector::ConnectorMetadataMaintenanceSession {
         let descriptor = adapter.descriptor.clone();
         let epoch = adapter.key.incarnation;
         let metadata = Arc::new(crate::metadata::IcebergMetadata::new(
@@ -2166,7 +2166,7 @@ mod tests {
             epoch,
             Arc::clone(&adapter.runtime),
         ));
-        novarocks_spi::connector::ConnectorMetadataMaintenanceLease::new(
+        novarocks_spi::connector::ConnectorMetadataMaintenanceSession::new(
             descriptor,
             novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             epoch,
@@ -3906,7 +3906,7 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(
                 executor.handle().clone(),
             )),
-            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+            Arc::new(novarocks_fs::TokioFileIoSpawner::new(
                 executor.handle().clone(),
             )),
         );

@@ -53,7 +53,7 @@ mod types;
 #[path = "../../../../../novarocks/types/src/engine_error_codes.rs"]
 mod engine_error_codes;
 
-use crate::cluster::{ClusterMode, ServerHandle, launch_server, validate_cluster_args};
+use crate::cluster::{ClusterMode, TestClusterOwner, launch_server, validate_cluster_args};
 use crate::config::{
     FixtureEndpoints, build_suite_configs, env_optional, list_sql_files, load_runner_config,
     placeholder_variables, project_fixture_value, resolve_config_path, resolve_path,
@@ -596,7 +596,7 @@ struct SuiteRunContext {
     target_session_sql: Vec<String>,
     rewrite_explain_contains_as_not_contains: Vec<String>,
     fail_fast: bool,
-    server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
+    cluster_owner: Arc<Mutex<Box<dyn TestClusterOwner>>>,
     failure_artifacts: Arc<FailureArtifactRecorder>,
     publication_catalog_control: Option<publication_catalog::FixtureControl>,
     publication_service_control: Option<publication_service::Control>,
@@ -1392,26 +1392,26 @@ fn run_explain_directive_checks(
 
 fn run_be_log_directives_for_successful_step(
     step: &SqlStep,
-    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    cluster_owner: &Arc<Mutex<Box<dyn TestClusterOwner>>>,
     snapshot: &be_log_directive::BeLogSnapshot,
     log: &mut String,
 ) -> Result<(), String> {
-    match server_handle.lock() {
-        Ok(server_handle) => be_log_directive::run(step, server_handle.as_ref(), snapshot, log)
+    match cluster_owner.lock() {
+        Ok(cluster_owner) => be_log_directive::run(step, cluster_owner.as_ref(), snapshot, log)
             .map_err(|error| format!("BE log directive failed: {error:#}")),
         Err(_) => Err("server handle mutex is poisoned".to_string()),
     }
 }
 
 struct LifecycleStatementObservationGuard {
-    server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
+    cluster_owner: Arc<Mutex<Box<dyn TestClusterOwner>>>,
     observation: novarocks_cluster_harness::QueryLifecycleStatementObservation,
     drained: bool,
 }
 
 impl LifecycleStatementObservationGuard {
     fn drain(&mut self) -> Result<()> {
-        self.server_handle
+        self.cluster_owner
             .lock()
             .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
             .drain_query_lifecycle_statement_observation(&self.observation)?;
@@ -1425,7 +1425,7 @@ impl Drop for LifecycleStatementObservationGuard {
         if self.drained {
             return;
         }
-        match self.server_handle.lock() {
+        match self.cluster_owner.lock() {
             Ok(mut server) => {
                 if let Err(error) =
                     server.drain_query_lifecycle_statement_observation(&self.observation)
@@ -1445,7 +1445,7 @@ fn await_lifecycle_statement_observation(
     deadline: Instant,
 ) -> Result<novarocks_cluster_harness::QueryLifecycleStructuredSnapshot> {
     guard
-        .server_handle
+        .cluster_owner
         .lock()
         .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
         .await_query_lifecycle_statement_observation(&guard.observation, true, deadline)
@@ -1680,7 +1680,7 @@ impl SqlStepOutcome {
 
 fn execute_target_query_with_fault(
     meta: &QueryMeta,
-    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    cluster_owner: &Arc<Mutex<Box<dyn TestClusterOwner>>>,
     session: &mut TrinoCaseSession,
     query_timeout: u64,
     sql: &str,
@@ -1689,7 +1689,7 @@ fn execute_target_query_with_fault(
 ) -> SqlStepOutcome {
     execute_target_query_with_selected_control(
         meta,
-        server_handle,
+        cluster_owner,
         session,
         query_timeout,
         sql,
@@ -1702,7 +1702,7 @@ fn execute_target_query_with_fault(
 
 fn execute_target_query_with_selected_control(
     meta: &QueryMeta,
-    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    cluster_owner: &Arc<Mutex<Box<dyn TestClusterOwner>>>,
     session: &mut TrinoCaseSession,
     query_timeout: u64,
     sql: &str,
@@ -1717,7 +1717,7 @@ fn execute_target_query_with_selected_control(
     let mut transport_failure = false;
     let fault_result = fault_injection::execute_with_post_fragment_start_fault(
         meta,
-        server_handle,
+        cluster_owner,
         Some(cancel_slot.clone()),
         fault_deadline,
         || {
@@ -1744,7 +1744,7 @@ fn execute_target_query_with_selected_control(
                         previous.drain()?;
                     }
                     if control.needs_nomination {
-                        let observation = server_handle
+                        let observation = cluster_owner
                             .lock()
                             .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
                             .arm_selected_statement_observation_for_client_query(
@@ -1754,7 +1754,7 @@ fn execute_target_query_with_selected_control(
                                 deadline,
                             )?;
                         *guard = Some(LifecycleStatementObservationGuard {
-                            server_handle: Arc::clone(server_handle),
+                            cluster_owner: Arc::clone(cluster_owner),
                             observation,
                             drained: false,
                         });
@@ -1790,7 +1790,7 @@ fn execute_target_query_with_selected_control(
                 false,
                 None,
                 fault_timeout_diagnostics(
-                    server_handle,
+                    cluster_owner,
                     "runner FE restart reconnect: shared lifecycle deadline expired",
                 ),
             ));
@@ -1800,7 +1800,7 @@ fn execute_target_query_with_selected_control(
                 false,
                 None,
                 fault_timeout_diagnostics(
-                    server_handle,
+                    cluster_owner,
                     &format!("runner FE restart reconnect failed: {error:#}"),
                 ),
             ));
@@ -1810,7 +1810,7 @@ fn execute_target_query_with_selected_control(
                 false,
                 None,
                 fault_timeout_diagnostics(
-                    server_handle,
+                    cluster_owner,
                     "runner FE restart reconnect exceeded shared lifecycle deadline",
                 ),
             ));
@@ -1950,7 +1950,7 @@ fn execute_case_step(request: CaseStepDispatch<'_>) -> SqlStepOutcome {
                 .to_json()
                 .expect("admitted context serialization"),
             meta: &step.meta,
-            server_handle: &ctx.server_handle,
+            cluster_owner: &ctx.cluster_owner,
             session_config: case_target_conn.clone(),
             session_defaults: ctx.session_defaults.clone(),
             convert_legacy: ctx.convert_legacy,
@@ -1993,7 +1993,7 @@ fn execute_case_step(request: CaseStepDispatch<'_>) -> SqlStepOutcome {
                     .to_json()
                     .expect("admitted context serialization"),
                 meta: &step.meta,
-                server_handle: &ctx.server_handle,
+                cluster_owner: &ctx.cluster_owner,
                 session_config: case_target_conn.clone(),
                 session_defaults: ctx.session_defaults.clone(),
                 convert_legacy: ctx.convert_legacy,
@@ -2021,7 +2021,7 @@ fn execute_case_step(request: CaseStepDispatch<'_>) -> SqlStepOutcome {
             InflightPublicationFrontendKill {
                 namespace_guard: ctx.namespace_guard(case_target_conn, step.meta.cleanup),
                 meta: &step.meta,
-                server_handle: &ctx.server_handle,
+                cluster_owner: &ctx.cluster_owner,
                 session_config: case_target_conn.clone(),
                 session_defaults: ctx.session_defaults.clone(),
                 convert_legacy: ctx.convert_legacy,
@@ -2052,7 +2052,7 @@ fn execute_case_step(request: CaseStepDispatch<'_>) -> SqlStepOutcome {
     } else {
         execute_target_query_with_selected_control(
             &step.meta,
-            &ctx.server_handle,
+            &ctx.cluster_owner,
             target_session,
             ctx.query_timeout,
             &step.sql,
@@ -2067,7 +2067,7 @@ fn execute_case_step(request: CaseStepDispatch<'_>) -> SqlStepOutcome {
 struct InflightPublicationFrontendKill<'a> {
     namespace_guard: namespace_guard::NamespaceGuard,
     meta: &'a QueryMeta,
-    server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
+    cluster_owner: &'a Arc<Mutex<Box<dyn TestClusterOwner>>>,
     session_config: ConnectionConfig,
     session_defaults: suite_manifest::SuiteSessionDefaults,
     convert_legacy: bool,
@@ -2087,7 +2087,7 @@ struct InflightPublicationConcurrentShell<'a> {
     run_context: String,
     writer_exit: Arc<AtomicBool>,
     meta: &'a QueryMeta,
-    server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
+    cluster_owner: &'a Arc<Mutex<Box<dyn TestClusterOwner>>>,
     session_config: ConnectionConfig,
     session_defaults: suite_manifest::SuiteSessionDefaults,
     convert_legacy: bool,
@@ -2106,7 +2106,7 @@ struct InflightPublicationServiceShell<'a> {
     run_context: String,
     writer_exit: Arc<AtomicBool>,
     meta: &'a QueryMeta,
-    server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
+    cluster_owner: &'a Arc<Mutex<Box<dyn TestClusterOwner>>>,
     session_config: ConnectionConfig,
     session_defaults: suite_manifest::SuiteSessionDefaults,
     convert_legacy: bool,
@@ -2128,7 +2128,7 @@ fn execute_target_query_with_inflight_publication_service_shell(
         run_context,
         writer_exit,
         meta,
-        server_handle,
+        cluster_owner,
         session_config,
         session_defaults,
         convert_legacy,
@@ -2145,7 +2145,7 @@ fn execute_target_query_with_inflight_publication_service_shell(
     let deadline =
         original_deadline.map_or(action_deadline, |original| original.min(action_deadline));
     let thread_meta = meta.clone();
-    let thread_server = Arc::clone(server_handle);
+    let thread_server = Arc::clone(cluster_owner);
     let query_thread =
         std::thread::spawn(move || {
             match TrinoCaseSession::new_with_session_defaults(
@@ -2256,7 +2256,7 @@ fn execute_target_query_while_publication_service_holds_shell(
         run_context,
         writer_exit,
         meta,
-        server_handle,
+        cluster_owner,
         session_config,
         session_defaults,
         convert_legacy,
@@ -2307,7 +2307,7 @@ fn execute_target_query_while_publication_service_holds_shell(
             session.set_namespace_guard(namespace_guard);
             execute_target_query_with_fault(
                 meta,
-                server_handle,
+                cluster_owner,
                 &mut session,
                 query_timeout,
                 &sql,
@@ -2398,7 +2398,7 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
         run_context,
         writer_exit,
         meta,
-        server_handle,
+        cluster_owner,
         session_config,
         session_defaults,
         convert_legacy,
@@ -2416,7 +2416,7 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
     let deadline =
         original_deadline.map_or(action_deadline, |original| original.min(action_deadline));
     let thread_meta = meta.clone();
-    let thread_server = Arc::clone(server_handle);
+    let thread_server = Arc::clone(cluster_owner);
     let query_timeout = bounded_fault_query_timeout(query_timeout, Some(deadline));
     let query_thread =
         std::thread::spawn(move || {
@@ -2456,7 +2456,7 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
             false,
             None,
             fault_timeout_diagnostics(
-                server_handle,
+                cluster_owner,
                 &format!("publication before-dispatch hold was not observed: {error:#}{primary}"),
             ),
         ));
@@ -2517,7 +2517,7 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
     let InflightPublicationFrontendKill {
         namespace_guard,
         meta,
-        server_handle,
+        cluster_owner,
         session_config,
         session_defaults,
         convert_legacy,
@@ -2535,7 +2535,7 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(query_timeout.saturating_add(10)));
     let deadline =
         original_deadline.map_or(action_deadline, |original| original.min(action_deadline));
-    let be_count = match server_handle.lock() {
+    let be_count = match cluster_owner.lock() {
         Ok(server) => server.be_count(),
         Err(_) => {
             return SqlStepOutcome::infrastructure((
@@ -2555,7 +2555,7 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
     }
 
     let thread_meta = meta.clone();
-    let thread_server = Arc::clone(server_handle);
+    let thread_server = Arc::clone(cluster_owner);
     let query_timeout = bounded_fault_query_timeout(query_timeout, Some(deadline));
     let query_thread =
         std::thread::spawn(move || {
@@ -2594,7 +2594,7 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
             false,
             None,
             fault_timeout_diagnostics(
-                server_handle,
+                cluster_owner,
                 &format!("publication downstream-successful hold was not observed: {error:#}"),
             ),
         ));
@@ -2604,7 +2604,7 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
         "    @publication_catalog_fault downstream-successful hold reached"
     );
 
-    let restart_result = server_handle
+    let restart_result = cluster_owner
         .lock()
         .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))
         .and_then(|mut server| {
@@ -2624,7 +2624,7 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
             false,
             None,
             fault_timeout_diagnostics(
-                server_handle,
+                cluster_owner,
                 &format!("publication in-flight frontend kill failed: {error:#}"),
             ),
         ));
@@ -2671,7 +2671,7 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
             false,
             None,
             fault_timeout_diagnostics(
-                server_handle,
+                cluster_owner,
                 &format!("reconnect runner session after in-flight frontend kill: {error:#}"),
             ),
         ));
@@ -2696,10 +2696,10 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
 }
 
 fn fault_timeout_diagnostics(
-    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    cluster_owner: &Arc<Mutex<Box<dyn TestClusterOwner>>>,
     message: &str,
 ) -> String {
-    let Ok(server) = server_handle.lock() else {
+    let Ok(server) = cluster_owner.lock() else {
         return format!("FAIL ({message}); server handle mutex is poisoned");
     };
     let tail = |contents: String| {
@@ -2745,7 +2745,7 @@ fn finish_expected_error_step(
     step: &SqlStep,
     matched_expected_error: bool,
     last_failure: &str,
-    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    cluster_owner: &Arc<Mutex<Box<dyn TestClusterOwner>>>,
     snapshot: &be_log_directive::BeLogSnapshot,
     log: &mut String,
 ) -> bool {
@@ -2758,7 +2758,7 @@ fn finish_expected_error_step(
         return false;
     }
     if let Err(reason) =
-        run_be_log_directives_for_successful_step(step, server_handle, snapshot, log)
+        run_be_log_directives_for_successful_step(step, cluster_owner, snapshot, log)
     {
         let _ = writeln!(log, "    ❌ FAIL: {reason}");
         return false;
@@ -3000,7 +3000,7 @@ fn preserve_case_failure_snapshot(
     log: &mut String,
 ) {
     let result = ctx.failure_artifacts.persist_case_failure(
-        ctx.server_handle.as_ref(),
+        ctx.cluster_owner.as_ref(),
         &ctx.suite_name,
         case_id,
         step_number,
@@ -3021,7 +3021,7 @@ fn preserve_case_failure_snapshot(
 
 fn preserve_suite_failure_snapshot(ctx: &SuiteRunContext, phase: &str, stdout_lock: &Mutex<()>) {
     let result = ctx.failure_artifacts.persist_suite_failure(
-        ctx.server_handle.as_ref(),
+        ctx.cluster_owner.as_ref(),
         &ctx.suite_name,
         phase,
     );
@@ -3120,7 +3120,7 @@ fn retire_unissued_case_role_launches(
         }
         for (role, reference) in launches {
             let mut server = ctx
-                .server_handle
+                .cluster_owner
                 .lock()
                 .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
             if server.retire_unissued_role_launch_if_reserved(*role, reference)? {
@@ -3625,11 +3625,11 @@ fn run_case_observed(
         let be_log_deadline =
             be_log_directive::step_evidence_deadline(&step.meta).map(|end| end.min(step_deadline));
         let resource_baseline = if fault_injection::has_fault(&step.meta) {
-            match ctx.server_handle.lock() {
-                Ok(mut server_handle)
-                    if server_handle.supports_query_execution_resource_oracle() =>
+            match ctx.cluster_owner.lock() {
+                Ok(mut cluster_owner)
+                    if cluster_owner.supports_query_execution_resource_oracle() =>
                 {
-                    match server_handle.query_execution_resource_snapshot() {
+                    match cluster_owner.query_execution_resource_snapshot() {
                         Ok(Some(snapshot)) => Some(snapshot),
                         Ok(None) => {
                             case_failed = true;
@@ -3678,25 +3678,25 @@ fn run_case_observed(
         let mut structured_lifecycle_observation: Option<LifecycleStatementObservationGuard> = None;
         let query_lifecycle_fault_guard = fault_injection::query_lifecycle_fault_step_guard(
             &step.meta,
-            Arc::clone(&ctx.server_handle),
+            Arc::clone(&ctx.cluster_owner),
             step.query_number,
             fault_cleanup_errors.clone(),
         );
         let cleanup_fault_guard = fault_injection::cleanup_fault_step_guard(
             &step.meta,
-            Arc::clone(&ctx.server_handle),
+            Arc::clone(&ctx.cluster_owner),
             step.query_number,
             fault_cleanup_errors.clone(),
         );
         if fault_injection::has_fault(&step.meta) {
             let fault_result = ctx
-                .server_handle
+                .cluster_owner
                 .lock()
                 .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))
-                .and_then(|mut server_handle| {
+                .and_then(|mut cluster_owner| {
                     fault_injection::apply_pre_query_with_token(
                         &step.meta,
-                        server_handle.as_mut(),
+                        cluster_owner.as_mut(),
                         selected_control
                             .and_then(|control| control.submissions.first())
                             .map(|target| target.run_token.as_str()),
@@ -3819,10 +3819,10 @@ fn run_case_observed(
             None => None,
         };
 
-        let be_log_snapshot = match ctx.server_handle.lock() {
-            Ok(server_handle) => be_log_directive::snapshot_with_deadline(
+        let be_log_snapshot = match ctx.cluster_owner.lock() {
+            Ok(cluster_owner) => be_log_directive::snapshot_with_deadline(
                 &step.meta,
-                server_handle.as_ref(),
+                cluster_owner.as_ref(),
                 be_log_deadline,
                 Some(step_deadline),
             ),
@@ -4198,7 +4198,7 @@ fn run_case_observed(
                     } else {
                         let be_log_ok = run_be_log_directives_for_successful_step(
                             step,
-                            &ctx.server_handle,
+                            &ctx.cluster_owner,
                             &be_log_snapshot,
                             &mut log,
                         );
@@ -4610,7 +4610,7 @@ fn run_case_observed(
                     } else if matched_expected_error {
                         match run_be_log_directives_for_successful_step(
                             step,
-                            &ctx.server_handle,
+                            &ctx.cluster_owner,
                             &be_log_snapshot,
                             &mut log,
                         ) {
@@ -4748,7 +4748,7 @@ fn run_case_observed(
                         let be_log_ok = {
                             match run_be_log_directives_for_successful_step(
                                 step,
-                                &ctx.server_handle,
+                                &ctx.cluster_owner,
                                 &be_log_snapshot,
                                 &mut log,
                             ) {
@@ -4927,7 +4927,7 @@ fn run_case_observed(
                 step,
                 matched_expected_error,
                 &last_failure,
-                &ctx.server_handle,
+                &ctx.cluster_owner,
                 &be_log_snapshot,
                 &mut log,
             );
@@ -5032,7 +5032,7 @@ fn run_case_observed(
                 }
                 let be_log_result = run_be_log_directives_for_successful_step(
                     step,
-                    &ctx.server_handle,
+                    &ctx.cluster_owner,
                     &be_log_snapshot,
                     &mut log,
                 );
@@ -5092,11 +5092,11 @@ fn run_case_observed(
                 },
             );
             let resource_result = ctx
-                .server_handle
+                .cluster_owner
                 .lock()
                 .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))
-                .and_then(|mut server_handle| {
-                    server_handle
+                .and_then(|mut cluster_owner| {
+                    cluster_owner
                         .await_query_execution_resource_convergence(&baseline, convergence_deadline)
                 });
             match resource_result {
@@ -5715,7 +5715,7 @@ fn run_post_step_server_actions(
             };
             restart_frontend_after_step(
                 step,
-                &ctx.server_handle,
+                &ctx.cluster_owner,
                 session,
                 Some(&mut after_exit),
                 log,
@@ -5733,7 +5733,7 @@ fn run_post_step_server_actions(
             "frontend restart did not invoke its required after-exit hook"
         );
     } else {
-        restart_frontend_after_step(step, &ctx.server_handle, session, None, log)?;
+        restart_frontend_after_step(step, &ctx.cluster_owner, session, None, log)?;
     }
     resume_mv_management_after_step(step, session, log)
 }
@@ -5812,7 +5812,7 @@ fn resume_mv_management_after_step(
 
 fn restart_frontend_after_step(
     step: &SqlStep,
-    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    cluster_owner: &Arc<Mutex<Box<dyn TestClusterOwner>>>,
     session: &mut TrinoCaseSession,
     after_exit: Option<&mut dyn FnMut() -> Result<()>>,
     log: &mut String,
@@ -5821,7 +5821,7 @@ fn restart_frontend_after_step(
         if !step.meta.restart_fe_after_step {
             return Ok(());
         }
-        let mut server = server_handle
+        let mut server = cluster_owner
             .lock()
             .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
         if server.be_count() == 0 {
@@ -5856,7 +5856,7 @@ fn restart_frontend_after_step(
     if !level.is_some_and(|value| value.eq_ignore_ascii_case("wipe")) {
         bail!("@imv_accelerator_wipe_restart did not confirm Accelerator wipe");
     }
-    let mut server = server_handle
+    let mut server = cluster_owner
         .lock()
         .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
     if server.be_count() == 0 {
@@ -5879,7 +5879,7 @@ fn restart_frontend_after_step(
 fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
     const DIRECTIVES: &[&str] = &[
         "kill_fe_after_mv_known_committed_before_projector_cas",
-        "restart_be_after_establish_context_index",
+        "restart_be_after_establish_participation_index",
         "cancel_query_after_be_log_contains",
         "kill_fe_after_be_log_contains",
         "kill_be_after_be_log_contains",
@@ -5893,14 +5893,6 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "expect_runtime_filter_total_at_least",
         "kill_query_at_lifecycle_phase",
         "kill_be_at_lifecycle_phase",
-        "query_control_fragment_backend_limit",
-    ];
-    const LIFECYCLE_EVIDENCE_MARKERS: &[&str] = &[
-        "NOVAROCKS_QUERY_INIT_",
-        "NOVAROCKS_QUERY_CONTROL_",
-        "NOVAROCKS_QUERY_FRAGMENT_",
-        "NOVAROCKS_QUERY_LIFECYCLE_",
-        "NOVAROCKS_QUERY_TERMINAL_",
     ];
     sql.lines().any(|line| {
         let line = line.trim_start();
@@ -5908,9 +5900,10 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
             .iter()
             .any(|directive| line.starts_with(&format!("-- @{directive}=")))
             || (line.starts_with("-- @be_log")
-                && LIFECYCLE_EVIDENCE_MARKERS
-                    .iter()
-                    .any(|marker| line.contains(marker)))
+                && novarocks_failpoint::observation_marker::markers().iter().any(|marker| {
+                    matches!(marker.family, novarocks_failpoint::observation_marker::MarkerFamily::Task | novarocks_failpoint::observation_marker::MarkerFamily::Participation)
+                        && line.contains(marker.name)
+                }))
     })
 }
 
@@ -6118,19 +6111,19 @@ fn validate_publication_catalog_directives(
 }
 
 fn selected_meta_requires_lifecycle(meta: &QueryMeta) -> bool {
-    let lifecycle_marker = |marker: &str| {
-        [
-            "NOVAROCKS_QUERY_INIT_",
-            "NOVAROCKS_QUERY_CONTROL_",
-            "NOVAROCKS_QUERY_FRAGMENT_",
-            "NOVAROCKS_QUERY_LIFECYCLE_",
-            "NOVAROCKS_QUERY_TERMINAL_",
-        ]
-        .iter()
-        .any(|prefix| marker.contains(prefix))
+    let lifecycle_marker = |pattern: &str| {
+        crate::parser::parse_observation_marker(pattern).is_ok_and(|marker| {
+            matches!(
+                marker.family,
+                novarocks_failpoint::observation_marker::MarkerFamily::Task
+                    | novarocks_failpoint::observation_marker::MarkerFamily::Participation
+            )
+        })
     };
     meta.kill_fe_after_mv_known_committed_before_projector_cas
-        || meta.restart_be_after_establish_context_index.is_some()
+        || meta
+            .restart_be_after_establish_participation_index
+            .is_some()
         || meta.cancel_query_after_be_log_contains.is_some()
         || meta.kill_fe_after_be_log_contains.is_some()
         || meta.kill_be_after_be_log_contains.is_some()
@@ -6140,7 +6133,6 @@ fn selected_meta_requires_lifecycle(meta: &QueryMeta) -> bool {
         || meta.query_lifecycle_structured_assertion.is_some()
         || meta.kill_query_at_lifecycle_phase.is_some()
         || meta.kill_be_at_lifecycle_phase.is_some()
-        || meta.query_control_fragment_backend_limit.is_some()
         || meta
             .be_log_contains
             .iter()
@@ -6177,13 +6169,13 @@ pub fn run_correctness(build: build_information::BuildInformation) -> Result<()>
     Ok(())
 }
 
-fn shutdown_server_handle(
-    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+fn shutdown_cluster_owner(
+    cluster_owner: &Arc<Mutex<Box<dyn TestClusterOwner>>>,
     retain_runtime_artifacts: bool,
 ) -> (Result<()>, bool) {
     let mut errors = Vec::new();
     let mut writer_exit_observed = false;
-    match server_handle.lock() {
+    match cluster_owner.lock() {
         Ok(mut handle) => {
             if retain_runtime_artifacts {
                 handle.retain_runtime_artifacts();
@@ -6212,12 +6204,12 @@ fn shutdown_server_handle(
 
 #[cfg(test)]
 fn finish_run_with_server_cleanup(
-    server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
+    cluster_owner: Arc<Mutex<Box<dyn TestClusterOwner>>>,
     primary_result: Result<i32>,
     failure_artifacts: &FailureArtifactRecorder,
 ) -> Result<i32> {
     finish_run_with_server_cleanup_recorded(
-        server_handle,
+        cluster_owner,
         primary_result,
         failure_artifacts,
         None,
@@ -6227,7 +6219,7 @@ fn finish_run_with_server_cleanup(
 }
 
 fn finish_run_with_server_cleanup_recorded(
-    server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
+    cluster_owner: Arc<Mutex<Box<dyn TestClusterOwner>>>,
     primary_result: Result<i32>,
     failure_artifacts: &FailureArtifactRecorder,
     results: Option<&Arc<results_record::ResultsWriter>>,
@@ -6242,10 +6234,10 @@ fn finish_run_with_server_cleanup_recorded(
     let shutdown_failure_candidate = if primary_failed {
         Ok(None)
     } else {
-        failure_artifacts.stage_run_failure(server_handle.as_ref())
+        failure_artifacts.stage_run_failure(cluster_owner.as_ref())
     };
     let mut preserve_result = if primary_failed {
-        failure_artifacts.persist_run_failure(server_handle.as_ref())
+        failure_artifacts.persist_run_failure(cluster_owner.as_ref())
     } else {
         Ok(None)
     };
@@ -6256,7 +6248,7 @@ fn finish_run_with_server_cleanup_recorded(
     let retain_runtime_artifacts =
         primary_failed || preserve_result.is_err() || shutdown_failure_candidate.is_err();
     let (cleanup_result, writer_exit_observed) =
-        shutdown_server_handle(&server_handle, retain_runtime_artifacts);
+        shutdown_cluster_owner(&cluster_owner, retain_runtime_artifacts);
     let writer_exit_observed = writer_exit_observed && !external;
     if let Some(observed) = writer_exit {
         observed.store(writer_exit_observed, Ordering::Release);
@@ -6569,7 +6561,8 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
     let totals = Mutex::new((0usize, 0usize, 0usize));
     let mut suite_facts = BTreeMap::new();
     let namespace_catalogs = namespace_guard::CatalogFacts::default();
-    let mut publication_catalog_fixture: Option<publication_catalog::FixtureHandle> = None;
+    let mut publication_catalog_fixture: Option<publication_catalog::PublicationCatalogFixture> =
+        None;
     let mut hms_case_inputs = Vec::new();
     let hms_consumers_may_exist = AtomicBool::new(false);
     let fixture_primary_unwind = hms_case_input::capture_unwind(|| -> Result<i32> {
@@ -6666,7 +6659,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         }
         let publication_catalog_control = publication_catalog_fixture
             .as_ref()
-            .map(publication_catalog::FixtureHandle::control)
+            .map(publication_catalog::PublicationCatalogFixture::control)
             .transpose()?;
 
         // Validate: per-suite path overrides conflict with multi-suite
@@ -7195,7 +7188,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             },
         );
         hms_consumers_may_exist.store(true, Ordering::Release);
-        let server_handle = launch_server(
+        let cluster_owner = launch_server(
             launch_cluster_mode,
             launch_cluster_size,
             &base_dir,
@@ -7204,11 +7197,11 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             test_sessions,
             &fixture_budget,
         )?;
-        let launched_target_port = server_handle.target_port();
-        let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
-        let server_handle = Arc::new(Mutex::new(server_handle));
+        let launched_target_port = cluster_owner.target_port();
+        let launched_target_host = cluster_owner.target_host().map(ToOwned::to_owned);
+        let cluster_owner = Arc::new(Mutex::new(cluster_owner));
         let primary_result = (|| -> Result<i32> {
-            if let Some(evidence) = server_handle
+            if let Some(evidence) = cluster_owner
                 .lock()
                 .map_err(|_| anyhow::anyhow!("server handle mutex poisoned"))?
                 .actual_build_information_evidence()?
@@ -7390,7 +7383,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                         .rewrite_explain_contains_as_not_contains
                         .clone(),
                     fail_fast: cli.fail_fast,
-                    server_handle: Arc::clone(&server_handle),
+                    cluster_owner: Arc::clone(&cluster_owner),
                     failure_artifacts: Arc::clone(&failure_artifacts),
                     publication_catalog_control: publication_catalog_control.clone(),
                     publication_service_control: publication_service_control.clone(),
@@ -7570,7 +7563,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             Ok(0)
         })();
         let result = finish_run_with_server_cleanup_recorded(
-            server_handle,
+            cluster_owner,
             primary_result,
             failure_artifacts.as_ref(),
             Some(&results_writer),
@@ -7798,7 +7791,7 @@ fn publication_catalog_fixture_suite(suite: &str) -> bool {
 fn start_publication_catalog_fixture(
     runner_config: &mut RunnerConfig,
     selected_suites: &[String],
-) -> Result<Option<publication_catalog::FixtureHandle>> {
+) -> Result<Option<publication_catalog::PublicationCatalogFixture>> {
     if !selected_suites
         .iter()
         .any(|suite| publication_catalog_fixture_suite(suite.as_str()))
@@ -7819,7 +7812,7 @@ fn start_publication_catalog_fixture(
         .cloned()
         .filter(|uri| !uri.trim().is_empty())
         .context("lake publication acceptance requires iceberg_rest_uri")?;
-    let fixture = publication_catalog::FixtureHandle::start(downstream)?;
+    let fixture = publication_catalog::PublicationCatalogFixture::start(downstream)?;
     // This fault proxy overlays SQL/engine transport only. Provider subprocesses
     // keep the physical publication's environment and container-side Spark URI.
     project_fixture_value(runner_config, "iceberg_rest_uri", fixture.uri());
@@ -7922,7 +7915,7 @@ mod tests {
             Ok(())
         };
         assert!(
-            crate::cluster::ServerHandle::restart_fe_with_after_exit_hook(
+            crate::cluster::TestClusterOwner::restart_fe_with_after_exit_hook(
                 &mut server,
                 &mut after_exit,
             )
@@ -7933,8 +7926,10 @@ mod tests {
 
     #[test]
     fn actual_unconsumed_fault_finish_retains_restart_failure_and_releases_the_arm() {
-        let mut fixture =
-            super::publication_catalog::FixtureHandle::start("http://127.0.0.1:9".into()).unwrap();
+        let mut fixture = super::publication_catalog::PublicationCatalogFixture::start(
+            "http://127.0.0.1:9".into(),
+        )
+        .unwrap();
         let control = fixture.control().unwrap();
         let mut guard = Some(
             control
@@ -8258,18 +8253,17 @@ mod tests {
         assert!(sql_text_has_query_lifecycle_fault_directive(
             "-- @query_lifecycle_fault=runtime-filter-contribution-ack-drop,1\nSELECT 1;"
         ));
+        assert!(sql_text_has_query_lifecycle_fault_directive(&format!(
+            "-- @cancel_query_after_be_log_contains={}\nSELECT 1;",
+            novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED
+        )));
         assert!(sql_text_has_query_lifecycle_fault_directive(
-            "-- @cancel_query_after_be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED\nSELECT 1;"
+            "-- @restart_be_after_establish_participation_index=1\nSELECT 1;"
         ));
-        assert!(sql_text_has_query_lifecycle_fault_directive(
-            "-- @query_control_fragment_backend_limit=2\nSELECT 1;"
-        ));
-        assert!(sql_text_has_query_lifecycle_fault_directive(
-            "-- @restart_be_after_establish_context_index=1\nSELECT 1;"
-        ));
-        assert!(sql_text_has_query_lifecycle_fault_directive(
-            "-- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3\nSELECT 1;"
-        ));
+        assert!(sql_text_has_query_lifecycle_fault_directive(&format!(
+            "-- @be_log_be_count_at_least={},3\nSELECT 1;",
+            novarocks_failpoint::observation_marker::TASK_TERMINAL_RETAINED
+        )));
         for directive in [
             "expect_runtime_filter_available=available",
             "expect_runtime_filter_detail=completed-channel",
@@ -8299,7 +8293,7 @@ mod tests {
             failure_fact: None,
             failure_detail: None,
             failure_site: None,
-            worker_contexts_converged: false,
+            worker_participations_converged: false,
             runtime_filter: harness::RuntimeFilterTerminalRollup::Available {
                 participants: vec![harness::RuntimeFilterParticipantTerminalTelemetry {
                     participant: harness::RuntimeFilterTerminalParticipant {
@@ -8316,7 +8310,7 @@ mod tests {
                                 channel_binding_id: 1,
                                 channel_id: 2,
                                 consumer_binding_id: 3,
-                                fragment_instance_id: None,
+                                task_key: None,
                                 latest_delivered_logical_version: Some(1),
                                 latest_applied_logical_version: None,
                                 subscription_terminal:
@@ -8676,7 +8670,7 @@ mod tests {
 
     struct MissingBeLogEvidenceServer;
 
-    impl crate::cluster::ServerHandle for MissingBeLogEvidenceServer {
+    impl crate::cluster::TestClusterOwner for MissingBeLogEvidenceServer {
         fn target_host(&self) -> Option<&str> {
             Some("127.0.0.1")
         }
@@ -8705,7 +8699,7 @@ mod tests {
                 ..QueryMeta::default()
             },
         };
-        let server_handle: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+        let cluster_owner: Arc<Mutex<Box<dyn crate::cluster::TestClusterOwner>>> =
             Arc::new(Mutex::new(Box::new(MissingBeLogEvidenceServer)));
         let mut log = String::new();
 
@@ -8713,7 +8707,7 @@ mod tests {
             &step,
             true,
             "planned rejection",
-            &server_handle,
+            &cluster_owner,
             &crate::be_log_directive::BeLogSnapshot::default(),
             &mut log,
         );
@@ -8725,7 +8719,7 @@ mod tests {
 
     struct PresentBeLogEvidenceServer(MissingBeLogEvidenceServer);
 
-    impl crate::cluster::ServerHandle for PresentBeLogEvidenceServer {
+    impl crate::cluster::TestClusterOwner for PresentBeLogEvidenceServer {
         fn target_host(&self) -> Option<&str> {
             self.0.target_host()
         }
@@ -8754,7 +8748,7 @@ mod tests {
                 ..QueryMeta::default()
             },
         };
-        let server_handle: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+        let cluster_owner: Arc<Mutex<Box<dyn crate::cluster::TestClusterOwner>>> =
             Arc::new(Mutex::new(Box::new(PresentBeLogEvidenceServer(
                 MissingBeLogEvidenceServer,
             ))));
@@ -8764,7 +8758,7 @@ mod tests {
             &step,
             true,
             "[ProtocolDecodeError] planned rejection",
-            &server_handle,
+            &cluster_owner,
             &crate::be_log_directive::BeLogSnapshot::default(),
             &mut log,
         ));
@@ -9061,7 +9055,7 @@ mod tests {
     fn default_empty_process_diagnostics_do_not_prove_writer_exit() {
         // This owner uses the trait defaults for shutdown, residual IDs and
         // writer settlement; successful control alone grants no cleanup proof.
-        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+        let server: Arc<Mutex<Box<dyn crate::cluster::TestClusterOwner>>> =
             Arc::new(Mutex::new(Box::new(ArtifactCapableServer)));
         let root = tempfile::TempDir::new().unwrap();
         let artifacts = crate::failure_artifacts::FailureArtifactRecorder::new(
@@ -9103,7 +9097,7 @@ mod tests {
         shutdown_started: bool,
     }
 
-    impl crate::cluster::ServerHandle for WriterExitServer {
+    impl crate::cluster::TestClusterOwner for WriterExitServer {
         fn target_host(&self) -> Option<&str> {
             None
         }
@@ -9134,7 +9128,7 @@ mod tests {
             for shutdown_fails in [false, true] {
                 for external in [false, true] {
                     for residual in [false, true] {
-                        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+                        let server: Arc<Mutex<Box<dyn crate::cluster::TestClusterOwner>>> =
                             Arc::new(Mutex::new(Box::new(WriterExitServer {
                                 observed,
                                 shutdown_fails,
@@ -9200,7 +9194,7 @@ mod tests {
         shutdown_started: bool,
     }
 
-    impl crate::cluster::ServerHandle for CleanupFailureServer {
+    impl crate::cluster::TestClusterOwner for CleanupFailureServer {
         fn target_host(&self) -> Option<&str> {
             Some("127.0.0.1")
         }
@@ -9244,7 +9238,7 @@ mod tests {
 
     #[test]
     fn post_launch_cleanup_reports_primary_shutdown_and_residual_failures() {
-        let server: std::sync::Arc<std::sync::Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+        let server: std::sync::Arc<std::sync::Mutex<Box<dyn crate::cluster::TestClusterOwner>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Box::new(CleanupFailureServer {
                 shutdown_started: false,
             })));
@@ -9276,7 +9270,7 @@ mod tests {
 
     #[test]
     fn server_cleanup_failure_captures_a_terminal_snapshot() {
-        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+        let server: Arc<Mutex<Box<dyn crate::cluster::TestClusterOwner>>> =
             Arc::new(Mutex::new(Box::new(CleanupFailureServer {
                 shutdown_started: false,
             })));
@@ -9343,7 +9337,7 @@ mod tests {
 
     struct ArtifactCapableServer;
 
-    impl crate::cluster::ServerHandle for ArtifactCapableServer {
+    impl crate::cluster::TestClusterOwner for ArtifactCapableServer {
         fn target_host(&self) -> Option<&str> {
             Some("127.0.0.1")
         }
@@ -9378,7 +9372,7 @@ mod tests {
         fail_snapshot: bool,
     }
 
-    impl crate::cluster::ServerHandle for RetentionTrackingServer {
+    impl crate::cluster::TestClusterOwner for RetentionTrackingServer {
         fn target_host(&self) -> Option<&str> {
             None
         }
@@ -9395,7 +9389,7 @@ mod tests {
             if self.fail_snapshot {
                 anyhow::bail!("injected original snapshot failure");
             }
-            crate::cluster::ServerHandle::failure_log_sources(
+            crate::cluster::TestClusterOwner::failure_log_sources(
                 &ArtifactCapableServer,
                 max_backend_logs,
                 max_history_tail_bytes,
@@ -9416,7 +9410,7 @@ mod tests {
     fn failed_run_retains_original_diagnostics_before_server_cleanup() {
         let directory = tempfile::TempDir::new().unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
-        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+        let server: Arc<Mutex<Box<dyn crate::cluster::TestClusterOwner>>> =
             Arc::new(Mutex::new(Box::new(RetentionTrackingServer {
                 events: Arc::clone(&events),
                 fail_snapshot: false,
@@ -9439,7 +9433,7 @@ mod tests {
     fn successful_run_does_not_retain_original_diagnostics_during_cleanup() {
         let directory = tempfile::TempDir::new().unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
-        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+        let server: Arc<Mutex<Box<dyn crate::cluster::TestClusterOwner>>> =
             Arc::new(Mutex::new(Box::new(RetentionTrackingServer {
                 events: Arc::clone(&events),
                 fail_snapshot: false,
@@ -9464,7 +9458,7 @@ mod tests {
     fn failed_terminal_candidate_retains_original_diagnostics_before_cleanup() {
         let directory = tempfile::TempDir::new().unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
-        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+        let server: Arc<Mutex<Box<dyn crate::cluster::TestClusterOwner>>> =
             Arc::new(Mutex::new(Box::new(RetentionTrackingServer {
                 events: Arc::clone(&events),
                 fail_snapshot: true,
@@ -9538,7 +9532,7 @@ mod tests {
             target_session_sql: vec![],
             rewrite_explain_contains_as_not_contains: vec![],
             fail_fast: false,
-            server_handle: Arc::new(Mutex::new(Box::new(ArtifactCapableServer))),
+            cluster_owner: Arc::new(Mutex::new(Box::new(ArtifactCapableServer))),
             failure_artifacts: artifacts,
             publication_catalog_control: None,
             publication_service_control: None,
@@ -9645,7 +9639,7 @@ mod tests {
                 suites: vec!["analytic".to_string()],
             },
         );
-        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+        let server: Arc<Mutex<Box<dyn crate::cluster::TestClusterOwner>>> =
             Arc::new(Mutex::new(Box::new(ArtifactCapableServer)));
 
         assert_eq!(
@@ -9667,7 +9661,7 @@ mod tests {
                 suites: vec!["analytic".to_string()],
             },
         );
-        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+        let server: Arc<Mutex<Box<dyn crate::cluster::TestClusterOwner>>> =
             Arc::new(Mutex::new(Box::new(ArtifactCapableServer)));
 
         assert_eq!(
@@ -9701,7 +9695,7 @@ mod tests {
                 suites: vec!["analytic".to_string()],
             },
         );
-        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+        let server: Arc<Mutex<Box<dyn crate::cluster::TestClusterOwner>>> =
             Arc::new(Mutex::new(Box::new(ArtifactCapableServer)));
 
         context

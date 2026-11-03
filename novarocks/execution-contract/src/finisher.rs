@@ -22,7 +22,7 @@ use crate::{SettlementPermit, TaskIdentity, failure::FailureProjection};
 
 /// Implemented by the admission owner over its original prepaid work. These
 /// operations update work/exit metadata only; they never invoke a callback or
-/// treat cancellation or dropping a bound role as positive exit evidence.
+/// treat cancellation or dropping bound completion work as positive exit evidence.
 pub trait CompletionWorkCapability: Send {
     fn started(&mut self);
     fn completed(self: Box<Self>);
@@ -38,16 +38,16 @@ enum Phase {
     Started,
 }
 
-/// Non-cloneable authority attached to the original OnceRole. Its completion
+/// Non-cloneable authority attached to the original completion custody. Its completion
 /// requires the original call/deferred finish and capture disposal proofs.
-#[must_use = "The original finisher keeps work until its actual role exit"]
+#[must_use = "The original finisher keeps work until its actual work exit"]
 pub struct CompletionWork {
     identity: Option<TaskIdentity>,
     phase: Phase,
     capability: Option<Box<dyn CompletionWorkCapability>>,
 }
 impl CompletionWork {
-    pub fn from_admitted_role(
+    pub fn from_admitted_work(
         identity: Option<TaskIdentity>,
         capability: Box<dyn CompletionWorkCapability>,
     ) -> Self {
@@ -78,7 +78,7 @@ impl CompletionWork {
         assert_ne!(
             self.phase,
             Phase::Unbound,
-            "unbound role exits through its holder"
+            "unbound completion work exits through its holder"
         );
         self.capability
             .take()
@@ -98,13 +98,13 @@ impl Drop for CompletionWork {
 }
 
 /// Issued before constructing/adopting a dormant fragment. Moving this pair
-/// gives Execution one finisher work role and one settlement registration.
+/// gives Execution one finisher work obligation and one settlement registration.
 pub struct AdmittedFinisher<C>
 where
     C: std::error::Error + FailureProjection + Send + Sync + 'static,
 {
     // Declaration order matters for an unused holder: revoke the unique
-    // child registration before reporting the never-bound original role exit.
+    // child registration before reporting the never-bound original work exit.
     settlement: SettlementPermit<C>,
     work: CompletionWork,
 }
@@ -113,8 +113,8 @@ where
     C: std::error::Error + FailureProjection + Send + Sync + 'static,
 {
     /// The issuer has already admitted both responsibilities in their common
-    /// scope. The work capability belongs to the permit's exact role identity.
-    pub fn from_admitted_role(
+    /// scope. The work capability belongs to the permit's exact Task identity.
+    pub fn from_admitted_parts(
         settlement: SettlementPermit<C>,
         work: Box<dyn CompletionWorkCapability>,
     ) -> Self {
@@ -136,10 +136,10 @@ where
     }
 }
 
-/// The three original, named completion roles of one admitted fragment. The
+/// The three original, named completion work obligations for one admitted Task. The
 /// settlement child belongs only to its resource finisher. Wall time and the
 /// terminal publisher cannot manufacture or duplicate that registration.
-pub struct AdmittedFragmentRoles<C>
+pub struct AdmittedWorkParts<C>
 where
     C: std::error::Error + FailureProjection + Send + Sync + 'static,
 {
@@ -147,11 +147,11 @@ where
     wall_time: CompletionWork,
     terminal_publisher: CompletionWork,
 }
-impl<C> AdmittedFragmentRoles<C>
+impl<C> AdmittedWorkParts<C>
 where
     C: std::error::Error + FailureProjection + Send + Sync + 'static,
 {
-    pub fn from_admitted_roles(
+    pub fn from_admitted_parts(
         finisher: AdmittedFinisher<C>,
         wall_time: Box<dyn CompletionWorkCapability>,
         terminal_publisher: Box<dyn CompletionWorkCapability>,
@@ -159,8 +159,8 @@ where
         let identity = finisher.identity();
         Self {
             finisher,
-            wall_time: CompletionWork::from_admitted_role(identity, wall_time),
-            terminal_publisher: CompletionWork::from_admitted_role(identity, terminal_publisher),
+            wall_time: CompletionWork::from_admitted_work(identity, wall_time),
+            terminal_publisher: CompletionWork::from_admitted_work(identity, terminal_publisher),
         }
     }
     pub const fn identity(&self) -> Option<TaskIdentity> {
@@ -257,8 +257,9 @@ mod tests {
     #[test]
     fn an_unused_admitted_holder_revokes_child_authority_before_original_role_exit() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let child = SettlementPermit::from_admitted_local_role(Box::new(Child(events.clone())));
-        let finisher = AdmittedFinisher::from_admitted_role(child, Box::new(Work(events.clone())));
+        let child =
+            SettlementPermit::from_admitted_local_reservation(Box::new(Child(events.clone())));
+        let finisher = AdmittedFinisher::from_admitted_parts(child, Box::new(Work(events.clone())));
         assert!(finisher.identity().is_none());
         drop(finisher);
         assert_eq!(*events.lock().unwrap(), ["child_revoked", "unused_exited"]);

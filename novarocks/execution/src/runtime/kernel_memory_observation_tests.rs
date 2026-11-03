@@ -36,7 +36,7 @@ fn authority(bytes: u64) -> novarocks_memory::MemoryAuthority {
     config.top_up = novarocks_memory::TopUpPolicy::uniform(1024);
     novarocks_memory::MemoryAuthority::new(config).unwrap()
 }
-fn work(authority: &novarocks_memory::MemoryAuthority) -> novarocks_memory::AccountHandle {
+fn work(authority: &novarocks_memory::MemoryAuthority) -> novarocks_memory::Account {
     authority
         .create_account(
             novarocks_memory::AccountKind::Work,
@@ -205,13 +205,13 @@ struct SettlementObservation {
     stopped: Option<Result<(), novarocks_memory::TeardownError>>,
 }
 struct SettleOnDrop<'a> {
-    lease: Option<novarocks_memory::ScopeLease>,
+    funding: Option<novarocks_memory::FundingScope>,
     domain: &'a novarocks_memory::FundingDomain,
     journal: &'a mut SettlementObservation,
 }
 impl Drop for SettleOnDrop<'_> {
     fn drop(&mut self) {
-        if let Some(lease) = self.lease.take() {
+        if let Some(lease) = self.funding.take() {
             self.journal.receipt = Some(lease.finish());
             self.journal.stopped = Some(self.domain.stop_producing());
         }
@@ -232,7 +232,7 @@ fn observed_ready_unwind_settles_after_restore_without_replaying_body() {
     let calls = Cell::new(0);
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _settler = SettleOnDrop {
-            lease: Some(lease),
+            funding: Some(lease),
             domain: &domain,
             journal: &mut settlement,
         };
@@ -266,7 +266,7 @@ fn observed_ready_body_error_and_real_closed_settlement_remain_distinct() {
     let mut settlement = SettlementObservation::default();
     let result = {
         let _settler = SettleOnDrop {
-            lease: Some(lease),
+            funding: Some(lease),
             domain: &domain,
             journal: &mut settlement,
         };

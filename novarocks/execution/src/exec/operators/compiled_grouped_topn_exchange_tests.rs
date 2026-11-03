@@ -28,11 +28,11 @@ use super::super::aggregate_fixture::{
 };
 use super::*;
 use crate::exec::chunk::ChunkSchema;
-use crate::exec::operators::{ResultSinkHandle, partition_chunk_by_hash_arrays};
+use crate::exec::operators::{ResultSinkBuffer, partition_chunk_by_hash_arrays};
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::builder::build_compiled_pipeline_graph;
 use crate::exec::pipeline::dependency::DependencyManager;
-use crate::runtime::fragment::io::exchange::test_support::Fixture;
+use crate::runtime::task::io::exchange::test_support::Fixture;
 use novarocks_physical_plan::{Distribution, EdgeId, Fragment, PhysicalPlan, ValueId};
 use novarocks_types::UniqueId;
 
@@ -375,7 +375,7 @@ fn geometry(program: &Arc<LocalProgram>, bindings: ExchangeBindings, partial_dop
         program,
         bindings,
         ScanBindings::default(),
-        crate::runtime::fragment::CompiledWriterBindings::default(),
+        crate::runtime::task::CompiledWriterBindings::default(),
         None,
         DependencyManager::new(),
         2,
@@ -521,7 +521,7 @@ fn execute(staged: bool, limit: usize) -> Vec<Output> {
         tracker.clone(),
     )
     .unwrap();
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     for (ordinal, (instance, binding)) in instances.iter().zip(bindings).enumerate() {
         let sink = if staged {
             stream_sink(

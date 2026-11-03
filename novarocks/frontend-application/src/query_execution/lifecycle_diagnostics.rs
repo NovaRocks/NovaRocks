@@ -31,7 +31,7 @@ pub(crate) struct QueryLifecycleConvergenceSnapshot {
     /// Original attempt terminal input, not a second logical failure acceptor.
     pub(crate) failure: Option<novarocks_query_application::execution_error::ExecutionFailureInput>,
     /// Set only after the original Native convergence future returned proof.
-    pub(crate) worker_contexts_converged: bool,
+    pub(crate) worker_participations_converged: bool,
     /// Runtime Filter terminal facts are normalized only from a complete set
     /// of participant contributions. The unavailable variant records why no
     /// such set existed for this attempt.
@@ -173,7 +173,7 @@ mod tests {
                 execution_id,
                 primary_error: None,
                 failure: None,
-                worker_contexts_converged: false,
+                worker_participations_converged: false,
                 runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
                     RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
                 ),

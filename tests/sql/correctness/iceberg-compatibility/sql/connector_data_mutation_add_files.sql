@@ -63,18 +63,30 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 2
 -- @skip_result_check=true
--- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
+-- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
+-- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
+-- Prove the write markers before asserting ADD FILES stays frontend-only.
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.add_files_write_control_${uuid0}
+  (id BIGINT) TBLPROPERTIES ("format-version" = "2");
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.add_files_write_control_${uuid0}
+  VALUES (1);
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.add_files_write_control_${uuid0} FORCE;
+
+-- query 3
+-- @skip_result_check=true
+-- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_${uuid0}
   ADD FILES FROM '${iceberg_test_warehouse}/c2-add-files-${uuid0}';
 
--- query 3
+-- query 4
 SELECT new_id, new_note
 FROM iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_${uuid0}
 ORDER BY new_id;
 
--- query 4
+-- query 5
 -- A second statement reaches the refreshed target base and is rejected by the
 -- RegisteredFilesNotLive dependency against the exact target-ref live set;
 -- no frontend source-scope ledger is a correctness authority.
@@ -82,36 +94,36 @@ ORDER BY new_id;
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_${uuid0}
   ADD FILES FROM '${iceberg_test_warehouse}/c2-add-files-${uuid0}';
 
--- query 5
+-- query 6
 -- @skip_result_check=true
 CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_partitioned_${uuid0}
   (id BIGINT) PARTITION BY (id)
   TBLPROPERTIES ("format-version" = "2");
 
--- query 6
+-- query 7
 -- @expect_error=unpartitioned
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_partitioned_${uuid0}
   ADD FILES FROM '${iceberg_test_warehouse}/c2-add-files-${uuid0}';
 
--- query 7
+-- query 8
 -- @skip_result_check=true
 CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_no_mapping_${uuid0}
   (new_id BIGINT, new_note VARCHAR)
   TBLPROPERTIES ("format-version" = "2");
 
--- query 8
+-- query 9
 -- @expect_error=schema.name-mapping.default
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_no_mapping_${uuid0}
   ADD FILES FROM '${iceberg_test_warehouse}/c2-add-files-no-mapping-${uuid0}';
 
--- query 9
+-- query 10
 -- @skip_result_check=true
 DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_${uuid0} FORCE;
 
--- query 10
+-- query 11
 -- @skip_result_check=true
 DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_partitioned_${uuid0} FORCE;
 
--- query 11
+-- query 12
 -- @skip_result_check=true
 DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_no_mapping_${uuid0} FORCE;

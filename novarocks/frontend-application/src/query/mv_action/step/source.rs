@@ -43,16 +43,16 @@ use crate::query_execution::{
         },
         refresh_preparation::{
             async_original::{MvRefreshPreparationOriginal, MvRefreshPreparationOutput},
-            driver::{MvRefreshTurnCustody, MvTurnFailure},
             io_gate::{MvRefreshPreparationIo, MvRefreshPreparationServices},
             pure_reader::MvRefreshPreparationInput,
+            turn_custody::{MvRefreshTurnCustody, MvTurnFailure},
         },
     },
     mv_native_write::PreparedMvNativeWriteAssembly,
     write_session::{ConnectorWriteSession, WriteBeginReceiving},
 };
 use novarocks_mv_application::{
-    activity::{MvActivityAdmissionError, MvActivityLease},
+    activity::{MvActivityAdmissionError, MvActivityPermit},
     management::EffectDisposition,
     product::{MvRefreshAttemptIdentity, MvTarget as ProductMvTarget},
     publication::{MvRefreshPublicationFinalizationFacts, MvRefreshPublicationIntent},
@@ -65,8 +65,8 @@ use novarocks_query_application::{
 };
 use novarocks_spi::connector::write_stack::ConnectorWriteNeededReady;
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorOriginalResultScope,
-    ConnectorRequestContext, ConnectorWriteLease, ExternalMutationEffect, ExternalMutationOutcome,
+    ConnectorControlPlanningPin, ConnectorError, ConnectorOriginalResultScope,
+    ConnectorRequestContext, ConnectorWrite, ExternalMutationEffect, ExternalMutationOutcome,
 };
 use novarocks_state_store_api::StateStoreExecutionRequests;
 use novarocks_workload_control::WorkScope;
@@ -128,7 +128,7 @@ struct Body {
     preparation: MvRefreshTurnCustody,
     preparation_input: Arc<MvRefreshPreparationInput>,
     preparation_started: bool,
-    activity: Option<Result<MvActivityLease, MvActivityAdmissionError>>,
+    activity: Option<Result<MvActivityPermit, MvActivityAdmissionError>>,
     activation_started: bool,
     preparation_result: Option<Result<MvRefreshPreparationOutput, MvApplicationError>>,
     precommit: Option<MvRefreshTurnCustody>,
@@ -136,8 +136,8 @@ struct Body {
     kind: Option<StepPreparedKind>,
     target: Option<MvTargetBinding>,
     product_target: Option<ProductMvTarget>,
-    planning: Option<ConnectorControlPlanningLease>,
-    exact_write: Option<ConnectorWriteLease>,
+    planning: Option<ConnectorControlPlanningPin>,
+    exact_write: Option<ConnectorWrite>,
     data: Option<PreparedMvRefreshWrite>,
     metadata: Option<PreparedMvMetadataOnlyWrite>,
     admitted: Option<Arc<AdmittedMvDataPublication>>,
@@ -828,7 +828,7 @@ impl Body {
             .target_binding
             .as_ref()
             .ok_or_else(|| phase_service("MV preparation has no exact retained target"))?;
-        let planning = target.lease().clone();
+        let planning = target.planning_pin().clone();
         let binding = planning.binding();
         if prepared.prepared.observed_binding
             != (novarocks_spi::connector::ConnectorProviderBindingKey {
@@ -872,7 +872,7 @@ impl Body {
         let planning = self
             .planning
             .as_ref()
-            .ok_or_else(|| phase_service("MV activation has no retained planning lease"))?;
+            .ok_or_else(|| phase_service("MV activation has no retained planning pin"))?;
         let exact = self
             .exact_write
             .as_ref()

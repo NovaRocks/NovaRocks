@@ -1186,8 +1186,8 @@ fn class_chunk_retirement_and_last_escaped_buffer_keep_separate_old_and_new_crea
 // HLL states are created by the original sketch implementation. K treats their
 // serialized bytes as nominal opaque values; it does not parse or recode them.
 fn nominal_hll_values() -> (Vec<u8>, Vec<u8>) {
-    use novarocks_functions::datasketches_hll::{HllHandle, HllTargetType};
-    let mut sketch = HllHandle::new_unreserved(12, HllTargetType::Hll8).unwrap();
+    use novarocks_functions::datasketches_hll::{HllAccumulator, HllTargetType};
+    let mut sketch = HllAccumulator::new_unreserved(12, HllTargetType::Hll8).unwrap();
     sketch.update_hash_unreserved(17).unwrap();
     let first = sketch.serialize().unwrap();
     sketch.update_hash_unreserved(19).unwrap();
@@ -1524,7 +1524,7 @@ fn nominal_raw_bytes_follow_the_real_bulk_hash_graph_without_reframing() {
             host: Arc::clone(&host),
             control: &CopyControl,
         };
-        let graph = BulkTaskGraph::begin(
+        let graph = BulkBuildGraph::begin(
             complete,
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(1).unwrap(),
@@ -1536,7 +1536,7 @@ fn nominal_raw_bytes_follow_the_real_bulk_hash_graph_without_reframing() {
             // A retained route cursor can wait for frontier space. Continue
             // claiming eager merge work before advancing each retained task
             // once; do not try to finish one route before claiming its merge.
-            while let BulkClaim::Task(task) = graph.claim(&ports).unwrap() {
+            while let BulkClaim::Step(task) = graph.claim(&ports).unwrap() {
                 pending.push(task);
             }
             if pending.is_empty() {

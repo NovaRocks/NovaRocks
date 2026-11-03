@@ -573,7 +573,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::commit::NOVAROCKS_UPDATE_MODE_MOR;
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
 
     fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
         let runtime = test_runtime().handle().clone();
@@ -581,7 +581,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
         )
     }
 

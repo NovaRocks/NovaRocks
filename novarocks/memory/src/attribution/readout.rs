@@ -176,11 +176,11 @@ impl AttributionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lane::{ResponsibilityClass, StoreHandle, UNATTRIBUTED_RECORDS};
+    use crate::lane::{RecordStorePin, ResponsibilityClass, UNATTRIBUTED_RECORDS};
     use crate::sync::Ordering;
     #[test]
     fn classified_facts_blind_spot_and_reconciliation_are_sampled_separately() {
-        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 8);
+        let store = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 8);
         let query = store
             .acquire(
                 1,
@@ -266,7 +266,7 @@ mod tests {
     }
     #[test]
     fn signed_samples_faults_and_pin_estimates_do_not_claim_settlement() {
-        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let store = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
         let query = store
             .acquire(
                 1,
@@ -298,7 +298,7 @@ mod tests {
     }
     #[test]
     fn reclaimed_generation_is_not_observed_as_the_previous_record() {
-        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let store = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
         let first = store
             .acquire(
                 1,
@@ -328,7 +328,7 @@ mod tests {
     fn region_composition_includes_small_only_facts_and_zero_byte_strong_owners() {
         use crate::lane::{RecordRegion, SlotCore};
 
-        let store = StoreHandle::owned(UNATTRIBUTED_RECORDS + 16);
+        let store = RecordStorePin::owned(UNATTRIBUTED_RECORDS + 16);
         let active_funding = store
             .acquire(1, ResponsibilityClass::Query, RecordRegion::Funding)
             .unwrap();
@@ -444,7 +444,7 @@ mod tests {
     fn a_real_zero_balance_slot_pin_retains_its_region_until_flush() {
         use crate::lane::SlotCore;
 
-        let store = StoreHandle::owned(UNATTRIBUTED_RECORDS + 4);
+        let store = RecordStorePin::owned(UNATTRIBUTED_RECORDS + 4);
         for region in RecordRegion::ALL {
             let owner = store
                 .acquire(9, ResponsibilityClass::Query, region)

@@ -118,7 +118,7 @@ fn pinned_file_set_query_table_binding(
     binding: SqlTableBindingId,
     read: QueryPinnedFileSetRead,
 ) -> Result<QueryTableBinding, String> {
-    let planning_lease = read.planning_lease.clone();
+    let planning_pin = read.planning_pin.clone();
     Ok(QueryTableBinding {
         resolved: pinned_file_set_resolved_analyzer_table(
             &identity,
@@ -126,7 +126,7 @@ fn pinned_file_set_query_table_binding(
             binding,
         ),
         statistics_pin: None,
-        admission: QueryTableBindingAdmission::FrozenRead(planning_lease),
+        admission: QueryTableBindingAdmission::FrozenRead(planning_pin),
         source_metadata: None,
         scan_materialization: None,
         mv_target_read: None,

@@ -52,8 +52,8 @@ use crate::exec::pipeline::{
     shape::{Transform, TransformKernel},
     step::{NextStep, StepResult},
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
 
 #[cfg(test)]
 pub(super) use crate::runtime::kernel_memory as runtime_kernel_memory;
@@ -181,7 +181,7 @@ impl RuntimeKernelControl {
     pub(crate) fn project_required_failure(&self, failure: ExecutionFailure) -> ExecutionFailure {
         if matches!(
             failure.cause(),
-            crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
+            crate::runtime::task::ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
         ) && let Some(original) = self.observed_stop.get()
         {
             return original.clone();
@@ -550,7 +550,7 @@ impl CompiledProjectProcessorFactory {
         let mut sites = Vec::with_capacity(exprs.len());
         for ordinal in 0..exprs.len() {
             let expression = novarocks_local_program::checked_program_ordinal(ordinal)
-                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
+                .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
             sites.push(root(
                 node,
                 ProgramNodeExpressionRole::ProjectOutput { expression },
@@ -681,10 +681,9 @@ pub(crate) fn project_chunk_with_source_observer(
         instance.observe_slot_source(Arc::clone(&observer));
     }
     let control = RuntimeErrorState::default();
-    let mut turn =
-        crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut turn = crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = crate::exec::pipeline::step_context::StepContext::new(
+    let mut ctx = crate::exec::pipeline::driver_step::DriverStep::new(
         &control,
         &mut turn,
         &mut value_conversions,
@@ -777,7 +776,7 @@ impl InputEncodingPolicy for CompiledProjectProcessor {
 impl TransformKernel for CompiledProjectProcessor {
     fn end_input(
         &mut self,
-        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
     ) -> ExecutionResult<crate::exec::pipeline::shape::TransformInputEnd> {
         // Every accepted input has already emitted its sole result. This
         // computing boundary owns no EOS payload or further materialization.
@@ -786,7 +785,7 @@ impl TransformKernel for CompiledProjectProcessor {
 
     fn apply(
         &mut self,
-        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         chunk: crate::exec::pipeline::input::PreparedInput,
     ) -> ExecutionResult<StepResult> {
         let chunk = chunk.into_uncovered_chunk()?;
@@ -1034,7 +1033,7 @@ impl novarocks_failure_contract::FailureProjection for CompiledFilterArrowFailur
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::FilterArrow.reason(),
+            crate::runtime::task::ExecutionReason::FilterArrow.reason(),
         )
     }
 }
@@ -1060,7 +1059,7 @@ impl crate::exec::pipeline::operator::InputEncodingPolicy for CompiledFilterProc
 impl crate::exec::pipeline::shape::TransformKernel for CompiledFilterProcessor {
     fn end_input(
         &mut self,
-        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
     ) -> ExecutionResult<crate::exec::pipeline::shape::TransformInputEnd> {
         // Every accepted input has already emitted its sole result. This
         // computing boundary owns no EOS payload or further materialization.
@@ -1069,7 +1068,7 @@ impl crate::exec::pipeline::shape::TransformKernel for CompiledFilterProcessor {
 
     fn apply(
         &mut self,
-        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         chunk: crate::exec::pipeline::input::PreparedInput,
     ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
         let chunk = chunk.into_uncovered_chunk()?;

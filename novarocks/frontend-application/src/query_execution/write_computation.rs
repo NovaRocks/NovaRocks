@@ -233,7 +233,7 @@ impl ConnectorWriteSession {
         .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?;
         Ok(WriteComputationDecode {
             origin: Arc::clone(&self.decode_origin),
-            decoder: self.lease.fragment_decoder(),
+            decoder: self.write_stack_pin.fragment_decoder(),
             query_targets: Arc::from(query_targets),
         })
     }

@@ -18,7 +18,7 @@
 //! Observe the real MV guard's provider boundary before any document lookup.
 //! A query's sink alone cannot consume a vended table response: its collection
 //! port must also carry this exact retained catalog's execution properties.
-use super::{IcebergMvUserMutation, reject_if_iceberg_mv_table_with_planning_lease_and_context};
+use super::{IcebergMvUserMutation, reject_if_iceberg_mv_table_with_planning_pin_and_context};
 use crate::catalog_application::resolver::TargetBackend;
 use novarocks_spi::connector::*;
 use std::sync::{Arc, Mutex};
@@ -122,14 +122,14 @@ impl ConnectorVendedCredentialLeaseSink for UnusedSink {
     }
 }
 
-fn fixture(with_properties: bool) -> (ConnectorControlPlanningLease, Arc<RecordingMetadata>) {
+fn fixture(with_properties: bool) -> (ConnectorControlPlanningPin, Arc<RecordingMetadata>) {
     refusal_fixture(with_properties, missing_table())
 }
 
 fn refusal_fixture(
     with_properties: bool,
     refusal: ConnectorError,
-) -> (ConnectorControlPlanningLease, Arc<RecordingMetadata>) {
+) -> (ConnectorControlPlanningPin, Arc<RecordingMetadata>) {
     let instance = ConnectorInstanceId::parse("guard_catalog").unwrap();
     let original =
         novarocks_catalog_application::test_support::test_control_binding_for(instance.clone(), 8);
@@ -153,7 +153,7 @@ fn refusal_fixture(
             .unwrap();
     }
     (
-        ConnectorControlPlanningLease::new(Arc::new(binding), || {}),
+        ConnectorControlPlanningPin::new(Arc::new(binding), || {}),
         metadata,
     )
 }
@@ -169,7 +169,7 @@ fn context(stop: &ConnectorStopOwner) -> ConnectorRequestContext {
 }
 
 fn invoke(
-    lease: &ConnectorControlPlanningLease,
+    lease: &ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     catalog: &str,
 ) -> String {
@@ -179,7 +179,7 @@ fn invoke(
         namespace: "db".into(),
         table: "table".into(),
     };
-    reject_if_iceberg_mv_table_with_planning_lease_and_context(
+    reject_if_iceberg_mv_table_with_planning_pin_and_context(
         &UnavailableMvStorageObservationPort,
         lease,
         super::super::test_admission::test_readiness().as_ref(),
@@ -398,7 +398,7 @@ async fn asynchronous_guard_provider_cause_survives_cleanup_product_and_service(
             let stop = ConnectorStopOwner::new();
             let readiness = super::super::test_admission::test_readiness();
             let error = if governed {
-                super::reject_if_iceberg_mv_table_with_governed_planning_lease_and_context_async(
+                super::reject_if_iceberg_mv_table_with_governed_planning_pin_and_context_async(
                     &UnavailableMvStorageObservationPort,
                     &lease,
                     &readiness,
@@ -410,7 +410,7 @@ async fn asynchronous_guard_provider_cause_survives_cleanup_product_and_service(
                 .await
                 .unwrap_err()
             } else {
-                super::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
+                super::reject_if_iceberg_mv_table_with_planning_pin_and_context_async(
                     &UnavailableMvStorageObservationPort,
                     &lease,
                     &readiness,
@@ -672,7 +672,7 @@ fn observed_guard_fixture() -> (ConnectorControlBinding, KeyedDocumentView) {
 fn guard_documents_lease(
     binding: ConnectorControlBinding,
     reply: Result<KeyedDocumentView, KeyedDocumentReadError>,
-) -> (ConnectorControlPlanningLease, Arc<GuardDocuments>) {
+) -> (ConnectorControlPlanningPin, Arc<GuardDocuments>) {
     let documents = Arc::new(GuardDocuments {
         descriptor: binding.descriptor().clone(),
         epoch: binding.incarnation(),
@@ -687,7 +687,7 @@ fn guard_documents_lease(
     )
     .unwrap();
     (
-        ConnectorControlPlanningLease::new(
+        ConnectorControlPlanningPin::new(
             Arc::new(binding.try_with_document_storage(Some(storage)).unwrap()),
             || {},
         ),
@@ -731,7 +731,7 @@ async fn unavailable_guard_readiness() -> (
 }
 async fn guard_with_observed_documents(
     asynchronous: bool,
-    lease: &ConnectorControlPlanningLease,
+    lease: &ConnectorControlPlanningPin,
     readiness: &crate::mv::domain::readiness::MvReadinessPort,
     mutation: IcebergMvUserMutation,
 ) -> Result<(), String> {
@@ -743,7 +743,7 @@ async fn guard_with_observed_documents(
     };
     let stop = ConnectorStopOwner::new();
     if asynchronous {
-        super::reject_if_iceberg_mv_table_with_governed_planning_lease_and_context_async(
+        super::reject_if_iceberg_mv_table_with_governed_planning_pin_and_context_async(
             &UnavailableMvStorageObservationPort,
             lease,
             readiness,
@@ -755,7 +755,7 @@ async fn guard_with_observed_documents(
         .await
         .map_err(|error| error.message().to_owned())
     } else {
-        reject_if_iceberg_mv_table_with_planning_lease_and_context(
+        reject_if_iceberg_mv_table_with_planning_pin_and_context(
             &UnavailableMvStorageObservationPort,
             lease,
             readiness,

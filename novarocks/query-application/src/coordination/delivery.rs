@@ -79,14 +79,14 @@ struct PendingPacket {
 /// protocol write completes or the statement fails.
 #[derive(Debug)]
 #[must_use = "a delivery permit must be completed or failed by its actor owner"]
-pub struct DeliveryPermit<P> {
+pub struct DeliveryObligation<P> {
     execution: QueryExecutionId,
     eligibility_generation: u64,
     packet: PendingPacket,
     packet_owner: ResultPacket<P>,
 }
 
-impl<P> DeliveryPermit<P> {
+impl<P> DeliveryObligation<P> {
     pub const fn execution(&self) -> QueryExecutionId {
         self.execution
     }
@@ -134,11 +134,11 @@ impl<P> DeliveryRejection<P> {
 #[derive(Debug)]
 pub struct DeliveryCompletionError<P> {
     error: DeliveryGateError,
-    permit: DeliveryPermit<P>,
+    permit: DeliveryObligation<P>,
 }
 
 impl<P> DeliveryCompletionError<P> {
-    pub(crate) const fn new(error: DeliveryGateError, permit: DeliveryPermit<P>) -> Self {
+    pub(crate) const fn new(error: DeliveryGateError, permit: DeliveryObligation<P>) -> Self {
         Self { error, permit }
     }
 
@@ -146,7 +146,7 @@ impl<P> DeliveryCompletionError<P> {
         self.error
     }
 
-    pub fn into_parts(self) -> (DeliveryGateError, DeliveryPermit<P>) {
+    pub fn into_parts(self) -> (DeliveryGateError, DeliveryObligation<P>) {
         (self.error, self.permit)
     }
 }
@@ -196,12 +196,12 @@ enum SchemaDeliveryState {
 
 #[derive(Debug)]
 #[must_use = "a schema permit must be completed or failed by its actor owner"]
-pub struct SchemaDeliveryPermit {
+pub struct SchemaDeliveryObligation {
     execution: QueryExecutionId,
     eligibility_generation: u64,
 }
 
-impl SchemaDeliveryPermit {
+impl SchemaDeliveryObligation {
     pub const fn execution(&self) -> QueryExecutionId {
         self.execution
     }
@@ -210,7 +210,7 @@ impl SchemaDeliveryPermit {
 #[derive(Debug)]
 pub enum BeginSchemaDelivery {
     AlreadyEmitted,
-    Permit(SchemaDeliveryPermit),
+    Obligation(SchemaDeliveryObligation),
 }
 
 #[derive(Debug)]
@@ -296,7 +296,7 @@ impl DeliveryGate {
                     execution,
                     eligibility_generation: self.eligibility_generation,
                 };
-                Ok(BeginSchemaDelivery::Permit(SchemaDeliveryPermit {
+                Ok(BeginSchemaDelivery::Obligation(SchemaDeliveryObligation {
                     execution,
                     eligibility_generation: self.eligibility_generation,
                 }))
@@ -309,7 +309,7 @@ impl DeliveryGate {
 
     pub(crate) fn complete_schema_delivery(
         &mut self,
-        permit: SchemaDeliveryPermit,
+        permit: SchemaDeliveryObligation,
     ) -> Result<(), DeliveryGateError> {
         self.require_schema_permit(&permit)?;
         self.schema = SchemaDeliveryState::Emitted;
@@ -318,7 +318,7 @@ impl DeliveryGate {
 
     pub(crate) fn fail_schema_delivery(
         &mut self,
-        permit: SchemaDeliveryPermit,
+        permit: SchemaDeliveryObligation,
     ) -> Result<(), DeliveryGateError> {
         self.require_schema_permit(&permit)?;
         self.schema = SchemaDeliveryState::Failed;
@@ -341,7 +341,7 @@ impl DeliveryGate {
         execution: QueryExecutionId,
         sequence: u64,
         packet_owner: ResultPacket<P>,
-    ) -> Result<DeliveryPermit<P>, DeliveryRejection<P>> {
+    ) -> Result<DeliveryObligation<P>, DeliveryRejection<P>> {
         if let Err(error) = self.require_current(execution) {
             return Err(DeliveryRejection {
                 error,
@@ -401,7 +401,7 @@ impl DeliveryGate {
             self.data_visible = true;
             self.phase = DeliveryPhase::Visible;
         }
-        Ok(DeliveryPermit {
+        Ok(DeliveryObligation {
             execution,
             eligibility_generation: self.eligibility_generation,
             packet,
@@ -411,7 +411,7 @@ impl DeliveryGate {
 
     pub(crate) fn complete_delivery<P>(
         &mut self,
-        permit: DeliveryPermit<P>,
+        permit: DeliveryObligation<P>,
     ) -> Result<CompletedDelivery<P>, DeliveryCompletionError<P>> {
         let error = match self.require_current(permit.execution) {
             Ok(()) if permit.eligibility_generation != self.eligibility_generation => {
@@ -444,7 +444,7 @@ impl DeliveryGate {
 
     pub(crate) fn fail_delivery<P>(
         &mut self,
-        permit: DeliveryPermit<P>,
+        permit: DeliveryObligation<P>,
     ) -> Result<ResultPacket<P>, DeliveryCompletionError<P>> {
         let error = match self.require_current(permit.execution) {
             Ok(()) if permit.eligibility_generation != self.eligibility_generation => {
@@ -523,7 +523,7 @@ impl DeliveryGate {
 
     fn require_schema_permit(
         &self,
-        permit: &SchemaDeliveryPermit,
+        permit: &SchemaDeliveryObligation,
     ) -> Result<(), DeliveryGateError> {
         match self.schema {
             SchemaDeliveryState::InFlight {
@@ -568,7 +568,8 @@ mod tests {
     }
 
     fn emit_schema(gate: &mut DeliveryGate, execution: QueryExecutionId) {
-        let BeginSchemaDelivery::Permit(permit) = gate.begin_schema_delivery(execution).unwrap()
+        let BeginSchemaDelivery::Obligation(permit) =
+            gate.begin_schema_delivery(execution).unwrap()
         else {
             panic!("schema must not already be emitted");
         };
@@ -637,7 +638,8 @@ mod tests {
     #[test]
     fn schema_is_committed_once_across_attempts() {
         let mut gate = DeliveryGate::new(execution(1));
-        let BeginSchemaDelivery::Permit(permit) = gate.begin_schema_delivery(execution(1)).unwrap()
+        let BeginSchemaDelivery::Obligation(permit) =
+            gate.begin_schema_delivery(execution(1)).unwrap()
         else {
             panic!("first schema write must receive a permit");
         };
@@ -664,7 +666,8 @@ mod tests {
     #[test]
     fn failed_schema_write_closes_recovery() {
         let mut gate = DeliveryGate::new(execution(1));
-        let BeginSchemaDelivery::Permit(permit) = gate.begin_schema_delivery(execution(1)).unwrap()
+        let BeginSchemaDelivery::Obligation(permit) =
+            gate.begin_schema_delivery(execution(1)).unwrap()
         else {
             panic!("first schema write must receive a permit");
         };

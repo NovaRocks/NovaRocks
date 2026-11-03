@@ -33,7 +33,7 @@
 #[cfg(test)]
 use crate::exec::pipeline::operator::OperatorLifecycle;
 #[cfg(test)]
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,7 +42,7 @@ use std::thread;
 use std::time::Instant;
 
 use crate::exec::pipeline::dependency::DependencyHandle;
-use crate::exec::pipeline::global_driver_executor::{DriverTask, ExecutorShared};
+use crate::exec::pipeline::global_driver_executor::{DriverRunner, ExecutorShared};
 use crate::exec::pipeline::operator::{BlockedReason, DriverBlockDeadline};
 use crate::exec::pipeline::schedule::observer::{Observable, PipelineObserver};
 use crate::runtime::dispatch_metrics::{
@@ -66,12 +66,12 @@ fn should_sample_log(counter: &AtomicU64) -> bool {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// Stable key that identifies a driver in event-scheduler maps and queues.
 pub(crate) struct DriverKey {
-    finst: Option<(i64, i64)>,
+    task_key: Option<(i64, i64)>,
     driver_id: i32,
 }
 
-struct BlockedTask {
-    task: DriverTask,
+struct BlockedDriver {
+    task: DriverRunner,
     observable: Option<(Weak<Observable>, u64)>,
     /// Terminal operator's early-finish observable and the generation sampled
     /// before the driver last checked whether it was finished. A newer
@@ -216,8 +216,11 @@ impl RescheduleState {
 }
 
 impl DriverKey {
-    pub(crate) fn new(finst: Option<(i64, i64)>, driver_id: i32) -> Self {
-        Self { finst, driver_id }
+    pub(crate) fn new(task_key: Option<(i64, i64)>, driver_id: i32) -> Self {
+        Self {
+            task_key,
+            driver_id,
+        }
     }
 }
 
@@ -395,7 +398,7 @@ impl EventDispatcherState {
             .collect()
     }
 
-    fn close_and_drain(&self) -> Vec<DriverTask> {
+    fn close_and_drain(&self) -> Vec<DriverRunner> {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return Vec::new();
         }
@@ -429,7 +432,7 @@ pub(crate) struct EventDispatcherCloser {
 impl EventDispatcherCloser {
     /// Closes the dispatcher, joins its thread and returns drivers that were
     /// still parked on it.
-    pub(crate) fn close_and_join(self) -> Vec<DriverTask> {
+    pub(crate) fn close_and_join(self) -> Vec<DriverRunner> {
         let tasks = self.state.close_and_drain();
         let _ = self.thread.join();
         tasks
@@ -479,7 +482,7 @@ impl EventDispatcher {
     }
 
     #[cfg(test)]
-    pub(crate) fn close_and_drain(&self) -> Vec<DriverTask> {
+    pub(crate) fn close_and_drain(&self) -> Vec<DriverRunner> {
         self.state.close_and_drain()
     }
 
@@ -594,7 +597,7 @@ impl Drop for ThreadExitGuard<'_> {
 pub(crate) struct EventScheduler {
     shared: OnceLock<Arc<ExecutorShared>>,
     dispatcher: OnceLock<DispatcherRegistration>,
-    blocked: Mutex<HashMap<DriverKey, BlockedTask>>,
+    blocked: Mutex<HashMap<DriverKey, BlockedDriver>>,
     reschedule_queue: Mutex<RescheduleState>,
     shutdown: AtomicBool,
     next_block_epoch: AtomicU64,
@@ -638,7 +641,7 @@ impl EventScheduler {
         let _ = self.shutdown_and_take_blocked();
     }
 
-    pub(crate) fn shutdown_and_take_blocked(&self) -> Vec<DriverTask> {
+    pub(crate) fn shutdown_and_take_blocked(&self) -> Vec<DriverRunner> {
         let mut blocked_guard = self.blocked.lock().expect("event scheduler blocked lock");
         let mut queue_guard = self
             .reschedule_queue
@@ -736,18 +739,18 @@ impl EventScheduler {
 
     pub(crate) fn add_blocked(
         self: &Arc<Self>,
-        task: DriverTask,
+        task: DriverRunner,
         reason: BlockedReason,
-    ) -> Result<(), Box<DriverTask>> {
+    ) -> Result<(), Box<DriverRunner>> {
         match reason {
             BlockedReason::InputEmpty | BlockedReason::OutputFull => {
                 let Some((observable, generation, deadline)) = task.blocked_observable_snapshot()
                 else {
                     if should_sample_log(&EVENT_SCHEDULER_MISSING_OBS_LOG_COUNT) {
                         debug!(
-                            "EventScheduler add_blocked: missing frozen observable; reason={:?} finst={:?} driver_id={}",
+                            "EventScheduler add_blocked: missing frozen observable; reason={:?} task_key={:?} driver_id={}",
                             reason,
-                            task.fragment_instance_id(),
+                            task.task_key(),
                             task.driver_id()
                         );
                     }
@@ -755,9 +758,9 @@ impl EventScheduler {
                 };
                 if should_sample_log(&EVENT_SCHEDULER_BLOCKED_ADD_LOG_COUNT) {
                     debug!(
-                        "EventScheduler add_blocked: reason={:?} finst={:?} driver_id={} generation={} observers_before={}",
+                        "EventScheduler add_blocked: reason={:?} task_key={:?} driver_id={} generation={} observers_before={}",
                         reason,
-                        task.fragment_instance_id(),
+                        task.task_key(),
                         task.driver_id(),
                         generation,
                         observable.num_observers()
@@ -787,7 +790,7 @@ impl EventScheduler {
     /// straight back to a worker to complete.
     pub(crate) fn add_pending_finish(
         self: &Arc<Self>,
-        slot: &mut Option<DriverTask>,
+        slot: &mut Option<DriverRunner>,
     ) -> Result<bool, crate::runtime::observable::ObservableCapacityError> {
         let task = slot.as_mut().expect("original pending-finish slot");
         let Some(wait) = task.refresh_pending_finish_wait()? else {
@@ -803,7 +806,7 @@ impl EventScheduler {
             shared.cv.notify_one();
             return Ok(true);
         };
-        let key = DriverKey::new(task.fragment_instance_id(), task.driver_id());
+        let key = DriverKey::new(task.task_key(), task.driver_id());
         let block_epoch = self
             .next_block_epoch
             .fetch_add(1, Ordering::AcqRel)
@@ -828,7 +831,7 @@ impl EventScheduler {
             let task = slot.take().expect("one blocked handoff");
             blocked.insert(
                 key,
-                BlockedTask {
+                BlockedDriver {
                     task,
                     observable: Some((Arc::downgrade(&wait.observable), wait.generation)),
                     terminal: terminal
@@ -883,12 +886,12 @@ impl EventScheduler {
 
     fn park_blocked(
         self: &Arc<Self>,
-        task: DriverTask,
+        task: DriverRunner,
         reason: BlockedReason,
         observable: Arc<Observable>,
         generation: u64,
         deadline: Option<DriverBlockDeadline>,
-    ) -> Result<(), Box<DriverTask>> {
+    ) -> Result<(), Box<DriverRunner>> {
         #[cfg(novarocks_dev_controls)]
         let test_observer = task.exchange_test_observer();
         #[cfg(novarocks_dev_controls)]
@@ -903,7 +906,7 @@ impl EventScheduler {
         let writer_diagnostic = task.writer_diagnostic();
         #[cfg(novarocks_dev_controls)]
         let mark_probe_dependency = task.mark_probe_dependency();
-        let key = DriverKey::new(task.fragment_instance_id(), task.driver_id());
+        let key = DriverKey::new(task.task_key(), task.driver_id());
         let block_epoch = self
             .next_block_epoch
             .fetch_add(1, Ordering::AcqRel)
@@ -922,7 +925,7 @@ impl EventScheduler {
             }
             blocked.insert(
                 key,
-                BlockedTask {
+                BlockedDriver {
                     task,
                     observable: Some((Arc::downgrade(&observable), generation)),
                     terminal: terminal
@@ -960,8 +963,8 @@ impl EventScheduler {
                 test_observer.as_deref(),
                 || {
                     format!(
-                        "event=driver_park finst={:?} driver_id={} reason={:?} frozen_generation={} current_generation={} block_epoch={} source_name={:?}",
-                        key.finst,
+                        "event=driver_park task_key={:?} driver_id={} reason={:?} frozen_generation={} current_generation={} block_epoch={} source_name={:?}",
+                        key.task_key,
                         key.driver_id,
                         reason,
                         generation,
@@ -978,8 +981,8 @@ impl EventScheduler {
         #[cfg(novarocks_dev_controls)]
         if let Some((scope, source, sink)) = writer_diagnostic {
             scope.emit("driver_park", || format!(
-                "finst={:?} driver_id={} source={source:?} sink={sink:?} reason={reason:?} mark_probe_dependency={mark_probe_dependency} frozen_generation={generation} current_generation={} block_epoch={block_epoch}",
-                key.finst, key.driver_id, observable.generation()
+                "task_key={:?} driver_id={} source={source:?} sink={sink:?} reason={reason:?} mark_probe_dependency={mark_probe_dependency} frozen_generation={generation} current_generation={} block_epoch={block_epoch}",
+                key.task_key, key.driver_id, observable.generation()
             ));
         }
 
@@ -1000,10 +1003,10 @@ impl EventScheduler {
 
     fn park_blocked_with_dependency(
         self: &Arc<Self>,
-        task: DriverTask,
+        task: DriverRunner,
         dep: DependencyHandle,
-    ) -> Result<(), Box<DriverTask>> {
-        let key = DriverKey::new(task.fragment_instance_id(), task.driver_id());
+    ) -> Result<(), Box<DriverRunner>> {
+        let key = DriverKey::new(task.task_key(), task.driver_id());
         let block_epoch = self
             .next_block_epoch
             .fetch_add(1, Ordering::AcqRel)
@@ -1019,7 +1022,7 @@ impl EventScheduler {
             }
             blocked.insert(
                 key,
-                BlockedTask {
+                BlockedDriver {
                     task,
                     observable: None,
                     terminal: terminal
@@ -1038,8 +1041,8 @@ impl EventScheduler {
         dep.add_waiter(Arc::new(move || {
             if dep_name.starts_with("nljoin_build:") {
                 debug!(
-                    "Dependency waiter fired: dep_id={} name={} finst={:?} driver_id={}",
-                    dep_id, dep_name, key.finst, key.driver_id
+                    "Dependency waiter fired: dep_id={} name={} task_key={:?} driver_id={}",
+                    dep_id, dep_name, key.task_key, key.driver_id
                 );
             }
             if let Some(scheduler) = scheduler.upgrade() {
@@ -1058,7 +1061,7 @@ impl EventScheduler {
     /// Registration is once per driver and observable identity.
     fn register_finish_observer(
         self: &Arc<Self>,
-        task: &DriverTask,
+        task: &DriverRunner,
         observable: Arc<Observable>,
     ) -> Result<(), crate::runtime::observable::ObservableCapacityError> {
         if !task.try_mark_finish_observer_registered(&observable) {
@@ -1067,9 +1070,9 @@ impl EventScheduler {
         let observer = Arc::new(PipelineObserver::new(
             Arc::downgrade(self),
             Arc::downgrade(&observable),
-            DriverKey::new(task.fragment_instance_id(), task.driver_id()),
+            DriverKey::new(task.task_key(), task.driver_id()),
             task.driver_id(),
-            task.fragment_instance_id(),
+            task.task_key(),
         ));
         self.try_add_observer(observable, observer, ObserverKind::Finish)
     }
@@ -1078,7 +1081,7 @@ impl EventScheduler {
     /// driver. Registration is once per driver and observable identity.
     fn register_terminal_observer(
         self: &Arc<Self>,
-        task: &DriverTask,
+        task: &DriverRunner,
         observable: Arc<Observable>,
     ) {
         if !task.try_mark_sink_observer_registered(&observable) {
@@ -1087,16 +1090,16 @@ impl EventScheduler {
         let observer = Arc::new(PipelineObserver::new(
             Arc::downgrade(self),
             Arc::downgrade(&observable),
-            DriverKey::new(task.fragment_instance_id(), task.driver_id()),
+            DriverKey::new(task.task_key(), task.driver_id()),
             task.driver_id(),
-            task.fragment_instance_id(),
+            task.task_key(),
         ));
         self.add_observer(observable, observer, ObserverKind::Sink);
     }
 
     fn register_observer(
         self: &Arc<Self>,
-        task: &DriverTask,
+        task: &DriverRunner,
         reason: &BlockedReason,
         observable: Arc<Observable>,
     ) {
@@ -1111,9 +1114,9 @@ impl EventScheduler {
         let observer = Arc::new(PipelineObserver::new(
             Arc::downgrade(self),
             Arc::downgrade(&observable),
-            DriverKey::new(task.fragment_instance_id(), task.driver_id()),
+            DriverKey::new(task.task_key(), task.driver_id()),
             task.driver_id(),
-            task.fragment_instance_id(),
+            task.task_key(),
         ));
         let kind = match reason {
             BlockedReason::InputEmpty => ObserverKind::Source,
@@ -1302,8 +1305,8 @@ impl EventScheduler {
                 Some(observer.as_ref()),
                 || {
                     format!(
-                        "event=driver_wake finst={:?} driver_id={} blocked_generation={} current_generation={} block_epoch={}",
-                        key.finst,
+                        "event=driver_wake task_key={:?} driver_id={} blocked_generation={} current_generation={} block_epoch={}",
+                        key.task_key,
                         key.driver_id,
                         blocked_generation,
                         current_generation,
@@ -1315,8 +1318,8 @@ impl EventScheduler {
         #[cfg(novarocks_dev_controls)]
         if let Some(((scope, source, sink), generations, epoch)) = writer_marker {
             scope.emit("driver_wake", || format!(
-                "finst={:?} driver_id={} source={source:?} sink={sink:?} generations={generations:?} block_epoch={epoch}",
-                key.finst, key.driver_id
+                "task_key={:?} driver_id={} source={source:?} sink={sink:?} generations={generations:?} block_epoch={epoch}",
+                key.task_key, key.driver_id
             ));
         }
         let Some((mut task, origin)) = task else {
@@ -1330,7 +1333,7 @@ impl EventScheduler {
         }
     }
 
-    fn enqueue_ready(&self, mut task: DriverTask) {
+    fn enqueue_ready(&self, mut task: DriverRunner) {
         let Some(shared) = self.shared.get() else {
             debug!("EventScheduler enqueue_ready: executor not attached");
             return;
@@ -1355,15 +1358,15 @@ mod tests {
 
     use crate::exec::chunk::Chunk;
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
-    use crate::exec::pipeline::fragment_context::FragmentContext;
-    use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
+    use crate::exec::pipeline::driver_step::DriverStep;
+    use crate::exec::pipeline::global_driver_executor::DriverGroupCompletion;
     use crate::exec::pipeline::input::{PreparedInput, RawInput};
     use crate::exec::pipeline::operator::{FinishWatch, InputEncodingPolicy, Operator};
     use crate::exec::pipeline::shape::{
         SinkKernel, SinkStep, Source, SourceKernel, Transform, TransformStart,
     };
     use crate::exec::pipeline::step::{AdmissionNext, NextStep, StepResult, WaitFact, WaitReason};
-    use crate::exec::pipeline::step_context::StepContext;
+    use crate::exec::pipeline::task_context::TaskContext;
     use crate::runtime::runtime_state::RuntimeState;
     use std::sync::atomic::AtomicUsize;
 
@@ -1387,7 +1390,7 @@ mod tests {
             }
         }
         impl SourceKernel for ExchangeSource {
-            fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
                 Ok(StepResult::new(
                     None,
                     NextStep::Wait(WaitFact {
@@ -1405,7 +1408,7 @@ mod tests {
         observable.notify_observers();
         let runtime =
             Arc::new(RuntimeState::default().with_exchange_test_observer(Some(events.clone())));
-        let finst = Some((67_900, 65_590));
+        let task_key = Some((67_900, 65_590));
         let mut driver = PipelineDriver::new(
             9,
             vec![
@@ -1418,7 +1421,7 @@ mod tests {
             None,
             Vec::new(),
             Arc::clone(&runtime),
-            finst,
+            task_key,
         );
         assert!(matches!(
             driver.process(Duration::from_millis(10)),
@@ -1445,10 +1448,10 @@ mod tests {
         let scheduler = Arc::new(EventScheduler::new());
         let executor = Arc::new(ExecutorShared::new());
         assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
-        let task = DriverTask::new(
+        let task = DriverRunner::new(
             driver,
-            FragmentCompletion::new(1, runtime.error_state()),
-            Arc::new(FragmentContext::new(None, runtime, finst, None, None, None)),
+            DriverGroupCompletion::new(1, runtime.error_state()),
+            Arc::new(TaskContext::new(None, runtime, task_key, None, None, None)),
             Duration::from_millis(10),
         );
         assert!(
@@ -1456,7 +1459,7 @@ mod tests {
                 .add_blocked(task, BlockedReason::InputEmpty)
                 .is_ok()
         );
-        let key = DriverKey::new(finst, 9);
+        let key = DriverKey::new(task_key, 9);
         let epoch = scheduler.blocked.lock().unwrap()[&key].block_epoch;
         let parked = events.0.lock().unwrap().clone();
         assert_eq!(parked.len(), 1);
@@ -1536,7 +1539,7 @@ mod tests {
     }
 
     // Native scheduling remains manually driven; neither a dispatcher thread nor
-    // the FragmentContext's explicit fanout participates in the wake oracle.
+    // the TaskContext's explicit fanout participates in the wake oracle.
     #[derive(Clone, Copy, Debug)]
     enum OwnerStopPark {
         Input,
@@ -1554,7 +1557,7 @@ mod tests {
         }
     }
     impl SourceKernel for OwnerStopSource {
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             Ok(StepResult::new(
                 None,
                 NextStep::Wait(WaitFact {
@@ -1593,7 +1596,7 @@ mod tests {
     impl SinkKernel for OwnerStopSink {
         fn consume(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: PreparedInput,
         ) -> ExecutionResult<SinkStep> {
             panic!("a stop-only wake fixture must not receive data")
@@ -1661,8 +1664,8 @@ mod tests {
             state.clone(),
             Some((91_082, 91_083)),
         );
-        let completion = FragmentCompletion::new(1, state.error_state());
-        let context = Arc::new(FragmentContext::new(
+        let completion = DriverGroupCompletion::new(1, state.error_state());
+        let context = Arc::new(TaskContext::new(
             None,
             state,
             Some((91_082, 91_083)),
@@ -1670,7 +1673,7 @@ mod tests {
             None,
             None,
         ));
-        let mut task = DriverTask::new(
+        let mut task = DriverRunner::new(
             driver,
             completion.clone(),
             context,
@@ -1688,7 +1691,7 @@ mod tests {
         let executor = Arc::new(ExecutorShared::new());
         assert!(scheduler.shared.set(executor.clone()).is_ok());
         let wakes = || scheduler.reschedule_queue.lock().unwrap().queue.len();
-        let park_task = |task: DriverTask| {
+        let park_task = |task: DriverRunner| {
             if let Some(reason) = blocked {
                 assert!(scheduler.add_blocked(task, reason).is_ok());
             } else {
@@ -1834,7 +1837,7 @@ mod tests {
     }
 
     impl SourceKernel for ControlledDynamicSource {
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             assert!(
                 !self.poll_forbidden.load(Ordering::Acquire),
                 "scheduler thread must not poll source readiness"
@@ -1880,7 +1883,7 @@ mod tests {
     }
 
     impl SourceKernel for DeadlineSource {
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             let generation = self.observable.generation();
             Ok(if self.ready.load(Ordering::Acquire) {
                 StepResult::new(Some(one_row_chunk()), NextStep::Runnable, 1)
@@ -1909,7 +1912,7 @@ mod tests {
     impl SinkKernel for ControlledTerminalSink {
         fn admission(
             &self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: &RawInput,
         ) -> ExecutionResult<Option<AdmissionNext>> {
             let generation = self.observable.generation();
@@ -1924,7 +1927,7 @@ mod tests {
         }
         fn consume(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             input: PreparedInput,
         ) -> ExecutionResult<SinkStep> {
             let chunk = input.into_uncovered_chunk()?;
@@ -1945,12 +1948,12 @@ mod tests {
         }
         fn consume(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: PreparedInput,
         ) -> ExecutionResult<SinkStep> {
             panic!("finish transition fixture owns no input edge")
         }
-        fn poll(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+        fn poll(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<SinkStep> {
             let generation = self.observable.generation();
             Ok(SinkStep::new(
                 if self.finished.load(Ordering::Acquire) {
@@ -1992,7 +1995,7 @@ mod tests {
         finished.store(true, Ordering::Release);
         observable.notify_observers();
 
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             runtime_state,
             Some((67_100, 65_538)),
@@ -2000,8 +2003,8 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, fragment_ctx.runtime_state().error_state());
-        let task = DriverTask::new(driver, completion, fragment_ctx, Duration::from_millis(10));
+        let completion = DriverGroupCompletion::new(1, task_ctx.runtime_state().error_state());
+        let task = DriverRunner::new(driver, completion, task_ctx, Duration::from_millis(10));
         let scheduler = Arc::new(EventScheduler::new());
         let executor = Arc::new(ExecutorShared::new());
         assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
@@ -2048,7 +2051,7 @@ mod tests {
         }
         fn poll_control(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::shape::ControlStep> {
             Ok(if self.finished.load(Ordering::Acquire) {
                 crate::exec::pipeline::shape::ControlStep::Withdrawn
@@ -2061,20 +2064,20 @@ mod tests {
         }
         fn try_push(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             _: crate::exec::pipeline::input::RawInput,
         ) -> crate::exec::pipeline::step::InputResult {
             panic!("control-only fixture must not receive input")
         }
         fn drive(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             panic!("control withdrawal must not need a data step")
         }
         fn finish(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<()> {
             Ok(())
         }
@@ -2135,7 +2138,7 @@ mod tests {
 
     impl EarlyFinishHarness {
         fn park(&mut self) {
-            let fragment_ctx = Arc::new(FragmentContext::new(
+            let task_ctx = Arc::new(TaskContext::new(
                 None,
                 Arc::clone(&self.runtime_state),
                 Some((67_300, 65_540)),
@@ -2143,10 +2146,10 @@ mod tests {
                 None,
                 None,
             ));
-            let task = DriverTask::new(
+            let task = DriverRunner::new(
                 self.driver.take().expect("driver"),
-                FragmentCompletion::new(1, fragment_ctx.runtime_state().error_state()),
-                fragment_ctx,
+                DriverGroupCompletion::new(1, task_ctx.runtime_state().error_state()),
+                task_ctx,
                 Duration::from_millis(10),
             );
             assert!(
@@ -2258,7 +2261,7 @@ mod tests {
         }
         fn poll_output(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             unreachable!("a drained source has no work")
         }
@@ -2277,14 +2280,14 @@ mod tests {
     impl crate::exec::pipeline::shape::TransformKernel for OwingAfterFinishProcessor {
         fn apply(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             _: crate::exec::pipeline::input::PreparedInput,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             unreachable!("this fixture starts with exhausted input")
         }
         fn drive(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
             let generation = self.observable.generation();
@@ -2305,7 +2308,7 @@ mod tests {
         }
         fn finish(
             &mut self,
-            ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             self.drive(ctx)
         }
@@ -2333,7 +2336,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SinkKernel for CountingSink {
         fn consume(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             input: crate::exec::pipeline::input::PreparedInput,
         ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
             let rows = input.into_uncovered_chunk()?.len();
@@ -2382,7 +2385,7 @@ mod tests {
         let scheduler = Arc::new(EventScheduler::new());
         let executor = Arc::new(ExecutorShared::new());
         assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             Arc::clone(&runtime_state),
             Some((67_500, 65_550)),
@@ -2390,10 +2393,10 @@ mod tests {
             None,
             None,
         ));
-        let task = DriverTask::new(
+        let task = DriverRunner::new(
             driver,
-            FragmentCompletion::new(1, fragment_ctx.runtime_state().error_state()),
-            fragment_ctx,
+            DriverGroupCompletion::new(1, task_ctx.runtime_state().error_state()),
+            task_ctx,
             Duration::from_millis(10),
         );
         assert!(
@@ -2449,7 +2452,7 @@ mod tests {
     }
 
     impl SourceKernel for EndlessSource {
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             Ok(StepResult::new(
                 Some(one_row_chunk()),
                 NextStep::Runnable,
@@ -2487,7 +2490,7 @@ mod tests {
     impl SinkKernel for FlushingLimitSink {
         fn consume(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             input: PreparedInput,
         ) -> ExecutionResult<SinkStep> {
             let chunk = input.into_uncovered_chunk()?;
@@ -2574,10 +2577,10 @@ mod tests {
         let scheduler = Arc::new(EventScheduler::new());
         let executor = Arc::new(ExecutorShared::new());
         assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
-        let task = DriverTask::new(
+        let task = DriverRunner::new(
             driver,
-            FragmentCompletion::new(1, runtime_state.error_state()),
-            Arc::new(FragmentContext::new(
+            DriverGroupCompletion::new(1, runtime_state.error_state()),
+            Arc::new(TaskContext::new(
                 None,
                 runtime_state,
                 Some((67_600, 65_560)),
@@ -2633,7 +2636,7 @@ mod tests {
             Arc::clone(&runtime_state),
             Some((72_100, 72_101)),
         );
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             runtime_state,
             Some((72_100, 72_101)),
@@ -2641,11 +2644,11 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, fragment_ctx.runtime_state().error_state());
-        let mut task = DriverTask::new(
+        let completion = DriverGroupCompletion::new(1, task_ctx.runtime_state().error_state());
+        let mut task = DriverRunner::new(
             driver,
             Arc::clone(&completion),
-            fragment_ctx,
+            task_ctx,
             Duration::from_millis(10),
         );
         let scheduler = Arc::new(EventScheduler::new());
@@ -2818,7 +2821,7 @@ mod tests {
             Arc::clone(&runtime_state),
             Some((93_001, 93_002)),
         );
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             runtime_state,
             Some((93_001, 93_002)),
@@ -2826,11 +2829,11 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, fragment_ctx.runtime_state().error_state());
-        let mut task = DriverTask::new(
+        let completion = DriverGroupCompletion::new(1, task_ctx.runtime_state().error_state());
+        let mut task = DriverRunner::new(
             driver,
             Arc::clone(&completion),
-            fragment_ctx,
+            task_ctx,
             Duration::from_millis(10),
         );
         let reason = match task.process_for_test(Duration::from_millis(10)) {
@@ -2948,7 +2951,7 @@ mod tests {
             Arc::clone(&runtime_state),
             Some((93_011, 93_012)),
         );
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             runtime_state,
             Some((93_011, 93_012)),
@@ -2956,11 +2959,11 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, fragment_ctx.runtime_state().error_state());
-        let mut task = DriverTask::new(
+        let completion = DriverGroupCompletion::new(1, task_ctx.runtime_state().error_state());
+        let mut task = DriverRunner::new(
             driver,
             Arc::clone(&completion),
-            fragment_ctx,
+            task_ctx,
             Duration::from_millis(10),
         );
         let reason = match task.process_for_test(Duration::from_millis(10)) {

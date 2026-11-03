@@ -1238,8 +1238,8 @@ pub struct FrontendWorkloadRuntimeConfig {
     pub control_inflight_limit: usize,
     pub control_ready_limit: usize,
     pub logical_actor_mailbox_capacity: usize,
-    pub logical_context_admission_issue_capacity: usize,
-    pub logical_context_establish_capacity: usize,
+    pub logical_participation_admission_issue_capacity: usize,
+    pub logical_participation_establish_capacity: usize,
     pub logical_abort_effect_capacity: usize,
     pub logical_rows_delivery_capacity: usize,
     pub logical_replacement_reservation_ms: u64,
@@ -1270,8 +1270,8 @@ impl Default for FrontendWorkloadRuntimeConfig {
             control_inflight_limit: 16,
             control_ready_limit: 256,
             logical_actor_mailbox_capacity: 64,
-            logical_context_admission_issue_capacity: 16,
-            logical_context_establish_capacity: 16,
+            logical_participation_admission_issue_capacity: 16,
+            logical_participation_establish_capacity: 16,
             logical_abort_effect_capacity: 16,
             logical_rows_delivery_capacity: 32,
             logical_replacement_reservation_ms: 30_000,
@@ -1390,12 +1390,12 @@ pub struct RuntimeConfig {
     pub task_backend_max_queued_operations: usize,
     #[serde(default = "default_task_backend_max_queued_bytes")]
     pub task_backend_max_queued_bytes: usize,
-    #[serde(default = "default_task_max_tasks_per_context")]
-    pub task_max_tasks_per_context: usize,
+    #[serde(default = "default_task_max_tasks_per_participation")]
+    pub task_max_tasks_per_participation: usize,
     #[serde(default = "default_task_max_active_tasks_per_backend")]
     pub task_max_active_tasks_per_backend: usize,
-    #[serde(default = "default_task_preparation_max_tasks_per_context")]
-    pub task_preparation_max_tasks_per_context: usize,
+    #[serde(default = "default_task_preparation_max_tasks_per_participation")]
+    pub task_preparation_max_tasks_per_participation: usize,
     #[serde(default = "default_task_preparation_max_tasks")]
     pub task_preparation_max_tasks: usize,
     #[serde(default = "default_task_preparation_max_bytes")]
@@ -1408,10 +1408,10 @@ pub struct RuntimeConfig {
     pub task_operation_create_wait_cap_ms: u64,
     #[serde(default = "default_task_operation_update_wait_cap_ms")]
     pub task_operation_update_wait_cap_ms: u64,
-    #[serde(default = "default_task_lease_min_ms")]
-    pub task_lease_min_ms: u64,
-    #[serde(default = "default_task_lease_max_ms")]
-    pub task_lease_max_ms: u64,
+    #[serde(default = "default_participation_lease_min_ms")]
+    pub participation_lease_min_ms: u64,
+    #[serde(default = "default_participation_lease_max_ms")]
+    pub participation_lease_max_ms: u64,
     #[serde(default = "default_task_status_subscription_error_budget")]
     pub task_status_subscription_error_budget: u32,
     #[serde(default = "default_write_commit_evidence_max_bytes")]
@@ -2026,16 +2026,16 @@ fn default_task_backend_max_queued_bytes() -> usize {
     FrontendTaskTransportBudget::DEFAULT.max_backend_queued_bytes()
 }
 
-fn default_task_max_tasks_per_context() -> usize {
-    FrontendTaskTransportBudget::DEFAULT.max_tasks_per_context()
+fn default_task_max_tasks_per_participation() -> usize {
+    FrontendTaskTransportBudget::DEFAULT.max_tasks_per_participation()
 }
 
 fn default_task_max_active_tasks_per_backend() -> usize {
     FrontendTaskTransportBudget::DEFAULT.max_active_tasks_per_backend()
 }
 
-fn default_task_preparation_max_tasks_per_context() -> usize {
-    novarocks_worker::TaskPreparationLimits::default().per_context()
+fn default_task_preparation_max_tasks_per_participation() -> usize {
+    novarocks_worker::TaskPreparationLimits::default().per_participation()
 }
 
 fn default_task_preparation_max_tasks() -> usize {
@@ -2064,11 +2064,11 @@ fn default_task_operation_update_wait_cap_ms() -> u64 {
     duration_millis(MaxWait::DEFAULT_UPDATE)
 }
 
-fn default_task_lease_min_ms() -> u64 {
+fn default_participation_lease_min_ms() -> u64 {
     duration_millis(LeaseBounds::DEFAULT.min())
 }
 
-fn default_task_lease_max_ms() -> u64 {
+fn default_participation_lease_max_ms() -> u64 {
     duration_millis(LeaseBounds::DEFAULT.max())
 }
 
@@ -2139,16 +2139,16 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
             runtime.task_backend_max_queued_bytes,
         ),
         (
-            "runtime.task_max_tasks_per_context",
-            runtime.task_max_tasks_per_context,
+            "runtime.task_max_tasks_per_participation",
+            runtime.task_max_tasks_per_participation,
         ),
         (
             "runtime.task_max_active_tasks_per_backend",
             runtime.task_max_active_tasks_per_backend,
         ),
         (
-            "runtime.task_preparation_max_tasks_per_context",
-            runtime.task_preparation_max_tasks_per_context,
+            "runtime.task_preparation_max_tasks_per_participation",
+            runtime.task_preparation_max_tasks_per_participation,
         ),
         (
             "runtime.task_preparation_max_tasks",
@@ -2184,8 +2184,14 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
             "runtime.task_operation_update_wait_cap_ms",
             runtime.task_operation_update_wait_cap_ms,
         ),
-        ("runtime.task_lease_min_ms", runtime.task_lease_min_ms),
-        ("runtime.task_lease_max_ms", runtime.task_lease_max_ms),
+        (
+            "runtime.participation_lease_min_ms",
+            runtime.participation_lease_min_ms,
+        ),
+        (
+            "runtime.participation_lease_max_ms",
+            runtime.participation_lease_max_ms,
+        ),
     ];
     for (field, value) in nonzero_durations {
         if value == 0 {
@@ -2193,14 +2199,16 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
         }
     }
     novarocks_worker::TaskPreparationLimits::try_new(
-        runtime.task_preparation_max_tasks_per_context,
+        runtime.task_preparation_max_tasks_per_participation,
         runtime.task_preparation_max_tasks,
         runtime.task_preparation_max_bytes,
         runtime.task_preparation_max_workers,
     )
     .map_err(|error| anyhow::anyhow!("invalid preparation limits: {error}"))?;
-    if runtime.task_lease_max_ms < runtime.task_lease_min_ms {
-        bail!("runtime.task_lease_max_ms must be at least runtime.task_lease_min_ms");
+    if runtime.participation_lease_max_ms < runtime.participation_lease_min_ms {
+        bail!(
+            "runtime.participation_lease_max_ms must be at least runtime.participation_lease_min_ms"
+        );
     }
     if runtime.task_descriptor_max_encoded_bytes > runtime.task_operation_max_batch_encoded_bytes {
         bail!(
@@ -2251,8 +2259,8 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
         bail!("task operation wait caps must not exceed {wait_ceiling} ms");
     }
     let lease_ceiling = duration_millis(LeaseValidFor::MAX_REPRESENTABLE);
-    if runtime.task_lease_max_ms > lease_ceiling {
-        bail!("runtime.task_lease_max_ms must not exceed {lease_ceiling} ms");
+    if runtime.participation_lease_max_ms > lease_ceiling {
+        bail!("runtime.participation_lease_max_ms must not exceed {lease_ceiling} ms");
     }
     Ok(())
 }
@@ -2703,18 +2711,18 @@ impl Default for RuntimeConfig {
             task_query_backend_max_queued_bytes: default_task_query_backend_max_queued_bytes(),
             task_backend_max_queued_operations: default_task_backend_max_queued_operations(),
             task_backend_max_queued_bytes: default_task_backend_max_queued_bytes(),
-            task_max_tasks_per_context: default_task_max_tasks_per_context(),
+            task_max_tasks_per_participation: default_task_max_tasks_per_participation(),
             task_max_active_tasks_per_backend: default_task_max_active_tasks_per_backend(),
-            task_preparation_max_tasks_per_context: default_task_preparation_max_tasks_per_context(
-            ),
+            task_preparation_max_tasks_per_participation:
+                default_task_preparation_max_tasks_per_participation(),
             task_preparation_max_tasks: default_task_preparation_max_tasks(),
             task_preparation_max_bytes: default_task_preparation_max_bytes(),
             task_preparation_max_workers: default_task_preparation_max_workers(),
             task_operation_queue_residence_ms: default_task_operation_queue_residence_ms(),
             task_operation_create_wait_cap_ms: default_task_operation_create_wait_cap_ms(),
             task_operation_update_wait_cap_ms: default_task_operation_update_wait_cap_ms(),
-            task_lease_min_ms: default_task_lease_min_ms(),
-            task_lease_max_ms: default_task_lease_max_ms(),
+            participation_lease_min_ms: default_participation_lease_min_ms(),
+            participation_lease_max_ms: default_participation_lease_max_ms(),
             task_status_subscription_error_budget: default_task_status_subscription_error_budget(),
             write_commit_evidence_max_bytes: default_write_commit_evidence_max_bytes(),
             write_commit_evidence_max_entries: default_write_commit_evidence_max_entries(),
@@ -3925,8 +3933,8 @@ access_key_secret = ""
         );
         assert_eq!(runtime.task_backend_max_queued_bytes, 512 * 1024 * 1024);
         assert_eq!(
-            runtime.task_max_tasks_per_context,
-            frozen.max_tasks_per_context()
+            runtime.task_max_tasks_per_participation,
+            frozen.max_tasks_per_participation()
         );
         assert_eq!(
             runtime.task_max_active_tasks_per_backend,
@@ -3945,11 +3953,11 @@ access_key_secret = ""
             MaxWait::DEFAULT_UPDATE.as_millis() as u64
         );
         assert_eq!(
-            runtime.task_lease_min_ms,
+            runtime.participation_lease_min_ms,
             LeaseBounds::DEFAULT.min().as_millis() as u64
         );
         assert_eq!(
-            runtime.task_lease_max_ms,
+            runtime.participation_lease_max_ms,
             LeaseBounds::DEFAULT.max().as_millis() as u64
         );
         assert!(runtime.task_status_subscription_error_budget > 0);
@@ -4037,14 +4045,14 @@ access_key_secret = ""
             ("task_backend_max_queued_bytes", |runtime| {
                 runtime.task_backend_max_queued_bytes = 0;
             }),
-            ("task_max_tasks_per_context", |runtime| {
-                runtime.task_max_tasks_per_context = 0;
+            ("task_max_tasks_per_participation", |runtime| {
+                runtime.task_max_tasks_per_participation = 0;
             }),
             ("task_max_active_tasks_per_backend", |runtime| {
                 runtime.task_max_active_tasks_per_backend = 0;
             }),
-            ("task_preparation_max_tasks_per_context", |runtime| {
-                runtime.task_preparation_max_tasks_per_context = 0;
+            ("task_preparation_max_tasks_per_participation", |runtime| {
+                runtime.task_preparation_max_tasks_per_participation = 0;
             }),
             ("task_preparation_max_tasks", |runtime| {
                 runtime.task_preparation_max_tasks = 0;
@@ -4067,11 +4075,11 @@ access_key_secret = ""
             ("task_operation_update_wait_cap_ms", |runtime| {
                 runtime.task_operation_update_wait_cap_ms = 0;
             }),
-            ("task_lease_min_ms", |runtime| {
-                runtime.task_lease_min_ms = 0;
+            ("participation_lease_min_ms", |runtime| {
+                runtime.participation_lease_min_ms = 0;
             }),
-            ("task_lease_max_ms", |runtime| {
-                runtime.task_lease_max_ms = 0;
+            ("participation_lease_max_ms", |runtime| {
+                runtime.participation_lease_max_ms = 0;
             }),
         ];
 
@@ -4094,9 +4102,9 @@ access_key_secret = ""
     )]
     fn task_execution_config_rejects_inverted_bounds() {
         let cases: [(&str, fn(&mut RuntimeConfig)); 7] = [
-            ("task_lease_max_ms", |runtime| {
-                runtime.task_lease_min_ms = 30_000;
-                runtime.task_lease_max_ms = 29_999;
+            ("participation_lease_max_ms", |runtime| {
+                runtime.participation_lease_min_ms = 30_000;
+                runtime.participation_lease_max_ms = 29_999;
             }),
             ("task_descriptor_max_encoded_bytes", |runtime| {
                 runtime.task_descriptor_max_encoded_bytes =
@@ -4122,8 +4130,8 @@ access_key_secret = ""
                 runtime.task_backend_max_queued_bytes =
                     runtime.task_operation_max_batch_encoded_bytes * 4 - 1;
             }),
-            ("task_lease_max_ms", |runtime| {
-                runtime.task_lease_max_ms =
+            ("participation_lease_max_ms", |runtime| {
+                runtime.participation_lease_max_ms =
                     (LeaseValidFor::MAX_REPRESENTABLE.as_millis() as u64) + 1;
             }),
         ];

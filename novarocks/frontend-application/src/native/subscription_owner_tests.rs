@@ -574,7 +574,7 @@ async fn future_destructor_panic_cannot_destroy_second_original_raw_cause() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_borrowed_drain_retains_same_original_reaper_and_records() {
-    fn cleanup_id(owner: &NativeSubscriptionOwner, lease: &SubscriptionLease) -> Option<Id> {
+    fn cleanup_id(owner: &NativeSubscriptionOwner, lease: &SubscriptionStopGuard) -> Option<Id> {
         let state = owner.core.state.lock().unwrap();
         let record = state.records[lease.index].as_ref()?;
         let OriginalState::Retiring(retirement) = &record.state else {

@@ -26,7 +26,7 @@ use super::{
     NativeLogicalExecutionSeed,
 };
 use crate::admitted_query_context::QueryResultCapacityBinding;
-use crate::coordination::{AbortQueryContextEffectPort, ReplacementQualificationEffectPort};
+use crate::coordination::{AbortParticipationEffectPort, ReplacementQualificationEffectPort};
 use crate::preparation::{ExecutionFinishBoundary, FrozenExecutionDescription};
 
 /// A product-independent query operation.
@@ -56,7 +56,7 @@ impl QueryExecutionRequest {
     /// the open ticket minted for that logical execution.
     pub fn bind_native(
         description: FrozenExecutionDescription,
-        aborts: Arc<dyn AbortQueryContextEffectPort>,
+        aborts: Arc<dyn AbortParticipationEffectPort>,
         replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
         attempts: impl NativeAttemptPreparationPort,
     ) -> Self {
@@ -273,8 +273,13 @@ pub use crate::coordination::{
     OriginalBackgroundActionInput, OriginalLogicalStartInput, RemoteExecutionDisposition,
 };
 
-pub type QueryExecutionFuture =
-    Pin<Box<dyn Future<Output = Result<ExecutionHandle, QueryExecutionError>> + Send + 'static>>;
+pub type QueryExecutionFuture = Pin<
+    Box<
+        dyn Future<Output = Result<ExecutionOutputObligation, QueryExecutionError>>
+            + Send
+            + 'static,
+    >,
+>;
 
 /// A single initial execution reserved before statement preparation.
 ///
@@ -525,25 +530,33 @@ impl ExecutionControl for WorkCancellationRequester {
     }
 }
 
-/// Move-only logical execution handle.
+/// Move-only checked obligation for the initial logical execution output.
 ///
-/// Dropping a handle is not a stop or resource-release fact. Bounded result
-/// delivery and convergence remain owned by the supervised logical execution.
+/// In the Rows phase this retains the original result consumer and its schema
+/// delivery. Dropping an uncompleted delivery reports Dropped to the original
+/// actor, which records failure; Drop does not complete that delivery.
+/// Taking the output transfers this same obligation to its consumer.
+///
+/// Completion and computation-ready phases carry control and observation
+/// facts. After output handoff this value retains only those interfaces.
+/// The supervised logical execution continues to own the original Work and
+/// convergence. Dropping this value neither cancels that Work nor proves its
+/// physical exit or resource release.
 ///
 /// ```compile_fail
-/// use novarocks_query_application::api::ExecutionHandle;
-/// fn duplicate(handle: ExecutionHandle) {
-///     let _copy = handle.clone();
+/// use novarocks_query_application::api::ExecutionOutputObligation;
+/// fn duplicate(obligation: ExecutionOutputObligation) {
+///     let _copy = obligation.clone();
 /// }
 /// ```
-pub struct ExecutionHandle {
+pub struct ExecutionOutputObligation {
     control: Box<dyn ExecutionControl>,
     output: Option<crate::api::ExecutionOutput>,
     ready: Option<ComputationReadyToken>,
     original_exit: Option<LogicalExecutionExitObserver>,
 }
 
-impl ExecutionHandle {
+impl ExecutionOutputObligation {
     pub(crate) fn new(control: impl ExecutionControl, output: crate::api::ExecutionOutput) -> Self {
         Self {
             control: Box::new(control),
@@ -616,23 +629,23 @@ mod tests {
     }
 
     #[test]
-    fn execution_handle_transfers_output_once_and_keeps_control() {
+    fn execution_output_obligation_transfers_output_once_and_keeps_control() {
         let cancelled = Arc::new(AtomicBool::new(false));
-        let mut handle = ExecutionHandle::new(
+        let mut obligation = ExecutionOutputObligation::new(
             RecordingControl(Arc::clone(&cancelled)),
             ExecutionOutput::Completion,
         );
         assert!(matches!(
-            handle.take_output(),
+            obligation.take_output(),
             Some(ExecutionOutput::Completion)
         ));
-        assert!(handle.take_output().is_none());
-        handle.request_cancel().unwrap();
+        assert!(obligation.take_output().is_none());
+        obligation.request_cancel().unwrap();
         assert!(cancelled.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn execution_handle_requests_cancellation_without_owning_work() {
+    fn execution_output_obligation_requests_cancellation_without_owning_work() {
         let control = WorkloadControl::try_new(
             WorkloadConfig::default(),
             ResourceConfig {
@@ -647,19 +660,19 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let scope = work.owner.scope();
-        let handle = ExecutionHandle::new(
+        let obligation = ExecutionOutputObligation::new(
             work.owner.cancellation_requester(),
             ExecutionOutput::Completion,
         );
 
-        handle.request_cancel().unwrap();
+        obligation.request_cancel().unwrap();
         assert_eq!(
             scope.cancellation().unwrap().reason(),
             Some(CancellationReason::Requested)
         );
         assert_eq!(control.snapshot().root_responsibilities, 1);
 
-        drop(handle);
+        drop(obligation);
         work.owner.complete();
         work.business.release();
     }

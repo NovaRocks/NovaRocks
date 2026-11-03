@@ -19,7 +19,7 @@
 use crate::aggregate_scalar::{
     ScalarReadFailure, ScalarReadFailureSink, ScalarReadObservation, scalar_from_array_with_failure,
 };
-use crate::datasketches_hll::{HllHandle, HllTargetType};
+use crate::datasketches_hll::{HllAccumulator, HllTargetType};
 use crate::datasketches_hll_failure::{
     HllFailureRecipe, HllFailureSink, HllInvariantRecipe, HllObservation,
 };
@@ -300,10 +300,10 @@ pub trait ScalarSketchPort<F: ScalarStateSink> {
         sink: &mut F,
     ) -> Result<(), Error<F>>;
 }
-/// Field order destroys original payload and handle before releasing authority.
+/// Field order destroys original payload and accumulator before releasing authority.
 pub struct ProducedState<R, P> {
     bytes: Vec<u8>,
-    _handle: HllHandle,
+    _accumulator: HllAccumulator,
     _reservation: R,
     _port: P,
 }
@@ -436,40 +436,45 @@ pub fn produce_row<F: ScalarStateSink, P: ScalarSketchPort<F>>(
         Some((a, r)) => target(a, r, sink)?,
         None => HllTargetType::Hll6,
     };
-    let preflight = HllHandle::new_allocation_preflight_with_failure(lg, target, sink)?;
+    let preflight = HllAccumulator::new_allocation_preflight_with_failure(lg, target, sink)?;
     let mut reservation = port.reserve(preflight.bounds().operation_peak_bytes, sink)?;
-    let (mut handle, outcome) =
-        HllHandle::new_under_reservation_with_failure(&preflight, &reservation, sink)?;
+    let (mut accumulator, outcome) =
+        HllAccumulator::new_under_reservation_with_failure(&preflight, &reservation, sink)?;
     port.reconcile(
         outcome
             .current_bytes
-            .saturating_sub(std::mem::size_of::<HllHandle>()),
+            .saturating_sub(std::mem::size_of::<HllAccumulator>()),
         &mut reservation,
         sink,
     )?;
     HllFailureSink::observe(sink, HllObservation::OpaqueBoundary)?;
     drop(reservation);
-    let preflight = handle.update_hash_allocation_preflight_with_failure(sink)?;
+    let preflight = accumulator.update_hash_allocation_preflight_with_failure(sink)?;
     let mut reservation = port.reserve(preflight.bounds().additional_headroom_bytes(), sink)?;
-    let outcome =
-        handle.update_hash_under_reservation_with_failure(hash, &preflight, &reservation, sink)?;
+    let outcome = accumulator.update_hash_under_reservation_with_failure(
+        hash,
+        &preflight,
+        &reservation,
+        sink,
+    )?;
     port.reconcile(
         outcome
             .current_bytes
-            .saturating_sub(std::mem::size_of::<HllHandle>()),
+            .saturating_sub(std::mem::size_of::<HllAccumulator>()),
         &mut reservation,
         sink,
     )?;
     HllFailureSink::observe(sink, HllObservation::OpaqueBoundary)?;
     drop(reservation);
-    let preflight = handle.serialization_allocation_preflight_observed(&mut || {
+    let preflight = accumulator.serialization_allocation_preflight_observed(&mut || {
         HllFailureSink::observe(sink, HllObservation::Step)
     })?;
     let reservation = port.reserve(preflight.bounds().additional_headroom_bytes, sink)?;
-    let bytes = handle.serialize_under_reservation_with_failure(&preflight, &reservation, sink)?;
+    let bytes =
+        accumulator.serialize_under_reservation_with_failure(&preflight, &reservation, sink)?;
     Ok(Some(ProducedState {
         bytes,
-        _handle: handle,
+        _accumulator: accumulator,
         _reservation: reservation,
         _port: port,
     }))

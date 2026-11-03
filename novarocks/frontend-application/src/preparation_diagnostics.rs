@@ -845,7 +845,7 @@ mod statement_observation_tests {
             execution_id,
             primary_error: None,
             failure: None,
-            worker_contexts_converged: false,
+            worker_participations_converged: false,
             runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
                 RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
             ),
@@ -1548,7 +1548,7 @@ mod session_owner_tests {
                 execution_id,
                 primary_error: None,
                 failure: None,
-                worker_contexts_converged: false,
+                worker_participations_converged: false,
                 runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
                     RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
                 ),

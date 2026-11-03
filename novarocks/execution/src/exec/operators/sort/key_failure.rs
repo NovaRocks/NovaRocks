@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Sort-key preparation owns its structural failures and retains type/Arrow causes.
-use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, SharedDomainFailure};
+use crate::runtime::task::{ExecutionFailure, ExecutionReason, SharedDomainFailure};
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 use novarocks_type_contract::ExecutionValueTypeError;
 use std::{error::Error, fmt};

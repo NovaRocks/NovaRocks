@@ -69,11 +69,11 @@ pub use access::{
 pub use aliyun_ecs_credentials::AliyunEcsRamRoleConfig;
 pub use cache::{
     BlockCache, BlockCacheOptions, CacheBlockRead, CacheDomain, CacheInputStream, CacheKey,
-    CacheOptions, DataCacheContext, DataCacheIoOptions, DataCacheManager, DataCacheMetricsRecorder,
-    DataCachePageCache, DataCachePageCacheOptions, DataCachePageKey, ExternalDataCacheRangeOptions,
-    PageCache, PageCacheStats, PageCacheValue, PageHandle, ParquetCacheOptions, get_block_cache,
-    init_block_cache, init_parquet_cache, validate_datacache_priority, validate_evict_probability,
-    validate_non_negative_i64,
+    CacheOptions, DataCacheIoOptions, DataCacheManager, DataCacheMetricsRecorder,
+    DataCachePageCache, DataCachePageCacheOptions, DataCachePageKey, DataCachePolicy,
+    ExternalDataCacheRangeOptions, PageCache, PageCacheStats, PageCacheValue, PagePin,
+    ParquetCacheOptions, get_block_cache, init_block_cache, init_parquet_cache,
+    validate_datacache_priority, validate_evict_probability, validate_non_negative_i64,
 };
 pub use catalog_properties::{
     AWS_S3_CATALOG_PROPERTY_KEYS, normalize_aws_s3_catalog_properties,
@@ -111,8 +111,8 @@ pub use read::{
 };
 pub use resources::FsAccessResources;
 pub use runtime::{
-    FileBytesFuture, FileCancellation, FileIoRuntime, FileTask, FileTaskFuture, FileTaskSpawner,
-    FileU64Future, TokioFileIoRuntime, TokioFileTaskSpawner,
+    FileBytesFuture, FileCancellation, FileIoFuture, FileIoJob, FileIoRuntime, FileIoSpawner,
+    FileU64Future, TokioFileIoRuntime, TokioFileIoSpawner,
 };
 pub use storage_authority::{
     AcquisitionFailure, AuthorityCapabilityPath, AuthorityMaterial, AuthorityMaterialSource,

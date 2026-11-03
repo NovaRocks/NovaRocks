@@ -1640,7 +1640,7 @@ pub type ConnectorTableObjectSnapshotFuture<'a> = std::pin::Pin<
 
 pub trait ConnectorMetadata: Send + Sync {
     /// Pure selected first-party metadata CPU author, authenticated with the
-    /// original planning lease before any closed phase is accepted.
+    /// original planning pin before any closed phase is accepted.
     fn provider_metadata_cpu_author(
         &self,
     ) -> Option<(super::ConnectorProviderBindingKey, std::any::TypeId)> {

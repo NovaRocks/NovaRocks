@@ -28,7 +28,7 @@ use super::super::{
 };
 use super::*;
 use crate::exec::hash_table::key_index::{
-    BulkClaim, BulkTask, BulkTaskAdvance, BulkTaskGraph, IndexPurpose, NullPolicy,
+    BulkBuildGraph, BulkBuildStep, BulkClaim, IndexPurpose, NullPolicy, StepAdvance,
 };
 use arrow::{
     array::{ArrayRef, Int32Array, StringArray},
@@ -43,7 +43,7 @@ pub(crate) fn captured_graph_for(
     strings: bool,
     purpose: IndexPurpose,
     work: &BulkWork<'_>,
-) -> (BulkTaskGraph, Arc<BuildRows>) {
+) -> (BulkBuildGraph, Arc<BuildRows>) {
     let ty = FunctionValueType::new(
         if strings {
             DataType::Utf8
@@ -104,8 +104,10 @@ pub(crate) fn captured_graph_for(
             .normal_input(receipt.run().index(), receipt)
             .unwrap();
     }
-    let BeginClaim::Claimed { inputs, mut lease } =
-        collection.claim_begin(work.owner, work.control).unwrap()
+    let BeginClaim::Claimed {
+        inputs,
+        mut begin_obligation,
+    } = collection.claim_begin(work.owner, work.control).unwrap()
     else {
         panic!("original input coverage");
     };
@@ -117,21 +119,21 @@ pub(crate) fn captured_graph_for(
     else {
         unreachable!()
     };
-    let graph = BulkTaskGraph::begin(
+    let graph = BulkBuildGraph::begin(
         keys.into_complete(domain, purpose, work).unwrap(),
         NonZeroUsize::new(3).unwrap(),
         NonZeroUsize::MIN,
         work,
     )
     .unwrap();
-    collection.complete_begin(&mut lease).unwrap();
+    collection.complete_begin(&mut begin_obligation).unwrap();
     (graph, rows)
 }
 pub(crate) fn captured_graph(
     pages: &[Vec<Option<i32>>],
     strings: bool,
     work: &BulkWork<'_>,
-) -> (BulkTaskGraph, Arc<BuildRows>) {
+) -> (BulkBuildGraph, Arc<BuildRows>) {
     captured_graph_for(pages, strings, IndexPurpose::KeyIds, work)
 }
 fn captured(
@@ -140,10 +142,10 @@ fn captured(
     work: &BulkWork<'_>,
 ) -> (Arc<IndexView>, BulkAssignments, Arc<BuildRows>) {
     let (graph, rows) = captured_graph(pages, strings, work);
-    let mut tasks: Vec<BulkTask> = Vec::new();
+    let mut tasks: Vec<BulkBuildStep> = Vec::new();
     for _ in 0..1_000_000 {
         match graph.claim(work).unwrap() {
-            BulkClaim::Task(task) => tasks.push(task),
+            BulkClaim::Step(task) => tasks.push(task),
             BulkClaim::Finished => {
                 assert!(tasks.is_empty());
                 let (view, assignments) = graph.take_ready(work).unwrap().unwrap().into_parts();
@@ -153,7 +155,7 @@ fn captured(
         }
         let mut index = 0;
         while index < tasks.len() {
-            if tasks[index].advance(13, work).unwrap() == BulkTaskAdvance::Done {
+            if tasks[index].advance(13, work).unwrap() == StepAdvance::Done {
                 let mut complete = tasks.swap_remove(index).finish().unwrap();
                 graph.complete(&mut complete, work).unwrap();
             } else {
@@ -188,8 +190,8 @@ fn drive(
     workers: usize,
     work: &BulkWork<'_>,
 ) -> (BuildCsr, Vec<(usize, CsrStage, Range<usize>)>) {
-    let mut active: Vec<Option<CsrLease>> = (0..workers).map(|_| None).collect();
-    let mut init: Vec<Option<SlotsLease>> = (0..workers).map(|_| None).collect();
+    let mut active: Vec<Option<CsrObligation>> = (0..workers).map(|_| None).collect();
+    let mut init: Vec<Option<SlotsObligation>> = (0..workers).map(|_| None).collect();
     let mut claims = Vec::new();
     for _ in 0..1_000_000 {
         for worker in 0..workers {

@@ -123,7 +123,7 @@ fn original_column_charge_is_shared_until_the_last_chunk_alias_exits() {
     let clone = chunk.clone();
     let slice_owner = construction_owner(chunk.chunk_schema());
     let slice = chunk
-        .slice_typed_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+        .slice_typed_observed::<crate::runtime::task::ExecutionFailure, _>(
             1,
             1,
             slice_owner.storage_lifetime(),
@@ -332,7 +332,7 @@ impl AggregateStateAllocator for DropOrderHost {
 fn publication(
     host: Arc<DropOrderHost>,
     metadata_columns: usize,
-) -> crate::runtime::fragment::ExecutionResult<Chunk> {
+) -> crate::runtime::task::ExecutionResult<Chunk> {
     let output = schema();
     let metadata =
         OutputColumnMetadata::try_new(metadata_columns, host.clone(), &Control::running())?;
@@ -384,7 +384,7 @@ fn unpublished_container_refusal_drops_the_batch_and_all_original_charges() {
     );
     assert_eq!(
         fact.reason(),
-        crate::runtime::fragment::ExecutionReason::ChunkOutputMetadata.reason()
+        crate::runtime::task::ExecutionReason::ChunkOutputMetadata.reason()
     );
     assert!(
         host.weak

@@ -17,21 +17,21 @@
 
 //! Source protocol: one reported output and next action per actual poll.
 
-use super::{ControlStep, InputResult, NextStep, RawInput, StepContext, StepOperator, StepResult};
+use super::{ControlStep, DriverStep, InputResult, NextStep, RawInput, StepOperator, StepResult};
 #[cfg(test)]
 use crate::exec::pipeline::operator::ExitProgress;
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::exec::pipeline::operator::{ExitObservation, FinishWatch, InputConstructionFactory};
 use crate::runtime::{
-    fragment::{ExecutionFailure, ExecutionResult, io::FragmentEventSink},
     mem_tracker::MemTracker,
     profile::OperatorProfiles,
     runtime_state::RuntimeState,
+    task::{ExecutionFailure, ExecutionResult, io::TaskEventSink},
 };
 use std::sync::Arc;
 
 pub trait SourceKernel: Send {
-    fn poll_control(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, _ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         Ok(ControlStep::Active)
     }
     fn control_observable(&self) -> Option<Arc<super::super::schedule::observer::Observable>> {
@@ -40,7 +40,7 @@ pub trait SourceKernel: Send {
     fn start(&self) -> SourceStart {
         SourceStart::Ready
     }
-    fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult>;
+    fn poll_output(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult>;
     fn on_downstream_backpressure(&mut self, _paused: bool) {}
 }
 
@@ -112,7 +112,7 @@ impl std::fmt::Display for SourceContractFailure {
 impl std::error::Error for SourceContractFailure {}
 impl novarocks_failure_contract::FailureProjection for SourceContractFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match self {
             Self::InputEdge => ExecutionReason::SourceInputEdge,
@@ -126,12 +126,12 @@ impl novarocks_failure_contract::FailureProjection for SourceContractFailure {
 }
 pub(crate) fn source_contract_failure(
     cause: SourceContractFailure,
-) -> crate::runtime::fragment::ExecutionFailure {
-    crate::runtime::fragment::ExecutionFailure::from_domain(cause)
+) -> crate::runtime::task::ExecutionFailure {
+    crate::runtime::task::ExecutionFailure::from_domain(cause)
 }
 
 impl<K: SourceKernel> StepOperator for Source<K> {
-    fn poll_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -159,7 +159,7 @@ impl<K: SourceKernel> StepOperator for Source<K> {
     fn initial_step(&self) -> NextStep {
         self.next.clone()
     }
-    fn try_push(&mut self, ctx: &mut StepContext<'_>, input: RawInput) -> InputResult {
+    fn try_push(&mut self, ctx: &mut DriverStep<'_>, input: RawInput) -> InputResult {
         InputResult::Rejected {
             input,
             failure: ctx
@@ -168,7 +168,7 @@ impl<K: SourceKernel> StepOperator for Source<K> {
                 .unwrap_or_else(|| source_contract_failure(SourceContractFailure::InputEdge)),
         }
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
         }
@@ -193,7 +193,7 @@ impl<K: SourceKernel> StepOperator for Source<K> {
         self.next = step.next.clone();
         Ok(step)
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
         Err(source_contract_failure(SourceContractFailure::InputEos))
     }
 }
@@ -251,8 +251,8 @@ impl<K: SourceKernel + OperatorLifecycle> OperatorLifecycle for Source<K> {
     fn activate(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.kernel.activate(state)
     }
-    fn set_fragment_event_sink(&mut self, sink: Arc<dyn FragmentEventSink>) {
-        self.kernel.set_fragment_event_sink(sink);
+    fn set_task_event_sink(&mut self, sink: Arc<dyn TaskEventSink>) {
+        self.kernel.set_task_event_sink(sink);
     }
     fn begin_exit(&mut self) -> ExecutionResult<()> {
         self.next = NextStep::Finished;
@@ -286,9 +286,9 @@ impl<K: SourceKernel + OperatorLifecycle> OperatorLifecycle for Source<K> {
 mod tests {
     use super::*;
     use crate::exec::pipeline::{
+        driver_step::TurnWork,
         schedule::observer::Observable,
         step::{WaitFact, WaitReason},
-        step_context::TurnWork,
     };
     use crate::runtime::runtime_state::RuntimeErrorState;
     use std::{
@@ -306,7 +306,7 @@ mod tests {
         fn start(&self) -> SourceStart {
             self.initial
         }
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             self.polls.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .steps
@@ -352,7 +352,7 @@ mod tests {
         let mut work = TurnWork::new(NonZeroU64::new(1).unwrap(), 2);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut context = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut context = DriverStep::new(&control, &mut work, &mut value_conversions);
         let first = source.drive(&mut context).unwrap();
         assert_eq!(first.output.unwrap().len(), 2);
         assert!(matches!(first.next, NextStep::Wait(_)));
@@ -377,7 +377,7 @@ mod tests {
         let mut work = TurnWork::new(NonZeroU64::new(1).unwrap(), 2);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut context = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut context = DriverStep::new(&control, &mut work, &mut value_conversions);
         let input = RawInput::new(chunk(), None);
         let InputResult::Rejected { input, .. } = source.try_push(&mut context, input) else {
             panic!("a source must return the exact unaccepted input");
@@ -393,7 +393,7 @@ mod tests {
 #[cfg(test)]
 mod exit_tests {
     use super::*;
-    use crate::exec::pipeline::{schedule::observer::Observable, step_context::TurnWork};
+    use crate::exec::pipeline::{driver_step::TurnWork, schedule::observer::Observable};
     use crate::runtime::runtime_state::RuntimeErrorState;
     use std::{
         num::NonZeroU64,
@@ -419,7 +419,7 @@ mod exit_tests {
         }
     }
     impl SourceKernel for Exiting {
-        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             self.payload_calls.fetch_add(1, Ordering::Relaxed);
             if let Some(failure) = &self.failure {
                 return Err(failure.clone());
@@ -447,7 +447,7 @@ mod exit_tests {
         let mut work = TurnWork::new(NonZeroU64::new(1).unwrap(), 8);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut context = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut context = DriverStep::new(&control, &mut work, &mut value_conversions);
         let step = source.drive(&mut context).unwrap();
         assert!(step.output.is_none());
         assert!(matches!(step.next, NextStep::Finished));
@@ -477,7 +477,7 @@ mod exit_tests {
         let mut work = TurnWork::new(NonZeroU64::MIN, 8);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
         assert_eq!(source.drive(&mut ctx).unwrap_err(), first);
         assert_eq!(source.drive(&mut ctx).unwrap_err(), first);
         assert_eq!(polls.load(Ordering::Relaxed), 1);

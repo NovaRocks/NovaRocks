@@ -1918,7 +1918,7 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(
                 executor.handle().clone(),
             )),
-            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+            Arc::new(novarocks_fs::TokioFileIoSpawner::new(
                 executor.handle().clone(),
             )),
         );

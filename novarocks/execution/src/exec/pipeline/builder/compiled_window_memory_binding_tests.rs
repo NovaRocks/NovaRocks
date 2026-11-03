@@ -18,8 +18,8 @@
 use super::*;
 
 use crate::runtime::execution_runtime::test_execution_runtime;
-use crate::runtime::fragment::runtime_state::{RuntimeStateInputs, build_runtime_state};
 use crate::runtime::query_memory::QueryMemoryBinding;
+use crate::runtime::task::runtime_state::{RuntimeStateInputs, build_runtime_state};
 use novarocks_execution_contract::TaskIdentity;
 use novarocks_memory::{AccountKind, ExternalRef};
 use novarocks_types::{
@@ -51,7 +51,7 @@ fn by_runtime_memory_ready_actual_compiled_window_operator_borrows_prepared_task
     let state = build_runtime_state(RuntimeStateInputs {
         query_options: None,
         query_id: Some(execution.query_id()),
-        fragment_instance_id: None,
+        task_key: None,
         backend_num: None,
         mem_tracker: None,
         runtime_filter_session: None,

@@ -391,19 +391,19 @@ impl ConnectorDocumentStorageBinding {
 }
 
 #[derive(Clone)]
-pub struct ConnectorDocumentStorageLease {
+pub struct ConnectorDocumentStorage {
     control_runtime_id: ConnectorControlRuntimeId,
     owner: ConnectorProviderBindingKey,
     catalog_handle: CatalogHandle,
     binding: ConnectorDocumentStorageBinding,
-    _release: Arc<DocumentStorageLeaseRelease>,
+    _release: Arc<DocumentStorageReleaseGuard>,
 }
 
-struct DocumentStorageLeaseRelease {
+struct DocumentStorageReleaseGuard {
     release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
 }
 
-impl ConnectorDocumentStorageLease {
+impl ConnectorDocumentStorage {
     pub(crate) fn new(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
@@ -428,7 +428,7 @@ impl ConnectorDocumentStorageLease {
             },
             catalog_handle,
             binding,
-            _release: Arc::new(DocumentStorageLeaseRelease {
+            _release: Arc::new(DocumentStorageReleaseGuard {
                 release: Mutex::new(Some(Box::new(release))),
             }),
         })
@@ -601,7 +601,7 @@ impl ConnectorDocumentStorageLease {
     }
 }
 
-impl Drop for DocumentStorageLeaseRelease {
+impl Drop for DocumentStorageReleaseGuard {
     fn drop(&mut self) {
         if let Some(release) = self
             .release

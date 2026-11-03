@@ -89,6 +89,13 @@ pub fn parse_meta_line(line: &str, meta_re: &Regex) -> Option<(String, String)> 
                 "native_observation_attempts"
                     | "publication_catalog_fault_target"
                     | "publication_catalog_fault_timing"
+                    | "be_log_contains"
+                    | "be_log_not_contains"
+                    | "be_log_count_at_least"
+                    | "be_log_be_count_at_least"
+                    | "cancel_query_after_be_log_contains"
+                    | "kill_fe_after_be_log_contains"
+                    | "kill_be_after_be_log_contains"
             ) && value.trim().is_empty())
             .then(|| (key.trim().to_ascii_lowercase(), String::new()));
         }
@@ -378,6 +385,25 @@ fn parse_kill_be_at_lifecycle_phase(raw: &str) -> anyhow::Result<KillBeAtLifecyc
         );
     }
     Ok(KillBeAtLifecyclePhaseDirective { be_index, phase })
+}
+
+/// Resolve the exact registered log marker and validate any field filters.
+/// SQL case loading calls this before observation grants can be planned.
+pub(crate) fn parse_observation_marker(
+    pattern: &str,
+) -> Result<&'static novarocks_failpoint::observation_marker::ObservationMarker> {
+    let mut fields = pattern.split_whitespace();
+    let name = fields.next().unwrap_or_default();
+    let marker = novarocks_failpoint::observation_marker::lookup(name)
+        .ok_or_else(|| anyhow::anyhow!("unregistered marker {name:?} in pattern {pattern:?}"))?;
+    for field in fields {
+        if let Some((key, _)) = field.split_once('=')
+            && !marker.keys.contains(&key)
+        {
+            bail!("unregistered field {key:?} for marker {name}");
+        }
+    }
+    Ok(marker)
 }
 
 fn parse_kill_be_after_be_log_directive(raw: &str) -> anyhow::Result<KillBeAfterBeLogDirective> {
@@ -684,26 +710,32 @@ fn parse_meta_with_name_binding(
                 meta.kill_fe_after_mv_known_committed_before_projector_cas =
                     parse_bool(&raw_value)?;
             }
-            "restart_be_after_establish_context_index" => {
+            "restart_be_after_establish_participation_index" => {
                 let value = raw_value.parse::<usize>().with_context(|| {
-                    format!("invalid restart_be_after_establish_context_index: {raw_value}")
+                    format!("invalid restart_be_after_establish_participation_index: {raw_value}")
                 })?;
-                meta.restart_be_after_establish_context_index = Some(value);
+                meta.restart_be_after_establish_participation_index = Some(value);
             }
             "kill_be_after_be_log_contains" => {
                 meta.kill_be_after_be_log_contains =
                     Some(parse_kill_be_after_be_log_directive(&raw_value)?);
+                parse_observation_marker(
+                    &meta.kill_be_after_be_log_contains.as_ref().unwrap().pattern,
+                )
+                .with_context(|| format!("@{key}: {line}"))?;
             }
             "kill_fe_after_be_log_contains" => {
                 if raw_value.is_empty() {
                     bail!("kill_fe_after_be_log_contains must not be empty");
                 }
+                parse_observation_marker(&raw_value).with_context(|| format!("@{key}: {line}"))?;
                 meta.kill_fe_after_be_log_contains = Some(raw_value);
             }
             "cancel_query_after_be_log_contains" => {
                 if raw_value.is_empty() {
                     bail!("cancel_query_after_be_log_contains must not be empty");
                 }
+                parse_observation_marker(&raw_value).with_context(|| format!("@{key}: {line}"))?;
                 meta.cancel_query_after_be_log_contains = Some(raw_value);
             }
             "terminal_snapshot_conflict_be_index" => {
@@ -766,12 +798,7 @@ fn parse_meta_with_name_binding(
                 meta.kill_be_at_lifecycle_phase =
                     Some(parse_kill_be_at_lifecycle_phase(&raw_value)?);
             }
-            "query_control_fragment_backend_limit" => {
-                let value = raw_value.parse::<usize>().with_context(|| {
-                    format!("invalid query_control_fragment_backend_limit: {raw_value}")
-                })?;
-                meta.query_control_fragment_backend_limit = Some(value);
-            }
+
             "iceberg_orphan_fixture" => {
                 if raw_value.is_empty() {
                     bail!("@iceberg_orphan_fixture requires <namespace>.<table>");
@@ -835,12 +862,14 @@ fn parse_meta_with_name_binding(
                 meta.native_observation_attempts = Some(attempts);
             }
             "be_log_contains" => {
+                parse_observation_marker(&raw_value).with_context(|| format!("@{key}: {line}"))?;
                 meta.be_log_contains.push(raw_value);
             }
             "be_log_not_contains" => {
                 if raw_value.is_empty() {
                     bail!("@be_log_not_contains pattern must not be empty");
                 }
+                parse_observation_marker(&raw_value).with_context(|| format!("@{key}: {line}"))?;
                 meta.be_log_not_contains.push(raw_value);
             }
             "be_log_count_at_least" => {
@@ -858,6 +887,7 @@ fn parse_meta_with_name_binding(
                 if count == 0 {
                     bail!("@be_log_count_at_least count must be positive");
                 }
+                parse_observation_marker(pattern).with_context(|| format!("@{key}: {line}"))?;
                 meta.be_log_count_at_least
                     .push((pattern.to_string(), count));
             }
@@ -876,6 +906,7 @@ fn parse_meta_with_name_binding(
                 if count == 0 {
                     bail!("@be_log_be_count_at_least count must be positive");
                 }
+                parse_observation_marker(pattern).with_context(|| format!("@{key}: {line}"))?;
                 meta.be_log_be_count_at_least
                     .push((pattern.to_string(), count));
             }
@@ -1091,9 +1122,9 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         kill_fe_after_mv_known_committed_before_projector_cas: override_meta
             .kill_fe_after_mv_known_committed_before_projector_cas
             || base.kill_fe_after_mv_known_committed_before_projector_cas,
-        restart_be_after_establish_context_index: override_meta
-            .restart_be_after_establish_context_index
-            .or(base.restart_be_after_establish_context_index),
+        restart_be_after_establish_participation_index: override_meta
+            .restart_be_after_establish_participation_index
+            .or(base.restart_be_after_establish_participation_index),
         restart_fe_after_step: override_meta.restart_fe_after_step || base.restart_fe_after_step,
         cleanup_fault: override_meta
             .cleanup_fault
@@ -1159,9 +1190,6 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         kill_be_at_lifecycle_phase: override_meta
             .kill_be_at_lifecycle_phase
             .or(base.kill_be_at_lifecycle_phase),
-        query_control_fragment_backend_limit: override_meta
-            .query_control_fragment_backend_limit
-            .or(base.query_control_fragment_backend_limit),
         iceberg_orphan_fixture: override_meta
             .iceberg_orphan_fixture
             .clone()
@@ -2118,21 +2146,29 @@ mod opt5_directive_tests {
         let re = meta_re();
         let lines = vec![
             "-- @kill_fe_after_mv_known_committed_before_projector_cas=true".to_string(),
-            "-- @restart_be_after_establish_context_index=1".to_string(),
-            "-- @cancel_query_after_be_log_contains=split_id=iceberg-metadata-0".to_string(),
+            "-- @restart_be_after_establish_participation_index=1".to_string(),
+            format!(
+                "-- @cancel_query_after_be_log_contains={} plan_node=0",
+                novarocks_failpoint::observation_marker::TASK_SPLIT_ASSIGNMENT_ACCEPTED
+            ),
             "-- @terminal_snapshot_conflict_be_index=2".to_string(),
             "-- @kill_query_at_lifecycle_phase=starting".to_string(),
             "-- @kill_be_at_lifecycle_phase=2,terminal-retained".to_string(),
-            "-- @query_control_fragment_backend_limit=2".to_string(),
         ];
 
         let meta = parse_meta(&lines, &re).expect("parse query lifecycle fault directives");
 
         assert!(meta.kill_fe_after_mv_known_committed_before_projector_cas);
-        assert_eq!(meta.restart_be_after_establish_context_index, Some(1));
+        assert_eq!(meta.restart_be_after_establish_participation_index, Some(1));
         assert_eq!(
             meta.cancel_query_after_be_log_contains.as_deref(),
-            Some("split_id=iceberg-metadata-0")
+            Some(
+                format!(
+                    "{} plan_node=0",
+                    novarocks_failpoint::observation_marker::TASK_SPLIT_ASSIGNMENT_ACCEPTED
+                )
+                .as_str()
+            )
         );
         assert_eq!(meta.terminal_snapshot_conflict_be_index, Some(2));
         assert_eq!(
@@ -2146,7 +2182,6 @@ mod opt5_directive_tests {
             meta.kill_query_at_lifecycle_phase,
             Some(QueryLifecyclePhase::Starting)
         );
-        assert_eq!(meta.query_control_fragment_backend_limit, Some(2));
     }
 
     #[test]
@@ -2154,12 +2189,8 @@ mod opt5_directive_tests {
         let re = meta_re();
         for (directive, expected) in [
             (
-                "query_control_fragment_backend_limit=two",
-                "invalid query_control_fragment_backend_limit: two",
-            ),
-            (
-                "restart_be_after_establish_context_index=first",
-                "invalid restart_be_after_establish_context_index: first",
+                "restart_be_after_establish_participation_index=first",
+                "invalid restart_be_after_establish_participation_index: first",
             ),
             (
                 "terminal_snapshot_conflict_be_index=first",
@@ -2588,16 +2619,18 @@ mod opt5_directive_tests {
     fn merge_meta_inherits_and_overrides_query_lifecycle_fault_directives() {
         let base = QueryMeta {
             kill_fe_after_mv_known_committed_before_projector_cas: true,
-            restart_be_after_establish_context_index: Some(0),
+            restart_be_after_establish_participation_index: Some(0),
             cancel_query_after_be_log_contains: Some("reader-open".to_string()),
             terminal_snapshot_conflict_be_index: Some(1),
             kill_query_at_lifecycle_phase: Some(QueryLifecyclePhase::Staging),
-            query_control_fragment_backend_limit: Some(2),
             ..QueryMeta::default()
         };
         let inherited = merge_meta(&base, &QueryMeta::default());
         assert!(inherited.kill_fe_after_mv_known_committed_before_projector_cas);
-        assert_eq!(inherited.restart_be_after_establish_context_index, Some(0));
+        assert_eq!(
+            inherited.restart_be_after_establish_participation_index,
+            Some(0)
+        );
         assert_eq!(
             inherited.cancel_query_after_be_log_contains.as_deref(),
             Some("reader-open")
@@ -2607,19 +2640,20 @@ mod opt5_directive_tests {
             inherited.kill_query_at_lifecycle_phase,
             Some(QueryLifecyclePhase::Staging)
         );
-        assert_eq!(inherited.query_control_fragment_backend_limit, Some(2));
 
         let override_meta = QueryMeta {
-            restart_be_after_establish_context_index: Some(2),
+            restart_be_after_establish_participation_index: Some(2),
             cancel_query_after_be_log_contains: Some("metadata-open".to_string()),
             terminal_snapshot_conflict_be_index: Some(0),
             kill_query_at_lifecycle_phase: Some(QueryLifecyclePhase::Running),
-            query_control_fragment_backend_limit: Some(1),
             ..QueryMeta::default()
         };
         let overridden = merge_meta(&base, &override_meta);
         assert!(overridden.kill_fe_after_mv_known_committed_before_projector_cas);
-        assert_eq!(overridden.restart_be_after_establish_context_index, Some(2));
+        assert_eq!(
+            overridden.restart_be_after_establish_participation_index,
+            Some(2)
+        );
         assert_eq!(
             overridden.cancel_query_after_be_log_contains.as_deref(),
             Some("metadata-open")
@@ -2629,43 +2663,63 @@ mod opt5_directive_tests {
             overridden.kill_query_at_lifecycle_phase,
             Some(QueryLifecyclePhase::Running)
         );
-        assert_eq!(overridden.query_control_fragment_backend_limit, Some(1));
     }
 
     #[test]
     fn be_log_directive_parser_collects_log_directives() {
         let re = meta_re();
         let lines = vec![
-            "-- @be_log_contains=be_log_ingress method=exec_batch_plan_fragments".to_string(),
-            "-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED".to_string(),
-            "-- @be_log_count_at_least=runtime_filter_receive,2".to_string(),
-            "-- @be_log_be_count_at_least=exchange_receive eos=true,2".to_string(),
+            format!(
+                "-- @be_log_contains={}",
+                novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED
+            ),
+            format!(
+                "-- @be_log_not_contains={}",
+                novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED
+            ),
+            format!(
+                "-- @be_log_count_at_least={},2",
+                novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED
+            ),
+            format!(
+                "-- @be_log_be_count_at_least={},2",
+                novarocks_failpoint::observation_marker::EXCHANGE_SNAPSHOT
+            ),
         ];
 
         let meta = parse_meta(&lines, &re).expect("parse BE log directives");
 
         assert_eq!(
             meta.be_log_contains,
-            vec!["be_log_ingress method=exec_batch_plan_fragments".to_string()]
+            vec![novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED.to_string()]
         );
         assert_eq!(
             meta.be_log_not_contains,
-            vec!["NOVAROCKS_CONNECTOR_WRITER_OPENED".to_string()]
+            vec![novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED.to_string()]
         );
         assert_eq!(
             meta.be_log_count_at_least,
-            vec![("runtime_filter_receive".to_string(), 2)]
+            vec![(
+                novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED.to_string(),
+                2
+            )]
         );
         assert_eq!(
             meta.be_log_be_count_at_least,
-            vec![("exchange_receive eos=true".to_string(), 2)]
+            vec![(
+                novarocks_failpoint::observation_marker::EXCHANGE_SNAPSHOT.to_string(),
+                2
+            )]
         );
     }
 
     #[test]
     fn be_log_directive_parser_rejects_invalid_log_count() {
         let re = meta_re();
-        let lines = vec!["-- @be_log_count_at_least=runtime_filter_receive,zero".to_string()];
+        let lines = vec![format!(
+            "-- @be_log_count_at_least={},zero",
+            novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED
+        )];
 
         let error = parse_meta(&lines, &re).expect_err("invalid count must fail");
 
@@ -2675,12 +2729,112 @@ mod opt5_directive_tests {
         );
     }
 
+    // These tests protect the parser-to-observation contract, including the
+    // distinct argument order of count and targeted-process directives.
+    #[test]
+    fn log_directives_reject_unregistered_markers_and_fields() {
+        let re = meta_re();
+        for (directive, prefix, suffix) in [
+            ("be_log_contains", "", ""),
+            ("be_log_not_contains", "", ""),
+            ("be_log_count_at_least", "", ",1"),
+            ("be_log_be_count_at_least", "", ",1"),
+            ("cancel_query_after_be_log_contains", "", ""),
+            ("kill_fe_after_be_log_contains", "", ""),
+            ("kill_be_after_be_log_contains", "1,", ""),
+        ] {
+            for (pattern, expected) in [
+                ("NOVAROCKS_NO_SUCH_MARKER", "unregistered marker"),
+                (
+                    format!(
+                        "{}typo",
+                        novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED
+                    )
+                    .as_str(),
+                    "unregistered marker",
+                ),
+                (
+                    format!(
+                        "{} 123=1",
+                        novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED
+                    )
+                    .as_str(),
+                    "unregistered field",
+                ),
+                (
+                    format!(
+                        "{} unknown-task=1",
+                        novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED
+                    )
+                    .as_str(),
+                    "unregistered field",
+                ),
+                (
+                    format!(
+                        "{} no_such_field=1",
+                        novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED
+                    )
+                    .as_str(),
+                    "unregistered field",
+                ),
+            ] {
+                let error =
+                    parse_meta(&[format!("-- @{directive}={prefix}{pattern}{suffix}")], &re)
+                        .expect_err("unknown observation vocabulary must fail before execution");
+                let error = format!("{error:#}");
+                assert!(
+                    error.contains(expected) && error.contains(directive),
+                    "{error}"
+                );
+            }
+            let error = parse_meta(&[format!("-- @{directive}=")], &re)
+                .expect_err("empty observation directives must not disappear");
+            assert!(format!("{error:#}").contains(directive));
+        }
+    }
+
+    #[test]
+    fn log_patterns_preserve_registered_empty_and_partial_field_values() {
+        use novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED;
+        for pattern in [
+            format!("{TASK_CREATE_APPLIED} task="),
+            format!("{TASK_CREATE_APPLIED} task=1"),
+        ] {
+            assert_eq!(
+                parse_observation_marker(&pattern).unwrap().name,
+                TASK_CREATE_APPLIED
+            );
+        }
+    }
+
+    #[test]
+    fn targeted_log_trigger_parses_backend_before_registered_pattern() {
+        let re = meta_re();
+        let meta = parse_meta(
+            &[format!(
+                "-- @kill_be_after_be_log_contains=1,{}",
+                novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED
+            )],
+            &re,
+        )
+        .expect("registered pattern follows backend index");
+        let trigger = meta.kill_be_after_be_log_contains.unwrap();
+        assert_eq!(trigger.be_index, 1);
+        assert_eq!(
+            trigger.pattern,
+            novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED
+        );
+    }
+
     #[test]
     fn expected_error_parser_preserves_be_log_directives_for_post_error_checks() {
         let re = meta_re();
         let lines = vec![
             "-- @expect_error=planned rejection".to_string(),
-            "-- @be_log_contains=be_log_ingress rejected".to_string(),
+            format!(
+                "-- @be_log_contains={}",
+                novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED
+            ),
         ];
 
         let meta = parse_meta(&lines, &re).expect("parse expected error with BE log directives");
@@ -2689,7 +2843,7 @@ mod opt5_directive_tests {
         assert!(meta.has_be_log_directives());
         assert_eq!(
             meta.be_log_contains,
-            vec!["be_log_ingress rejected".to_string()]
+            vec![novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED.to_string()]
         );
     }
 

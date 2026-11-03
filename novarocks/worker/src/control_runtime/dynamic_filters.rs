@@ -17,20 +17,20 @@
 
 //! One prepaid coalescing RF source. Rich values have unique store owners;
 //! only real publisher/host threads dispose them. Reporter clones issue no RF
-//! capability, and a Context-held feedback sink keeps only a weak writer.
+//! capability, and a Participation-held feedback sink keeps only a weak writer.
 
 mod read;
 pub(crate) use read::TaskDynamicFilterLoan;
 
 use super::{
-    actors::{ContextMessage, WorkerActor, WorkerMessage},
-    admitted_role::adopt_reported_work,
+    actors::{ParticipationMessage, WorkerActor, WorkerMessage},
+    reported_work_admission::adopt_reported_work,
 };
-use crate::{task_completion_roles::AdmittedCompletionRole, task_port::TaskPendingNotice};
+use crate::{task_completion_set::AdmittedCompletionTransfer, task_port::TaskPendingNotice};
 use novarocks_control_runtime::{
+    actor_turn::{ActorRuntime, ActorTurnError, InputPhase, StandingInputObligation},
     completion::ReportSlot,
-    driver::{ActorRuntime, DriverError, InputPhase, InputRole},
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError},
+    exit_custody::{ExitCustody, ExitCustodyError, ExitObligation},
     read_resource::{ReadResourceError, ReadResourceOwner, ReadResourceStore},
     transaction::{RuntimeError, ScopeHandle},
 };
@@ -40,8 +40,8 @@ use novarocks_control_runtime_core::{
 };
 use novarocks_execution_contract::task_execution::domain::CodecOwnedContent;
 use novarocks_execution_contract::{DomainVersion, TaskIdentity};
-use novarocks_worker_protocol::context::ContextInput;
 use novarocks_worker_protocol::creation::PayloadId;
+use novarocks_worker_protocol::participation::ParticipationInput;
 use std::{
     any::Any,
     mem::ManuallyDrop,
@@ -131,9 +131,9 @@ struct Custody {
     work: WorkId,
     scope: ScopeHandle,
     generation: Generation,
-    role: ExitRole,
+    exit_custody: ExitCustody,
     report: ReportSlot,
-    authority: Mutex<Option<ExitAuthority>>,
+    authority: Mutex<Option<ExitObligation>>,
     store: ReadResourceStore<OpaquePayload>,
     state: Mutex<State>,
     pending: Arc<dyn TaskPendingNotice>,
@@ -187,9 +187,12 @@ impl TaskDynamicFilterWriter {
             return DynamicFilterSubmission::Sealed;
         };
         let custody = &publisher.custody;
-        if custody.role.phase() == novarocks_control_runtime::exit_role::ExitRolePhase::Admitted {
+        if custody.exit_custody.phase()
+            == novarocks_control_runtime::exit_custody::ExitCustodyPhase::Admitted
+        {
             let mut authority = custody.authority.lock().expect("original RF authority");
-            if custody.role.phase() == novarocks_control_runtime::exit_role::ExitRolePhase::Admitted
+            if custody.exit_custody.phase()
+                == novarocks_control_runtime::exit_custody::ExitCustodyPhase::Admitted
                 && authority
                     .as_mut()
                     .expect("original RF author")
@@ -302,8 +305,8 @@ fn dispose_unexposed(snapshot: Snapshot) -> Result<(), Snapshot> {
 #[derive(Debug)]
 pub(crate) enum DynamicFilterError {
     Runtime(RuntimeError),
-    Driver(DriverError),
-    Role(ExitRoleError),
+    ActorTurn(ActorTurnError),
+    Role(ExitCustodyError),
     Resource(ReadResourceError),
     Unresolved,
     MissingInput,
@@ -316,7 +319,7 @@ impl std::fmt::Display for DynamicFilterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Runtime(error) => write!(f, "dynamic filter runtime failed: {error}"),
-            Self::Driver(error) => write!(f, "dynamic filter control driver failed: {error}"),
+            Self::ActorTurn(error) => write!(f, "dynamic filter control driver failed: {error}"),
             Self::Role(error) => write!(f, "dynamic filter role failed: {error}"),
             Self::Resource(error) => write!(f, "dynamic filter read resource failed: {error}"),
             Self::Unresolved => f.write_str("dynamic filter responsibility remains unresolved"),
@@ -338,7 +341,7 @@ impl std::error::Error for DynamicFilterError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Runtime(error) => Some(error),
-            Self::Driver(error) => Some(error),
+            Self::ActorTurn(error) => Some(error),
             Self::Role(error) => Some(error),
             Self::Resource(error) => Some(error),
             Self::Unresolved
@@ -355,13 +358,13 @@ impl From<RuntimeError> for DynamicFilterError {
         Self::Runtime(e)
     }
 }
-impl From<DriverError> for DynamicFilterError {
-    fn from(e: DriverError) -> Self {
-        Self::Driver(e)
+impl From<ActorTurnError> for DynamicFilterError {
+    fn from(e: ActorTurnError) -> Self {
+        Self::ActorTurn(e)
     }
 }
-impl From<ExitRoleError> for DynamicFilterError {
-    fn from(e: ExitRoleError) -> Self {
+impl From<ExitCustodyError> for DynamicFilterError {
+    fn from(e: ExitCustodyError) -> Self {
         Self::Role(e)
     }
 }
@@ -383,7 +386,7 @@ pub(crate) struct TaskDynamicFilterInbox {
     runtime: ActorRuntime<WorkerActor>,
     actor: ActorId,
     work: WorkId,
-    input: InputRole<WorkerActor>,
+    input: StandingInputObligation<WorkerActor>,
     closed: bool,
     input_closed: bool,
 }
@@ -393,20 +396,23 @@ pub(crate) struct DynamicFilterProgress {
 }
 impl TaskDynamicFilterInbox {
     pub(crate) fn from_admitted(
-        role: AdmittedCompletionRole,
-        input: InputRole<WorkerActor>,
+        completion_transfer: AdmittedCompletionTransfer,
+        input: StandingInputObligation<WorkerActor>,
         binding: DynamicFilterBinding,
     ) -> (Self, TaskDynamicFilterProducer) {
-        let work = role.work.id();
-        let report = role.report.clone();
-        let (role, authority) =
-            ExitRole::from_admitted(adopt_reported_work(role.work, role.capacity, role.report));
+        let work = completion_transfer.work.id();
+        let report = completion_transfer.report.clone();
+        let (exit_custody, authority) = ExitCustody::from_admitted(adopt_reported_work(
+            completion_transfer.work,
+            completion_transfer.capacity,
+            completion_transfer.report,
+        ));
         let custody = Arc::new(Custody {
             task: binding.task,
             work,
             scope: binding.scope.clone(),
             generation: binding.generation,
-            role,
+            exit_custody,
             report,
             authority: Mutex::new(Some(authority)),
             store: ReadResourceStore::new(binding.scope, RF_FIXED_PAYLOAD_POSITIONS),
@@ -511,9 +517,9 @@ impl TaskDynamicFilterInbox {
                         result.progressed = true;
                     }
                     Err(
-                        DriverError::InputStillQueued
-                        | DriverError::EffectsRemain
-                        | DriverError::ReservationsRemain,
+                        ActorTurnError::InputStillQueued
+                        | ActorTurnError::EffectsRemain
+                        | ActorTurnError::ReservationsRemain,
                     ) => return Ok(result),
                     Err(error) => return Err(error.into()),
                 }
@@ -631,7 +637,7 @@ impl TaskDynamicFilterInbox {
                     result.progressed = true;
                 }
             }
-            if self.custody.role.try_retire()? {
+            if self.custody.exit_custody.try_retire()? {
                 self.closed = true;
                 let retained = self
                     .custody
@@ -657,13 +663,13 @@ impl TaskDynamicFilterInbox {
             return Ok(result);
         }
         if let Some(snapshot) = state.pending_value.take() {
-            let command = WorkerMessage::Context(ContextMessage::Command {
+            let command = WorkerMessage::Participation(ParticipationMessage::Command {
                 work: novarocks_control_runtime_core::identity::ScopedWorkRef {
                     scope: self.custody.scope.id(),
                     work: self.work,
                 },
                 request: None,
-                command: ContextInput::DynamicFilterPublished {
+                command: ParticipationInput::DynamicFilterPublished {
                     task: self.custody.task,
                     version: snapshot.version,
                     payload: PayloadId(snapshot.row.id().get()),
@@ -760,9 +766,9 @@ impl TaskDynamicFilterInbox {
                         result.progressed = true;
                     }
                     Err(
-                        DriverError::InputStillQueued
-                        | DriverError::EffectsRemain
-                        | DriverError::ReservationsRemain,
+                        ActorTurnError::InputStillQueued
+                        | ActorTurnError::EffectsRemain
+                        | ActorTurnError::ReservationsRemain,
                     ) => return Ok(result),
                     Err(error) => return Err(error.into()),
                 }
@@ -842,14 +848,14 @@ impl TaskDynamicFilterInbox {
             self.input_closed = true;
             result.progressed = true;
         }
-        if self.custody.role.actual_exit_ready()? {
+        if self.custody.exit_custody.actual_exit_ready()? {
             let observer = ConsumerId::new(2).unwrap();
             if self.custody.report.consumption(observer)? == Consumption::Pending {
                 self.custody.report.consume(observer)?;
                 result.progressed = true;
             }
         }
-        if self.input_closed && self.custody.role.try_retire()? {
+        if self.input_closed && self.custody.exit_custody.try_retire()? {
             self.closed = true;
             let retained = self
                 .custody

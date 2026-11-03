@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use novarocks_execution_contract::{
     ExchangeCloseDisposition, ExchangeDeliveryRequirement, ExchangeSource, ExchangeStreamClose,
-    ExchangeStreamIdentity, FragmentNodeId, QueryContextRef, TaskDescriptor, TaskIdentity,
+    ExchangeStreamIdentity, FragmentNodeId, ParticipationRef, TaskDescriptor, TaskIdentity,
 };
 use novarocks_types::{QueryExecutionId, UniqueId};
 
@@ -39,7 +39,7 @@ enum InboundCapabilityFailure {
     ConflictingCloseFacts {
         task: TaskIdentity,
     },
-    ContextClosed {
+    ParticipationClosed {
         task: TaskIdentity,
     },
     KeyClosed {
@@ -64,9 +64,9 @@ impl std::fmt::Display for InboundCapabilityFailure {
                 f,
                 "task {task} normal-close facts conflict with its retained original record"
             ),
-            Self::ContextClosed { task } => write!(
+            Self::ParticipationClosed { task } => write!(
                 f,
-                "task {task} cannot install inbound capability after its query context closed"
+                "task {task} cannot install inbound capability after its participation closed"
             ),
             Self::KeyClosed { task, key, .. } => write!(
                 f,
@@ -88,8 +88,8 @@ impl novarocks_execution_contract::failure::FailureProjection for InboundCapabil
             Self::InvalidCloseFacts { .. } | Self::ConflictingCloseFacts { .. } => {
                 FailureFact::new(FailureClass::Invariant, R::InboundCloseContract.reason())
             }
-            Self::ContextClosed { .. } => {
-                FailureFact::stop_observation(R::InboundContextClosed.reason())
+            Self::ParticipationClosed { .. } => {
+                FailureFact::stop_observation(R::InboundParticipationClosed.reason())
             }
             Self::KeyClosed { task, holder, .. } => {
                 if task == holder {
@@ -217,7 +217,7 @@ impl NormalClosedInbound {
         self.close.stream.destination()
     }
     pub const fn destination_kernel_key(self) -> UniqueId {
-        self.close.stream.destination_fragment_instance_id()
+        self.close.stream.destination_task_key()
     }
     pub const fn destination_node_id(self) -> FragmentNodeId {
         self.close.stream.destination_node()
@@ -368,7 +368,7 @@ impl TaskInboundCapabilities {
             .lock()
             .expect(CAPABILITY_LOCK)
             .delivery_gates
-            .get(&stream.destination_fragment_instance_id())
+            .get(&stream.destination_task_key())
             .cloned();
         let _delivery = gate
             .as_ref()
@@ -382,7 +382,7 @@ impl TaskInboundCapabilities {
         state: &TaskInboundCapabilityState,
         stream: ExchangeStreamIdentity,
     ) -> Result<InboundFrameAdmission, InboundFrameClaim> {
-        let key = stream.destination_fragment_instance_id();
+        let key = stream.destination_task_key();
         let (destination, inbound) = if let Some(closed) = state.normally_closed.get(&key) {
             (closed.destination, closed.inbound.as_slice())
         } else if let Some(descriptor) = state.installed.get(&key) {
@@ -411,7 +411,7 @@ impl TaskInboundCapabilities {
             state,
             key,
             stream.destination_node(),
-            stream.source().fragment_instance_id(),
+            stream.source().task_key(),
             stream.source().sender_ordinal(),
             count,
         ) {
@@ -598,12 +598,12 @@ impl TaskInboundCapabilities {
         self.state.lock().expect(CAPABILITY_LOCK).installed.len()
     }
 
-    pub fn retains_normal_close(&self, context: QueryContextRef) -> bool {
+    pub fn retains_normal_close(&self, participation: ParticipationRef) -> bool {
         self.state
             .lock()
             .expect(CAPABILITY_LOCK)
             .normal_closed_executions
-            .contains(&context.query_execution_id())
+            .contains(&participation.query_execution_id())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -611,14 +611,14 @@ impl TaskInboundCapabilities {
     }
 
     pub fn install(&self, descriptor: Arc<TaskDescriptor>) -> Result<(), HostRejection> {
-        let key = descriptor.fragment_instance_id();
+        let key = descriptor.task_key();
         let mut state = self.state.lock().expect(CAPABILITY_LOCK);
         if state
             .closed_executions
             .contains(&descriptor.identity().query_execution_id())
         {
             return Err(capability_rejection(
-                InboundCapabilityFailure::ContextClosed {
+                InboundCapabilityFailure::ParticipationClosed {
                     task: descriptor.identity(),
                 },
             ));
@@ -647,17 +647,17 @@ impl TaskInboundCapabilities {
     /// Normal closure fences new receiver installation, while an already
     /// installed exact stream keeps its DATA permission until actual retirement.
     /// Only abort revokes that existing data-plane permission.
-    pub fn close_context(&self, context: QueryContextRef) {
+    pub fn close_participation(&self, participation: ParticipationRef) {
         self.state
             .lock()
             .expect(CAPABILITY_LOCK)
             .closed_executions
-            .insert(context.query_execution_id());
+            .insert(participation.query_execution_id());
     }
 
-    pub fn abort_context(&self, context: QueryContextRef) {
+    pub fn abort_participation(&self, participation: ParticipationRef) {
         let mut state = self.state.lock().expect(CAPABILITY_LOCK);
-        let execution = context.query_execution_id();
+        let execution = participation.query_execution_id();
         state.closed_executions.insert(execution);
         state.aborted_executions.insert(execution);
         state.normal_closed_executions.remove(&execution);
@@ -667,9 +667,9 @@ impl TaskInboundCapabilities {
     /// The original Context owner calls this only at its request horizon, or
     /// after process ingress has closed and every installed receiver exited.
     /// Hot execution retirement alone never forgets retained close facts.
-    pub fn forget_context(&self, context: QueryContextRef) {
+    pub fn forget_participation(&self, participation: ParticipationRef) {
         let mut state = self.state.lock().expect(CAPABILITY_LOCK);
-        let execution = context.query_execution_id();
+        let execution = participation.query_execution_id();
         assert!(
             state
                 .installed
@@ -708,7 +708,7 @@ impl TaskInboundCapabilities {
         descriptor: &TaskDescriptor,
         detach: impl FnOnce() -> T,
     ) -> T {
-        let key = descriptor.fragment_instance_id();
+        let key = descriptor.task_key();
         let gate = self
             .state
             .lock()
@@ -750,7 +750,7 @@ impl TaskInboundCapabilities {
                         stream: ExchangeStreamIdentity::try_new(
                             *source,
                             descriptor.identity(),
-                            descriptor.fragment_instance_id(),
+                            descriptor.task_key(),
                             node.node_id(),
                         )
                         .expect("frozen inbound stream identity"),
@@ -812,7 +812,7 @@ impl TaskInboundCapabilities {
                 let stream = ExchangeStreamIdentity::try_new(
                     *source,
                     descriptor.identity(),
-                    descriptor.fragment_instance_id(),
+                    descriptor.task_key(),
                     node.node_id(),
                 )
                 .map_err(|_| invalid())?;
@@ -840,7 +840,7 @@ impl TaskInboundCapabilities {
         closes: Box<[ExchangeStreamClose]>,
         retire_receiver: impl FnOnce(),
     ) -> Result<(), HostRejection> {
-        let key = descriptor.fragment_instance_id();
+        let key = descriptor.task_key();
         let gate = self
             .state
             .lock()
@@ -908,7 +908,7 @@ mod tests {
     };
 
     use novarocks_execution_contract::{
-        ExchangeInbound, ExchangeSource, ExchangeTopology, FragmentNodeId, QueryContextRef,
+        ExchangeInbound, ExchangeSource, ExchangeTopology, FragmentNodeId, ParticipationRef,
         TaskDescriptor, TaskIdentity,
     };
     use novarocks_types::{
@@ -993,38 +993,26 @@ mod tests {
         capabilities.install(Arc::new(second.clone())).unwrap();
         assert_eq!(capabilities.normal_close_retention(), retained);
         assert!(matches!(
-            claim(&capabilities, first.fragment_instance_id(), source, 0, 1),
+            claim(&capabilities, first.task_key(), source, 0, 1),
             InboundFrameClaim::NormallyClosed(_)
         ));
         assert_eq!(
-            claim(
-                &capabilities,
-                second.fragment_instance_id(),
-                second_source,
-                0,
-                1
-            ),
+            claim(&capabilities, second.task_key(), second_source, 0, 1),
             InboundFrameClaim::Authorized
         );
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             first.identity().query_execution_id(),
             FrontendProcessId::new_v7(),
             first.identity().backend_process_id(),
         );
-        capabilities.forget_context(context);
+        capabilities.forget_participation(participation);
         assert_eq!(capabilities.normal_close_retention(), (0, 0));
         assert_eq!(
-            claim(&capabilities, first.fragment_instance_id(), source, 0, 1),
+            claim(&capabilities, first.task_key(), source, 0, 1),
             InboundFrameClaim::NotHeld
         );
         assert_eq!(
-            claim(
-                &capabilities,
-                second.fragment_instance_id(),
-                second_source,
-                0,
-                1
-            ),
+            claim(&capabilities, second.task_key(), second_source, 0, 1),
             InboundFrameClaim::Authorized
         );
         capabilities.remove(&second);
@@ -1041,7 +1029,7 @@ mod tests {
         let callbacks = Cell::new(0);
         owner.close_normally(&first, || callbacks.set(callbacks.get() + 1));
         let InboundFrameClaim::NormallyClosed(original) =
-            claim(&owner, first.fragment_instance_id(), source, 0, 1)
+            claim(&owner, first.task_key(), source, 0, 1)
         else {
             panic!("the original exact normal-close record remains visible");
         };
@@ -1074,14 +1062,14 @@ mod tests {
         );
         assert_eq!(callbacks.get(), 2, "refusal precedes metadata detachment");
         let InboundFrameClaim::NormallyClosed(retained) =
-            claim(&owner, first.fragment_instance_id(), source, 0, 1)
+            claim(&owner, first.task_key(), source, 0, 1)
         else {
             panic!("a conflicting replay cannot erase the original record");
         };
         assert_eq!(retained.close(), original);
         assert_eq!(owner.normal_close_retention(), retention);
 
-        owner.forget_context(QueryContextRef::new(
+        owner.forget_participation(ParticipationRef::new(
             first.identity().query_execution_id(),
             FrontendProcessId::new_v7(),
             first.identity().backend_process_id(),
@@ -1091,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_close_metadata_grows_with_actual_records_until_each_context_forgets() {
+    fn normal_close_metadata_grows_with_actual_records_until_each_participation_forgets() {
         let (first, first_source) = descriptor(102, UniqueId::new(101, 102));
         let (second, second_source) = descriptor(202, UniqueId::new(201, 202));
         let (third, _) = descriptor(302, UniqueId::new(301, 302));
@@ -1120,18 +1108,12 @@ mod tests {
         }
         assert!(both_retained.1 > first_retained.1);
         assert!(matches!(
-            claim(
-                &capabilities,
-                first.fragment_instance_id(),
-                first_source,
-                0,
-                1
-            ),
+            claim(&capabilities, first.task_key(), first_source, 0, 1),
             InboundFrameClaim::NormallyClosed(_)
         ));
         capabilities.remove(&third);
         assert_eq!(capabilities.normal_close_retention(), both_retained);
-        capabilities.forget_context(QueryContextRef::new(
+        capabilities.forget_participation(ParticipationRef::new(
             first.identity().query_execution_id(),
             FrontendProcessId::new_v7(),
             first.identity().backend_process_id(),
@@ -1146,16 +1128,10 @@ mod tests {
             })
         );
         assert!(matches!(
-            claim(
-                &capabilities,
-                second.fragment_instance_id(),
-                second_source,
-                0,
-                1
-            ),
+            claim(&capabilities, second.task_key(), second_source, 0, 1),
             InboundFrameClaim::NormallyClosed(_)
         ));
-        capabilities.forget_context(QueryContextRef::new(
+        capabilities.forget_participation(ParticipationRef::new(
             second.identity().query_execution_id(),
             FrontendProcessId::new_v7(),
             second.identity().backend_process_id(),
@@ -1220,12 +1196,12 @@ mod tests {
         let kernel = UniqueId::new(8, 9);
         let (descriptor, source) = descriptor(401, kernel);
         capabilities.install(Arc::new(descriptor.clone())).unwrap();
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             descriptor.identity().query_execution_id(),
             FrontendProcessId::new_v7(),
             descriptor.identity().backend_process_id(),
         );
-        capabilities.close_context(context);
+        capabilities.close_participation(participation);
         assert_eq!(
             claim(&capabilities, kernel, source, 0, 1),
             InboundFrameClaim::Authorized,
@@ -1236,10 +1212,10 @@ mod tests {
             .expect("the same installed DATA admission remains valid");
         let later = TaskDescriptor::try_new(
             TaskIdentity::new(
-                context.query_execution_id(),
+                participation.query_execution_id(),
                 descriptor.identity().stage_id(),
                 TaskId::new(2).unwrap(),
-                context.backend_process_id(),
+                participation.backend_process_id(),
             ),
             UniqueId::new(10, 11),
             descriptor.pipeline_dop(),
@@ -1252,7 +1228,7 @@ mod tests {
             "the same normal closure still fences a new destination"
         );
         capabilities.close_normally(&descriptor, || {});
-        capabilities.abort_context(context);
+        capabilities.abort_participation(participation);
         assert_eq!(
             claim(&capabilities, kernel, source, 0, 1),
             InboundFrameClaim::NotHeld
@@ -1331,7 +1307,7 @@ mod tests {
         let stream = ExchangeStreamIdentity::try_new(
             source,
             descriptor.identity(),
-            descriptor.fragment_instance_id(),
+            descriptor.task_key(),
             node.node_id(),
         )
         .unwrap();
@@ -1343,13 +1319,9 @@ mod tests {
             BackendProcessId::new_v7(),
         );
         let forged_stream = ExchangeStreamIdentity::try_new(
-            ExchangeSource::new(
-                forged,
-                source.fragment_instance_id(),
-                source.sender_ordinal(),
-            ),
+            ExchangeSource::new(forged, source.task_key(), source.sender_ordinal()),
             descriptor.identity(),
-            descriptor.fragment_instance_id(),
+            descriptor.task_key(),
             node.node_id(),
         )
         .unwrap();
@@ -1372,7 +1344,7 @@ mod tests {
         let node = &base.topology().inbound()[0];
         let strict = TaskDescriptor::try_new(
             base.identity(),
-            base.fragment_instance_id(),
+            base.task_key(),
             NonZeroUsize::new(1).unwrap(),
             Vec::new(),
             ExchangeTopology::try_new(
@@ -1395,7 +1367,7 @@ mod tests {
         let stream = ExchangeStreamIdentity::try_new(
             node.sources()[0],
             strict.identity(),
-            strict.fragment_instance_id(),
+            strict.task_key(),
             node.node_id(),
         )
         .unwrap();
@@ -1459,7 +1431,7 @@ mod tests {
         .unwrap();
         let descriptor = TaskDescriptor::try_new(
             base.identity(),
-            base.fragment_instance_id(),
+            base.task_key(),
             NonZeroUsize::new(1).unwrap(),
             Vec::new(),
             topology,
@@ -1471,7 +1443,7 @@ mod tests {
             ExchangeStreamIdentity::try_new(
                 source,
                 descriptor.identity(),
-                descriptor.fragment_instance_id(),
+                descriptor.task_key(),
                 FragmentNodeId::new(node),
             )
             .unwrap()
@@ -1538,7 +1510,7 @@ mod tests {
         let stream = ExchangeStreamIdentity::try_new(
             input.sources()[0],
             descriptor.identity(),
-            descriptor.fragment_instance_id(),
+            descriptor.task_key(),
             input.node_id(),
         )
         .unwrap();
@@ -1562,11 +1534,11 @@ mod tests {
         let forged = ExchangeStreamIdentity::try_new(
             ExchangeSource::new(
                 forged,
-                stream.source().fragment_instance_id(),
+                stream.source().task_key(),
                 stream.source().sender_ordinal(),
             ),
             descriptor.identity(),
-            descriptor.fragment_instance_id(),
+            descriptor.task_key(),
             input.node_id(),
         )
         .unwrap();
@@ -1610,8 +1582,7 @@ mod tests {
         let (descriptor, _) = descriptor(911, UniqueId::new(93, 94));
         let owner = TaskInboundCapabilities::new();
         owner.install(Arc::new(descriptor.clone())).unwrap();
-        let gate =
-            owner.state.lock().unwrap().delivery_gates[&descriptor.fragment_instance_id()].clone();
+        let gate = owner.state.lock().unwrap().delivery_gates[&descriptor.task_key()].clone();
         let drops = Arc::new(AtomicUsize::new(0));
         let original = Box::new(Capture {
             owner: owner.clone(),
@@ -1642,7 +1613,7 @@ mod tests {
         let stream = ExchangeStreamIdentity::try_new(
             node.sources()[0],
             descriptor.identity(),
-            descriptor.fragment_instance_id(),
+            descriptor.task_key(),
             node.node_id(),
         )
         .unwrap();

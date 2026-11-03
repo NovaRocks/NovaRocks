@@ -21,7 +21,7 @@
 
 use super::*;
 use crate::runtime::tracked_state_allocator::expression_allocation_host;
-use crate::runtime::{fragment::ExecutionFailureCause, mem_tracker::MemTracker};
+use crate::runtime::{mem_tracker::MemTracker, task::ExecutionFailureCause};
 use crate::runtime_filter::RuntimeFilterFailure;
 use arrow::array::StringArray;
 use std::{

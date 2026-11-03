@@ -254,7 +254,7 @@ impl BackendRoutingChannel {
                 return Err(BackendRoutingError::DuplicateProducerInstance {
                     channel: channel_id,
                     binding: key.0,
-                    fragment_instance_id: key.1,
+                    task_key: key.1,
                 });
             }
         }
@@ -371,7 +371,7 @@ impl BackendRoutingShard {
         &self,
         channel_id: RuntimeFilterChannelId,
         binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         kind: BackendEnvelopeKind,
     ) -> Result<&BackendRoutingEdge, BackendRoutingError> {
         if !matches!(
@@ -389,11 +389,11 @@ impl BackendRoutingShard {
         let channel = self.channel(channel_id)?;
         let source_participant = *channel
             .producer_participants
-            .get(&(binding_id, fragment_instance_id))
+            .get(&(binding_id, task_key))
             .ok_or(BackendRoutingError::UnknownProducerInstance {
                 channel: channel_id,
                 binding: binding_id,
-                fragment_instance_id,
+                task_key,
             })?;
         let source_role = BackendRouteRole::Producer(binding_id);
         let edges = channel
@@ -565,7 +565,7 @@ pub enum BackendRoutingError {
     DuplicateProducerInstance {
         channel: RuntimeFilterChannelId,
         binding: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
     },
     NoLocalRoles(RuntimeFilterChannelId),
     UnknownChannel(RuntimeFilterChannelId),
@@ -580,7 +580,7 @@ pub enum BackendRoutingError {
     UnknownProducerInstance {
         channel: RuntimeFilterChannelId,
         binding: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
     },
     UnknownInboundProducerRoute {
         channel: RuntimeFilterChannelId,

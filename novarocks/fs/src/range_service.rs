@@ -33,8 +33,8 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, oneshot};
 
 use crate::{
-    BoundFile, FileCancellation, FileError, FileErrorKind, FileReadRange, FileResult,
-    FileTaskSpawner, PreparedFileInput,
+    BoundFile, FileCancellation, FileError, FileErrorKind, FileIoSpawner, FileReadRange,
+    FileResult, PreparedFileInput,
 };
 
 const SEGMENT_BYTES: usize = 8 * 1024 * 1024;
@@ -745,7 +745,7 @@ pub struct FileRangeService {
     queue_capacity: usize,
     demand_waiters: AtomicUsize,
     next_id: AtomicU64,
-    task_spawner: Arc<dyn FileTaskSpawner>,
+    io_spawner: Arc<dyn FileIoSpawner>,
     scan_handle: Handle,
     state: Mutex<State>,
     /// Segment supervisors that have not exited yet.
@@ -835,7 +835,7 @@ impl FileRangeService {
         process_window: NonZeroUsize,
         source_window: NonZeroUsize,
         queue_capacity: NonZeroUsize,
-        task_spawner: Arc<dyn FileTaskSpawner>,
+        io_spawner: Arc<dyn FileIoSpawner>,
         scan_handle: Handle,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -844,7 +844,7 @@ impl FileRangeService {
             queue_capacity: queue_capacity.get(),
             demand_waiters: AtomicUsize::new(0),
             next_id: AtomicU64::new(0),
-            task_spawner,
+            io_spawner,
             scan_handle,
             state: Mutex::new(State::default()),
             live_supervisors: AtomicUsize::new(0),
@@ -1336,7 +1336,7 @@ impl FileRangeService {
                 index,
             }) => {
                 let len = bytes.len() as u64;
-                self.task_spawner.spawn(Box::pin(async move {
+                self.io_spawner.spawn(Box::pin(async move {
                     let result = file
                         .read_into(
                             FileReadRange::Bounded {
@@ -1351,7 +1351,7 @@ impl FileRangeService {
                     let _ = sender.send(result);
                 }))
             }
-            DispatchUnit::Stat => self.task_spawner.spawn(Box::pin(async move {
+            DispatchUnit::Stat => self.io_spawner.spawn(Box::pin(async move {
                 let result = file.stat(&cancellation).await.map(UnitOutput::Stat);
                 let _ = sender.send(result);
             })),
@@ -1438,7 +1438,7 @@ impl FileRangeService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FileIdentity, FileTask, FileTaskFuture, FsAccessResolver};
+    use crate::{FileIdentity, FileIoFuture, FileIoJob, FsAccessResolver};
     use novarocks_spi::connector::StorageAccessDomainId;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
@@ -1463,11 +1463,11 @@ mod tests {
         }
     }
 
-    impl FileTaskSpawner for GateSpawner {
-        fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
+    impl FileIoSpawner for GateSpawner {
+        fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
             self.started.fetch_add(1, Ordering::SeqCst);
             let permits = Arc::clone(&self.permits);
-            Ok(FileTask::new(tokio::spawn(async move {
+            Ok(FileIoJob::new(tokio::spawn(async move {
                 let permit = permits.acquire_owned().await.expect("gate open");
                 permit.forget();
                 task.await;
@@ -1974,9 +1974,7 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
             NonZeroUsize::new(1).unwrap(),
             NonZeroUsize::new(2).unwrap(),
-            Arc::new(crate::TokioFileTaskSpawner::new(
-                io_runtime.handle().clone(),
-            )),
+            Arc::new(crate::TokioFileIoSpawner::new(io_runtime.handle().clone())),
             scan_runtime.handle().clone(),
         );
         // A read that never completes holds the only process slot.
@@ -2087,7 +2085,7 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
             NonZeroUsize::new(1).unwrap(),
             NonZeroUsize::new(1).unwrap(),
-            Arc::new(crate::TokioFileTaskSpawner::new(Handle::current())),
+            Arc::new(crate::TokioFileIoSpawner::new(Handle::current())),
             Handle::current(),
         );
         let mut request = service
@@ -2154,7 +2152,7 @@ mod tests {
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
-            Arc::new(crate::TokioFileTaskSpawner::new(Handle::current())),
+            Arc::new(crate::TokioFileIoSpawner::new(Handle::current())),
             Handle::current(),
         );
         let present = PreparedFileInput::new(&file, 4, BytesMut::from(&b"efgh"[..]))
@@ -2536,8 +2534,8 @@ mod tests {
             .build()
             .expect("scan runtime");
         let (_dir, file) = fixture();
-        let spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(crate::TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(crate::TokioFileIoSpawner::new(runtime.handle().clone()));
         let service = FileRangeService::new(
             NonZeroUsize::new(1).unwrap(),
             NonZeroUsize::new(1).unwrap(),
@@ -2597,8 +2595,8 @@ mod tests {
                 FileIdentity::new(path.to_string_lossy(), (SEGMENT_BYTES + 4) as u64, None),
             )
             .expect("bound file");
-        let spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(crate::TokioFileTaskSpawner::new(Handle::current()));
+        let spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(crate::TokioFileIoSpawner::new(Handle::current()));
         let service = FileRangeService::new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
@@ -2715,11 +2713,11 @@ mod tests {
         count: AtomicUsize,
     }
 
-    impl FileTaskSpawner for FailFirstSpawner {
-        fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
+    impl FileIoSpawner for FailFirstSpawner {
+        fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
             let first = self.count.fetch_add(1, Ordering::SeqCst) == 0;
             let gate = Arc::clone(&self.gate);
-            Ok(FileTask::new(tokio::spawn(async move {
+            Ok(FileIoJob::new(tokio::spawn(async move {
                 if first {
                     drop(task);
                     return;

@@ -77,11 +77,11 @@ impl KernelEvaluationControl for Trace {
         panic!("N sorting never waits")
     }
 }
-struct Lease {
+struct Reservation {
     trace: Arc<Trace>,
     len: usize,
 }
-impl Drop for Lease {
+impl Drop for Reservation {
     fn drop(&mut self) {
         assert!(self.trace.active.swap(false, AtomicOrdering::SeqCst));
         self.trace
@@ -96,18 +96,18 @@ struct Resources {
     refusal: Option<KernelFailure>,
 }
 impl NSortResources for Resources {
-    type Lease = Lease;
+    type Reservation = Reservation;
     fn before_sort(
         &mut self,
         len: usize,
         _: &mut ScalarWork<'_, '_>,
-    ) -> Result<Lease, KernelFailure> {
+    ) -> Result<Reservation, KernelFailure> {
         self.trace.events.lock().unwrap().push(Event::Enter(len));
         if let Some(cause) = &self.refusal {
             return Err(cause.clone());
         }
         assert!(!self.trace.active.swap(true, AtomicOrdering::SeqCst));
-        Ok(Lease {
+        Ok(Reservation {
             trace: self.trace.clone(),
             len,
         })

@@ -69,11 +69,11 @@ pub(crate) enum FailureClass {
     Clock,
     Transport,
     Framing,
-    Driver,
+    ConnectionJob,
     PriorFailure,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub(crate) enum DriverExit {
+pub(crate) enum ConnectionExit {
     NotSpawned,
     Live,
     Closed,
@@ -104,7 +104,7 @@ pub(crate) struct HeldObservation {
     pub reset_requested: bool,
     pub response_abandoned: bool,
     pub abort_requested: bool,
-    pub driver_exit: DriverExit,
+    pub connection_exit: ConnectionExit,
 }
 
 /// The actual first source remains owned; fixed presentation never formats it.
@@ -270,13 +270,13 @@ impl Capture {
 
 /// A success receipt exists only after the original JoinHandle actually returns.
 /// Expected local abort still retains that actual JoinError as owned evidence.
-pub(crate) struct JoinedOriginalDriver {
+pub(crate) struct JoinedOriginalConnection {
     pub observation: HeldObservation,
     pub actual_expected_cancellation: Option<JoinError>,
 }
-impl std::fmt::Debug for JoinedOriginalDriver {
+impl std::fmt::Debug for JoinedOriginalConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("JoinedOriginalDriver { actual_join_completed: true }")
+        f.write_str("JoinedOriginalConnection { actual_join_completed: true }")
     }
 }
 
@@ -289,7 +289,7 @@ pub(crate) struct HeldRootResponse {
     sender: Option<client::SendRequest<Bytes>>,
     request_stream: Option<SendStream<Bytes>>,
     response: Option<RecvStream>,
-    driver: Option<JoinHandle<std::result::Result<(), h2::Error>>>,
+    connection_job: Option<JoinHandle<std::result::Result<(), h2::Error>>>,
     capture: Capture,
     phase: Phase,
     first_failure: Option<FailureClass>,
@@ -299,8 +299,8 @@ pub(crate) struct HeldRootResponse {
     reset_requested: bool,
     response_abandoned: bool,
     abort_requested: bool,
-    driver_exit: DriverExit,
-    // A test-only hold at the original await boundary. It owns no driver/body.
+    connection_exit: ConnectionExit,
+    // A test-only hold at the original await boundary. It owns no connection job/body.
     #[cfg(test)]
     settle_before_join: Option<SettleHold>,
 }
@@ -406,7 +406,7 @@ impl HeldRootResponse {
             sender: None,
             request_stream: None,
             response: None,
-            driver: None,
+            connection_job: None,
             capture: Capture::new(),
             phase: Phase::Prepared,
             first_failure: None,
@@ -416,7 +416,7 @@ impl HeldRootResponse {
             reset_requested: false,
             response_abandoned: false,
             abort_requested: false,
-            driver_exit: DriverExit::NotSpawned,
+            connection_exit: ConnectionExit::NotSpawned,
             #[cfg(test)]
             settle_before_join: None,
         }
@@ -442,7 +442,7 @@ impl HeldRootResponse {
             reset_requested: self.reset_requested,
             response_abandoned: self.response_abandoned,
             abort_requested: self.abort_requested,
-            driver_exit: self.driver_exit,
+            connection_exit: self.connection_exit,
         }
     }
     pub(crate) fn require_closed_ack(
@@ -502,8 +502,8 @@ impl HeldRootResponse {
     async fn attach_and_capture(&mut self, io: BoxedIo) -> Result<()> {
         let (sender, connection) = client::handshake(io).await?;
         // No await/fallible call between spawn and installation of its original handle.
-        self.driver = Some(tokio::spawn(connection));
-        self.driver_exit = DriverExit::Live;
+        self.connection_job = Some(tokio::spawn(connection));
+        self.connection_exit = ConnectionExit::Live;
         self.sender = Some(sender);
         before(self.deadline)?;
         poll_fn(|cx| {
@@ -582,8 +582,12 @@ impl HeldRootResponse {
             "held response already ended"
         );
         ensure!(
-            !self.driver.as_ref().expect("original driver").is_finished(),
-            "original driver exited before held observation"
+            !self
+                .connection_job
+                .as_ref()
+                .expect("original connection job")
+                .is_finished(),
+            "original connection job exited before held observation"
         );
         Ok(())
     }
@@ -600,25 +604,33 @@ impl HeldRootResponse {
         if let Err(error) = before(self.deadline) {
             return Err(self.fail(FailureClass::Clock, error));
         }
-        if self.driver.as_ref().is_some_and(JoinHandle::is_finished) {
+        if self
+            .connection_job
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
             // Borrow the same original handle until its actual result is obtained.
-            let joined = self.driver.as_mut().expect("original driver").await;
-            self.driver.take();
+            let joined = self
+                .connection_job
+                .as_mut()
+                .expect("original connection job")
+                .await;
+            self.connection_job.take();
             let cause = match joined {
                 Ok(Ok(())) => {
-                    self.driver_exit = DriverExit::Closed;
-                    anyhow::anyhow!("original driver exited early")
+                    self.connection_exit = ConnectionExit::Closed;
+                    anyhow::anyhow!("original connection job exited early")
                 }
                 Ok(Err(error)) => {
-                    self.driver_exit = DriverExit::ConnectionFailed;
+                    self.connection_exit = ConnectionExit::ConnectionFailed;
                     error.into()
                 }
                 Err(error) => {
-                    self.driver_exit = DriverExit::JoinFailed;
+                    self.connection_exit = ConnectionExit::JoinFailed;
                     error.into()
                 }
             };
-            return Err(self.fail(FailureClass::Driver, cause));
+            return Err(self.fail(FailureClass::ConnectionJob, cause));
         }
         let response = self.response.as_mut().expect("held original response");
         if response.is_end_stream() {
@@ -644,11 +656,11 @@ impl HeldRootResponse {
     /// not a fresh cleanup/success clock. No timeout drops the original handle.
     pub(crate) async fn settle(
         &mut self,
-    ) -> std::result::Result<JoinedOriginalDriver, HeldFailure> {
+    ) -> std::result::Result<JoinedOriginalConnection, HeldFailure> {
         if self.phase == Phase::Settled {
             return Err(self.fail(
                 FailureClass::Transition,
-                anyhow::anyhow!("original driver settled twice"),
+                anyhow::anyhow!("original connection job settled twice"),
             ));
         }
         // Only an unfinished borrowed settle leaves this phase. Re-entry
@@ -657,11 +669,16 @@ impl HeldRootResponse {
             self.first_failure.get_or_insert(FailureClass::Transition);
         }
         let mut clock_error = before(self.deadline).err();
-        // Cleanup is not a final held observation: an already exited driver
+        // Cleanup is not a final held observation: an already exited connection job
         // must stay failed even when joining its original handle returns Ok.
         if self.phase == Phase::Held {
-            if self.driver.as_ref().is_none_or(JoinHandle::is_finished) {
-                self.first_failure.get_or_insert(FailureClass::Driver);
+            if self
+                .connection_job
+                .as_ref()
+                .is_none_or(JoinHandle::is_finished)
+            {
+                self.first_failure
+                    .get_or_insert(FailureClass::ConnectionJob);
             }
             if let Some(response) = self.response.as_mut() {
                 self.withheld = response.flow_control().used_capacity();
@@ -688,32 +705,32 @@ impl HeldRootResponse {
         drop(self.authorization.take());
         drop(self.connector.take());
         let mut actual_expected_cancellation = None;
-        let mut driver_error = None;
-        if let Some(driver) = self.driver.as_mut() {
-            driver.abort();
+        let mut connection_error = None;
+        if let Some(connection_job) = self.connection_job.as_mut() {
+            connection_job.abort();
             self.abort_requested = true;
             #[cfg(test)]
             if let Some(hold) = self.settle_before_join.take() {
-                // The original handle remains in self.driver across this
+                // The original handle remains in self.connection_job across this
                 // cancellable hold; no wrapper task or alternate handle.
                 hold.entered.notify_one();
                 hold.release.notified().await;
             }
-            let actual = driver.await;
-            self.driver.take();
+            let actual = connection_job.await;
+            self.connection_job.take();
             match actual {
-                Ok(Ok(())) => self.driver_exit = DriverExit::Closed,
+                Ok(Ok(())) => self.connection_exit = ConnectionExit::Closed,
                 Ok(Err(error)) => {
-                    self.driver_exit = DriverExit::ConnectionFailed;
-                    driver_error = Some(error.into());
+                    self.connection_exit = ConnectionExit::ConnectionFailed;
+                    connection_error = Some(error.into());
                 }
                 Err(error) if error.is_cancelled() => {
-                    self.driver_exit = DriverExit::AbortedAndJoined;
+                    self.connection_exit = ConnectionExit::AbortedAndJoined;
                     actual_expected_cancellation = Some(error);
                 }
                 Err(error) => {
-                    self.driver_exit = DriverExit::JoinFailed;
-                    driver_error = Some(error.into());
+                    self.connection_exit = ConnectionExit::JoinFailed;
+                    connection_error = Some(error.into());
                 }
             }
         }
@@ -721,8 +738,8 @@ impl HeldRootResponse {
         if let Err(error) = before(self.deadline) {
             clock_error.get_or_insert(error);
         }
-        if let Some(error) = driver_error {
-            let mut failure = self.fail(FailureClass::Driver, error);
+        if let Some(error) = connection_error {
+            let mut failure = self.fail(FailureClass::ConnectionJob, error);
             failure.additional_actual_source = clock_error;
             return Err(failure);
         }
@@ -731,15 +748,15 @@ impl HeldRootResponse {
             failure.additional_actual_source = actual_expected_cancellation.map(Into::into);
             return Err(failure);
         }
-        if self.first_failure.is_some() || self.driver_exit == DriverExit::NotSpawned {
+        if self.first_failure.is_some() || self.connection_exit == ConnectionExit::NotSpawned {
             let mut failure = self.fail(
                 FailureClass::PriorFailure,
-                anyhow::anyhow!("original held attempt failed or never spawned a driver"),
+                anyhow::anyhow!("original held attempt failed or never spawned a connection job"),
             );
             failure.additional_actual_source = actual_expected_cancellation.map(Into::into);
             return Err(failure);
         }
-        Ok(JoinedOriginalDriver {
+        Ok(JoinedOriginalConnection {
             observation: self.snapshot(),
             actual_expected_cancellation,
         })
@@ -749,8 +766,8 @@ impl Drop for HeldRootResponse {
     fn drop(&mut self) {
         // Emergency abort only. This branch produces NO joined/success receipt.
         // The scene must explicitly settle the same outer owner before dropping it.
-        if let Some(driver) = &self.driver {
-            driver.abort();
+        if let Some(connection_job) = &self.connection_job {
+            connection_job.abort();
         }
     }
 }

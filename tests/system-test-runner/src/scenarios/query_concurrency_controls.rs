@@ -22,7 +22,7 @@ use std::thread;
 
 pub(super) fn created_for(line: &str, binding: &StatementExecutionBinding) -> Result<bool> {
     let fields = line.split_whitespace().collect::<Vec<_>>();
-    if !fields.contains(&"NOVAROCKS_TASK_CREATE_APPLIED") {
+    if !fields.contains(&novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED) {
         return Ok(false);
     }
     let field = |name: &str| -> Result<&str> {
@@ -85,7 +85,8 @@ mod tests {
     fn q1_creation_does_not_credit_q2_or_another_backend() {
         let binding = binding();
         let line = format!(
-            "NOVAROCKS_TASK_CREATE_APPLIED execution_id=10:20:1 stage=2 task=3 backend={}",
+            "{} execution_id=10:20:1 stage=2 task=3 backend={}",
+            novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED,
             binding.backend_process_id
         );
         assert!(created_for(&line, &binding).unwrap());

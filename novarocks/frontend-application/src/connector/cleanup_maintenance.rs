@@ -28,7 +28,7 @@ use std::sync::Mutex;
 use novarocks_spi::connector::{
     BatchReceipt, CandidatePage, ConnectorCleanupCandidatePageRequest,
     ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest,
-    ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver,
+    ConnectorCleanupMaintenanceResolver, ConnectorCleanupMaintenanceSession,
     ConnectorCleanupOperation, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
     ConnectorCleanupPlan, ConnectorCleanupPrepareRequest, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
@@ -48,7 +48,7 @@ pub enum CleanupBatchExecution {
 /// execute attempt in-process so a caller cannot accidentally send the same
 /// prepared batch twice before the durable checkpoint takes over.
 pub struct CleanupMaintenanceSession {
-    lease: ConnectorCleanupMaintenanceLease,
+    session: ConnectorCleanupMaintenanceSession,
     plan: ConnectorCleanupPlan,
     context: ConnectorRequestContext,
     executed_ordinals: Mutex<BTreeSet<u32>>,
@@ -56,7 +56,7 @@ pub struct CleanupMaintenanceSession {
 
 impl CleanupMaintenanceSession {
     pub(crate) fn require_scanned_object_gc(&self) -> Result<(), ConnectorError> {
-        self.lease.scan_gc_safety().require_scanned_object_gc()
+        self.session.scan_gc_safety().require_scanned_object_gc()
     }
 
     /// Acquire one current cleanup capability, strictly load the table on that
@@ -75,15 +75,16 @@ impl CleanupMaintenanceSession {
                 "cleanup table does not belong to requested connector instance",
             ));
         }
-        let lease = resolver.acquire_current_cleanup_maintenance(instance_id)?;
-        let metadata = lease
+        let session = resolver.acquire_current_cleanup_maintenance(instance_id)?;
+        let metadata = session
             .metadata()
             .load_frontend_table(ConnectorTableRequest {
                 table: table.clone(),
                 resolution: ConnectorTableResolution::StrictBaseTable,
                 context: context.clone(),
             })?;
-        if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
+        if metadata.identity != table || metadata.table.owner() != &session.descriptor().instance_id
+        {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "cleanup metadata returned a table handle for a different exact owner",
@@ -91,8 +92,8 @@ impl CleanupMaintenanceSession {
         }
         let operation =
             ConnectorCleanupOperation::remove_unreferenced_objects(metadata.table, older_than_ms)?;
-        let plan = lease.plan_operation(operation_id, operation, context.clone())?;
-        Self::from_plan(lease, plan, context)
+        let plan = session.plan_operation(operation_id, operation, context.clone())?;
+        Self::from_plan(session, plan, context)
     }
 
     /// Freeze the second cleanup plan after the frontend has durably observed
@@ -114,15 +115,16 @@ impl CleanupMaintenanceSession {
                 "cleanup table does not belong to requested connector instance",
             ));
         }
-        let lease = resolver.acquire_current_cleanup_maintenance(instance_id)?;
-        let metadata = lease
+        let session = resolver.acquire_current_cleanup_maintenance(instance_id)?;
+        let metadata = session
             .metadata()
             .load_frontend_table(ConnectorTableRequest {
                 table: table.clone(),
                 resolution: ConnectorTableResolution::StrictBaseTable,
                 context: context.clone(),
             })?;
-        if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
+        if metadata.identity != table || metadata.table.owner() != &session.descriptor().instance_id
+        {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "cleanup metadata returned a table handle for a different exact owner",
@@ -130,18 +132,22 @@ impl CleanupMaintenanceSession {
         }
         let operation =
             ConnectorCleanupOperation::remove_unreferenced_objects(metadata.table, older_than_ms)?;
-        let plan =
-            lease.plan_selected_owned_refs(operation_id, operation, selection, context.clone())?;
-        Self::from_plan(lease, plan, context)
+        let plan = session.plan_selected_owned_refs(
+            operation_id,
+            operation,
+            selection,
+            context.clone(),
+        )?;
+        Self::from_plan(session, plan, context)
     }
 
     fn from_plan(
-        lease: ConnectorCleanupMaintenanceLease,
+        session: ConnectorCleanupMaintenanceSession,
         plan: ConnectorCleanupPlan,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         Ok(Self {
-            lease,
+            session,
             plan,
             context,
             executed_ordinals: Mutex::new(BTreeSet::new()),
@@ -157,7 +163,7 @@ impl CleanupMaintenanceSession {
     /// cannot manufacture a new dispatch target.
     pub fn prepare_batch(&self, batch_ordinal: u32) -> Result<PreparedBatch, ConnectorError> {
         self.ensure_active("prepare")?;
-        self.lease
+        self.session
             .prepare_batch(ConnectorCleanupPrepareRequest::try_new(
                 self.plan.clone(),
                 batch_ordinal,
@@ -190,7 +196,7 @@ impl CleanupMaintenanceSession {
             }
         }
         match self
-            .lease
+            .session
             .execute_batch(ConnectorCleanupExecuteRequest::try_new(
                 self.plan.clone(),
                 prepared,
@@ -207,7 +213,7 @@ impl CleanupMaintenanceSession {
         offset: u64,
         limit: u32,
     ) -> Result<CandidatePage, ConnectorError> {
-        self.lease
+        self.session
             .read_candidate_page(ConnectorCleanupCandidatePageRequest::try_new(
                 self.plan.clone(),
                 offset,
@@ -219,7 +225,7 @@ impl CleanupMaintenanceSession {
     /// This is intentionally best-effort from the frontend terminal path. It
     /// can delete provider artifacts but cannot affect the durable result.
     pub fn finalize_terminal(&self) -> Result<(), ConnectorError> {
-        self.lease
+        self.session
             .finalize_terminal(ConnectorCleanupFinalizeRequest::try_new(
                 self.plan.clone(),
                 self.context.clone(),

@@ -34,7 +34,7 @@ use novarocks_spi::connector::read_stack::{
     ConnectorPreparedSourceRead, ConnectorReadSourceProjection, ConnectorReadSourceSelection,
 };
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
+    ConnectorControlPlanningPin, ConnectorReadSelector, ConnectorTableHandle,
     ConnectorTableMetadata,
 };
 use novarocks_sql::binding::{SqlTableBindingAllocator, SqlTableBindingId, SqlTableBindingScopeId};
@@ -223,19 +223,19 @@ pub enum QueryTableBindingAdmission {
     Local,
     /// A connector-owned table admission retains the exact generation that
     /// admitted its read materialization or terminal write target.
-    Exact(ConnectorControlPlanningLease),
+    Exact(ConnectorControlPlanningPin),
     /// A provider-frozen read has no independent table-selector materialization.
     /// Its source facts remain opaque in the provider request, while this
     /// retained lease fences the synthetic SQL relation to one exact control
     /// generation.
-    FrozenRead(ConnectorControlPlanningLease),
+    FrozenRead(ConnectorControlPlanningPin),
 }
 
 impl QueryTableBindingAdmission {
-    pub fn exact_planning_lease(&self) -> Result<ConnectorControlPlanningLease, String> {
+    pub fn exact_planning_pin(&self) -> Result<ConnectorControlPlanningPin, String> {
         match self {
             Self::Exact(lease) | Self::FrozenRead(lease) => Ok(lease.clone()),
-            Self::Local => Err("query binding has no connector planning lease".to_string()),
+            Self::Local => Err("query binding has no connector planning pin".to_string()),
         }
     }
 }
@@ -255,10 +255,10 @@ pub enum QueryFrozenCohortRead {
 
 impl QueryFrozenCohortRead {
     /// The generation this cohort was frozen against.
-    pub fn planning_lease(&self) -> &ConnectorControlPlanningLease {
+    pub fn planning_pin(&self) -> &ConnectorControlPlanningPin {
         match self {
-            Self::PinnedFileSet(read) => &read.planning_lease,
-            Self::TableExecute(read) => &read.planning_lease,
+            Self::PinnedFileSet(read) => &read.planning_pin,
+            Self::TableExecute(read) => &read.planning_pin,
         }
     }
 
@@ -278,7 +278,7 @@ pub struct QueryTableBinding {
     pub admission: QueryTableBindingAdmission,
     /// The exact provider metadata that SQL analysis used for a connector
     /// base relation. It is retained solely for CREATE-time source identity
-    /// observation through the paired planning lease.
+    /// observation through the paired planning pin.
     pub source_metadata: Option<ConnectorTableMetadata>,
     /// Provider facts required by scan preparation.  This is deliberately
     /// application-owned and paired with the same token as `resolved`; it is
@@ -301,7 +301,7 @@ pub struct QueryTableBinding {
     /// from/to comparison, so the primary materialization alone is not
     /// sufficient to recover a historical scan at preparation time.
     ///
-    /// The map is query-local and shares the binding's planning lease; it is
+    /// The map is query-local and shares the binding's planning pin; it is
     /// never populated by a later catalog lookup.
     pub frozen_snapshot_materializations: BTreeMap<i64, QueryScanMaterialization>,
     /// Completed source preparations selected for this binding. A nonempty
@@ -323,7 +323,7 @@ pub enum QueryPreparedSourceSelector {
 pub struct QueryPreparedSourceRead {
     pub(crate) receipt: ConnectorPreparedSourceRead,
     pub(crate) projection: ConnectorReadSourceProjection,
-    pub(crate) planning: ConnectorControlPlanningLease,
+    pub(crate) planning: ConnectorControlPlanningPin,
 }
 
 fn prepared_source_selector(
@@ -387,7 +387,7 @@ pub struct QueryScanMaterialization {
     /// Provider-owned exact file selection for an affected MV target read.
     pub mv_partition_selection:
         Option<novarocks_spi::connector::read_stack::ConnectorMvTargetPartitionSelection>,
-    pub planning_lease: ConnectorControlPlanningLease,
+    pub planning_pin: ConnectorControlPlanningPin,
 }
 
 #[derive(Clone)]
@@ -430,9 +430,9 @@ impl QueryTableBinding {
         &mut self,
         receipt: ConnectorPreparedSourceRead,
         projection: ConnectorReadSourceProjection,
-        planning: ConnectorControlPlanningLease,
+        planning: ConnectorControlPlanningPin,
     ) -> Result<(), String> {
-        let admitted = self.admission.exact_planning_lease()?;
+        let admitted = self.admission.exact_planning_pin()?;
         receipt
             .request()
             .observed_source_facts()
@@ -471,7 +471,7 @@ impl QueryTableBinding {
             .ok_or("prepared source has no primary To materialization")?;
         if primary.selector != ConnectorReadSelector::SnapshotId(to_snapshot)
             || primary.table != receipt.to_metadata().table
-            || !Arc::ptr_eq(primary.planning_lease.binding(), planning.binding())
+            || !Arc::ptr_eq(primary.planning_pin.binding(), planning.binding())
         {
             return Err(
                 "prepared source primary materialization is not its original Snapshot(To)".into(),
@@ -706,7 +706,7 @@ impl QueryTableBindingStore {
                     self.exact_binding_receipts.register_connector_binding(
                         id,
                         [identity.catalog(), identity.namespace(), identity.table()],
-                        &materialization.planning_lease,
+                        &materialization.planning_pin,
                         &materialization.table,
                         materialization.selector,
                     )?;
@@ -1018,13 +1018,13 @@ mod tests {
     }
 
     #[test]
-    fn spi5b_local_binding_cannot_supply_a_connector_planning_lease() {
-        let error = match local_binding().admission.exact_planning_lease() {
+    fn spi5b_local_binding_cannot_supply_a_connector_planning_pin() {
+        let error = match local_binding().admission.exact_planning_pin() {
             Ok(_) => panic!("local SQL bindings cannot admit a connector read"),
             Err(error) => error,
         };
 
-        assert_eq!(error, "query binding has no connector planning lease");
+        assert_eq!(error, "query binding has no connector planning pin");
     }
 
     #[test]

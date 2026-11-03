@@ -21,16 +21,16 @@
 use std::sync::Arc;
 #[path = "compiled_ordered_output.rs"]
 mod compiled_ordered_output;
-use compiled_ordered_output::CompiledOrderedOutputDriver;
+use compiled_ordered_output::CompiledOrderedOutputEvaluator;
 pub(super) use compiled_ordered_output::CompiledOrderedOutputFactory;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::operators::runtime_filter::{
     CompiledRuntimeFilterConsumers, CompiledRuntimeFilterKeys, RuntimeFilterConsumerState,
 };
-use crate::runtime::fragment::io::FragmentEventSink;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit};
+use crate::runtime::task::io::TaskEventSink;
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 // These counters describe the core-owned residual scan conjunct. They are
 // intentionally separate from runtime-filter counters because a connector may
@@ -54,7 +54,7 @@ pub(super) struct ScanOutputFilter {
 pub(super) struct ScanDriverFilter {
     filter: ScanOutputFilter,
     compiled_keys: Option<CompiledRuntimeFilterKeys>,
-    compiled_ordered: Option<CompiledOrderedOutputDriver>,
+    compiled_ordered: Option<CompiledOrderedOutputEvaluator>,
 }
 
 impl ScanOutputFilter {
@@ -168,7 +168,7 @@ impl ScanDriverFilter {
         &mut self,
         chunk: Chunk,
         profiles: Option<&OperatorProfiles>,
-        event_sink: &Arc<dyn FragmentEventSink>,
+        event_sink: &Arc<dyn TaskEventSink>,
     ) -> ExecutionResult<Option<Chunk>> {
         let filter = &self.filter;
         let Some(chunk) = (match self.compiled_ordered.as_mut() {
@@ -279,7 +279,7 @@ impl std::error::Error for ScanOutputFailure {
 }
 impl novarocks_failure_contract::FailureProjection for ScanOutputFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let (class, reason) = match self {
             Self::Contract(_) => (FailureClass::Invariant, ExecutionReason::ScanOutputContract),

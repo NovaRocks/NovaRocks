@@ -76,22 +76,22 @@ use crate::exec::node::table_writer::{
 use crate::exec::operators::table_writer::tests::{
     TestFragmentEncoder, adapter, catalog_handle, commit_fragment, request_context, writer_handle,
 };
-use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory};
 use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use crate::runtime::fragment::CompiledWriterBindings;
-use crate::runtime::fragment::exchange::{
+use crate::runtime::endpoint::{RuntimeEndpoint, TaskDestination};
+use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::CompiledWriterBindings;
+use crate::runtime::task::exchange::{
     CompiledExchangeReceivers, materialize_compiled_exchange_receivers,
 };
-use crate::runtime::fragment::instance::{
-    ExchangeInputAssignment, ExchangeInputAssignments, FragmentSinkAssignment,
+use crate::runtime::task::instance::{
+    ExchangeInputAssignment, ExchangeInputAssignments, TaskSinkAssignment,
 };
-use crate::runtime::fragment::io::exchange::test_support::{Fixture, UnitLoopback};
-use crate::runtime::fragment::io::{ExchangeFrameTransmitter, NoopFragmentEventSink};
-use crate::runtime::fragment::sink::materialize_compiled_sink;
-use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::io::exchange::test_support::{Fixture, UnitLoopback};
+use crate::runtime::task::io::{ExchangeFrameTransmitter, NoopTaskEventSink};
+use crate::runtime::task::sink::materialize_compiled_sink;
 
 const WRITER_FINST: UniqueId = UniqueId::new(0x81, 0x01);
 const FINISH_FINST: UniqueId = UniqueId::new(0x82, 0x02);
@@ -693,19 +693,19 @@ struct LoopbackTransmitter {
 impl ExchangeFrameTransmitter for LoopbackTransmitter {
     fn deliver_unit(
         &self,
-        frame: crate::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+        frame: crate::runtime::task::io::exchange_unit::ExchangeUnitFrame,
         stop: tokio_util::sync::CancellationToken,
-        activity: crate::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
-        done: crate::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
+        done: crate::runtime::task::io::exchange_unit::ExchangeDeliveryCallback,
     ) {
         self.unit.deliver_unit(frame, stop, activity, done);
     }
     fn register_unit_demands(
         &self,
         destination: RuntimeEndpoint,
-        entries: Vec<crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry>,
+        entries: Vec<crate::runtime::task::io::exchange_unit::ExchangeDemandEntry>,
         stop: tokio_util::sync::CancellationToken,
-        done: crate::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+        done: crate::runtime::task::io::exchange_unit::ExchangeDemandCallback,
     ) {
         self.unit
             .register_unit_demands(destination, entries, stop, done)
@@ -714,7 +714,7 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
         &self,
         destination: RuntimeEndpoint,
         stream: novarocks_execution_contract::ExchangeStreamIdentity,
-        wake: crate::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+        wake: crate::runtime::task::io::exchange_unit::ExchangeGrantWake,
     ) -> Result<(), novarocks_failure_contract::FailureFact> {
         self.unit.watch_unit_facts(destination, stream, wake)
     }
@@ -789,7 +789,7 @@ fn run(
         None,
         pipeline_dop,
         fixture.state(instance),
-        Arc::new(NoopFragmentEventSink),
+        Arc::new(NoopTaskEventSink),
     )
     .map_err(|error| error.to_string())?
     .start()
@@ -849,9 +849,9 @@ fn run_insert(
     let writer_sink = fixture
         .sink(
             &insert.writer,
-            &FragmentSinkAssignment::StreamDestinations {
+            &TaskSinkAssignment::StreamDestinations {
                 destinations: vec![
-                    FragmentDestination::new(
+                    TaskDestination::new(
                         FINISH_FINST,
                         RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
                         WRITER_FINST,
@@ -879,12 +879,12 @@ fn run_insert(
         WRITER_FINST,
         writer_dop,
     )?;
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let finish_sink = materialize_compiled_sink(
         &insert.finish,
-        &FragmentSinkAssignment::None,
+        &TaskSinkAssignment::None,
         FINISH_FINST,
-        crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+        crate::runtime::task::io::exchange::discard_exchange_transmitter(),
         Some(Box::new(ResultSinkFactory::new(output.clone()))),
         None,
     )
@@ -2120,7 +2120,7 @@ mod statistics {
     fn poll_typed(
         operator: &mut Box<dyn Operator>,
         state: &RuntimeState,
-    ) -> crate::runtime::fragment::ExecutionResult<Vec<Chunk>> {
+    ) -> crate::runtime::task::ExecutionResult<Vec<Chunk>> {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut calls = TestDriver::new(operator.as_mut(), state);
         let mut output = Vec::new();
@@ -2155,7 +2155,7 @@ mod statistics {
         operator: &mut dyn Operator,
         state: &RuntimeState,
         chunk: Chunk,
-    ) -> crate::runtime::fragment::ExecutionResult<()> {
+    ) -> crate::runtime::task::ExecutionResult<()> {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut calls = TestDriver::new(operator, state);
         let mut input = RawInput::for_test(chunk);
@@ -2273,7 +2273,7 @@ mod statistics {
         relation: &crate::exec::chunk::ChunkSchemaRef,
         chunks: &[Chunk],
         state: &RuntimeState,
-    ) -> crate::runtime::fragment::ExecutionResult<Vec<Chunk>> {
+    ) -> crate::runtime::task::ExecutionResult<Vec<Chunk>> {
         let mut operator = factory.create(1, 0);
         install_statistics_construction(operator.as_mut(), state);
         operator.prepare()?;
@@ -2572,7 +2572,7 @@ mod statistics {
     struct StatisticsRun {
         compiled_writer: Vec<Vec<Chunk>>,
         expected_writer: Vec<Vec<RecordBatch>>,
-        compiled_root: crate::runtime::fragment::ExecutionResult<Vec<Chunk>>,
+        compiled_root: crate::runtime::task::ExecutionResult<Vec<Chunk>>,
         expected_root: Vec<RecordBatch>,
     }
 
@@ -2790,7 +2790,7 @@ mod statistics {
             compiled.failure_fact(),
             FailureFact::new(
                 FailureClass::Invariant,
-                crate::runtime::fragment::ExecutionReason::FinishCoverage.reason(),
+                crate::runtime::task::ExecutionReason::FinishCoverage.reason(),
             )
         );
     }
@@ -2928,7 +2928,7 @@ mod statistics {
     struct Reject(crate::exec::node::table_write_relation::TableWriteAggregateBoundary);
 
     #[cfg(novarocks_dev_controls)]
-    impl crate::exec::node::table_write_relation::TableWriteAggregateGuard for Reject {
+    impl crate::exec::node::table_write_relation::TableWriteAggregateFaultHook for Reject {
         fn check(
             &self,
             boundary: crate::exec::node::table_write_relation::TableWriteAggregateBoundary,
@@ -3181,7 +3181,7 @@ mod statistics {
     #[test]
     fn compiled_final_prepare_preserves_first_real_tracker_limit_refusal() {
         use crate::exec::pipeline::operator::ConstructionFailure;
-        use crate::runtime::fragment::ExecutionFailureCause;
+        use crate::runtime::task::ExecutionFailureCause;
         let compiled = compiled(0, &[], 1);
         let state = statistics_state(theta_function_set());
         let (_, statistics) = CompiledFinishStatistics::try_new(

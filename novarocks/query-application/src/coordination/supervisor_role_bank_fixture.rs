@@ -276,8 +276,8 @@ where
 }
 
 struct TestDriverCustody(std::sync::Mutex<Option<Box<JointProgressDriver>>>);
-struct TestDriverLease<'a>(&'a TestDriverCustody, Option<Box<JointProgressDriver>>);
-impl Drop for TestDriverLease<'_> {
+struct TestDriverLoan<'a>(&'a TestDriverCustody, Option<Box<JointProgressDriver>>);
+impl Drop for TestDriverLoan<'_> {
     fn drop(&mut self) {
         let previous = self.0.0.lock().unwrap().replace(self.1.take().unwrap());
         assert!(previous.is_none());
@@ -286,7 +286,7 @@ impl Drop for TestDriverLease<'_> {
 impl TestDriverCustody {
     fn with<R>(&self, f: impl FnOnce(&mut JointProgressDriver) -> R) -> R {
         let driver = self.0.lock().unwrap().take().unwrap();
-        let mut lease = TestDriverLease(self, Some(driver));
+        let mut lease = TestDriverLoan(self, Some(driver));
         f(lease.1.as_deref_mut().unwrap())
     }
 }

@@ -34,12 +34,12 @@ use super::aggregate_fixture::{
 use super::family_fixture::{FixtureControl, constant_policy, int64, int64_rows};
 use super::{PipelineGraph, PipelinePlan, build_compiled_pipeline_graph};
 use crate::exec::node::scan::ScanOp;
-use crate::exec::operators::ResultSinkHandle;
+use crate::exec::operators::ResultSinkBuffer;
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::dependency::DependencyManager;
-use crate::runtime::fragment::CompiledWriterBindings;
-use crate::runtime::fragment::scan::compiled_fixture::{FixtureScanOp, SCAN_NODE, scan_program};
 use crate::runtime::runtime_state::RuntimeErrorState;
+use crate::runtime::task::CompiledWriterBindings;
+use crate::runtime::task::scan::compiled_fixture::{FixtureScanOp, SCAN_NODE, scan_program};
 
 fn scan_graph(dop: usize, root_dop: Option<i32>) -> PipelineGraph {
     let program = scan_program(dop, false);
@@ -314,7 +314,7 @@ fn compiled_mixed_update_and_merge_calls_keep_their_own_phase_and_exact_result()
         functions[1].input_is_intermediate,
         "SUM reads the exact state of its original logical INT64 binding"
     );
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let instance = UniqueId::new(71, 72);
     try_run(
         &program,

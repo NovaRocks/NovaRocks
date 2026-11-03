@@ -113,14 +113,14 @@ pub(super) fn wait_ingress(f: &mut Fixture, input: InputId) -> EstablishIngressO
         f.runtime.wait_after_timeout(version, remaining);
     }
 }
-pub(super) fn wait_disposal(f: &Fixture, input: InputId) -> ExitRolePhase {
+pub(super) fn wait_disposal(f: &Fixture, input: InputId) -> ExitCustodyPhase {
     let deadline = Instant::now() + WATCHDOG;
     loop {
         let version = f.runtime.change_version();
         let phase = f.root.establish_source_phase(input).unwrap().unwrap();
         if matches!(
             phase,
-            ExitRolePhase::Exited | ExitRolePhase::Retired | ExitRolePhase::Unresolved
+            ExitCustodyPhase::Exited | ExitCustodyPhase::Retired | ExitCustodyPhase::Unresolved
         ) {
             return phase;
         }

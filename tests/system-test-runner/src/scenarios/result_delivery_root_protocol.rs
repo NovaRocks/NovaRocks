@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-const CREATED_MARKER: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
+const CREATED_MARKER: &str = novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED;
 const REQUEST_CAP: usize = 4096;
 const RESPONSE_CAP: usize = 1048576 + 4096;
 const ROOT_PATH: &str = "/novarocks.NovaRocksGrpc/FetchRootResult";
@@ -311,7 +311,7 @@ pub(super) fn probe_candidate(
             let (mut sender, connection) = client::handshake(stream)
                 .await
                 .context("handshake root probe HTTP/2")?;
-            let driver = ConnectionDriver(Some(tokio::spawn(connection)));
+            let connection_job = ConnectionJob(Some(tokio::spawn(connection)));
             let request = Request::builder()
                 .method("POST")
                 .uri(ROOT_PATH)
@@ -355,7 +355,7 @@ pub(super) fn probe_candidate(
             let status = response_status(header_status, trailer_status, &bytes, saw_data)?;
             drop(body);
             drop(sender);
-            driver.finish().await;
+            connection_job.finish().await;
             Ok::<_, anyhow::Error>((bytes, status))
         })
         .await
@@ -435,19 +435,19 @@ fn identity_observation(identity: novarocks_execution_contract::TaskIdentity) ->
 }
 
 /// Abort on error/timeout as well as success; dropping a JoinHandle detaches.
-struct ConnectionDriver(Option<tokio::task::JoinHandle<Result<(), h2::Error>>>);
-impl ConnectionDriver {
+struct ConnectionJob(Option<tokio::task::JoinHandle<Result<(), h2::Error>>>);
+impl ConnectionJob {
     async fn finish(mut self) {
-        if let Some(driver) = self.0.take() {
-            driver.abort();
-            let _ = driver.await;
+        if let Some(connection_job) = self.0.take() {
+            connection_job.abort();
+            let _ = connection_job.await;
         }
     }
 }
-impl Drop for ConnectionDriver {
+impl Drop for ConnectionJob {
     fn drop(&mut self) {
-        if let Some(driver) = &self.0 {
-            driver.abort();
+        if let Some(connection_job) = &self.0 {
+            connection_job.abort();
         }
     }
 }
@@ -580,7 +580,10 @@ mod tests {
 
     #[test]
     fn task_candidates_preserve_the_first_appended_stdout_marker_and_order() {
-        let ready = "NOVAROCKS_READY role=be grpc_port=23000\n";
+        let ready = &*format!(
+            "{} role=be grpc_port=23000\n",
+            novarocks_failpoint::observation_marker::READY
+        );
         let earlier = marker().replace("-7:23:2", "-7:22:2");
         let baseline = format!("{ready}{earlier}");
         let first = marker();
@@ -597,7 +600,10 @@ mod tests {
 
     #[test]
     fn task_candidates_reject_shrunk_or_replaced_stdout_prefixes() {
-        let baseline = "NOVAROCKS_READY role=be\n";
+        let baseline = &*format!(
+            "{} role=be\n",
+            novarocks_failpoint::observation_marker::READY
+        );
         let same_size_replacement = baseline.replace("READY", "OTHER");
         assert_eq!(same_size_replacement.len(), baseline.len());
         for observed in [

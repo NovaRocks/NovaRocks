@@ -20,7 +20,7 @@
 
 use super::*;
 use crate::exec::arrow_work::{ArrowWorkBudget, ArrowWorkShape};
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use novarocks_functions::opaque_memory::OpaqueRetainedCharge;
 use novarocks_functions::{
     AggregateStateAllocator, EvaluationCheckpoints, KernelDiagnostic, KernelEvaluationControl,

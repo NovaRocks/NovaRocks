@@ -126,7 +126,7 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
         include_table_names: bool,
     ) -> futures::future::BoxFuture<'a, Result<Option<SystemCatalogFacts>, String>> {
         Box::pin(async move {
-            let lease = match crate::connector::acquire_metadata_planning_lease(
+            let lease = match crate::connector::acquire_metadata_planning_pin(
                 self.connector_control.as_ref(),
                 catalog_name,
             ) {
@@ -136,7 +136,7 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
             let mut budget = ConnectorListingBudget::new(ConnectorListingBound::V1)
                 .map_err(|e| e.to_string())?;
             let mut schema_names =
-                crate::connector::metadata_list_namespaces_with_planning_lease_async(
+                crate::connector::metadata_list_namespaces_with_planning_pin_async(
                     lease.clone(),
                     request.clone(),
                     budget.remaining_bound(),
@@ -153,7 +153,7 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
             let mut table_names = Vec::new();
             if include_table_names {
                 for schema in &schema_names {
-                    let tables = crate::connector::metadata_list_tables_with_planning_lease_async(
+                    let tables = crate::connector::metadata_list_tables_with_planning_pin_async(
                         &lease,
                         request.clone(),
                         schema,
@@ -179,7 +179,7 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
         catalog_name: &str,
         include_table_names: bool,
     ) -> Result<Option<SystemCatalogFacts>, String> {
-        let lease = match crate::connector::acquire_metadata_planning_lease(
+        let lease = match crate::connector::acquire_metadata_planning_pin(
             self.connector_control.as_ref(),
             catalog_name,
         ) {
@@ -194,7 +194,7 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
             include_table_names,
             |bound| {
                 Ok(
-                    crate::connector::metadata_list_namespaces_with_planning_lease(
+                    crate::connector::metadata_list_namespaces_with_planning_pin(
                         lease,
                         request.clone(),
                         bound,
@@ -205,7 +205,7 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
                 )
             },
             |schema_name, bound| {
-                crate::connector::metadata_list_tables_with_planning_lease(
+                crate::connector::metadata_list_tables_with_planning_pin(
                     &listing_lease,
                     request.clone(),
                     schema_name,

@@ -18,12 +18,12 @@
 //! The Native preparation's two original, named physical obligations.
 //! Worker still registers one child; no producer work runs on its polling owner.
 
-use crate::native_fragment_query::NativeFragmentRegistrationLease;
+use crate::native_query_context::NativeTaskRegistration;
 use novarocks_execution::runtime::{
     execution_health::{ExecutionExitOrigin, ExecutionHealth},
-    fragment::{
-        DormantFragmentHandle, ExecutionFailure, ExecutionResult, RunningFragmentHandle,
-        handle::FragmentTerminalPublisher,
+    task::{
+        ExecutionFailure, ExecutionResult, PreparedTaskExecution, RunningTaskExecution,
+        handle::LocalTaskTerminalPublisher,
     },
     task_control::TaskExecutionControl,
 };
@@ -51,12 +51,12 @@ pub(crate) enum Phase {
     RootPoll,
     RootAdopt,
     RootHolder,
-    KernelStart,
-    KernelPoll,
-    KernelHolder,
+    LocalTaskStart,
+    LocalTaskPoll,
+    LocalTaskHolder,
     Registration,
     Control,
-    KernelObserve,
+    LocalTaskObserve,
     RootOutput,
 }
 const PHASES: usize = 11;
@@ -68,7 +68,7 @@ enum Action {
     Unresolved,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kernel {
+enum LocalTaskPhase {
     Vacant,
     Building,
     Prepared,
@@ -84,7 +84,7 @@ enum Kernel {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum NativePreparedOwnerFailure {
     DuplicateRoot,
-    DuplicateKernel,
+    DuplicateLocalTask,
     OfferWithoutPrepared,
     AdoptWithoutOffer,
     StartWithoutAdoption,
@@ -95,7 +95,7 @@ impl std::fmt::Display for NativePreparedOwnerFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DuplicateRoot => f.write_str("Native preparation already owns its Root child"),
-            Self::DuplicateKernel => {
+            Self::DuplicateLocalTask => {
                 f.write_str("Native preparation already owns its prepared kernel")
             }
             Self::OfferWithoutPrepared => {
@@ -122,7 +122,7 @@ impl FailureProjection for NativePreparedOwnerFailure {
     fn failure_fact(&self) -> FailureFact {
         let (class, reason) = match self {
             Self::DuplicateRoot => (FailureClass::Invariant, 9640),
-            Self::DuplicateKernel => (FailureClass::Invariant, 9641),
+            Self::DuplicateLocalTask => (FailureClass::Invariant, 9641),
             Self::OfferWithoutPrepared => (FailureClass::Invariant, 9642),
             Self::AdoptWithoutOffer => (FailureClass::Invariant, 9643),
             Self::StartWithoutAdoption => (FailureClass::Invariant, 9644),
@@ -148,12 +148,12 @@ struct State {
     rollback: bool,
     root_transferred: bool,
     root_birth: RootBirth,
-    kernel: Kernel,
+    local_task: LocalTaskPhase,
     root: Option<ManuallyDrop<Arc<dyn TaskPreparationChild>>>,
-    dormant: Option<ManuallyDrop<DormantFragmentHandle>>,
-    running: Option<ManuallyDrop<RunningFragmentHandle>>,
-    publisher: Option<ManuallyDrop<FragmentTerminalPublisher>>,
-    registration: Option<ManuallyDrop<NativeFragmentRegistrationLease>>,
+    dormant: Option<ManuallyDrop<PreparedTaskExecution>>,
+    running: Option<ManuallyDrop<RunningTaskExecution>>,
+    publisher: Option<ManuallyDrop<LocalTaskTerminalPublisher>>,
+    registration: Option<ManuallyDrop<NativeTaskRegistration>>,
     // Only real prepared kernel work keeps this capability, never Root metadata.
     control: Option<Arc<TaskExecutionControl>>,
     phases: [Action; PHASES],
@@ -168,7 +168,7 @@ pub(crate) struct NativePreparationChild {
     health: Arc<ExecutionHealth>,
     state: Arc<Mutex<State>>,
     self_weak: std::sync::Weak<Self>,
-    kernel_stopped: std::sync::atomic::AtomicBool,
+    task_stopped: std::sync::atomic::AtomicBool,
     #[cfg(novarocks_dev_controls)]
     prepared_exit_gate: Mutex<Option<super::prepared_exit_control::PreparedExitGate>>,
 }
@@ -185,7 +185,7 @@ impl NativePreparationChild {
                 rollback: false,
                 root_transferred: false,
                 root_birth: RootBirth::NeverStarted,
-                kernel: Kernel::Vacant,
+                local_task: LocalTaskPhase::Vacant,
                 root: None,
                 dormant: None,
                 running: None,
@@ -198,7 +198,7 @@ impl NativePreparationChild {
                 publication: std::array::from_fn(|_| None),
             })),
             self_weak: weak.clone(),
-            kernel_stopped: std::sync::atomic::AtomicBool::new(false),
+            task_stopped: std::sync::atomic::AtomicBool::new(false),
             #[cfg(novarocks_dev_controls)]
             prepared_exit_gate: Mutex::new(None),
         });
@@ -225,7 +225,7 @@ impl NativePreparationChild {
         };
         // A concurrent original stop may already have begun rollback while the
         // finite runner connection was established. It wins without a new fault.
-        if self.state.lock().unwrap().kernel != Kernel::Prepared {
+        if self.state.lock().unwrap().local_task != LocalTaskPhase::Prepared {
             return Ok(None);
         }
         let cause = gate.cause().clone();
@@ -242,7 +242,7 @@ impl NativePreparationChild {
     }
     pub(crate) fn offer_available(&self) -> bool {
         let state = self.state.lock().unwrap();
-        !state.rollback && state.kernel == Kernel::Prepared
+        !state.rollback && state.local_task == LocalTaskPhase::Prepared
     }
     /// The original physical constructor reserves this once before opening a
     /// channel. Rollback and Root birth use this same original state lock.
@@ -329,23 +329,25 @@ impl NativePreparationChild {
     }
     /// One linear construction token closes the slot before Core can build a
     /// second kernel. It grants ownership placement, never memory capacity.
-    pub(crate) fn reserve_kernel(self: &Arc<Self>) -> ExecutionResult<PreparedKernelConstruction> {
+    pub(crate) fn reserve_local_task(
+        self: &Arc<Self>,
+    ) -> ExecutionResult<PreparedLocalTaskConstruction> {
         let mut state = self.state.lock().unwrap();
         if state.rollback {
             return Err(NativePreparedOwnerFailure::LateInstall.into());
         }
-        if state.kernel != Kernel::Vacant {
-            return Err(NativePreparedOwnerFailure::DuplicateKernel.into());
+        if state.local_task != LocalTaskPhase::Vacant {
+            return Err(NativePreparedOwnerFailure::DuplicateLocalTask.into());
         }
-        state.kernel = Kernel::Building;
-        Ok(PreparedKernelConstruction {
+        state.local_task = LocalTaskPhase::Building;
+        Ok(PreparedLocalTaskConstruction {
             owner: self.clone(),
             installed: false,
         })
     }
     pub(crate) fn take_exchange_retirement(
         &self,
-    ) -> Option<novarocks_execution::runtime::fragment::ExchangeReceiverRetirement> {
+    ) -> Option<novarocks_execution::runtime::task::ExchangeReceiverRetirement> {
         self.state
             .lock()
             .unwrap()
@@ -354,16 +356,16 @@ impl NativePreparationChild {
             .expect("installed prepared kernel")
             .take_exchange_retirement()
     }
-    pub(crate) fn offer(self: &Arc<Self>) -> ExecutionResult<PreparedKernelOffer> {
+    pub(crate) fn offer(self: &Arc<Self>) -> ExecutionResult<PreparedLocalTaskOffer> {
         let mut state = self.state.lock().unwrap();
         if state.rollback {
             return Err(NativePreparedOwnerFailure::LateInstall.into());
         }
-        if state.kernel != Kernel::Prepared {
+        if state.local_task != LocalTaskPhase::Prepared {
             return Err(NativePreparedOwnerFailure::OfferWithoutPrepared.into());
         }
-        state.kernel = Kernel::Offered;
-        Ok(PreparedKernelOffer {
+        state.local_task = LocalTaskPhase::Offered;
+        Ok(PreparedLocalTaskOffer {
             owner: self.clone(),
         })
     }
@@ -386,14 +388,14 @@ impl NativePreparationChild {
             state.primary[phase as usize] = payload;
             if matches!(
                 phase,
-                Phase::KernelStart
-                    | Phase::KernelPoll
-                    | Phase::KernelHolder
+                Phase::LocalTaskStart
+                    | Phase::LocalTaskPoll
+                    | Phase::LocalTaskHolder
                     | Phase::Registration
                     | Phase::Control
-                    | Phase::KernelObserve
+                    | Phase::LocalTaskObserve
             ) {
-                state.kernel = Kernel::Unresolved;
+                state.local_task = LocalTaskPhase::Unresolved;
             }
         }
         // This is the original finite owner; never a process-global parking list.
@@ -451,10 +453,7 @@ impl NativePreparationChild {
     }
     fn poll_root(&self) -> TaskPreparationChildExit {
         if self.state.lock().unwrap().root_transferred {
-            return if self
-                .kernel_stopped
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            return if self.task_stopped.load(std::sync::atomic::Ordering::Acquire) {
                 TaskPreparationChildExit::Exited {
                     output: TaskPreparationOutputExit::Unknown,
                 }
@@ -534,15 +533,15 @@ impl NativePreparationChild {
             let mut state = self.state.lock().unwrap();
             if !state.rollback
                 || !matches!(
-                    state.kernel,
-                    Kernel::Prepared | Kernel::Offered | Kernel::Adopted
+                    state.local_task,
+                    LocalTaskPhase::Prepared | LocalTaskPhase::Offered | LocalTaskPhase::Adopted
                 )
             {
                 return;
             }
-            let previous = state.kernel;
-            state.kernel = Kernel::Starting;
-            state.phases[Phase::KernelStart as usize] = Action::Started;
+            let previous = state.local_task;
+            state.local_task = LocalTaskPhase::Starting;
+            state.phases[Phase::LocalTaskStart as usize] = Action::Started;
             (
                 previous,
                 state
@@ -558,12 +557,12 @@ impl NativePreparationChild {
             Ok(true) => {}
             Ok(false) => {
                 let mut state = self.state.lock().unwrap();
-                state.kernel = previous;
-                state.phases[Phase::KernelStart as usize] = Action::NotStarted;
+                state.local_task = previous;
+                state.phases[Phase::LocalTaskStart as usize] = Action::NotStarted;
                 return;
             }
             Err(payload) => {
-                self.fault(Phase::KernelStart, Some(payload), None);
+                self.fault(Phase::LocalTaskStart, Some(payload), None);
                 return;
             }
         }
@@ -577,8 +576,8 @@ impl NativePreparationChild {
                     .is_some_and(|cause| std::ptr::eq(cause.cause(), gate.cause().cause()));
                 if same && !gate.poll_open() {
                     let mut state = self.state.lock().unwrap();
-                    state.kernel = previous;
-                    state.phases[Phase::KernelStart as usize] = Action::NotStarted;
+                    state.local_task = previous;
+                    state.phases[Phase::LocalTaskStart as usize] = Action::NotStarted;
                     return;
                 }
                 // Cancellation or another earlier failure must never be held
@@ -595,7 +594,7 @@ impl NativePreparationChild {
             .map(ManuallyDrop::into_inner);
         let mut slot = dormant;
         let result = catch_unwind(AssertUnwindSafe(|| {
-            DormantFragmentHandle::try_drain_stopped(&mut slot)
+            PreparedTaskExecution::try_drain_stopped(&mut slot)
         }));
         // Restore any unconsumed original before health/diagnostic publication.
         if let Some(dormant) = slot.take() {
@@ -605,17 +604,17 @@ impl NativePreparationChild {
             Ok(Ok(running)) => {
                 let mut state = self.state.lock().unwrap();
                 state.running = Some(ManuallyDrop::new(running));
-                state.kernel = Kernel::Draining;
-                state.phases[Phase::KernelStart as usize] = Action::Exited;
+                state.local_task = LocalTaskPhase::Draining;
+                state.phases[Phase::LocalTaskStart as usize] = Action::Exited;
                 drop(state);
                 let _ = self.bind_publisher(None);
             }
-            Ok(Err(cause)) => self.fault(Phase::KernelStart, None, Some(cause)),
-            Err(payload) => self.fault(Phase::KernelStart, Some(payload), None),
+            Ok(Err(cause)) => self.fault(Phase::LocalTaskStart, None, Some(cause)),
+            Err(payload) => self.fault(Phase::LocalTaskStart, Some(payload), None),
         }
     }
-    fn finish_kernel(&self) -> TaskPreparationChildExit {
-        if self.claim(Phase::KernelHolder) {
+    fn finish_task(&self) -> TaskPreparationChildExit {
+        if self.claim(Phase::LocalTaskHolder) {
             let mut running = self.state.lock().unwrap().running.take();
             let result = catch_unwind(AssertUnwindSafe(|| {
                 if let Some(running) = running.as_mut() {
@@ -628,22 +627,22 @@ impl NativePreparationChild {
                 std::ptr::write(&mut running, None);
             }
             match result {
-                Ok(()) => self.exited(Phase::KernelHolder),
-                Err(payload) => self.fault(Phase::KernelHolder, Some(payload), None),
+                Ok(()) => self.exited(Phase::LocalTaskHolder),
+                Err(payload) => self.fault(Phase::LocalTaskHolder, Some(payload), None),
             }
         }
         self.finish_registration();
         let mut state = self.state.lock().unwrap();
-        let exited = [Phase::KernelHolder, Phase::Registration, Phase::Control]
+        let exited = [Phase::LocalTaskHolder, Phase::Registration, Phase::Control]
             .iter()
             .all(|phase| state.phases[*phase as usize] == Action::Exited);
         if exited {
-            state.kernel = Kernel::Exited;
+            state.local_task = LocalTaskPhase::Exited;
             return TaskPreparationChildExit::Exited {
                 output: TaskPreparationOutputExit::Unknown,
             };
         }
-        if [Phase::KernelHolder, Phase::Registration, Phase::Control]
+        if [Phase::LocalTaskHolder, Phase::Registration, Phase::Control]
             .iter()
             .any(|phase| state.phases[*phase as usize] == Action::Unresolved)
         {
@@ -684,15 +683,15 @@ impl NativePreparationChild {
         &self,
         completion: Option<novarocks_worker::TaskCompletionSignal>,
     ) -> ExecutionResult<()> {
-        if !self.claim(Phase::KernelObserve) {
+        if !self.claim(Phase::LocalTaskObserve) {
             return Err(NativePreparedOwnerFailure::StartWithoutAdoption.into());
         }
         let rollback = completion.is_none();
         let weak = self.self_weak.clone();
-        let publisher: FragmentTerminalPublisher = Box::new(move |fact| {
+        let publisher: LocalTaskTerminalPublisher = Box::new(move |fact| {
             if let Some(owner) = weak.upgrade() {
                 owner
-                    .kernel_stopped
+                    .task_stopped
                     .store(true, std::sync::atomic::Ordering::Release);
                 if rollback {
                     owner.finish_registration();
@@ -720,41 +719,38 @@ impl NativePreparationChild {
         }
         match result {
             Ok(Ok(())) => {
-                self.exited(Phase::KernelObserve);
+                self.exited(Phase::LocalTaskObserve);
                 Ok(())
             }
             Ok(Err(cause)) => {
-                self.fault(Phase::KernelObserve, None, Some(cause));
-                Err(NativePreparedOwnerFailure::Panicked(Phase::KernelObserve).into())
+                self.fault(Phase::LocalTaskObserve, None, Some(cause));
+                Err(NativePreparedOwnerFailure::Panicked(Phase::LocalTaskObserve).into())
             }
             Err(payload) => {
-                self.fault(Phase::KernelObserve, Some(payload), None);
-                Err(NativePreparedOwnerFailure::Panicked(Phase::KernelObserve).into())
+                self.fault(Phase::LocalTaskObserve, Some(payload), None);
+                Err(NativePreparedOwnerFailure::Panicked(Phase::LocalTaskObserve).into())
             }
         }
     }
-    fn poll_kernel(&self) -> TaskPreparationChildExit {
+    fn poll_task(&self) -> TaskPreparationChildExit {
         self.start_rollback();
         let running = {
             let mut state = self.state.lock().unwrap();
-            match state.kernel {
-                Kernel::Vacant if state.rollback => {
-                    state.kernel = Kernel::Exited;
+            match state.local_task {
+                LocalTaskPhase::Vacant if state.rollback => {
+                    state.local_task = LocalTaskPhase::Exited;
                     return TaskPreparationChildExit::Exited {
                         output: TaskPreparationOutputExit::Unknown,
                     };
                 }
-                Kernel::Exited => {
+                LocalTaskPhase::Exited => {
                     return TaskPreparationChildExit::Exited {
                         output: TaskPreparationOutputExit::Unknown,
                     };
                 }
-                Kernel::Unresolved => return TaskPreparationChildExit::Unresolved,
-                Kernel::Transferred => {
-                    return if self
-                        .kernel_stopped
-                        .load(std::sync::atomic::Ordering::Acquire)
-                    {
+                LocalTaskPhase::Unresolved => return TaskPreparationChildExit::Unresolved,
+                LocalTaskPhase::Transferred => {
+                    return if self.task_stopped.load(std::sync::atomic::Ordering::Acquire) {
                         TaskPreparationChildExit::Exited {
                             output: TaskPreparationOutputExit::Unknown,
                         }
@@ -762,20 +758,22 @@ impl NativePreparationChild {
                         TaskPreparationChildExit::Pending
                     };
                 }
-                Kernel::Draining => state.running.as_ref().map(|running| (**running).clone()),
+                LocalTaskPhase::Draining => {
+                    state.running.as_ref().map(|running| (**running).clone())
+                }
                 _ => return TaskPreparationChildExit::Pending,
             }
         };
         {
             let mut state = self.state.lock().unwrap();
-            match state.phases[Phase::KernelPoll as usize] {
+            match state.phases[Phase::LocalTaskPoll as usize] {
                 Action::Started => return TaskPreparationChildExit::Pending,
                 Action::Unresolved => return TaskPreparationChildExit::Unresolved,
                 Action::Exited => {
                     drop(state);
-                    return self.finish_kernel();
+                    return self.finish_task();
                 }
-                Action::NotStarted => state.phases[Phase::KernelPoll as usize] = Action::Started,
+                Action::NotStarted => state.phases[Phase::LocalTaskPoll as usize] = Action::Started,
             }
         }
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -784,15 +782,16 @@ impl NativePreparationChild {
         drop(running); // Still protected by the original running slot.
         match result {
             Ok(Some(_)) => {
-                self.exited(Phase::KernelPoll);
-                self.finish_kernel()
+                self.exited(Phase::LocalTaskPoll);
+                self.finish_task()
             }
             Ok(None) => {
-                self.state.lock().unwrap().phases[Phase::KernelPoll as usize] = Action::NotStarted;
+                self.state.lock().unwrap().phases[Phase::LocalTaskPoll as usize] =
+                    Action::NotStarted;
                 TaskPreparationChildExit::Pending
             }
             Err(payload) => {
-                self.fault(Phase::KernelPoll, Some(payload), None);
+                self.fault(Phase::LocalTaskPoll, Some(payload), None);
                 TaskPreparationChildExit::Unresolved
             }
         }
@@ -803,9 +802,9 @@ impl NativePreparationChild {
             if state.rollback {
                 return Err(NativePreparedOwnerFailure::LateInstall.into());
             }
-            match state.kernel {
-                Kernel::Offered => state.kernel = Kernel::Adopted,
-                Kernel::Adopted => {}
+            match state.local_task {
+                LocalTaskPhase::Offered => state.local_task = LocalTaskPhase::Adopted,
+                LocalTaskPhase::Adopted => {}
                 _ => return Err(NativePreparedOwnerFailure::AdoptWithoutOffer.into()),
             }
         }
@@ -823,15 +822,15 @@ impl NativePreparationChild {
     fn start_adopted(
         &self,
         initial_failure: Option<ExecutionFailure>,
-    ) -> ExecutionResult<RunningFragmentHandle> {
+    ) -> ExecutionResult<RunningTaskExecution> {
         self.adopt()?; // Explicit committed offer also serves direct host callers.
         let dormant = {
             let mut state = self.state.lock().unwrap();
-            if state.kernel != Kernel::Adopted {
+            if state.local_task != LocalTaskPhase::Adopted {
                 return Err(NativePreparedOwnerFailure::StartWithoutAdoption.into());
             }
-            state.kernel = Kernel::Starting;
-            state.phases[Phase::KernelStart as usize] = Action::Started;
+            state.local_task = LocalTaskPhase::Starting;
+            state.phases[Phase::LocalTaskStart as usize] = Action::Started;
             state
                 .dormant
                 .take()
@@ -851,21 +850,21 @@ impl NativePreparationChild {
         let running = match result {
             Ok(running) => running,
             Err(payload) => {
-                self.fault(Phase::KernelStart, Some(payload), None);
-                return Err(NativePreparedOwnerFailure::Panicked(Phase::KernelStart).into());
+                self.fault(Phase::LocalTaskStart, Some(payload), None);
+                return Err(NativePreparedOwnerFailure::Panicked(Phase::LocalTaskStart).into());
             }
         };
         let returned = running.clone();
         let mut state = self.state.lock().unwrap();
         state.running = Some(ManuallyDrop::new(running));
-        state.kernel = Kernel::RuntimeStarting;
+        state.local_task = LocalTaskPhase::RuntimeStarting;
         Ok(returned)
     }
     fn finish_handoff(
         &self,
         completion: novarocks_worker::TaskCompletionSignal,
     ) -> ExecutionResult<()> {
-        if self.state.lock().unwrap().kernel != Kernel::RuntimeStarting {
+        if self.state.lock().unwrap().local_task != LocalTaskPhase::RuntimeStarting {
             return Err(NativePreparedOwnerFailure::StartWithoutAdoption.into());
         }
         self.bind_publisher(Some(completion))?;
@@ -882,10 +881,10 @@ impl NativePreparationChild {
         self.exited(Phase::Registration);
         // The exact NativeRunnable was attached before this handoff. Releasing
         // this handle therefore cannot be the last foreign Running holder.
-        if self.claim(Phase::KernelHolder) {
+        if self.claim(Phase::LocalTaskHolder) {
             let running = self.state.lock().unwrap().running.take();
             drop(running.map(ManuallyDrop::into_inner));
-            self.exited(Phase::KernelHolder);
+            self.exited(Phase::LocalTaskHolder);
         }
         if self.claim(Phase::Control) {
             let control = self.state.lock().unwrap().control.take();
@@ -898,14 +897,14 @@ impl NativePreparationChild {
             }
         }
         let mut state = self.state.lock().unwrap();
-        state.phases[Phase::KernelStart as usize] = Action::Exited;
-        state.kernel = Kernel::Transferred;
+        state.phases[Phase::LocalTaskStart as usize] = Action::Exited;
+        state.local_task = LocalTaskPhase::Transferred;
         Ok(())
     }
 }
 impl Drop for NativePreparationChild {
     fn drop(&mut self) {
-        let vacant = self.state.lock().unwrap().kernel == Kernel::Vacant;
+        let vacant = self.state.lock().unwrap().local_task == LocalTaskPhase::Vacant;
         if vacant {
             // With no installed kernel this is only Root exit metadata. The
             // original pool/issuer still own the actual job, including after
@@ -927,7 +926,7 @@ impl Drop for NativePreparationChild {
             // Last-owner loss with live work is not an asynchronous cleanup
             // service. Keep the exact finite original state addressable.
             self.fault(
-                Phase::KernelHolder,
+                Phase::LocalTaskHolder,
                 None,
                 Some(NativePreparedOwnerFailure::StartWithoutAdoption.into()),
             );
@@ -943,7 +942,7 @@ impl TaskPreparationChild for NativePreparationChild {
     fn poll_exit(&self) -> TaskPreparationChildExit {
         // Always advance both independent members before merging the result.
         let root = self.poll_root();
-        let kernel = self.poll_kernel();
+        let kernel = self.poll_task();
         let unknown = self
             .state
             .lock()
@@ -991,47 +990,47 @@ impl TaskPreparationChild for NativePreparationChild {
 #[derive(Debug)]
 pub(crate) struct NativePreparationUnresolved;
 
-pub(crate) struct PreparedKernelConstruction {
+pub(crate) struct PreparedLocalTaskConstruction {
     owner: Arc<NativePreparationChild>,
     installed: bool,
 }
-impl PreparedKernelConstruction {
+impl PreparedLocalTaskConstruction {
     /// Infallible pure transfer from the one actual Core construction. All
     /// validation occurred before that construction could create live drivers.
     pub(crate) fn install(
         mut self,
-        dormant: DormantFragmentHandle,
-        registration: NativeFragmentRegistrationLease,
+        dormant: PreparedTaskExecution,
+        registration: NativeTaskRegistration,
         control: Arc<TaskExecutionControl>,
     ) {
         let mut state = self.owner.state.lock().unwrap();
         state.dormant = Some(ManuallyDrop::new(dormant));
         state.registration = Some(ManuallyDrop::new(registration));
         state.control = Some(control);
-        if state.kernel != Kernel::Unresolved {
-            state.kernel = Kernel::Prepared;
+        if state.local_task != LocalTaskPhase::Unresolved {
+            state.local_task = LocalTaskPhase::Prepared;
         }
         self.installed = true;
     }
 }
-impl Drop for PreparedKernelConstruction {
+impl Drop for PreparedLocalTaskConstruction {
     fn drop(&mut self) {
         if !self.installed {
             let mut state = self.owner.state.lock().unwrap();
-            if state.kernel == Kernel::Building {
-                state.kernel = Kernel::Vacant;
+            if state.local_task == LocalTaskPhase::Building {
+                state.local_task = LocalTaskPhase::Vacant;
             }
         }
     }
 }
-pub(crate) struct PreparedKernelOffer {
+pub(crate) struct PreparedLocalTaskOffer {
     owner: Arc<NativePreparationChild>,
 }
-impl PreparedKernelOffer {
+impl PreparedLocalTaskOffer {
     pub(crate) fn start(
         &self,
         initial_failure: Option<ExecutionFailure>,
-    ) -> ExecutionResult<RunningFragmentHandle> {
+    ) -> ExecutionResult<RunningTaskExecution> {
         self.owner.start_adopted(initial_failure)
     }
     pub(crate) fn finish_handoff(

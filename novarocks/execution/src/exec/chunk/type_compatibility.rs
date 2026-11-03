@@ -106,7 +106,7 @@ impl novarocks_failure_contract::FailureProjection for TypeMismatch {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::SchemaTypeMismatch.reason(),
+            crate::runtime::task::ExecutionReason::SchemaTypeMismatch.reason(),
         )
     }
 }

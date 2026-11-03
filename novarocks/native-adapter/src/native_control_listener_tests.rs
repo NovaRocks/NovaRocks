@@ -214,13 +214,13 @@ fn start(
     trust: &Arc<NativeTrust>,
     observation: &Arc<Observation>,
     domain: NativeEndpointDomain,
-) -> NativeRpcServerHandle {
+) -> NativeRpcListener {
     let class = match domain {
         NativeEndpointDomain::BackendData => TransportClass::Data,
         NativeEndpointDomain::BackendControl => TransportClass::Control,
         NativeEndpointDomain::FrontendMembership => unreachable!(),
     };
-    NativeRpcServerHandle::start_with_admission(
+    NativeRpcListener::start_with_admission(
         "127.0.0.1",
         0,
         ProbeService(observation.clone()),
@@ -245,7 +245,7 @@ fn start(
 
 struct Client {
     sender: h2::client::SendRequest<Bytes>,
-    task: tokio::task::JoinHandle<Result<(), h2::Error>>,
+    connection_job: tokio::task::JoinHandle<Result<(), h2::Error>>,
     address: SocketAddr,
 }
 impl Client {
@@ -254,10 +254,10 @@ impl Client {
             .await
             .unwrap();
         let (sender, connection) = bounded(h2::client::handshake(stream)).await.unwrap();
-        let task = tokio::spawn(connection);
+        let connection_job = tokio::spawn(connection);
         Self {
             sender,
-            task,
+            connection_job,
             address,
         }
     }
@@ -367,7 +367,7 @@ impl Client {
     }
     async fn join(self) {
         drop(self.sender);
-        let _ = bounded(self.task).await.unwrap();
+        let _ = bounded(self.connection_job).await.unwrap();
     }
 }
 
@@ -595,7 +595,7 @@ fn mismatched_domain_and_stock_class_refuse_before_address_resolution() {
             TransportClass::Data,
         ),
     ] {
-        let outcome = NativeRpcServerHandle::start_with_admission(
+        let outcome = NativeRpcListener::start_with_admission(
             "not-a-real-native-endpoint.invalid",
             0,
             ProbeService(Arc::new(Observation::default())),

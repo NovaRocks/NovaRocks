@@ -35,7 +35,7 @@ use tower::ServiceExt;
 use super::*;
 use crate::generated::nova_rocks_grpc_server::NovaRocksGrpc;
 use crate::native_ingress::NativeIngressService;
-use crate::native_server::{NativeIngressConfig, NativeRpcServerHandle};
+use crate::native_server::{NativeIngressConfig, NativeRpcListener};
 use crate::native_transport_admission::{AdmissionDimensions, TransportRole};
 
 const WATCHDOG: Duration = Duration::from_secs(8);
@@ -648,8 +648,8 @@ fn frontend_trust() -> Arc<NativeTrust> {
 fn data_listener(
     admission: &NativeTransportAdmission,
     trust: &Arc<NativeTrust>,
-) -> NativeRpcServerHandle {
-    NativeRpcServerHandle::start_with_admission(
+) -> NativeRpcListener {
+    NativeRpcListener::start_with_admission(
         "127.0.0.1",
         0,
         LaneProbe,
@@ -675,8 +675,8 @@ fn data_listener(
 fn membership_listener(
     admission: &NativeTransportAdmission,
     trust: &Arc<NativeTrust>,
-) -> Result<NativeRpcServerHandle, String> {
-    NativeRpcServerHandle::start_frontend_membership(
+) -> Result<NativeRpcListener, String> {
+    NativeRpcListener::start_frontend_membership(
         "127.0.0.1",
         0,
         LaneProbe,

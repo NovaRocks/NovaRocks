@@ -20,7 +20,7 @@ mod common;
 use arrow::array::Int32Array;
 use bytes::BytesMut;
 use novarocks_fs::{
-    CacheOptions, DataCacheContext, FileErrorKind, FileFormat, FileIdentity, FileProjection,
+    CacheOptions, DataCachePolicy, FileErrorKind, FileFormat, FileIdentity, FileProjection,
     FileReadRange, MinMaxPredicateOp, MinMaxPredicateValue, PreparedFileInput, ScanPredicate,
     ScanPredicateDomain, ScanPredicateSource, inspect_parquet_metadata,
     inspect_parquet_metadata_from_prepared, open_file_reader_with_parquet_inspection,
@@ -210,7 +210,7 @@ fn inspection_rejects_different_file_identity() {
 fn inspection_upgrades_page_index_once_for_later_runs() {
     let fixture = Fixture::parquet();
     let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
-    let cache = DataCacheContext::external(CacheOptions {
+    let cache = DataCachePolicy::external(CacheOptions {
         enable_scan_datacache: true,
         enable_populate_datacache: false,
         enable_datacache_async_populate_mode: false,

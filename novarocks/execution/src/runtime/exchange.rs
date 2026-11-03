@@ -38,7 +38,11 @@ pub(crate) fn emit_exchange_snapshot_marker(
     build: impl FnOnce() -> String,
 ) {
     if let Some(observer) = observer.filter(|observer| observer.is_active()) {
-        observer.observe(&format!("NOVAROCKS_EXCHANGE_SNAPSHOT {}", build()));
+        observer.observe(&format!(
+            "{} {}",
+            novarocks_failpoint::observation_marker::EXCHANGE_SNAPSHOT,
+            build()
+        ));
     }
 }
 
@@ -69,15 +73,15 @@ pub use result_ipc_preflight::{TypedRootResultDecodeBounds, preflight_typed_root
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ExchangeKey {
-    pub finst_id_hi: i64,
-    pub finst_id_lo: i64,
+    pub task_key_hi: i64,
+    pub task_key_lo: i64,
     pub node_id: i32,
 }
 
 impl ExchangeKey {
     #[inline]
-    pub fn finst_uuid(&self) -> String {
-        format_uuid(self.finst_id_hi, self.finst_id_lo)
+    pub fn task_key_uuid(&self) -> String {
+        format_uuid(self.task_key_hi, self.task_key_lo)
     }
 }
 
@@ -90,7 +94,7 @@ impl ExchangeKey {
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ExchangeSenderIdentity {
     Native {
-        source_fragment_instance_id: UniqueId,
+        source_task_key: UniqueId,
         sender_ordinal: u32,
     },
     Local {
@@ -100,9 +104,9 @@ pub enum ExchangeSenderIdentity {
 }
 
 impl ExchangeSenderIdentity {
-    pub const fn native(source_fragment_instance_id: UniqueId, sender_ordinal: u32) -> Self {
+    pub const fn native(source_task_key: UniqueId, sender_ordinal: u32) -> Self {
         Self::Native {
-            source_fragment_instance_id,
+            source_task_key,
             sender_ordinal,
         }
     }
@@ -119,15 +123,12 @@ impl std::fmt::Display for ExchangeSenderIdentity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Native {
-                source_fragment_instance_id,
+                source_task_key,
                 sender_ordinal,
             } => write!(
                 formatter,
-                "native(source_finst={}, ordinal={sender_ordinal})",
-                format_uuid(
-                    source_fragment_instance_id.high(),
-                    source_fragment_instance_id.low()
-                )
+                "native(source_task_key={}, ordinal={sender_ordinal})",
+                format_uuid(source_task_key.high(), source_task_key.low())
             ),
             Self::Local {
                 sender_id,
@@ -367,8 +368,8 @@ impl ExchangeReceiverCloseObserver {
         expected
             .iter()
             .map(|stream| {
-                if stream.destination_fragment_instance_id()
-                    != UniqueId::new(self.key.finst_id_hi, self.key.finst_id_lo)
+                if stream.destination_task_key()
+                    != UniqueId::new(self.key.task_key_hi, self.key.task_key_lo)
                     || stream.destination_node().get() != self.key.node_id
                 {
                     return Err(exchange_contract(
@@ -434,8 +435,8 @@ fn get_or_create(registry: &ExecutionExchangeRegistry, key: ExchangeKey) -> Arc<
         .clone();
     if !existed {
         debug!(
-            "exchange receiver CREATED: finst={} node_id={}",
-            key.finst_uuid(),
+            "exchange receiver CREATED: task_key={} node_id={}",
+            key.task_key_uuid(),
             key.node_id
         );
     }
@@ -477,14 +478,14 @@ impl ExecutionExchangeRegistry {
         Ok(())
     }
 
-    pub fn remove_fragment(&self, finst_id_hi: i64, finst_id_lo: i64) {
+    pub fn remove_task(&self, task_key_hi: i64, task_key_lo: i64) {
         let keys: Vec<_> = self
             .receivers
             .lock()
             .expect("exchange lock")
             .keys()
             .copied()
-            .filter(|key| key.finst_id_hi == finst_id_hi && key.finst_id_lo == finst_id_lo)
+            .filter(|key| key.task_key_hi == task_key_hi && key.task_key_lo == task_key_lo)
             .collect();
         for key in keys {
             self.remove_exchange_key(key);
@@ -510,14 +511,14 @@ impl ExecutionExchangeRegistry {
         self.receivers.lock().expect("exchange lock").remove(&key);
     }
 
-    pub fn cancel_fragment(&self, finst_id_hi: i64, finst_id_lo: i64) {
+    pub fn cancel_task(&self, task_key_hi: i64, task_key_lo: i64) {
         let keys: Vec<_> = self
             .receivers
             .lock()
             .expect("exchange lock")
             .keys()
             .copied()
-            .filter(|key| key.finst_id_hi == finst_id_hi && key.finst_id_lo == finst_id_lo)
+            .filter(|key| key.task_key_hi == task_key_hi && key.task_key_lo == task_key_lo)
             .collect();
         for key in keys {
             self.cancel_exchange_key(key);
@@ -702,29 +703,29 @@ impl ExecutionExchangeRegistry {
         match st.expected.as_ref() {
             Some(_) if reject_existing => {
                 return Err(exchange_contract(format_args!(
-                    "exchange receiver already registered: finst={} node_id={}",
-                    key.finst_uuid(),
+                    "exchange receiver already registered: task_key={} node_id={}",
+                    key.task_key_uuid(),
                     key.node_id
                 )));
             }
             Some(existing) if existing.chunk_schema.as_ref() != chunk_schema.as_ref() => {
                 return Err(exchange_contract(format_args!(
-                    "exchange expected chunk schema mismatch: finst={} node_id={}",
-                    key.finst_uuid(),
+                    "exchange expected chunk schema mismatch: task_key={} node_id={}",
+                    key.task_key_uuid(),
                     key.node_id
                 )));
             }
             Some(existing) if existing.recipe.value.digest() != recipe.value.digest() => {
                 return Err(exchange_contract(format_args!(
-                    "exchange wire recipe mismatch: finst={} node_id={}",
-                    key.finst_uuid(),
+                    "exchange wire recipe mismatch: task_key={} node_id={}",
+                    key.task_key_uuid(),
                     key.node_id
                 )));
             }
             Some(existing) if existing.column_binding != column_binding => {
                 return Err(exchange_contract(format_args!(
-                    "exchange column binding mismatch: finst={} node_id={} registered={:?} requested={:?}",
-                    key.finst_uuid(),
+                    "exchange column binding mismatch: task_key={} node_id={} registered={:?} requested={:?}",
+                    key.task_key_uuid(),
                     key.node_id,
                     existing.column_binding,
                     column_binding
@@ -764,8 +765,8 @@ impl ExecutionExchangeRegistry {
             return Ok(Arc::clone(existing));
         }
         let label = format!(
-            "exchange receiver queue: finst={} node_id={}",
-            key.finst_uuid(),
+            "exchange receiver queue: task_key={} node_id={}",
+            key.task_key_uuid(),
             key.node_id
         );
         let tracker = MemTracker::new_child(label, root);
@@ -796,12 +797,14 @@ pub enum ExchangePopResult {
     Finished(ExchangeRecvStats),
 }
 
-pub struct ExchangeReceiverHandle {
+/// Pins the original receiver and its charged metadata even after routing
+/// removal. Consumption and routing retirement still use their explicit paths.
+pub struct ExchangeReceiverPin {
     key: ExchangeKey,
     receiver: Arc<Receiver>,
 }
 
-impl ExchangeReceiverHandle {
+impl ExchangeReceiverPin {
     pub fn try_pop_next_with_stats(
         &self,
         expected_senders: usize,
@@ -868,8 +871,8 @@ impl ExchangeReceiverHandle {
         if res && should_log_exchange_ready() {
             let queued_rows: usize = st.chunks.iter().map(|c| c.len()).sum();
             debug!(
-                "exchange ready: finst={} node_id={} expected_param={} expected_senders={} finished_senders={} queued_chunks={} queued_rows={} canceled={} ready_chunks={} ready_finished={}",
-                self.key.finst_uuid(),
+                "exchange ready: task_key={} node_id={} expected_param={} expected_senders={} finished_senders={} queued_chunks={} queued_rows={} canceled={} ready_chunks={} ready_finished={}",
+                self.key.task_key_uuid(),
                 self.key.node_id,
                 expected_senders,
                 expected,
@@ -883,8 +886,8 @@ impl ExchangeReceiverHandle {
         } else if !res && should_log_exchange_not_ready() {
             let queued_rows: usize = st.chunks.iter().map(|c| c.len()).sum();
             debug!(
-                "exchange not ready: finst={} node_id={} expected_senders={} finished_senders={} queued_chunks={} queued_rows={} canceled={}",
-                self.key.finst_uuid(),
+                "exchange not ready: task_key={} node_id={} expected_senders={} finished_senders={} queued_chunks={} queued_rows={} canceled={}",
+                self.key.task_key_uuid(),
                 self.key.node_id,
                 expected,
                 finished,
@@ -898,11 +901,11 @@ impl ExchangeReceiverHandle {
 }
 
 impl ExecutionExchangeRegistry {
-    pub fn get_receiver_handle(
+    pub fn get_receiver_pin(
         &self,
         key: ExchangeKey,
         expected_senders: usize,
-    ) -> Result<ExchangeReceiverHandle, ExchangeFailure> {
+    ) -> Result<ExchangeReceiverPin, ExchangeFailure> {
         if is_key_canceled(self, &key) {
             return Err(exchange_stopped());
         }
@@ -923,11 +926,11 @@ impl ExecutionExchangeRegistry {
                 || state.expected_senders != expected_senders
             {
                 return Err(exchange_contract(
-                    "exchange handle differs from its frozen receiver declaration",
+                    "exchange receiver pin differs from its frozen receiver declaration",
                 ));
             }
         }
-        Ok(ExchangeReceiverHandle { key, receiver })
+        Ok(ExchangeReceiverPin { key, receiver })
     }
 }
 
@@ -1314,7 +1317,7 @@ fn validate_exchange_dictionary_batch(batch: &RecordBatch) -> Result<(), Exchang
             Ok::<_, std::convert::Infallible>(())
         })
         .map_err(|failure| {
-            ExchangeFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(
+            ExchangeFailure::Source(crate::runtime::task::SharedDomainFailure::new(
                 failure.into_error(),
             ))
         })?;
@@ -1695,7 +1698,7 @@ fn build_zero_column_marker_batch_with_creation(
     rows: usize,
     owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
     control: &dyn novarocks_functions::KernelEvaluationControl,
-) -> crate::runtime::fragment::ExecutionResult<RecordBatch> {
+) -> crate::runtime::task::ExecutionResult<RecordBatch> {
     use crate::exec::pipeline::operator::ConstructionFailure;
     use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
     fn checked_arc(layout: std::alloc::Layout) -> Result<std::alloc::Layout, ConstructionFailure> {
@@ -1735,7 +1738,7 @@ fn build_zero_column_marker_batch_for_schema_with_creation(
     schema: SchemaRef,
     owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
     control: &dyn novarocks_functions::KernelEvaluationControl,
-) -> crate::runtime::fragment::ExecutionResult<RecordBatch> {
+) -> crate::runtime::task::ExecutionResult<RecordBatch> {
     use crate::exec::pipeline::operator::ConstructionFailure;
     use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
     let mut request = |layout| owner.request(layout);
@@ -1751,7 +1754,7 @@ fn build_zero_column_marker_batch_for_schema_with_creation(
         &mut creation,
         control,
     )
-    .map_err(|cause| -> crate::runtime::fragment::ExecutionFailure {
+    .map_err(|cause| -> crate::runtime::task::ExecutionFailure {
         use novarocks_functions::selected_copy::CopyConstructionError;
         match cause {
             CopyConstructionError::Creator(cause) => cause.into(),
@@ -1841,7 +1844,7 @@ fn encode_typed_arrow_ipc_chunks_to<W: std::io::Write>(
     );
     // This sole schema writer model excludes record-batch payload copying.
     // Batch-private structure/payload bounds remain a separately listed gap.
-    let map_ipc = |cause: IpcConstructionError<ConstructionFailure>| -> crate::runtime::fragment::ExecutionFailure {
+    let map_ipc = |cause: IpcConstructionError<ConstructionFailure>| -> crate::runtime::task::ExecutionFailure {
         match cause {
             IpcConstructionError::Creator(cause) => cause.into(),
             IpcConstructionError::Control(cause) => cause.into(),
@@ -1930,7 +1933,7 @@ pub(crate) fn encode_chunks_with_creation(
     include_slot_ids: bool,
     factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
     control: &dyn novarocks_functions::KernelEvaluationControl,
-) -> crate::runtime::fragment::ExecutionResult<Vec<u8>> {
+) -> crate::runtime::task::ExecutionResult<Vec<u8>> {
     use crate::exec::pipeline::operator::ConstructionFailure;
     if chunks.is_empty() {
         return Ok(Vec::new());
@@ -2255,16 +2258,16 @@ pub fn register_expected_chunk_schema(
         expected_senders,
         tests::plain_declaration(&wire_chunk_schema),
         tests::plain_declaration(&chunk_schema),
-        crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+        crate::runtime::task::exchange::test_receiver_creation_factory(),
     )
 }
 
 #[cfg(test)]
-pub fn get_receiver_handle(
+pub fn get_receiver_pin(
     key: ExchangeKey,
     expected_senders: usize,
-) -> Result<ExchangeReceiverHandle, ExchangeFailure> {
-    test_registry().get_receiver_handle(key, expected_senders)
+) -> Result<ExchangeReceiverPin, ExchangeFailure> {
+    test_registry().get_receiver_pin(key, expected_senders)
 }
 
 #[cfg(test)]
@@ -2325,7 +2328,7 @@ mod typed_receiver_header_tests {
         .unwrap();
         Arc::new(
             crate::exec::chunk::ChunkSchema::try_new_typed_observed::<
-                crate::runtime::fragment::ExecutionFailure,
+                crate::runtime::task::ExecutionFailure,
             >(vec![slot], storage, |_| Ok(()), |_| Ok(()))
             .unwrap(),
         )
@@ -2357,8 +2360,8 @@ mod typed_receiver_header_tests {
     }
     fn key() -> ExchangeKey {
         ExchangeKey {
-            finst_id_hi: 19,
-            finst_id_lo: 37,
+            task_key_hi: 19,
+            task_key_lo: 37,
             node_id: 7,
         }
     }
@@ -2412,7 +2415,7 @@ mod typed_receiver_header_tests {
         .unwrap_err();
         assert!(matches!(
             refusal,
-            ExchangeFailure::Execution(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::Memory(_)))
+            ExchangeFailure::Execution(error) if matches!(error.cause(), crate::runtime::task::ExecutionFailureCause::Construction(ConstructionFailure::Memory(_)))
         ));
         assert_eq!(tracker.current(), baseline);
         assert_eq!(original_array.len(), 1);
@@ -2522,7 +2525,7 @@ mod bounded_root_header_tests {
         )
         .unwrap();
         let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
-        Chunk::try_new_typed_with_columns_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+        Chunk::try_new_typed_with_columns_observed::<crate::runtime::task::ExecutionFailure, _>(
             schema,
             vec![array],
             rows,
@@ -2582,7 +2585,7 @@ mod bounded_root_header_tests {
             2,
         );
         let count = Chunk::try_new_typed_with_columns_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(
             Arc::new(ChunkSchema::try_new_typed(vec![], pure).unwrap()),

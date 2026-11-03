@@ -251,11 +251,11 @@ struct Observed<'a> {
     parsed: usize,
 }
 impl NCodecResources for Observed<'_> {
-    type Lease = NCodecLease;
+    type Reservation = NCodecReservation;
     fn before_decimal256_format(
         &mut self,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<NCodecLease, KernelFailure> {
+    ) -> Result<NCodecReservation, KernelFailure> {
         self.bound.before_decimal256_format(work)
     }
     fn after_decimal256_format(
@@ -277,7 +277,7 @@ impl NCodecResources for Observed<'_> {
         &mut self,
         bytes: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<NCodecLease, KernelFailure> {
+    ) -> Result<NCodecReservation, KernelFailure> {
         self.bound.before_decimal256_parse(bytes, work)
     }
     fn after_decimal256_parse(
@@ -355,7 +355,7 @@ fn decimal_extrema_hold_string_and_library_loans_through_original_appends() {
 
 struct Noop;
 impl NCodecResources for Noop {
-    type Lease = ();
+    type Reservation = ();
     fn before_decimal256_format(
         &mut self,
         _: &mut ScalarWork<'_, '_>,

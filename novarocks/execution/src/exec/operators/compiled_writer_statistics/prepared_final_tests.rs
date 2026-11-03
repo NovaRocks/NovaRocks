@@ -18,7 +18,7 @@
 use super::*;
 use crate::exec::pipeline::builder::compiled_statistics_finish_fixture;
 use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
-use crate::runtime::fragment::ExecutionFailureCause;
+use crate::runtime::task::ExecutionFailureCause;
 use novarocks_local_program::{
     PreparedWriterAggregateCall, PreparedWriterAggregateCalls, PreparedWriterCallsError,
 };
@@ -255,7 +255,7 @@ fn plan_tree_prepared_final_preserves_first_memory_and_original_caller_without_t
         .begin_typed_construction(&source.input)
         .unwrap();
     let original = ExecutionFailure::from(KernelFailure::DeadlineExceeded)
-        .at_operator(7, crate::runtime::fragment::PipelineOperation::Admission);
+        .at_operator(7, crate::runtime::task::PipelineOperation::Admission);
     source.state.error_state().set_error(original.clone());
     let before = source.tracker.allocated();
     let failure = prepared_final_in(
@@ -269,7 +269,7 @@ fn plan_tree_prepared_final_preserves_first_memory_and_original_caller_without_t
     .err()
     .expect("original caller stops before allocation");
     assert_eq!(failure.cause(), original.cause());
-    assert_eq!(failure.context(), original.context());
+    assert_eq!(failure.site(), original.site());
     assert_eq!(source.tracker.allocated(), before);
     let tracker = source.tracker.clone();
     drop(owner);

@@ -165,7 +165,7 @@ impl FrameFailure for KernelFailure {
         work.finish(result)
     }
 }
-impl FrameFailure for crate::runtime::fragment::ExecutionFailure {
+impl FrameFailure for crate::runtime::task::ExecutionFailure {
     const ACTIVATE_EMPTY: bool = true;
     fn invoke<'a>(
         instance: &mut CallInstance,
@@ -233,8 +233,7 @@ impl FrameFailure for crate::runtime::fragment::ExecutionFailure {
         selection: Selection<'_>,
         error: novarocks_functions::RowDataError,
     ) -> Self {
-        match crate::runtime::fragment::RequiredExpressionRowError::try_new(root, selection, error)
-        {
+        match crate::runtime::task::RequiredExpressionRowError::try_new(root, selection, error) {
             Ok(error) => error.into(),
             Err(cause) => cause.into(),
         }

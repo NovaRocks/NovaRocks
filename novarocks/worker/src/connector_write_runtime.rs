@@ -201,7 +201,7 @@ impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
                 #[cfg(novarocks_dev_controls)]
                 emit_writer_marker(
                     self.writer_observer.as_deref(),
-                    "NOVAROCKS_CONNECTOR_WRITER_OPENED",
+                    novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED,
                     writer,
                 );
                 Ok(Box::new(ObservedConnectorBatchWriter {
@@ -315,13 +315,13 @@ fn emit_writer_marker(
     if let Some(observer) = observer {
         let execution = writer.execution_id();
         let physical = writer.physical();
-        let bytes = physical.fragment_instance_id();
+        let bytes = physical.task_key();
         // The original Native binding authors these two big-endian halves.
         // Render the same identity as the Task's prepared-DOP observation.
         let high = i64::from_be_bytes(bytes[..8].try_into().expect("fixed identity high half"));
         let low = i64::from_be_bytes(bytes[8..].try_into().expect("fixed identity low half"));
         observer.observe(&format!(
-            "{marker} execution_id={}:{}:{} finst={high:x}:{low:x} plan_node={} write_target={} driver_id={} writer_ordinal={}",
+            "{marker} execution_id={}:{}:{} task_key={high:x}:{low:x} plan_node={} write_target={} driver_id={} writer_ordinal={}",
             execution.query_id().high(),
             execution.query_id().low(),
             execution.attempt_id().get(),
@@ -376,7 +376,7 @@ mod tests {
     }
 
     impl ProviderWriteRuntime for StubWriteRuntime {
-        type CommitHandle = ();
+        type CommitSession = ();
         type WriterHandle = ();
         type CommitFragment = ();
 

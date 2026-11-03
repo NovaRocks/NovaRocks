@@ -359,7 +359,7 @@ impl Drop for AggregateStateSlot<'_> {
 /// latches this frame. The host separately latches the entire operator and
 /// must not rebuild a frame to replay an already mutated successful prefix.
 pub struct AggregateBatchInvocation<'frame> {
-    inner: LeasedBatchExecution<'frame>,
+    inner: ReservedBatchExecution<'frame>,
 }
 impl AggregateBatchInvocation<'_> {
     pub fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), KernelFailure> {
@@ -375,7 +375,7 @@ impl AggregateBatchInvocation<'_> {
 
 /// Same erased row loop, with the lossless whole invocation failure channel.
 pub struct AggregateEvaluationBatchInvocation<'frame> {
-    inner: LeasedBatchExecution<'frame>,
+    inner: ReservedBatchExecution<'frame>,
 }
 impl AggregateEvaluationBatchInvocation<'_> {
     pub fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), EvaluationFailure> {
@@ -391,11 +391,11 @@ impl AggregateEvaluationBatchInvocation<'_> {
 
 /// Declaration order destroys the pointee and deallocates its actual Box
 /// before returning the helper reservation. The wrapper itself stays inline.
-pub(crate) struct LeasedBatchExecution<'frame> {
+pub(crate) struct ReservedBatchExecution<'frame> {
     inner: Box<dyn BatchExecution + 'frame>,
-    _helper_lease: Option<crate::opaque_memory::OpaqueReservation>,
+    _helper_reservation: Option<crate::opaque_memory::OpaqueReservation>,
 }
-impl LeasedBatchExecution<'_> {
+impl ReservedBatchExecution<'_> {
     fn retained_preparation_bytes(&self) -> usize {
         self.inner.retained_preparation_bytes()
     }
@@ -460,7 +460,7 @@ pub(crate) trait ErasedAggregateOps: Send + Sync + fmt::Debug {
         input: SelectedAggregateUpdateInput<'frame, 'frame>,
         allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<LeasedBatchExecution<'frame>, EvaluationFailure>;
+    ) -> Result<ReservedBatchExecution<'frame>, EvaluationFailure>;
     fn prepare_merge<'frame, 'storage: 'frame>(
         &'frame self,
         states: &'frame mut [AggregateStateSlot<'storage>],
@@ -468,7 +468,7 @@ pub(crate) trait ErasedAggregateOps: Send + Sync + fmt::Debug {
         input: SelectedAggregateMergeInput<'frame, 'frame>,
         allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<LeasedBatchExecution<'frame>, EvaluationFailure>;
+    ) -> Result<ReservedBatchExecution<'frame>, EvaluationFailure>;
     fn emit(
         &self,
         states: &[AggregateStateSlot<'_>],
@@ -617,7 +617,7 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
         input: SelectedAggregateUpdateInput<'frame, 'frame>,
         allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<LeasedBatchExecution<'frame>, EvaluationFailure> {
+    ) -> Result<ReservedBatchExecution<'frame>, EvaluationFailure> {
         let helper_lease = if self.helper_memory {
             Some(crate::aggregate_helper_memory::reserve_frame_backing(
                 allocator.as_ref(),
@@ -635,7 +635,7 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
             allocator,
             control,
         )?;
-        Ok(LeasedBatchExecution {
+        Ok(ReservedBatchExecution {
             inner: Box::new(UpdateFrame {
                 adapter: self,
                 states,
@@ -644,7 +644,7 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
                 processed: 0,
                 finished: false,
             }),
-            _helper_lease: helper_lease,
+            _helper_reservation: helper_lease,
         })
     }
     fn prepare_merge<'frame, 'storage: 'frame>(
@@ -654,7 +654,7 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
         input: SelectedAggregateMergeInput<'frame, 'frame>,
         allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<LeasedBatchExecution<'frame>, EvaluationFailure> {
+    ) -> Result<ReservedBatchExecution<'frame>, EvaluationFailure> {
         let helper_lease = if self.helper_memory {
             Some(crate::aggregate_helper_memory::reserve_frame_backing(
                 allocator.as_ref(),
@@ -671,7 +671,7 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
             allocator,
             control,
         )?;
-        Ok(LeasedBatchExecution {
+        Ok(ReservedBatchExecution {
             inner: Box::new(MergeFrame {
                 adapter: self,
                 states,
@@ -680,7 +680,7 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
                 processed: 0,
                 finished: false,
             }),
-            _helper_lease: helper_lease,
+            _helper_reservation: helper_lease,
         })
     }
     fn emit(

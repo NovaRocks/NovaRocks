@@ -48,7 +48,7 @@ where
             return Err(TargetBusy::Busy);
         }
         Ok(TargetActivityPermit {
-            _lease: Arc::new(ActivityLease {
+            _slot: Arc::new(TargetActivitySlot {
                 target,
                 owner: Arc::downgrade(&self.active),
             }),
@@ -64,15 +64,15 @@ pub enum TargetBusy {
 
 #[derive(Clone)]
 pub struct TargetActivityPermit<K: Eq + Hash> {
-    _lease: Arc<ActivityLease<K>>,
+    _slot: Arc<TargetActivitySlot<K>>,
 }
 
-struct ActivityLease<K: Eq + Hash> {
+struct TargetActivitySlot<K: Eq + Hash> {
     target: K,
     owner: Weak<Mutex<HashSet<K>>>,
 }
 
-impl<K> Drop for ActivityLease<K>
+impl<K> Drop for TargetActivitySlot<K>
 where
     K: Eq + Hash,
 {

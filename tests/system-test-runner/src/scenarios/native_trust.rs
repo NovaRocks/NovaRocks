@@ -40,7 +40,7 @@ use novarocks_cluster_harness::vended_rest_catalog::{
 };
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, NativeTrustFixture,
-    NativeTrustFixtureMode, QueryLifecycleStructuredSnapshot, ServerHandle,
+    NativeTrustFixtureMode, QueryLifecycleStructuredSnapshot, TestClusterOwner,
 };
 use novarocks_native_trust::{NativeEndpointConnector, NativeTrust};
 use novarocks_proto_models::novarocks as proto;
@@ -558,7 +558,7 @@ token = "${{ENV:{environment_name}}}"
             .map(|index| {
                 context
                     .handle()
-                    .be_log_count(index, task_evidence::CONTEXT_ESTABLISH_APPLIED)
+                    .be_log_count(index, task_evidence::PARTICIPATION_ESTABLISH_APPLIED)
             })
             .collect::<Result<Vec<_>>>()?;
         let selected = self.intent.take(0)?;
@@ -587,7 +587,7 @@ token = "${{ENV:{environment_name}}}"
             .map(|index| {
                 context
                     .handle()
-                    .be_log_count(index, task_evidence::CONTEXT_ESTABLISH_APPLIED)
+                    .be_log_count(index, task_evidence::PARTICIPATION_ESTABLISH_APPLIED)
             })
             .collect::<Result<Vec<_>>>()?;
         ensure!(
@@ -715,12 +715,12 @@ fn assert_credential_domain_task_ingress(
     let request = proto::ApplyTaskOperationsRequest {
         operations: vec![proto::TaskOperation {
             envelope: None,
-            operation: Some(proto::task_operation::Operation::UpdateQueryContext(
-                proto::UpdateQueryContextRequest {
-                    command: Some(proto::update_query_context_request::Command::Establish(
-                        proto::EstablishQueryContextRequest {
-                            initial_credential: Some(proto::QueryContextCredentialDomain {
-                                lease_id: 1,
+            operation: Some(proto::task_operation::Operation::UpdateParticipation(
+                proto::UpdateParticipationRequest {
+                    command: Some(proto::update_participation_request::Command::Establish(
+                        proto::EstablishParticipationRequest {
+                            initial_credential: Some(proto::ParticipationCredentialDomain {
+                                credential_domain_id: 1,
                                 epoch: 1,
                                 descriptors: Vec::new(),
                             }),
@@ -871,7 +871,7 @@ fn raw_grpc_probe_with_deadline(
     tokio::runtime::Runtime::new()
         .context("create Native raw probe runtime")?
         .block_on(async move {
-            let mut driver = None;
+            let mut connection_job = None;
             let probe = async {
                 let stream = connector
                     .connect()
@@ -881,7 +881,7 @@ fn raw_grpc_probe_with_deadline(
                 let (mut sender, connection) = client::handshake(stream)
                     .await
                     .context("perform Native raw probe HTTP/2 handshake")?;
-                driver = Some(tokio::spawn(connection));
+                connection_job = Some(tokio::spawn(connection));
                 let mut request = Request::builder()
                     .method("POST")
                     .uri(path)
@@ -950,8 +950,8 @@ fn raw_grpc_probe_with_deadline(
                 None => probe.await,
             };
             // Response failure or timeout must also abort and actually join
-            // the owned HTTP/2 driver. Peer keep-alive is not its exit signal.
-            let joined = native_trust_controls::join_probe_driver(driver).await;
+            // the owned HTTP/2 connection job. Peer keep-alive is not its exit signal.
+            let joined = native_trust_controls::join_probe_connection(connection_job).await;
             native_trust_controls::with_cleanup(result, joined)
         })
 }

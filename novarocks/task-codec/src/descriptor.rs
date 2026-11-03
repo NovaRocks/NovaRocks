@@ -118,9 +118,9 @@ fn decode_destination(
         )
     })?;
     let task = decode_task_identity(task, path.clone().field("task"))?;
-    let fragment_instance_id = decode_unique_id(
-        src.fragment_instance_id.as_ref(),
-        path.clone().field("fragment_instance_id"),
+    let task_key = decode_unique_id(
+        src.task_key.as_ref(),
+        path.clone().field("task_key"),
         "exchange destination requires a fragment instance id",
     )?;
     let endpoint = src.endpoint.as_ref().ok_or_else(|| {
@@ -132,18 +132,13 @@ fn decode_destination(
     let endpoint = RuntimeEndpoint::new(endpoint.host.clone(), endpoint.port as i32)
         .map_err(|error| invalid(path.clone().field("endpoint"), error))?;
     let node = decode_nonnegative_node(src.destination_node_id, path.field("destination_node_id"))?;
-    Ok(ExchangeDestination::new(
-        task,
-        fragment_instance_id,
-        endpoint,
-        node,
-    ))
+    Ok(ExchangeDestination::new(task, task_key, endpoint, node))
 }
 
 fn encode_destination(value: &ExchangeDestination) -> novarocks::TaskExchangeDestination {
     novarocks::TaskExchangeDestination {
         task: Some(encode_task_identity(value.task())),
-        fragment_instance_id: Some(encode_unique_id(value.fragment_instance_id())),
+        task_key: Some(encode_unique_id(value.task_key())),
         endpoint: Some(novarocks::QueryControlEndpoint {
             host: value.endpoint().host().to_owned(),
             // A validated runtime endpoint always holds a nonzero u16 port.
@@ -266,8 +261,8 @@ fn decode_inbound(
         })?;
         let task = decode_task_identity(task, source_path.clone().field("task"))?;
         let key = decode_unique_id(
-            source.fragment_instance_id.as_ref(),
-            source_path.field("fragment_instance_id"),
+            source.task_key.as_ref(),
+            source_path.field("task_key"),
             "exchange source requires a fragment instance id",
         )?;
         sources.push(ExchangeSource::new(task, key, source.sender_ordinal));
@@ -299,7 +294,7 @@ fn encode_inbound(value: &ExchangeInbound) -> novarocks::TaskExchangeInbound {
             .iter()
             .map(|source| novarocks::TaskExchangeSource {
                 task: Some(encode_task_identity(source.task())),
-                fragment_instance_id: Some(encode_unique_id(source.fragment_instance_id())),
+                task_key: Some(encode_unique_id(source.task_key())),
                 sender_ordinal: source.sender_ordinal(),
             })
             .collect(),
@@ -365,9 +360,9 @@ pub fn decode_task_descriptor(
     })?;
     let identity = decode_task_identity(identity, path.clone().field("identity"))?;
 
-    let fragment_instance_id = decode_unique_id(
-        src.fragment_instance_id.as_ref(),
-        path.clone().field("fragment_instance_id"),
+    let task_key = decode_unique_id(
+        src.task_key.as_ref(),
+        path.clone().field("task_key"),
         "task descriptor requires a fragment instance id",
     )?;
 
@@ -400,21 +395,15 @@ pub fn decode_task_descriptor(
     })?;
     let topology = decode_topology(topology, path.clone().field("topology"))?;
 
-    TaskDescriptor::try_new(
-        identity,
-        fragment_instance_id,
-        pipeline_dop,
-        split_plan_nodes,
-        topology,
-    )
-    .map_err(|error| inconsistent(path, error.to_string()))
+    TaskDescriptor::try_new(identity, task_key, pipeline_dop, split_plan_nodes, topology)
+        .map_err(|error| inconsistent(path, error.to_string()))
 }
 
 /// Encodes an immutable task descriptor.
 pub fn encode_task_descriptor(value: &TaskDescriptor) -> novarocks::TaskDescriptor {
     novarocks::TaskDescriptor {
         identity: Some(encode_task_identity(value.identity())),
-        fragment_instance_id: Some(encode_unique_id(value.fragment_instance_id())),
+        task_key: Some(encode_unique_id(value.task_key())),
         pipeline_dop: value.pipeline_dop().get() as u32,
         split_plan_nodes: value
             .split_plan_nodes()

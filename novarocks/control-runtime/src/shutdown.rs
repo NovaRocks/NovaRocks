@@ -19,7 +19,7 @@
 
 use crate::{
     actor::Actor,
-    driver::{ActorRuntime, DriverError},
+    actor_turn::{ActorRuntime, ActorTurnError},
     transaction::{RuntimeError, RuntimeLedger},
 };
 
@@ -30,21 +30,24 @@ impl Shutdown {
     pub fn new(ledger: RuntimeLedger) -> Self {
         Self { ledger }
     }
-    pub fn close_external<A: Actor>(&self, driver: &ActorRuntime<A>) {
-        driver.close_admission();
+    pub fn close_external<A: Actor>(&self, runtime: &ActorRuntime<A>) {
+        runtime.close_admission();
         self.ledger.close_admission();
     }
-    pub fn ready<A: Actor>(&self, driver: &ActorRuntime<A>) -> bool {
-        self.ledger.is_empty() && driver.is_empty()
+    pub fn ready<A: Actor>(&self, runtime: &ActorRuntime<A>) -> bool {
+        self.ledger.is_empty() && runtime.is_empty()
     }
     pub fn reap(&self, budget: usize) -> Result<usize, RuntimeError> {
         self.ledger.reap_ready(budget)
     }
-    pub fn require_drained<A: Actor>(&self, driver: &ActorRuntime<A>) -> Result<(), DriverError> {
-        if self.ready(driver) {
+    pub fn require_drained<A: Actor>(
+        &self,
+        runtime: &ActorRuntime<A>,
+    ) -> Result<(), ActorTurnError> {
+        if self.ready(runtime) {
             Ok(())
         } else {
-            Err(DriverError::ActorNotRetired)
+            Err(ActorTurnError::ActorNotRetired)
         }
     }
 }

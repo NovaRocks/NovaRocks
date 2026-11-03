@@ -19,7 +19,7 @@
 //! Parquet source structs belong to the Connector's sole conversion kernel.
 
 use crate::exec::variant_failure::{self, SdkStage};
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -857,7 +857,7 @@ mod tests {
     #[test]
     fn variant_path_strict_errors_but_try_returns_null_on_cast_failure() {
         let error = materialized_variant_path(true).expect_err("strict cast must fail");
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureProjection};
         let fact = error.failure_fact();
         assert_eq!(fact.class(), FailureClass::Data);
@@ -931,7 +931,7 @@ impl novarocks_failure_contract::FailureProjection for MaterializationContract {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::VariantMaterializationContract.reason(),
+            crate::runtime::task::ExecutionReason::VariantMaterializationContract.reason(),
         )
     }
 }

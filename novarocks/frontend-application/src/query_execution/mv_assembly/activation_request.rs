@@ -29,7 +29,9 @@ use crate::{
         completion_facts::CompletionFactOwners,
         mv_assembly::{
             refresh_handoff::PreparedMvRefreshWrite,
-            refresh_preparation::{driver::MvRefreshTurnCustody, io_gate::MvRefreshPreparationIo},
+            refresh_preparation::{
+                io_gate::MvRefreshPreparationIo, turn_custody::MvRefreshTurnCustody,
+            },
         },
         write_session::ConnectorWriteSession,
     },
@@ -37,7 +39,7 @@ use crate::{
 use novarocks_query_application::admitted_query_context::{
     QueryExecutionContext, QueryResultCapacityBinding,
 };
-use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorRequestContext};
+use novarocks_spi::connector::{ConnectorControlPlanningPin, ConnectorRequestContext};
 
 /// The caller has already received these exact facts in its original Action.
 /// Moving this request preserves the same session and preparation receivers;
@@ -45,7 +47,7 @@ use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorRequestCo
 pub struct OriginalMvWritePreparationRequest {
     pub(crate) prepared: PreparedMvRefreshWrite,
     pub(crate) target: MvTargetBinding,
-    pub(crate) planning: ConnectorControlPlanningLease,
+    pub(crate) planning: ConnectorControlPlanningPin,
     pub(crate) execution: QueryExecutionContext,
     pub(crate) context: ConnectorRequestContext,
     pub(crate) session: Arc<ConnectorWriteSession>,

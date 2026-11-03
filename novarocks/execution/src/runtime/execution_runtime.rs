@@ -5,9 +5,9 @@ use std::time::Duration;
 use crate::exec::pipeline::global_driver_executor::GlobalDriverExecutor;
 use crate::runtime::exchange::ExecutionExchangeRegistry;
 use crate::runtime::execution_services::ExecutionServices;
-use crate::runtime::fragment::io::exchange_stream_sender::ExchangeUnitSendScheduler;
 use crate::runtime::function_set::SealedExecutionFunctionSet;
 use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
+use crate::runtime::task::io::exchange_stream_sender::ExchangeUnitSendScheduler;
 use novarocks_memory::MemoryAuthority;
 
 /// Frozen process-local settings used to construct one execution runtime.
@@ -284,7 +284,7 @@ impl ExecutionRuntime {
     /// Stop accepting driver work and wait a bounded time for driver scheduling
     /// threads to join. A reaper retains join ownership after a timeout.
     /// Application shutdown invokes this before releasing the runtime owner.
-    pub fn shutdown_driver_execution(&self) -> crate::runtime::fragment::ExecutionResult<()> {
+    pub fn shutdown_driver_execution(&self) -> crate::runtime::task::ExecutionResult<()> {
         self.driver_executor.shutdown()
     }
 

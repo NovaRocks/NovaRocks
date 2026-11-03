@@ -22,7 +22,7 @@ use novarocks_spi::connector::read_stack::{
     ConnectorPreparedSourceRead, ConnectorReadSourceSelection,
 };
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorExactSemanticRevision, ConnectorProviderBindingKey,
+    ConnectorControlPlanningPin, ConnectorExactSemanticRevision, ConnectorProviderBindingKey,
     ConnectorTableMetadata, ConnectorTableObjectId,
 };
 use novarocks_types::naming::TableIdentity;
@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 pub(crate) struct CapturedRefreshSource {
     pub(crate) table: TableIdentity,
-    pub(crate) lease: ConnectorControlPlanningLease,
+    pub(crate) planning_pin: ConnectorControlPlanningPin,
     pub(crate) observed: ConnectorTableMetadata,
     pub(crate) object: ConnectorTableObjectId,
     pub(crate) observation: crate::mv::domain::storage_observation::MvRefreshBaseObservation,
@@ -41,7 +41,7 @@ pub(crate) struct CapturedRefreshSource {
 impl CapturedRefreshSource {
     pub(crate) fn new(
         table: TableIdentity,
-        lease: ConnectorControlPlanningLease,
+        planning_pin: ConnectorControlPlanningPin,
         observed: ConnectorTableMetadata,
         observation: crate::mv::domain::storage_observation::MvRefreshBaseObservation,
         snapshot: Option<i64>,
@@ -49,7 +49,7 @@ impl CapturedRefreshSource {
     ) -> Self {
         Self {
             table,
-            lease,
+            planning_pin,
             observed,
             object: observation.object_id().clone(),
             observation,
@@ -60,8 +60,8 @@ impl CapturedRefreshSource {
     }
     fn binding(&self) -> ConnectorProviderBindingKey {
         ConnectorProviderBindingKey {
-            instance_id: self.lease.binding().descriptor().instance_id.clone(),
-            incarnation: self.lease.binding().incarnation(),
+            instance_id: self.planning_pin.binding().descriptor().instance_id.clone(),
+            incarnation: self.planning_pin.binding().incarnation(),
         }
     }
     pub(crate) fn receipt(
@@ -85,8 +85,8 @@ impl CapturedRefreshSource {
         request
             .observed_source_facts()
             .validate_owner(&self.binding())?;
-        if value.binding().descriptor() != self.lease.binding().descriptor()
-            || value.binding().catalog_handle() != self.lease.binding().catalog_handle()?
+        if value.binding().descriptor() != self.planning_pin.binding().descriptor()
+            || value.binding().catalog_handle() != self.planning_pin.binding().catalog_handle()?
             || request.object_id() != &self.object
             || request.to_revision() != &self.revision
             || request.observed_table() != &self.observed.table
@@ -214,16 +214,16 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::*;
 
-    fn observed(lease: ConnectorControlPlanningLease, snapshot: i64) -> CapturedRefreshSource {
+    fn observed(planning_pin: ConnectorControlPlanningPin, snapshot: i64) -> CapturedRefreshSource {
         let context = crate::connector::test_request_context();
         let identity = ConnectorTableIdentity {
-            instance_id: lease.binding().descriptor().instance_id.clone(),
+            instance_id: planning_pin.binding().descriptor().instance_id.clone(),
             namespace: Arc::from("ns"),
             table: Arc::from("source"),
         };
         let object = ConnectorTableObjectId::try_new(Bytes::from_static(b"stable-object")).unwrap();
         let revision = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
-            lease.binding().descriptor().provider_id.clone(),
+            planning_pin.binding().descriptor().provider_id.clone(),
             &object,
             Some(snapshot),
         )
@@ -244,7 +244,7 @@ mod tests {
                 version: None,
                 statistics_data_version: None,
                 table: ConnectorTableHandle::try_new(
-                    lease.binding().descriptor().instance_id.clone(),
+                    planning_pin.binding().descriptor().instance_id.clone(),
                     Bytes::from_static(b"frozen-observation"),
                 )
                 .unwrap(),
@@ -263,15 +263,15 @@ mod tests {
                 namespace: "ns".into(),
                 table: "source".into(),
             },
-            lease,
+            planning_pin,
             metadata,
             observation,
             Some(snapshot),
             revision,
         )
     }
-    fn lease(epoch: u8) -> ConnectorControlPlanningLease {
-        ConnectorControlPlanningLease::new(
+    fn planning_pin(epoch: u8) -> ConnectorControlPlanningPin {
+        ConnectorControlPlanningPin::new(
             Arc::new(
                 novarocks_catalog_application::test_support::test_control_binding_for(
                     ConnectorInstanceId::parse("ice").unwrap(),
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn an_observed_current_schema_cannot_substitute_for_a_completed_to_preparation() {
-        let original = observed(lease(7), 17);
+        let original = observed(planning_pin(7), 17);
         // The complete initial metadata is available, yet no Provider receipt
         // has certified the selected To schema or executable provenance.
         assert!(original.metadata().is_err());
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn occurrence_aliases_share_the_original_pin_but_other_roots_do_not() {
         let stock = CapturedRefreshSources::default();
-        let first = stock.install(observed(lease(7), 17)).unwrap();
+        let first = stock.install(observed(planning_pin(7), 17)).unwrap();
         let alias = TableIdentity {
             catalog: "ice".into(),
             namespace: "ns".into(),
@@ -306,22 +306,22 @@ mod tests {
         assert_eq!(stock.require(&alias).unwrap().snapshot, Some(17));
         // A second Current observation cannot replace facts already selected
         // inside this Root, even when its logical name still matches.
-        assert!(stock.install(observed(lease(7), 18)).is_err());
+        assert!(stock.install(observed(planning_pin(7), 18)).is_err());
         assert_eq!(stock.require(&alias).unwrap().snapshot, Some(17));
         let same_facts_other_root = CapturedRefreshSources::default();
         let independent = same_facts_other_root
-            .install(observed(first.lease.clone(), 17))
+            .install(observed(first.planning_pin.clone(), 17))
             .unwrap();
         assert_eq!(first.binding(), independent.binding());
         assert_eq!(first.object, independent.object);
         assert_eq!(first.revision, independent.revision);
         assert!(!Arc::ptr_eq(&first, &independent));
         let other = CapturedRefreshSources::default();
-        let second = other.install(observed(lease(8), 18)).unwrap();
+        let second = other.install(observed(planning_pin(8), 18)).unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
         assert_ne!(
-            first.lease.binding().incarnation(),
-            second.lease.binding().incarnation()
+            first.planning_pin.binding().incarnation(),
+            second.planning_pin.binding().incarnation()
         );
         assert_eq!(second.snapshot, Some(18));
     }

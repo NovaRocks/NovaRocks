@@ -138,7 +138,7 @@ fn validate_slot(
     }) {
         return Err(foreign());
     }
-    let owner = original.context_owner().ok_or_else(foreign)?;
+    let owner = original.participation_owner().ok_or_else(foreign)?;
     let expected = ConsumerKind::Owner {
         scope: owner.scope_id(),
         generation: owner.initial_epoch(),
@@ -150,7 +150,7 @@ fn validate_slot(
     {
         // The original report has already been removed at role retirement;
         // its still-resident header can need the caller's bounded reaper.
-        if custody.phase() == novarocks_control_runtime::exit_role::ExitRolePhase::Retired {
+        if custody.phase() == novarocks_control_runtime::exit_custody::ExitCustodyPhase::Retired {
             continue;
         }
         if custody
@@ -172,8 +172,8 @@ impl TaskProposalIngress {
         cut: CutId,
         original: &Arc<RequestReadySlot>,
     ) -> Result<(), IngressError> {
-        let (actor, work) = original.context_author().ok_or_else(foreign)?;
-        let owner = original.context_owner().ok_or_else(foreign)?;
+        let (actor, work) = original.participation_author().ok_or_else(foreign)?;
+        let owner = original.participation_owner().ok_or_else(foreign)?;
         if actor != owner.actor() {
             return Err(foreign());
         }
@@ -265,7 +265,7 @@ impl TaskProposalIngress {
         {
             return Err(foreign());
         }
-        let (_, work) = original.context_author().ok_or_else(foreign)?;
+        let (_, work) = original.participation_author().ok_or_else(foreign)?;
         if retired.funding.custody.iter().any(|source| {
             !original.belongs_to_financial_scope(source.financial_scope())
                 || source.financial_scope().id() != work.scope

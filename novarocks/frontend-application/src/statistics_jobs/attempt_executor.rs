@@ -177,7 +177,7 @@ use novarocks_query_application::{
     session_error::{QueryServiceError, QueryServiceErrorKind},
 };
 use novarocks_spi::connector::{
-    AsyncStatisticsCollectionSession, ConnectorControlPlanningLease, ConnectorStatisticsLease,
+    AsyncStatisticsCollectionSession, ConnectorControlPlanningPin, ConnectorStatisticsSession,
     LakePublicationDisposition, StatisticsArtifactDraft, StatisticsCpuPort,
     StatisticsPublicationClose, StatisticsPublicationReady,
 };
@@ -259,15 +259,15 @@ impl FrontendStatisticsAttemptExecutor {
         let (deadline, cancellation) = self.context(&scope)?;
         let instance = novarocks_spi::connector::ConnectorInstanceId::parse(&job.target.catalog)
             .map_err(|e| Self::failure(e.to_string()))?;
-        let planning_lease = self
+        let planning_pin = self
             .ports
             .connector_control
             .acquire_current(&instance)
             .map_err(|e| Self::failure(e.to_string()))?;
-        let lease = planning_lease
+        let statistics_session = planning_pin
             .derive_statistics_lease()
             .map_err(|e| Self::failure(e.to_string()))?;
-        let profile = lease
+        let profile = statistics_session
             .collection_io_profile()
             .map_err(|e| Self::failure(e.to_string()))?;
         // The original action header remains a responsibility fact. Provider
@@ -336,7 +336,7 @@ impl FrontendStatisticsAttemptExecutor {
             .statistics_cpu_port(
                 &scope,
                 capacity.window_alias(),
-                &lease,
+                &statistics_session,
                 cancellation,
                 self.ports.runtime.clone(),
                 wake.clone(),
@@ -375,8 +375,8 @@ impl FrontendStatisticsAttemptExecutor {
                         )
                         .map_err(|e| Self::failure(e.to_string()))?,
                     request: Some(request),
-                    planning_lease: Some(planning_lease),
-                    lease: Some(lease),
+                    planning_pin: Some(planning_pin),
+                    statistics_session: Some(statistics_session),
                     cpu,
                     io,
                     wake,
@@ -504,8 +504,8 @@ struct StatisticsState {
     progress: StatisticsJobProgress,
     relation: crate::query_execution::statistics::StatisticsRelationIdentity,
     request: Option<StatisticsAttemptRequest>,
-    planning_lease: Option<ConnectorControlPlanningLease>,
-    lease: Option<ConnectorStatisticsLease>,
+    planning_pin: Option<ConnectorControlPlanningPin>,
+    statistics_session: Option<ConnectorStatisticsSession>,
     cpu: Arc<dyn StatisticsCpuPort>,
     io: Arc<MetadataIoAdmission>,
     wake: Arc<StatisticsWake>,
@@ -618,8 +618,8 @@ impl StatisticsState {
                 self.pending = Some(Box::pin(begin_session(
                     self.session.clone(),
                     self.request.take().unwrap(),
-                    self.planning_lease.as_ref().unwrap().clone(),
-                    self.lease.take().unwrap(),
+                    self.planning_pin.as_ref().unwrap().clone(),
+                    self.statistics_session.take().unwrap(),
                     self.context.clone(),
                     self.cpu.clone(),
                 )));
@@ -696,7 +696,7 @@ impl StatisticsState {
                         context,
                         identity,
                         program,
-                        self.planning_lease.take().unwrap(),
+                        self.planning_pin.take().unwrap(),
                         scope,
                         self.wake.clone(),
                     )));
@@ -1182,8 +1182,8 @@ impl FrontendStatisticsAttemptExecutor {
 async fn begin_session(
     slot: Arc<tokio::sync::Mutex<SessionSlot>>,
     request: StatisticsAttemptRequest,
-    planning: ConnectorControlPlanningLease,
-    lease: ConnectorStatisticsLease,
+    planning: ConnectorControlPlanningPin,
+    statistics_session: ConnectorStatisticsSession,
     context: ConnectorRequestContext,
     cpu: Arc<dyn StatisticsCpuPort>,
 ) -> Result<(), CoreStatisticsAttemptError> {
@@ -1215,7 +1215,7 @@ async fn begin_session(
         )
         .map_err(failure)?,
     };
-    let start = match lease
+    let start = match statistics_session
         .begin_collection_async(
             StatisticsCollectionStartRequest {
                 operation_id: operation_id(&request),
@@ -1257,7 +1257,7 @@ async fn prepare_plan(
     context: ConnectorRequestContext,
     identity: crate::query_execution::statistics::StatisticsRelationIdentity,
     program: crate::query_execution::statistics::StatisticsCollectionProgram,
-    planning: ConnectorControlPlanningLease,
+    planning: ConnectorControlPlanningPin,
     stage: WorkScope,
     wake: Arc<StatisticsWake>,
 ) -> Result<(), CoreStatisticsAttemptError> {

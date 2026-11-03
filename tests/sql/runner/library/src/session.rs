@@ -1549,7 +1549,7 @@ mod session_tests {
     // Exercise the real outer case loop with the existing private HTTP peer.
     // No second SQL owner, public bridge, feature, or dependency is introduced.
     struct BoundaryServer;
-    impl crate::cluster::ServerHandle for BoundaryServer {
+    impl crate::cluster::TestClusterOwner for BoundaryServer {
         fn target_host(&self) -> Option<&str> {
             None
         }
@@ -1588,7 +1588,7 @@ mod session_tests {
         convert: bool,
         steps: Vec<crate::types::SqlStep>,
         initial_golden: Option<&str>,
-        server: Box<dyn crate::cluster::ServerHandle>,
+        server: Box<dyn crate::cluster::TestClusterOwner>,
     ) -> (
         crate::CaseOutcome,
         crate::results_record::CaseEvidence,
@@ -1613,7 +1613,7 @@ mod session_tests {
         steps: Vec<crate::types::SqlStep>,
         initial_golden: Option<&str>,
         owner_and_setup: (
-            Box<dyn crate::cluster::ServerHandle>,
+            Box<dyn crate::cluster::TestClusterOwner>,
             impl FnOnce(&mut crate::SuiteRunContext),
         ),
     ) -> (
@@ -1673,7 +1673,7 @@ mod session_tests {
             target_session_sql: vec![],
             rewrite_explain_contains_as_not_contains: vec![],
             fail_fast: false,
-            server_handle: Arc::new(Mutex::new(server)),
+            cluster_owner: Arc::new(Mutex::new(server)),
             failure_artifacts: Arc::new(crate::failure_artifacts::FailureArtifactRecorder::new(
                 crate::failure_artifacts::FailureArtifactContext {
                     root: temp.path().join("failures"),
@@ -1951,7 +1951,7 @@ mod session_tests {
         gate: Arc<FaultPeerGate>,
         calls: Arc<Mutex<[usize; 3]>>,
     }
-    impl crate::cluster::ServerHandle for FrontendBoundaryServer {
+    impl crate::cluster::TestClusterOwner for FrontendBoundaryServer {
         fn target_host(&self) -> Option<&str> {
             None
         }
@@ -2669,7 +2669,7 @@ mod session_tests {
         fail_restart: bool,
         wrong_target: bool,
     }
-    impl crate::cluster::ServerHandle for PublicationRestartServer {
+    impl crate::cluster::TestClusterOwner for PublicationRestartServer {
         fn target_host(&self) -> Option<&str> {
             None
         }
@@ -2722,7 +2722,7 @@ mod session_tests {
                 "/v1/namespaces/owned_ns/tables/a_mv",
                 "{}",
             )]);
-            let mut proxy = crate::publication_catalog::FixtureHandle::start(format!(
+            let mut proxy = crate::publication_catalog::PublicationCatalogFixture::start(format!(
                 "http://127.0.0.1:{}",
                 target.port
             ))
@@ -2841,7 +2841,7 @@ mod session_tests {
                 vec![]
             };
             let target = Peer::start(replies);
-            let mut proxy = crate::publication_catalog::FixtureHandle::start(format!(
+            let mut proxy = crate::publication_catalog::PublicationCatalogFixture::start(format!(
                 "http://127.0.0.1:{}",
                 target.port
             ))
@@ -2945,10 +2945,9 @@ mod session_tests {
                     "/v1/namespaces/owned_ns/tables/t",
                     "{}",
                 )]);
-                let mut proxy = crate::publication_catalog::FixtureHandle::start(format!(
-                    "http://127.0.0.1:{}",
-                    target.port
-                ))
+                let mut proxy = crate::publication_catalog::PublicationCatalogFixture::start(
+                    format!("http://127.0.0.1:{}", target.port),
+                )
                 .unwrap();
                 let control = proxy.control().unwrap();
                 let uri = proxy.uri().to_string();
@@ -3312,7 +3311,7 @@ mod session_tests {
     }
 
     struct PlainPostNegativeRestartServer(Arc<Mutex<usize>>);
-    impl crate::cluster::ServerHandle for PlainPostNegativeRestartServer {
+    impl crate::cluster::TestClusterOwner for PlainPostNegativeRestartServer {
         fn target_host(&self) -> Option<&str> {
             None
         }
@@ -3543,7 +3542,7 @@ mod session_tests {
         gate: Arc<FaultPeerGate>,
         calls: Arc<Mutex<[usize; 2]>>,
     }
-    impl crate::cluster::ServerHandle for PublicationKillBoundaryServer {
+    impl crate::cluster::TestClusterOwner for PublicationKillBoundaryServer {
         fn target_host(&self) -> Option<&str> {
             None
         }
@@ -3637,7 +3636,7 @@ mod session_tests {
             "/v1/namespaces/owned_ns/tables/t",
             "{}",
         )]);
-        let mut proxy = crate::publication_catalog::FixtureHandle::start(format!(
+        let mut proxy = crate::publication_catalog::PublicationCatalogFixture::start(format!(
             "http://127.0.0.1:{}",
             target.port
         ))

@@ -126,7 +126,7 @@ mod tests {
     use crate::catalog::{CatalogCreateIntent, CatalogNamespaceName, CatalogTableName};
     use crate::iceberg::TableCreation;
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::{ConnectorErrorKind, ConnectorListingBound};
 
     /// Build a catalog for a test the way production does.
@@ -144,7 +144,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
         );
         let client = crate::catalog_runtime::build_catalog_client(
             configuration,
@@ -231,7 +231,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
         )
         .for_request(context.clone());
         super::super::admission_test_support::publish_catalog(
@@ -319,7 +319,7 @@ mod tests {
                         None,
                         FsAccessResolver::new(),
                         Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-                        Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
+                        Arc::new(TokioFileIoSpawner::new(runtime.clone())),
                     )
                     .for_request(
                         novarocks_spi::connector::ConnectorRequestContext::try_new(

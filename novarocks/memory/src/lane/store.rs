@@ -494,15 +494,16 @@ pub fn global_store() -> &'static RecordStore {
     &GLOBAL_STORE
 }
 
-/// Keeps an instance alive outside hooks; production handles point to the
-/// process-lifetime store without allocating an Arc for the store itself.
+/// Pins the original record store outside hooks. Global points to the
+/// process-lifetime store. Cloning Owned shares ownership of the same backing
+/// until the last pin drops.
 #[derive(Clone, Debug)]
-pub enum StoreHandle {
+pub enum RecordStorePin {
     #[cfg(not(loom))]
     Global,
     Owned(std::sync::Arc<RecordStore>),
 }
-impl StoreHandle {
+impl RecordStorePin {
     #[cfg(not(loom))]
     pub const fn global() -> Self {
         Self::Global
@@ -540,9 +541,9 @@ mod exact_reclaim_tests {
 
     #[test]
     fn exact_reclaim_requires_owner_drop_and_final_real_count() {
-        let handle = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 32);
-        let store = handle.store();
-        let owner = handle
+        let store_pin = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 32);
+        let store = store_pin.store();
+        let owner = store_pin
             .acquire(
                 1,
                 ResponsibilityClass::Query,
@@ -567,9 +568,9 @@ mod exact_reclaim_tests {
 
     #[test]
     fn exact_reclaim_accepts_a_completed_collector_reclaim() {
-        let handle = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 32);
-        let store = handle.store();
-        let owner = handle
+        let store_pin = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 32);
+        let store = store_pin.store();
+        let owner = store_pin
             .acquire(
                 1,
                 ResponsibilityClass::Query,
@@ -580,7 +581,7 @@ mod exact_reclaim_tests {
         drop(owner);
         assert_eq!(store.reclaim(1), 1);
         assert!(store.reclaim_exact(reference));
-        let replacement = handle
+        let replacement = store_pin
             .acquire(
                 2,
                 ResponsibilityClass::Service,
@@ -596,11 +597,11 @@ mod exact_reclaim_tests {
 
     #[test]
     fn stale_queue_visit_never_reclaims_a_reused_generation() {
-        let handle = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 96);
-        let store = handle.store();
+        let store_pin = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 96);
+        let store = store_pin.store();
         let mut blockers = Vec::new();
         for origin in 1..=16 {
-            let owner = handle
+            let owner = store_pin
                 .acquire(
                     origin,
                     ResponsibilityClass::Query,
@@ -613,7 +614,7 @@ mod exact_reclaim_tests {
             blockers.push(reference);
             drop(owner);
         }
-        let owner = handle
+        let owner = store_pin
             .acquire(
                 17,
                 ResponsibilityClass::Query,
@@ -624,7 +625,7 @@ mod exact_reclaim_tests {
         drop(owner);
         assert!(store.reclaim_exact(reference));
         // acquire's sixteen bounded visits cannot reach the stale tail entry.
-        let replacement = handle
+        let replacement = store_pin
             .acquire(
                 18,
                 ResponsibilityClass::Service,
@@ -652,7 +653,7 @@ mod region_tests {
     use super::*;
     #[test]
     fn observation_exhaustion_never_borrows_funding_and_reclaim_preserves_region() {
-        let store = StoreHandle::owned(UNATTRIBUTED_RECORDS + 4);
+        let store = RecordStorePin::owned(UNATTRIBUTED_RECORDS + 4);
         let a = store
             .acquire(1, ResponsibilityClass::Query, RecordRegion::Observation)
             .unwrap();
@@ -691,7 +692,7 @@ mod region_tests {
     }
     #[test]
     fn boundary_segment_is_shared_without_replacing_issued_record_addresses() {
-        let store = StoreHandle::owned(UNATTRIBUTED_RECORDS + 4);
+        let store = RecordStorePin::owned(UNATTRIBUTED_RECORDS + 4);
         let f = store
             .acquire(1, ResponsibilityClass::Query, RecordRegion::Funding)
             .unwrap();

@@ -35,7 +35,7 @@ use crate::task_protocol_config::CoordinationBudgets;
 use novarocks_coordination_contract::AttemptFailureClass;
 use novarocks_coordination_contract::RecoveryMode;
 use novarocks_execution_contract::{
-    AcquireQueryContextAdmissionTicket, LeaseValidFor, OperationOutcome, QueryContextRef,
+    AcquireParticipationAdmissionTicket, LeaseValidFor, OperationOutcome, ParticipationRef,
     TaskOperationId,
 };
 use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
@@ -53,10 +53,10 @@ use novarocks_query_application::api::{
     NativeAttemptTerminal, QueryExecutionClient, QueryExecutionError, QueryExecutionRequest,
 };
 use novarocks_query_application::coordination::{
-    AbortQueryContextEffectAdmission, AbortQueryContextEffectPort, AbortQueryContextIssueIdentity,
-    AcceptedRootStatusSource, ActiveAttemptIsolationOwner, AttemptIsolationActivationFailure,
-    AttemptIsolationReservation, AttemptSchedule, NativeAttemptDrive,
-    QualifiedReplacementReservation, QualifiedWorkerAdmission,
+    AbortParticipationEffectAdmission, AbortParticipationEffectPort,
+    AbortParticipationIssueIdentity, AcceptedRootStatusSource, ActiveAttemptIsolationOwner,
+    AttemptIsolationActivationFailure, AttemptIsolationReservation, AttemptSchedule,
+    NativeAttemptDrive, QualifiedReplacementReservation, QualifiedWorkerAdmission,
     ReplacementQualificationEffectAdmission, ReplacementQualificationEffectPort,
     ReplacementQualificationEffectReservation, ReplacementQualificationEffectSubmission,
     ReplacementQualificationFailure, ReplacementQualificationIdentity,
@@ -74,7 +74,7 @@ use tokio::sync::watch;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
-use crate::native::fragment_transport::{
+use crate::native::task_result_transport::{
     NativeBoundedRootReadPort, NativeTaskResultTransport, TaskReadGrace,
 };
 use crate::native::task_transport::{
@@ -121,7 +121,7 @@ use novarocks_query_application::api::{BackendProcessObservationService, Backend
 struct LogicalAbortRouter {
     routes: Mutex<BTreeMap<novarocks_types::QueryExecutionId, Arc<NativeAbortEffectAdapter>>>,
     capacity_epoch: watch::Sender<u64>,
-    worker_closed_contexts: Arc<Mutex<BTreeSet<QueryContextRef>>>,
+    worker_closed_participations: Arc<Mutex<BTreeSet<ParticipationRef>>>,
     closure_epoch: watch::Sender<u64>,
 }
 
@@ -132,7 +132,7 @@ impl LogicalAbortRouter {
         Arc::new(Self {
             routes: Mutex::new(BTreeMap::new()),
             capacity_epoch,
-            worker_closed_contexts: Arc::new(Mutex::new(BTreeSet::new())),
+            worker_closed_participations: Arc::new(Mutex::new(BTreeSet::new())),
             closure_epoch,
         })
     }
@@ -143,13 +143,13 @@ impl LogicalAbortRouter {
         capacity: NonZeroUsize,
         wake: Arc<dyn StatusIntakeWake>,
     ) -> Result<(LogicalAbortRoute, NativeAbortEffectIntake), NativeAttemptActivationFailure> {
-        let closed = Arc::clone(&self.worker_closed_contexts);
+        let closed = Arc::clone(&self.worker_closed_participations);
         let closure_epoch = self.closure_epoch.clone();
-        let observer = Arc::new(move |context| {
+        let observer = Arc::new(move |participation| {
             closed
                 .lock()
-                .expect("logical Abort closed-context facts")
-                .insert(context);
+                .expect("logical Abort closed-participation facts")
+                .insert(participation);
             closure_epoch.send_modify(|epoch| *epoch = epoch.saturating_add(1));
         });
         let (adapter, intake) = NativeAbortEffectAdapter::bounded_with_observer(
@@ -179,8 +179,8 @@ impl LogicalAbortRouter {
         ))
     }
 
-    fn worker_closed_contexts(&self) -> Arc<Mutex<BTreeSet<QueryContextRef>>> {
-        Arc::clone(&self.worker_closed_contexts)
+    fn worker_closed_participations(&self) -> Arc<Mutex<BTreeSet<ParticipationRef>>> {
+        Arc::clone(&self.worker_closed_participations)
     }
 
     fn closure_epoch(&self) -> watch::Sender<u64> {
@@ -188,21 +188,21 @@ impl LogicalAbortRouter {
     }
 }
 
-impl AbortQueryContextEffectPort for LogicalAbortRouter {
+impl AbortParticipationEffectPort for LogicalAbortRouter {
     fn subscribe_capacity(&self) -> watch::Receiver<u64> {
         self.capacity_epoch.subscribe()
     }
 
     fn try_reserve(
         &self,
-        identity: AbortQueryContextIssueIdentity,
-    ) -> AbortQueryContextEffectAdmission {
-        let execution = identity.context().query_execution_id();
+        identity: AbortParticipationIssueIdentity,
+    ) -> AbortParticipationEffectAdmission {
+        let execution = identity.participation().query_execution_id();
         self.routes
             .lock()
             .expect("logical Abort route table")
             .get(&execution)
-            .map_or(AbortQueryContextEffectAdmission::Backpressured, |route| {
+            .map_or(AbortParticipationEffectAdmission::Backpressured, |route| {
                 route.try_reserve(identity)
             })
     }
@@ -246,7 +246,7 @@ struct LogicalReplacementQualificationState {
     candidates: Mutex<BTreeMap<novarocks_types::QueryExecutionId, ReplacementCandidate>>,
     busy: AtomicBool,
     capacity_epoch: watch::Sender<u64>,
-    worker_closed_contexts: Arc<Mutex<BTreeSet<QueryContextRef>>>,
+    worker_closed_participations: Arc<Mutex<BTreeSet<ParticipationRef>>>,
     closure_epoch: watch::Sender<u64>,
 }
 
@@ -262,7 +262,7 @@ impl std::fmt::Debug for LogicalReplacementQualificationPort {
 impl LogicalReplacementQualificationPort {
     fn new(
         runtime: FrontendNativeLogicalExecutionRuntime,
-        worker_closed_contexts: Arc<Mutex<BTreeSet<QueryContextRef>>>,
+        worker_closed_participations: Arc<Mutex<BTreeSet<ParticipationRef>>>,
         closure_epoch: watch::Sender<u64>,
     ) -> Self {
         let (capacity_epoch, _) = watch::channel(0);
@@ -272,7 +272,7 @@ impl LogicalReplacementQualificationPort {
                 candidates: Mutex::new(BTreeMap::new()),
                 busy: AtomicBool::new(false),
                 capacity_epoch,
-                worker_closed_contexts,
+                worker_closed_participations,
                 closure_epoch,
             }),
         }
@@ -365,19 +365,19 @@ impl LogicalReplacementQualificationPort {
             .runtime
             .process_observation
             .subscribe_process_changes();
-        for context in request.failed_contexts() {
+        for participation in request.failed_participations() {
             let target = failed
                 .targets
-                .get(&context.backend_process_id())
+                .get(&participation.backend_process_id())
                 .ok_or(ReplacementQualificationFailure::InvalidReservation)?;
             let endpoint = target
                 .endpoint()
                 .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?;
-            wait_for_failed_context_isolation(
+            wait_for_failed_participation_isolation(
                 &self.inner.runtime.process_observation,
-                *context,
+                *participation,
                 &endpoint,
-                &self.inner.worker_closed_contexts,
+                &self.inner.worker_closed_participations,
                 &mut closure_epoch,
                 &mut process_epoch,
                 &mut cancellation,
@@ -395,18 +395,18 @@ impl LogicalReplacementQualificationPort {
         Ok(FrontendAttemptIsolationReservation {
             identity: request.identity(),
             topology_revision: replacement.topology_revision,
-            failed_contexts: request.failed_contexts().iter().copied().collect(),
+            failed_participations: request.failed_participations().iter().copied().collect(),
             admissions,
             runtime: self.inner.runtime.data_runtime.clone(),
         })
     }
 }
 
-async fn wait_for_failed_context_isolation(
+async fn wait_for_failed_participation_isolation(
     process_observation: &BackendProcessObservationService,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     endpoint: &novarocks_execution::runtime::endpoint::RuntimeEndpoint,
-    worker_closed_contexts: &Arc<Mutex<BTreeSet<QueryContextRef>>>,
+    worker_closed_participations: &Arc<Mutex<BTreeSet<ParticipationRef>>>,
     closure_epoch: &mut watch::Receiver<u64>,
     process_epoch: &mut watch::Receiver<u64>,
     cancellation: &mut watch::Receiver<bool>,
@@ -416,13 +416,13 @@ async fn wait_for_failed_context_isolation(
         if *cancellation.borrow() {
             return Err(ReplacementQualificationFailure::Rejected);
         }
-        let observation =
-            process_observation.observe_process_at_endpoint(context.backend_process_id(), endpoint);
-        let closed = worker_closed_contexts
+        let observation = process_observation
+            .observe_process_at_endpoint(participation.backend_process_id(), endpoint);
+        let closed = worker_closed_participations
             .lock()
-            .expect("logical Abort closed-context facts")
-            .contains(&context);
-        if failed_context_allows_successor(&observation, closed) {
+            .expect("logical Abort closed-participation facts")
+            .contains(&participation);
+        if failed_participation_allows_successor(&observation, closed) {
             return Ok(());
         }
         tokio::select! {
@@ -430,14 +430,14 @@ async fn wait_for_failed_context_isolation(
             _ = process_epoch.changed() => {},
             _ = cancellation.changed() => {},
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(absolute_expiry)) => {
-                tracing::warn!(?context, "replacement failed-context isolation expired");
+                tracing::warn!(?participation, "replacement failed-participation isolation expired");
                 return Err(ReplacementQualificationFailure::Expired);
             }
         }
     }
 }
 
-fn failed_context_allows_successor(
+fn failed_participation_allows_successor(
     observation: &Result<
         novarocks_query_application::api::BackendProcessObservation,
         novarocks_query_application::api::BackendTopologyError,
@@ -516,7 +516,7 @@ impl ReplacementQualificationEffectPort for LogicalReplacementQualificationPort 
 struct FrontendAttemptIsolationReservation {
     identity: ReplacementQualificationIdentity,
     topology_revision: u64,
-    failed_contexts: BTreeSet<QueryContextRef>,
+    failed_participations: BTreeSet<ParticipationRef>,
     admissions: Box<[QualifiedWorkerAdmission]>,
     runtime: FrontendDataRuntime,
 }
@@ -547,10 +547,13 @@ impl AttemptIsolationReservation for FrontendAttemptIsolationReservation {
 
     fn validate_binding(
         &self,
-        failed_contexts: &[QueryContextRef],
+        failed_participations: &[ParticipationRef],
     ) -> Result<(), ReplacementQualificationFailure> {
-        let expected = failed_contexts.iter().copied().collect::<BTreeSet<_>>();
-        (expected == self.failed_contexts)
+        let expected = failed_participations
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        (expected == self.failed_participations)
             .then_some(())
             .ok_or(ReplacementQualificationFailure::InvalidReservation)
     }
@@ -626,13 +629,13 @@ async fn acquire_replacement_admissions(
     candidate: &ReplacementCandidate,
     mut cancellation: watch::Receiver<bool>,
 ) -> Result<Box<[QualifiedWorkerAdmission]>, ReplacementQualificationFailure> {
-    let mut backends = Vec::with_capacity(qualification.replacement_contexts().len());
-    for context in qualification.replacement_contexts() {
+    let mut backends = Vec::with_capacity(qualification.replacement_participations().len());
+    for participation in qualification.replacement_participations() {
         let target = candidate
             .targets
-            .get(&context.backend_process_id())
+            .get(&participation.backend_process_id())
             .ok_or(ReplacementQualificationFailure::InvalidReservation)?;
-        if target.descriptor().process_id() != context.backend_process_id() {
+        if target.descriptor().process_id() != participation.backend_process_id() {
             return Err(ReplacementQualificationFailure::InvalidReservation);
         }
         backends.push(target.descriptor().clone());
@@ -655,26 +658,26 @@ async fn acquire_replacement_admissions(
     )
     .map_err(|error| ReplacementQualificationFailure::DomainRefused(error.failure_fact()))?;
     let valid_for =
-        LeaseValidFor::new(crate::task_execution::context_owner::ADMISSION_TICKET_VALID_FOR)
+        LeaseValidFor::new(crate::task_execution::participation_owner::ADMISSION_TICKET_VALID_FOR)
             .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?;
     let acquire = async {
         let mut admissions = PendingReplacementAdmissions::new(runtime.data_runtime.clone());
-        for context in qualification.replacement_contexts() {
+        for participation in qualification.replacement_participations() {
             if *cancellation.borrow() {
                 return Err(ReplacementQualificationFailure::Rejected);
             }
-            let request = AcquireQueryContextAdmissionTicket::new(
+            let request = AcquireParticipationAdmissionTicket::new(
                 TaskOperationId::new_v7(),
-                *context,
+                *participation,
                 valid_for,
                 runtime.native_compatibility_id,
                 candidate
                     .targets
-                    .get(&context.backend_process_id())
-                    .expect("replacement context target checked above")
+                    .get(&participation.backend_process_id())
+                    .expect("replacement participation target checked above")
                     .admission_epoch_capability(),
             );
-            let intent = OperationIntent::AcquireQueryContextAdmissionTicket(request);
+            let intent = OperationIntent::AcquireParticipationAdmissionTicket(request);
             let mut retry_delay = runtime.task_update_retry_policy.initial_backoff();
             // These are fields of the same original qualification future,
             // already held by its stable QA owner. Local backpressure never
@@ -704,7 +707,7 @@ async fn acquire_replacement_admissions(
                     };
                     if let Some(permit) = permit {
                         pending_batch = Some(DispatchBatch::with_queued_at(
-                            context.backend_process_id(),
+                            participation.backend_process_id(),
                             crate::task_protocol_config::DispatchLane::Lifecycle,
                             vec![intent.clone()],
                             vec![permit],
@@ -1066,7 +1069,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
             let aborts = LogicalAbortRouter::new();
             let replacements = LogicalReplacementQualificationPort::new(
                 self.runtime.clone(),
-                aborts.worker_closed_contexts(),
+                aborts.worker_closed_participations(),
                 aborts.closure_epoch(),
             );
             let factory = ProductionDormantAttemptFactory {
@@ -1095,7 +1098,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
             original.request = Some(
                 QueryExecutionRequest::bind_native(
                     description,
-                    aborts as Arc<dyn AbortQueryContextEffectPort>,
+                    aborts as Arc<dyn AbortParticipationEffectPort>,
                     Some(Arc::new(replacements) as Arc<dyn ReplacementQualificationEffectPort>),
                     attempts,
                 )
@@ -1210,7 +1213,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
             let aborts = LogicalAbortRouter::new();
             let replacements = LogicalReplacementQualificationPort::new(
                 self.runtime.clone(),
-                aborts.worker_closed_contexts(),
+                aborts.worker_closed_participations(),
                 aborts.closure_epoch(),
             );
             let factory = ProductionDormantAttemptFactory {
@@ -1246,7 +1249,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
             // and unique owner still occupied the caller's stable fields.
             let request = QueryExecutionRequest::bind_native(
                 description,
-                aborts as Arc<dyn AbortQueryContextEffectPort>,
+                aborts as Arc<dyn AbortParticipationEffectPort>,
                 replacement_port,
                 attempts,
             )
@@ -1841,9 +1844,11 @@ impl ProductionManifestAttemptProjection {
         // Full parent D was bound by the original exact manifest above. One
         // positive cohort must precede writers, initializer, watch and every round RPC.
         // Qualification has its own paid Native action source after the same full-D gate.
-        let source_count =
-            native_source_count(prepared.typed_scans().count(), manifest.contexts().len())
-                .map_err(|error| projection_message(error.to_string()))?;
+        let source_count = native_source_count(
+            prepared.typed_scans().count(),
+            manifest.participations().len(),
+        )
+        .map_err(|error| projection_message(error.to_string()))?;
         std::future::poll_fn(|cx| self.source_cohort.poll(&self.work_scope, source_count, cx))
             .await
             .map_err(|error| {
@@ -2005,9 +2010,9 @@ impl ProductionManifestAttemptProjection {
             .map_err(projection_failure)?;
 
         let live_backends = manifest
-            .contexts()
+            .participations()
             .iter()
-            .map(|context| context.backend().target().clone())
+            .map(|participation| participation.backend().target().clone())
             .collect::<Vec<_>>();
         let options = QueryInitOptions::new(
             execution,
@@ -2050,10 +2055,10 @@ impl ProductionManifestAttemptProjection {
             ));
         }
 
-        let mut runtime_filters = Vec::with_capacity(manifest.contexts().len());
+        let mut runtime_filters = Vec::with_capacity(manifest.participations().len());
         let compiled_filters = task_prepared.runtime_filter_contributions();
-        for context in manifest.contexts() {
-            let backend = context.backend();
+        for participation in manifest.participations() {
+            let backend = participation.backend();
             let contribution = match compiled_filters.get(&backend.backend_idx()) {
                 Some(contribution) => contribution.clone(),
                 None if compiled_filters.is_empty() => Default::default(),
@@ -2085,9 +2090,9 @@ impl ProductionManifestAttemptProjection {
         // Even an empty table carries the original collector's transfer fact.
         let credential_storage = Some(storage);
         let backends = manifest
-            .contexts()
+            .participations()
             .iter()
-            .map(|context| context.backend().target().descriptor().clone())
+            .map(|participation| participation.backend().target().descriptor().clone())
             .collect::<Vec<_>>();
         let mut round = crate::task_execution::manifest_round::assemble_manifest_round(
             manifest,
@@ -2140,7 +2145,7 @@ impl ProductionManifestAttemptProjection {
             projection_message("logical execution Task round has no accepted root status source")
         })?;
         let result_transport_for_diagnostics = Arc::clone(&result_transport)
-            as Arc<dyn crate::native::fragment_transport::TaskResultTransport>;
+            as Arc<dyn crate::native::task_result_transport::TaskResultTransport>;
         let root_binding = match &self.delivery {
             ProductionRootDelivery::Relayed {
                 kind,
@@ -2462,7 +2467,7 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
                     execution_id,
                     primary_error: None,
                 failure: observed_failure,
-                worker_contexts_converged: matches!(&convergence, NativeActiveConvergenceClosure::Evidence(_)),
+                worker_participations_converged: matches!(&convergence, NativeActiveConvergenceClosure::Evidence(_)),
                     runtime_filter,
                 },
             );
@@ -2971,7 +2976,7 @@ where
                 observation.bind_attempt(request.execution());
             }
             // A failed attempt can be replaced on the same live processes once
-            // its exact contexts are fenced. Qualification, not a topology
+            // its exact participations are fenced. Qualification, not a topology
             // revision change, enforces that isolation before activation. A typed
             // failed process additionally constrains successor placement.
             if state.pending_changes.is_none() {
@@ -3007,7 +3012,7 @@ where
                         }
                         if let Some(observations) = &state.observations {
                             for action in [
-                                "grpc-fragment",
+                                "task-protocol",
                                 "reader-marker",
                                 "writer-marker",
                                 "catalog-materialization",
@@ -3218,7 +3223,7 @@ mod replacement_ack_tests {
             let publish = || {
                 acks.handle().publish(crate::task_execution::intent::OperationAcknowledgement::new(
                     operation,
-                    novarocks_execution_contract::OperationKind::AcquireQueryContextAdmissionTicket,
+                    novarocks_execution_contract::OperationKind::AcquireParticipationAdmissionTicket,
                     OperationOutcome::ResourceExhausted,
                     AckPayload::None,
                 ));
@@ -3285,8 +3290,8 @@ mod tests {
     use super::{
         AttemptFailureClass, FrontendActiveAttemptBehavior, FrontendDormantAttemptBehavior,
         QueryExecutionErrorKind, RetainedAttemptInputs, SnapshotBoundDormantAttemptOwner,
-        attempt_runtime_failure, failed_context_allows_successor,
-        wait_for_failed_context_isolation,
+        attempt_runtime_failure, failed_participation_allows_successor,
+        wait_for_failed_participation_isolation,
     };
     use novarocks_execution::task_execution::AdmissionEpochCapability;
     use novarocks_execution_contract::BackendProcessDescriptor;
@@ -3507,7 +3512,7 @@ mod tests {
             processes,
         );
 
-        let old_context = novarocks_execution_contract::QueryContextRef::new(
+        let old_participation = novarocks_execution_contract::ParticipationRef::new(
             QueryExecutionId::new(
                 QueryId::new(0x4567, 0x89ab),
                 AttemptId::new(1).expect("attempt one"),
@@ -3527,9 +3532,9 @@ mod tests {
         let mut closure_changes = closure_epoch.subscribe();
         let mut process_changes = observation.subscribe_process_changes();
         let (_cancel, mut cancellation) = tokio::sync::watch::channel(false);
-        let qualification = wait_for_failed_context_isolation(
+        let qualification = wait_for_failed_participation_isolation(
             &observation,
-            old_context,
+            old_participation,
             &endpoint,
             &closed,
             &mut closure_changes,
@@ -3542,14 +3547,17 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(5), &mut qualification)
                 .await
                 .is_err(),
-            "the same live process must fence the old context before replacement"
+            "the same live process must fence the old participation before replacement"
         );
-        closed.lock().expect("closed contexts").insert(old_context);
+        closed
+            .lock()
+            .expect("closed participations")
+            .insert(old_participation);
         closure_epoch.send_modify(|epoch| *epoch += 1);
         tokio::time::timeout(Duration::from_millis(100), &mut qualification)
             .await
             .expect("exact closure wakes qualification")
-            .expect("closed old context permits replacement on unchanged topology");
+            .expect("closed old participation permits replacement on unchanged topology");
     }
 
     #[derive(Debug)]
@@ -3560,25 +3568,25 @@ mod tests {
     #[test]
     fn readonly_replacement_waits_only_for_a_reachable_current_worker_to_close() {
         let replacement = BackendProcessId::new_v7();
-        assert!(!failed_context_allows_successor(
+        assert!(!failed_participation_allows_successor(
             &Ok(BackendProcessObservation::Current),
             false,
         ));
-        assert!(failed_context_allows_successor(
+        assert!(failed_participation_allows_successor(
             &Ok(BackendProcessObservation::Current),
             true,
         ));
-        assert!(failed_context_allows_successor(
+        assert!(failed_participation_allows_successor(
             &Ok(BackendProcessObservation::Unobservable),
             false,
         ));
-        assert!(failed_context_allows_successor(
+        assert!(failed_participation_allows_successor(
             &Ok(BackendProcessObservation::Replaced {
                 current_process: replacement,
             }),
             false,
         ));
-        assert!(failed_context_allows_successor(
+        assert!(failed_participation_allows_successor(
             &Err(BackendTopologyError::Unavailable {
                 message: "transient observation failure".to_string(),
             }),
@@ -3609,7 +3617,7 @@ mod tests {
     #[tokio::test]
     async fn current_worker_waits_for_abort_closure_under_the_same_deadline() {
         let process = BackendProcessId::new_v7();
-        let context = novarocks_execution_contract::QueryContextRef::new(
+        let participation = novarocks_execution_contract::ParticipationRef::new(
             QueryExecutionId::new(
                 QueryId::new(0x1234, 0x5678),
                 AttemptId::new(1).expect("attempt one"),
@@ -3629,9 +3637,9 @@ mod tests {
         let mut closure_changes = closure_epoch.subscribe();
         let mut process_changes = observation.subscribe_process_changes();
         let (_cancel, mut cancellation) = tokio::sync::watch::channel(false);
-        let wait = wait_for_failed_context_isolation(
+        let wait = wait_for_failed_participation_isolation(
             &observation,
-            context,
+            participation,
             &endpoint,
             &closed,
             &mut closure_changes,
@@ -3646,7 +3654,10 @@ mod tests {
                 .is_err()
         );
 
-        closed.lock().expect("closed contexts").insert(context);
+        closed
+            .lock()
+            .expect("closed participations")
+            .insert(participation);
         closure_epoch.send_modify(|epoch| *epoch += 1);
         tokio::time::timeout(Duration::from_millis(100), &mut wait)
             .await
@@ -3657,7 +3668,7 @@ mod tests {
     #[tokio::test]
     async fn current_worker_wait_honors_cancellation_and_absolute_expiry() {
         let process = BackendProcessId::new_v7();
-        let context = novarocks_execution_contract::QueryContextRef::new(
+        let participation = novarocks_execution_contract::ParticipationRef::new(
             QueryExecutionId::new(
                 QueryId::new(0x2345, 0x6789),
                 AttemptId::new(1).expect("attempt one"),
@@ -3679,9 +3690,9 @@ mod tests {
         let mut process_changes = observation.subscribe_process_changes();
         let (_cancel_owner, mut cancelled) = tokio::sync::watch::channel(true);
         assert!(matches!(
-            wait_for_failed_context_isolation(
+            wait_for_failed_participation_isolation(
                 &observation,
-                context,
+                participation,
                 &endpoint,
                 &closed,
                 &mut closure_changes,
@@ -3697,9 +3708,9 @@ mod tests {
         let mut process_changes = observation.subscribe_process_changes();
         let (_cancel_owner, mut active) = tokio::sync::watch::channel(false);
         assert!(matches!(
-            wait_for_failed_context_isolation(
+            wait_for_failed_participation_isolation(
                 &observation,
-                context,
+                participation,
                 &endpoint,
                 &closed,
                 &mut closure_changes,
@@ -3786,7 +3797,7 @@ mod tests {
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             Box::pin(async {
                 Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(),
                 ))
             })
         }
@@ -3945,7 +3956,7 @@ mod tests {
             Box::pin(async move {
                 observed.store(true, Ordering::SeqCst);
                 Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(),
                 ))
             })
         }

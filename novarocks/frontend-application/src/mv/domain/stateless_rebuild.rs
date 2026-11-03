@@ -223,7 +223,7 @@ fn execute_request_with_context(
         namespace: Arc::from(req.namespace.as_str()),
         table: Arc::from(req.mv.as_str()),
     };
-    let loaded_table = crate::connector::metadata_load_connector_table_with_planning_lease(
+    let loaded_table = crate::connector::metadata_load_connector_table_with_planning_pin(
         &exact_lease,
         connector_context.clone(),
         &table.namespace,
@@ -288,7 +288,7 @@ fn available_level(has_publication: bool) -> StatelessLevel {
 /// clears the cache cannot clear the cache of an MV that is not there.
 fn observe_current_documents(
     readiness: &crate::mv::domain::readiness::MvReadinessPort,
-    exact_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    exact_lease: &novarocks_spi::connector::ConnectorControlPlanningPin,
     loaded_table: &novarocks_spi::connector::ConnectorTableMetadata,
     context: ConnectorRequestContext,
     req: &ImvStatelessRebuildRequest,
@@ -308,18 +308,18 @@ fn observe_current_documents(
             },
         )
         .map_err(|error| format!("bind stateless rebuild target object: {error}"))?;
-    let documents_lease = exact_lease
+    let document_storage_binding = exact_lease
         .derive_document_storage_lease()
         .map_err(|error| format!("derive stateless rebuild document lease: {error}"))?;
     let request = crate::mv::domain::staged_create::keyed_request(
-        &documents_lease,
+        &document_storage_binding,
         loaded_table.identity.clone(),
         binding.object_id.clone(),
         context,
     );
     readiness
         .candidate_reader()
-        .observe_current(&documents_lease, request)
+        .observe_current(&document_storage_binding, request)
         .map_err(|e| {
             format!(
                 "MV '{}.{}' has no readable keyed lake documents in catalog '{}': {e}",

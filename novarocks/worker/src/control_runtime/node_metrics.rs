@@ -56,16 +56,17 @@ pub struct WorkerNodeMetricsSnapshot {
     pub preparing_tasks: u64,
     pub preparing_bytes: u64,
     pub requests: u64,
-    pub contexts: u64,
+    pub participations: u64,
 }
 impl WorkerNodeMetricsSnapshot {
-    pub(super) fn sample(ledger: &RuntimeLedger, contexts: usize) -> Self {
+    pub(super) fn sample(ledger: &RuntimeLedger, participations: usize) -> Self {
         Self {
             active_tasks: ledger.used(Dimension::ActiveTasks.id()),
             preparing_tasks: ledger.used(Dimension::PreparingTasks.id()),
             preparing_bytes: ledger.used(Dimension::PreparingBytes.id()),
             requests: ledger.used(Dimension::Requests.id()),
-            contexts: u64::try_from(contexts).expect("Context metadata count fits u64"),
+            participations: u64::try_from(participations)
+                .expect("Participation metadata count fits u64"),
         }
     }
 }
@@ -77,8 +78,8 @@ impl WorkerNodeMetricsSnapshot {
 pub struct WorkerPreparationSnapshot {
     pub positions: u64,
     pub position_limit: u64,
-    pub context_positions: u64,
-    pub context_position_limit: u64,
+    pub participation_positions: u64,
+    pub participation_position_limit: u64,
     pub queued_positions: u64,
     pub workers: u64,
     pub worker_limit: u64,
@@ -95,9 +96,9 @@ impl WorkerPreparationSnapshot {
     pub(super) fn sample(
         ledger: &RuntimeLedger,
         preparation: &super::host_executor::HostExecutorHandle<
-            super::context_host::task_driver::TaskDriverHostJob,
+            super::participation_host::task_io::TaskIoHostJob,
         >,
-        context_limit: usize,
+        participation_limit: usize,
     ) -> Result<Option<Self>, WorkerPreparationObservationError> {
         let Some(queue) = preparation
             .try_preparation_snapshot()
@@ -120,9 +121,9 @@ impl WorkerPreparationSnapshot {
         Ok(Some(Self {
             positions: charges.used[0],
             position_limit: charges.limits[0],
-            context_positions: charges.max_owner_usage,
-            context_position_limit: u64::try_from(context_limit)
-                .expect("configured Context limit fits u64"),
+            participation_positions: charges.max_owner_usage,
+            participation_position_limit: u64::try_from(participation_limit)
+                .expect("configured Participation limit fits u64"),
             queued_positions: u64::try_from(queue.queued).expect("bounded physical queue fits u64"),
             workers: u64::try_from(queue.running).expect("configured physical workers fit u64"),
             worker_limit: u64::try_from(queue.worker_limit)
@@ -135,7 +136,7 @@ impl WorkerPreparationSnapshot {
 
 // These types are the same original Common metadata projection. No Worker
 // counter, status algorithm, runtime owner or resource permission is copied.
-pub use novarocks_control_runtime::driver::{
+pub use novarocks_control_runtime::actor_turn::{
     PollerObservationSnapshot as WorkerControlPlaneSnapshot,
     PollerPhase as WorkerControlPlanePhase, PollerTimerSnapshot as WorkerControlPlaneTimerSnapshot,
     PollerWorkerSnapshot as WorkerControlPlaneWorkerSnapshot,
@@ -150,7 +151,7 @@ pub struct WorkerExecutionQuiescenceSnapshot {
     pub preparing_tasks: u64,
     pub preparing_bytes: u64,
     pub requests: u64,
-    pub contexts_with_execution_custody: u64,
+    pub participations_with_execution_custody: u64,
     pub root_producers_running: u64,
     pub root_data_positions: u64,
     pub root_payload_bytes: u64,
@@ -158,15 +159,15 @@ pub struct WorkerExecutionQuiescenceSnapshot {
     pub root_deliveries: u64,
     pub root_retained_reservations: u64,
     pub root_metadata_holders: u64,
-    pub context_records: u64,
+    pub participation_records: u64,
     pub root_channels: u64,
     pub root_metadata_bytes: u64,
 }
 impl WorkerExecutionQuiescenceSnapshot {
     pub(super) fn sample(
         ledger: &RuntimeLedger,
-        contexts_with_execution_custody: u64,
-        context_records: usize,
+        participations_with_execution_custody: u64,
+        participation_records: usize,
         root: crate::root_result_channel::RootOwnershipSnapshot,
     ) -> Option<Self> {
         let charges = ledger
@@ -185,8 +186,8 @@ impl WorkerExecutionQuiescenceSnapshot {
             preparing_tasks: charges.used[1],
             preparing_bytes: charges.used[2],
             requests: charges.used[3],
-            context_records: u64::try_from(context_records).ok()?,
-            contexts_with_execution_custody,
+            participation_records: u64::try_from(participation_records).ok()?,
+            participations_with_execution_custody,
             root_producers_running: u64::try_from(root.producers_running).ok()?,
             root_data_positions: u64::try_from(root.data_positions).ok()?,
             root_payload_bytes: u64::try_from(root.payload_bytes).ok()?,
@@ -204,15 +205,17 @@ impl WorkerExecutionQuiescenceSnapshot {
 /// receipt. Estimates cover only documented inline fields; all indirect backing
 /// and allocator overhead remain unmeasured. No estimate is a capacity grant.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct WorkerContextRetentionSnapshot {
-    pub compact_contexts: usize,
+pub struct WorkerParticipationRetentionSnapshot {
+    pub compact_participations: usize,
     pub failed_custodians: usize,
     pub decided_task_records: Option<usize>,
     pub metadata_bytes_estimate: Option<usize>,
 }
-impl WorkerContextRetentionSnapshot {
+impl WorkerParticipationRetentionSnapshot {
     pub(super) fn try_add(&mut self, other: Self) -> Option<()> {
-        self.compact_contexts = self.compact_contexts.checked_add(other.compact_contexts)?;
+        self.compact_participations = self
+            .compact_participations
+            .checked_add(other.compact_participations)?;
         self.failed_custodians = self
             .failed_custodians
             .checked_add(other.failed_custodians)?;
@@ -236,7 +239,7 @@ impl WorkerContextRetentionSnapshot {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkerProtocolRetentionSnapshot {
-    pub contexts: WorkerContextRetentionSnapshot,
+    pub participations: WorkerParticipationRetentionSnapshot,
     pub admission: novarocks_worker_protocol::admission::AdmissionRetentionInventory,
     pub control: novarocks_worker_protocol::control::ControlRetentionInventory,
 }

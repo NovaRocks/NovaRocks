@@ -260,7 +260,7 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
             .flatten()
             .map(|placement| RuntimeFilterValidatedPlacementFacts {
                 fragment_id: placement.fragment_id,
-                fragment_instance_id: placement.finst_id,
+                task_key: placement.task_key,
                 backend_idx: placement.backend_idx,
             })
     }
@@ -467,7 +467,7 @@ pub enum RuntimeFilterDeploymentBindingRoleFacts {
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterValidatedPlacementFacts {
     fragment_id: u32,
-    fragment_instance_id: novarocks_types::UniqueId,
+    task_key: novarocks_types::UniqueId,
     backend_idx: usize,
 }
 
@@ -476,8 +476,8 @@ impl RuntimeFilterValidatedPlacementFacts {
         self.fragment_id
     }
 
-    pub const fn fragment_instance_id(self) -> novarocks_types::UniqueId {
-        self.fragment_instance_id
+    pub const fn task_key(self) -> novarocks_types::UniqueId {
+        self.task_key
     }
 
     pub const fn backend_idx(self) -> usize {

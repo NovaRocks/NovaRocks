@@ -29,7 +29,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use novarocks_spi::connector::{
-    ConnectorCommittedVersion, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+    ConnectorCommittedVersion, ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
     ConnectorRequestContext, ConnectorTableMetadata, ConnectorTableObjectId, LakePublicationId,
     MvExactPartitionField, MvExactPartitionTransform,
 };
@@ -238,7 +238,7 @@ pub struct IcebergStorageInspector;
 impl IcebergStorageInspector {
     pub fn observe_schema_validation(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<IcebergStorageExactSchemaObservation, ConnectorError> {
@@ -254,7 +254,7 @@ impl IcebergStorageInspector {
 
     pub fn observe_source_schema(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<IcebergStorageSourceSchemaObservation, ConnectorError> {
@@ -272,7 +272,7 @@ impl IcebergStorageInspector {
 
     pub fn observe_created_target(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<IcebergStorageTargetObservation, ConnectorError> {
@@ -282,7 +282,7 @@ impl IcebergStorageInspector {
 
     pub fn observe_refresh_base(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<IcebergStorageRefreshBaseObservation, ConnectorError> {
@@ -292,7 +292,7 @@ impl IcebergStorageInspector {
 
     pub fn observe_refresh_target(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<IcebergStorageRefreshTargetObservation, ConnectorError> {
@@ -303,7 +303,7 @@ impl IcebergStorageInspector {
     /// Project the maintenance facts carried by the table metadata itself.
     pub fn observe_maintenance_metadata(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<IcebergStorageMaintenanceMetadataObservation, ConnectorError> {
@@ -878,7 +878,7 @@ struct TableHandlePayload {
 }
 
 fn decoded_table(
-    exact_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorControlPlanningPin,
     metadata: &ConnectorTableMetadata,
     context: &ConnectorRequestContext,
 ) -> Result<TableMetadata, ConnectorError> {
@@ -886,7 +886,7 @@ fn decoded_table(
 }
 
 fn decoded_table_generation(
-    exact_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorControlPlanningPin,
     metadata: &ConnectorTableMetadata,
     context: &ConnectorRequestContext,
 ) -> Result<(TableMetadata, Option<String>), ConnectorError> {

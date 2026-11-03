@@ -20,7 +20,7 @@
 //! backing is preflighted before growth under the original last-edge permit.
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionReason, ExecutionResult};
 
 #[cfg(test)]
 use crate::runtime::runtime_state::RuntimeState;
@@ -50,15 +50,15 @@ use crate::exec::pipeline::operator::{
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::{AcceptedInput, InputPreparationFailure, RawInput},
     shape::{
         HydrateInput, InputPreparation, PreparationStep, ReceiverPreparation, ReceiverSlot,
         StepOperator,
     },
     step::{AdmissionNext, InputResult, NextStep, RootPending, RootStep, StepResult},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::io::RootInputPermit;
+use crate::runtime::task::io::RootInputPermit;
 use novarocks_local_program::StaticLayout;
 use novarocks_type_contract::ValueKind;
 
@@ -453,7 +453,7 @@ impl OperatorFactory for StatisticsMaterializerFactory {
 struct StatisticsMaterializer {
     receiver: ReceiverSlot<StatisticsPreparation>,
     next: NextStep,
-    failure: Option<crate::runtime::fragment::ExecutionFailure>,
+    failure: Option<crate::runtime::task::ExecutionFailure>,
     definition: Arc<Definition>,
     output: Option<ChunkSchemaRef>,
     fixed_capacity: usize,
@@ -541,7 +541,7 @@ impl InputEncodingPolicy for StatisticsInputPolicy {}
 impl InputPreparation<StatisticsInputPolicy> for StatisticsPreparation {
     fn admission(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: &RawInput,
         _: &StatisticsInputPolicy,
     ) -> ExecutionResult<Option<AdmissionNext>> {
@@ -553,7 +553,7 @@ impl InputPreparation<StatisticsInputPolicy> for StatisticsPreparation {
     }
     fn prepare(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: AcceptedInput,
         policy: &StatisticsInputPolicy,
     ) -> Result<PreparationStep, InputPreparationFailure> {
@@ -578,7 +578,7 @@ impl std::fmt::Display for StatisticsStepFailure {
 impl std::error::Error for StatisticsStepFailure {}
 impl novarocks_failure_contract::FailureProjection for StatisticsStepFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match self {
             Self::InputAfterFinish => ExecutionReason::StatisticsInputAfterFinish,
@@ -599,9 +599,9 @@ impl StatisticsMaterializer {
     }
     fn fail(
         &mut self,
-        ctx: &StepContext<'_>,
-        error: crate::runtime::fragment::ExecutionFailure,
-    ) -> crate::runtime::fragment::ExecutionFailure {
+        ctx: &DriverStep<'_>,
+        error: crate::runtime::task::ExecutionFailure,
+    ) -> crate::runtime::task::ExecutionFailure {
         ctx.report_failure(error.clone());
         self.failure.get_or_insert(error).clone()
     }
@@ -759,14 +759,14 @@ impl StepOperator for StatisticsMaterializer {
     fn initial_step(&self) -> NextStep {
         self.next.clone()
     }
-    fn try_push(&mut self, ctx: &mut StepContext<'_>, input: RawInput) -> InputResult {
+    fn try_push(&mut self, ctx: &mut DriverStep<'_>, input: RawInput) -> InputResult {
         if let Some(failure) = self.failure.clone().or_else(|| ctx.checkpoint().err()) {
             return InputResult::Rejected { input, failure };
         }
         if self.finishing || matches!(self.next, NextStep::Finished) {
             return InputResult::Rejected {
                 input,
-                failure: crate::runtime::fragment::ExecutionFailure::from_domain(
+                failure: crate::runtime::task::ExecutionFailure::from_domain(
                     StatisticsStepFailure::InputAfterFinish,
                 ),
             };
@@ -783,7 +783,7 @@ impl StepOperator for StatisticsMaterializer {
         }
         result
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -794,14 +794,14 @@ impl StepOperator for StatisticsMaterializer {
         }
         Err(self.fail(
             ctx,
-            crate::runtime::fragment::ExecutionFailure::from_domain(
+            crate::runtime::task::ExecutionFailure::from_domain(
                 StatisticsStepFailure::MissingRootGrant,
             ),
         ))
     }
     fn drive_with_root_input(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         permit: &RootInputPermit,
     ) -> ExecutionResult<RootStep> {
         if let Some(error) = &self.failure {
@@ -817,7 +817,7 @@ impl StepOperator for StatisticsMaterializer {
                 // Validation borrows the prepared payload; a returned failure is
                 // reported while this owner still retains that payload.
                 if let Err(error) = ctx
-                    .perform(crate::runtime::fragment::PipelineOperation::Push, |_| {
+                    .perform(crate::runtime::task::PipelineOperation::Push, |_| {
                         self.validate_input(input.chunk())
                     })
                 {
@@ -840,7 +840,7 @@ impl StepOperator for StatisticsMaterializer {
             Err(error) => return Err(self.fail(ctx, error)),
             Ok(ReceiverPreparation::Empty) => {}
         }
-        let result = ctx.perform(crate::runtime::fragment::PipelineOperation::Pull, |_| {
+        let result = ctx.perform(crate::runtime::task::PipelineOperation::Pull, |_| {
             self.materialize_root(permit)
         });
         match result {
@@ -857,7 +857,7 @@ impl StepOperator for StatisticsMaterializer {
     fn release_root_workspace(&mut self) {
         drop(self.workspace.take());
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -1269,7 +1269,7 @@ fn statistics_extent(label: &'static str, required: u128, limit: usize) -> Execu
 mod tests {
     use super::*;
     use crate::exec::chunk::{ChunkSchema, RootArrayStorageLimits, borrowed_root_chunk_storage};
-    use crate::runtime::fragment::io::{
+    use crate::runtime::task::io::{
         ResultWriteCredit, RootInputAdmission, RootInputAuthority, RootResultWriteSpec,
     };
     use novarocks_execution_contract::TaskIdentity;
@@ -1285,12 +1285,12 @@ mod tests {
 
     fn with_context<T>(
         state: &RuntimeState,
-        action: impl FnOnce(&mut StepContext<'_>) -> ExecutionResult<T>,
+        action: impl FnOnce(&mut DriverStep<'_>) -> ExecutionResult<T>,
     ) -> ExecutionResult<T> {
         let control = state.error_state();
         let mut work =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        action(&mut DriverStep::new(
             &control,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -1452,7 +1452,7 @@ mod tests {
             &spec,
             Arc::new(crate::runtime::execution_health::ExecutionHealth::new()),
         );
-        let crate::runtime::fragment::io::RootInputReservationAdmission::Granted(mut reservation) =
+        let crate::runtime::task::io::RootInputReservationAdmission::Granted(mut reservation) =
             authority.try_reserve().unwrap()
         else {
             panic!("one original reservation");
@@ -1472,11 +1472,11 @@ mod tests {
         let grant = permit();
         let control = state.error_state();
         let mut work =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 0);
         for _ in 0..2 {
             let result = source
                 .drive_with_root_input(
-                    &mut StepContext::new(
+                    &mut DriverStep::new(
                         &control,
                         &mut work,
                         &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -1497,7 +1497,7 @@ mod tests {
         assert!(matches!(
             source
                 .drive_with_root_input(
-                    &mut StepContext::new(
+                    &mut DriverStep::new(
                         &control,
                         &mut work,
                         &mut novarocks_value_arrays::decode::ValueConversionContext::default()
@@ -1515,7 +1515,7 @@ mod tests {
         assert!(matches!(
             source
                 .drive_with_root_input(
-                    &mut StepContext::new(
+                    &mut DriverStep::new(
                         &control,
                         &mut work,
                         &mut novarocks_value_arrays::decode::ValueConversionContext::default()
@@ -1723,7 +1723,7 @@ mod tests {
         assert!(
             matches!(
                 refused.cause(),
-                crate::runtime::fragment::ExecutionFailureCause::Construction(
+                crate::runtime::task::ExecutionFailureCause::Construction(
                     ConstructionFailure::Memory(_)
                 )
             ),
@@ -1929,7 +1929,7 @@ mod tests {
             &program,
             ExchangeBindings::default(),
             ScanBindings::default(),
-            crate::runtime::fragment::CompiledWriterBindings::default(),
+            crate::runtime::task::CompiledWriterBindings::default(),
             None,
             DependencyManager::new(),
             1,

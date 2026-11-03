@@ -117,7 +117,7 @@ impl std::fmt::Display for CacheOptionError {
 impl std::error::Error for CacheOptionError {}
 impl novarocks_failure_contract::FailureProjection for CacheOptionError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match self {
             Self::EvictionProbability(_) => ExecutionReason::CacheEvictionProbability,
@@ -127,7 +127,7 @@ impl novarocks_failure_contract::FailureProjection for CacheOptionError {
         FailureFact::new(FailureClass::Invariant, reason.reason())
     }
 }
-impl From<CacheOptionError> for crate::runtime::fragment::ExecutionFailure {
+impl From<CacheOptionError> for crate::runtime::task::ExecutionFailure {
     fn from(cause: CacheOptionError) -> Self {
         Self::from_domain(cause)
     }

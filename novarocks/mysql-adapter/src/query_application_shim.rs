@@ -57,7 +57,7 @@ fn write_exact_mysql_bound_marker_for_hook<W: std::io::Write>(
     write_original_mysql_bound_marker(
         writer,
         hook.is_some(),
-        "NOVAROCKS_EXACT_MYSQL_TARGET_BOUND",
+        novarocks_failpoint::observation_marker::EXACT_MYSQL_TARGET_BOUND,
         connection,
         statement,
         sql_sha256,

@@ -246,7 +246,7 @@ fn keyed_management_lease(
         novarocks_spi::connector::KeyedDocumentReadError,
     >,
 ) -> (
-    novarocks_spi::connector::ConnectorDocumentStorageLease,
+    novarocks_spi::connector::ConnectorDocumentStorage,
     novarocks_spi::connector::KeyedDocumentObservationRequest,
     Arc<std::sync::atomic::AtomicUsize>,
 ) {
@@ -261,7 +261,7 @@ fn keyed_management_lease_with_caps(
         novarocks_spi::connector::KeyedDocumentReadError,
     >,
 ) -> (
-    novarocks_spi::connector::ConnectorDocumentStorageLease,
+    novarocks_spi::connector::ConnectorDocumentStorage,
     novarocks_spi::connector::KeyedDocumentObservationRequest,
     Arc<KeyedManagementObservationCaps>,
 ) {
@@ -305,7 +305,7 @@ fn keyed_management_lease_with_caps(
     .with_catalog_properties(properties)
     .and_then(|binding| binding.try_with_document_storage(Some(documents)))
     .unwrap();
-    let lease = ConnectorControlPlanningLease::new(Arc::new(binding), || {})
+    let lease = ConnectorControlPlanningPin::new(Arc::new(binding), || {})
         .derive_document_storage_lease()
         .unwrap();
     let request = KeyedDocumentObservationRequest {
@@ -2479,7 +2479,7 @@ fn drop_request(
     .unwrap()
 }
 
-fn mark_drop_dispatched(lease: &mut ManagementEntranceLease, target: &ManagedMvTarget) {
+fn mark_drop_dispatched(lease: &mut ManagementEntranceObligation, target: &ManagedMvTarget) {
     lease
         .mark_dispatched(EffectResponsibility::new(
             EffectIdentity::from_bytes([61; 16]),
@@ -3521,7 +3521,7 @@ fn installed_keyed_drop_fixture() -> (
     ManagementEntrance,
     ManagedMvTarget,
     ManagementDependencySet,
-    novarocks_spi::connector::ConnectorDocumentStorageLease,
+    novarocks_spi::connector::ConnectorDocumentStorage,
     novarocks_spi::connector::KeyedDocumentObservationRequest,
     Arc<KeyedManagementObservationCaps>,
 ) {

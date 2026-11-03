@@ -29,10 +29,10 @@ use std::task::{Context, Poll};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorMaxCompactableDataFilesRequest, ConnectorMetadataMaintenanceExecuteRequest,
-    ConnectorMetadataMaintenanceExecution, ConnectorMetadataMaintenanceLease,
-    ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenanceOutcome,
-    ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenanceReceipt,
-    ConnectorMetadataMaintenanceResolver, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorMetadataMaintenanceExecution, ConnectorMetadataMaintenanceOperation,
+    ConnectorMetadataMaintenanceOutcome, ConnectorMetadataMaintenancePlan,
+    ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceResolver,
+    ConnectorMetadataMaintenanceSession, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
     ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
     ExternalMutationEffect, ExternalMutationFinalization, ExternalMutationOutcome,
@@ -167,7 +167,7 @@ type MaintenancePreparation = Pin<
 /// Cancelling a borrowed wait leaves preparation, the exact lease and execution
 /// handle in this same field; it is not permission to create another call.
 pub struct MetadataMaintenanceCall {
-    lease: ConnectorMetadataMaintenanceLease,
+    maintenance_session: ConnectorMetadataMaintenanceSession,
     table: ConnectorTableIdentity,
     operation_id: ConnectorMutationOperationId,
     intent: MetadataMaintenanceIntent,
@@ -202,7 +202,7 @@ impl MetadataMaintenanceCall {
                 MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
             ));
         }
-        let lease = resolver
+        let maintenance_session = resolver
             .acquire_current_metadata_maintenance(instance_id)
             .map_err(|error| {
                 contract_failure(
@@ -210,15 +210,15 @@ impl MetadataMaintenanceCall {
                     MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
                 )
             })?;
-        let preparation = Box::pin(MetadataMaintenanceSession::plan_on_lease(
-            lease.clone(),
+        let preparation = Box::pin(MetadataMaintenanceSession::plan_on_session(
+            maintenance_session.clone(),
             operation_id,
             table.clone(),
             intent.clone(),
             context.clone(),
         ));
         Ok(Self {
-            lease,
+            maintenance_session,
             table,
             operation_id,
             intent,
@@ -295,7 +295,7 @@ impl MetadataMaintenanceCall {
         table: &ConnectorTableIdentity,
         intent: &MetadataMaintenanceIntent,
     ) -> bool {
-        self.lease.descriptor().instance_id == *instance
+        self.maintenance_session.descriptor().instance_id == *instance
             && self.operation_id == operation_id
             && self.table == *table
             && self.intent == *intent
@@ -464,15 +464,16 @@ pub async fn execute_planned_metadata_maintenance(
 /// that same generation; it does not load or create another schema.
 pub(crate) fn begin_captured_max_compactable_data_files(
     resolver: &dyn ConnectorMetadataMaintenanceResolver,
-    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning: &novarocks_spi::connector::ConnectorControlPlanningPin,
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
     context: ConnectorRequestContext,
     cpu: std::sync::Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
 ) -> Result<novarocks_spi::connector::ConnectorMaxCompactableDataFilesExecution, ConnectorError> {
-    let lease = resolver.acquire_exact_metadata_maintenance(planning.control_runtime_id())?;
-    if metadata.identity.instance_id != lease.descriptor().instance_id
-        || metadata.table.owner() != &lease.descriptor().instance_id
-        || planning.control_runtime_id() != lease.control_runtime_id()
+    let maintenance_session =
+        resolver.acquire_exact_metadata_maintenance(planning.control_runtime_id())?;
+    if metadata.identity.instance_id != maintenance_session.descriptor().instance_id
+        || metadata.table.owner() != &maintenance_session.descriptor().instance_id
+        || planning.control_runtime_id() != maintenance_session.control_runtime_id()
     {
         return Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
@@ -481,11 +482,11 @@ pub(crate) fn begin_captured_max_compactable_data_files(
     }
     let request =
         ConnectorMaxCompactableDataFilesRequest::try_new(metadata.table.clone(), context)?;
-    lease.begin_read_max_compactable_data_files(request, cpu)
+    maintenance_session.begin_read_max_compactable_data_files(request, cpu)
 }
 
 pub struct MetadataMaintenanceSession {
-    lease: ConnectorMetadataMaintenanceLease,
+    session: ConnectorMetadataMaintenanceSession,
     table: ConnectorTableIdentity,
     plan: ConnectorMetadataMaintenancePlan,
     context: ConnectorRequestContext,
@@ -517,15 +518,15 @@ impl MetadataMaintenanceSession {
         std::future::poll_fn(|cx| call.poll_prepared(cx)).await?;
         Ok(call.session.take().expect("prepared test session"))
     }
-    async fn plan_on_lease(
-        lease: ConnectorMetadataMaintenanceLease,
+    async fn plan_on_session(
+        session: ConnectorMetadataMaintenanceSession,
         operation_id: ConnectorMutationOperationId,
         table: ConnectorTableIdentity,
         intent: MetadataMaintenanceIntent,
         context: ConnectorRequestContext,
     ) -> Result<Self, ResolvedMetadataMaintenance> {
         let metadata = crate::connector::schema_creation::load_frontend_table_async(
-            lease.metadata().as_ref(),
+            session.metadata().as_ref(),
             ConnectorTableRequest {
                 table: table.clone(),
                 resolution: ConnectorTableResolution::StrictBaseTable,
@@ -537,7 +538,8 @@ impl MetadataMaintenanceSession {
             failure: KnownUncommittedMetadataMaintenance::Planning(error),
             cleanup: ExternalMutationFinalization::Complete,
         })?;
-        if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
+        if metadata.identity != table || metadata.table.owner() != &session.descriptor().instance_id
+        {
             return Err(contract_failure(
                 ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -552,7 +554,7 @@ impl MetadataMaintenanceSession {
                 cleanup: ExternalMutationFinalization::Complete,
             }
         })?;
-        let plan = lease
+        let plan = session
             .plan_operation(operation_id, operation, context.clone())
             .await
             .map_err(|error| ResolvedMetadataMaintenance::KnownUncommitted {
@@ -560,7 +562,7 @@ impl MetadataMaintenanceSession {
                 cleanup: ExternalMutationFinalization::Complete,
             })?;
         Ok(Self {
-            lease,
+            session,
             table,
             plan,
             context,
@@ -619,7 +621,7 @@ impl MetadataMaintenanceSession {
             // A panic after this call entered cannot prove non-dispatch.
             // The same session retains that fact before any foreign callback.
             self.execution_begin_unproven = true;
-            match self.lease.begin_execute(request) {
+            match self.session.begin_execute(request) {
                 Ok(execution) => {
                     self.execution = Some(execution);
                     self.execution_begin_unproven = false;
@@ -1172,9 +1174,11 @@ mod tests {
                 releases: Arc::new(AtomicUsize::new(0)),
             }
         }
-        fn lease(&self) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+        fn maintenance_session(
+            &self,
+        ) -> Result<ConnectorMetadataMaintenanceSession, ConnectorError> {
             let releases = self.releases.clone();
-            ConnectorMetadataMaintenanceLease::new(
+            ConnectorMetadataMaintenanceSession::new(
                 self.provider.descriptor.clone(),
                 ConnectorControlRuntimeId::from_bytes([8; 16]),
                 self.provider.key.incarnation,
@@ -1190,15 +1194,15 @@ mod tests {
         fn acquire_current_metadata_maintenance(
             &self,
             _: &ConnectorInstanceId,
-        ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
-            self.lease()
+        ) -> Result<ConnectorMetadataMaintenanceSession, ConnectorError> {
+            self.maintenance_session()
         }
         fn acquire_exact_metadata_maintenance(
             &self,
             control_runtime_id: ConnectorControlRuntimeId,
-        ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+        ) -> Result<ConnectorMetadataMaintenanceSession, ConnectorError> {
             if control_runtime_id == ConnectorControlRuntimeId::from_bytes([8; 16]) {
-                self.lease()
+                self.maintenance_session()
             } else {
                 Err(ConnectorError::new(
                     ConnectorErrorKind::NotFound,
@@ -1491,7 +1495,7 @@ mod tests {
     }
 
     struct ObservingResolver {
-        planning: novarocks_spi::connector::ConnectorControlPlanningLease,
+        planning: novarocks_spi::connector::ConnectorControlPlanningPin,
         provider: Arc<dyn ConnectorMetadataMaintenance>,
     }
     impl ObservingResolver {
@@ -1524,8 +1528,10 @@ mod tests {
                 .expect("current observation generation");
             Self { planning, provider }
         }
-        fn lease(&self) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
-            ConnectorMetadataMaintenanceLease::new(
+        fn maintenance_session(
+            &self,
+        ) -> Result<ConnectorMetadataMaintenanceSession, ConnectorError> {
+            ConnectorMetadataMaintenanceSession::new(
                 self.provider.descriptor().clone(),
                 self.planning.control_runtime_id(),
                 self.provider.binding_key().incarnation,
@@ -1539,26 +1545,26 @@ mod tests {
         fn acquire_current_metadata_maintenance(
             &self,
             instance: &ConnectorInstanceId,
-        ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+        ) -> Result<ConnectorMetadataMaintenanceSession, ConnectorError> {
             if instance != &self.provider.descriptor().instance_id {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     "observation generation not registered",
                 ));
             }
-            self.lease()
+            self.maintenance_session()
         }
         fn acquire_exact_metadata_maintenance(
             &self,
             runtime: ConnectorControlRuntimeId,
-        ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+        ) -> Result<ConnectorMetadataMaintenanceSession, ConnectorError> {
             if runtime != self.planning.control_runtime_id() {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     "observation generation retired",
                 ));
             }
-            self.lease()
+            self.maintenance_session()
         }
     }
 

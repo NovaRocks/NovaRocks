@@ -18,12 +18,12 @@
 //! R1 attribution helpers retain access responsibility without funding authority.
 // Design: ADR-0167 (docs/adr/ADR-0167-size-banded-allocation-attribution.md)
 use super::{band::is_tagged, binding};
-use crate::lane::{LaneHandle, RecordRef};
+use crate::lane::{Lane, RecordRef};
 use std::{alloc::Layout, marker::PhantomData, rc::Rc};
 
 #[derive(Clone, Debug)]
 pub struct ExplicitOwner {
-    lane: Option<LaneHandle>,
+    lane: Option<Lane>,
 }
 struct ExplicitStep {
     previous: Option<RecordRef>,
@@ -39,7 +39,7 @@ impl Drop for ExplicitStep {
     }
 }
 impl ExplicitOwner {
-    pub(crate) fn new(lane: LaneHandle) -> Self {
+    pub(crate) fn new(lane: Lane) -> Self {
         Self { lane: Some(lane) }
     }
     pub(crate) fn uncovered() -> Self {
@@ -47,7 +47,7 @@ impl ExplicitOwner {
     }
     /// This diagnostic identity grants no access after the owner is dropped.
     pub fn reference(&self) -> Option<RecordRef> {
-        self.lane.as_ref().map(LaneHandle::reference)
+        self.lane.as_ref().map(Lane::reference)
     }
     fn binding(&self) -> RecordRef {
         self.reference().unwrap_or(RecordRef::SHADOW)

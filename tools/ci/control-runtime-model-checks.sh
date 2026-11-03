@@ -135,7 +135,7 @@ initial = sources()
 save(output / 'sources-start.json', initial)
 # This target list belongs to the runtime's model boundary. Test counts are
 # discovered from each actual native libtest run, never assumed from source.
-targets = ('concurrency_loom', 'continuation_loom', 'exit_role_loom', 'failure_publication_loom', 'read_resource_loom')
+targets = ('concurrency_loom', 'continuation_loom', 'exit_custody_loom', 'failure_publication_loom', 'read_resource_loom')
 results = []
 code = 0
 for target in targets:

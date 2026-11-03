@@ -53,22 +53,22 @@ use novarocks_types::{SlotId, UniqueId};
 
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::fragment::program::FragmentNodeId;
-use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle, partition_chunk_by_hash_arrays};
+use crate::exec::operators::{ResultSinkBuffer, ResultSinkFactory, partition_chunk_by_hash_arrays};
 use crate::exec::pipeline::binding::{ExchangeBinding, ExchangeBindings};
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use crate::runtime::endpoint::{RuntimeEndpoint, TaskDestination};
 use crate::runtime::exchange::ExchangeKey;
-use crate::runtime::fragment::exchange::{
+use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::exchange::{
     CompiledExchangeReceivers, materialize_compiled_exchange_receivers,
 };
-use crate::runtime::fragment::instance::{
-    ExchangeInputAssignment, ExchangeInputAssignments, FragmentSinkAssignment,
+use crate::runtime::task::instance::{
+    ExchangeInputAssignment, ExchangeInputAssignments, TaskSinkAssignment,
 };
-use crate::runtime::fragment::io::exchange::test_support::{Fixture, UnitLoopback};
-use crate::runtime::fragment::io::{ExchangeFrameTransmitter, NoopFragmentEventSink};
-use crate::runtime::fragment::sink::materialize_compiled_sink;
-use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime::task::io::exchange::test_support::{Fixture, UnitLoopback};
+use crate::runtime::task::io::{ExchangeFrameTransmitter, NoopTaskEventSink};
+use crate::runtime::task::sink::materialize_compiled_sink;
 
 const PRODUCER_FINST: UniqueId = UniqueId::new(0x71, 0x01);
 const CONSUMER_FINST: UniqueId = UniqueId::new(0x72, 0x02);
@@ -519,19 +519,19 @@ struct LoopbackTransmitter {
 impl ExchangeFrameTransmitter for LoopbackTransmitter {
     fn deliver_unit(
         &self,
-        frame: crate::runtime::fragment::io::exchange_unit::ExchangeUnitFrame,
+        frame: crate::runtime::task::io::exchange_unit::ExchangeUnitFrame,
         stop: tokio_util::sync::CancellationToken,
-        activity: crate::runtime::fragment::io::exchange_unit::ExchangeCallActivity,
-        done: crate::runtime::fragment::io::exchange_unit::ExchangeDeliveryCallback,
+        activity: crate::runtime::task::io::exchange_unit::ExchangeCallActivity,
+        done: crate::runtime::task::io::exchange_unit::ExchangeDeliveryCallback,
     ) {
         self.unit.deliver_unit(frame, stop, activity, done);
     }
     fn register_unit_demands(
         &self,
         destination: RuntimeEndpoint,
-        entries: Vec<crate::runtime::fragment::io::exchange_unit::ExchangeDemandEntry>,
+        entries: Vec<crate::runtime::task::io::exchange_unit::ExchangeDemandEntry>,
         stop: tokio_util::sync::CancellationToken,
-        done: crate::runtime::fragment::io::exchange_unit::ExchangeDemandCallback,
+        done: crate::runtime::task::io::exchange_unit::ExchangeDemandCallback,
     ) {
         self.unit
             .register_unit_demands(destination, entries, stop, done)
@@ -540,7 +540,7 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
         &self,
         destination: RuntimeEndpoint,
         stream: novarocks_execution_contract::ExchangeStreamIdentity,
-        wake: crate::runtime::fragment::io::exchange_unit::ExchangeGrantWake,
+        wake: crate::runtime::task::io::exchange_unit::ExchangeGrantWake,
     ) -> Result<(), novarocks_failure_contract::FailureFact> {
         self.unit.watch_unit_facts(destination, stream, wake)
     }
@@ -570,7 +570,7 @@ fn runtime_state() -> Arc<RuntimeState> {
     ))
 }
 
-fn finst(id: UniqueId) -> Option<(i64, i64)> {
+fn task_key(id: UniqueId) -> Option<(i64, i64)> {
     Some((id.high(), id.low()))
 }
 
@@ -581,10 +581,10 @@ fn assignments(receiver: NodeId) -> ExchangeInputAssignments {
     )]))
 }
 
-fn stream_assignment() -> FragmentSinkAssignment {
-    FragmentSinkAssignment::StreamDestinations {
+fn stream_assignment() -> TaskSinkAssignment {
+    TaskSinkAssignment::StreamDestinations {
         destinations: vec![
-            FragmentDestination::new(
+            TaskDestination::new(
                 CONSUMER_FINST,
                 RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
                 PRODUCER_FINST,
@@ -628,10 +628,10 @@ fn run(
         Duration::from_millis(10),
         sink,
         bindings,
-        finst(instance),
+        task_key(instance),
         1,
         fixture.state(instance),
-        Arc::new(NoopFragmentEventSink),
+        Arc::new(NoopTaskEventSink),
     )
     .expect("compiled program prepares drivers")
     .start()
@@ -650,10 +650,10 @@ fn prepare_error(
         Duration::from_millis(10),
         sink,
         bindings,
-        finst(instance),
+        task_key(instance),
         1,
         runtime_state(),
-        Arc::new(NoopFragmentEventSink),
+        Arc::new(NoopTaskEventSink),
     ) {
         Ok(_) => panic!("compiled program must be refused"),
         Err(error) => error.to_string(),
@@ -774,12 +774,12 @@ fn assert_gather_stream_positionally(programs: Programs, local_nullable: [bool; 
         PRODUCER_FINST,
     );
 
-    let output = ResultSinkHandle::new();
+    let output = ResultSinkBuffer::new();
     let consumer_sink = materialize_compiled_sink(
         &programs.consumer,
-        &FragmentSinkAssignment::None,
+        &TaskSinkAssignment::None,
         CONSUMER_FINST,
-        crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+        crate::runtime::task::io::exchange::discard_exchange_transmitter(),
         Some(Box::new(ResultSinkFactory::new(output.clone()))),
         None,
     )
@@ -825,7 +825,7 @@ fn compiled_exchange_source_requires_exactly_its_own_receiver_binding() {
     let fixture = Fixture::new();
     let port = fixture.port.clone();
     let result_sink = || -> Box<dyn OperatorFactory> {
-        Box::new(ResultSinkFactory::new(ResultSinkHandle::new()))
+        Box::new(ResultSinkFactory::new(ResultSinkBuffer::new()))
     };
 
     let missing = prepare_error(
@@ -839,8 +839,8 @@ fn compiled_exchange_source_requires_exactly_its_own_receiver_binding() {
     let receiver = i32::try_from(programs.receiver.get()).unwrap();
     let binding = |node_id: i32, instance: UniqueId| ExchangeBinding {
         key: ExchangeKey {
-            finst_id_hi: instance.high(),
-            finst_id_lo: instance.low(),
+            task_key_hi: instance.high(),
+            task_key_lo: instance.low(),
             node_id,
         },
         expected_senders: 1,
@@ -873,7 +873,7 @@ fn compiled_exchange_source_requires_exactly_its_own_receiver_binding() {
         CONSUMER_FINST,
         &ExchangeInputAssignments::default(),
         Arc::clone(&port),
-        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
+        Some(&crate::runtime::task::exchange::test_receiver_creation_factory()),
     ) {
         Ok(_) => panic!("a receiver without an assignment must be refused"),
         Err(error) => error,
@@ -895,7 +895,7 @@ fn compiled_exchange_source_requires_exactly_its_own_receiver_binding() {
         CONSUMER_FINST,
         &ExchangeInputAssignments::new(surplus),
         Arc::clone(&port),
-        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
+        Some(&crate::runtime::task::exchange::test_receiver_creation_factory()),
     ) {
         Ok(_) => panic!("an assignment without a receiver must be refused"),
         Err(error) => error,
@@ -909,10 +909,10 @@ fn compiled_exchange_source_requires_exactly_its_own_receiver_binding() {
 #[test]
 fn compiled_sink_materialization_refuses_mismatched_capabilities() {
     let programs = programs();
-    let transmitter = crate::runtime::fragment::io::exchange::discard_exchange_transmitter;
+    let transmitter = crate::runtime::task::io::exchange::discard_exchange_transmitter;
     let detail = |result: Result<
         Box<dyn OperatorFactory>,
-        crate::runtime::fragment::FragmentLaunchError,
+        crate::runtime::task::LocalTaskLaunchError,
     >| match result {
         Ok(_) => panic!("compiled sink must be refused"),
         Err(error) => error.detail().to_string(),
@@ -920,7 +920,7 @@ fn compiled_sink_materialization_refuses_mismatched_capabilities() {
 
     let no_result_sink = detail(materialize_compiled_sink(
         &programs.consumer,
-        &FragmentSinkAssignment::None,
+        &TaskSinkAssignment::None,
         CONSUMER_FINST,
         transmitter(),
         None,
@@ -936,7 +936,7 @@ fn compiled_sink_materialization_refuses_mismatched_capabilities() {
         &stream_assignment(),
         PRODUCER_FINST,
         transmitter(),
-        Some(Box::new(ResultSinkFactory::new(ResultSinkHandle::new()))),
+        Some(Box::new(ResultSinkFactory::new(ResultSinkBuffer::new()))),
         None,
     ));
     assert!(
@@ -946,7 +946,7 @@ fn compiled_sink_materialization_refuses_mismatched_capabilities() {
 
     let no_destinations = detail(materialize_compiled_sink(
         &programs.producer,
-        &FragmentSinkAssignment::None,
+        &TaskSinkAssignment::None,
         PRODUCER_FINST,
         transmitter(),
         None,
@@ -958,8 +958,8 @@ fn compiled_sink_materialization_refuses_mismatched_capabilities() {
     );
 }
 
-fn destination(instance: UniqueId) -> FragmentDestination {
-    FragmentDestination::new(
+fn destination(instance: UniqueId) -> TaskDestination {
+    TaskDestination::new(
         instance,
         RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
         PRODUCER_FINST,
@@ -1052,7 +1052,7 @@ fn compiled_hash_stream_places_rows_by_the_exchange_hash_of_its_key_roots() {
     let producer_sink = fixture
         .sink(
             &programs.producer,
-            &FragmentSinkAssignment::StreamDestinations {
+            &TaskSinkAssignment::StreamDestinations {
                 destinations: vec![destination(CONSUMER_FINST), destination(CONSUMER_FINST_2)],
                 sender_id: None,
             },
@@ -1073,12 +1073,12 @@ fn compiled_hash_stream_places_rows_by_the_exchange_hash_of_its_key_roots() {
     );
 
     for (index, (instance, bindings)) in consumer_bindings.into_iter().enumerate() {
-        let output = ResultSinkHandle::new();
+        let output = ResultSinkBuffer::new();
         let consumer_sink = materialize_compiled_sink(
             &programs.consumer,
-            &FragmentSinkAssignment::None,
+            &TaskSinkAssignment::None,
             instance,
-            crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+            crate::runtime::task::io::exchange::discard_exchange_transmitter(),
             Some(Box::new(ResultSinkFactory::new(output.clone()))),
             None,
         )
@@ -1428,14 +1428,14 @@ fn compiled_receiver_schema_first_memory_refusal_rolls_back_without_registration
 fn compiled_stream_materialization_keeps_its_exact_edge_gate() {
     let programs = programs();
     let gates =
-        crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates::try_new(std::iter::empty())
+        crate::runtime::task::io::exchange_edge::ExchangeEdgeGates::try_new(std::iter::empty())
             .unwrap();
     for gated in [false, true] {
         let factory = materialize_compiled_sink(
             &programs.producer,
             &stream_assignment(),
             PRODUCER_FINST,
-            crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+            crate::runtime::task::io::exchange::discard_exchange_transmitter(),
             None,
             gated.then(|| Arc::clone(&gates)),
         )

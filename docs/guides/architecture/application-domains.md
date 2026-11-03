@@ -26,7 +26,8 @@ under the License.
 [ADR-0161](../../adr/ADR-0161-pure-local-programs-and-supervised-task-lifecycle.md)、
 [ADR-0198](../../adr/ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) 和
 [ADR-0147](../../adr/ADR-0147-process-local-work-governance-separates-responsibility-and-resources.md)
-为准；Task 的 wire/lifecycle、创建载体、按 identity 重放与一次激活以 ADR-0161 为准。
+为准；执行与句柄词汇遵循 [ADR-0216](../../adr/ADR-0216-execution-vocabulary-participation-task-and-handles.md)。
+Task 的 wire/lifecycle、创建载体、按 identity 重放与一次激活以 ADR-0161 为准。
 ADR-0198 的统一执行契约已接受；源码索引反映旧同步协调路径退役后的组合，
 不构成整族原生验收或最终验证完成证明。ADR 保持 implementation pending，已记录失败仍须单独处置。
 
@@ -68,7 +69,7 @@ runtime wrapper 分开，仍共用同业务闸门和调度状态，不弱化 Unk
 | Coordination Contract | `novarocks-coordination-contract` | FE owner 之间实际共用的身份、时间、消息与中立事实 | Tokio、运行资源、领域载荷、任意 callback 或恢复算法 |
 | Query Application | `novarocks-query-application` | request-local 观察/准备，各分布式意图的逻辑执行、attempt 恢复、可见性与计算就绪 | 产品业务结果、publication/GC 策略、角色实现、wire codec 或 Server 配置 |
 | Frontend Application | `novarocks-frontend-application` | FE 装配、prepare 前语句监督、Native attempt 驱动、领域就绪证明与 SQL/MySQL 结果接线 | BE Task registry、第二套逻辑执行 policy 或第二份 Provider 提交真相 |
-| Worker | `novarocks-worker` | BE 本地 Task/context 准入、租约、入站围栏、实际停止与收敛 | FE 观察、编译、逻辑恢复政策或产品状态 |
+| Worker | `novarocks-worker` | BE 本地 Task/Participation 准入、租约、入站围栏、实际停止与收敛 | FE 观察、编译、逻辑恢复政策或产品状态 |
 | Workload Control | `novarocks-workload-control` | 进程内 scope、责任/完整依赖事实及原结果预算授权 | MV/Statistics/Maintenance 的业务锁、外部提交或 durable truth |
 | Catalog Application | `novarocks-catalog-application` | 长期 Catalog generation 与退休 | 查询局部 compiler 映射或 Connector execution instance |
 | 产品应用 | MV、Statistics、Maintenance application crates | 业务状态、外部效果、发布与业务恢复决定 | Query Application 的通用协调 policy |
@@ -86,7 +87,7 @@ Query Application 不反向依赖产品、Frontend、Backend、adapter、wire co
 查询的 SQL 语义和执行资源有不同生命周期。准备阶段可以在一个有界 request scope 内
 交替进行观察、纯编译与 Connector negotiation；只有 exact binding、输出契约、残余责任、
 恢复模式和资源需求全部确定后，才能冻结 `FrozenExecutionDescription`。冻结描述和静态
-Native template 不携带 endpoint、placement、Task identity、credential、Catalog lease、split
+Native template 不携带 endpoint、placement、Task identity、credential、Catalog generation pin、split
 source 或可回调的重新观察逻辑。
 
 | 阶段 | owner 的事实 | 禁止的捷径 |
@@ -130,12 +131,12 @@ Exchange 只有在冻结 destination 已 Installed 或准确正常撤回输入�
 失败不能伪装成正常撤回。Native status 生产入口只接受 covered subscription 的非零
 generation，不再接入旧 cursor-only 模式。
 
-`novarocks/worker/src/task_registry.rs` 的准备数量、bytes 和 per-context position 预算
+`novarocks/worker/src/control_runtime/{preparation,node_geometry}.rs` 的准备数量、bytes 和 per-participation position 预算
 在 job 实际退出后归还；发布 Installed 或 terminal 本身不能证明 job 已释放输入与临时
 展开资源。FE 的 `novarocks/frontend-application/src/task_execution/{execution,remote_task}.rs`
 另行持有每 BE 的部署窗口 W：Accepted ACK 或 RPC 未知结果不能归还位置，Installed、
 terminal evidence 或永久 stand-down 才能归还。W 必须小于等于该准确 BE immutable
-descriptor 广告的 per-context 准备位置 P；两端预算分别由各自 owner 负责。
+descriptor 广告的 per-participation 准备位置 P；两端预算分别由各自 owner 负责。
 
 这些路径说明当前所有权边界，最终验收仍须按下文分层报告实际测试证据。
 

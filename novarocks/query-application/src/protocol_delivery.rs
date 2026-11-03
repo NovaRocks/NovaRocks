@@ -18,8 +18,9 @@
 //! Move-only protocol settlement for governed query application output.
 
 use crate::api::{
-    ExecutionHandle, ExecutionOutput, LocalResultProducer, OwnedLocalResult, QueryExecutionError,
-    QueryResult, QueryResultStream, ResultDelivery, ResultFailureView, SchemaDelivery,
+    ExecutionOutput, ExecutionOutputObligation, LocalResultProducer, OwnedLocalResult,
+    QueryExecutionError, QueryResult, QueryResultStream, ResultDelivery, ResultFailureView,
+    SchemaDelivery,
 };
 use crate::cancellation::QueryCancellationView;
 use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason};
@@ -475,7 +476,7 @@ impl GovernedErrorStatementResult {
 /// lets the logical actor settle undelivered stream items.
 #[must_use = "the streaming statement must be completed or explicitly failed by its protocol owner"]
 pub struct StreamingStatementResult {
-    execution: ExecutionHandle,
+    execution: ExecutionOutputObligation,
     stream: QueryResultStream,
     protocol: GovernedProtocolOwner,
     settled: bool,
@@ -483,7 +484,7 @@ pub struct StreamingStatementResult {
 
 impl StreamingStatementResult {
     pub(crate) fn from_verified_execution(
-        mut execution: ExecutionHandle,
+        mut execution: ExecutionOutputObligation,
         statement: GovernedQueryStatementOwner,
     ) -> Self {
         let Some(ExecutionOutput::Rows(stream)) = execution.take_output() else {
@@ -498,7 +499,7 @@ impl StreamingStatementResult {
     }
 
     pub fn try_from_execution(
-        mut execution: ExecutionHandle,
+        mut execution: ExecutionOutputObligation,
         statement: GovernedQueryStatementOwner,
     ) -> Result<Self, QueryExecutionError> {
         let stream = match execution.take_output() {
@@ -793,8 +794,10 @@ mod execution_handoff_tests {
                 .unwrap();
             let scope = statement.scope().clone();
             let owner = statement.take_execution_owner().unwrap();
-            let mut execution =
-                ExecutionHandle::new(owner.cancellation_requester(), ExecutionOutput::Completion);
+            let mut execution = ExecutionOutputObligation::new(
+                owner.cancellation_requester(),
+                ExecutionOutput::Completion,
+            );
             if already_transferred {
                 assert!(matches!(
                     execution.take_output(),

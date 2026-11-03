@@ -58,7 +58,7 @@ pub fn check_operation_reply(raw: &[u8]) -> Result<(), ResourcePreflightError> {
 struct AckCounts {
     create_domains: usize,
     update_domains: usize,
-    context_domains: usize,
+    participation_domains: usize,
     quiesce_tasks: usize,
     profile_sections: [usize; 4],
 }
@@ -76,9 +76,9 @@ impl AckCounts {
                         // The actual typed context decoder uses the same 256
                         // bound as task domains; its older IDL comment says 16.
                         checked_increment(
-                            &mut self.context_domains,
+                            &mut self.participation_domains,
                             MAX_DOMAIN_UPDATES,
-                            "context acknowledgement exceeds domain bound",
+                            "participation acknowledgement exceeds domain bound",
                         )?;
                     }
                     Ok(())
@@ -93,8 +93,8 @@ impl AckCounts {
                     if let (3, Value::Bytes(_)) = (field, value) {
                         checked_increment(
                             &mut self.quiesce_tasks,
-                            TransportBudget::DEFAULT.max_tasks_per_context(),
-                            "quiesce acknowledgement exceeds context membership bound",
+                            TransportBudget::DEFAULT.max_tasks_per_participation(),
+                            "quiesce acknowledgement exceeds participation membership bound",
                         )?;
                     }
                     Ok(())

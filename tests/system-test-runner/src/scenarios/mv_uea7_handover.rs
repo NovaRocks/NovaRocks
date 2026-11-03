@@ -23,7 +23,7 @@ use crate::scenarios::mv_uea7::{
 use anyhow::{Context, Result, bail};
 use mysql::Row;
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use std::path::Path;
 use std::sync::Mutex;
 

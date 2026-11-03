@@ -23,13 +23,13 @@ use super::super::{
 use super::*;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};
 use crate::runtime::{
-    fragment::ExecutionFailureCause,
     mem_tracker::MemTracker,
     query_memory::QueryMemoryBinding,
     runtime_state::RuntimeState,
     scalar_memory::{
         RuntimeScalarMemoryJournal, RuntimeScalarMemoryRefusal, RuntimeScalarMemoryScope,
     },
+    task::ExecutionFailureCause,
 };
 use arrow::{
     array::{Array, BooleanArray, Int64Array, StringArray},
@@ -380,7 +380,7 @@ fn runtime_invocation_memory_actual_sql_ordered_filter_or_scan_suppresses_and_ma
                 &mut RuntimeScalarMemoryScope::new(&control, &mut journal),
             );
             if demanded {
-                use crate::runtime::fragment::ExecutionFailureCause;
+                use crate::runtime::task::ExecutionFailureCause;
                 let error = result.unwrap_err();
                 let ExecutionFailureCause::ScalarInvocationData(data) = error.cause() else {
                     panic!("original selected full Data")

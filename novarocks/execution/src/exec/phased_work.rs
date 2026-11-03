@@ -159,7 +159,7 @@ impl<E: Clone, H> PhasedRangeWork<E, H> {
         self: &Arc<Self>,
         state: &mut State<E>,
         range: Range<usize>,
-    ) -> Result<RangeLease<E, H>, E> {
+    ) -> Result<RangeObligation<E, H>, E> {
         let ordinal = state.issued;
         let Some(issued) = state.issued.checked_add(1) else {
             return Err(self.overflow(state));
@@ -169,7 +169,7 @@ impl<E: Clone, H> PhasedRangeWork<E, H> {
         };
         state.issued = issued;
         state.inflight = inflight;
-        Ok(RangeLease {
+        Ok(RangeObligation {
             owner: Arc::clone(self),
             generation: state.generation,
             ordinal,
@@ -177,7 +177,7 @@ impl<E: Clone, H> PhasedRangeWork<E, H> {
             settled: false,
         })
     }
-    pub(crate) fn claim(self: &Arc<Self>) -> Result<Option<RangeLease<E, H>>, E> {
+    pub(crate) fn claim(self: &Arc<Self>) -> Result<Option<RangeObligation<E, H>>, E> {
         let mut state = self.state()?;
         let Enumeration::Dense { total, width } = state.enumeration else {
             return Err(self.invalid(&mut state));
@@ -192,7 +192,7 @@ impl<E: Clone, H> PhasedRangeWork<E, H> {
         state.exhausted = end == total;
         Ok(Some(lease))
     }
-    pub(crate) fn claim_one(self: &Arc<Self>) -> Result<RangeLease<E, H>, E> {
+    pub(crate) fn claim_one(self: &Arc<Self>) -> Result<RangeObligation<E, H>, E> {
         let mut state = self.state()?;
         if !matches!(state.enumeration, Enumeration::Open) || state.exhausted {
             return Err(self.invalid(&mut state));
@@ -217,7 +217,7 @@ impl<E: Clone, H> PhasedRangeWork<E, H> {
     pub(crate) fn inflight(&self) -> Result<usize, E> {
         Ok(self.state()?.inflight)
     }
-    fn validate_in(&self, state: &mut State<E>, lease: &RangeLease<E, H>) -> Result<(), E> {
+    fn validate_in(&self, state: &mut State<E>, lease: &RangeObligation<E, H>) -> Result<(), E> {
         if !std::ptr::eq(self, Arc::as_ptr(&lease.owner))
             || lease.generation != state.generation
             || lease.ordinal >= state.issued
@@ -231,11 +231,11 @@ impl<E: Clone, H> PhasedRangeWork<E, H> {
     }
     /// Validate before caller-owned output installation. The caller serializes
     /// that installation with completion; this grants no effect or capacity.
-    pub(crate) fn validate(&self, lease: &RangeLease<E, H>) -> Result<(), E> {
+    pub(crate) fn validate(&self, lease: &RangeObligation<E, H>) -> Result<(), E> {
         let mut state = self.state()?;
         self.validate_in(&mut state, lease)
     }
-    pub(crate) fn complete(&self, lease: &mut RangeLease<E, H>) -> Result<(), E> {
+    pub(crate) fn complete(&self, lease: &mut RangeObligation<E, H>) -> Result<(), E> {
         let mut state = self.state()?;
         self.validate_in(&mut state, lease)?;
         state.inflight -= 1;
@@ -246,14 +246,14 @@ impl<E: Clone, H> PhasedRangeWork<E, H> {
 }
 
 /// Uniquely owns one claimed range until completion or actual drop.
-pub(crate) struct RangeLease<E: Clone, H = ()> {
+pub(crate) struct RangeObligation<E: Clone, H = ()> {
     owner: Arc<PhasedRangeWork<E, H>>,
     generation: usize,
     ordinal: usize,
     range: Range<usize>,
     settled: bool,
 }
-impl<E: Clone, H> RangeLease<E, H> {
+impl<E: Clone, H> RangeObligation<E, H> {
     pub(crate) fn is_settled(&self) -> bool {
         self.settled
     }
@@ -264,7 +264,7 @@ impl<E: Clone, H> RangeLease<E, H> {
         self.range.clone()
     }
 }
-impl<E: Clone, H> Drop for RangeLease<E, H> {
+impl<E: Clone, H> Drop for RangeObligation<E, H> {
     fn drop(&mut self) {
         if self.settled {
             return;

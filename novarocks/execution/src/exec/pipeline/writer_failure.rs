@@ -17,7 +17,7 @@
 
 //! Failures whose facts belong to the writer and its asynchronous actor.
 
-use crate::runtime::fragment::connector_failure::ConnectorOperation;
+use crate::runtime::task::connector_failure::ConnectorOperation;
 use novarocks_failure_contract::BoundedDetail;
 use novarocks_failure_contract::{
     FailureClass, FailureFact, FailureProjection, ResourceDimension, ResourceFacts, ResourceScope,
@@ -177,7 +177,7 @@ impl fmt::Display for WriterFailure {
 impl Error for WriterFailure {}
 impl FailureProjection for WriterFailure {
     fn failure_fact(&self) -> FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         let (class, code) = match self {
             Self::FrozenContract { .. } => (
                 FailureClass::Invariant,

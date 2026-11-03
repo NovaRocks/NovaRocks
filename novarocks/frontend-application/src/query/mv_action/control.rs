@@ -42,7 +42,7 @@ use novarocks_query_application::{
 };
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_sql::planning::mv::SqlMvTarget;
-use source::{ControlSource, Phase, PhaseTask};
+use source::{ControlSource, Phase, PhaseObligation};
 use std::{
     sync::Arc,
     task::{Context, Poll},
@@ -83,7 +83,7 @@ pub(super) struct MvControlStepOriginal {
     context: ConnectorRequestContext,
     wake: Arc<MvWake>,
     source: Option<Arc<ControlSource>>,
-    phase: Option<PhaseTask>,
+    phase: Option<PhaseObligation>,
     prepared: bool,
     projected: bool,
     transition: Option<MvDropTransition<MvKeyedProjectionDeleteGuard>>,
@@ -244,7 +244,7 @@ impl MvControlStepOriginal {
             }
             let mut port = DropPort {
                 source: &source,
-                task: &mut self.phase,
+                obligation: &mut self.phase,
                 store,
                 duration: self.input.state_store.transaction_deadline,
             };
@@ -315,8 +315,8 @@ impl MvControlStepOriginal {
             return Poll::Ready(Ok(()));
         };
         source.poll_progress(cx);
-        if let Some(task) = &mut self.phase {
-            if task.poll(cx).is_pending() {
+        if let Some(obligation) = &mut self.phase {
+            if obligation.poll(cx).is_pending() {
                 return Poll::Pending;
             }
             // Receive the original result before retiring this borrowed phase.
@@ -329,22 +329,22 @@ impl MvControlStepOriginal {
 
 fn poll_phase(
     source: &Arc<ControlSource>,
-    task: &mut Option<PhaseTask>,
+    obligation: &mut Option<PhaseObligation>,
     phase: Phase,
     cx: &mut Context<'_>,
 ) -> Poll<Result<(), MvProviderFailure>> {
-    if task.is_none() {
-        *task = Some(source.phase(phase));
+    if obligation.is_none() {
+        *obligation = Some(source.phase(phase));
     }
-    std::task::ready!(task.as_mut().unwrap().poll(cx));
+    std::task::ready!(obligation.as_mut().unwrap().poll(cx));
     let result = source.take_response();
-    // PhaseTask has already received raw and dropped its real F normally.
-    task.take();
+    // PhaseObligation has already received raw and dropped its real F normally.
+    obligation.take();
     Poll::Ready(result)
 }
 struct DropPort<'a> {
     source: &'a Arc<ControlSource>,
-    task: &'a mut Option<PhaseTask>,
+    obligation: &'a mut Option<PhaseObligation>,
     store: &'a StateStoreOriginalOwner,
     duration: std::time::Duration,
 }
@@ -356,7 +356,7 @@ impl MvDropProgressPort<MvKeyedProjectionDeleteGuard> for DropPort<'_> {
         _: &MvTarget,
         _: bool,
     ) -> Poll<Result<MvDropReadiness<MvKeyedProjectionDeleteGuard>, MvProviderFailure>> {
-        std::task::ready!(poll_phase(self.source, self.task, Phase::Prepare, cx))?;
+        std::task::ready!(poll_phase(self.source, self.obligation, Phase::Prepare, cx))?;
         Poll::Ready(self.source.take_drop_readiness())
     }
     fn poll_drop_target(
@@ -383,10 +383,10 @@ impl MvDropProgressPort<MvKeyedProjectionDeleteGuard> for DropPort<'_> {
         _: MvOperationContext,
         guard: &mut Option<MvKeyedProjectionDeleteGuard>,
     ) -> Poll<Result<(), MvProviderFailure>> {
-        if self.task.is_none() {
+        if self.obligation.is_none() {
             self.source.receive_delete_guard(guard)?;
         }
-        poll_phase(self.source, self.task, Phase::DeleteProjection, cx)
+        poll_phase(self.source, self.obligation, Phase::DeleteProjection, cx)
     }
     fn poll_unregister_target(
         &mut self,
@@ -394,6 +394,6 @@ impl MvDropProgressPort<MvKeyedProjectionDeleteGuard> for DropPort<'_> {
         _: MvOperationContext,
         _: &MvTarget,
     ) -> Poll<Result<(), MvProviderFailure>> {
-        poll_phase(self.source, self.task, Phase::Unregister, cx)
+        poll_phase(self.source, self.obligation, Phase::Unregister, cx)
     }
 }

@@ -27,10 +27,10 @@ use crate::{
 };
 pub(crate) use novarocks_control_runtime::continuation::ContinuationPhase as SettlementPhase;
 use novarocks_control_runtime::{
+    actor_turn::{ActorRuntime, ActorTurnError, EffectTicket, FailurePublicationSession},
     completion::ReportSlot,
     continuation::{ContinuationDispatch, ContinuationSlot, InvocationResult, RegistrationToken},
-    driver::{ActorRuntime, DriverError, EffectTicket, FailurePublicationSession},
-    lease::{ReservationBundle, WorkLease},
+    obligation::{ReservationObligation, WorkObligation},
     publication::PublishedReply,
     transaction::{RuntimeError, ScopeHandle},
 };
@@ -40,7 +40,7 @@ use novarocks_control_runtime_core::{
 };
 use novarocks_execution::{
     runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth},
-    runtime::fragment::ExecutionFailure,
+    runtime::task::ExecutionFailure,
 };
 use novarocks_execution_contract::{
     AcceptedTaskConclusion, SettledContinuation, SettlementCapability, SettlementPermit,
@@ -63,7 +63,7 @@ struct InvocationInput {
 #[derive(Debug)]
 pub(crate) enum SettlementDispatchError {
     WrongRole,
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
     Runtime(RuntimeError),
     Continuation(novarocks_control_runtime::continuation::ContinuationError),
     FailureSnapshotMissing,
@@ -73,7 +73,7 @@ impl std::fmt::Display for SettlementDispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::WrongRole => f.write_str("Settlement dispatch has a different original role"),
-            Self::Driver(error) => write!(f, "Settlement dispatch driver failure: {error}"),
+            Self::ActorTurn(error) => write!(f, "Settlement dispatch driver failure: {error}"),
             Self::Runtime(error) => write!(f, "Settlement dispatch runtime failure: {error}"),
             Self::Continuation(error) => write!(f, "Settlement continuation failed: {error}"),
             Self::FailureSnapshotMissing => {
@@ -86,7 +86,7 @@ impl std::fmt::Display for SettlementDispatchError {
 impl std::error::Error for SettlementDispatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Driver(error) => Some(error),
+            Self::ActorTurn(error) => Some(error),
             Self::Runtime(error) => Some(error),
             Self::Continuation(error) => Some(error),
             Self::Ordering(error) => Some(error),
@@ -107,31 +107,34 @@ pub(crate) enum SettlementRun {
 /// callback preparation, invocation and disposal of this original port loan.
 #[must_use = "Retain the same original settlement dispatch on physical queue refusal"]
 pub(crate) struct FailedSettlementDispatch {
-    role: SettlementRole,
+    settlement_custody: SettlementCustody,
     dispatch: ContinuationDispatch<InvocationInput>,
     port: Arc<TaskRuntimePort>,
     pending: Arc<dyn crate::task_port::TaskPendingNotice>,
 }
 impl FailedSettlementDispatch {
     pub(crate) fn queue_key(&self) -> (ScopeId, WorkId) {
-        (self.role.work.scope, self.role.work.work)
+        (
+            self.settlement_custody.work.scope,
+            self.settlement_custody.work.work,
+        )
     }
     /// Run only on the supervised physical lifecycle lane. No foreign
     /// callback, input refresh or port destructor runs on the metadata owner.
     pub(crate) fn run(self) -> Result<SettlementRun, SettlementDispatchError> {
         let Self {
-            role,
+            settlement_custody,
             mut dispatch,
             port,
             pending,
         } = self;
-        let result = role.run_claimed(&port, &mut dispatch);
+        let result = settlement_custody.run_claimed(&port, &mut dispatch);
         drop(port);
         if result
             .as_ref()
             .is_ok_and(|run| *run != SettlementRun::Deferred)
         {
-            role.complete_original_barrier()?;
+            settlement_custody.complete_original_barrier()?;
             pending.pending();
         }
         // Keep the original execution claim through all port-capture cleanup
@@ -175,7 +178,7 @@ impl SettlementCapability<ExecutionFailure> for Registration {
 }
 
 #[derive(Clone)]
-pub(crate) struct SettlementRole {
+pub(crate) struct SettlementCustody {
     identity: TaskIdentity,
     work: ScopedWorkRef,
     scope: ScopeHandle,
@@ -188,11 +191,11 @@ pub(crate) struct SettlementRole {
     original_effect: Arc<Mutex<Option<EffectTicket<WorkerAction>>>>,
     effect_runtime: Arc<Mutex<Option<ActorRuntime<WorkerActor>>>>,
 }
-impl SettlementRole {
+impl SettlementCustody {
     pub(crate) fn from_admitted(
         identity: TaskIdentity,
-        work: WorkLease,
-        capacity: ReservationBundle,
+        work: WorkObligation,
+        capacity: ReservationObligation,
         completion: ReportSlot,
         health: Arc<ExecutionHealth>,
         mut notice: Box<dyn RegistrationNotice>,
@@ -202,9 +205,11 @@ impl SettlementRole {
         notice.bind_work(work_id);
         let barrier = PublishedReply::new(&scope);
         let (slot, token) = ContinuationSlot::from_admitted(
-            crate::control_runtime::admitted_role::adopt_reported_work(work, capacity, completion),
+            crate::control_runtime::reported_work_admission::adopt_reported_work(
+                work, capacity, completion,
+            ),
         );
-        let permit = SettlementPermit::from_admitted_role(
+        let permit = SettlementPermit::from_admitted_reservation(
             identity,
             Box::new(Registration { token, notice }),
         );
@@ -255,14 +260,14 @@ impl SettlementRole {
         if port.identity() != self.identity
             || ticket.descriptor.work != self.work
             || !matches!(&ticket.effect,
-                WorkerAction::Context(novarocks_worker_protocol::context::ContextEffect::SettlementBarrier { task, work })
+                WorkerAction::Participation(novarocks_worker_protocol::participation::ParticipationEffect::SettlementBarrier { task, work })
                     if *task == self.identity && *work == self.work)
         {
             return Err(SettlementDispatchError::WrongRole);
         }
         runtime
             .commit_reply(ticket, &self.barrier, Arc::new(port.accepted()))
-            .map_err(|(error, _snapshot)| SettlementDispatchError::Driver(error))
+            .map_err(|(error, _snapshot)| SettlementDispatchError::ActorTurn(error))
     }
     pub(crate) fn handoff_original_barrier(
         &self,
@@ -312,7 +317,7 @@ impl SettlementRole {
                     .original_effect
                     .lock()
                     .expect("refused original settlement effect") = Some(refusal.ticket);
-                return Err(SettlementDispatchError::Driver(refusal.error));
+                return Err(SettlementDispatchError::ActorTurn(refusal.error));
             }
         }
         Ok(())
@@ -333,7 +338,7 @@ impl SettlementRole {
             .ok_or(SettlementDispatchError::FailureSnapshotMissing)?;
         session
             .commit_reply(&self.barrier, Arc::new(Some(snapshot)))
-            .map_err(|(error, _snapshot)| SettlementDispatchError::Driver(error))
+            .map_err(|(error, _snapshot)| SettlementDispatchError::ActorTurn(error))
     }
     /// Publication and callback start have separate generation gates. Failure
     /// between them preserves the admitted call and waits for actual failure
@@ -365,7 +370,7 @@ impl SettlementRole {
     ) -> Result<Option<FailedSettlementDispatch>, SettlementDispatchError> {
         stage
             .validate_scope(runtime, actor, &self.scope)
-            .map_err(SettlementDispatchError::Driver)?;
+            .map_err(SettlementDispatchError::ActorTurn)?;
         if port.identity() != self.identity {
             return Err(SettlementDispatchError::WrongRole);
         }
@@ -381,7 +386,7 @@ impl SettlementRole {
             return Ok(None);
         };
         Ok(Some(FailedSettlementDispatch {
-            role: self.clone(),
+            settlement_custody: self.clone(),
             dispatch,
             port,
             pending,
@@ -493,9 +498,9 @@ impl SettlementRole {
             ),
         );
     }
-    pub(crate) fn unused_role_exited(&self) {
+    pub(crate) fn unused_holder_exited(&self) {
         self.slot
-            .unused_role_exited()
+            .unused_holder_exited()
             .expect("original unused Task settlement exits");
     }
     pub(crate) fn try_retire(&self) -> bool {
@@ -526,7 +531,7 @@ mod tests {
         report: ReportSlot,
         owner: ConsumerId,
         observer: ConsumerId,
-        role: SettlementRole,
+        settlement_custody: SettlementCustody,
         permit: Option<SettlementPermit<ExecutionFailure>>,
         health: Arc<ExecutionHealth>,
         notifications: Arc<AtomicUsize>,
@@ -600,7 +605,7 @@ mod tests {
             novarocks_types::identity::TaskId::new(1).unwrap(),
             novarocks_types::identity::BackendProcessId::new_v7(),
         );
-        let (role, permit) = SettlementRole::from_admitted(
+        let (settlement_custody, permit) = SettlementCustody::from_admitted(
             identity,
             work,
             capacity,
@@ -614,7 +619,7 @@ mod tests {
             report,
             owner,
             observer,
-            role,
+            settlement_custody,
             permit: Some(permit),
             health,
             notifications,
@@ -624,7 +629,7 @@ mod tests {
     fn drain(f: &Fixture) {
         f.report.consume(f.owner).unwrap();
         f.report.consume(f.observer).unwrap();
-        assert!(f.role.try_retire());
+        assert!(f.settlement_custody.try_retire());
         assert_eq!(f.ledger.reap_ready(1).unwrap(), 1);
         f.scope.close_external().unwrap();
         assert!(f.scope.snapshot().unwrap().retirement_ready);
@@ -642,15 +647,15 @@ mod tests {
             assert!(snapshot.is_none());
             seen.fetch_add(1, Ordering::SeqCst);
         }));
-        assert_eq!(f.role.phase(), SettlementPhase::Registered);
+        assert_eq!(f.settlement_custody.phase(), SettlementPhase::Registered);
         assert_eq!(f.notifications.load(Ordering::SeqCst), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(!f.role.try_retire());
-        f.role.publish_barrier(None);
-        f.role.invoke();
+        assert!(!f.settlement_custody.try_retire());
+        f.settlement_custody.publish_barrier(None);
+        f.settlement_custody.invoke();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(f.role.phase(), SettlementPhase::Exited);
-        assert!(!f.role.try_retire());
+        assert_eq!(f.settlement_custody.phase(), SettlementPhase::Exited);
+        assert!(!f.settlement_custody.try_retire());
         assert_eq!(f.ledger.used(DimensionId::new(1).unwrap()), 1);
         drain(&f);
     }
@@ -659,13 +664,13 @@ mod tests {
     fn unused_authority_revocation_does_not_claim_actual_role_exit() {
         let mut f = fixture();
         drop(f.permit.take().unwrap());
-        assert_eq!(f.role.phase(), SettlementPhase::Unused);
+        assert_eq!(f.settlement_custody.phase(), SettlementPhase::Unused);
         assert_eq!(f.notifications.load(Ordering::SeqCst), 2);
         f.scope.close_external().unwrap();
         assert!(!f.scope.snapshot().unwrap().join_ready);
-        assert!(!f.role.try_retire());
-        f.role.unused_role_exited();
-        assert!(!f.role.try_retire());
+        assert!(!f.settlement_custody.try_retire());
+        f.settlement_custody.unused_holder_exited();
+        assert!(!f.settlement_custody.try_retire());
         drain(&f);
     }
 
@@ -691,24 +696,24 @@ mod tests {
         f.permit.take().unwrap().register(Box::new(move |_| {
             let _ = &capture;
         }));
-        f.role.publish_barrier(None);
-        let role = f.role.clone();
-        let invocation = std::thread::spawn(move || role.invoke());
+        f.settlement_custody.publish_barrier(None);
+        let settlement_custody = f.settlement_custody.clone();
+        let invocation = std::thread::spawn(move || settlement_custody.invoke());
         entered.wait();
         f.scope.fail().unwrap();
         f.report
             .abandon_failed_owner(f.owner, &f.scope, Generation::new(1).unwrap())
             .unwrap();
         assert!(!f.scope.snapshot().unwrap().join_ready);
-        assert!(!f.role.try_retire());
+        assert!(!f.settlement_custody.try_retire());
         release.wait();
         invocation.join().unwrap();
         assert!(
-            !f.role.try_retire(),
+            !f.settlement_custody.try_retire(),
             "another consumer still owes the report"
         );
         f.report.consume(f.observer).unwrap();
-        assert!(f.role.try_retire());
+        assert!(f.settlement_custody.try_retire());
         f.ledger.reap_ready(1).unwrap();
         assert!(f.scope.snapshot().unwrap().retirement_ready);
     }
@@ -719,12 +724,12 @@ mod tests {
         f.permit.take().unwrap().register(Box::new(|_| {
             panic!("injected settlement call failure");
         }));
-        f.role.publish_barrier(None);
-        f.role.invoke();
-        assert_eq!(f.role.phase(), SettlementPhase::Unresolved);
+        f.settlement_custody.publish_barrier(None);
+        f.settlement_custody.invoke();
+        assert_eq!(f.settlement_custody.phase(), SettlementPhase::Unresolved);
         assert!(f.health.failure().is_some());
         assert!(!f.scope.snapshot().unwrap().join_ready);
-        assert!(!f.role.try_retire());
+        assert!(!f.settlement_custody.try_retire());
         assert_eq!(f.ledger.used(DimensionId::new(1).unwrap()), 1);
     }
 }

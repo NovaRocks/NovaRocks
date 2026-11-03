@@ -588,7 +588,7 @@ impl BackendMetricsRegistry {
         let execution_quiescence_gauges = IntGaugeVec::new(
             Opts::new(
                 "novarocks_backend_execution_quiescence",
-                "Original execution custody and physical Root borrows over a bounded interval; context_records/root_channels/root_metadata_bytes are cold diagnostic inventory, not an exit receipt or a release of their original fees.",
+                "Original execution custody and physical Root borrows over a bounded interval; participation_records/root_channels/root_metadata_bytes are cold diagnostic inventory, not an exit receipt or a release of their original fees.",
             ), &["resource"],
         ).map_err(|error| format!("construct execution quiescence metrics: {error}"))?;
         registry
@@ -604,7 +604,7 @@ impl BackendMetricsRegistry {
         let protocol_retention_gauges = IntGaugeVec::new(
             Opts::new(
                 "novarocks_backend_protocol_retention",
-                "Original retained-owner records and metadata_bytes_estimate over independent nonblocking samples. Estimates cover documented inline fields/container elements only; indirect Arc backing, tree/hash nodes and allocator overhead are unmeasured, never actual allocation/RSS or capacity. Compact contexts and failed custodians may overlap after cold owner failure.",
+                "Original retained-owner records and metadata_bytes_estimate over independent nonblocking samples. Estimates cover documented inline fields/container elements only; indirect Arc backing, tree/hash nodes and allocator overhead are unmeasured, never actual allocation/RSS or capacity. Compact participations and failed custodians may overlap after cold owner failure.",
             ), &["owner", "resource"],
         ).map_err(|error| format!("construct protocol retention metrics: {error}"))?;
         registry
@@ -658,7 +658,7 @@ impl BackendMetricsRegistry {
             Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_WRITER_TOTALS).clone()),
             Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_WRITER_ABORTS).clone()),
             Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK).clone()),
-            Box::new(Lazy::force(&BACKEND_FRAGMENT_RESULT_TERMINALS).clone()),
+            Box::new(Lazy::force(&BACKEND_TASK_RESULT_TERMINALS).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_INGRESS_SLOTS).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_INGRESS_WAIT_OLDEST_SINCE).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_INGRESS_LAST_PROGRESS).clone()),
@@ -687,7 +687,7 @@ impl BackendMetricsRegistry {
                 Lazy::force(&BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS).clone(),
             ))
             .map_err(|error| format!("register backend debug metrics collector: {error}"))?;
-        novarocks_execution::runtime::fragment::io::exchange_metrics::register_exchange_metrics(
+        novarocks_execution::runtime::task::io::exchange_metrics::register_exchange_metrics(
             &registry,
         )?;
         novarocks_execution::runtime::table_writer_metrics::register_table_writer_metrics(
@@ -847,7 +847,7 @@ impl BackendMetricsRegistry {
                 ("preparing_tasks", snapshot.preparing_tasks),
                 ("preparing_bytes", snapshot.preparing_bytes),
                 ("requests", snapshot.requests),
-                ("contexts", snapshot.contexts),
+                ("participations", snapshot.participations),
             ] {
                 self.worker_node_gauges
                     .with_label_values(&[resource])
@@ -936,7 +936,7 @@ impl BackendMetricsRegistry {
             .as_ref()
             .and_then(|owner| owner.try_protocol_retention_snapshot())
             .and_then(protocol_retention_values);
-        for owner in ["context", "ticket", "control"] {
+        for owner in ["participation", "ticket", "control"] {
             self.protocol_retention_available
                 .with_label_values(&[owner])
                 .set(i64::from(protocol.is_some()));
@@ -975,9 +975,9 @@ impl BackendMetricsRegistry {
             for (resource, used, limit) in [
                 ("positions", snapshot.positions, snapshot.position_limit),
                 (
-                    "context_positions",
-                    snapshot.context_positions,
-                    snapshot.context_position_limit,
+                    "participation_positions",
+                    snapshot.participation_positions,
+                    snapshot.participation_position_limit,
                 ),
                 (
                     "queued_positions",
@@ -1017,7 +1017,7 @@ impl BackendMetricsRegistry {
                 snapshot.second_chance_contexts,
             );
             publish_backend_query_execution_resource(
-                "native_query_active_fragments",
+                "native_query_active_tasks",
                 snapshot.active_fragments,
             );
         }
@@ -1052,14 +1052,14 @@ fn protocol_retention_values(
     let mut rows = Vec::with_capacity(16);
     for (owner, resource, value) in [
         (
-            "context",
-            "compact_contexts",
-            snapshot.contexts.compact_contexts,
+            "participation",
+            "compact_participations",
+            snapshot.participations.compact_participations,
         ),
         (
-            "context",
+            "participation",
             "failed_custodians",
-            snapshot.contexts.failed_custodians,
+            snapshot.participations.failed_custodians,
         ),
         (
             "ticket",
@@ -1096,14 +1096,14 @@ fn protocol_retention_values(
     }
     for (owner, resource, value) in [
         (
-            "context",
+            "participation",
             "decided_task_records",
-            snapshot.contexts.decided_task_records,
+            snapshot.participations.decided_task_records,
         ),
         (
-            "context",
+            "participation",
             "metadata_bytes_estimate",
-            snapshot.contexts.metadata_bytes_estimate,
+            snapshot.participations.metadata_bytes_estimate,
         ),
         (
             "ticket",
@@ -1129,7 +1129,7 @@ fn protocol_retention_values(
         }
     }
     // Explicitly unknown: these structural estimates are not complete heaps.
-    for owner in ["context", "ticket", "control"] {
+    for owner in ["participation", "ticket", "control"] {
         rows.push((owner, "indirect_backing_bytes_available", 0));
     }
     Some(rows)
@@ -1205,8 +1205,8 @@ fn execution_quiescence_values(
         ("preparing_bytes", sample.preparing_bytes),
         ("requests", sample.requests),
         (
-            "contexts_with_execution_custody",
-            sample.contexts_with_execution_custody,
+            "participations_with_execution_custody",
+            sample.participations_with_execution_custody,
         ),
         ("root_producers_running", sample.root_producers_running),
         ("root_data_positions", sample.root_data_positions),
@@ -1218,7 +1218,7 @@ fn execution_quiescence_values(
             sample.root_retained_reservations,
         ),
         ("root_metadata_holders", sample.root_metadata_holders),
-        ("context_records", sample.context_records),
+        ("participation_records", sample.participation_records),
         ("root_channels", sample.root_channels),
         ("root_metadata_bytes", sample.root_metadata_bytes),
     ]
@@ -1557,17 +1557,17 @@ static BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS: Lazy<prometheus::IntCounterVec> = L
     .expect("construct novarocks_backend_connector_write_debug_faults_total")
 });
 
-/// Native fragment result sessions that reached one accepted terminal.
+/// Native task result sessions that reached one accepted terminal.
 /// `finished` is the owner-side publication of successful Root EOF.
-static BACKEND_FRAGMENT_RESULT_TERMINALS: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+static BACKEND_TASK_RESULT_TERMINALS: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
     prometheus::IntCounterVec::new(
         Opts::new(
-            "novarocks_backend_fragment_result_terminals_total",
-            "Cumulative accepted native fragment result terminals, by terminal.",
+            "novarocks_backend_task_result_terminals_total",
+            "Cumulative accepted native task result terminals, by terminal.",
         ),
         &["terminal"],
     )
-    .expect("construct novarocks_backend_fragment_result_terminals_total")
+    .expect("construct novarocks_backend_task_result_terminals_total")
 });
 
 /// High-water mark of the prepared write set observed by a root aggregation on
@@ -1647,8 +1647,8 @@ pub fn record_connector_write_debug_fault(kind: &'static str) {
         .inc();
 }
 
-pub fn record_fragment_result_terminal(terminal: &'static str) {
-    BACKEND_FRAGMENT_RESULT_TERMINALS
+pub fn record_task_result_terminal(terminal: &'static str) {
+    BACKEND_TASK_RESULT_TERMINALS
         .with_label_values(&[terminal])
         .inc();
 }
@@ -1964,7 +1964,7 @@ fn ensure_backend_metric_label_families() {
     for class in ["data", "control"] {
         let _ = BACKEND_NATIVE_TRANSPORT_REFUSED.get_metric_with_label_values(&[class]);
     }
-    for resource in ["catalog_query_leases", "catalog_handle_leases"] {
+    for resource in ["catalog_query_pins", "catalog_handle_pins"] {
         let _ = BACKEND_QUERY_EXECUTION_RESOURCES.get_metric_with_label_values(&[resource]);
     }
     for outcome in ["succeeded", "failed"] {
@@ -1974,7 +1974,7 @@ fn ensure_backend_metric_label_families() {
     #[cfg(novarocks_dev_controls)]
     let _ = BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS.get_metric_with_label_values(&["append_hold"]);
     for terminal in ["finished", "aborted"] {
-        let _ = BACKEND_FRAGMENT_RESULT_TERMINALS.get_metric_with_label_values(&[terminal]);
+        let _ = BACKEND_TASK_RESULT_TERMINALS.get_metric_with_label_values(&[terminal]);
     }
 }
 #[cfg(test)]
@@ -2081,32 +2081,41 @@ mod tests {
 
     struct UnusedPreparationHost;
 
-    impl novarocks_worker::QueryContextHost for UnusedPreparationHost {
+    impl novarocks_worker::ParticipationHost for UnusedPreparationHost {
         fn materialize(
             &self,
             _: novarocks_worker::SharedFactsRequest<'_>,
         ) -> Result<(), novarocks_worker::HostRejection> {
-            panic!("metrics fixture must not materialize a context")
+            panic!("metrics fixture must not materialize a participation")
         }
         fn release(
             &self,
-            _: novarocks_execution_contract::QueryContextRef,
-        ) -> novarocks_worker::ReleasedContextEvidence {
-            panic!("metrics fixture must not release a context")
+            _: novarocks_execution_contract::ParticipationRef,
+        ) -> novarocks_worker::ReleasedParticipationEvidence {
+            panic!("metrics fixture must not release a participation")
         }
         fn advance_shared_domain(
             &self,
-            _: novarocks_execution_contract::QueryContextRef,
-            _: &novarocks_execution_contract::task_execution::operation::QueryContextDomainUpdate,
+            _: novarocks_execution_contract::ParticipationRef,
+            _: &novarocks_execution_contract::task_execution::operation::ParticipationDomainUpdate,
         ) -> Result<(), novarocks_worker::HostRejection> {
-            panic!("metrics fixture must not advance a context")
+            panic!("metrics fixture must not advance a participation")
         }
     }
 
     impl novarocks_worker::TaskExecutionHost for UnusedPreparationHost {
-        fn close_context_admission(&self, _: novarocks_execution_contract::QueryContextRef) {}
-        fn retire_context_execution(&self, _: novarocks_execution_contract::QueryContextRef) {}
-        fn forget_context_admission(&self, _: novarocks_execution_contract::QueryContextRef) {}
+        fn close_participation_admission(&self, _: novarocks_execution_contract::ParticipationRef) {
+        }
+        fn retire_participation_execution(
+            &self,
+            _: novarocks_execution_contract::ParticipationRef,
+        ) {
+        }
+        fn forget_participation_admission(
+            &self,
+            _: novarocks_execution_contract::ParticipationRef,
+        ) {
+        }
         fn install_receiver(
             &self,
             _: &novarocks_execution_contract::task_execution::descriptor::TaskDescriptor,
@@ -2263,7 +2272,7 @@ mod tests {
             .set(123);
         let text = render_metrics(&backend).unwrap();
         assert!(!text.contains("novarocks_backend_protocol_retention{"));
-        for owner in ["context", "ticket", "control", "inbound"] {
+        for owner in ["participation", "ticket", "control", "inbound"] {
             assert!(text.contains(&format!(
                 "novarocks_backend_protocol_retention_snapshot_available{{owner=\"{owner}\"}} 0"
             )));
@@ -2305,9 +2314,9 @@ mod tests {
         for (resource, used, limit) in [
             ("positions", snapshot.positions, snapshot.position_limit),
             (
-                "context_positions",
-                snapshot.context_positions,
-                snapshot.context_position_limit,
+                "participation_positions",
+                snapshot.participation_positions,
+                snapshot.participation_position_limit,
             ),
             (
                 "queued_positions",
@@ -2396,8 +2405,8 @@ mod tests {
             .with_inbound_retention(Arc::clone(&inbound));
         let rendered = render_metrics(&backend).expect("render Backend metrics");
         for (owner, resource) in [
-            ("context", "compact_contexts"),
-            ("context", "failed_custodians"),
+            ("participation", "compact_participations"),
+            ("participation", "failed_custodians"),
             ("ticket", "ticket_records"),
             ("control", "directory_records"),
             ("inbound", "records"),
@@ -2421,7 +2430,7 @@ mod tests {
             "preparing_tasks",
             "preparing_bytes",
             "requests",
-            "contexts",
+            "participations",
         ] {
             assert!(
                 rendered.contains(&format!(
@@ -2454,7 +2463,7 @@ mod tests {
             "preparing_tasks",
             "preparing_bytes",
             "requests",
-            "contexts",
+            "participations",
         ] {
             assert!(
                 rows.as_array()

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Sort operations retain actual Arrow causes independently of their call stage.
-use crate::runtime::fragment::{ExecutionFailure, ExecutionReason};
+use crate::runtime::task::{ExecutionFailure, ExecutionReason};
 use arrow::error::ArrowError;
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 #[cfg(test)]

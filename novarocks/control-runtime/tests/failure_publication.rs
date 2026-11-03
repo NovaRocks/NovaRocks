@@ -18,10 +18,10 @@
 #![cfg(not(loom))]
 
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, DriverError, EffectTicket, FailureSourceState, InputPhase},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::{ActorRuntime, ActorTurnError, EffectTicket, FailureSourceState, InputPhase},
     history::HistoryCapture,
-    lease::{ReservationBundle, WorkLease},
+    obligation::{ReservationObligation, WorkObligation},
     publication::{PublishedReply, PublishedSnapshot},
     transaction::{RuntimeLedger, ScopeHandle},
 };
@@ -79,7 +79,7 @@ impl Actor for FailingActor {
         _now: Tick,
         _input: InputEnvelope,
         value: u64,
-        step: &mut StepContext<'_, u64>,
+        step: &mut ActorStep<'_, u64>,
     ) {
         assert_ne!(value, 99, "controlled owner failure");
         step.effect(
@@ -100,7 +100,7 @@ impl Actor for FailingActor {
         _scope: ScopeId,
         _generation: Generation,
         _input: InputEnvelope,
-        step: &mut StepContext<'_, u64>,
+        step: &mut ActorStep<'_, u64>,
     ) {
         // Deliberately sparse: history publications must follow the actual
         // failure batch action watermark, never batch length or a guessed 1.
@@ -122,10 +122,10 @@ struct Fixture {
     runtime: ActorRuntime<FailingActor>,
     history: HistoryCapture,
     committed: PublishedReply<&'static str>,
-    business: WorkLease,
-    business_capacity: ReservationBundle,
-    cleanup: WorkLease,
-    cleanup_capacity: ReservationBundle,
+    business: WorkObligation,
+    business_capacity: ReservationObligation,
+    cleanup: WorkObligation,
+    cleanup_capacity: ReservationObligation,
     first: InputId,
     failed: InputId,
     reserved: InputId,
@@ -280,7 +280,7 @@ fn drain(mut f: Fixture) {
 
 struct Incarnation {
     scope: ScopeHandle,
-    work: [(WorkLease, ReservationBundle); 2],
+    work: [(WorkObligation, ReservationObligation); 2],
     input: InputId,
     cleanup: EffectTicket<u64>,
 }
@@ -396,10 +396,16 @@ fn reject_reused_actor_session(different_ledger: bool) {
     // Always retire actual work before asserting the intended regression, so
     // an old implementation fails once rather than unwinding live actor custody.
     retire_incarnation(&runtime, &next_ledger, second);
-    assert_eq!(stale_matches, Err(DriverError::EffectTicketOriginMismatch));
+    assert_eq!(
+        stale_matches,
+        Err(ActorTurnError::EffectTicketOriginMismatch)
+    );
     assert_eq!(current_matches, Ok(true));
     assert!(
-        matches!(rejected, Err((DriverError::EffectTicketOriginMismatch, _))),
+        matches!(
+            rejected,
+            Err((ActorTurnError::EffectTicketOriginMismatch, _))
+        ),
         "a retired scope's session must not acquire the new actor incarnation: {rejected:?}"
     );
     assert_eq!(after_stale, "new bootstrap");
@@ -443,7 +449,7 @@ fn one_prepaid_failure_session_publishes_each_actual_target_without_republishing
     assert!(!session.matches_actor_runtime(&unrelated, aid()).unwrap());
     assert_eq!(
         f.runtime.claim_failure_publication(initial).unwrap_err(),
-        DriverError::FailurePublicationAlreadyClaimed
+        ActorTurnError::FailurePublicationAlreadyClaimed
     );
     let first = PublishedSnapshot::new(&f.scope, Arc::new("old"));
     let second = PublishedSnapshot::new(&f.scope, Arc::new("old"));
@@ -469,7 +475,7 @@ fn one_prepaid_failure_session_publishes_each_actual_target_without_republishing
             .commit_snapshot(initial, &first, Arc::new("bypass"))
             .unwrap_err()
             .0,
-        DriverError::FailurePublicationRequired
+        ActorTurnError::FailurePublicationRequired
     );
     let actions: Vec<_> = f
         .history
@@ -493,13 +499,13 @@ fn one_prepaid_failure_session_publishes_each_actual_target_without_republishing
     assert_eq!(
         f.runtime
             .retire_input(aid(), f.initial.as_ref().unwrap().input),
-        Err(DriverError::EffectsRemain),
+        Err(ActorTurnError::EffectsRemain),
         "initial cleanup stays Started throughout publication slices"
     );
     drop(session);
     assert_eq!(
         f.runtime.claim_failure_publication(initial).unwrap_err(),
-        DriverError::FailurePublicationAlreadyClaimed,
+        ActorTurnError::FailurePublicationAlreadyClaimed,
         "Drop cannot mint another authority or fake exit"
     );
     drain(f);
@@ -516,7 +522,7 @@ fn previously_committed_reply_survives_failure_and_is_never_overwritten() {
     let (error, rejected) = session
         .commit_reply(reply, Arc::new("OwnerFailed"))
         .unwrap_err();
-    assert_eq!(error, DriverError::ReplyAlreadyCommitted);
+    assert_eq!(error, ActorTurnError::ReplyAlreadyCommitted);
     assert_eq!(*rejected, "OwnerFailed");
     assert_eq!(*reply.take_once().unwrap(), "success");
     assert_eq!(
@@ -524,7 +530,7 @@ fn previously_committed_reply_survives_failure_and_is_never_overwritten() {
             .commit_reply(reply, Arc::new("OwnerFailed"))
             .unwrap_err()
             .0,
-        DriverError::ReplyAlreadyCommitted
+        ActorTurnError::ReplyAlreadyCommitted
     );
     drain(f);
 }
@@ -536,7 +542,7 @@ fn cleanup_work_must_be_started_and_still_have_a_live_body_for_each_commit() {
         f.runtime
             .claim_failure_publication(f.initial.as_ref().unwrap())
             .unwrap_err(),
-        DriverError::FailureWorkInactive
+        ActorTurnError::FailureWorkInactive
     );
     f.cleanup.start().unwrap();
     let mut session = f
@@ -548,11 +554,11 @@ fn cleanup_work_must_be_started_and_still_have_a_live_body_for_each_commit() {
     f.cleanup.body_exited().unwrap();
     assert_eq!(
         session.matches_actor_runtime(&f.runtime, aid()),
-        Err(DriverError::FailureWorkInactive)
+        Err(ActorTurnError::FailureWorkInactive)
     );
     assert_eq!(
         session.commit_snapshot(&target, Arc::new(1)).unwrap_err().0,
-        DriverError::FailureWorkInactive
+        ActorTurnError::FailureWorkInactive
     );
     assert_eq!(*target.read(), 0);
     f.cleanup.captures_exited().unwrap();
@@ -613,7 +619,7 @@ fn a_cleanup_descriptor_cannot_borrow_business_work_as_failure_publication_autho
         .unwrap_err();
     assert_eq!(
         refusal.0,
-        DriverError::FailureWorkInactive,
+        ActorTurnError::FailureWorkInactive,
         "the actual registration gate refuses a Business role as failure authority"
     );
     business.body_exited().unwrap();
@@ -699,7 +705,7 @@ fn failed_input_is_abandoned_once_and_waits_for_its_failure_batch_to_retire() {
     assert_eq!(
         f.runtime
             .retire_input(aid(), f.initial.as_ref().unwrap().input),
-        Err(DriverError::EffectsRemain)
+        Err(ActorTurnError::EffectsRemain)
     );
     f.runtime.abandon_failed_input(aid(), f.reserved).unwrap();
     f.runtime.abandon_failed_input(aid(), f.reserved).unwrap();

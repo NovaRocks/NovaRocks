@@ -26,7 +26,7 @@ use crate::api::{
     StatementNativeHealthFailure,
 };
 use novarocks_coordination_contract::AttemptActivationIdentity;
-use novarocks_execution_contract::{QueryContextRef, TaskIdentity};
+use novarocks_execution_contract::{ParticipationRef, TaskIdentity};
 use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
 use novarocks_workload_control::CancellationView;
 use std::{
@@ -75,7 +75,7 @@ enum ActiveSlotOwner {
 }
 struct ActiveSlot {
     original_exit: Weak<super::original_exit::OriginalLogicalExit>,
-    contexts: BTreeSet<QueryContextRef>,
+    participations: BTreeSet<ParticipationRef>,
     owner: Mutex<Option<ActiveSlotOwner>>,
     convergence_failure: NativeConvergenceFailureSlot,
     root_ack: Mutex<RootAckTailState>,
@@ -475,13 +475,13 @@ impl NativeActiveCustodyRegistry {
     pub(super) fn reserve_with_original_exit(
         &self,
         key: NativeActiveCustodyKey,
-        contexts: &[QueryContextRef],
+        participations: &[ParticipationRef],
         registry: LogicalExecutionRuntimeRegistryHandle,
         original_exit: Weak<super::original_exit::OriginalLogicalExit>,
     ) -> Option<NativeActiveCustodyReservation> {
-        let exact = contexts.iter().copied().collect::<BTreeSet<_>>();
+        let exact = participations.iter().copied().collect::<BTreeSet<_>>();
         if exact.is_empty()
-            || exact.len() != contexts.len()
+            || exact.len() != participations.len()
             || exact
                 .iter()
                 .any(|c| c.query_execution_id() != key.execution)
@@ -494,7 +494,7 @@ impl NativeActiveCustodyRegistry {
         }
         let slot = Arc::new(ActiveSlot {
             original_exit,
-            contexts: exact,
+            participations: exact,
             owner: Mutex::new(None),
             convergence_failure: NativeConvergenceFailureSlot::default(),
             root_ack: Mutex::new(RootAckTailState::default()),
@@ -520,10 +520,9 @@ impl NativeActiveCustodyRegistry {
         let mut state = slot.root_ack.lock().unwrap_or_else(|e| e.into_inner());
         if activation.execution() != key.execution
             || root.query_execution_id() != key.execution
-            || !slot
-                .contexts
-                .iter()
-                .any(|context| context.backend_process_id() == root.backend_process_id())
+            || !slot.participations.iter().any(|participation| {
+                participation.backend_process_id() == root.backend_process_id()
+            })
             || state.native_closed
             || !matches!(state.phase, RootAckTailPhase::Unreserved)
         {
@@ -628,8 +627,8 @@ impl NativeActiveCustodyRegistry {
                     && input.activation.stream.activation().execution() == key.execution
                     && input.activation.source.activation() == input.activation.stream.activation()
                     && input.activation.source.root().query_execution_id() == key.execution
-                    && slot.contexts.iter().any(|context| {
-                        context.backend_process_id()
+                    && slot.participations.iter().any(|participation| {
+                        participation.backend_process_id()
                             == input.activation.source.root().backend_process_id()
                     })
             });
@@ -853,12 +852,15 @@ impl NativeActiveCustodyRegistry {
                     .pending()
             })
     }
-    pub(crate) fn contexts(&self, key: NativeActiveCustodyKey) -> Option<Vec<QueryContextRef>> {
+    pub(crate) fn participations(
+        &self,
+        key: NativeActiveCustodyKey,
+    ) -> Option<Vec<ParticipationRef>> {
         self.slots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
-            .map(|s| s.contexts.iter().copied().collect())
+            .map(|s| s.participations.iter().copied().collect())
     }
     pub(crate) fn len(&self) -> usize {
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).len()
@@ -1277,15 +1279,20 @@ impl SupervisedActiveNativeOwner {
         if let Some(failure) = self.custody.slot.convergence_failure.failure() {
             return Err(self.retain_unresolved(failure));
         }
-        let expected = self.custody.slot.contexts.clone();
+        let expected = self.custody.slot.participations.clone();
         let (observed, count) = match &closure {
             NativeActiveConvergenceClosure::Evidence(
-                NativeAttemptConvergence::AllWorkersStoppedAndContextsFenced,
+                NativeAttemptConvergence::AllWorkersStoppedAndParticipationsFenced,
             ) => (expected.clone(), expected.len()),
-            NativeActiveConvergenceClosure::Evidence(NativeAttemptConvergence::Contexts(facts)) => {
-                (facts.iter().map(|f| f.context()).collect(), facts.len())
-            }
-            NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_contexts } => {
+            NativeActiveConvergenceClosure::Evidence(NativeAttemptConvergence::Participations(
+                facts,
+            )) => (
+                facts.iter().map(|f| f.participation()).collect(),
+                facts.len(),
+            ),
+            NativeActiveConvergenceClosure::RemoteTrackingEnded {
+                exact_participations,
+            } => {
                 if self.remote_deadline.is_none_or(|d| Instant::now() < d) {
                     return Err(self.retain_unresolved(
                         StatementNativeHealthFailure::actual_exit_unproven(
@@ -1295,15 +1302,15 @@ impl SupervisedActiveNativeOwner {
                     ));
                 }
                 (
-                    exact_contexts.iter().copied().collect(),
-                    exact_contexts.len(),
+                    exact_participations.iter().copied().collect(),
+                    exact_participations.len(),
                 )
             }
         };
         if expected != observed || observed.len() != count {
             return Err(self.retain_unresolved(
                 StatementNativeHealthFailure::actual_exit_unproven(
-                    "active Native closure differs from its original exact context set",
+                    "active Native closure differs from its original exact participation set",
                     Arc::new(ActiveCustodyInvariant),
                 ),
             ));
@@ -1552,7 +1559,7 @@ fn root_ack_test_fixture_for_key(
 ) -> (RootAckTestOwner, RootAckTailReservation) {
     let slot = Arc::new(ActiveSlot {
         original_exit: Weak::new(),
-        contexts: BTreeSet::from([QueryContextRef::new(
+        participations: BTreeSet::from([ParticipationRef::new(
             key.execution,
             novarocks_types::FrontendProcessId::new_v7(),
             root.backend_process_id(),
@@ -1932,7 +1939,7 @@ mod tests {
             generation: 1,
             execution: activation.execution(),
         };
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             key.execution,
             FrontendProcessId::new_v7(),
             root.backend_process_id(),
@@ -1943,10 +1950,10 @@ mod tests {
             LogicalExecutionHealth::new(Arc::new(Notify::new())),
             Arc::new(Notify::new()),
         );
-        // Exercise the real exact-context reservation and owner binding. This
+        // Exercise the real exact-participation reservation and owner binding. This
         // rejection precedes forwarding any closure to the actor registry.
         let reservation = storage
-            .reserve_with_original_exit(key, &[context], runtime.handle(), Weak::new())
+            .reserve_with_original_exit(key, &[participation], runtime.handle(), Weak::new())
             .unwrap();
         let drops = Arc::new(AtomicUsize::new(0));
         let original: Box<dyn ActiveNativeAttemptOwner> = Box::new(HeldWindowOwner {
@@ -1974,7 +1981,7 @@ mod tests {
 
         let error = active
             .record_and_close(NativeActiveConvergenceClosure::RemoteTrackingEnded {
-                exact_contexts: vec![context].into_boxed_slice(),
+                exact_participations: vec![participation].into_boxed_slice(),
             })
             .await
             .unwrap_err();
@@ -2305,7 +2312,7 @@ mod tests {
                     key,
                     Arc::new(ActiveSlot {
                         original_exit: Weak::new(),
-                        contexts: BTreeSet::from([QueryContextRef::new(
+                        participations: BTreeSet::from([ParticipationRef::new(
                             key.execution,
                             FrontendProcessId::new_v7(),
                             BackendProcessId::new_v7(),
@@ -2410,7 +2417,7 @@ mod tests {
             },
         ];
         // These are the same private empty pre-reservation slots: valid exact
-        // contexts, no live owner, no WorkOwner/obligation, no exit evidence.
+        // participations, no live owner, no WorkOwner/obligation, no exit evidence.
         {
             let mut slots = registry.slots.lock().unwrap();
             for key in keys {
@@ -2418,7 +2425,7 @@ mod tests {
                     key,
                     Arc::new(ActiveSlot {
                         original_exit: Weak::new(),
-                        contexts: BTreeSet::from([QueryContextRef::new(
+                        participations: BTreeSet::from([ParticipationRef::new(
                             key.execution,
                             FrontendProcessId::new_v7(),
                             BackendProcessId::new_v7(),

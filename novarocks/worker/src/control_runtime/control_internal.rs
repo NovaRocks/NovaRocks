@@ -16,24 +16,26 @@
 // under the License.
 
 //! One original internal input serializes coalesced control hints and original
-//! failed-Context lifecycle facts. No Context prepays Work for this source.
+//! failed-Participation lifecycle facts. No Participation prepays Work for this source.
 
 mod lifecycle;
+pub(crate) use lifecycle::{
+    ControlLifecycleConsumption, ControlLifecycleFact, ControlLifecycleReceipt,
+};
 use lifecycle::{InFlightLifecycle, PendingLifecycle};
-pub(crate) use lifecycle::{RootLifecycleConsumption, RootLifecycleFact, RootLifecycleReceipt};
 
 use super::{
     actors::{ControlMessage, WorkerAction, WorkerActor, WorkerMessage},
-    context_ready::ContextReadyNotice,
+    participation_ready::ParticipationReadyNotice,
     process_control::ProcessControlOwner,
 };
 use crate::control_runtime_policy::StorageNeed;
 use novarocks_control_runtime::{
-    driver::{
-        ActorFailureProof, ActorRegistration, ActorRuntime, DriverError, EffectTicket, InputPermit,
-        InputPhase, InputRole, TimerSourceState,
+    actor_turn::{
+        ActorFailureProof, ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket,
+        InputPhase, ReservedInputObligation, StandingInputObligation, TimerSourceState,
     },
-    lease::{ReservationBundle, WorkLease},
+    obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeError, RuntimeLedger},
 };
 use novarocks_control_runtime_core::{
@@ -42,7 +44,7 @@ use novarocks_control_runtime_core::{
     scope::{WorkAdmission, WorkKind},
 };
 use novarocks_worker_protocol::control::{ControlCore, ControlEffect, ControlInput};
-use novarocks_worker_protocol::retention::ContextRetirementIdentity;
+use novarocks_worker_protocol::retention::ParticipationRetirementIdentity;
 use std::collections::VecDeque;
 
 pub(crate) const CONTROL_INTERNAL_STORAGE: StorageNeed = StorageNeed {
@@ -60,7 +62,7 @@ pub(crate) const CONTROL_INTERNAL_STORAGE: StorageNeed = StorageNeed {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControlInternalError {
     Runtime(RuntimeError),
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
     WrongEffect,
     WrongOwner,
     NotEnabled,
@@ -75,7 +77,7 @@ impl std::fmt::Display for ControlInternalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Runtime(error) => write!(f, "Control internal role operation failed: {error}"),
-            Self::Driver(error) => write!(
+            Self::ActorTurn(error) => write!(
                 f,
                 "Control internal input or effect operation failed: {error}"
             ),
@@ -97,7 +99,7 @@ impl std::error::Error for ControlInternalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Runtime(error) => Some(error),
-            Self::Driver(error) => Some(error),
+            Self::ActorTurn(error) => Some(error),
             Self::WrongEffect
             | Self::WrongOwner
             | Self::NotEnabled
@@ -113,10 +115,10 @@ impl std::error::Error for ControlInternalError {
 /// Work is not rolled back or recreated when the input position is refused.
 #[must_use = "Retain the original partially admitted internal source"]
 pub(crate) struct ControlInternalPartial {
-    pub work: WorkLease,
-    pub capacity: ReservationBundle,
-    pub permit: Option<InputPermit<WorkerActor>>,
-    pub role: Option<InputRole<WorkerActor>>,
+    pub work: WorkObligation,
+    pub capacity: ReservationObligation,
+    pub permit: Option<ReservedInputObligation<WorkerActor>>,
+    pub input_obligation: Option<StandingInputObligation<WorkerActor>>,
 }
 pub(crate) struct ControlInternalRefusal {
     pub error: ControlInternalError,
@@ -144,9 +146,9 @@ pub(crate) struct ControlInternal {
     runtime: ActorRuntime<WorkerActor>,
     registration: ActorRegistration,
     actor: ActorId,
-    work: WorkLease,
-    capacity: ReservationBundle,
-    role: InputRole<WorkerActor>,
+    work: WorkObligation,
+    capacity: ReservationObligation,
+    input_obligation: StandingInputObligation<WorkerActor>,
     pending: bool,
     process_drain_pending: bool,
     ingress_closed_pending: bool,
@@ -155,7 +157,7 @@ pub(crate) struct ControlInternal {
     lifecycle_turn: bool,
     body_exited: bool,
     captures_exited: bool,
-    role_closed: bool,
+    input_closed: bool,
 }
 impl ControlInternal {
     pub(crate) fn admit(root: &ProcessControlOwner) -> Result<Self, ControlInternalRefusal> {
@@ -189,7 +191,7 @@ impl ControlInternal {
             work,
             capacity,
             permit: None,
-            role: None,
+            input_obligation: None,
         };
         let permit =
             match root
@@ -199,17 +201,17 @@ impl ControlInternal {
                 Ok(permit) => permit,
                 Err(error) => {
                     return Err(ControlInternalRefusal {
-                        error: ControlInternalError::Driver(error),
+                        error: ControlInternalError::ActorTurn(error),
                         partial: Some(partial),
                     });
                 }
             };
-        match permit.into_role() {
-            Ok(role) => partial.role = Some(role),
+        match permit.into_standing_input() {
+            Ok(role) => partial.input_obligation = Some(role),
             Err((error, permit)) => {
                 partial.permit = Some(permit);
                 return Err(ControlInternalRefusal {
-                    error: ControlInternalError::Driver(error),
+                    error: ControlInternalError::ActorTurn(error),
                     partial: Some(partial),
                 });
             }
@@ -227,7 +229,10 @@ impl ControlInternal {
             actor: root.actor(),
             work: partial.work,
             capacity: partial.capacity,
-            role: partial.role.take().expect("actual input role converted"),
+            input_obligation: partial
+                .input_obligation
+                .take()
+                .expect("actual input role converted"),
             pending: false,
             process_drain_pending: false,
             ingress_closed_pending: false,
@@ -236,31 +241,31 @@ impl ControlInternal {
             lifecycle_turn: true,
             body_exited: false,
             captures_exited: false,
-            role_closed: false,
+            input_closed: false,
         })
     }
 
     /// Called only after this same Root's external Work gate has closed.
     /// The original paid role serializes this with its in-flight continuation.
     pub(crate) fn request_process_drain(&mut self) -> Result<(), ControlInternalError> {
-        if self.role_closed || self.body_exited {
+        if self.input_closed || self.body_exited {
             return Err(ControlInternalError::Closed);
         }
         self.process_drain_pending = true;
         self.runtime
             .notify_host_actor(&self.registration)
-            .map_err(ControlInternalError::Driver)
+            .map_err(ControlInternalError::ActorTurn)
     }
     /// An explicit caller acknowledgement of actual listener/body exit, not a
     /// flag inferred from a timer or a request to begin shutting down.
     pub(crate) fn confirm_ingress_closed(&mut self) -> Result<(), ControlInternalError> {
-        if self.role_closed || self.body_exited {
+        if self.input_closed || self.body_exited {
             return Err(ControlInternalError::Closed);
         }
         self.ingress_closed_pending = true;
         self.runtime
             .notify_host_actor(&self.registration)
-            .map_err(ControlInternalError::Driver)
+            .map_err(ControlInternalError::ActorTurn)
     }
 
     /// Transfer one original failed owner's neutral fact to this process's
@@ -269,20 +274,20 @@ impl ControlInternal {
     pub(crate) fn enqueue_failed_lifecycle(
         &mut self,
         proof: &ActorFailureProof,
-        fact: RootLifecycleFact,
-        notice: ContextReadyNotice,
-    ) -> Result<RootLifecycleReceipt, ControlInternalError> {
-        if self.role_closed || self.body_exited {
+        fact: ControlLifecycleFact,
+        notice: ParticipationReadyNotice,
+    ) -> Result<ControlLifecycleReceipt, ControlInternalError> {
+        if self.input_closed || self.body_exited {
             return Err(ControlInternalError::Closed);
         }
         self.runtime
             .validate_registration(&self.registration)
-            .map_err(ControlInternalError::Driver)?;
+            .map_err(ControlInternalError::ActorTurn)?;
         let retirement = fact.retirement().ok_or(ControlInternalError::WrongOwner)?;
         let actual = self
             .runtime
             .failure_proof_for(proof.registration())
-            .map_err(ControlInternalError::Driver)?;
+            .map_err(ControlInternalError::ActorTurn)?;
         if actual.initial_epoch() != proof.initial_epoch()
             || actual.failed_epoch() != proof.failed_epoch()
             || !actual
@@ -291,12 +296,12 @@ impl ControlInternal {
             || proof.registration().actor() == self.actor
             || !proof.registration().retained_in_process(self.work.scope())
             || !notice.matches_registration(&self.runtime, proof.registration())
-            || notice.context() != fact.context()
+            || notice.participation() != fact.participation()
             || !retirement.is_valid()
         {
             return Err(ControlInternalError::WrongOwner);
         }
-        if let ContextRetirementIdentity::OwnerFailure {
+        if let ParticipationRetirementIdentity::OwnerFailure {
             actor,
             initial_epoch,
             failed_epoch,
@@ -312,7 +317,7 @@ impl ControlInternal {
         // hidden accepted fact and a released caller cannot lose the notice.
         self.runtime
             .notify_host_actor(&self.registration)
-            .map_err(ControlInternalError::Driver)?;
+            .map_err(ControlInternalError::ActorTurn)?;
         let (original, receipt) = PendingLifecycle::new(fact, notice, &self.registration);
         self.lifecycle_pending.push_back(original);
         Ok(receipt)
@@ -323,30 +328,30 @@ impl ControlInternal {
     /// receipt, while this existing Source alone pays the actual Root input.
     pub(crate) fn enqueue_host_removed(
         &mut self,
-        original: &WorkLease,
-        context: novarocks_execution_contract::QueryContextRef,
-    ) -> Result<RootLifecycleReceipt, ControlInternalError> {
-        if self.role_closed || self.body_exited {
+        original: &WorkObligation,
+        participation: novarocks_execution_contract::ParticipationRef,
+    ) -> Result<ControlLifecycleReceipt, ControlInternalError> {
+        if self.input_closed || self.body_exited {
             return Err(ControlInternalError::Closed);
         }
         self.runtime
             .validate_registration(&self.registration)
-            .map_err(ControlInternalError::Driver)?;
+            .map_err(ControlInternalError::ActorTurn)?;
         if !self.registration.matches_scope(original.scope()) {
             return Err(ControlInternalError::WrongOwner);
         }
         self.runtime
             .validate_work_author(&self.registration, original)
-            .map_err(ControlInternalError::Driver)?;
-        let fact = RootLifecycleFact::HostRemoved {
-            context,
+            .map_err(ControlInternalError::ActorTurn)?;
+        let fact = ControlLifecycleFact::HostRemoved {
+            participation,
             subject: original.reference(),
         };
         // Notify before transferring the single neutral fact. A refused wake
         // leaves the original caller's owner and its unregistered fact intact.
         self.runtime
             .notify_host_actor(&self.registration)
-            .map_err(ControlInternalError::Driver)?;
+            .map_err(ControlInternalError::ActorTurn)?;
         let (pending, receipt) =
             PendingLifecycle::for_root(fact, &self.runtime, &self.registration);
         self.lifecycle_pending.push_back(pending);
@@ -362,8 +367,8 @@ impl ControlInternal {
     ) -> Result<(), ControlInternalError> {
         self.runtime
             .validate_effect_ticket(ticket)
-            .map_err(ControlInternalError::Driver)?;
-        if self.role_closed || self.body_exited {
+            .map_err(ControlInternalError::ActorTurn)?;
+        if self.input_closed || self.body_exited {
             return Err(ControlInternalError::Closed);
         }
         if ticket.actor != self.actor
@@ -380,20 +385,20 @@ impl ControlInternal {
         self.pending = true;
         self.runtime
             .notify_host_actor(&self.registration)
-            .map_err(ControlInternalError::Driver)?;
+            .map_err(ControlInternalError::ActorTurn)?;
         Ok(())
     }
 
     /// Called from the root's actual progress wake, never by a request scan.
     /// Busy retirement keeps the old input and the pending bool unchanged.
     pub(crate) fn advance(&mut self) -> Result<InternalAdvance, ControlInternalError> {
-        if self.role_closed || self.body_exited {
+        if self.input_closed || self.body_exited {
             return Err(ControlInternalError::Closed);
         }
         if let Some(input) = self
-            .role
+            .input_obligation
             .in_flight()
-            .map_err(ControlInternalError::Driver)?
+            .map_err(ControlInternalError::ActorTurn)?
         {
             if let Some(original) = &self.lifecycle_in_flight {
                 if original.input != input {
@@ -402,9 +407,9 @@ impl ControlInternal {
                 let custody = self
                     .runtime
                     .input_custody(self.actor, input)
-                    .map_err(ControlInternalError::Driver)?
+                    .map_err(ControlInternalError::ActorTurn)?
                     .ok_or(ControlInternalError::WrongOwner)?;
-                if custody.role != Some(self.role.id())
+                if custody.standing_input_id != Some(self.input_obligation.id())
                     || custody.source != self.actor
                     || custody.class != InputClass::Control
                     || custody.runtime_metadata
@@ -414,7 +419,7 @@ impl ControlInternal {
                 match custody.phase {
                     InputPhase::Committed => original.original.consumed(input)?,
                     InputPhase::AbandonedByOwnerFailure => {
-                        return Err(ControlInternalError::Driver(DriverError::ActorFailed));
+                        return Err(ControlInternalError::ActorTurn(ActorTurnError::ActorFailed));
                     }
                     _ => {}
                 }
@@ -427,12 +432,12 @@ impl ControlInternal {
                     }
                 }
                 Err(
-                    DriverError::InputStillQueued
-                    | DriverError::EffectsRemain
-                    | DriverError::ReservationsRemain
-                    | DriverError::MetadataStillPending,
+                    ActorTurnError::InputStillQueued
+                    | ActorTurnError::EffectsRemain
+                    | ActorTurnError::ReservationsRemain
+                    | ActorTurnError::MetadataStillPending,
                 ) => return Ok(InternalAdvance::Waiting(input)),
-                Err(error) => return Err(ControlInternalError::Driver(error)),
+                Err(error) => return Err(ControlInternalError::ActorTurn(error)),
             }
         } else if self.lifecycle_in_flight.is_some() {
             return Err(ControlInternalError::WrongOwner);
@@ -464,13 +469,13 @@ impl ControlInternal {
             request: None,
             command,
         });
-        let input = match self.role.fill(message) {
+        let input = match self.input_obligation.fill(message) {
             Ok(input) => input,
             Err((error, _same_neutral_command)) => {
                 if let Some(original) = selected.take() {
                     self.lifecycle_pending.push_front(original);
                 }
-                return Err(ControlInternalError::Driver(error));
+                return Err(ControlInternalError::ActorTurn(error));
             }
         };
         if let Some(original) = selected {
@@ -499,7 +504,7 @@ impl ControlInternal {
         if self
             .runtime
             .timer_source_state(self.actor)
-            .map_err(ControlInternalError::Driver)?
+            .map_err(ControlInternalError::ActorTurn)?
             != TimerSourceState::ClosedDrained
         {
             return Err(ControlInternalError::TimerStillOpen);
@@ -526,7 +531,7 @@ impl ControlInternal {
         if self
             .runtime
             .timer_source_state(self.actor)
-            .map_err(ControlInternalError::Driver)?
+            .map_err(ControlInternalError::ActorTurn)?
             != TimerSourceState::ClosedDrained
             || self.pending
             || self.process_drain_pending
@@ -536,20 +541,20 @@ impl ControlInternal {
         {
             return Ok(false);
         }
-        if !self.role_closed {
+        if !self.input_closed {
             if let Some(input) = self
-                .role
+                .input_obligation
                 .in_flight()
-                .map_err(ControlInternalError::Driver)?
+                .map_err(ControlInternalError::ActorTurn)?
             {
                 match self.runtime.retire_input(self.actor, input) {
                     Ok(()) => {}
                     Err(
-                        DriverError::InputStillQueued
-                        | DriverError::EffectsRemain
-                        | DriverError::ReservationsRemain,
+                        ActorTurnError::InputStillQueued
+                        | ActorTurnError::EffectsRemain
+                        | ActorTurnError::ReservationsRemain,
                     ) => return Ok(false),
-                    Err(error) => return Err(ControlInternalError::Driver(error)),
+                    Err(error) => return Err(ControlInternalError::ActorTurn(error)),
                 }
             }
             if !self.body_exited {
@@ -564,10 +569,10 @@ impl ControlInternal {
                     .map_err(ControlInternalError::Runtime)?;
                 self.captures_exited = true;
             }
-            self.role
+            self.input_obligation
                 .close_after_exit()
-                .map_err(ControlInternalError::Driver)?;
-            self.role_closed = true;
+                .map_err(ControlInternalError::ActorTurn)?;
+            self.input_closed = true;
         }
         if !self.work.retirement_observer().is_retired() {
             self.ledger
@@ -577,7 +582,7 @@ impl ControlInternal {
                 // A finite ready-header tail, never an I/O poll or a false exit.
                 self.runtime
                     .notify_host_actor(&self.registration)
-                    .map_err(ControlInternalError::Driver)?;
+                    .map_err(ControlInternalError::ActorTurn)?;
                 return Ok(false);
             }
         }

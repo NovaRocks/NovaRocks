@@ -20,7 +20,7 @@
 
 use crate::{
     completion::ReportSlot,
-    lease::{ReservationBundle, WorkLease},
+    obligation::{ReservationObligation, WorkObligation},
     reported_work::ReportedWork,
     sync::{Arc, AtomicBool, Mutex, Ordering},
     transaction::RuntimeError,
@@ -76,8 +76,8 @@ struct State<T: Send + 'static> {
     phase: ContinuationPhase,
     callback: Option<ManuallyDrop<ContinuationCallback<T>>>,
     value: Option<ManuallyDrop<T>>,
-    work: Option<WorkLease>,
-    capacity: Option<ReservationBundle>,
+    work: Option<WorkObligation>,
+    capacity: Option<ReservationObligation>,
     panic: Option<PanicPayload>,
     body_exited: bool,
     captures_exited: bool,
@@ -367,20 +367,23 @@ impl<T: Send + 'static> ContinuationSlot<T> {
     }
     /// Positive evidence supplied by the original unused holder, after its body
     /// and captures really exited. Token Drop deliberately cannot call this.
-    pub fn unused_role_exited(&self) -> Result<InvocationResult, ContinuationError> {
+    pub fn unused_holder_exited(&self) -> Result<InvocationResult, ContinuationError> {
         let work = {
             let mut state = self.0.state.lock().expect("continuation custody lock");
             if state.phase != ContinuationPhase::Unused {
                 return Err(ContinuationError::InvalidPhase(state.phase));
             }
             state.phase = ContinuationPhase::Running;
-            state.work.take().expect("original unused role work")
+            state
+                .work
+                .take()
+                .expect("original unused continuation work")
         };
         self.observe_actual_exit(work)
     }
     fn observe_actual_exit(
         &self,
-        mut work: WorkLease,
+        mut work: WorkObligation,
     ) -> Result<InvocationResult, ContinuationError> {
         let mut body_exited = false;
         let mut captures_exited = false;

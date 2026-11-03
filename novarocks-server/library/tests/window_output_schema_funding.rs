@@ -732,8 +732,8 @@ fn analytic_actual_private_host_and_original_builder_capture_separate_occurrence
 #[test]
 fn analytic_original_schema_actual_capacity_and_worker_stop_remain_nominal() {
     use novarocks_execution::runtime::{
-        fragment::ExecutionFailureCause, preparation_memory::PreparationMemoryRefusal,
-        preparation_metadata::PreparationMetadataFailure,
+        preparation_memory::PreparationMemoryRefusal,
+        preparation_metadata::PreparationMetadataFailure, task::ExecutionFailureCause,
     };
     use novarocks_native_adapter::backend_task_execution::node_test_support::PreparationStop;
     let _ = novarocks_server_application::memory_observation::snapshot();
@@ -792,10 +792,10 @@ fn analytic_original_schema_actual_capacity_and_worker_stop_remain_nominal() {
 #[test]
 fn analytic_original_schema_actual_occupied_capacity_retains_qualified_shortage() {
     use novarocks_execution::runtime::{
-        fragment::ExecutionFailureCause,
         kernel_memory::{KernelMemoryAdmission, KernelMemoryJournal, request_complete_operation},
         preparation_memory::PreparationMemoryRefusal,
         preparation_metadata::PreparationMetadataFailure,
+        task::ExecutionFailureCause,
     };
     let _ = novarocks_server_application::memory_observation::snapshot();
     const TOTAL: u64 = 2 << 20;

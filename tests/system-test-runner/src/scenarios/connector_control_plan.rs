@@ -23,7 +23,7 @@ use crate::scenarios::native_sql_controls::SelectedStatement;
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::{FromRow, Queryable};
 use novarocks_cluster_harness::{
-    QueryLifecycleStatementObservation, ServerHandle,
+    QueryLifecycleStatementObservation, TestClusterOwner,
     test_sessions::{ClusterTestSessionPlan, RoleLaunchReference, RoleSlot},
 };
 use novarocks_failpoint::session::DomainGrant;
@@ -44,10 +44,14 @@ use std::{
     time::Instant,
 };
 
-pub(super) const READER: &str = "reader-marker";
-pub(super) const GRPC: &str = "grpc-fragment";
-pub(super) const MATERIAL: &str = "catalog-materialization";
-pub(super) const LIFECYCLE: &str = "catalog-lifecycle";
+pub(super) const READER: &str =
+    novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker.as_str();
+pub(super) const GRPC: &str =
+    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str();
+pub(super) const MATERIAL: &str =
+    novarocks_failpoint::observation_marker::ObservationAction::CatalogMaterialization.as_str();
+pub(super) const LIFECYCLE: &str =
+    novarocks_failpoint::observation_marker::ObservationAction::CatalogLifecycle.as_str();
 pub(super) const HOLD: &str = "catalog-hold";
 pub(super) const FAILURE: &str = "catalog-failure";
 
@@ -435,7 +439,7 @@ pub(super) fn specs(name: &str) -> Result<(Vec<Spec>, bool, Vec<usize>)> {
                 ),
                 Spec::observed(simple(catalog, database, table), &[MATERIAL, LIFECYCLE]),
                 Spec::observed(simple(catalog, database, table), &[MATERIAL])
-                    .fault(1, super::ESTABLISH_CONTEXT_ACK_DROP),
+                    .fault(1, super::ESTABLISH_PARTICIPATION_ACK_DROP),
             ]
         }
         "connector/catalog-fe-restart-cache" => {
@@ -1004,7 +1008,10 @@ mod tests {
                 .iter()
                 .all(|(_, action)| matches!(*action, MATERIAL | LIFECYCLE))
         );
-        assert_eq!(specs[5].faults, vec![(1, "establish-context-ack-drop")]);
+        assert_eq!(
+            specs[5].faults,
+            vec![(1, "establish-participation-ack-drop")]
+        );
         assert!(
             specs[5]
                 .observations

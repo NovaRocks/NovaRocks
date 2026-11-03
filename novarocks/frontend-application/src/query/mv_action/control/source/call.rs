@@ -19,7 +19,7 @@
 use super::*;
 type MutationFuture = Pin<Box<dyn Future<Output = Result<(), ConnectorError>> + Send>>;
 pub(super) struct PublicationInput {
-    lease: ConnectorCatalogMutationLease,
+    mutation_session: ConnectorCatalogMutationSession,
     pub(super) operation: ConnectorCatalogMutationOperation,
     operation_id: ConnectorMutationOperationId,
     context: ConnectorRequestContext,
@@ -65,13 +65,13 @@ impl CatalogCall {
     }
     pub(super) fn start(
         &self,
-        lease: ConnectorCatalogMutationLease,
+        mutation_session: ConnectorCatalogMutationSession,
         operation_id: ConnectorMutationOperationId,
         operation: ConnectorCatalogMutationOperation,
         context: ConnectorRequestContext,
     ) {
         let original = Arc::new(PublicationInput {
-            lease,
+            mutation_session,
             operation_id,
             operation,
             context,
@@ -83,7 +83,7 @@ impl CatalogCall {
         let receiving = self.receiving.clone();
         let future = Box::pin(async move {
             crate::connector::mutation::dispatch_catalog_mutation_once_with_lease_async_in(
-                &original.lease,
+                &original.mutation_session,
                 original.operation_id,
                 original.operation.clone(),
                 original.context.clone(),

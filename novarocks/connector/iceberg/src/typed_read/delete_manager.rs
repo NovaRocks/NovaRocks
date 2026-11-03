@@ -1152,8 +1152,8 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use novarocks_fs::{
-        FileCancellation, FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime,
-        TokioFileTaskSpawner,
+        FileCancellation, FileIoRuntime, FileIoSpawner, FsAccessResolver, TokioFileIoRuntime,
+        TokioFileIoSpawner,
     };
     use novarocks_spi::connector::read_stack::{SplitWeight, TupleDomain};
     use parquet::arrow::ArrowWriter;
@@ -1182,10 +1182,10 @@ mod tests {
             let runtime = tokio::runtime::Runtime::new().expect("build Tokio runtime");
             let file_runtime: StdArc<dyn FileIoRuntime> =
                 StdArc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
-            let task_spawner: StdArc<dyn FileTaskSpawner> =
-                StdArc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+            let io_spawner: StdArc<dyn FileIoSpawner> =
+                StdArc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
             let binding =
-                IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, task_spawner);
+                IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, io_spawner);
             let context = binding
                 .file_read_context(
                     FileCancellation::new(),
@@ -2599,21 +2599,23 @@ mod tests {
         finished: Arc<tokio::sync::Notify>,
         loads: AtomicUsize,
     }
-    impl FileTaskSpawner for NamedArtifactGate {
+    impl FileIoSpawner for NamedArtifactGate {
         fn spawn(
             &self,
-            task: novarocks_fs::FileTaskFuture,
-        ) -> novarocks_fs::FileResult<novarocks_fs::FileTask> {
+            task: novarocks_fs::FileIoFuture,
+        ) -> novarocks_fs::FileResult<novarocks_fs::FileIoJob> {
             self.loads.fetch_add(1, Ordering::Relaxed);
             let barrier = self.release.clone();
             let started = self.started.clone();
             let finished = self.finished.clone();
-            Ok(novarocks_fs::FileTask::new(self.handle.spawn(async move {
-                started.notify_one();
-                barrier.notified().await;
-                task.await;
-                finished.notify_one();
-            })))
+            Ok(novarocks_fs::FileIoJob::new(self.handle.spawn(
+                async move {
+                    started.notify_one();
+                    barrier.notified().await;
+                    task.await;
+                    finished.notify_one();
+                },
+            )))
         }
         fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
             self.handle.spawn_blocking(job);
@@ -2674,7 +2676,7 @@ mod tests {
                 cancellation: FileCancellation::new(),
                 deadline: Some(Instant::now() + Duration::from_secs(60)),
                 runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-                task_spawner: gate.clone(),
+                io_spawner: gate.clone(),
                 range: Some(range),
             };
             Self {

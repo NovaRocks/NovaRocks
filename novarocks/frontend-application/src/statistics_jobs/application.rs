@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorControlPlanningLease, ConnectorControlRegistry,
+    CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorControlPlanningPin, ConnectorControlRegistry,
     ConnectorError, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
     ConnectorTableObjectBinding, ConnectorTableObjectBindingFailure,
     ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
@@ -83,7 +83,7 @@ pub struct StatisticsAttemptRequest {
 }
 
 /// Identity-gated current binding retained only within one attempt and its
-/// planning lease lifetime. It must never be retained by the process runtime.
+/// planning pin lifetime. It must never be retained by the process runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsAttemptBinding {
     pub table: novarocks_spi::connector::ConnectorTableHandle,
@@ -93,19 +93,19 @@ pub struct StatisticsAttemptBinding {
 
 /// The frontend captures a logical ANALYZE target before job creation.
 pub trait StatisticsTargetResolver: Send + Sync {
-    fn planning_lease(
+    fn planning_pin(
         &self,
         _target: &StatisticsTableTarget,
-    ) -> Result<ConnectorControlPlanningLease, StatisticsApplicationError> {
+    ) -> Result<ConnectorControlPlanningPin, StatisticsApplicationError> {
         Err(StatisticsApplicationError::new(
-            "statistics capture has no governed planning lease",
+            "statistics capture has no governed planning pin",
         ))
     }
     fn capture_table_object_async<'a>(
         &'a self,
         _target: &'a StatisticsTableTarget,
         _context: ConnectorRequestContext,
-        _lease: &'a ConnectorControlPlanningLease,
+        _lease: &'a ConnectorControlPlanningPin,
         _cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
     ) -> std::pin::Pin<
         Box<
@@ -134,10 +134,10 @@ impl ConnectorStatisticsTargetResolver {
 }
 
 impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
-    fn planning_lease(
+    fn planning_pin(
         &self,
         target: &StatisticsTableTarget,
-    ) -> Result<ConnectorControlPlanningLease, StatisticsApplicationError> {
+    ) -> Result<ConnectorControlPlanningPin, StatisticsApplicationError> {
         let id = ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         self.controls
@@ -148,7 +148,7 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
         &'a self,
         target: &'a StatisticsTableTarget,
         context: ConnectorRequestContext,
-        lease: &'a ConnectorControlPlanningLease,
+        lease: &'a ConnectorControlPlanningPin,
         cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
     ) -> std::pin::Pin<
         Box<
@@ -217,7 +217,7 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
 }
 
 pub(crate) async fn rebind_table_object_async(
-    lease: &ConnectorControlPlanningLease,
+    lease: &ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     request: &StatisticsAttemptRequest,
     cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,

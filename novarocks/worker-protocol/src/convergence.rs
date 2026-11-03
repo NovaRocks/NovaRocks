@@ -51,7 +51,7 @@ impl TaskConvergenceSnapshot {
         self.output_released
     }
 
-    /// The original Context now owns retained output; no physical release is implied.
+    /// The original Participation now owns retained output; no physical release is implied.
     pub const fn output_transferred(self) -> bool {
         self.output_transferred
     }

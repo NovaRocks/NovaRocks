@@ -167,13 +167,13 @@ fn write_relation_contracts_are_versioned_append_only_fields() {
 /// rather than left declared with no carrier: a `Loading` state nothing can
 /// send is a second, unreachable catalog authority.
 #[test]
-fn the_catalog_contribution_is_carried_only_by_a_query_context() {
+fn the_catalog_contribution_is_carried_only_by_a_participation() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
 
     for (message_name, field_number) in [
-        ("novarocks.EstablishQueryContextRequest", 2u32),
-        ("novarocks.QueryContextCatalogDomain", 2),
+        ("novarocks.EstablishParticipationRequest", 2u32),
+        ("novarocks.ParticipationCatalogDomain", 2),
     ] {
         let message = pool
             .get_message_by_name(message_name)
@@ -231,7 +231,7 @@ fn native_compatibility_identity_fields_are_exact_and_append_only() {
             5,
         ),
         (
-            "novarocks.EstablishQueryContextRequest",
+            "novarocks.EstablishParticipationRequest",
             "native_compatibility_id",
             7,
         ),
@@ -887,7 +887,7 @@ fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
         .get_message_by_name("novarocks.CreationMetadata")
         .expect("CreationMetadata descriptor");
     for (name, tag, type_name) in [
-        ("query_context", 1, "novarocks.QueryContextRef"),
+        ("participation", 1, "novarocks.ParticipationRef"),
         ("descriptor", 2, "novarocks.TaskDescriptor"),
         ("initial_domains", 4, "novarocks.TaskDomainUpdate"),
         ("assignment", 5, "novarocks.TaskAssignment"),
@@ -935,7 +935,7 @@ fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
     );
     for absent in [
         "query_id",
-        "fragment_instance_id",
+        "task_key",
         "query_options",
         "per_exch_num_senders",
     ] {
@@ -1035,8 +1035,8 @@ fn small_control_method_has_a_closed_input_schema() {
     for (name, tag) in [
         ("renew_lease", 2),
         ("cancel_task", 3),
-        ("abort_query_context", 4),
-        ("release_query_context", 5),
+        ("abort_participation", 4),
+        ("release_participation", 5),
     ] {
         assert_eq!(control.get_field_by_name(name).expect(name).number(), tag);
     }
@@ -1072,7 +1072,7 @@ fn the_task_protocol_separates_create_from_update_on_the_descriptor() {
         "a task is created from exactly one descriptor"
     );
     assert!(
-        metadata.get_field_by_name("query_context").is_some(),
+        metadata.get_field_by_name("participation").is_some(),
         "creation metadata must address the query context of its own backend"
     );
 
@@ -1081,12 +1081,12 @@ fn the_task_protocol_separates_create_from_update_on_the_descriptor() {
     // contract rather than a naming convention.
     for message_name in [
         "novarocks.UpdateTaskRequest",
-        "novarocks.AdvanceQueryContextDomainRequest",
-        "novarocks.RenewQueryExecutionLeaseRequest",
-        "novarocks.EstablishQueryContextRequest",
+        "novarocks.AdvanceParticipationDomainRequest",
+        "novarocks.RenewParticipationLeaseRequest",
+        "novarocks.EstablishParticipationRequest",
         "novarocks.CancelTaskRequest",
-        "novarocks.AbortQueryContextRequest",
-        "novarocks.ReleaseQueryContextRequest",
+        "novarocks.AbortParticipationRequest",
+        "novarocks.ReleaseParticipationRequest",
     ] {
         let message = pool
             .get_message_by_name(message_name)
@@ -1112,7 +1112,7 @@ fn the_task_protocol_separates_create_from_update_on_the_descriptor() {
 /// Only an establish may create a query context, and the command set that can
 /// reach a context is closed.
 #[test]
-fn the_task_operation_and_query_context_command_sets_are_closed() {
+fn the_task_operation_and_participation_command_sets_are_closed() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
 
@@ -1123,12 +1123,12 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
             &[
                 "create_task",
                 "update_task",
-                "update_query_context",
+                "update_participation",
                 "cancel_task",
-                "abort_query_context",
-                "release_query_context",
-                "acquire_query_context_admission_ticket",
-                "quiesce_query_context",
+                "abort_participation",
+                "release_participation",
+                "acquire_participation_admission_ticket",
+                "quiesce_participation",
             ][..],
         ),
         (
@@ -1137,9 +1137,9 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
             &[
                 "renew_lease",
                 "cancel_task",
-                "abort_query_context",
-                "release_query_context",
-                "quiesce_query_context",
+                "abort_participation",
+                "release_participation",
+                "quiesce_participation",
                 "close_exchange_destinations",
             ][..],
         ),
@@ -1154,15 +1154,15 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
             &[
                 "create_task",
                 "update_task",
-                "query_context",
-                "release_query_context",
+                "participation",
+                "release_participation",
                 "cancel_task",
-                "query_context_admission_ticket",
-                "quiesce_query_context",
+                "participation_admission_ticket",
+                "quiesce_participation",
             ][..],
         ),
         (
-            "novarocks.UpdateQueryContextRequest",
+            "novarocks.UpdateParticipationRequest",
             "command",
             &["establish", "advance_domain", "renew_lease"][..],
         ),
@@ -1177,7 +1177,7 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
             ][..],
         ),
         (
-            "novarocks.QueryContextDomainUpdate",
+            "novarocks.ParticipationDomainUpdate",
             "domain",
             &["catalog_binding", "shared_dynamic_filter", "credential"][..],
         ),
@@ -1192,7 +1192,7 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
             &[
                 "task_status",
                 "task_gone",
-                "context_convergence",
+                "participation_convergence",
                 "task_convergence",
                 "quiesce",
                 "task_status_unchanged",
@@ -1213,7 +1213,7 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
             ][..],
         ),
         (
-            "novarocks.QueryContextDomainReceipt",
+            "novarocks.ParticipationDomainReceipt",
             "receipt",
             &["catalog_binding", "shared_dynamic_filter", "credential"][..],
         ),
@@ -1255,7 +1255,7 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
         .get_message_by_name("novarocks.SubscribeTaskStatusRequest")
         .expect("SubscribeTaskStatusRequest descriptor");
     let convergence_cursor = subscription
-        .get_field_by_name("context_convergence_cursor")
+        .get_field_by_name("participation_convergence_cursor")
         .expect("a status subscription must carry an optional context convergence cursor");
     assert_eq!(convergence_cursor.number(), 3);
     assert_eq!(
@@ -1264,7 +1264,7 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
             .as_message()
             .expect("context convergence cursor message")
             .full_name(),
-        "novarocks.QueryContextConvergenceCursor"
+        "novarocks.ParticipationConvergenceCursor"
     );
 }
 
@@ -1297,7 +1297,7 @@ fn the_task_exchange_topology_freezes_both_addresses() {
         );
         assert_eq!(
             message
-                .get_field_by_name("fragment_instance_id")
+                .get_field_by_name("task_key")
                 .expect("the kernel key")
                 .kind()
                 .as_message()
@@ -1460,7 +1460,7 @@ fn the_root_result_poll_is_addressed_by_task_identity() {
             .full_name(),
         "novarocks.TaskIdentity"
     );
-    assert!(request.get_field_by_name("finst_id").is_none());
+    assert!(request.get_field_by_name("task_key").is_none());
     for (name, number) in [
         ("profile_id", 2),
         ("output_kind", 3),
@@ -1514,8 +1514,8 @@ fn a_credential_domain_announces_scopes_and_carries_no_material() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
     let domain = pool
-        .get_message_by_name("novarocks.QueryContextCredentialDomain")
-        .expect("QueryContextCredentialDomain descriptor");
+        .get_message_by_name("novarocks.ParticipationCredentialDomain")
+        .expect("ParticipationCredentialDomain descriptor");
     assert!(
         domain
             .get_field_by_name("descriptors")
@@ -1545,15 +1545,18 @@ fn a_credential_domain_announces_scopes_and_carries_no_material() {
     assert!(domain.get_field_by_name("epoch").is_some());
 
     let receipt = pool
-        .get_message_by_name("novarocks.QueryContextCredentialReceipt")
-        .expect("QueryContextCredentialReceipt descriptor");
+        .get_message_by_name("novarocks.ParticipationCredentialReceipt")
+        .expect("ParticipationCredentialReceipt descriptor");
     let reported = receipt
         .fields()
         .map(|field| field.name().to_owned())
         .collect::<Vec<_>>();
     assert_eq!(
         reported,
-        vec!["lease_id".to_owned(), "accepted_epoch".to_owned()],
+        vec![
+            "credential_domain_id".to_owned(),
+            "accepted_epoch".to_owned()
+        ],
         "a credential receipt reports only an epoch, never material or a digest of it"
     );
 }
@@ -1672,10 +1675,10 @@ fn establish_installs_shared_facts_without_a_task_manifest_or_digest() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
     let establish = pool
-        .get_message_by_name("novarocks.EstablishQueryContextRequest")
-        .expect("EstablishQueryContextRequest descriptor");
+        .get_message_by_name("novarocks.EstablishParticipationRequest")
+        .expect("EstablishParticipationRequest descriptor");
     for required in [
-        "query_context",
+        "participation",
         "catalog_set",
         "initial_runtime_filter",
         "initial_credential",
@@ -1688,7 +1691,7 @@ fn establish_installs_shared_facts_without_a_task_manifest_or_digest() {
         );
     }
     for forbidden in [
-        "expected_fragment_instance_ids",
+        "expected_task_keys",
         "expected_task_identities",
         "task_set_digest",
         "init_digest",
@@ -1703,15 +1706,15 @@ fn establish_installs_shared_facts_without_a_task_manifest_or_digest() {
     }
 
     let release = pool
-        .get_message_by_name("novarocks.ReleaseQueryContextRequest")
-        .expect("ReleaseQueryContextRequest descriptor");
+        .get_message_by_name("novarocks.ReleaseParticipationRequest")
+        .expect("ReleaseParticipationRequest descriptor");
     let release_fields = release
         .fields()
         .map(|field| field.name().to_owned())
         .collect::<Vec<_>>();
     assert_eq!(
         release_fields,
-        vec!["query_context".to_owned()],
+        vec!["participation".to_owned()],
         "release is the frontend's closure statement, not a manifest"
     );
 }
@@ -1730,12 +1733,12 @@ fn admission_ticket_contract_is_exact_and_append_only() {
     assert!(matches!(nonce.kind(), prost_reflect::Kind::Bytes));
 
     let request = pool
-        .get_message_by_name("novarocks.AcquireQueryContextAdmissionTicketRequest")
+        .get_message_by_name("novarocks.AcquireParticipationAdmissionTicketRequest")
         .expect("admission ticket request descriptor");
     assert_eq!(request.fields().count(), 4);
     assert_eq!(
         request
-            .get_field_by_name("query_context")
+            .get_field_by_name("participation")
             .expect("query context")
             .number(),
         1
@@ -1765,18 +1768,18 @@ fn admission_ticket_contract_is_exact_and_append_only() {
     ));
 
     let ack = pool
-        .get_message_by_name("novarocks.QueryContextAdmissionTicketAck")
+        .get_message_by_name("novarocks.ParticipationAdmissionTicketAck")
         .expect("admission ticket acknowledgement descriptor");
     for (name, number) in [
         ("ticket_id", 1),
-        ("query_context", 2),
+        ("participation", 2),
         ("valid_for_millis", 3),
     ] {
         assert_eq!(ack.get_field_by_name(name).expect(name).number(), number);
     }
 
     let establish = pool
-        .get_message_by_name("novarocks.EstablishQueryContextRequest")
+        .get_message_by_name("novarocks.EstablishParticipationRequest")
         .expect("establish descriptor");
     assert_eq!(
         establish
@@ -1791,7 +1794,7 @@ fn admission_ticket_contract_is_exact_and_append_only() {
         .expect("task operation descriptor");
     assert_eq!(
         operation
-            .get_field_by_name("acquire_query_context_admission_ticket")
+            .get_field_by_name("acquire_participation_admission_ticket")
             .expect("admission ticket operation")
             .number(),
         8
@@ -1823,7 +1826,7 @@ fn admission_ticket_contract_is_exact_and_append_only() {
         .expect("task operation verdict descriptor");
     assert_eq!(
         verdict
-            .get_field_by_name("query_context_admission_ticket")
+            .get_field_by_name("participation_admission_ticket")
             .expect("admission ticket receipt")
             .number(),
         10

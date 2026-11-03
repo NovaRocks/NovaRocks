@@ -19,7 +19,9 @@
 //! the scope-failure gate; host I/O happens only after commit returns.
 
 use crate::{
-    driver::{ActorRegistration, ActorRuntime, DriverError, InputAuthor, PendingInputAuthor},
+    actor_turn::{
+        ActorRegistration, ActorRuntime, ActorTurnError, InputAuthor, PendingInputAuthor,
+    },
     sync::{Arc, Mutex, MutexGuard},
     transaction::ScopeHandle,
 };
@@ -150,8 +152,8 @@ impl<T> PublishedReply<T> {
     pub fn new_for_admitted_work<A: crate::actor::Actor>(
         runtime: &ActorRuntime<A>,
         registration: &ActorRegistration,
-        work: &crate::lease::WorkLease,
-    ) -> Result<Self, DriverError> {
+        work: &crate::obligation::WorkObligation,
+    ) -> Result<Self, ActorTurnError> {
         let binding = runtime.pending_input_author_for(registration, work)?;
         Ok(Self {
             owner: work.scope().clone(),
@@ -167,16 +169,16 @@ impl<T> PublishedReply<T> {
         &self,
         runtime: &ActorRuntime<A>,
         author: &InputAuthor,
-    ) -> Result<(), DriverError> {
+    ) -> Result<(), ActorTurnError> {
         runtime.validate_original_input_author(author)?;
         let mut cell = self.cell.lock().expect("published reply lock");
         if cell.phase != ReplyPhase::Empty || cell.value.is_some() {
-            return Err(DriverError::ReplyAlreadyCommitted);
+            return Err(ActorTurnError::ReplyAlreadyCommitted);
         }
         match &cell.binding {
             PublicationBinding::PendingInput(original) if original.matches(author) => {}
             PublicationBinding::Input(original) if original.same_binding(author) => return Ok(()),
-            _ => return Err(DriverError::InputAuthorMismatch),
+            _ => return Err(ActorTurnError::InputAuthorMismatch),
         }
         cell.binding = PublicationBinding::Input(author.clone());
         Ok(())
@@ -197,4 +199,4 @@ impl<T> PublishedReply<T> {
 }
 
 /// Failure-owner publication uses the original running cleanup work authority.
-pub use crate::driver::FailurePublicationSession;
+pub use crate::actor_turn::FailurePublicationSession;

@@ -25,8 +25,8 @@ use crate::{
         pipeline::operator_factory::OperatorFactory,
     },
     runtime::{
-        fragment::ExecutionFailureCause, mem_tracker::MemTracker, query_memory::QueryMemoryBinding,
-        scalar_memory::RuntimeScalarMemoryRefusal,
+        mem_tracker::MemTracker, query_memory::QueryMemoryBinding,
+        scalar_memory::RuntimeScalarMemoryRefusal, task::ExecutionFailureCause,
     },
 };
 use arrow::{
@@ -104,11 +104,11 @@ fn runtime_scalar_memory_actual_sql_window_target_uses_same_binding() {
             novarocks_types::identity::TaskId::new(1).unwrap(),
             novarocks_types::identity::BackendProcessId::new_v7(),
         );
-        let state = crate::runtime::fragment::runtime_state::build_runtime_state(
-            crate::runtime::fragment::runtime_state::RuntimeStateInputs {
+        let state = crate::runtime::task::runtime_state::build_runtime_state(
+            crate::runtime::task::runtime_state::RuntimeStateInputs {
                 query_options: None,
                 query_id: Some(execution.query_id()),
-                fragment_instance_id: None,
+                task_key: None,
                 backend_num: None,
                 mem_tracker: None,
                 runtime_filter_session: None,

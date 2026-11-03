@@ -27,17 +27,17 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 use std::sync::Arc;
 
 use super::driver::{PipelineDriver, PipelineDriverBindings};
-use super::fragment_context::FragmentContext;
 use super::instance::OperatorInstance;
 use super::operator::input_construction::{
     InputConstructionProfile, try_runtime_input_construction_factory,
 };
 use super::operator_factory::OperatorFactory;
+use super::task_context::TaskContext;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use tracing::debug;
@@ -97,14 +97,14 @@ impl Pipeline {
 
     pub(crate) fn instantiate_drivers(
         &self,
-        ctx: &Arc<FragmentContext>,
+        ctx: &Arc<TaskContext>,
     ) -> ExecutionResult<Vec<PipelineDriver>> {
         self.instantiate_drivers_with_schema_preparation(ctx, None)
     }
 
     pub(crate) fn instantiate_drivers_with_schema_preparation(
         &self,
-        ctx: &Arc<FragmentContext>,
+        ctx: &Arc<TaskContext>,
         mut schema_preparation: Option<
             &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
         >,
@@ -193,7 +193,7 @@ impl Pipeline {
                 // Activation may create asynchronous workers which retain the
                 // event sink. Install the fragment-owned sink while preparing
                 // so they cannot capture the default no-op recorder later.
-                op.set_fragment_event_sink(ctx.event_sink());
+                op.set_task_event_sink(ctx.event_sink());
                 let site = op
                     .compiled_schema_preparation_site()
                     .map(|(program, site)| (Arc::clone(program), site));
@@ -232,7 +232,7 @@ impl Pipeline {
                 driver_profiler,
                 operator_profiles,
                 std::sync::Arc::clone(ctx.runtime_state()),
-                ctx.fragment_instance_id(),
+                ctx.task_key(),
                 PipelineDriverBindings::new(ctx.event_sink())
                     .with_query_memory(ctx.runtime_state().query_memory().cloned()),
             ));
@@ -266,7 +266,7 @@ impl std::fmt::Display for PipelineShapeFailure {
 impl std::error::Error for PipelineShapeFailure {}
 impl novarocks_failure_contract::FailureProjection for PipelineShapeFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let reason = match self {
             Self::MultipleSource | Self::MultipleSink => ExecutionReason::PipelineMultipleEndpoint,
@@ -276,7 +276,7 @@ impl novarocks_failure_contract::FailureProjection for PipelineShapeFailure {
         FailureFact::new(FailureClass::Invariant, reason.reason())
     }
 }
-impl From<PipelineShapeFailure> for crate::runtime::fragment::ExecutionFailure {
+impl From<PipelineShapeFailure> for crate::runtime::task::ExecutionFailure {
     fn from(cause: PipelineShapeFailure) -> Self {
         Self::from_domain(cause)
     }

@@ -46,7 +46,8 @@ impl WriterDiagnostics {
             // lock may remain held across this callback.
             let fields = sample();
             self.observer.observe(&format!(
-                "NOVAROCKS_WRITER_DIAGNOSTIC event={event} task={} {fields}",
+                "{} event={event} task={} {fields}",
+                novarocks_failpoint::observation_marker::WRITER_DIAGNOSTIC,
                 self.task
             ));
         }

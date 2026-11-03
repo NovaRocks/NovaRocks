@@ -30,8 +30,8 @@ use crate::query_execution::{
         refresh_explain::MvExplainPreparationInput,
         refresh_preparation::{
             async_original::{MvRefreshPreparationOriginal, MvRefreshPreparationOutput},
-            driver::{MvRefreshTurnCustody, MvTurnFailure},
             io_gate::{MvRefreshPreparationIo, MvRefreshPreparationServices},
+            turn_custody::{MvRefreshTurnCustody, MvTurnFailure},
         },
     },
 };

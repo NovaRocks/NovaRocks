@@ -1727,7 +1727,7 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(
                 executor.handle().clone(),
             )),
-            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+            Arc::new(novarocks_fs::TokioFileIoSpawner::new(
                 executor.handle().clone(),
             )),
         );
@@ -1948,7 +1948,7 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(
                 executor.handle().clone(),
             )),
-            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+            Arc::new(novarocks_fs::TokioFileIoSpawner::new(
                 executor.handle().clone(),
             )),
         );
@@ -2152,7 +2152,7 @@ mod evidence_tests {
             None,
             novarocks_fs::FsAccessResolver::new(),
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
-            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle)),
+            Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle)),
         )
         .for_request(context.clone());
         crate::catalog::admission_test_support::publish_catalog_with_document(
@@ -2445,7 +2445,7 @@ mod evidence_tests {
     async fn ordinary_loads_share_novarocks_decoding_in_static_and_vended_modes() {
         use crate::catalog::SnapshotLoading;
         use crate::rest_protocol::endpoints::RestEndpoints;
-        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
         for mode in [
             RestAccessDelegationMode::Static,
             RestAccessDelegationMode::Vended,
@@ -2478,7 +2478,7 @@ mod evidence_tests {
                     None,
                     FsAccessResolver::new(),
                     Arc::new(TokioFileIoRuntime::new(handle.clone())),
-                    Arc::new(TokioFileTaskSpawner::new(handle)),
+                    Arc::new(TokioFileIoSpawner::new(handle)),
                 );
                 Arc::new(RestEndpoints::new(
                     Arc::new(properties),

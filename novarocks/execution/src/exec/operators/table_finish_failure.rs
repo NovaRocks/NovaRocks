@@ -17,7 +17,7 @@
 
 //! TableFinish authors only its own protocol/shape refusals. Connector,
 //! memory, type and Chunk causes are forwarded without diagnostic conversion.
-use crate::runtime::fragment::{ExecutionFailure, ExecutionReason};
+use crate::runtime::task::{ExecutionFailure, ExecutionReason};
 use novarocks_failure_contract::{
     BoundedDetail, FailureClass, FailureFact, FailureProjection, RepresentationBoundary,
     RepresentationFacts, RepresentationLayout, ResourceDimension, ResourceFacts, ResourceScope,

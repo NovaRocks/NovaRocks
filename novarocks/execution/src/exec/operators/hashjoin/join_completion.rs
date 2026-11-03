@@ -26,8 +26,8 @@ use crate::{
         pipeline::operator::{ConstructionFailure, InputConstructionOwner},
     },
     runtime::{
-        fragment::{ExecutionFailure, ExecutionResult},
         observable::Observable,
+        task::{ExecutionFailure, ExecutionResult},
     },
 };
 use novarocks_functions::KernelEvaluationControl;

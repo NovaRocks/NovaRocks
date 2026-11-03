@@ -160,7 +160,7 @@ fn idle_snapshot(
                 "preparing_tasks",
                 "preparing_bytes",
                 "requests",
-                "contexts_with_execution_custody",
+                "participations_with_execution_custody",
                 "root_producers_running",
                 "root_data_positions",
                 "root_payload_bytes",
@@ -168,7 +168,7 @@ fn idle_snapshot(
                 "root_deliveries",
                 "root_retained_reservations",
                 "root_metadata_holders",
-                "context_records",
+                "participation_records",
                 "root_channels",
                 "root_metadata_bytes",
             ] {
@@ -179,7 +179,7 @@ fn idle_snapshot(
                 )?;
                 if !matches!(
                     resource,
-                    "context_records" | "root_channels" | "root_metadata_bytes"
+                    "participation_records" | "root_channels" | "root_metadata_bytes"
                 ) {
                     idle &= used == 0;
                 }

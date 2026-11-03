@@ -18,8 +18,8 @@
 #![cfg(not(loom))]
 
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, DriverError},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::{ActorRuntime, ActorTurnError},
     transaction::RuntimeLedger,
 };
 use novarocks_control_runtime_core::{
@@ -51,13 +51,13 @@ impl Actor for Recorder {
     fn timer_input(_: Tick) -> u64 {
         unreachable!("no deadline")
     }
-    fn handle(&mut self, _: Tick, _: InputEnvelope, value: u64, _: &mut StepContext<'_, ()>) {
+    fn handle(&mut self, _: Tick, _: InputEnvelope, value: u64, _: &mut ActorStep<'_, ()>) {
         self.0.push(value);
     }
     fn next_deadline(&self) -> Option<Tick> {
         None
     }
-    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {
         unreachable!()
     }
 }
@@ -89,18 +89,18 @@ fn one_actor_closes_new_positions_but_drains_both_prepaid_input_kinds_before_sea
     let mut role = runtime
         .reserve_input(actor(), peer, InputClass::Lifecycle)
         .unwrap()
-        .into_role()
+        .into_standing_input()
         .unwrap();
     runtime.close_actor_admission(actor()).unwrap();
     assert_eq!(
         runtime
             .reserve_input(actor(), peer, InputClass::Ordinary)
             .err(),
-        Some(DriverError::Closed)
+        Some(ActorTurnError::Closed)
     );
     assert_eq!(
         runtime.seal_actor(actor()),
-        Err(DriverError::ActorNotRetired)
+        Err(ActorTurnError::ActorNotRetired)
     );
     let input = original.fill(1).unwrap();
     let lifecycle = role.fill(2).unwrap();
@@ -152,22 +152,22 @@ impl Actor for PausedTimer {
             state = pause.1.wait(state).unwrap();
         }
     }
-    fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut StepContext<'_, ()>) {
+    fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut ActorStep<'_, ()>) {
         panic!("a retired timer cannot execute");
     }
     fn next_deadline(&self) -> Option<Tick> {
         Some(Tick(1))
     }
-    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {
         panic!("retirement cannot fail a healthy owner");
     }
 }
 struct TimerThread {
-    handle: Option<std::thread::JoinHandle<Result<usize, DriverError>>>,
+    handle: Option<std::thread::JoinHandle<Result<usize, ActorTurnError>>>,
     pause: Arc<(Mutex<Pause>, Condvar)>,
 }
 impl TimerThread {
-    fn release(&mut self) -> std::thread::Result<Result<usize, DriverError>> {
+    fn release(&mut self) -> std::thread::Result<Result<usize, ActorTurnError>> {
         self.pause.0.lock().unwrap().released = true;
         self.pause.1.notify_all();
         self.handle.take().unwrap().join()

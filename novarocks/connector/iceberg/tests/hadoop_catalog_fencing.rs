@@ -31,7 +31,7 @@ use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 use novarocks_connector_iceberg::iceberg::{Catalog, TableIdent};
 use novarocks_connector_iceberg::novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreConfig, ObjectStoreProviderPool,
-    ObjectStoreSecretMaterial, SecretValue, TokioFileIoRuntime, TokioFileTaskSpawner,
+    ObjectStoreSecretMaterial, SecretValue, TokioFileIoRuntime, TokioFileIoSpawner,
 };
 use novarocks_connector_iceberg::resources::IcebergMetadataResources;
 use novarocks_spi::connector::{
@@ -570,7 +570,7 @@ fn catalog_binding(config: &IcebergCatalogConfiguration) -> IcebergReadBinding {
         config.object_store_config.clone(),
         FsAccessResolver::new(),
         Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-        Arc::new(TokioFileTaskSpawner::new(runtime)),
+        Arc::new(TokioFileIoSpawner::new(runtime)),
     )
 }
 
@@ -692,7 +692,7 @@ fn child_control(
         Arc::new(ObjectStoreProviderPool::new(Default::default()).expect("child provider pool")),
         FsAccessResolver::new(),
         Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-        Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
     );
     let planning_binding = IcebergReadBinding::with_metadata_credential_resolver(
         resources,

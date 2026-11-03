@@ -21,14 +21,14 @@
 //! - Tracks completion and terminal error state for client-side result retrieval.
 //!
 //! Key exported interfaces:
-//! - Types: `ResultSinkHandle`, `ResultSinkFactory`.
+//! - Types: `ResultSinkBuffer`, `ResultSinkFactory`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 use std::sync::{Arc, Mutex};
 
@@ -37,19 +37,21 @@ use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{SinkKernel, SinkStep, Transform},
     step::NextStep,
-    step_context::StepContext,
 };
 
 #[derive(Clone)]
-/// Shared handle that stores buffered result chunks and terminal status for client fetch.
+/// Shared buffer of retained result chunks. Cloning shares the same buffer
+/// and original chunk charges. Taking chunks transfers their ownership; the
+/// final buffer owner drops any remaining chunks.
 #[allow(
     dead_code,
     reason = "Result-sink types remain available for embedded execution integration tests."
 )]
-pub struct ResultSinkHandle {
+pub struct ResultSinkBuffer {
     inner: Arc<Mutex<Vec<Chunk>>>,
 }
 
@@ -57,7 +59,7 @@ pub struct ResultSinkHandle {
     dead_code,
     reason = "Result-sink handle helpers remain available for embedded execution integration tests."
 )]
-impl ResultSinkHandle {
+impl ResultSinkBuffer {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Vec::new())),
@@ -70,7 +72,7 @@ impl ResultSinkHandle {
     }
 }
 
-impl Default for ResultSinkHandle {
+impl Default for ResultSinkBuffer {
     fn default() -> Self {
         Self::new()
     }
@@ -83,7 +85,7 @@ impl Default for ResultSinkHandle {
 )]
 pub struct ResultSinkFactory {
     name: String,
-    handle: ResultSinkHandle,
+    handle: ResultSinkBuffer,
 }
 
 #[allow(
@@ -91,11 +93,11 @@ pub struct ResultSinkFactory {
     reason = "Result-sink factory remains available for embedded execution integration tests."
 )]
 impl ResultSinkFactory {
-    pub fn new(handle: ResultSinkHandle) -> Self {
+    pub fn new(handle: ResultSinkBuffer) -> Self {
         Self::new_with_plan_node_id(handle, None)
     }
 
-    pub fn new_with_plan_node_id(handle: ResultSinkHandle, plan_node_id: Option<i32>) -> Self {
+    pub fn new_with_plan_node_id(handle: ResultSinkBuffer, plan_node_id: Option<i32>) -> Self {
         let plan_node_id = match plan_node_id {
             Some(id) if id >= 0 => id,
             _ => -1,
@@ -128,7 +130,7 @@ impl OperatorFactory for ResultSinkFactory {
 )]
 struct ResultSinkOperator {
     name: String,
-    handle: ResultSinkHandle,
+    handle: ResultSinkBuffer,
 }
 
 impl OperatorLifecycle for ResultSinkOperator {
@@ -140,7 +142,7 @@ impl InputEncodingPolicy for ResultSinkOperator {}
 impl SinkKernel for ResultSinkOperator {
     fn consume(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<SinkStep> {
         let chunk = input.into_uncovered_chunk()?;

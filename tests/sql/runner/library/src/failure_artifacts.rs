@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cluster::{ServerFailureLogSources, ServerHandle};
+use crate::cluster::{ServerFailureLogSources, TestClusterOwner};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -348,34 +348,34 @@ impl FailureArtifactRecorder {
 
     pub(crate) fn persist_case_failure(
         &self,
-        server_handle: &Mutex<Box<dyn ServerHandle>>,
+        cluster_owner: &Mutex<Box<dyn TestClusterOwner>>,
         suite: &str,
         case_id: &str,
         step_number: Option<usize>,
     ) -> Result<Option<PathBuf>> {
         let prefix = case_artifact_name_prefix(&self.context.lane, suite, case_id, step_number);
-        self.persist_claimed(server_handle, SnapshotSlot::FirstCausal, prefix)
+        self.persist_claimed(cluster_owner, SnapshotSlot::FirstCausal, prefix)
     }
 
     pub(crate) fn persist_suite_failure(
         &self,
-        server_handle: &Mutex<Box<dyn ServerHandle>>,
+        cluster_owner: &Mutex<Box<dyn TestClusterOwner>>,
         suite: &str,
         phase: &str,
     ) -> Result<Option<PathBuf>> {
         let prefix = suite_artifact_name_prefix(&self.context.lane, suite, phase);
-        self.persist_claimed(server_handle, SnapshotSlot::FirstCausal, prefix)
+        self.persist_claimed(cluster_owner, SnapshotSlot::FirstCausal, prefix)
     }
 
     pub(crate) fn persist_run_failure(
         &self,
-        server_handle: &Mutex<Box<dyn ServerHandle>>,
+        cluster_owner: &Mutex<Box<dyn TestClusterOwner>>,
     ) -> Result<Option<PathBuf>> {
         let prefix = format!(
             "{}-terminal",
             artifact_name_prefix(&self.context.lane, &self.context.suites)
         );
-        self.persist_claimed(server_handle, SnapshotSlot::Terminal, prefix)
+        self.persist_claimed(cluster_owner, SnapshotSlot::Terminal, prefix)
     }
 
     /// Captures the terminal candidate while process logs still exist, without
@@ -383,9 +383,9 @@ impl FailureArtifactRecorder {
     /// this bounded value; a shutdown failure can persist it afterwards.
     pub(crate) fn stage_run_failure(
         &self,
-        server_handle: &Mutex<Box<dyn ServerHandle>>,
+        cluster_owner: &Mutex<Box<dyn TestClusterOwner>>,
     ) -> Result<Option<StagedRunFailure>> {
-        detach_failure_log_sources(server_handle)?
+        detach_failure_log_sources(cluster_owner)?
             .map(|sources| {
                 capture_failure_log_sources(sources, SnapshotSlot::Terminal)
                     .map(|captured| StagedRunFailure { captured })
@@ -418,7 +418,7 @@ impl FailureArtifactRecorder {
 
     fn persist_claimed(
         &self,
-        server_handle: &Mutex<Box<dyn ServerHandle>>,
+        cluster_owner: &Mutex<Box<dyn TestClusterOwner>>,
         slot: SnapshotSlot,
         prefix: String,
     ) -> Result<Option<PathBuf>> {
@@ -429,7 +429,7 @@ impl FailureArtifactRecorder {
         // The server lock protects only path/Arc cloning and bounded history
         // tails. Durable-log reads, redaction, file creation, writes, and syncs
         // all happen after the global handle is free.
-        let result = detach_failure_log_sources(server_handle)
+        let result = detach_failure_log_sources(cluster_owner)
             .and_then(|sources| {
                 sources
                     .map(|sources| capture_failure_log_sources(sources, slot))
@@ -633,7 +633,7 @@ impl Drop for PendingArtifactDir {
 
 #[cfg(test)]
 fn persist_cross_process_failure_logs(
-    server: &dyn ServerHandle,
+    server: &dyn TestClusterOwner,
     context: &FailureArtifactContext,
 ) -> Result<Option<PathBuf>> {
     capture_cross_process_failure_logs(server, SnapshotSlot::FirstCausal)?
@@ -649,7 +649,7 @@ fn persist_cross_process_failure_logs(
 
 #[cfg(test)]
 fn capture_cross_process_failure_logs(
-    server: &dyn ServerHandle,
+    server: &dyn TestClusterOwner,
     slot: SnapshotSlot,
 ) -> Result<Option<CapturedFailureLogs>> {
     server
@@ -659,9 +659,9 @@ fn capture_cross_process_failure_logs(
 }
 
 fn detach_failure_log_sources(
-    server_handle: &Mutex<Box<dyn ServerHandle>>,
+    cluster_owner: &Mutex<Box<dyn TestClusterOwner>>,
 ) -> Result<Option<ServerFailureLogSources>> {
-    match server_handle.lock() {
+    match cluster_owner.lock() {
         Ok(server) => server
             .failure_log_sources(MAX_CAPTURED_BACKEND_LOGS, MAX_PROCESS_LOG_TAIL_BYTES)
             .context("detach cross-process failure log sources"),
@@ -847,7 +847,7 @@ mod tests {
         be_logs: Vec<String>,
     }
 
-    impl ServerHandle for LogServer {
+    impl TestClusterOwner for LogServer {
         fn target_host(&self) -> Option<&str> {
             Some("127.0.0.1")
         }
@@ -1149,7 +1149,7 @@ mod tests {
     fn first_case_snapshot_is_unique_and_terminal_snapshot_is_independent() {
         let temp = TempDir::new().expect("temp dir");
         let recorder = FailureArtifactRecorder::new(context(temp.path()));
-        let server: Mutex<Box<dyn ServerHandle>> = Mutex::new(Box::new(LogServer {
+        let server: Mutex<Box<dyn TestClusterOwner>> = Mutex::new(Box::new(LogServer {
             fe_log: "FE at first failure\n".to_string(),
             be_logs: vec!["BE at first failure\n".to_string()],
         }));
@@ -1196,7 +1196,7 @@ mod tests {
     fn separate_failed_cases_share_one_first_causal_snapshot() {
         let temp = TempDir::new().expect("temp dir");
         let recorder = FailureArtifactRecorder::new(context(temp.path()));
-        let server: Mutex<Box<dyn ServerHandle>> = Mutex::new(Box::new(LogServer {
+        let server: Mutex<Box<dyn TestClusterOwner>> = Mutex::new(Box::new(LogServer {
             fe_log: "FE diagnostic\n".to_string(),
             be_logs: vec!["BE diagnostic\n".to_string()],
         }));
@@ -1443,7 +1443,7 @@ mod tests {
     fn suite_failure_can_claim_the_first_causal_slot() {
         let temp = TempDir::new().expect("temp dir");
         let recorder = FailureArtifactRecorder::new(context(temp.path()));
-        let server: Mutex<Box<dyn ServerHandle>> = Mutex::new(Box::new(LogServer {
+        let server: Mutex<Box<dyn TestClusterOwner>> = Mutex::new(Box::new(LogServer {
             fe_log: "FE init failure\n".to_string(),
             be_logs: vec!["BE init failure\n".to_string()],
         }));
@@ -1532,10 +1532,10 @@ mod tests {
     }
 
     // Keep these imports exercised as trait objects too: production owns the
-    // handle behind Arc<Mutex<Box<dyn ServerHandle>>>.
+    // handle behind Arc<Mutex<Box<dyn TestClusterOwner>>>.
     #[test]
     fn log_server_is_compatible_with_runner_handle_shape() {
-        let _: Arc<Mutex<Box<dyn ServerHandle>>> = Arc::new(Mutex::new(Box::new(LogServer {
+        let _: Arc<Mutex<Box<dyn TestClusterOwner>>> = Arc::new(Mutex::new(Box::new(LogServer {
             fe_log: String::new(),
             be_logs: vec![String::new()],
         })));

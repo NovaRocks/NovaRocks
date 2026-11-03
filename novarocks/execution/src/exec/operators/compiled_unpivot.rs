@@ -67,14 +67,14 @@ use crate::exec::pipeline::operator::{
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{Transform, TransformKernel},
     step::{NextStep, StepResult},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use novarocks_functions::array_projection::ArrayNormalizationStep;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure};
 use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
@@ -586,7 +586,7 @@ impl novarocks_failure_contract::FailureProjection for LiteralOffsetExtent {
         };
         FailureFact::new(
             FailureClass::Representation,
-            crate::runtime::fragment::ExecutionReason::UnpivotLiteralOffset.reason(),
+            crate::runtime::task::ExecutionReason::UnpivotLiteralOffset.reason(),
         )
         .with_representation(RepresentationFacts {
             boundary: if self.one_value > i32::MAX as u128 {
@@ -1073,7 +1073,7 @@ impl InputEncodingPolicy for CompiledUnpivotProcessor {}
 impl TransformKernel for CompiledUnpivotProcessor {
     fn apply(
         &mut self,
-        _ctx: &mut StepContext<'_>,
+        _ctx: &mut DriverStep<'_>,
         chunk: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         let chunk = chunk.into_uncovered_chunk()?;
@@ -1163,7 +1163,7 @@ impl TransformKernel for CompiledUnpivotProcessor {
         expansion.cursor = 0;
         Ok(StepResult::new(None, NextStep::Runnable, rows))
     }
-    fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         let factory = self
             .construction
             .as_ref()

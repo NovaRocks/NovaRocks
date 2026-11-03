@@ -31,9 +31,9 @@ use crate::{
             BulkMatch, BulkPresenceBatch, BulkProbeBatch, BulkWork, IndexPurpose, KeyInput,
             NullPolicy, PreparedKeyBatch,
         },
-        pipeline::step_context::TurnWork,
+        pipeline::driver_step::TurnWork,
     },
-    runtime::fragment::ExecutionResult,
+    runtime::task::ExecutionResult,
 };
 use novarocks_type_contract::ValueTypeStorageLifetime;
 use std::{ops::Range, sync::Arc};

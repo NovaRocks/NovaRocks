@@ -49,9 +49,9 @@ mod tests {
     use crate::exec::pipeline::operator::input_construction::{
         ConstructionFailure, InputConstructionFactory, try_runtime_input_construction_factory,
     };
-    use crate::runtime::fragment::{ExecutionFailure, PipelineOperation};
     use crate::runtime::mem_tracker::MemTracker;
     use crate::runtime::runtime_state::RuntimeErrorState;
+    use crate::runtime::task::{ExecutionFailure, PipelineOperation};
     use arrow::array::{ArrayData, DictionaryArray, Int32Array, ListArray};
     use arrow::buffer::{Buffer, NullBuffer};
     use arrow::datatypes::{Field, Int32Type};
@@ -82,7 +82,7 @@ mod tests {
         )
         .unwrap();
         Chunk::try_new_typed_with_columns_owned_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(
             Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap()),

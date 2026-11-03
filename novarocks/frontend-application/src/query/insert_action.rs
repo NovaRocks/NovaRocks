@@ -47,12 +47,17 @@ impl WriteStatementFamily for InsertFamily {
             ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
         };
         let context =
-            crate::connector::context_for_planning_lease(&input.lease, input.context.clone())?;
+            crate::connector::context_for_planning_pin(&input.planning_pin, input.context.clone())?;
         let table = crate::connector::schema_creation::load_frontend_table_async(
-            input.lease.binding().metadata().as_ref(),
+            input.planning_pin.binding().metadata().as_ref(),
             ConnectorTableRequest {
                 table: ConnectorTableIdentity {
-                    instance_id: input.lease.binding().descriptor().instance_id.clone(),
+                    instance_id: input
+                        .planning_pin
+                        .binding()
+                        .descriptor()
+                        .instance_id
+                        .clone(),
                     namespace: Arc::from(input.target.namespace.as_str()),
                     table: Arc::from(input.target.table.as_str()),
                 },
@@ -62,8 +67,8 @@ impl WriteStatementFamily for InsertFamily {
         )
         .await
         .map_err(|e| e.to_string())?;
-        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
-            input.kernel.mv_storage_observation().as_ref(), &input.lease,
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context_async(
+            input.kernel.mv_storage_observation().as_ref(), &input.planning_pin,
             input.kernel.mv_readiness().as_ref(), &input.target,
             crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert, context.clone(),
         ).await?;
@@ -93,7 +98,7 @@ impl WriteStatementFamily for InsertFamily {
             &input.reference,
             input.execution.clone(),
             &context,
-            input.lease.clone(),
+            input.planning_pin.clone(),
             Arc::clone(&input.begin_receiving),
         )
         .await
@@ -121,7 +126,7 @@ struct PreparationInput {
     reference: String,
     context: ConnectorRequestContext,
     execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     begin_receiving: Arc<WriteBeginReceiving>,
 }
 pub(crate) fn prepare(
@@ -149,13 +154,13 @@ pub(crate) fn prepare(
         input.context.session().current_catalog(),
         input.context.session().current_database(),
     )?;
-    let lease = crate::connector::acquire_metadata_planning_lease(
+    let planning_pin = crate::connector::acquire_metadata_planning_pin(
         kernel.connector_control().as_ref(),
         &target.catalog,
     )?;
     let stack = kernel
         .typed_connector_control()
-        .acquire_exact_write_stack(lease.control_runtime_id())
+        .acquire_exact_write_stack(planning_pin.control_runtime_id())
         .map_err(|e| e.to_string())?;
     let profile = stack.session().io_profile().map_err(|e| e.to_string())?;
     drop(stack);
@@ -205,7 +210,7 @@ pub(crate) fn prepare(
         reference,
         context: context.clone(),
         execution: input.context.execution().clone(),
-        lease,
+        planning_pin,
         begin_receiving: Arc::clone(&begin_receiving),
     });
     Ok(write_action::prepare::<InsertFamily>(WriteStatementStart {

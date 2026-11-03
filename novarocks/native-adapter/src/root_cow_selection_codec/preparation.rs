@@ -27,7 +27,7 @@ use novarocks_arrow_batch_codec::{
     BatchRecipe, CodecError, RecipeField, RepresentationPolicy, UnitObserver,
 };
 use novarocks_execution::runtime::{
-    fragment::{ExecutionFailure, ExecutionResult},
+    task::{ExecutionFailure, ExecutionResult},
     task_control::TaskExecutionControl,
 };
 use novarocks_local_program::StaticLayout;

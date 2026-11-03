@@ -26,7 +26,7 @@ use super::{
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use std::{
     path::Path,
     sync::{Arc, Mutex},

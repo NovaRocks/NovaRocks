@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn equality_delete_reader_ignores_bad_arrow_hint_and_binds_real_ids() {
         use novarocks_fs::{
-            FileCancellation, FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+            FileCancellation, FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner,
         };
         use parquet::arrow::ArrowWriter;
         let directory = tempfile::tempdir().unwrap();
@@ -428,7 +428,7 @@ mod tests {
             cancellation: FileCancellation::new(),
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            task_spawner: Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            io_spawner: Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
             range: None,
         };
         let spec = IcebergDeleteFileSpec {

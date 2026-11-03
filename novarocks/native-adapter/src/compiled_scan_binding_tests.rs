@@ -408,11 +408,11 @@ fn bind_filtered(
         recipe,
         consumers,
         layout,
-        &CompiledScanTask {
+        &CompiledScanTaskFacts {
             #[cfg(novarocks_dev_controls)]
             observation_controls: None,
             runtime,
-            fragment_instance_id: UniqueId::new(3, 4),
+            task_key: UniqueId::new(3, 4),
             query_options: &options,
             stop: ConnectorStopOwner::new().view(),
             runtime_filters: endpoints,
@@ -1126,8 +1126,8 @@ fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32)
 // another fake registry. Refusal must preserve the first exact capability.
 #[test]
 fn duplicate_read_registration_keeps_the_original_capability() {
-    use novarocks_worker::read_attempt::{ReadExecutionRegistrationError, TypedReadAttemptContext};
-    let context = TypedReadAttemptContext::new();
+    use novarocks_worker::read_attempt::{ReadExecutionRegistrationError, TaskReadBindingRegistry};
+    let context = TaskReadBindingRegistry::new();
     let first = test_support::installed_read_execution();
     let original = first.provider_factory();
     let second = test_support::installed_read_execution();

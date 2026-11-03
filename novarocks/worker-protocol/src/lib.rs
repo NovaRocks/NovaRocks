@@ -22,13 +22,13 @@
 
 pub mod admission;
 pub mod conclusion;
-pub mod context;
 pub mod control;
 pub mod creation;
 pub mod domain;
 pub mod inbound_cost;
 pub mod lifecycle;
 pub mod observation;
+pub mod participation;
 pub mod proposal_summary;
 pub mod retention;
 pub mod task;

@@ -74,7 +74,7 @@ pub fn authorize_inbound_frame(
     sender_ordinal: u32,
     sender_count: u32,
 ) -> Result<ExchangeSource, IngressRejection> {
-    if destination_kernel_key != descriptor.fragment_instance_id() {
+    if destination_kernel_key != descriptor.task_key() {
         return Err(IngressRejection::UnknownDestinationTask);
     }
     let node = descriptor

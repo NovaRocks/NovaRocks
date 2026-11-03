@@ -67,7 +67,7 @@ impl novarocks_execution::connector::ScheduledSplitFacts for ReceivedReadSplit {
 ///
 /// Bindings remain invisible until publish, so a split cannot resolve
 /// against a partially-decoded attempt.
-pub struct TypedReadAttemptContext {
+pub struct TaskReadBindingRegistry {
     entries: Mutex<BTreeMap<i32, ConnectorExecutionReadBinding>>,
     published: AtomicBool,
 }
@@ -106,13 +106,13 @@ impl novarocks_execution_contract::failure::FailureProjection for ReadExecutionR
     }
 }
 
-impl Default for TypedReadAttemptContext {
+impl Default for TaskReadBindingRegistry {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TypedReadAttemptContext {
+impl TaskReadBindingRegistry {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(BTreeMap::new()),

@@ -27,9 +27,9 @@ pub(crate) use storage::{SOURCE_SLOT_STORAGE, SourceSlotAdmission, SourceSlotSto
 
 use super::source_custody::{SourceCustody, SourcePermit};
 use crate::task_port::TaskPendingNotice;
-use novarocks_control_runtime::exit_role::ExitRolePhase;
+use novarocks_control_runtime::exit_custody::ExitCustodyPhase;
 use novarocks_control_runtime::{reported_work::ReportedWork, transaction::ScopeHandle};
-use novarocks_execution::runtime::{execution_health::ExecutionHealth, fragment::ExecutionFailure};
+use novarocks_execution::runtime::{execution_health::ExecutionHealth, task::ExecutionFailure};
 use novarocks_execution_contract::{RetainedTaskSource, TaskFailurePhase, TaskIdentity};
 use novarocks_worker_protocol::proposal_summary::SourceId;
 use std::{
@@ -863,7 +863,7 @@ impl Drop for SourcePositions {
         // Normal cleanup explicitly detaches original holders after actual
         // role retirement; dropping the bank cannot invent that observation.
         for position in self.positions.values() {
-            if position.custody.phase() == ExitRolePhase::Retired
+            if position.custody.phase() == ExitCustodyPhase::Retired
                 && position
                     .state
                     .lock()
@@ -1102,10 +1102,10 @@ mod tests {
     mod residency;
     mod slot_storage;
     use super::*;
-    use crate::task_completion_roles::AdmittedCompletionRole;
+    use crate::task_completion_set::AdmittedCompletionTransfer;
     use novarocks_control_runtime::{
         completion::ReportSlot,
-        lease::{ReservationBundle, WorkLease},
+        obligation::{ReservationObligation, WorkObligation},
         transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
     };
     use novarocks_control_runtime_core::{
@@ -1131,21 +1131,25 @@ mod tests {
     };
 
     // Each component role binds its actual original Header/report/capture.
-    fn reported(role: AdmittedCompletionRole) -> ReportedWork {
-        super::super::admitted_role::adopt_reported_work(role.work, role.capacity, role.report)
+    fn reported(role: AdmittedCompletionTransfer) -> ReportedWork {
+        super::super::reported_work_admission::adopt_reported_work(
+            role.work,
+            role.capacity,
+            role.report,
+        )
     }
-    fn model(role: AdmittedCompletionRole) -> SourceSlotAdmission {
+    fn model(role: AdmittedCompletionTransfer) -> SourceSlotAdmission {
         SourceSlotAdmission::from_admitted(reported(role)).unwrap()
     }
-    fn raw_reported(role: ReportedWork) -> AdmittedCompletionRole {
+    fn raw_reported(role: ReportedWork) -> AdmittedCompletionTransfer {
         let (work, capacity, report) = role.into_parts();
-        AdmittedCompletionRole {
+        AdmittedCompletionTransfer {
             work,
             capacity,
             report,
         }
     }
-    fn raw_admission(admission: SourceSlotAdmission) -> AdmittedCompletionRole {
+    fn raw_admission(admission: SourceSlotAdmission) -> AdmittedCompletionTransfer {
         raw_reported(admission.into_reported())
     }
     struct Pending(AtomicUsize);
@@ -1194,7 +1198,7 @@ mod tests {
         assert_eq!(initial.key.address(), key.address());
         assert_eq!(initial.source, None);
         assert_eq!(initial.phase, SourcePositionPhase::Available);
-        assert_eq!(initial.custody.phase(), ExitRolePhase::Admitted);
+        assert_eq!(initial.custody.phase(), ExitCustodyPhase::Admitted);
         f.bank().validate_unclaimed_pair(&pair).unwrap();
         assert_eq!(f.ledger.change_version(), version);
 
@@ -1208,7 +1212,7 @@ mod tests {
         assert_eq!(pending.source, Some(SourceId(123)));
         assert_eq!(pending.phase, SourcePositionPhase::Pending);
         assert_eq!(pending.custody.report().id(), initial.custody.report().id());
-        assert_eq!(pending.custody.phase(), ExitRolePhase::Admitted);
+        assert_eq!(pending.custody.phase(), ExitCustodyPhase::Admitted);
         assert_eq!(
             f.bank().validate_unclaimed_pair(&pair),
             Err(SourcePositionError::NotAvailable)
@@ -1228,8 +1232,8 @@ mod tests {
         task: TaskIdentity,
         ledger: RuntimeLedger,
         scope: ScopeHandle,
-        parent: WorkLease,
-        funding: ReservationBundle,
+        parent: WorkObligation,
+        funding: ReservationObligation,
         pending: Arc<Pending>,
         health: Arc<ExecutionHealth>,
         bank: Option<SourcePositions>,
@@ -1274,7 +1278,7 @@ mod tests {
         fn bank_mut(&mut self) -> &mut SourcePositions {
             self.bank.as_mut().unwrap()
         }
-        fn role(&self) -> AdmittedCompletionRole {
+        fn role(&self) -> AdmittedCompletionTransfer {
             let generation = self.scope.gates().unwrap().generation;
             let mut guard = self
                 .scope
@@ -1311,7 +1315,7 @@ mod tests {
             )
             .unwrap();
             let (work, capacity) = guard.bind(WorkKind::Cleanup).unwrap();
-            AdmittedCompletionRole {
+            AdmittedCompletionTransfer {
                 work,
                 capacity,
                 report,
@@ -1352,7 +1356,7 @@ mod tests {
             let key = self.key(id);
             self.bank_mut().take_for_disposal(&key)
         }
-        fn dispose_role(&self, role: AdmittedCompletionRole) {
+        fn dispose_role(&self, role: AdmittedCompletionTransfer) {
             let (custody, permit) = SourceCustody::from_admitted(
                 self.task,
                 role,
@@ -1367,7 +1371,7 @@ mod tests {
         }
         fn reap_generation(&mut self, id: SourcePositionId) -> ReapedPosition {
             let custody = self.bank().custody(id).unwrap();
-            if custody.phase() == ExitRolePhase::Retired {
+            if custody.phase() == ExitCustodyPhase::Retired {
                 return self
                     .bank()
                     .retirement_probe(id)
@@ -1375,7 +1379,7 @@ mod tests {
                     .observe_reaped()
                     .unwrap();
             }
-            assert_eq!(custody.phase(), ExitRolePhase::Exited);
+            assert_eq!(custody.phase(), ExitCustodyPhase::Exited);
             if self.bank().phase(id).unwrap() == SourcePositionPhase::Unused {
                 assert_unused_report(&custody);
             } else {
@@ -1539,7 +1543,7 @@ mod tests {
             claim
         };
         assert_eq!(f.ledger.change_version(), version);
-        assert_eq!(custody.phase(), ExitRolePhase::Admitted);
+        assert_eq!(custody.phase(), ExitCustodyPhase::Admitted);
         let bound = claim.bind(original);
         assert_eq!(bound.retained().cause().cause() as *const _, original_ptr);
         let version = f.ledger.change_version();
@@ -1625,14 +1629,14 @@ mod tests {
         let late = accepted.originating_failure().unwrap().clone();
         let custody = f.bank().custody(id).unwrap();
         drop(accepted);
-        assert_eq!(custody.phase(), ExitRolePhase::Started);
+        assert_eq!(custody.phase(), ExitCustodyPhase::Started);
         assert!(!custody.actual_exit_ready().unwrap());
         drop(early);
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
-        assert_eq!(custody.phase(), ExitRolePhase::Started);
+        assert_eq!(custody.phase(), ExitCustodyPhase::Started);
         drop(late);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
-        assert_eq!(custody.phase(), ExitRolePhase::Exited);
+        assert_eq!(custody.phase(), ExitCustodyPhase::Exited);
         f.finish();
     }
     #[test]
@@ -1706,7 +1710,7 @@ mod tests {
         let retained = f.take_for_disposal(id).unwrap();
         assert_eq!(retained.cause().cause() as *const _, pointer);
         assert!(custody.observe_pending_failure());
-        assert_eq!(custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(custody.phase(), ExitCustodyPhase::Unresolved);
         drop(retained);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
         assert!(!custody.try_retire().unwrap());
@@ -1727,12 +1731,12 @@ mod tests {
             );
         }
         assert_eq!(f.ledger.change_version(), version);
-        assert_eq!(custody.phase(), ExitRolePhase::Admitted);
+        assert_eq!(custody.phase(), ExitCustodyPhase::Admitted);
         assert!(f.ledger.unresolved_work().is_empty());
         assert!(f.health.failure().is_none());
         assert_eq!(f.pending.0.load(Ordering::SeqCst), 0);
         assert!(custody.observe_pending_failure());
-        assert_eq!(custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(custody.phase(), ExitCustodyPhase::Unresolved);
         assert_eq!(f.ledger.unresolved_work().len(), 1);
         assert!(!custody.try_retire().unwrap());
     }
@@ -1752,13 +1756,13 @@ mod tests {
         let _original_panic = ManuallyDrop::new(panic);
         assert!(cut.is_poisoned());
         assert_eq!(f.ledger.change_version(), version);
-        assert_eq!(custody.phase(), ExitRolePhase::Admitted);
+        assert_eq!(custody.phase(), ExitCustodyPhase::Admitted);
         assert!(f.ledger.unresolved_work().is_empty());
         assert!(f.health.failure().is_none());
         assert_eq!(f.pending.0.load(Ordering::SeqCst), 0);
         assert_eq!(f.bank().phase(id).unwrap(), SourcePositionPhase::Abandoned);
         assert!(custody.observe_pending_failure());
-        assert_eq!(custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(custody.phase(), ExitCustodyPhase::Unresolved);
         assert!(!custody.try_retire().unwrap());
     }
 
@@ -1775,7 +1779,7 @@ mod tests {
             drop(f.bank.take());
         }
         assert_eq!(f.ledger.change_version(), version);
-        assert_eq!(custody.phase(), ExitRolePhase::Admitted);
+        assert_eq!(custody.phase(), ExitCustodyPhase::Admitted);
         assert!(f.health.failure().is_none());
         assert_eq!(f.pending.0.load(Ordering::SeqCst), 0);
         let position = position
@@ -1789,7 +1793,7 @@ mod tests {
             }
         ));
         assert!(custody.observe_pending_failure());
-        assert_eq!(custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(custody.phase(), ExitCustodyPhase::Unresolved);
         assert!(!custody.reusable());
     }
     #[test]
@@ -1805,7 +1809,7 @@ mod tests {
         let version = f.ledger.change_version();
         custody.note_inventory_abandoned();
         assert_eq!(f.ledger.change_version(), version);
-        assert_eq!(custody.phase(), ExitRolePhase::Started);
+        assert_eq!(custody.phase(), ExitCustodyPhase::Started);
         let (error, bound) = f.bank_mut().install(bound).unwrap_err();
         assert_eq!(error, SourcePositionError::SourceUnresolved);
         assert!(!f.bank().is_ready(SourceId(1)));
@@ -1825,7 +1829,7 @@ mod tests {
         let _original_panic = ManuallyDrop::new(payload);
         let custody = f.bank().custody(id).unwrap();
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
-        assert_eq!(custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(custody.phase(), ExitCustodyPhase::Unresolved);
         assert!(custody.report().consume(core()).is_err());
         assert!(!custody.try_retire().unwrap());
         assert!(

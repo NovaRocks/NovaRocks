@@ -141,7 +141,7 @@ impl SourceKernel for Pages {
     fn control_observable(&self) -> Option<Arc<Observable>> {
         Some(self.owner.event.clone())
     }
-    fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn poll_output(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if !ctx.work().try_consume(1) {
             return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
@@ -171,7 +171,7 @@ impl InputEncodingPolicy for Collector {}
 impl SinkKernel for Collector {
     fn admission(
         &self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         _: &RawInput,
     ) -> ExecutionResult<Option<AdmissionNext>> {
         let observed_generation = self.event.generation();
@@ -186,7 +186,7 @@ impl SinkKernel for Collector {
     }
     fn consume(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<SinkStep> {
         let chunk = input.into_uncovered_chunk()?;
@@ -200,7 +200,7 @@ impl SinkKernel for Collector {
             .extend(column.values().iter().copied());
         Ok(SinkStep::new(NextStep::NeedInput, chunk.len() as u64))
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<SinkStep> {
         self.finishes.fetch_add(1, Ordering::AcqRel);
         Ok(SinkStep::new(NextStep::Finished, 0))
     }
@@ -341,7 +341,7 @@ impl StepOperator for Withdraw {
     fn control_observable(&self) -> Option<Arc<Observable>> {
         Some(self.event.clone())
     }
-    fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         if let Some(failure) = self.late_failure.lock().unwrap().clone() {
             return Err(failure);
         }
@@ -353,7 +353,7 @@ impl StepOperator for Withdraw {
             ControlStep::Active
         })
     }
-    fn try_push(&mut self, _: &mut StepContext<'_>, input: RawInput) -> InputResult {
+    fn try_push(&mut self, _: &mut DriverStep<'_>, input: RawInput) -> InputResult {
         let observed_generation = self.event.generation();
         InputResult::Deferred {
             input,
@@ -365,10 +365,10 @@ impl StepOperator for Withdraw {
             }),
         }
     }
-    fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         panic!("no input was accepted")
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
         panic!("withdrawal has no upstream EOS")
     }
 }

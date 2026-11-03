@@ -54,13 +54,13 @@ use crate::exec::pipeline::operator::{
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{Transform, TransformKernel},
     step::{NextStep, StepResult},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 /// One event's frozen facts, resolved to root indices and output ordinals.
 #[derive(Clone)]
@@ -180,7 +180,7 @@ impl CompiledChangeEventProcessorFactory {
                                 .borrowed()
                                 .same_physical_binding_ignoring_root_nullability_observed(
                                     target.borrowed(),
-                                    || Ok::<(), crate::runtime::fragment::ExecutionFailure>(()),
+                                    || Ok::<(), crate::runtime::task::ExecutionFailure>(()),
                                 )?
                         {
                             return Err(invalid(format!(
@@ -292,7 +292,7 @@ impl std::fmt::Display for ChangeEventFailure {
 impl std::error::Error for ChangeEventFailure {}
 impl novarocks_failure_contract::FailureProjection for ChangeEventFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         let reason = match self {
             Self::PredicateType { .. } => ExecutionReason::ChangeEventPredicateType,
             Self::AssignmentType { .. } => ExecutionReason::ChangeEventAssignmentType,
@@ -479,7 +479,7 @@ impl InputEncodingPolicy for CompiledChangeEventProcessor {}
 impl TransformKernel for CompiledChangeEventProcessor {
     fn apply(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         self.alive()?;
@@ -497,7 +497,7 @@ impl TransformKernel for CompiledChangeEventProcessor {
         };
         Ok(StepResult::new(None, next, rows))
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.alive()?;
         let Some(input) = self.input.as_ref() else {
             return Ok(StepResult::new(None, NextStep::NeedInput, 0));

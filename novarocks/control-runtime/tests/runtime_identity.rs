@@ -18,8 +18,8 @@
 #![cfg(not(loom))]
 
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
-    driver::ActorRuntime,
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::ActorRuntime,
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -36,11 +36,11 @@ impl Actor for Neutral {
     fn timer_input(_: Tick) {
         unreachable!("no timer in this fixture")
     }
-    fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut StepContext<'_, ()>) {}
+    fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut ActorStep<'_, ()>) {}
     fn next_deadline(&self) -> Option<Tick> {
         None
     }
-    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {
         unreachable!("no failing actor in this fixture")
     }
 }
@@ -116,13 +116,13 @@ impl Actor for FailingIdentityActor {
     fn timer_input(_: Tick) -> bool {
         unreachable!("no timer in this identity scenario")
     }
-    fn handle(&mut self, _: Tick, _: InputEnvelope, fail: bool, _: &mut StepContext<'_, ()>) {
+    fn handle(&mut self, _: Tick, _: InputEnvelope, fail: bool, _: &mut ActorStep<'_, ()>) {
         assert!(!fail, "the original identity owner fails");
     }
     fn next_deadline(&self) -> Option<Tick> {
         None
     }
-    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {
         // This actor owns no I/O, publication, callback or Work. Its original
         // neutral inputs and panic payload still require actual custody exit.
     }
@@ -130,7 +130,7 @@ impl Actor for FailingIdentityActor {
 
 #[test]
 fn failed_owner_input_handles_cannot_access_positions_in_a_replacement_actor() {
-    use novarocks_control_runtime::driver::DriverError;
+    use novarocks_control_runtime::actor_turn::ActorTurnError;
     use novarocks_control_runtime_core::mailbox::InputClass;
 
     let ledger = RuntimeLedger::new(ResourceVector::default());
@@ -162,7 +162,7 @@ fn failed_owner_input_handles_cannot_access_positions_in_a_replacement_actor() {
     let stale_fill = reserve();
     let stale_convert = reserve();
     let stale_revoke = reserve();
-    let mut stale_role = reserve().into_role().unwrap();
+    let mut stale_role = reserve().into_standing_input().unwrap();
     let failed = reserve().fill(true).unwrap();
     assert!(runtime.poll_one(Tick(1)).unwrap());
     assert!(runtime.snapshot(actor()).unwrap().failed);
@@ -173,7 +173,7 @@ fn failed_owner_input_handles_cannot_access_positions_in_a_replacement_actor() {
     // The failed source has actually ended. Its failure custodian closes the
     // lost role, while its old Rust handle can still be held by that custodian.
     runtime
-        .close_failed_role_after_exit(actor(), stale_role.id())
+        .close_failed_standing_input_after_exit(actor(), stale_role.id())
         .unwrap();
     runtime.retire_input(actor(), failed).unwrap();
     for input in runtime.pending_batches(actor(), None, 2).unwrap() {
@@ -199,7 +199,7 @@ fn failed_owner_input_handles_cannot_access_positions_in_a_replacement_actor() {
     let current_fill = reserve();
     let current_convert = reserve();
     let current_revoke = reserve();
-    let mut current_role = reserve().into_role().unwrap();
+    let mut current_role = reserve().into_standing_input().unwrap();
     assert_eq!(stale_fill.id(), current_fill.id());
     assert_eq!(stale_convert.id(), current_convert.id());
     assert_eq!(stale_revoke.id(), current_revoke.id());
@@ -207,31 +207,31 @@ fn failed_owner_input_handles_cannot_access_positions_in_a_replacement_actor() {
     let current = runtime.snapshot(actor()).unwrap();
     assert_eq!(
         stale_fill.fill(false).unwrap_err(),
-        (DriverError::EffectTicketOriginMismatch, false)
+        (ActorTurnError::EffectTicketOriginMismatch, false)
     );
     assert_eq!(
-        stale_convert.into_role().unwrap_err().0,
-        DriverError::EffectTicketOriginMismatch
+        stale_convert.into_standing_input().unwrap_err().0,
+        ActorTurnError::EffectTicketOriginMismatch
     );
     assert_eq!(
         stale_revoke.revoke_unused(),
-        Err(DriverError::EffectTicketOriginMismatch)
+        Err(ActorTurnError::EffectTicketOriginMismatch)
     );
     assert_eq!(
         stale_role.author().unwrap_err(),
-        DriverError::EffectTicketOriginMismatch
+        ActorTurnError::EffectTicketOriginMismatch
     );
     assert_eq!(
         stale_role.in_flight(),
-        Err(DriverError::EffectTicketOriginMismatch)
+        Err(ActorTurnError::EffectTicketOriginMismatch)
     );
     assert_eq!(
         stale_role.fill(false).unwrap_err(),
-        (DriverError::EffectTicketOriginMismatch, false)
+        (ActorTurnError::EffectTicketOriginMismatch, false)
     );
     assert_eq!(
         stale_role.close_after_exit(),
-        Err(DriverError::EffectTicketOriginMismatch)
+        Err(ActorTurnError::EffectTicketOriginMismatch)
     );
     assert_eq!(runtime.snapshot(actor()).unwrap(), current);
     current_fill.revoke_unused().unwrap();

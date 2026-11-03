@@ -21,7 +21,7 @@
 //! header and the remaining independent sources and reports.
 
 use super::*;
-use novarocks_control_runtime::exit_role::ExitRolePhase;
+use novarocks_control_runtime::exit_custody::ExitCustodyPhase;
 use novarocks_control_runtime::transaction::RuntimeLedger;
 use novarocks_control_runtime_core::{completion::Consumption, identity::ConsumerId};
 use std::mem::ManuallyDrop;
@@ -32,12 +32,12 @@ impl TaskHostRecord {
         ticket: &EffectTicket<WorkerAction>,
         host: Arc<dyn crate::TaskExecutionHost>,
         ledger: &RuntimeLedger,
-    ) -> Result<Option<super::super::context_host::task_driver::TaskDriverHostJob>, TaskHostError>
+    ) -> Result<Option<super::super::participation_host::task_io::TaskIoHostJob>, TaskHostError>
     {
         if ticket.actor != self.actor
             || !matches!(&ticket.effect,
-                WorkerAction::Context(ContextEffect::RetireTask { task, .. }
-                    | ContextEffect::FinalizeTaskExecution { task, .. }) if *task == self.task)
+                WorkerAction::Participation(ParticipationEffect::RetireTask { task, .. }
+                    | ParticipationEffect::FinalizeTaskExecution { task, .. }) if *task == self.task)
         {
             return Err(TaskHostError::WrongEffect);
         }
@@ -45,7 +45,7 @@ impl TaskHostRecord {
             .causal
             .runtime()
             .validate_effect_ticket(ticket)
-            .map_err(TaskHostError::Driver)?;
+            .map_err(TaskHostError::ActorTurn)?;
         // RetireTask is the original Core's positive final authority: a
         // healthy Task may never have needed Stop. Revoke only that original
         // unexposed capability; a queued/started capture still owes real exit.
@@ -74,7 +74,7 @@ impl TaskHostRecord {
                 // run its real port-close/observer notifications on a host.
                 if !matches!(
                     &ticket.effect,
-                    WorkerAction::Context(ContextEffect::RetireTask { .. })
+                    WorkerAction::Participation(ParticipationEffect::RetireTask { .. })
                 ) || self.resources.preparation.is_some()
                     || self.resources.pending_preparation_adoption.is_some()
                     || self.resources.completion.is_some()
@@ -110,13 +110,13 @@ impl TaskHostRecord {
             Err(error) => return Err(TaskHostError::HostCall(error)),
         };
         Ok(Some(
-            super::super::context_host::task_driver::TaskDriverHostJob::RetireExecution {
+            super::super::participation_host::task_io::TaskIoHostJob::RetireExecution {
                 job,
                 call,
                 owner,
                 host,
                 ingress: match &ticket.effect {
-                    WorkerAction::Context(ContextEffect::FinalizeTaskExecution {
+                    WorkerAction::Participation(ParticipationEffect::FinalizeTaskExecution {
                         normally_stopped: true,
                         ..
                     }) if !strict_canceled => crate::TaskIngressRetirement::PreserveNormalClose,
@@ -159,7 +159,7 @@ impl TaskHostRecord {
         if !self.completion_core_observed
             && let Some(action) = &self.resources.completion_action
         {
-            self.completion_core_observed = action.phase() == ExitRolePhase::Retired
+            self.completion_core_observed = action.phase() == ExitCustodyPhase::Retired
                 || action.report().consumption(ConsumerId::new(1).unwrap())?
                     == Consumption::Consumed;
         }
@@ -168,15 +168,15 @@ impl TaskHostRecord {
             && roles.execution_calls_exited()
         {
             for kind in [
-                TaskLifecycleRole::Finisher,
-                TaskLifecycleRole::WallTime,
-                TaskLifecycleRole::TerminalPublisher,
-                TaskLifecycleRole::Settlement,
+                TaskLifecycleInputKind::Finisher,
+                TaskLifecycleInputKind::WallTime,
+                TaskLifecycleInputKind::TerminalPublisher,
+                TaskLifecycleInputKind::Settlement,
             ] {
-                let retired = if kind == TaskLifecycleRole::Settlement {
+                let retired = if kind == TaskLifecycleInputKind::Settlement {
                     roles.settlement_phase() == crate::settlement::SettlementPhase::Retired
                 } else {
-                    roles.phase(kind) == ExitRolePhase::Retired
+                    roles.phase(kind) == ExitCustodyPhase::Retired
                 };
                 if retired {
                     continue;
@@ -196,16 +196,16 @@ impl TaskHostRecord {
             // A newly retired settlement child is real progress even
             // while its finisher awaits the next original header reaping.
             let before = (
-                roles.phase(TaskLifecycleRole::Finisher),
-                roles.phase(TaskLifecycleRole::WallTime),
-                roles.phase(TaskLifecycleRole::TerminalPublisher),
+                roles.phase(TaskLifecycleInputKind::Finisher),
+                roles.phase(TaskLifecycleInputKind::WallTime),
+                roles.phase(TaskLifecycleInputKind::TerminalPublisher),
                 roles.settlement_phase(),
             );
             roles.try_retire();
             let after = (
-                roles.phase(TaskLifecycleRole::Finisher),
-                roles.phase(TaskLifecycleRole::WallTime),
-                roles.phase(TaskLifecycleRole::TerminalPublisher),
+                roles.phase(TaskLifecycleInputKind::Finisher),
+                roles.phase(TaskLifecycleInputKind::WallTime),
+                roles.phase(TaskLifecycleInputKind::TerminalPublisher),
                 roles.settlement_phase(),
             );
             progress |= before != after;
@@ -279,7 +279,7 @@ impl TaskHostRecord {
                 .pair_inventory(route)
                 .map_err(|error| TaskHostError::Causal(error.into()))?
             {
-                if position.custody.phase() != ExitRolePhase::Retired {
+                if position.custody.phase() != ExitCustodyPhase::Retired {
                     return Ok(progress);
                 }
             }
@@ -344,7 +344,7 @@ impl TaskHostRecord {
                     .resources
                     .lifecycle_inputs
                     .values()
-                    .any(|input| input.phase() != ExitRolePhase::Retired)
+                    .any(|input| input.phase() != ExitCustodyPhase::Retired)
             {
                 return Ok(progress);
             }
@@ -466,12 +466,12 @@ impl ProductionPreparation {
         outcome
     }
 }
-/// The actual removed Task owner remains in the Context's finite Task slot
+/// The actual removed Task owner remains in the Participation's finite Task slot
 /// until its physical payload destruction and original payment release finish.
 /// Unexpected foreign Drop retains the same payment and panic inventory.
 pub(crate) struct TaskDisposal {
-    role: super::super::task_disposal::TaskDisposalRole,
-    retirement: novarocks_control_runtime::lease::WorkRetirementObserver,
+    disposal_custody: super::super::task_disposal::TaskDisposalCustody,
+    retirement: novarocks_control_runtime::obligation::WorkRetirementObserver,
     state: std::sync::Mutex<TaskDisposalState>,
 }
 struct TaskDisposalState {
@@ -481,9 +481,9 @@ struct TaskDisposalState {
     payload: Option<Box<ManuallyDrop<Box<dyn std::any::Any + Send>>>>,
     payment: Option<(
         TaskLifetime,
-        ReservationBundle,
-        Option<ReservationBundle>,
-        Option<ReservationBundle>,
+        ReservationObligation,
+        Option<ReservationObligation>,
+        Option<ReservationObligation>,
     )>,
     panic: Option<ManuallyDrop<Box<dyn std::any::Any + Send>>>,
     // Neutral identity copied only from the same original RetireTask effect.
@@ -515,7 +515,7 @@ impl TaskDisposal {
         let TaskHostResources {
             active,
             preparation_remainder,
-            accepted_role_storage,
+            accepted_completion_storage,
             lifetime,
             port,
             host_calls,
@@ -539,7 +539,7 @@ impl TaskDisposal {
         let task = lifetime.observation().identity();
         (
             Self {
-                role: disposal,
+                disposal_custody: disposal,
                 retirement,
                 state: std::sync::Mutex::new(TaskDisposalState {
                     observation: ports.map(|ports| Box::new(ManuallyDrop::new((ports, task)))),
@@ -568,7 +568,7 @@ impl TaskDisposal {
                         lifetime,
                         active,
                         preparation_remainder,
-                        accepted_role_storage,
+                        accepted_completion_storage,
                     )),
                     panic: None,
                     accepted_custody: None,
@@ -584,10 +584,10 @@ impl TaskDisposal {
         novarocks_control_runtime_core::identity::ScopeId,
         novarocks_control_runtime_core::identity::WorkId,
     ) {
-        self.role.key()
+        self.disposal_custody.key()
     }
     pub(crate) fn complete(&self) -> bool {
-        self.role.is_retired()
+        self.disposal_custody.is_retired()
             && self.retirement.is_retired()
             && self
                 .state
@@ -676,8 +676,8 @@ impl TaskDisposal {
         super::super::task_disposal::TaskDisposalJob,
         super::super::task_disposal::TaskDisposalError,
     > {
-        let authorization = self.role.authorize_failure(stage)?;
-        self.role
+        let authorization = self.disposal_custody.authorize_failure(stage)?;
+        self.disposal_custody
             .take_job(authorization)
             .map_err(|(error, _authorization)| error)
     }
@@ -740,10 +740,10 @@ impl TaskDisposal {
     /// retains only neutral disposal metadata and grants no execution capacity.
     pub(crate) fn advance_retirement(&self, ledger: &RuntimeLedger) -> Result<bool, TaskHostError> {
         let progress = self
-            .role
+            .disposal_custody
             .advance_retirement(ledger)
             .map_err(TaskHostError::Disposal)?;
-        if !self.role.is_retired() || !self.retirement.is_retired() {
+        if !self.disposal_custody.is_retired() || !self.retirement.is_retired() {
             return Ok(progress);
         }
         let payment = {

@@ -186,7 +186,7 @@ impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControl
         &self,
         instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorControlPlanningLease,
+        novarocks_spi::connector::ConnectorControlPlanningPin,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -209,7 +209,10 @@ impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControl
                     ),
                 )
             })?;
-        Ok(novarocks_spi::connector::ConnectorControlPlanningLease::new(binding, || {}))
+        Ok(novarocks_spi::connector::ConnectorControlPlanningPin::new(
+            binding,
+            || {},
+        ))
     }
 }
 
@@ -219,7 +222,7 @@ impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnecto
         &self,
         instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorCatalogMutationLease,
+        novarocks_spi::connector::ConnectorCatalogMutationSession,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -248,7 +251,7 @@ impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnecto
                 "test connector control binding has no mutation capability",
             )
         })?;
-        novarocks_spi::connector::ConnectorCatalogMutationLease::new(
+        novarocks_spi::connector::ConnectorCatalogMutationSession::new(
             binding.descriptor().clone(),
             binding.control_runtime_id(),
             binding.incarnation(),
@@ -261,7 +264,7 @@ impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnecto
         &self,
         control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorCatalogMutationLease,
+        novarocks_spi::connector::ConnectorCatalogMutationSession,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -288,7 +291,7 @@ impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnecto
                 "test connector control binding has no mutation capability",
             )
         })?;
-        novarocks_spi::connector::ConnectorCatalogMutationLease::new(
+        novarocks_spi::connector::ConnectorCatalogMutationSession::new(
             binding.descriptor().clone(),
             binding.control_runtime_id(),
             binding.incarnation(),
@@ -304,7 +307,7 @@ impl novarocks_spi::connector::ConnectorDataMutationResolver for TestConnectorCo
         &self,
         instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorDataMutationLease,
+        novarocks_spi::connector::ConnectorDataMutationSession,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -334,7 +337,7 @@ impl novarocks_spi::connector::ConnectorDataMutationResolver for TestConnectorCo
         &self,
         control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorDataMutationLease,
+        novarocks_spi::connector::ConnectorDataMutationSession,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -363,7 +366,7 @@ impl novarocks_spi::connector::ConnectorDataMutationResolver for TestConnectorCo
 fn test_data_mutation_lease(
     binding: Arc<novarocks_spi::connector::ConnectorControlBinding>,
 ) -> Result<
-    novarocks_spi::connector::ConnectorDataMutationLease,
+    novarocks_spi::connector::ConnectorDataMutationSession,
     novarocks_spi::connector::ConnectorError,
 > {
     let mutation = binding.data_mutation().cloned().ok_or_else(|| {
@@ -376,7 +379,7 @@ fn test_data_mutation_lease(
         instance_id: binding.descriptor().instance_id.clone(),
         incarnation: binding.incarnation(),
     };
-    novarocks_spi::connector::ConnectorDataMutationLease::new(
+    novarocks_spi::connector::ConnectorDataMutationSession::new(
         binding.descriptor().clone(),
         binding.control_runtime_id(),
         key.incarnation,
@@ -394,7 +397,7 @@ impl novarocks_spi::connector::ConnectorMetadataMaintenanceResolver
         &self,
         instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorMetadataMaintenanceLease,
+        novarocks_spi::connector::ConnectorMetadataMaintenanceSession,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -424,7 +427,7 @@ impl novarocks_spi::connector::ConnectorMetadataMaintenanceResolver
         &self,
         control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorMetadataMaintenanceLease,
+        novarocks_spi::connector::ConnectorMetadataMaintenanceSession,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -457,7 +460,7 @@ impl novarocks_spi::connector::ConnectorCleanupMaintenanceResolver
         &self,
         instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorCleanupMaintenanceLease,
+        novarocks_spi::connector::ConnectorCleanupMaintenanceSession,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -484,7 +487,7 @@ impl novarocks_spi::connector::ConnectorCleanupMaintenanceResolver
         &self,
         control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorCleanupMaintenanceLease,
+        novarocks_spi::connector::ConnectorCleanupMaintenanceSession,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -513,7 +516,7 @@ impl novarocks_spi::connector::ConnectorCleanupMaintenanceResolver
 fn test_cleanup_maintenance_lease(
     binding: Arc<novarocks_spi::connector::ConnectorControlBinding>,
 ) -> Result<
-    novarocks_spi::connector::ConnectorCleanupMaintenanceLease,
+    novarocks_spi::connector::ConnectorCleanupMaintenanceSession,
     novarocks_spi::connector::ConnectorError,
 > {
     let cleanup = binding.cleanup_maintenance().cloned().ok_or_else(|| {
@@ -526,7 +529,7 @@ fn test_cleanup_maintenance_lease(
         instance_id: binding.descriptor().instance_id.clone(),
         incarnation: binding.incarnation(),
     };
-    novarocks_spi::connector::ConnectorCleanupMaintenanceLease::new(
+    novarocks_spi::connector::ConnectorCleanupMaintenanceSession::new(
         binding.descriptor().clone(),
         binding.control_runtime_id(),
         key.incarnation,
@@ -540,7 +543,7 @@ fn test_cleanup_maintenance_lease(
 fn test_metadata_maintenance_lease(
     binding: Arc<novarocks_spi::connector::ConnectorControlBinding>,
 ) -> Result<
-    novarocks_spi::connector::ConnectorMetadataMaintenanceLease,
+    novarocks_spi::connector::ConnectorMetadataMaintenanceSession,
     novarocks_spi::connector::ConnectorError,
 > {
     let maintenance = binding.metadata_maintenance().cloned().ok_or_else(|| {
@@ -553,7 +556,7 @@ fn test_metadata_maintenance_lease(
         instance_id: binding.descriptor().instance_id.clone(),
         incarnation: binding.incarnation(),
     };
-    novarocks_spi::connector::ConnectorMetadataMaintenanceLease::new(
+    novarocks_spi::connector::ConnectorMetadataMaintenanceSession::new(
         binding.descriptor().clone(),
         binding.control_runtime_id(),
         key.incarnation,
@@ -571,7 +574,7 @@ impl novarocks_spi::connector::ConnectorDistributedRewriteResolver
         &self,
         instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorDistributedRewriteLease,
+        novarocks_spi::connector::SharedConnectorDistributedRewrite,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -601,7 +604,7 @@ impl novarocks_spi::connector::ConnectorDistributedRewriteResolver
         &self,
         control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorDistributedRewriteLease,
+        novarocks_spi::connector::SharedConnectorDistributedRewrite,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -630,7 +633,7 @@ impl novarocks_spi::connector::ConnectorDistributedRewriteResolver
 fn test_distributed_rewrite_lease(
     binding: Arc<novarocks_spi::connector::ConnectorControlBinding>,
 ) -> Result<
-    novarocks_spi::connector::ConnectorDistributedRewriteLease,
+    novarocks_spi::connector::SharedConnectorDistributedRewrite,
     novarocks_spi::connector::ConnectorError,
 > {
     let rewrite = binding.distributed_rewrite().cloned().ok_or_else(|| {
@@ -645,11 +648,11 @@ fn test_distributed_rewrite_lease(
             "test connector control binding has no distributed write capability",
         )
     })?;
-    novarocks_spi::connector::ConnectorDistributedRewriteLease::new(
+    novarocks_spi::connector::SharedConnectorDistributedRewrite::new(
         binding.descriptor().clone(),
         binding.control_runtime_id(),
         binding.incarnation(),
-        novarocks_spi::connector::ConnectorControlPlanningLease::new(binding.clone(), || {}),
+        novarocks_spi::connector::ConnectorControlPlanningPin::new(binding.clone(), || {}),
         Arc::clone(binding.metadata()),
         Arc::clone(binding.planning()),
         rewrite,
@@ -665,7 +668,7 @@ impl novarocks_spi::connector::ConnectorStatisticsResolver for TestConnectorCont
         &self,
         instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorStatisticsLease,
+        novarocks_spi::connector::ConnectorStatisticsSession,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -694,7 +697,7 @@ impl novarocks_spi::connector::ConnectorStatisticsResolver for TestConnectorCont
                 "test connector control binding has no statistics capability",
             )
         })?;
-        novarocks_spi::connector::ConnectorStatisticsLease::new(
+        novarocks_spi::connector::ConnectorStatisticsSession::new(
             binding.descriptor().clone(),
             binding.incarnation(),
             statistics,

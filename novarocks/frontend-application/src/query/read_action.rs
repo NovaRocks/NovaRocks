@@ -27,7 +27,7 @@ use crate::state_store::execution::StateStoreOriginalOwner;
 use io_source::ReadMetadataIoSource;
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::api::{
-    ExecutionHandle, LocalResultProducer, LogicalExecutionExitObserver,
+    ExecutionOutputObligation, LocalResultProducer, LogicalExecutionExitObserver,
     LogicalExecutionExitReceipt, StatementNativeHealthFailure,
 };
 use novarocks_query_application::session_control::{
@@ -520,7 +520,7 @@ struct ReadStatementAction {
     read: Option<crate::query_execution::completion::PreparedLogicalRead>,
     capacity: Option<QueryResultCapacityBinding>,
     original: OriginalComputationStart,
-    execution: Option<Result<ExecutionHandle, QueryExecutionError>>,
+    execution: Option<Result<ExecutionOutputObligation, QueryExecutionError>>,
     error: Option<QueryServiceError>,
     completed_preparation: bool,
     preparation_started: bool,

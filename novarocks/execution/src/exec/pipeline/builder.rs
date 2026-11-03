@@ -28,7 +28,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 fn program_failure(
     kind: crate::exec::fragment::error::FragmentBindingErrorKind,
@@ -141,7 +141,7 @@ struct PipelineBuildContext {
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
     /// Exact task-owned write capabilities for the compiled program.
-    compiled_writers: crate::runtime::fragment::CompiledWriterBindings,
+    compiled_writers: crate::runtime::task::CompiledWriterBindings,
     next_pipeline_id: i32,
     pipeline_dop: i32,
     operator_buffer_chunks: usize,

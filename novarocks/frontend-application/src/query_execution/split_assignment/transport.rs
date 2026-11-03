@@ -220,9 +220,9 @@ mod tests {
         .expect("valid execution id");
         let target = AssignmentTarget {
             backend_idx: 0,
-            fragment_instance_id: UniqueId::new(5, 6),
+            task_key: UniqueId::new(5, 6),
         };
-        let request = TaskUpdateRequest::new(target.fragment_instance_id, Vec::new());
+        let request = TaskUpdateRequest::new(target.task_key, Vec::new());
         transport
             .begin(execution_id, &target, &request)
             .expect("first borrowed send");

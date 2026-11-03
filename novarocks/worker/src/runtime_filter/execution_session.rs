@@ -28,11 +28,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use novarocks_execution::runtime_filter::{
     PartitionId, ProducerSequence, RuntimeFilterBindOutcome, RuntimeFilterBindingId,
     RuntimeFilterChannelId, RuntimeFilterContractViolation, RuntimeFilterContractViolationKind,
-    RuntimeFilterContribution, RuntimeFilterExecutionContract,
-    RuntimeFilterFinalDomainCompletionHandle, RuntimeFilterFinalDomainOpenRequest,
-    RuntimeFilterProducer, RuntimeFilterProducerFailure, RuntimeFilterProducerHandle,
-    RuntimeFilterProducerOpenRequest, RuntimeFilterSession, RuntimeFilterSubmitOutcome,
-    RuntimeFilterSubscriptionHandle, RuntimeFilterSubscriptionRequest, UnavailableReason,
+    RuntimeFilterContribution, RuntimeFilterExecutionContract, RuntimeFilterFinalDomainOpenRequest,
+    RuntimeFilterProducer, RuntimeFilterProducerFailure, RuntimeFilterProducerOpenRequest,
+    RuntimeFilterSession, RuntimeFilterSubmitOutcome, RuntimeFilterSubscriptionPin,
+    RuntimeFilterSubscriptionRequest, SharedRuntimeFilterFinalDomainCompletion,
+    SharedRuntimeFilterProducer, UnavailableReason,
 };
 use novarocks_types::UniqueId;
 
@@ -53,7 +53,7 @@ pub trait RuntimeFilterParticipantOutbound: Send + Sync {
         &self,
         channel_id: RuntimeFilterChannelId,
         binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition: PartitionId,
         sequence: ProducerSequence,
         local_partition_count: u32,
@@ -64,7 +64,7 @@ pub trait RuntimeFilterParticipantOutbound: Send + Sync {
         &self,
         channel_id: RuntimeFilterChannelId,
         binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition: PartitionId,
         sequence: ProducerSequence,
         local_partition_count: u32,
@@ -74,14 +74,14 @@ pub trait RuntimeFilterParticipantOutbound: Send + Sync {
         &self,
         channel_id: RuntimeFilterChannelId,
         binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         reason: RuntimeFilterProducerFailure,
     ) -> Result<(), RuntimeFilterContractViolation>;
 }
 
 /// One fragment's view of an installed Worker runtime-filter participant.
 pub struct WorkerRuntimeFilterExecutionSession {
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     participant: BackendParticipantIdentity,
     producers: BTreeMap<RuntimeFilterBindingId, Arc<BackendRuntimeFilterSession>>,
     consumers: BTreeMap<RuntimeFilterBindingId, Arc<BackendRuntimeFilterSession>>,
@@ -92,7 +92,7 @@ pub struct WorkerRuntimeFilterExecutionSession {
 
 impl WorkerRuntimeFilterExecutionSession {
     pub fn new(
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         participant: BackendParticipantIdentity,
         producers: BTreeMap<RuntimeFilterBindingId, Arc<BackendRuntimeFilterSession>>,
         consumers: BTreeMap<RuntimeFilterBindingId, Arc<BackendRuntimeFilterSession>>,
@@ -101,7 +101,7 @@ impl WorkerRuntimeFilterExecutionSession {
         cancelled: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            fragment_instance_id,
+            task_key,
             participant,
             producers,
             consumers,
@@ -116,7 +116,7 @@ impl RuntimeFilterSession for WorkerRuntimeFilterExecutionSession {
     fn open_producer(
         &self,
         request: RuntimeFilterProducerOpenRequest,
-    ) -> Result<RuntimeFilterBindOutcome<RuntimeFilterProducerHandle>, RuntimeFilterContractViolation>
+    ) -> Result<RuntimeFilterBindOutcome<SharedRuntimeFilterProducer>, RuntimeFilterContractViolation>
     {
         if self.cancelled.load(Ordering::Acquire) {
             return Ok(RuntimeFilterBindOutcome::Unavailable(
@@ -131,7 +131,7 @@ impl RuntimeFilterSession for WorkerRuntimeFilterExecutionSession {
             )
         })?;
         let local_partition_count = request.local_partition_count();
-        match session.open_producer(self.fragment_instance_id, request)? {
+        match session.open_producer(self.task_key, request)? {
             RuntimeFilterBindOutcome::Bound(local) => {
                 self.observation.register_producer_instance(
                     BackendChannelIdentity::new(
@@ -139,7 +139,7 @@ impl RuntimeFilterSession for WorkerRuntimeFilterExecutionSession {
                         binding_id,
                         session.channel().channel_id(),
                     ),
-                    self.fragment_instance_id,
+                    self.task_key,
                     local_partition_count,
                 );
                 Ok(RuntimeFilterBindOutcome::Bound(Arc::new(
@@ -149,7 +149,7 @@ impl RuntimeFilterSession for WorkerRuntimeFilterExecutionSession {
                         participant: self.participant,
                         binding_id,
                         channel_id: session.channel().channel_id(),
-                        fragment_instance_id: self.fragment_instance_id,
+                        task_key: self.task_key,
                         local_partition_count,
                         observation: Arc::clone(&self.observation),
                     },
@@ -165,7 +165,7 @@ impl RuntimeFilterSession for WorkerRuntimeFilterExecutionSession {
         &self,
         request: RuntimeFilterSubscriptionRequest,
     ) -> Result<
-        RuntimeFilterBindOutcome<RuntimeFilterSubscriptionHandle>,
+        RuntimeFilterBindOutcome<RuntimeFilterSubscriptionPin>,
         RuntimeFilterContractViolation,
     > {
         if self.cancelled.load(Ordering::Acquire) {
@@ -180,14 +180,14 @@ impl RuntimeFilterSession for WorkerRuntimeFilterExecutionSession {
                 "consumer binding is not installed for this Backend fragment",
             )
         })?;
-        session.subscribe(self.fragment_instance_id, request)
+        session.subscribe(self.task_key, request)
     }
 
     fn open_final_domain_completion(
         &self,
         request: RuntimeFilterFinalDomainOpenRequest,
     ) -> Result<
-        RuntimeFilterBindOutcome<RuntimeFilterFinalDomainCompletionHandle>,
+        RuntimeFilterBindOutcome<SharedRuntimeFilterFinalDomainCompletion>,
         RuntimeFilterContractViolation,
     > {
         if self.cancelled.load(Ordering::Acquire) {
@@ -238,12 +238,12 @@ impl RuntimeFilterSession for WorkerRuntimeFilterExecutionSession {
 }
 
 struct WorkerRuntimeFilterProducer {
-    local: RuntimeFilterProducerHandle,
+    local: SharedRuntimeFilterProducer,
     outbound: Arc<dyn RuntimeFilterParticipantOutbound>,
     participant: BackendParticipantIdentity,
     binding_id: RuntimeFilterBindingId,
     channel_id: RuntimeFilterChannelId,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     local_partition_count: u32,
     observation: Arc<RuntimeFilterObservationEmitter>,
 }
@@ -261,7 +261,7 @@ impl RuntimeFilterProducer for WorkerRuntimeFilterProducer {
     ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation> {
         let stream = BackendProducerStreamIdentity::new(
             BackendChannelIdentity::new(self.participant, self.binding_id, self.channel_id),
-            self.fragment_instance_id,
+            self.task_key,
             partition,
         );
         let outcome = match self.local.submit(partition, sequence, contribution.clone()) {
@@ -304,7 +304,7 @@ impl RuntimeFilterProducer for WorkerRuntimeFilterProducer {
         self.outbound.forward_producer_contribution(
             self.channel_id,
             self.binding_id,
-            self.fragment_instance_id,
+            self.task_key,
             partition,
             sequence,
             self.local_partition_count,
@@ -322,7 +322,7 @@ impl RuntimeFilterProducer for WorkerRuntimeFilterProducer {
         self.outbound.forward_producer_close(
             self.channel_id,
             self.binding_id,
-            self.fragment_instance_id,
+            self.task_key,
             partition,
             terminal,
             self.local_partition_count,
@@ -338,7 +338,7 @@ impl RuntimeFilterProducer for WorkerRuntimeFilterProducer {
         self.outbound.forward_producer_failure(
             self.channel_id,
             self.binding_id,
-            self.fragment_instance_id,
+            self.task_key,
             reason,
         )?;
         Ok(outcome)

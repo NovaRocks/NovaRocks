@@ -89,7 +89,7 @@ pub use runtime::{
     ConnectorReadConstraint, ConnectorReadDynamicFilter, ConnectorReadDynamicFilterSnapshot,
     ConnectorReadFilterApplication, ConnectorReadFrozenRewriteGroup, ConnectorReadLimitApplication,
     ConnectorReadMetadata, ConnectorReadOpenedRelation, ConnectorReadPageSourceProvider,
-    ConnectorReadRegistrationLease, ConnectorReadRelation, ConnectorReadRelationKind,
+    ConnectorReadRegistrationPin, ConnectorReadRelation, ConnectorReadRelationKind,
     ConnectorReadRelationPreparation, ConnectorReadRelationPreparationFuture,
     ConnectorReadRelationPreparationKind, ConnectorReadRelationPreparationRequest,
     ConnectorReadRelationVersion, ConnectorReadRequestControl, ConnectorReadRequestControlFactory,

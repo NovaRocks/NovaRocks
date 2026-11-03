@@ -29,7 +29,9 @@ use crate::query_execution::completion_facts::FrontendPlanningCpuSource;
 use crate::query_execution::logical_execution::OriginalComputationStart;
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::api::StatementNativeHealthFailure;
-use novarocks_query_application::api::{ExecutionHandle, LocalResultProducer, OwnedLocalResult};
+use novarocks_query_application::api::{
+    ExecutionOutputObligation, LocalResultProducer, OwnedLocalResult,
+};
 use novarocks_query_application::session_control::{
     GovernedActionContext, GovernedQueryStatementOwner, GovernedStatementAction,
     GovernedStatementResidual, StatementActionValue,
@@ -202,7 +204,7 @@ struct ExplainStatementAction {
     profile: Option<Box<PreparedAsyncProfile>>,
     capacity: Option<QueryResultCapacityBinding>,
     original: OriginalComputationStart,
-    execution: Option<Result<ExecutionHandle, QueryExecutionError>>,
+    execution: Option<Result<ExecutionOutputObligation, QueryExecutionError>>,
     diagnostics: Option<DiagnosticFuture>,
     raw_result: Option<Result<QueryResult, QueryServiceError>>,
     local: Option<OwnedLocalResult>,

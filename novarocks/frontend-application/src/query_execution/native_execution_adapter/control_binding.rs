@@ -531,12 +531,12 @@ mod tests {
             ]
         );
         assert!(b.eligible_backends().contains(&processes[2]));
-        assert_eq!(b.contexts().len(), 1);
+        assert_eq!(b.participations().len(), 1);
         assert!(
             schedule
-                .contexts()
+                .participations()
                 .iter()
-                .all(|context| context.backend_process_id() == processes[1])
+                .all(|participation| participation.backend_process_id() == processes[1])
         );
         let mut initial = NativeControlBinding::default();
         for _ in 0..100_000 {

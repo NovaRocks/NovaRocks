@@ -48,7 +48,7 @@ const LARGE_SHA: &str = "d4bbd8c0cd3c3d647c6a0c948692db381360406584f25e3f6653fc9
 const TINY_SHA: &str = "a250875085fd54bc3c35e0c1e7a08173d2f36920bc7dc6ab83ba6dbf2745d127";
 pub(crate) const EFFECTIVE_POLICY: &str = "freeze_original_prepared_before_role_spawn";
 const IDENTITY_ARGUMENT: &str = "--mem-1-m07-build-identity";
-const IDENTITY_PREFIX: &str = "NOVAROCKS_MEM_1_M07_BUILD commit=";
+const IDENTITY_PREFIX: &str = novarocks_failpoint::observation_marker::MEM_1_M07_BUILD;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -638,8 +638,9 @@ fn require_compiled_runner(commit: &str, build: &str, expected: &str) -> Result<
 fn server_identity(bytes: &[u8], expected: &str) -> Result<String> {
     revision(expected)?;
     let text = std::str::from_utf8(bytes)?;
-    let required =
-        format!("{IDENTITY_PREFIX}{expected} build_identity={expected} exact_mysql_write=true\n");
+    let required = format!(
+        "{IDENTITY_PREFIX} commit={expected} build_identity={expected} exact_mysql_write=true\n"
+    );
     ensure!(
         text == required,
         "actual diagnostic is not the exact feature/full-clean-build identity record"

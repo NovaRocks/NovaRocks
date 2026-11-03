@@ -578,7 +578,7 @@ fn scan_operation(raw: &[u8]) -> ScanResult {
     for_fields(raw, |field, value| {
         match (field, value) {
             (3, Value::Bytes(update)) => scan_update_task(update, &mut update_domains)?,
-            (4, Value::Bytes(update)) => scan_update_context(update)?,
+            (4, Value::Bytes(update)) => scan_update_participation(update)?,
             _ => {}
         }
         Ok(())
@@ -616,7 +616,7 @@ fn scan_task_domain(raw: &[u8]) -> ScanResult {
     })
 }
 
-fn scan_update_context(raw: &[u8]) -> ScanResult {
+fn scan_update_participation(raw: &[u8]) -> ScanResult {
     for_fields(raw, |field, value| {
         match (field, value) {
             (1, Value::Bytes(establish)) => {

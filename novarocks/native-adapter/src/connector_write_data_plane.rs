@@ -25,7 +25,7 @@ use novarocks_execution::exec::node::table_write_relation::{
 };
 #[cfg(novarocks_dev_controls)]
 use novarocks_execution::exec::node::table_write_relation::{
-    TableWriteAggregateBoundary, TableWriteAggregateGuard,
+    TableWriteAggregateBoundary, TableWriteAggregateFaultHook,
 };
 use novarocks_proto_codec::connector_write::{
     ConnectorWriteFragmentEncoder, ValidatedCommitFragment,
@@ -407,14 +407,14 @@ impl ConnectorCommitFragmentCarrierValidator for RootCommitFragmentCarrierValida
 /// attempt; Execution sees only a typed boundary and can neither inspect the
 /// token protocol nor fabricate replacement aggregate data.
 #[cfg(novarocks_dev_controls)]
-pub struct QueryScopedTableWriteAggregateGuard {
+pub struct QueryScopedTableWriteAggregateFaultHook {
     controls: Arc<crate::test_controls::NativeTestControls>,
     execution_id: QueryExecutionId,
     node_id: i32,
 }
 
 #[cfg(novarocks_dev_controls)]
-impl QueryScopedTableWriteAggregateGuard {
+impl QueryScopedTableWriteAggregateFaultHook {
     pub fn new(
         execution_id: QueryExecutionId,
         node_id: i32,
@@ -429,7 +429,7 @@ impl QueryScopedTableWriteAggregateGuard {
 }
 
 #[cfg(novarocks_dev_controls)]
-impl TableWriteAggregateGuard for QueryScopedTableWriteAggregateGuard {
+impl TableWriteAggregateFaultHook for QueryScopedTableWriteAggregateFaultHook {
     fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
         let kind = match boundary {
             TableWriteAggregateBoundary::PartialUpdate => {
@@ -913,7 +913,7 @@ mod tests {
     }
 
     impl ProviderWriteRuntime for StubWriteRuntime {
-        type CommitHandle = ();
+        type CommitSession = ();
         type WriterHandle = String;
         type CommitFragment = String;
 

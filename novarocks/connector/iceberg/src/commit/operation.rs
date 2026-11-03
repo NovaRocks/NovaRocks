@@ -685,7 +685,7 @@ impl IcebergCommitOperation {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::{
         ConnectorWriteOperationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -702,7 +702,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.clone())),
         );
         IcebergCommitOperation::new(
             OperationToken::from_write(ConnectorWriteOperationId::from_bytes([1; 16])),
@@ -1046,7 +1046,7 @@ mod tests {
             }),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.clone())),
         );
         let stop = ConnectorStopOwner::new();
         let operation = IcebergCommitOperation::new(

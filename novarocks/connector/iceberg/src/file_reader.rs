@@ -554,7 +554,7 @@ pub(crate) mod tests {
     #[test]
     fn iceberg_readers_ignore_bad_hints_and_keep_only_physical_ids() {
         use novarocks_fs::{
-            FileCancellation, FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+            FileCancellation, FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner,
         };
         use parquet::arrow::arrow_writer::ArrowWriterOptions;
         use parquet::arrow::{ARROW_SCHEMA_META_KEY, ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -620,7 +620,7 @@ pub(crate) mod tests {
                     cancellation: FileCancellation::new(),
                     deadline: None,
                     runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-                    task_spawner: Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+                    io_spawner: Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
                     range: None,
                 };
                 let projection = if identified {
@@ -961,7 +961,7 @@ pub(crate) mod tests {
         use arrow::array::BinaryArray;
         use novarocks_fs::{
             FileCancellation, FileReaderOptions, FsAccessResolver, TokioFileIoRuntime,
-            TokioFileTaskSpawner,
+            TokioFileIoSpawner,
         };
         use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
         use parquet::basic::Compression;
@@ -1055,7 +1055,7 @@ pub(crate) mod tests {
                     cancellation: FileCancellation::new(),
                     deadline: None,
                     runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-                    task_spawner: Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+                    io_spawner: Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
                     range: None,
                 };
                 let predicate = ScanPredicate::new(
@@ -1173,7 +1173,7 @@ pub(crate) mod tests {
     fn small_position_file_reports_whole_probe_even_when_one_group_matches() {
         use novarocks_fs::{
             FileCancellation, FileReaderOptions, FsAccessResolver, TokioFileIoRuntime,
-            TokioFileTaskSpawner,
+            TokioFileIoSpawner,
         };
         use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
         use parquet::file::properties::WriterProperties;
@@ -1240,7 +1240,7 @@ pub(crate) mod tests {
                 cancellation: FileCancellation::new(),
                 deadline: None,
                 runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-                task_spawner: Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+                io_spawner: Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
                 range: None,
             };
             let predicate = ScanPredicate::new(
@@ -1305,7 +1305,7 @@ pub(crate) mod tests {
     #[test]
     fn delete_async_boundaries_preserve_physical_failure_kinds_and_content_corruption() {
         use novarocks_fs::{
-            FileCancellation, FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+            FileCancellation, FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner,
         };
         use novarocks_spi::connector::ConnectorErrorKind;
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1324,7 +1324,7 @@ pub(crate) mod tests {
             cancellation: FileCancellation::new(),
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            task_spawner: Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            io_spawner: Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
             range: None,
         };
         for (physical, expected) in [
@@ -1399,11 +1399,11 @@ pub(crate) mod tests {
     }
 
     struct RejectRangeSpawner;
-    impl novarocks_fs::FileTaskSpawner for RejectRangeSpawner {
+    impl novarocks_fs::FileIoSpawner for RejectRangeSpawner {
         fn spawn(
             &self,
-            _task: novarocks_fs::FileTaskFuture,
-        ) -> novarocks_fs::FileResult<novarocks_fs::FileTask> {
+            _task: novarocks_fs::FileIoFuture,
+        ) -> novarocks_fs::FileResult<novarocks_fs::FileIoJob> {
             Err(novarocks_fs::FileError::new(
                 novarocks_fs::FileErrorKind::ResourceExhausted,
                 "identified range admission is exhausted",
@@ -1446,7 +1446,7 @@ pub(crate) mod tests {
             cancellation: FileCancellation::new(),
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            task_spawner: spawner,
+            io_spawner: spawner,
             range: Some(range),
         };
         let raw = runtime

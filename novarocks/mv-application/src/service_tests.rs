@@ -1052,7 +1052,7 @@ fn original_operations_and_service_share_the_same_fifo_and_scheduler() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn active_original_operations_do_not_retain_the_service_or_joined_runtime() {
-    use crate::process_runtime::{MvBackgroundRuntime, MvBackgroundTasks};
+    use crate::process_runtime::{MvBackgroundJobs, MvBackgroundRuntime};
     use std::time::{Duration, Instant};
 
     let service = Arc::new(service_with_refresh_readiness().await);
@@ -1081,7 +1081,7 @@ async fn active_original_operations_do_not_retain_the_service_or_joined_runtime(
         crate::process_runtime::test_health_port(),
         Duration::from_secs(60),
         Duration::from_secs(60),
-        MvBackgroundTasks::new(
+        MvBackgroundJobs::new(
             Box::new(move |_, _| {
                 let original = refresh_operations.clone();
                 let started = refresh_started.take();

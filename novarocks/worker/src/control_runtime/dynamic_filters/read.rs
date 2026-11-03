@@ -19,12 +19,12 @@
 //! They never issue another Work or lend an Arc of the opaque payload.
 
 use super::{
-    CodecOwnedContent, DomainVersion, DynamicFilterError, ExitAuthority, OpaquePayload, PayloadId,
+    CodecOwnedContent, DomainVersion, DynamicFilterError, ExitObligation, OpaquePayload, PayloadId,
     TaskDynamicFilterInbox, TaskIdentity,
 };
 use crate::{control_runtime::actors::WorkerAction, task_port::TaskPendingNotice};
-use novarocks_control_runtime::{driver::EffectTicket, read_resource::ResourceReadLoan};
-use novarocks_worker_protocol::context::ContextEffect;
+use novarocks_control_runtime::{actor_turn::EffectTicket, read_resource::ResourceReadLoan};
+use novarocks_worker_protocol::participation::ParticipationEffect;
 use std::sync::Arc;
 
 #[must_use = "Return the original read authority after the actual payload borrow exits"]
@@ -53,7 +53,7 @@ impl TaskDynamicFilterLoan {
     }
     /// The common loan releases its real pin before returning the SAME token.
     /// Notify the original RF owner only afterwards, outside every store lock.
-    pub(crate) fn reclaim(mut self) -> ExitAuthority {
+    pub(crate) fn reclaim(mut self) -> ExitObligation {
         let original = self
             .original
             .take()
@@ -82,8 +82,8 @@ impl TaskDynamicFilterInbox {
         task: TaskIdentity,
         version: DomainVersion,
         payload: PayloadId,
-        authority: ExitAuthority,
-    ) -> Result<TaskDynamicFilterLoan, (DynamicFilterError, ExitAuthority)> {
+        authority: ExitObligation,
+    ) -> Result<TaskDynamicFilterLoan, (DynamicFilterError, ExitObligation)> {
         if task != self.custody.task {
             return Err((DynamicFilterError::WrongReadSelection, authority));
         }
@@ -149,7 +149,7 @@ impl TaskDynamicFilterInbox {
         self.runtime.validate_effect_ticket(ticket)?;
         if ticket.actor != self.actor
             || !matches!(&ticket.effect,
-                WorkerAction::Context(ContextEffect::RetireTask { task, .. })
+                WorkerAction::Participation(ParticipationEffect::RetireTask { task, .. })
                 if *task == self.custody.task)
             || !self.runtime.owns_scope(self.actor, &self.custody.scope)?
         {

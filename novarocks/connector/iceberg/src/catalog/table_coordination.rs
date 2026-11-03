@@ -37,21 +37,21 @@ pub(crate) struct IcebergTableCoordination {
 
 struct Entry {
     mutex: Arc<AsyncMutex<()>>,
-    leases: usize,
+    pins: usize,
 }
 
 impl IcebergTableCoordination {
     pub(crate) fn acquire_entry(
         self: &Arc<Self>,
         table_uuid: Uuid,
-    ) -> Result<IcebergTableEntryLease, ConnectorError> {
+    ) -> Result<IcebergTableEntryPin, ConnectorError> {
         let mut entries = self.entries.lock().map_err(|_| unavailable())?;
         let entry = entries.entry(table_uuid).or_insert_with(|| Entry {
             mutex: Arc::new(AsyncMutex::new(())),
-            leases: 0,
+            pins: 0,
         });
-        entry.leases = entry.leases.checked_add(1).ok_or_else(unavailable)?;
-        Ok(IcebergTableEntryLease {
+        entry.pins = entry.pins.checked_add(1).ok_or_else(unavailable)?;
+        Ok(IcebergTableEntryPin {
             owner: Arc::clone(self),
             table_uuid,
             mutex: Arc::clone(&entry.mutex),
@@ -73,13 +73,13 @@ impl IcebergTableCoordination {
     }
 }
 
-pub(crate) struct IcebergTableEntryLease {
+pub(crate) struct IcebergTableEntryPin {
     owner: Arc<IcebergTableCoordination>,
     table_uuid: Uuid,
     mutex: Arc<AsyncMutex<()>>,
 }
 
-impl IcebergTableEntryLease {
+impl IcebergTableEntryPin {
     pub(crate) async fn lock(
         self,
         request: &ConnectorRequestContext,
@@ -105,7 +105,7 @@ impl IcebergTableEntryLease {
     }
 }
 
-impl Drop for IcebergTableEntryLease {
+impl Drop for IcebergTableEntryPin {
     fn drop(&mut self) {
         let Ok(mut entries) = self.owner.entries.lock() else {
             return;
@@ -118,9 +118,9 @@ impl Drop for IcebergTableEntryLease {
         if !Arc::ptr_eq(&entry.mutex, &self.mutex) {
             return;
         }
-        debug_assert!(entry.leases > 0, "coordination entry lease underflow");
-        entry.leases -= 1;
-        if entry.leases == 0 {
+        debug_assert!(entry.pins > 0, "coordination entry lease underflow");
+        entry.pins -= 1;
+        if entry.pins == 0 {
             entries.remove(&self.table_uuid);
         }
     }
@@ -129,7 +129,7 @@ impl Drop for IcebergTableEntryLease {
 /// Drop the owned mutex guard before unregistering its holder lease.
 pub(crate) struct IcebergTableCoordinationGuard {
     _guard: OwnedMutexGuard<()>,
-    _entry: IcebergTableEntryLease,
+    _entry: IcebergTableEntryPin,
 }
 
 fn unavailable() -> ConnectorError {

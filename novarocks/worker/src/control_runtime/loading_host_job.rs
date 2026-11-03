@@ -113,7 +113,7 @@ mod tests {
         loading::TaskCreatePayload,
         task::{LoadingSubmission, TaskHostRecord},
     };
-    use novarocks_control_runtime::driver::InputPhase;
+    use novarocks_control_runtime::actor_turn::InputPhase;
     use novarocks_control_runtime_core::{completion::ReturnState, identity::Tick};
     use novarocks_execution_contract::{
         CreateTask, CreationContent, ExchangeTopology, FrozenBytes, OperationOutcome,
@@ -265,8 +265,8 @@ mod tests {
             effect,
             WorkerAction::Reply(reply)
                 if matches!(reply.body.as_ref(),
-                    novarocks_worker_protocol::context::ContextReplyBody::Verdict(
-                        novarocks_worker_protocol::context::RequestResult::Outcome(
+                    novarocks_worker_protocol::participation::ParticipationReplyBody::Verdict(
+                        novarocks_worker_protocol::participation::RequestResult::Outcome(
                             OperationOutcome::ResourceExhausted)))
         )));
         assert!(host.loader().unwrap().take_input_disposal().unwrap().run());

@@ -23,7 +23,7 @@ use super::mv_uea7::{
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan;
 use serde_json::Value;
 use std::fs;

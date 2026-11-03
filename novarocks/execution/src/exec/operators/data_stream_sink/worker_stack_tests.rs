@@ -20,17 +20,17 @@
 
 use super::*;
 use crate::exec::pipeline::{
-    fragment_context::FragmentContext,
-    global_driver_executor::{DriverTask, FragmentCompletion, GlobalDriverExecutor},
+    driver_step::DriverStep,
+    global_driver_executor::{DriverGroupCompletion, DriverRunner, GlobalDriverExecutor},
     operator::{Operator, OperatorLifecycle},
     operator_factory::OperatorFactory,
     pipeline::Pipeline,
     schedule::observer::Observable,
     shape::{Source, SourceKernel},
     step::{StepResult, WaitFact, WaitReason},
-    step_context::StepContext,
+    task_context::TaskContext,
 };
-use crate::runtime::fragment::io::exchange_unit::ExchangeUnitItem;
+use crate::runtime::task::io::exchange_unit::ExchangeUnitItem;
 use crate::runtime::{
     execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig},
     mem_tracker::MemTracker,
@@ -206,7 +206,7 @@ impl OperatorLifecycle for OneSource {
     }
 }
 impl SourceKernel for OneSource {
-    fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         event(&self.trace, "source.poll");
         if let Some(chunk) = self.chunk.take() {
             let rows = chunk.len() as u64;
@@ -275,7 +275,7 @@ fn runtime() -> Arc<ExecutionRuntime> {
 struct Running {
     executor: Arc<GlobalDriverExecutor>,
     state: Arc<RuntimeState>,
-    completion: Arc<FragmentCompletion>,
+    completion: Arc<DriverGroupCompletion>,
     task_owner: Arc<crate::runtime::task_control::test_support::Owner>,
     joined: bool,
 }
@@ -306,7 +306,7 @@ impl Running {
         assert_eq!(
             cancellation.failure_fact(),
             novarocks_failure_contract::FailureFact::stop_observation(
-                crate::runtime::fragment::ExecutionReason::TaskControlObservedStop.reason(),
+                crate::runtime::task::ExecutionReason::TaskControlObservedStop.reason(),
             ),
         );
         self.executor
@@ -640,12 +640,12 @@ fn run_worker_with_input(
     };
     let transport = fixture.transport();
     let dests = (0..destinations)
-        .map(|i| destination_with_finst(&fixture, 90 + i as i64))
+        .map(|i| destination_with_task_key(&fixture, 90 + i as i64))
         .collect::<Vec<_>>();
     let gates = ExchangeEdgeGates::try_new(dests.iter().enumerate().map(|(i, d)| {
         (
             edge_id(i as u32 + 1),
-            vec![ExchangeDestinationKey::new(*d.finst_id(), 1)],
+            vec![ExchangeDestinationKey::new(*d.task_key(), 1)],
         )
     }))
     .unwrap();
@@ -687,7 +687,7 @@ fn run_worker_with_input(
         ],
         1,
     );
-    let context = Arc::new(FragmentContext::new(
+    let context = Arc::new(TaskContext::new(
         None,
         state.clone(),
         Some((1, 2)),
@@ -698,12 +698,12 @@ fn run_worker_with_input(
     let drivers = pipeline
         .instantiate_drivers(&context)
         .expect("real runtime-created sink preparation");
-    let completion = FragmentCompletion::new(drivers.len(), state.error_state());
+    let completion = DriverGroupCompletion::new(drivers.len(), state.error_state());
     let executor = runtime.driver_executor();
     let tasks = drivers
         .into_iter()
         .map(|driver| {
-            DriverTask::new(
+            DriverRunner::new(
                 driver,
                 completion.clone(),
                 context.clone(),
@@ -765,13 +765,7 @@ fn run_worker_with_input(
             );
             let ended = ends
                 .iter()
-                .map(|frame| {
-                    frame
-                        .receiver
-                        .stream
-                        .destination_fragment_instance_id()
-                        .low()
-                })
+                .map(|frame| frame.receiver.stream.destination_task_key().low())
                 .collect::<std::collections::BTreeSet<_>>();
             assert_eq!(ended, (0..destinations).map(|i| 90 + i as i64).collect());
             for end in &ends {
@@ -820,11 +814,7 @@ fn run_worker_with_input(
         for frame in &frames {
             if compiled_hash {
                 assert_eq!(
-                    frame
-                        .receiver
-                        .stream
-                        .destination_fragment_instance_id()
-                        .low(),
+                    frame.receiver.stream.destination_task_key().low(),
                     90,
                     "the frozen odd Int64 key takes FNV partition0; an empty-key seed would take1"
                 );

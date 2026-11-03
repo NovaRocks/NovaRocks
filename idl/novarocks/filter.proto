@@ -36,7 +36,7 @@ enum RuntimeFilterEnvelopeKind {
 
 message RuntimeFilterContributionRouteIdentity {
   uint32 producer_binding_id = 1;
-  novarocks.common.UniqueId fragment_instance_id = 2;
+  novarocks.common.UniqueId task_key = 2;
   uint32 partition_id = 3;
   uint64 sequence = 4;
 }
@@ -48,7 +48,7 @@ message RuntimeFilterDeliveryRouteIdentity {
 
 message RuntimeFilterProducerInstanceRouteIdentity {
   uint32 producer_binding_id = 1;
-  novarocks.common.UniqueId fragment_instance_id = 2;
+  novarocks.common.UniqueId task_key = 2;
 }
 
 message RuntimeFilterRouteIdentity {
@@ -161,7 +161,7 @@ message RuntimeFilterConsumerArtifactProfile {
 message RuntimeFilterProducerDeployment {
   uint32 binding_id = 1;
   uint32 coverage_witness_id = 2;
-  repeated novarocks.common.UniqueId expected_fragment_instances = 3;
+  repeated novarocks.common.UniqueId expected_tasks = 3;
 }
 
 message RuntimeFilterConsumerDeployment {
@@ -170,7 +170,7 @@ message RuntimeFilterConsumerDeployment {
   repeated novarocks.plan.RuntimeFilterArtifactCapability capabilities = 3;
   RuntimeFilterConsumerArtifactProfile artifact_profile = 4;
   repeated uint32 route_edge_ids = 5;
-  repeated novarocks.common.UniqueId expected_fragment_instances = 6;
+  repeated novarocks.common.UniqueId expected_tasks = 6;
 }
 
 enum RuntimeFilterOutboundMaterializationOwner {
@@ -260,7 +260,7 @@ message RuntimeFilterRoutingEdgeView {
 
 message RuntimeFilterProducerInstanceRoute {
   uint32 binding_id = 1;
-  novarocks.common.UniqueId fragment_instance_id = 2;
+  novarocks.common.UniqueId task_key = 2;
   uint32 participant_id = 3;
 }
 

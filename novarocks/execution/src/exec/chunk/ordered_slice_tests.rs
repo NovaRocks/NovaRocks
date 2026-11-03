@@ -23,7 +23,7 @@ use crate::exec::chunk::typed_fixture;
 use crate::exec::pipeline::operator::{InputConstructionFactory, InputConstructionOwner};
 use crate::runtime::tracked_state_allocator::expression_allocation_host;
 use crate::runtime::{
-    fragment::ExecutionFailureCause, mem_tracker::MemTracker, runtime_state::RuntimeErrorState,
+    mem_tracker::MemTracker, runtime_state::RuntimeErrorState, task::ExecutionFailureCause,
 };
 use arrow::{
     array::{Int64Array, StringArray},

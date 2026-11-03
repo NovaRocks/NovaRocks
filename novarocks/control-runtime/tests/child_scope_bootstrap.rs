@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_control_runtime::{
-    lease::{ReservationBundle, WorkLease},
+    obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -35,7 +35,12 @@ fn dimension() -> DimensionId {
 fn resources() -> ResourceVector {
     ResourceVector::new([(dimension(), 1)]).unwrap()
 }
-fn parent() -> (RuntimeLedger, ScopeHandle, WorkLease, ReservationBundle) {
+fn parent() -> (
+    RuntimeLedger,
+    ScopeHandle,
+    WorkObligation,
+    ReservationObligation,
+) {
     let ledger = RuntimeLedger::new(resources());
     let scope = ledger.open_scope_next(None, generation()).unwrap();
     let (mut work, capacity) = scope
@@ -51,13 +56,13 @@ fn parent() -> (RuntimeLedger, ScopeHandle, WorkLease, ReservationBundle) {
     work.start().unwrap();
     (ledger, scope, work, capacity)
 }
-fn release(mut capacity: ReservationBundle) {
+fn release(mut capacity: ReservationObligation) {
     capacity
         .release_quota(&capacity.resources().unwrap().quota)
         .unwrap();
     capacity.finish().unwrap();
 }
-fn exit(work: &mut WorkLease) {
+fn exit(work: &mut WorkObligation) {
     work.body_exited().unwrap();
     work.captures_exited().unwrap();
 }
@@ -65,8 +70,8 @@ fn retire_child(
     ledger: &RuntimeLedger,
     parent_scope: &ScopeHandle,
     scope: ScopeHandle,
-    mut work: WorkLease,
-    capacity: ReservationBundle,
+    mut work: WorkObligation,
+    capacity: ReservationObligation,
 ) -> usize {
     scope.close_external().unwrap();
     exit(&mut work);
@@ -83,8 +88,8 @@ fn retire_child(
 fn retire_parent(
     ledger: &RuntimeLedger,
     scope: ScopeHandle,
-    mut work: WorkLease,
-    capacity: ReservationBundle,
+    mut work: WorkObligation,
+    capacity: ReservationObligation,
 ) {
     scope.close_external().unwrap();
     exit(&mut work);

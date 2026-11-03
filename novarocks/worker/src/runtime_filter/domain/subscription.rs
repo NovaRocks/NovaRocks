@@ -32,7 +32,7 @@ use novarocks_execution::runtime::observable::Observable;
 use novarocks_execution::runtime_filter::{
     BlockingSnapshotSubscription, ConsumerActivation, LivePollOutcome, LiveTerminal,
     LogicalVersion, NonBlockingLiveSubscription, RuntimeFilterSnapshot,
-    RuntimeFilterSubscriptionHandle, SnapshotAcquireOutcome, UnavailableReason,
+    RuntimeFilterSubscriptionPin, SnapshotAcquireOutcome, UnavailableReason,
 };
 use novarocks_types::UniqueId;
 
@@ -354,11 +354,11 @@ impl BackendSubscriptionGroup {
     ) -> Self {
         let slots = instances
             .into_iter()
-            .map(|fragment_instance_id| {
+            .map(|task_key| {
                 let identity = BackendConsumerSubscriptionIdentity::new(
                     channel,
                     consumer_binding_id,
-                    fragment_instance_id,
+                    task_key,
                 );
                 let slot = match activation {
                     ConsumerActivation::BlockingSnapshot => {
@@ -372,7 +372,7 @@ impl BackendSubscriptionGroup {
                         ))
                     }
                 };
-                (fragment_instance_id, slot)
+                (task_key, slot)
             })
             .collect();
         Self {
@@ -382,18 +382,15 @@ impl BackendSubscriptionGroup {
         }
     }
 
-    pub fn handle(
-        &self,
-        fragment_instance_id: UniqueId,
-    ) -> Option<RuntimeFilterSubscriptionHandle> {
-        match self.slots.get(&fragment_instance_id)? {
+    pub fn subscription_pin(&self, task_key: UniqueId) -> Option<RuntimeFilterSubscriptionPin> {
+        match self.slots.get(&task_key)? {
             BackendInstalledSubscriptionSlot::Blocking(slot) => {
                 let slot: Arc<dyn BlockingSnapshotSubscription> = slot.clone();
-                Some(RuntimeFilterSubscriptionHandle::Blocking(slot))
+                Some(RuntimeFilterSubscriptionPin::Blocking(slot))
             }
             BackendInstalledSubscriptionSlot::Live(slot) => {
                 let slot: Arc<dyn NonBlockingLiveSubscription> = slot.clone();
-                Some(RuntimeFilterSubscriptionHandle::Live(slot))
+                Some(RuntimeFilterSubscriptionPin::Live(slot))
             }
         }
     }
@@ -521,8 +518,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let RuntimeFilterSubscriptionHandle::Blocking(slot) =
-            group.handle(UniqueId::new(12, 13)).unwrap()
+        let RuntimeFilterSubscriptionPin::Blocking(slot) =
+            group.subscription_pin(UniqueId::new(12, 13)).unwrap()
         else {
             panic!("expected blocking slot")
         };
@@ -550,8 +547,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let RuntimeFilterSubscriptionHandle::Live(slot) =
-            group.handle(UniqueId::new(12, 13)).unwrap()
+        let RuntimeFilterSubscriptionPin::Live(slot) =
+            group.subscription_pin(UniqueId::new(12, 13)).unwrap()
         else {
             panic!("expected live slot")
         };
@@ -578,8 +575,8 @@ mod tests {
                 Some(LiveTerminal::Completed),
             )
             .unwrap();
-        let RuntimeFilterSubscriptionHandle::Live(slot) =
-            group.handle(UniqueId::new(12, 13)).unwrap()
+        let RuntimeFilterSubscriptionPin::Live(slot) =
+            group.subscription_pin(UniqueId::new(12, 13)).unwrap()
         else {
             panic!("expected live slot")
         };

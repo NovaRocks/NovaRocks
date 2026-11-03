@@ -1251,22 +1251,22 @@ pub trait ConnectorStatisticsResolver: Send + Sync {
     fn acquire_current_statistics(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorStatisticsLease, ConnectorError>;
+    ) -> Result<ConnectorStatisticsSession, ConnectorError>;
 }
 
 #[derive(Clone)]
-pub struct ConnectorStatisticsLease {
+pub struct ConnectorStatisticsSession {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ProviderBindingEpoch,
     statistics: Arc<dyn ConnectorStatistics>,
-    _release: Arc<StatisticsLeaseRelease>,
+    _release: Arc<StatisticsReleaseGuard>,
 }
 
-struct StatisticsLeaseRelease {
+struct StatisticsReleaseGuard {
     release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
 }
 
-impl ConnectorStatisticsLease {
+impl ConnectorStatisticsSession {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -1278,7 +1278,7 @@ impl ConnectorStatisticsLease {
             descriptor,
             incarnation,
             statistics,
-            _release: Arc::new(StatisticsLeaseRelease {
+            _release: Arc::new(StatisticsReleaseGuard {
                 release: Mutex::new(Some(Box::new(release))),
             }),
         })
@@ -1399,14 +1399,15 @@ impl ConnectorStatisticsLease {
             data_version,
             read_version_ordinal,
             required_aggregations,
-            session: Box::new(LeaseBoundStatisticsSession {
+            session: Box::new(GenerationPinnedStatisticsSession {
                 inner: session,
-                _lease: self.clone(),
+                _statistics_session: self.clone(),
             }),
         })
     }
     pub fn session_backing_bytes() -> usize {
-        std::mem::size_of::<LeaseBoundStatisticsSession<dyn AsyncStatisticsCollectionSession>>()
+        std::mem::size_of::<GenerationPinnedStatisticsSession<dyn AsyncStatisticsCollectionSession>>(
+        )
     }
     pub fn begin_collection(
         self,
@@ -1454,9 +1455,9 @@ impl ConnectorStatisticsLease {
             required_aggregations,
             session,
         } = start;
-        let session = Box::new(LeaseBoundStatisticsSession {
+        let session = Box::new(GenerationPinnedStatisticsSession {
             inner: session,
-            _lease: self,
+            _statistics_session: self,
         });
         StatisticsCollectionStart::try_new(
             table,
@@ -1486,13 +1487,13 @@ impl ConnectorStatisticsLease {
     }
 }
 
-struct LeaseBoundStatisticsSession<S: ?Sized> {
+struct GenerationPinnedStatisticsSession<S: ?Sized> {
     inner: Box<S>,
-    _lease: ConnectorStatisticsLease,
+    _statistics_session: ConnectorStatisticsSession,
 }
 
 impl AsyncStatisticsCollectionSession
-    for LeaseBoundStatisticsSession<dyn AsyncStatisticsCollectionSession>
+    for GenerationPinnedStatisticsSession<dyn AsyncStatisticsCollectionSession>
 {
     fn io_profile(&self) -> Result<ConnectorMetadataMaintenanceIoProfile, ConnectorError> {
         self.inner.io_profile()
@@ -1528,7 +1529,9 @@ impl AsyncStatisticsCollectionSession
     }
 }
 
-impl StatisticsCollectionSession for LeaseBoundStatisticsSession<dyn StatisticsCollectionSession> {
+impl StatisticsCollectionSession
+    for GenerationPinnedStatisticsSession<dyn StatisticsCollectionSession>
+{
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         self.inner.descriptor()
     }
@@ -1549,17 +1552,23 @@ impl StatisticsCollectionSession for LeaseBoundStatisticsSession<dyn StatisticsC
         self: Box<Self>,
         artifacts: Vec<StatisticsArtifactDraft>,
     ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
-        let Self { inner, _lease } = *self;
+        let Self {
+            inner,
+            _statistics_session,
+        } = *self;
         inner.finish(artifacts)
     }
 
     fn abort(self: Box<Self>) -> Result<(), ConnectorError> {
-        let Self { inner, _lease } = *self;
+        let Self {
+            inner,
+            _statistics_session,
+        } = *self;
         inner.abort()
     }
 }
 
-impl Drop for StatisticsLeaseRelease {
+impl Drop for StatisticsReleaseGuard {
     fn drop(&mut self) {
         let Ok(mut release) = self.release.lock() else {
             return;
@@ -2067,7 +2076,7 @@ mod tests {
             Bytes::from_static(b"table"),
         )
         .unwrap();
-        let lease = ConnectorStatisticsLease::new(
+        let lease = ConnectorStatisticsSession::new(
             descriptor.clone(),
             incarnation,
             Arc::new(WrongOperationStatistics {

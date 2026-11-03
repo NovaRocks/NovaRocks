@@ -52,7 +52,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use mysql::prelude::Queryable;
 use mysql::{Row, Value};
 use novarocks_cluster_harness::{
-    QueryLifecycleFailureSite, QueryLifecycleStructuredSnapshot, ServerHandle,
+    QueryLifecycleFailureSite, QueryLifecycleStructuredSnapshot, TestClusterOwner,
 };
 use novarocks_connector_iceberg::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1;
 use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
@@ -83,7 +83,7 @@ const WRITER_TOTALS: &str = "novarocks_backend_connector_write_writer_totals";
 const WRITER_ABORTS: &str = "novarocks_backend_connector_write_writer_aborts_total";
 const WRITE_DEBUG_FAULTS: &str = "novarocks_backend_connector_write_debug_faults_total";
 const ROOT_PEAK: &str = "novarocks_backend_connector_write_root_prepared_set_peak";
-const RESULT_TERMINALS: &str = "novarocks_backend_fragment_result_terminals_total";
+const RESULT_TERMINALS: &str = "novarocks_backend_task_result_terminals_total";
 const WRITER_PARTIAL_TOTALS: &str = "novarocks_table_writer_partial_totals";
 
 /// `LakePublicationFamily::Write` — INSERT and INSERT OVERWRITE.
@@ -2570,17 +2570,19 @@ enum WriteFault {
 /// task protocol runs its fragments from `NativeTaskExecutionHost`, and that
 /// ingress no longer exists.
 const TASK_EXECUTION_FAILURE: &str = "task-execution-failure";
-const TASK_EXECUTION_FAILURE_INJECTED: &str = "NOVAROCKS_TASK_EXECUTION_FAILURE_INJECTED";
+const TASK_EXECUTION_FAILURE_INJECTED: &str =
+    novarocks_failpoint::observation_marker::TASK_EXECUTION_FAILURE_INJECTED;
 
 /// One task was admitted on a backend, which is this protocol's earliest
 /// evidence that an attempt is actually running out there.
-const TASK_CREATE_APPLIED: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
+const TASK_CREATE_APPLIED: &str = novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED;
 
 /// One backend applied this query's abort. Client cancellation reaches a
 /// backend as this operation, so it is what a case about aborting a running
 /// write has to count -- the retired chain's own abort and phase markers have
 /// no live emitter.
-const TASK_CONTEXT_ABORT_APPLIED: &str = "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED";
+const PARTICIPATION_ABORT_APPLIED: &str =
+    novarocks_failpoint::observation_marker::PARTICIPATION_ABORT_APPLIED;
 
 impl WriteFault {
     /// Incomplete delivery cuts own exclusive targets; the recovery matrix
@@ -2645,7 +2647,7 @@ impl WriteFault {
             // needs is that the abort was delivered somewhere at all, because
             // the alternative -- a client error with no abort behind it -- is
             // exactly what a timeout looks like.
-            Self::FetchAbort => InjectionEvidence::EveryBackend(TASK_CONTEXT_ABORT_APPLIED),
+            Self::FetchAbort => InjectionEvidence::EveryBackend(PARTICIPATION_ABORT_APPLIED),
             Self::DeadlineAbort => InjectionEvidence::AppendHolds,
         }
     }
@@ -3503,7 +3505,7 @@ fn assert_sealed_root_read_failure(
     .map_err(|_| anyhow!("original statement has an invalid execution identity"))?;
     anyhow::ensure!(
         snapshot.attempt_id == 1
-            && snapshot.worker_contexts_converged
+            && snapshot.worker_participations_converged
             && snapshot.execution_id.as_deref()
                 == Some(
                     format!(
@@ -3755,7 +3757,7 @@ fn assert_connector_failure(
     anyhow::ensure!(
         snapshot.failure_fact == Some(expected)
             && snapshot.attempt_id == 1
-            && snapshot.worker_contexts_converged,
+            && snapshot.worker_participations_converged,
         "{case}: original Connector fact or physical context convergence changed: {snapshot:?}"
     );
     let Some(QueryLifecycleFailureSite::Task { identity, phase }) = &snapshot.failure_site else {
@@ -3883,7 +3885,7 @@ fn writer_fault_specs(cluster_size: usize) -> Vec<StatementSpec> {
                     .unwrap_or_default(),
                 observations: if matches!(fault, WriteFault::FetchAbort) {
                     (0..cluster_size)
-                        .map(|index| (index, "grpc-fragment", None))
+                        .map(|index| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), None))
                         .collect()
                 } else {
                     vec![]
@@ -4117,9 +4119,11 @@ mod controlled_writer_tests {
                 .starts_with("INSERT INTO distributed_writer_faults.")
         }));
         assert!(specs.iter().all(|spec| {
-            spec.observations
-                .iter()
-                .all(|(_, action, _)| *action == "grpc-fragment")
+            spec.observations.iter().all(|(_, action, _)| {
+                *action
+                    == novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str()
+            })
         }));
         assert_eq!(
             specs.iter().map(|spec| spec.faults.len()).sum::<usize>(),

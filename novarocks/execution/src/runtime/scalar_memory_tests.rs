@@ -1854,7 +1854,7 @@ fn runtime_scalar_memory_original_domain_error_and_late_cancel_keep_real_settlem
     let release = Release(&pointer, &allocator, layout);
     let domain = RefCell::new(None::<novarocks_memory::FundingDomain>);
     let expected = KernelFailure::from_domain(LayoutResourceError::SourceModel);
-    let late_cancel: crate::runtime::fragment::ExecutionFailure = KernelFailure::Cancelled.into();
+    let late_cancel: crate::runtime::task::ExecutionFailure = KernelFailure::Cancelled.into();
     let mut journal = RuntimeScalarMemoryJournal::default();
     let actual = RuntimeScalarMemoryScope::new(&control, &mut journal)
         .run(

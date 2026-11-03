@@ -35,7 +35,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::input_construction::{
     ConstructionFailure, InputConstructionFactory,
 };
-use crate::runtime::fragment::ExecutionFailure;
+use crate::runtime::task::ExecutionFailure;
 
 #[derive(Debug)]
 pub(super) enum UnpivotProbeFailure {
@@ -113,7 +113,7 @@ impl std::error::Error for UnpivotProbeFailure {
 }
 impl novarocks_failure_contract::FailureProjection for UnpivotProbeFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{
             FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
             RepresentationLayout, domain,

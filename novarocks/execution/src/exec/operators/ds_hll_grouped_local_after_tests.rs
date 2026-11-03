@@ -240,11 +240,11 @@ fn ds_hll_grouped_local_after_actual_partial_final_cancel_latch_drop() {
             processor.input_without_output(first.clone()).unwrap();
             assert!(tracker.current() > 0);
             let originating =
-                crate::runtime::fragment::ExecutionFailure::from(KernelFailure::ResourceExhausted);
+                crate::runtime::task::ExecutionFailure::from(KernelFailure::ResourceExhausted);
             phase.error.set_error(originating.clone());
             let primary = processor.input_without_output(first.clone()).unwrap_err();
             assert!(primary.same_occurrence(&originating));
-            assert_eq!(primary.context(), originating.context());
+            assert_eq!(primary.site(), originating.site());
             // The local driver preserves its already known originating cause.
             assert!(phase.error.error().unwrap().same_occurrence(&originating));
             assert_eq!(tracker.current(), creator_bytes);

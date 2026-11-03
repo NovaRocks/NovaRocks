@@ -29,7 +29,7 @@ use crate::{
         },
         pipeline::operator::InputConstructionOwner,
     },
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use arrow::array::{Array, ArrayRef, BinaryViewArray};
 use novarocks_functions::{AggregateStateAllocator, KernelEvaluationControl};

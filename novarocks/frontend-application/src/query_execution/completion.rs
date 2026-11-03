@@ -634,10 +634,10 @@ fn format_distributed_profile_summary(
     summary: &crate::query_execution::profile::DistributedProfileSummary,
 ) -> String {
     format!(
-        "Profile: fragments={} fragment_wall_max={} fragment_wall_sum={} driver_total={} driver_blocked={} source_wait={} sink_wait={} dependency_wait={} operator_active={} exchange_wait={} exchange_process={} network={} scan_io={}",
-        summary.fragment_instance_count,
-        format_explain_analyze_duration_ns(summary.fragment_wall_max_ns),
-        format_explain_analyze_duration_ns(summary.fragment_wall_sum_ns),
+        "Profile: tasks={} task_wall_max={} task_wall_sum={} driver_total={} driver_blocked={} source_wait={} sink_wait={} dependency_wait={} operator_active={} exchange_wait={} exchange_process={} network={} scan_io={}",
+        summary.task_count,
+        format_explain_analyze_duration_ns(summary.task_wall_max_ns),
+        format_explain_analyze_duration_ns(summary.task_wall_sum_ns),
         format_explain_analyze_duration_ns(summary.driver_total_time_ns),
         format_explain_analyze_duration_ns(summary.driver_blocked_time_ns),
         format_explain_analyze_duration_ns(summary.source_wait_time_ns),

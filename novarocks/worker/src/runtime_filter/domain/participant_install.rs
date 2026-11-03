@@ -254,7 +254,7 @@ impl BackendOutboundMaterializationGroup {
 pub struct BackendProducerInstall {
     contract: RuntimeFilterProducerContract,
     coverage_witness: BackendCoverageWitnessId,
-    expected_fragment_instances: BTreeSet<UniqueId>,
+    expected_tasks: BTreeSet<UniqueId>,
     max_contribution_bytes: usize,
 }
 
@@ -262,12 +262,11 @@ impl BackendProducerInstall {
     pub fn new(
         contract: RuntimeFilterProducerContract,
         coverage_witness: BackendCoverageWitnessId,
-        expected_fragment_instances: impl IntoIterator<Item = UniqueId>,
+        expected_tasks: impl IntoIterator<Item = UniqueId>,
         max_contribution_bytes: usize,
     ) -> Result<Self, BackendParticipantInstallError> {
-        let expected_fragment_instances: BTreeSet<UniqueId> =
-            expected_fragment_instances.into_iter().collect();
-        if expected_fragment_instances.is_empty() {
+        let expected_tasks: BTreeSet<UniqueId> = expected_tasks.into_iter().collect();
+        if expected_tasks.is_empty() {
             return Err(BackendParticipantInstallError::EmptyExpectedInstances);
         }
         if max_contribution_bytes == 0 {
@@ -276,7 +275,7 @@ impl BackendProducerInstall {
         Ok(Self {
             contract,
             coverage_witness,
-            expected_fragment_instances,
+            expected_tasks,
             max_contribution_bytes,
         })
     }
@@ -287,8 +286,8 @@ impl BackendProducerInstall {
     pub const fn coverage_witness(&self) -> BackendCoverageWitnessId {
         self.coverage_witness
     }
-    pub const fn expected_fragment_instances(&self) -> &BTreeSet<UniqueId> {
-        &self.expected_fragment_instances
+    pub const fn expected_tasks(&self) -> &BTreeSet<UniqueId> {
+        &self.expected_tasks
     }
     pub const fn max_contribution_bytes(&self) -> usize {
         self.max_contribution_bytes
@@ -300,7 +299,7 @@ pub struct BackendConsumerInstall {
     contract: RuntimeFilterConsumerContract,
     profile: ConsumerArtifactProfile,
     route_edge_ids: BTreeSet<BackendRouteEdgeId>,
-    expected_fragment_instances: BTreeSet<UniqueId>,
+    expected_tasks: BTreeSet<UniqueId>,
 }
 
 impl BackendConsumerInstall {
@@ -308,22 +307,21 @@ impl BackendConsumerInstall {
         contract: RuntimeFilterConsumerContract,
         profile: ConsumerArtifactProfile,
         route_edge_ids: impl IntoIterator<Item = BackendRouteEdgeId>,
-        expected_fragment_instances: impl IntoIterator<Item = UniqueId>,
+        expected_tasks: impl IntoIterator<Item = UniqueId>,
     ) -> Result<Self, BackendParticipantInstallError> {
         let route_edge_ids: BTreeSet<BackendRouteEdgeId> = route_edge_ids.into_iter().collect();
-        let expected_fragment_instances: BTreeSet<UniqueId> =
-            expected_fragment_instances.into_iter().collect();
+        let expected_tasks: BTreeSet<UniqueId> = expected_tasks.into_iter().collect();
         if route_edge_ids.is_empty() {
             return Err(BackendParticipantInstallError::EmptyConsumerRoutes);
         }
-        if expected_fragment_instances.is_empty() {
+        if expected_tasks.is_empty() {
             return Err(BackendParticipantInstallError::EmptyExpectedInstances);
         }
         Ok(Self {
             contract,
             profile,
             route_edge_ids,
-            expected_fragment_instances,
+            expected_tasks,
         })
     }
 
@@ -336,8 +334,8 @@ impl BackendConsumerInstall {
     pub const fn route_edge_ids(&self) -> &BTreeSet<BackendRouteEdgeId> {
         &self.route_edge_ids
     }
-    pub const fn expected_fragment_instances(&self) -> &BTreeSet<UniqueId> {
-        &self.expected_fragment_instances
+    pub const fn expected_tasks(&self) -> &BTreeSet<UniqueId> {
+        &self.expected_tasks
     }
 }
 

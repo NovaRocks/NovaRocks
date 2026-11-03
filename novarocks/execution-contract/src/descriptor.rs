@@ -184,7 +184,7 @@ impl RuntimeEndpoint {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExchangeDestination {
     task: TaskIdentity,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     endpoint: RuntimeEndpoint,
     destination_node_id: FragmentNodeId,
 }
@@ -192,21 +192,21 @@ pub struct ExchangeDestination {
 impl ExchangeDestination {
     pub const fn new(
         task: TaskIdentity,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         endpoint: RuntimeEndpoint,
         destination_node_id: FragmentNodeId,
     ) -> Self {
         Self {
             task,
-            fragment_instance_id,
+            task_key,
             endpoint,
             destination_node_id,
         }
     }
 
     /// The execution kernel's key for this destination.
-    pub const fn fragment_instance_id(&self) -> UniqueId {
-        self.fragment_instance_id
+    pub const fn task_key(&self) -> UniqueId {
+        self.task_key
     }
 
     pub const fn task(&self) -> TaskIdentity {
@@ -278,7 +278,7 @@ impl ExchangeEdge {
         by_task.dedup();
         let mut by_key: Vec<UniqueId> = destinations
             .iter()
-            .map(|destination| destination.fragment_instance_id())
+            .map(|destination| destination.task_key())
             .collect();
         by_key.sort_unstable();
         by_key.dedup();
@@ -331,19 +331,15 @@ impl ExchangeEdge {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ExchangeSource {
     task: TaskIdentity,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     sender_ordinal: u32,
 }
 
 impl ExchangeSource {
-    pub const fn new(
-        task: TaskIdentity,
-        fragment_instance_id: UniqueId,
-        sender_ordinal: u32,
-    ) -> Self {
+    pub const fn new(task: TaskIdentity, task_key: UniqueId, sender_ordinal: u32) -> Self {
         Self {
             task,
-            fragment_instance_id,
+            task_key,
             sender_ordinal,
         }
     }
@@ -352,8 +348,8 @@ impl ExchangeSource {
         self.task
     }
 
-    pub const fn fragment_instance_id(self) -> UniqueId {
-        self.fragment_instance_id
+    pub const fn task_key(self) -> UniqueId {
+        self.task_key
     }
 
     pub const fn sender_ordinal(self) -> u32 {
@@ -390,10 +386,7 @@ impl ExchangeInbound {
         let mut by_task: Vec<TaskIdentity> = sources.iter().map(|source| source.task()).collect();
         by_task.sort_unstable();
         by_task.dedup();
-        let mut by_key: Vec<UniqueId> = sources
-            .iter()
-            .map(|source| source.fragment_instance_id())
-            .collect();
+        let mut by_key: Vec<UniqueId> = sources.iter().map(|source| source.task_key()).collect();
         by_key.sort_unstable();
         by_key.dedup();
         // Both addresses must be unique: two tasks sharing one kernel key
@@ -449,7 +442,7 @@ impl ExchangeInbound {
         self.sources
             .iter()
             .copied()
-            .find(|frozen| frozen.fragment_instance_id() == key)
+            .find(|frozen| frozen.task_key() == key)
     }
 }
 
@@ -599,7 +592,7 @@ impl crate::failure::FailureProjection for DescriptorError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskDescriptor {
     identity: TaskIdentity,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     pipeline_dop: NonZeroUsize,
     split_plan_nodes: Vec<PlanNodeId>,
     topology: ExchangeTopology,
@@ -609,13 +602,13 @@ impl TaskDescriptor {
     /// Builds a descriptor, rejecting every shape the protocol does not
     /// allow.
     ///
-    /// `fragment_instance_id` is the execution kernel's local key. It is
+    /// `task_key` is the execution kernel's local key. It is
     /// derived one-to-one from `identity` by the frontend and is never a
     /// second wire admission identity: nothing selects a backend, retries, or
     /// reaches a terminal state through it.
     pub fn try_new(
         identity: TaskIdentity,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         pipeline_dop: NonZeroUsize,
         split_plan_nodes: Vec<PlanNodeId>,
         topology: ExchangeTopology,
@@ -635,7 +628,7 @@ impl TaskDescriptor {
         }
         Ok(Self {
             identity,
-            fragment_instance_id,
+            task_key,
             pipeline_dop,
             split_plan_nodes,
             topology,
@@ -647,8 +640,8 @@ impl TaskDescriptor {
     }
 
     /// The execution kernel's local fragment instance key.
-    pub const fn fragment_instance_id(&self) -> UniqueId {
-        self.fragment_instance_id
+    pub const fn task_key(&self) -> UniqueId {
+        self.task_key
     }
 
     pub const fn pipeline_dop(&self) -> NonZeroUsize {
@@ -1108,7 +1101,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        assert_eq!(descriptor.fragment_instance_id(), OWN_KEY);
+        assert_eq!(descriptor.task_key(), OWN_KEY);
         assert_eq!(descriptor.pipeline_dop().get(), 4);
         assert!(descriptor.accepts_split_plan_node(PlanNodeId::new(3).expect("nonnegative")));
         assert!(!descriptor.accepts_split_plan_node(PlanNodeId::new(4).expect("nonnegative")));

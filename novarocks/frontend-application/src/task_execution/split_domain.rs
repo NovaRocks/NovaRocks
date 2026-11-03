@@ -39,7 +39,7 @@ use crate::query_execution::split_assignment::SplitAssignmentDriverError;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct TaskAssignmentTarget {
     pub(crate) identity: novarocks_execution::task_execution::TaskIdentity,
-    pub(crate) fragment_instance_id: UniqueId,
+    pub(crate) task_key: UniqueId,
 }
 
 /// The driver's addresses for every task of one plan node.
@@ -57,7 +57,7 @@ pub(crate) fn assignment_targets(graph: &TaskGraph, node: PlanNodeId) -> Vec<Tas
         .filter(|task| task.split_plan_nodes().contains(&node))
         .map(|task| TaskAssignmentTarget {
             identity: task.identity(),
-            fragment_instance_id: task.fragment_instance_id(),
+            task_key: task.task_key(),
         })
         .collect()
 }
@@ -73,10 +73,10 @@ pub(crate) fn assignment_targets(graph: &TaskGraph, node: PlanNodeId) -> Vec<Tas
     dead_code,
     reason = "The task protocol is not routed into production yet; the adapter is exercised by this module's tests until the transport cutover lands."
 )]
-pub(crate) fn task_kernel_index(graph: &TaskGraph) -> BTreeMap<UniqueId, TaskId> {
+pub(crate) fn task_key_index(graph: &TaskGraph) -> BTreeMap<UniqueId, TaskId> {
     graph
         .tasks()
-        .map(|task| (task.fragment_instance_id(), task.task_id()))
+        .map(|task| (task.task_key(), task.task_id()))
         .collect()
 }
 

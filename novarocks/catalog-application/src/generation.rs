@@ -115,7 +115,7 @@ struct Generation<T> {
     handle: Option<CatalogHandle>,
     runtime: Arc<T>,
     state: GenerationState,
-    leases: usize,
+    pins: usize,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -189,7 +189,7 @@ impl<T> CatalogGenerationOwner<T> {
                 handle: prepared.handle,
                 runtime: prepared.runtime,
                 state: GenerationState::Current,
-                leases: 0,
+                pins: 0,
             },
         );
         state.current.insert(name, runtime_id);
@@ -210,7 +210,7 @@ impl<T> CatalogGenerationOwner<T> {
     pub fn acquire_current(
         &self,
         name: &ConnectorInstanceId,
-    ) -> Result<CatalogGenerationLease<T>, CatalogGenerationError> {
+    ) -> Result<CatalogGenerationPin<T>, CatalogGenerationError> {
         let mut state = self.lock()?;
         let runtime_id = state
             .current
@@ -227,7 +227,7 @@ impl<T> CatalogGenerationOwner<T> {
         &self,
         handle: &CatalogHandle,
         runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<CatalogGenerationLease<T>, CatalogGenerationError> {
+    ) -> Result<CatalogGenerationPin<T>, CatalogGenerationError> {
         let mut state = self.lock()?;
         let matches = state
             .by_handle
@@ -245,7 +245,7 @@ impl<T> CatalogGenerationOwner<T> {
     pub fn acquire_runtime(
         &self,
         runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<CatalogGenerationLease<T>, CatalogGenerationError> {
+    ) -> Result<CatalogGenerationPin<T>, CatalogGenerationError> {
         let mut state = self.lock()?;
         if !state.generations.contains_key(&runtime_id) {
             return Err(CatalogGenerationError::NotFound);
@@ -313,16 +313,16 @@ fn acquire<T>(
     owner: &Arc<OwnerInner<T>>,
     state: &mut OwnerState<T>,
     runtime_id: ConnectorControlRuntimeId,
-) -> Result<CatalogGenerationLease<T>, CatalogGenerationError> {
+) -> Result<CatalogGenerationPin<T>, CatalogGenerationError> {
     let generation = state
         .generations
         .get_mut(&runtime_id)
         .ok_or(CatalogGenerationError::CorruptOwner)?;
-    generation.leases = generation
-        .leases
+    generation.pins = generation
+        .pins
         .checked_add(1)
         .ok_or(CatalogGenerationError::LeaseOverflow)?;
-    Ok(CatalogGenerationLease {
+    Ok(CatalogGenerationPin {
         owner: Arc::downgrade(owner),
         runtime_id,
         name: generation.name.clone(),
@@ -345,7 +345,7 @@ fn reap_if_unleased<T>(
         .generations
         .get(&runtime_id)
         .is_some_and(|generation| {
-            generation.state == GenerationState::Retiring && generation.leases == 0
+            generation.state == GenerationState::Retiring && generation.pins == 0
         });
     if remove && let Some(generation) = state.generations.remove(&runtime_id) {
         if let Some(handle) = &generation.handle
@@ -367,7 +367,7 @@ fn reap_if_unleased<T>(
 }
 
 /// Move-only proof that one exact Catalog generation remains available.
-pub struct CatalogGenerationLease<T> {
+pub struct CatalogGenerationPin<T> {
     owner: Weak<OwnerInner<T>>,
     runtime_id: ConnectorControlRuntimeId,
     name: ConnectorInstanceId,
@@ -375,7 +375,7 @@ pub struct CatalogGenerationLease<T> {
     runtime: Arc<T>,
 }
 
-impl<T> CatalogGenerationLease<T> {
+impl<T> CatalogGenerationPin<T> {
     pub const fn runtime_id(&self) -> ConnectorControlRuntimeId {
         self.runtime_id
     }
@@ -393,7 +393,7 @@ impl<T> CatalogGenerationLease<T> {
     }
 }
 
-impl<T> Drop for CatalogGenerationLease<T> {
+impl<T> Drop for CatalogGenerationPin<T> {
     fn drop(&mut self) {
         let Some(owner) = self.owner.upgrade() else {
             return;
@@ -404,8 +404,8 @@ impl<T> Drop for CatalogGenerationLease<T> {
         let Some(generation) = state.generations.get_mut(&self.runtime_id) else {
             return;
         };
-        debug_assert!(generation.leases > 0, "Catalog lease count underflow");
-        generation.leases = generation.leases.saturating_sub(1);
+        debug_assert!(generation.pins > 0, "Catalog lease count underflow");
+        generation.pins = generation.pins.saturating_sub(1);
         let retired = reap_if_unleased(&mut state, self.runtime_id);
         drop(state);
         if let (Some(observer), Some(retired)) = (&owner.retirement_observer, retired) {

@@ -411,16 +411,16 @@ fn runtime_filter_profile_tree(
                 && consumer.channel_id == channel.channel_id
         }) {
             let consumer_profile = channel_profile.child(format!(
-                "RuntimeFilterConsumer (consumer_binding_id={}, fragment_instance_id={})",
+                "RuntimeFilterConsumer (consumer_binding_id={}, task_key={})",
                 consumer.consumer_binding_id,
                 novarocks_types::UniqueId::new(
                     consumer
-                        .fragment_instance_id
+                        .task_key
                         .as_ref()
                         .expect("validated runtime-filter consumer has fragment identity")
                         .hi,
                     consumer
-                        .fragment_instance_id
+                        .task_key
                         .as_ref()
                         .expect("validated runtime-filter consumer has fragment identity")
                         .lo,
@@ -631,9 +631,9 @@ const DICT_UNSUPPORTED_COLUMNS: &str = "DictUnsupportedColumns";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DistributedProfileSummary {
-    pub(crate) fragment_instance_count: usize,
-    pub(crate) fragment_wall_max_ns: i64,
-    pub(crate) fragment_wall_sum_ns: i64,
+    pub(crate) task_count: usize,
+    pub(crate) task_wall_max_ns: i64,
+    pub(crate) task_wall_sum_ns: i64,
     pub(crate) driver_total_time_ns: i64,
     pub(crate) operator_active_time_ns: i64,
     pub(crate) driver_blocked_time_ns: i64,
@@ -837,11 +837,11 @@ fn profile_tree_has_runtime_statistics(tree: &RuntimeProfileTree) -> bool {
 
 /// Summarize one fragment-instance profile tree into a single-instance summary.
 fn summarize_one_tree(tree: &RuntimeProfileTree) -> DistributedProfileSummary {
-    let fragment_wall_ns = native_counter_in_tree(tree, "FragmentWallTime");
+    let task_wall_ns = native_counter_in_tree(tree, "TaskWallTime");
     DistributedProfileSummary {
-        fragment_instance_count: 1,
-        fragment_wall_max_ns: fragment_wall_ns,
-        fragment_wall_sum_ns: fragment_wall_ns,
+        task_count: 1,
+        task_wall_max_ns: task_wall_ns,
+        task_wall_sum_ns: task_wall_ns,
         driver_total_time_ns: native_counter_in_tree(tree, "DriverTotalTime"),
         operator_active_time_ns: native_counter_in_tree(tree, "OperatorTotalTime"),
         driver_blocked_time_ns: native_counter_in_tree(tree, "DriverBlockedTime"),
@@ -948,11 +948,9 @@ fn native_counter_in_node(node: &ProfileNode, name: &str) -> i64 {
 /// Fold `other` into `into`: counts/times sum, fragment wall takes max — identical to the
 /// query-level aggregation so per-fragment and query-level numbers reconcile.
 fn merge_summary(into: &mut DistributedProfileSummary, other: &DistributedProfileSummary) {
-    into.fragment_instance_count += other.fragment_instance_count;
-    into.fragment_wall_max_ns = into.fragment_wall_max_ns.max(other.fragment_wall_max_ns);
-    into.fragment_wall_sum_ns = into
-        .fragment_wall_sum_ns
-        .saturating_add(other.fragment_wall_sum_ns);
+    into.task_count += other.task_count;
+    into.task_wall_max_ns = into.task_wall_max_ns.max(other.task_wall_max_ns);
+    into.task_wall_sum_ns = into.task_wall_sum_ns.saturating_add(other.task_wall_sum_ns);
     into.driver_total_time_ns = into
         .driver_total_time_ns
         .saturating_add(other.driver_total_time_ns);
@@ -1154,7 +1152,7 @@ mod tests {
                                 channel_binding_id,
                                 channel_id: participant_seed as u32,
                                 consumer_binding_id: channel_binding_id + 100,
-                                fragment_instance_id: Some(common::UniqueId {
+                                task_key: Some(common::UniqueId {
                                     hi: participant_seed as i64,
                                     lo: channel_binding_id as i64,
                                 }),
@@ -1741,7 +1739,7 @@ mod tests {
     #[test]
     fn summarizes_distributed_profile_attribution_from_native_trees() {
         let profiler = Profiler::new("fragment");
-        profiler.counter_set("FragmentWallTime", ProfileUnit::TimeNs, 20_000);
+        profiler.counter_set("TaskWallTime", ProfileUnit::TimeNs, 20_000);
         let driver = profiler
             .child("Pipeline (id=0)")
             .child("PipelineDriver (id=0)");
@@ -1767,9 +1765,9 @@ mod tests {
         let summary =
             collect_distributed_profile_summary_from_profile_trees(&[profiler.to_native_tree()]);
 
-        assert_eq!(summary.fragment_instance_count, 1);
-        assert_eq!(summary.fragment_wall_max_ns, 20_000);
-        assert_eq!(summary.fragment_wall_sum_ns, 20_000);
+        assert_eq!(summary.task_count, 1);
+        assert_eq!(summary.task_wall_max_ns, 20_000);
+        assert_eq!(summary.task_wall_sum_ns, 20_000);
         assert_eq!(summary.driver_total_time_ns, 10_000);
         assert_eq!(summary.operator_active_time_ns, 5_000);
         assert_eq!(summary.driver_blocked_time_ns, 4_500);
@@ -1937,11 +1935,11 @@ mod tests {
 
         assert_eq!(by_fragment.len(), 2);
         let a = by_fragment.get(&9).expect("fragment root node 9");
-        assert_eq!(a.fragment_instance_count, 2);
+        assert_eq!(a.task_count, 2);
         assert_eq!(a.operator_active_time_ns, 30_000);
         assert_eq!(a.driver_blocked_time_ns, 300);
         let b = by_fragment.get(&2).expect("fragment root node 2");
-        assert_eq!(b.fragment_instance_count, 1);
+        assert_eq!(b.task_count, 1);
         assert_eq!(b.operator_active_time_ns, 5_000);
         assert_eq!(b.driver_blocked_time_ns, 300);
     }
@@ -1974,7 +1972,7 @@ mod tests {
         assert!(collect_per_fragment_profile_summaries(&profiles).is_empty());
         assert_eq!(
             collect_distributed_profile_summary_from_profile_trees(&[profiles[0].tree.clone()])
-                .fragment_instance_count,
+                .task_count,
             0
         );
         assert!(
@@ -2224,7 +2222,7 @@ mod tests {
             "the only fragment key is the sealed fragment root the caller named"
         );
         let fragment = by_fragment.get(&7).expect("fragment root node 7");
-        assert_eq!(fragment.fragment_instance_count, 2);
+        assert_eq!(fragment.task_count, 2);
         assert_eq!(fragment.operator_active_time_ns, 15_000);
     }
 

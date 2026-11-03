@@ -2059,7 +2059,7 @@ else:
         }
 
         struct NeverStartedServer;
-        impl crate::cluster::ServerHandle for NeverStartedServer {
+        impl crate::cluster::TestClusterOwner for NeverStartedServer {
             fn target_host(&self) -> Option<&str> {
                 panic!("aborted case must not access a Server")
             }
@@ -2114,7 +2114,7 @@ else:
                         target_session_sql: vec![],
                         rewrite_explain_contains_as_not_contains: vec![],
                         fail_fast: true,
-                        server_handle: Arc::new(std::sync::Mutex::new(Box::new(
+                        cluster_owner: Arc::new(std::sync::Mutex::new(Box::new(
                             NeverStartedServer,
                         ))),
                         failure_artifacts: Arc::new(

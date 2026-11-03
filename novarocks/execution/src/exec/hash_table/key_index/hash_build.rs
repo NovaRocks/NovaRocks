@@ -28,7 +28,7 @@ use crate::{
     exec::{
         hash_table::allocation::AggregateAllocator, pipeline::operator::InputConstructionOwner,
     },
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use novarocks_functions::KernelEvaluationControl;
 use novarocks_value_arrays::ValueViolation;

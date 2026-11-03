@@ -23,7 +23,7 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_failpoint::target_binding::StatementExecutionBinding;
 use std::fs;
 use std::io::{Read, Write};
@@ -39,15 +39,15 @@ use std::time::Instant;
 const REQUIRED_BACKENDS: usize = 3;
 
 /// The task protocol's restart rendezvous: it holds one applied
-/// `EstablishQueryContext` open so the harness can replace that exact process.
+/// `EstablishParticipation` open so the harness can replace that exact process.
 /// It replaces the retired protocol's `restart-after-init-ack` because
 /// establish is the task protocol's first per-backend admission point.
-const RESTART_AFTER_ESTABLISH_CONTEXT: &str = "restart-after-establish-context";
+const RESTART_AFTER_ESTABLISH_PARTICIPATION: &str = "restart-after-establish-participation";
 
 /// Runner-side half of the establish-before-restart handoff.
 ///
 /// The listener exists before the query starts. The backend sends the exact
-/// fault token after it applies EstablishQueryContext and keeps that RPC
+/// fault token after it applies EstablishParticipation and keeps that RPC
 /// parked until the runner completes process replacement. A log marker proves
 /// the same event but cannot synchronize it: a polling runner can see the
 /// marker only after the backend has consumed the request boundary.
@@ -272,8 +272,12 @@ impl Drop for MembershipActor {
 fn membership_statement(sql: &str) -> StatementSpec {
     StatementSpec {
         sql: sql.into(),
-        faults: vec![(0, RESTART_AFTER_ESTABLISH_CONTEXT)],
-        observations: vec![(0, "grpc-fragment", Some(1))],
+        faults: vec![(0, RESTART_AFTER_ESTABLISH_PARTICIPATION)],
+        observations: vec![(
+            0,
+            novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
+            Some(1),
+        )],
     }
 }
 
@@ -369,7 +373,7 @@ impl Scenario for PreReadyReplan {
         let token = selected.token.clone();
         let rendezvous = RestartAfterEstablishRendezvous::bind(&token)?;
         context.action(format!(
-            "armed token-scoped restart after BE[{target}] EstablishQueryContext; old_process_id={old_process_id}"
+            "armed token-scoped restart after BE[{target}] EstablishParticipation; old_process_id={old_process_id}"
         ));
         let (sender, receiver) = mpsc::sync_channel(1);
         let _actor = MembershipActor(Some(thread::spawn(move || {
@@ -386,7 +390,12 @@ impl Scenario for PreReadyReplan {
         // FE publishes this exact first-attempt binding before Establish runs.
         let binding = context
             .handle()
-            .selected_native_observation_binding(target, "grpc-fragment", &token, Some(1))?
+            .selected_native_observation_binding(
+                target,
+                novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(),
+                &token,
+                Some(1),
+            )?
             .context("fired restart lacks its declared first-attempt binding")?;
         let expected_attempt = bound_replan_attempt(&binding, &token, target)?;
 
@@ -394,7 +403,7 @@ impl Scenario for PreReadyReplan {
         context
             .handle()
             .restart_be_until(target, deadline)
-            .context("replace BE immediately after token-scoped EstablishQueryContext")?;
+            .context("replace BE immediately after token-scoped EstablishParticipation")?;
         let replacement_process_id = context.handle().backend_process_id(target)?;
         ensure!(
             replacement_process_id != old_process_id,
@@ -429,7 +438,7 @@ impl Scenario for PreReadyReplan {
             .handle()
             .drain_query_lifecycle_statement_observation(&observation)?;
         context.action(format!(
-            "replaced BE[{target}] after EstablishQueryContext and observed successful statement attempt=2 completion with new_process_id={replacement_process_id}"
+            "replaced BE[{target}] after EstablishParticipation and observed successful statement attempt=2 completion with new_process_id={replacement_process_id}"
         ));
         Ok(())
     }
@@ -543,7 +552,7 @@ impl Scenario for PreReadyDmlNoRecovery {
         let token = selected.token.clone();
         let rendezvous = RestartAfterEstablishRendezvous::bind(&token)?;
         context.action(format!(
-            "armed token-scoped restart after BE[{target}] DML EstablishQueryContext; old_process_id={old_process_id}"
+            "armed token-scoped restart after BE[{target}] DML EstablishParticipation; old_process_id={old_process_id}"
         ));
         let (sender, receiver) = mpsc::sync_channel(1);
         let _actor = MembershipActor(Some(thread::spawn(move || {
@@ -560,7 +569,7 @@ impl Scenario for PreReadyDmlNoRecovery {
         context
             .handle()
             .restart_be_until(target, deadline)
-            .context("replace BE immediately after token-scoped DML EstablishQueryContext")?;
+            .context("replace BE immediately after token-scoped DML EstablishParticipation")?;
         let replacement_process_id = context.handle().backend_process_id(target)?;
         ensure!(
             replacement_process_id != old_process_id,
@@ -623,7 +632,7 @@ impl Scenario for PreReadyDmlNoRecovery {
             "the client statement retry must publish exactly once, got {rows:?}"
         );
         context.action(format!(
-            "replaced BE[{target}] after DML EstablishQueryContext; the first attempt returned KnownUncommitted without published data, then an explicit client statement retry published once; new_process_id={replacement_process_id}"
+            "replaced BE[{target}] after DML EstablishParticipation; the first attempt returned KnownUncommitted without published data, then an explicit client statement retry published once; new_process_id={replacement_process_id}"
         ));
         Ok(())
     }
@@ -671,7 +680,10 @@ mod binding_tests {
             plan.validate_selected_intents(3).unwrap();
             let selected = owner.take(0).unwrap();
             assert_eq!(selected.sql, sql);
-            assert_eq!(selected.faults, vec![(0, RESTART_AFTER_ESTABLISH_CONTEXT)]);
+            assert_eq!(
+                selected.faults,
+                vec![(0, RESTART_AFTER_ESTABLISH_PARTICIPATION)]
+            );
             assert_eq!(selected.deadline, deadline);
             assert!(owner.take(0).is_err());
         }

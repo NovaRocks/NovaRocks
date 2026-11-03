@@ -49,12 +49,12 @@ enum SourceOwner {
     #[cfg(test)]
     Fixture,
 }
-struct SourceLease<'a> {
+struct SplitSourceLoan<'a> {
     cell: &'a SourceCell,
     source: Option<Box<dyn ConnectorReadSplitSource>>,
 }
 impl SourceCell {
-    fn borrow(&self) -> Result<SourceLease<'_>, ConnectorError> {
+    fn borrow(&self) -> Result<SplitSourceLoan<'_>, ConnectorError> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(invalid("original split source callback unwound"));
         }
@@ -62,20 +62,20 @@ impl SourceCell {
     }
     // Retirement is a distinct once-only operation, not a retry of an unwound
     // enumeration/profile callback. It must still reach the same original Box.
-    fn borrow_original(&self) -> Result<SourceLease<'_>, ConnectorError> {
+    fn borrow_original(&self) -> Result<SplitSourceLoan<'_>, ConnectorError> {
         let source = self
             .source
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .ok_or_else(|| invalid("original split source is busy or already retired"))?;
-        Ok(SourceLease {
+        Ok(SplitSourceLoan {
             cell: self,
             source: Some(source),
         })
     }
 }
-impl Drop for SourceLease<'_> {
+impl Drop for SplitSourceLoan<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             self.cell.poisoned.store(true, Ordering::Release);

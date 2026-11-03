@@ -34,7 +34,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow_buffer::i256;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-use novarocks_execution::runtime::fragment::io::{
+use novarocks_execution::runtime::task::io::{
     ResultAbort, ResultWriteAdmission, RootInputAdmission, RootInputAuthority, RootInputPermit,
     RootInputReservationAdmission, RootProducerState, RootResultSession, RootResultWriteSpec,
     RootWorkExitProgress,
@@ -186,7 +186,7 @@ fn open_original_with_layout(
             // This producer component explicitly takes the original channel's
             // retention responsibility. The Task stays in held preparation;
             // this channel-local handoff does not publish Installed.
-            session.channel().mark_context_owned().unwrap();
+            session.channel().mark_participation_owned().unwrap();
             (session, preparation.runtime_control())
         });
     original_node.retain_root_for_teardown(Arc::clone(session.channel()));
@@ -199,7 +199,8 @@ impl Drop for Fixture {
         // this ordinary cleanup. A healthy case joins the actual pool first.
         self.session
             .abort(ResultAbort::Cancelled("component fixture closed".into()));
-        self.channel.close(RootRetentionClose::ContextReleased);
+        self.channel
+            .close(RootRetentionClose::ParticipationReleased);
         self.pool
             .shutdown()
             .expect("original component pool joined");
@@ -461,7 +462,7 @@ async fn client_dictionary_repeated_occurrences_and_null_have_independent_exact_
     assert!(matches!(dictionary.data_type(), DataType::Dictionary(_, _)));
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 owned_chunk(Arc::new(dictionary)),
                 input(&fixture.session).await,
             ),
@@ -473,7 +474,7 @@ async fn client_dictionary_repeated_occurrences_and_null_have_independent_exact_
         );
     };
     fixture.session.finish_input().unwrap();
-    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ParticipationHeld).await;
     await_whole_exit(&fixture.session).await;
     assert_eq!(fixture.channel.snapshot().consumed_through, 0);
     assert_eq!(fixture.channel.snapshot().offered_through, 0);
@@ -508,7 +509,7 @@ async fn count_only_accepts_decimal256_without_client_cell_rendering() {
     .unwrap();
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 owned_chunk(Arc::new(array)),
                 input(&fixture.session).await,
             ),
@@ -520,7 +521,7 @@ async fn count_only_accepts_decimal256_without_client_cell_rendering() {
         );
     };
     fixture.session.finish_input().unwrap();
-    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ParticipationHeld).await;
     await_whole_exit(&fixture.session).await;
     assert_eq!(fixture.channel.snapshot().data_positions, 0);
     assert_eq!(fixture.channel.snapshot().produced_through, 1);
@@ -560,7 +561,7 @@ async fn one_original_input_position_and_same_task_foreign_issuer_are_distinct()
     };
     let error = {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 strings(vec![Some("foreign")]),
                 foreign_permit,
             ),
@@ -599,7 +600,7 @@ async fn one_original_input_position_and_same_task_foreign_issuer_are_distinct()
     assert!(next.generation() > generation);
     drop(next);
     fixture.session.finish_input().unwrap();
-    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ParticipationHeld).await;
     shutdown(&fixture.pool).await;
 }
 
@@ -608,7 +609,7 @@ async fn tiny_complete_batches_flush_before_finish_and_before_next_input() {
     let fixture = Fixture::new(client(1));
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 strings(vec![Some("a")]),
                 input(&fixture.session).await,
             ),
@@ -629,7 +630,7 @@ async fn tiny_complete_batches_flush_before_finish_and_before_next_input() {
     drop(first);
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 strings(vec![Some("b")]),
                 input(&fixture.session).await,
             ),
@@ -643,7 +644,7 @@ async fn tiny_complete_batches_flush_before_finish_and_before_next_input() {
     wait_until(|| fixture.channel.snapshot().produced_through == 2).await;
     assert_eq!(fixture.channel.snapshot().data_positions, 2);
     fixture.session.finish_input().unwrap();
-    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ParticipationHeld).await;
     await_whole_exit(&fixture.session).await;
     let second = read(&fixture.channel, Some(2), 0).await;
     assert_eq!(body(&second), [2, 0, 0, 0, 1, b'b']);
@@ -660,7 +661,7 @@ async fn client_single_row_has_an_exact_one_byte_continuation_before_end() {
     let value = "x".repeat(RootProfileV1::SEGMENT_BYTES - 7);
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 strings(vec![Some(&value)]),
                 input(&fixture.session).await,
             ),
@@ -672,7 +673,7 @@ async fn client_single_row_has_an_exact_one_byte_continuation_before_end() {
         );
     };
     fixture.session.finish_input().unwrap();
-    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ParticipationHeld).await;
     await_whole_exit(&fixture.session).await;
     let profile = ClientRowProfile::try_new(
         RootProfileV1::SEGMENT_BYTES,
@@ -715,7 +716,8 @@ async fn empty_finish_has_end_without_a_prior_input_or_data_item() {
     for output in [client(1), FrozenRootOutput::CountOnly] {
         let fixture = Fixture::new(output);
         fixture.session.finish_input().unwrap();
-        wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+        wait_until(|| fixture.session.producer_state() == RootProducerState::ParticipationHeld)
+            .await;
         await_whole_exit(&fixture.session).await;
         assert!(fixture.session.try_acquire_input().is_err());
         assert_eq!(fixture.channel.snapshot().data_positions, 0);
@@ -741,7 +743,7 @@ async fn ordinary_upstream_output_beyond_the_input_allowance_fails_after_pull() 
     .unwrap();
     let error = {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 owned_chunk(Arc::new(array)),
                 input(&fixture.session).await,
             ),
@@ -813,7 +815,7 @@ async fn unknown_actual_schema_refuses_before_producer_and_drops_chunk_before_cr
         }));
     let error = {
         let mut submitted =
-            Some(novarocks_execution::runtime::fragment::io::RootResultInput::new(unknown, permit));
+            Some(novarocks_execution::runtime::task::io::RootResultInput::new(unknown, permit));
         let original_array =
             Arc::as_ptr(submitted.as_ref().unwrap().chunk().record_batch().column(0));
         let generation = submitted.as_ref().unwrap().permit().generation();
@@ -865,7 +867,7 @@ async fn full_window_suspends_original_input_and_abort_exits_with_response_alias
     let weak = Arc::downgrade(&array);
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 owned_chunk(array),
                 input(&fixture.session).await,
             ),
@@ -926,7 +928,7 @@ async fn pool_shutdown_drains_an_active_blocked_session_without_consumer_ack() {
     let weak = Arc::downgrade(&array);
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 owned_chunk(array),
                 input(&fixture.session).await,
             ),
@@ -955,7 +957,9 @@ async fn pool_shutdown_drains_an_active_blocked_session_without_consumer_ack() {
         fixture.pool.reserve_for_test(super::ROOT_CLEANUP).is_err(),
         "the same closed pool rejects a new producer reservation"
     );
-    fixture.channel.close(RootRetentionClose::ContextReleased);
+    fixture
+        .channel
+        .close(RootRetentionClose::ParticipationReleased);
 }
 
 #[tokio::test]
@@ -971,7 +975,7 @@ async fn repeated_cancel_issuer_observer_panics_keep_notification_unknown_after_
     let weak = Arc::downgrade(&array);
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 owned_chunk(array),
                 input(&fixture.session).await,
             ),
@@ -1045,7 +1049,7 @@ async fn count_only_panicking_issuer_observer_keeps_unknown_after_cpu_and_grant_
     // catches this notification fault independently of its exact grant receipt.
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 owned_chunk(array),
                 permit,
             ),
@@ -1081,7 +1085,7 @@ async fn count_only_panicking_issuer_observer_keeps_unknown_after_cpu_and_grant_
 async fn cancel_after_a_normal_end_keeps_the_completed_terminal() {
     let fixture = Fixture::new(client(1));
     fixture.session.finish_input().unwrap();
-    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ParticipationHeld).await;
     await_whole_exit(&fixture.session).await;
     // A pool shutdown can still reach a job whose slot it has not yet
     // removed; cancelling a completed producer must not rewrite its End.
@@ -1090,14 +1094,15 @@ async fn cancel_after_a_normal_end_keeps_the_completed_terminal() {
         .abort(ResultAbort::Cancelled("late shutdown cancel".into()));
     assert_eq!(
         fixture.session.producer_state(),
-        RootProducerState::ContextHeld
+        RootProducerState::ParticipationHeld
     );
     assert_end(&read(&fixture.channel, Some(1), 0).await, 1, 0);
     shutdown(&fixture.pool).await;
 }
 
 #[tokio::test]
-async fn encoder_handoff_notification_panic_keeps_contextheld_and_channel_metadata_unknown() {
+async fn encoder_handoff_notification_panic_keeps_participation_held_and_channel_metadata_unknown()
+{
     if !crate::root_unknown_test::enter() {
         return;
     }
@@ -1117,11 +1122,11 @@ async fn encoder_handoff_notification_panic_keeps_contextheld_and_channel_metada
         .writable_observable()
         .subscribe(Arc::new(move || {
             if let Some(channel) = channel.upgrade()
-                && channel.producer_state() == RootProducerState::ContextHeld
+                && channel.producer_state() == RootProducerState::ParticipationHeld
                 && !observed.swap(true, Ordering::SeqCst)
             {
                 // End has been published and the real producer guard has
-                // handed off to its context. This notification still precedes
+                // handed off to its participation. This notification still precedes
                 // whole-pool-job proof. The channel's original finite metadata
                 // owner catches it without invalidating the CPU job's exit.
                 panic!("injected one-time completed producer exit notification failure");
@@ -1132,7 +1137,7 @@ async fn encoder_handoff_notification_panic_keeps_contextheld_and_channel_metada
     shutdown_with_channel_metadata_unknown(&fixture, metadata_before_fault).await;
     assert_eq!(
         fixture.session.producer_state(),
-        RootProducerState::ContextHeld
+        RootProducerState::ParticipationHeld
     );
     assert_eq!(fixture.channel.snapshot().data_positions, 0);
     assert_eq!(fixture.channel.snapshot().consumed_through, 0);
@@ -1218,7 +1223,7 @@ async fn writable_snapshot_retains_fixed_metadata_after_last_session_arc_exits()
         weak_session.upgrade().is_none(),
         "the notification snapshot must not pin the Session itself"
     );
-    channel.close(RootRetentionClose::ContextAborted);
+    channel.close(RootRetentionClose::ParticipationAborted);
     original_node.release_body();
     let owners = wait_until(|| channel.physical_idle());
     tokio::pin!(owners);
@@ -1391,7 +1396,7 @@ async fn statistics_domain_emits_exact_opaque_records_across_two_original_inputs
     let (chunk, weak) = statistics_chunk(&[9, 7], "é", &[0, 255, 65]);
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 chunk,
                 input(&fixture.session).await,
             ),
@@ -1416,7 +1421,7 @@ async fn statistics_domain_emits_exact_opaque_records_across_two_original_inputs
     let (chunk, _) = statistics_chunk(&[3], "x", &[]);
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(chunk, second_permit),
+            novarocks_execution::runtime::task::io::RootResultInput::new(chunk, second_permit),
         );
         fixture.session.submit_input(&mut submitted).unwrap();
         assert!(
@@ -1449,7 +1454,7 @@ async fn statistics_record_can_cross_segments_and_cancel_releases_its_original_b
     let (chunk, weak) = statistics_chunk(&[1], "theta", &body_bytes);
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 chunk,
                 input(&fixture.session).await,
             ),
@@ -1554,7 +1559,7 @@ async fn write_commit_records_cross_inputs_and_end_after_their_summary() {
     ));
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 write_chunk(&[(0, b"a"), (1, b"bc")], None),
                 input(&fixture.session).await,
             ),
@@ -1567,7 +1572,7 @@ async fn write_commit_records_cross_inputs_and_end_after_their_summary() {
     };
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 write_chunk(&[], Some(3)),
                 input(&fixture.session).await,
             ),
@@ -1579,7 +1584,7 @@ async fn write_commit_records_cross_inputs_and_end_after_their_summary() {
         );
     };
     fixture.session.finish_input().unwrap();
-    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ParticipationHeld).await;
     let mut bytes = Vec::new();
     let mut sequence = 1;
     let rows = loop {
@@ -1620,7 +1625,7 @@ async fn write_commit_without_summary_fails_instead_of_a_success_end() {
     ));
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 write_chunk(&[(0, b"a")], None),
                 input(&fixture.session).await,
             ),
@@ -1712,7 +1717,7 @@ async fn every_internal_domain_opens_and_an_untyped_scalar_identity_has_no_chann
         let channel = session.channel().clone();
         session.abort(ResultAbort::Cancelled(String::new()));
         drop(session);
-        channel.close(RootRetentionClose::ContextReleased);
+        channel.close(RootRetentionClose::ParticipationReleased);
         drop(channel);
         drop(_control);
         drop(original_node);
@@ -1743,7 +1748,7 @@ async fn cow_selection_records_decode_back_to_their_batches() {
     for chunk in inputs {
         {
             let mut submitted = Some(
-                novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                novarocks_execution::runtime::task::io::RootResultInput::new(
                     chunk,
                     input(&fixture.session).await,
                 ),
@@ -1771,7 +1776,7 @@ async fn cow_selection_records_decode_back_to_their_batches() {
         sequence += 1;
     };
     assert_eq!(rows, 4);
-    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ParticipationHeld).await;
     let mut rest = bytes.as_slice();
     let recipe = fixture.session.shared.cow_recipe.as_ref().unwrap();
     let mut batches = Vec::new();
@@ -1838,7 +1843,7 @@ fn longs(values: Vec<Option<i64>>) -> Chunk {
     owned_chunk(Arc::new(Int64Array::from(values)))
 }
 async fn scalar_record(fixture: &Fixture, schema: &ScalarSchema, rows: u64) -> ScalarRecord {
-    wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
+    wait_until(|| fixture.session.producer_state() == RootProducerState::ParticipationHeld).await;
     await_whole_exit(&fixture.session).await;
     assert_eq!(fixture.channel.snapshot().data_positions, 1);
     let data = read(&fixture.channel, Some(1), 0).await;
@@ -1855,7 +1860,7 @@ async fn scalar_value_is_published_once_at_sealed_end_after_empty_batches() {
     for chunk in [longs(vec![]), longs(vec![Some(42)]), longs(vec![])] {
         {
             let mut submitted = Some(
-                novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                novarocks_execution::runtime::task::io::RootResultInput::new(
                     chunk,
                     input(&fixture.session).await,
                 ),
@@ -1898,7 +1903,7 @@ async fn scalar_zero_rows_is_unique_no_rows_and_one_null_row_is_a_value() {
     for _ in 0..2 {
         {
             let mut submitted = Some(
-                novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                novarocks_execution::runtime::task::io::RootResultInput::new(
                     longs(vec![]),
                     input(&empty_batches.session).await,
                 ),
@@ -1920,7 +1925,7 @@ async fn scalar_zero_rows_is_unique_no_rows_and_one_null_row_is_a_value() {
     let null_row = Fixture::new(output);
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 longs(vec![None]),
                 input(&null_row.session).await,
             ),
@@ -1945,7 +1950,7 @@ async fn scalar_second_row_fails_before_any_record_is_published() {
     let across_batches = Fixture::new(output.clone());
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 longs(vec![Some(1)]),
                 input(&across_batches.session).await,
             ),
@@ -1958,7 +1963,7 @@ async fn scalar_second_row_fails_before_any_record_is_published() {
     };
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 longs(vec![Some(2)]),
                 input(&across_batches.session).await,
             ),
@@ -1981,7 +1986,7 @@ async fn scalar_second_row_fails_before_any_record_is_published() {
     let one_batch = Fixture::new(output);
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 longs(vec![Some(1), Some(2)]),
                 input(&one_batch.session).await,
             ),
@@ -2007,7 +2012,7 @@ async fn scalar_cancel_after_an_accepted_row_publishes_neither_value_nor_no_rows
     let fixture = Fixture::new(output);
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 longs(vec![Some(7)]),
                 input(&fixture.session).await,
             ),
@@ -2055,7 +2060,7 @@ async fn scalar_nested_list_record_is_published_whole() {
     .unwrap();
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 owned_nested_chunk(Arc::new(list), vec![item]),
                 input(&fixture.session).await,
             ),
@@ -2087,7 +2092,7 @@ async fn scalar_type_mismatch_fails_without_a_record() {
     let fixture = Fixture::new(output);
     {
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 longs(vec![Some(1)]),
                 input(&fixture.session).await,
             ),
@@ -2110,7 +2115,7 @@ async fn scalar_type_mismatch_fails_without_a_record() {
 // The input fixtures independently establish the violated storage contract.
 // Root session and IO must preserve that exact author, not restate its text.
 fn assert_original_root_storage_cause(
-    error: &novarocks_execution::runtime::fragment::io::FragmentIoError,
+    error: &novarocks_execution::runtime::task::io::TaskIoError,
     expected: novarocks_execution::exec::chunk::RootArrayStorageError,
 ) {
     use novarocks_execution_contract::failure::FailureProjection;
@@ -2184,7 +2189,7 @@ async fn maximum_cow_depth_round_trips_on_the_original_one_mib_producer() {
             Some(declared_root_layout(chunk.chunk_schema())),
         );
         let mut submitted = Some(
-            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            novarocks_execution::runtime::task::io::RootResultInput::new(
                 chunk,
                 input(&fixture.session).await,
             ),
@@ -2256,7 +2261,7 @@ async fn maximum_cow_depth_cancellation_joins_before_releasing_the_input() {
         Some(declared_root_layout(chunk.chunk_schema())),
     );
     let mut submitted = Some(
-        novarocks_execution::runtime::fragment::io::RootResultInput::new(
+        novarocks_execution::runtime::task::io::RootResultInput::new(
             chunk,
             input(&fixture.session).await,
         ),

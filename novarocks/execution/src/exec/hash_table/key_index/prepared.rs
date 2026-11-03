@@ -27,7 +27,7 @@ use crate::{
         },
         pipeline::operator::InputConstructionOwner,
     },
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use arrow::{array::ArrayRef, datatypes::DataType};
 use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};

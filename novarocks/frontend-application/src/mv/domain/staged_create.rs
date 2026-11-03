@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use novarocks_mv_application::management::{
     EffectDisposition, EffectIdentity, EffectResponsibility, EffectScope, ManagedMvTarget,
-    ManagementEntrance, ManagementEntranceLease, ManagementRequest, ManagementTimestamp,
+    ManagementEntrance, ManagementEntranceObligation, ManagementRequest, ManagementTimestamp,
     ProcessIncarnation,
 };
 use novarocks_mv_application::persistence::codec::{DefinitionDocument, InterpretationDocument};
@@ -39,10 +39,10 @@ use novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevisi
 use novarocks_mv_application::persistence::publication_facts::MvPublicationInputs;
 use novarocks_spi::connector::document_storage::{
     ConnectorDocumentManagementAdmission, ConnectorDocumentManagementAdmissionRequest,
-    ConnectorDocumentManagementOperation, ConnectorDocumentStorageLease,
+    ConnectorDocumentManagementOperation, ConnectorDocumentStorage,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorControlPlanningLease, ConnectorExactSemanticRevision,
+    CatalogHandle, ConnectorControlPlanningPin, ConnectorExactSemanticRevision,
     ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableIdentity,
     ConnectorTableObjectId, LakePublicationId,
 };
@@ -472,7 +472,7 @@ enum MvConvergence {
 }
 
 pub(crate) fn keyed_request(
-    lease: &ConnectorDocumentStorageLease,
+    lease: &ConnectorDocumentStorage,
     table: ConnectorTableIdentity,
     object: ConnectorTableObjectId,
     context: ConnectorRequestContext,
@@ -490,8 +490,8 @@ impl ManagedTargetCurrentSource<'_> {
     fn register_incarnation(
         &self,
         state: &mut novarocks_mv_application::management::ManagementObservationState,
-        lease: &ConnectorControlPlanningLease,
-        documents: &ConnectorDocumentStorageLease,
+        lease: &ConnectorControlPlanningPin,
+        documents: &ConnectorDocumentStorage,
         observed: &novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
         context: &ConnectorRequestContext,
     ) -> Result<(), String> {
@@ -605,8 +605,8 @@ pub(crate) struct CurrentProjectionRegistration {
 }
 
 struct CurrentRegistrationPreparation {
-    planning: ConnectorControlPlanningLease,
-    documents: ConnectorDocumentStorageLease,
+    planning: ConnectorControlPlanningPin,
+    documents: ConnectorDocumentStorage,
     observed:
         novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
     context: ConnectorRequestContext,
@@ -1003,8 +1003,8 @@ impl OriginalManagedTargetCurrentSource<'_> {
     async fn register_incarnation(
         &self,
         state: &mut novarocks_mv_application::management::ManagementObservationState,
-        lease: &ConnectorControlPlanningLease,
-        documents: &ConnectorDocumentStorageLease,
+        lease: &ConnectorControlPlanningPin,
+        documents: &ConnectorDocumentStorage,
         observed: &novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
         context: &ConnectorRequestContext,
     ) -> Result<(), novarocks_mv_application::readiness::MvProjectionError> {
@@ -1560,7 +1560,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
 /// explicit terminal records `CommitUnknown`, which is the conservative answer
 /// when nobody could say whether the commit happened.
 pub(crate) struct AdmittedMvPublication {
-    management: ManagementEntranceLease,
+    management: ManagementEntranceObligation,
     admission: ConnectorDocumentManagementAdmission,
     /// The exact target and incarnation this publication took responsibility
     /// under, so the responsibility it dispatches cannot name another.
@@ -1590,7 +1590,7 @@ impl AdmittedMvPublication {
     /// its original future; no Current/StateStore authority is manufactured.
     pub(crate) async fn recheck_current_dependencies_async(
         &self,
-        planning_lease: &ConnectorControlPlanningLease,
+        planning_pin: &ConnectorControlPlanningPin,
         context: &ConnectorRequestContext,
         metadata_cpu: &CurrentProjectionMetadataCpu,
         registration: &CurrentProjectionRegistration,
@@ -1608,7 +1608,7 @@ impl AdmittedMvPublication {
         let binding = registration
             .capture
             .capture(
-                planning_lease,
+                planning_pin,
                 metadata_cpu,
                 ConnectorTableObjectCaptureRequest {
                     table: self.source_revision.target.clone(),
@@ -1621,7 +1621,7 @@ impl AdmittedMvPublication {
             .map_err(current_metadata_cpu::CaptureFailure::into_application)?;
         self.validate_current_dependency_binding(&binding)
             .map_err(domain)?;
-        let document_lease = planning_lease
+        let document_lease = planning_pin
             .derive_document_storage_lease()
             .map_err(connector)?;
         let request = keyed_request(
@@ -1832,13 +1832,13 @@ impl AdmittedMvDataPublication {
 
     pub(crate) async fn recheck_current_dependencies_async(
         &self,
-        planning_lease: &ConnectorControlPlanningLease,
+        planning_pin: &ConnectorControlPlanningPin,
         context: &ConnectorRequestContext,
         metadata_cpu: &CurrentProjectionMetadataCpu,
         registration: &CurrentProjectionRegistration,
     ) -> Result<(), super::application::MvApplicationError> {
         self.publication
-            .recheck_current_dependencies_async(planning_lease, context, metadata_cpu, registration)
+            .recheck_current_dependencies_async(planning_pin, context, metadata_cpu, registration)
             .await
     }
 
@@ -1881,21 +1881,21 @@ pub(crate) struct MvPublicationAdmissionReceiving {
 
 struct MvPublicationAdmissionInput {
     entrance: ManagementEntrance,
-    planning: ConnectorControlPlanningLease,
+    planning: ConnectorControlPlanningPin,
     projection: novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
     publication_id: LakePublicationId,
     context: ConnectorRequestContext,
 }
 
 struct MvPublicationAdmissionDocument {
-    lease: ConnectorDocumentStorageLease,
+    documents: ConnectorDocumentStorage,
     request: ConnectorDocumentManagementAdmissionRequest,
 }
 
 #[derive(Default)]
 struct MvPublicationAdmissionBody {
     claimed: bool,
-    management: Option<ManagementEntranceLease>,
+    management: Option<ManagementEntranceObligation>,
     prepared: Option<MvPublicationAdmissionParts>,
     result: Option<Result<AdmittedMvPublication, super::application::MvApplicationError>>,
     taken: bool,
@@ -1917,7 +1917,7 @@ struct MvPublicationAdmissionParts {
 impl MvPublicationAdmissionParts {
     fn finish(
         self,
-        management: ManagementEntranceLease,
+        management: ManagementEntranceObligation,
         admission: ConnectorDocumentManagementAdmission,
     ) -> AdmittedMvPublication {
         AdmittedMvPublication {
@@ -2015,7 +2015,7 @@ impl MvPublicationAdmissionReceiving {
 /// already retained before entering the foreign author.
 pub(crate) async fn admit_mv_publication_async_in(
     entrance: &ManagementEntrance,
-    planning: &ConnectorControlPlanningLease,
+    planning: &ConnectorControlPlanningPin,
     projection: &novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
     publication_id: LakePublicationId,
     context: &ConnectorRequestContext,
@@ -2132,7 +2132,7 @@ pub(crate) async fn admit_mv_publication_async_in(
         if receiving
             .document
             .set(MvPublicationAdmissionDocument {
-                lease: document_lease,
+                documents: document_lease,
                 request,
             })
             .is_err()
@@ -2146,7 +2146,7 @@ pub(crate) async fn admit_mv_publication_async_in(
         // Foreign provider callback and all error projection are outside the
         // receiving lock. On panic the original input, request and lease stay.
         let admission = document
-            .lease
+            .documents
             .admit_management(document.request.clone())
             .map_err(|error| {
                 MvApplicationError::from_connector(MvApplicationErrorKind::Engine, error)
@@ -2181,7 +2181,7 @@ mod tests {
 
     fn admission_wait_fixture() -> (
         ManagementEntrance,
-        ConnectorControlPlanningLease,
+        ConnectorControlPlanningPin,
         novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
         ConnectorRequestContext,
     ) {
@@ -2204,7 +2204,7 @@ mod tests {
         )
         .with_catalog_properties(super::super::test_admission::catalog_properties(&instance))
         .unwrap();
-        let planning = ConnectorControlPlanningLease::new(Arc::new(binding), || {});
+        let planning = ConnectorControlPlanningPin::new(Arc::new(binding), || {});
         let context = ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(30),
             ConnectorStopOwner::new().view(),
@@ -2221,7 +2221,7 @@ mod tests {
     }
 
     fn admission_blocker_request(
-        planning: &ConnectorControlPlanningLease,
+        planning: &ConnectorControlPlanningPin,
         projection: &novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
     ) -> ManagementRequest {
         ManagementRequest::for_create_intent(

@@ -71,7 +71,7 @@ INSERT INTO ${case_db}.fe_crash VALUES (2, 15);
 INSERT INTO ${case_db}.fe_crash VALUES (3, 15);
 
 -- query 5
--- @kill_fe_after_be_log_contains=NOVAROCKS_TASK_LEASE_RENEWED
+-- @kill_fe_after_be_log_contains=NOVAROCKS_PARTICIPATION_LEASE_RENEWED
 -- @expect_error=Trino transport failure
 -- Every context's lease expires, and this count stays at the cluster size
 -- because that is the property: a frontend that dies must be noticed by each
@@ -82,14 +82,14 @@ INSERT INTO ${case_db}.fe_crash VALUES (3, 15);
 -- load average 2-8, and 2 of 3 at load 25-31 with another cluster competing
 -- for the machine. If this times out with the marker on two of three
 -- backends, read the load average before reading the code.
--- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_LEASE_EXPIRED,3
+-- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_LEASE_EXPIRED,3
 -- Termination completes on a backend only after its own work stops, and
 -- `sleep()` is an uninterruptible `std::thread::sleep`: a backend inside one
 -- finishes terminating only once it returns, which can fall outside this
 -- evidence budget. The lease expiry above is the liveness proof and is
 -- asserted on every context; this asserts that termination really followed on
 -- more than one backend rather than pinning a count a sleep can delay.
--- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_TERMINATION_COMPLETED,2
+-- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_TERMINATION_COMPLETED,2
 SELECT COUNT(*)
 FROM ${case_db}.fe_crash
 WHERE sleep(delay_s);

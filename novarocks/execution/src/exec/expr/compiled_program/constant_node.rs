@@ -118,5 +118,5 @@ pub fn evaluate_constant_node(
     control: &dyn PureCompileControl,
     phase: CompilePhase,
 ) -> Result<ConstantNodeOutcome, ConstantNodeFailure> {
-    super::guarded::constant_driver::evaluate(node, children, result, control, phase)
+    super::guarded::constant_evaluator::evaluate(node, children, result, control, phase)
 }

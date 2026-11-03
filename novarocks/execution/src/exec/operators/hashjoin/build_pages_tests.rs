@@ -19,7 +19,7 @@
 
 use super::super::{
     build_capture::{EvaluatedJoinKeyPage, EvaluatedKeyProjection, InputRunWriter},
-    build_collection::{BeginClaim, BeginLease, BuildCollection},
+    build_collection::{BeginClaim, BeginObligation, BuildCollection},
     join_completion::{
         JoinCompletion, JoinParticipants,
         tests::{Control, fixture},
@@ -136,7 +136,7 @@ pub(crate) fn collect(
     work: &BulkWork<'_>,
 ) -> (
     CollectedInputs<BuildInputReceipt>,
-    BeginLease<BuildInputReceipt, NoArtifact>,
+    BeginObligation<BuildInputReceipt, NoArtifact>,
 ) {
     let completion: Arc<JoinCompletion<NoArtifact>> = JoinCompletion::new(
         JoinParticipants {
@@ -159,7 +159,10 @@ pub(crate) fn collect(
             .unwrap();
     }
     match collection.claim_begin(work.owner, work.control).unwrap() {
-        BeginClaim::Claimed { inputs, lease } => (inputs, lease),
+        BeginClaim::Claimed {
+            inputs,
+            begin_obligation,
+        } => (inputs, begin_obligation),
         _ => panic!("all actual input receipts must be available"),
     }
 }

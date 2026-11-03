@@ -35,7 +35,7 @@ fn unit(n: u64, end_after_unit: bool) -> ExchangeUnitItem {
     }
 }
 
-fn grant(receipt: &mut ExchangeStreamReceipt, n: u64) {
+fn grant(receipt: &mut ExchangeStreamReceiverState, n: u64) {
     assert_eq!(
         receipt.register_demand(demand(n), 64).unwrap(),
         ExchangeDemandOutcome::Registered
@@ -43,7 +43,7 @@ fn grant(receipt: &mut ExchangeStreamReceipt, n: u64) {
     assert_eq!(receipt.grant_next().unwrap(), Some(demand(n)));
 }
 
-fn claim(receipt: &mut ExchangeStreamReceipt, n: u64, end: bool) -> ExchangeDecodeToken {
+fn claim(receipt: &mut ExchangeStreamReceiverState, n: u64, end: bool) -> ExchangeDecodeToken {
     match receipt.begin_admission(unit(n, end)).unwrap() {
         ExchangeAdmissionStart::Decode(token) => token,
         other => panic!("expected a unique decode claim, got {other:?}"),
@@ -52,7 +52,7 @@ fn claim(receipt: &mut ExchangeStreamReceipt, n: u64, end: bool) -> ExchangeDeco
 
 #[test]
 fn early_last_unit_and_end_wait_for_the_missing_data_prefix() {
-    let mut receipt = ExchangeStreamReceipt::try_new(2).unwrap();
+    let mut receipt = ExchangeStreamReceiverState::try_new(2).unwrap();
     grant(&mut receipt, 1);
     grant(&mut receipt, 2);
     let second = claim(&mut receipt, 2, true);
@@ -84,7 +84,7 @@ fn early_last_unit_and_end_wait_for_the_missing_data_prefix() {
 
 #[test]
 fn standalone_early_end_and_combined_end_are_the_same_boundary() {
-    let mut receipt = ExchangeStreamReceipt::try_new(1).unwrap();
+    let mut receipt = ExchangeStreamReceiverState::try_new(1).unwrap();
     grant(&mut receipt, 1);
     assert_eq!(
         receipt
@@ -114,7 +114,7 @@ fn standalone_early_end_and_combined_end_are_the_same_boundary() {
 
 #[test]
 fn in_progress_replay_observes_facts_without_a_second_decode_token() {
-    let mut receipt = ExchangeStreamReceipt::try_new(1).unwrap();
+    let mut receipt = ExchangeStreamReceiverState::try_new(1).unwrap();
     grant(&mut receipt, 1);
     let original = claim(&mut receipt, 1, true);
     for _ in 0..3 {
@@ -133,7 +133,7 @@ fn in_progress_replay_observes_facts_without_a_second_decode_token() {
 
 #[test]
 fn sender_stop_fences_late_demand_and_data_while_the_receiver_is_live() {
-    let mut receipt = ExchangeStreamReceipt::try_new(2).unwrap();
+    let mut receipt = ExchangeStreamReceiverState::try_new(2).unwrap();
     grant(&mut receipt, 1);
     assert_eq!(receipt.stop_sender(), vec![demand(1)]);
     assert!(receipt.facts().sender_stopped);
@@ -164,7 +164,7 @@ fn sender_stop_fences_late_demand_and_data_while_the_receiver_is_live() {
 
 #[test]
 fn sender_stop_does_not_revoke_an_already_owned_decode() {
-    let mut receipt = ExchangeStreamReceipt::try_new(2).unwrap();
+    let mut receipt = ExchangeStreamReceiverState::try_new(2).unwrap();
     grant(&mut receipt, 1);
     grant(&mut receipt, 2);
     let original = claim(&mut receipt, 1, false);
@@ -185,7 +185,7 @@ fn sender_stop_does_not_revoke_an_already_owned_decode() {
 
 #[test]
 fn receiver_close_pins_decode_work_and_never_manufactures_consumption() {
-    let mut receipt = ExchangeStreamReceipt::try_new(2).unwrap();
+    let mut receipt = ExchangeStreamReceiverState::try_new(2).unwrap();
     grant(&mut receipt, 1);
     grant(&mut receipt, 2);
     let original = claim(&mut receipt, 1, false);
@@ -215,7 +215,7 @@ fn receiver_close_pins_decode_work_and_never_manufactures_consumption() {
 
 #[test]
 fn oversized_or_conflicting_demand_cannot_consume_a_position() {
-    let mut receipt = ExchangeStreamReceipt::try_new(1).unwrap();
+    let mut receipt = ExchangeStreamReceiverState::try_new(1).unwrap();
     assert_eq!(
         receipt.register_demand(demand(1), 6),
         Err(ExchangeReceiptError::UnitTooLarge {
@@ -252,7 +252,7 @@ fn oversized_or_conflicting_demand_cannot_consume_a_position() {
 
 #[test]
 fn empty_end_needs_no_grant_but_still_needs_real_input_completion() {
-    let mut receipt = ExchangeStreamReceipt::try_new(1).unwrap();
+    let mut receipt = ExchangeStreamReceiverState::try_new(1).unwrap();
     assert_eq!(
         receipt.begin_admission(ExchangeUnitItem::End(sequence(2))),
         Err(ExchangeReceiptError::EndConflict)
@@ -279,7 +279,7 @@ fn empty_end_needs_no_grant_but_still_needs_real_input_completion() {
 
 #[test]
 fn unit_evidence_and_end_type_are_checked_before_duplicate_classification() {
-    let mut receipt = ExchangeStreamReceipt::try_new(1).unwrap();
+    let mut receipt = ExchangeStreamReceiverState::try_new(1).unwrap();
     grant(&mut receipt, 1);
     let token = claim(&mut receipt, 1, true);
     assert_eq!(

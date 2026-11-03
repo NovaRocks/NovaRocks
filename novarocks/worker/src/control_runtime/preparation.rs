@@ -25,9 +25,9 @@ use crate::{
     task_port::{TaskPendingNotice, TaskStopSignal},
 };
 use novarocks_control_runtime::{
+    actor_turn::{ActorRuntime, ActorTurnError, EffectTicket},
     completion::ReportSlot,
-    driver::{ActorRuntime, DriverError, EffectTicket},
-    lease::{ReservationBundle, StepGuard, WorkLease},
+    obligation::{ReservationObligation, StepRegistration, WorkObligation},
     transaction::{RuntimeError, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -39,7 +39,7 @@ use novarocks_control_runtime_core::{
 };
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
 use novarocks_execution_contract::{
-    QueryContextRef, TaskCreationInput, TaskFailurePhase, TaskIdentity,
+    ParticipationRef, TaskCreationInput, TaskFailurePhase, TaskIdentity,
     failure::{FailureClass, FailureFact},
 };
 use std::{
@@ -54,8 +54,8 @@ type Key = (ScopeId, WorkId);
 type PanicPayload = ManuallyDrop<Box<dyn Any + Send>>;
 
 struct State {
-    work: Option<WorkLease>,
-    capacity: Option<ReservationBundle>,
+    work: Option<WorkObligation>,
+    capacity: Option<ReservationObligation>,
     body_exited: bool,
     captures_exited: bool,
     exit_published: bool,
@@ -94,14 +94,14 @@ pub(crate) struct PreparationParent {
     work: WorkId,
 }
 impl PreparationParent {
-    pub(crate) fn from_admitted(work: &WorkLease) -> Self {
+    pub(crate) fn from_admitted(work: &WorkObligation) -> Self {
         Self {
             scope: work.scope().clone(),
             work: work.id(),
         }
     }
     #[cfg(test)]
-    pub(crate) fn derive(&self, kind: WorkKind) -> Result<StepGuard, RuntimeError> {
+    pub(crate) fn derive(&self, kind: WorkKind) -> Result<StepRegistration, RuntimeError> {
         self.derive_with_storage(kind, ReservationResources::work_only())
     }
     /// This actual parent is already counted. Allocate only the new child's
@@ -110,7 +110,7 @@ impl PreparationParent {
         &self,
         kind: WorkKind,
         resources: ReservationResources,
-    ) -> Result<StepGuard, RuntimeError> {
+    ) -> Result<StepRegistration, RuntimeError> {
         let generation = self.scope.gates()?.generation;
         self.scope.reserve_next(
             generation,
@@ -151,7 +151,7 @@ impl<T> std::fmt::Display for PreparationOutcome<T> {
 pub(crate) enum PreparationAdoptionError {
     WrongEffect,
     WrongTask,
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
     Runtime(RuntimeError),
 }
 impl std::fmt::Display for PreparationAdoptionError {
@@ -163,7 +163,9 @@ impl std::fmt::Display for PreparationAdoptionError {
             Self::WrongTask => {
                 f.write_str("preparation stop signal differs from the admitted Task")
             }
-            Self::Driver(error) => write!(f, "preparation responsibility transfer failed: {error}"),
+            Self::ActorTurn(error) => {
+                write!(f, "preparation responsibility transfer failed: {error}")
+            }
             Self::Runtime(error) => write!(f, "preparation report admission failed: {error}"),
         }
     }
@@ -171,7 +173,7 @@ impl std::fmt::Display for PreparationAdoptionError {
 impl std::error::Error for PreparationAdoptionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Driver(error) => Some(error),
+            Self::ActorTurn(error) => Some(error),
             Self::Runtime(error) => Some(error),
             Self::WrongEffect | Self::WrongTask => None,
         }
@@ -252,8 +254,8 @@ impl PreparationCustody {
         binding: PreparationBinding,
     ) -> Result<(Self, PreparationJob), (PreparationAdoptionError, TaskCreationInput)> {
         let (task, reservation) = match &ticket.effect {
-            WorkerAction::Context(
-                novarocks_worker_protocol::context::ContextEffect::EnqueuePreparation {
+            WorkerAction::Participation(
+                novarocks_worker_protocol::participation::ParticipationEffect::EnqueuePreparation {
                     task,
                     reservation,
                     ..
@@ -266,7 +268,7 @@ impl PreparationCustody {
         }
         let mut guard = match runtime.take_step_reservation(ticket, reservation) {
             Ok(guard) => guard,
-            Err(error) => return Err((PreparationAdoptionError::Driver(error), input)),
+            Err(error) => return Err((PreparationAdoptionError::ActorTurn(error), input)),
         };
         let scope = guard.scope().clone();
         let generation = ticket.generation;
@@ -320,8 +322,8 @@ impl PreparationCustody {
     /// after real whole exit and report retirement.
     pub(crate) fn from_admitted(
         binding: PreparationBinding,
-        mut work: WorkLease,
-        mut capacity: ReservationBundle,
+        mut work: WorkObligation,
+        mut capacity: ReservationObligation,
         reports: [ReportSlot; 2],
         input: TaskCreationInput,
     ) -> (Self, PreparationJob) {
@@ -379,18 +381,18 @@ impl PreparationCustody {
     }
     /// Transfer the original unused Task roles once. Preparation P/bytes,
     /// its actual job/input and independent reports stay with this owner.
-    pub(crate) fn take_task_role_storage(
+    pub(crate) fn take_task_source_storage(
         &self,
         resources: &ReservationResources,
-    ) -> Result<ReservationBundle, PreparationStorageSplitError> {
-        let per_role = crate::control_runtime_policy::StorageNeed::role(false);
+    ) -> Result<ReservationObligation, PreparationStorageSplitError> {
+        let per_cut = crate::control_runtime_policy::StorageNeed::causal_cut_storage(false);
         let headers = resources.owned_slots.work_headers;
-        let roles = headers / per_role.work;
-        let expected = per_role
-            .checked_mul(roles)
+        let cut_count = headers / per_cut.work;
+        let expected = per_cut
+            .checked_mul(cut_count)
             .and_then(crate::control_runtime_policy::StorageNeed::resources)
             .map_err(|_| PreparationStorageSplitError::InvalidResources)?;
-        if roles == 0 || !resources.quota.is_empty() || *resources != expected {
+        if cut_count == 0 || !resources.quota.is_empty() || *resources != expected {
             return Err(PreparationStorageSplitError::InvalidResources);
         }
         let mut state = self.0.state.lock().expect("preparation custody lock");
@@ -617,7 +619,7 @@ impl PreparationCustody {
     }
     /// Transfer the original bundle once. Only P/count/bytes leave the ledger;
     /// Remaining Task role storage stays in the same original bundle.
-    pub(crate) fn take_after_exit(&self) -> Result<Option<ReservationBundle>, RuntimeError> {
+    pub(crate) fn take_after_exit(&self) -> Result<Option<ReservationObligation>, RuntimeError> {
         let mut state = self.0.state.lock().expect("preparation custody lock");
         if state.transferred || !state.exit_published || state.unresolved {
             return Ok(None);
@@ -741,12 +743,12 @@ impl Drop for PreparationJob {
 }
 
 /// Fairness is scheduling metadata, never a Scope capability or Work identity.
-/// An ingress RPC has its own paid source scope but shares the Context's
-/// physical-worker limit with every other RPC for that exact Context.
+/// An ingress RPC has its own paid source scope but shares the Participation's
+/// physical-worker limit with every other RPC for that exact Participation.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum HostFairnessGroup {
     Scope(ScopeId),
-    Context(QueryContextRef),
+    Participation(ParticipationRef),
 }
 pub(crate) trait QueuedPreparation: Send + 'static {
     /// Read-only metadata, called before taking the queue lock.
@@ -809,29 +811,29 @@ pub(crate) struct RunningPreparation<J: QueuedPreparation = PreparationJob> {
     job: Option<J>,
 }
 impl<J: QueuedPreparation> PreparationQueue<J> {
-    pub(crate) fn new(jobs: usize, per_context: usize, workers: usize) -> Self {
+    pub(crate) fn new(jobs: usize, per_group: usize, workers: usize) -> Self {
         Self::with_queue(
-            FairWorkQueue::new(jobs, per_context),
+            FairWorkQueue::new(jobs, per_group),
             jobs,
-            per_context,
+            per_group,
             workers,
         )
     }
-    pub(crate) fn eligible_fifo(jobs: usize, per_context: usize, workers: usize) -> Self {
+    pub(crate) fn eligible_fifo(jobs: usize, per_group: usize, workers: usize) -> Self {
         Self::with_queue(
-            FairWorkQueue::eligible_fifo(jobs, per_context),
+            FairWorkQueue::eligible_fifo(jobs, per_group),
             jobs,
-            per_context,
+            per_group,
             workers,
         )
     }
     fn with_queue(
         fair: FairWorkQueue<HostFairnessGroup, Key>,
         jobs: usize,
-        per_context: usize,
+        per_group: usize,
         workers: usize,
     ) -> Self {
-        assert!(jobs > 0 && per_context > 0 && workers > 0);
+        assert!(jobs > 0 && per_group > 0 && workers > 0);
         Self(Arc::new(Queue {
             state: Mutex::new(QueueState {
                 fair,

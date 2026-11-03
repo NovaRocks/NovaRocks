@@ -102,7 +102,7 @@ impl ConstructionErrorSignal for Arc<RuntimeErrorState> {
 #[derive(Debug)]
 enum ReceiverConstructionState {
     Open,
-    Stopped(crate::runtime::fragment::ExecutionFailure),
+    Stopped(crate::runtime::task::ExecutionFailure),
     ClosedNeutral,
 }
 struct ReceiverConstructionSignal {
@@ -122,8 +122,8 @@ impl ReceiverConstructionSignal {
     /// the signal lock, including after its irreversible neutral closure.
     fn try_stop(
         &self,
-        cause: crate::runtime::fragment::ExecutionFailure,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+        cause: crate::runtime::task::ExecutionFailure,
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if matches!(*state, ReceiverConstructionState::Open) {
             *state = ReceiverConstructionState::Stopped(cause);
@@ -133,7 +133,7 @@ impl ReceiverConstructionSignal {
             Err(cause)
         }
     }
-    fn close(&self) -> Option<crate::runtime::fragment::ExecutionFailure> {
+    fn close(&self) -> Option<crate::runtime::task::ExecutionFailure> {
         let previous = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             let previous = std::mem::replace(&mut *state, ReceiverConstructionState::ClosedNeutral);
@@ -165,7 +165,7 @@ impl ConstructionErrorSignal for ReceiverConstructionSignal {
         };
         Err(ConstructionFailure::Caller(Box::new(
             original.unwrap_or_else(|| {
-                crate::runtime::fragment::ExecutionFailure::from_domain(ReceiverConstructionClosed)
+                crate::runtime::task::ExecutionFailure::from_domain(ReceiverConstructionClosed)
             }),
         )))
     }
@@ -182,7 +182,7 @@ impl std::error::Error for ReceiverConstructionClosed {}
 impl novarocks_failure_contract::FailureProjection for ReceiverConstructionClosed {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::stop_observation(
-            crate::runtime::fragment::ExecutionReason::ReceiverConstructionClosed.reason(),
+            crate::runtime::task::ExecutionReason::ReceiverConstructionClosed.reason(),
         )
     }
 }
@@ -195,7 +195,7 @@ pub struct ReceiverInputConstructionStopOwner {
     stop_on_drop: bool,
 }
 impl ReceiverInputConstructionStopOwner {
-    pub fn stop(&self, cause: crate::runtime::fragment::ExecutionFailure) {
+    pub fn stop(&self, cause: crate::runtime::task::ExecutionFailure) {
         // A later source loses first-wins without being destroyed under the
         // signal lock. Its caller still supervises this synchronous capture.
         drop(self.control.error.try_stop(cause));
@@ -206,7 +206,7 @@ impl ReceiverInputConstructionStopOwner {
     /// outside every dependency lock. Neither source nor Work exit is proved.
     /// Late factory/scope metadata remains irreversibly stopped and retains
     /// no rich failure source. Consuming this owner revokes further stop calls.
-    pub fn close_after_ingress(mut self) -> Option<crate::runtime::fragment::ExecutionFailure> {
+    pub fn close_after_ingress(mut self) -> Option<crate::runtime::task::ExecutionFailure> {
         self.stop_on_drop = false;
         self.control.error.close()
     }
@@ -315,7 +315,7 @@ impl<S: ConstructionErrorSignal> novarocks_functions::KernelEvaluationControl
     }
 }
 fn kernel_custody_failure(source: novarocks_functions::KernelFailure) -> ConstructionFailure {
-    crate::runtime::fragment::ExecutionFailure::from(source).into()
+    crate::runtime::task::ExecutionFailure::from(source).into()
 }
 
 struct TrackedDecodedSourceCustody<S> {
@@ -486,7 +486,7 @@ mod tests {
     fn source() -> Chunk {
         let storage = ValueTypeStorageLifetime::pure();
         Chunk::try_new_typed_with_columns_owned_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(
             Arc::new(ChunkSchema::try_new_typed(vec![], storage.clone()).unwrap()),
@@ -513,10 +513,9 @@ mod tests {
             work: owner.as_ref(),
             observed: std::sync::OnceLock::new(),
         };
-        let original =
-            crate::runtime::fragment::ExecutionFailure::from(KernelFailure::Operational(
-                novarocks_functions::KernelDiagnostic::new("original decoded source stop"),
-            ));
+        let original = crate::runtime::task::ExecutionFailure::from(KernelFailure::Operational(
+            novarocks_functions::KernelDiagnostic::new("original decoded source stop"),
+        ));
         error.set_error(original.clone());
         assert!(matches!(
             control.checkpoint(7),
@@ -553,7 +552,7 @@ mod tests {
             .finish::<()>(Err(KernelFailure::ResourceExhausted))
             .unwrap_err();
         assert!(
-            matches!(failure, ConstructionFailure::Caller(source) if matches!(source.cause(), crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)))
+            matches!(failure, ConstructionFailure::Caller(source) if matches!(source.cause(), crate::runtime::task::ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)))
         );
     }
 
@@ -592,7 +591,7 @@ mod tests {
     #[test]
     fn runtime_control_returns_the_original_failure_payload() {
         let error = Arc::new(RuntimeErrorState::default());
-        let original: crate::runtime::fragment::ExecutionFailure =
+        let original: crate::runtime::task::ExecutionFailure =
             novarocks_functions::KernelFailure::DeadlineExceeded.into();
         error.set_error(original.clone());
         let control = RuntimeInputConstructionControl::new(error);
@@ -611,7 +610,7 @@ mod tests {
         let tracker = MemTracker::new_root("receiver construction metadata");
         tracker.install_limit_once(1).unwrap();
         let kernel = Arc::new(RuntimeErrorState::default());
-        let original: crate::runtime::fragment::ExecutionFailure =
+        let original: crate::runtime::task::ExecutionFailure =
             novarocks_functions::KernelFailure::DeadlineExceeded.into();
         kernel.set_error(original.clone());
         let before = tracker.allocated();
@@ -638,7 +637,7 @@ mod tests {
             weak_kernel.upgrade().is_none(),
             "receiver control never retains the kernel"
         );
-        let original: crate::runtime::fragment::ExecutionFailure =
+        let original: crate::runtime::task::ExecutionFailure =
             novarocks_functions::KernelFailure::ResourceExhausted.into();
         owner.stop(original.clone());
         owner.stop(novarocks_functions::KernelFailure::DeadlineExceeded.into());
@@ -736,7 +735,7 @@ mod tests {
         let storage = scope.storage_lifetime();
         drop(factory);
         drop(owner);
-        let cancelled: crate::runtime::fragment::ExecutionFailure =
+        let cancelled: crate::runtime::task::ExecutionFailure =
             novarocks_functions::KernelFailure::Cancelled.into();
         assert_eq!(
             scope.request(Layout::new::<u64>()).unwrap_err(),
@@ -768,11 +767,11 @@ mod tests {
         );
         assert_eq!(
             cause.failure_fact().reason(),
-            crate::runtime::fragment::ExecutionReason::ReceiverConstructionClosed.reason()
+            crate::runtime::task::ExecutionReason::ReceiverConstructionClosed.reason()
         );
         assert!(matches!(
             cause.cause(),
-            crate::runtime::fragment::ExecutionFailureCause::Domain(source)
+            crate::runtime::task::ExecutionFailureCause::Domain(source)
                 if source.downcast_ref::<ReceiverConstructionClosed>().is_some()
         ));
     }
@@ -828,7 +827,7 @@ mod tests {
         let storage = scope.storage_lifetime();
         let weak_control = Arc::downgrade(&owner.control);
         let drops = Arc::new(AtomicUsize::new(0));
-        let original = crate::runtime::fragment::ExecutionFailure::from_domain(ReentrantSource {
+        let original = crate::runtime::task::ExecutionFailure::from_domain(ReentrantSource {
             control: weak_control.clone(),
             drops: drops.clone(),
             panic_on_drop: false,
@@ -881,7 +880,7 @@ mod tests {
         let control = owner.control.clone();
         assert!(owner.close_after_ingress().is_none());
         assert_closed(control.checkpoint(0).unwrap_err());
-        let late: crate::runtime::fragment::ExecutionFailure =
+        let late: crate::runtime::task::ExecutionFailure =
             novarocks_functions::KernelFailure::DeadlineExceeded.into();
         let alias = late.clone();
         let returned = control.error.try_stop(late).unwrap_err();
@@ -937,7 +936,7 @@ mod tests {
         .unwrap();
         let control = owner.control.clone();
         let drops = Arc::new(AtomicUsize::new(0));
-        owner.stop(crate::runtime::fragment::ExecutionFailure::from_domain(
+        owner.stop(crate::runtime::task::ExecutionFailure::from_domain(
             ReentrantSource {
                 control: Arc::downgrade(&control),
                 drops: drops.clone(),

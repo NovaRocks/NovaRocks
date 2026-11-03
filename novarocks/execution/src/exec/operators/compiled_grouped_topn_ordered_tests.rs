@@ -225,7 +225,7 @@ impl rf::RuntimeFilterSession for Session {
         &self,
         request: rf::RuntimeFilterProducerOpenRequest,
     ) -> Result<
-        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterProducerHandle>,
+        rf::RuntimeFilterBindOutcome<rf::SharedRuntimeFilterProducer>,
         rf::RuntimeFilterContractViolation,
     > {
         if request.contract() != &self.expected {
@@ -238,7 +238,7 @@ impl rf::RuntimeFilterSession for Session {
         &self,
         _: rf::RuntimeFilterSubscriptionRequest,
     ) -> Result<
-        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterSubscriptionHandle>,
+        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterSubscriptionPin>,
         rf::RuntimeFilterContractViolation,
     > {
         Err(refused())
@@ -247,7 +247,7 @@ impl rf::RuntimeFilterSession for Session {
         &self,
         _: rf::RuntimeFilterFinalDomainOpenRequest,
     ) -> Result<
-        rf::RuntimeFilterBindOutcome<rf::RuntimeFilterFinalDomainCompletionHandle>,
+        rf::RuntimeFilterBindOutcome<rf::SharedRuntimeFilterFinalDomainCompletion>,
         rf::RuntimeFilterContractViolation,
     > {
         Err(refused())

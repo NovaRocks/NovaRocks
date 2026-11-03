@@ -648,7 +648,7 @@ mod tests {
         FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
         SortOrder, Summary, TableMetadataBuilder, Type,
     };
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::{
         CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
         ConnectorOriginalResultScopeCheck, ConnectorProviderId, OriginalResultCheckError,
@@ -764,7 +764,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(executor.handle().clone())),
         );
         let runtime = Arc::new(
             crate::metadata_context::IcebergMetadataContext::try_new(

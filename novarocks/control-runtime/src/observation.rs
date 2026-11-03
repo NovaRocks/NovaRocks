@@ -19,7 +19,7 @@
 //! resources, select scheduling, infer exit, or reconstruct duties from history.
 
 use crate::{
-    driver::Clock,
+    actor_turn::Clock,
     sync::{Arc, Mutex, MutexGuard},
 };
 use novarocks_control_runtime_core::{

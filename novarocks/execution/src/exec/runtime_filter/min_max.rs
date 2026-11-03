@@ -61,10 +61,7 @@ pub enum MinMaxValue {
 }
 
 impl MinMaxValue {
-    fn cmp(
-        &self,
-        other: &MinMaxValue,
-    ) -> Result<Ordering, crate::runtime::fragment::ExecutionFailure> {
+    fn cmp(&self, other: &MinMaxValue) -> Result<Ordering, crate::runtime::task::ExecutionFailure> {
         match (self, other) {
             (MinMaxValue::Bool(a), MinMaxValue::Bool(b)) => Ok(a.cmp(b)),
             (MinMaxValue::Int8(a), MinMaxValue::Int8(b)) => Ok(a.cmp(b)),
@@ -140,75 +137,73 @@ impl RuntimeMinMaxFilter {
         &self,
     ) -> Result<
         Option<(MinMaxPredicateValue, MinMaxPredicateValue)>,
-        crate::runtime::fragment::ExecutionFailure,
+        crate::runtime::task::ExecutionFailure,
     > {
         if !self.has_min_max {
             return Ok(None);
         }
-        let to_value = |ltype: RuntimeFilterType,
-                        value: &MinMaxValue|
-         -> Result<
-            MinMaxPredicateValue,
-            crate::runtime::fragment::ExecutionFailure,
-        > {
-            match (ltype, value) {
-                (RuntimeFilterType::Boolean, MinMaxValue::Bool(v)) => {
-                    Ok(MinMaxPredicateValue::Boolean(*v))
-                }
-                (RuntimeFilterType::Int8, MinMaxValue::Int8(v)) => {
-                    Ok(MinMaxPredicateValue::Int32(i32::from(*v)))
-                }
-                (RuntimeFilterType::Int16, MinMaxValue::Int16(v)) => {
-                    Ok(MinMaxPredicateValue::Int32(i32::from(*v)))
-                }
-                (RuntimeFilterType::Int32, MinMaxValue::Int32(v)) => {
-                    Ok(MinMaxPredicateValue::Int32(*v))
-                }
-                (RuntimeFilterType::Int64, MinMaxValue::Int64(v)) => {
-                    Ok(MinMaxPredicateValue::Int64(*v))
-                }
-                (RuntimeFilterType::LargeInt, MinMaxValue::LargeInt(v)) => {
-                    Ok(MinMaxPredicateValue::LargeInt(*v))
-                }
-                (RuntimeFilterType::Float32, MinMaxValue::Float32(v)) => {
-                    Ok(MinMaxPredicateValue::Float(*v))
-                }
-                (RuntimeFilterType::Float64, MinMaxValue::Float64(v)) => {
-                    Ok(MinMaxPredicateValue::Double(*v))
-                }
-                (RuntimeFilterType::Date32, MinMaxValue::Date32(v)) => {
-                    Ok(MinMaxPredicateValue::Date32(*v))
-                }
-                (RuntimeFilterType::TimestampMicros, MinMaxValue::Timestamp(v))
-                | (RuntimeFilterType::TimeMicros, MinMaxValue::Timestamp(v)) => {
-                    Ok(MinMaxPredicateValue::DateTimeMicros(*v))
-                }
-                (t, MinMaxValue::Utf8(v)) if is_utf8_type(&t) => {
-                    Ok(MinMaxPredicateValue::ByteArray(v.as_bytes().to_vec()))
-                }
-                (
-                    RuntimeFilterType::Decimal {
-                        precision: Some(precision),
-                        scale: Some(scale),
-                        ..
-                    },
-                    MinMaxValue::Decimal128(value),
-                ) => Ok(MinMaxPredicateValue::Decimal128 {
-                    value: *value,
-                    precision,
-                    scale,
-                }),
-                (t, MinMaxValue::Decimal128(_)) if is_decimal_type(&t) => Err(
-                    crate::exec::runtime_filter::failure::contract(format_args!(
-                        "runtime min/max conversion for decimal type {:?} is unsupported because precision/scale metadata is missing",
-                        t
+        let to_value =
+            |ltype: RuntimeFilterType,
+             value: &MinMaxValue|
+             -> Result<MinMaxPredicateValue, crate::runtime::task::ExecutionFailure> {
+                match (ltype, value) {
+                    (RuntimeFilterType::Boolean, MinMaxValue::Bool(v)) => {
+                        Ok(MinMaxPredicateValue::Boolean(*v))
+                    }
+                    (RuntimeFilterType::Int8, MinMaxValue::Int8(v)) => {
+                        Ok(MinMaxPredicateValue::Int32(i32::from(*v)))
+                    }
+                    (RuntimeFilterType::Int16, MinMaxValue::Int16(v)) => {
+                        Ok(MinMaxPredicateValue::Int32(i32::from(*v)))
+                    }
+                    (RuntimeFilterType::Int32, MinMaxValue::Int32(v)) => {
+                        Ok(MinMaxPredicateValue::Int32(*v))
+                    }
+                    (RuntimeFilterType::Int64, MinMaxValue::Int64(v)) => {
+                        Ok(MinMaxPredicateValue::Int64(*v))
+                    }
+                    (RuntimeFilterType::LargeInt, MinMaxValue::LargeInt(v)) => {
+                        Ok(MinMaxPredicateValue::LargeInt(*v))
+                    }
+                    (RuntimeFilterType::Float32, MinMaxValue::Float32(v)) => {
+                        Ok(MinMaxPredicateValue::Float(*v))
+                    }
+                    (RuntimeFilterType::Float64, MinMaxValue::Float64(v)) => {
+                        Ok(MinMaxPredicateValue::Double(*v))
+                    }
+                    (RuntimeFilterType::Date32, MinMaxValue::Date32(v)) => {
+                        Ok(MinMaxPredicateValue::Date32(*v))
+                    }
+                    (RuntimeFilterType::TimestampMicros, MinMaxValue::Timestamp(v))
+                    | (RuntimeFilterType::TimeMicros, MinMaxValue::Timestamp(v)) => {
+                        Ok(MinMaxPredicateValue::DateTimeMicros(*v))
+                    }
+                    (t, MinMaxValue::Utf8(v)) if is_utf8_type(&t) => {
+                        Ok(MinMaxPredicateValue::ByteArray(v.as_bytes().to_vec()))
+                    }
+                    (
+                        RuntimeFilterType::Decimal {
+                            precision: Some(precision),
+                            scale: Some(scale),
+                            ..
+                        },
+                        MinMaxValue::Decimal128(value),
+                    ) => Ok(MinMaxPredicateValue::Decimal128 {
+                        value: *value,
+                        precision,
+                        scale,
+                    }),
+                    (t, MinMaxValue::Decimal128(_)) if is_decimal_type(&t) => Err(
+                        crate::exec::runtime_filter::failure::contract(format_args!(
+                            "runtime min/max conversion for decimal type {:?} is unsupported because precision/scale metadata is missing",
+                            t
+                        )),
+                    ),
+                    _ => Err(crate::exec::runtime_filter::failure::contract(
+                        "runtime min/max predicate value type mismatch",
                     )),
-                ),
-                _ => Err(crate::exec::runtime_filter::failure::contract(
-                    "runtime min/max predicate value type mismatch",
-                )),
-            }
-        };
+                }
+            };
         let min = to_value(self.ltype, &self.min)?;
         let max = to_value(self.ltype, &self.max)?;
         Ok(Some((min, max)))
@@ -216,14 +211,14 @@ impl RuntimeMinMaxFilter {
 
     pub fn full_range(
         ltype: RuntimeFilterType,
-    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Self, crate::runtime::task::ExecutionFailure> {
         let (min, max) = full_range_values(&ltype)?;
         Ok(Self::new(ltype, true, min, max))
     }
 
     pub fn empty_range(
         ltype: RuntimeFilterType,
-    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Self, crate::runtime::task::ExecutionFailure> {
         let (min, max) = empty_range_values(&ltype)?;
         Ok(Self::new(ltype, true, min, max))
     }
@@ -231,7 +226,7 @@ impl RuntimeMinMaxFilter {
     pub fn from_arrays(
         ltype: RuntimeFilterType,
         arrays: &[ArrayRef],
-    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Self, crate::runtime::task::ExecutionFailure> {
         if arrays.is_empty() {
             return Self::empty_range(ltype);
         }
@@ -397,7 +392,7 @@ impl RuntimeMinMaxFilter {
     pub fn from_array(
         ltype: RuntimeFilterType,
         array: &ArrayRef,
-    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Self, crate::runtime::task::ExecutionFailure> {
         Self::from_arrays(ltype, std::slice::from_ref(array))
     }
 
@@ -410,7 +405,7 @@ impl RuntimeMinMaxFilter {
         ltype: RuntimeFilterType,
         array: &ArrayRef,
         is_asc: bool,
-    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Self, crate::runtime::task::ExecutionFailure> {
         let data = Self::from_array(ltype, array)?;
         if !data.has_min_max {
             // No values (empty column) → a filter that prunes nothing.
@@ -433,7 +428,7 @@ impl RuntimeMinMaxFilter {
     pub fn to_min_max_predicates(
         &self,
         column_name: &str,
-    ) -> Result<Vec<MinMaxPredicate>, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Vec<MinMaxPredicate>, crate::runtime::task::ExecutionFailure> {
         let Some((min_val, max_val)) = self.min_max_predicate_values()? else {
             return Ok(vec![]);
         };
@@ -452,7 +447,7 @@ impl RuntimeMinMaxFilter {
     pub fn merge_from(
         &mut self,
         other: &RuntimeMinMaxFilter,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         if self.ltype != other.ltype {
             return Err(crate::exec::runtime_filter::failure::contract(
                 "runtime min/max filter type mismatch",
@@ -477,7 +472,7 @@ impl RuntimeMinMaxFilter {
     }
 
     #[allow(dead_code)]
-    pub fn is_empty_range(&self) -> Result<bool, crate::runtime::fragment::ExecutionFailure> {
+    pub fn is_empty_range(&self) -> Result<bool, crate::runtime::task::ExecutionFailure> {
         if !self.has_min_max {
             return Ok(false);
         }
@@ -490,7 +485,7 @@ impl RuntimeMinMaxFilter {
         has_null: bool,
         check_null: bool,
         keep: &mut [bool],
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         if !self.has_min_max {
             return Ok(());
         }
@@ -747,7 +742,7 @@ impl RuntimeMinMaxFilter {
     pub fn encode_into(
         &self,
         buf: &mut Vec<u8>,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         buf.push(if self.has_min_max { 1 } else { 0 });
         encode_value(&self.ltype, &self.min, buf)?;
         encode_value(&self.ltype, &self.max, buf)?;
@@ -758,14 +753,14 @@ impl RuntimeMinMaxFilter {
         ltype: RuntimeFilterType,
         data: &[u8],
         offset: &mut usize,
-    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Self, crate::runtime::task::ExecutionFailure> {
         let has_min_max = read_u8(data, offset)? != 0;
         let min = decode_value(&ltype, data, offset)?;
         let max = decode_value(&ltype, data, offset)?;
         Ok(Self::new(ltype, has_min_max, min, max))
     }
 
-    fn bool_range(&self) -> Result<(bool, bool), crate::runtime::fragment::ExecutionFailure> {
+    fn bool_range(&self) -> Result<(bool, bool), crate::runtime::task::ExecutionFailure> {
         match (&self.min, &self.max) {
             (MinMaxValue::Bool(min), MinMaxValue::Bool(max)) => Ok((*min, *max)),
             _ => Err(crate::exec::runtime_filter::failure::contract(
@@ -774,7 +769,7 @@ impl RuntimeMinMaxFilter {
         }
     }
 
-    fn i8_range(&self) -> Result<(i8, i8), crate::runtime::fragment::ExecutionFailure> {
+    fn i8_range(&self) -> Result<(i8, i8), crate::runtime::task::ExecutionFailure> {
         match (&self.min, &self.max) {
             (MinMaxValue::Int8(min), MinMaxValue::Int8(max)) => Ok((*min, *max)),
             _ => Err(crate::exec::runtime_filter::failure::contract(
@@ -783,7 +778,7 @@ impl RuntimeMinMaxFilter {
         }
     }
 
-    fn i16_range(&self) -> Result<(i16, i16), crate::runtime::fragment::ExecutionFailure> {
+    fn i16_range(&self) -> Result<(i16, i16), crate::runtime::task::ExecutionFailure> {
         match (&self.min, &self.max) {
             (MinMaxValue::Int16(min), MinMaxValue::Int16(max)) => Ok((*min, *max)),
             _ => Err(crate::exec::runtime_filter::failure::contract(
@@ -792,7 +787,7 @@ impl RuntimeMinMaxFilter {
         }
     }
 
-    fn i32_range(&self) -> Result<(i32, i32), crate::runtime::fragment::ExecutionFailure> {
+    fn i32_range(&self) -> Result<(i32, i32), crate::runtime::task::ExecutionFailure> {
         match (&self.min, &self.max) {
             (MinMaxValue::Int32(min), MinMaxValue::Int32(max)) => Ok((*min, *max)),
             _ => Err(crate::exec::runtime_filter::failure::contract(
@@ -801,7 +796,7 @@ impl RuntimeMinMaxFilter {
         }
     }
 
-    fn i64_range(&self) -> Result<(i64, i64), crate::runtime::fragment::ExecutionFailure> {
+    fn i64_range(&self) -> Result<(i64, i64), crate::runtime::task::ExecutionFailure> {
         match (&self.min, &self.max) {
             (MinMaxValue::Int64(min), MinMaxValue::Int64(max)) => Ok((*min, *max)),
             _ => Err(crate::exec::runtime_filter::failure::contract(
@@ -810,7 +805,7 @@ impl RuntimeMinMaxFilter {
         }
     }
 
-    fn i128_range(&self) -> Result<(i128, i128), crate::runtime::fragment::ExecutionFailure> {
+    fn i128_range(&self) -> Result<(i128, i128), crate::runtime::task::ExecutionFailure> {
         match (&self.min, &self.max) {
             (MinMaxValue::LargeInt(min), MinMaxValue::LargeInt(max)) => Ok((*min, *max)),
             _ => Err(crate::exec::runtime_filter::failure::contract(
@@ -819,7 +814,7 @@ impl RuntimeMinMaxFilter {
         }
     }
 
-    fn f32_range(&self) -> Result<(f32, f32), crate::runtime::fragment::ExecutionFailure> {
+    fn f32_range(&self) -> Result<(f32, f32), crate::runtime::task::ExecutionFailure> {
         match (&self.min, &self.max) {
             (MinMaxValue::Float32(min), MinMaxValue::Float32(max)) => Ok((*min, *max)),
             _ => Err(crate::exec::runtime_filter::failure::contract(
@@ -828,7 +823,7 @@ impl RuntimeMinMaxFilter {
         }
     }
 
-    fn f64_range(&self) -> Result<(f64, f64), crate::runtime::fragment::ExecutionFailure> {
+    fn f64_range(&self) -> Result<(f64, f64), crate::runtime::task::ExecutionFailure> {
         match (&self.min, &self.max) {
             (MinMaxValue::Float64(min), MinMaxValue::Float64(max)) => Ok((*min, *max)),
             _ => Err(crate::exec::runtime_filter::failure::contract(
@@ -837,7 +832,7 @@ impl RuntimeMinMaxFilter {
         }
     }
 
-    fn date32_range(&self) -> Result<(i32, i32), crate::runtime::fragment::ExecutionFailure> {
+    fn date32_range(&self) -> Result<(i32, i32), crate::runtime::task::ExecutionFailure> {
         match (&self.min, &self.max) {
             (MinMaxValue::Date32(min), MinMaxValue::Date32(max)) => Ok((*min, *max)),
             _ => Err(crate::exec::runtime_filter::failure::contract(
@@ -846,7 +841,7 @@ impl RuntimeMinMaxFilter {
         }
     }
 
-    fn timestamp_range(&self) -> Result<(i64, i64), crate::runtime::fragment::ExecutionFailure> {
+    fn timestamp_range(&self) -> Result<(i64, i64), crate::runtime::task::ExecutionFailure> {
         match (&self.min, &self.max) {
             (MinMaxValue::Timestamp(min), MinMaxValue::Timestamp(max)) => Ok((*min, *max)),
             _ => Err(crate::exec::runtime_filter::failure::contract(
@@ -855,7 +850,7 @@ impl RuntimeMinMaxFilter {
         }
     }
 
-    fn utf8_range(&self) -> Result<(&String, &String), crate::runtime::fragment::ExecutionFailure> {
+    fn utf8_range(&self) -> Result<(&String, &String), crate::runtime::task::ExecutionFailure> {
         match (&self.min, &self.max) {
             (MinMaxValue::Utf8(min), MinMaxValue::Utf8(max)) => Ok((min, max)),
             _ => Err(crate::exec::runtime_filter::failure::contract(
@@ -864,7 +859,7 @@ impl RuntimeMinMaxFilter {
         }
     }
 
-    fn decimal_range(&self) -> Result<(i128, i128), crate::runtime::fragment::ExecutionFailure> {
+    fn decimal_range(&self) -> Result<(i128, i128), crate::runtime::task::ExecutionFailure> {
         match (&self.min, &self.max) {
             (MinMaxValue::Decimal128(min), MinMaxValue::Decimal128(max)) => Ok((*min, *max)),
             _ => Err(crate::exec::runtime_filter::failure::contract(
@@ -877,7 +872,7 @@ impl RuntimeMinMaxFilter {
 fn as_array<'a, T: Array + 'static>(
     array: &'a ArrayRef,
     expected: &str,
-) -> Result<&'a T, crate::runtime::fragment::ExecutionFailure> {
+) -> Result<&'a T, crate::runtime::task::ExecutionFailure> {
     array.as_any().downcast_ref::<T>().ok_or_else(|| {
         crate::exec::runtime_filter::failure::contract(format_args!(
             "runtime min/max type mismatch for {expected}"
@@ -889,7 +884,7 @@ fn update_min_max(
     value: MinMaxValue,
     min: &mut Option<MinMaxValue>,
     max: &mut Option<MinMaxValue>,
-) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+) -> Result<(), crate::runtime::task::ExecutionFailure> {
     match min.as_ref() {
         Some(current) => {
             if current.cmp(&value)? == Ordering::Greater {
@@ -911,7 +906,7 @@ fn update_min_max(
 
 fn full_range_values(
     ltype: &RuntimeFilterType,
-) -> Result<(MinMaxValue, MinMaxValue), crate::runtime::fragment::ExecutionFailure> {
+) -> Result<(MinMaxValue, MinMaxValue), crate::runtime::task::ExecutionFailure> {
     match *ltype {
         RuntimeFilterType::Boolean => Ok((MinMaxValue::Bool(false), MinMaxValue::Bool(true))),
         RuntimeFilterType::Int8 => Ok((MinMaxValue::Int8(i8::MIN), MinMaxValue::Int8(i8::MAX))),
@@ -976,7 +971,7 @@ fn full_range_values(
 
 fn empty_range_values(
     ltype: &RuntimeFilterType,
-) -> Result<(MinMaxValue, MinMaxValue), crate::runtime::fragment::ExecutionFailure> {
+) -> Result<(MinMaxValue, MinMaxValue), crate::runtime::task::ExecutionFailure> {
     match *ltype {
         RuntimeFilterType::Boolean => Ok((MinMaxValue::Bool(true), MinMaxValue::Bool(false))),
         RuntimeFilterType::Int8 => Ok((MinMaxValue::Int8(i8::MAX), MinMaxValue::Int8(i8::MIN))),
@@ -1043,7 +1038,7 @@ fn decode_value(
     ltype: &RuntimeFilterType,
     data: &[u8],
     offset: &mut usize,
-) -> Result<MinMaxValue, crate::runtime::fragment::ExecutionFailure> {
+) -> Result<MinMaxValue, crate::runtime::task::ExecutionFailure> {
     match *ltype {
         RuntimeFilterType::Boolean => Ok(MinMaxValue::Bool(read_u8(data, offset)? != 0)),
         RuntimeFilterType::Int8 => Ok(MinMaxValue::Int8(read_i8(data, offset)?)),
@@ -1111,7 +1106,7 @@ fn encode_value(
     ltype: &RuntimeFilterType,
     value: &MinMaxValue,
     buf: &mut Vec<u8>,
-) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+) -> Result<(), crate::runtime::task::ExecutionFailure> {
     match (ltype, value) {
         (t, MinMaxValue::Bool(v)) if *t == RuntimeFilterType::Boolean => {
             buf.push(if *v { 1 } else { 0 });
@@ -1193,7 +1188,7 @@ fn encode_value(
 fn read_i128_le(
     data: &[u8],
     offset: &mut usize,
-) -> Result<i128, crate::runtime::fragment::ExecutionFailure> {
+) -> Result<i128, crate::runtime::task::ExecutionFailure> {
     if data.len() < *offset + 16 {
         return Err(crate::exec::runtime_filter::failure::contract(
             "runtime min/max data truncated",
@@ -1207,7 +1202,7 @@ fn read_i128_le(
 
 fn timestamp_values(
     array: &ArrayRef,
-) -> Result<(Vec<(i64, bool)>, TimeUnit), crate::runtime::fragment::ExecutionFailure> {
+) -> Result<(Vec<(i64, bool)>, TimeUnit), crate::runtime::task::ExecutionFailure> {
     match array.data_type() {
         DataType::Timestamp(unit, _) => match unit {
             TimeUnit::Second => {

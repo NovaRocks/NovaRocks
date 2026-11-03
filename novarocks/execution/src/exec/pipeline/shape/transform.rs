@@ -23,10 +23,10 @@ use crate::exec::pipeline::operator::{
     ExitObservation, FinishWatch, InputConstructionFactory, InputEncodingPolicy,
 };
 use crate::runtime::{
-    fragment::{ExecutionResult, io::FragmentEventSink},
     mem_tracker::MemTracker,
     profile::OperatorProfiles,
     runtime_state::RuntimeState,
+    task::{ExecutionResult, io::TaskEventSink},
 };
 use std::sync::Arc;
 
@@ -97,8 +97,8 @@ impl<K: TransformKernel + InputEncodingPolicy + OperatorLifecycle, P: InputPrepa
     fn activate(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.kernel.activate(state)
     }
-    fn set_fragment_event_sink(&mut self, sink: Arc<dyn FragmentEventSink>) {
-        self.kernel.set_fragment_event_sink(sink);
+    fn set_task_event_sink(&mut self, sink: Arc<dyn TaskEventSink>) {
+        self.kernel.set_task_event_sink(sink);
     }
     fn begin_exit(&mut self) -> ExecutionResult<()> {
         self.next = NextStep::Finished;

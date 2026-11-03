@@ -16,7 +16,7 @@
 // under the License.
 
 //! Required parent data and host invariants of a compiled table invocation.
-use crate::runtime::fragment::{ExecutionFailure, ExecutionReason};
+use crate::runtime::task::{ExecutionFailure, ExecutionReason};
 use novarocks_failure_contract::{
     FailureClass, FailureFact, FailureProjection, RepresentationBoundary, RepresentationFacts,
     RepresentationLayout, domain,

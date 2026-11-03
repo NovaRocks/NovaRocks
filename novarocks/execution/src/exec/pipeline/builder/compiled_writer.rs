@@ -206,11 +206,11 @@ fn build_logical_finish(
     };
     let handle = receiver
         .receiver_port
-        .receiver_handle(
-            crate::runtime::fragment::io::ExchangeReceiverKey {
-                fragment_instance_id: novarocks_types::identity::UniqueId::new(
-                    receiver.key.finst_id_hi,
-                    receiver.key.finst_id_lo,
+        .receiver_pin(
+            crate::runtime::task::io::ExchangeReceiverKey {
+                task_key: novarocks_types::identity::UniqueId::new(
+                    receiver.key.task_key_hi,
+                    receiver.key.task_key_lo,
                 ),
                 node_id: receiver.key.node_id,
             },

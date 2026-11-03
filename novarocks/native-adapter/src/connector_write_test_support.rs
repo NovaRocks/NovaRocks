@@ -53,7 +53,7 @@ pub struct StubProviderRuntime {
 }
 
 impl ProviderWriteRuntime for StubProviderRuntime {
-    type CommitHandle = ();
+    type CommitSession = ();
     type WriterHandle = String;
     type CommitFragment = String;
 
@@ -291,13 +291,13 @@ pub fn test_request_context() -> novarocks_spi::connector::ConnectorRequestConte
 
 pub fn test_write_scan_runtime(
     execution_id: QueryExecutionId,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
     execution: Arc<RecordingWriteExecution>,
 ) -> novarocks_worker::TypedScanRuntime {
     let binding = test_write_binding(execution);
     let expected = test_write_catalog_handle();
     let queues = novarocks_execution::connector::SplitQueueRegistry::new().open_attempt(
-        novarocks_execution::connector::TaskAttemptKey::new(execution_id, fragment_instance_id),
+        novarocks_execution::connector::SplitQueueKey::new(execution_id, task_key),
         novarocks_execution::connector::SplitQueueConfig::default(),
     );
     let session = novarocks_spi::connector::read_stack::ConnectorSession::try_new(
@@ -331,7 +331,7 @@ pub fn test_write_scan_runtime(
         queues,
         session,
         Arc::new(|| Ok(None)),
-        Arc::new(novarocks_worker::read_attempt::TypedReadAttemptContext::new()),
+        Arc::new(novarocks_worker::read_attempt::TaskReadBindingRegistry::new()),
         Arc::new(NoVendedStorage),
         novarocks_worker::ScanStreamHost::new(
             novarocks_worker::ScanPreparationConfig::default(),

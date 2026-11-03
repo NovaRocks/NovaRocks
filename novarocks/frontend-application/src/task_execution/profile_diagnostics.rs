@@ -31,7 +31,7 @@ use super::{
     completion::accept_final_info, graph::TaskNode, round::TaskRound,
     status_intake::StatusIntakeWake,
 };
-use crate::native::fragment_transport::{FinalTaskInfoRead, TaskResultTransport};
+use crate::native::task_result_transport::{FinalTaskInfoRead, TaskResultTransport};
 use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution_contract::{FinalTaskInfo, OperationOutcome, TaskIdentity};
 use novarocks_query_application::api::ComputationReadyToken;
@@ -314,12 +314,17 @@ impl TaskFinalInfoCollector {
         }
         if let Some(deadline) = deadline {
             let expired = now.has_reached(deadline);
-            let releases_complete = round.execution().graph().contexts().all(|context| {
+            let releases_complete =
                 round
                     .execution()
-                    .owner(*context)
-                    .is_some_and(|owner| owner.is_released())
-            });
+                    .graph()
+                    .participations()
+                    .all(|participation| {
+                        round
+                            .execution()
+                            .owner(*participation)
+                            .is_some_and(|owner| owner.is_released())
+                    });
             let split_finished = !matches!(
                 self.split_diagnostic(),
                 ProfileSplitDiagnostic::Missing(ProfileSplitDiagnosticMissing::Pending)

@@ -22,9 +22,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorDataMutationExecuteRequest, ConnectorDataMutationLease,
-    ConnectorDataMutationOperation, ConnectorDataMutationReceipt,
-    ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver, ConnectorError,
+    ConnectorDataMutationExecuteRequest, ConnectorDataMutationOperation,
+    ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest,
+    ConnectorDataMutationResolver, ConnectorDataMutationSession, ConnectorError,
     ConnectorErrorKind, ConnectorInstanceId, ConnectorMutationFailure,
     ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorRequestContext,
     ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
@@ -221,7 +221,7 @@ pub fn resolve_data_mutation(
 }
 
 pub struct DataMutationSession {
-    lease: ConnectorDataMutationLease,
+    session: ConnectorDataMutationSession,
     table: ConnectorTableIdentity,
     plan: novarocks_spi::connector::ConnectorDataMutationPlan,
     context: ConnectorRequestContext,
@@ -255,12 +255,12 @@ impl DataMutationSession {
                 DataMutationDispatchState::ConfirmedNotDispatched,
             ));
         }
-        let lease = resolver
+        let session = resolver
             .acquire_current_data_mutation(instance_id)
             .map_err(|error| {
                 contract_failure(error, DataMutationDispatchState::ConfirmedNotDispatched)
             })?;
-        let metadata = lease
+        let metadata = session
             .metadata()
             .load_frontend_table(ConnectorTableRequest {
                 table: table.clone(),
@@ -271,7 +271,8 @@ impl DataMutationSession {
                 failure: KnownUncommittedDataMutation::Planning(error),
                 cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             })?;
-        if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
+        if metadata.identity != table || metadata.table.owner() != &session.descriptor().instance_id
+        {
             return Err(contract_failure(
                 ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -286,14 +287,14 @@ impl DataMutationSession {
                 cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             }
         })?;
-        let plan = lease
+        let plan = session
             .plan_operation(operation_id, operation, context.clone())
             .map_err(|error| ResolvedDataMutation::KnownUncommitted {
                 failure: KnownUncommittedDataMutation::Planning(error),
                 cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             })?;
         Ok(Self {
-            lease,
+            session,
             table,
             plan,
             context,
@@ -306,7 +307,7 @@ impl DataMutationSession {
     }
 
     pub fn descriptor_ref(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
-        self.lease.descriptor()
+        self.session.descriptor()
     }
 
     /// Dispatch the retained plan exactly once.
@@ -338,7 +339,7 @@ impl DataMutationSession {
                 return contract_failure(error, DataMutationDispatchState::ConfirmedNotDispatched);
             }
         };
-        let outcome = match self.lease.execute(request) {
+        let outcome = match self.session.execute(request) {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.phase = DataMutationSessionPhase::Terminal;
@@ -405,7 +406,7 @@ impl DataMutationSession {
                 };
             }
         };
-        let outcome = match self.lease.reconcile(reconcile) {
+        let outcome = match self.session.reconcile(reconcile) {
             Ok(outcome) => outcome,
             Err(_error) => {
                 self.phase = DataMutationSessionPhase::Terminal;
@@ -847,9 +848,9 @@ mod tests {
         fn acquire_current_data_mutation(
             &self,
             _instance_id: &ConnectorInstanceId,
-        ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+        ) -> Result<ConnectorDataMutationSession, ConnectorError> {
             let releases = self.releases.clone();
-            ConnectorDataMutationLease::new(
+            ConnectorDataMutationSession::new(
                 self.provider.descriptor.clone(),
                 self.provider.control_runtime_id,
                 self.provider.key.incarnation,
@@ -864,7 +865,7 @@ mod tests {
         fn acquire_exact_data_mutation(
             &self,
             _control_runtime_id: ConnectorControlRuntimeId,
-        ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+        ) -> Result<ConnectorDataMutationSession, ConnectorError> {
             unreachable!()
         }
     }
@@ -875,7 +876,7 @@ mod tests {
         fn acquire_current_data_mutation(
             &self,
             _instance_id: &ConnectorInstanceId,
-        ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+        ) -> Result<ConnectorDataMutationSession, ConnectorError> {
             Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 "data mutation capability is unavailable",
@@ -885,7 +886,7 @@ mod tests {
         fn acquire_exact_data_mutation(
             &self,
             _control_runtime_id: ConnectorControlRuntimeId,
-        ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+        ) -> Result<ConnectorDataMutationSession, ConnectorError> {
             unreachable!()
         }
     }

@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionReason, ExecutionResult};
 use novarocks_failure_contract::{
     BoundedDetail, FailureClass, FailureFact, FailureProjection, RepresentationBoundary,
     RepresentationFacts, RepresentationLayout, domain,
@@ -26,16 +26,16 @@ use std::{
 };
 
 #[derive(Debug)]
-struct AnalyticGuard {
+struct AnalyticContractViolation {
     detail: BoundedDetail,
 }
-impl fmt::Display for AnalyticGuard {
+impl fmt::Display for AnalyticContractViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.detail.as_str())
     }
 }
-impl Error for AnalyticGuard {}
-impl FailureProjection for AnalyticGuard {
+impl Error for AnalyticContractViolation {}
+impl FailureProjection for AnalyticContractViolation {
     fn failure_fact(&self) -> FailureFact {
         FailureFact::new(
             FailureClass::Invariant,
@@ -44,7 +44,7 @@ impl FailureProjection for AnalyticGuard {
     }
 }
 pub(super) fn contract(detail: impl fmt::Display) -> ExecutionFailure {
-    ExecutionFailure::from_domain(AnalyticGuard {
+    ExecutionFailure::from_domain(AnalyticContractViolation {
         detail: BoundedDetail::truncating_display(detail),
     })
 }
@@ -84,13 +84,13 @@ pub(super) fn arrow(source: arrow::error::ArrowError) -> ExecutionFailure {
 }
 
 #[derive(Debug)]
-struct AnalyticContext {
+struct AnalyticOperatorFailure {
     stage: Option<&'static str>,
     #[cfg(test)]
     call: Option<usize>,
     source: ExecutionFailure,
 }
-impl fmt::Display for AnalyticContext {
+impl fmt::Display for AnalyticOperatorFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         #[cfg(test)]
         if let Some(call) = self.call {
@@ -99,18 +99,18 @@ impl fmt::Display for AnalyticContext {
         write!(f, "{}: {}", self.stage.unwrap(), self.source)
     }
 }
-impl Error for AnalyticContext {
+impl Error for AnalyticOperatorFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.source)
     }
 }
-impl FailureProjection for AnalyticContext {
+impl FailureProjection for AnalyticOperatorFailure {
     fn failure_fact(&self) -> FailureFact {
         self.source.failure_fact()
     }
 }
 pub(super) fn stage(stage: &'static str, source: ExecutionFailure) -> ExecutionFailure {
-    ExecutionFailure::from_domain(AnalyticContext {
+    ExecutionFailure::from_domain(AnalyticOperatorFailure {
         stage: Some(stage),
         #[cfg(test)]
         call: None,
@@ -119,7 +119,7 @@ pub(super) fn stage(stage: &'static str, source: ExecutionFailure) -> ExecutionF
 }
 #[cfg(test)]
 pub(super) fn call(call: usize, source: ExecutionFailure) -> ExecutionFailure {
-    ExecutionFailure::from_domain(AnalyticContext {
+    ExecutionFailure::from_domain(AnalyticOperatorFailure {
         stage: None,
         call: Some(call),
         source,

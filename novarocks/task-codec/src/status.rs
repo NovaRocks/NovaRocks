@@ -101,11 +101,11 @@ pub(crate) fn encode_cancel_reason(value: CancelReason) -> i32 {
 }
 
 pub(crate) fn decode_abort_cause(value: i32, path: FieldPath) -> Result<AbortCause, ProtocolError> {
-    match novarocks::QueryContextAbortCause::try_from(value) {
-        Ok(novarocks::QueryContextAbortCause::QueryFailed) => Ok(AbortCause::QueryFailed),
-        Ok(novarocks::QueryContextAbortCause::LeaseExpired) => Ok(AbortCause::LeaseExpired),
-        Ok(novarocks::QueryContextAbortCause::PeerTaskFailed) => Ok(AbortCause::PeerTaskFailed),
-        Ok(novarocks::QueryContextAbortCause::Unspecified) | Err(_) => Err(invalid_enum(
+    match novarocks::ParticipationAbortCause::try_from(value) {
+        Ok(novarocks::ParticipationAbortCause::QueryFailed) => Ok(AbortCause::QueryFailed),
+        Ok(novarocks::ParticipationAbortCause::LeaseExpired) => Ok(AbortCause::LeaseExpired),
+        Ok(novarocks::ParticipationAbortCause::PeerTaskFailed) => Ok(AbortCause::PeerTaskFailed),
+        Ok(novarocks::ParticipationAbortCause::Unspecified) | Err(_) => Err(invalid_enum(
             path,
             "abort cause must be a known non-default value",
         )),
@@ -114,9 +114,9 @@ pub(crate) fn decode_abort_cause(value: i32, path: FieldPath) -> Result<AbortCau
 
 pub(crate) fn encode_abort_cause(value: AbortCause) -> i32 {
     let encoded = match value {
-        AbortCause::QueryFailed => novarocks::QueryContextAbortCause::QueryFailed,
-        AbortCause::LeaseExpired => novarocks::QueryContextAbortCause::LeaseExpired,
-        AbortCause::PeerTaskFailed => novarocks::QueryContextAbortCause::PeerTaskFailed,
+        AbortCause::QueryFailed => novarocks::ParticipationAbortCause::QueryFailed,
+        AbortCause::LeaseExpired => novarocks::ParticipationAbortCause::LeaseExpired,
+        AbortCause::PeerTaskFailed => novarocks::ParticipationAbortCause::PeerTaskFailed,
     };
     encoded as i32
 }

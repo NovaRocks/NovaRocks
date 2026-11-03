@@ -25,7 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_proto_models::novarocks as proto;
 
 use super::native_compatibility::raw_apply_task_operations_until;
@@ -121,14 +121,14 @@ impl Scenario for PreparationCapacity {
 
     fn launch_config(&self, _root: &Path) -> Result<ScenarioLaunchConfig> {
         let mut launch = ScenarioLaunchConfig::default();
-        let (per_context, count, bytes) = if self.bytes {
+        let (per_participation, count, bytes) = if self.bytes {
             (32, 32, 2048)
         } else {
             (2, 3, 64 * 1024 * 1024)
         };
         launch.config_overlay.fe = Some("[runtime]\ntask_dispatch_create_permits = 2\n".to_owned());
         launch.config_overlay.be = Some(format!(
-            "[runtime]\ntask_preparation_max_tasks_per_context = {per_context}\ntask_preparation_max_tasks = {count}\ntask_preparation_max_bytes = {bytes}\ntask_preparation_max_workers = 1\n"
+            "[runtime]\ntask_preparation_max_tasks_per_participation = {per_participation}\ntask_preparation_max_tasks = {count}\ntask_preparation_max_bytes = {bytes}\ntask_preparation_max_workers = 1\n"
         ));
         Ok(launch)
     }
@@ -207,7 +207,7 @@ impl Scenario for PreparationInterleaving {
     fn launch_config(&self, _root: &Path) -> Result<ScenarioLaunchConfig> {
         let mut launch = ScenarioLaunchConfig::default();
         launch.config_overlay.fe = Some("[runtime]\ntask_dispatch_create_permits = 2\n".into());
-        launch.config_overlay.be = Some("[runtime]\ntask_preparation_max_tasks_per_context = 2\ntask_preparation_max_tasks = 4\ntask_preparation_max_bytes = 67108864\ntask_preparation_max_workers = 2\n".into());
+        launch.config_overlay.be = Some("[runtime]\ntask_preparation_max_tasks_per_participation = 2\ntask_preparation_max_tasks = 4\ntask_preparation_max_bytes = 67108864\ntask_preparation_max_workers = 2\n".into());
         Ok(launch)
     }
 
@@ -316,7 +316,7 @@ fn same_batch(
     gate: &mut PreparationRendezvous,
     intent: &DirectIntent,
 ) -> Result<()> {
-    // Worker intentionally serializes preparation within one Context. Two
+    // Worker intentionally serializes preparation within one Participation. Two
     // Contexts on the same BE allow its two workers to progress independently.
     let slow = establish_declared(context, intent, 0, 0)?;
     let fast = establish_declared(context, intent, 1, 0)?;
@@ -457,9 +457,9 @@ fn fifo_capacity(
     gate.await_entered(context, &a, &a1)?;
     ensure_accepted(&a, &a2)?;
     ensure!(
-        outcome(&a.apply(receiver(&a, 3).operation(), "full Context P")?)?
+        outcome(&a.apply(receiver(&a, 3).operation(), "full Participation P")?)?
             == proto::TaskOperationOutcome::PreparationBusy,
-        "full Context preparation positions did not reject"
+        "full Participation preparation positions did not reject"
     );
     ensure_accepted(&b, &b1)?;
     ensure!(
@@ -469,9 +469,9 @@ fn fifo_capacity(
     );
     let full = await_snapshot(context, 3, 2, 1)?;
     ensure!(
-        full.context_positions == 2
+        full.participation_positions == 2
             && full.position_limit == 3
-            && full.context_limit == 2
+            && full.participation_limit == 2
             && full.worker_limit == 1
             && full.bytes > 0,
         "wrong configured owner view: {full:?}"
@@ -504,7 +504,7 @@ fn fifo_capacity(
     await_snapshot(context, 0, 0, 0)?;
     finish(context, &a, &[a1, a2, a3])?;
     finish(context, &b, &[b1])?;
-    context.action("P=2/global=3/workers=1: full Context and global positions rejected with PreparationBusy; exact rendezvous order A1,A2,B1 and owner gauges 3->2->1->0 proved FIFO and live Installed charge handoff; the previously Busy A3 was then Accepted while A1/A2 stayed live");
+    context.action("P=2/global=3/workers=1: full Participation and global positions rejected with PreparationBusy; exact rendezvous order A1,A2,B1 and owner gauges 3->2->1->0 proved FIFO and live Installed charge handoff; the previously Busy A3 was then Accepted while A1/A2 stayed live");
 
     let canceled = establish_declared(context, intent, 2, 0)?;
     let first = receiver(&canceled, 1);
@@ -528,7 +528,7 @@ fn fifo_capacity(
         outcome(&canceled.apply(
             receiver(&canceled, 3).operation(),
             "Create after held Quiesce"
-        )?)? == proto::TaskOperationOutcome::ContextTerminalReceipt,
+        )?)? == proto::TaskOperationOutcome::ParticipationTerminalReceipt,
         "Quiesce reopened preparation admission"
     );
     gate.release()?;
@@ -565,7 +565,7 @@ fn byte_capacity(
     let full = await_snapshot(context, accepted.len(), accepted.len() - 1, 1)?;
     ensure!(
         full.position_limit == 32
-            && full.context_limit == 32
+            && full.participation_limit == 32
             && full.byte_limit == 2048
             && full.bytes > 0
             && full.bytes <= 2048
@@ -626,8 +626,8 @@ fn finish(
 pub(super) struct Snapshot {
     pub(super) positions: usize,
     pub(super) position_limit: usize,
-    pub(super) context_positions: usize,
-    pub(super) context_limit: usize,
+    pub(super) participation_positions: usize,
+    pub(super) participation_limit: usize,
     pub(super) queued: usize,
     pub(super) workers: usize,
     pub(super) worker_limit: usize,
@@ -683,8 +683,8 @@ fn parse_snapshot(body: &str) -> Result<Option<Snapshot>> {
     Ok(Some(Snapshot {
         positions: sample("positions", "used")?,
         position_limit: sample("positions", "limit")?,
-        context_positions: sample("context_positions", "used")?,
-        context_limit: sample("context_positions", "limit")?,
+        participation_positions: sample("participation_positions", "used")?,
+        participation_limit: sample("participation_positions", "limit")?,
         queued: sample("queued_positions", "used")?,
         workers: sample("workers", "used")?,
         worker_limit: sample("workers", "limit")?,
@@ -717,14 +717,14 @@ pub(super) fn await_snapshot_at(
             ensure!(
                 snapshot.bytes <= snapshot.byte_limit
                     && snapshot.positions <= snapshot.position_limit
-                    && snapshot.context_positions <= snapshot.context_limit
+                    && snapshot.participation_positions <= snapshot.participation_limit
                     && snapshot.workers <= snapshot.worker_limit,
                 "owner exceeded configured preparation charge limits: {snapshot:?}"
             );
             if positions == 0 {
                 ensure!(
-                    snapshot.bytes == 0 && snapshot.context_positions == 0,
-                    "exited jobs leaked temporary byte/Context charges: {snapshot:?}"
+                    snapshot.bytes == 0 && snapshot.participation_positions == 0,
+                    "exited jobs leaked temporary byte/Participation charges: {snapshot:?}"
                 );
             }
             return Ok(snapshot);
@@ -860,8 +860,8 @@ mod snapshot_tests {
             "novarocks_backend_task_preparation_snapshot_available 1\n",
             "novarocks_backend_task_preparation{dimension=\"used\",resource=\"positions\"} 3\n",
             "novarocks_backend_task_preparation{dimension=\"limit\",resource=\"positions\"} 7\n",
-            "novarocks_backend_task_preparation{dimension=\"used\",resource=\"context_positions\"} 2\n",
-            "novarocks_backend_task_preparation{dimension=\"limit\",resource=\"context_positions\"} 5\n",
+            "novarocks_backend_task_preparation{dimension=\"used\",resource=\"participation_positions\"} 2\n",
+            "novarocks_backend_task_preparation{dimension=\"limit\",resource=\"participation_positions\"} 5\n",
             "novarocks_backend_task_preparation{dimension=\"used\",resource=\"queued_positions\"} 2\n",
             "novarocks_backend_task_preparation{dimension=\"used\",resource=\"workers\"} 1\n",
             "novarocks_backend_task_preparation{dimension=\"limit\",resource=\"workers\"} 4\n",
@@ -870,8 +870,8 @@ mod snapshot_tests {
         )).unwrap().expect("available exact owner snapshot");
         assert_eq!(snapshot.positions, 3);
         assert_eq!(snapshot.position_limit, 7);
-        assert_eq!(snapshot.context_positions, 2);
-        assert_eq!(snapshot.context_limit, 5);
+        assert_eq!(snapshot.participation_positions, 2);
+        assert_eq!(snapshot.participation_limit, 5);
         assert_eq!(snapshot.queued, 2);
         assert_eq!(snapshot.workers, 1);
         assert_eq!(snapshot.worker_limit, 4);

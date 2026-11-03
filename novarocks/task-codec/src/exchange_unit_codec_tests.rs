@@ -139,8 +139,8 @@ fn delivery_round_trip_keeps_the_same_payload_allocation_and_full_envelope() {
 fn envelope_length_and_required_fields_are_checked_before_delivery() {
     let valid = encode_delivery_request(frame());
     let mutations: [fn(&mut wire::DeliverExchangeUnitRequest); 8] = [
-        |value| value.finst_id_hi += 1,
-        |value| value.source_finst_id_lo += 1,
+        |value| value.task_key_hi += 1,
+        |value| value.source_task_key_lo += 1,
         |value| value.node_id += 1,
         |value| value.sender_ordinal = 0,
         |value| value.sender_count = 1,

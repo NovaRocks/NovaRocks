@@ -55,17 +55,17 @@ impl Control {
     }
 }
 impl SynchronousPreparationControl for Control {
-    fn checkpoint(&self) -> crate::runtime::fragment::ExecutionResult<()> {
+    fn checkpoint(&self) -> crate::runtime::task::ExecutionResult<()> {
         self.checks.set(self.checks.get() + 1);
         if self.checks.get() == self.stop_at {
-            Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+            Err(crate::runtime::task::ExecutionFailure::from_domain(
                 PreparationMemoryStop::Abort(AbortCause::LeaseExpired),
             ))
         } else {
             Ok(())
         }
     }
-    fn wait(&self) -> crate::runtime::fragment::ExecutionResult<()> {
+    fn wait(&self) -> crate::runtime::task::ExecutionResult<()> {
         panic!("a granted contract test must not enter Pending");
     }
 }
@@ -239,7 +239,7 @@ fn preparation_stop_is_an_observation_and_cannot_refine_another_tasks_cause() {
         PreparationMemoryStop::Abort(AbortCause::LeaseExpired),
     ] {
         let fact = PreparationMemoryRefusal::Interrupted(
-            crate::runtime::fragment::ExecutionFailure::from_domain(stop),
+            crate::runtime::task::ExecutionFailure::from_domain(stop),
         )
         .failure_fact();
         assert_eq!(fact.class(), FailureClass::Control);
@@ -276,7 +276,7 @@ fn preparation_stop_source<'a>(
 
 #[test]
 fn preparation_control_keeps_an_actual_originating_failure_without_inventing_stop_intent() {
-    use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+    use crate::runtime::task::{ExecutionFailure, ExecutionResult};
     use novarocks_failure_contract::{FailureEvidence, FailureProjection};
     struct OriginalControl(ExecutionFailure);
     impl SynchronousPreparationControl for OriginalControl {

@@ -31,9 +31,9 @@ use novarocks_query_application::{
 #[cfg(test)]
 use novarocks_spi::connector::ConnectorIoAdmissionPort;
 use novarocks_spi::connector::{
-    ConnectorDistributedRewriteLease, ConnectorOperationControl, ConnectorRequestContext,
-    ConnectorTableJobAdmissionRequest, ConnectorTableJobKind, ConnectorTableObjectCaptureRequest,
-    ConnectorTableObjectSelector, ConnectorTableResolution, ProviderMetadataCpuPort,
+    ConnectorOperationControl, ConnectorRequestContext, ConnectorTableJobAdmissionRequest,
+    ConnectorTableJobKind, ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector,
+    ConnectorTableResolution, ProviderMetadataCpuPort, SharedConnectorDistributedRewrite,
 };
 use novarocks_table_maintenance::{
     OptimizeCompletionMode,
@@ -64,7 +64,7 @@ struct SubmissionBody {
     engine: RequestScopedMaintenanceEngine,
     product: Arc<TableMaintenanceProduct>,
     roots: novarocks_workload_control::RootAdmissionHandle,
-    lease: ConnectorDistributedRewriteLease,
+    rewrite: SharedConnectorDistributedRewrite,
     target: MaintenanceTarget,
     context: ConnectorRequestContext,
     dependencies: Vec<novarocks_spi::connector::SharedDependency>,
@@ -147,11 +147,11 @@ pub(crate) fn prepare(
     })?;
     let identity = RequestScopedMaintenanceEngine::target_identity(&target)
         .map_err(TerminalError::pre_dispatch_failed)?;
-    let lease = kernel
+    let rewrite = kernel
         .connector_control()
         .acquire_current_distributed_rewrite(&identity.instance_id)
         .map_err(TerminalError::from_original_cause)?;
-    let dependencies = lease
+    let dependencies = rewrite
         .planning_initial_dependencies()
         .map_err(TerminalError::from_original_cause)?;
     let origin = capacity
@@ -166,7 +166,7 @@ pub(crate) fn prepare(
         ),
         product: host.product,
         roots: host.roots,
-        lease,
+        rewrite,
         target,
         context: connector,
         dependencies,
@@ -264,7 +264,7 @@ impl OptimizeSubmissionState {
                 .provider_metadata_cpu_port(
                     &scope,
                     self.origin.try_clone().map_err(service)?,
-                    &source.lease,
+                    &source.rewrite,
                     source.engine.execution.cancellation().clone(),
                     runtime.execution.0.runtime().clone(),
                     self.wake.clone(),
@@ -517,7 +517,7 @@ async fn prepare_original_submission(
         .engine
         .reject_direct_rewrite_on_mv_governed(
             &original.target,
-            &original.lease.planning_lease(),
+            &original.rewrite.planning_pin(),
             original.cpu.as_ref().unwrap().clone(),
         )
         .await
@@ -530,7 +530,7 @@ async fn prepare_original_submission(
             .begin_submission(nomination.as_ref(), &original.target)
             .map_err(TerminalError::pre_dispatch_failed)?;
     }
-    let metadata = original.lease.metadata().clone();
+    let metadata = original.rewrite.metadata().clone();
     let completion = metadata
         .admit_table_job(ConnectorTableJobAdmissionRequest {
             table: identity.clone(),

@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use novarocks_execution_contract::task_execution::identity::{
-    AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
+    AdmissionTicketId, ParticipationRef, TaskIdentity, TaskOperationId,
 };
 use novarocks_execution_contract::task_execution::operation::OperationKind;
 use novarocks_execution_contract::task_execution::operation::OperationOutcome;
@@ -38,7 +38,7 @@ use novarocks_execution_contract::task_execution::status::{SafeDetail, TaskFailu
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::TransportBudget;
-use novarocks_task_codec::identity::{decode_admission_ticket_id, decode_query_context_ref};
+use novarocks_task_codec::identity::{decode_admission_ticket_id, decode_participation_ref};
 use novarocks_task_codec::operation::{
     DecodedOperation, decode_control_operation_batch, decode_envelope,
     decode_ordinary_operation_batch, decode_ordinary_operation_batch_with_skip, encode_receipt,
@@ -111,22 +111,22 @@ pub trait TaskOperationBatchApplier: Send + Sync {
         ownership: Option<Arc<NativeIngressOwnership>>,
     ) -> Result<proto::TaskOperationReceipt, tonic::Status>;
 
-    /// The Worker owner's context-bound, read-only ticket observation.
+    /// The Worker owner's participation-bound, read-only ticket observation.
     async fn observe_admission_ticket(
         &self,
         operation: TaskOperationId,
         ticket_id: AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         deadline: Instant,
     ) -> Result<NodeAdmissionTicketObservation, tonic::Status>;
 
-    /// A narrow Worker-authored refusal only when an absent context would
+    /// A narrow Worker-authored refusal only when an absent participation would
     /// reach expiry redemption next. All ambiguous states return None.
     async fn preflight_expired_establish_ticket(
         &self,
         operation_id: TaskOperationId,
         ticket_id: AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         native_compatibility_id: Option<&proto::NativeCompatibilityId>,
         deadline: Instant,
     ) -> Result<Option<proto::TaskOperationReceipt>, tonic::Status>;
@@ -188,7 +188,7 @@ pub(crate) async fn apply_task_operations_with_ownership_at(
         // kind; the full typed decoder supplies the real kind below.
         let envelope = decode_envelope(
             item.envelope.as_ref().expect("checked envelope"),
-            OperationKind::UpdateQueryContext,
+            OperationKind::UpdateParticipation,
             FieldPath::root("apply_task_operations")
                 .field("operations")
                 .index(index)
@@ -197,24 +197,24 @@ pub(crate) async fn apply_task_operations_with_ownership_at(
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         envelopes.push(envelope);
     }
-    // Read only the formal context and ticket identities before the full
+    // Read only the formal participation and ticket identities before the full
     // Establish content is decoded. The observation is advisory: the Worker
     // still owns every final verdict and atomically redeems the ticket.
     let mut ticket_preflight = Vec::with_capacity(request.operations.len());
     let mut early_receipts = vec![None; request.operations.len()];
     for (index, item) in request.operations.iter().enumerate() {
-        let Some(proto::task_operation::Operation::UpdateQueryContext(update)) = &item.operation
+        let Some(proto::task_operation::Operation::UpdateParticipation(update)) = &item.operation
         else {
             ticket_preflight.push(None);
             continue;
         };
-        let Some(proto::update_query_context_request::Command::Establish(establish)) =
+        let Some(proto::update_participation_request::Command::Establish(establish)) =
             &update.command
         else {
             ticket_preflight.push(None);
             continue;
         };
-        let Some(context) = &establish.query_context else {
+        let Some(participation) = &establish.participation else {
             ticket_preflight.push(None);
             continue;
         };
@@ -225,10 +225,11 @@ pub(crate) async fn apply_task_operations_with_ownership_at(
         let path = FieldPath::root("apply_task_operations")
             .field("operations")
             .index(index)
-            .field("update_query_context")
+            .field("update_participation")
             .field("establish");
-        let context = decode_query_context_ref(context, path.clone().field("query_context"))
-            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        let participation =
+            decode_participation_ref(participation, path.clone().field("participation"))
+                .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let ticket_id = decode_admission_ticket_id(ticket_id, path.field("admission_ticket_id"))
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         ticket_preflight.push(
@@ -236,13 +237,13 @@ pub(crate) async fn apply_task_operations_with_ownership_at(
                 .observe_admission_ticket(
                     envelopes[index].operation_id(),
                     ticket_id,
-                    context,
+                    participation,
                     timing.operation_deadline(envelopes[index].max_wait().get()),
                 )
                 .await?
             {
                 NodeAdmissionTicketObservation::Issued { remaining } => {
-                    Some((ticket_id, context, Instant::now() + remaining))
+                    Some((ticket_id, participation, Instant::now() + remaining))
                 }
                 NodeAdmissionTicketObservation::Expired
                     if index == 0
@@ -255,7 +256,7 @@ pub(crate) async fn apply_task_operations_with_ownership_at(
                         .preflight_expired_establish_ticket(
                             envelopes[index].operation_id(),
                             ticket_id,
-                            context,
+                            participation,
                             establish.native_compatibility_id.as_ref(),
                             timing.operation_deadline(envelopes[index].max_wait().get()),
                         )
@@ -384,7 +385,7 @@ async fn apply_decoded_operations(
     operations: Vec<Option<DecodedOperation>>,
     early_receipts: &[Option<proto::TaskOperationReceipt>],
     waits: &[Duration],
-    ticket_preflight: &[Option<(AdmissionTicketId, QueryContextRef, Instant)>],
+    ticket_preflight: &[Option<(AdmissionTicketId, ParticipationRef, Instant)>],
     timing: TaskIngressTiming,
     ownership: Option<Arc<NativeIngressOwnership>>,
 ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
@@ -415,7 +416,7 @@ async fn apply_decoded_operations(
             continue;
         }
         let mut deadline = operation_deadline;
-        if let Some((ticket_id, context, first_deadline)) =
+        if let Some((ticket_id, participation, first_deadline)) =
             ticket_preflight.get(index).copied().flatten()
             && let NodeAdmissionTicketObservation::Issued {
                 remaining: ticket_remaining,
@@ -423,7 +424,7 @@ async fn apply_decoded_operations(
                 .observe_admission_ticket(
                     operation.envelope().operation_id(),
                     ticket_id,
-                    context,
+                    participation,
                     operation_deadline,
                 )
                 .await?
@@ -593,12 +594,12 @@ mod tests {
 
     use super::proto;
     use crate::worker_node_projection::{encode_frame, observation_projection};
-    use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
-    use novarocks_execution_contract::task_execution::operation::QuiesceQueryContextReceipt;
+    use novarocks_execution_contract::task_execution::identity::{ParticipationRef, TaskIdentity};
+    use novarocks_execution_contract::task_execution::operation::QuiesceParticipationReceipt;
     use novarocks_execution_contract::task_execution::status::{
         TaskStatus, TaskStatusCursor, TaskStatusVersion,
     };
-    use novarocks_execution_contract::task_execution::transition::QueryContextState;
+    use novarocks_execution_contract::task_execution::transition::ParticipationState;
     use novarocks_proto_codec::FieldPath;
     use novarocks_task_codec::operation::{
         CoveredObservationBookmark, CoveredStatusStreamEvent, CoveredStatusStreamFact,
@@ -662,7 +663,7 @@ mod tests {
     }
 
     struct CoveredFixture {
-        context: QueryContextRef,
+        participation: ParticipationRef,
         source: ObservationSource,
         next_subscription: u64,
     }
@@ -691,11 +692,11 @@ mod tests {
             let position = CoveredSubscriptionRequest {
                 status: decoded.status_cursors,
                 convergence: decoded.task_convergence_cursors,
-                context: decoded.context_cursor,
+                participation: decoded.participation_cursor,
                 quiesce: decoded
                     .quiesce_cursor
                     .map(|cursor| QuiesceObservationCursor {
-                        context: cursor.context,
+                        participation: cursor.participation,
                         fence_version: cursor.fence_version,
                     }),
                 required: decoded.required_identities,
@@ -740,7 +741,7 @@ mod tests {
         )
         .expect("nonzero query");
         let backend = BackendProcessId::new_v7();
-        let context = QueryContextRef::new(execution, FrontendProcessId::new_v7(), backend);
+        let participation = ParticipationRef::new(execution, FrontendProcessId::new_v7(), backend);
         let identity = |task| {
             TaskIdentity::new(
                 execution,
@@ -752,9 +753,9 @@ mod tests {
         let projection = observation_projection();
         (
             CoveredFixture {
-                context,
+                participation,
                 source: ObservationSource::new(
-                    context,
+                    participation,
                     4096,
                     8,
                     projection.max_frame_bytes.get(),
@@ -768,15 +769,15 @@ mod tests {
     }
 
     fn covered_request(
-        context: QueryContextRef,
+        participation: ParticipationRef,
         required: Vec<TaskIdentity>,
     ) -> proto::SubscribeTaskStatusRequest {
         encode_covered_subscribe_task_status(&DecodedCoveredSubscription {
-            context,
+            participation,
             generation: NonZeroU64::new(7).expect("nonzero generation"),
             status_cursors: Vec::new(),
             task_convergence_cursors: Vec::new(),
-            context_cursor: None,
+            participation_cursor: None,
             quiesce_cursor: None,
             required_identities: required,
         })
@@ -788,7 +789,7 @@ mod tests {
         let (mut fixture, a, b) = covered_fixture();
         fixture.publish(TaskStatus::created(a));
         let id = fixture
-            .subscribe(covered_request(fixture.context, vec![a, b]))
+            .subscribe(covered_request(fixture.participation, vec![a, b]))
             .expect("covered subscription opens");
         let mut saw_status = false;
         let mut saw_unknown = false;
@@ -855,7 +856,7 @@ mod tests {
     fn covered_subscription_rejects_future_status_and_quiesce_cursors() {
         let (mut fixture, a, _) = covered_fixture();
         fixture.publish(TaskStatus::created(a));
-        let mut status_future = covered_request(fixture.context, vec![a]);
+        let mut status_future = covered_request(fixture.participation, vec![a]);
         status_future
             .cursors
             .push(novarocks_task_codec::status::encode_task_status_cursor(
@@ -865,10 +866,10 @@ mod tests {
             .subscribe(status_future)
             .expect_err("future status cursor must fail closed");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        let mut quiesce_future = covered_request(fixture.context, vec![a]);
-        quiesce_future.quiesce_cursor = Some(proto::QuiesceQueryContextCursor {
-            query_context: Some(novarocks_task_codec::identity::encode_query_context_ref(
-                fixture.context,
+        let mut quiesce_future = covered_request(fixture.participation, vec![a]);
+        quiesce_future.quiesce_cursor = Some(proto::QuiesceParticipationCursor {
+            participation: Some(novarocks_task_codec::identity::encode_participation_ref(
+                fixture.participation,
             )),
             fence_version: 1,
         });
@@ -879,42 +880,44 @@ mod tests {
     }
 
     #[test]
-    fn covered_rpc_rejects_legacy_mode_future_convergence_and_foreign_context() {
+    fn covered_rpc_rejects_legacy_mode_future_convergence_and_foreign_participation() {
         let (mut fixture, task, _) = covered_fixture();
-        let mut missing = covered_request(fixture.context, vec![task]);
+        let mut missing = covered_request(fixture.participation, vec![task]);
         missing.generation = 0;
         let legacy = proto::SubscribeTaskStatusRequest {
-            query_context: missing.query_context.clone(),
+            participation: missing.participation.clone(),
             ..Default::default()
         };
-        let mut future_task = covered_request(fixture.context, vec![task]);
+        let mut future_task = covered_request(fixture.participation, vec![task]);
         future_task.task_convergence_cursors = vec![proto::TaskConvergenceCursor {
             identity: Some(novarocks_task_codec::identity::encode_task_identity(task)),
             current_version: 1,
         }];
-        let mut future_context = covered_request(fixture.context, vec![task]);
-        future_context.context_convergence_cursor = Some(proto::QueryContextConvergenceCursor {
-            query_context: missing.query_context.clone(),
-            current_version: 1,
-        });
-        let mut foreign_context = covered_request(fixture.context, vec![task]);
-        let foreign = QueryContextRef::new(
-            fixture.context.query_execution_id(),
+        let mut future_participation = covered_request(fixture.participation, vec![task]);
+        future_participation.participation_convergence_cursor =
+            Some(proto::ParticipationConvergenceCursor {
+                participation: missing.participation.clone(),
+                current_version: 1,
+            });
+        let mut foreign_participation = covered_request(fixture.participation, vec![task]);
+        let foreign = ParticipationRef::new(
+            fixture.participation.query_execution_id(),
             FrontendProcessId::new_v7(),
-            fixture.context.backend_process_id(),
+            fixture.participation.backend_process_id(),
         );
-        foreign_context.context_convergence_cursor = Some(proto::QueryContextConvergenceCursor {
-            query_context: Some(novarocks_task_codec::identity::encode_query_context_ref(
-                foreign,
-            )),
-            current_version: 0,
-        });
+        foreign_participation.participation_convergence_cursor =
+            Some(proto::ParticipationConvergenceCursor {
+                participation: Some(novarocks_task_codec::identity::encode_participation_ref(
+                    foreign,
+                )),
+                current_version: 0,
+            });
         for (name, request) in [
             ("missing generation", missing),
             ("legacy cursor-only", legacy),
             ("future Task convergence", future_task),
-            ("future Context convergence", future_context),
-            ("foreign Context", foreign_context),
+            ("future Participation convergence", future_participation),
+            ("foreign Participation", foreign_participation),
         ] {
             match fixture.subscribe(request) {
                 Ok(_) => panic!("{name} must not start a subscription"),
@@ -940,11 +943,11 @@ mod tests {
                 )
             })
             .collect();
-        let receipt = QuiesceQueryContextReceipt::new(
-            fixture.context,
+        let receipt = QuiesceParticipationReceipt::new(
+            fixture.participation,
             1,
             members.clone(),
-            QueryContextState::Quiescing,
+            ParticipationState::Quiescing,
         );
         let wire = encode_frame(
             &CoveredObservationFrame::CatchUp(CoveredObservationFact::Quiesce(Arc::new(receipt))),
@@ -961,11 +964,11 @@ mod tests {
         ));
         let rejected = encode_frame(
             &CoveredObservationFrame::CatchUp(CoveredObservationFact::Quiesce(Arc::new(
-                QuiesceQueryContextReceipt::new(
-                    fixture.context,
+                QuiesceParticipationReceipt::new(
+                    fixture.participation,
                     1,
                     too_many,
-                    QueryContextState::Quiescing,
+                    ParticipationState::Quiescing,
                 ),
             ))),
             7,

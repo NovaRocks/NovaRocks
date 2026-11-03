@@ -30,10 +30,10 @@ fn execution(attempt: u64) -> QueryExecutionId {
     QueryExecutionId::new(QueryId::new(97201, 97202), AttemptId::new(attempt).unwrap()).unwrap()
 }
 fn admission(
-    runtime: &NativeFragmentQueryRuntime,
+    runtime: &NativeQueryContextRuntime,
     id: QueryExecutionId,
     limit: Option<i64>,
-) -> Result<NativeFragmentAdmissionResources, String> {
+) -> Result<NativeTaskAdmissionResources, String> {
     runtime.prepare_admission_execution(
         id,
         UniqueId::new(97203, 97204),
@@ -47,7 +47,7 @@ fn admission(
 fn mem_a1_v2_none_creates_real_account_without_local_policy_or_grant() {
     let authority = authority(32);
     let manager = QueryContextManager::new_for_test();
-    let runtime = NativeFragmentQueryRuntime::new_for_test(manager, authority.clone());
+    let runtime = NativeQueryContextRuntime::new_for_test(manager, authority.clone());
     let before = authority.root().committed_bytes();
     let resources = admission(&runtime, execution(1), None).unwrap();
     let memory = resources
@@ -66,7 +66,7 @@ fn mem_a1_v2_none_creates_real_account_without_local_policy_or_grant() {
 fn mem_a1_v2_none_real_metadata_refusal_keeps_typed_cause_and_full_legacy_text() {
     let authority = authority(1);
     let manager = QueryContextManager::new_for_test();
-    let runtime = NativeFragmentQueryRuntime::new_for_test(manager, authority.clone());
+    let runtime = NativeQueryContextRuntime::new_for_test(manager, authority.clone());
     let before = authority.root().committed_bytes();
     let error = runtime
         .prepare_admission_execution_typed(
@@ -81,7 +81,7 @@ fn mem_a1_v2_none_real_metadata_refusal_keeps_typed_cause_and_full_legacy_text()
         .expect("root occupies the real account registry");
     assert!(matches!(
         &error,
-        NativeFragmentAdmissionError::MemoryAccount(QueryMemoryAccountError::Capacity(
+        NativeTaskAdmissionError::MemoryAccount(QueryMemoryAccountError::Capacity(
             CapacityError::MetadataExhausted { .. }
         ))
     ));
@@ -97,7 +97,7 @@ fn mem_a1_v2_none_real_metadata_refusal_keeps_typed_cause_and_full_legacy_text()
 fn mem_a1_installed_account_is_carried_without_erasing_policy_or_granting_work() {
     let authority = authority(32);
     let manager = QueryContextManager::new_for_test();
-    let runtime = NativeFragmentQueryRuntime::new_for_test(manager, authority.clone());
+    let runtime = NativeQueryContextRuntime::new_for_test(manager, authority.clone());
     let first = admission(&runtime, execution(1), Some(8192)).unwrap();
     let memory = first.query_memory().unwrap();
     let account = memory.account().id();
@@ -153,7 +153,7 @@ fn mem_a1_worker_creation_keeps_actual_typed_metadata_cause_and_legacy_text() {
 fn mem_a1_native_binder_checks_actual_worker_owner_attempt_and_authority() {
     let authority = authority(32);
     let manager = QueryContextManager::new_for_test();
-    let runtime = NativeFragmentQueryRuntime::new_for_test(manager.clone(), authority.clone());
+    let runtime = NativeQueryContextRuntime::new_for_test(manager.clone(), authority.clone());
     admission(&runtime, execution(1), Some(8192)).unwrap();
     let owner = manager
         .query_memory_account_execution(execution_key(execution(1)))
@@ -180,7 +180,7 @@ fn mem_a1_native_binder_checks_actual_worker_owner_attempt_and_authority() {
 fn mem_a1_v2_none_then_some_then_none_keeps_the_real_context_owner_and_policy() {
     let authority = authority(32);
     let manager = QueryContextManager::new_for_test();
-    let runtime = NativeFragmentQueryRuntime::new_for_test(manager, authority);
+    let runtime = NativeQueryContextRuntime::new_for_test(manager, authority);
     let first = admission(&runtime, execution(1), None).unwrap();
     let id = first.query_memory().unwrap().account().id();
     let limited = admission(&runtime, execution(1), Some(8192)).unwrap();
@@ -219,7 +219,7 @@ fn mem_a1_v2_none_then_some_then_none_keeps_the_real_context_owner_and_policy() 
 fn mem_a1_v2_context_removal_releases_only_after_the_last_actual_binding_drop() {
     let authority = authority(32);
     let manager = QueryContextManager::new_for_test();
-    let runtime = NativeFragmentQueryRuntime::new_for_test(manager, authority.clone());
+    let runtime = NativeQueryContextRuntime::new_for_test(manager, authority.clone());
     let before = authority.root().committed_bytes();
     let resources = admission(&runtime, execution(1), None).unwrap();
     let held = resources.query_memory().unwrap().clone();
@@ -236,7 +236,7 @@ fn mem_a1_v2_context_removal_releases_only_after_the_last_actual_binding_drop() 
 fn mem_a1_v2_context_removal_is_not_funded_domain_teardown_evidence() {
     let authority = authority(32);
     let manager = QueryContextManager::new_for_test();
-    let runtime = NativeFragmentQueryRuntime::new_for_test(manager, authority.clone());
+    let runtime = NativeQueryContextRuntime::new_for_test(manager, authority.clone());
     let resources = admission(&runtime, execution(1), None).unwrap();
     let domain = resources
         .query_memory()
@@ -261,12 +261,12 @@ fn native_fragment_query_early_type_binding_and_later_admission_consume_same_acc
     let authority = authority(32);
     let manager = QueryContextManager::new_for_test();
     let runtime =
-        NativeFragmentQueryRuntime::new_for_test(Arc::clone(&manager), Arc::clone(&authority));
+        NativeQueryContextRuntime::new_for_test(Arc::clone(&manager), Arc::clone(&authority));
     let execution = execution(37);
     let first = UniqueId::new(37, 1);
     let second = UniqueId::new(37, 2);
     let lease = runtime
-        .register_fragment_execution(
+        .register_task_execution(
             execution,
             first,
             Duration::from_secs(30),
@@ -283,7 +283,7 @@ fn native_fragment_query_early_type_binding_and_later_admission_consume_same_acc
         .unwrap();
     let account = early.binding().account().id();
     let other_lease = runtime
-        .register_fragment_execution(
+        .register_task_execution(
             execution,
             second,
             Duration::from_secs(30),
@@ -345,10 +345,10 @@ fn native_fragment_query_early_type_binding_and_later_admission_consume_same_acc
 fn native_fragment_query_refused_early_type_memory_rolls_back_only_its_original_lease() {
     let authority = authority(1);
     let manager = QueryContextManager::new_for_test();
-    let runtime = NativeFragmentQueryRuntime::new_for_test(Arc::clone(&manager), authority);
+    let runtime = NativeQueryContextRuntime::new_for_test(Arc::clone(&manager), authority);
     let execution = execution(38);
     let lease = runtime
-        .register_fragment_execution(
+        .register_task_execution(
             execution,
             UniqueId::new(38, 1),
             Duration::from_secs(30),
@@ -362,7 +362,7 @@ fn native_fragment_query_refused_early_type_memory_rolls_back_only_its_original_
             Duration::from_secs(30),
             None
         ),
-        Err(NativeFragmentAdmissionError::MemoryAccount(
+        Err(NativeTaskAdmissionError::MemoryAccount(
             QueryMemoryAccountError::Capacity(CapacityError::MetadataExhausted { .. })
         ))
     ));

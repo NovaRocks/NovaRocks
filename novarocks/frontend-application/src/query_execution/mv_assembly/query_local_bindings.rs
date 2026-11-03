@@ -100,7 +100,7 @@ fn group_sources_by_locator(
 pub(crate) fn bind_imv_target_query_table_from_metadata(
     rewrite: &IcebergMvRewriteContext,
     store: &Arc<QueryTableBindingStore>,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     metadata: novarocks_spi::connector::ConnectorTableMetadata,
     affected_partitions: Option<&AffectedTargetPartitions>,
 ) -> Result<novarocks_sql::binding::SqlTableBindingId, String> {
@@ -114,7 +114,7 @@ pub(crate) fn bind_imv_target_query_table_from_metadata(
         table: metadata.table.clone(),
         selector,
         mv_partition_selection: None,
-        planning_lease: planning_lease.clone(),
+        planning_pin: planning_pin.clone(),
     };
     let selection = affected_partitions
         .and_then(|affected| match affected {
@@ -231,7 +231,7 @@ pub(crate) fn bind_imv_target_query_table_from_metadata(
             statistics_pin: None,
             admission:
                 crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact(
-                    planning_lease,
+                    planning_pin,
                 ),
             source_metadata: None,
             scan_materialization: Some(mv_target_read.full.clone()),
@@ -248,7 +248,7 @@ pub(crate) async fn bind_imv_target_query_table_in_store_from_rewrite_original(
     io: &crate::query_execution::mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationIo,
     rewrite: &IcebergMvRewriteContext,
     store: &Arc<QueryTableBindingStore>,
-    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    planning_pin: &novarocks_spi::connector::ConnectorControlPlanningPin,
     connector_context: &ConnectorRequestContext,
     affected_partitions: Option<&AffectedTargetPartitions>,
 ) -> Result<
@@ -257,7 +257,7 @@ pub(crate) async fn bind_imv_target_query_table_in_store_from_rewrite_original(
 > {
     let metadata = io
         .metadata(
-            planning_lease,
+            planning_pin,
             connector_context.clone(),
             &rewrite.target.namespace,
             &rewrite.target.table,
@@ -267,7 +267,7 @@ pub(crate) async fn bind_imv_target_query_table_in_store_from_rewrite_original(
     bind_imv_target_query_table_from_metadata(
         rewrite,
         store,
-        planning_lease.clone(),
+        planning_pin.clone(),
         metadata,
         affected_partitions,
     )
@@ -293,7 +293,7 @@ pub(crate) async fn freeze_imv_base_query_local_overlays_from_captured_inputs_or
         let source = sources.require(&base)?;
         let metadata = source.metadata()?;
         let materialization = crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
-            metadata, source.lease.clone())?;
+            metadata, source.planning_pin.clone())?;
         validate_source_revisions_original(&materialization, current.iter())?;
         // Historical From is an execution dependency only for a Delta-capable receipt.
         // FullRebuild/MetadataOnly cannot manufacture an executable From relation.
@@ -330,7 +330,7 @@ pub(crate) fn freeze_captured_source_overlays(
             captured.observed.clone()
         };
         let mut materialization = crate::catalog_application::query_catalog::connector_table_materialization_from_metadata(
-            metadata, captured.lease.clone())?;
+            metadata, captured.planning_pin.clone())?;
         if let Some(snapshot) = captured.snapshot {
             materialization.read_selector = ConnectorReadSelector::SnapshotId(snapshot);
         }
@@ -364,7 +364,7 @@ pub(crate) fn freeze_captured_source_overlays(
                     result.install_prepared_source_read(
                         to.clone(),
                         Projection::To,
-                        materialization.planning_lease.clone(),
+                        materialization.planning_pin.clone(),
                     )?;
                 }
                 for receipt in &receipts {
@@ -377,12 +377,12 @@ pub(crate) fn freeze_captured_source_overlays(
                             result.install_prepared_source_read(
                                 receipt.clone(),
                                 Projection::From,
-                                materialization.planning_lease.clone(),
+                                materialization.planning_pin.clone(),
                             )?;
                             result.install_prepared_source_read(
                                 receipt.clone(),
                                 Projection::Delta,
-                                materialization.planning_lease.clone(),
+                                materialization.planning_pin.clone(),
                             )?;
                         }
                         Some(
@@ -391,7 +391,7 @@ pub(crate) fn freeze_captured_source_overlays(
                             result.install_prepared_source_read(
                                 receipt.clone(),
                                 Projection::Delta,
-                                materialization.planning_lease.clone(),
+                                materialization.planning_pin.clone(),
                             )?;
                         }
                         _ => {}
@@ -413,7 +413,7 @@ fn validate_source_revisions_original<'a>(
 > {
     for source in sources {
         let observed = materialization
-            .planning_lease
+            .planning_pin
             .binding()
             .metadata()
             .exact_semantic_revision(

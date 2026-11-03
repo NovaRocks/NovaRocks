@@ -17,15 +17,15 @@
 
 //! One scheduler/poller pool runs both Worker actor units. The enum only
 //! selects the protocol owner; it introduces no additional lifecycle policy.
-use super::{ContextActor, ContextMessage, ControlActor, ControlMessage, WorkerAction};
-use novarocks_control_runtime::actor::{Actor, StepContext};
+use super::{ControlActor, ControlMessage, ParticipationActor, ParticipationMessage, WorkerAction};
+use novarocks_control_runtime::actor::{Actor, ActorStep};
 use novarocks_control_runtime_core::{
     identity::{Generation, ScopeId, Tick},
     mailbox::InputEnvelope,
 };
 
 pub(crate) enum WorkerActor {
-    Context(Box<ContextActor>),
+    Participation(Box<ParticipationActor>),
     Control(Box<ControlActor>),
 }
 #[expect(
@@ -34,7 +34,7 @@ pub(crate) enum WorkerActor {
 )]
 #[derive(Debug)]
 pub(crate) enum WorkerMessage {
-    Context(ContextMessage),
+    Participation(ParticipationMessage),
     Control(ControlMessage),
     Timer,
 }
@@ -49,17 +49,17 @@ impl Actor for WorkerActor {
         now: Tick,
         envelope: InputEnvelope,
         message: WorkerMessage,
-        step: &mut StepContext<'_, WorkerAction>,
+        step: &mut ActorStep<'_, WorkerAction>,
     ) {
         match (self, message) {
-            (Self::Context(core), WorkerMessage::Context(input)) => {
+            (Self::Participation(core), WorkerMessage::Participation(input)) => {
                 core.handle(now, envelope, input, step)
             }
             (Self::Control(core), WorkerMessage::Control(input)) => {
                 core.handle(now, envelope, input, step)
             }
-            (Self::Context(core), WorkerMessage::Timer) => {
-                core.handle(now, envelope, ContextMessage::Timer, step)
+            (Self::Participation(core), WorkerMessage::Timer) => {
+                core.handle(now, envelope, ParticipationMessage::Timer, step)
             }
             (Self::Control(core), WorkerMessage::Timer) => {
                 core.handle(now, envelope, ControlMessage::Timer, step)
@@ -69,7 +69,7 @@ impl Actor for WorkerActor {
     }
     fn next_deadline(&self) -> Option<Tick> {
         match self {
-            Self::Context(core) => core.next_deadline(),
+            Self::Participation(core) => core.next_deadline(),
             Self::Control(core) => core.next_deadline(),
         }
     }
@@ -77,8 +77,8 @@ impl Actor for WorkerActor {
         scope: ScopeId,
         generation: Generation,
         input: InputEnvelope,
-        step: &mut StepContext<'_, WorkerAction>,
+        step: &mut ActorStep<'_, WorkerAction>,
     ) {
-        ContextActor::owner_failed(scope, generation, input, step);
+        ParticipationActor::owner_failed(scope, generation, input, step);
     }
 }

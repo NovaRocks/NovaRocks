@@ -76,14 +76,14 @@ use crate::exec::pipeline::operator::{
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{Transform, TransformKernel},
     step::{NextStep, StepResult},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use crate::runtime_filter::{
     OrderedTopNAllocationHost, RuntimeFilterProducerFailure, RuntimeFilterSessionRef,
 };
@@ -110,7 +110,7 @@ impl novarocks_failure_contract::FailureProjection for AggregateGroupContractFai
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::AggregateGroupContract.reason(),
+            crate::runtime::task::ExecutionReason::AggregateGroupContract.reason(),
         )
     }
 }
@@ -361,7 +361,7 @@ impl CompiledAggregateProcessorFactory {
         let mut sites = Vec::new();
         for group in 0..group_by.len() {
             let group = novarocks_local_program::checked_program_ordinal(group)
-                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
+                .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
             sites.push(ProgramExpressionRootSite::Node {
                 node,
                 role: ProgramNodeExpressionRole::AggregateGroup { group },
@@ -370,7 +370,7 @@ impl CompiledAggregateProcessorFactory {
         let mut calls = Vec::with_capacity(functions.len());
         for (ordinal, function) in functions.iter().enumerate() {
             let call = novarocks_local_program::checked_program_ordinal(ordinal)
-                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
+                .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
             let Some(ProgramStateTemplate::Aggregate { kernel, .. }) =
                 program.state_template(ProgramCallSite::Aggregate { node, call })
             else {
@@ -1195,7 +1195,7 @@ impl InputEncodingPolicy for CompiledAggregateProcessor {}
 impl TransformKernel for CompiledAggregateProcessor {
     fn apply(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         let chunk = input.into_uncovered_chunk()?;
@@ -1220,7 +1220,7 @@ impl TransformKernel for CompiledAggregateProcessor {
         self.failure_result(result)?;
         Ok(StepResult::new(None, NextStep::NeedInput, rows))
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(error) = &self.failed {
             return Err(error.clone());
         }
@@ -1261,7 +1261,7 @@ impl TransformKernel for CompiledAggregateProcessor {
         };
         Ok(StepResult::new(Some(output), next, 0))
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(error) = &self.failed {
             return Err(error.clone());
         }
@@ -1300,7 +1300,7 @@ mod failure_latch_tests {
     };
     use super::family_fixture::{FixtureControl, int64};
     use super::*;
-    use crate::runtime::fragment::{
+    use crate::runtime::task::{
         ExecutionFailureCause, PipelineOperation, RequiredExpressionRowError,
     };
     use arrow::array::{Array, Int64Array};
@@ -1568,11 +1568,11 @@ mod failure_latch_tests {
         assert_eq!(count.values().as_ref(), &[4, 4, 2, 2]);
     }
 
-    fn with_context<T>(state: &RuntimeState, action: impl FnOnce(&mut StepContext<'_>) -> T) -> T {
+    fn with_context<T>(state: &RuntimeState, action: impl FnOnce(&mut DriverStep<'_>) -> T) -> T {
         let error = state.error_state();
         let mut work =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        action(&mut DriverStep::new(
             &error,
             &mut work,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -1768,8 +1768,8 @@ mod failure_latch_tests {
             .expect("known failure reported before prefix destruction");
         assert!(seen.same_occurrence(&first));
         assert_eq!(
-            seen.context(),
-            Some(crate::runtime::fragment::ExecutionFailureContext {
+            seen.site(),
+            Some(crate::runtime::task::OperatorFailureSite {
                 operator_ordinal: 7,
                 operation: PipelineOperation::Finishing,
             })
@@ -1875,7 +1875,7 @@ mod failure_latch_tests {
     }
     #[test]
     fn compiled_aggregate_output_cursor_yields_without_allocating_and_emits_each_group_once() {
-        use crate::exec::pipeline::step_context::TurnWork;
+        use crate::exec::pipeline::driver_step::TurnWork;
         let (mut processor, original, error, tracker) = processor();
         let groups = OUTPUT_CHUNK_ROWS + 17;
         let input = Chunk::try_new_with_chunk_schema(
@@ -1904,7 +1904,7 @@ mod failure_latch_tests {
         assert!(processor.key_table.is_none());
         let mut work = TurnWork::new(std::num::NonZeroU64::new(41).unwrap(), 1);
         let first = processor
-            .drive(&mut StepContext::new(
+            .drive(&mut DriverStep::new(
                 &error,
                 &mut work,
                 &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -1916,7 +1916,7 @@ mod failure_latch_tests {
         let allocated = tracker.allocated();
         let cursor = processor.emission.as_ref().unwrap().offset;
         let yielded = processor
-            .drive(&mut StepContext::new(
+            .drive(&mut DriverStep::new(
                 &error,
                 &mut work,
                 &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -1928,7 +1928,7 @@ mod failure_latch_tests {
         assert_eq!(processor.emission.as_ref().unwrap().offset, cursor);
         work.begin_turn(1).unwrap();
         let last = processor
-            .drive(&mut StepContext::new(
+            .drive(&mut DriverStep::new(
                 &error,
                 &mut work,
                 &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -2086,7 +2086,7 @@ mod schema_prepare_tests {
         let error = operator.prepare().unwrap_err();
         assert!(matches!(
             error.cause(),
-            crate::runtime::fragment::ExecutionFailureCause::Construction(
+            crate::runtime::task::ExecutionFailureCause::Construction(
                 ConstructionFailure::MissingOwner,
             )
         ));
@@ -2121,9 +2121,9 @@ mod schema_prepare_tests {
         let first = operator.prepare().unwrap_err();
         assert!(matches!(
             first.cause(),
-            crate::runtime::fragment::ExecutionFailureCause::Construction(
-                ConstructionFailure::Memory(_),
-            )
+            crate::runtime::task::ExecutionFailureCause::Construction(ConstructionFailure::Memory(
+                _
+            ),)
         ));
         assert_eq!(tracker.current(), installed_bytes);
         assert_eq!(operator.prepare().unwrap_err(), first);

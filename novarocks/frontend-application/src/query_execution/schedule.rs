@@ -30,10 +30,10 @@ use novarocks_types::UniqueId;
 
 /// Placement information for one fragment instance.
 #[derive(Clone, Debug)]
-pub struct FragmentInstancePlacement {
+pub struct TaskPlacement {
     pub fragment_id: FragmentId,
     pub instance_index: usize,
-    pub finst_id: UniqueId,
+    pub task_key: UniqueId,
     pub backend_idx: usize,
     #[cfg(test)]
     pub endpoint: RuntimeEndpoint,
@@ -44,8 +44,8 @@ pub struct FragmentInstancePlacement {
 #[derive(Clone, Debug)]
 pub struct SchedulingPlan {
     pub root_fragment_id: FragmentId,
-    pub by_fragment: BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
-    pub root_finst_id: UniqueId,
+    pub by_fragment: BTreeMap<FragmentId, Vec<TaskPlacement>>,
+    pub root_task_key: UniqueId,
     pub root_backend_idx: usize,
 }
 
@@ -62,7 +62,7 @@ impl SchedulingPlan {
     pub(crate) fn placements_for_fragment_for_test(
         &self,
         fragment_id: FragmentId,
-    ) -> Option<&[FragmentInstancePlacement]> {
+    ) -> Option<&[TaskPlacement]> {
         self.by_fragment.get(&fragment_id).map(Vec::as_slice)
     }
 }

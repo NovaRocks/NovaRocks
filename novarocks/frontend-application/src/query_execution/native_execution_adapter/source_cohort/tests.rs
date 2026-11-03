@@ -150,7 +150,7 @@ pub(crate) fn finish(
 }
 
 #[test]
-fn source_count_is_the_shared_checked_scan_and_context_recipe() {
+fn source_count_is_the_shared_checked_scan_and_participation_recipe() {
     assert_eq!(source_count(1, 3).unwrap().get(), 4);
     assert_eq!(source_count(0, 3).unwrap().get(), 3);
     assert!(matches!(

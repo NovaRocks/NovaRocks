@@ -549,7 +549,7 @@ fn check_preparation_stop(
 ) -> Result<(), CompileControlError> {
     stop.borrow_control().checkpoint().map_err(|error| {
         CompileControlError::Source(
-            novarocks_execution::runtime::fragment::SharedDomainFailure::new(error),
+            novarocks_execution::runtime::task::SharedDomainFailure::new(error),
         )
     })
 }

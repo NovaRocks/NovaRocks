@@ -25,12 +25,12 @@ use super::{
 };
 use crate::{
     exec::{
-        phased_work::{PhasedRangeWork, RangeLease},
+        phased_work::{PhasedRangeWork, RangeObligation},
         pipeline::operator::InputConstructionOwner,
     },
     runtime::{
-        fragment::{ExecutionFailure, ExecutionResult},
         observable::Observable,
+        task::{ExecutionFailure, ExecutionResult},
     },
 };
 use novarocks_functions::KernelEvaluationControl;
@@ -135,7 +135,7 @@ pub(crate) enum SlotsClaim {
     Pending,
     Finished,
     Retired,
-    Range(SlotsLease),
+    Range(SlotsObligation),
 }
 pub(crate) enum SlotsFreeze {
     Pending,
@@ -152,10 +152,10 @@ pub(crate) enum SlotsProgress {
 }
 /// Only the original phase can issue this opaque lease. Its pending Arc never
 /// escapes before installation; Arc::get_mut is the sole mutable storage port.
-pub(crate) struct SlotsLease {
+pub(crate) struct SlotsObligation {
     pending: Option<Arc<Segment>>,
     owner: Arc<CsrSlotsInit>,
-    lease: Option<RangeLease<ExecutionFailure, ValueTypeStorageLifetime>>,
+    obligation: Option<RangeObligation<ExecutionFailure, ValueTypeStorageLifetime>>,
     cells: Range<usize>,
 }
 impl CsrSlotsInit {
@@ -242,10 +242,10 @@ impl CsrSlotsInit {
                 let count = self.rows;
                 let cells = segment_cells(count, directory.len(), id)
                     .map_err(|cause| self.ranges.latch(cause))?;
-                SlotsLease {
+                SlotsObligation {
                     pending: None,
                     owner: Arc::clone(self),
-                    lease: Some(lease),
+                    obligation: Some(lease),
                     cells,
                 }
             };
@@ -315,7 +315,7 @@ impl CsrSlotsInit {
         result
     }
 }
-impl SlotsLease {
+impl SlotsObligation {
     pub(crate) fn initialize(
         &mut self,
         quota: usize,
@@ -325,7 +325,7 @@ impl SlotsLease {
         let result = (|| {
             {
                 let state = self.owner.state()?;
-                let lease = self.lease.as_ref().ok_or_else(|| {
+                let lease = self.obligation.as_ref().ok_or_else(|| {
                     self.owner
                         .ranges
                         .latch(build_contract("join CSR lease was already dropped"))
@@ -405,7 +405,7 @@ impl SlotsLease {
         let notify = self.owner.changed.defer_notify();
         let result = (|| {
             let state = self.owner.state()?;
-            let lease = self.lease.as_mut().ok_or_else(|| {
+            let lease = self.obligation.as_mut().ok_or_else(|| {
                 self.owner
                     .ranges
                     .latch(build_contract("join CSR lease was already dropped"))
@@ -476,7 +476,7 @@ impl SlotsLease {
                         "join CSR lease retired while demand remains",
                     )));
                 }
-                let lease = self.lease.as_ref().ok_or_else(|| {
+                let lease = self.obligation.as_ref().ok_or_else(|| {
                     self.owner
                         .ranges
                         .latch(build_contract("join CSR lease was already dropped"))
@@ -488,18 +488,18 @@ impl SlotsLease {
             drop(self.pending.take());
             self.owner
                 .ranges
-                .complete(self.lease.as_mut().expect("private validated lease"))
+                .complete(self.obligation.as_mut().expect("private validated lease"))
         })();
         notify.arm();
         result
     }
 }
-impl Drop for SlotsLease {
+impl Drop for SlotsObligation {
     fn drop(&mut self) {
         // All safe Vec elements and their actual segment creator exit before
         // the original lease returns its inflight position and notifies.
         drop(self.pending.take());
-        if let Some(lease) = self.lease.take() {
+        if let Some(lease) = self.obligation.take() {
             let unfinished = !lease.is_settled();
             drop(lease);
             if unfinished {

@@ -64,7 +64,14 @@ impl Scenario for LimitZeroUnknownSender {
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let mut statement = fault_statement(QUERY, FAULT);
         statement.observations = (0..REQUIRED_BACKENDS)
-            .map(|index| (index, "grpc-fragment", None))
+            .map(|index| {
+                (
+                    index,
+                    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str(),
+                    None,
+                )
+            })
             .collect();
         Ok(Some(self.intent.freeze(
             vec![statement],
@@ -238,19 +245,17 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
         );
         let target_log = context.handle().be_log_contents(target)?;
         ensure!(
-            !target_log
-                .lines()
-                .any(|line| line.contains("NOVAROCKS_TASK_CREATE_APPLIED")
-                    && line.contains(&format!("{identity} "))),
+            !target_log.lines().any(|line| line
+                .contains(novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED)
+                && line.contains(&format!("{identity} "))),
             "held Create unexpectedly reached Worker before root success: {identity}"
         );
         let root_log = context.handle().be_log_contents(root_backend)?;
         ensure!(
-            root_log
-                .lines()
-                .any(|line| line.contains("NOVAROCKS_GRPC_FETCH_TYPED")
-                    && line.contains(&root_fetch_identity)
-                    && line.contains("eos=true")),
+            root_log.lines().any(|line| line
+                .contains(novarocks_failpoint::observation_marker::GRPC_FETCH_TYPED)
+                && line.contains(&root_fetch_identity)
+                && line.contains("eos=true")),
             "completed empty result omitted the exact root EOS evidence: {root_fetch_identity}"
         );
         context.action(format!("empty root result completed on exact attempt={execution} while {identity} remained unadmitted on live partitioned process={process}"));

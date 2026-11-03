@@ -1549,8 +1549,8 @@ mod tests {
     #[tokio::test]
     async fn streaming_closing_transfer_releases_ordinary_window_after_last_alias_exit() {
         use crate::api::{
-            ExecutionHandle, ExecutionOutput, QueryResultStream, ResultField, ResultRowCarrier,
-            ResultSchema,
+            ExecutionOutput, ExecutionOutputObligation, QueryResultStream, ResultField,
+            ResultRowCarrier, ResultSchema,
         };
         use crate::protocol_delivery::StreamingStatementResult;
         use novarocks_workload_control::{ResultCapacityConfig, ResultWindowClass};
@@ -1617,7 +1617,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let execution = ExecutionHandle::new(
+        let execution = ExecutionOutputObligation::new(
             owner.cancellation_requester(),
             ExecutionOutput::Rows(stream),
         );

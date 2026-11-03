@@ -63,7 +63,7 @@ use novarocks_cluster_harness::delayed_s3::{
     DelayedS3Config, DelayedS3ConnectionEventKind, DelayedS3EventKind, DelayedS3Proxy,
     DelayedS3ReadHold,
 };
-use novarocks_cluster_harness::{CrossProcessConfigOverlay, LaunchProfile, ServerHandle};
+use novarocks_cluster_harness::{CrossProcessConfigOverlay, LaunchProfile, TestClusterOwner};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::env;
@@ -87,7 +87,7 @@ const PAIMON_CANDIDATES: [&str; 5] = [
     "pk_default",
     "pk_sequence",
 ];
-const SPLIT_MARKER: &str = "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED";
+const SPLIT_MARKER: &str = novarocks_failpoint::observation_marker::TASK_SPLIT_ASSIGNMENT_ACCEPTED;
 const HOLD_ENTRY_TIMEOUT: Duration = Duration::from_secs(30);
 const MARKER_TIMEOUT: Duration = Duration::from_secs(15);
 const MARKER_POLL: Duration = Duration::from_millis(25);
@@ -562,7 +562,14 @@ fn scan_specs(sqls: Vec<String>, cluster_size: usize) -> Vec<StatementSpec> {
             sql,
             faults: vec![],
             observations: (0..cluster_size)
-                .map(|index| (index, "reader-marker", None))
+                .map(|index| {
+                    (
+                        index,
+                        novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker
+                            .as_str(),
+                        None,
+                    )
+                })
                 .collect(),
         })
         .collect()
@@ -1090,11 +1097,11 @@ mod tests {
                 assert_eq!(grants.len(), 43);
             } else {
                 assert_eq!(grants.len(), 14);
-                assert!(
-                    grants
-                        .iter()
-                        .all(|grant| grant["action"] == "reader-marker")
-                );
+                assert!(grants.iter().all(|grant| {
+                    grant["action"]
+                        == novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker
+                            .as_str()
+                }));
             }
         }
         let first = owner.take(INDEPENDENT_ICE_STATEMENT).unwrap();
@@ -1136,15 +1143,24 @@ mod tests {
         let lines = [
             line(
                 0,
-                "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED execution_id=-1:7:1 finst=1:2 plan_node=3 enqueued=1 duplicate=0 accepted_through=1",
+                &*format!(
+                    "{} execution_id=-1:7:1 task_key=1:2 plan_node=3 enqueued=1 duplicate=0 accepted_through=1",
+                    novarocks_failpoint::observation_marker::TASK_SPLIT_ASSIGNMENT_ACCEPTED
+                ),
             ),
             line(
                 1,
-                "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED execution_id=-1:7:1 finst=1:3 plan_node=3 enqueued=0 duplicate=0 accepted_through=0",
+                &*format!(
+                    "{} execution_id=-1:7:1 task_key=1:3 plan_node=3 enqueued=0 duplicate=0 accepted_through=0",
+                    novarocks_failpoint::observation_marker::TASK_SPLIT_ASSIGNMENT_ACCEPTED
+                ),
             ),
             line(
                 2,
-                "NOVAROCKS_TASK_SPLIT_NO_MORE execution_id=-1:7:1 finst=1:4 plan_node=3",
+                &*format!(
+                    "{} execution_id=-1:7:1 task_key=1:4 plan_node=3",
+                    novarocks_failpoint::observation_marker::TASK_SPLIT_NO_MORE
+                ),
             ),
         ];
         let placements = split_placements(&lines);
@@ -1154,8 +1170,10 @@ mod tests {
 
     #[test]
     fn marker_fields_come_from_the_marker_line_only() {
-        let text =
-            "prefix enqueued=9 NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED execution_id=a enqueued=2";
+        let text = &*format!(
+            "prefix enqueued=9 {} execution_id=a enqueued=2",
+            novarocks_failpoint::observation_marker::TASK_SPLIT_ASSIGNMENT_ACCEPTED
+        );
         assert_eq!(marker_field(text, SPLIT_MARKER, "enqueued"), Some("2"));
         assert_eq!(
             marker_field("no marker enqueued=1", SPLIT_MARKER, "enqueued"),

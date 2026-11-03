@@ -24,12 +24,12 @@ use super::*;
 use crate::runtime::exchange_slots::{
     ExchangeSlotAdmission, ExchangeSlotInstance, ExchangeSlotRegistration,
 };
-use crate::runtime::fragment::io::exchange_receiver::ExchangeReceiverKey;
-use crate::runtime::fragment::io::exchange_unit::{
+use crate::runtime::runtime_state::RuntimeErrorState;
+use crate::runtime::task::io::exchange_receiver::ExchangeReceiverKey;
+use crate::runtime::task::io::exchange_unit::{
     ExchangeDemandEntry, ExchangeDemandOperation, ExchangeStreamObservation, ExchangeUnitReceipt,
     ExchangeUnitReceiverFrame, ExchangeUnitStateListener,
 };
-use crate::runtime::runtime_state::RuntimeErrorState;
 use novarocks_execution_contract::ordered_retained_stream::exchange::{
     ExchangeDecodeCommit, ExchangeStreamFacts, ExchangeUnitItem, ExchangeUnitSequence,
 };
@@ -69,7 +69,7 @@ struct UnitBoundary {
 
 fn receiver_key(key: ExchangeKey) -> ExchangeReceiverKey {
     ExchangeReceiverKey {
-        fragment_instance_id: UniqueId::new(key.finst_id_hi, key.finst_id_lo),
+        task_key: UniqueId::new(key.task_key_hi, key.task_key_lo),
         node_id: key.node_id,
     }
 }
@@ -104,7 +104,7 @@ impl ReceiverState {
             .is_some_and(|end| end.get() <= facts.custody_through)
         {
             self.finished.insert(ExchangeSenderIdentity::native(
-                stream.source().fragment_instance_id(),
+                stream.source().task_key(),
                 stream.source().sender_ordinal(),
             ));
         }
@@ -234,7 +234,7 @@ impl ExecutionExchangeRegistry {
             .unit_slots
             .register(ExchangeSlotRegistration {
                 task,
-                fragment_instance_id: UniqueId::new(key.finst_id_hi, key.finst_id_lo),
+                task_key: UniqueId::new(key.task_key_hi, key.task_key_lo),
                 node: novarocks_execution_contract::FragmentNodeId::new(key.node_id),
                 streams: streams.clone(),
                 grantable_unit_bytes,
@@ -305,8 +305,7 @@ impl ExecutionExchangeRegistry {
         decode: impl FnOnce(ExchangeSenderIdentity, &[u8]) -> Result<Vec<Chunk>, ExchangeFailure>,
     ) -> Result<ExchangeUnitReceipt, ExchangeFailure> {
         let stream = frame.stream;
-        if stream.destination_fragment_instance_id()
-            != UniqueId::new(key.finst_id_hi, key.finst_id_lo)
+        if stream.destination_task_key() != UniqueId::new(key.task_key_hi, key.task_key_lo)
             || stream.destination_node().get() != key.node_id
             || frame.sender_count == 0
             || stream.source().sender_ordinal() >= frame.sender_count
@@ -386,7 +385,7 @@ impl ExecutionExchangeRegistry {
                 let mut state = receiver.mu.lock().expect("exchange receiver lock");
                 if matches!(frame.item, ExchangeUnitItem::End(_))
                     && receipt.verdict
-                        == crate::runtime::fragment::io::exchange_unit::ExchangeAdmissionVerdict::Applied
+                        == crate::runtime::task::io::exchange_unit::ExchangeAdmissionVerdict::Applied
                 {
                     state.recv_request_count = state.recv_request_count.saturating_add(1);
                 }
@@ -400,7 +399,7 @@ impl ExecutionExchangeRegistry {
                 #[cfg(novarocks_dev_controls)]
                 receiver.observe_unit_decode("unit_decode_begin", sequence);
                 let sender = ExchangeSenderIdentity::native(
-                    stream.source().fragment_instance_id(),
+                    stream.source().task_key(),
                     stream.source().sender_ordinal(),
                 );
                 let start = Instant::now();
@@ -454,7 +453,7 @@ impl ExecutionExchangeRegistry {
     }
 }
 
-impl ExchangeReceiverHandle {
+impl ExchangeReceiverPin {
     pub(super) fn try_pop_unit(
         &self,
         owner: &UnitReceiverOwner,
@@ -570,8 +569,8 @@ mod tests {
             let task = Owner::new();
             let destination = task.identity();
             let key = ExchangeKey {
-                finst_id_hi: destination.query_execution_id().query_id().high(),
-                finst_id_lo: 991,
+                task_key_hi: destination.query_execution_id().query_id().high(),
+                task_key_lo: 991,
                 node_id: 7,
             };
             let source = TaskIdentity::new(
@@ -583,7 +582,7 @@ mod tests {
             let stream = ExchangeStreamIdentity::try_new(
                 ExchangeSource::new(source, UniqueId::new(992, 1), 0),
                 destination,
-                UniqueId::new(key.finst_id_hi, key.finst_id_lo),
+                UniqueId::new(key.task_key_hi, key.task_key_lo),
                 novarocks_execution_contract::FragmentNodeId::new(7),
             )
             .unwrap();
@@ -601,7 +600,7 @@ mod tests {
                     (schema.clone()).clone(),
                     schema.clone(),
                     ExchangeColumnBinding::Positional,
-                    crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+                    crate::runtime::task::exchange::test_receiver_creation_factory(),
                 )
                 .unwrap();
             registry
@@ -666,11 +665,11 @@ mod tests {
                 .unwrap()
         }
 
-        fn receiver(&self) -> ExchangeReceiverHandle {
-            self.registry.get_receiver_handle(self.key, 1).unwrap()
+        fn receiver(&self) -> ExchangeReceiverPin {
+            self.registry.get_receiver_pin(self.key, 1).unwrap()
         }
 
-        fn values(&self, receiver: &ExchangeReceiverHandle) -> Vec<i32> {
+        fn values(&self, receiver: &ExchangeReceiverPin) -> Vec<i32> {
             let Some(ExchangePopResult::Chunk(chunk)) =
                 receiver.try_pop_next_with_stats(1).unwrap()
             else {
@@ -692,13 +691,13 @@ mod tests {
         use crate::exec::operators::ExchangeSourceFactory;
         use crate::exec::pipeline::{
             binding::ExchangeBinding,
+            driver_step::{DEFAULT_TURN_WORK_UNITS, DriverStep, TurnWork},
             operator_factory::OperatorFactory,
             step::NextStep,
-            step_context::{DEFAULT_TURN_WORK_UNITS, StepContext, TurnWork},
         };
         use crate::runtime::execution_runtime::{ExecutionRuntime, test_execution_runtime};
-        use crate::runtime::fragment::io::ExecutionRuntimeExchangeReceiverPort;
         use crate::runtime::runtime_state::RuntimeState;
+        use crate::runtime::task::io::ExecutionRuntimeExchangeReceiverPort;
 
         let base = test_execution_runtime();
         let runtime = Arc::new(
@@ -718,7 +717,7 @@ mod tests {
             None,
             None,
             Some(f.task.identity().query_execution_id().query_id()),
-            Some(UniqueId::new(f.key.finst_id_hi, f.key.finst_id_lo)),
+            Some(UniqueId::new(f.key.task_key_hi, f.key.task_key_lo)),
             Some(0),
             Some(MemTracker::new_root("late End real Source")),
             Some(runtime.clone()),
@@ -740,7 +739,7 @@ mod tests {
             let mut work = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
             let mut values = novarocks_value_arrays::decode::ValueConversionContext::default();
             source
-                .drive(&mut StepContext::new(&errors, &mut work, &mut values))
+                .drive(&mut DriverStep::new(&errors, &mut work, &mut values))
                 .unwrap()
         };
         let NextStep::Wait(before) = drive().next else {
@@ -783,7 +782,7 @@ mod tests {
                 assert_eq!(admission.facts.custody_through, 0);
                 assert_eq!(
                     admission.verdict,
-                    crate::runtime::fragment::io::exchange_unit::ExchangeAdmissionVerdict::Applied
+                    crate::runtime::task::io::exchange_unit::ExchangeAdmissionVerdict::Applied
                 );
                 assert_eq!(decoded.facts.custody_through, 2);
                 let snapshot = receiver
@@ -880,7 +879,7 @@ mod tests {
         let replay = f.registry.receive_unit(f.key, second).unwrap();
         assert_eq!(
             replay.verdict,
-            crate::runtime::fragment::io::exchange_unit::ExchangeAdmissionVerdict::Idempotent
+            crate::runtime::task::io::exchange_unit::ExchangeAdmissionVerdict::Idempotent
         );
         assert_eq!(replay.facts.custody_through, 3);
         let receiver = f.receiver();

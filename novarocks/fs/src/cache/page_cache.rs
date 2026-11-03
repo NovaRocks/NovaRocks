@@ -54,7 +54,7 @@ where
         }
     }
 
-    pub fn lookup(&self, key: &K) -> Option<PageHandle<V>> {
+    pub fn lookup(&self, key: &K) -> Option<PagePin<V>> {
         let mut inner = self.inner.lock().expect("page cache lock");
         inner.lookup(key)
     }
@@ -123,9 +123,9 @@ where
         }
     }
 
-    fn lookup(&mut self, key: &K) -> Option<PageHandle<V>> {
+    fn lookup(&mut self, key: &K) -> Option<PagePin<V>> {
         let entry = self.entries.get(key)?;
-        let handle = PageHandle::new(ArcPageEntry::clone(&entry.data));
+        let handle = PagePin::new(ArcPageEntry::clone(&entry.data));
         let key = key.clone();
         self.move_to_tail(&key);
         Some(handle)
@@ -373,11 +373,11 @@ impl<V> ArcPageEntry<V> {
 }
 
 #[derive(Debug)]
-pub struct PageHandle<V = Bytes> {
+pub struct PagePin<V = Bytes> {
     data: ArcPageEntry<V>,
 }
 
-impl<V> PageHandle<V> {
+impl<V> PagePin<V> {
     fn new(data: ArcPageEntry<V>) -> Self {
         data.pin();
         Self { data }
@@ -388,19 +388,19 @@ impl<V> PageHandle<V> {
     }
 }
 
-impl PageHandle<Bytes> {
+impl PagePin<Bytes> {
     pub fn bytes(&self) -> &Bytes {
         self.value()
     }
 }
 
-impl<V> Clone for PageHandle<V> {
+impl<V> Clone for PagePin<V> {
     fn clone(&self) -> Self {
-        PageHandle::new(ArcPageEntry::clone(&self.data))
+        PagePin::new(ArcPageEntry::clone(&self.data))
     }
 }
 
-impl<V> Drop for PageHandle<V> {
+impl<V> Drop for PagePin<V> {
     fn drop(&mut self) {
         self.data.unpin();
     }

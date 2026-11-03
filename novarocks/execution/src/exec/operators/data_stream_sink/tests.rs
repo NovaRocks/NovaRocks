@@ -43,7 +43,7 @@ fn make_test_operator(fixture: &Fixture) -> DataStreamSinkOperator {
         )
         .expect("test sink input"),
         transmitter: fixture.transport(),
-        fragment_instance_id: UniqueId::new(1, 2),
+        task_key: UniqueId::new(1, 2),
         init_error: None,
         driver_id: 0,
         sender_id: 11,
@@ -290,8 +290,8 @@ fn cancellation_revokes_eos_debt_but_waits_for_blocked_transmit() {
 fn task_shutdown_waits_for_the_inflight_send_before_publishing_stopped() {
     let fixture = Fixture::new();
     use crate::exec::pipeline::driver::PipelineDriver;
-    use crate::exec::pipeline::fragment_context::FragmentContext;
-    use crate::exec::pipeline::global_driver_executor::{DriverTask, FragmentCompletion};
+    use crate::exec::pipeline::global_driver_executor::{DriverGroupCompletion, DriverRunner};
+    use crate::exec::pipeline::task_context::TaskContext;
 
     let (mut sink, transmitter, entered, release) = blocked_eos_sink(&fixture);
     SinkKernel::finish_for_test(&mut sink, &fixture.state()).expect("enqueue EOS");
@@ -310,8 +310,8 @@ fn task_shutdown_waits_for_the_inflight_send_before_publishing_stopped() {
         Arc::clone(&state),
         None,
     );
-    let completion = FragmentCompletion::new(1, state.error_state());
-    let submitted_failure: crate::runtime::fragment::ExecutionFailure =
+    let completion = DriverGroupCompletion::new(1, state.error_state());
+    let submitted_failure: crate::runtime::task::ExecutionFailure =
         (crate::exec::pipeline::driver_failure::DriverFailure::ExecutorShutdown).into();
     completion.fail(submitted_failure.clone());
     assert!(
@@ -321,8 +321,8 @@ fn task_shutdown_waits_for_the_inflight_send_before_publishing_stopped() {
             .unwrap_err()
             .same_occurrence(&submitted_failure)
     );
-    let context = Arc::new(FragmentContext::new(None, state, None, None, None, None));
-    let task = DriverTask::new(
+    let context = Arc::new(TaskContext::new(None, state, None, None, None, None));
+    let task = DriverRunner::new(
         driver,
         Arc::clone(&completion),
         context,
@@ -344,8 +344,8 @@ fn task_shutdown_waits_for_the_inflight_send_before_publishing_stopped() {
     assert_eq!(transmitter.calls.load(Ordering::Acquire), 1);
 }
 
-fn make_test_destination(fixture: &Fixture) -> FragmentDestination {
-    FragmentDestination::new(
+fn make_test_destination(fixture: &Fixture) -> TaskDestination {
+    TaskDestination::new(
         UniqueId::new(9, 9),
         RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
         UniqueId::new(1, 2),
@@ -356,8 +356,8 @@ fn make_test_destination(fixture: &Fixture) -> FragmentDestination {
     .with_task_identity(fixture.destination_task(9))
 }
 
-fn destination_with_finst(fixture: &Fixture, low: i64) -> FragmentDestination {
-    FragmentDestination::new(
+fn destination_with_task_key(fixture: &Fixture, low: i64) -> TaskDestination {
+    TaskDestination::new(
         UniqueId::new(9, low),
         RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
         UniqueId::new(1, 2),
@@ -374,12 +374,12 @@ fn edge_id(value: u32) -> ExchangeEdgeId {
 
 /// Gates the sink's destinations one edge per destination, all closed, so
 /// each edge's decision is observable in isolation.
-fn gate_destinations(op: &mut DataStreamSinkOperator, dests: Vec<FragmentDestination>) {
+fn gate_destinations(op: &mut DataStreamSinkOperator, dests: Vec<TaskDestination>) {
     let gates = ExchangeEdgeGates::try_new(dests.iter().enumerate().map(|(idx, dest)| {
         (
             edge_id(idx as u32 + 1),
             vec![ExchangeDestinationKey::new(
-                *dest.finst_id(),
+                *dest.task_key(),
                 op.input.dest_node_id,
             )],
         )
@@ -427,7 +427,7 @@ fn zero_column_chunk_with_rows(row_count: usize) -> Chunk {
         )
         .unwrap(),
     );
-    Chunk::try_new_typed_with_columns_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+    Chunk::try_new_typed_with_columns_observed::<crate::runtime::task::ExecutionFailure, _>(
         schema,
         Vec::new(),
         row_count,
@@ -592,14 +592,14 @@ fn pending_grant_keeps_the_next_payload_and_retries_without_a_sequence_gap() {
 }
 
 #[test]
-fn exchange_unit_carries_distinct_dest_and_sender_finsts() {
+fn exchange_unit_carries_distinct_destination_and_sender_task_keys() {
     let fixture = Fixture::new();
     let mut sink = make_test_operator(&fixture);
-    sink.fragment_instance_id = UniqueId::new(81, 82);
-    let destination = FragmentDestination::new(
+    sink.task_key = UniqueId::new(81, 82);
+    let destination = TaskDestination::new(
         UniqueId::new(91, 92),
         RuntimeEndpoint::new("127.0.0.1", 9030).unwrap(),
-        sink.fragment_instance_id,
+        sink.task_key,
         0,
         1,
     )
@@ -615,14 +615,8 @@ fn exchange_unit_carries_distinct_dest_and_sender_finsts() {
     ));
     let frames = fixture.transport().frames();
     let frame = &frames[0].receiver;
-    assert_eq!(
-        frame.stream.destination_fragment_instance_id(),
-        UniqueId::new(91, 92)
-    );
-    assert_eq!(
-        frame.stream.source().fragment_instance_id(),
-        UniqueId::new(81, 82)
-    );
+    assert_eq!(frame.stream.destination_task_key(), UniqueId::new(91, 92));
+    assert_eq!(frame.stream.source().task_key(), UniqueId::new(81, 82));
     assert_eq!(frame.stream.source().sender_ordinal(), 0);
     assert_eq!(frame.sender_count, 1);
     assert_eq!(frame.item.sequence().get(), 1);
@@ -735,8 +729,8 @@ fn a_normally_cancelled_edge_discards_its_payload_and_its_pending_chunks() {
 fn a_normally_cancelled_edge_leaves_the_other_destinations_sending() {
     let fixture = Fixture::new();
     let mut op = make_test_operator(&fixture);
-    let abandoned = destination_with_finst(&fixture, 1);
-    let healthy = destination_with_finst(&fixture, 2);
+    let abandoned = destination_with_task_key(&fixture, 1);
+    let healthy = destination_with_task_key(&fixture, 2);
     gate_destinations(&mut op, vec![abandoned.clone(), healthy.clone()]);
     prepare_test_operator(&fixture, &mut op);
     open_edges(&op, &[edge_id(1), edge_id(2)]);
@@ -776,8 +770,8 @@ fn a_normally_cancelled_edge_leaves_the_other_destinations_sending() {
 fn a_closed_edge_does_not_stall_a_destination_that_can_send() {
     let fixture = Fixture::new();
     let mut op = make_test_operator(&fixture);
-    let closed = destination_with_finst(&fixture, 1);
-    let open = destination_with_finst(&fixture, 2);
+    let closed = destination_with_task_key(&fixture, 1);
+    let open = destination_with_task_key(&fixture, 2);
     gate_destinations(&mut op, vec![closed, open]);
     prepare_test_operator(&fixture, &mut op);
     open_edges(&op, &[edge_id(2)]);
@@ -799,10 +793,11 @@ fn a_closed_edge_does_not_stall_a_destination_that_can_send() {
 fn a_destination_no_edge_claims_fails_closed() {
     let fixture = Fixture::new();
     let mut op = make_test_operator(&fixture);
-    gate_destinations(&mut op, vec![destination_with_finst(&fixture, 1)]);
+    gate_destinations(&mut op, vec![destination_with_task_key(&fixture, 1)]);
     prepare_test_operator(&fixture, &mut op);
 
-    let Err(error) = op.try_enqueue_payload(&destination_with_finst(&fixture, 7), test_payload(4))
+    let Err(error) =
+        op.try_enqueue_payload(&destination_with_task_key(&fixture, 7), test_payload(4))
     else {
         panic!("an unattributed destination must not send");
     };
@@ -813,7 +808,7 @@ fn a_destination_no_edge_claims_fails_closed() {
     // per-driver gate lookup; retain that owner's nominal source.
     assert!(matches!(
         error.cause(),
-        crate::runtime::fragment::ExecutionFailureCause::Domain(_)
+        crate::runtime::task::ExecutionFailureCause::Domain(_)
     ));
     assert_eq!(fixture.transport().call_count(), 0);
 }
@@ -1394,8 +1389,8 @@ mod typed_sender_header_tests {
     use crate::exec::pipeline::operator::{
         ConstructionFailure, InputConstructionFactory, InputConstructionOwner,
     };
-    use crate::runtime::fragment::ExecutionFailureCause;
     use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::task::ExecutionFailureCause;
     use arrow::array::ListArray;
     use arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use novarocks_type_contract::{
@@ -2103,9 +2098,9 @@ mod conditional_compiled_selection {
     ) -> ExecutionResult<CompiledPartitionBatch> {
         let control = RuntimeErrorState::default();
         let mut work =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-        let ctx = StepContext::new(&control, &mut work, &mut conversions);
+        let ctx = DriverStep::new(&control, &mut work, &mut conversions);
         sink.compiled_partition_keys(&ctx, chunk)
             .map(|batch| batch.expect("compiled partition"))
     }
@@ -2243,10 +2238,9 @@ fn conditional_network_routes_true_keys_and_round_robins_false_or_null_rows() {
     let source = typed_int64_chunk(6);
     let state = fixture.state();
     let control = state.error_state();
-    let mut work =
-        crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut work = crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&control, &mut work, &mut conversions);
+    let mut ctx = DriverStep::new(&control, &mut work, &mut conversions);
     let mask = BooleanArray::from(vec![
         Some(true),
         Some(false),
@@ -2299,10 +2293,9 @@ fn all_bypass_needs_no_key_column_or_key_decode_and_wraps_its_cursor() {
     );
     let state = fixture.state();
     let control = state.error_state();
-    let mut work =
-        crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut work = crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&control, &mut work, &mut conversions);
+    let mut ctx = DriverStep::new(&control, &mut work, &mut conversions);
     let mut cursor = 2;
     assert_eq!(
         instance_partition_rows(&batch, &source, 5, 3, &mut cursor, &mut ctx).unwrap(),
@@ -2325,10 +2318,9 @@ fn selected_network_target_key_cannot_acquire_the_null_identity() {
     );
     let state = fixture.state();
     let control = state.error_state();
-    let mut work =
-        crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut work = crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&control, &mut work, &mut conversions);
+    let mut ctx = DriverStep::new(&control, &mut work, &mut conversions);
     let failure = instance_partition_rows(&batch, &source, 3, 4, &mut 0, &mut ctx).unwrap_err();
     let expected = ExecutionFailure::from_domain(novarocks_value_arrays::ValueError::Invariant(
         novarocks_value_arrays::ValueViolation::RequiredNull,
@@ -2349,10 +2341,9 @@ fn hierarchical_network_uses_frozen_instance_domain_and_keeps_ordinary_mapping()
     );
     let state = fixture.state();
     let control = state.error_state();
-    let mut work =
-        crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut work = crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&control, &mut work, &mut conversions);
+    let mut ctx = DriverStep::new(&control, &mut work, &mut conversions);
     assert_eq!(
         instance_partition_rows(&batch, &source, 3, 4, &mut 0, &mut ctx).unwrap(),
         vec![vec![], vec![0], vec![1], vec![2]]
@@ -2394,10 +2385,9 @@ fn network_partition_scope_preserves_the_exact_originating_stop() {
     ));
     let control = state.error_state();
     control.set_error(original.clone());
-    let mut work =
-        crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut work = crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&control, &mut work, &mut conversions);
+    let mut ctx = DriverStep::new(&control, &mut work, &mut conversions);
     assert_eq!(
         instance_partition_rows(&batch, &source, 2, 3, &mut 0, &mut ctx).unwrap_err(),
         original
@@ -2415,9 +2405,9 @@ fn async_send_failure_remains_visible_while_task_conclusion_owner_is_deferred() 
     )));
     let fixture = Fixture::with_error(state.clone());
     let transport = fixture.transport();
-    let failure = crate::runtime::fragment::io::FragmentIoError::new(
-        crate::runtime::fragment::io::FragmentIoOperation::ExchangeTransmit,
-        crate::runtime::fragment::io::FragmentIoErrorKind::Unavailable,
+    let failure = crate::runtime::task::io::TaskIoError::new(
+        crate::runtime::task::io::TaskIoOperation::ExchangeTransmit,
+        crate::runtime::task::io::TaskIoErrorKind::Unavailable,
         "actual receiver transport failure",
     )
     .failure_fact();
@@ -2456,10 +2446,10 @@ fn required_withdrawal_cannot_skip_parked_payload_or_end_even_after_earlier_poll
     for pending in [false, true] {
         let mut sink = make_test_operator(&fixture);
         sink.input.delivery = novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain;
-        let destination = FragmentDestination::new(
+        let destination = TaskDestination::new(
             UniqueId::new(701, 702),
             RuntimeEndpoint::new("127.0.0.1", 9030).unwrap(),
-            sink.fragment_instance_id,
+            sink.task_key,
             0,
             1,
         )

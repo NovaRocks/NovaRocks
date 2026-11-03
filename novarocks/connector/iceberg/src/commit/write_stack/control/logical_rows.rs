@@ -22,7 +22,7 @@ use super::*;
 use novarocks_spi::connector::write_stack::ConnectorWriteRowChange;
 
 pub(super) fn project(
-    handle: &IcebergCommitHandle,
+    handle: &IcebergWriteCommitSession,
     validated: &[ValidatedFragment<'_>],
 ) -> Result<Option<ConnectorWriteRowChange>, ConnectorError> {
     if handle.document_publication().is_none() {

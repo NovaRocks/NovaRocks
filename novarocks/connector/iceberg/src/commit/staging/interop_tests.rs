@@ -43,7 +43,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks_fs::{
-    FsAccessResolver, ObjectStoreConfig, SecretValue, TokioFileIoRuntime, TokioFileTaskSpawner,
+    FsAccessResolver, ObjectStoreConfig, SecretValue, TokioFileIoRuntime, TokioFileIoSpawner,
 };
 use novarocks_spi::connector::{
     ConnectorMutationFailureKind, ConnectorRequestContext, ConnectorStopOwner,
@@ -458,7 +458,7 @@ impl Java {
             }),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
         );
         Self {
             client,

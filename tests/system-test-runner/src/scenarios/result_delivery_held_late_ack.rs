@@ -30,12 +30,12 @@ use crate::scenarios::independent_root_target::{
     FrontendIdentitySource, IndependentRootObserver, IndependentRootTarget,
 };
 use crate::scenarios::result_delivery_root_protocol::{
-    held_response::{HeldObservation, HeldRootResponse, JoinedOriginalDriver, ProvenReplayOne},
+    held_response::{HeldObservation, HeldRootResponse, JoinedOriginalConnection, ProvenReplayOne},
     probe_owned,
 };
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::process_resources::ProcessLaunchIdentity;
-use novarocks_cluster_harness::{LaunchProfile, ServerHandle};
+use novarocks_cluster_harness::{LaunchProfile, TestClusterOwner};
 use novarocks_execution_contract::{TaskIdentity, root_result::RootResultRead};
 use novarocks_proto_codec::FieldPath;
 use novarocks_result_contract::{RootOutputKind, RootProfileId};
@@ -263,7 +263,7 @@ struct Facts {
     mysql: Option<TextResultObservation>,
     health: Option<TextResultObservation>,
     expected_server_err_retained: bool,
-    expected_driver_cancel_retained: bool,
+    expected_connection_cancel_retained: bool,
 }
 struct OwnedFailure {
     errors: [Option<anyhow::Error>; 8],
@@ -383,7 +383,7 @@ fn same_target(
             && fresh.root_backend_index == original.root_backend_index
             && fresh.backend_process_from_descriptor == original.backend_process_from_descriptor
             && fresh.frontend == original.frontend
-            && fresh.contexts == original.contexts
+            && fresh.participations == original.participations
             && fresh.fresh_tasks == original.fresh_tasks,
         "closed original root/context/task inventory changed"
     );
@@ -511,7 +511,7 @@ fn run_owned(
     };
     let mut errors: [Option<anyhow::Error>; 8] = std::array::from_fn(|_| None);
     let mut expected_server_error: Option<anyhow::Error> = None;
-    let mut expected_driver_exit: Option<tokio::task::JoinError> = None;
+    let mut expected_connection_exit: Option<tokio::task::JoinError> = None;
     let primary = (|| -> Result<()> {
         runtime.block_on(await_idle(context, deadline))?;
         // Only this selected neutral source supplies expected FE; no RPC/CID/PID fallback.
@@ -731,13 +731,13 @@ fn run_owned(
     // Actual join may be late; the actor keeps Clock failure sticky. No timeout-drop.
     if let Some(owner) = actor.as_mut() {
         match runtime.block_on(owner.settle()) {
-            Ok(JoinedOriginalDriver {
+            Ok(JoinedOriginalConnection {
                 observation,
                 actual_expected_cancellation,
             }) => {
                 facts.actor_actual_join = true;
                 facts.actor = Some(observation);
-                expected_driver_exit = actual_expected_cancellation;
+                expected_connection_exit = actual_expected_cancellation;
             }
             Err(error) => {
                 facts.actor = Some(error.observation);
@@ -776,7 +776,7 @@ fn run_owned(
         job.take(); // original handle already actually joined, not discarded pending
     }
     facts.expected_server_err_retained = expected_server_error.is_some();
-    facts.expected_driver_cancel_retained = expected_driver_exit.is_some();
+    facts.expected_connection_cancel_retained = expected_connection_exit.is_some();
     if errors.iter().all(Option::is_none) {
         let recovery = (|| -> Result<()> {
             let before = runtime.block_on(census(context, deadline))?.created;
@@ -845,7 +845,7 @@ fn run_owned(
         "kill_returned_us":facts.kill_returned_from_original_prelaunch_us,
         "settled_us":facts.settled_from_original_prelaunch_us,
         "expected_server_error_actual_source_retained":facts.expected_server_err_retained,
-        "expected_driver_joinerror_retained":facts.expected_driver_cancel_retained,
+        "expected_connection_joinerror_retained":facts.expected_connection_cancel_retained,
         "root_samples":facts.samples,"original_wire":facts.mysql,"same_socket_health":facts.health,
         "failed_source_slots":errors.each_ref().map(Option::is_some),"raw_error_formatter_invoked":false,
         "scope":"Context-owned unique root positive physical delivery/reservation holders only; excludes released roots, allocator dealloc, last Arc alias and full Closing pool"});
@@ -871,7 +871,7 @@ fn run_owned(
     }
     // Expected terminal sources remain alive through receipt settlement. They are
     // separate from unknown failures; successful actual joins are already explicit.
-    drop(expected_driver_exit);
+    drop(expected_connection_exit);
     drop(expected_server_error);
     if errors.iter().any(Option::is_some) {
         return Err(OwnedFailure { errors }.into());

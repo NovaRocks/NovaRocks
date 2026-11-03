@@ -36,7 +36,7 @@ use crate::exec::{
     operators::compiled_expression::{
         evaluate_chunk_all, evaluate_projected_chunk_all, evaluate_projected_chunk_rows,
     },
-    pipeline::{operator::OperatorLifecycle, shape::ControlStep, step_context::TurnWork},
+    pipeline::{driver_step::TurnWork, operator::OperatorLifecycle, shape::ControlStep},
 };
 use novarocks_functions::KernelEvaluationControl;
 use novarocks_value_arrays::reachability::ReachableRows;
@@ -394,7 +394,7 @@ impl JoinProbe {
     }
     fn step_result(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         result: ExecutionResult<StepResult>,
     ) -> ExecutionResult<StepResult> {
         result.map_err(|cause| {
@@ -550,7 +550,7 @@ impl TransformKernel for JoinProbe {
     }
     fn poll_receiver_control(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         receiver_empty: bool,
     ) -> ExecutionResult<ControlStep> {
         self.frame()?.completion.check()?;
@@ -587,7 +587,7 @@ impl TransformKernel for JoinProbe {
     }
     fn admission(
         &self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         _: &RawInput,
     ) -> ExecutionResult<Option<AdmissionNext>> {
         if !self.active {
@@ -608,7 +608,7 @@ impl TransformKernel for JoinProbe {
     }
     fn apply(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         let mut accepted = match input.into_uncovered_chunk() {
@@ -694,7 +694,7 @@ impl TransformKernel for JoinProbe {
         drop(accepted);
         result
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         let mut admitted = self.cursor.take();
         let result = (|| -> ExecutionResult<StepResult> {
             if self.b0_ready && admitted.is_none() {
@@ -750,7 +750,7 @@ impl TransformKernel for JoinProbe {
         drop(admitted);
         result
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         let result = if self.cursor.is_some() {
             Err(build_contract(
                 "join probe reached EOS with admitted candidate work",

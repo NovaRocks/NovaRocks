@@ -20,13 +20,13 @@
 #![forbid(unsafe_code)]
 
 pub mod actor;
+pub mod actor_turn;
 pub mod completion;
 pub mod continuation;
-pub mod driver;
-pub mod exit_role;
+pub mod exit_custody;
 pub mod header_readiness;
-pub mod lease;
 pub mod notify;
+pub mod obligation;
 pub mod owned_return;
 pub mod read_resource;
 pub mod reply_notification;

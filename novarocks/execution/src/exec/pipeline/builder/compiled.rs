@@ -63,8 +63,8 @@ use crate::exec::operators::compiled_window::CompiledWindowProcessorFactory;
 use crate::exec::operators::runtime_filter::{
     CompiledOrderedScanFactory, CompiledRuntimeFilterConsumers,
 };
-use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::ExecutionResult;
 use crate::runtime_filter::OrderedTopNAllocationHost;
 use novarocks_local_program::{
     AssertRowsMode, BindingRequirement, FilterConsumerActivation, FilterConsumerAtExpr,
@@ -485,7 +485,7 @@ pub fn build_compiled_pipeline_graph_for_test(
     program: &Arc<LocalProgram>,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
-    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    writer_bindings: crate::runtime::task::CompiledWriterBindings,
     runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
     dep_manager: DependencyManager,
     pipeline_dop: i32,
@@ -511,7 +511,7 @@ pub(crate) fn build_compiled_pipeline_graph(
     program: &Arc<LocalProgram>,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
-    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    writer_bindings: crate::runtime::task::CompiledWriterBindings,
     runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
     dep_manager: DependencyManager,
     pipeline_dop: i32,
@@ -544,7 +544,7 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
     program: &Arc<LocalProgram>,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
-    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    writer_bindings: crate::runtime::task::CompiledWriterBindings,
     runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
     _dep_manager: DependencyManager,
     pipeline_dop: i32,

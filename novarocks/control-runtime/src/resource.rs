@@ -65,7 +65,7 @@ impl<T> Clone for ResourceStore<T> {
     }
 }
 #[must_use = "A host must consume the resource or retain this custody handle"]
-pub struct ResourceHandle<T> {
+pub struct ResourceObligation<T> {
     store: ResourceStore<T>,
     id: SlotId,
     scope: ScopeId,
@@ -144,7 +144,7 @@ impl<T> ResourceStore<T> {
         scope: ScopeId,
         generation: Generation,
         value: T,
-    ) -> Result<ResourceHandle<T>, (ResourceError, T)> {
+    ) -> Result<ResourceObligation<T>, (ResourceError, T)> {
         let mut state = self.state.lock().expect("runtime resource lock");
         if state.entries.contains_key(&id) {
             return Err((ResourceError::Duplicate, value));
@@ -160,7 +160,7 @@ impl<T> ResourceStore<T> {
                 value: ManuallyDrop::new(value),
             },
         );
-        Ok(ResourceHandle {
+        Ok(ResourceObligation {
             store: self.clone(),
             id,
             scope,
@@ -168,7 +168,7 @@ impl<T> ResourceStore<T> {
         })
     }
 }
-impl<T> ResourceHandle<T> {
+impl<T> ResourceObligation<T> {
     pub const fn id(&self) -> SlotId {
         self.id
     }

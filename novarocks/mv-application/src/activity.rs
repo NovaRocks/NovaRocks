@@ -190,7 +190,7 @@ impl MvActivityGate {
         target: CanonicalMvTarget,
         owner: MvActivityOwner,
         cancelled: impl Fn() -> bool,
-    ) -> Result<MvActivityLease, MvActivityAdmissionError> {
+    ) -> Result<MvActivityPermit, MvActivityAdmissionError> {
         let mut ticket = self
             .request(target, owner)
             .map_err(|_| MvActivityAdmissionError::Stopping)?;
@@ -208,7 +208,7 @@ impl MvActivityGate {
         target: CanonicalMvTarget,
         owner: MvActivityOwner,
         cancelled: impl Future<Output = ()>,
-    ) -> Result<MvActivityLease, MvActivityAdmissionError> {
+    ) -> Result<MvActivityPermit, MvActivityAdmissionError> {
         let mut ticket = self
             .request(target, owner)
             .map_err(|_| MvActivityAdmissionError::Stopping)?;
@@ -236,7 +236,7 @@ pub struct MvActivityTicket {
 
 impl MvActivityTicket {
     /// Acquires only when this ticket is the head of its target's FIFO queue.
-    pub fn try_acquire(&mut self) -> Result<Option<MvActivityLease>, MvActivityGateError> {
+    pub fn try_acquire(&mut self) -> Result<Option<MvActivityPermit>, MvActivityGateError> {
         if self.claimed {
             return Ok(None);
         }
@@ -276,7 +276,7 @@ impl MvActivityTicket {
         });
         self.claimed = true;
         inner.changed.notify_all();
-        Ok(Some(MvActivityLease {
+        Ok(Some(MvActivityPermit {
             inner: Arc::downgrade(&inner),
             target: self.target.clone(),
             ticket_id: self.ticket_id,
@@ -290,7 +290,7 @@ impl MvActivityTicket {
     pub fn acquire_waiting(
         &mut self,
         cancelled: impl Fn() -> bool,
-    ) -> Result<Option<MvActivityLease>, MvActivityGateError> {
+    ) -> Result<Option<MvActivityPermit>, MvActivityGateError> {
         if self.claimed {
             return Ok(None);
         }
@@ -334,7 +334,7 @@ impl MvActivityTicket {
                 });
                 self.claimed = true;
                 inner.changed.notify_all();
-                return Ok(Some(MvActivityLease {
+                return Ok(Some(MvActivityPermit {
                     inner: Arc::downgrade(&inner),
                     target: self.target.clone(),
                     ticket_id: self.ticket_id,
@@ -356,7 +356,7 @@ impl MvActivityTicket {
     pub async fn acquire_waiting_async(
         &mut self,
         cancelled: impl Future<Output = ()>,
-    ) -> Result<Option<MvActivityLease>, MvActivityGateError> {
+    ) -> Result<Option<MvActivityPermit>, MvActivityGateError> {
         if self.claimed {
             return Ok(None);
         }
@@ -405,20 +405,20 @@ impl Drop for MvActivityTicket {
 }
 
 /// Exclusive ownership of one MV activity slot. Dropping it releases the slot.
-pub struct MvActivityLease {
+pub struct MvActivityPermit {
     inner: Weak<GateInner>,
     target: CanonicalMvTarget,
     ticket_id: u64,
     cancellation: Option<QueryCancellationView>,
 }
 
-impl MvActivityLease {
+impl MvActivityPermit {
     pub fn cancellation(&self) -> Option<QueryCancellationView> {
         self.cancellation.clone()
     }
 }
 
-impl Drop for MvActivityLease {
+impl Drop for MvActivityPermit {
     fn drop(&mut self) {
         let Some(inner) = self.inner.upgrade() else {
             return;

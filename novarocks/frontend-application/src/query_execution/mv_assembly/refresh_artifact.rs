@@ -72,7 +72,7 @@ pub(crate) struct MvFirstRefreshLogicalContext {
 /// Application envelope for a join first-refresh artifact.
 ///
 /// The canonical SELECT is deliberately not compiled until activation, after
-/// the frontend has retained the exact planning lease and admitted the query
+/// the frontend has retained the exact planning pin and admitted the query
 /// execution.  Carrying only immutable refresh facts here prevents an
 /// unscoped logical plan from outliving the request-local table bindings that
 /// must prepare its scans.

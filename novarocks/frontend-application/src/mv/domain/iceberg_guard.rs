@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorInstanceId,
+    ConnectorControlPlanningPin, ConnectorControlResolver, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableObjectCaptureRequest,
     ConnectorTableObjectSelector, ConnectorTableResolution,
 };
@@ -82,7 +82,7 @@ pub fn reject_if_iceberg_mv_table_with_ports(
         None,
         novarocks_spi::connector::ConnectorStopOwner::new().view(),
     )?;
-    reject_if_iceberg_mv_table_with_planning_lease_and_context(
+    reject_if_iceberg_mv_table_with_planning_pin_and_context(
         storage_observation,
         &exact_lease,
         readiness,
@@ -96,9 +96,9 @@ pub fn reject_if_iceberg_mv_table_with_ports(
 /// and request context. Query-scoped callers use this form so any vended REST
 /// response contributes to the same attempt collector rather than reopening
 /// metadata under an unbound control-only context.
-pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
+pub fn reject_if_iceberg_mv_table_with_planning_pin_and_context(
     _storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
-    exact_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorControlPlanningPin,
     readiness: &crate::mv::domain::readiness::MvReadinessPort,
     target: &TargetBackend,
     mutation: IcebergMvUserMutation,
@@ -112,10 +112,10 @@ pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
         .map_err(|error| format!("parse Iceberg catalog identity for MV guard: {error}"))?;
     if exact_lease.binding().descriptor().instance_id != instance_id {
         return Err(
-            "MV mutation guard planning lease does not match the target connector".to_string(),
+            "MV mutation guard planning pin does not match the target connector".to_string(),
         );
     }
-    let context = crate::connector::context_for_planning_lease(exact_lease, context)?;
+    let context = crate::connector::context_for_planning_pin(exact_lease, context)?;
     let identity = ConnectorTableIdentity {
         instance_id,
         namespace: Arc::from(target.namespace.as_str()),
@@ -180,9 +180,9 @@ pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
 }
 
 /// Same exact lease/marker/LegacyFormat guard after direct physical awaits.
-pub(crate) async fn reject_if_iceberg_mv_table_with_planning_lease_and_context_async(
+pub(crate) async fn reject_if_iceberg_mv_table_with_planning_pin_and_context_async(
     _storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
-    exact_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorControlPlanningPin,
     readiness: &crate::mv::domain::readiness::MvReadinessPort,
     target: &TargetBackend,
     mutation: IcebergMvUserMutation,
@@ -199,10 +199,10 @@ pub(crate) async fn reject_if_iceberg_mv_table_with_planning_lease_and_context_a
     })?;
     if exact_lease.binding().descriptor().instance_id != instance_id {
         return Err(super::readiness::application_error(
-            "MV mutation guard planning lease does not match the target connector",
+            "MV mutation guard planning pin does not match the target connector",
         ));
     }
-    let context = crate::connector::context_for_planning_lease_typed(exact_lease, context)
+    let context = crate::connector::context_for_planning_pin_typed(exact_lease, context)
         .map_err(super::readiness::connector_application_error)?;
     let identity = ConnectorTableIdentity {
         instance_id,
@@ -233,9 +233,9 @@ pub(crate) async fn reject_if_iceberg_mv_table_with_planning_lease_and_context_a
 }
 
 /// Same original guard algorithm, with the selected generation's governed binding CPU.
-pub(crate) async fn reject_if_iceberg_mv_table_with_governed_planning_lease_and_context_async(
+pub(crate) async fn reject_if_iceberg_mv_table_with_governed_planning_pin_and_context_async(
     _storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
-    exact_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorControlPlanningPin,
     readiness: &crate::mv::domain::readiness::MvReadinessPort,
     target: &TargetBackend,
     mutation: IcebergMvUserMutation,
@@ -253,10 +253,10 @@ pub(crate) async fn reject_if_iceberg_mv_table_with_governed_planning_lease_and_
     })?;
     if exact_lease.binding().descriptor().instance_id != instance_id {
         return Err(super::readiness::application_error(
-            "MV mutation guard planning lease does not match the target connector",
+            "MV mutation guard planning pin does not match the target connector",
         ));
     }
-    let context = crate::connector::context_for_planning_lease_typed(exact_lease, context)
+    let context = crate::connector::context_for_planning_pin_typed(exact_lease, context)
         .map_err(super::readiness::connector_application_error)?;
     let identity = ConnectorTableIdentity {
         instance_id,
@@ -290,7 +290,7 @@ pub(crate) async fn reject_if_iceberg_mv_table_with_governed_planning_lease_and_
 }
 
 async fn reject_bound_iceberg_mv_table_async(
-    exact_lease: &ConnectorControlPlanningLease,
+    exact_lease: &ConnectorControlPlanningPin,
     readiness: &crate::mv::domain::readiness::MvReadinessPort,
     target: &TargetBackend,
     mutation: IcebergMvUserMutation,

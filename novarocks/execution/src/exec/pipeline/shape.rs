@@ -21,11 +21,11 @@
 //! custom credited/asynchronous operator may implement StepOperator directly.
 
 use super::{
+    driver_step::DriverStep,
     input::{AcceptedInput, InputPreparationFailure, PreparedInput, RawInput},
     step::{AdmissionNext, InputResult, NextStep, StepResult},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 /// Normal downstream demand withdrawal can stop data work independently of
 /// blocked input/output or the turn's row allowance. It is not a Task verdict
@@ -53,23 +53,23 @@ pub trait StepOperator: Send {
         state: &crate::runtime::runtime_state::RuntimeState,
         input: RawInput,
     ) -> InputResult {
-        super::step_context::with_test_step(state, |ctx| self.try_push(ctx, input))
+        super::driver_step::with_test_step(state, |ctx| self.try_push(ctx, input))
     }
     #[cfg(test)]
     fn drive_for_test(
         &mut self,
         state: &crate::runtime::runtime_state::RuntimeState,
     ) -> ExecutionResult<StepResult> {
-        super::step_context::with_test_step(state, |ctx| self.drive(ctx))
+        super::driver_step::with_test_step(state, |ctx| self.drive(ctx))
     }
     #[cfg(test)]
     fn finish_for_test(
         &mut self,
         state: &crate::runtime::runtime_state::RuntimeState,
     ) -> ExecutionResult<()> {
-        super::step_context::with_test_step(state, |ctx| self.finish(ctx))
+        super::driver_step::with_test_step(state, |ctx| self.finish(ctx))
     }
-    fn poll_control(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, _ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         Ok(ControlStep::Active)
     }
     /// Installed control endpoints keep their identity through retirement.
@@ -81,7 +81,7 @@ pub trait StepOperator: Send {
     /// overrides this to acquire its finite input overlap before production.
     fn reserve_upstream(
         &mut self,
-        _ctx: &mut StepContext<'_>,
+        _ctx: &mut DriverStep<'_>,
     ) -> ExecutionResult<super::step::UpstreamPull> {
         Ok(super::step::UpstreamPull::Uncovered)
     }
@@ -89,8 +89,8 @@ pub trait StepOperator: Send {
     /// Ordinary producers retain their own funding and finish in one call.
     fn drive_with_root_input(
         &mut self,
-        ctx: &mut StepContext<'_>,
-        _input: &crate::runtime::fragment::io::RootInputPermit,
+        ctx: &mut DriverStep<'_>,
+        _input: &crate::runtime::task::io::RootInputPermit,
     ) -> ExecutionResult<super::step::RootStep> {
         self.drive(ctx).map(super::step::RootStep::Complete)
     }
@@ -100,12 +100,12 @@ pub trait StepOperator: Send {
     fn initial_step(&self) -> NextStep {
         NextStep::Runnable
     }
-    fn try_push(&mut self, ctx: &mut StepContext<'_>, input: RawInput) -> InputResult;
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult>;
+    fn try_push(&mut self, ctx: &mut DriverStep<'_>, input: RawInput) -> InputResult;
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult>;
     /// Signal input EOS once. Payload-producing finalization advances only
     /// through admitted drive. An explicit no-payload EOS control may finish
     /// data work without another output/root grant; physical exit is separate.
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()>;
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()>;
 }
 
 /// Preparation state, including any scratch/plan, belongs to this receiver.
@@ -139,14 +139,14 @@ pub trait InputPreparation<K>: Send {
     /// every later allocation performed by preparation or calculation.
     fn admission(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: &RawInput,
         kernel: &K,
     ) -> ExecutionResult<Option<AdmissionNext>>;
     fn accept(&mut self, input: RawInput) -> AcceptedInput;
     fn prepare(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: AcceptedInput,
         kernel: &K,
     ) -> Result<PreparationStep, InputPreparationFailure>;
@@ -195,7 +195,7 @@ impl<P> ReceiverSlot<P> {
     /// its current computation can accept another input before entering here.
     pub fn try_accept<K>(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: RawInput,
         kernel: &K,
     ) -> InputResult
@@ -232,7 +232,7 @@ impl<P> ReceiverSlot<P> {
 
     pub fn prepare<K>(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         kernel: &K,
     ) -> ExecutionResult<ReceiverPreparation>
     where
@@ -278,10 +278,10 @@ impl ReceiverSlot<RootInputPreparation> {
     /// explicit input continuation, not discard RawInput and its permit together.
     pub(crate) fn take_original_for_exit(
         &mut self,
-    ) -> Option<crate::runtime::fragment::io::RootResultInput> {
+    ) -> Option<crate::runtime::task::io::RootResultInput> {
         self.take_accepted_for_exit().map(|input| {
             let (chunk, permit) = input.into_exit_parts();
-            crate::runtime::fragment::io::RootResultInput::new(
+            crate::runtime::task::io::RootResultInput::new(
                 chunk,
                 permit.expect("accepted Root input retains its original permit"),
             )
@@ -316,12 +316,12 @@ pub trait TransformKernel: Send {
     /// kernel cursor alone is not such a proof.
     fn poll_receiver_control(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         _receiver_empty: bool,
     ) -> ExecutionResult<ControlStep> {
         self.poll_control(ctx)
     }
-    fn poll_control(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, _ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         Ok(ControlStep::Active)
     }
     fn control_observable(&self) -> Option<std::sync::Arc<super::schedule::observer::Observable>> {
@@ -334,26 +334,26 @@ pub trait TransformKernel: Send {
     /// metadata is public here; prepared columns are available in apply.
     fn admission(
         &self,
-        _ctx: &mut StepContext<'_>,
+        _ctx: &mut DriverStep<'_>,
         _input: &RawInput,
     ) -> ExecutionResult<Option<AdmissionNext>> {
         Ok(None)
     }
     fn apply(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult>;
-    fn drive(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, _ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         Ok(StepResult::new(None, NextStep::NeedInput, 0))
     }
     /// Once-only EOS metadata. No input is accepted, columns read, storage
     /// materialized, or output produced here. A kernel with final output must
     /// retain the conservative result and use finish/drive after admission.
-    fn end_input(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<TransformInputEnd> {
+    fn end_input(&mut self, _ctx: &mut DriverStep<'_>) -> ExecutionResult<TransformInputEnd> {
         Ok(TransformInputEnd::NeedsOutputStep)
     }
-    fn finish(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, _ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         Ok(StepResult::new(None, NextStep::Finished, 0))
     }
 }
@@ -368,7 +368,7 @@ pub struct Transform<K, P> {
     finish_started: bool,
     end_input_started: bool,
     next: NextStep,
-    failure: Option<crate::runtime::fragment::ExecutionFailure>,
+    failure: Option<crate::runtime::task::ExecutionFailure>,
 }
 impl<K: TransformKernel, P: InputPreparation<K>> Transform<K, P> {
     pub fn new(kernel: K, preparation: P) -> Self {
@@ -399,14 +399,14 @@ impl<K: TransformKernel, P: InputPreparation<K>> Transform<K, P> {
     }
     fn stop_work(
         &mut self,
-        failure: crate::runtime::fragment::ExecutionFailure,
-    ) -> crate::runtime::fragment::ExecutionFailure {
+        failure: crate::runtime::task::ExecutionFailure,
+    ) -> crate::runtime::task::ExecutionFailure {
         let failure = self.failure.get_or_insert(failure).clone();
         self.next = NextStep::Finished;
         self.needs_input = false;
         failure
     }
-    fn end_input_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn end_input_control(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         if !self.finishing
             || !self.needs_input
             || self.receiver.is_occupied()
@@ -417,10 +417,9 @@ impl<K: TransformKernel, P: InputPreparation<K>> Transform<K, P> {
         }
         // Save the once-only phase before invoking the actual kernel author.
         self.end_input_started = true;
-        let end = ctx.perform(
-            crate::runtime::fragment::PipelineOperation::Finishing,
-            |ctx| self.kernel.end_input(ctx),
-        )?;
+        let end = ctx.perform(crate::runtime::task::PipelineOperation::Finishing, |ctx| {
+            self.kernel.end_input(ctx)
+        })?;
         match end {
             TransformInputEnd::NeedsOutputStep => Ok(ControlStep::Active),
             TransformInputEnd::Finished => {
@@ -446,7 +445,7 @@ impl<K: TransformKernel, P: InputPreparation<K>> StepOperator for Transform<K, P
         self.kernel.is_mark_join_probe()
     }
 
-    fn poll_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -485,7 +484,7 @@ impl<K: TransformKernel, P: InputPreparation<K>> StepOperator for Transform<K, P
     fn initial_step(&self) -> NextStep {
         self.next.clone()
     }
-    fn try_push(&mut self, ctx: &mut StepContext<'_>, input: RawInput) -> InputResult {
+    fn try_push(&mut self, ctx: &mut DriverStep<'_>, input: RawInput) -> InputResult {
         if let Some(failure) = &self.failure {
             return InputResult::Rejected {
                 input,
@@ -498,7 +497,7 @@ impl<K: TransformKernel, P: InputPreparation<K>> StepOperator for Transform<K, P
         if self.finishing || matches!(self.next, NextStep::Finished) {
             return InputResult::Rejected {
                 input,
-                failure: crate::runtime::fragment::ExecutionFailure::from_domain(
+                failure: crate::runtime::task::ExecutionFailure::from_domain(
                     hydration::ReceiverContractFailure::InputAfterFinish,
                 ),
             };
@@ -517,7 +516,7 @@ impl<K: TransformKernel, P: InputPreparation<K>> StepOperator for Transform<K, P
         result
     }
 
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
         }
@@ -530,7 +529,7 @@ impl<K: TransformKernel, P: InputPreparation<K>> StepOperator for Transform<K, P
         {
             return Ok(StepResult::new(None, self.next.clone(), 0));
         }
-        use crate::runtime::fragment::PipelineOperation;
+        use crate::runtime::task::PipelineOperation;
         let result = (|| -> ExecutionResult<StepResult> {
             let prepared = ctx.perform(PipelineOperation::Preparation, |ctx| {
                 self.receiver.prepare(ctx, &self.kernel)
@@ -559,7 +558,7 @@ impl<K: TransformKernel, P: InputPreparation<K>> StepOperator for Transform<K, P
             Err(failure) => Err(self.stop_work(failure)),
         }
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
         }
@@ -599,7 +598,7 @@ mod tests {
     use super::*;
     use crate::{
         exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema},
-        exec::pipeline::step_context::TurnWork,
+        exec::pipeline::driver_step::TurnWork,
         runtime::runtime_state::RuntimeErrorState,
     };
     use arrow::{
@@ -647,7 +646,7 @@ mod tests {
     impl<K: Send> InputPreparation<K> for Prepare {
         fn admission(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: &RawInput,
             _: &K,
         ) -> ExecutionResult<Option<AdmissionNext>> {
@@ -659,7 +658,7 @@ mod tests {
         }
         fn prepare(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             input: AcceptedInput,
             _: &K,
         ) -> Result<PreparationStep, InputPreparationFailure> {
@@ -687,7 +686,7 @@ mod tests {
     impl TransformKernel for Kernel {
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             input: PreparedInput,
         ) -> ExecutionResult<StepResult> {
             self.counts.applied.fetch_add(1, Ordering::SeqCst);
@@ -695,10 +694,10 @@ mod tests {
             assert!(permit.is_none());
             Ok(StepResult::new(Some(chunk), NextStep::NeedInput, 2))
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             Ok(StepResult::new(None, NextStep::Finished, 0))
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             self.counts.finished.fetch_add(1, Ordering::SeqCst);
             Ok(StepResult::new(None, NextStep::Runnable, 0))
         }
@@ -729,7 +728,7 @@ mod tests {
         let mut work = TurnWork::new(NonZeroU64::MIN, 10);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
         let original = chunk();
         let address = original.columns()[0].as_ref() as *const _;
         let mut input = RawInput::new(original, None);
@@ -757,7 +756,7 @@ mod tests {
         let mut work = TurnWork::new(NonZeroU64::MIN, 10);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
         assert!(matches!(
             operator.try_push(&mut ctx, RawInput::new(chunk(), None)),
             InputResult::Accepted(Ok(_))
@@ -822,7 +821,7 @@ mod tests {
         let mut work = TurnWork::new(NonZeroU64::MIN, 10);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
         assert!(matches!(
             operator.try_push(&mut ctx, RawInput::new(chunk(), None)),
             InputResult::Accepted(_)
@@ -854,27 +853,27 @@ mod tests {
     fn work_failure_stops_reentry_and_rejects_the_same_unaccepted_raw_without_a_task_decision() {
         struct FailingKernel {
             calls: Arc<AtomicUsize>,
-            original: crate::runtime::fragment::ExecutionFailure,
+            original: crate::runtime::task::ExecutionFailure,
         }
         impl TransformKernel for FailingKernel {
             fn apply(
                 &mut self,
-                _: &mut StepContext<'_>,
+                _: &mut DriverStep<'_>,
                 _: PreparedInput,
             ) -> ExecutionResult<StepResult> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Err(self.original.clone())
             }
-            fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
                 panic!("a failed input must never enter a continuation");
             }
-            fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
                 panic!("a failed input must never finalize");
             }
         }
         let counts = Arc::new(Counts::default());
         let calls = Arc::new(AtomicUsize::new(0));
-        let original = crate::runtime::fragment::ExecutionFailure::from(
+        let original = crate::runtime::task::ExecutionFailure::from(
             novarocks_functions::KernelFailure::ResourceExhausted,
         );
         let mut operator = Transform::new(
@@ -893,7 +892,7 @@ mod tests {
         let mut work = TurnWork::new(NonZeroU64::MIN, 10);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
         assert!(matches!(
             operator.try_push(&mut ctx, RawInput::new(chunk(), None)),
             InputResult::Accepted(Ok(_))
@@ -924,7 +923,7 @@ mod tests {
     impl TransformKernel for WaitingKernel {
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             input: PreparedInput,
         ) -> ExecutionResult<StepResult> {
             self.counts.applied.fetch_add(1, Ordering::SeqCst);
@@ -939,11 +938,11 @@ mod tests {
                 2,
             ))
         }
-        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             self.counts.applied.fetch_add(1, Ordering::SeqCst);
             Ok(StepResult::new(Some(chunk()), NextStep::NeedInput, 0))
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             self.counts.finished.fetch_add(1, Ordering::SeqCst);
             Ok(StepResult::new(None, NextStep::Finished, 0))
         }
@@ -968,7 +967,7 @@ mod tests {
         let mut turn = TurnWork::new(NonZeroU64::MIN, 10);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut turn, &mut value_conversions);
         assert!(matches!(
             operator.try_push(&mut ctx, RawInput::new(chunk(), None)),
             InputResult::Accepted(Ok(_))
@@ -1007,7 +1006,7 @@ mod tests {
     impl TransformKernel for NoOutputEnd {
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             input: PreparedInput,
         ) -> ExecutionResult<StepResult> {
             self.counts.applied.fetch_add(1, Ordering::SeqCst);
@@ -1017,11 +1016,11 @@ mod tests {
                 2,
             ))
         }
-        fn end_input(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<TransformInputEnd> {
+        fn end_input(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<TransformInputEnd> {
             self.ends.fetch_add(1, Ordering::SeqCst);
             Ok(TransformInputEnd::Finished)
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             panic!("no-output EOS must not invoke payload finalization")
         }
     }
@@ -1045,7 +1044,7 @@ mod tests {
         let mut turn = TurnWork::new(NonZeroU64::MIN, 10);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut turn, &mut value_conversions);
         assert!(matches!(
             operator.try_push(&mut ctx, RawInput::new(chunk(), None)),
             InputResult::Accepted(Ok(_))
@@ -1087,12 +1086,12 @@ mod tests {
     impl TransformKernel for ProducingEnd {
         fn apply(
             &mut self,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
             _: PreparedInput,
         ) -> ExecutionResult<StepResult> {
             panic!("this finalizer has no input")
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(StepResult::new(Some(chunk()), NextStep::Finished, 2))
         }
@@ -1114,7 +1113,7 @@ mod tests {
         let mut turn = TurnWork::new(NonZeroU64::MIN, 10);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut turn, &mut value_conversions);
         operator.finish(&mut ctx).unwrap();
         for _ in 0..3 {
             assert!(matches!(
@@ -1138,7 +1137,7 @@ mod tests {
         impl TransformKernel for Boundary {
             fn poll_receiver_control(
                 &mut self,
-                _: &mut StepContext<'_>,
+                _: &mut DriverStep<'_>,
                 empty: bool,
             ) -> ExecutionResult<ControlStep> {
                 self.observations.lock().unwrap().push(empty);
@@ -1146,7 +1145,7 @@ mod tests {
             }
             fn apply(
                 &mut self,
-                _: &mut StepContext<'_>,
+                _: &mut DriverStep<'_>,
                 _: PreparedInput,
             ) -> ExecutionResult<StepResult> {
                 Ok(StepResult::new(None, NextStep::NeedInput, 0))
@@ -1168,7 +1167,7 @@ mod tests {
         let control = RuntimeErrorState::default();
         let mut turn = TurnWork::new(NonZeroU64::MIN, 10);
         let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut turn, &mut conversions);
+        let mut ctx = DriverStep::new(&control, &mut turn, &mut conversions);
         operator.poll_control(&mut ctx).unwrap();
         assert!(matches!(
             operator.try_push(&mut ctx, RawInput::new(chunk(), None)),

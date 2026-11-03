@@ -17,7 +17,7 @@
 
 // Included as a child of attempt_handoff; all product payloads stay concrete.
 use super::*;
-use crate::native::fragment_transport::{
+use crate::native::task_result_transport::{
     DynamicFilterRead, DynamicFilterReadError, FinalTaskInfoRead, TaskResultTransport,
 };
 use crate::native::task_transport::TaskAckIntakeHandle;
@@ -34,15 +34,15 @@ use crate::task_execution::{
 use novarocks_coordination_contract::MonotonicClock;
 use novarocks_execution_contract::root_result::RootResultEnd;
 use novarocks_execution_contract::{
-    DomainVersion, OperationKind, OperationOutcome, QueryContextConvergenceReceipt,
-    QueryContextConvergenceState, QueryContextConvergenceVersion, QueryContextReceipt,
-    QueryContextRef, QueryContextState, ReleaseOutcome,
+    DomainVersion, OperationKind, OperationOutcome, ParticipationConvergenceReceipt,
+    ParticipationConvergenceState, ParticipationConvergenceVersion, ParticipationReceipt,
+    ParticipationRef, ParticipationState, ReleaseOutcome,
 };
 use novarocks_query_application::api::{
     ComputationObservationBudgets, ComputationReadyToken, InternalConsumerActivation,
 };
 use novarocks_query_application::coordination::{
-    AbortQueryContextEffectPort, LogicalExecutionActorConfig,
+    AbortParticipationEffectPort, LogicalExecutionActorConfig,
 };
 use novarocks_query_application::test_support::LogicalExecutionTestHarness;
 use novarocks_task_codec::operation::{CoveredStatusStreamEvent, CoveredStatusStreamFact};
@@ -90,7 +90,7 @@ pub(crate) struct OriginalAttempt {
     clock: Arc<ManualClock>,
     pub(crate) plan: PlanSeal,
     pub(crate) root: TaskIdentity,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     pub(crate) logical: LogicalExecutionTestHarness,
     // This stands for the original Native active behavior's strong custody.
     pub(crate) native_credentials: Arc<AttemptCredentialStorage>,
@@ -221,7 +221,7 @@ impl OriginalAttempt {
                 (round, acks, Some(release), None, clock, protocol, facts)
             };
         let root = round.root_task();
-        let context = *round.execution().graph().contexts().next().unwrap();
+        let participation = *round.execution().graph().participations().next().unwrap();
         let (control, work, capacity, business) = if let Some((control, work, capacity)) = original
         {
             (control, work, capacity, None)
@@ -259,15 +259,15 @@ impl OriginalAttempt {
             execution,
             description.effect(),
             NonZeroUsize::new(8).unwrap(),
-            vec![context],
+            vec![participation],
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             work,
             stage,
         )
         .unwrap()
-        .with_abort_query_context_effect_port(
-            abort as Arc<dyn AbortQueryContextEffectPort>,
+        .with_abort_participation_effect_port(
+            abort as Arc<dyn AbortParticipationEffectPort>,
             NonZeroUsize::new(2).unwrap(),
         );
         let mut logical = LogicalExecutionTestHarness::install_internal(
@@ -278,7 +278,7 @@ impl OriginalAttempt {
             Arc::clone(&clock) as Arc<dyn MonotonicClock>,
             ComputationObservationBudgets::new(Duration::from_secs(1), Duration::from_secs(5)),
             execution,
-            vec![context],
+            vec![participation],
         )
         .unwrap();
         logical.activate_initial().await.unwrap();
@@ -310,7 +310,7 @@ impl OriginalAttempt {
                 clock,
                 plan,
                 root,
-                context,
+                participation,
                 logical,
                 native_credentials,
                 diagnostics,
@@ -377,7 +377,7 @@ impl OriginalAttempt {
     }
     fn settle_original_release(&mut self) {
         if let Some(release) = self.release.as_ref() {
-            let OperationIntent::ReleaseQueryContext(request) = release else {
+            let OperationIntent::ReleaseParticipation(request) = release else {
                 unreachable!("the fixture returns its original Release")
             };
             // A diagnostic consumer can already have settled this exact
@@ -385,18 +385,18 @@ impl OriginalAttempt {
             if !self
                 .round
                 .execution()
-                .owner(self.context)
+                .owner(self.participation)
                 .unwrap()
                 .is_released()
             {
                 self.acks.publish(OperationAcknowledgement::new(
                     release.operation_id(),
-                    OperationKind::ReleaseQueryContext,
+                    OperationKind::ReleaseParticipation,
                     OperationOutcome::Accepted,
                     AckPayload::Release {
-                        receipt: QueryContextReceipt::new(
-                            request.context(),
-                            QueryContextState::TerminalRetained,
+                        receipt: ParticipationReceipt::new(
+                            request.participation(),
+                            ParticipationState::TerminalRetained,
                         ),
                         outcome: ReleaseOutcome::Released,
                         runtime_filter: None,
@@ -433,7 +433,7 @@ impl OriginalAttempt {
             assert!(
                 self.round
                     .execution()
-                    .owner(self.context)
+                    .owner(self.participation)
                     .unwrap()
                     .is_released()
             );
@@ -453,14 +453,14 @@ impl OriginalAttempt {
             .execution_mut()
             .apply_covered_entries(vec![ObservationIntakeEntry::Frame(Box::new(
                 ObservationFrame::Covered {
-                    context: self.context,
+                    participation: self.participation,
                     generation: 1,
                     event: CoveredStatusStreamEvent {
-                        fact: CoveredStatusStreamFact::ContextConvergence(
-                            QueryContextConvergenceReceipt::new(
-                                self.context,
-                                QueryContextConvergenceVersion::FIRST,
-                                QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+                        fact: CoveredStatusStreamFact::ParticipationConvergence(
+                            ParticipationConvergenceReceipt::new(
+                                self.participation,
+                                ParticipationConvergenceVersion::FIRST,
+                                ParticipationConvergenceState::WorkerStoppedAndParticipationFenced,
                             ),
                         ),
                         source_revision: None,
@@ -470,7 +470,7 @@ impl OriginalAttempt {
             .unwrap();
         assert!(self.round.attempt_drained());
         assert!(self.round.pumps_closed());
-        assert!(self.round.execution().worker_contexts_stopped());
+        assert!(self.round.execution().worker_participations_stopped());
         // A Native failure may already have consumed the original permit.
         // Only an unconcluded attempt needs abandonment; finish_until drops
         // any retained permit without choosing another logical conclusion.
@@ -485,7 +485,7 @@ impl OriginalAttempt {
             self.logical.abandon_running_attempt();
         }
         self.logical
-            .observe_worker_stopped_and_context_fenced(self.context)
+            .observe_worker_stopped_and_participation_fenced(self.participation)
             .await
             .unwrap();
         self.logical

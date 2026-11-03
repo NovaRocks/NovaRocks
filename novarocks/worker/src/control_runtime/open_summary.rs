@@ -22,13 +22,15 @@
 #[cfg(test)]
 use super::source_positions::ReapedPosition;
 use super::{
-    actors::{ContextMessage, WorkerActor, WorkerMessage},
+    actors::{ParticipationMessage, WorkerActor, WorkerMessage},
     failure::ScopePublicationsDrained,
     lifecycle_read::TaskLifetime,
 };
 use crate::task_proposal_ingress::{IngressError, TaskProposalIngress};
 use novarocks_control_runtime::{
-    driver::{ActorRegistration, ActorRuntime, DriverError, InputPhase, InputRole},
+    actor_turn::{
+        ActorRegistration, ActorRuntime, ActorTurnError, InputPhase, StandingInputObligation,
+    },
     transaction::RuntimeError,
 };
 use novarocks_control_runtime_core::{
@@ -36,7 +38,7 @@ use novarocks_control_runtime_core::{
     identity::{ActorId, Generation, InputId, ScopedWorkRef},
 };
 use novarocks_execution_contract::TaskIdentity;
-use novarocks_worker_protocol::{context::ContextInput, proposal_summary::SourceId};
+use novarocks_worker_protocol::{participation::ParticipationInput, proposal_summary::SourceId};
 use std::{mem::ManuallyDrop, sync::Arc};
 
 /// The original Task lifetime funds this one reusable neutral input. It owns
@@ -46,7 +48,7 @@ pub(crate) const OPEN_SUMMARY_STORAGE: crate::control_runtime_policy::StorageNee
         requests: 0,
         inputs: 1,
         batches: 1,
-        effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+        effects: crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
         cuts: 0,
         replies: 0,
         completions: 0,
@@ -56,7 +58,7 @@ pub(crate) const OPEN_SUMMARY_STORAGE: crate::control_runtime_policy::StorageNee
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OpenSummaryError {
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
     Ingress(IngressError),
     Runtime(RuntimeError),
     Busy,
@@ -67,9 +69,9 @@ pub(crate) enum OpenSummaryError {
     WrongLifetime,
     WorkStillLive,
 }
-impl From<DriverError> for OpenSummaryError {
-    fn from(error: DriverError) -> Self {
-        Self::Driver(error)
+impl From<ActorTurnError> for OpenSummaryError {
+    fn from(error: ActorTurnError) -> Self {
+        Self::ActorTurn(error)
     }
 }
 impl From<IngressError> for OpenSummaryError {
@@ -111,12 +113,12 @@ pub(crate) struct TaskOpenSummaryInbox {
     task: TaskIdentity,
     work: ScopedWorkRef,
     ingress: Arc<TaskProposalIngress>,
-    input: InputRole<WorkerActor>,
+    input: StandingInputObligation<WorkerActor>,
     delivered: Option<Delivered>,
     closed: bool,
 }
 impl TaskOpenSummaryInbox {
-    /// The trusted Task issuer supplies its existing InputRole, original Task
+    /// The trusted Task issuer supplies its existing StandingInputObligation, original Task
     /// Work, and the same source FIFO as the Task's causal authors. This method
     /// reserves nothing and creates no alternate protocol generation state.
     pub(crate) fn from_admitted(
@@ -126,8 +128,8 @@ impl TaskOpenSummaryInbox {
         task: TaskIdentity,
         work: ScopedWorkRef,
         ingress: Arc<TaskProposalIngress>,
-        input: InputRole<WorkerActor>,
-    ) -> Result<Self, (OpenSummaryError, InputRole<WorkerActor>)> {
+        input: StandingInputObligation<WorkerActor>,
+    ) -> Result<Self, (OpenSummaryError, StandingInputObligation<WorkerActor>)> {
         match input.in_flight() {
             Ok(None) => Ok(Self {
                 runtime,
@@ -152,7 +154,7 @@ impl TaskOpenSummaryInbox {
         generation: Generation,
     ) -> Result<Option<InputId>, OpenSummaryError> {
         if self.closed {
-            return Err(DriverError::Closed.into());
+            return Err(ActorTurnError::Closed.into());
         }
         if self.delivered.is_some() || self.input.in_flight()?.is_some() {
             return Ok(None);
@@ -166,10 +168,10 @@ impl TaskOpenSummaryInbox {
         assert!(candidates.next().is_none(), "two fixed source candidates");
         // End the borrowed candidate iterator before moving the same summary.
         drop(candidates);
-        let message = WorkerMessage::Context(ContextMessage::Command {
+        let message = WorkerMessage::Participation(ParticipationMessage::Command {
             work: self.work,
             request: None,
-            command: ContextInput::Summary {
+            command: ParticipationInput::Summary {
                 task: self.task,
                 generation,
                 cut: None,
@@ -244,7 +246,7 @@ impl TaskOpenSummaryInbox {
             return Ok(progress);
         }
         if let Some(input) = self.input.in_flight()? {
-            const AUTHOR_BOUND: usize = 2 * super::actors::ContextActor::MAX_STEP_ACTIONS + 2;
+            const AUTHOR_BOUND: usize = 2 * super::actors::ParticipationActor::MAX_STEP_ACTIONS + 2;
             let authors = self
                 .runtime
                 .input_header_authors(self.actor, input, AUTHOR_BOUND)?;
@@ -255,9 +257,9 @@ impl TaskOpenSummaryInbox {
                     progress.retired_authors = authors;
                 }
                 Err(
-                    DriverError::InputStillQueued
-                    | DriverError::EffectsRemain
-                    | DriverError::ReservationsRemain,
+                    ActorTurnError::InputStillQueued
+                    | ActorTurnError::EffectsRemain
+                    | ActorTurnError::ReservationsRemain,
                 ) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -457,9 +459,9 @@ impl TaskOpenSummaryInbox {
                     progress.progressed = true;
                 }
                 Err(
-                    DriverError::InputStillQueued
-                    | DriverError::EffectsRemain
-                    | DriverError::ReservationsRemain,
+                    ActorTurnError::InputStillQueued
+                    | ActorTurnError::EffectsRemain
+                    | ActorTurnError::ReservationsRemain,
                 ) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -553,7 +555,7 @@ mod tests {
         identity::{ConsumerId, Tick},
         mailbox::InputClass,
     };
-    use novarocks_execution::runtime::fragment::ExecutionFailure;
+    use novarocks_execution::runtime::task::ExecutionFailure;
     use novarocks_execution_contract::{
         CancelReason, TaskConclusionProposal, TaskFailurePhase,
         failure::{FailureClass, FailureFact, FailureProjection, FailureReason, domain},
@@ -569,13 +571,20 @@ mod tests {
         let mut host = f.adopt_task_host(task, 1);
         host.admit_open_summary(&f.runtime).unwrap();
         assert!(host.open_summary_mut().is_some());
-        let count = f.runtime.role_inventory(actor(), None, 32).unwrap().len();
+        let count = f
+            .runtime
+            .standing_input_inventory(actor(), None, 32)
+            .unwrap()
+            .len();
         assert!(matches!(
             host.admit_open_summary(&f.runtime),
             Err(crate::control_runtime::task::TaskHostError::OpenSummaryAlreadyIssued)
         ));
         assert_eq!(
-            f.runtime.role_inventory(actor(), None, 32).unwrap().len(),
+            f.runtime
+                .standing_input_inventory(actor(), None, 32)
+                .unwrap()
+                .len(),
             count
         );
         let mut resources = host.into_resources();
@@ -583,7 +592,7 @@ mod tests {
         // events; the actual preparation reservation still belongs to the
         // fixture's admitted job until its real child exit at teardown.
         for command in [
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task,
                 result: Ok(CreationCost {
                     input_retained_bytes: 1,
@@ -591,7 +600,7 @@ mod tests {
                     structural_bytes: 1,
                 }),
             },
-            ContextInput::Installed { task },
+            ParticipationInput::Installed { task },
         ] {
             let input = f.send(command, None, InputClass::Lifecycle, 2);
             f.runtime.poll_one(Tick(1)).unwrap();
@@ -620,7 +629,7 @@ mod tests {
             &resources.host_calls,
             &f.ledger,
         );
-        // This unissued disposal is the original Context child, outside Task join.
+        // This unissued disposal is the original Participation child, outside Task join.
         let mut disposal_retired = false;
         for _ in 0..64 {
             if resources.disposal.retire_unused(&f.ledger).unwrap() {
@@ -758,7 +767,7 @@ mod tests {
             scope::WorkKind,
         };
         use novarocks_execution_contract::AbortCause;
-        use novarocks_worker_protocol::context::{ContextEffect, TaskCloseIntent};
+        use novarocks_worker_protocol::participation::{ParticipationEffect, TaskCloseIntent};
 
         fn commit(
             f: &mut Fixture,
@@ -791,7 +800,11 @@ mod tests {
             .pair_inventory(PairRoute::ConsumingOpen)
             .unwrap()
             .map(|p| p.key.address());
-        let roles = f.runtime.role_inventory(actor(), None, 256).unwrap().len();
+        let roles = f
+            .runtime
+            .standing_input_inventory(actor(), None, 256)
+            .unwrap()
+            .len();
         // Multiple notification/diagnostic deliveries still belong to the
         // original peer segment and cannot mint new first candidates.
         for _ in 0..4 {
@@ -806,7 +819,10 @@ mod tests {
             commit(&mut f, &mut open);
         }
         assert_eq!(
-            f.runtime.role_inventory(actor(), None, 256).unwrap().len(),
+            f.runtime
+                .standing_input_inventory(actor(), None, 256)
+                .unwrap()
+                .len(),
             roles
         );
         assert_eq!(
@@ -840,7 +856,7 @@ mod tests {
         assert_eq!(open.observe_core().unwrap(), Consumption::Consumed);
         let effects = f.drain(origin_input);
         assert!(effects.iter().any(|effect| matches!(effect,
-            super::super::actors::WorkerAction::Context(ContextEffect::PublishConclusion { source: Some(id), .. }) if *id == source)));
+            super::super::actors::WorkerAction::Participation(ParticipationEffect::PublishConclusion { source: Some(id), .. }) if *id == source)));
         open.finish_delivery().unwrap();
         assert!(
             !ingress
@@ -864,22 +880,32 @@ mod tests {
             assert_eq!(drops.load(Ordering::SeqCst), 0);
         }
         assert_eq!(
-            f.runtime.role_inventory(actor(), None, 256).unwrap().len(),
+            f.runtime
+                .standing_input_inventory(actor(), None, 256)
+                .unwrap()
+                .len(),
             roles
         );
 
-        // The real Context decision schedules a close generation. This
+        // The real Participation decision schedules a close generation. This
         // original finite close author pays for its cut and input positions.
-        let fenced = f.send(ContextInput::OwnerFenced, None, InputClass::Lifecycle, 2);
+        let fenced = f.send(
+            ParticipationInput::OwnerFenced,
+            None,
+            InputClass::Lifecycle,
+            2,
+        );
         f.runtime.poll_one(Tick(2)).unwrap();
         let fenced_effects = f.drain(fenced);
         let selected_close = |effects: &[super::super::actors::WorkerAction]| {
             effects.iter().find_map(|effect| match effect {
-                super::super::actors::WorkerAction::Context(ContextEffect::ApplyTaskClose {
-                    task: original,
-                    generation,
-                    intent,
-                }) if *original == task => Some((*generation, *intent)),
+                super::super::actors::WorkerAction::Participation(
+                    ParticipationEffect::ApplyTaskClose {
+                        task: original,
+                        generation,
+                        intent,
+                    },
+                ) if *original == task => Some((*generation, *intent)),
                 _ => None,
             })
         };
@@ -891,15 +917,20 @@ mod tests {
                         .iter()
                         .filter(|effect| matches!(
                             effect,
-                            super::super::actors::WorkerAction::Context(
-                                ContextEffect::WakeInternal
+                            super::super::actors::WorkerAction::Participation(
+                                ParticipationEffect::WakeInternal
                             )
                         ))
                         .count(),
                     1,
                     "the Actor retains the actual close cursor behind one prepaid wake"
                 );
-                let next = f.send(ContextInput::NextInternal, None, InputClass::Lifecycle, 2);
+                let next = f.send(
+                    ParticipationInput::NextInternal,
+                    None,
+                    InputClass::Lifecycle,
+                    2,
+                );
                 f.runtime.poll_one(Tick(2)).unwrap();
                 selected_close(&f.drain(next))
                     .expect("the real remaining close slice selects this original Task")
@@ -921,7 +952,7 @@ mod tests {
                         work_headers: 1,
                         inputs: 2,
                         batches: 2,
-                        effects: 2 * super::super::actors::ContextActor::MAX_STEP_ACTIONS,
+                        effects: 2 * super::super::actors::ParticipationActor::MAX_STEP_ACTIONS,
                         replies: 1,
                         ..OwnedSlotNeed::default()
                     },
@@ -1225,7 +1256,7 @@ mod tests {
         f.scope.fail().unwrap();
         assert_eq!(
             open.deliver_next(generation()),
-            Err(OpenSummaryError::Driver(DriverError::ActorFailed))
+            Err(OpenSummaryError::ActorTurn(ActorTurnError::ActorFailed))
         );
         assert_eq!(open.source_input(source).unwrap(), None);
         assert_eq!(
@@ -1237,10 +1268,10 @@ mod tests {
         assert_eq!(open.retire_unclaimed(), Err(OpenSummaryError::Busy));
         assert!(open.input.in_flight().unwrap().is_none());
         let rejected = open.delivered.as_ref().unwrap().rejected.as_ref().unwrap();
-        let WorkerMessage::Context(ContextMessage::Command {
+        let WorkerMessage::Participation(ParticipationMessage::Command {
             work,
             command:
-                ContextInput::Summary {
+                ParticipationInput::Summary {
                     task,
                     generation: epoch,
                     cut,

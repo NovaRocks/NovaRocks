@@ -19,7 +19,7 @@
 //! Plain retention cannot authorize new allocation or mint a byte receipt.
 
 use super::{ConnectorError, ConnectorErrorKind};
-use novarocks_resource_contract::{ExistingOwnerRetentionLease, RetentionPinError};
+use novarocks_resource_contract::{ExistingOwnerRetentionPin, RetentionPinError};
 use std::fmt;
 use std::sync::Arc;
 
@@ -33,7 +33,7 @@ pub trait ConnectorPayloadByteBudget: Send + Sync {
 
 enum Retention {
     Shared(Arc<dyn Send + Sync>),
-    Existing(ExistingOwnerRetentionLease),
+    Existing(ExistingOwnerRetentionPin),
     Budgeted(Arc<dyn ConnectorPayloadByteBudget>),
 }
 
@@ -84,7 +84,7 @@ impl ConnectorPayloadRetentionGuard {
         }
     }
     /// Move an original owner's existing pin; no new Arc allocation or pin.
-    pub fn from_existing_lease(lease: ExistingOwnerRetentionLease) -> Self {
+    pub fn from_existing_lease(lease: ExistingOwnerRetentionPin) -> Self {
         Self {
             holder: Retention::Existing(lease),
             lifetime: None,
@@ -163,7 +163,7 @@ mod tests {
             pins: Mutex::new(1),
             maximum: 3,
         });
-        let lease = ExistingOwnerRetentionLease::from_existing_pin(owner.clone(), [7, 3]);
+        let lease = ExistingOwnerRetentionPin::from_existing_pin(owner.clone(), [7, 3]);
         let guard = ConnectorPayloadRetentionGuard::from_existing_lease(lease);
         assert_eq!(Arc::strong_count(&owner), 2);
         let copy = guard.try_clone().unwrap();
@@ -182,7 +182,7 @@ mod tests {
             maximum: 1,
         });
         let guard = ConnectorPayloadRetentionGuard::from_existing_lease(
-            ExistingOwnerRetentionLease::from_existing_pin(owner.clone(), [7, 3]),
+            ExistingOwnerRetentionPin::from_existing_pin(owner.clone(), [7, 3]),
         );
         assert!(matches!(
             guard.try_clone(),
@@ -312,7 +312,7 @@ mod tests {
         let lifetime = Arc::new(());
         let weak = Arc::downgrade(&lifetime);
         let guard = ConnectorPayloadRetentionGuard::from_existing_lease(
-            ExistingOwnerRetentionLease::from_existing_pin(owner.clone(), [7, 3]),
+            ExistingOwnerRetentionPin::from_existing_pin(owner.clone(), [7, 3]),
         )
         .with_lifetime_retention(ConnectorPayloadRetentionGuard::new(lifetime));
         assert!(matches!(

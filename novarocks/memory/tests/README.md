@@ -86,8 +86,8 @@ address safety.
 
 | Current consumer | Required neutral interface/behavior |
 |---|---|
-| Worker `query_context.rs` | Store/clone AccountHandle; `create_account(Work, ExternalRef)`; one account per query execution |
-| Native Adapter `native_fragment_query.rs` | Install Work policy from the existing query limit; the existing MemTracker remains the actual allocation mechanism in this slice |
+| Worker `query_context.rs` | Store/clone Account; `create_account(Work, ExternalRef)`; one account per query execution |
+| Native Adapter `native_query_context.rs` | Install Work policy from the existing query limit; the existing MemTracker remains the actual allocation mechanism in this slice |
 | Frontend `metrics/management.rs` | Authority/account snapshot, P/B/H and C/L/F/O projections, capacity remainder, bound quality, activity count and control capability presence |
 | Server `main.rs`, `app_config.rs` | One injected authority per process; B+H within P; real prepaid control floor before work admission; explicit composition/configuration refusal |
 | Server `memory_observation.rs` and Native Adapter `backend_metrics.rs` | AttributingAllocator, retained CountingAllocator comparator, allocator/physical readings, coverage and unknown-source quality; existing jemalloc/cgroup facts |
@@ -100,7 +100,7 @@ Their long-term grant/bound/holder semantics still need candidate coverage.
 its workspace/Cargo entries, tests and benchmarks. Production Execution
 Arrow/Chunk types are outside that deletion scope.
 
-The Native Adapter test in `native_fragment_query_tests.rs` uses
+The Native Adapter test in `native_query_context_tests.rs` uses
 `request_grant(4096)` only to check that tracker charges have not migrated into
 the account. Update its neutral-interface assertion; do not keep a dead grant
 API for that test. Other business types named reservation or holder are not

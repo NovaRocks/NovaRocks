@@ -53,7 +53,7 @@ impl std::fmt::Display for WindowGeometryError {
 impl std::error::Error for WindowGeometryError {}
 impl novarocks_failure_contract::FailureProjection for WindowGeometryError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         let reason = match self {
             Self::NegativeOffset { .. } => ExecutionReason::WindowNegativeOffset,
             Self::RangeOffset => ExecutionReason::WindowRangeOffset,
@@ -64,7 +64,7 @@ impl novarocks_failure_contract::FailureProjection for WindowGeometryError {
         )
     }
 }
-impl From<WindowGeometryError> for crate::runtime::fragment::ExecutionFailure {
+impl From<WindowGeometryError> for crate::runtime::task::ExecutionFailure {
     fn from(cause: WindowGeometryError) -> Self {
         Self::from_domain(cause)
     }
@@ -146,7 +146,7 @@ pub(crate) fn frame_table_tracked(
     peers: &[WindowRowRange],
     host: std::sync::Arc<dyn novarocks_functions::AggregateStateAllocator>,
     control: &dyn novarocks_functions::KernelEvaluationControl,
-) -> crate::runtime::fragment::ExecutionResult<
+) -> crate::runtime::task::ExecutionResult<
     novarocks_functions::WindowInvocationScratch<WindowRowRange>,
 > {
     match frame_table_authored(

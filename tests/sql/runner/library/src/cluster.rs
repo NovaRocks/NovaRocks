@@ -28,10 +28,11 @@ use std::time::Duration;
 #[allow(unused_imports)]
 pub(crate) use novarocks_cluster_harness::{
     BePorts, ClusterProcessRole, CrossProcessRuntime, QueryLifecyclePhase, ServerFailureLogSources,
-    ServerHandle, build_novarocks_command, render_cross_process_config, startup_timeout_from_env,
+    TestClusterOwner, build_novarocks_command, render_cross_process_config,
+    startup_timeout_from_env,
 };
 use novarocks_cluster_harness::{
-    CrossProcessClusterOptions, CrossProcessConfigOverlay, CrossProcessServerHandle, LaunchProfile,
+    CrossProcessCluster, CrossProcessClusterOptions, CrossProcessConfigOverlay, LaunchProfile,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -42,7 +43,7 @@ pub(crate) enum ClusterMode {
 
 struct NoopServerHandle;
 
-impl ServerHandle for NoopServerHandle {
+impl TestClusterOwner for NoopServerHandle {
     fn target_host(&self) -> Option<&str> {
         None
     }
@@ -60,7 +61,7 @@ pub(crate) fn launch_server(
     launch_profile: LaunchProfile,
     test_sessions: Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>,
     budget: &novarocks_cluster_harness::fixture_run::RunBudget,
-) -> Result<Box<dyn ServerHandle>> {
+) -> Result<Box<dyn TestClusterOwner>> {
     match mode {
         ClusterMode::AllInOne => Ok(Box::new(NoopServerHandle)),
         ClusterMode::CrossProcess => {
@@ -80,17 +81,15 @@ pub(crate) fn launch_server(
                 config_overlay: resolve_role_scoped_connector_overlay()?,
                 native_trust_fixture: Default::default(),
             };
-            Ok(Box::new(
-                CrossProcessServerHandle::launch_with_fixture_budget(
-                    options,
-                    test_sessions,
-                    Default::default(),
-                    None,
-                    None,
-                    None,
-                    budget.clone(),
-                )?,
-            ))
+            Ok(Box::new(CrossProcessCluster::launch_with_fixture_budget(
+                options,
+                test_sessions,
+                Default::default(),
+                None,
+                None,
+                None,
+                budget.clone(),
+            )?))
         }
     }
 }

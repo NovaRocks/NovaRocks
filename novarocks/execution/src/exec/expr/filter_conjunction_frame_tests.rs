@@ -21,7 +21,7 @@ use super::filter_conjunction_actual_sql_compiler_tests::{
 };
 use super::ndv_filter_actual_sql_source_tests::ndv_sql_source;
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
-use crate::runtime::fragment::ExecutionFailureCause;
+use crate::runtime::task::ExecutionFailureCause;
 use arrow::{
     array::{Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array},
     record_batch::RecordBatch,

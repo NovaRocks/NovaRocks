@@ -41,8 +41,8 @@ use crate::exec::hash_table::{
     partition_keys::source_key_owner,
 };
 use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner};
-use crate::runtime::fragment::ExecutionFailure;
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::task::ExecutionFailure;
 use novarocks_functions::KernelEvaluationControl;
 use novarocks_type_contract::FunctionValueType;
 use novarocks_value_arrays::{
@@ -52,7 +52,7 @@ use novarocks_value_arrays::{
 
 use super::failure::{SetStateFailure, fail};
 use super::set_op_stage::SetOpStageController;
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 pub trait DistinctSetSemantics: Clone + Send + Sync + 'static {
     type Marker: Clone + Send + Sync + 'static;
@@ -314,17 +314,14 @@ impl<S: DistinctSetSemantics> DistinctSetSharedState<S> {
         guard.latch(result)
     }
 
-    pub(crate) fn finish_stage(
-        &self,
-        stage: usize,
-    ) -> crate::runtime::fragment::ExecutionResult<()> {
+    pub(crate) fn finish_stage(&self, stage: usize) -> crate::runtime::task::ExecutionResult<()> {
         self.inner
             .lock()
             .expect("distinct set state lock")
             .check()?;
         self.controller
             .producer_finished(stage)
-            .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
+            .map_err(crate::runtime::task::ExecutionFailure::from_domain)
     }
 
     /// Export only the source cursor's requested dense positions. K preserves

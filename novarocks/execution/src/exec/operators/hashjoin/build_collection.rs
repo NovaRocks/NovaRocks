@@ -26,10 +26,10 @@ use super::{
 };
 use crate::{
     exec::{
-        phased_work::{PhasedRangeWork, RangeLease},
+        phased_work::{PhasedRangeWork, RangeObligation},
         pipeline::operator::InputConstructionOwner,
     },
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use novarocks_functions::KernelEvaluationControl;
 use novarocks_type_contract::ValueTypeStorageLifetime;
@@ -77,12 +77,12 @@ pub(crate) enum BeginClaim<I, A> {
     // Destruction of the original input container precedes lease abandonment.
     Claimed {
         inputs: CollectedInputs<I>,
-        lease: BeginLease<I, A>,
+        begin_obligation: BeginObligation<I, A>,
     },
 }
-pub(crate) struct BeginLease<I, A> {
+pub(crate) struct BeginObligation<I, A> {
     owner: Arc<BuildCollection<I, A>>,
-    lease: RangeLease<ExecutionFailure, ValueTypeStorageLifetime>,
+    obligation: RangeObligation<ExecutionFailure, ValueTypeStorageLifetime>,
 }
 impl<I, A> BuildCollection<I, A> {
     pub(crate) fn new(
@@ -230,9 +230,9 @@ impl<I, A> BuildCollection<I, A> {
         let Some(token) = token else {
             return Ok(BeginClaim::InProgress);
         };
-        let mut lease = BeginLease {
+        let mut begin_obligation = BeginObligation {
             owner: Arc::clone(self),
-            lease: token,
+            obligation: token,
         };
         // Only the winning F pays O(E) metadata and moves original receipts.
         // Resource/cancel refusal is latched before the unfinished token drops.
@@ -259,21 +259,27 @@ impl<I, A> BuildCollection<I, A> {
             })
         })();
         match values {
-            Ok(inputs) => Ok(BeginClaim::Claimed { inputs, lease }),
-            Err(cause) => Err(lease.fail(cause)),
+            Ok(inputs) => Ok(BeginClaim::Claimed {
+                inputs,
+                begin_obligation,
+            }),
+            Err(cause) => Err(begin_obligation.fail(cause)),
         }
     }
     /// Call only after the winning F has installed the actual graph/finalizer
     /// state. This settles begin responsibility, not BuildPublished or Ready.
-    pub(crate) fn complete_begin(&self, lease: &mut BeginLease<I, A>) -> ExecutionResult<()> {
+    pub(crate) fn complete_begin(
+        &self,
+        begin_obligation: &mut BeginObligation<I, A>,
+    ) -> ExecutionResult<()> {
         self.check()?;
-        if !std::ptr::eq(self, Arc::as_ptr(&lease.owner)) {
+        if !std::ptr::eq(self, Arc::as_ptr(&begin_obligation.owner)) {
             return Err(self
                 .completion
                 .fail(build_contract("join begin completion has a foreign owner")));
         }
         let mut state = self.state()?;
-        if let Err(cause) = self.begin.complete(&mut lease.lease) {
+        if let Err(cause) = self.begin.complete(&mut begin_obligation.obligation) {
             drop(state);
             return Err(self.completion.fail(cause));
         }
@@ -299,7 +305,7 @@ impl<I, A> BuildCollection<I, A> {
         self.completion.publish(artifact, rows)
     }
 }
-impl<I, A> BeginLease<I, A> {
+impl<I, A> BeginObligation<I, A> {
     pub(crate) fn fail(&mut self, cause: ExecutionFailure) -> ExecutionFailure {
         let cause = self.owner.begin.latch(cause);
         self.owner.completion.fail(cause)
@@ -315,15 +321,15 @@ impl<I, A> BeginLease<I, A> {
         }
         self.owner
             .begin
-            .complete(&mut self.lease)
+            .complete(&mut self.obligation)
             .map_err(|cause| self.owner.completion.fail(cause))?;
         self.owner.completion.finalized_step();
         Ok(())
     }
 }
-impl<I, A> Drop for BeginLease<I, A> {
+impl<I, A> Drop for BeginObligation<I, A> {
     fn drop(&mut self) {
-        if !self.lease.is_settled() {
+        if !self.obligation.is_settled() {
             let cause = self
                 .owner
                 .begin

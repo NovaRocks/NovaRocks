@@ -19,10 +19,10 @@
 //! preparation, continuation and finalization use the common receiver machine.
 
 use super::{
-    AdmissionNext, ControlStep, NextStep, PreparedInput, RawInput, StepContext, StepResult,
+    AdmissionNext, ControlStep, DriverStep, NextStep, PreparedInput, RawInput, StepResult,
     TransformKernel, TransformStart,
 };
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 #[derive(Debug)]
 pub struct SinkStep {
@@ -42,7 +42,7 @@ impl SinkStep {
 }
 
 pub trait SinkKernel: Send {
-    fn poll_control(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, _ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         Ok(ControlStep::Active)
     }
     fn control_observable(
@@ -55,20 +55,20 @@ pub trait SinkKernel: Send {
     }
     fn admission(
         &self,
-        _ctx: &mut StepContext<'_>,
+        _ctx: &mut DriverStep<'_>,
         _input: &RawInput,
     ) -> ExecutionResult<Option<AdmissionNext>> {
         Ok(None)
     }
     fn consume(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<SinkStep>;
-    fn poll(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+    fn poll(&mut self, _ctx: &mut DriverStep<'_>) -> ExecutionResult<SinkStep> {
         Ok(SinkStep::new(NextStep::NeedInput, 0))
     }
-    fn finish(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+    fn finish(&mut self, _ctx: &mut DriverStep<'_>) -> ExecutionResult<SinkStep> {
         Ok(SinkStep::new(NextStep::Finished, 0))
     }
     #[cfg(test)]
@@ -76,7 +76,7 @@ pub trait SinkKernel: Send {
         &mut self,
         state: &crate::runtime::runtime_state::RuntimeState,
     ) -> ExecutionResult<SinkStep> {
-        super::super::step_context::with_test_step(state, |ctx| self.poll(ctx))
+        super::super::driver_step::with_test_step(state, |ctx| self.poll(ctx))
     }
     #[cfg(test)]
     fn consume_for_test(
@@ -86,10 +86,10 @@ pub trait SinkKernel: Send {
     ) -> ExecutionResult<SinkStep> {
         let control = state.error_state();
         let mut turn =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut turn, &mut value_conversions);
         self.consume(&mut ctx, PreparedInput::for_test(chunk))
     }
     #[cfg(test)]
@@ -99,15 +99,15 @@ pub trait SinkKernel: Send {
     ) -> ExecutionResult<SinkStep> {
         let control = state.error_state();
         let mut turn =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut turn, &mut value_conversions);
         SinkKernel::finish(self, &mut ctx)
     }
 }
 impl<K: SinkKernel> TransformKernel for K {
-    fn poll_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         SinkKernel::poll_control(self, ctx)
     }
     fn control_observable(
@@ -120,22 +120,22 @@ impl<K: SinkKernel> TransformKernel for K {
     }
     fn admission(
         &self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: &RawInput,
     ) -> ExecutionResult<Option<AdmissionNext>> {
         SinkKernel::admission(self, ctx, input)
     }
     fn apply(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         self.consume(ctx, input).map(SinkStep::into_step)
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.poll(ctx).map(SinkStep::into_step)
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         SinkKernel::finish(self, ctx).map(SinkStep::into_step)
     }
 }

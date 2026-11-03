@@ -4907,7 +4907,7 @@ pub(crate) mod final_static_facts_tests {
 mod public_read_schema_tests {
     use std::sync::Arc;
 
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::read_stack::ConnectorReadMetadata;
     use novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter;
     use novarocks_spi::connector::{
@@ -4958,7 +4958,7 @@ mod public_read_schema_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let resources =
             crate::resources::IcebergMetadataResources::new(binding, runtime.handle().clone());
@@ -5111,7 +5111,7 @@ mod attempt_access_tests {
     use std::sync::{Arc, Weak};
     use std::time::{Duration, Instant};
 
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, ConnectorProviderId,
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -5200,7 +5200,7 @@ mod attempt_access_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(executor.handle().clone())),
         );
         let original = IcebergMetadataContext::try_new(
             crate::catalog_control::IcebergCatalogControlState::new(configuration),
@@ -5465,7 +5465,7 @@ mod attempt_access_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let resources =
             crate::resources::IcebergMetadataResources::new(binding, runtime.handle().clone());
@@ -6041,7 +6041,7 @@ mod system_work_unit_tests {
 #[cfg(test)]
 mod prepared_source_relation_tests {
     use super::*;
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::{CatalogHandle, ConnectorExactSemanticRevision};
     use novarocks_spi::connector::{
         ConnectorChangeWindowAdmission, ConnectorChangeWindowFullRebuildReason,
@@ -6107,7 +6107,7 @@ mod prepared_source_relation_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(executor.handle().clone())),
         );
         let resources = crate::resources::IcebergMetadataResources::new(
             binding.clone(),

@@ -40,7 +40,7 @@ use super::provider::MysqlProviderOpen;
 #[cfg(feature = "state-store-test-hooks")]
 use super::test_support::{
     MysqlHeldAdvisoryLock, MysqlHeldConnection, MysqlReadinessSnapshot, MysqlRuntimeOwner,
-    MysqlSchemaMutation, MysqlSchemaSnapshot, MysqlStoreReadinessSnapshot, MysqlTestHandle,
+    MysqlSchemaMutation, MysqlSchemaSnapshot, MysqlStoreReadinessSnapshot, MysqlTestSlot,
 };
 use super::{MysqlOpenCancellation, MysqlStateStore};
 #[cfg(feature = "state-store-test-hooks")]
@@ -240,7 +240,7 @@ impl MysqlRuntime {
         cancellation.check()?;
         mysql_active_readiness(Arc::clone(&pool), deadline).await?;
         cancellation.check()?;
-        let lease = MysqlProviderHandle::new(shared, pool)?;
+        let lease = MysqlProviderPermit::new(shared, pool)?;
         let store = MysqlStateStore::open(
             lease,
             database,
@@ -387,7 +387,7 @@ impl MysqlRuntime {
         let connection = checkout_hygienic_connection(pool, deadline).await?;
         Ok(MysqlHeldConnection::new(
             connection,
-            MysqlTestHandle::new(move || drop(operation)),
+            MysqlTestSlot::new(move || drop(operation)),
         ))
     }
 
@@ -431,7 +431,7 @@ impl MysqlRuntime {
                 .await?;
         Ok(MysqlHeldAdvisoryLock::new(
             connection,
-            MysqlTestHandle::new(move || drop(operation)),
+            MysqlTestSlot::new(move || drop(operation)),
             lock_name,
         ))
     }
@@ -685,13 +685,13 @@ enum MysqlGuardKind {
 }
 
 #[cfg(feature = "mysql-state-store-provider")]
-pub(super) struct MysqlProviderHandle {
+pub(super) struct MysqlProviderPermit {
     _provider: MysqlRuntimeGuard,
     pool: Arc<dyn PoolLifecycle>,
 }
 
 #[cfg(feature = "mysql-state-store-provider")]
-impl MysqlProviderHandle {
+impl MysqlProviderPermit {
     fn new(
         shared: Arc<MysqlRuntimeShared>,
         pool: Arc<dyn PoolLifecycle>,
@@ -720,8 +720,8 @@ impl MysqlProviderHandle {
     /// may ask about an attempt after the transaction that ran it is gone. The
     /// evidence owner therefore needs its own way to register work so a
     /// shutdown drain still waits for it.
-    pub(super) fn operations(&self) -> MysqlOperationLease {
-        MysqlOperationLease {
+    pub(super) fn operations(&self) -> MysqlOperationGate {
+        MysqlOperationGate {
             shared: Arc::clone(&self._provider.shared),
         }
     }
@@ -729,12 +729,12 @@ impl MysqlProviderHandle {
 
 #[cfg(feature = "mysql-state-store-provider")]
 #[derive(Clone)]
-pub(super) struct MysqlOperationLease {
+pub(super) struct MysqlOperationGate {
     shared: Arc<MysqlRuntimeShared>,
 }
 
 #[cfg(feature = "mysql-state-store-provider")]
-impl MysqlOperationLease {
+impl MysqlOperationGate {
     pub(super) fn acquire(&self) -> Result<MysqlRuntimeGuard, StateStoreError> {
         MysqlRuntimeGuard::acquire(Arc::clone(&self.shared), MysqlGuardKind::Operation)
     }

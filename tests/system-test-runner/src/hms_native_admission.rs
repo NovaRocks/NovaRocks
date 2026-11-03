@@ -119,9 +119,14 @@ fn project_deadline(
 }
 fn identity(raw: &[u8], expected: &str) -> Result<()> {
     revision(expected)?;
-    ensure!(raw == format!(
-        "NOVAROCKS_MEM_1_M07_HMS_LISTING_BUILD commit={expected} build_identity={expected} hms_listing_observe=true\n"
-    ).as_bytes(), "HMS actual server feature/full-clean-build identity differs");
+    ensure!(
+        raw == format!(
+            "{} commit={expected} build_identity={expected} hms_listing_observe=true\n",
+            novarocks_failpoint::observation_marker::MEM_1_M07_HMS_LISTING_BUILD
+        )
+        .as_bytes(),
+        "HMS actual server feature/full-clean-build identity differs"
+    );
     Ok(())
 }
 fn read_pin(
@@ -471,7 +476,8 @@ mod tests {
     fn default_or_foreign_server_never_implies_hms_feature() {
         let revision = "a".repeat(40);
         let valid = format!(
-            "NOVAROCKS_MEM_1_M07_HMS_LISTING_BUILD commit={revision} build_identity={revision} hms_listing_observe=true\n"
+            "{} commit={revision} build_identity={revision} hms_listing_observe=true\n",
+            novarocks_failpoint::observation_marker::MEM_1_M07_HMS_LISTING_BUILD
         );
         assert!(identity(valid.as_bytes(), &revision).is_ok());
         for raw in [

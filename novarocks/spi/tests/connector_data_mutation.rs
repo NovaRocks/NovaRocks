@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorControlRuntimeId, ConnectorDataMutation, ConnectorDataMutationExecuteRequest,
-    ConnectorDataMutationLease, ConnectorDataMutationOperation, ConnectorDataMutationPlan,
-    ConnectorDataMutationPlanSummary, ConnectorDataMutationPlanningRequest,
-    ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest,
+    ConnectorDataMutationOperation, ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
+    ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
+    ConnectorDataMutationReconcileRequest, ConnectorDataMutationSession,
     ConnectorDataMutationSourceScope, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorListTablesRequest,
     ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
@@ -114,8 +114,8 @@ impl FakeDataMutation {
         })
     }
 
-    fn lease(self: &Arc<Self>) -> ConnectorDataMutationLease {
-        ConnectorDataMutationLease::new(
+    fn lease(self: &Arc<Self>) -> ConnectorDataMutationSession {
+        ConnectorDataMutationSession::new(
             self.descriptor.clone(),
             ConnectorControlRuntimeId::from_bytes([1; 16]),
             self.key.incarnation,
@@ -398,7 +398,7 @@ fn bounds_and_exact_generation_fail_closed() {
     );
 
     assert_eq!(
-        ConnectorDataMutationLease::new(
+        ConnectorDataMutationSession::new(
             fake.descriptor.clone(),
             ConnectorControlRuntimeId::from_bytes([2; 16]),
             ProviderBindingEpoch::from_bytes([9; 16]),

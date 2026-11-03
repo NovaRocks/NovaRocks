@@ -144,7 +144,8 @@ impl ResultHandoffControl {
         state.hit = true;
         drop(state);
         eprintln!(
-            "NOVAROCKS_RESULT_HANDOFF_TERMINAL_OBSERVED token={} statement={}:{}",
+            "{} token={} statement={}:{}",
+            novarocks_failpoint::observation_marker::RESULT_HANDOFF_TERMINAL_OBSERVED,
             self.run_token.escape_default(),
             actual.session().key().get(),
             actual.generation()
@@ -162,7 +163,7 @@ mod tests {
         session::{DECLARATION_VERSION, DomainGrant, SessionDeclaration, SessionRole},
     };
     use novarocks_query_application::{
-        api::{ExecutionHandle, ExecutionOutput, QueryExecutionError, QueryResultStream},
+        api::{ExecutionOutput, ExecutionOutputObligation, QueryExecutionError, QueryResultStream},
         execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
         session_control::SessionToken,
         test_support::ResultStreamTestProducer,
@@ -282,7 +283,7 @@ mod tests {
     }
     struct Stream {
         producer: ResultStreamTestProducer,
-        execution: ExecutionHandle,
+        execution: ExecutionOutputObligation,
         stream: QueryResultStream,
     }
     impl Stream {

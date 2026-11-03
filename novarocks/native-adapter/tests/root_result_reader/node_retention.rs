@@ -19,18 +19,18 @@
 
 use super::*;
 
-fn retire_empty_context(fixture: &Fixture, ordinal: i64) {
-    let context = QueryContextRef::new(
+fn retire_empty_participation(fixture: &Fixture, ordinal: i64) {
+    let participation = ParticipationRef::new(
         QueryExecutionId::new(QueryId::new(32200, ordinal), AttemptId::new(1).unwrap()).unwrap(),
-        fixture.context.frontend_process_id(),
-        fixture.context.backend_process_id(),
+        fixture.participation.frontend_process_id(),
+        fixture.participation.backend_process_id(),
     );
     let ticket = AdmissionTicketId::try_from_bytes(TaskOperationId::new_v7().to_bytes()).unwrap();
     let lease = LeaseValidFor::new(Duration::from_secs(10)).unwrap();
     let acquired = await_original(fixture.control.acquire(
-        AcquireQueryContextAdmissionTicket::new(
+        AcquireParticipationAdmissionTicket::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             lease,
             NativeCompatibilityId::new([0x71; 32]),
             fixture.control.admission_epoch_capability(),
@@ -45,15 +45,15 @@ fn retire_empty_context(fixture: &Fixture, ordinal: i64) {
     ));
     drop(acquired);
     let established = await_original(fixture.control.establish(
-        EstablishQueryContext::new(
+        EstablishParticipation::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             ticket,
             Arc::new(Content),
             Arc::new(Content),
             Arc::new(Content),
             CredentialUpdate::new(
-                CredentialLeaseId::new(1),
+                CredentialDomainId::new(1),
                 CredentialEpoch::FIRST,
                 Arc::new(Secret),
             ),
@@ -63,36 +63,36 @@ fn retire_empty_context(fixture: &Fixture, ordinal: i64) {
     ))
     .unwrap();
     assert!(
-        matches!(established.body(), WorkerControlReplyBody::Context(ack)
+        matches!(established.body(), WorkerControlReplyBody::Participation(ack)
         if ack.outcome == OperationOutcome::Accepted)
     );
     drop(established);
-    release_empty_context(fixture, context);
+    release_empty_participation(fixture, participation);
 }
 
-fn release_empty_context(fixture: &Fixture, context: QueryContextRef) {
+fn release_empty_participation(fixture: &Fixture, participation: ParticipationRef) {
     let quiesced = await_original(fixture.control.quiesce(
-        QuiesceQueryContext::new(TaskOperationId::new_v7(), context),
+        QuiesceParticipation::new(TaskOperationId::new_v7(), participation),
         deadline(&fixture.control),
     ))
     .unwrap();
     assert!(matches!(
         quiesced.body(),
-        WorkerContextReplyBody::Quiesce {
+        WorkerParticipationReplyBody::Quiesce {
             outcome: OperationOutcome::Accepted,
             ..
         }
     ));
     drop(quiesced);
     let released = await_original(fixture.control.release(
-        ReleaseQueryContext::new(TaskOperationId::new_v7(), context),
+        ReleaseParticipation::new(TaskOperationId::new_v7(), participation),
         deadline(&fixture.control),
     ))
     .unwrap();
     assert!(matches!(
         released.body(),
-        WorkerContextReplyBody::Release {
-            state: QueryContextState::TerminalRetained,
+        WorkerParticipationReplyBody::Release {
+            state: ParticipationState::TerminalRetained,
             ..
         }
     ));
@@ -103,31 +103,31 @@ fn release_empty_context(fixture: &Fixture, context: QueryContextRef) {
 }
 
 #[test]
-fn three_thousand_compact_contexts_expire_and_cold_shutdown_does_not_wait_for_the_horizon() {
-    // No Task/Root is installed. All context materialization, request custody,
+fn three_thousand_compact_participations_expire_and_cold_shutdown_does_not_wait_for_the_horizon() {
+    // No Task/Root is installed. All participation materialization, request custody,
     // release, compaction, timer delivery and forget jobs use the actual Node.
     let fixture = Fixture::uninstalled(false, None);
     let original_now = fixture.control.now();
-    release_empty_context(&fixture, fixture.context);
+    release_empty_participation(&fixture, fixture.participation);
     for ordinal in 1..=3_000 {
-        retire_empty_context(&fixture, ordinal);
+        retire_empty_participation(&fixture, ordinal);
     }
     wait_until(|| {
         fixture
             .control
             .try_protocol_retention_snapshot()
-            .is_some_and(|snapshot| snapshot.contexts.compact_contexts == 3_001)
+            .is_some_and(|snapshot| snapshot.participations.compact_participations == 3_001)
     });
     assert_eq!(fixture.control.now(), original_now);
-    assert_eq!(fixture.control.metrics_snapshot().contexts, 3_001);
-    // Include the original fixture context in the same compact population;
+    assert_eq!(fixture.control.metrics_snapshot().participations, 3_001);
+    // Include the original fixture participation in the same compact population;
     // none of these records may retain execution custody or task slots.
     wait_until(|| {
         fixture
             .control
             .try_execution_quiescence_snapshot()
             .is_some_and(|snapshot| {
-                snapshot.contexts_with_execution_custody == 0 && snapshot.requests == 0
+                snapshot.participations_with_execution_custody == 0 && snapshot.requests == 0
             })
     });
     assert_eq!(fixture.control.metrics_snapshot().active_tasks, 0);
@@ -142,28 +142,29 @@ fn three_thousand_compact_contexts_expire_and_cold_shutdown_does_not_wait_for_th
         .as_ref()
         .unwrap()
         .notify_clock_changed();
-    wait_until(|| fixture.control.metrics_snapshot().contexts == 0);
+    wait_until(|| fixture.control.metrics_snapshot().participations == 0);
     wait_until(|| {
         fixture
             .control
             .try_protocol_retention_snapshot()
             .is_some_and(|snapshot| {
-                snapshot.contexts.compact_contexts == 0 && snapshot.admission.ticket_records == 0
+                snapshot.participations.compact_participations == 0
+                    && snapshot.admission.ticket_records == 0
             })
     });
     // A fresh cold population must drain without advancing this same clock.
     for ordinal in 3_001..=3_032 {
-        retire_empty_context(&fixture, ordinal);
+        retire_empty_participation(&fixture, ordinal);
     }
     wait_until(|| {
         fixture
             .control
             .try_protocol_retention_snapshot()
-            .is_some_and(|snapshot| snapshot.contexts.compact_contexts == 32)
+            .is_some_and(|snapshot| snapshot.participations.compact_participations == 32)
     });
     let control = fixture.control.clone();
     let before_shutdown = control.now();
     drop(fixture); // The existing fixture joins the original Node and pools.
     assert_eq!(control.now(), before_shutdown);
-    assert_eq!(control.metrics_snapshot().contexts, 0);
+    assert_eq!(control.metrics_snapshot().participations, 0);
 }

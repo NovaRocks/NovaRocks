@@ -28,7 +28,7 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -113,7 +113,7 @@ impl SourceKernel for UnionAllSourceOperator {
     }
     fn poll_output(
         &mut self,
-        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
     ) -> ExecutionResult<StepResult> {
         let observable = self.state.observable();
         let observed_generation = observable.generation();
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn last_producer_publication_is_delivered_before_source_eos() {
-        use crate::exec::pipeline::step_context::{StepContext, TurnWork};
+        use crate::exec::pipeline::driver_step::{DriverStep, TurnWork};
         use std::num::NonZeroU64;
         let state = RuntimeState::default();
         let shared = UnionAllSharedState::new_with_limits(2, 7, 1024, 1024);
@@ -174,7 +174,7 @@ mod tests {
         let mut work = TurnWork::new(NonZeroU64::new(1).unwrap(), 8);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut context = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut context = DriverStep::new(&control, &mut work, &mut value_conversions);
         let source = source.as_mut();
         let waiting = source.drive(&mut context).unwrap();
         assert!(waiting.output.is_none());

@@ -26,10 +26,10 @@ use super::{
 };
 use crate::{
     exec::{
-        phased_work::{PhasedRangeWork, RangeLease},
+        phased_work::{PhasedRangeWork, RangeObligation},
         pipeline::operator::InputConstructionOwner,
     },
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use novarocks_functions::KernelEvaluationControl;
 use novarocks_type_contract::ValueTypeStorageLifetime;
@@ -46,12 +46,12 @@ pub(crate) enum TailClaim<A> {
     Unavailable,
     Withdrawn,
     Finished,
-    Range(TailLease<A>),
+    Range(TailObligation<A>),
 }
-pub(crate) struct TailLease<A> {
+pub(crate) struct TailObligation<A> {
     published: Published<A>,
     owner: Arc<TailRanges<A>>,
-    lease: RangeLease<ExecutionFailure, ValueTypeStorageLifetime>,
+    obligation: RangeObligation<ExecutionFailure, ValueTypeStorageLifetime>,
 }
 impl<A> TailRanges<A> {
     /// Build publication fixes physical rows. No bitmap/slot initialization or
@@ -109,10 +109,10 @@ impl<A> TailRanges<A> {
             .claim()
             .map_err(|cause| self.completion.fail(cause))?
         {
-            Some(lease) => Ok(TailClaim::Range(TailLease {
+            Some(obligation) => Ok(TailClaim::Range(TailObligation {
                 published,
                 owner: Arc::clone(self),
-                lease,
+                obligation,
             })),
             None if self
                 .ranges
@@ -125,9 +125,9 @@ impl<A> TailRanges<A> {
         }
     }
 }
-impl<A> TailLease<A> {
+impl<A> TailObligation<A> {
     pub(crate) fn rows(&self) -> Range<usize> {
-        self.lease.range()
+        self.obligation.range()
     }
     pub(crate) fn artifact(&self) -> &A {
         self.published.artifact.as_ref()
@@ -145,7 +145,7 @@ impl<A> TailLease<A> {
         self.owner.completion.check()?;
         self.owner
             .ranges
-            .complete(&mut self.lease)
+            .complete(&mut self.obligation)
             .map_err(|cause| self.owner.completion.fail(cause))?;
         self.owner.completion.finalized_step();
         Ok(())
@@ -163,15 +163,15 @@ impl<A> TailLease<A> {
         }
         self.owner
             .ranges
-            .complete(&mut self.lease)
+            .complete(&mut self.obligation)
             .map_err(|cause| self.owner.completion.fail(cause))?;
         self.owner.completion.finalized_step();
         Ok(())
     }
 }
-impl<A> Drop for TailLease<A> {
+impl<A> Drop for TailObligation<A> {
     fn drop(&mut self) {
-        if !self.lease.is_settled() {
+        if !self.obligation.is_settled() {
             let cause = self
                 .owner
                 .ranges

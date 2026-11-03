@@ -126,7 +126,7 @@ impl ConnectorReadAttemptAccess {
     pub fn for_attempt(
         &self,
         request: crate::connector::ConnectorAttemptContext,
-        generation: crate::connector::ConnectorControlPlanningLease,
+        generation: crate::connector::ConnectorControlPlanningPin,
     ) -> ConnectorReadAttemptCapabilitiesFuture {
         let source = self.source.clone();
         let encoder = Arc::clone(&self.encoder);

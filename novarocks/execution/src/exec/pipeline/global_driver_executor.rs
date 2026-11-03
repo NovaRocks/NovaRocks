@@ -30,7 +30,7 @@
 
 #[cfg(test)]
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -40,31 +40,31 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::driver::{DriverState, PendingFinishWait, PipelineDriver};
-use super::fragment_context::FragmentContext;
 use super::operator::{BlockedReason, DriverBlockDeadline};
 use super::schedule::event_scheduler::EventDispatcher;
+use super::task_context::TaskContext;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::dispatch_metrics::{DispatchTransition, observe_dispatch};
 use tracing::error;
 
-#[path = "once_role.rs"]
-pub(crate) mod once_role;
+#[path = "completion_custody.rs"]
+pub(crate) mod completion_custody;
 
 #[path = "driver_batch.rs"]
 mod driver_batch;
 pub(crate) use driver_batch::DriverBatch;
 pub(crate) use driver_batch::{Poll as RetirementPoll, Retirement};
 pub(crate) struct ParkingPhase {
-    roles: [driver_batch::Phase; 2],
+    phases: [driver_batch::Phase; 2],
 }
 impl ParkingPhase {
     fn new() -> Self {
         Self {
-            roles: std::array::from_fn(|_| driver_batch::Phase::new()),
+            phases: std::array::from_fn(|_| driver_batch::Phase::new()),
         }
     }
     fn is_unknown(&self) -> bool {
-        self.roles.iter().any(driver_batch::Phase::is_unknown)
+        self.phases.iter().any(driver_batch::Phase::is_unknown)
     }
 }
 use driver_batch::{Poll as ReaperPoll, ReaperEntry};
@@ -75,13 +75,13 @@ const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const DRIVER_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 /// Completion result payload reported when a fragment finishes execution.
-pub struct FragmentCompletion {
-    mu: Mutex<FragmentCompletionState>,
+pub struct DriverGroupCompletion {
+    mu: Mutex<DriverGroupCompletionState>,
     cv: Condvar,
-    resources_finisher: Arc<once_role::OnceRole<FragmentStoppedFact>>,
-    wall_time: Arc<once_role::OnceRole<FragmentStoppedFact>>,
+    resources_finisher: Arc<completion_custody::OnceCustody<DriverGroupStoppedFact>>,
+    wall_time: Arc<completion_custody::OnceCustody<DriverGroupStoppedFact>>,
     control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
-    local_completion: std::sync::OnceLock<crate::runtime::local_completion::LocalCompletionDriver>,
+    local_completion: std::sync::OnceLock<crate::runtime::local_completion::LocalCompletionPoller>,
 }
 
 /// Immutable proof that every submitted driver has actually stopped.
@@ -90,42 +90,46 @@ pub struct FragmentCompletion {
 /// this fact when they release execution-owned resources or publish a stopped
 /// lifecycle transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FragmentStoppedFact {
+pub struct DriverGroupStoppedFact {
     conclusion: ExecutionResult<()>,
 }
 
-impl FragmentStoppedFact {
+impl DriverGroupStoppedFact {
     pub fn conclusion(&self) -> ExecutionResult<()> {
         self.conclusion.clone()
     }
 }
 
-struct FragmentCompletionState {
+struct DriverGroupCompletionState {
     remaining: usize,
     activated: bool,
     // Cold start/capture obligations, separate from actual driver exit receipts.
     start_holds: usize,
-    stopped: Option<FragmentStoppedFact>,
+    stopped: Option<DriverGroupStoppedFact>,
 }
 
-impl FragmentCompletion {
+impl DriverGroupCompletion {
     pub fn new(
         driver_count: usize,
         control: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
     ) -> Arc<Self> {
-        let stopped = (driver_count == 0).then(|| FragmentStoppedFact {
+        let stopped = (driver_count == 0).then(|| DriverGroupStoppedFact {
             conclusion: control.error().map_or(Ok(()), Err),
         });
         Arc::new(Self {
-            mu: Mutex::new(FragmentCompletionState {
+            mu: Mutex::new(DriverGroupCompletionState {
                 remaining: driver_count,
                 activated: true,
                 start_holds: 0,
                 stopped,
             }),
             cv: Condvar::new(),
-            resources_finisher: once_role::OnceRole::new(once_role::Role::PipelineFinisher),
-            wall_time: once_role::OnceRole::new(once_role::Role::WallTime),
+            resources_finisher: completion_custody::OnceCustody::new(
+                completion_custody::CompletionKind::PipelineFinisher,
+            ),
+            wall_time: completion_custody::OnceCustody::new(
+                completion_custody::CompletionKind::WallTime,
+            ),
             control,
             local_completion: std::sync::OnceLock::new(),
         })
@@ -170,14 +174,14 @@ impl FragmentCompletion {
             if state.remaining != 0 {
                 return;
             }
-            let stopped = FragmentStoppedFact {
+            let stopped = DriverGroupStoppedFact {
                 conclusion: self.control.error().map_or(Ok(()), Err),
             };
             state.stopped = Some(stopped.clone());
             self.cv.notify_all();
             stopped
         };
-        self.run_completion_roles(&stopped);
+        self.run_completion_work(&stopped);
     }
 
     pub fn should_abort(&self) -> bool {
@@ -204,14 +208,14 @@ impl FragmentCompletion {
             }
 
             let conclusion = self.control.error().map_or(Ok(()), Err);
-            let stopped = FragmentStoppedFact { conclusion };
+            let stopped = DriverGroupStoppedFact { conclusion };
             st.stopped = Some(stopped.clone());
             self.cv.notify_all();
             stopped
         };
         // The body proof is frozen before either named role. Their independent
         // capture scopes cannot revoke it or suppress the sibling role.
-        self.run_completion_roles(&stopped);
+        self.run_completion_work(&stopped);
         true
     }
 
@@ -229,7 +233,7 @@ impl FragmentCompletion {
             .map(|_| Ok(()))
     }
 
-    pub fn stopped_fact(&self) -> Option<FragmentStoppedFact> {
+    pub fn stopped_fact(&self) -> Option<DriverGroupStoppedFact> {
         self.mu
             .lock()
             .expect("fragment completion lock")
@@ -237,7 +241,9 @@ impl FragmentCompletion {
             .clone()
     }
 
-    pub(crate) fn resources_finisher(&self) -> Arc<once_role::OnceRole<FragmentStoppedFact>> {
+    pub(crate) fn resources_finisher(
+        &self,
+    ) -> Arc<completion_custody::OnceCustody<DriverGroupStoppedFact>> {
         Arc::clone(&self.resources_finisher)
     }
 
@@ -254,30 +260,30 @@ impl FragmentCompletion {
             .expect("original dormant wall-time role has no bound callback or prior work");
     }
 
-    pub(crate) fn admit_local_completion_driver(
+    pub(crate) fn admit_local_completion_poller(
         &self,
-        driver: crate::runtime::local_completion::LocalCompletionDriver,
+        poller: crate::runtime::local_completion::LocalCompletionPoller,
     ) {
         assert!(
-            self.local_completion.set(driver).is_ok(),
-            "one local completion driver"
+            self.local_completion.set(poller).is_ok(),
+            "one local completion poller"
         );
     }
 
-    fn run_completion_roles(&self, stopped: &FragmentStoppedFact) {
+    fn run_completion_work(&self, stopped: &DriverGroupStoppedFact) {
         self.wall_time.invoke(stopped, &self.control);
         self.resources_finisher.invoke(stopped, &self.control);
-        if let Some(driver) = self.local_completion.get() {
+        if let Some(poller) = self.local_completion.get() {
             // The original callback's stack and return-publication step have
             // finished before this taskless barrier can invoke its one child.
-            driver.run();
+            poller.run();
         }
     }
 
     /// Bind the unique original resource owner before submitting its drivers.
     pub(crate) fn bind_resources_finisher(
         &self,
-        slot: &mut Option<once_role::Callback<FragmentStoppedFact>>,
+        slot: &mut Option<completion_custody::Callback<DriverGroupStoppedFact>>,
     ) -> ExecutionResult<()> {
         self.resources_finisher.bind(slot)?;
         if let Some(stopped) = self.stopped_fact() {
@@ -291,7 +297,7 @@ impl FragmentCompletion {
 
     pub(crate) fn bind_wall_time(
         &self,
-        slot: &mut Option<once_role::Callback<FragmentStoppedFact>>,
+        slot: &mut Option<completion_custody::Callback<DriverGroupStoppedFact>>,
     ) -> ExecutionResult<()> {
         self.wall_time.bind(slot)?;
         if let Some(stopped) = self.stopped_fact() {
@@ -348,9 +354,9 @@ impl FragmentCompletion {
     #[cfg(test)]
     fn bind_test_resources_finisher(
         &self,
-        mut callback: impl FnMut(&FragmentStoppedFact) + Send + 'static,
+        mut callback: impl FnMut(&DriverGroupStoppedFact) + Send + 'static,
     ) {
-        let mut slot: Option<once_role::Callback<FragmentStoppedFact>> =
+        let mut slot: Option<completion_custody::Callback<DriverGroupStoppedFact>> =
             Some(Box::new(move |fact| {
                 callback(fact);
                 true
@@ -359,8 +365,11 @@ impl FragmentCompletion {
             .expect("one test resource owner");
     }
     #[cfg(test)]
-    fn bind_test_wall_time(&self, mut callback: impl FnMut(&FragmentStoppedFact) + Send + 'static) {
-        let mut slot: Option<once_role::Callback<FragmentStoppedFact>> =
+    fn bind_test_wall_time(
+        &self,
+        mut callback: impl FnMut(&DriverGroupStoppedFact) + Send + 'static,
+    ) {
+        let mut slot: Option<completion_custody::Callback<DriverGroupStoppedFact>> =
             Some(Box::new(move |fact| {
                 callback(fact);
                 true
@@ -376,13 +385,13 @@ impl FragmentCompletion {
 }
 
 /// Schedulable driver task containing execution context and completion hooks.
-pub struct DriverTask {
+pub struct DriverRunner {
     driver: PipelineDriver,
-    completion: Arc<FragmentCompletion>,
-    fragment_ctx: Arc<FragmentContext>,
+    completion: Arc<DriverGroupCompletion>,
+    task_ctx: Arc<TaskContext>,
     time_slice: Duration,
     /// Held from admission until the task is dropped.
-    lease: Option<ExecutorTaskLease>,
+    driver_live_guard: Option<LiveDriverGuard>,
     /// When the task last entered the ready queue.
     queued_at: Option<Instant>,
 }
@@ -392,25 +401,25 @@ pub struct DriverTask {
 /// The executor keeps its workers, and they keep the event dispatcher, until
 /// every admitted driver has ended: a closing driver still waits for its
 /// finish watches, and only a worker can complete it.
-struct ExecutorTaskLease {
+struct LiveDriverGuard {
     shared: Weak<ExecutorShared>,
 }
 
-impl ExecutorTaskLease {
+impl LiveDriverGuard {
     fn acquire(shared: &Arc<ExecutorShared>) -> Self {
-        shared.live_tasks.fetch_add(1, Ordering::AcqRel);
+        shared.live_drivers.fetch_add(1, Ordering::AcqRel);
         Self {
             shared: Arc::downgrade(shared),
         }
     }
 }
 
-impl Drop for ExecutorTaskLease {
+impl Drop for LiveDriverGuard {
     fn drop(&mut self) {
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
-        if shared.live_tasks.fetch_sub(1, Ordering::AcqRel) == 1
+        if shared.live_drivers.fetch_sub(1, Ordering::AcqRel) == 1
             && shared.shutdown.load(Ordering::Acquire)
         {
             // Workers read the count under the queue lock before they wait,
@@ -422,26 +431,23 @@ impl Drop for ExecutorTaskLease {
     }
 }
 
-impl DriverTask {
+impl DriverRunner {
     pub fn new(
         driver: PipelineDriver,
-        completion: Arc<FragmentCompletion>,
-        fragment_ctx: Arc<FragmentContext>,
+        completion: Arc<DriverGroupCompletion>,
+        task_ctx: Arc<TaskContext>,
         time_slice: Duration,
     ) -> Self {
         assert!(
-            Arc::ptr_eq(
-                &completion.control,
-                &fragment_ctx.runtime_state().error_state()
-            ),
+            Arc::ptr_eq(&completion.control, &task_ctx.runtime_state().error_state()),
             "driver completion must use its runtime's exact failure owner"
         );
         Self {
             driver,
             completion,
-            fragment_ctx,
+            task_ctx,
             time_slice,
-            lease: None,
+            driver_live_guard: None,
             queued_at: None,
         }
     }
@@ -480,7 +486,7 @@ impl DriverTask {
         String,
     )> {
         crate::runtime::writer_diagnostics::WriterDiagnostics::from_runtime(
-            self.fragment_ctx.runtime_state(),
+            self.task_ctx.runtime_state(),
         )
         .map(|scope| {
             (
@@ -491,19 +497,19 @@ impl DriverTask {
         })
     }
 
-    pub(crate) fn fragment_instance_id(&self) -> Option<(i64, i64)> {
-        self.driver.fragment_instance_id()
+    pub(crate) fn task_key(&self) -> Option<(i64, i64)> {
+        self.driver.task_key()
     }
 
     #[cfg(novarocks_dev_controls)]
     pub(crate) fn exchange_test_observer(
         &self,
     ) -> Option<Arc<dyn crate::runtime::exchange::TestEventObserver>> {
-        self.fragment_ctx.runtime_state().exchange_test_observer()
+        self.task_ctx.runtime_state().exchange_test_observer()
     }
 
-    pub(crate) fn fragment_ctx(&self) -> &Arc<FragmentContext> {
-        &self.fragment_ctx
+    pub(crate) fn task_ctx(&self) -> &Arc<TaskContext> {
+        &self.task_ctx
     }
 
     pub(crate) fn should_abort(&self) -> bool {
@@ -598,12 +604,12 @@ impl DriverTask {
 
 /// Shared executor internals used by global driver executor worker threads.
 pub(crate) struct ExecutorShared {
-    pub(crate) queue: Mutex<VecDeque<DriverTask>>,
+    pub(crate) queue: Mutex<VecDeque<DriverRunner>>,
     pub(crate) cv: Condvar,
     pub(crate) admission_closed: AtomicBool,
     pub(crate) shutdown: AtomicBool,
     /// Admitted drivers that have not ended yet, queued or parked.
-    pub(crate) live_tasks: AtomicUsize,
+    pub(crate) live_drivers: AtomicUsize,
     #[cfg(test)]
     pub(crate) live_workers: AtomicUsize,
 }
@@ -615,7 +621,7 @@ impl ExecutorShared {
             cv: Condvar::new(),
             admission_closed: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
-            live_tasks: AtomicUsize::new(0),
+            live_drivers: AtomicUsize::new(0),
             #[cfg(test)]
             live_workers: AtomicUsize::new(0),
         }
@@ -642,15 +648,15 @@ struct ExecutorLifecycleOwner {
 #[derive(Debug)]
 struct ExecutorDrainDeadline {
     timeout: Duration,
-    live_tasks: usize,
+    live_drivers: usize,
 }
 impl std::fmt::Display for ExecutorDrainDeadline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "driver executor did not stop within {} ms ({} live tasks)",
+            "driver executor did not stop within {} ms ({} live drivers)",
             self.timeout.as_millis(),
-            self.live_tasks
+            self.live_drivers
         )
     }
 }
@@ -659,7 +665,7 @@ impl novarocks_failure_contract::FailureProjection for ExecutorDrainDeadline {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Control,
-            crate::runtime::fragment::ExecutionReason::ExecutorDrainDeadline.reason(),
+            crate::runtime::task::ExecutionReason::ExecutorDrainDeadline.reason(),
         )
     }
 }
@@ -733,7 +739,7 @@ impl GlobalDriverExecutor {
     /// Returns `false` after shutdown has closed admission. Rejected drivers
     /// receive cooperative cancellation, but a driver with live asynchronous
     /// finish work does not publish a forged stopped fact.
-    pub fn submit(&self, tasks: Vec<DriverTask>) -> bool {
+    pub fn submit(&self, tasks: Vec<DriverRunner>) -> bool {
         let batch = DriverBatch::new(tasks);
         self.submit_owned(&batch)
     }
@@ -770,7 +776,7 @@ impl GlobalDriverExecutor {
             }
             for index in 0..batch.len() {
                 batch.borrow_prepared(index, |task| {
-                    task.fragment_ctx()
+                    task.task_ctx()
                         .event_scheduler()
                         .attach_executor(Arc::clone(&self.shared), &self.event_dispatcher);
                 });
@@ -839,7 +845,7 @@ impl GlobalDriverExecutor {
             if now >= deadline {
                 return Err(ExecutionFailure::from_domain(ExecutorDrainDeadline {
                     timeout,
-                    live_tasks: self.shared.live_tasks.load(Ordering::Acquire),
+                    live_drivers: self.shared.live_drivers.load(Ordering::Acquire),
                 }));
             }
             let (next, wait) = self
@@ -851,7 +857,7 @@ impl GlobalDriverExecutor {
             if wait.timed_out() && lifecycle.phase != ExecutorShutdownPhase::Joined {
                 return Err(ExecutionFailure::from_domain(ExecutorDrainDeadline {
                     timeout,
-                    live_tasks: self.shared.live_tasks.load(Ordering::Acquire),
+                    live_drivers: self.shared.live_drivers.load(Ordering::Acquire),
                 }));
             }
         }
@@ -950,7 +956,7 @@ struct RejectedDriverReaper {
 }
 
 impl RejectedDriverReaper {
-    fn enqueue(&self, task: DriverTask) {
+    fn enqueue(&self, task: DriverRunner) {
         self.enqueue_entry(ReaperEntry::from_pending(task));
     }
     fn enqueue_entry(&self, entry: ReaperEntry) {
@@ -1018,8 +1024,8 @@ fn run_rejected_driver_reaper(reaper: Arc<RejectedDriverReaper>) {
 
 /// Parks a driver whose asynchronous owners still hold finish work on its
 /// fragment's event scheduler until one of their finish watches fires.
-fn park_pending_finish(task: DriverTask) {
-    let scheduler = task.fragment_ctx().event_scheduler();
+fn park_pending_finish(task: DriverRunner) {
+    let scheduler = task.task_ctx().event_scheduler();
     let custody = task.driver.exit_custody();
     if !custody.try_begin_parking() {
         rejected_driver_reaper().enqueue(task);
@@ -1029,9 +1035,9 @@ fn park_pending_finish(task: DriverTask) {
     let health = control.exit_health_reporter();
     let mut slot = std::mem::ManuallyDrop::new(Some(task));
     let mut phase = ParkingPhase::new();
-    phase.roles[0].run(
+    phase.phases[0].run(
         &control,
-        crate::runtime::fragment::ExecutionReason::DriverParking
+        crate::runtime::task::ExecutionReason::DriverParking
             .code()
             .get(),
         || {
@@ -1047,9 +1053,9 @@ fn park_pending_finish(task: DriverTask) {
     }
     // A concurrent ready worker may already have retired the original task.
     // Last control/capture Drop has its detached same-health reporter.
-    phase.roles[1].run_metadata(
+    phase.phases[1].run_metadata(
         &health,
-        crate::runtime::fragment::ExecutionReason::DriverParkingControlDrop
+        crate::runtime::task::ExecutionReason::DriverParkingControlDrop
             .code()
             .get(),
         || drop(std::mem::ManuallyDrop::into_inner(control)),
@@ -1072,7 +1078,7 @@ fn worker_loop(shared: Arc<ExecutorShared>) {
                 // Stay while an admitted driver is parked: waking it needs a
                 // worker, even after shutdown began.
                 if shared.shutdown.load(Ordering::Acquire)
-                    && shared.live_tasks.load(Ordering::Acquire) == 0
+                    && shared.live_drivers.load(Ordering::Acquire) == 0
                 {
                     return;
                 }
@@ -1106,7 +1112,7 @@ fn worker_loop(shared: Arc<ExecutorShared>) {
                 // turn advances the original EOS and actual-exit observers.
                 return DriverState::Ready;
             }
-            let context = Arc::clone(&task.fragment_ctx);
+            let context = Arc::clone(&task.task_ctx);
             task.driver.capture_process_panic(payload, |cause| {
                 context.set_final_status(cause);
             })
@@ -1156,7 +1162,7 @@ fn worker_loop(shared: Arc<ExecutorShared>) {
                 }
                 match reason {
                     BlockedReason::InputEmpty | BlockedReason::OutputFull => {
-                        let scheduler = task.fragment_ctx().event_scheduler();
+                        let scheduler = task.task_ctx().event_scheduler();
                         match scheduler.add_blocked(task, reason.clone()) {
                             Ok(()) => {}
                             Err(task) => {
@@ -1172,7 +1178,7 @@ fn worker_loop(shared: Arc<ExecutorShared>) {
                         }
                     }
                     BlockedReason::Dependency(_) => {
-                        let scheduler = task.fragment_ctx().event_scheduler();
+                        let scheduler = task.task_ctx().event_scheduler();
                         match scheduler.add_blocked(task, reason.clone()) {
                             Ok(()) => {}
                             Err(task) => {
@@ -1225,7 +1231,7 @@ impl Drop for WorkerCountGuard<'_> {
 
 #[cfg(test)]
 mod tests {
-    fn assert_executor_shutdown(result: crate::runtime::fragment::ExecutionResult<()>) {
+    fn assert_executor_shutdown(result: crate::runtime::task::ExecutionResult<()>) {
         use novarocks_failure_contract::FailureProjection;
         use std::error::Error;
         let failure = result.expect_err("driver must retain the accepted shutdown cause");
@@ -1299,7 +1305,7 @@ mod tests {
         }
         fn poll_output(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             Ok(crate::exec::pipeline::step::StepResult::new(
                 None,
@@ -1329,7 +1335,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SourceKernel for BlockingSource {
         fn poll_output(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             self.entered.store(true, Ordering::Release);
             let (released, cv) = &*self.gate;
@@ -1360,7 +1366,7 @@ mod tests {
     impl crate::exec::pipeline::shape::SourceKernel for PanickingSource {
         fn poll_output(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             panic!("injected driver panic")
         }
@@ -1384,7 +1390,7 @@ mod tests {
             }
             fn poll_output(
                 &mut self,
-                _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+                _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
             ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
                 unreachable!("backing-only owner has no data work")
             }
@@ -1396,7 +1402,7 @@ mod tests {
             _responsibility: responsibility,
         };
         let runtime_state = Arc::new(RuntimeState::default());
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             Arc::clone(&runtime_state),
             None,
@@ -1404,14 +1410,14 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, runtime_state.error_state());
+        let completion = DriverGroupCompletion::new(1, runtime_state.error_state());
         let observed_bytes = Arc::new(std::sync::atomic::AtomicI64::new(-1));
         let observed = Arc::clone(&observed_bytes);
         let original_tracker = tracker.clone();
         completion.bind_test_resources_finisher(move |_| {
             observed.store(original_tracker.current(), Ordering::Release);
         });
-        let task = DriverTask::new(
+        let task = DriverRunner::new(
             PipelineDriver::new(
                 1,
                 vec![Box::new(crate::exec::pipeline::shape::Source::new(
@@ -1423,7 +1429,7 @@ mod tests {
                 None,
             ),
             Arc::clone(&completion),
-            fragment_ctx,
+            task_ctx,
             Duration::from_millis(1),
         );
         assert_eq!(tracker.current(), 512);
@@ -1439,7 +1445,7 @@ mod tests {
 
     #[test]
     fn fragment_completion_wait_timeout_drains_before_returning_timeout_error() {
-        let completion = FragmentCompletion::new(
+        let completion = DriverGroupCompletion::new(
             1,
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         );
@@ -1484,13 +1490,13 @@ mod tests {
 
     #[test]
     fn failed_conclusion_does_not_claim_that_drivers_stopped() {
-        let completion = FragmentCompletion::new(
+        let completion = DriverGroupCompletion::new(
             2,
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         );
 
         let failure = ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded);
-        let submitted_failure: crate::runtime::fragment::ExecutionFailure = failure.clone();
+        let submitted_failure: crate::runtime::task::ExecutionFailure = failure.clone();
         completion.fail(submitted_failure.clone());
         assert!(
             completion
@@ -1521,7 +1527,7 @@ mod tests {
     #[test]
     fn prepared_zero_driver_group_freezes_only_after_initial_failure_and_role_installation() {
         let control = Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default());
-        let completion = FragmentCompletion::new_prepared(0, control.clone());
+        let completion = DriverGroupCompletion::new_prepared(0, control.clone());
         assert!(completion.stopped_fact().is_none());
         let seen = Arc::new(Mutex::new(None));
         let observed = seen.clone();
@@ -1530,7 +1536,7 @@ mod tests {
         });
         let original: ExecutionFailure =
             novarocks_functions::KernelFailure::DeadlineExceeded.into();
-        let submitted_failure: crate::runtime::fragment::ExecutionFailure = original.clone();
+        let submitted_failure: crate::runtime::task::ExecutionFailure = original.clone();
         completion.fail(submitted_failure.clone());
         assert!(
             completion
@@ -1559,7 +1565,7 @@ mod tests {
 
     #[test]
     fn stopped_subscription_before_and_after_transition_fires_once() {
-        let completion = FragmentCompletion::new(
+        let completion = DriverGroupCompletion::new(
             1,
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         );
@@ -1587,11 +1593,11 @@ mod tests {
 
     #[test]
     fn stopped_observer_panic_before_transition_is_isolated() {
-        let completion = FragmentCompletion::new(
+        let completion = DriverGroupCompletion::new(
             1,
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         );
-        let peer = FragmentCompletion::new(
+        let peer = DriverGroupCompletion::new(
             0,
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         );
@@ -1628,14 +1634,14 @@ mod tests {
 
     #[test]
     fn stopped_observer_panic_after_transition_is_isolated() {
-        let completion = FragmentCompletion::new(
+        let completion = DriverGroupCompletion::new(
             0,
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         );
         let frozen = completion
             .stopped_fact()
             .expect("zero-driver completion starts stopped");
-        let peer = FragmentCompletion::new(
+        let peer = DriverGroupCompletion::new(
             0,
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         );
@@ -1664,7 +1670,7 @@ mod tests {
     #[test]
     fn stopped_subscription_racing_the_last_driver_cannot_lose_wakeup() {
         for _ in 0..1_000 {
-            let completion = FragmentCompletion::new(
+            let completion = DriverGroupCompletion::new(
                 1,
                 Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
             );
@@ -1735,7 +1741,7 @@ mod tests {
         let observed = Arc::new(AtomicBool::new(false));
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let runtime_state = Arc::new(RuntimeState::default());
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             Arc::clone(&runtime_state),
             Some((41_001, 41_002)),
@@ -1743,8 +1749,8 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, runtime_state.error_state());
-        executor.submit(vec![DriverTask::new(
+        let completion = DriverGroupCompletion::new(1, runtime_state.error_state());
+        executor.submit(vec![DriverRunner::new(
             PipelineDriver::new(
                 1,
                 vec![Box::new(crate::exec::pipeline::shape::Source::new(
@@ -1762,7 +1768,7 @@ mod tests {
                 Some((41_001, 41_002)),
             ),
             Arc::clone(&completion),
-            fragment_ctx,
+            task_ctx,
             Duration::from_millis(1),
         )]);
         assert!(wait_until(Duration::from_secs(1), || observed.load(Ordering::Acquire)));
@@ -1825,7 +1831,7 @@ mod tests {
         }
         fn poll_output(
             &mut self,
-            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
             unreachable!("finished data has no work")
         }
@@ -1835,27 +1841,27 @@ mod tests {
         observable: Option<Arc<Observable>>,
         checks: Arc<AtomicUsize>,
         cancelled: Arc<AtomicBool>,
-        completion: Arc<FragmentCompletion>,
-        fragment_ctx: Arc<FragmentContext>,
+        completion: Arc<DriverGroupCompletion>,
+        task_ctx: Arc<TaskContext>,
     }
 
     impl PendingHarness {
-        fn submit(executor: &GlobalDriverExecutor, finst: (i64, i64), notify: bool) -> Self {
+        fn submit(executor: &GlobalDriverExecutor, task_key: (i64, i64), notify: bool) -> Self {
             let pending = Arc::new(AtomicBool::new(true));
             let observable = notify.then(|| Arc::new(Observable::new()));
             let checks = Arc::new(AtomicUsize::new(0));
             let cancelled = Arc::new(AtomicBool::new(false));
             let runtime_state = Arc::new(RuntimeState::default());
-            let fragment_ctx = Arc::new(FragmentContext::new(
+            let task_ctx = Arc::new(TaskContext::new(
                 None,
                 Arc::clone(&runtime_state),
-                Some(finst),
+                Some(task_key),
                 None,
                 None,
                 None,
             ));
-            let completion = FragmentCompletion::new(1, runtime_state.error_state());
-            assert!(executor.submit(vec![DriverTask::new(
+            let completion = DriverGroupCompletion::new(1, runtime_state.error_state());
+            assert!(executor.submit(vec![DriverRunner::new(
                 PipelineDriver::new(
                     1,
                     vec![Box::new(crate::exec::pipeline::shape::Source::new(
@@ -1869,10 +1875,10 @@ mod tests {
                     None,
                     Vec::new(),
                     runtime_state,
-                    Some(finst),
+                    Some(task_key),
                 ),
                 Arc::clone(&completion),
-                Arc::clone(&fragment_ctx),
+                Arc::clone(&task_ctx),
                 Duration::from_millis(1),
             )]));
             Self {
@@ -1881,7 +1887,7 @@ mod tests {
                 checks,
                 cancelled,
                 completion,
-                fragment_ctx,
+                task_ctx,
             }
         }
 
@@ -1966,7 +1972,7 @@ mod tests {
         // The fragment fails elsewhere: the parked driver gets one turn to
         // deliver cancellation, then waits for its owner again.
         let failure = ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded);
-        let submitted_failure: crate::runtime::fragment::ExecutionFailure = failure.clone();
+        let submitted_failure: crate::runtime::task::ExecutionFailure = failure.clone();
         harness.completion.fail(submitted_failure.clone());
         assert!(
             harness
@@ -1976,7 +1982,7 @@ mod tests {
                 .unwrap_err()
                 .same_occurrence(&submitted_failure)
         );
-        harness.fragment_ctx.set_final_status(failure.clone());
+        harness.task_ctx.set_final_status(failure.clone());
         assert!(wait_until(Duration::from_secs(1), || {
             harness.cancelled.load(Ordering::Acquire)
         }));
@@ -2038,7 +2044,7 @@ mod tests {
         let entered = Arc::new(AtomicBool::new(false));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let runtime_state = Arc::new(RuntimeState::default());
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             Arc::clone(&runtime_state),
             Some((42_001, 42_002)),
@@ -2046,8 +2052,8 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, runtime_state.error_state());
-        executor.submit(vec![DriverTask::new(
+        let completion = DriverGroupCompletion::new(1, runtime_state.error_state());
+        executor.submit(vec![DriverRunner::new(
             PipelineDriver::new(
                 1,
                 vec![Box::new(crate::exec::pipeline::shape::Source::new(
@@ -2062,7 +2068,7 @@ mod tests {
                 Some((42_001, 42_002)),
             ),
             completion,
-            fragment_ctx,
+            task_ctx,
             Duration::from_millis(1),
         )]);
         assert!(wait_until(Duration::from_secs(1), || entered.load(Ordering::Acquire)));
@@ -2101,7 +2107,7 @@ mod tests {
             None,
             control.clone(),
         ));
-        let fragment = Arc::new(FragmentContext::new(
+        let fragment = Arc::new(TaskContext::new(
             None,
             state.clone(),
             Some((8801, 8802)),
@@ -2109,11 +2115,11 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, control.clone());
+        let completion = DriverGroupCompletion::new(1, control.clone());
         let pending = Arc::new(AtomicBool::new(true));
         let observed = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
-        let task = DriverTask::new(
+        let task = DriverRunner::new(
             PipelineDriver::new(
                 1,
                 vec![Box::new(crate::exec::pipeline::shape::Source::new(
@@ -2155,7 +2161,7 @@ mod tests {
         let executor = GlobalDriverExecutor::new(1);
         executor.shutdown().expect("executor shutdown");
         let runtime_state = Arc::new(RuntimeState::default());
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             Arc::clone(&runtime_state),
             Some((31_001, 31_002)),
@@ -2163,9 +2169,9 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, runtime_state.error_state());
+        let completion = DriverGroupCompletion::new(1, runtime_state.error_state());
         let shared_owners_before_submit = Arc::strong_count(&executor.shared);
-        let task = DriverTask::new(
+        let task = DriverRunner::new(
             PipelineDriver::new(
                 1,
                 Vec::new(),
@@ -2175,7 +2181,7 @@ mod tests {
                 Some((31_001, 31_002)),
             ),
             Arc::clone(&completion),
-            Arc::clone(&fragment_ctx),
+            Arc::clone(&task_ctx),
             Duration::from_millis(1),
         );
 
@@ -2222,7 +2228,7 @@ mod tests {
                 owner.view(TaskFailurePhase::Execution),
             ))),
         ));
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             runtime_state.clone(),
             Some((33_041, 33_042)),
@@ -2230,8 +2236,8 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, runtime_state.error_state());
-        let task = DriverTask::new(
+        let completion = DriverGroupCompletion::new(1, runtime_state.error_state());
+        let task = DriverRunner::new(
             PipelineDriver::new(
                 1,
                 vec![
@@ -2252,7 +2258,7 @@ mod tests {
                 Some((33_041, 33_042)),
             ),
             completion.clone(),
-            fragment_ctx,
+            task_ctx,
             Duration::from_secs(1),
         );
         assert!(executor.submit(vec![task]));
@@ -2267,14 +2273,14 @@ mod tests {
         assert!(owner.pending_len() > 0);
         assert!(completion.stopped_fact().is_none());
         assert_eq!(completion.remaining_drivers(), 1);
-        assert_eq!(executor.shared.live_tasks.load(Ordering::Acquire), 1);
+        assert_eq!(executor.shared.live_drivers.load(Ordering::Acquire), 1);
         pending.store(false, Ordering::Release);
         assert!(wait_until(Duration::from_secs(2), || completion
             .stopped_fact()
             .is_some()));
         assert!(wait_until(Duration::from_secs(2), || executor
             .shared
-            .live_tasks
+            .live_drivers
             .load(Ordering::Acquire)
             == 0));
         assert_eq!(completion.remaining_drivers(), 0);
@@ -2340,7 +2346,7 @@ mod tests {
         let observed = Arc::new(AtomicBool::new(false));
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let runtime_state = Arc::new(RuntimeState::default());
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             Arc::clone(&runtime_state),
             Some((33_001, 33_002)),
@@ -2348,8 +2354,8 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, runtime_state.error_state());
-        let task = DriverTask::new(
+        let completion = DriverGroupCompletion::new(1, runtime_state.error_state());
+        let task = DriverRunner::new(
             PipelineDriver::new(
                 1,
                 vec![
@@ -2370,7 +2376,7 @@ mod tests {
                 Some((33_001, 33_002)),
             ),
             Arc::clone(&completion),
-            fragment_ctx,
+            task_ctx,
             Duration::from_secs(1),
         );
         assert!(executor.submit(vec![task]));
@@ -2406,7 +2412,7 @@ mod tests {
         let observed = Arc::new(AtomicBool::new(false));
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let runtime_state = Arc::new(RuntimeState::default());
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             Arc::clone(&runtime_state),
             Some((32_001, 32_002)),
@@ -2414,8 +2420,8 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, runtime_state.error_state());
-        let task = DriverTask::new(
+        let completion = DriverGroupCompletion::new(1, runtime_state.error_state());
+        let task = DriverRunner::new(
             PipelineDriver::new(
                 1,
                 vec![Box::new(crate::exec::pipeline::shape::Source::new(
@@ -2433,7 +2439,7 @@ mod tests {
                 Some((32_001, 32_002)),
             ),
             Arc::clone(&completion),
-            fragment_ctx,
+            task_ctx,
             Duration::from_millis(1),
         );
 
@@ -2468,7 +2474,7 @@ mod tests {
         let observed = Arc::new(AtomicBool::new(false));
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let runtime_state = Arc::new(RuntimeState::default());
-        let fragment_ctx = Arc::new(FragmentContext::new(
+        let task_ctx = Arc::new(TaskContext::new(
             None,
             Arc::clone(&runtime_state),
             Some((32_001, 32_002)),
@@ -2476,8 +2482,8 @@ mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1, runtime_state.error_state());
-        let mut task = DriverTask::new(
+        let completion = DriverGroupCompletion::new(1, runtime_state.error_state());
+        let mut task = DriverRunner::new(
             PipelineDriver::new(
                 1,
                 vec![Box::new(crate::exec::pipeline::shape::Source::new(
@@ -2495,17 +2501,17 @@ mod tests {
                 Some((32_001, 32_002)),
             ),
             Arc::clone(&completion),
-            Arc::clone(&fragment_ctx),
+            Arc::clone(&task_ctx),
             Duration::from_millis(1),
         );
 
-        task.lease = Some(ExecutorTaskLease::acquire(&shared));
+        task.driver_live_guard = Some(LiveDriverGuard::acquire(&shared));
         let task = task
             .reject_due_to_executor_shutdown()
             .expect("asynchronous owner still holds the task");
-        fragment_ctx.event_scheduler().shutdown();
+        task_ctx.event_scheduler().shutdown();
         park_pending_finish(task);
-        assert_eq!(shared.live_tasks.load(Ordering::Acquire), 1);
+        assert_eq!(shared.live_drivers.load(Ordering::Acquire), 1);
 
         assert!(cancel_requested.load(Ordering::Acquire));
         assert!(observed.load(Ordering::Acquire));
@@ -2522,7 +2528,7 @@ mod tests {
             .is_some()));
         assert_eq!(completion.remaining_drivers(), 0);
         assert!(wait_until(Duration::from_secs(1), || shared
-            .live_tasks
+            .live_drivers
             .load(Ordering::Acquire)
             == 0));
         assert_executor_shutdown(
@@ -2548,7 +2554,7 @@ mod tests {
                 for ordinal in 0..8 {
                     let identity = group * 8 + ordinal;
                     let runtime_state = Arc::new(RuntimeState::default());
-                    let fragment_ctx = Arc::new(FragmentContext::new(
+                    let task_ctx = Arc::new(TaskContext::new(
                         None,
                         Arc::clone(&runtime_state),
                         Some((34_001, identity)),
@@ -2556,10 +2562,10 @@ mod tests {
                         None,
                         None,
                     ));
-                    let completion = FragmentCompletion::new(1, runtime_state.error_state());
+                    let completion = DriverGroupCompletion::new(1, runtime_state.error_state());
                     let observed = Arc::new(AtomicBool::new(false));
                     let cancel_requested = Arc::new(AtomicBool::new(false));
-                    let task = DriverTask::new(
+                    let task = DriverRunner::new(
                         PipelineDriver::new(
                             1,
                             vec![Box::new(crate::exec::pipeline::shape::Source::new(
@@ -2577,7 +2583,7 @@ mod tests {
                             Some((34_001, identity)),
                         ),
                         Arc::clone(&completion),
-                        fragment_ctx,
+                        task_ctx,
                         Duration::from_millis(1),
                     );
                     assert!(!executor.submit(vec![task]));
@@ -2619,12 +2625,12 @@ mod tests {
 
     #[test]
     fn typed_failure_completion_first_cause_precedes_actual_stop_and_survives_second_failure() {
-        let completion = FragmentCompletion::new(
+        let completion = DriverGroupCompletion::new(
             2,
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         );
         let first: ExecutionFailure = novarocks_functions::KernelFailure::ResourceExhausted.into();
-        let submitted_failure: crate::runtime::fragment::ExecutionFailure = first.clone();
+        let submitted_failure: crate::runtime::task::ExecutionFailure = first.clone();
         completion.fail(submitted_failure.clone());
         assert!(
             completion

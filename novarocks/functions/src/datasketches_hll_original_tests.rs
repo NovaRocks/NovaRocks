@@ -19,7 +19,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use datasketches::hll::{HllSketch, HllType};
 
-use super::{HllHandle, HllTargetType, hll_estimate};
+use super::{HllAccumulator, HllTargetType, hll_estimate};
 
 #[test]
 fn known_compact_payload_is_still_readable() {
@@ -29,10 +29,10 @@ fn known_compact_payload_is_still_readable() {
 
     assert_eq!(hll_estimate(&payload).expect("estimate"), 1);
     assert_eq!(
-        HllHandle::from_payload_unreserved(&payload)
-            .expect("handle from payload")
+        HllAccumulator::from_payload_unreserved(&payload)
+            .expect("accumulator from payload")
             .estimate()
-            .expect("estimate from handle"),
+            .expect("estimate from accumulator"),
         1
     );
 }
@@ -50,7 +50,7 @@ fn legacy_coupon_union_with_typed_sql_string_is_two_and_replay_is_idempotent() {
     assert_eq!(hash, 0xd68c_fa33_ac86_5d67);
     assert_eq!(prehash_array_value(&values, 1, "test").unwrap(), None);
     let legacy = STANDARD.decode("AgEHEQMIAQQ9nPUc").unwrap();
-    let mut string = HllHandle::new_unreserved(10, HllTargetType::Hll6).unwrap();
+    let mut string = HllAccumulator::new_unreserved(10, HllTargetType::Hll6).unwrap();
     string.update_hash_unreserved(hash).unwrap();
     let string_payload = string.serialize().unwrap();
     assert_eq!(string_payload[6], 1);
@@ -62,7 +62,7 @@ fn legacy_coupon_union_with_typed_sql_string_is_two_and_replay_is_idempotent() {
         } else {
             (&legacy, &string_payload)
         };
-        let mut merged = HllHandle::from_payload_unreserved(first).unwrap();
+        let mut merged = HllAccumulator::from_payload_unreserved(first).unwrap();
         merged.merge_payload_unreserved(second).unwrap();
         merged.merge_payload_unreserved(first).unwrap();
         merged.merge_payload_unreserved(second).unwrap();
@@ -83,19 +83,22 @@ fn legacy_coupon_union_with_typed_sql_string_is_two_and_replay_is_idempotent() {
 
 #[test]
 fn native_hll_roundtrip_merges_without_cpp() {
-    let mut left = HllHandle::new_unreserved(10, HllTargetType::Hll6).expect("left handle");
+    let mut left =
+        HllAccumulator::new_unreserved(10, HllTargetType::Hll6).expect("left accumulator");
     for value in 0_u64..64 {
         left.update_hash_unreserved(value).expect("update left");
     }
     let left_payload = left.serialize().expect("serialize left");
 
-    let mut right = HllHandle::new_unreserved(10, HllTargetType::Hll6).expect("right handle");
+    let mut right =
+        HllAccumulator::new_unreserved(10, HllTargetType::Hll6).expect("right accumulator");
     for value in 64_u64..128 {
         right.update_hash_unreserved(value).expect("update right");
     }
     let right_payload = right.serialize().expect("serialize right");
 
-    let mut merged = HllHandle::from_payload_unreserved(&left_payload).expect("merged handle");
+    let mut merged =
+        HllAccumulator::from_payload_unreserved(&left_payload).expect("merged accumulator");
     merged
         .merge_payload_unreserved(&right_payload)
         .expect("merge right");
@@ -109,14 +112,16 @@ fn native_hll_roundtrip_merges_without_cpp() {
 
 #[test]
 fn native_hll4_roundtrip_merges_without_cpp() {
-    let mut sparse = HllHandle::new_unreserved(10, HllTargetType::Hll4).expect("sparse handle");
+    let mut sparse =
+        HllAccumulator::new_unreserved(10, HllTargetType::Hll4).expect("sparse accumulator");
     for value in 0_u64..7 {
         sparse.update_hash_unreserved(value).expect("update sparse");
     }
     let sparse_sketch = HllSketch::deserialize(&sparse.serialize().expect("serialize sparse HLL4"))
         .expect("deserialize sparse HLL4");
 
-    let mut left = HllHandle::new_unreserved(10, HllTargetType::Hll4).expect("left handle");
+    let mut left =
+        HllAccumulator::new_unreserved(10, HllTargetType::Hll4).expect("left accumulator");
     for value in 0_u64..4_096 {
         left.update_hash_unreserved(value).expect("update left");
     }
@@ -125,7 +130,8 @@ fn native_hll4_roundtrip_merges_without_cpp() {
     assert_eq!(left_sketch.target_type(), HllType::Hll4);
     assert!(left_sketch.estimated_size() > sparse_sketch.estimated_size());
 
-    let mut right = HllHandle::new_unreserved(10, HllTargetType::Hll4).expect("right handle");
+    let mut right =
+        HllAccumulator::new_unreserved(10, HllTargetType::Hll4).expect("right accumulator");
     for value in 4_096_u64..8_192 {
         right.update_hash_unreserved(value).expect("update right");
     }
@@ -133,7 +139,8 @@ fn native_hll4_roundtrip_merges_without_cpp() {
     let right_sketch = HllSketch::deserialize(&right_payload).expect("deserialize right");
     assert_eq!(right_sketch.target_type(), HllType::Hll4);
 
-    let mut merged = HllHandle::from_payload_unreserved(&left_payload).expect("merged handle");
+    let mut merged =
+        HllAccumulator::from_payload_unreserved(&left_payload).expect("merged accumulator");
     merged
         .merge_payload_unreserved(&right_payload)
         .expect("merge right");
@@ -141,7 +148,8 @@ fn native_hll4_roundtrip_merges_without_cpp() {
     let merged_sketch = HllSketch::deserialize(&merged_payload).expect("deserialize merged");
     assert_eq!(merged_sketch.target_type(), HllType::Hll4);
 
-    let roundtrip = HllHandle::from_payload_unreserved(&merged_payload).expect("roundtrip handle");
+    let roundtrip =
+        HllAccumulator::from_payload_unreserved(&merged_payload).expect("roundtrip accumulator");
     let roundtrip_payload = roundtrip.serialize().expect("serialize roundtrip");
     assert_eq!(
         HllSketch::deserialize(&roundtrip_payload)

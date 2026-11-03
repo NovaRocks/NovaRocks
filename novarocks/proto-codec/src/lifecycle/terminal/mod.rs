@@ -373,7 +373,7 @@ fn producer_stream_key(
     value: &novarocks::QueryTerminalRuntimeFilterProducerStreamV1,
 ) -> ((u32, u32), i64, i64, u32) {
     let id = value
-        .producer_fragment_instance_id
+        .producer_task_key
         .as_ref()
         .map_or((i64::MIN, i64::MIN), |id| (id.hi, id.lo));
     (
@@ -397,7 +397,7 @@ fn consumer_key(
     value: &novarocks::QueryTerminalRuntimeFilterConsumerV1,
 ) -> ((u32, u32), u32, i64, i64) {
     let id = value
-        .fragment_instance_id
+        .task_key
         .as_ref()
         .map_or((i64::MIN, i64::MIN), |id| (id.hi, id.lo));
     (
@@ -413,20 +413,14 @@ fn validate_producer_streams(
     path: FieldPath,
 ) -> Result<(), ProtocolError> {
     for (index, value) in values.iter().enumerate() {
-        let value_path = path
-            .clone()
-            .index(index)
-            .field("producer_fragment_instance_id");
-        let id = value
-            .producer_fragment_instance_id
-            .as_ref()
-            .ok_or_else(|| {
-                error(
-                    value_path.clone(),
-                    ProtocolErrorKind::MissingField,
-                    "terminal runtime-filter producer fragment instance id is required",
-                )
-            })?;
+        let value_path = path.clone().index(index).field("producer_task_key");
+        let id = value.producer_task_key.as_ref().ok_or_else(|| {
+            error(
+                value_path.clone(),
+                ProtocolErrorKind::MissingField,
+                "terminal runtime-filter producer fragment instance id is required",
+            )
+        })?;
         validate_nonzero_unique_id(
             id,
             value_path,
@@ -465,16 +459,16 @@ fn validate_consumers(
                 "terminal runtime-filter consumer binding id must be nonzero",
             ));
         }
-        let id = value.fragment_instance_id.as_ref().ok_or_else(|| {
+        let id = value.task_key.as_ref().ok_or_else(|| {
             error(
-                value_path.field("fragment_instance_id"),
+                value_path.field("task_key"),
                 ProtocolErrorKind::MissingField,
                 "terminal runtime-filter consumer fragment instance id is required",
             )
         })?;
         validate_nonzero_unique_id(
             id,
-            value_path.field("fragment_instance_id"),
+            value_path.field("task_key"),
             "terminal runtime-filter consumer fragment instance id must be nonzero",
         )?;
         validate_optional_nonzero(

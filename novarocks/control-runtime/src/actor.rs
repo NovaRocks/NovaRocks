@@ -45,7 +45,7 @@ pub trait Actor: Send + 'static {
         now: Tick,
         input: InputEnvelope,
         value: Self::Input,
-        step: &mut StepContext<'_, Self::Effect>,
+        step: &mut ActorStep<'_, Self::Effect>,
     );
     fn next_deadline(&self) -> Option<Tick>;
     /// A pure failure hook cannot inspect the partially mutated protocol state.
@@ -53,30 +53,30 @@ pub trait Actor: Send + 'static {
         scope: ScopeId,
         generation: Generation,
         input: InputEnvelope,
-        step: &mut StepContext<'_, Self::Effect>,
+        step: &mut ActorStep<'_, Self::Effect>,
     );
 }
 
-pub struct StepContext<'a, E> {
+pub struct ActorStep<'a, E> {
     scope: &'a crate::transaction::ScopeHandle,
     turn: &'a mut TurnBudget,
     work_remaining: usize,
     batch: EffectBatchState,
     payloads: std::collections::BTreeMap<novarocks_control_runtime_core::identity::ActionId, E>,
-    reservations: std::collections::BTreeMap<ReservationId, crate::lease::StepGuard>,
+    reservations: std::collections::BTreeMap<ReservationId, crate::obligation::StepRegistration>,
     max_reservations: usize,
     failure_work: Option<ScopedWorkRef>,
     retained: bool,
     runtime_metadata: bool,
-    input_author: Option<crate::driver::InputAuthor>,
+    input_author: Option<crate::actor_turn::InputAuthor>,
     authors: std::collections::BTreeMap<
         novarocks_control_runtime_core::identity::ActionId,
-        crate::driver::InputAuthor,
+        crate::actor_turn::InputAuthor,
     >,
     metadata: Vec<MetadataEffect<E>>,
     stop_producing: bool,
 }
-impl<'a, E> StepContext<'a, E> {
+impl<'a, E> ActorStep<'a, E> {
     pub(crate) fn new(
         budget: &'a mut TurnBudget,
         scope: &'a crate::transaction::ScopeHandle,
@@ -109,7 +109,7 @@ impl<'a, E> StepContext<'a, E> {
             ),
         }
     }
-    pub(crate) fn set_input_author(&mut self, author: Option<crate::driver::InputAuthor>) {
+    pub(crate) fn set_input_author(&mut self, author: Option<crate::actor_turn::InputAuthor>) {
         self.input_author = author;
     }
     pub(crate) fn retained(&mut self) {
@@ -120,9 +120,9 @@ impl<'a, E> StepContext<'a, E> {
     pub fn input_work(&self) -> Option<ScopedWorkRef> {
         self.input_author
             .as_ref()
-            .map(crate::driver::InputAuthor::work)
+            .map(crate::actor_turn::InputAuthor::work)
     }
-    pub fn input_author(&self) -> Option<&crate::driver::InputAuthor> {
+    pub fn input_author(&self) -> Option<&crate::actor_turn::InputAuthor> {
         self.input_author.as_ref()
     }
     pub(crate) fn set_runtime_metadata(&mut self, value: bool) {
@@ -180,8 +180,8 @@ impl<'a, E> StepContext<'a, E> {
     /// the originals until its actual host or failure custodian takes them.
     pub fn reservation(
         &mut self,
-        guard: crate::lease::StepGuard,
-    ) -> Result<(), (ReservationHandoffError, crate::lease::StepGuard)> {
+        guard: crate::obligation::StepRegistration,
+    ) -> Result<(), (ReservationHandoffError, crate::obligation::StepRegistration)> {
         let error = if self.retained || !guard.belongs_to(self.scope) {
             Some(ReservationHandoffError::WrongScope)
         } else if self.reservations.contains_key(&guard.reservation_id()) {
@@ -206,7 +206,7 @@ impl<'a, E> StepContext<'a, E> {
         true
     }
     /// The work identity references a pre-admitted host role. Emitting a neutral
-    /// effect does not create a WorkLease, payload, execution credit or exit fact.
+    /// effect does not create a WorkObligation, payload, execution credit or exit fact.
     pub fn effect(
         &mut self,
         descriptor: EffectDescriptor,
@@ -222,7 +222,7 @@ impl<'a, E> StepContext<'a, E> {
     /// A delayed reply must borrow its original admitted author binding.
     pub fn effect_from_author(
         &mut self,
-        author: &crate::driver::InputAuthor,
+        author: &crate::actor_turn::InputAuthor,
         descriptor: EffectDescriptor,
         effect: E,
     ) -> Result<(), (EffectEmissionError, E)> {
@@ -233,7 +233,7 @@ impl<'a, E> StepContext<'a, E> {
     }
     fn effect_inner(
         &mut self,
-        author: Option<crate::driver::InputAuthor>,
+        author: Option<crate::actor_turn::InputAuthor>,
         descriptor: EffectDescriptor,
         effect: E,
     ) -> Result<(), (EffectEmissionError, E)> {
@@ -286,8 +286,8 @@ impl<'a, E> StepContext<'a, E> {
 pub(crate) struct MetadataEffect<E> {
     pub(crate) value: Option<E>,
     pub(crate) completed: bool,
-    pub(crate) forwarded: Option<crate::driver::MetadataDelivery>,
-    pub(crate) credit_waiter: Option<crate::driver::MetadataCreditWait>,
+    pub(crate) forwarded: Option<crate::actor_turn::MetadataDelivery>,
+    pub(crate) credit_waiter: Option<crate::actor_turn::MetadataCreditWait>,
 }
 pub(crate) struct StepEnvelope<E> {
     pub(crate) ordinal: Option<BatchId>,
@@ -295,11 +295,12 @@ pub(crate) struct StepEnvelope<E> {
     pub(crate) state: EffectBatchState,
     pub(crate) payloads:
         std::collections::BTreeMap<novarocks_control_runtime_core::identity::ActionId, E>,
-    pub(crate) reservations: std::collections::BTreeMap<ReservationId, crate::lease::StepGuard>,
+    pub(crate) reservations:
+        std::collections::BTreeMap<ReservationId, crate::obligation::StepRegistration>,
     pub(crate) metadata: Vec<MetadataEffect<E>>,
     pub(crate) authors: std::collections::BTreeMap<
         novarocks_control_runtime_core::identity::ActionId,
-        crate::driver::InputAuthor,
+        crate::actor_turn::InputAuthor,
     >,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

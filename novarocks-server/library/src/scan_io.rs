@@ -21,9 +21,9 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use novarocks_fs::{
-    FileBytesFuture, FileError, FileErrorKind, FileIoRuntime, FileRangeService, FileResult,
-    FileTask, FileTaskFuture, FileTaskSpawner, FileU64Future, TokioFileIoRuntime,
-    TokioFileTaskSpawner,
+    FileBytesFuture, FileError, FileErrorKind, FileIoFuture, FileIoJob, FileIoRuntime,
+    FileIoSpawner, FileRangeService, FileResult, FileU64Future, TokioFileIoRuntime,
+    TokioFileIoSpawner,
 };
 use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 use tokio::sync::Notify;
@@ -145,13 +145,13 @@ fn map_scan_join<T>(result: Result<FileResult<T>, tokio::task::JoinError>) -> Fi
     }
 }
 
-struct TrackedFileTaskSpawner {
-    inner: TokioFileTaskSpawner,
+struct TrackedFileIoSpawner {
+    inner: TokioFileIoSpawner,
     flight: Arc<FlightState>,
 }
 
-impl FileTaskSpawner for TrackedFileTaskSpawner {
-    fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
+impl FileIoSpawner for TrackedFileIoSpawner {
+    fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
         let flight = self.flight.enter()?;
         let stop = self.flight.stop.view();
         self.inner.spawn(Box::pin(async move {
@@ -179,7 +179,7 @@ impl FileTaskSpawner for TrackedFileTaskSpawner {
 #[derive(Clone)]
 pub struct ScanIoServices {
     file_runtime: Arc<dyn FileIoRuntime>,
-    file_task_spawner: Arc<dyn FileTaskSpawner>,
+    file_io_spawner: Arc<dyn FileIoSpawner>,
     range_service: Arc<FileRangeService>,
     flight: Arc<FlightState>,
     handle: tokio::runtime::Handle,
@@ -196,8 +196,8 @@ impl ScanIoServices {
         Arc::clone(&self.file_runtime)
     }
 
-    pub fn file_task_spawner(&self) -> Arc<dyn FileTaskSpawner> {
-        Arc::clone(&self.file_task_spawner)
+    pub fn file_io_spawner(&self) -> Arc<dyn FileIoSpawner> {
+        Arc::clone(&self.file_io_spawner)
     }
 
     pub fn range_service(&self) -> Arc<FileRangeService> {
@@ -237,8 +237,8 @@ impl ScanIoRuntime {
             .map_err(|error| anyhow::anyhow!("build backend scan I/O runtime: {error}"))?;
         let handle = runtime.handle().clone();
         let flight = Arc::new(FlightState::default());
-        let file_task_spawner: Arc<dyn FileTaskSpawner> = Arc::new(TrackedFileTaskSpawner {
-            inner: TokioFileTaskSpawner::new(handle.clone()),
+        let file_io_spawner: Arc<dyn FileIoSpawner> = Arc::new(TrackedFileIoSpawner {
+            inner: TokioFileIoSpawner::new(handle.clone()),
             flight: Arc::clone(&flight),
         });
         let range_service = FileRangeService::new(
@@ -248,7 +248,7 @@ impl ScanIoRuntime {
                 .ok_or_else(|| anyhow::anyhow!("scan range source window must be nonzero"))?,
             NonZeroUsize::new(config.scan_range_queue_capacity)
                 .ok_or_else(|| anyhow::anyhow!("scan range queue capacity must be nonzero"))?,
-            Arc::clone(&file_task_spawner),
+            Arc::clone(&file_io_spawner),
             handle.clone(),
         );
         Ok(Self {
@@ -259,7 +259,7 @@ impl ScanIoRuntime {
                     handle: handle.clone(),
                     flight: Arc::clone(&flight),
                 }),
-                file_task_spawner,
+                file_io_spawner,
                 range_service,
                 flight: Arc::clone(&flight),
                 handle: handle.clone(),
@@ -321,7 +321,7 @@ mod tests {
         let (started, started_rx) = tokio::sync::oneshot::channel();
         let (release, release_rx) = std::sync::mpsc::channel();
         services
-            .file_task_spawner()
+            .file_io_spawner()
             .spawn_detached_blocking(Box::new(move || {
                 started.send(()).expect("notify blocking start");
                 release_rx.recv().expect("release blocking refresh");
@@ -329,12 +329,12 @@ mod tests {
         started_rx.await.expect("blocking refresh started");
 
         let task = services
-            .file_task_spawner()
+            .file_io_spawner()
             .spawn(Box::pin(async move {
                 std::future::pending::<()>().await;
             }))
             .expect("spawn scan task");
-        // Even a caller that forgets its FileTask cannot keep shutdown alive:
+        // Even a caller that forgets its FileIoJob cannot keep shutdown alive:
         // the service owns the stop signal and the tracked task exit.
         std::mem::forget(task);
         let stopped = runtime.flight.stop.view();
@@ -342,7 +342,7 @@ mod tests {
         stopped.stopped().await;
         assert!(!shutdown.is_finished());
         let refused = services
-            .file_task_spawner()
+            .file_io_spawner()
             .spawn(Box::pin(async {}))
             .err()
             .expect("closed scan I/O rejects new work");

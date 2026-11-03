@@ -182,13 +182,13 @@ use novarocks_state_store_api::{
 };
 
 #[cfg(feature = "foundationdb-provider")]
-use self::runtime::ProviderHandle;
+use self::runtime::FoundationDbDatabaseRegistration;
 
 #[cfg(feature = "foundationdb-provider")]
 pub(crate) struct FoundationDbStateStore {
     /// Shared with the adjudicator, which has to outlive any single request in
     /// order to answer for an attempt whose caller is already gone.
-    lease: Arc<ProviderHandle>,
+    database_registration: Arc<FoundationDbDatabaseRegistration>,
     codec: KeyspaceCodec,
     identity: StoreIdentity,
     limits: StateStoreLimits,
@@ -241,13 +241,13 @@ fn classify_native_read_error(error: FdbError) -> StateStoreError {
 #[cfg(feature = "foundationdb-provider")]
 impl FoundationDbStateStore {
     async fn open(
-        lease: ProviderHandle,
+        database_registration: FoundationDbDatabaseRegistration,
         limits: StateStoreLimits,
         cluster_id: String,
         keyspace_id: Uuid,
     ) -> Result<Self, StateStoreError> {
-        let lease = Arc::new(lease);
-        let database = lease.database()?;
+        let database_registration = Arc::new(database_registration);
+        let database = database_registration.database()?;
         // One tag per open. An attempt identity is deliberately not convertible
         // to bytes, so this is what keeps two live opens of one keyspace from
         // addressing each other's commit-state keys.
@@ -261,7 +261,7 @@ impl FoundationDbStateStore {
         );
         let metrics = Arc::new(ProviderMetrics::new(FOUNDATIONDB_STATE_STORE_PROVIDER_ID));
         let evidence = Arc::new(FoundationDbEvidence::new(
-            Arc::clone(&lease),
+            Arc::clone(&database_registration),
             codec.clone(),
             limits.clone(),
             Arc::clone(&metrics),
@@ -271,7 +271,7 @@ impl FoundationDbStateStore {
             evidence as Arc<dyn InDoubtAdjudicator>,
         );
         Ok(Self {
-            lease,
+            database_registration,
             codec,
             identity,
             limits,
@@ -314,7 +314,7 @@ impl StateStore for FoundationDbStateStore {
     }
 
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
-        let _operation = self.lease.acquire_operation()?;
+        let _operation = self.database_registration.acquire_operation()?;
         Ok(self.identity.clone())
     }
 }

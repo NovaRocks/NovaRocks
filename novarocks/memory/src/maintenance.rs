@@ -141,7 +141,7 @@ impl MemoryAuthority {
                 let account = self.shared.accounts.lock().unwrap().records[index]
                     .as_ref()
                     .and_then(|a| a.upgrade())
-                    .map(crate::AccountHandle);
+                    .map(crate::Account);
                 if let Some(account) = account {
                     account.return_slack(u64::MAX);
                 }
@@ -297,7 +297,7 @@ impl MemoryAuthority {
         true
     }
     /// Checks capability ownership only. This grants no funding domain.
-    pub fn validate_account(&self, account: &crate::AccountHandle) -> Result<(), CapacityError> {
+    pub fn validate_account(&self, account: &crate::Account) -> Result<(), CapacityError> {
         if !Arc::ptr_eq(&self.shared, &account.0.shared) {
             return Err(CapacityError::Invalid {
                 detail: "account belongs to another authority",
@@ -309,7 +309,7 @@ impl MemoryAuthority {
     /// exact recheck under current target/policy qualification.
     pub fn request_domain(
         &self,
-        account: &crate::AccountHandle,
+        account: &crate::Account,
         bytes: u64,
         budget: usize,
     ) -> RequestOutcome {

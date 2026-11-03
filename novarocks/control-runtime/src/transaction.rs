@@ -18,8 +18,8 @@
 //! Scope gates and capacity reservations use the same short transaction.
 
 use crate::{
-    lease::StepGuard,
     notify::Notify,
+    obligation::StepRegistration,
     sync::{Arc, Mutex},
 };
 use novarocks_control_runtime_core::{
@@ -290,7 +290,7 @@ pub struct ScopeParentAdmission {
     pub admission: WorkAdmission,
 }
 /// Exact declaration of one actual role, including its original consumers.
-pub struct RoleSpec {
+pub struct DeclaredInput {
     pub generation: Generation,
     pub kind: WorkKind,
     pub resources: ReservationResources,
@@ -461,11 +461,11 @@ impl RuntimeLedger {
     /// can bind for cleanup; it cannot derive new Business work after failure.
     pub fn open_child_scope_with_root(
         &self,
-        parent: &crate::lease::WorkLease,
+        parent: &crate::obligation::WorkObligation,
         child_generation: Generation,
         root_kind: WorkKind,
         resources: ReservationResources,
-    ) -> Result<(ScopeHandle, StepGuard), RuntimeError> {
+    ) -> Result<(ScopeHandle, StepRegistration), RuntimeError> {
         let parent_is_local = Arc::ptr_eq(&self.shared, &parent.scope().runtime.shared);
         if !parent_is_local && self.shared.history.is_none() {
             let result = Err(CapacityError::WrongOwner.into());
@@ -617,7 +617,10 @@ impl RuntimeLedger {
             };
 
             notify = true;
-            Ok((scope.clone(), StepGuard::new(scope, root, reservation)))
+            Ok((
+                scope.clone(),
+                StepRegistration::new(scope, root, reservation),
+            ))
         })();
         self.shared.record_capacity_refusal(&result, || {
             refusal_intent.expect("enabled history retains the original capacity intent")
@@ -843,7 +846,7 @@ impl RuntimeLedger {
     /// Readiness still comes from canonical body/capture/child/pin gates.
     pub fn reap_observed_header(
         &self,
-        observer: &crate::lease::WorkRetirementObserver,
+        observer: &crate::obligation::WorkRetirementObserver,
     ) -> Result<bool, RuntimeError> {
         let (scope, work) = observer
             .for_ledger(self)
@@ -1191,9 +1194,9 @@ impl ScopeHandle {
     /// role. Every ordinary refusal precedes mutation, with no exposed partial.
     pub fn reserve_child_from(
         &self,
-        payer: &mut crate::lease::ReservationBundle,
-        actual_parent: &crate::lease::WorkLease,
-        role: RoleSpec,
+        payer: &mut crate::obligation::ReservationObligation,
+        actual_parent: &crate::obligation::WorkObligation,
+        role: DeclaredInput,
     ) -> Result<crate::reported_work::ReportedWork, RuntimeError> {
         self.reserve_child_from_parent(payer, actual_parent.scope(), actual_parent.id(), role)
     }
@@ -1202,18 +1205,18 @@ impl ScopeHandle {
     /// lifecycle and Unknown-exit checks share the admission transaction.
     pub fn reserve_child_from_authority(
         &self,
-        payer: &mut crate::lease::ReservationBundle,
-        authority: &crate::lease::WorkChildAuthority,
-        role: RoleSpec,
+        payer: &mut crate::obligation::ReservationObligation,
+        authority: &crate::obligation::WorkChildAuthority,
+        role: DeclaredInput,
     ) -> Result<crate::reported_work::ReportedWork, RuntimeError> {
         self.reserve_child_from_parent(payer, authority.scope(), authority.parent(), role)
     }
     fn reserve_child_from_parent(
         &self,
-        payer: &mut crate::lease::ReservationBundle,
+        payer: &mut crate::obligation::ReservationObligation,
         parent_scope: &ScopeHandle,
         parent: WorkId,
-        role: RoleSpec,
+        role: DeclaredInput,
     ) -> Result<crate::reported_work::ReportedWork, RuntimeError> {
         let precheck =
             if !self.same_scope(parent_scope) || !self.same_scope(&payer.scope) || !payer.active {
@@ -1258,7 +1261,7 @@ impl ScopeHandle {
         let result = (|| {
             use crate::{
                 completion::{ReportRecord, ReportSlot},
-                lease::{ReservationBundle, WorkLease},
+                obligation::{ReservationObligation, WorkObligation},
                 reported_work::ReportedWork,
             };
             if let Some(error) = precheck {
@@ -1346,8 +1349,8 @@ impl ScopeHandle {
 
             notify = true;
             Ok(ReportedWork::from_committed(
-                WorkLease::new(self.clone(), work),
-                ReservationBundle {
+                WorkObligation::new(self.clone(), work),
+                ReservationObligation {
                     scope: self.clone(),
                     id: reservation,
                     active: true,
@@ -1376,7 +1379,7 @@ impl ScopeHandle {
         resources: ReservationResources,
         kind: WorkKind,
         admission: WorkAdmission,
-    ) -> Result<StepGuard, RuntimeError> {
+    ) -> Result<StepRegistration, RuntimeError> {
         self.reserve_next_parent(generation, resources, kind, admission, None)
     }
     /// Derives from the actual work holding an existing bound reservation.
@@ -1390,7 +1393,7 @@ impl ScopeHandle {
         parent: ReservationId,
         resources: ReservationResources,
         kind: WorkKind,
-    ) -> Result<StepGuard, RuntimeError> {
+    ) -> Result<StepRegistration, RuntimeError> {
         self.reserve_next_parent(
             generation,
             resources,
@@ -1406,7 +1409,7 @@ impl ScopeHandle {
         kind: WorkKind,
         admission: WorkAdmission,
         parent: Option<ReservationId>,
-    ) -> Result<StepGuard, RuntimeError> {
+    ) -> Result<StepRegistration, RuntimeError> {
         let mut state = self
             .runtime
             .shared
@@ -1481,7 +1484,7 @@ impl ScopeHandle {
                 reservation,
                 parent: state.history_parent(self.id, work),
             });
-            Ok(StepGuard::new(self.clone(), work, reservation))
+            Ok(StepRegistration::new(self.clone(), work, reservation))
         })();
         self.runtime.shared.record_capacity_refusal(&result, || {
             refusal_intent.expect("enabled history retains the original capacity intent")
@@ -1492,7 +1495,7 @@ impl ScopeHandle {
     }
     /// Explicit identities are for deterministic tests or an already serialized
     /// identity owner. Concurrent production callers use reserve_next.
-    pub fn reserve(&self, request: ReservationRequest) -> Result<StepGuard, RuntimeError> {
+    pub fn reserve(&self, request: ReservationRequest) -> Result<StepRegistration, RuntimeError> {
         let mut state = self
             .runtime
             .shared
@@ -1526,7 +1529,7 @@ impl ScopeHandle {
                 reservation,
                 parent: state.history_parent(self.id, work),
             });
-            Ok(StepGuard::new(self.clone(), work, reservation))
+            Ok(StepRegistration::new(self.clone(), work, reservation))
         })();
         self.runtime.shared.record_capacity_refusal(&result, || {
             refusal_intent.expect("enabled history retains the original capacity intent")
@@ -1603,7 +1606,7 @@ impl ScopeHandle {
         id: WorkId,
         kind: WorkKind,
         admission: WorkAdmission,
-    ) -> Result<crate::lease::WorkLease, RuntimeError> {
+    ) -> Result<crate::obligation::WorkObligation, RuntimeError> {
         let mut state = self
             .runtime
             .shared
@@ -1623,6 +1626,6 @@ impl ScopeHandle {
             work: id,
             parent: state.history_parent(self.id, id),
         });
-        Ok(crate::lease::WorkLease::new(self.clone(), id))
+        Ok(crate::obligation::WorkObligation::new(self.clone(), id))
     }
 }

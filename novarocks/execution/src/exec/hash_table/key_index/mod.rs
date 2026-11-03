@@ -21,8 +21,8 @@
 // Design: ADR-0205 (docs/adr/ADR-0205-shared-local-key-index-and-consumer-row-topology.md)
 
 mod bulk;
+mod bulk_build;
 mod bulk_read;
-mod bulk_tasks;
 mod canonical_store;
 mod capture;
 mod compact;
@@ -48,33 +48,32 @@ mod table;
 mod tests;
 
 pub(crate) use bulk::CompleteInput;
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
+)]
+pub(crate) use bulk_build::AssignmentChunk;
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
+)]
+pub(crate) use bulk_build::Assignments;
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
+)]
+pub(crate) use bulk_build::BulkReady;
+#[expect(
+    unused_imports,
+    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
+)]
+pub(crate) use bulk_build::Completion as BulkCompletion;
+pub(crate) use bulk_build::{
+    BulkAssignments, BulkBuildGraph, BulkBuildStep, Claim as BulkClaim, StepAdvance,
+};
 pub(crate) use bulk_read::BulkPresenceBatch;
 pub(crate) use bulk_read::BulkProbeBatch;
 pub(crate) use bulk_read::{BulkKey, BulkMatch, IndexView};
-#[expect(
-    unused_imports,
-    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
-)]
-pub(crate) use bulk_tasks::AssignmentChunk;
-#[expect(
-    unused_imports,
-    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
-)]
-pub(crate) use bulk_tasks::Assignments;
-#[expect(
-    unused_imports,
-    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
-)]
-pub(crate) use bulk_tasks::BulkReady;
-#[expect(
-    unused_imports,
-    reason = "Names the frozen K bulk handoff contract even when current consumers infer its returned type."
-)]
-pub(crate) use bulk_tasks::Completion as BulkCompletion;
-pub(crate) use bulk_tasks::{
-    BulkAssignments, BulkTaskGraph, Claim as BulkClaim, Task as BulkTask,
-    TaskAdvance as BulkTaskAdvance,
-};
 pub(crate) use capture::CapturedPageId;
 pub(crate) use capture::{
     BulkDomain, BulkInput, CaptureBuilder, CaptureWork, EvaluatedPage, SealedCapture,
@@ -126,7 +125,7 @@ pub(crate) use table::{KeyIndex, KeyMatch};
 
 use crate::{
     exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner},
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use novarocks_value_arrays::{ValueError, ValueFailure, ValueViolation};
 use std::alloc::Layout;

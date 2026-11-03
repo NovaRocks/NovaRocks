@@ -31,7 +31,7 @@
 //! diagnostics and failpoints are keyed by the compiled display identity, the
 //! writer's local node index.
 
-use novarocks_execution::runtime::fragment::ExecutionFailure;
+use novarocks_execution::runtime::task::ExecutionFailure;
 
 use std::fmt;
 use std::sync::Arc;
@@ -42,8 +42,8 @@ use novarocks_execution::exec::node::table_finish::TableFinishRuntimeBinding;
 use novarocks_execution::exec::node::table_writer::{
     TableWriterPhysicalContextTemplate, TableWriterRuntimeBinding,
 };
-use novarocks_execution::runtime::fragment::CompiledWriterBindings;
 use novarocks_execution::runtime::query_options::{QueryOptions, query_expire_durations};
+use novarocks_execution::runtime::task::CompiledWriterBindings;
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 use novarocks_spi::connector::write_stack::validate_writer_handle_bytes;
 use novarocks_spi::connector::{
@@ -55,14 +55,14 @@ use novarocks_worker::TypedScanRuntime;
 use novarocks_worker::connector_write_runtime::ObservedConnectorWriteExecution;
 
 #[cfg(novarocks_dev_controls)]
-use crate::connector_write_data_plane::QueryScopedTableWriteAggregateGuard;
+use crate::connector_write_data_plane::QueryScopedTableWriteAggregateFaultHook;
 use crate::connector_write_data_plane::{
     NativeConnectorWriteObservationPort, RoleBoundCommitFragmentEncoder,
     RootCommitFragmentCarrierValidator,
 };
 
 /// The Task facts every compiled writer and finish of one task binds with.
-pub(crate) struct CompiledWriteTask<'a> {
+pub(crate) struct CompiledWriteTaskFacts<'a> {
     #[cfg(novarocks_dev_controls)]
     pub(crate) test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
     #[cfg(novarocks_dev_controls)]
@@ -70,7 +70,7 @@ pub(crate) struct CompiledWriteTask<'a> {
         Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
     pub(crate) backend_process_id: novarocks_types::BackendProcessId,
     pub(crate) runtime: &'a TypedScanRuntime,
-    pub(crate) fragment_instance_id: UniqueId,
+    pub(crate) task_key: UniqueId,
     pub(crate) query_options: &'a QueryOptions,
     pub(crate) stop: ConnectorStopView,
 }
@@ -182,7 +182,7 @@ impl novarocks_execution_contract::failure::FailureProjection for WriterBindingC
 /// Every refusal precedes registration; nothing is opened here.
 pub(crate) fn bind_compiled_writers(
     program: &LocalProgram,
-    task: &CompiledWriteTask<'_>,
+    task: &CompiledWriteTaskFacts<'_>,
     topology: &novarocks_execution_contract::descriptor::ExchangeTopology,
 ) -> Result<CompiledWriterBindings, CompiledWriterBindingError> {
     let mut bindings = CompiledWriterBindings::default();
@@ -284,7 +284,7 @@ fn display_id(id: ProgramNodeId) -> Result<i32, CompiledWriterBindingError> {
 pub(crate) fn bind_compiled_writer(
     id: ProgramNodeId,
     recipe: &ConnectorWriteRecipe,
-    task: &CompiledWriteTask<'_>,
+    task: &CompiledWriteTaskFacts<'_>,
 ) -> Result<TableWriterRuntimeBinding, CompiledWriterBindingError> {
     let draft = recipe.draft();
     let node_id = display_id(id)?;
@@ -318,10 +318,7 @@ pub(crate) fn bind_compiled_writer(
             execution_id.query_id().low(),
         ),
         execution_id.attempt_id().get(),
-        uuid_bytes(
-            task.fragment_instance_id.high(),
-            task.fragment_instance_id.low(),
-        ),
+        uuid_bytes(task.task_key.high(), task.task_key.low()),
         0,
     );
     let (_, query_expire) = query_expire_durations(Some(task.query_options));
@@ -350,7 +347,13 @@ pub(crate) fn bind_compiled_writer(
         #[cfg(novarocks_dev_controls)]
         task.observation_controls
             .as_ref()
-            .map(|controls| controls.observation_for("writer-marker", execution_id))
+            .map(|controls| {
+                controls.observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::WriterMarker
+                        .as_str(),
+                    execution_id,
+                )
+            })
             .transpose()
             .map_err(|detail| {
                 CompiledWriterBindingError::at_domain(
@@ -381,7 +384,7 @@ pub(crate) fn bind_compiled_writer(
     .map_err(|source| CompiledWriterBindingError::at_domain(id, source))?;
     #[cfg(novarocks_dev_controls)]
     let writer = if let Some(controls) = task.test_controls.as_ref() {
-        writer.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateGuard::new(
+        writer.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateFaultHook::new(
             execution_id,
             node_id,
             Arc::clone(controls),
@@ -395,7 +398,7 @@ pub(crate) fn bind_compiled_writer(
 /// Bind one compiled finish to the Task's canonical carrier validator.
 pub(crate) fn bind_compiled_finish(
     id: ProgramNodeId,
-    task: &CompiledWriteTask<'_>,
+    task: &CompiledWriteTaskFacts<'_>,
 ) -> Result<TableFinishRuntimeBinding, CompiledWriterBindingError> {
     let execution_id = task.runtime.execution_id();
     let node_id = display_id(id)?;
@@ -409,7 +412,7 @@ pub(crate) fn bind_compiled_finish(
     let finish = TableFinishRuntimeBinding::new(Arc::new(validator));
     #[cfg(novarocks_dev_controls)]
     let finish = if let Some(controls) = task.test_controls.as_ref() {
-        finish.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateGuard::new(
+        finish.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateFaultHook::new(
             execution_id,
             node_id,
             Arc::clone(controls),

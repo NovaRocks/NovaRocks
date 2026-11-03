@@ -50,13 +50,13 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::api::{
-    ActiveNativeAttemptOwner, ExecutionHandle, LogicalExecutionNativePort, LogicalNativeOpenError,
-    LogicalNativeOpenRequest, LogicalNativeSession, NativeActiveConvergenceClosure,
-    NativeActiveConvergenceRequest, NativeAttemptConvergence, NativeAttemptPreparationError,
-    NativeAttemptPreparationFailure, NativeAttemptTerminal, NativeContextConvergenceKind,
-    NativeRowsAttemptRuntime, QueryExecutionClient, QueryExecutionDriver, QueryExecutionError,
-    QueryExecutionErrorKind, QueryExecutionFuture, QueryExecutionRequest,
-    ReservedExecutionIdentity, ResultSchema, StatementNativeHealthFailure,
+    ActiveNativeAttemptOwner, ExecutionOutputObligation, LogicalExecutionNativePort,
+    LogicalNativeOpenError, LogicalNativeOpenRequest, LogicalNativeSession,
+    NativeActiveConvergenceClosure, NativeActiveConvergenceRequest, NativeAttemptConvergence,
+    NativeAttemptPreparationError, NativeAttemptPreparationFailure, NativeAttemptTerminal,
+    NativeParticipationConvergenceKind, NativeRowsAttemptRuntime, QueryExecutionClient,
+    QueryExecutionDriver, QueryExecutionError, QueryExecutionErrorKind, QueryExecutionFuture,
+    QueryExecutionRequest, ReservedExecutionIdentity, ResultSchema, StatementNativeHealthFailure,
 };
 use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason};
 use crate::preparation::OutputContract;
@@ -78,8 +78,8 @@ const DEFAULT_REMOTE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogicalExecutionSupervisorConfig {
     actor_mailbox_capacity: NonZeroUsize,
-    max_admission_issues_per_context: NonZeroUsize,
-    max_establish_authorizations_per_context: NonZeroUsize,
+    max_admission_issues_per_participation: NonZeroUsize,
+    max_establish_authorizations_per_participation: NonZeroUsize,
     rows: LogicalExecutionRowsConfig,
     remote_cleanup_timeout: Duration,
     diagnostic_timeout: Duration,
@@ -114,14 +114,14 @@ impl LogicalExecutionRowsConfig {
 impl LogicalExecutionSupervisorConfig {
     pub const fn new(
         actor_mailbox_capacity: NonZeroUsize,
-        max_admission_issues_per_context: NonZeroUsize,
-        max_establish_authorizations_per_context: NonZeroUsize,
+        max_admission_issues_per_participation: NonZeroUsize,
+        max_establish_authorizations_per_participation: NonZeroUsize,
         rows: LogicalExecutionRowsConfig,
     ) -> Self {
         Self {
             actor_mailbox_capacity,
-            max_admission_issues_per_context,
-            max_establish_authorizations_per_context,
+            max_admission_issues_per_participation,
+            max_establish_authorizations_per_participation,
             rows,
             remote_cleanup_timeout: DEFAULT_REMOTE_CLEANUP_TIMEOUT,
             diagnostic_timeout: DEFAULT_REMOTE_CLEANUP_TIMEOUT,
@@ -1109,7 +1109,7 @@ impl QueryExecutionDriver for QueryExecutionDriverHandle {
 /// Keep this move-only value in the caller's stable original source field.
 pub struct OriginalLogicalStartInput {
     input: Option<LogicalRoleInput>,
-    response: Option<oneshot::Receiver<Result<ExecutionHandle, QueryExecutionError>>>,
+    response: Option<oneshot::Receiver<Result<ExecutionOutputObligation, QueryExecutionError>>>,
     context: Option<Arc<OriginalLogicalExit>>,
     internal_cut: bool,
     issuer: Arc<()>,
@@ -1215,7 +1215,7 @@ enum LogicalRoleInput {
 }
 struct NativeLogicalRoleInput {
     original_exit: Weak<OriginalLogicalExit>,
-    reply: oneshot::Sender<Result<ExecutionHandle, QueryExecutionError>>,
+    reply: oneshot::Sender<Result<ExecutionOutputObligation, QueryExecutionError>>,
     reserved: Option<ReservedExecutionIdentity>,
     query_ids: Arc<ProcessQueryIdAllocator>,
     frontend_process_id: FrontendProcessId,
@@ -1793,7 +1793,7 @@ async fn run_logical_role(
         Ok(stage) => stage,
         Err(error) => return fail_uninstalled_start(pending_owner, reply, work_error(error)),
     };
-    let contexts = schedule.contexts().to_vec();
+    let participations = schedule.participations().to_vec();
     let original_exit = match original_exit.upgrade() {
         Some(source) => source,
         None => {
@@ -1809,7 +1809,7 @@ async fn run_logical_role(
     };
     let reservation = match registry.reserve_with_original_exit(
         initial_execution,
-        contexts.clone(),
+        participations.clone(),
         Some(original_exit),
     ) {
         Ok(reservation) => reservation,
@@ -1833,15 +1833,15 @@ async fn run_logical_role(
     } else {
         None
     };
-    let max_establish_authorizations = config.max_establish_authorizations_per_context;
+    let max_establish_authorizations = config.max_establish_authorizations_per_participation;
     let actor_config = if internal {
         let config_result = match description.recovery() {
             RecoveryMode::NoRecovery => LogicalExecutionActorConfig::no_recovery_completion(
                 initial_execution,
                 description.effect(),
                 config.actor_mailbox_capacity,
-                contexts,
-                config.max_admission_issues_per_context,
+                participations,
+                config.max_admission_issues_per_participation,
                 max_establish_authorizations,
                 pending_owner.take(),
                 stage,
@@ -1852,8 +1852,8 @@ async fn run_logical_role(
                     LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
                         initial_execution,
                         config.actor_mailbox_capacity,
-                        contexts,
-                        config.max_admission_issues_per_context,
+                        participations,
+                        config.max_admission_issues_per_participation,
                         max_establish_authorizations,
                         config.rows.max_attempts,
                         replacement,
@@ -1884,8 +1884,8 @@ async fn run_logical_role(
                     initial_execution,
                     description.effect(),
                     config.actor_mailbox_capacity,
-                    contexts,
-                    config.max_admission_issues_per_context,
+                    participations,
+                    config.max_admission_issues_per_participation,
                     max_establish_authorizations,
                     pending_owner.take(),
                     stage,
@@ -1895,8 +1895,8 @@ async fn run_logical_role(
                 LogicalExecutionActorConfig::single_attempt_read_rows(
                     initial_execution,
                     config.actor_mailbox_capacity,
-                    contexts,
-                    config.max_admission_issues_per_context,
+                    participations,
+                    config.max_admission_issues_per_participation,
                     max_establish_authorizations,
                     pending_owner.take(),
                     stage,
@@ -1914,8 +1914,8 @@ async fn run_logical_role(
                         LogicalExecutionActorConfig::read_only_pre_visibility_recovery_rows(
                             initial_execution,
                             config.actor_mailbox_capacity,
-                            contexts,
-                            config.max_admission_issues_per_context,
+                            participations,
+                            config.max_admission_issues_per_participation,
                             max_establish_authorizations,
                             config.rows.max_attempts,
                             replacement,
@@ -1939,7 +1939,7 @@ async fn run_logical_role(
         Ok(actor_config) => actor_config
             .with_native_action_authority(body.native_actions.take())
             .with_clock(Arc::clone(&clock))
-            .with_abort_query_context_effect_port(
+            .with_abort_participation_effect_port(
                 session.abort_effect_port(),
                 max_establish_authorizations,
             ),
@@ -1979,7 +1979,7 @@ async fn run_logical_role(
         let mut active_custody = match registry.reserve_active_native_owner(
             &registration,
             schedule.execution(),
-            schedule.contexts(),
+            schedule.participations(),
         ) {
             Ok(reservation) => Some(reservation),
             Err(error) => {
@@ -2114,7 +2114,7 @@ async fn run_logical_role(
                         let convergence_result = record_reported_active_convergence(
                             &registry,
                             &registration,
-                            schedule.contexts(),
+                            schedule.participations(),
                             convergence,
                         )
                         .await;
@@ -2135,8 +2135,9 @@ async fn run_logical_role(
                         })
                     }
                     None => {
-                        let handle = ExecutionHandle::new(requester.clone(), output.into_output());
-                        let _ = reply.send(Ok(handle));
+                        let output_obligation =
+                            ExecutionOutputObligation::new(requester.clone(), output.into_output());
+                        let _ = reply.send(Ok(output_obligation));
                         None
                     }
                 };
@@ -2202,7 +2203,7 @@ async fn run_logical_role(
                 let convergence_result = record_reported_active_convergence(
                     &registry,
                     &registration,
-                    schedule.contexts(),
+                    schedule.participations(),
                     convergence,
                 )
                 .await;
@@ -2238,7 +2239,7 @@ async fn run_logical_role(
                 let convergence_result = record_reported_active_convergence(
                     &registry,
                     &registration,
-                    schedule.contexts(),
+                    schedule.participations(),
                     convergence,
                 )
                 .await;
@@ -2275,7 +2276,7 @@ async fn run_logical_role(
                 let convergence_result = record_reported_active_convergence(
                     &registry,
                     &registration,
-                    schedule.contexts(),
+                    schedule.participations(),
                     convergence,
                 )
                 .await;
@@ -2305,8 +2306,9 @@ async fn run_logical_role(
                 // continues independently.
                 let actor_result = match actor.complete_attempt(running).await {
                     Ok(super::LogicalConclusion::Succeeded) => {
-                        let handle = ExecutionHandle::new(requester.clone(), output.into_output());
-                        let _ = reply.send(Ok(handle));
+                        let output_obligation =
+                            ExecutionOutputObligation::new(requester.clone(), output.into_output());
+                        let _ = reply.send(Ok(output_obligation));
                         Ok(())
                     }
                     Ok(conclusion) => {
@@ -2379,7 +2381,7 @@ async fn run_logical_role(
         let convergence_result = record_reported_active_convergence(
             &registry,
             &registration,
-            schedule.contexts(),
+            schedule.participations(),
             convergence,
         )
         .await;
@@ -2414,8 +2416,8 @@ async fn supervise_internal_outcome(
         watch::Receiver<Option<Result<crate::api::ComputationReadyToken, QueryExecutionError>>>,
     >,
     requester: novarocks_workload_control::WorkCancellationRequester,
-    reply: oneshot::Sender<Result<ExecutionHandle, QueryExecutionError>>,
-    mut local_result: oneshot::Receiver<Result<ExecutionHandle, QueryExecutionError>>,
+    reply: oneshot::Sender<Result<ExecutionOutputObligation, QueryExecutionError>>,
+    mut local_result: oneshot::Receiver<Result<ExecutionOutputObligation, QueryExecutionError>>,
     consumer: Arc<dyn crate::api::InternalComputationConsumer>,
 ) -> Result<(), QueryExecutionError> {
     tokio::pin!(supervision);
@@ -2437,10 +2439,9 @@ async fn supervise_internal_outcome(
                 local_started = true;
             }
             if let Some(reply) = reply.take() {
-                let _ = reply.send(
-                    verdict
-                        .map(|token| ExecutionHandle::computation_ready(requester.clone(), token)),
-                );
+                let _ = reply.send(verdict.map(|token| {
+                    ExecutionOutputObligation::computation_ready(requester.clone(), token)
+                }));
             }
         }
         if supervision_result.is_some() && (!local_started || local_finished) {
@@ -2450,8 +2451,9 @@ async fn supervise_internal_outcome(
                     .as_ref()
                     .and_then(|outcome| outcome.borrow().clone());
                 let candidate = match verdict {
-                    Some(verdict) => verdict
-                        .map(|token| ExecutionHandle::computation_ready(requester.clone(), token)),
+                    Some(verdict) => verdict.map(|token| {
+                        ExecutionOutputObligation::computation_ready(requester.clone(), token)
+                    }),
                     None => local_result.try_recv().unwrap_or_else(|_| {
                         Err(result.as_ref().err().cloned().unwrap_or_else(|| result_protocol_error(
                             "internal computation lost its logical outcome owner before readiness",
@@ -2514,7 +2516,7 @@ struct RowsAttempt {
 }
 
 type ResidualRowsConvergence = JoinSet<(
-    Box<[novarocks_execution_contract::QueryContextRef]>,
+    Box<[novarocks_execution_contract::ParticipationRef]>,
     ActiveAttemptConvergence,
 )>;
 
@@ -2525,7 +2527,7 @@ type ResidualRowsConvergence = JoinSet<(
 enum ActiveAttemptConvergence {
     Evidence(NativeAttemptConvergence),
     RemoteTrackingEnded {
-        exact_contexts: Box<[novarocks_execution_contract::QueryContextRef]>,
+        exact_participations: Box<[novarocks_execution_contract::ParticipationRef]>,
     },
     Unresolved(StatementNativeHealthFailure),
     Recorded(Box<Result<(), QueryExecutionError>>),
@@ -2534,7 +2536,7 @@ enum ActiveAttemptConvergence {
 fn supervise_residual_rows_attempt(
     residuals: &mut ResidualRowsConvergence,
     mut active: SupervisedActiveNativeOwner,
-    contexts: Box<[novarocks_execution_contract::QueryContextRef]>,
+    participations: Box<[novarocks_execution_contract::ParticipationRef]>,
     cancellation: novarocks_workload_control::CancellationView,
     mut shutdown: watch::Receiver<bool>,
     requester: novarocks_workload_control::WorkCancellationRequester,
@@ -2549,13 +2551,13 @@ fn supervise_residual_rows_attempt(
             cleanup_timeout,
         )
         .await;
-        (contexts, convergence)
+        (participations, convergence)
     });
 }
 
 async fn converge_rows_attempts(
     active: &mut SupervisedActiveNativeOwner,
-    active_contexts: &[novarocks_execution_contract::QueryContextRef],
+    active_participations: &[novarocks_execution_contract::ParticipationRef],
     residuals: &mut ResidualRowsConvergence,
     cancellation: novarocks_workload_control::CancellationView,
     registry: &LogicalExecutionRuntimeRegistryHandle,
@@ -2570,7 +2572,7 @@ async fn converge_rows_attempts(
     let result = record_reported_active_convergence(
         registry,
         registration,
-        active_contexts,
+        active_participations,
         active_convergence,
     )
     .await;
@@ -2588,9 +2590,14 @@ async fn converge_residual_rows_attempts(
     let mut result = Ok(());
     while let Some(joined) = residuals.join_next().await {
         let convergence = match joined {
-            Ok((contexts, convergence)) => {
-                record_reported_active_convergence(registry, registration, &contexts, convergence)
-                    .await
+            Ok((participations, convergence)) => {
+                record_reported_active_convergence(
+                    registry,
+                    registration,
+                    &participations,
+                    convergence,
+                )
+                .await
             }
             Err(error) => {
                 let diagnostic = QueryExecutionError::new(
@@ -2958,7 +2965,7 @@ async fn supervise_rows_inner(
                 session.retire_preparation();
                 return converge_rows_attempts(
                     &mut attempt.active,
-                    attempt.schedule.contexts(),
+                    attempt.schedule.participations(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
                     registry,
@@ -2973,7 +2980,7 @@ async fn supervise_rows_inner(
                 session.retire_preparation();
                 let convergence = converge_rows_attempts(
                     &mut attempt.active,
-                    attempt.schedule.contexts(),
+                    attempt.schedule.participations(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
                     registry,
@@ -2996,7 +3003,7 @@ async fn supervise_rows_inner(
 
                 let convergence = converge_rows_attempts(
                     &mut attempt.active,
-                    attempt.schedule.contexts(),
+                    attempt.schedule.participations(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
                     registry,
@@ -3020,7 +3027,7 @@ async fn supervise_rows_inner(
 
                 let convergence = converge_rows_attempts(
                     &mut attempt.active,
-                    attempt.schedule.contexts(),
+                    attempt.schedule.participations(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
                     registry,
@@ -3042,7 +3049,7 @@ async fn supervise_rows_inner(
                     effect: description.effect(),
                     failure: decision.class(),
                     pre_ready_replacement: decision.pre_ready_replacement().filter(|witness| {
-                        witness.context().query_execution_id() == attempt.schedule.execution()
+                        witness.participation().query_execution_id() == attempt.schedule.execution()
                             && decision
                                 .error()
                                 .execution_failure()
@@ -3072,7 +3079,7 @@ async fn supervise_rows_inner(
 
                     let convergence = converge_rows_attempts(
                         &mut attempt.active,
-                        attempt.schedule.contexts(),
+                        attempt.schedule.participations(),
                         &mut residuals,
                         cancellation,
                         registry,
@@ -3096,7 +3103,7 @@ async fn supervise_rows_inner(
                             .or_else(actor_terminal_refusal);
                         let convergence = converge_rows_attempts(
                             &mut attempt.active,
-                            attempt.schedule.contexts(),
+                            attempt.schedule.participations(),
                             &mut residuals,
                             cancellation,
                             registry,
@@ -3144,7 +3151,7 @@ async fn supervise_rows_inner(
                         let supervision = preparation_supervision_result(error, actor_outcome);
                         let convergence = converge_rows_attempts(
                             &mut attempt.active,
-                            attempt.schedule.contexts(),
+                            attempt.schedule.participations(),
                             &mut residuals,
                             cancellation,
                             registry,
@@ -3186,7 +3193,7 @@ async fn supervise_rows_inner(
                         converge_dormant(dormant, cancellation.clone(), shutdown, requester).await;
                     let old_convergence = converge_rows_attempts(
                         &mut attempt.active,
-                        attempt.schedule.contexts(),
+                        attempt.schedule.participations(),
                         &mut residuals,
                         cancellation,
                         registry,
@@ -3201,54 +3208,59 @@ async fn supervise_rows_inner(
                         first_supervision_error(replacement_convergence, old_convergence),
                     );
                 }
-                let qualification = match decision
-                    .begin_replacement(actor, replacement, replacement_schedule.contexts().to_vec())
-                    .await
-                {
-                    Ok((qualification, _)) => qualification,
-                    Err(error) => {
-                        session.retire_preparation();
-                        let replacement_convergence = match converge_dormant(
-                            dormant,
-                            cancellation,
-                            shutdown,
-                            requester,
+                let qualification =
+                    match decision
+                        .begin_replacement(
+                            actor,
+                            replacement,
+                            replacement_schedule.participations().to_vec(),
                         )
                         .await
-                        {
-                            Ok(()) => {
-                                record_active_convergence(
-                                    registry,
-                                    registration,
-                                    replacement_schedule.contexts(),
-                                )
-                                .await
-                            }
-                            Err(original) => Err(original),
-                        };
-                        let old_convergence = converge_rows_attempts(
-                            &mut attempt.active,
-                            attempt.schedule.contexts(),
-                            &mut residuals,
-                            scope.cancellation().map_err(work_error)?,
-                            registry,
-                            registration,
-                            shutdown,
-                            requester,
-                            config.remote_cleanup_timeout(),
-                        )
-                        .await;
-                        return first_supervision_error(
-                            actor_terminal_refusal(error),
-                            first_supervision_error(replacement_convergence, old_convergence),
-                        );
-                    }
-                };
+                    {
+                        Ok((qualification, _)) => qualification,
+                        Err(error) => {
+                            session.retire_preparation();
+                            let replacement_convergence =
+                                match converge_dormant(dormant, cancellation, shutdown, requester)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        record_active_convergence(
+                                            registry,
+                                            registration,
+                                            replacement_schedule.participations(),
+                                        )
+                                        .await
+                                    }
+                                    Err(original) => Err(original),
+                                };
+                            let old_convergence = converge_rows_attempts(
+                                &mut attempt.active,
+                                attempt.schedule.participations(),
+                                &mut residuals,
+                                scope.cancellation().map_err(work_error)?,
+                                registry,
+                                registration,
+                                shutdown,
+                                requester,
+                                config.remote_cleanup_timeout(),
+                            )
+                            .await;
+                            return first_supervision_error(
+                                actor_terminal_refusal(error),
+                                first_supervision_error(replacement_convergence, old_convergence),
+                            );
+                        }
+                    };
 
                 supervise_residual_rows_attempt(
                     &mut residuals,
                     attempt.active,
-                    attempt.schedule.contexts().to_vec().into_boxed_slice(),
+                    attempt
+                        .schedule
+                        .participations()
+                        .to_vec()
+                        .into_boxed_slice(),
                     cancellation.clone(),
                     shutdown.clone(),
                     requester.clone(),
@@ -3277,7 +3289,7 @@ async fn supervise_rows_inner(
                                 record_active_convergence(
                                     registry,
                                     registration,
-                                    replacement_schedule.contexts(),
+                                    replacement_schedule.participations(),
                                 )
                                 .await
                             }
@@ -3314,7 +3326,7 @@ async fn supervise_rows_inner(
                                 record_active_convergence(
                                     registry,
                                     registration,
-                                    replacement_schedule.contexts(),
+                                    replacement_schedule.participations(),
                                 )
                                 .await
                             }
@@ -3332,7 +3344,7 @@ async fn supervise_rows_inner(
                 let mut replacement_custody = match registry.reserve_active_native_owner(
                     registration,
                     replacement_schedule.execution(),
-                    replacement_schedule.contexts(),
+                    replacement_schedule.participations(),
                 ) {
                     Ok(reservation) => Some(reservation),
                     Err(error) => {
@@ -3355,7 +3367,7 @@ async fn supervise_rows_inner(
                                 record_active_convergence(
                                     registry,
                                     registration,
-                                    replacement_schedule.contexts(),
+                                    replacement_schedule.participations(),
                                 )
                                 .await
                             }
@@ -3418,7 +3430,7 @@ async fn supervise_rows_inner(
                                 record_active_convergence(
                                     registry,
                                     registration,
-                                    replacement_schedule.contexts(),
+                                    replacement_schedule.participations(),
                                 )
                                 .await
                             }
@@ -3455,7 +3467,7 @@ async fn supervise_rows_inner(
                                 record_active_convergence(
                                     registry,
                                     registration,
-                                    replacement_schedule.contexts(),
+                                    replacement_schedule.participations(),
                                 )
                                 .await
                             }
@@ -3503,7 +3515,7 @@ async fn supervise_rows_inner(
                     let replacement_convergence = record_reported_active_convergence(
                         registry,
                         registration,
-                        replacement_schedule.contexts(),
+                        replacement_schedule.participations(),
                         convergence,
                     )
                     .await;
@@ -3534,7 +3546,7 @@ async fn supervise_rows_inner(
                         let replacement_convergence = record_reported_active_convergence(
                             registry,
                             registration,
-                            replacement_schedule.contexts(),
+                            replacement_schedule.participations(),
                             convergence,
                         )
                         .await;
@@ -3626,12 +3638,12 @@ fn next_attempt(execution: QueryExecutionId) -> Result<QueryExecutionId, QueryEx
 async fn record_active_convergence(
     registry: &LogicalExecutionRuntimeRegistryHandle,
     registration: &super::LogicalExecutionRegistration,
-    contexts: &[novarocks_execution_contract::QueryContextRef],
+    participations: &[novarocks_execution_contract::ParticipationRef],
 ) -> Result<(), QueryExecutionError> {
     let mut first_error = None;
-    for &context in contexts {
+    for &participation in participations {
         if let Err(error) = registry
-            .observe_worker_stopped_and_context_fenced(registration, context)
+            .observe_worker_stopped_and_participation_fenced(registration, participation)
             .await
         {
             first_error.get_or_insert_with(|| registry_error(error));
@@ -3643,7 +3655,7 @@ async fn record_active_convergence(
 async fn record_reported_active_convergence(
     registry: &LogicalExecutionRuntimeRegistryHandle,
     registration: &super::LogicalExecutionRegistration,
-    expected_contexts: &[novarocks_execution_contract::QueryContextRef],
+    expected_participations: &[novarocks_execution_contract::ParticipationRef],
     convergence: ActiveAttemptConvergence,
 ) -> Result<(), QueryExecutionError> {
     let convergence = match convergence {
@@ -3654,54 +3666,69 @@ async fn record_reported_active_convergence(
                 failure.detail(),
             ));
         }
-        ActiveAttemptConvergence::RemoteTrackingEnded { exact_contexts } => {
-            let expected = expected_contexts.iter().copied().collect::<BTreeSet<_>>();
-            let reported = exact_contexts.iter().copied().collect::<BTreeSet<_>>();
-            if expected != reported || reported.len() != exact_contexts.len() {
+        ActiveAttemptConvergence::RemoteTrackingEnded {
+            exact_participations,
+        } => {
+            let expected = expected_participations
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let reported = exact_participations
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if expected != reported || reported.len() != exact_participations.len() {
                 return Err(QueryExecutionError::new(
                     QueryExecutionErrorKind::InvalidRequest,
-                    "Native remote tracking omitted or duplicated original contexts",
+                    "Native remote tracking omitted or duplicated original participations",
                 ));
             }
-            return record_remote_tracking_ended(registry, registration, expected_contexts).await;
+            return record_remote_tracking_ended(registry, registration, expected_participations)
+                .await;
         }
         ActiveAttemptConvergence::Evidence(convergence) => convergence,
     };
-    let NativeAttemptConvergence::Contexts(facts) = convergence else {
-        return record_active_convergence(registry, registration, expected_contexts).await;
+    let NativeAttemptConvergence::Participations(facts) = convergence else {
+        return record_active_convergence(registry, registration, expected_participations).await;
     };
-    let expected = expected_contexts.iter().copied().collect::<BTreeSet<_>>();
+    let expected = expected_participations
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
     let mut observed = BTreeSet::new();
     for fact in &facts {
-        if !expected.contains(&fact.context()) || !observed.insert(fact.context()) {
+        if !expected.contains(&fact.participation()) || !observed.insert(fact.participation()) {
             return Err(QueryExecutionError::new(
                 QueryExecutionErrorKind::InvalidRequest,
-                "Native active convergence returned duplicate or foreign context evidence",
+                "Native active convergence returned duplicate or foreign participation evidence",
             ));
         }
     }
     if observed != expected {
         return Err(QueryExecutionError::new(
             QueryExecutionErrorKind::InvalidRequest,
-            "Native active convergence omitted scheduled context evidence",
+            "Native active convergence omitted scheduled participation evidence",
         ));
     }
     let mut first_error = None;
     for fact in facts {
         let result = match fact.kind() {
-            NativeContextConvergenceKind::NeverEstablished => {
+            NativeParticipationConvergenceKind::NeverEstablished => {
                 registry
-                    .observe_context_never_established(registration, fact.context())
+                    .observe_participation_never_established(registration, fact.participation())
                     .await
             }
-            NativeContextConvergenceKind::WorkerStoppedAndContextFenced => {
+            NativeParticipationConvergenceKind::WorkerStoppedAndParticipationFenced => {
                 registry
-                    .observe_worker_stopped_and_context_fenced(registration, fact.context())
+                    .observe_worker_stopped_and_participation_fenced(
+                        registration,
+                        fact.participation(),
+                    )
                     .await
             }
-            NativeContextConvergenceKind::WorkerProcessReplaced => {
+            NativeParticipationConvergenceKind::WorkerProcessReplaced => {
                 registry
-                    .observe_worker_process_replaced(registration, fact.context())
+                    .observe_worker_process_replaced(registration, fact.participation())
                     .await
             }
         };
@@ -3715,12 +3742,12 @@ async fn record_reported_active_convergence(
 async fn record_remote_tracking_ended(
     registry: &LogicalExecutionRuntimeRegistryHandle,
     registration: &super::LogicalExecutionRegistration,
-    contexts: &[novarocks_execution_contract::QueryContextRef],
+    participations: &[novarocks_execution_contract::ParticipationRef],
 ) -> Result<(), QueryExecutionError> {
     let mut first_error = None;
-    for &context in contexts {
+    for &participation in participations {
         if let Err(error) = registry
-            .end_remote_context_tracking(registration, context)
+            .end_remote_participation_tracking(registration, participation)
             .await
         {
             first_error.get_or_insert_with(|| registry_error(error));
@@ -3932,10 +3959,12 @@ async fn converge_supervised_active(
                 .record_and_close(NativeActiveConvergenceClosure::Evidence(evidence))
                 .await
         }
-        ActiveAttemptConvergence::RemoteTrackingEnded { exact_contexts } => {
+        ActiveAttemptConvergence::RemoteTrackingEnded {
+            exact_participations,
+        } => {
             owner
                 .record_and_close(NativeActiveConvergenceClosure::RemoteTrackingEnded {
-                    exact_contexts,
+                    exact_participations,
                 })
                 .await
         }
@@ -4019,9 +4048,11 @@ async fn converge_active_request(
             Ok(Ok(NativeActiveConvergenceClosure::Evidence(evidence))) => {
                 ActiveAttemptConvergence::Evidence(evidence)
             }
-            Ok(Ok(NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_contexts })) => {
-                ActiveAttemptConvergence::RemoteTrackingEnded { exact_contexts }
-            }
+            Ok(Ok(NativeActiveConvergenceClosure::RemoteTrackingEnded {
+                exact_participations,
+            })) => ActiveAttemptConvergence::RemoteTrackingEnded {
+                exact_participations,
+            },
             Ok(Err(health)) | Err(health) => ActiveAttemptConvergence::Unresolved(health),
         };
         return (outcome, deadline);
@@ -4196,7 +4227,7 @@ impl Drop for PendingWorkOwner {
 
 fn fail_uninstalled_start(
     owner: PendingWorkOwner,
-    reply: oneshot::Sender<Result<ExecutionHandle, QueryExecutionError>>,
+    reply: oneshot::Sender<Result<ExecutionOutputObligation, QueryExecutionError>>,
     error: QueryExecutionError,
 ) -> Result<(), QueryExecutionError> {
     owner.complete_uninstalled_failure();
@@ -4410,10 +4441,10 @@ mod tests {
 
     use novarocks_execution_contract::{
         AdmissionEpochCapability, AdmissionTicketId, CodecOwnedContent, ConfidentialContent,
-        ContentFingerprint, CredentialEpoch, CredentialLeaseId, CredentialUpdate,
-        EstablishQueryContext, LeaseValidFor, OperationOutcome, QueryContextAdmissionTicketReceipt,
-        QueryContextRef, TaskOperationId, TaskOutputFacts, TaskState, TaskStatus,
-        TaskStatusVersion,
+        ContentFingerprint, CredentialDomainId, CredentialEpoch, CredentialUpdate,
+        EstablishParticipation, LeaseValidFor, OperationOutcome,
+        ParticipationAdmissionTicketReceipt, ParticipationRef, TaskOperationId, TaskOutputFacts,
+        TaskState, TaskStatus, TaskStatusVersion,
     };
     use novarocks_types::NativeCompatibilityId;
     use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
@@ -4550,7 +4581,7 @@ mod tests {
             Box::pin(async move {
                 tokio::time::sleep_until(request.remote_observation_deadline().into()).await;
                 Ok(NativeActiveConvergenceClosure::RemoteTrackingEnded {
-                    exact_contexts: Box::new([]),
+                    exact_participations: Box::new([]),
                 })
             })
         }
@@ -4640,7 +4671,7 @@ mod tests {
             Box::pin(async move {
                 self.0.notified().await;
                 Ok(NativeActiveConvergenceClosure::RemoteTrackingEnded {
-                    exact_contexts: Box::new([]),
+                    exact_participations: Box::new([]),
                 })
             })
         }
@@ -5637,7 +5668,7 @@ mod tests {
             Box::pin(async move {
                 self.converged.store(true, Ordering::SeqCst);
                 Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(),
                 ))
             })
         }
@@ -6537,7 +6568,7 @@ mod tests {
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             Box::pin(async {
                 Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(),
                 ))
             })
         }
@@ -6986,23 +7017,23 @@ mod tests {
         ) {
             let request = submission.request();
             let admissions: Box<[_]> = request
-                .replacement_contexts()
+                .replacement_participations()
                 .iter()
                 .enumerate()
-                .map(|(index, context)| {
+                .map(|(index, participation)| {
                     let tag = u8::try_from(index + 1).unwrap();
                     let valid_for = LeaseValidFor::new(Duration::from_secs(30)).unwrap();
                     let admission_request =
-                        novarocks_execution_contract::AcquireQueryContextAdmissionTicket::new(
+                        novarocks_execution_contract::AcquireParticipationAdmissionTicket::new(
                             TaskOperationId::new_v7(),
-                            *context,
+                            *participation,
                             valid_for,
                             NativeCompatibilityId::new([tag; 32]),
                             AdmissionEpochCapability::try_from_bytes([tag; 16]).unwrap(),
                         );
-                    let ticket = QueryContextAdmissionTicketReceipt::new(
+                    let ticket = ParticipationAdmissionTicketReceipt::new(
                         AdmissionTicketId::try_from_bytes([tag; 16]).unwrap(),
-                        *context,
+                        *participation,
                         valid_for,
                     );
                     super::super::QualifiedWorkerAdmission::try_new(
@@ -7016,8 +7047,12 @@ mod tests {
                 .into_boxed_slice();
             let reservation = ImmediateIsolationReservation {
                 identity: request.identity(),
-                failed_contexts: request.failed_contexts().iter().copied().collect(),
-                replacement_contexts: request.replacement_contexts().iter().copied().collect(),
+                failed_participations: request.failed_participations().iter().copied().collect(),
+                replacement_participations: request
+                    .replacement_participations()
+                    .iter()
+                    .copied()
+                    .collect(),
                 admissions,
             };
             let qualified = super::super::QualifiedReplacementReservation::try_new(
@@ -7047,8 +7082,8 @@ mod tests {
     #[derive(Debug)]
     struct ImmediateIsolationReservation {
         identity: super::super::ReplacementQualificationIdentity,
-        failed_contexts: BTreeSet<QueryContextRef>,
-        replacement_contexts: BTreeSet<QueryContextRef>,
+        failed_participations: BTreeSet<ParticipationRef>,
+        replacement_participations: BTreeSet<ParticipationRef>,
         admissions: Box<[super::super::QualifiedWorkerAdmission]>,
     }
 
@@ -7067,15 +7102,16 @@ mod tests {
 
         fn validate_binding(
             &self,
-            failed_contexts: &[QueryContextRef],
+            failed_participations: &[ParticipationRef],
         ) -> Result<(), super::super::ReplacementQualificationFailure> {
-            let failed: BTreeSet<_> = failed_contexts.iter().copied().collect();
+            let failed: BTreeSet<_> = failed_participations.iter().copied().collect();
             let replacements: BTreeSet<_> = self
                 .admissions
                 .iter()
-                .map(super::super::QualifiedWorkerAdmission::context)
+                .map(super::super::QualifiedWorkerAdmission::participation)
                 .collect();
-            (failed == self.failed_contexts && replacements == self.replacement_contexts)
+            (failed == self.failed_participations
+                && replacements == self.replacement_participations)
                 .then_some(())
                 .ok_or(super::super::ReplacementQualificationFailure::InvalidReservation)
         }
@@ -7218,7 +7254,7 @@ mod tests {
             _cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptActivationFuture<'a> {
             let root = schedule.root();
-            let context = schedule.contexts()[0];
+            let participation = schedule.participations()[0];
             let ordinal = self.ordinal;
             let runs = Arc::clone(&self.runs);
             let convergences = Arc::clone(&self.convergences);
@@ -7261,7 +7297,7 @@ mod tests {
                     RecoveringRowsActiveOwner {
                         ordinal,
                         failures_before_success,
-                        context,
+                        participation,
                         runs,
                         convergences,
                         allow_initial_convergence,
@@ -7288,7 +7324,7 @@ mod tests {
     struct RecoveringRowsActiveOwner {
         ordinal: u64,
         failures_before_success: u64,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         runs: Arc<AtomicU64>,
         convergences: Arc<AtomicU64>,
         allow_initial_convergence: Arc<tokio::sync::Notify>,
@@ -7321,7 +7357,7 @@ mod tests {
                                 "injected pre-visibility infrastructure failure",
                             ),
                             ExecutionFailureSite::Backend {
-                                process: self.context.backend_process_id(),
+                                process: self.participation.backend_process_id(),
                             },
                         ),
                     ))
@@ -7348,7 +7384,7 @@ mod tests {
                         _ = self.allow_initial_convergence.notified() => {}
                         _ = tokio::time::sleep_until(request.remote_observation_deadline().into()) => {
                             return Ok(NativeActiveConvergenceClosure::RemoteTrackingEnded {
-                                exact_contexts: vec![self.context].into_boxed_slice(),
+                                exact_participations: vec![self.participation].into_boxed_slice(),
                             });
                         }
                     }
@@ -7356,13 +7392,13 @@ mod tests {
                 self.convergences.fetch_add(1, Ordering::SeqCst);
                 Ok(NativeActiveConvergenceClosure::Evidence(
                     if self.ordinal == 1 {
-                        NativeAttemptConvergence::contexts(vec![
-                            crate::api::NativeContextConvergence::worker_process_replaced(
-                                self.context,
+                        NativeAttemptConvergence::participations(vec![
+                            crate::api::NativeParticipationConvergence::worker_process_replaced(
+                                self.participation,
                             ),
                         ])
                     } else {
-                        NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced()
+                        NativeAttemptConvergence::all_workers_stopped_and_participations_fenced()
                     },
                 ))
             })
@@ -8317,7 +8353,7 @@ mod tests {
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             Box::pin(async {
                 Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(),
                 ))
             })
         }
@@ -8518,7 +8554,7 @@ mod tests {
                     panic!("injected Native convergence panic");
                 }
                 Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(),
                 ))
             })
         }
@@ -9139,14 +9175,15 @@ mod tests {
         ) -> NativeAttemptActivationFuture<'a> {
             assert!(
                 schedule
-                    .contexts()
+                    .participations()
                     .iter()
-                    .all(|context| context.frontend_process_id() == self.expected_frontend)
+                    .all(|participation| participation.frontend_process_id()
+                        == self.expected_frontend)
             );
-            let contexts = schedule.contexts().to_vec();
+            let participations = schedule.participations().to_vec();
             Box::pin(async move {
                 Ok(ActivatedNativeAttempt::completion(
-                    SuccessfulCompletionActiveOwner { contexts },
+                    SuccessfulCompletionActiveOwner { participations },
                 ))
             })
         }
@@ -9161,7 +9198,7 @@ mod tests {
 
     #[derive(Debug)]
     struct SuccessfulCompletionActiveOwner {
-        contexts: Vec<QueryContextRef>,
+        participations: Vec<ParticipationRef>,
     }
 
     impl ActiveNativeAttemptOwner for SuccessfulCompletionActiveOwner {
@@ -9172,14 +9209,14 @@ mod tests {
         ) -> NativeAttemptRunFuture<'a> {
             Box::pin(async move {
                 let valid_for = LeaseValidFor::new(Duration::from_secs(30)).unwrap();
-                for (index, &context) in self.contexts.iter().enumerate() {
+                for (index, &participation) in self.participations.iter().enumerate() {
                     let tag = u8::try_from(index + 1).unwrap();
                     let compatibility = NativeCompatibilityId::new([tag; 32]);
                     let issue = drive
                         .begin_admission_issue(
-                            novarocks_execution_contract::AcquireQueryContextAdmissionTicket::new(
+                            novarocks_execution_contract::AcquireParticipationAdmissionTicket::new(
                                 TaskOperationId::new_v7(),
-                                context,
+                                participation,
                                 valid_for,
                                 compatibility,
                                 AdmissionEpochCapability::try_from_bytes([tag; 16]).unwrap(),
@@ -9187,9 +9224,9 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                    let ticket = QueryContextAdmissionTicketReceipt::new(
+                    let ticket = ParticipationAdmissionTicketReceipt::new(
                         AdmissionTicketId::try_from_bytes([tag; 16]).unwrap(),
-                        context,
+                        participation,
                         valid_for,
                     );
                     drive
@@ -9207,15 +9244,15 @@ mod tests {
                     let content = |offset: u8| {
                         Arc::new(TestContent(tag + offset)) as Arc<dyn CodecOwnedContent>
                     };
-                    let establish = Arc::new(EstablishQueryContext::new(
+                    let establish = Arc::new(EstablishParticipation::new(
                         TaskOperationId::new_v7(),
-                        context,
+                        participation,
                         ticket.ticket_id(),
                         content(0),
                         content(1),
                         content(2),
                         CredentialUpdate::new(
-                            CredentialLeaseId::new(u64::from(tag)),
+                            CredentialDomainId::new(u64::from(tag)),
                             CredentialEpoch::new(1).unwrap(),
                             Arc::new(TestSecret),
                         ),
@@ -9241,7 +9278,7 @@ mod tests {
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             Box::pin(async {
                 Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(),
                 ))
             })
         }
@@ -9366,7 +9403,7 @@ mod tests {
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             Box::pin(async {
                 Ok(NativeActiveConvergenceClosure::Evidence(
-                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                    NativeAttemptConvergence::all_workers_stopped_and_participations_fenced(),
                 ))
             })
         }

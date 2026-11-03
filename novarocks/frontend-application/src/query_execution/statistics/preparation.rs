@@ -39,7 +39,7 @@ use novarocks_query_application::{
         ReadAccessSink,
     },
 };
-use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorRequestContext};
+use novarocks_spi::connector::{ConnectorControlPlanningPin, ConnectorRequestContext};
 use novarocks_workload_control::{WorkError, WorkScope};
 use std::sync::Arc;
 
@@ -169,7 +169,7 @@ pub(crate) async fn prepare_statistics_computation_in(
     context: ConnectorRequestContext,
     identity: &StatisticsRelationIdentity,
     program: StatisticsCollectionProgram,
-    planning_lease: ConnectorControlPlanningLease,
+    planning_pin: ConnectorControlPlanningPin,
     stage: &WorkScope,
     provider: &FrontendCompletionCustody,
     cells: StatisticsPreparationCells<'_>,
@@ -185,7 +185,7 @@ pub(crate) async fn prepare_statistics_computation_in(
         ));
     }
     let capacity = computation_capacity(execution, stage).map_err(work_failure)?;
-    let (bindings, scan) = prepare_statistics_scan(execution, identity, &program, planning_lease)?;
+    let (bindings, scan) = prepare_statistics_scan(execution, identity, &program, planning_pin)?;
     let need = novarocks_sql::planning::dml::statistics_provider_read_need(&scan)
         .map_err(contract_violation)?;
     let scope = StatementFactScope::governed_read_io(
@@ -443,7 +443,7 @@ pub(super) fn prepare_statistics_scan(
     execution: &QueryExecutionContext,
     identity: &StatisticsRelationIdentity,
     program: &StatisticsCollectionProgram,
-    planning_lease: ConnectorControlPlanningLease,
+    planning_pin: ConnectorControlPlanningPin,
 ) -> Result<
     (
         Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
@@ -458,16 +458,16 @@ pub(super) fn prepare_statistics_scan(
             "statistics collection requires at least one live backend",
         ));
     }
-    if planning_lease.binding().descriptor().instance_id != *program.table().owner() {
+    if planning_pin.binding().descriptor().instance_id != *program.table().owner() {
         return Err(contract_violation(
-            "statistics collection planning lease does not own its resolved table handle",
+            "statistics collection planning pin does not own its resolved table handle",
         ));
     }
-    if planning_lease.binding().descriptor().instance_id.as_str() != identity.catalog {
+    if planning_pin.binding().descriptor().instance_id.as_str() != identity.catalog {
         return Err(contract_violation(format!(
             "statistics collection of `{}` was planned through connector instance `{}`",
             identity.fqn(),
-            planning_lease.binding().descriptor().instance_id.as_str()
+            planning_pin.binding().descriptor().instance_id.as_str()
         )));
     }
     let bindings = Arc::new(
@@ -475,7 +475,7 @@ pub(super) fn prepare_statistics_scan(
             .map_err(contract_violation)?,
     );
     let binding =
-        admit_statistics_scan_binding(bindings.as_ref(), identity, program, planning_lease)?;
+        admit_statistics_scan_binding(bindings.as_ref(), identity, program, planning_pin)?;
     let scan = novarocks_sql::planning::dml::StatisticsConnectorScan {
         binding,
         catalog: identity.catalog.clone(),

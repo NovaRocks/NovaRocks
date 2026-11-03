@@ -59,7 +59,7 @@ use tokio::time::Instant;
 
 use self::commit::MysqlEvidence;
 use self::metrics::StateStoreMetrics;
-use self::runtime::MysqlProviderHandle;
+use self::runtime::MysqlProviderPermit;
 use novarocks_state_store_api::{
     AttemptSupervisor, DEFAULT_MAX_OUTSTANDING_ATTEMPTS, InDoubtAdjudicator, ReadTransaction,
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreProviderId,
@@ -244,7 +244,7 @@ pub use provider::MysqlStateStoreProviderFactory;
 pub use test_config::{MysqlTestLimitOverrides, MysqlTestProviderConfig, MysqlTestStoreConfig};
 
 struct MysqlStateStore {
-    lease: MysqlProviderHandle,
+    provider_permit: MysqlProviderPermit,
     identity: StoreIdentity,
     limits: StateStoreLimits,
     metrics: Arc<StateStoreMetrics>,
@@ -259,7 +259,7 @@ struct MysqlOpenCancellation {
 
 impl MysqlStateStore {
     async fn open(
-        lease: MysqlProviderHandle,
+        provider_permit: MysqlProviderPermit,
         database: String,
         cluster_id: String,
         limits: StateStoreLimits,
@@ -268,7 +268,7 @@ impl MysqlStateStore {
         cancellation: MysqlOpenCancellation,
     ) -> Result<Self, StateStoreError> {
         let (identity, _) = schema::validate_store_readiness(
-            lease.pool(),
+            provider_permit.pool(),
             &database,
             &cluster_id,
             limits.max_key_bytes,
@@ -279,8 +279,8 @@ impl MysqlStateStore {
         cancellation.check()?;
         tracing::info!(provider = "mysql", client_status = "ready", identity_hash = %codec::redacted_identity_hash(format!("{database}\0{cluster_id}").as_bytes()), "MySQL state store client is ready");
         let evidence = Arc::new(MysqlEvidence::new(
-            lease.pool(),
-            lease.operations(),
+            provider_permit.pool(),
+            provider_permit.operations(),
             codec::MysqlCodec::new(limits.max_key_bytes)?,
             limits.transaction_deadline,
         ));
@@ -289,7 +289,7 @@ impl MysqlStateStore {
             Arc::clone(&evidence) as Arc<dyn InDoubtAdjudicator>,
         );
         Ok(Self {
-            lease,
+            provider_permit,
             identity,
             limits,
             metrics: Arc::new(StateStoreMetrics::new()),
@@ -332,10 +332,10 @@ impl StateStore for MysqlStateStore {
         &self.attempts
     }
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
-        let operation = self.lease.acquire_operation()?;
+        let operation = self.provider_permit.acquire_operation()?;
         Ok(Box::new(
             txn::begin_read(
-                self.lease.pool(),
+                self.provider_permit.pool(),
                 operation,
                 self.limits.clone(),
                 Arc::clone(&self.metrics),
@@ -352,10 +352,10 @@ impl StateStore for MysqlStateStore {
         // acquired, so a handle retained across a reopen cannot address this
         // store and is left provably without effect.
         attempt.require_scope(self.attempts.scope())?;
-        let operation = self.lease.acquire_operation()?;
+        let operation = self.provider_permit.acquire_operation()?;
         Ok(Box::new(
             txn::begin_write(
-                self.lease.pool(),
+                self.provider_permit.pool(),
                 operation,
                 attempt,
                 Arc::clone(&self.evidence),
@@ -366,7 +366,7 @@ impl StateStore for MysqlStateStore {
         ))
     }
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
-        let _operation = self.lease.acquire_operation()?;
+        let _operation = self.provider_permit.acquire_operation()?;
         Ok(self.identity.clone())
     }
 }

@@ -30,13 +30,13 @@ use std::time::Duration;
 
 fn original_rpc_roles(
     scope: &ScopeHandle,
-    parent: &WorkLease,
-) -> (AdmittedCompletionRole, [SourceSlotAdmission; 2]) {
+    parent: &WorkObligation,
+) -> (AdmittedCompletionTransfer, [SourceSlotAdmission; 2]) {
     let generation = scope.gates().unwrap().generation;
     let (work, mut capacity) = scope
         .reserve_next(
             generation,
-            StorageNeed::role(false).resources().unwrap(),
+            StorageNeed::causal_cut_storage(false).resources().unwrap(),
             WorkKind::Settlement,
             novarocks_control_runtime_core::scope::WorkAdmission::Derived(parent.id()),
         )
@@ -72,7 +72,7 @@ fn original_rpc_roles(
     )
     .unwrap();
     (
-        AdmittedCompletionRole {
+        AdmittedCompletionTransfer {
             work,
             capacity,
             report,
@@ -96,7 +96,7 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
     };
     let RpcAuthorAdmission {
         cut,
-        role,
+        original_exit_custody,
         authority,
         sender,
         input_author: _,
@@ -109,7 +109,8 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
     let only_admission_closed = !host.request_admission_open()
         && f.scope.snapshot().unwrap() == before_close
         && host.causal().cut_inventory(None, 4) == vec![cut]
-        && role.phase() == novarocks_control_runtime::exit_role::ExitRolePhase::Admitted;
+        && original_exit_custody.phase()
+            == novarocks_control_runtime::exit_custody::ExitCustodyPhase::Admitted;
 
     let (rejected, source_roles) = original_rpc_roles(&f.scope, host.resources.lifetime.work());
     let work = rejected.work.id();
@@ -177,7 +178,7 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
     host.causal().observe_effects_exited(cut).unwrap();
     authority.withdraw_unpublished_and_exit().unwrap();
     assert!(
-        !role.try_retire().unwrap(),
+        !original_exit_custody.try_retire().unwrap(),
         "R's original Source2 children still join their actual parent"
     );
     let mut reaped_sources = None;
@@ -193,7 +194,7 @@ fn closing_task_rpc_admission_returns_new_originals_and_keeps_the_existing_cut_a
     }
     let reaped_sources =
         reaped_sources.expect("same R's two unused Source children actually exit and reap");
-    let original_retired = role.try_retire().unwrap();
+    let original_retired = original_exit_custody.try_retire().unwrap();
     let retired = host
         .causal()
         .retire_after_exit(cut, CausalSourceRetirement::Reaped(reaped_sources))

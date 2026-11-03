@@ -1149,28 +1149,28 @@ pub trait ConnectorCatalogMutationResolver: Send + Sync {
     fn acquire_current_mutation(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorCatalogMutationLease, ConnectorError>;
+    ) -> Result<ConnectorCatalogMutationSession, ConnectorError>;
 
     fn acquire_exact_mutation(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorCatalogMutationLease, ConnectorError>;
+    ) -> Result<ConnectorCatalogMutationSession, ConnectorError>;
 }
 
 #[derive(Clone)]
-pub struct ConnectorCatalogMutationLease {
+pub struct ConnectorCatalogMutationSession {
     descriptor: ConnectorInstanceDescriptor,
     control_runtime_id: ConnectorControlRuntimeId,
     provider_incarnation: ProviderBindingEpoch,
     mutation: Arc<dyn ConnectorCatalogMutation>,
-    _release: Arc<MutationLeaseRelease>,
+    _release: Arc<MutationReleaseGuard>,
 }
 
-struct MutationLeaseRelease {
+struct MutationReleaseGuard {
     release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
 }
 
-impl ConnectorCatalogMutationLease {
+impl ConnectorCatalogMutationSession {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
@@ -1189,7 +1189,7 @@ impl ConnectorCatalogMutationLease {
             control_runtime_id,
             provider_incarnation,
             mutation,
-            _release: Arc::new(MutationLeaseRelease {
+            _release: Arc::new(MutationReleaseGuard {
                 release: Mutex::new(Some(Box::new(release))),
             }),
         })
@@ -1548,7 +1548,7 @@ impl ConnectorCatalogMutationReceiving {
 
     fn install_request(
         &self,
-        lease: &ConnectorCatalogMutationLease,
+        lease: &ConnectorCatalogMutationSession,
         request: &ConnectorCatalogMutationRequest,
     ) -> Result<(), ConnectorError> {
         let mut state = self
@@ -1603,7 +1603,7 @@ impl ConnectorCatalogMutationReceiving {
         );
         state.raw = Some(outcome);
     }
-    fn validate_raw(&self, lease: &ConnectorCatalogMutationLease) {
+    fn validate_raw(&self, lease: &ConnectorCatalogMutationSession) {
         let mut state = self
             .state
             .lock()
@@ -1943,7 +1943,7 @@ impl Drop for CatalogMutationChild<'_> {
     }
 }
 
-impl Drop for MutationLeaseRelease {
+impl Drop for MutationReleaseGuard {
     fn drop(&mut self) {
         let Ok(mut release) = self.release.lock() else {
             return;
@@ -2003,7 +2003,7 @@ mod tests {
             provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
             instance_id: ConnectorInstanceId::parse("analytics").unwrap(),
         };
-        let lease = ConnectorCatalogMutationLease::new(
+        let lease = ConnectorCatalogMutationSession::new(
             descriptor.clone(),
             ConnectorControlRuntimeId::new(),
             ProviderBindingEpoch::from_bytes([1; 16]),
@@ -2480,8 +2480,8 @@ mod tests {
     }
     fn async_lease(
         capability: &Arc<AsyncCatalogCapability>,
-    ) -> super::ConnectorCatalogMutationLease {
-        super::ConnectorCatalogMutationLease::new(
+    ) -> super::ConnectorCatalogMutationSession {
+        super::ConnectorCatalogMutationSession::new(
             capability.descriptor.clone(),
             crate::connector::ConnectorControlRuntimeId::new(),
             capability.epoch,
@@ -2491,7 +2491,7 @@ mod tests {
         .unwrap()
     }
     fn async_request(
-        lease: &super::ConnectorCatalogMutationLease,
+        lease: &super::ConnectorCatalogMutationSession,
     ) -> super::ConnectorCatalogMutationRequest {
         super::ConnectorCatalogMutationRequest {
             operation_id: ConnectorMutationOperationId::new(),
@@ -2649,7 +2649,7 @@ mod tests {
             }
         }
         let capability = SyncOnly(async_capability().descriptor);
-        let lease = ConnectorCatalogMutationLease::new(
+        let lease = ConnectorCatalogMutationSession::new(
             capability.0.clone(),
             ConnectorControlRuntimeId::new(),
             capability.incarnation(),

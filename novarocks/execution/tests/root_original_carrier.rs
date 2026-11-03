@@ -25,6 +25,7 @@ use arrow::record_batch::RecordBatch;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::operators::RootResultSinkFactory;
 use novarocks_execution::exec::pipeline::driver::{DriverState, PipelineDriver};
+use novarocks_execution::exec::pipeline::driver_step::DriverStep;
 use novarocks_execution::exec::pipeline::input::PreparedInput;
 use novarocks_execution::exec::pipeline::operator::{
     InputEncodingPolicy, Operator, OperatorLifecycle,
@@ -34,17 +35,15 @@ use novarocks_execution::exec::pipeline::shape::{
     SinkKernel, SinkStep, Source, SourceKernel, SourceStart, Transform,
 };
 use novarocks_execution::exec::pipeline::step::{NextStep, StepResult};
-use novarocks_execution::exec::pipeline::step_context::StepContext;
-use novarocks_execution::runtime::fragment::ExecutionResult;
-use novarocks_execution::runtime::fragment::io::{
-    FragmentIoError, ResultAbort, ResultWriteCredit, RootInputAdmission, RootInputAuthority,
-    RootProducerState, RootResultInput, RootResultSession, RootResultWriteSpec,
-    RootWorkExitProgress,
-};
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::observable::Observable;
 use novarocks_execution::runtime::profile::{OperatorProfiles, Profiler};
 use novarocks_execution::runtime::runtime_state::RuntimeState;
+use novarocks_execution::runtime::task::ExecutionResult;
+use novarocks_execution::runtime::task::io::{
+    ResultAbort, ResultWriteCredit, RootInputAdmission, RootInputAuthority, RootProducerState,
+    RootResultInput, RootResultSession, RootResultWriteSpec, RootWorkExitProgress, TaskIoError,
+};
 use novarocks_execution_contract::TaskIdentity;
 use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
 use novarocks_types::SlotId;
@@ -72,7 +71,7 @@ impl SourceKernel for OneChunkSource {
             SourceStart::Finished
         }
     }
-    fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(authority) = &self.root_authority {
             assert!(
                 !authority.is_available(),
@@ -108,7 +107,7 @@ impl InputEncodingPolicy for OrdinaryReceiver {}
 impl SinkKernel for OrdinaryReceiver {
     fn consume(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<SinkStep> {
         let chunk = input.into_uncovered_chunk()?;
@@ -128,8 +127,8 @@ impl RootResultSession for OriginalSession {
     fn spec(&self) -> &RootResultWriteSpec {
         &self.spec
     }
-    fn try_acquire_input(&self) -> Result<RootInputAdmission, FragmentIoError> {
-        let novarocks_execution::runtime::fragment::io::RootInputReservationAdmission::Granted(
+    fn try_acquire_input(&self) -> Result<RootInputAdmission, TaskIoError> {
+        let novarocks_execution::runtime::task::io::RootInputReservationAdmission::Granted(
             mut reservation,
         ) = self.authority.try_reserve()?
         else {
@@ -145,15 +144,15 @@ impl RootResultSession for OriginalSession {
     fn writable_observable(&self) -> Arc<Observable> {
         self.authority.observable()
     }
-    fn submit_input(&self, offered: &mut Option<RootResultInput>) -> Result<(), FragmentIoError> {
+    fn submit_input(&self, offered: &mut Option<RootResultInput>) -> Result<(), TaskIoError> {
         let submitted = offered
             .as_ref()
             .expect("root submission owns its offered slot");
         assert!(self.authority.owns_original(submitted.permit()));
         if self.finished.load(Ordering::Acquire) {
-            return Err(FragmentIoError::new(
-                novarocks_execution::runtime::fragment::io::FragmentIoOperation::ResultWrite,
-                novarocks_execution::runtime::fragment::io::FragmentIoErrorKind::Cancelled,
+            return Err(TaskIoError::new(
+                novarocks_execution::runtime::task::io::TaskIoOperation::ResultWrite,
+                novarocks_execution::runtime::task::io::TaskIoErrorKind::Cancelled,
                 "fixture original input is closed",
             ));
         }
@@ -193,7 +192,7 @@ impl RootResultSession for OriginalSession {
         assert_eq!(permit.retire(), RootWorkExitProgress::Exited);
         Ok(())
     }
-    fn finish_input(&self) -> Result<(), FragmentIoError> {
+    fn finish_input(&self) -> Result<(), TaskIoError> {
         assert!(self.authority.is_available());
         assert!(!self.finished.swap(true, Ordering::AcqRel));
         // Submission is synchronous; retained output is Context-owned, not a job.
@@ -207,7 +206,7 @@ impl RootResultSession for OriginalSession {
     }
     fn producer_state(&self) -> RootProducerState {
         if self.finished.load(Ordering::Acquire) {
-            RootProducerState::ContextHeld
+            RootProducerState::ParticipationHeld
         } else {
             RootProducerState::Accepting
         }

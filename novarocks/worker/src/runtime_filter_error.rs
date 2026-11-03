@@ -140,7 +140,7 @@ mod projection_tests {
             let execution = rejection
                 .source()
                 .unwrap()
-                .downcast_ref::<novarocks_execution::runtime::fragment::ExecutionFailure>()
+                .downcast_ref::<novarocks_execution::runtime::task::ExecutionFailure>()
                 .unwrap();
             assert_eq!(execution.failure_fact(), expected);
             let mut source = execution.source();

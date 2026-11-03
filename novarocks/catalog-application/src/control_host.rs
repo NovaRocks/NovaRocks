@@ -19,19 +19,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    CatalogGenerationError, CatalogGenerationLease, CatalogGenerationOwner,
-    PreparedCatalogGeneration,
+    CatalogGenerationError, CatalogGenerationOwner, CatalogGenerationPin, PreparedCatalogGeneration,
 };
 
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver,
-    ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver, ConnectorControlBinding,
-    ConnectorControlPlanningLease, ConnectorControlRegistry, ConnectorControlResolver,
-    ConnectorControlRuntimeId, ConnectorDataMutationLease, ConnectorDataMutationResolver,
-    ConnectorDistributedRewriteLease, ConnectorDistributedRewriteResolver, ConnectorError,
-    ConnectorErrorKind, ConnectorInstanceId, ConnectorMetadataMaintenanceLease,
-    ConnectorMetadataMaintenanceResolver, ConnectorProviderBindingKey, ConnectorProviderId,
-    ConnectorStatisticsLease, ConnectorStatisticsResolver, ConnectorWriteLease,
+    CatalogHandle, ConnectorCatalogMutationResolver, ConnectorCatalogMutationSession,
+    ConnectorCleanupMaintenanceResolver, ConnectorCleanupMaintenanceSession,
+    ConnectorControlBinding, ConnectorControlPlanningPin, ConnectorControlRegistry,
+    ConnectorControlResolver, ConnectorControlRuntimeId, ConnectorDataMutationResolver,
+    ConnectorDataMutationSession, ConnectorDistributedRewriteResolver, ConnectorError,
+    ConnectorErrorKind, ConnectorInstanceId, ConnectorMetadataMaintenanceResolver,
+    ConnectorMetadataMaintenanceSession, ConnectorProviderBindingKey, ConnectorProviderId,
+    ConnectorStatisticsResolver, ConnectorStatisticsSession, ConnectorWrite,
+    SharedConnectorDistributedRewrite,
 };
 use novarocks_spi::connector::{
     ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlRoleBindingFactory,
@@ -84,7 +84,7 @@ struct ControlGeneration {
     binding: Arc<ConnectorControlBinding>,
     /// The complete role generation is the only typed-read authority.  The
     /// generic binding remains separately stored only while legacy SPI callers
-    /// still consume it; a planning lease always resolves the typed group from
+    /// still consume it; a planning pin always resolves the typed group from
     /// this same exact generation rather than through a second registry.
     role_binding: Option<Arc<ConnectorControlRoleBinding>>,
     legacy_execution_key: ConnectorProviderBindingKey,
@@ -212,7 +212,7 @@ impl ConnectorControlHost {
 
     /// Publishes one complete, immutable FE role generation.  The generic SPI
     /// control binding and every typed-read capability are installed together;
-    /// a subsequent planning lease cannot pair one generation's generic
+    /// a subsequent planning pin cannot pair one generation's generic
     /// control with another generation's encoder or request factory.
     pub fn register_role_binding(
         &self,
@@ -283,18 +283,18 @@ impl ConnectorControlHost {
     }
 
     /// Returns the typed-read group carried by the exact generation already
-    /// retained by `planning_lease`.  This is a snapshot lookup only; it does
+    /// retained by `planning_pin`.  This is a snapshot lookup only; it does
     /// not acquire another host lease or consult a parallel typed registry.
-    pub fn typed_read_for_planning_lease(
+    pub fn typed_read_for_planning_pin(
         &self,
-        planning_lease: &ConnectorControlPlanningLease,
+        planning_pin: &ConnectorControlPlanningPin,
     ) -> Result<ConnectorControlReadBinding, ConnectorError> {
-        let runtime_id = planning_lease.binding().control_runtime_id();
+        let runtime_id = planning_pin.binding().control_runtime_id();
         let generation = self.exact_generation(runtime_id)?;
-        if !Arc::ptr_eq(&generation.runtime().binding, planning_lease.binding()) {
+        if !Arc::ptr_eq(&generation.runtime().binding, planning_pin.binding()) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "connector control planning lease does not match the host generation",
+                "connector control planning pin does not match the host generation",
             ));
         }
         generation
@@ -348,10 +348,10 @@ impl ConnectorControlHost {
     fn acquire(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorControlPlanningLease, ConnectorError> {
+    ) -> Result<ConnectorControlPlanningPin, ConnectorError> {
         let generation = self.current_generation(instance_id)?;
         let binding = Arc::clone(&generation.runtime().binding);
-        Ok(ConnectorControlPlanningLease::new(binding, move || {
+        Ok(ConnectorControlPlanningPin::new(binding, move || {
             drop(generation);
         }))
     }
@@ -359,7 +359,7 @@ impl ConnectorControlHost {
     fn acquire_mutation(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorCatalogMutationLease, ConnectorError> {
+    ) -> Result<ConnectorCatalogMutationSession, ConnectorError> {
         let generation = self.current_generation(instance_id)?;
         Self::build_mutation_lease(generation)
     }
@@ -367,14 +367,14 @@ impl ConnectorControlHost {
     fn acquire_exact_mutation(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorCatalogMutationLease, ConnectorError> {
+    ) -> Result<ConnectorCatalogMutationSession, ConnectorError> {
         let generation = self.exact_generation(control_runtime_id)?;
         Self::build_mutation_lease(generation)
     }
 
     fn build_mutation_lease(
-        generation: CatalogGenerationLease<ControlGeneration>,
-    ) -> Result<ConnectorCatalogMutationLease, ConnectorError> {
+        generation: CatalogGenerationPin<ControlGeneration>,
+    ) -> Result<ConnectorCatalogMutationSession, ConnectorError> {
         let control_runtime_id = generation.runtime_id();
         let (descriptor, provider_incarnation, mutation) = {
             let binding = &generation.runtime().binding;
@@ -390,7 +390,7 @@ impl ConnectorControlHost {
                 mutation,
             )
         };
-        ConnectorCatalogMutationLease::new(
+        ConnectorCatalogMutationSession::new(
             descriptor,
             control_runtime_id,
             provider_incarnation,
@@ -402,7 +402,7 @@ impl ConnectorControlHost {
     fn acquire_current_data_mutation(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+    ) -> Result<ConnectorDataMutationSession, ConnectorError> {
         let generation = self.current_generation(instance_id)?;
         Self::build_data_mutation_lease(generation)
     }
@@ -410,14 +410,14 @@ impl ConnectorControlHost {
     fn acquire_exact_data_mutation(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+    ) -> Result<ConnectorDataMutationSession, ConnectorError> {
         let generation = self.exact_generation(control_runtime_id)?;
         Self::build_data_mutation_lease(generation)
     }
 
     fn build_data_mutation_lease(
-        generation: CatalogGenerationLease<ControlGeneration>,
-    ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+        generation: CatalogGenerationPin<ControlGeneration>,
+    ) -> Result<ConnectorDataMutationSession, ConnectorError> {
         let control_runtime_id = generation.runtime_id();
         let (descriptor, provider_incarnation, metadata, mutation) = {
             let binding = &generation.runtime().binding;
@@ -434,7 +434,7 @@ impl ConnectorControlHost {
                 mutation,
             )
         };
-        ConnectorDataMutationLease::new(
+        ConnectorDataMutationSession::new(
             descriptor,
             control_runtime_id,
             provider_incarnation,
@@ -447,7 +447,7 @@ impl ConnectorControlHost {
     fn acquire_current_metadata_maintenance(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+    ) -> Result<ConnectorMetadataMaintenanceSession, ConnectorError> {
         let generation = self.current_generation(instance_id)?;
         Self::build_metadata_maintenance_lease(generation)
     }
@@ -455,14 +455,14 @@ impl ConnectorControlHost {
     fn acquire_exact_metadata_maintenance(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+    ) -> Result<ConnectorMetadataMaintenanceSession, ConnectorError> {
         let generation = self.exact_generation(control_runtime_id)?;
         Self::build_metadata_maintenance_lease(generation)
     }
 
     fn build_metadata_maintenance_lease(
-        generation: CatalogGenerationLease<ControlGeneration>,
-    ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+        generation: CatalogGenerationPin<ControlGeneration>,
+    ) -> Result<ConnectorMetadataMaintenanceSession, ConnectorError> {
         let control_runtime_id = generation.runtime_id();
         let (descriptor, provider_incarnation, metadata, maintenance) = {
             let binding = &generation.runtime().binding;
@@ -479,7 +479,7 @@ impl ConnectorControlHost {
                 maintenance,
             )
         };
-        ConnectorMetadataMaintenanceLease::new(
+        ConnectorMetadataMaintenanceSession::new(
             descriptor,
             control_runtime_id,
             provider_incarnation,
@@ -492,7 +492,7 @@ impl ConnectorControlHost {
     fn acquire_current_cleanup_maintenance(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
+    ) -> Result<ConnectorCleanupMaintenanceSession, ConnectorError> {
         let generation = self.current_generation(instance_id)?;
         Self::build_cleanup_maintenance_lease(generation)
     }
@@ -500,7 +500,7 @@ impl ConnectorControlHost {
     fn acquire_exact_cleanup_maintenance(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
+    ) -> Result<ConnectorCleanupMaintenanceSession, ConnectorError> {
         let generation = self.exact_generation(control_runtime_id)?;
         Self::build_cleanup_maintenance_lease(generation)
     }
@@ -509,8 +509,8 @@ impl ConnectorControlHost {
     /// is FE-only and its lease keeps a retiring generation alive for replay of
     /// immutable prepared evidence; it never substitutes a current generation.
     fn build_cleanup_maintenance_lease(
-        generation: CatalogGenerationLease<ControlGeneration>,
-    ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
+        generation: CatalogGenerationPin<ControlGeneration>,
+    ) -> Result<ConnectorCleanupMaintenanceSession, ConnectorError> {
         let control_runtime_id = generation.runtime_id();
         let (descriptor, provider_incarnation, metadata, cleanup) = {
             let binding = &generation.runtime().binding;
@@ -527,7 +527,7 @@ impl ConnectorControlHost {
                 cleanup,
             )
         };
-        ConnectorCleanupMaintenanceLease::new(
+        ConnectorCleanupMaintenanceSession::new(
             descriptor,
             control_runtime_id,
             provider_incarnation,
@@ -540,7 +540,7 @@ impl ConnectorControlHost {
     fn acquire_current_distributed_rewrite(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
+    ) -> Result<SharedConnectorDistributedRewrite, ConnectorError> {
         let generation = self.current_generation(instance_id)?;
         self.build_distributed_rewrite_lease(generation)
     }
@@ -548,19 +548,19 @@ impl ConnectorControlHost {
     fn acquire_exact_distributed_rewrite(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
+    ) -> Result<SharedConnectorDistributedRewrite, ConnectorError> {
         let generation = self.exact_generation(control_runtime_id)?;
         self.build_distributed_rewrite_lease(generation)
     }
 
     /// Acquire the metadata, rewrite planning, write-control, and execution
     /// distribution capabilities from exactly one registered generation. The
-    /// resulting lease and its derived planning lease retain the same exact
+    /// resulting lease and its derived planning pin retain the same exact
     /// generation rather than acquiring a separate current generation.
     fn build_distributed_rewrite_lease(
         &self,
-        generation: CatalogGenerationLease<ControlGeneration>,
-    ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
+        generation: CatalogGenerationPin<ControlGeneration>,
+    ) -> Result<SharedConnectorDistributedRewrite, ConnectorError> {
         let control_runtime_id = generation.runtime_id();
         let (
             binding,
@@ -601,14 +601,14 @@ impl ConnectorControlHost {
             )
         };
         let planning_generation = self.exact_generation(control_runtime_id)?;
-        let planning_lease = ConnectorControlPlanningLease::new(binding, move || {
+        let planning_pin = ConnectorControlPlanningPin::new(binding, move || {
             drop(planning_generation);
         });
-        ConnectorDistributedRewriteLease::new(
+        SharedConnectorDistributedRewrite::new(
             descriptor,
             control_runtime_id,
             provider_incarnation,
-            planning_lease,
+            planning_pin,
             metadata,
             planning,
             rewrite,
@@ -621,7 +621,7 @@ impl ConnectorControlHost {
     fn acquire_write(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorWriteLease, ConnectorError> {
+    ) -> Result<ConnectorWrite, ConnectorError> {
         let generation = self.current_generation(instance_id)?;
         let runtime_id = generation.runtime_id();
         let (write, provider_id, distribution, catalog_properties, legacy_key, runtime_id) = {
@@ -644,7 +644,7 @@ impl ConnectorControlHost {
                 runtime_id,
             )
         };
-        ConnectorWriteLease::new_with_execution_distribution(
+        ConnectorWrite::new_with_execution_distribution(
             runtime_id,
             legacy_key,
             write,
@@ -663,11 +663,11 @@ impl ConnectorControlHost {
     /// active now": between planning and commit the active generation can be
     /// replaced, and committing through the replacement would attach staged
     /// work to a runtime that never admitted it. Callers pass the runtime id of
-    /// the planning lease they are already holding.
+    /// the planning pin they are already holding.
     pub fn acquire_exact_write_stack(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorWriteStackLease, ConnectorError> {
+    ) -> Result<ConnectorWriteStackPin, ConnectorError> {
         let generation = self.exact_generation(control_runtime_id)?;
         Self::build_write_stack_lease(generation)
     }
@@ -680,14 +680,14 @@ impl ConnectorControlHost {
     pub fn acquire_current_write_stack(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorWriteStackLease, ConnectorError> {
+    ) -> Result<ConnectorWriteStackPin, ConnectorError> {
         let generation = self.current_generation(instance_id)?;
         Self::build_write_stack_lease(generation)
     }
 
     fn build_write_stack_lease(
-        generation: CatalogGenerationLease<ControlGeneration>,
-    ) -> Result<ConnectorWriteStackLease, ConnectorError> {
+        generation: CatalogGenerationPin<ControlGeneration>,
+    ) -> Result<ConnectorWriteStackPin, ConnectorError> {
         let control_runtime_id = generation.runtime_id();
         let group = generation
             .runtime()
@@ -700,7 +700,7 @@ impl ConnectorControlHost {
                     "connector control generation has no distributed write capability",
                 )
             })?;
-        Ok(ConnectorWriteStackLease::new(
+        Ok(ConnectorWriteStackPin::new(
             control_runtime_id,
             group,
             move || drop(generation),
@@ -710,7 +710,7 @@ impl ConnectorControlHost {
     fn acquire_statistics(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorStatisticsLease, ConnectorError> {
+    ) -> Result<ConnectorStatisticsSession, ConnectorError> {
         let generation = self.current_generation(instance_id)?;
         let (descriptor, incarnation, statistics) = {
             let binding = &generation.runtime().binding;
@@ -726,7 +726,7 @@ impl ConnectorControlHost {
                 statistics,
             )
         };
-        ConnectorStatisticsLease::new(descriptor, incarnation, statistics, move || {
+        ConnectorStatisticsSession::new(descriptor, incarnation, statistics, move || {
             drop(generation);
         })
     }
@@ -734,7 +734,7 @@ impl ConnectorControlHost {
     fn current_generation(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<CatalogGenerationLease<ControlGeneration>, ConnectorError> {
+    ) -> Result<CatalogGenerationPin<ControlGeneration>, ConnectorError> {
         self.generations
             .acquire_current(instance_id)
             .map_err(map_generation_error)
@@ -743,7 +743,7 @@ impl ConnectorControlHost {
     fn exact_generation(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<CatalogGenerationLease<ControlGeneration>, ConnectorError> {
+    ) -> Result<CatalogGenerationPin<ControlGeneration>, ConnectorError> {
         self.generations
             .acquire_runtime(control_runtime_id)
             .map_err(map_generation_error)
@@ -788,7 +788,7 @@ impl ConnectorControlResolver for ConnectorControlHost {
     fn acquire_current(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorControlPlanningLease, ConnectorError> {
+    ) -> Result<ConnectorControlPlanningPin, ConnectorError> {
         self.acquire(instance_id)
     }
 }
@@ -797,14 +797,14 @@ impl ConnectorCatalogMutationResolver for ConnectorControlHost {
     fn acquire_current_mutation(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorCatalogMutationLease, ConnectorError> {
+    ) -> Result<ConnectorCatalogMutationSession, ConnectorError> {
         self.acquire_mutation(instance_id)
     }
 
     fn acquire_exact_mutation(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorCatalogMutationLease, ConnectorError> {
+    ) -> Result<ConnectorCatalogMutationSession, ConnectorError> {
         Self::acquire_exact_mutation(self, control_runtime_id)
     }
 }
@@ -813,14 +813,14 @@ impl ConnectorDataMutationResolver for ConnectorControlHost {
     fn acquire_current_data_mutation(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+    ) -> Result<ConnectorDataMutationSession, ConnectorError> {
         Self::acquire_current_data_mutation(self, instance_id)
     }
 
     fn acquire_exact_data_mutation(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorDataMutationLease, ConnectorError> {
+    ) -> Result<ConnectorDataMutationSession, ConnectorError> {
         Self::acquire_exact_data_mutation(self, control_runtime_id)
     }
 }
@@ -829,14 +829,14 @@ impl ConnectorMetadataMaintenanceResolver for ConnectorControlHost {
     fn acquire_current_metadata_maintenance(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+    ) -> Result<ConnectorMetadataMaintenanceSession, ConnectorError> {
         Self::acquire_current_metadata_maintenance(self, instance_id)
     }
 
     fn acquire_exact_metadata_maintenance(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
+    ) -> Result<ConnectorMetadataMaintenanceSession, ConnectorError> {
         Self::acquire_exact_metadata_maintenance(self, control_runtime_id)
     }
 }
@@ -845,14 +845,14 @@ impl ConnectorCleanupMaintenanceResolver for ConnectorControlHost {
     fn acquire_current_cleanup_maintenance(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
+    ) -> Result<ConnectorCleanupMaintenanceSession, ConnectorError> {
         Self::acquire_current_cleanup_maintenance(self, instance_id)
     }
 
     fn acquire_exact_cleanup_maintenance(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
+    ) -> Result<ConnectorCleanupMaintenanceSession, ConnectorError> {
         Self::acquire_exact_cleanup_maintenance(self, control_runtime_id)
     }
 }
@@ -861,14 +861,14 @@ impl ConnectorDistributedRewriteResolver for ConnectorControlHost {
     fn acquire_current_distributed_rewrite(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
+    ) -> Result<SharedConnectorDistributedRewrite, ConnectorError> {
         Self::acquire_current_distributed_rewrite(self, instance_id)
     }
 
     fn acquire_exact_distributed_rewrite(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
+    ) -> Result<SharedConnectorDistributedRewrite, ConnectorError> {
         Self::acquire_exact_distributed_rewrite(self, control_runtime_id)
     }
 }
@@ -877,7 +877,7 @@ impl ConnectorStatisticsResolver for ConnectorControlHost {
     fn acquire_current_statistics(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorStatisticsLease, ConnectorError> {
+    ) -> Result<ConnectorStatisticsSession, ConnectorError> {
         self.acquire_statistics(instance_id)
     }
 }
@@ -899,13 +899,13 @@ impl ConnectorControlRegistry for ConnectorControlHost {
 /// authority that commits it are the same generation" a fact rather than a
 /// hope. The commit authority itself is reached only through `session()`, and
 /// there is deliberately no way to clone the lease into another owner.
-pub struct ConnectorWriteStackLease {
+pub struct ConnectorWriteStackPin {
     control_runtime_id: ConnectorControlRuntimeId,
     group: ConnectorControlWriteBinding,
     release: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
-impl ConnectorWriteStackLease {
+impl ConnectorWriteStackPin {
     pub(crate) fn new(
         control_runtime_id: ConnectorControlRuntimeId,
         group: ConnectorControlWriteBinding,
@@ -942,7 +942,7 @@ impl ConnectorWriteStackLease {
     }
 }
 
-impl Drop for ConnectorWriteStackLease {
+impl Drop for ConnectorWriteStackPin {
     fn drop(&mut self) {
         if let Some(release) = self.release.take() {
             release();
@@ -950,10 +950,10 @@ impl Drop for ConnectorWriteStackLease {
     }
 }
 
-impl std::fmt::Debug for ConnectorWriteStackLease {
+impl std::fmt::Debug for ConnectorWriteStackPin {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ConnectorWriteStackLease")
+            .debug_struct("ConnectorWriteStackPin")
             .field("control_runtime_id", &self.control_runtime_id)
             .finish_non_exhaustive()
     }
@@ -1191,16 +1191,16 @@ pub(crate) mod tests {
         let instance_id = ConnectorInstanceId::parse("catalog.starrocks").expect("instance ID");
         host.register(starrocks_binding())
             .expect("register StarRocks generation");
-        let planning_lease = host.acquire_current(&instance_id).expect("planning lease");
+        let planning_pin = host.acquire_current(&instance_id).expect("planning pin");
 
         let typed_error = host
-            .acquire_exact_write_stack(planning_lease.control_runtime_id())
+            .acquire_exact_write_stack(planning_pin.control_runtime_id())
             .expect_err("StarRocks has no distributed write capability");
         assert_eq!(typed_error.kind(), ConnectorErrorKind::Unsupported);
     }
 
     #[test]
-    fn observing_current_binding_does_not_require_a_planning_lease() {
+    fn observing_current_binding_does_not_require_a_planning_pin() {
         let host = ConnectorControlHost::new();
         let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
         let binding = binding(7);
@@ -1219,9 +1219,9 @@ pub(crate) mod tests {
                 .expect("observe active control runtime"),
             control_runtime_id
         );
-        let planning_lease = host.acquire_current(&instance_id).expect("planning lease");
-        assert_eq!(planning_lease.control_runtime_id(), control_runtime_id);
-        drop(planning_lease);
+        let planning_pin = host.acquire_current(&instance_id).expect("planning pin");
+        assert_eq!(planning_pin.control_runtime_id(), control_runtime_id);
+        drop(planning_pin);
         host.retire_current(&instance_id)
             .expect("retire unleased generation");
         assert!(
@@ -1231,11 +1231,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn retiring_generation_waits_for_planning_lease_before_remote_retire() {
+    fn retiring_generation_waits_for_planning_pin_before_remote_retire() {
         let host = ConnectorControlHost::new();
         let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
         host.register(binding(7)).expect("register old generation");
-        let lease = host.acquire_current(&instance_id).expect("planning lease");
+        let lease = host.acquire_current(&instance_id).expect("planning pin");
         let old_key = ConnectorProviderBindingKey {
             instance_id: instance_id.clone(),
             incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
@@ -1257,7 +1257,7 @@ pub(crate) mod tests {
         assert_eq!(ready[0].installed_backends, vec![String::from("be-1")]);
         assert_eq!(
             host.acquire_current(&instance_id)
-                .expect("replacement planning lease")
+                .expect("replacement planning pin")
                 .binding()
                 .incarnation()
                 .to_bytes(),

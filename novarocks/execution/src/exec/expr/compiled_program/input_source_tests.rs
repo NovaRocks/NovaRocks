@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::runtime::fragment::{ExecutionFailureCause, ExecutionResult};
+use crate::runtime::task::{ExecutionFailureCause, ExecutionResult};
 use arrow::array::{Array, BooleanArray, Int64Array};
 use novarocks_functions::ScalarInvocationActivation;
 use novarocks_local_program::ProgramNodeExpressionRole;

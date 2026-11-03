@@ -31,18 +31,18 @@ use crate::exec::pipeline::{
 use crate::exec::{
     chunk::Chunk,
     pipeline::{
+        driver_step::DriverStep,
         input::{AcceptedInput, InputPreparationFailure, PreparedInput, RawInput},
         operator::{ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator},
         step::{AdmissionNext, InputResult, NextStep, StepResult, WaitFact, WaitReason},
-        step_context::StepContext,
     },
 };
 use crate::runtime::{
-    fragment::{ExecutionFailure, ExecutionResult, io::FragmentEventSink},
     mem_tracker::MemTracker,
     observable::{Observable, ObserverSubscription},
     profile::OperatorProfiles,
     runtime_state::{RuntimeErrorState, RuntimeState},
+    task::{ExecutionFailure, ExecutionResult, io::TaskEventSink},
 };
 use std::sync::Arc;
 
@@ -55,19 +55,19 @@ pub(crate) trait FanoutRouter: InputEncodingPolicy {
         &mut self,
         input: PreparedInput,
         factory: &dyn InputConstructionFactory,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
     ) -> ExecutionResult<Self::Cursor>;
     fn advance(
         &mut self,
         cursor: &mut Self::Cursor,
         factory: &dyn InputConstructionFactory,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
     ) -> ExecutionResult<RouteStep>;
     fn accepts_branch(&self, branch: usize) -> bool;
     fn requires_branch_drain(&self, _branch: usize) -> bool {
         false
     }
-    fn input_exhausted(&mut self, _ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn input_exhausted(&mut self, _ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         Ok(())
     }
     fn visit_demand_events(&self, _visit: &mut dyn FnMut(Arc<Observable>)) {}
@@ -82,7 +82,7 @@ struct FanoutPreparation(HydrateInput);
 impl<R: FanoutRouter> InputPreparation<R> for FanoutPreparation {
     fn admission(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: &RawInput,
         _: &R,
     ) -> ExecutionResult<Option<AdmissionNext>> {
@@ -94,7 +94,7 @@ impl<R: FanoutRouter> InputPreparation<R> for FanoutPreparation {
     }
     fn prepare(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: AcceptedInput,
         router: &R,
     ) -> Result<PreparationStep, InputPreparationFailure> {
@@ -220,7 +220,7 @@ impl std::fmt::Display for FanoutFailure {
 impl std::error::Error for FanoutFailure {}
 impl novarocks_failure_contract::FailureProjection for FanoutFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         let (class, code) = match self {
             Self::EmptyBranches => (
@@ -332,7 +332,7 @@ impl<R: FanoutRouter> Fanout<R> {
             cursor_exit: OperatorExitScope::new(),
         }
     }
-    fn fail(&mut self, ctx: &StepContext<'_>, failure: ExecutionFailure) -> ExecutionFailure {
+    fn fail(&mut self, ctx: &DriverStep<'_>, failure: ExecutionFailure) -> ExecutionFailure {
         ctx.report_failure(failure.clone());
         self.failure.get_or_insert(failure).clone()
     }
@@ -395,7 +395,7 @@ impl<R: FanoutRouter> Fanout<R> {
         &mut self,
         index: usize,
         result: StepResult,
-        ctx: &StepContext<'_>,
+        ctx: &DriverStep<'_>,
     ) -> ExecutionResult<()> {
         if result.output.is_some() {
             let failure = fault(FanoutFailure::BranchOutput);
@@ -455,7 +455,7 @@ impl<R: FanoutRouter> Fanout<R> {
                 }
             })
     }
-    fn close_disabled_inputs(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<bool> {
+    fn close_disabled_inputs(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<bool> {
         // A shared zero cannot overtake the last prefix claimed by this driver.
         if self.receiver.is_occupied()
             || self.cursor.is_some()
@@ -471,10 +471,9 @@ impl<R: FanoutRouter> Fanout<R> {
             if !branch.input_closed && (self.finishing || !self.router.accepts_branch(index)) {
                 branch.input_closed = true;
                 if !matches!(branch.next, NextStep::Finished) {
-                    ctx.perform(
-                        crate::runtime::fragment::PipelineOperation::Finishing,
-                        |ctx| branch.operator.as_mut().finish(ctx),
-                    )?;
+                    ctx.perform(crate::runtime::task::PipelineOperation::Finishing, |ctx| {
+                        branch.operator.as_mut().finish(ctx)
+                    })?;
                     branch.next = NextStep::Runnable;
                     changed = true;
                 }
@@ -539,7 +538,7 @@ impl<R: FanoutRouter> Fanout<R> {
     }
     fn drive_once(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         generation: u64,
     ) -> ExecutionResult<StepResult> {
         if ctx.work().remaining() == 0 {
@@ -556,9 +555,8 @@ impl<R: FanoutRouter> Fanout<R> {
             if matches!(branch.next, NextStep::NeedInput) {
                 let raw = branch.pending.take().expect("pending route selected");
                 branch.admission = None;
-                let admission = ctx.perform(
-                    crate::runtime::fragment::PipelineOperation::Admission,
-                    |ctx| {
+                let admission =
+                    ctx.perform(crate::runtime::task::PipelineOperation::Admission, |ctx| {
                         Ok(match branch.operator.as_mut().try_push(ctx, raw) {
                             InputResult::Rejected { input, failure } => {
                                 let failure = ctx.locate(failure);
@@ -572,8 +570,7 @@ impl<R: FanoutRouter> Fanout<R> {
                             }
                             result => result,
                         })
-                    },
-                )?;
+                    })?;
                 match admission {
                     InputResult::Accepted(result) => self.record_branch(index, result?, ctx)?,
                     InputResult::Deferred { input, next } => {
@@ -628,7 +625,7 @@ impl<R: FanoutRouter> Fanout<R> {
         }
         if self.receiver.is_occupied() {
             let preparation = ctx.perform(
-                crate::runtime::fragment::PipelineOperation::Preparation,
+                crate::runtime::task::PipelineOperation::Preparation,
                 |ctx| self.receiver.prepare(ctx, &self.router),
             )?;
             match preparation {
@@ -697,7 +694,7 @@ impl<R: FanoutRouter> StepOperator for Fanout<R> {
     fn control_observable(&self) -> Option<Arc<Observable>> {
         Some(self.observable.clone())
     }
-    fn poll_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
         }
@@ -745,7 +742,7 @@ impl<R: FanoutRouter> StepOperator for Fanout<R> {
         })();
         result.map_err(|failure| self.fail(ctx, failure))
     }
-    fn try_push(&mut self, ctx: &mut StepContext<'_>, input: RawInput) -> InputResult {
+    fn try_push(&mut self, ctx: &mut DriverStep<'_>, input: RawInput) -> InputResult {
         if let Some(failure) = self.failure.clone().or_else(|| ctx.checkpoint().err()) {
             return InputResult::Rejected { input, failure };
         }
@@ -811,7 +808,7 @@ impl<R: FanoutRouter> StepOperator for Fanout<R> {
         }
         result
     }
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
         }
@@ -826,7 +823,7 @@ impl<R: FanoutRouter> StepOperator for Fanout<R> {
         self.drive_once(ctx, generation)
             .map_err(|failure| self.fail(ctx, failure))
     }
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
         }
@@ -873,9 +870,9 @@ impl<R: FanoutRouter> OperatorLifecycle for Fanout<R> {
             ));
         }
     }
-    fn set_fragment_event_sink(&mut self, sink: Arc<dyn FragmentEventSink>) {
+    fn set_task_event_sink(&mut self, sink: Arc<dyn TaskEventSink>) {
         for branch in &mut self.branches {
-            branch.operator.set_fragment_event_sink(sink.clone());
+            branch.operator.set_task_event_sink(sink.clone());
         }
     }
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
@@ -1106,7 +1103,7 @@ pub(crate) mod test_support {
             &mut self,
             input: PreparedInput,
             _: &dyn InputConstructionFactory,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
         ) -> ExecutionResult<Self::Cursor> {
             Ok((input.into_uncovered_chunk()?, 0))
         }
@@ -1114,7 +1111,7 @@ pub(crate) mod test_support {
             &mut self,
             cursor: &mut Self::Cursor,
             _: &dyn InputConstructionFactory,
-            _: &mut StepContext<'_>,
+            _: &mut DriverStep<'_>,
         ) -> ExecutionResult<RouteStep> {
             if cursor.1 == self.0 {
                 return Ok(RouteStep::Finished);
@@ -1198,7 +1195,7 @@ pub(crate) mod test_support {
         fn control_observable(&self) -> Option<Arc<Observable>> {
             Some(self.probe.event.clone())
         }
-        fn try_push(&mut self, ctx: &mut StepContext<'_>, input: RawInput) -> InputResult {
+        fn try_push(&mut self, ctx: &mut DriverStep<'_>, input: RawInput) -> InputResult {
             let attempt = self.probe.tries.fetch_add(1, Ordering::AcqRel);
             let mut first = self.probe.first_raw.lock().unwrap();
             if attempt == 0 {
@@ -1231,7 +1228,7 @@ pub(crate) mod test_support {
             }
             self.receiver.try_accept(ctx, input, &CopyRouter(0))
         }
-        fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
             self.probe.drives.fetch_add(1, Ordering::AcqRel);
             assert!(
                 self.receiver.is_occupied() || self.finishing,
@@ -1281,18 +1278,18 @@ pub(crate) mod test_support {
             );
             Ok(StepResult::new(None, NextStep::Finished, 0))
         }
-        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+        fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
             assert!(!self.finishing);
             self.finishing = true;
             self.probe.finishes.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
     }
-    pub(crate) fn context<T>(action: impl FnOnce(&mut StepContext<'_>) -> T) -> T {
+    pub(crate) fn context<T>(action: impl FnOnce(&mut DriverStep<'_>) -> T) -> T {
         let control = RuntimeErrorState::default();
         let mut turn =
-            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(
+            crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        action(&mut DriverStep::new(
             &control,
             &mut turn,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -1348,7 +1345,7 @@ pub(crate) mod test_support {
         }
         let rows = arrays.first().unwrap().len();
         let schema = Arc::new(ChunkSchema::try_new_typed(slots, storage).unwrap());
-        Chunk::try_new_typed_with_columns_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+        Chunk::try_new_typed_with_columns_observed::<crate::runtime::task::ExecutionFailure, _>(
             schema,
             arrays,
             rows,
@@ -1686,14 +1683,14 @@ pub(crate) mod test_support {
             fn control_observable(&self) -> Option<Arc<Observable>> {
                 Some(self.event.clone())
             }
-            fn try_push(&mut self, _: &mut StepContext<'_>, _: RawInput) -> InputResult {
+            fn try_push(&mut self, _: &mut DriverStep<'_>, _: RawInput) -> InputResult {
                 unreachable!("this EOS fixture has no input data")
             }
-            fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<()> {
+            fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<()> {
                 self.finishing = true;
                 Ok(())
             }
-            fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            fn drive(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
                 assert!(self.finishing);
                 Ok(StepResult::new(None, NextStep::Finished, 0))
             }
@@ -1721,7 +1718,7 @@ pub(crate) mod test_support {
                 self.queries.fetch_add(1, Ordering::SeqCst);
                 Some(self.event.clone())
             }
-            fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            fn poll_output(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
                 unreachable!("the source has no work")
             }
         }
@@ -1736,7 +1733,7 @@ pub(crate) mod test_support {
                 &mut self,
                 input: PreparedInput,
                 factory: &dyn InputConstructionFactory,
-                ctx: &mut StepContext<'_>,
+                ctx: &mut DriverStep<'_>,
             ) -> ExecutionResult<Self::Cursor> {
                 self.copy.begin(input, factory, ctx)
             }
@@ -1744,7 +1741,7 @@ pub(crate) mod test_support {
                 &mut self,
                 cursor: &mut Self::Cursor,
                 factory: &dyn InputConstructionFactory,
-                ctx: &mut StepContext<'_>,
+                ctx: &mut DriverStep<'_>,
             ) -> ExecutionResult<RouteStep> {
                 self.copy.advance(cursor, factory, ctx)
             }
@@ -1963,7 +1960,7 @@ pub(crate) mod test_support {
             }
             fn consume(
                 &mut self,
-                _: &mut StepContext<'_>,
+                _: &mut DriverStep<'_>,
                 _: PreparedInput,
             ) -> ExecutionResult<super::super::SinkStep> {
                 unreachable!("closed fixture cannot receive input")
@@ -1977,7 +1974,7 @@ pub(crate) mod test_support {
                 &mut self,
                 _: PreparedInput,
                 _: &dyn InputConstructionFactory,
-                _: &mut StepContext<'_>,
+                _: &mut DriverStep<'_>,
             ) -> ExecutionResult<()> {
                 unreachable!("empty fixture has no input")
             }
@@ -1985,7 +1982,7 @@ pub(crate) mod test_support {
                 &mut self,
                 _: &mut (),
                 _: &dyn InputConstructionFactory,
-                _: &mut StepContext<'_>,
+                _: &mut DriverStep<'_>,
             ) -> ExecutionResult<RouteStep> {
                 Ok(RouteStep::Finished)
             }

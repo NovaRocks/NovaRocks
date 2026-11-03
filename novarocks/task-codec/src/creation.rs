@@ -20,7 +20,7 @@
 //! A create request carries two immutable byte fields. The static fragment is
 //! one fragment's plan, encoded once per plan version by the frontend and sent
 //! unchanged to every task of that fragment. The creation metadata is the
-//! task-local half: its context, descriptor, initial domains and assignment,
+//! task-local half: its participation, descriptor, initial domains and assignment,
 //! each fact with exactly one owner.
 //!
 //! Ingress decodes the metadata once for every request, because identity,
@@ -39,7 +39,7 @@ use std::collections::BTreeSet;
 
 use novarocks_execution_contract::task_execution::creation::{CreationContent, FrozenBytes};
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
-use novarocks_execution_contract::task_execution::identity::QueryContextRef;
+use novarocks_execution_contract::task_execution::identity::ParticipationRef;
 use novarocks_execution_contract::task_execution::operation::OperationEnvelope;
 use novarocks_proto_codec::{FieldPath, ProtocolError};
 use novarocks_proto_models::novarocks;
@@ -47,7 +47,7 @@ use prost::Message;
 use prost::encoding::{encoded_len_varint, key_len};
 
 use crate::descriptor::{MAX_TOPOLOGY_ENTRIES, encode_task_descriptor};
-use crate::identity::encode_query_context_ref;
+use crate::identity::encode_participation_ref;
 use crate::operation::encode_envelope;
 use crate::{duplicate, inconsistent, invalid, missing, out_of_range};
 
@@ -266,13 +266,13 @@ pub fn decode_static_package(
 /// The frontend calls this once to learn the carrier's exact length and once
 /// to freeze it, and discards the returned message both times.
 pub fn encode_creation_metadata(
-    context: QueryContextRef,
+    participation: ParticipationRef,
     descriptor: &TaskDescriptor,
     assignment: novarocks::TaskAssignment,
     initial_domains: Vec<novarocks::TaskDomainUpdate>,
 ) -> novarocks::CreationMetadata {
     novarocks::CreationMetadata {
-        query_context: Some(encode_query_context_ref(context)),
+        participation: Some(encode_participation_ref(participation)),
         descriptor: Some(encode_task_descriptor(descriptor)),
         initial_domains,
         assignment: Some(assignment),

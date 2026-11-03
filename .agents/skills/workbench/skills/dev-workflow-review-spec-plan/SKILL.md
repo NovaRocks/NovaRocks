@@ -49,6 +49,9 @@ description: "Review the direction of a spec, umbrella, or implementation plan a
 7. **外部依赖。** 方案是否需要 vendor 补丁、fork 或替换上游？按 contract 第 2.2 节第 4 条给出扩展点、升级或
    暂不支持并写明恢复条件的替代路线。
 
+8. **词汇与公共类型名。** 新增公共类型名时，对照项目的词汇 ADR（如有），核对名称是否准确表达概念、
+   所有权与生命周期契约；既有名字不能成为延续歧义的理由。
+
 评审 plan 时另看：关键结构与流程是否忠实落实了 spec 的方向，有没有引入 spec 之外的新方向、长期不该存在的过渡
 结构，或绕开 spec 裁决的所有者。Plan 暴露出 spec 本身的方向问题时，直接指出并说明需要回到哪个阶段。
 

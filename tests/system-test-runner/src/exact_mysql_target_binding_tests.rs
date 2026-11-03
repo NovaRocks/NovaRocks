@@ -20,8 +20,39 @@ use super::*;
 use std::io::{self, Cursor};
 use std::time::Duration;
 
-const FE: &[u8] = b"NOVAROCKS_MEM_1_M07_EXACT_MYSQL_FE frontend_process_id=01890f6e-7a00-7123-8123-456789abcdef\n";
-const BOUND: &[u8] = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id=71 connection_generation=19 session_connection_id=71 session_key=23 statement_generation=29 sql_sha256=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n";
+const FE: &[u8] = &const {
+    let marker = novarocks_failpoint::observation_marker::MEM_1_M07_EXACT_MYSQL_FE.as_bytes();
+    let suffix = b" frontend_process_id=01890f6e-7a00-7123-8123-456789abcdef\n";
+    let mut bytes = [0; novarocks_failpoint::observation_marker::MEM_1_M07_EXACT_MYSQL_FE.len()
+        + b" frontend_process_id=01890f6e-7a00-7123-8123-456789abcdef\n".len()];
+    let mut index = 0;
+    while index < marker.len() {
+        bytes[index] = marker[index];
+        index += 1;
+    }
+    let mut suffix_index = 0;
+    while suffix_index < suffix.len() {
+        bytes[index + suffix_index] = suffix[suffix_index];
+        suffix_index += 1;
+    }
+    bytes
+};
+const BOUND: &[u8] = &const {
+    let marker = novarocks_failpoint::observation_marker::EXACT_MYSQL_TARGET_BOUND.as_bytes();
+    let suffix = b" connection_id=71 connection_generation=19 session_connection_id=71 session_key=23 statement_generation=29 sql_sha256=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n";
+    let mut bytes = [0; novarocks_failpoint::observation_marker::EXACT_MYSQL_TARGET_BOUND.len() + b" connection_id=71 connection_generation=19 session_connection_id=71 session_key=23 statement_generation=29 sql_sha256=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n".len()];
+    let mut index = 0;
+    while index < marker.len() {
+        bytes[index] = marker[index];
+        index += 1;
+    }
+    let mut suffix_index = 0;
+    while suffix_index < suffix.len() {
+        bytes[index + suffix_index] = suffix[suffix_index];
+        suffix_index += 1;
+    }
+    bytes
+};
 
 fn frontend() -> FrontendProcessId {
     parse_frontend(&FE[..FE.len() - 1]).expect("valid independently fixed FE UUID")
@@ -89,7 +120,22 @@ fn full_original_binding_preserves_distinct_domains_and_hash() {
 
 #[test]
 fn maximum_numeric_widths_accept_without_narrowing_domains() {
-    let max = b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND connection_id=4294967295 connection_generation=18446744073709551615 session_connection_id=4294967295 session_key=18446744073709551615 statement_generation=18446744073709551615 sql_sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n";
+    let max = &const {
+        let marker = novarocks_failpoint::observation_marker::EXACT_MYSQL_TARGET_BOUND.as_bytes();
+        let suffix = b" connection_id=4294967295 connection_generation=18446744073709551615 session_connection_id=4294967295 session_key=18446744073709551615 statement_generation=18446744073709551615 sql_sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n";
+        let mut bytes = [0; novarocks_failpoint::observation_marker::EXACT_MYSQL_TARGET_BOUND.len() + b" connection_id=4294967295 connection_generation=18446744073709551615 session_connection_id=4294967295 session_key=18446744073709551615 statement_generation=18446744073709551615 sql_sha256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n".len()];
+        let mut index = 0;
+        while index < marker.len() {
+            bytes[index] = marker[index];
+            index += 1;
+        }
+        let mut suffix_index = 0;
+        while suffix_index < suffix.len() {
+            bytes[index + suffix_index] = suffix[suffix_index];
+            suffix_index += 1;
+        }
+        bytes
+    };
     let bytes = [FE, max.as_slice()].concat();
     let value = scan(
         &mut Cursor::new(&bytes),
@@ -143,8 +189,11 @@ fn unknown_missing_duplicate_reordered_fields_and_extra_spaces_refuse() {
         ("1e1f\n", "1e1f unknown=1\n"),
         ("1e1f\n", "1e1f \n"),
         (
-            "NOVAROCKS_EXACT_MYSQL_TARGET_BOUND ",
-            "NOVAROCKS_EXACT_MYSQL_TARGET_BOUND",
+            &*format!(
+                "{} ",
+                novarocks_failpoint::observation_marker::EXACT_MYSQL_TARGET_BOUND
+            ),
+            novarocks_failpoint::observation_marker::EXACT_MYSQL_TARGET_BOUND,
         ),
     ] {
         assert!(
@@ -153,8 +202,46 @@ fn unknown_missing_duplicate_reordered_fields_and_extra_spaces_refuse() {
         );
     }
     for bytes in [
-        b"NOVAROCKS_EXACT_MYSQL_TARGET_BOUND\n".as_slice(),
-        b"NOVAROCKS_MEM_1_M07_EXACT_MYSQL_FE\n".as_slice(),
+        (const {
+            let marker =
+                novarocks_failpoint::observation_marker::EXACT_MYSQL_TARGET_BOUND.as_bytes();
+            let suffix = b"\n";
+            let mut bytes = [0; novarocks_failpoint::observation_marker::EXACT_MYSQL_TARGET_BOUND
+                .len()
+                + b"\n".len()];
+            let mut index = 0;
+            while index < marker.len() {
+                bytes[index] = marker[index];
+                index += 1;
+            }
+            let mut suffix_index = 0;
+            while suffix_index < suffix.len() {
+                bytes[index + suffix_index] = suffix[suffix_index];
+                suffix_index += 1;
+            }
+            bytes
+        })
+        .as_slice(),
+        (const {
+            let marker =
+                novarocks_failpoint::observation_marker::MEM_1_M07_EXACT_MYSQL_FE.as_bytes();
+            let suffix = b"\n";
+            let mut bytes = [0; novarocks_failpoint::observation_marker::MEM_1_M07_EXACT_MYSQL_FE
+                .len()
+                + b"\n".len()];
+            let mut index = 0;
+            while index < marker.len() {
+                bytes[index] = marker[index];
+                index += 1;
+            }
+            let mut suffix_index = 0;
+            while suffix_index < suffix.len() {
+                bytes[index + suffix_index] = suffix[suffix_index];
+                suffix_index += 1;
+            }
+            bytes
+        })
+        .as_slice(),
     ] {
         let mut full = log();
         full.extend_from_slice(bytes);

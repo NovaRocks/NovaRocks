@@ -17,7 +17,7 @@
 //! Processor lifecycle probes, independent of compile/source transport tests.
 use super::*;
 use crate::exec::chunk::ChunkSchema;
-use crate::runtime::fragment::ExecutionFailureCause;
+use crate::runtime::task::ExecutionFailureCause;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use novarocks_failure_contract::FailureProjection;
@@ -107,11 +107,10 @@ fn control(fail_at: Option<usize>, cause: KernelFailure) -> Arc<Control> {
         cause,
     })
 }
-fn with_context<T>(state: &RuntimeState, action: impl FnOnce(&mut StepContext<'_>) -> T) -> T {
+fn with_context<T>(state: &RuntimeState, action: impl FnOnce(&mut DriverStep<'_>) -> T) -> T {
     let error = state.error_state();
-    let mut work =
-        crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
-    action(&mut StepContext::new(
+    let mut work = crate::exec::pipeline::driver_step::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    action(&mut DriverStep::new(
         &error,
         &mut work,
         &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -202,7 +201,7 @@ fn compiled_generate_series_control_original_whole_data_has_no_late_footer_or_ro
 #[test]
 fn compiled_generate_series_control_finishing_owes_exact_output_then_latches_finished() {
     use crate::exec::pipeline::{
-        input::RawInput, shape::StepOperator, step::InputResult, step_context::TurnWork,
+        driver_step::TurnWork, input::RawInput, shape::StepOperator, step::InputResult,
     };
     let state = RuntimeState::default();
     let error = state.error_state();
@@ -211,7 +210,7 @@ fn compiled_generate_series_control_finishing_owes_exact_output_then_latches_fin
     let mut processor = Transform::hydrating(kernel);
     let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&error, &mut work, &mut value_conversions);
+    let mut ctx = DriverStep::new(&error, &mut work, &mut value_conversions);
     assert!(matches!(processor.initial_step(), NextStep::NeedInput));
     assert!(matches!(
         processor.try_push(&mut ctx, RawInput::for_test(chunk)),

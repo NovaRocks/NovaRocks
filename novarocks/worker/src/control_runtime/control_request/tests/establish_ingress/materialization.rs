@@ -22,31 +22,31 @@ mod node_task_flow;
 
 use super::*;
 use crate::{
-    HostRejection, QueryContextHostFactory, QueryContextHostInstance, ReleasedContextEvidence,
-    SharedFactsRequest,
+    HostRejection, ParticipationHostFactory, ParticipationHostInstance,
+    ReleasedParticipationEvidence, SharedFactsRequest,
     control_runtime::{
-        context_executors::{ContextExecutorStartRefusal, ContextExecutors},
-        context_host::CONTEXT_BOOTSTRAP_STORAGE,
+        participation_executors::{ParticipationExecutorStartRefusal, ParticipationExecutors},
+        participation_host::PARTICIPATION_BOOTSTRAP_STORAGE,
     },
-    control_runtime_policy::{ControlRuntimePolicy, IngressRoleLimits},
+    control_runtime_policy::{ControlRuntimePolicy, IngressPositionLimits},
 };
-use novarocks_execution_contract::QueryContextState;
+use novarocks_execution_contract::ParticipationState;
 use novarocks_worker_protocol::{
-    context::{ContextConfig, ContextCore},
     lease::LeaseBounds,
+    participation::{ParticipationConfig, ParticipationCore},
 };
 use std::{
     sync::{Condvar, Mutex},
     time::Instant,
 };
 
-fn context_actor() -> ActorId {
+fn participation_actor() -> ActorId {
     ActorId::new(4).unwrap()
 }
 const BRIDGE_STORAGE: StorageNeed = StorageNeed {
     inputs: 1,
     batches: 1,
-    effects: crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+    effects: crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
     work: 1,
     captures: 1,
     requests: 0,
@@ -54,22 +54,22 @@ const BRIDGE_STORAGE: StorageNeed = StorageNeed {
     replies: 0,
     completions: 0,
 };
-fn start_original_context_executors(
+fn start_original_participation_executors(
     f: &mut Fixture,
-) -> Result<ContextExecutors, ContextExecutorStartRefusal> {
+) -> Result<ParticipationExecutors, ParticipationExecutorStartRefusal> {
     let one = NonZeroUsize::new(1).unwrap();
-    // One physical Context M job per simultaneously held Establish R; the
+    // One physical Participation M job per simultaneously held Establish R; the
     // remaining original R position belongs to the control request.
     let jobs = NonZeroUsize::new(f.positions.checked_sub(1).unwrap()).unwrap();
     let limits = crate::control_runtime::host_executor::HostExecutorLimits {
         jobs,
-        per_context: one,
+        per_group: one,
         workers: one,
     };
     let capacity = f.root.task_capacity_signal().unwrap();
     f.root
         .service()
-        .start_context_executors(limits, limits, capacity)
+        .start_participation_executors(limits, limits, capacity)
 }
 
 #[test]
@@ -77,8 +77,9 @@ fn the_same_instance_waits_for_materialization_exit_while_its_control_plane_clos
     node_flow::blocked_materialization_keeps_control_live();
 }
 #[test]
-fn accepted_creator_retires_its_original_rpc_while_active_context_keeps_the_credential_holder() {
-    node_flow::accepted_creator_retains_only_context_custody();
+fn accepted_creator_retires_its_original_rpc_while_active_participation_keeps_the_credential_holder()
+ {
+    node_flow::accepted_creator_retains_only_participation_custody();
 }
 #[test]
 fn a_core_release_before_queued_materialization_never_calls_factory_and_retires_the_original_roles()

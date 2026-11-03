@@ -28,7 +28,7 @@ INSERT INTO ${case_db}.explain_analyze_actuals_r VALUES (1, 100), (2, 200), (4, 
 -- @skip_result_check=true
 -- @result_contains=Planning:
 -- @result_contains=Rows: 1
--- @result_contains=Profile: fragments=
+-- @result_contains=Profile: tasks=
 -- @result_contains=HASH JOIN (BROADCAST, INNER
 -- @result_contains=act={rows=
 EXPLAIN ANALYZE

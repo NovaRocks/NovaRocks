@@ -129,7 +129,7 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
     let target_schema_observation =
         crate::mv::domain::storage_observation::observe_schema_validation(
             source.storage_observation(),
-            target_binding.lease(),
+            target_binding.planning_pin(),
             target_binding.metadata(),
             connector_context.clone(),
         )
@@ -1299,7 +1299,7 @@ async fn plan_prepared_base_partitions(
             prepared_source: Some(
                 crate::mv::domain::partition::planner::PreparedPartitionSource {
                     receipt: &receipt,
-                    planning: &captured.lease,
+                    planning: &captured.planning_pin,
                     schema: &observation,
                 },
             ),
@@ -1460,7 +1460,7 @@ async fn reconcile_published_lake_projection(
     binding: &crate::mv::domain::refresh::target_binding::MvTargetBinding,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), RefreshError> {
-    let catalog = binding.lease().binding().catalog_handle()?.clone();
+    let catalog = binding.planning_pin().binding().catalog_handle()?.clone();
     let target_identity = novarocks_mv_application::product::MvTarget::try_new(
         Some(target.catalog.clone()),
         target.namespace.clone(),
@@ -1471,7 +1471,7 @@ async fn reconcile_published_lake_projection(
     // readiness operation; only that operation performs the document read.
     let metadata = io
         .metadata(
-            binding.lease(),
+            binding.planning_pin(),
             context.clone(),
             &target.namespace,
             &target.table,
@@ -1480,7 +1480,7 @@ async fn reconcile_published_lake_projection(
         .await?;
     let schema = crate::mv::domain::storage_observation::observe_schema_validation(
         source.storage_observation(),
-        binding.lease(),
+        binding.planning_pin(),
         &metadata,
         context.clone(),
     )?;
@@ -1490,7 +1490,7 @@ async fn reconcile_published_lake_projection(
     )?;
     io.rebuild_read_only(
         source,
-        binding.lease().clone(),
+        binding.planning_pin().clone(),
         catalog,
         target_identity,
         metadata.identity.clone(),
@@ -1510,7 +1510,7 @@ pub(crate) async fn validate_target_snapshot_original(
     binding: &crate::mv::domain::refresh::target_binding::MvTargetBinding,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), RefreshError> {
-    let documents = binding.lease().derive_document_storage_lease()?;
+    let documents = binding.planning_pin().derive_document_storage_lease()?;
     let request = crate::mv::domain::staged_create::keyed_request(
         &documents,
         binding.identity().clone(),

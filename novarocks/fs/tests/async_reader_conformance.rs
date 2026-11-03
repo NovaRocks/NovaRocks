@@ -33,11 +33,11 @@ use arrow::record_batch::RecordBatch;
 use common::{Fixture, collect};
 use novarocks_fs::{
     AsyncFileBatchReader, BoundFile, FileBatch, FileCancellation, FileErrorKind, FileFormat,
-    FileIdentity, FileIoRuntime, FileProjection, FileRangeScope, FileRangeService, FileReadBudget,
-    FileReadContext, FileReadRange, FileReadRequest, FileReaderOptions, FileResult, FileTask,
-    FileTaskFuture, FileTaskSpawner, FsAccessResolver, MinMaxPredicateOp, MinMaxPredicateValue,
-    PhysicalPageSelection, PhysicalPruning, ScanPredicate, ScanPredicateDomain,
-    ScanPredicateSource, TokioFileIoRuntime, inspect_parquet_metadata,
+    FileIdentity, FileIoFuture, FileIoJob, FileIoRuntime, FileIoSpawner, FileProjection,
+    FileRangeScope, FileRangeService, FileReadBudget, FileReadContext, FileReadRange,
+    FileReadRequest, FileReaderOptions, FileResult, FsAccessResolver, MinMaxPredicateOp,
+    MinMaxPredicateValue, PhysicalPageSelection, PhysicalPruning, ScanPredicate,
+    ScanPredicateDomain, ScanPredicateSource, TokioFileIoRuntime, inspect_parquet_metadata,
     inspect_parquet_metadata_async, open_file_reader, open_file_reader_async,
 };
 use novarocks_spi::connector::StorageAccessDomainId;
@@ -93,13 +93,13 @@ impl OrderedGateSpawner {
     }
 }
 
-impl FileTaskSpawner for OrderedGateSpawner {
-    fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
+impl FileIoSpawner for OrderedGateSpawner {
+    fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
         let index = self.started.fetch_add(1, Ordering::SeqCst);
         let fail = self.fail.lock().unwrap().contains(&index);
         let hold = self.hold && !self.released.lock().unwrap().contains(&index);
         let gate = self.gate(index);
-        Ok(FileTask::new(self.handle.spawn(async move {
+        Ok(FileIoJob::new(self.handle.spawn(async move {
             if fail {
                 drop(task);
                 return;
@@ -122,10 +122,10 @@ struct CountingSpawner {
     spawned: AtomicUsize,
 }
 
-impl FileTaskSpawner for CountingSpawner {
-    fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
+impl FileIoSpawner for CountingSpawner {
+    fn spawn(&self, task: FileIoFuture) -> FileResult<FileIoJob> {
         self.spawned.fetch_add(1, Ordering::SeqCst);
-        Ok(FileTask::new(self.handle.spawn(task)))
+        Ok(FileIoJob::new(self.handle.spawn(task)))
     }
 
     fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
@@ -201,7 +201,7 @@ fn large_parquet() -> LargeFile {
 fn request_through(
     file: &BoundFile,
     handle: &tokio::runtime::Handle,
-    spawner: Arc<dyn FileTaskSpawner>,
+    spawner: Arc<dyn FileIoSpawner>,
     service: Option<(Arc<FileRangeService>, ConnectorSourceOperations)>,
 ) -> FileReadRequest {
     FileReadRequest {
@@ -222,7 +222,7 @@ fn request_through(
             cancellation: FileCancellation::new(),
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())) as Arc<dyn FileIoRuntime>,
-            task_spawner: spawner,
+            io_spawner: spawner,
             range: service.map(|(service, operations)| {
                 service.bind(
                     FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap(),
@@ -234,7 +234,7 @@ fn request_through(
 }
 
 fn service(
-    spawner: Arc<dyn FileTaskSpawner>,
+    spawner: Arc<dyn FileIoSpawner>,
     handle: &tokio::runtime::Handle,
     window: usize,
 ) -> Arc<FileRangeService> {
@@ -316,7 +316,7 @@ fn awaited_reader_matches_the_blocking_reader_row_for_row() {
     // Every row group of the large file, through the range service.
     let large = large_parquet();
     let handle = large.runtime.handle().clone();
-    let spawner: Arc<dyn FileTaskSpawner> = Arc::new(CountingSpawner {
+    let spawner: Arc<dyn FileIoSpawner> = Arc::new(CountingSpawner {
         handle: handle.clone(),
         spawned: AtomicUsize::new(0),
     });
@@ -356,7 +356,7 @@ fn awaited_footer_and_page_indexes_read_what_the_blocking_path_reads() {
             handle: handle.clone(),
             spawned: AtomicUsize::new(0),
         });
-        let as_spawner: Arc<dyn FileTaskSpawner> = spawner.clone();
+        let as_spawner: Arc<dyn FileIoSpawner> = spawner.clone();
         let request = request_through(
             &large.file,
             &handle,
@@ -430,7 +430,7 @@ fn a_decoder_request_s_ranges_run_concurrently_and_land_in_order() {
     let handle = large.runtime.handle().clone();
     // The footer comes through an ungated path, so the gated spawner sees
     // only the decoder's two column chunks.
-    let plain: Arc<dyn FileTaskSpawner> = Arc::new(CountingSpawner {
+    let plain: Arc<dyn FileIoSpawner> = Arc::new(CountingSpawner {
         handle: handle.clone(),
         spawned: AtomicUsize::new(0),
     });
@@ -442,7 +442,7 @@ fn a_decoder_request_s_ranges_run_concurrently_and_land_in_order() {
     )
     .expect("inspect");
     let gated = OrderedGateSpawner::new(handle.clone(), true);
-    let as_spawner: Arc<dyn FileTaskSpawner> = gated.clone();
+    let as_spawner: Arc<dyn FileIoSpawner> = gated.clone();
     let operations = ConnectorSourceOperations::new();
     let mut request = request_through(
         &large.file,
@@ -487,7 +487,7 @@ fn a_decoder_request_s_ranges_run_concurrently_and_land_in_order() {
 fn a_failed_range_stops_its_sibling_and_the_error_wins() {
     let large = large_parquet();
     let handle = large.runtime.handle().clone();
-    let plain: Arc<dyn FileTaskSpawner> = Arc::new(CountingSpawner {
+    let plain: Arc<dyn FileIoSpawner> = Arc::new(CountingSpawner {
         handle: handle.clone(),
         spawned: AtomicUsize::new(0),
     });
@@ -500,7 +500,7 @@ fn a_failed_range_stops_its_sibling_and_the_error_wins() {
     .expect("inspect");
     let gated = OrderedGateSpawner::new(handle.clone(), true);
     gated.fail_unrun(0);
-    let as_spawner: Arc<dyn FileTaskSpawner> = gated.clone();
+    let as_spawner: Arc<dyn FileIoSpawner> = gated.clone();
     let operations = ConnectorSourceOperations::new();
     let mut request = request_through(
         &large.file,
@@ -543,7 +543,7 @@ fn concurrent_ranges_of_a_small_file_share_one_whole_file_read() {
         handle: handle.clone(),
         spawned: AtomicUsize::new(0),
     });
-    let as_spawner: Arc<dyn FileTaskSpawner> = spawner.clone();
+    let as_spawner: Arc<dyn FileIoSpawner> = spawner.clone();
     let mut request = request_through(
         &fixture.file,
         &handle,

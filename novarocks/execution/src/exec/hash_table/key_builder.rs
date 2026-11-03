@@ -43,7 +43,7 @@ use novarocks_types::largeint;
 
 use super::hash::{canonical_f32_bits, canonical_f64_bits};
 
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GroupKeyEncodingContract(novarocks_failure_contract::BoundedDetail);
 impl std::fmt::Display for GroupKeyEncodingContract {
@@ -56,7 +56,7 @@ impl novarocks_failure_contract::FailureProjection for GroupKeyEncodingContract 
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::GroupKeyEncodingContract.reason(),
+            crate::runtime::task::ExecutionReason::GroupKeyEncodingContract.reason(),
         )
     }
 }
@@ -93,7 +93,7 @@ impl novarocks_failure_contract::FailureProjection for GroupKeyComponentExtent {
         };
         FailureFact::new(
             FailureClass::Representation,
-            crate::runtime::fragment::ExecutionReason::GroupKeyComponentExtent.reason(),
+            crate::runtime::task::ExecutionReason::GroupKeyComponentExtent.reason(),
         )
         .with_representation(RepresentationFacts {
             boundary: RepresentationBoundary::MinimumUnit,
@@ -151,7 +151,7 @@ impl std::error::Error for GroupKeyDecodeFailure {
 }
 impl novarocks_failure_contract::FailureProjection for GroupKeyDecodeFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use arrow::error::ArrowError;
         use novarocks_failure_contract::{
             FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
@@ -254,7 +254,7 @@ impl novarocks_failure_contract::FailureProjection for GroupKeyOutputExtent {
         };
         FailureFact::new(
             FailureClass::Representation,
-            crate::runtime::fragment::ExecutionReason::GroupKeyOutputExtent.reason(),
+            crate::runtime::task::ExecutionReason::GroupKeyOutputExtent.reason(),
         )
         .with_representation(RepresentationFacts {
             boundary,
@@ -1384,8 +1384,7 @@ mod encoding_extent_failure_tests {
             assert_eq!(extent.boundary, RepresentationBoundary::MinimumUnit);
             assert_eq!(extent.required, Some(u64::from(u32::MAX) + 1));
             assert_eq!(extent.extent_limit, Some(u64::from(u32::MAX)));
-            let crate::runtime::fragment::ExecutionFailureCause::Domain(cause) = failure.cause()
-            else {
+            let crate::runtime::task::ExecutionFailureCause::Domain(cause) = failure.cause() else {
                 panic!("expected original encoding source")
             };
             let cause = cause.downcast_ref::<GroupKeyComponentExtent>().unwrap();
@@ -1412,7 +1411,7 @@ mod decoding_failure_tests {
         assert!(weak.upgrade().is_none());
         assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
         assert_eq!(failure.failure_fact().reason().code(), 374);
-        let crate::runtime::fragment::ExecutionFailureCause::Domain(cause) = failure.cause() else {
+        let crate::runtime::task::ExecutionFailureCause::Domain(cause) = failure.cause() else {
             panic!("expected canonical decoder source")
         };
         let source = cause.downcast_ref::<GroupKeyDecodeFailure>().unwrap();
@@ -1449,8 +1448,7 @@ mod decoding_failure_tests {
             let failure = decode_group_key_rows(&ty, &[Some(bytes.as_slice())]).unwrap_err();
             assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
             assert_eq!(failure.failure_fact().reason().code(), 373);
-            let crate::runtime::fragment::ExecutionFailureCause::Domain(cause) = failure.cause()
-            else {
+            let crate::runtime::task::ExecutionFailureCause::Domain(cause) = failure.cause() else {
                 panic!("expected exact Arrow construction source")
             };
             let source = cause.downcast_ref::<GroupKeyDecodeFailure>().unwrap();

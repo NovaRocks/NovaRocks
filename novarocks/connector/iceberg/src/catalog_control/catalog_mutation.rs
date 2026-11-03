@@ -3375,7 +3375,7 @@ mod tests {
 
     use novarocks_spi::connector::{
         CatalogHandle, CatalogProperties, CatalogVersion, ConnectorControlBinding,
-        ConnectorControlPlanningLease, ConnectorDocumentFormat,
+        ConnectorControlPlanningPin, ConnectorDocumentFormat,
         ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentManagementOperation,
         ConnectorDocumentStorageBinding, ConnectorDocumentStorageManagement, ConnectorInstanceId,
         ConnectorMetadata, ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRefKind,
@@ -3560,7 +3560,7 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(
                 executor.handle().clone(),
             )),
-            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+            Arc::new(novarocks_fs::TokioFileIoSpawner::new(
                 executor.handle().clone(),
             )),
         );
@@ -3616,11 +3616,11 @@ mod tests {
         }
     }
 
-    impl novarocks_fs::FileTaskSpawner for RefuseFileIo {
+    impl novarocks_fs::FileIoSpawner for RefuseFileIo {
         fn spawn(
             &self,
-            _: novarocks_fs::FileTaskFuture,
-        ) -> novarocks_fs::FileResult<novarocks_fs::FileTask> {
+            _: novarocks_fs::FileIoFuture,
+        ) -> novarocks_fs::FileResult<novarocks_fs::FileIoJob> {
             panic!("refused catalog mutation must not spawn FileIO")
         }
 
@@ -5105,15 +5105,13 @@ mod tests {
 
     fn document_storage_lease(
         provider: &IcebergMetadata,
-    ) -> novarocks_spi::connector::ConnectorDocumentStorageLease {
-        document_control_planning_lease(provider)
+    ) -> novarocks_spi::connector::ConnectorDocumentStorage {
+        document_control_planning_pin(provider)
             .derive_document_storage_lease()
             .expect("document storage lease")
     }
 
-    fn document_control_planning_lease(
-        provider: &IcebergMetadata,
-    ) -> ConnectorControlPlanningLease {
+    fn document_control_planning_pin(provider: &IcebergMetadata) -> ConnectorControlPlanningPin {
         let descriptor = provider.descriptor().clone();
         let incarnation = provider.incarnation();
         let storage = Arc::new(crate::document_storage::IcebergDocumentStorage::new(
@@ -5166,7 +5164,7 @@ mod tests {
         })
         .and_then(|binding| binding.try_with_document_storage(Some(document_storage)))
         .expect("control binding");
-        ConnectorControlPlanningLease::new(Arc::new(binding), || {})
+        ConnectorControlPlanningPin::new(Arc::new(binding), || {})
     }
 
     fn schema() -> Schema {
@@ -9310,7 +9308,7 @@ mod tests {
         use novarocks_spi::connector::{ConnectorCatalogMutationReceiving, ConnectorSlotName};
         let (executor, _warehouse, provider) = document_provider();
         let table = guarded_table(&provider);
-        let planning = document_control_planning_lease(&provider);
+        let planning = document_control_planning_pin(&provider);
         let lease = planning.derive_mutation_lease().unwrap();
         let first = keyed_channel_request(&provider, &table, keyed_configuration_change());
         let operation_id = first.operation_id;
@@ -9497,7 +9495,7 @@ mod tests {
             } = keyed_finalization_fixture(projection_error);
             let expected_owner = request.target.clone();
             let operation_kind = request.operation.kind();
-            let planning = document_control_planning_lease(&provider);
+            let planning = document_control_planning_pin(&provider);
             let lease = planning.derive_mutation_lease().unwrap();
             let receiving = ConnectorCatalogMutationReceiving::new();
             std::thread::scope(|threads| {
@@ -9649,7 +9647,7 @@ mod tests {
 
         let (executor, _warehouse, provider) = document_provider();
         let table = guarded_table(&provider);
-        let planning = document_control_planning_lease(&provider);
+        let planning = document_control_planning_pin(&provider);
         let lease = planning.derive_mutation_lease().unwrap();
         let before = provider
             .runtime()
@@ -9766,7 +9764,7 @@ mod tests {
         use novarocks_spi::connector::ConnectorCatalogMutationReceiving;
         let (executor, _warehouse, provider) = document_provider();
         let table = guarded_table(&provider);
-        let lease = document_control_planning_lease(&provider)
+        let lease = document_control_planning_pin(&provider)
             .derive_mutation_lease()
             .unwrap();
         let before = provider
@@ -9914,7 +9912,7 @@ mod tests {
             Err(crate::catalog::publication_dispatch::PreparationFailure(failure)) => failure,
             Ok(_) => panic!("the original partition author must reject the mismatch"),
         };
-        let lease = document_control_planning_lease(&provider)
+        let lease = document_control_planning_pin(&provider)
             .derive_mutation_lease()
             .unwrap();
         let receiving = ConnectorCatalogMutationReceiving::new();
@@ -9975,7 +9973,7 @@ mod tests {
         use novarocks_spi::connector::ConnectorCatalogMutationReceiving;
         let (executor, _warehouse, provider) = document_provider();
         let table = guarded_table(&provider);
-        let lease = document_control_planning_lease(&provider)
+        let lease = document_control_planning_pin(&provider)
             .derive_mutation_lease()
             .unwrap();
         let target = ConnectorProviderBindingKey {
@@ -10058,7 +10056,7 @@ mod tests {
                 })))
                 .on("DELETE", path, Reply::status(code)));
             let (executor, provider) = variant_definition_provider(&server.url());
-            let lease = document_control_planning_lease(&provider)
+            let lease = document_control_planning_pin(&provider)
                 .derive_mutation_lease()
                 .unwrap();
             let request = drop_request(&provider, DropPolicy::FailIfMissing, true);

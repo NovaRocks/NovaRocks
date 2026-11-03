@@ -18,7 +18,7 @@
 use super::*;
 use bytes::Bytes;
 use novarocks_control_runtime::{
-    lease::{ReservationBundle, WorkLease},
+    obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -28,7 +28,7 @@ use novarocks_control_runtime_core::{
     scope::{WorkAdmission, WorkKind},
 };
 use novarocks_execution_contract::{
-    CreationContent, ExchangeTopology, FrozenBytes, QueryContextRef, TaskDescriptor, TaskIdentity,
+    CreationContent, ExchangeTopology, FrozenBytes, ParticipationRef, TaskDescriptor, TaskIdentity,
     TaskOperationId,
 };
 use novarocks_types::{
@@ -119,8 +119,8 @@ impl Drop for Probe {
 struct Fixture {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
-    parent: WorkLease,
-    capacity: ReservationBundle,
+    parent: WorkObligation,
+    capacity: ReservationObligation,
     owner: LoaderCustody,
     job: Option<LoaderJob>,
     getter: Arc<AtomicUsize>,
@@ -129,10 +129,10 @@ struct Fixture {
 }
 fn reserve_role(
     scope: &ScopeHandle,
-    parent: &ReservationBundle,
+    parent: &ReservationObligation,
     kind: WorkKind,
     core_leg: bool,
-) -> AdmittedCompletionRole {
+) -> AdmittedCompletionTransfer {
     let mut guard = scope
         .reserve_child_next(
             generation(),
@@ -161,7 +161,7 @@ fn reserve_role(
     }
     let report = ReportSlot::reserve_next(&mut guard, generation(), 2, consumers).unwrap();
     let (work, capacity) = guard.bind(kind).unwrap();
-    AdmittedCompletionRole {
+    AdmittedCompletionTransfer {
         work,
         capacity,
         report,
@@ -193,16 +193,16 @@ impl Fixture {
             .unwrap();
         let loader = reserve_role(&scope, &capacity, WorkKind::Business, true);
         let input_role = reserve_role(&scope, &loader.capacity, WorkKind::Cleanup, false);
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             QueryExecutionId::new(QueryId::new(7501, 7502), AttemptId::new(1).unwrap()).unwrap(),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         );
         let task = TaskIdentity::new(
-            context.query_execution_id(),
+            participation.query_execution_id(),
             StageId::new(1).unwrap(),
             TaskId::new(1).unwrap(),
-            context.backend_process_id(),
+            participation.backend_process_id(),
         );
         let descriptor = TaskDescriptor::try_new(
             task,
@@ -218,7 +218,7 @@ impl Fixture {
         let request = Arc::new(
             CreateTask::try_new(
                 TaskOperationId::try_from_bytes(op).unwrap(),
-                context,
+                participation,
                 descriptor,
                 domains,
             )
@@ -416,7 +416,7 @@ fn lost_loader_authority_keeps_its_original_input_and_reports_invariant_unknown_
     drop(f.job.take());
     assert_eq!(f.getter.load(Ordering::SeqCst), 0);
     assert_eq!(f.drops.load(Ordering::SeqCst), 0);
-    assert_eq!(f.owner.phase(), ExitRolePhase::Unresolved);
+    assert_eq!(f.owner.phase(), ExitCustodyPhase::Unresolved);
     assert!(!f.owner.ready_for_exit().unwrap());
     assert!(f.owner.take_input_disposal().is_none());
     assert_eq!(
@@ -435,7 +435,7 @@ fn scope_stop_refuses_loader_business_but_allows_its_original_cleanup_child() {
     f.scope.request_stop().unwrap();
     assert!(matches!(
         f.job.take().unwrap().run(),
-        LoaderOutcome::StartRefused(ExitRoleError::Runtime(RuntimeError::Scope(
+        LoaderOutcome::StartRefused(ExitCustodyError::Runtime(RuntimeError::Scope(
             ScopeError::Stopped
         )))
     ));
@@ -455,7 +455,10 @@ fn lost_input_disposal_job_restores_original_custody_and_never_claims_source_exi
     ));
     drop(f.owner.take_input_disposal().unwrap());
     assert_eq!(f.drops.load(Ordering::SeqCst), 0);
-    assert_eq!(f.owner.0.input_role.phase(), ExitRolePhase::Unresolved);
+    assert_eq!(
+        f.owner.0.input_exit_custody.phase(),
+        ExitCustodyPhase::Unresolved
+    );
     assert!(!f.owner.ready_for_exit().unwrap());
     assert_eq!(
         f.owner.0.health.failure().unwrap().fact().class(),

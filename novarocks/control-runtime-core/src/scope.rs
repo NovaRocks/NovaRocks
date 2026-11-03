@@ -82,12 +82,12 @@ pub struct WorkRecord {
 /// token explicitly; dropping it cannot manufacture a completed input or exit.
 #[derive(Debug)]
 #[must_use = "Return the original header pin when its actual holder retires"]
-pub struct WorkHeaderPin {
+pub struct WorkHeaderObligation {
     scope: ScopeId,
     work: WorkId,
     header: OwnedPositionId,
 }
-impl WorkHeaderPin {
+impl WorkHeaderObligation {
     pub const fn scope(&self) -> ScopeId {
         self.scope
     }
@@ -400,19 +400,22 @@ impl ScopeState {
         Ok(self.work_exited(id)? && self.work[&id].header_pins == 0)
     }
     /// Called by the actual Work or still-owned guard holder, never an identity alone.
-    pub fn pin_work_header(&mut self, id: WorkId) -> Result<WorkHeaderPin, ScopeError> {
+    pub fn pin_work_header(&mut self, id: WorkId) -> Result<WorkHeaderObligation, ScopeError> {
         let work = self.work.get_mut(&id).ok_or(ScopeError::UnknownWork)?;
         work.header_pins = work
             .header_pins
             .checked_add(1)
             .ok_or(ScopeError::IdentityExhausted)?;
-        Ok(WorkHeaderPin {
+        Ok(WorkHeaderObligation {
             scope: self.id,
             work: id,
             header: work.header_identity(),
         })
     }
-    pub fn retain_work_header(&mut self, pin: &WorkHeaderPin) -> Result<WorkHeaderPin, ScopeError> {
+    pub fn retain_work_header(
+        &mut self,
+        pin: &WorkHeaderObligation,
+    ) -> Result<WorkHeaderObligation, ScopeError> {
         if pin.scope != self.id
             || self
                 .work
@@ -425,8 +428,8 @@ impl ScopeState {
     }
     pub fn release_work_header(
         &mut self,
-        pin: WorkHeaderPin,
-    ) -> Result<bool, (ScopeError, WorkHeaderPin)> {
+        pin: WorkHeaderObligation,
+    ) -> Result<bool, (ScopeError, WorkHeaderObligation)> {
         if pin.scope != self.id
             || self
                 .work

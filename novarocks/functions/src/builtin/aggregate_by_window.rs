@@ -25,7 +25,7 @@ use crate::aggregate_scalar::{self as scalar, ScalarWork};
 use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::OpaqueRetainedCharge;
-use crate::scalar_output_operation::{LeasedScalarOutput, with_scalar_output_operation};
+use crate::scalar_output_operation::{RetainedScalarOutput, with_scalar_output_operation};
 use crate::scalar_output_resources::ScalarOutputResources;
 use crate::window_invocation_data::{
     WindowDataSlot, WindowEvaluationFailure, WindowInvocationContext, WindowInvocationPhase,
@@ -196,7 +196,7 @@ impl<'input> ByWindowInput<'input> {
 struct ByPartition<'input> {
     // Output buffers must be destroyed before dropping the retaining host
     // handles. External ArrayRef/Buffer loans have their own real custody.
-    output: Option<LeasedScalarOutput>,
+    output: Option<RetainedScalarOutput>,
     owner: Arc<TrackedByWindow>,
     input: ByWindowInput<'input>,
     allocator: HostAggregateAllocator,

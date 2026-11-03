@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn fragment_root_is_not_reported_as_an_operator() {
         let fragment = RuntimeProfile::new("execute_fragment_native (plan_node_id=3)");
-        let _ = fragment.add_timer("FragmentWallTime");
+        let _ = fragment.add_timer("TaskWallTime");
         add_operator(
             &fragment
                 .child("Pipeline (id=0)")

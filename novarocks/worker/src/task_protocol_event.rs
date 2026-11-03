@@ -21,14 +21,14 @@
 //! Worker only classifies the settled receipt or lifecycle fact once, so an
 //! adapter cannot accidentally reinterpret an idempotent replay as an apply.
 
-use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
+use novarocks_execution_contract::task_execution::identity::{ParticipationRef, TaskIdentity};
 use novarocks_execution_contract::task_execution::lease::LeaseSequence;
 use novarocks_execution_contract::task_execution::operation::{OperationOutcome, ReleaseOutcome};
 use novarocks_execution_contract::task_execution::status::{TaskState, TerminationDetail};
 
-use crate::{CreateTaskOutcome, QueryContextOutcome, ReleaseQueryContextOutcome};
+use crate::{CreateTaskOutcome, ParticipationOutcome, ReleaseParticipationOutcome};
 
-/// The runtime-filter observation carried by an applied context release.
+/// The runtime-filter observation carried by an applied participation release.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeFilterReleaseObservation {
     Absent,
@@ -39,17 +39,17 @@ pub enum RuntimeFilterReleaseObservation {
 /// One Worker-owned task-protocol fact for a process-local telemetry adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskProtocolEvent {
-    ContextEstablishApplied {
-        context: QueryContextRef,
+    ParticipationEstablishApplied {
+        participation: ParticipationRef,
     },
-    ContextEstablishIdempotent {
-        context: QueryContextRef,
+    ParticipationEstablishIdempotent {
+        participation: ParticipationRef,
     },
-    ContextEstablishConflict {
-        context: QueryContextRef,
+    ParticipationEstablishConflict {
+        participation: ParticipationRef,
     },
     LeaseRenewed {
-        context: QueryContextRef,
+        participation: ParticipationRef,
         sequence: LeaseSequence,
     },
     TaskCreateApplied {
@@ -58,15 +58,15 @@ pub enum TaskProtocolEvent {
     TaskCreateIdempotent {
         identity: TaskIdentity,
     },
-    ContextReleaseApplied {
-        context: QueryContextRef,
+    ParticipationReleaseApplied {
+        participation: ParticipationRef,
         runtime_filter: RuntimeFilterReleaseObservation,
     },
-    ContextLeaseExpired {
-        context: QueryContextRef,
+    ParticipationLeaseExpired {
+        participation: ParticipationRef,
     },
-    ContextTerminationCompleted {
-        context: QueryContextRef,
+    ParticipationTerminationCompleted {
+        participation: ParticipationRef,
         cause: &'static str,
         retained_tasks: usize,
     },
@@ -74,33 +74,41 @@ pub enum TaskProtocolEvent {
         identity: TaskIdentity,
         state: TaskState,
     },
-    ContextAbortApplied {
-        context: QueryContextRef,
+    ParticipationAbortApplied {
+        participation: ParticipationRef,
     },
 }
 
 impl TaskProtocolEvent {
     /// Maps an establish receipt to its observable domain progression.
-    pub fn establish_query_context(
-        context: QueryContextRef,
-        receipt: &QueryContextOutcome,
+    pub fn establish_participation(
+        participation: ParticipationRef,
+        receipt: &ParticipationOutcome,
     ) -> Option<Self> {
         match receipt.outcome() {
-            OperationOutcome::Accepted => Some(Self::ContextEstablishApplied { context }),
-            OperationOutcome::Idempotent => Some(Self::ContextEstablishIdempotent { context }),
-            OperationOutcome::ContextConflict => Some(Self::ContextEstablishConflict { context }),
+            OperationOutcome::Accepted => {
+                Some(Self::ParticipationEstablishApplied { participation })
+            }
+            OperationOutcome::Idempotent => {
+                Some(Self::ParticipationEstablishIdempotent { participation })
+            }
+            OperationOutcome::ParticipationConflict => {
+                Some(Self::ParticipationEstablishConflict { participation })
+            }
             _ => None,
         }
     }
 
     /// Maps a lease receipt to the one progression that extends the lease.
-    pub fn renew_query_execution_lease(
-        context: QueryContextRef,
+    pub fn renew_participation_lease(
+        participation: ParticipationRef,
         sequence: LeaseSequence,
-        receipt: &QueryContextOutcome,
+        receipt: &ParticipationOutcome,
     ) -> Option<Self> {
-        (receipt.outcome() == OperationOutcome::Accepted)
-            .then_some(Self::LeaseRenewed { context, sequence })
+        (receipt.outcome() == OperationOutcome::Accepted).then_some(Self::LeaseRenewed {
+            participation,
+            sequence,
+        })
     }
 
     /// Maps a create receipt to its observable domain progression.
@@ -116,26 +124,26 @@ impl TaskProtocolEvent {
         }
     }
 
-    /// Records the one release that actually moved an active context to release.
-    pub fn release_query_context(
-        context: QueryContextRef,
-        receipt: &ReleaseQueryContextOutcome,
+    /// Records the one release that actually moved an active participation to release.
+    pub fn release_participation(
+        participation: ParticipationRef,
+        receipt: &ReleaseParticipationOutcome,
         runtime_filter: RuntimeFilterReleaseObservation,
     ) -> Option<Self> {
         (receipt.outcome() == OperationOutcome::Accepted
             && receipt.acknowledgement().map(|ack| ack.release()) == Some(ReleaseOutcome::Released))
-        .then_some(Self::ContextReleaseApplied {
-            context,
+        .then_some(Self::ParticipationReleaseApplied {
+            participation,
             runtime_filter,
         })
     }
 
-    pub const fn query_execution_lease_expired(context: QueryContextRef) -> Self {
-        Self::ContextLeaseExpired { context }
+    pub const fn participation_lease_expired(participation: ParticipationRef) -> Self {
+        Self::ParticipationLeaseExpired { participation }
     }
 
-    pub fn context_termination_completed(
-        context: QueryContextRef,
+    pub fn participation_termination_completed(
+        participation: ParticipationRef,
         cause: Option<&TerminationDetail>,
         retained_tasks: usize,
     ) -> Self {
@@ -145,8 +153,8 @@ impl TaskProtocolEvent {
             Some(TerminationDetail::Failed(_)) => "TASK_FAILED",
             None => "NONE",
         };
-        Self::ContextTerminationCompleted {
-            context,
+        Self::ParticipationTerminationCompleted {
+            participation,
             cause,
             retained_tasks,
         }
@@ -157,12 +165,12 @@ impl TaskProtocolEvent {
     }
 
     /// Maps an abort receipt to the one operation that delivered cancellation.
-    pub fn abort_query_context(
-        context: QueryContextRef,
-        receipt: &QueryContextOutcome,
+    pub fn abort_participation(
+        participation: ParticipationRef,
+        receipt: &ParticipationOutcome,
     ) -> Option<Self> {
         (receipt.outcome() == OperationOutcome::Accepted)
-            .then_some(Self::ContextAbortApplied { context })
+            .then_some(Self::ParticipationAbortApplied { participation })
     }
 }
 
@@ -170,22 +178,22 @@ impl TaskProtocolEvent {
 mod tests {
     use super::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
     use crate::{
-        CreateTaskOutcome, OperationReceipt, QueryContextOutcome, ReleaseAcknowledgement,
-        ReleaseQueryContextOutcome,
+        CreateTaskOutcome, OperationReceipt, ParticipationOutcome, ReleaseAcknowledgement,
+        ReleaseParticipationOutcome,
     };
     use novarocks_execution_contract::task_execution::identity::{
-        QueryContextRef, TaskIdentity, TaskOperationId,
+        ParticipationRef, TaskIdentity, TaskOperationId,
     };
     use novarocks_execution_contract::task_execution::operation::{
         OperationOutcome, ReleaseOutcome,
     };
-    use novarocks_execution_contract::task_execution::transition::QueryContextState;
+    use novarocks_execution_contract::task_execution::transition::ParticipationState;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
 
-    fn context() -> QueryContextRef {
-        QueryContextRef::new(
+    fn participation() -> ParticipationRef {
+        ParticipationRef::new(
             QueryExecutionId::new(
                 QueryId::new(7, 11),
                 AttemptId::new(1).expect("attempt is nonzero"),
@@ -196,26 +204,26 @@ mod tests {
         )
     }
 
-    fn task(context: QueryContextRef) -> TaskIdentity {
+    fn task(participation: ParticipationRef) -> TaskIdentity {
         TaskIdentity::new(
-            context.query_execution_id(),
+            participation.query_execution_id(),
             StageId::new(1).expect("stage is nonzero"),
             TaskId::new(1).expect("task is nonzero"),
-            context.backend_process_id(),
+            participation.backend_process_id(),
         )
     }
 
     #[test]
     fn only_domain_progressions_become_events() {
-        let context = context();
-        let establish: QueryContextOutcome = OperationReceipt::rejected(
+        let participation = participation();
+        let establish: ParticipationOutcome = OperationReceipt::rejected(
             TaskOperationId::new_v7(),
-            OperationOutcome::ContextConflict,
+            OperationOutcome::ParticipationConflict,
             "test",
         );
         assert!(matches!(
-            TaskProtocolEvent::establish_query_context(context, &establish),
-            Some(TaskProtocolEvent::ContextEstablishConflict { context: actual }) if actual == context
+            TaskProtocolEvent::establish_participation(participation, &establish),
+            Some(TaskProtocolEvent::ParticipationEstablishConflict { participation: actual }) if actual == participation
         ));
 
         let create: CreateTaskOutcome = OperationReceipt::rejected(
@@ -224,41 +232,41 @@ mod tests {
             "test",
         );
         assert!(matches!(
-            TaskProtocolEvent::create_task(task(context), &create),
+            TaskProtocolEvent::create_task(task(participation), &create),
             Some(TaskProtocolEvent::TaskCreateIdempotent { .. })
         ));
 
-        let rejected: QueryContextOutcome = OperationReceipt::rejected(
+        let rejected: ParticipationOutcome = OperationReceipt::rejected(
             TaskOperationId::new_v7(),
             OperationOutcome::InvalidStateOrRequest,
             "test",
         );
         assert_eq!(
-            TaskProtocolEvent::abort_query_context(context, &rejected),
+            TaskProtocolEvent::abort_participation(participation, &rejected),
             None
         );
     }
 
     #[test]
     fn release_event_requires_a_real_release() {
-        let context = context();
-        let receipt: ReleaseQueryContextOutcome = OperationReceipt::acknowledged(
+        let participation = participation();
+        let receipt: ReleaseParticipationOutcome = OperationReceipt::acknowledged(
             TaskOperationId::new_v7(),
             OperationOutcome::Accepted,
             ReleaseAcknowledgement::new(
-                context,
+                participation,
                 ReleaseOutcome::Released,
-                QueryContextState::Releasing,
+                ParticipationState::Releasing,
                 None,
             ),
         );
         assert!(matches!(
-            TaskProtocolEvent::release_query_context(
-                context,
+            TaskProtocolEvent::release_participation(
+                participation,
                 &receipt,
                 RuntimeFilterReleaseObservation::Available,
             ),
-            Some(TaskProtocolEvent::ContextReleaseApplied {
+            Some(TaskProtocolEvent::ParticipationReleaseApplied {
                 runtime_filter: RuntimeFilterReleaseObservation::Available,
                 ..
             })

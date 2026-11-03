@@ -19,11 +19,13 @@
 //! while the predecessor's host effects still retain their original batch.
 
 #[cfg(test)]
-use novarocks_control_runtime::driver::InputRoleId;
+use novarocks_control_runtime::actor_turn::StandingInputId;
 use novarocks_control_runtime::{
     actor::Actor,
-    driver::{ActorRegistration, ActorRuntime, DriverError, InputAuthor, InputRole},
-    lease::WorkLease,
+    actor_turn::{
+        ActorRegistration, ActorRuntime, ActorTurnError, InputAuthor, StandingInputObligation,
+    },
+    obligation::WorkObligation,
 };
 use novarocks_control_runtime_core::{
     identity::{ActorId, InputId},
@@ -35,9 +37,9 @@ use novarocks_control_runtime_core::{
 /// make event progress wait for the predecessor's actual capture/source exit.
 pub(crate) const CAUSAL_INPUT_POSITIONS: usize = 2;
 #[cfg(test)]
-type FillResult<T> = Result<(Option<InputId>, InputId), (DriverError, Option<T>, T)>;
+type FillResult<T> = Result<(Option<InputId>, InputId), (ActorTurnError, Option<T>, T)>;
 pub(crate) struct CausalFillFailure<T> {
-    pub error: DriverError,
+    pub error: ActorTurnError,
     pub predecessor: Option<T>,
     pub event: T,
     /// The prefix may have transferred even when the event fill was refused.
@@ -46,11 +48,11 @@ pub(crate) struct CausalFillFailure<T> {
     pub predecessor_input: Option<InputId>,
 }
 
-pub(crate) struct CausalInputRole<A: Actor> {
-    predecessor: InputRole<A>,
-    event: InputRole<A>,
+pub(crate) struct CausalInputObligation<A: Actor> {
+    predecessor: StandingInputObligation<A>,
+    event: StandingInputObligation<A>,
 }
-impl<A: Actor> CausalInputRole<A> {
+impl<A: Actor> CausalInputObligation<A> {
     /// Both positions are issued for the original target incarnation and the
     /// actual already admitted producer Work, including a process-scope R.
     pub(crate) fn reserve_admitted(
@@ -58,8 +60,8 @@ impl<A: Actor> CausalInputRole<A> {
         target: &ActorRegistration,
         source: ActorId,
         class: InputClass,
-        author: &WorkLease,
-    ) -> Result<Self, DriverError> {
+        author: &WorkObligation,
+    ) -> Result<Self, ActorTurnError> {
         assert!(
             class != InputClass::Timer,
             "causal roles cannot consume the actor timer"
@@ -75,8 +77,8 @@ impl<A: Actor> CausalInputRole<A> {
                 return Err(error);
             }
         };
-        let mut predecessor = match predecessor.into_role() {
-            Ok(role) => role,
+        let mut predecessor = match predecessor.into_standing_input() {
+            Ok(standing_input) => standing_input,
             Err((error, unused)) => {
                 unused
                     .revoke_unused()
@@ -85,8 +87,8 @@ impl<A: Actor> CausalInputRole<A> {
                 return Err(error);
             }
         };
-        let event = match event.into_role() {
-            Ok(role) => role,
+        let event = match event.into_standing_input() {
+            Ok(standing_input) => standing_input,
             Err((error, unused)) => {
                 unused.revoke_unused().expect("no event captures bound");
                 predecessor
@@ -99,11 +101,11 @@ impl<A: Actor> CausalInputRole<A> {
     }
     /// Read only the original event position's actual producer/financial
     /// binding. It grants no additional Work, reply cell or consumed fact.
-    pub(crate) fn event_author(&self) -> Result<InputAuthor, DriverError> {
+    pub(crate) fn event_author(&self) -> Result<InputAuthor, ActorTurnError> {
         self.event.author()
     }
     #[cfg(test)]
-    pub(crate) fn positions(&self) -> [InputRoleId; CAUSAL_INPUT_POSITIONS] {
+    pub(crate) fn positions(&self) -> [StandingInputId; CAUSAL_INPUT_POSITIONS] {
         [self.predecessor.id(), self.event.id()]
     }
     /// The per-Task handoff owner calls this in sealed-cut order, before filling
@@ -126,7 +128,7 @@ impl<A: Actor> CausalInputRole<A> {
         self.fill_with_receipt(predecessor, event)
             .map_err(|failure| (failure.error, failure.predecessor, failure.event))
     }
-    pub(crate) fn in_flight(&self) -> Result<[Option<InputId>; 2], DriverError> {
+    pub(crate) fn in_flight(&self) -> Result<[Option<InputId>; 2], ActorTurnError> {
         Ok([self.predecessor.in_flight()?, self.event.in_flight()?])
     }
     pub(crate) fn fill_with_receipt(
@@ -143,7 +145,7 @@ impl<A: Actor> CausalInputRole<A> {
             Ok(true) => {}
             Ok(false) => {
                 return Err(CausalFillFailure {
-                    error: DriverError::RoleBusy,
+                    error: ActorTurnError::StandingInputBusy,
                     predecessor,
                     event,
                     predecessor_input: None,
@@ -190,9 +192,9 @@ impl<A: Actor> CausalInputRole<A> {
     }
     /// The higher-level owner has proved actual holder/capture/report exit.
     /// Neither an expired RPC nor an unprocessed event supplies that proof.
-    pub(crate) fn close_after_exit(&mut self) -> Result<(), DriverError> {
+    pub(crate) fn close_after_exit(&mut self) -> Result<(), ActorTurnError> {
         if self.predecessor.in_flight()?.is_some() || self.event.in_flight()?.is_some() {
-            return Err(DriverError::RoleBusy);
+            return Err(ActorTurnError::StandingInputBusy);
         }
         self.predecessor.close_after_exit()?;
         self.event.close_after_exit()
@@ -203,8 +205,8 @@ impl<A: Actor> CausalInputRole<A> {
 mod tests {
     use super::*;
     use novarocks_control_runtime::{
-        actor::{ActorConfig, StepContext},
-        lease::{ReservationBundle, WorkLease},
+        actor::{ActorConfig, ActorStep},
+        obligation::{ReservationObligation, WorkObligation},
         transaction::{RuntimeLedger, ScopeHandle},
     };
     use novarocks_control_runtime_core::{
@@ -223,7 +225,7 @@ mod tests {
         fn timer_input(_: Tick) -> u8 {
             unreachable!("no timer")
         }
-        fn handle(&mut self, _: Tick, _: InputEnvelope, value: u8, step: &mut StepContext<'_, ()>) {
+        fn handle(&mut self, _: Tick, _: InputEnvelope, value: u8, step: &mut ActorStep<'_, ()>) {
             assert!(step.charge(1));
             self.0.push(value);
             if value == 1 {
@@ -244,7 +246,7 @@ mod tests {
         fn next_deadline(&self) -> Option<Tick> {
             None
         }
-        fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {}
+        fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {}
     }
     fn actor() -> ActorId {
         ActorId::new(1).unwrap()
@@ -255,10 +257,10 @@ mod tests {
     struct Fixture {
         ledger: RuntimeLedger,
         scope: ScopeHandle,
-        work: WorkLease,
-        capacity: ReservationBundle,
+        work: WorkObligation,
+        capacity: ReservationObligation,
         runtime: ActorRuntime<Receiver>,
-        registration: novarocks_control_runtime::driver::ActorRegistration,
+        registration: novarocks_control_runtime::actor_turn::ActorRegistration,
     }
     fn fixture(control: usize) -> Fixture {
         let resources = ResourceVector::new([(DimensionId::new(1).unwrap(), 3)]).unwrap();
@@ -334,7 +336,7 @@ mod tests {
     #[test]
     fn event_core_consumption_does_not_wait_for_the_predecessors_actual_host_cleanup() {
         let f = fixture(2);
-        let mut role = CausalInputRole::reserve_admitted(
+        let mut causal_input = CausalInputObligation::reserve_admitted(
             &f.runtime,
             &f.registration,
             source(),
@@ -342,8 +344,8 @@ mod tests {
             &f.work,
         )
         .unwrap();
-        assert_ne!(role.positions()[0], role.positions()[1]);
-        let (prefix, event) = role.fill(Some(1), 2).unwrap();
+        assert_ne!(causal_input.positions()[0], causal_input.positions()[1]);
+        let (prefix, event) = causal_input.fill(Some(1), 2).unwrap();
         let other = f
             .runtime
             .reserve_input(actor(), ActorId::new(3).unwrap(), InputClass::Control)
@@ -354,17 +356,20 @@ mod tests {
         let prefix = prefix.unwrap();
         assert_eq!(
             f.runtime.retire_input(actor(), prefix),
-            Err(DriverError::EffectsRemain)
+            Err(ActorTurnError::EffectsRemain)
         );
         // Both actual command inputs have reached Core despite the held host
         // effect. This is not inferred from notification or queue emptiness.
         f.runtime.retire_input(actor(), event).unwrap();
         f.runtime.retire_input(actor(), other).unwrap();
         assert_eq!(
-            role.fill(Some(1), 4).unwrap_err(),
-            (DriverError::RoleBusy, Some(1), 4)
+            causal_input.fill(Some(1), 4).unwrap_err(),
+            (ActorTurnError::StandingInputBusy, Some(1), 4)
         );
-        assert_eq!(role.close_after_exit(), Err(DriverError::RoleBusy));
+        assert_eq!(
+            causal_input.close_after_exit(),
+            Err(ActorTurnError::StandingInputBusy)
+        );
         let cleanup = f
             .runtime
             .take_effect(actor(), prefix, ActionId::new(1).unwrap())
@@ -372,11 +377,11 @@ mod tests {
         f.runtime.effect_completed(cleanup).unwrap();
         f.runtime.retire_input(actor(), prefix).unwrap();
         f.runtime.close_admission();
-        let (prefix, event) = role.fill(None, 4).unwrap();
+        let (prefix, event) = causal_input.fill(None, 4).unwrap();
         assert!(prefix.is_none(), "an empty prefix needs no extra dispatch");
         f.runtime.poll_one(Tick(2)).unwrap();
         f.runtime.retire_input(actor(), event).unwrap();
-        role.close_after_exit().unwrap();
+        causal_input.close_after_exit().unwrap();
         let seen = f.finish();
         assert_eq!(seen[0], 1);
         assert!(
@@ -393,19 +398,19 @@ mod tests {
             .reserve_input(actor(), source(), InputClass::Control)
             .unwrap();
         assert!(matches!(
-            CausalInputRole::reserve_admitted(
+            CausalInputObligation::reserve_admitted(
                 &f.runtime,
                 &f.registration,
                 source(),
                 InputClass::Control,
                 &f.work
             ),
-            Err(DriverError::InputCapacity)
+            Err(ActorTurnError::InputCapacity)
         ));
         assert_eq!(f.runtime.snapshot(actor()).unwrap().inputs, 1);
-        assert_eq!(f.runtime.snapshot(actor()).unwrap().roles, 0);
+        assert_eq!(f.runtime.snapshot(actor()).unwrap().standing_inputs, 0);
         held.revoke_unused().unwrap();
-        let mut role = CausalInputRole::reserve_admitted(
+        let mut causal_input = CausalInputObligation::reserve_admitted(
             &f.runtime,
             &f.registration,
             source(),
@@ -413,7 +418,7 @@ mod tests {
             &f.work,
         )
         .unwrap();
-        role.close_after_exit().unwrap();
+        causal_input.close_after_exit().unwrap();
         assert!(f.finish().is_empty());
     }
 }

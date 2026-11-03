@@ -20,8 +20,8 @@
 use super::super::window_fixture::window_catalog_from_actual;
 use super::*;
 use crate::exec::pipeline::test_driver::TestDriver;
-use crate::runtime::fragment::ExecutionFailureCause;
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::task::ExecutionFailureCause;
 use novarocks_functions::FunctionKind;
 
 fn source(rows: &[Row], running: bool) -> (Arc<LocalProgram>, RecordBatch) {
@@ -299,9 +299,9 @@ mod source_custody_tests;
 #[test]
 fn by_window_step_keeps_arrival_boundaries_and_yields_before_output_construction() {
     use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
         input::RawInput,
         step::{InputResult, NextStep},
-        step_context::{StepContext, TurnWork},
     };
     use std::num::NonZeroU64;
     let (program, batch) = source(
@@ -323,7 +323,7 @@ fn by_window_step_keeps_arrival_boundaries_and_yields_before_output_construction
     {
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut context = StepContext::new(&error, &mut turn, &mut value_conversions);
+        let mut context = DriverStep::new(&error, &mut turn, &mut value_conversions);
         for (offset, rows) in [(0, 1), (1, 2)] {
             assert!(matches!(
                 step.try_push(
@@ -351,7 +351,7 @@ fn by_window_step_keeps_arrival_boundaries_and_yields_before_output_construction
     let first = {
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut context = StepContext::new(&error, &mut turn, &mut value_conversions);
+        let mut context = DriverStep::new(&error, &mut turn, &mut value_conversions);
         let first = step.drive(&mut context).unwrap();
         assert!(matches!(first.next, NextStep::Runnable));
         let first = first.output.unwrap();
@@ -368,7 +368,7 @@ fn by_window_step_keeps_arrival_boundaries_and_yields_before_output_construction
     let last = {
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut context = StepContext::new(&error, &mut turn, &mut value_conversions);
+        let mut context = DriverStep::new(&error, &mut turn, &mut value_conversions);
         let last = step.drive(&mut context).unwrap();
         assert!(matches!(last.next, NextStep::Finished));
         let last = last.output.unwrap();

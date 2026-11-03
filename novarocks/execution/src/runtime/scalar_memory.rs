@@ -508,7 +508,7 @@ pub mod test_support {
 
 impl novarocks_failure_contract::FailureProjection for RuntimeScalarMemoryRefusal {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         match self {
             Self::MissingQueryMemory => FailureFact::new(

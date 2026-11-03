@@ -18,8 +18,8 @@
 #![cfg(not(loom))]
 
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, ActorFailurePolicy, StepContext},
-    driver::{ActorRuntime, DriverError, InputPhase},
+    actor::{Actor, ActorConfig, ActorFailurePolicy, ActorStep},
+    actor_turn::{ActorRuntime, ActorTurnError, InputPhase},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -75,7 +75,7 @@ impl Actor for ControlledActor {
     fn timer_input(_: Tick) -> Input {
         Input::HostFailure
     }
-    fn handle(&mut self, _: Tick, _: InputEnvelope, value: Input, step: &mut StepContext<'_, ()>) {
+    fn handle(&mut self, _: Tick, _: InputEnvelope, value: Input, step: &mut ActorStep<'_, ()>) {
         match value {
             Input::HostFailure => self.host_failure_seen = true,
             Input::Panic => {
@@ -103,7 +103,7 @@ impl Actor for ControlledActor {
     fn next_deadline(&self) -> Option<Tick> {
         None
     }
-    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, step: &mut StepContext<'_, ()>) {
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, step: &mut ActorStep<'_, ()>) {
         step.effect(
             EffectDescriptor {
                 id: ActionId::new(1).unwrap(),
@@ -197,7 +197,7 @@ fn child(mode: &str) {
                 .phase,
             InputPhase::AbandonedByOwnerFailure
         );
-        let novarocks_control_runtime::driver::FailureSourceState::ClosedPending(supervisor) =
+        let novarocks_control_runtime::actor_turn::FailureSourceState::ClosedPending(supervisor) =
             runtime.failure_source_state(actor()).unwrap()
         else {
             panic!("the actual isolated failure owns its builtin supervisor input");
@@ -343,7 +343,7 @@ fn explicit_policy_still_rejects_a_foreign_original_supervisor_with_equal_numeri
             ActorFailurePolicy::ProcessFailStop,
         )
         .unwrap_err();
-    assert_eq!(error, DriverError::PublicationTargetMismatch);
+    assert_eq!(error, ActorTurnError::PublicationTargetMismatch);
     assert_eq!(scope.snapshot().unwrap().storage, 0);
     assert_eq!(foreign_scope.snapshot().unwrap().storage, 0);
     assert_eq!(ledger.used(dimension()), 1);

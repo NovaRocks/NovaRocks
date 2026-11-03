@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actor-owned authorization for issuing one exact query-context establish.
+//! Actor-owned authorization for issuing one exact participation establish.
 //!
 //! This module owns no transport. It treats confidential request content as an
 //! opaque value and retains the exact request `Arc` while issue responsibility
@@ -30,10 +30,10 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use novarocks_execution_contract::{
-    AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
-    CodecOwnedContent, ConfidentialContent, CredentialEpoch, CredentialLeaseId,
-    EstablishQueryContext, EstablishSemanticIdentity, LeaseSequence, LeaseValidFor,
-    OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextRef, TaskOperationId,
+    AcquireParticipationAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
+    CodecOwnedContent, ConfidentialContent, CredentialDomainId, CredentialEpoch,
+    EstablishParticipation, EstablishSemanticIdentity, LeaseSequence, LeaseValidFor,
+    OperationOutcome, ParticipationAdmissionTicketReceipt, ParticipationRef, TaskOperationId,
 };
 use novarocks_types::NativeCompatibilityId;
 use tokio::sync::mpsc;
@@ -45,12 +45,12 @@ use novarocks_coordination_contract::{AttemptActivationIdentity, MonotonicInstan
 ///
 /// Replays retain both the operation identity and the first send time. A caller
 /// therefore cannot extend a Worker's admission grant by reminting local time
-/// for the same context.
+/// for the same participation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdmissionIssueReceipt {
     activation: AttemptActivationIdentity,
     operation_id: TaskOperationId,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     valid_for: LeaseValidFor,
     native_compatibility_id: NativeCompatibilityId,
     admission_epoch_capability: AdmissionEpochCapability,
@@ -65,7 +65,7 @@ pub struct AdmissionIssueReceipt {
 pub struct AdmissionIssueSettlement {
     operation_id: TaskOperationId,
     outcome: Option<OperationOutcome>,
-    ticket: Option<QueryContextAdmissionTicketReceipt>,
+    ticket: Option<ParticipationAdmissionTicketReceipt>,
     prior_transport_unknown: bool,
 }
 
@@ -79,7 +79,7 @@ impl AdmissionIssueSettlement {
     pub fn applied(
         operation_id: TaskOperationId,
         outcome: OperationOutcome,
-        ticket: QueryContextAdmissionTicketReceipt,
+        ticket: ParticipationAdmissionTicketReceipt,
     ) -> Result<Self, EstablishIssueError> {
         if !matches!(
             outcome,
@@ -139,7 +139,7 @@ impl AdmissionIssueSettlement {
         self.outcome
     }
 
-    pub const fn ticket(self) -> Option<QueryContextAdmissionTicketReceipt> {
+    pub const fn ticket(self) -> Option<ParticipationAdmissionTicketReceipt> {
         self.ticket
     }
 }
@@ -147,16 +147,16 @@ impl AdmissionIssueSettlement {
 impl AdmissionIssueReceipt {
     fn from_request(
         activation: AttemptActivationIdentity,
-        request: AcquireQueryContextAdmissionTicket,
+        request: AcquireParticipationAdmissionTicket,
         first_sent_at: MonotonicInstant,
     ) -> Result<Self, EstablishIssueError> {
-        if activation.execution() != request.context().query_execution_id() {
+        if activation.execution() != request.participation().query_execution_id() {
             return Err(EstablishIssueError::ActivationExecutionMismatch);
         }
         Ok(Self {
             activation,
             operation_id: request.envelope().operation_id(),
-            context: request.context(),
+            participation: request.participation(),
             valid_for: request.valid_for(),
             native_compatibility_id: request.native_compatibility_id(),
             admission_epoch_capability: request.admission_epoch_capability(),
@@ -168,14 +168,14 @@ impl AdmissionIssueReceipt {
         self.operation_id
     }
 
-    pub const fn context(self) -> QueryContextRef {
-        self.context
+    pub const fn participation(self) -> ParticipationRef {
+        self.participation
     }
 
     fn authorizes_same_request(self, other: Self) -> bool {
         self.activation == other.activation
             && self.operation_id == other.operation_id
-            && self.context == other.context
+            && self.participation == other.participation
             && self.valid_for == other.valid_for
             && self.native_compatibility_id == other.native_compatibility_id
             && self.admission_epoch_capability == other.admission_epoch_capability
@@ -190,7 +190,7 @@ impl AdmissionIssueReceipt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EstablishIssueIdentity {
     activation: AttemptActivationIdentity,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     operation_id: TaskOperationId,
     ticket_id: AdmissionTicketId,
     semantics: EstablishSemanticIdentity,
@@ -204,16 +204,16 @@ impl EstablishIssueIdentity {
     /// fields as proof of actor authorization.
     pub(crate) fn from_request(
         activation: AttemptActivationIdentity,
-        request: &EstablishQueryContext,
+        request: &EstablishParticipation,
         native_compatibility_id: NativeCompatibilityId,
     ) -> Result<Self, EstablishIssueError> {
-        let context = request.context();
-        if activation.execution() != context.query_execution_id() {
+        let participation = request.participation();
+        if activation.execution() != participation.query_execution_id() {
             return Err(EstablishIssueError::ActivationExecutionMismatch);
         }
         Ok(Self {
             activation,
-            context,
+            participation,
             operation_id: request.envelope().operation_id(),
             ticket_id: request.admission_ticket_id(),
             semantics: request.semantic_identity(),
@@ -225,8 +225,8 @@ impl EstablishIssueIdentity {
         self.activation
     }
 
-    pub const fn context(self) -> QueryContextRef {
-        self.context
+    pub const fn participation(self) -> ParticipationRef {
+        self.participation
     }
 
     pub const fn operation_id(self) -> TaskOperationId {
@@ -274,10 +274,10 @@ pub enum EstablishIssueState {
     WorkerSettled(EstablishWorkerSettlement),
 }
 
-/// Immutable observation of one context's Establish issue ledger.
+/// Immutable observation of one participation's Establish issue ledger.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EstablishIssueSnapshot {
-    ticket: QueryContextAdmissionTicketReceipt,
+    ticket: ParticipationAdmissionTicketReceipt,
     conservative_expiry: MonotonicInstant,
     identity: Option<EstablishIssueIdentity>,
     state: EstablishIssueState,
@@ -288,7 +288,7 @@ pub struct EstablishIssueSnapshot {
 /// keeping the actor-retained request allocation private.
 #[derive(Clone, Copy)]
 pub struct EstablishTransportRequest<'a> {
-    request: &'a EstablishQueryContext,
+    request: &'a EstablishParticipation,
 }
 
 impl<'a> EstablishTransportRequest<'a> {
@@ -296,8 +296,8 @@ impl<'a> EstablishTransportRequest<'a> {
         self.request.envelope().operation_id()
     }
 
-    pub const fn context(self) -> QueryContextRef {
-        self.request.context()
+    pub const fn participation(self) -> ParticipationRef {
+        self.request.participation()
     }
 
     pub const fn admission_ticket_id(self) -> AdmissionTicketId {
@@ -316,8 +316,8 @@ impl<'a> EstablishTransportRequest<'a> {
         self.request.query_options().as_ref()
     }
 
-    pub const fn credential_lease_id(self) -> CredentialLeaseId {
-        self.request.initial_credential().lease_id()
+    pub const fn credential_domain_id(self) -> CredentialDomainId {
+        self.request.initial_credential().credential_domain_id()
     }
 
     pub const fn credential_epoch(self) -> CredentialEpoch {
@@ -342,9 +342,9 @@ impl fmt::Debug for EstablishTransportRequest<'_> {
         formatter
             .debug_struct("EstablishTransportRequest")
             .field("operation_id", &self.operation_id())
-            .field("context", &self.context())
+            .field("participation", &self.participation())
             .field("admission_ticket_id", &self.admission_ticket_id())
-            .field("credential_lease_id", &self.credential_lease_id())
+            .field("credential_domain_id", &self.credential_domain_id())
             .field("credential_epoch", &self.credential_epoch())
             .field("initial_lease_sequence", &self.initial_lease_sequence())
             .field("initial_lease_valid_for", &self.initial_lease_valid_for())
@@ -353,7 +353,7 @@ impl fmt::Debug for EstablishTransportRequest<'_> {
 }
 
 impl EstablishIssueSnapshot {
-    pub const fn ticket(self) -> QueryContextAdmissionTicketReceipt {
+    pub const fn ticket(self) -> ParticipationAdmissionTicketReceipt {
         self.ticket
     }
 
@@ -374,7 +374,7 @@ impl EstablishIssueSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EstablishIssueError {
     ActivationExecutionMismatch,
-    UnknownContext,
+    UnknownParticipation,
     ConflictingAdmissionIssue,
     AdmissionReplayClosed,
     AdmissionIssueBudgetExhausted,
@@ -401,21 +401,23 @@ impl fmt::Display for EstablishIssueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::ActivationExecutionMismatch => {
-                "attempt activation and query context name different executions"
+                "attempt activation and participation name different executions"
             }
-            Self::UnknownContext => "Establish issue names a context with no held ticket",
+            Self::UnknownParticipation => {
+                "Establish issue names a participation with no held ticket"
+            }
             Self::ConflictingAdmissionIssue => {
-                "query context admission was already issued with different immutable facts"
+                "participation admission was already issued with different immutable facts"
             }
             Self::AdmissionReplayClosed => "settled admission operation cannot be issued again",
             Self::AdmissionIssueBudgetExhausted => {
-                "query context admission issue budget is exhausted"
+                "participation admission issue budget is exhausted"
             }
             Self::InvalidAdmissionSettlement => {
                 "admission settlement does not match its exact request or outcome shape"
             }
-            Self::AdmissionRejected => "Worker rejected query context admission",
-            Self::ConflictingTicket => "query context already holds a different admission ticket",
+            Self::AdmissionRejected => "Worker rejected participation admission",
+            Self::ConflictingTicket => "participation already holds a different admission ticket",
             Self::AdmissionTimeInFuture => {
                 "admission issue time is later than the actor's current monotonic time"
             }
@@ -465,7 +467,7 @@ impl novarocks_execution_contract::failure::FailureProjection for EstablishIssue
             Self::ActivationExecutionMismatch => (FailureClass::Invariant, 72, false),
             Self::IdentityMismatch => (FailureClass::Invariant, 72, false),
             Self::TicketDoesNotAuthorizeRequest => (FailureClass::Invariant, 72, false),
-            Self::UnknownContext => (FailureClass::Invariant, 73, false),
+            Self::UnknownParticipation => (FailureClass::Invariant, 73, false),
             Self::ConflictingAdmissionIssue => (FailureClass::Invariant, 74, false),
             Self::ConflictingTicket => (FailureClass::Invariant, 74, false),
             Self::ConflictingWorkerSettlement => (FailureClass::Invariant, 74, false),
@@ -499,17 +501,19 @@ impl EstablishIssueError {
     pub fn safe_detail(&self) -> novarocks_execution_contract::SafeDetail {
         let message = match self {
             Self::ActivationExecutionMismatch => {
-                "attempt activation and query context name different executions"
+                "attempt activation and participation name different executions"
             }
             Self::IdentityMismatch => "Establish event does not match its authorized request",
             Self::TicketDoesNotAuthorizeRequest => {
                 "held admission ticket does not authorize the Establish request"
             }
-            Self::UnknownContext => "Establish issue names a context with no held ticket",
-            Self::ConflictingAdmissionIssue => {
-                "query context admission was issued with conflicting immutable facts"
+            Self::UnknownParticipation => {
+                "Establish issue names a participation with no held ticket"
             }
-            Self::ConflictingTicket => "query context already holds a different admission ticket",
+            Self::ConflictingAdmissionIssue => {
+                "participation admission was issued with conflicting immutable facts"
+            }
+            Self::ConflictingTicket => "participation already holds a different admission ticket",
             Self::ConflictingWorkerSettlement => {
                 "Establish issue received conflicting Worker settlements"
             }
@@ -533,7 +537,7 @@ impl EstablishIssueError {
             }
             Self::EventChannelClosed => "Establish issue actor event channel is closed",
             Self::AdmissionIssueBudgetExhausted => {
-                "query context admission issue budget is exhausted"
+                "participation admission issue budget is exhausted"
             }
             Self::AuthorizationBudgetExhausted => {
                 "Establish issue authorization budget is exhausted"
@@ -542,7 +546,7 @@ impl EstablishIssueError {
                 "bounded Establish authorization generation could not advance"
             }
             Self::TicketExpired => "admission ticket expired before Establish issue authorization",
-            Self::AdmissionRejected => "Worker rejected query context admission",
+            Self::AdmissionRejected => "Worker rejected participation admission",
             Self::EstablishRejected => "Worker rejected a required Establish operation",
         };
         novarocks_execution_contract::SafeDetail::truncating(message)
@@ -552,10 +556,10 @@ impl EstablishIssueError {
 #[derive(Debug)]
 struct EstablishIssueRecord {
     activation: AttemptActivationIdentity,
-    ticket: QueryContextAdmissionTicketReceipt,
+    ticket: ParticipationAdmissionTicketReceipt,
     conservative_expiry: MonotonicInstant,
     identity: Option<EstablishIssueIdentity>,
-    request: Option<Arc<EstablishQueryContext>>,
+    request: Option<Arc<EstablishParticipation>>,
     authorization_generation: u64,
     state: EstablishIssueState,
 }
@@ -592,10 +596,10 @@ enum AdmissionIssueState {
     Pending,
     RetryableNoGrant(OperationOutcome),
     Granted {
-        ticket: QueryContextAdmissionTicketReceipt,
+        ticket: ParticipationAdmissionTicketReceipt,
         conservative_expiry: MonotonicInstant,
     },
-    ExpiredGrant(QueryContextAdmissionTicketReceipt),
+    ExpiredGrant(ParticipationAdmissionTicketReceipt),
     Rejected(OperationOutcome),
     PreWorkerRejected,
     PreWorkerRejectedAfterUnknown,
@@ -611,7 +615,7 @@ struct AdmissionIssueRecord {
 /// Pure actor-owned state for Establish issue authorization and settlement.
 ///
 /// One unbounded sender is created per ledger. The ledger state permits at most
-/// one live permit or submission per context, and both context count and
+/// one live permit or submission per participation, and both participation count and
 /// authorization count are bounded. Each authorization publishes at most two
 /// fixed-size events: transport ownership plus one settlement. Late Worker
 /// carriers contain no request and cannot exceed the authorization budget, so
@@ -620,13 +624,13 @@ struct AdmissionIssueRecord {
 /// A closed receiver fails the caller instead of silently losing authority.
 #[derive(Debug)]
 pub(crate) struct EstablishIssueLedger {
-    required_contexts: BTreeSet<QueryContextRef>,
-    result_withdrawn: BTreeSet<QueryContextRef>,
-    max_admission_issues_per_context: NonZeroUsize,
-    max_authorizations_per_context: NonZeroUsize,
-    admission_issues: BTreeMap<QueryContextRef, AdmissionIssueRecord>,
-    retired_admission_issues: BTreeMap<(QueryContextRef, TaskOperationId), AdmissionIssueRecord>,
-    records: BTreeMap<QueryContextRef, EstablishIssueRecord>,
+    required_participations: BTreeSet<ParticipationRef>,
+    result_withdrawn: BTreeSet<ParticipationRef>,
+    max_admission_issues_per_participation: NonZeroUsize,
+    max_authorizations_per_participation: NonZeroUsize,
+    admission_issues: BTreeMap<ParticipationRef, AdmissionIssueRecord>,
+    retired_admission_issues: BTreeMap<(ParticipationRef, TaskOperationId), AdmissionIssueRecord>,
+    records: BTreeMap<ParticipationRef, EstablishIssueRecord>,
     events: mpsc::UnboundedSender<EstablishIssueEvent>,
     event_rx: mpsc::UnboundedReceiver<EstablishIssueEvent>,
     fence: Arc<EstablishIssueFence>,
@@ -675,16 +679,16 @@ impl EstablishIssueFence {
 
 impl EstablishIssueLedger {
     pub(crate) fn new(
-        required_contexts: BTreeSet<QueryContextRef>,
-        max_admission_issues_per_context: NonZeroUsize,
-        max_authorizations_per_context: NonZeroUsize,
+        required_participations: BTreeSet<ParticipationRef>,
+        max_admission_issues_per_participation: NonZeroUsize,
+        max_authorizations_per_participation: NonZeroUsize,
     ) -> Self {
         let (events, event_rx) = mpsc::unbounded_channel();
         Self {
-            required_contexts,
+            required_participations,
             result_withdrawn: BTreeSet::new(),
-            max_admission_issues_per_context,
-            max_authorizations_per_context,
+            max_admission_issues_per_participation,
+            max_authorizations_per_participation,
             admission_issues: BTreeMap::new(),
             retired_admission_issues: BTreeMap::new(),
             records: BTreeMap::new(),
@@ -700,17 +704,20 @@ impl EstablishIssueLedger {
     pub(crate) fn begin_admission_issue(
         &mut self,
         activation: AttemptActivationIdentity,
-        request: AcquireQueryContextAdmissionTicket,
+        request: AcquireParticipationAdmissionTicket,
         now: MonotonicInstant,
     ) -> Result<AdmissionIssueReceipt, EstablishIssueError> {
         let receipt = AdmissionIssueReceipt::from_request(activation, request, now)?;
-        if !self.required_contexts.contains(&receipt.context) {
-            return Err(EstablishIssueError::UnknownContext);
+        if !self
+            .required_participations
+            .contains(&receipt.participation)
+        {
+            return Err(EstablishIssueError::UnknownParticipation);
         }
         if !self.fence.is_open() {
             return Err(EstablishIssueError::IssueAuthorityRevoked);
         }
-        let context = receipt.context;
+        let participation = receipt.participation;
         if let Some(existing) = self
             .admission_issues
             .values()
@@ -737,9 +744,9 @@ impl EstablishIssueLedger {
                 Err(EstablishIssueError::ConflictingAdmissionIssue)
             };
         }
-        let Some(existing) = self.admission_issues.get(&context).copied() else {
+        let Some(existing) = self.admission_issues.get(&participation).copied() else {
             self.admission_issues.insert(
-                context,
+                participation,
                 AdmissionIssueRecord {
                     receipt,
                     generation: 1,
@@ -755,7 +762,7 @@ impl EstablishIssueLedger {
                 ..
             } if now.has_reached(conservative_expiry) => self
                 .records
-                .get(&context)
+                .get(&participation)
                 .is_some_and(|record| record.state == EstablishIssueState::TicketHeld),
             AdmissionIssueState::Pending
             | AdmissionIssueState::Granted { .. }
@@ -766,14 +773,14 @@ impl EstablishIssueLedger {
         if !replaceable {
             return Err(EstablishIssueError::ConflictingAdmissionIssue);
         }
-        if existing.generation >= self.max_admission_issues_per_context.get() {
+        if existing.generation >= self.max_admission_issues_per_participation.get() {
             return Err(EstablishIssueError::AdmissionIssueBudgetExhausted);
         }
-        self.records.remove(&context);
+        self.records.remove(&participation);
         self.retired_admission_issues
-            .insert((context, existing.receipt.operation_id), existing);
+            .insert((participation, existing.receipt.operation_id), existing);
         self.admission_issues.insert(
-            context,
+            participation,
             AdmissionIssueRecord {
                 receipt,
                 generation: existing.generation + 1,
@@ -803,7 +810,7 @@ impl EstablishIssueLedger {
         settlement: AdmissionIssueSettlement,
         now: MonotonicInstant,
     ) -> Result<AdmissionIssueDisposition, EstablishIssueError> {
-        let context = admission_issue.context;
+        let participation = admission_issue.participation;
         if admission_issue.activation != activation
             || settlement.operation_id != admission_issue.operation_id
         {
@@ -811,12 +818,12 @@ impl EstablishIssueLedger {
         }
         if self
             .admission_issues
-            .get(&context)
+            .get(&participation)
             .is_none_or(|record| record.receipt != admission_issue)
         {
             let retired = self
                 .retired_admission_issues
-                .get(&(context, admission_issue.operation_id))
+                .get(&(participation, admission_issue.operation_id))
                 .ok_or(EstablishIssueError::ConflictingAdmissionIssue)?;
             if retired.receipt != admission_issue {
                 return Err(EstablishIssueError::ConflictingAdmissionIssue);
@@ -825,14 +832,16 @@ impl EstablishIssueLedger {
         }
         let record = self
             .admission_issues
-            .get_mut(&context)
+            .get_mut(&participation)
             .ok_or(EstablishIssueError::ConflictingAdmissionIssue)?;
         if admission_issue.first_sent_at > now {
             return Err(EstablishIssueError::AdmissionTimeInFuture);
         }
         match (settlement.outcome, settlement.ticket) {
             (Some(OperationOutcome::Accepted | OperationOutcome::Idempotent), Some(ticket)) => {
-                if ticket.context() != context || ticket.valid_for() != admission_issue.valid_for {
+                if ticket.participation() != participation
+                    || ticket.valid_for() != admission_issue.valid_for
+                {
                     return Err(EstablishIssueError::InvalidAdmissionSettlement);
                 }
                 let conservative_expiry = admission_issue
@@ -864,7 +873,7 @@ impl EstablishIssueLedger {
                     conservative_expiry,
                 };
                 self.records.insert(
-                    context,
+                    participation,
                     EstablishIssueRecord {
                         activation,
                         ticket,
@@ -925,7 +934,7 @@ impl EstablishIssueLedger {
     pub(crate) fn authorize_issue(
         &mut self,
         activation: AttemptActivationIdentity,
-        request: Arc<EstablishQueryContext>,
+        request: Arc<EstablishParticipation>,
         native_compatibility_id: NativeCompatibilityId,
         now: MonotonicInstant,
     ) -> Result<EstablishIssuePermit, EstablishIssueError> {
@@ -937,12 +946,12 @@ impl EstablishIssueLedger {
         )?;
         let record = self
             .records
-            .get_mut(&identity.context())
-            .ok_or(EstablishIssueError::UnknownContext)?;
+            .get_mut(&identity.participation())
+            .ok_or(EstablishIssueError::UnknownParticipation)?;
         if record.activation != activation {
             return Err(EstablishIssueError::IdentityMismatch);
         }
-        if record.ticket.context() != identity.context()
+        if record.ticket.participation() != identity.participation()
             || record.ticket.ticket_id() != identity.ticket_id()
         {
             return Err(EstablishIssueError::TicketDoesNotAuthorizeRequest);
@@ -963,24 +972,24 @@ impl EstablishIssueLedger {
             request,
             &self.events,
             &self.fence,
-            self.max_authorizations_per_context,
+            self.max_authorizations_per_participation,
         )
     }
 
     /// Re-signs only the actor-retained request after a definitely-unsent or
-    /// transport-unknown settlement. The caller names the context but cannot
+    /// transport-unknown settlement. The caller names the participation but cannot
     /// substitute another payload, ticket, operation, or compatibility id.
     pub(crate) fn reauthorize_issue(
         &mut self,
         activation: AttemptActivationIdentity,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         now: MonotonicInstant,
     ) -> Result<EstablishIssuePermit, EstablishIssueError> {
         self.drain_events()?;
         let record = self
             .records
-            .get_mut(&context)
-            .ok_or(EstablishIssueError::UnknownContext)?;
+            .get_mut(&participation)
+            .ok_or(EstablishIssueError::UnknownParticipation)?;
         if record.activation != activation {
             return Err(EstablishIssueError::IdentityMismatch);
         }
@@ -1010,7 +1019,7 @@ impl EstablishIssueLedger {
             request,
             &self.events,
             &self.fence,
-            self.max_authorizations_per_context,
+            self.max_authorizations_per_participation,
         )
     }
 
@@ -1041,56 +1050,60 @@ impl EstablishIssueLedger {
         }
     }
 
-    pub(crate) fn snapshot(&self, context: QueryContextRef) -> Option<EstablishIssueSnapshot> {
+    pub(crate) fn snapshot(
+        &self,
+        participation: ParticipationRef,
+    ) -> Option<EstablishIssueSnapshot> {
         self.records
-            .get(&context)
+            .get(&participation)
             .map(EstablishIssueRecord::snapshot)
     }
 
-    pub(crate) fn required_contexts(&self) -> Arc<[QueryContextRef]> {
-        self.required_contexts
+    pub(crate) fn required_participations(&self) -> Arc<[ParticipationRef]> {
+        self.required_participations
             .iter()
             .copied()
             .collect::<Vec<_>>()
             .into()
     }
 
-    /// Projects only the facts needed by actor-owned context stand-down.
+    /// Projects only the facts needed by actor-owned participation stand-down.
     ///
     /// A granted admission ticket remains an Abort responsibility even when
     /// Establish was definitely unsent. Worker Abort owns both the absent-
-    /// context fence and prompt return of that ticket's reserved capacity.
+    /// participation fence and prompt return of that ticket's reserved capacity.
     pub(crate) fn stand_down_facts(
         &mut self,
-    ) -> Result<Vec<(QueryContextRef, EstablishStandDownFact)>, EstablishIssueError> {
+    ) -> Result<Vec<(ParticipationRef, EstablishStandDownFact)>, EstablishIssueError> {
         self.drain_events()?;
         Ok(self
-            .required_contexts
+            .required_participations
             .iter()
-            .map(|context| {
+            .map(|participation| {
                 let fact = if self
                     .records
-                    .get(context)
+                    .get(participation)
                     .is_some_and(|record| record.state == EstablishIssueState::IssueAuthorized)
                 {
                     EstablishStandDownFact::IssueUnsettled
-                } else if self.records.contains_key(context)
+                } else if self.records.contains_key(participation)
                     || self
                         .admission_issues
-                        .get(context)
+                        .get(participation)
                         .is_some_and(|record| admission_may_hold_worker_capacity(record.state))
                     || self
                         .retired_admission_issues
                         .iter()
                         .any(|((retired, _), record)| {
-                            retired == context && admission_may_hold_worker_capacity(record.state)
+                            retired == participation
+                                && admission_may_hold_worker_capacity(record.state)
                         })
                 {
                     EstablishStandDownFact::AbortRequired
                 } else {
                     EstablishStandDownFact::NoGrant
                 };
-                (*context, fact)
+                (*participation, fact)
             })
             .collect())
     }
@@ -1109,35 +1122,39 @@ impl EstablishIssueLedger {
     /// activation/root. Keep required_contexts and every issue for stand-down.
     pub(crate) fn record_result_withdrawals(
         &mut self,
-        contexts: &BTreeSet<QueryContextRef>,
+        participations: &BTreeSet<ParticipationRef>,
     ) -> Result<(), EstablishIssueError> {
-        if !contexts.is_subset(&self.required_contexts) {
-            return Err(EstablishIssueError::UnknownContext);
+        if !participations.is_subset(&self.required_participations) {
+            return Err(EstablishIssueError::UnknownParticipation);
         }
-        self.result_withdrawn.extend(contexts.iter().copied());
+        self.result_withdrawn.extend(participations.iter().copied());
         Ok(())
     }
 
     pub(crate) fn ensure_success_ready(&mut self) -> Result<(), EstablishIssueError> {
         self.drain_events()?;
         let mut pending = false;
-        for context in &self.required_contexts {
-            if self.result_withdrawn.contains(context) {
+        for participation in &self.required_participations {
+            if self.result_withdrawn.contains(participation) {
                 continue;
             }
             // Admission can fail before any Establish record exists. Keep
             // that known refusal distinct from a still-pending requirement.
-            if self.admission_issues.get(context).is_some_and(|record| {
-                matches!(
-                    record.state,
-                    AdmissionIssueState::Rejected(_)
-                        | AdmissionIssueState::PreWorkerRejected
-                        | AdmissionIssueState::PreWorkerRejectedAfterUnknown
-                )
-            }) {
+            if self
+                .admission_issues
+                .get(participation)
+                .is_some_and(|record| {
+                    matches!(
+                        record.state,
+                        AdmissionIssueState::Rejected(_)
+                            | AdmissionIssueState::PreWorkerRejected
+                            | AdmissionIssueState::PreWorkerRejectedAfterUnknown
+                    )
+                })
+            {
                 return Err(EstablishIssueError::AdmissionRejected);
             }
-            match self.records.get(context).map(|record| record.state) {
+            match self.records.get(participation).map(|record| record.state) {
                 Some(EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Applied)) => {}
                 Some(EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Rejected(
                     _,
@@ -1159,8 +1176,8 @@ impl EstablishIssueLedger {
         let issue_authority_open = self.fence.is_open();
         let record = self
             .records
-            .get_mut(&event.identity.context())
-            .ok_or(EstablishIssueError::UnknownContext)?;
+            .get_mut(&event.identity.participation())
+            .ok_or(EstablishIssueError::UnknownParticipation)?;
         if record.identity != Some(event.identity) {
             return Err(EstablishIssueError::IdentityMismatch);
         }
@@ -1271,15 +1288,15 @@ fn replay_retired_admission_settlement(
 fn mint_issue_permit(
     record: &mut EstablishIssueRecord,
     identity: EstablishIssueIdentity,
-    request: Arc<EstablishQueryContext>,
+    request: Arc<EstablishParticipation>,
     events: &mpsc::UnboundedSender<EstablishIssueEvent>,
     fence: &Arc<EstablishIssueFence>,
-    max_authorizations_per_context: NonZeroUsize,
+    max_authorizations_per_participation: NonZeroUsize,
 ) -> Result<EstablishIssuePermit, EstablishIssueError> {
     if !fence.is_open() {
         return Err(EstablishIssueError::IssueAuthorityRevoked);
     }
-    if record.authorization_generation >= max_authorizations_per_context.get() as u64 {
+    if record.authorization_generation >= max_authorizations_per_participation.get() as u64 {
         return Err(EstablishIssueError::AuthorizationBudgetExhausted);
     }
     record.authorization_generation = record
@@ -1338,7 +1355,7 @@ fn event_matches_state(state: EstablishIssueState, event: EstablishIssueEventKin
 pub struct EstablishIssuePermit {
     identity: EstablishIssueIdentity,
     authorization_generation: u64,
-    request: Option<Arc<EstablishQueryContext>>,
+    request: Option<Arc<EstablishParticipation>>,
     events: mpsc::UnboundedSender<EstablishIssueEvent>,
     fence: Arc<EstablishIssueFence>,
 }
@@ -1440,7 +1457,7 @@ pub trait EstablishTransportReservation: fmt::Debug + Send {
 pub struct EstablishTransportSubmission {
     identity: EstablishIssueIdentity,
     authorization_generation: u64,
-    request: Option<Arc<EstablishQueryContext>>,
+    request: Option<Arc<EstablishParticipation>>,
     events: mpsc::UnboundedSender<EstablishIssueEvent>,
 }
 
@@ -1553,8 +1570,8 @@ mod tests {
     use std::time::Duration;
 
     use novarocks_execution_contract::{
-        CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch,
-        CredentialLeaseId, CredentialUpdate, LeaseValidFor,
+        CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialDomainId,
+        CredentialEpoch, CredentialUpdate, LeaseValidFor,
     };
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
@@ -1716,46 +1733,49 @@ mod tests {
 
     fn actor_config(
         execution: QueryExecutionId,
-        contexts: Vec<QueryContextRef>,
+        participations: Vec<ParticipationRef>,
     ) -> LogicalExecutionActorConfig {
         let (work_owner, stage) = governed_work();
         LogicalExecutionActorConfig::single_attempt_completion(
             execution,
             ExecutionEffect::None,
             NonZeroUsize::new(1).unwrap(),
-            contexts,
+            participations,
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             work_owner,
             stage,
         )
         .unwrap()
-        .with_abort_query_context_effect_port(
+        .with_abort_participation_effect_port(
             crate::coordination::PermanentlyBackpressuredAbortEffectPort::shared(),
             NonZeroUsize::new(2).unwrap(),
         )
     }
 
-    fn context(execution: QueryExecutionId) -> QueryContextRef {
-        QueryContextRef::new(
+    fn participation(execution: QueryExecutionId) -> ParticipationRef {
+        ParticipationRef::new(
             execution,
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         )
     }
 
-    fn ticket(context: QueryContextRef, tag: u8) -> QueryContextAdmissionTicketReceipt {
-        QueryContextAdmissionTicketReceipt::new(
+    fn ticket(participation: ParticipationRef, tag: u8) -> ParticipationAdmissionTicketReceipt {
+        ParticipationAdmissionTicketReceipt::new(
             AdmissionTicketId::try_from_bytes([tag; 16]).unwrap(),
-            context,
+            participation,
             LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
         )
     }
 
-    fn admission_request(context: QueryContextRef, tag: u8) -> AcquireQueryContextAdmissionTicket {
-        AcquireQueryContextAdmissionTicket::new(
+    fn admission_request(
+        participation: ParticipationRef,
+        tag: u8,
+    ) -> AcquireParticipationAdmissionTicket {
+        AcquireParticipationAdmissionTicket::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
             NativeCompatibilityId::new([tag; 32]),
             AdmissionEpochCapability::try_from_bytes([tag; 16]).unwrap(),
@@ -1765,7 +1785,7 @@ mod tests {
     fn hold_ticket(
         ledger: &mut EstablishIssueLedger,
         activation: AttemptActivationIdentity,
-        ticket: QueryContextAdmissionTicketReceipt,
+        ticket: ParticipationAdmissionTicketReceipt,
         tag: u8,
         first_sent_at: MonotonicInstant,
         observed_at: MonotonicInstant,
@@ -1773,7 +1793,7 @@ mod tests {
         let admission = ledger
             .begin_admission_issue(
                 activation,
-                admission_request(ticket.context(), tag),
+                admission_request(ticket.participation(), tag),
                 first_sent_at,
             )
             .unwrap();
@@ -1796,7 +1816,7 @@ mod tests {
     async fn settle_actor_ticket(
         running: &crate::coordination::RunningAttemptPermit,
         admission: AdmissionIssueReceipt,
-        ticket: QueryContextAdmissionTicketReceipt,
+        ticket: ParticipationAdmissionTicketReceipt,
     ) {
         assert_eq!(
             running
@@ -1816,24 +1836,24 @@ mod tests {
     }
 
     fn establish_request(
-        context: QueryContextRef,
-        ticket: QueryContextAdmissionTicketReceipt,
+        participation: ParticipationRef,
+        ticket: ParticipationAdmissionTicketReceipt,
         tag: u8,
-    ) -> Arc<EstablishQueryContext> {
+    ) -> Arc<EstablishParticipation> {
         let content = |offset| {
             Arc::new(FakeContent(ContentFingerprint::from_bytes(
                 [tag + offset; 16],
             ))) as Arc<dyn CodecOwnedContent>
         };
-        Arc::new(EstablishQueryContext::new(
+        Arc::new(EstablishParticipation::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             ticket.ticket_id(),
             content(0),
             content(1),
             content(2),
             CredentialUpdate::new(
-                CredentialLeaseId::new(u64::from(tag)),
+                CredentialDomainId::new(u64::from(tag)),
                 CredentialEpoch::new(1).unwrap(),
                 Arc::new(FakeSecret),
             ),
@@ -1848,9 +1868,12 @@ mod tests {
         )
     }
 
-    fn issue_ledger(context: QueryContextRef, max_authorizations: usize) -> EstablishIssueLedger {
+    fn issue_ledger(
+        participation: ParticipationRef,
+        max_authorizations: usize,
+    ) -> EstablishIssueLedger {
         EstablishIssueLedger::new(
-            BTreeSet::from([context]),
+            BTreeSet::from([participation]),
             NonZeroUsize::new(3).unwrap(),
             NonZeroUsize::new(max_authorizations).unwrap(),
         )
@@ -1860,10 +1883,10 @@ mod tests {
     async fn pre_worker_admission_refusal_closes_replay_without_a_grant() {
         let execution = execution(31);
         let activation = activation(execution);
-        let context = context(execution);
+        let participation = participation(execution);
         let now = times().0;
-        let mut ledger = issue_ledger(context, 2);
-        let request = admission_request(context, 31);
+        let mut ledger = issue_ledger(participation, 2);
+        let request = admission_request(participation, 31);
         let issue = ledger
             .begin_admission_issue(activation, request, now)
             .unwrap();
@@ -1880,7 +1903,7 @@ mod tests {
         );
         assert_eq!(
             ledger.stand_down_facts().unwrap(),
-            vec![(context, EstablishStandDownFact::NoGrant)]
+            vec![(participation, EstablishStandDownFact::NoGrant)]
         );
     }
 
@@ -1888,10 +1911,10 @@ mod tests {
     async fn owner_failed_admission_closes_replay_but_keeps_abort_responsibility() {
         let execution = execution(35);
         let activation = activation(execution);
-        let context = context(execution);
+        let participation = participation(execution);
         let now = times().0;
-        let mut ledger = issue_ledger(context, 2);
-        let request = admission_request(context, 35);
+        let mut ledger = issue_ledger(participation, 2);
+        let request = admission_request(participation, 35);
         let issue = ledger
             .begin_admission_issue(activation, request, now)
             .unwrap();
@@ -1907,12 +1930,12 @@ mod tests {
             Err(EstablishIssueError::AdmissionReplayClosed)
         );
         assert_eq!(
-            ledger.begin_admission_issue(activation, admission_request(context, 36), now),
+            ledger.begin_admission_issue(activation, admission_request(participation, 36), now),
             Err(EstablishIssueError::ConflictingAdmissionIssue)
         );
         assert_eq!(
             ledger.stand_down_facts().unwrap(),
-            vec![(context, EstablishStandDownFact::AbortRequired)]
+            vec![(participation, EstablishStandDownFact::AbortRequired)]
         );
     }
 
@@ -1920,11 +1943,11 @@ mod tests {
     async fn admission_refusal_after_unknown_keeps_abort_responsibility() {
         let execution = execution(33);
         let activation = activation(execution);
-        let context = context(execution);
+        let participation = participation(execution);
         let now = times().0;
-        let mut ledger = issue_ledger(context, 2);
+        let mut ledger = issue_ledger(participation, 2);
         let issue = ledger
-            .begin_admission_issue(activation, admission_request(context, 33), now)
+            .begin_admission_issue(activation, admission_request(participation, 33), now)
             .unwrap();
         assert_eq!(
             ledger.settle_admission_issue(
@@ -1940,7 +1963,7 @@ mod tests {
         );
         assert_eq!(
             ledger.stand_down_facts().unwrap(),
-            vec![(context, EstablishStandDownFact::AbortRequired)]
+            vec![(participation, EstablishStandDownFact::AbortRequired)]
         );
     }
 
@@ -1948,20 +1971,20 @@ mod tests {
     async fn original_worker_receipt_settles_unknown_without_reauthorization() {
         for outcome in [
             OperationOutcome::Accepted,
-            OperationOutcome::ContextConflict,
+            OperationOutcome::ParticipationConflict,
         ] {
             let execution = execution(40);
             let activation = activation(execution);
-            let context = context(execution);
+            let participation = participation(execution);
             let now = times().0;
-            let mut ledger = issue_ledger(context, 2);
-            let held = ticket(context, 40);
+            let mut ledger = issue_ledger(participation, 2);
+            let held = ticket(participation, 40);
             hold_ticket(&mut ledger, activation, held, 40, now, now);
             let late = submit(
                 ledger
                     .authorize_issue(
                         activation,
-                        establish_request(context, held, 40),
+                        establish_request(participation, held, 40),
                         NativeCompatibilityId::new([40; 32]),
                         now,
                     )
@@ -1971,17 +1994,23 @@ mod tests {
             .unwrap();
             ledger.drain_events().unwrap();
             let identity = late.identity();
-            assert_eq!(ledger.snapshot(context).unwrap().identity(), Some(identity));
             assert_eq!(
-                ledger.snapshot(context).unwrap().state(),
+                ledger.snapshot(participation).unwrap().identity(),
+                Some(identity)
+            );
+            assert_eq!(
+                ledger.snapshot(participation).unwrap().state(),
                 EstablishIssueState::TransportUnknown
             );
             ledger.revoke_issue_authority();
             late.worker_settled(outcome).unwrap();
             ledger.drain_events().unwrap();
-            assert_eq!(ledger.snapshot(context).unwrap().identity(), Some(identity));
             assert_eq!(
-                ledger.snapshot(context).unwrap().state(),
+                ledger.snapshot(participation).unwrap().identity(),
+                Some(identity)
+            );
+            assert_eq!(
+                ledger.snapshot(participation).unwrap().state(),
                 EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::from_outcome(
                     outcome
                 ))
@@ -1996,7 +2025,7 @@ mod tests {
             );
             assert_eq!(
                 ledger.stand_down_facts().unwrap(),
-                vec![(context, EstablishStandDownFact::AbortRequired)]
+                vec![(participation, EstablishStandDownFact::AbortRequired)]
             );
         }
     }
@@ -2006,16 +2035,16 @@ mod tests {
         for mode in 0..3 {
             let execution = execution(34 + mode);
             let activation = activation(execution);
-            let context = context(execution);
+            let participation = participation(execution);
             let now = times().0;
-            let mut ledger = issue_ledger(context, 2);
+            let mut ledger = issue_ledger(participation, 2);
             let issue = ledger
-                .begin_admission_issue(activation, admission_request(context, 34), now)
+                .begin_admission_issue(activation, admission_request(participation, 34), now)
                 .unwrap();
             let settlement = if mode == 0 {
                 AdmissionIssueSettlement::rejected(
                     issue.operation_id(),
-                    OperationOutcome::ContextConflict,
+                    OperationOutcome::ParticipationConflict,
                 )
                 .unwrap()
             } else {
@@ -2028,7 +2057,7 @@ mod tests {
                 ledger.settle_admission_issue(activation, issue, settlement, now),
                 Err(EstablishIssueError::AdmissionRejected)
             );
-            assert!(ledger.snapshot(context).is_none());
+            assert!(ledger.snapshot(participation).is_none());
             assert_eq!(
                 ledger.ensure_success_ready(),
                 Err(EstablishIssueError::AdmissionRejected)
@@ -2037,7 +2066,7 @@ mod tests {
             assert_eq!(
                 original_responsibility,
                 vec![(
-                    context,
+                    participation,
                     if mode == 2 {
                         EstablishStandDownFact::AbortRequired
                     } else {
@@ -2046,7 +2075,7 @@ mod tests {
                 )]
             );
             ledger
-                .record_result_withdrawals(&BTreeSet::from([context]))
+                .record_result_withdrawals(&BTreeSet::from([participation]))
                 .unwrap();
             assert_eq!(ledger.ensure_success_ready(), Ok(()));
             assert_eq!(ledger.stand_down_facts().unwrap(), original_responsibility);
@@ -2059,15 +2088,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_context_cannot_hide_a_later_required_admission_or_establish_refusal() {
+    async fn pending_participation_cannot_hide_a_later_required_admission_or_establish_refusal() {
         for admission_only in [true, false] {
             let execution = execution(38);
             let activation = activation(execution);
-            let contexts = BTreeSet::from([context(execution), context(execution)]);
-            let rejected = *contexts.last().unwrap();
+            let participations =
+                BTreeSet::from([participation(execution), participation(execution)]);
+            let rejected = *participations.last().unwrap();
             let now = times().0;
             let mut ledger = EstablishIssueLedger::new(
-                contexts.clone(),
+                participations.clone(),
                 NonZeroUsize::new(3).unwrap(),
                 NonZeroUsize::new(2).unwrap(),
             );
@@ -2112,25 +2142,25 @@ mod tests {
             assert_eq!(
                 ledger.ensure_success_ready(),
                 Err(EstablishIssueError::EstablishNotSettled),
-                "the earlier still-pending context remains required"
+                "the earlier still-pending participation remains required"
             );
         }
     }
 
     #[tokio::test]
-    async fn withdrawn_result_context_still_validates_its_original_worker_receipts() {
+    async fn withdrawn_result_participation_still_validates_its_original_worker_receipts() {
         let execution = execution(39);
         let activation = activation(execution);
-        let context = context(execution);
+        let participation = participation(execution);
         let now = times().0;
-        let mut ledger = issue_ledger(context, 2);
-        let held = ticket(context, 39);
+        let mut ledger = issue_ledger(participation, 2);
+        let held = ticket(participation, 39);
         hold_ticket(&mut ledger, activation, held, 39, now, now);
         let late = submit(
             ledger
                 .authorize_issue(
                     activation,
-                    establish_request(context, held, 39),
+                    establish_request(participation, held, 39),
                     NativeCompatibilityId::new([39; 32]),
                     now,
                 )
@@ -2139,27 +2169,31 @@ mod tests {
         .transport_unknown()
         .unwrap();
         ledger.drain_events().unwrap();
-        submit(ledger.reauthorize_issue(activation, context, now).unwrap())
-            .worker_settled(OperationOutcome::Accepted)
-            .unwrap();
+        submit(
+            ledger
+                .reauthorize_issue(activation, participation, now)
+                .unwrap(),
+        )
+        .worker_settled(OperationOutcome::Accepted)
+        .unwrap();
         ledger.drain_events().unwrap();
         ledger
-            .record_result_withdrawals(&BTreeSet::from([context]))
+            .record_result_withdrawals(&BTreeSet::from([participation]))
             .unwrap();
-        late.worker_settled(OperationOutcome::ContextConflict)
+        late.worker_settled(OperationOutcome::ParticipationConflict)
             .unwrap();
         assert_eq!(
             ledger.ensure_success_ready(),
             Err(EstablishIssueError::ConflictingWorkerSettlement)
         );
         assert_eq!(
-            ledger.snapshot(context).unwrap().state(),
+            ledger.snapshot(participation).unwrap().state(),
             EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Applied),
             "a refused contradictory event cannot overwrite the original verdict"
         );
         assert_eq!(
             ledger.stand_down_facts().unwrap(),
-            vec![(context, EstablishStandDownFact::AbortRequired)]
+            vec![(participation, EstablishStandDownFact::AbortRequired)]
         );
     }
 
@@ -2167,12 +2201,12 @@ mod tests {
     async fn pre_worker_establish_refusal_retains_ticket_abort_responsibility() {
         let execution = execution(32);
         let activation = activation(execution);
-        let context = context(execution);
+        let participation = participation(execution);
         let now = times().0;
-        let mut ledger = issue_ledger(context, 2);
-        let held = ticket(context, 32);
+        let mut ledger = issue_ledger(participation, 2);
+        let held = ticket(participation, 32);
         hold_ticket(&mut ledger, activation, held, 32, now, now);
-        let request = establish_request(context, held, 32);
+        let request = establish_request(participation, held, 32);
         let submission = submit(
             ledger
                 .authorize_issue(
@@ -2186,7 +2220,7 @@ mod tests {
         submission.pre_worker_rejected().unwrap();
         ledger.drain_events().unwrap();
         assert_eq!(
-            ledger.snapshot(context).unwrap().state(),
+            ledger.snapshot(participation).unwrap().state(),
             EstablishIssueState::PreWorkerRejected
         );
         assert_eq!(
@@ -2195,7 +2229,7 @@ mod tests {
         );
         assert_eq!(
             ledger.stand_down_facts().unwrap(),
-            vec![(context, EstablishStandDownFact::AbortRequired)]
+            vec![(participation, EstablishStandDownFact::AbortRequired)]
         );
     }
 
@@ -2203,9 +2237,9 @@ mod tests {
     async fn identity_is_typed_and_rejects_a_foreign_activation() {
         let first = execution(1);
         let second = execution(2);
-        let context = context(first);
-        let ticket = ticket(context, 1);
-        let request = establish_request(context, ticket, 1);
+        let participation = participation(first);
+        let ticket = ticket(participation, 1);
+        let request = establish_request(participation, ticket, 1);
         assert_eq!(
             EstablishIssueIdentity::from_request(
                 activation(second),
@@ -2223,7 +2257,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(identity.activation(), activation);
-        assert_eq!(identity.context(), context);
+        assert_eq!(identity.participation(), participation);
         assert_eq!(identity.operation_id(), request.envelope().operation_id());
         assert_eq!(identity.ticket_id(), ticket.ticket_id());
         assert_eq!(identity.semantics(), request.semantic_identity());
@@ -2237,12 +2271,12 @@ mod tests {
     async fn ticket_receipt_and_expiry_are_retained_exactly() {
         let execution = execution(3);
         let activation = activation(execution);
-        let context = context(execution);
-        let receipt = ticket(context, 3);
+        let participation = participation(execution);
+        let receipt = ticket(participation, 3);
         let (now, expiry) = times();
-        let mut ledger = issue_ledger(context, 2);
+        let mut ledger = issue_ledger(participation, 2);
         let admission = hold_ticket(&mut ledger, activation, receipt, 3, now, now);
-        let snapshot = ledger.snapshot(context).unwrap();
+        let snapshot = ledger.snapshot(participation).unwrap();
         assert_eq!(snapshot.ticket(), receipt);
         assert_eq!(snapshot.conservative_expiry(), expiry);
         assert_eq!(snapshot.identity(), None);
@@ -2261,10 +2295,14 @@ mod tests {
                 expiry,
             )
             .unwrap();
-        let other_context = self::context(execution);
+        let other_participation = self::participation(execution);
         assert_eq!(
-            ledger.begin_admission_issue(activation, admission_request(other_context, 13), now,),
-            Err(EstablishIssueError::UnknownContext)
+            ledger.begin_admission_issue(
+                activation,
+                admission_request(other_participation, 13),
+                now,
+            ),
+            Err(EstablishIssueError::UnknownParticipation)
         );
     }
 
@@ -2272,11 +2310,11 @@ mod tests {
     async fn admission_replay_retains_the_first_issue_time_and_operation() {
         let execution = execution(3);
         let activation = activation(execution);
-        let context = context(execution);
-        let request = admission_request(context, 3);
+        let participation = participation(execution);
+        let request = admission_request(participation, 3);
         let first_sent_at = MonotonicInstant::from_origin(Duration::from_secs(2));
         let replayed_at = MonotonicInstant::from_origin(Duration::from_secs(8));
-        let mut ledger = issue_ledger(context, 2);
+        let mut ledger = issue_ledger(participation, 2);
 
         let first = ledger
             .begin_admission_issue(activation, request, first_sent_at)
@@ -2287,7 +2325,11 @@ mod tests {
         assert_eq!(replay, first);
         assert_eq!(replay.operation_id(), request.envelope().operation_id());
         assert_eq!(
-            ledger.begin_admission_issue(activation, admission_request(context, 4), replayed_at,),
+            ledger.begin_admission_issue(
+                activation,
+                admission_request(participation, 4),
+                replayed_at,
+            ),
             Err(EstablishIssueError::ConflictingAdmissionIssue)
         );
     }
@@ -2296,15 +2338,15 @@ mod tests {
     async fn expired_ticket_can_be_replaced_by_one_bounded_new_admission_operation() {
         let execution = execution(3);
         let activation = activation(execution);
-        let context = context(execution);
+        let participation = participation(execution);
         let (now, expiry) = times();
         let mut ledger = EstablishIssueLedger::new(
-            BTreeSet::from([context]),
+            BTreeSet::from([participation]),
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
         );
-        let first_ticket = ticket(context, 3);
-        let first_request = admission_request(context, 3);
+        let first_ticket = ticket(participation, 3);
+        let first_request = admission_request(participation, 3);
         let first_admission = ledger
             .begin_admission_issue(activation, first_request, now)
             .unwrap();
@@ -2329,7 +2371,7 @@ mod tests {
             Err(EstablishIssueError::AdmissionReplayClosed)
         );
 
-        let replacement_request = admission_request(context, 4);
+        let replacement_request = admission_request(participation, 4);
         let replacement = ledger
             .begin_admission_issue(activation, replacement_request, expiry)
             .unwrap();
@@ -2337,7 +2379,7 @@ mod tests {
             replacement.operation_id(),
             replacement_request.envelope().operation_id()
         );
-        assert_eq!(ledger.snapshot(context), None);
+        assert_eq!(ledger.snapshot(participation), None);
         assert_eq!(
             ledger
                 .settle_admission_issue(
@@ -2371,16 +2413,16 @@ mod tests {
         );
         assert_eq!(
             ledger.stand_down_facts().unwrap(),
-            vec![(context, EstablishStandDownFact::AbortRequired)],
+            vec![(participation, EstablishStandDownFact::AbortRequired)],
             "a locally expired retired grant and AdmissionTicketStillActive still own Worker capacity"
         );
         assert_eq!(
             ledger.begin_admission_issue(activation, first_request, expiry),
             Err(EstablishIssueError::AdmissionReplayClosed)
         );
-        let reused_operation = AcquireQueryContextAdmissionTicket::new(
+        let reused_operation = AcquireParticipationAdmissionTicket::new(
             first_request.envelope().operation_id(),
-            context,
+            participation,
             LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
             NativeCompatibilityId::new([5; 32]),
             AdmissionEpochCapability::try_from_bytes([5; 16]).unwrap(),
@@ -2390,7 +2432,7 @@ mod tests {
             Err(EstablishIssueError::ConflictingAdmissionIssue)
         );
         assert_eq!(
-            ledger.begin_admission_issue(activation, admission_request(context, 5), expiry),
+            ledger.begin_admission_issue(activation, admission_request(participation, 5), expiry),
             Err(EstablishIssueError::AdmissionIssueBudgetExhausted)
         );
     }
@@ -2399,11 +2441,11 @@ mod tests {
     async fn admission_settlement_must_name_the_exact_operation_and_ticket_shape() {
         let execution = execution(3);
         let activation = activation(execution);
-        let context = context(execution);
+        let participation = participation(execution);
         let (now, _expiry) = times();
-        let mut ledger = issue_ledger(context, 2);
+        let mut ledger = issue_ledger(participation, 2);
         let admission = ledger
-            .begin_admission_issue(activation, admission_request(context, 3), now)
+            .begin_admission_issue(activation, admission_request(participation, 3), now)
             .unwrap();
         let wrong_operation = TaskOperationId::new_v7();
 
@@ -2414,7 +2456,7 @@ mod tests {
                 AdmissionIssueSettlement::applied(
                     wrong_operation,
                     OperationOutcome::Accepted,
-                    ticket(context, 3),
+                    ticket(participation, 3),
                 )
                 .unwrap(),
                 now,
@@ -2434,11 +2476,11 @@ mod tests {
     async fn dropping_a_permit_is_definitely_unsent_and_allows_exact_resign() {
         let execution = execution(4);
         let activation = activation(execution);
-        let context = context(execution);
-        let ticket = ticket(context, 4);
-        let request = establish_request(context, ticket, 4);
+        let participation = participation(execution);
+        let ticket = ticket(participation, 4);
+        let request = establish_request(participation, ticket, 4);
         let (now, expiry) = times();
-        let mut ledger = issue_ledger(context, 2);
+        let mut ledger = issue_ledger(participation, 2);
         let admission = hold_ticket(&mut ledger, activation, ticket, 4, now, now);
         let permit = ledger
             .authorize_issue(
@@ -2451,7 +2493,7 @@ mod tests {
         drop(permit);
         assert_eq!(ledger.drain_events().unwrap(), 1);
         assert_eq!(
-            ledger.snapshot(context).unwrap().state(),
+            ledger.snapshot(participation).unwrap().state(),
             EstablishIssueState::DefinitelyUnsent
         );
         ledger
@@ -2470,7 +2512,9 @@ mod tests {
 
         let request_weak = Arc::downgrade(&request);
         drop(request);
-        let resigned = ledger.reauthorize_issue(activation, context, now).unwrap();
+        let resigned = ledger
+            .reauthorize_issue(activation, participation, now)
+            .unwrap();
         assert!(Arc::ptr_eq(
             resigned
                 .request
@@ -2489,12 +2533,12 @@ mod tests {
     async fn revocation_releases_a_retained_definitely_unsent_request() {
         let execution = execution(4);
         let activation = activation(execution);
-        let context = context(execution);
-        let ticket = ticket(context, 4);
-        let request = establish_request(context, ticket, 4);
+        let participation = participation(execution);
+        let ticket = ticket(participation, 4);
+        let request = establish_request(participation, ticket, 4);
         let request_weak = Arc::downgrade(&request);
         let (now, _expiry) = times();
-        let mut ledger = issue_ledger(context, 2);
+        let mut ledger = issue_ledger(participation, 2);
         hold_ticket(&mut ledger, activation, ticket, 4, now, now);
         let permit = ledger
             .authorize_issue(
@@ -2517,11 +2561,11 @@ mod tests {
     async fn transport_backpressure_is_the_only_external_definitely_unsent_proof() {
         let execution = execution(5);
         let activation = activation(execution);
-        let context = context(execution);
-        let ticket = ticket(context, 5);
-        let request = establish_request(context, ticket, 5);
+        let participation = participation(execution);
+        let ticket = ticket(participation, 5);
+        let request = establish_request(participation, ticket, 5);
         let (now, _expiry) = times();
-        let mut ledger = issue_ledger(context, 2);
+        let mut ledger = issue_ledger(participation, 2);
         hold_ticket(&mut ledger, activation, ticket, 5, now, now);
         let permit = ledger
             .authorize_issue(
@@ -2537,7 +2581,7 @@ mod tests {
         );
         assert_eq!(ledger.drain_events().unwrap(), 1);
         assert_eq!(
-            ledger.snapshot(context).unwrap().state(),
+            ledger.snapshot(participation).unwrap().state(),
             EstablishIssueState::DefinitelyUnsent
         );
     }
@@ -2546,11 +2590,11 @@ mod tests {
     async fn transport_guard_drop_is_unknown_and_exact_replay_survives_expiry() {
         let execution = execution(5);
         let activation = activation(execution);
-        let context = context(execution);
-        let ticket = ticket(context, 5);
-        let request = establish_request(context, ticket, 5);
+        let participation = participation(execution);
+        let ticket = ticket(participation, 5);
+        let request = establish_request(participation, ticket, 5);
         let (now, expiry) = times();
-        let mut ledger = issue_ledger(context, 2);
+        let mut ledger = issue_ledger(participation, 2);
         hold_ticket(&mut ledger, activation, ticket, 5, now, now);
         let permit = ledger
             .authorize_issue(
@@ -2564,27 +2608,27 @@ mod tests {
         drop(guard);
         assert_eq!(ledger.drain_events().unwrap(), 2);
         assert_eq!(
-            ledger.snapshot(context).unwrap().state(),
+            ledger.snapshot(participation).unwrap().state(),
             EstablishIssueState::TransportUnknown
         );
 
         let after_expiry = expiry.saturating_add(Duration::from_secs(1));
         drop(request);
         let replay = ledger
-            .reauthorize_issue(activation, context, after_expiry)
+            .reauthorize_issue(activation, participation, after_expiry)
             .unwrap();
         drop(replay);
     }
 
     #[tokio::test]
-    async fn exact_replay_cannot_exceed_the_context_authorization_budget() {
+    async fn exact_replay_cannot_exceed_the_participation_authorization_budget() {
         let execution = execution(6);
         let activation = activation(execution);
-        let context = context(execution);
-        let ticket = ticket(context, 6);
-        let request = establish_request(context, ticket, 6);
+        let participation = participation(execution);
+        let ticket = ticket(participation, 6);
+        let request = establish_request(participation, ticket, 6);
         let (now, _expiry) = times();
-        let mut ledger = issue_ledger(context, 1);
+        let mut ledger = issue_ledger(participation, 1);
         hold_ticket(&mut ledger, activation, ticket, 6, now, now);
         let submission = submit(
             ledger
@@ -2599,7 +2643,7 @@ mod tests {
         let _late = submission.transport_unknown().unwrap();
         ledger.drain_events().unwrap();
         let error = ledger
-            .reauthorize_issue(activation, context, now)
+            .reauthorize_issue(activation, participation, now)
             .unwrap_err();
         assert_eq!(error, EstablishIssueError::AuthorizationBudgetExhausted);
         use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
@@ -2617,12 +2661,12 @@ mod tests {
     async fn worker_settlement_is_terminal_and_idempotent() {
         let execution = execution(6);
         let activation = activation(execution);
-        let context = context(execution);
-        let ticket = ticket(context, 6);
-        let request = establish_request(context, ticket, 6);
+        let participation = participation(execution);
+        let ticket = ticket(participation, 6);
+        let request = establish_request(participation, ticket, 6);
         let request_weak = Arc::downgrade(&request);
         let (now, _expiry) = times();
-        let mut ledger = issue_ledger(context, 2);
+        let mut ledger = issue_ledger(participation, 2);
         hold_ticket(&mut ledger, activation, ticket, 6, now, now);
         let guard = submit(
             ledger
@@ -2639,7 +2683,7 @@ mod tests {
         guard.worker_settled(OperationOutcome::Accepted).unwrap();
         assert_eq!(ledger.drain_events().unwrap(), 2);
         assert_eq!(
-            ledger.snapshot(context).unwrap().state(),
+            ledger.snapshot(participation).unwrap().state(),
             EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Applied)
         );
         assert!(request_weak.upgrade().is_none());
@@ -2660,11 +2704,11 @@ mod tests {
     async fn late_worker_settlement_wins_over_a_reissue_but_old_carrier_events_do_not() {
         let execution = execution(7);
         let activation = activation(execution);
-        let context = context(execution);
-        let ticket = ticket(context, 7);
-        let request = establish_request(context, ticket, 7);
+        let participation = participation(execution);
+        let ticket = ticket(participation, 7);
+        let request = establish_request(participation, ticket, 7);
         let (now, _expiry) = times();
-        let mut ledger = issue_ledger(context, 2);
+        let mut ledger = issue_ledger(participation, 2);
         hold_ticket(&mut ledger, activation, ticket, 7, now, now);
         let first_guard = submit(
             ledger
@@ -2682,7 +2726,11 @@ mod tests {
         assert_eq!(ledger.drain_events().unwrap(), 2);
 
         drop(request);
-        let second_guard = submit(ledger.reauthorize_issue(activation, context, now).unwrap());
+        let second_guard = submit(
+            ledger
+                .reauthorize_issue(activation, participation, now)
+                .unwrap(),
+        );
         let second_generation = second_guard.authorization_generation;
         assert!(second_generation > first_generation);
 
@@ -2702,7 +2750,7 @@ mod tests {
             );
         }
         assert_eq!(
-            ledger.snapshot(context).unwrap().state(),
+            ledger.snapshot(participation).unwrap().state(),
             EstablishIssueState::IssueAuthorized
         );
 
@@ -2711,7 +2759,7 @@ mod tests {
             .unwrap();
         assert_eq!(ledger.drain_events().unwrap(), 2);
         assert_eq!(
-            ledger.snapshot(context).unwrap().state(),
+            ledger.snapshot(participation).unwrap().state(),
             EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Applied)
         );
         second_guard
@@ -2719,7 +2767,7 @@ mod tests {
             .unwrap();
         assert_eq!(ledger.drain_events().unwrap(), 0);
         assert_eq!(
-            ledger.snapshot(context).unwrap().state(),
+            ledger.snapshot(participation).unwrap().state(),
             EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Applied)
         );
         assert_eq!(
@@ -2727,7 +2775,9 @@ mod tests {
                 identity,
                 authorization_generation: second_generation,
                 kind: EstablishIssueEventKind::WorkerSettled(
-                    EstablishWorkerSettlement::from_outcome(OperationOutcome::ContextConflict),
+                    EstablishWorkerSettlement::from_outcome(
+                        OperationOutcome::ParticipationConflict
+                    ),
                 ),
             }),
             Err(EstablishIssueError::ConflictingWorkerSettlement)
@@ -2759,11 +2809,11 @@ mod tests {
     async fn definitely_unsent_replay_still_obeys_ticket_expiry() {
         let execution = execution(8);
         let activation = activation(execution);
-        let context = context(execution);
-        let ticket = ticket(context, 8);
-        let request = establish_request(context, ticket, 8);
+        let participation = participation(execution);
+        let ticket = ticket(participation, 8);
+        let request = establish_request(participation, ticket, 8);
         let (now, expiry) = times();
-        let mut ledger = issue_ledger(context, 2);
+        let mut ledger = issue_ledger(participation, 2);
         hold_ticket(&mut ledger, activation, ticket, 8, now, now);
         let permit = ledger
             .authorize_issue(
@@ -2776,7 +2826,7 @@ mod tests {
         drop(permit);
         ledger.drain_events().unwrap();
         let error = ledger
-            .reauthorize_issue(activation, context, expiry)
+            .reauthorize_issue(activation, participation, expiry)
             .unwrap_err();
         assert_eq!(error, EstablishIssueError::TicketExpired);
         use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
@@ -2801,26 +2851,26 @@ mod tests {
     #[tokio::test]
     async fn actor_derives_ticket_expiry_from_its_admission_issue_clock() {
         let execution = execution(9);
-        let context = context(execution);
+        let participation = participation(execution);
         let sent_at = MonotonicInstant::from_origin(Duration::from_secs(3));
         let observed_at = MonotonicInstant::from_origin(Duration::from_secs(5));
         let expected_expiry = MonotonicInstant::from_origin(Duration::from_secs(13));
         let clock = Arc::new(ManualActorClock::new(sent_at));
-        let config = actor_config(execution, vec![context]).with_clock(clock.clone());
+        let config = actor_config(execution, vec![participation]).with_clock(clock.clone());
         let (owner, initial, _output) = spawn_logical_execution_actor(&Handle::current(), config)
             .unwrap()
             .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
         let issue = running
-            .begin_admission_issue(admission_request(context, 9))
+            .begin_admission_issue(admission_request(participation, 9))
             .await
             .unwrap();
         clock.set(observed_at);
-        settle_actor_ticket(&running, issue, ticket(context, 9)).await;
+        settle_actor_ticket(&running, issue, ticket(participation, 9)).await;
         assert_eq!(
             actor
-                .establish_snapshot(context)
+                .establish_snapshot(participation)
                 .await
                 .unwrap()
                 .unwrap()
@@ -2830,10 +2880,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_refuses_success_when_a_required_context_was_never_issued() {
+    async fn actor_refuses_success_when_a_required_participation_was_never_issued() {
         let execution = execution(10);
-        let context = context(execution);
-        let config = actor_config(execution, vec![context]);
+        let participation = participation(execution);
+        let config = actor_config(execution, vec![participation]);
         let (owner, initial, _output) = spawn_logical_execution_actor(&Handle::current(), config)
             .unwrap()
             .into_parts();
@@ -2854,18 +2904,18 @@ mod tests {
     #[tokio::test]
     async fn actor_owns_exact_establish_replay_until_worker_settlement() {
         let execution = execution(11);
-        let context = context(execution);
-        let config = actor_config(execution, vec![context]);
+        let participation = participation(execution);
+        let config = actor_config(execution, vec![participation]);
         let (owner, initial, _output) = spawn_logical_execution_actor(&Handle::current(), config)
             .unwrap()
             .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let ticket = ticket(context, 11);
-        let request = establish_request(context, ticket, 11);
+        let ticket = ticket(participation, 11);
+        let request = establish_request(participation, ticket, 11);
         let request_weak = Arc::downgrade(&request);
         let admission = running
-            .begin_admission_issue(admission_request(context, 11))
+            .begin_admission_issue(admission_request(participation, 11))
             .await
             .unwrap();
 
@@ -2877,7 +2927,7 @@ mod tests {
         drop(request);
         drop(permit);
 
-        let replay = running.reauthorize_establish(context).await.unwrap();
+        let replay = running.reauthorize_establish(participation).await.unwrap();
         assert!(Arc::ptr_eq(
             replay
                 .request
@@ -2894,7 +2944,7 @@ mod tests {
 
         assert_eq!(
             actor
-                .establish_snapshot(context)
+                .establish_snapshot(participation)
                 .await
                 .unwrap()
                 .unwrap()
@@ -2911,17 +2961,17 @@ mod tests {
     #[tokio::test]
     async fn actor_cancellation_revokes_an_authorized_pre_transport_permit() {
         let execution = execution(12);
-        let context = context(execution);
-        let config = actor_config(execution, vec![context]);
+        let participation = participation(execution);
+        let config = actor_config(execution, vec![participation]);
         let (owner, initial, _output) = spawn_logical_execution_actor(&Handle::current(), config)
             .unwrap()
             .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let ticket = ticket(context, 12);
-        let request = establish_request(context, ticket, 12);
+        let ticket = ticket(participation, 12);
+        let request = establish_request(participation, ticket, 12);
         let admission = running
-            .begin_admission_issue(admission_request(context, 12))
+            .begin_admission_issue(admission_request(participation, 12))
             .await
             .unwrap();
 
@@ -2947,7 +2997,7 @@ mod tests {
         ));
         for _ in 0..16 {
             if actor
-                .establish_snapshot(context)
+                .establish_snapshot(participation)
                 .await
                 .unwrap()
                 .is_some_and(|snapshot| snapshot.state() == EstablishIssueState::DefinitelyUnsent)
@@ -2963,8 +3013,8 @@ mod tests {
     async fn completion_without_result_withdrawal_cannot_skip_admission_refusal() {
         for mode in 0..3 {
             let execution = execution(35 + mode);
-            let context = context(execution);
-            let config = actor_config(execution, vec![context]);
+            let participation = participation(execution);
+            let config = actor_config(execution, vec![participation]);
             let (owner, initial, _output) =
                 spawn_logical_execution_actor(&Handle::current(), config)
                     .unwrap()
@@ -2972,13 +3022,13 @@ mod tests {
             let actor = owner.actor();
             let running = actor.activate(initial.ready()).await.unwrap();
             let issue = running
-                .begin_admission_issue(admission_request(context, 35))
+                .begin_admission_issue(admission_request(participation, 35))
                 .await
                 .unwrap();
             let settlement = if mode == 0 {
                 AdmissionIssueSettlement::rejected(
                     issue.operation_id(),
-                    OperationOutcome::ContextConflict,
+                    OperationOutcome::ParticipationConflict,
                 )
                 .unwrap()
             } else {
@@ -2994,7 +3044,13 @@ mod tests {
                 ))
             );
             assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
-            assert!(actor.establish_snapshot(context).await.unwrap().is_none());
+            assert!(
+                actor
+                    .establish_snapshot(participation)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(
                 actor.complete_attempt(running).await,
                 Err(LogicalExecutionActorError::Establish(
@@ -3011,22 +3067,22 @@ mod tests {
     #[tokio::test]
     async fn actor_keeps_consuming_settlements_after_a_protocol_failure() {
         let execution = execution(13);
-        let first_context = context(execution);
-        let second_context = context(execution);
-        let config = actor_config(execution, vec![first_context, second_context]);
+        let first_participation = participation(execution);
+        let second_participation = participation(execution);
+        let config = actor_config(execution, vec![first_participation, second_participation]);
         let (owner, initial, _output) = spawn_logical_execution_actor(&Handle::current(), config)
             .unwrap()
             .into_parts();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
-        let first_ticket = ticket(first_context, 13);
-        let second_ticket = ticket(second_context, 14);
-        let first_request = establish_request(first_context, first_ticket, 13);
-        let second_request = establish_request(second_context, second_ticket, 14);
+        let first_ticket = ticket(first_participation, 13);
+        let second_ticket = ticket(second_participation, 14);
+        let first_request = establish_request(first_participation, first_ticket, 13);
+        let second_request = establish_request(second_participation, second_ticket, 14);
         let second_request_weak = Arc::downgrade(&second_request);
 
         let first_issue = running
-            .begin_admission_issue(admission_request(first_context, 13))
+            .begin_admission_issue(admission_request(first_participation, 13))
             .await
             .unwrap();
         settle_actor_ticket(&running, first_issue, first_ticket).await;
@@ -3039,7 +3095,7 @@ mod tests {
         let late_first = first_submission.transport_unknown().unwrap();
 
         let second_issue = running
-            .begin_admission_issue(admission_request(second_context, 14))
+            .begin_admission_issue(admission_request(second_participation, 14))
             .await
             .unwrap();
         settle_actor_ticket(&running, second_issue, second_ticket).await;
@@ -3050,12 +3106,17 @@ mod tests {
                 .unwrap(),
         );
 
-        submit(running.reauthorize_establish(first_context).await.unwrap())
-            .worker_settled(OperationOutcome::Accepted)
-            .unwrap();
+        submit(
+            running
+                .reauthorize_establish(first_participation)
+                .await
+                .unwrap(),
+        )
+        .worker_settled(OperationOutcome::Accepted)
+        .unwrap();
         for _ in 0..16 {
             if actor
-                .establish_snapshot(first_context)
+                .establish_snapshot(first_participation)
                 .await
                 .unwrap()
                 .is_some_and(|snapshot| {
@@ -3069,7 +3130,7 @@ mod tests {
         }
 
         late_first
-            .worker_settled(OperationOutcome::ContextConflict)
+            .worker_settled(OperationOutcome::ParticipationConflict)
             .unwrap();
         for _ in 0..16 {
             if actor.snapshot().await.unwrap().establish_error
@@ -3107,7 +3168,7 @@ mod tests {
 
         // Deferring is sound only because a failed Establish ledger can no
         // longer publish success. A conflicting settlement is refused without
-        // rolling its record back, so every required context still reads
+        // rolling its record back, so every required participation still reads
         // Applied and only the recorded failure fences this completion.
         assert_eq!(
             actor.complete_attempt(running).await,

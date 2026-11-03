@@ -21,7 +21,7 @@ use novarocks_cluster_harness::vended_rest_catalog::{
 };
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, NativeTrustFixture,
-    QueryExecutionResourceSnapshot, ServerHandle,
+    QueryExecutionResourceSnapshot, TestClusterOwner,
 };
 use novarocks_secret::SecretValue;
 use serde::Serialize;
@@ -33,11 +33,13 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-const CONNECTOR_READER_OPEN: &str = "NOVAROCKS_CONNECTOR_UNIT_READER_OPEN";
+const CONNECTOR_READER_OPEN: &str =
+    novarocks_failpoint::observation_marker::CONNECTOR_UNIT_READER_OPEN;
 /// The task protocol's abort marker, emitted where the abort actually
 /// applied. It replaces `NOVAROCKS_QUERY_LIFECYCLE_ABORT`, which only the
 /// retired chain emits and which a production query no longer reaches.
-const TASK_CONTEXT_ABORT_APPLIED: &str = "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED";
+const PARTICIPATION_ABORT_APPLIED: &str =
+    novarocks_failpoint::observation_marker::PARTICIPATION_ABORT_APPLIED;
 const VENDED_METADATA_CREDENTIAL_NAME: &str = "vended-rest-metadata";
 const VENDED_METADATA_CREDENTIAL_GENERATION: &str = "v1";
 const VENDED_METADATA_ACCESS_KEY_ENV: &str = "NOVAROCKS_VENDED_METADATA_ACCESS_KEY_ID";
@@ -56,31 +58,36 @@ const VENDED_METADATA_SECRET_KEY_ENV: &str = "NOVAROCKS_VENDED_METADATA_SECRET_A
 /// point at which a cold install is observably in flight: the install runs
 /// inside the establish that carries the catalog bindings, not in a background
 /// pass with its own Loading/Ready progression.
-const CATALOG_INSTALL_STARTED: &str = "NOVAROCKS_CATALOG_INSTALL_STARTED";
+const CATALOG_INSTALL_STARTED: &str =
+    novarocks_failpoint::observation_marker::CATALOG_INSTALL_STARTED;
 /// One selected Backend's cold install was failed by the runner's trigger.
-const CATALOG_INSTALL_FAILED: &str = "NOVAROCKS_CATALOG_INSTALL_FAILED";
+const CATALOG_INSTALL_FAILED: &str =
+    novarocks_failpoint::observation_marker::CATALOG_INSTALL_FAILED;
 /// A provider bind produced one catalog runtime. Protocol-neutral and live:
 /// it is emitted by the catalog manager's factory set, which both the retired
 /// chain and the task protocol drive, and it is the fact "this catalog is
 /// usable here" actually consists of.
-const CATALOG_RUNTIME_MATERIALIZED: &str = "NOVAROCKS_CATALOG_RUNTIME_MATERIALIZED";
+const CATALOG_RUNTIME_MATERIALIZED: &str =
+    novarocks_failpoint::observation_marker::CATALOG_RUNTIME_MATERIALIZED;
 /// One task was admitted on a Backend. The successor of
 /// `NOVAROCKS_CATALOG_STAGE_ADMITTED` for ordering claims: a task is the
 /// smallest thing a Backend admits, and it cannot exist before the establish
 /// that installed its context's catalogs returned.
-const TASK_CREATE_APPLIED: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
+const TASK_CREATE_APPLIED: &str = novarocks_failpoint::observation_marker::TASK_CREATE_APPLIED;
 /// One Backend renewed a query context's task lease.
 ///
 /// Emitted on a timer by a Backend that still holds the context, which makes it
 /// the evidence that an attempt is alive when the data path is deliberately
 /// slow.
-const TASK_LEASE_RENEWED: &str = "NOVAROCKS_TASK_LEASE_RENEWED";
+const PARTICIPATION_LEASE_RENEWED: &str =
+    novarocks_failpoint::observation_marker::PARTICIPATION_LEASE_RENEWED;
 /// The task protocol's establish acknowledgement drop, and the marker its
-/// claim prints. It replaces the retired `InitAck` drop: `EstablishQueryContext`
+/// claim prints. It replaces the retired `InitAck` drop: `EstablishParticipation`
 /// is where a query's catalog bindings cross the boundary, so it is the
 /// operation whose lost answer could make one Backend install twice.
-const ESTABLISH_CONTEXT_ACK_DROP: &str = "establish-context-ack-drop";
-const ESTABLISH_CONTEXT_ACK_DROPPED_MARKER: &str = "NOVAROCKS_TASK_ESTABLISH_CONTEXT_ACK_DROPPED";
+const ESTABLISH_PARTICIPATION_ACK_DROP: &str = "establish-participation-ack-drop";
+const ESTABLISH_PARTICIPATION_ACK_DROPPED_MARKER: &str =
+    novarocks_failpoint::observation_marker::PARTICIPATION_ESTABLISH_ACK_DROPPED;
 /// The one Backend the injected catalog-install failure and the dropped
 /// establish acknowledgement are armed on.
 ///
@@ -88,11 +95,15 @@ const ESTABLISH_CONTEXT_ACK_DROPPED_MARKER: &str = "NOVAROCKS_TASK_ESTABLISH_CON
 /// process its evidence must come from, and nothing here assumes how many
 /// Backends a plan reaches.
 const CATALOG_FAILURE_BACKEND: usize = 1;
-const TYPED_SPLIT_ACCEPTED: &str = "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED";
-const TYPED_SPLIT_NO_MORE: &str = "NOVAROCKS_TASK_SPLIT_NO_MORE";
-const TYPED_PAGE_SOURCE_OPEN: &str = "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN";
-const TYPED_PAGE_SOURCE_CLOSE: &str = "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE";
-const CONNECTOR_READER_CLOSE: &str = "NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE";
+const TYPED_SPLIT_ACCEPTED: &str =
+    novarocks_failpoint::observation_marker::TASK_SPLIT_ASSIGNMENT_ACCEPTED;
+const TYPED_SPLIT_NO_MORE: &str = novarocks_failpoint::observation_marker::TASK_SPLIT_NO_MORE;
+const TYPED_PAGE_SOURCE_OPEN: &str =
+    novarocks_failpoint::observation_marker::CONNECTOR_PAGE_SOURCE_OPEN;
+const TYPED_PAGE_SOURCE_CLOSE: &str =
+    novarocks_failpoint::observation_marker::CONNECTOR_PAGE_SOURCE_CLOSE;
+const CONNECTOR_READER_CLOSE: &str =
+    novarocks_failpoint::observation_marker::CONNECTOR_UNIT_READER_CLOSE;
 const READER_CACHE_OVERLAY: &str = r#"
 [runtime.cache]
 page_cache_enable = true
@@ -262,15 +273,16 @@ impl Scenario for Uea5dMultiSplitDop {
                         let scan_instances = log
                             .lines()
                             .filter(|line| line.contains(TYPED_SPLIT_ACCEPTED))
-                            .filter_map(|line| line.split_once("finst=").map(|(_, rest)| rest))
+                            .filter_map(|line| line.split_once("task_key=").map(|(_, rest)| rest))
                             .filter_map(|rest| rest.split_whitespace().next())
                             .collect::<Vec<_>>();
                         log.lines().any(|line| {
-                            line.contains("NOVAROCKS_TASK_PREPARED_DOP")
-                                && line.contains(&actual_dop_marker)
+                            line.contains(
+                                novarocks_failpoint::observation_marker::TASK_PREPARED_DOP,
+                            ) && line.contains(&actual_dop_marker)
                                 && scan_instances
                                     .iter()
-                                    .any(|instance| line.contains(&format!("finst={instance} ")))
+                                    .any(|instance| line.contains(&format!("task_key={instance} ")))
                         })
                     }),
                     "DOP {dop} read produced no split-owning prepared task with {actual_dop_marker}"
@@ -287,7 +299,7 @@ impl Scenario for Uea5dMultiSplitDop {
                                         || line.contains(TYPED_SPLIT_NO_MORE)
                                         || line.contains(TYPED_PAGE_SOURCE_OPEN)
                                         || line.contains(TYPED_PAGE_SOURCE_CLOSE)
-                                        || line.contains("NOVAROCKS_TASK_PREPARED_DOP")
+                                        || line.contains(novarocks_failpoint::observation_marker::TASK_PREPARED_DOP)
                                 })
                                 .map(str::to_owned)
                                 .collect()
@@ -893,7 +905,7 @@ impl Scenario for CatalogReadyLifecycle {
                 // either the abort or the hold file, so lifting the file first would
                 // let a cancellation that had not arrived yet race a provider bind
                 // that then really would make the catalog usable.
-                wait_for_context_abort_on(
+                wait_for_participation_abort_on(
                     context,
                     &before_cancel,
                     &installing,
@@ -1110,7 +1122,7 @@ impl Scenario for CatalogReadyLifecycle {
             // A dropped establish acknowledgement is recovered by replaying the
             // exact establish, and the replay must not build a second runtime.
             //
-            // This replaced the retired InitAck drop: `EstablishQueryContext` is
+            // This replaced the retired InitAck drop: `EstablishParticipation` is
             // where the task protocol carries a query's catalog bindings, so it is
             // the operation whose lost answer can make a backend install twice.
             control
@@ -1120,7 +1132,7 @@ impl Scenario for CatalogReadyLifecycle {
             let before_replay = backend_log_snapshots(context)?;
             let before_ack_drop = context.handle().be_log_count(
                 CATALOG_FAILURE_BACKEND,
-                ESTABLISH_CONTEXT_ACK_DROPPED_MARKER,
+                ESTABLISH_PARTICIPATION_ACK_DROPPED_MARKER,
             )?;
             context.action("retry the exact cold establish after its acknowledgement is dropped");
             let rows: Vec<i64> = connector_control_plan::query(
@@ -1146,11 +1158,11 @@ impl Scenario for CatalogReadyLifecycle {
             // no byte cursor or ordering across the two streams is inferred.
             let after_ack_drop = context.handle().be_log_count(
                 CATALOG_FAILURE_BACKEND,
-                ESTABLISH_CONTEXT_ACK_DROPPED_MARKER,
+                ESTABLISH_PARTICIPATION_ACK_DROPPED_MARKER,
             )?;
             ensure!(
                 after_ack_drop.checked_sub(before_ack_drop) == Some(1),
-                "BE[{CATALOG_FAILURE_BACKEND}] must emit exactly one {ESTABLISH_CONTEXT_ACK_DROPPED_MARKER} in the selected replay window; before={before_ack_drop}, after={after_ack_drop}",
+                "BE[{CATALOG_FAILURE_BACKEND}] must emit exactly one {ESTABLISH_PARTICIPATION_ACK_DROPPED_MARKER} in the selected replay window; before={before_ack_drop}, after={after_ack_drop}",
             );
             assert_catalog_runtime_built_at_most_once(&before_replay, &after_replay, CATALOG)?;
             // A prepared task with no registered fragment must release its query
@@ -2348,7 +2360,7 @@ impl Scenario for VendedRestRefreshPem {
                 "vended_refresh_db",
                 "vended_refresh_data",
             ),
-            lease_markers: true,
+            task_protocol_markers: true,
         }];
         let (plan, inputs) = storage_control_plan::plan(
             cluster_size,
@@ -2838,19 +2850,19 @@ impl Scenario for VendedCredentialFaultPem {
             queries.push(storage_control_plan::QueryIntent {
                 run_token: storage_control_plan::FAULT_PRIME_TOKEN,
                 sql: sql.clone(),
-                lease_markers: false,
+                task_protocol_markers: false,
             });
         }
         queries.push(storage_control_plan::QueryIntent {
             run_token: storage_control_plan::FAULT_READ_TOKEN,
             sql: sql.clone(),
-            lease_markers: false,
+            task_protocol_markers: false,
         });
         if matches!(self.kind, VendedCredentialFault::LateClose) {
             queries.push(storage_control_plan::QueryIntent {
                 run_token: storage_control_plan::FAULT_FOLLOWUP_TOKEN,
                 sql,
-                lease_markers: false,
+                task_protocol_markers: false,
             });
         }
         let (plan, inputs) = storage_control_plan::plan(
@@ -4985,7 +4997,9 @@ fn wait_for_lease_renewal_on_every_backend(
             &baselines,
             "for a task lease renewed since this phase began",
         )?;
-        Ok(appended.iter().all(|log| log.contains(TASK_LEASE_RENEWED)))
+        Ok(appended
+            .iter()
+            .all(|log| log.contains(PARTICIPATION_LEASE_RENEWED)))
     })
 }
 
@@ -5230,7 +5244,7 @@ fn wait_for_cold_catalog_install(
 }
 
 /// Waits until every Backend in `backends` has applied this query's abort.
-fn wait_for_context_abort_on(
+fn wait_for_participation_abort_on(
     context: &mut ScenarioContext,
     before: &[String],
     backends: &BTreeSet<usize>,
@@ -5245,7 +5259,7 @@ fn wait_for_context_abort_on(
             logs.get(index)
                 .zip(before.get(index))
                 .and_then(|(log, previous)| log.get(previous.len()..))
-                .is_some_and(|added| added.contains(TASK_CONTEXT_ABORT_APPLIED))
+                .is_some_and(|added| added.contains(PARTICIPATION_ABORT_APPLIED))
         })
     })
     .map(|_| ())
@@ -5516,7 +5530,7 @@ fn assert_catalog_runtime_built_at_most_once(
 fn assert_no_reader_open_after_abort(logs: &[String]) -> Result<()> {
     let mut aborted_backends = 0_usize;
     for (index, log) in logs.iter().enumerate() {
-        let Some(abort_offset) = log.find(TASK_CONTEXT_ABORT_APPLIED) else {
+        let Some(abort_offset) = log.find(PARTICIPATION_ABORT_APPLIED) else {
             continue;
         };
         aborted_backends += 1;
@@ -5526,7 +5540,7 @@ fn assert_no_reader_open_after_abort(logs: &[String]) -> Result<()> {
     }
     if aborted_backends == 0 {
         bail!(
-            "no backend recorded {TASK_CONTEXT_ABORT_APPLIED} after KILL QUERY, so the abort \
+            "no backend recorded {PARTICIPATION_ABORT_APPLIED} after KILL QUERY, so the abort \
              never reached one"
         );
     }
@@ -5626,7 +5640,7 @@ fn reader_counts(log: &str) -> (usize, usize) {
 fn catalog_materialization_counts(logs: &[String]) -> Vec<usize> {
     logs.iter()
         .map(|log| {
-            log.matches("NOVAROCKS_CATALOG_RUNTIME_MATERIALIZED")
+            log.matches(novarocks_failpoint::observation_marker::CATALOG_RUNTIME_MATERIALIZED)
                 .count()
         })
         .collect()
@@ -5857,7 +5871,10 @@ mod tests {
 
     #[test]
     fn a_first_stdout_catalog_marker_remains_complete_and_in_stream_order() {
-        let ready = "NOVAROCKS_READY role=be\n";
+        let ready = &*format!(
+            "{} role=be\n",
+            novarocks_failpoint::observation_marker::READY
+        );
         let started = format!("{CATALOG_INSTALL_STARTED} execution_id=1:2:1 catalog_count=1\n");
         let runtime = format!("{CATALOG_RUNTIME_MATERIALIZED} catalog=fixture\n");
         let created = format!("{TASK_CREATE_APPLIED} execution_id=1:2:1\n");

@@ -33,7 +33,6 @@ use novarocks_execution::{
         },
     },
     runtime::{
-        fragment::{CompiledWriterBindings, ExecutionResult},
         function_set::SealedExecutionFunctionSet,
         preparation_metadata::{
             CompiledSchemaPreparationScope, CompiledSchemaSite, PreparationMetadataFailure,
@@ -41,6 +40,7 @@ use novarocks_execution::{
         },
         query_memory::QueryMemoryBinding,
         runtime_state::RuntimeErrorState,
+        task::{CompiledWriterBindings, ExecutionResult},
     },
 };
 use novarocks_local_program::{LocalProgram, ProgramNodeId, StaticLayout};

@@ -19,7 +19,7 @@
 use novarocks_control_runtime_core::identity::{Generation, ReservationId};
 use novarocks_execution_contract::operation::DomainFailureOutcome;
 use novarocks_execution_contract::{
-    OperationDomainFailure, OperationOutcome, QueryContextRef, TaskIdentity,
+    OperationDomainFailure, OperationOutcome, ParticipationRef, TaskIdentity,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,22 +40,22 @@ impl CreationCost {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionNeed {
     ActiveTask {
-        context: QueryContextRef,
+        participation: ParticipationRef,
         task: TaskIdentity,
         generation: Generation,
     },
     Preparation {
-        context: QueryContextRef,
+        participation: ParticipationRef,
         task: TaskIdentity,
         /// The actual loading/Task lifetime reservation. The synchronous port
         /// resolves its live parent work inside the same ledger transaction.
         active: ReservationId,
         generation: Generation,
-        preparing_in_context: usize,
+        preparing_in_participation: usize,
         bytes: u64,
     },
-    Context {
-        context: QueryContextRef,
+    Participation {
+        participation: ParticipationRef,
         generation: Generation,
     },
 }
@@ -97,7 +97,7 @@ pub trait AdmissionPort {
 /// frozen absolute deadline. Immediate replies retain the same runtime no-reuse
 /// obligation even though they need no pending entry in the pure core.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RequestContext {
+pub struct RequestReplyTag {
     /// The same original admitted R work, qualified by its actual scope.
     /// This neutral identity grants no runtime permission or capacity.
     pub author: novarocks_control_runtime_core::identity::ScopedWorkRef,

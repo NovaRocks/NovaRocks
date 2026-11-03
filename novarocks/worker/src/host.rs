@@ -25,7 +25,7 @@ use novarocks_execution_contract::task_execution::creation::{
 };
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution_contract::task_execution::domain::CodecOwnedContent;
-use novarocks_execution_contract::task_execution::identity::QueryContextRef;
+use novarocks_execution_contract::task_execution::identity::ParticipationRef;
 use novarocks_execution_contract::task_execution::operation::{CredentialUpdate, TaskDomainUpdate};
 use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailureCategory,
@@ -37,11 +37,11 @@ use crate::RuntimeFilterReleaseObservation;
 use crate::TaskStatusReporter;
 use crate::root_result_channel::RootResultChannel;
 
-/// The actual preparation capture moves this complete original role set.
-/// Binding refusal returns the same set; observers cannot recreate any role.
-pub struct TaskPreparationRoles {
-    pub fragments: novarocks_execution_contract::AdmittedFragmentRoles<
-        novarocks_execution::runtime::fragment::ExecutionFailure,
+/// The actual preparation capture moves this complete original set of work and capabilities.
+/// Binding refusal returns the same set; observers cannot recreate its work or capabilities.
+pub struct TaskPreparationCapture {
+    pub completion_work: novarocks_execution_contract::AdmittedWorkParts<
+        novarocks_execution::runtime::task::ExecutionFailure,
     >,
     pub start: crate::TaskStartPermit,
     pub terminal: crate::TaskTerminalPermit,
@@ -50,9 +50,9 @@ pub struct TaskPreparationRoles {
     pub final_statistics: crate::TaskStatisticsFinalizer,
     pub completion_exit: crate::CompletionExitNotice,
 }
-impl TaskPreparationRoles {
+impl TaskPreparationCapture {
     pub(crate) fn matches(&self, identity: novarocks_execution_contract::TaskIdentity) -> bool {
-        self.fragments.identity() == Some(identity)
+        self.completion_work.identity() == Some(identity)
             && self.start.identity() == identity
             && self.terminal.identity() == identity
             && self.statistics.identity() == identity
@@ -61,9 +61,9 @@ impl TaskPreparationRoles {
             && self.completion_exit.identity() == identity
     }
 }
-impl fmt::Debug for TaskPreparationRoles {
+impl fmt::Debug for TaskPreparationCapture {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TaskPreparationRoles")
+        f.debug_struct("TaskPreparationCapture")
             .field("identity", &self.start.identity())
             .finish_non_exhaustive()
     }
@@ -107,7 +107,7 @@ impl TaskPreparationView {
     }
 }
 
-/// One actual preparation body owns one original, finite fragment role set.
+/// One actual preparation body owns one original, finite set of Task capabilities.
 /// Metadata gets only a weak stop view. Moving this context into the Native
 /// host cannot copy the finisher or sign another settlement registration.
 pub struct TaskPreparationContext<'a> {
@@ -115,26 +115,26 @@ pub struct TaskPreparationContext<'a> {
     children: &'a Arc<crate::task_preparation::TaskPreparationScope>,
     cadence: std::time::Duration,
     readiness_waker: std::task::Waker,
-    roles: Option<TaskPreparationRoles>,
+    preparation_capture: Option<TaskPreparationCapture>,
 }
 impl<'a> TaskPreparationContext<'a> {
     pub(crate) fn from_admitted(
         owner: Arc<dyn novarocks_execution::runtime::task_control::TaskExecutionPort>,
         children: &'a Arc<crate::task_preparation::TaskPreparationScope>,
         cadence: std::time::Duration,
-        roles: TaskPreparationRoles,
+        capture: TaskPreparationCapture,
         readiness_waker: std::task::Waker,
     ) -> Result<
         Self,
         (
             novarocks_execution::runtime::task_control::TaskControlIdentityMismatch,
-            TaskPreparationRoles,
+            TaskPreparationCapture,
         ),
     > {
-        if !roles.matches(owner.identity()) || children.identity() != owner.identity() {
+        if !capture.matches(owner.identity()) || children.identity() != owner.identity() {
             return Err((
                 novarocks_execution::runtime::task_control::TaskControlIdentityMismatch,
-                roles,
+                capture,
             ));
         }
         Ok(Self {
@@ -142,7 +142,7 @@ impl<'a> TaskPreparationContext<'a> {
             children,
             cadence,
             readiness_waker,
-            roles: Some(roles),
+            preparation_capture: Some(capture),
         })
     }
     #[cfg(test)]
@@ -181,20 +181,22 @@ impl<'a> TaskPreparationContext<'a> {
     }
     /// Move the complete original capture once, before the Native builder
     /// attaches any kernel or completion callback. An error returns no partial
-    /// set, and metadata views expose no role factory.
-    pub fn take_roles(&mut self) -> Result<TaskPreparationRoles, TaskPreparationRolesTaken> {
-        self.roles.take().ok_or(TaskPreparationRolesTaken)
+    /// set, and metadata views expose no capability factory.
+    pub fn take_capture(&mut self) -> Result<TaskPreparationCapture, TaskPreparationCaptureTaken> {
+        self.preparation_capture
+            .take()
+            .ok_or(TaskPreparationCaptureTaken)
     }
 }
 #[derive(Debug)]
-pub struct TaskPreparationRolesTaken;
-impl fmt::Display for TaskPreparationRolesTaken {
+pub struct TaskPreparationCaptureTaken;
+impl fmt::Display for TaskPreparationCaptureTaken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("the original Task preparation roles were already transferred")
+        f.write_str("the original Task preparation capture was already transferred")
     }
 }
-impl std::error::Error for TaskPreparationRolesTaken {}
-impl FailureProjection for TaskPreparationRolesTaken {
+impl std::error::Error for TaskPreparationCaptureTaken {}
+impl FailureProjection for TaskPreparationCaptureTaken {
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
         use novarocks_execution_contract::failure::{FailureClass, FailureFact};
         FailureFact::new(
@@ -247,10 +249,10 @@ impl<'a> PreparationControlLoan<'a> {
             _borrow: std::marker::PhantomData,
         }
     }
-    pub fn checkpoint(&self) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+    pub fn checkpoint(&self) -> novarocks_execution::runtime::task::ExecutionResult<()> {
         let Some(control) = &self.control else {
             return Err(
-                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+                novarocks_execution::runtime::task::ExecutionFailure::from_domain(
                     PreparationOwnerUnavailable,
                 ),
             );
@@ -258,14 +260,14 @@ impl<'a> PreparationControlLoan<'a> {
         if control.is_stopped() {
             // A successful conclusion is not permission to start new work.
             return Err(control.error().unwrap_or_else(|| {
-                novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+                novarocks_execution::runtime::task::ExecutionFailure::from_domain(
                     PreparationOwnerUnavailable,
                 )
             }));
         }
         Ok(())
     }
-    pub fn wait(&self) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+    pub fn wait(&self) -> novarocks_execution::runtime::task::ExecutionResult<()> {
         self.checkpoint()?;
         let control = self
             .control
@@ -277,7 +279,7 @@ impl<'a> PreparationControlLoan<'a> {
 }
 
 /// Pure preparation facts and the exact runtime owner created alongside them.
-/// The context's creation transaction takes the optional root atomically;
+/// The participation's creation transaction takes the optional root atomically;
 /// transport handles never enter the shared execution-contract vocabulary.
 pub struct PreparedTaskInstallation {
     facts: PreparedTaskFacts,
@@ -329,10 +331,10 @@ impl PreparedTaskInstallation {
 /// The shared facts one establish installs, handed over as a single unit.
 ///
 /// They are passed together because they become observable together: the
-/// context reaches `Active` only once all four are materialized, so a host
+/// participation reaches `Active` only once all four are materialized, so a host
 /// never publishes a catalog binding a query's credential cannot yet read.
 pub struct SharedFactsRequest<'a> {
-    context: QueryContextRef,
+    participation: ParticipationRef,
     catalog_binding: &'a Arc<dyn CodecOwnedContent>,
     initial_runtime_filter: &'a Arc<dyn CodecOwnedContent>,
     query_options: &'a Arc<dyn CodecOwnedContent>,
@@ -341,14 +343,14 @@ pub struct SharedFactsRequest<'a> {
 
 impl<'a> SharedFactsRequest<'a> {
     pub const fn new(
-        context: QueryContextRef,
+        participation: ParticipationRef,
         catalog_binding: &'a Arc<dyn CodecOwnedContent>,
         initial_runtime_filter: &'a Arc<dyn CodecOwnedContent>,
         query_options: &'a Arc<dyn CodecOwnedContent>,
         initial_credential: &'a CredentialUpdate,
     ) -> Self {
         Self {
-            context,
+            participation,
             catalog_binding,
             initial_runtime_filter,
             query_options,
@@ -356,8 +358,8 @@ impl<'a> SharedFactsRequest<'a> {
         }
     }
 
-    pub const fn context(&self) -> QueryContextRef {
-        self.context
+    pub const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
     pub const fn catalog_binding(&self) -> &'a Arc<dyn CodecOwnedContent> {
@@ -451,13 +453,13 @@ impl novarocks_execution_contract::failure::FailureProjection for TestUpdateCons
 /// A port refusal retaining its actual local domain source. The legacy
 /// category/detail are this operation's response projection, never a Task
 /// conclusion and never an authority that can reclassify the domain facts.
-/// The pure Context core accepts Task proposals with explicit scope and phase.
+/// The pure Participation core accepts Task proposals with explicit scope and phase.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostRejection {
     response_category: TaskFailureCategory,
     detail: SafeDetail,
     fact: novarocks_execution_contract::failure::FailureFact,
-    source: novarocks_execution::runtime::fragment::ExecutionFailure,
+    source: novarocks_execution::runtime::task::ExecutionFailure,
     closed_queue: bool,
 }
 impl HostRejection {
@@ -471,12 +473,12 @@ impl HostRejection {
     {
         Self::from_failure(
             category,
-            novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(source),
+            novarocks_execution::runtime::task::ExecutionFailure::from_domain(source),
         )
     }
     pub fn from_failure(
         category: TaskFailureCategory,
-        source: novarocks_execution::runtime::fragment::ExecutionFailure,
+        source: novarocks_execution::runtime::task::ExecutionFailure,
     ) -> Self {
         let fact = source.failure_fact();
         let detail = source.safe_detail_for_fact(fact);
@@ -502,7 +504,7 @@ impl HostRejection {
             + Sync
             + 'static,
     {
-        let source = novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(source);
+        let source = novarocks_execution::runtime::task::ExecutionFailure::from_domain(source);
         let fact = source.failure_fact();
         Self {
             response_category: category,
@@ -545,7 +547,7 @@ impl HostRejection {
     }
     /// Transfer the original execution carrier without rebuilding it from the
     /// response projection or retaining it in a neutral tombstone.
-    pub fn into_failure(self) -> novarocks_execution::runtime::fragment::ExecutionFailure {
+    pub fn into_failure(self) -> novarocks_execution::runtime::task::ExecutionFailure {
         self.source
     }
 }
@@ -609,27 +611,27 @@ impl fmt::Debug for FrozenCodecContent {
     }
 }
 
-/// The frozen terminal evidence one query-context release sealed.
+/// The frozen terminal evidence one participation release sealed.
 ///
 /// Worker retains only plain immutable codec facts after the host has exited.
 /// The producing role-local adapter validates the exact domain and decodes the
 /// original bytes for the matching release acknowledgement.
 #[derive(Clone)]
-pub struct ReleasedContextEvidence {
+pub struct ReleasedParticipationEvidence {
     runtime_filter: Option<FrozenCodecContent>,
     runtime_filter_observation: RuntimeFilterReleaseObservation,
 }
 
-impl Default for ReleasedContextEvidence {
+impl Default for ReleasedParticipationEvidence {
     fn default() -> Self {
         Self::none()
     }
 }
 
-impl fmt::Debug for ReleasedContextEvidence {
+impl fmt::Debug for ReleasedParticipationEvidence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ReleasedContextEvidence")
+            .debug_struct("ReleasedParticipationEvidence")
             .field(
                 "runtime_filter_fingerprint",
                 &self
@@ -652,7 +654,7 @@ impl fmt::Debug for ReleasedContextEvidence {
     }
 }
 
-impl ReleasedContextEvidence {
+impl ReleasedParticipationEvidence {
     /// Evidence from a tear-down that found no participant to seal.
     pub const fn none() -> Self {
         Self {
@@ -692,13 +694,13 @@ impl ReleasedContextEvidence {
     }
 }
 
-/// The query-context side of execution.
+/// The participation side of execution.
 ///
-/// `materialize` runs while the context is `Establishing`, outside the owner's
+/// `materialize` runs while the participation is `Establishing`, outside the owner's
 /// lock and already racing the sequence-zero lease. Whatever it installs must
 /// be undone by `release`, because an establish that loses that race rolls
 /// back rather than reaching `Active` late.
-pub trait QueryContextHost: Send + Sync {
+pub trait ParticipationHost: Send + Sync {
     fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection>;
 
     /// Undoes everything `materialize` installed. Called for a rollback and
@@ -709,44 +711,44 @@ pub trait QueryContextHost: Send + Sync {
     /// local task is a terminal record and nothing further will be observed --
     /// so the seal happens here and its result is handed back rather than left
     /// inside the host for a later reader to go looking for.
-    fn release(&self, context: QueryContextRef) -> ReleasedContextEvidence;
+    fn release(&self, participation: ParticipationRef) -> ReleasedParticipationEvidence;
 
     /// Applies a shared-domain advance the owner already classified as
     /// applicable.
     fn advance_shared_domain(
         &self,
-        context: QueryContextRef,
-        domain: &novarocks_execution_contract::task_execution::operation::QueryContextDomainUpdate,
+        participation: ParticipationRef,
+        domain: &novarocks_execution_contract::task_execution::operation::ParticipationDomainUpdate,
     ) -> Result<(), HostRejection>;
 }
 
 /// Allocates one actual host instance inside an admitted materialization job.
-/// The caller publishes the returned capability to its Context owner before
+/// The caller publishes the returned capability to its Participation owner before
 /// invoking materialization. Release and updates must use that same capability.
-/// Allocation does not establish the Context or publish a protocol result.
+/// Allocation does not establish the Participation or publish a protocol result.
 /// The factory allocates metadata only; I/O belongs to `materialize`. An error
 /// must leave no new unpublished instance behind.
-pub trait QueryContextHostFactory: Send + Sync {
+pub trait ParticipationHostFactory: Send + Sync {
     fn create_instance(
         self: Arc<Self>,
-        context: QueryContextRef,
-    ) -> Result<Arc<dyn QueryContextHostInstance>, HostRejection>;
+        participation: ParticipationRef,
+    ) -> Result<Arc<dyn ParticipationHostInstance>, HostRejection>;
 }
 
-/// The host resources of one Context incarnation. No operation resolves a
-/// Context key again: a delayed job retains its original instance, never a
+/// The host resources of one Participation incarnation. No operation resolves a
+/// Participation key again: a delayed job retains its original instance, never a
 /// later occupant of the directory. The owning scope must retain this
 /// capability until all admitted calls and their reports have actually exited.
-pub trait QueryContextHostInstance: Send + Sync {
-    fn context(&self) -> QueryContextRef;
+pub trait ParticipationHostInstance: Send + Sync {
+    fn participation(&self) -> ParticipationRef;
 
     fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection>;
 
-    fn release(&self) -> ReleasedContextEvidence;
+    fn release(&self) -> ReleasedParticipationEvidence;
 
     fn advance_shared_domain(
         &self,
-        domain: &novarocks_execution_contract::task_execution::operation::QueryContextDomainUpdate,
+        domain: &novarocks_execution_contract::task_execution::operation::ParticipationDomainUpdate,
     ) -> Result<(), HostRejection>;
 }
 
@@ -763,7 +765,7 @@ pub trait RunnableTask: fmt::Debug + Send + Sync {
 
     fn cancel(&self, reason: CancelReason);
 
-    /// Stop normally after the context admission fence while retaining
+    /// Stop normally after the participation admission fence while retaining
     /// already published root results and write evidence until release.
     fn quiesce(&self) {
         self.cancel(CancelReason::UpstreamNoLongerNeeded);
@@ -797,25 +799,25 @@ pub enum TaskIngressRetirement {
 
 pub trait TaskExecutionHost: Send + Sync {
     /// Closes data-plane admission for every task of this exact query
-    /// execution. The registry calls this while it linearizes context
+    /// execution. The registry calls this while it linearizes participation
     /// termination, before any per-task capability can be withdrawn.
-    fn close_context_admission(&self, context: QueryContextRef);
+    fn close_participation_admission(&self, participation: ParticipationRef);
 
     /// An abort revokes any earlier normal-close answers for this execution.
-    fn abort_context_admission(&self, context: QueryContextRef) {
-        self.close_context_admission(context);
+    fn abort_participation_admission(&self, participation: ParticipationRef) {
+        self.close_participation_admission(participation);
     }
     /// Releases an idle execution context after every task has physically
     /// converged and no new task can be admitted for this exact attempt.
-    fn retire_context_execution(&self, context: QueryContextRef);
+    fn retire_participation_execution(&self, participation: ParticipationRef);
 
-    /// Reclaims the compact context fence after the registry has forgotten
-    /// the context itself. No task capability for the execution may remain.
-    fn forget_context_admission(&self, context: QueryContextRef);
+    /// Reclaims the compact participation fence after the registry has forgotten
+    /// the participation itself. No task capability for the execution may remain.
+    fn forget_participation_admission(&self, participation: ParticipationRef);
 
-    /// Whether this context retains exact normal-close facts until its
+    /// Whether this participation retains exact normal-close facts until its
     /// request horizon. This observation grants no resource capacity.
-    fn retains_normal_close(&self, _context: QueryContextRef) -> bool {
+    fn retains_normal_close(&self, _participation: ParticipationRef) -> bool {
         false
     }
 
@@ -980,7 +982,7 @@ mod operation_failure_snapshot_tests {
     }
     #[test]
     fn frozen_operation_snapshot_never_reprojects_the_original_source() {
-        use novarocks_execution::runtime::fragment::{ExecutionFailure, PipelineOperation};
+        use novarocks_execution::runtime::task::{ExecutionFailure, PipelineOperation};
         let nz = |n| std::num::NonZeroU16::new(n).unwrap();
         let first = FailureFact::new(
             FailureClass::Representation,
@@ -1007,7 +1009,7 @@ mod operation_failure_snapshot_tests {
                 HostRejection::from_domain_with_detail(
                     TaskFailureCategory::Protocol,
                     cause,
-                    SafeDetail::new("producer checked context").unwrap(),
+                    SafeDetail::new("producer checked participation").unwrap(),
                 )
             } else {
                 HostRejection::from_failure(
@@ -1021,7 +1023,7 @@ mod operation_failure_snapshot_tests {
                 "both actual constructors freeze exactly one fact"
             );
             let expected_detail = if explicit_detail {
-                "producer checked context"
+                "producer checked participation"
             } else {
                 "Representation failure (reason 65534:65001) at operator 7 during Push at batch row 19 (selected ordinal 0)"
             };
@@ -1087,7 +1089,7 @@ mod operation_failure_snapshot_tests {
             representable_prefix: Some(0),
         });
         let source =
-            novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(ActualDomain {
+            novarocks_execution::runtime::task::ExecutionFailure::from_domain(ActualDomain {
                 fact,
                 drops: drops.clone(),
             });

@@ -303,9 +303,9 @@ pub struct QueryMeta {
     /// Kill and restart FE after an MV lake publication is known committed but
     /// before the Accelerator projector can CAS its local projection.
     pub kill_fe_after_mv_known_committed_before_projector_cas: bool,
-    /// Replace one BE process after its task-protocol `EstablishQueryContext`
+    /// Replace one BE process after its task-protocol `EstablishParticipation`
     /// has been applied.
-    pub restart_be_after_establish_context_index: Option<usize>,
+    pub restart_be_after_establish_participation_index: Option<usize>,
     /// Execute KILL QUERY after a new matching line is observed in a runner-owned BE log.
     pub cancel_query_after_be_log_contains: Option<String>,
     /// Kill one BE after a new matching line is observed in a runner-owned BE
@@ -338,7 +338,6 @@ pub struct QueryMeta {
     /// Kill one BE only after FE has retained an immutable participant outcome
     /// for the requested lifecycle phase.
     pub kill_be_at_lifecycle_phase: Option<KillBeAtLifecyclePhaseDirective>,
-    pub query_control_fragment_backend_limit: Option<usize>,
     /// Before this step, resolve a REST-catalog table and write one real,
     /// deliberately unreferenced MinIO object below its data directory.
     pub iceberg_orphan_fixture: Option<String>,

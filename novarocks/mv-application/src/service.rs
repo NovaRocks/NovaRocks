@@ -22,7 +22,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use crate::activity::{
-    MvActivityAdmissionError, MvActivityGate, MvActivityLease, MvActivityOwner, MvActivityTicket,
+    MvActivityAdmissionError, MvActivityGate, MvActivityOwner, MvActivityPermit, MvActivityTicket,
 };
 use crate::ports::{
     MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvProviderFailure,
@@ -37,7 +37,7 @@ use crate::product::{
     MvProductResult, MvRefreshAttemptIdentity, MvStagedTarget, MvTarget,
 };
 use crate::publication::MvRefreshPublicationFinalizationFacts;
-use crate::readiness::{MvDropReadiness, MvKeyedReadinessService, MvRuntimePublicationLease};
+use crate::readiness::{MvDropReadiness, MvKeyedReadinessService, MvPublicationPermit};
 use crate::repository::{MvRepositoryError, MvRepositoryErrorKind};
 use crate::scheduler::{MvRefreshScheduler, MvSchedulerConfig};
 
@@ -73,7 +73,7 @@ pub struct MvProductOperations {
 pub struct MvRefreshTransition {
     target: MvTarget,
     attempt: MvRefreshAttemptIdentity,
-    publication: Option<MvRuntimePublicationLease>,
+    publication: Option<MvPublicationPermit>,
     phase: RefreshPhase,
     result: Option<Result<MvProductResult, MvProductError>>,
 }
@@ -201,7 +201,7 @@ impl MvProductOperations {
         &self,
         target: &MvTarget,
         attempt: &MvRefreshAttemptIdentity,
-    ) -> Result<MvRuntimePublicationLease, MvProductError> {
+    ) -> Result<MvPublicationPermit, MvProductError> {
         let readiness = self.readiness.as_ref().ok_or_else(|| {
             MvProductError::new(
                 MvProductErrorKind::Unavailable,
@@ -329,7 +329,7 @@ impl MvProductOperations {
         target: MvTarget,
         owner: MvActivityOwner,
         cancelled: impl Fn() -> bool,
-    ) -> Result<MvActivityLease, MvActivityAdmissionError> {
+    ) -> Result<MvActivityPermit, MvActivityAdmissionError> {
         self.activity_gate
             .acquire_foreground(target, owner, cancelled)
     }
@@ -341,7 +341,7 @@ impl MvProductOperations {
         target: MvTarget,
         owner: MvActivityOwner,
         cancelled: impl std::future::Future<Output = ()>,
-    ) -> Result<MvActivityLease, MvActivityAdmissionError> {
+    ) -> Result<MvActivityPermit, MvActivityAdmissionError> {
         self.activity_gate
             .acquire_foreground_async(target, owner, cancelled)
             .await

@@ -917,7 +917,7 @@ mod lifecycle_tests {
     use crate::{CaseStatus, PreparedSuite, SuiteRunContext};
     use std::sync::atomic::AtomicBool;
     struct NoServer;
-    impl crate::cluster::ServerHandle for NoServer {
+    impl crate::cluster::TestClusterOwner for NoServer {
         fn target_host(&self) -> Option<&str> {
             None
         }
@@ -998,7 +998,7 @@ mod lifecycle_tests {
             target_session_sql: vec![],
             rewrite_explain_contains_as_not_contains: vec![],
             fail_fast: false,
-            server_handle: Arc::new(Mutex::new(Box::new(NoServer))),
+            cluster_owner: Arc::new(Mutex::new(Box::new(NoServer))),
             failure_artifacts: artifacts,
             publication_catalog_control: None,
             publication_service_control: None,

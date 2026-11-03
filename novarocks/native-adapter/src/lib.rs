@@ -50,9 +50,6 @@ pub mod descriptor_snapshot;
 pub mod exchange_data_plane;
 mod exchange_grant_subscription;
 pub mod exchange_transmitter;
-pub mod fragment_instance;
-pub mod fragment_result_writer;
-pub mod fragment_submission;
 pub mod management_http;
 mod native_channel_cache;
 mod native_channel_identity;
@@ -71,18 +68,22 @@ pub mod root_scalar_container_codec;
 pub mod root_scalar_leaf_codec;
 pub mod root_statistics_codec;
 pub mod root_write_commit_codec;
+pub mod task_instance;
+pub mod task_result_writer;
+pub mod task_submission;
 pub use native_client::NativeRpcClient;
 pub mod native_codec;
-pub mod native_fragment_query;
-#[cfg(test)]
-mod native_fragment_query_tests;
 pub mod native_ingress;
+pub mod native_query_context;
+#[cfg(test)]
+mod native_query_context_tests;
 pub mod native_server;
 pub mod native_transport_admission;
 pub mod native_transport_geometry;
 pub(crate) mod native_type_construction;
 pub(crate) mod native_type_decode;
-pub use native_server::NativeRpcServerHandle;
+pub use native_server::NativeRpcListener;
+pub mod established_query_options;
 pub mod query_options;
 pub mod runtime_filter_feedback;
 pub mod runtime_filter_ingress;
@@ -100,7 +101,6 @@ pub mod task_execution_observation;
 pub mod task_protocol;
 #[cfg(novarocks_dev_controls)]
 pub mod task_protocol_fault;
-pub mod task_query_context_options;
 pub mod task_result_diagnostics;
 pub mod task_shared_facts;
 #[cfg(any(test, novarocks_dev_controls))]
@@ -242,7 +242,7 @@ impl FrontendTaskTransportBudget {
         max_query_backend_queued_bytes: usize,
         max_backend_queued_operations: usize,
         max_backend_queued_bytes: usize,
-        max_tasks_per_context: usize,
+        max_tasks_per_participation: usize,
         max_active_tasks_per_backend: usize,
         frontend_queue_residence: Duration,
     ) -> Option<Self> {
@@ -254,7 +254,7 @@ impl FrontendTaskTransportBudget {
             max_query_backend_queued_bytes,
             max_backend_queued_operations,
             max_backend_queued_bytes,
-            max_tasks_per_context,
+            max_tasks_per_participation,
             max_active_tasks_per_backend,
             frontend_queue_residence,
         )
@@ -289,8 +289,8 @@ impl FrontendTaskTransportBudget {
         self.0.max_backend_queued_bytes()
     }
 
-    pub const fn max_tasks_per_context(self) -> usize {
-        self.0.max_tasks_per_context()
+    pub const fn max_tasks_per_participation(self) -> usize {
+        self.0.max_tasks_per_participation()
     }
 
     pub const fn max_active_tasks_per_backend(self) -> usize {
@@ -405,7 +405,7 @@ mod tests {
         assert_eq!(budget.max_query_backend_queued_bytes(), 4096);
         assert_eq!(budget.max_backend_queued_operations(), 4);
         assert_eq!(budget.max_backend_queued_bytes(), 4096);
-        assert_eq!(budget.max_tasks_per_context(), 1);
+        assert_eq!(budget.max_tasks_per_participation(), 1);
         assert_eq!(budget.max_active_tasks_per_backend(), 2);
         assert_eq!(budget.frontend_queue_residence(), Duration::from_secs(1));
         assert_eq!(budget.into_codec().max_batch_items(), 2);

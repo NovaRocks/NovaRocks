@@ -164,7 +164,7 @@ impl RuntimeBitsetFilter {
     pub fn merge_from(
         &mut self,
         other: &RuntimeBitsetFilter,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         if self.filter_id != other.filter_id || self.ltype != other.ltype {
             return Err(crate::exec::runtime_filter::failure::contract(
                 "runtime bitset filter metadata mismatch",
@@ -193,7 +193,7 @@ impl RuntimeBitsetFilter {
     pub fn filter_chunk(
         &self,
         chunk: Chunk,
-    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Option<Chunk>, crate::runtime::task::ExecutionFailure> {
         if self.is_empty() {
             return Ok(Some(chunk));
         }
@@ -226,7 +226,7 @@ impl RuntimeBitsetFilter {
         &self,
         array: &ArrayRef,
         chunk: Chunk,
-    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<Option<Chunk>, crate::runtime::task::ExecutionFailure> {
         if self.is_empty() {
             return Ok(Some(chunk));
         }
@@ -260,7 +260,7 @@ impl RuntimeBitsetFilter {
         &self,
         array: &ArrayRef,
         keep: &mut [bool],
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         if self.is_empty() {
             return Ok(());
         }
@@ -276,7 +276,7 @@ pub fn maybe_build_runtime_bitset_filter(
     size: u64,
     arrays: &[ArrayRef],
     min_max: RuntimeMinMaxFilter,
-) -> Result<Option<RuntimeBitsetFilter>, crate::runtime::fragment::ExecutionFailure> {
+) -> Result<Option<RuntimeBitsetFilter>, crate::runtime::task::ExecutionFailure> {
     if arrays.is_empty() || size == 0 {
         return Ok(None);
     }
@@ -350,7 +350,7 @@ fn is_decimal_bitset_ltype(ltype: &RuntimeFilterType) -> bool {
 fn decimal_value_for_bitset(
     arr: &Decimal128Array,
     index: usize,
-) -> Result<i64, crate::runtime::fragment::ExecutionFailure> {
+) -> Result<i64, crate::runtime::task::ExecutionFailure> {
     let value = arr.value(index);
     i64::try_from(value).map_err(|source| {
         crate::exec::runtime_filter::failure::narrow("bitset decimal i64", value, source)
@@ -368,7 +368,7 @@ fn should_use_bitset(bitset_memory_usage: usize, bloom_memory_usage: usize) -> b
 fn scan_bitset_build_stats(
     ltype: &RuntimeFilterType,
     arrays: &[ArrayRef],
-) -> Result<Option<(bool, i64, i64)>, crate::runtime::fragment::ExecutionFailure> {
+) -> Result<Option<(bool, i64, i64)>, crate::runtime::task::ExecutionFailure> {
     let mut has_null = false;
     let mut has_value = false;
     let mut min_value = i64::MAX;
@@ -516,7 +516,7 @@ fn fill_bitset_from_arrays(
     min_value: i64,
     max_value: i64,
     bitset: &mut [u8],
-) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+) -> Result<(), crate::runtime::task::ExecutionFailure> {
     let mut set_value = |value: i64| {
         if value < min_value || value > max_value {
             return;
@@ -652,7 +652,7 @@ fn apply_bitset_filter(
     has_null: bool,
     array: ArrayRef,
     keep: &mut [bool],
-) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+) -> Result<(), crate::runtime::task::ExecutionFailure> {
     let len = array.len();
     if keep.len() != len {
         return Err(crate::exec::runtime_filter::failure::contract(

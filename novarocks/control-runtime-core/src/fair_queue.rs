@@ -27,7 +27,7 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FairQueueError {
     Full,
-    ContextFull,
+    GroupFull,
     DuplicateWork,
     UnknownWork,
     WrongRunningWork,
@@ -121,10 +121,10 @@ impl<G: Copy + Ord + Debug, W: Copy + Ord + Debug> FairWorkQueue<G, W> {
         }
         if let Some(queue) = self.groups.get(&group) {
             if queue.queued + usize::from(queue.running.is_some()) >= self.per_group {
-                return Err(FairQueueError::ContextFull);
+                return Err(FairQueueError::GroupFull);
             }
         } else if self.per_group == 0 {
-            return Err(FairQueueError::ContextFull);
+            return Err(FairQueueError::GroupFull);
         }
         let ready = self
             .groups

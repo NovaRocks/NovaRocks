@@ -46,7 +46,7 @@ INSERT INTO ${case_db}.sqlx1_timeout_cleanup VALUES (3, 3);
 -- @expect_sql_code=query.execution.deadline_exceeded
 -- @expect_sql_phase=Execution
 -- @expect_error=[query.execution.deadline_exceeded]
--- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED,3
+-- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ABORT_APPLIED,3
 SET query_timeout = 1;
 SELECT COUNT(*)
 FROM ${case_db}.sqlx1_timeout_cleanup

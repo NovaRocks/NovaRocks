@@ -27,8 +27,8 @@ use novarocks_control_runtime_core::{
 struct Fixture {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
-    parent: WorkLease,
-    payer: Option<ReservationBundle>,
+    parent: WorkObligation,
+    payer: Option<ReservationObligation>,
 }
 impl Fixture {
     fn new(headers: usize, completions: usize, captures: usize) -> Self {

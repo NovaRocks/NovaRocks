@@ -28,10 +28,11 @@ use crate::{
 use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
 use novarocks_task_codec::TransportBudget;
 use novarocks_worker::{
-    LeaseBounds, METRIC_PUBLISH_MIN_INTERVAL, NODE_CONTEXT_STEP_BUDGET, NODE_CONTROL_STEP_BUDGET,
-    NodeAdmissionTicketConfig, NodeContextCoreConfig, NodeControlConfig, NodeGeometry,
-    NodeGeometryError, NodeGeometryInputs, NodeWorkers, RequestHorizon, TaskPreparationLimits,
-    control_runtime_policy::{ControlRuntimePolicy, IngressRoleLimits, PolicyError},
+    LeaseBounds, METRIC_PUBLISH_MIN_INTERVAL, NODE_CONTROL_STEP_BUDGET,
+    NODE_PARTICIPATION_STEP_BUDGET, NodeAdmissionTicketConfig, NodeControlConfig, NodeGeometry,
+    NodeGeometryError, NodeGeometryInputs, NodeParticipationCoreConfig, NodeWorkers,
+    RequestHorizon, TaskPreparationLimits,
+    control_runtime_policy::{ControlRuntimePolicy, IngressPositionLimits, PolicyError},
 };
 use std::{fmt, num::NonZeroUsize, time::Duration};
 
@@ -60,7 +61,7 @@ impl fmt::Display for WorkerNodeConfigError {
 /// No placeholder bootstrap or second production owner is manufactured here.
 pub(super) struct ResolvedWorkerNodeConfig {
     pub control: NodeControlConfig,
-    pub context: NodeContextCoreConfig,
+    pub participation: NodeParticipationCoreConfig,
     pub tickets: NodeAdmissionTicketConfig,
     pub geometry: NodeGeometry,
     pub workers: NodeWorkers,
@@ -77,7 +78,7 @@ impl ResolvedWorkerNodeConfig {
         workers: NodeWorkers,
     ) -> Result<Self, WorkerNodeConfigError> {
         let transport = TransportBudget::DEFAULT;
-        let tasks = NonZeroUsize::new(transport.max_tasks_per_context()).ok_or(
+        let tasks = NonZeroUsize::new(transport.max_tasks_per_participation()).ok_or(
             WorkerNodeConfigError::Invalid("Native Task bound must be positive"),
         )?;
         let active = NonZeroUsize::new(transport.max_active_tasks_per_backend()).ok_or(
@@ -88,9 +89,9 @@ impl ResolvedWorkerNodeConfig {
                 "Node preparation workers differ from the configured preparation owner",
             ));
         }
-        if preparation.per_context() > tasks.get() {
+        if preparation.per_participation() > tasks.get() {
             return Err(WorkerNodeConfigError::Invalid(
-                "per-Context preparation positions exceed the actual Native Task bound",
+                "per-Participation preparation positions exceed the actual Native Task bound",
             ));
         }
         let profile = NativeResultSupportGeometry::V1;
@@ -112,7 +113,7 @@ impl ResolvedWorkerNodeConfig {
             incoming_lane_stream_limit(TransportRole::Backend, NativeLane::Observation, &profile)
                 .map_err(WorkerNodeConfigError::RootIngress)?;
         let policy = ControlRuntimePolicy::try_new_with_request_sources(
-            IngressRoleLimits {
+            IngressPositionLimits {
                 ordinary_running: native.ordinary_running,
                 ordinary_waiting: native.ordinary_waiting,
                 control_running: native.control_running,
@@ -126,7 +127,7 @@ impl ResolvedWorkerNodeConfig {
         .map_err(WorkerNodeConfigError::Policy)?;
         let tickets = NodeAdmissionTicketConfig::DEFAULT;
         let geometry = NodeGeometry::try_new(NodeGeometryInputs {
-            tasks_per_context: tasks,
+            tasks_per_participation: tasks,
             active_tasks: active,
             preparing_tasks: NonZeroUsize::new(preparation.tasks()).ok_or(
                 WorkerNodeConfigError::Invalid("preparation Task positions must be positive"),
@@ -143,22 +144,22 @@ impl ResolvedWorkerNodeConfig {
             max_pending_requests: request_positions,
             step_budget: NODE_CONTROL_STEP_BUDGET,
         };
-        let context = NodeContextCoreConfig {
+        let participation = NodeParticipationCoreConfig {
             request_horizon: RequestHorizon::DEFAULT,
             max_tasks: tasks.get(),
             max_creation_waiters: request_positions,
             max_pending_requests: request_positions,
-            max_preparing: preparation.per_context(),
+            max_preparing: preparation.per_participation(),
             max_task_bytes: u64::try_from(preparation.bytes()).map_err(|_| {
                 WorkerNodeConfigError::Invalid("preparation bytes do not fit the protocol width")
             })?,
-            step_budget: NODE_CONTEXT_STEP_BUDGET,
+            step_budget: NODE_PARTICIPATION_STEP_BUDGET,
             lease_bounds: LeaseBounds::DEFAULT,
             metric_publish_interval: METRIC_PUBLISH_MIN_INTERVAL,
         };
         Ok(Self {
             control,
-            context,
+            participation,
             tickets,
             geometry,
             workers,

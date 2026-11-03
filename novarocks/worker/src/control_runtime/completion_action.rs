@@ -23,13 +23,13 @@ use super::{
     causal_input::{CausalInputBinding, CausalInputCustody, InputAuthor},
 };
 use crate::{
-    task_completion_roles::AdmittedCompletionRole,
+    task_completion_set::AdmittedCompletionTransfer,
     task_lifecycle::{CompletionExitCapability, CompletionExitNotice},
     task_port::TaskPendingNotice,
 };
 use novarocks_execution::runtime::execution_health::ExecutionHealth;
 use novarocks_execution_contract::TaskIdentity;
-use novarocks_worker_protocol::{context::ContextInput, proposal_summary::CutId};
+use novarocks_worker_protocol::{participation::ParticipationInput, proposal_summary::CutId};
 use std::{ops::Deref, sync::Arc};
 
 #[derive(Clone)]
@@ -44,7 +44,7 @@ impl Deref for CompletionActionCustody {
 impl CompletionActionCustody {
     pub(crate) fn from_admitted(
         task: TaskIdentity,
-        admitted: AdmittedCompletionRole,
+        admitted: AdmittedCompletionTransfer,
         inbox: &mut TaskCausalInbox,
         cut: CutId,
         sender: TaskCausalSender,
@@ -67,7 +67,7 @@ impl CompletionActionCustody {
             },
         );
         let notice =
-            CompletionExitNotice::from_admitted_role(task, Box::new(Exit { task, author }));
+            CompletionExitNotice::from_admitted_capability(task, Box::new(Exit { task, author }));
         (Self(original), notice)
     }
 }
@@ -78,7 +78,7 @@ struct Exit {
 impl CompletionExitCapability for Exit {
     fn exited(self: Box<Self>) {
         let Self { task, author } = *self;
-        let _reported = author.publish(ContextInput::CompletionExited { task });
+        let _reported = author.publish(ParticipationInput::CompletionExited { task });
     }
     fn withdrawn(self: Box<Self>) {
         let _reported = self.author.withdraw();

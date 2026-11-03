@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 /// The preflight facts remain available for the original read-back stage.
 /// They do not become an authorization for another operation.
-pub(crate) struct LeasedScalarOutput {
+pub(crate) struct RetainedScalarOutput {
     pub(crate) values: ArrayRef,
     pub(crate) resources: ScalarOutputResources,
     pub(crate) original_carrier_stock: usize,
@@ -41,7 +41,7 @@ pub(crate) fn with_scalar_output_operation(
     allocator: &HostAggregateAllocator,
     work: &mut EvaluationCheckpoints<'_>,
     compute: impl FnOnce(&mut ScalarWork<'_, '_>) -> Result<ArrayRef, KernelFailure>,
-) -> Result<LeasedScalarOutput, KernelFailure> {
+) -> Result<RetainedScalarOutput, KernelFailure> {
     let bytes = resources.operation_upper_bound()?;
     let charge = OpaqueRetainedCharge::try_new(host)?;
     work.flush()?;
@@ -51,7 +51,7 @@ pub(crate) fn with_scalar_output_operation(
     work.flush()?;
     let values = compute(&mut ScalarWork::new(Some(work)))?;
     let values = retain_result_backing(values, charge, &mut reservation, allocator.clone(), work)?;
-    Ok(LeasedScalarOutput {
+    Ok(RetainedScalarOutput {
         values: values.values,
         resources,
         original_carrier_stock: values.original_carrier_stock,

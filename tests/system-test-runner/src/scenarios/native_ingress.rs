@@ -27,7 +27,7 @@ use bytes::Bytes;
 use h2::client;
 use http::{Request, header};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_native_trust::NativeEndpointConnector;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_types::BackendProcessId;
@@ -56,7 +56,7 @@ use super::native_direct_controls::{
 
 use super::native_compatibility::{
     RawUnaryConnection, RawUnaryResponse, authorization_header, raw_acquire_admission_ticket,
-    raw_establish, raw_operation_envelope, raw_query_context, raw_unary_response,
+    raw_establish, raw_operation_envelope, raw_participation, raw_unary_response,
     raw_unary_response_until,
 };
 
@@ -263,7 +263,7 @@ impl Scenario for QueryMessageBounds {
             .admission_epoch_capability
             .context("heartbeat omitted admission epoch")?;
         let binary =
-            raw_acquire_admission_ticket(raw_query_context(backend), compatibility_id, epoch);
+            raw_acquire_admission_ticket(raw_participation(backend), compatibility_id, epoch);
         for (size, accepted) in [(ORDINARY_BATCH_MAX, true), (ORDINARY_BATCH_MAX + 1, false)] {
             let request = pad_ordinary(binary.clone(), size)?;
             let response: RawUnaryResponse<proto::ApplyTaskOperationsResponse> =
@@ -304,7 +304,7 @@ impl Scenario for QueryMessageBounds {
             control: Some(proto::task_control_operation::Control::CancelTask(
                 proto::CancelTaskRequest {
                     identity: Some(proto::TaskIdentity {
-                        query_execution_id: raw_query_context(backend).query_execution_id,
+                        query_execution_id: raw_participation(backend).query_execution_id,
                         stage_id: 1,
                         task_id: 1,
                         backend_process_id: Some(proto::BackendProcessId {
@@ -605,7 +605,7 @@ impl Scenario for BlockingSaturationControl {
             "Native ingress deadline changed after freeze"
         );
         // Positively observe the initial real owner inventory; do not assume
-        // that a freshly launched process has no active Context custody.
+        // that a freshly launched process has no active Participation custody.
         wait_execution_custody(context, 0.0)?;
         let operations = held_operations(
             &intent,
@@ -624,27 +624,27 @@ impl Scenario for BlockingSaturationControl {
         let releasable_query = intent
             .queries
             .get(8)
-            .context("missing declared control Context")?;
-        let (releasable, _) = establish_declared_context(
+            .context("missing declared control Participation")?;
+        let (releasable, _) = establish_declared_participation(
             &connector,
             &control_connector,
             &authorization,
             backend,
             compatibility_id,
-            (releasable_query.context(backend), None),
+            (releasable_query.participation(backend), None),
             context.deadline(),
         )?;
         let expiring_query = intent
             .queries
             .get(9)
-            .context("missing declared timer Context")?;
-        let (expiring, expiring_lease) = establish_declared_context(
+            .context("missing declared timer Participation")?;
+        let (expiring, expiring_lease) = establish_declared_participation(
             &connector,
             &control_connector,
             &authorization,
             backend,
             compatibility_id,
-            (expiring_query.context(backend), Some(1_000)),
+            (expiring_query.participation(backend), Some(1_000)),
             context.deadline(),
         )?;
         let before_expiry = wait_execution_custody(context, 2.0)?;
@@ -678,7 +678,7 @@ impl Scenario for BlockingSaturationControl {
             context.action("ninth ordinary request visibly waited at Native gate");
 
             // Management sampling cannot deliver a Worker input to this
-            // Context. Its actual execution Scope must disappear BEFORE a
+            // Participation. Its actual execution Scope must disappear BEFORE a
             // typed RPC probe could itself observe time and expire the lease.
             let after_expiry = wait_execution_custody(context, 1.0)?;
             ensure!(
@@ -706,13 +706,13 @@ impl Scenario for BlockingSaturationControl {
                 operations: vec![proto::TaskControlOperation {
                     envelope: Some(raw_operation_envelope(15_000)),
                     control: Some(proto::task_control_operation::Control::RenewLease(
-                        proto::RenewQueryExecutionLeaseRequest {
-                            query_context: Some(expiring.clone()),
-                            lease: Some(proto::QueryExecutionLeaseGrant {
+                        proto::RenewParticipationLeaseRequest {
+                            participation: Some(expiring.clone()),
+                            lease: Some(proto::ParticipationLeaseGrant {
                                 sequence: expiring_lease
                                     .sequence
                                     .checked_add(1)
-                                    .context("timer Context lease sequence overflow")?,
+                                    .context("timer Participation lease sequence overflow")?,
                                 valid_for_millis: expiring_lease.requested_valid_for_millis,
                             }),
                         },
@@ -734,37 +734,39 @@ impl Scenario for BlockingSaturationControl {
                 )?,
                 &probe_id,
                 proto::TaskOperationOutcome::LeaseExpired,
-                "original timer Context",
+                "original timer Participation",
             )?;
-            let Some(proto::task_operation_verdict::Ack::QueryContext(ack)) =
+            let Some(proto::task_operation_verdict::Ack::Participation(ack)) =
                 &receipt_verdict(&timer)?.ack
             else {
-                anyhow::bail!("timer Context omitted its typed Context receipt");
+                anyhow::bail!("timer Participation omitted its typed Participation receipt");
             };
             ensure!(
-                ack.query_context.as_ref() == Some(&expiring)
+                ack.participation.as_ref() == Some(&expiring)
                     && matches!(
-                        proto::QueryContextState::try_from(ack.state),
-                        Ok(proto::QueryContextState::Aborting
-                            | proto::QueryContextState::TerminalRetained)
+                        proto::ParticipationState::try_from(ack.state),
+                        Ok(proto::ParticipationState::Aborting
+                            | proto::ParticipationState::TerminalRetained)
                     ),
-                "the already-retired timer Context changed identity/state: {ack:?}"
+                "the already-retired timer Participation changed identity/state: {ack:?}"
             );
             fs::write(
                 context
                     .scenario_root()
                     .join("ordinary-full-original-timer.json"),
-                serde_json::to_vec_pretty(&serde_json::json!({"context":format!("{expiring:?}"),
+                serde_json::to_vec_pretty(
+                    &serde_json::json!({"participation":format!("{expiring:?}"),
                     "initial_sequence":expiring_lease.sequence,
                     "requested_valid_for_millis":expiring_lease.requested_valid_for_millis,
                     "effective_valid_for_millis":expiring_lease.effective_valid_for_millis,
                     "before_probe_execution_custody":after_expiry,
                     "before_expiry_execution_custody":before_expiry,
-                    "outcome":"LeaseExpired"}))?,
+                    "outcome":"LeaseExpired"}),
+                )?,
             )?;
-            context.action("the original short-lease Context's actual execution custody fell from two to one while all eight ordinary permits remained held, before any Worker probe; its exact later control receipt confirmed LeaseExpired");
+            context.action("the original short-lease Participation's actual execution custody fell from two to one while all eight ordinary permits remained held, before any Worker probe; its exact later control receipt confirmed LeaseExpired");
 
-            // No task was created in this context. A typed Worker refusal proves
+            // No task was created in this participation. A typed Worker refusal proves
             // control-lane progress without claiming that a real task was canceled.
             let cancel_request = control_cancel(backend);
             let cancel_id = cancel_request.operations[0]
@@ -815,17 +817,17 @@ impl Scenario for BlockingSaturationControl {
                 proto::TaskOperationOutcome::Accepted,
                 "Quiesce",
             )?;
-            let Some(proto::task_operation_verdict::Ack::QuiesceQueryContext(ack)) =
+            let Some(proto::task_operation_verdict::Ack::QuiesceParticipation(ack)) =
                 &receipt_verdict(&receipt)?.ack
             else {
                 anyhow::bail!("Quiesce control omitted its typed acknowledgement: {receipt:?}");
             };
             ensure!(
-                ack.query_context.as_ref() == Some(&releasable)
+                ack.participation.as_ref() == Some(&releasable)
                     && ack.fence_version == 1
                     && ack.accepted_tasks.is_empty()
-                    && proto::QueryContextState::try_from(ack.state)
-                        == Ok(proto::QueryContextState::Quiescing),
+                    && proto::ParticipationState::try_from(ack.state)
+                        == Ok(proto::ParticipationState::Quiescing),
                 "task-free Quiesce did not freeze the exact empty accepted-task set: {ack:?}"
             );
             context.action("Quiesce installed fence version one with an empty accepted-task set under ordinary saturation");
@@ -849,22 +851,22 @@ impl Scenario for BlockingSaturationControl {
                 proto::TaskOperationOutcome::Accepted,
                 "Release",
             )?;
-            let Some(proto::task_operation_verdict::Ack::ReleaseQueryContext(ack)) =
+            let Some(proto::task_operation_verdict::Ack::ReleaseParticipation(ack)) =
                 &receipt_verdict(&receipt)?.ack
             else {
                 anyhow::bail!("Release control omitted its typed acknowledgement: {receipt:?}");
             };
             ensure!(
-                ack.query_context.as_ref() == Some(&releasable)
-                    && proto::ReleaseQueryContextOutcome::try_from(ack.outcome)
-                        == Ok(proto::ReleaseQueryContextOutcome::Released)
-                    && proto::QueryContextState::try_from(ack.state)
-                        == Ok(proto::QueryContextState::TerminalRetained)
+                ack.participation.as_ref() == Some(&releasable)
+                    && proto::ReleaseParticipationOutcome::try_from(ack.outcome)
+                        == Ok(proto::ReleaseParticipationOutcome::Released)
+                    && proto::ParticipationState::try_from(ack.state)
+                        == Ok(proto::ParticipationState::TerminalRetained)
                     && ack.termination_cause.is_none(),
-                "task-free context did not release normally under ordinary saturation: {ack:?}"
+                "task-free participation did not release normally under ordinary saturation: {ack:?}"
             );
             context.action(
-            "Release of the exact quiesced, task-free context returned Released and TerminalRetained under ordinary saturation",
+            "Release of the exact quiesced, task-free participation returned Released and TerminalRetained under ordinary saturation",
         );
 
             let still_full = read_backend_metrics(context, 0)?;
@@ -1137,8 +1139,8 @@ impl Scenario for RegistryContentionControl {
         binary: &Path,
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
-        // One original Context's already Accepted preparation is the held
-        // host action. The second Context uses the same live backend/poller.
+        // One original Participation's already Accepted preparation is the held
+        // host action. The second Participation uses the same live backend/poller.
         Ok(Some(self.intent.freeze(
             "preparation-hold",
             2,
@@ -1165,7 +1167,7 @@ impl Scenario for RegistryContentionControl {
         let query = intent
             .queries
             .first()
-            .context("missing held Context identity")?;
+            .context("missing held Participation identity")?;
         let held =
             RawBackendSession::establish_declared(context, 0, query.query_id, query.frontend)?;
         intent.verify_backend(0, held.backend)?;
@@ -1176,29 +1178,29 @@ impl Scenario for RegistryContentionControl {
         create.exchange_input = true;
         ensure_accepted(&held, &create)?;
         rendezvous.await_entered(&held, &create, context.deadline())?;
-        context.action("one Context's exact Accepted preparation entered its supervised Native host action; no poller or registry lock is held");
+        context.action("one Participation's exact Accepted preparation entered its supervised Native host action; no poller or registry lock is held");
 
         let query = intent
             .queries
             .get(1)
-            .context("missing sibling Context identity")?;
+            .context("missing sibling Participation identity")?;
         let sibling =
             RawBackendSession::establish_declared(context, 0, query.query_id, query.frontend)?;
         intent.verify_backend(0, sibling.backend)?;
         ensure!(
             held.backend == sibling.backend && held.query_id != sibling.query_id,
-            "host-action isolation must use two actual Contexts on the same backend"
+            "host-action isolation must use two actual Participations on the same backend"
         );
         let original = sibling
             .establish_request
             .as_ref()
             .context("sibling lost original Establish")?;
-        let Some(proto::task_operation::Operation::UpdateQueryContext(update)) =
+        let Some(proto::task_operation::Operation::UpdateParticipation(update)) =
             &original.operation
         else {
-            anyhow::bail!("sibling original operation is not a Context update");
+            anyhow::bail!("sibling original operation is not a Participation update");
         };
-        let Some(proto::update_query_context_request::Command::Establish(establish)) =
+        let Some(proto::update_participation_request::Command::Establish(establish)) =
             &update.command
         else {
             anyhow::bail!("sibling original update is not Establish");
@@ -1213,8 +1215,8 @@ impl Scenario for RegistryContentionControl {
         let renewed = session_control(
             &sibling,
             proto::task_control_operation::Control::RenewLease(
-                proto::RenewQueryExecutionLeaseRequest {
-                    query_context: Some(sibling.context_under(sibling.frontend, 1)),
+                proto::RenewParticipationLeaseRequest {
+                    participation: Some(sibling.participation_under(sibling.frontend, 1)),
                     lease: Some(lease),
                 },
             ),
@@ -1223,23 +1225,23 @@ impl Scenario for RegistryContentionControl {
             outcome(&renewed)? == proto::TaskOperationOutcome::Accepted,
             "same-backend sibling renewal did not complete while the host action was held: {renewed:?}"
         );
-        let Some(proto::task_operation_verdict::Ack::QueryContext(ack)) =
+        let Some(proto::task_operation_verdict::Ack::Participation(ack)) =
             &receipt_verdict(&renewed)?.ack
         else {
-            anyhow::bail!("sibling renewal omitted its exact Context receipt");
+            anyhow::bail!("sibling renewal omitted its exact Participation receipt");
         };
         let receipt = ack
             .lease
             .as_ref()
             .context("sibling renewal omitted its lease receipt")?;
         ensure!(
-            ack.query_context.as_ref() == Some(&sibling.context_under(sibling.frontend, 1))
-                && ack.state == proto::QueryContextState::Active as i32
+            ack.participation.as_ref() == Some(&sibling.participation_under(sibling.frontend, 1))
+                && ack.state == proto::ParticipationState::Active as i32
                 && receipt.sequence == lease.sequence
                 && receipt.requested_valid_for_millis == lease.valid_for_millis
                 && receipt.effective_valid_for_millis > 0
                 && receipt.effective_valid_for_millis <= lease.valid_for_millis,
-            "sibling renewal changed its original Context or lease: {ack:?}"
+            "sibling renewal changed its original Participation or lease: {ack:?}"
         );
         let sibling_fence = quiesce_session(&sibling)?;
         ensure!(
@@ -1247,10 +1249,10 @@ impl Scenario for RegistryContentionControl {
             "sibling fence invented Task membership: {sibling_fence:?}"
         );
         ensure!(
-            sibling.release_when_ready(context)? == proto::ReleaseQueryContextOutcome::Released,
+            sibling.release_when_ready(context)? == proto::ReleaseParticipationOutcome::Released,
             "same-backend sibling did not actually release while the host action was held"
         );
-        context.action("the independent same-BE Context established, renewed its exact next lease, fenced and actually Released before the held host action was released");
+        context.action("the independent same-BE Participation established, renewed its exact next lease, fenced and actually Released before the held host action was released");
 
         let replay = held.apply(
             create.operation(),
@@ -1279,20 +1281,20 @@ impl Scenario for RegistryContentionControl {
         let identities = vec![raw_create_identity(&create)];
         ensure!(
             fence.fence_version != 0 && fence.accepted_tasks == identities,
-            "held Context fence changed original Task membership: {fence:?}"
+            "held Participation fence changed original Task membership: {fence:?}"
         );
         observe_all_canceled_and_stopped(context, &held, &fence, &identities)?;
         ensure!(
-            held.release_when_ready(context)? == proto::ReleaseQueryContextOutcome::Released,
-            "held Context did not actually release after its host action exited"
+            held.release_when_ready(context)? == proto::ReleaseParticipationOutcome::Released,
+            "held Participation did not actually release after its host action exited"
         );
         super::result_delivery_support::await_idle(
             context,
-            "context-host-action",
+            "participation-host-action",
             "after-original-release",
             epoch,
         )?;
-        context.action("the original held host action exited, installed and normally stopped its exact Task, and both Contexts released with the existing owner-idle barrier");
+        context.action("the original held host action exited, installed and normally stopped its exact Task, and both Participations released with the existing owner-idle barrier");
         Ok(())
     }
 }
@@ -1395,7 +1397,7 @@ fn partial_body_deadline(
     tokio::runtime::Runtime::new()?.block_on(async move {
         let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
         let (mut sender, connection) = client::handshake(stream).await?;
-        let driver = tokio::spawn(connection);
+        let connection_job = tokio::spawn(connection);
         let request = Request::builder()
             .method("POST")
             .uri(ORDINARY_PATH)
@@ -1413,8 +1415,8 @@ fn partial_body_deadline(
         let response = match response {
             Ok(response) => response,
             Err(_) => {
-                driver.abort();
-                let _ = driver.await;
+                connection_job.abort();
+                let _ = connection_job.await;
                 return Ok((PartialBodyOutcome::TransportAbort, started.elapsed()));
             }
         };
@@ -1426,16 +1428,16 @@ fn partial_body_deadline(
         let mut body = response.into_body();
         while let Some(chunk) = body.data().await {
             if chunk.is_err() {
-                driver.abort();
-                let _ = driver.await;
+                connection_job.abort();
+                let _ = connection_job.await;
                 return Ok((PartialBodyOutcome::TransportAbort, started.elapsed()));
             }
         }
         let trailers = match body.trailers().await {
             Ok(trailers) => trailers,
             Err(_) => {
-                driver.abort();
-                let _ = driver.await;
+                connection_job.abort();
+                let _ = connection_job.await;
                 return Ok((PartialBodyOutcome::TransportAbort, started.elapsed()));
             }
         };
@@ -1448,8 +1450,8 @@ fn partial_body_deadline(
                     .and_then(|value| value.parse::<u16>().ok())
             })
             .context("partial-body rejection omitted grpc-status")?;
-        driver.abort();
-        let _ = driver.await;
+        connection_job.abort();
+        let _ = connection_job.await;
         ensure!(
             status == tonic::Code::DeadlineExceeded as u16,
             "partial-body grpc-status={status}"
@@ -1557,7 +1559,7 @@ fn held_operations(
                 .context("hold query outside frozen set")?;
             Ok((
                 raw_acquire_admission_ticket(
-                    query.context(backend),
+                    query.participation(backend),
                     compatibility_id,
                     epoch.clone(),
                 ),
@@ -1595,22 +1597,22 @@ fn ticket_operation(
         .admission_epoch_capability
         .context("heartbeat omitted admission epoch")?;
     Ok(raw_acquire_admission_ticket(
-        raw_query_context(backend),
+        raw_participation(backend),
         compatibility_id,
         epoch,
     ))
 }
 
-fn establish_declared_context(
+fn establish_declared_participation(
     connector: &NativeEndpointConnector,
     control_connector: &NativeEndpointConnector,
     authorization: &str,
     backend: BackendProcessId,
     compatibility_id: [u8; 32],
-    declared: (proto::QueryContextRef, Option<u64>),
+    declared: (proto::ParticipationRef, Option<u64>),
     deadline: Instant,
-) -> Result<(proto::QueryContextRef, proto::QueryExecutionLeaseReceipt)> {
-    let (declared_context, lease_duration_millis) = declared;
+) -> Result<(proto::ParticipationRef, proto::ParticipationLeaseReceipt)> {
+    let (declared_participation, lease_duration_millis) = declared;
     let mut acquisition = ticket_operation(
         control_connector,
         authorization,
@@ -1619,12 +1621,12 @@ fn establish_declared_context(
         deadline,
     )?;
     match acquisition.operation.as_mut() {
-        Some(proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(request)) => {
-            request.query_context = Some(declared_context.clone());
+        Some(proto::task_operation::Operation::AcquireParticipationAdmissionTicket(request)) => {
+            request.participation = Some(declared_participation.clone());
         }
         _ => anyhow::bail!("ticket helper produced wrong operation"),
     }
-    let context = declared_context;
+    let target_participation = declared_participation;
     let acquisition_id = acquisition
         .envelope
         .as_ref()
@@ -1645,25 +1647,30 @@ fn establish_declared_context(
         proto::TaskOperationOutcome::Accepted,
         "Admission ticket",
     )?;
-    let Some(proto::task_operation_verdict::Ack::QueryContextAdmissionTicket(ticket)) =
+    let Some(proto::task_operation_verdict::Ack::ParticipationAdmissionTicket(ticket)) =
         receipt_verdict(&receipt)?.ack.clone()
     else {
         anyhow::bail!("ticket acquisition omitted ticket acknowledgement");
     };
     ensure!(
-        ticket.query_context.as_ref() == Some(&context) && ticket.valid_for_millis == 10_000,
-        "admission ticket did not bind the exact context and requested validity: {ticket:?}"
+        ticket.participation.as_ref() == Some(&target_participation)
+            && ticket.valid_for_millis == 10_000,
+        "admission ticket did not bind the exact participation and requested validity: {ticket:?}"
     );
     let ticket_id = ticket
         .ticket_id
         .context("ticket acknowledgement omitted id")?;
-    let mut operation = raw_establish(context.clone(), ticket_id, Some(compatibility_id.to_vec()));
-    let Some(proto::task_operation::Operation::UpdateQueryContext(update)) =
+    let mut operation = raw_establish(
+        target_participation.clone(),
+        ticket_id,
+        Some(compatibility_id.to_vec()),
+    );
+    let Some(proto::task_operation::Operation::UpdateParticipation(update)) =
         operation.operation.as_mut()
     else {
         anyhow::bail!("original Establish factory produced the wrong operation");
     };
-    let Some(proto::update_query_context_request::Command::Establish(establish)) =
+    let Some(proto::update_participation_request::Command::Establish(establish)) =
         update.command.as_mut()
     else {
         anyhow::bail!("original Establish factory produced the wrong command");
@@ -1688,31 +1695,31 @@ fn establish_declared_context(
     // Establish installs these actual three initial domains. Even empty
     // catalog/filter content receives its first-version Apply receipt.
     let expected_domains = vec![
-        proto::QueryContextDomainReceipt {
+        proto::ParticipationDomainReceipt {
             progression: proto::AcceptedDomainProgression::Apply as i32,
             receipt: Some(
-                proto::query_context_domain_receipt::Receipt::CatalogBinding(
+                proto::participation_domain_receipt::Receipt::CatalogBinding(
                     proto::ScalarDomainReceipt {
                         accepted_version: novarocks_execution_contract::DomainVersion::FIRST.get(),
                     },
                 ),
             ),
         },
-        proto::QueryContextDomainReceipt {
+        proto::ParticipationDomainReceipt {
             progression: proto::AcceptedDomainProgression::Apply as i32,
             receipt: Some(
-                proto::query_context_domain_receipt::Receipt::SharedDynamicFilter(
+                proto::participation_domain_receipt::Receipt::SharedDynamicFilter(
                     proto::ScalarDomainReceipt {
                         accepted_version: novarocks_execution_contract::DomainVersion::FIRST.get(),
                     },
                 ),
             ),
         },
-        proto::QueryContextDomainReceipt {
+        proto::ParticipationDomainReceipt {
             progression: proto::AcceptedDomainProgression::Apply as i32,
-            receipt: Some(proto::query_context_domain_receipt::Receipt::Credential(
-                proto::QueryContextCredentialReceipt {
-                    lease_id: credential.lease_id,
+            receipt: Some(proto::participation_domain_receipt::Receipt::Credential(
+                proto::ParticipationCredentialReceipt {
+                    credential_domain_id: credential.credential_domain_id,
                     accepted_epoch: credential.epoch,
                 },
             )),
@@ -1738,30 +1745,30 @@ fn establish_declared_context(
         proto::TaskOperationOutcome::Accepted,
         "Establish",
     )?;
-    let Some(proto::task_operation_verdict::Ack::QueryContext(ack)) =
+    let Some(proto::task_operation_verdict::Ack::Participation(ack)) =
         receipt_verdict(&receipt)?.ack.clone()
     else {
-        anyhow::bail!("Establish omitted its typed context acknowledgement");
+        anyhow::bail!("Establish omitted its typed participation acknowledgement");
     };
     let lease = ack
         .lease
         .as_ref()
         .context("Establish omitted its initial lease receipt")?;
     ensure!(
-        ack.query_context.as_ref() == Some(&context)
-            && proto::QueryContextState::try_from(ack.state)
-                == Ok(proto::QueryContextState::Active)
+        ack.participation.as_ref() == Some(&target_participation)
+            && proto::ParticipationState::try_from(ack.state)
+                == Ok(proto::ParticipationState::Active)
             && ack.termination_cause.is_none()
             && ack.accepted_domains == expected_domains
             && lease.sequence == requested_sequence
             && lease.requested_valid_for_millis == requested_duration
             && lease.effective_valid_for_millis > 0
             && lease.effective_valid_for_millis <= lease.requested_valid_for_millis,
-        "Establish did not install the exact active context and initial facts: {ack:?}"
+        "Establish did not install the exact active participation and initial facts: {ack:?}"
     );
     Ok((
-        context,
-        proto::QueryExecutionLeaseReceipt {
+        target_participation,
+        proto::ParticipationLeaseReceipt {
             sequence: lease.sequence,
             requested_valid_for_millis: lease.requested_valid_for_millis,
             effective_valid_for_millis: lease.effective_valid_for_millis,
@@ -1770,7 +1777,7 @@ fn establish_declared_context(
 }
 
 /// Read management-only original execution custody. A timer proof must be
-/// recorded before any application input could itself advance that Context.
+/// recorded before any application input could itself advance that Participation.
 fn node_hot_resources(rows: &[Value]) -> Result<[f64; 4]> {
     ensure!(
         metric(
@@ -1818,7 +1825,7 @@ fn wait_execution_custody(context: &mut ScenarioContext, expected: f64) -> Resul
             let actual = metric(
                 &rows,
                 "novarocks_backend_execution_quiescence",
-                &[("resource", "contexts_with_execution_custody")],
+                &[("resource", "participations_with_execution_custody")],
             )?;
             if actual == expected {
                 return Ok(rows);
@@ -1843,7 +1850,7 @@ fn control_cancel(backend: BackendProcessId) -> proto::ApplyTaskControlOperation
             control: Some(proto::task_control_operation::Control::CancelTask(
                 proto::CancelTaskRequest {
                     identity: Some(proto::TaskIdentity {
-                        query_execution_id: raw_query_context(backend).query_execution_id,
+                        query_execution_id: raw_participation(backend).query_execution_id,
                         stage_id: 1,
                         task_id: 1,
                         backend_process_id: Some(proto::BackendProcessId {
@@ -1887,28 +1894,36 @@ fn exact_probe_receipt(
     Ok(receipt)
 }
 
-fn control_quiesce(context: proto::QueryContextRef) -> proto::ApplyTaskControlOperationsRequest {
+fn control_quiesce(
+    target_participation: proto::ParticipationRef,
+) -> proto::ApplyTaskControlOperationsRequest {
     proto::ApplyTaskControlOperationsRequest {
         operations: vec![proto::TaskControlOperation {
             envelope: Some(raw_operation_envelope(15_000)),
-            control: Some(proto::task_control_operation::Control::QuiesceQueryContext(
-                proto::QuiesceQueryContextRequest {
-                    query_context: Some(context),
-                },
-            )),
+            control: Some(
+                proto::task_control_operation::Control::QuiesceParticipation(
+                    proto::QuiesceParticipationRequest {
+                        participation: Some(target_participation),
+                    },
+                ),
+            ),
         }],
     }
 }
 
-fn control_release(context: proto::QueryContextRef) -> proto::ApplyTaskControlOperationsRequest {
+fn control_release(
+    target_participation: proto::ParticipationRef,
+) -> proto::ApplyTaskControlOperationsRequest {
     proto::ApplyTaskControlOperationsRequest {
         operations: vec![proto::TaskControlOperation {
             envelope: Some(raw_operation_envelope(15_000)),
-            control: Some(proto::task_control_operation::Control::ReleaseQueryContext(
-                proto::ReleaseQueryContextRequest {
-                    query_context: Some(context),
-                },
-            )),
+            control: Some(
+                proto::task_control_operation::Control::ReleaseParticipation(
+                    proto::ReleaseParticipationRequest {
+                        participation: Some(target_participation),
+                    },
+                ),
+            ),
         }],
     }
 }
@@ -2269,7 +2284,7 @@ fn header_rejection(
     tokio::runtime::Runtime::new()?.block_on(async move {
         let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
         let (mut sender, connection) = client::handshake(stream).await?;
-        let driver = tokio::spawn(connection);
+        let connection_job = tokio::spawn(connection);
         let request = Request::builder()
             .method("POST")
             .uri(path)
@@ -2284,8 +2299,8 @@ fn header_rejection(
             .context("Native ingress did not reject headers before reading the body")??;
         let status = tonic::Status::from_header_map(response.headers())
             .context("early Native ingress rejection omitted grpc-status")?;
-        driver.abort();
-        let _ = driver.await;
+        connection_job.abort();
+        let _ = connection_job.await;
         Ok(status)
     })
 }
@@ -2299,7 +2314,7 @@ fn streamed_control_over_limit(
     tokio::runtime::Runtime::new()?.block_on(async move {
         let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
         let (mut sender, connection) = client::handshake(stream).await?;
-        let driver = tokio::spawn(connection);
+        let connection_job = tokio::spawn(connection);
         let request = Request::builder()
             .method("POST")
             .uri(CONTROL_PATH)
@@ -2321,8 +2336,8 @@ fn streamed_control_over_limit(
         let status = header_status
             .or_else(|| trailers.as_ref().and_then(tonic::Status::from_header_map))
             .context("streaming size rejection omitted grpc-status")?;
-        driver.abort();
-        let _ = driver.await;
+        connection_job.abort();
+        let _ = connection_job.await;
         Ok(status)
     })
 }

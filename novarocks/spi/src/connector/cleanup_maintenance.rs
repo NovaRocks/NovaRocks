@@ -1371,15 +1371,15 @@ pub trait ConnectorCleanupMaintenanceResolver: Send + Sync {
     fn acquire_current_cleanup_maintenance(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError>;
+    ) -> Result<ConnectorCleanupMaintenanceSession, ConnectorError>;
     fn acquire_exact_cleanup_maintenance(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
-    ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError>;
+    ) -> Result<ConnectorCleanupMaintenanceSession, ConnectorError>;
 }
 
 #[derive(Clone)]
-pub struct ConnectorCleanupMaintenanceLease {
+pub struct ConnectorCleanupMaintenanceSession {
     descriptor: ConnectorInstanceDescriptor,
     control_runtime_id: ConnectorControlRuntimeId,
     provider_binding_key: ConnectorProviderBindingKey,
@@ -1391,7 +1391,7 @@ struct CleanupRelease {
     release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
 }
 
-impl ConnectorCleanupMaintenanceLease {
+impl ConnectorCleanupMaintenanceSession {
     pub fn metadata_cpu_source_type_id(&self) -> Result<std::any::TypeId, ConnectorError> {
         let selected = self.cleanup.metadata_cpu_source_type_id()?;
         let (key, actual) = self

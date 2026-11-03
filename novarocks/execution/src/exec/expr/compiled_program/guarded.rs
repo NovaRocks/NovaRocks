@@ -3092,8 +3092,8 @@ fn validate_membership_phase(
 #[path = "copy_continuation_tests.rs"]
 mod copy_continuation_tests;
 
-#[path = "constant_driver.rs"]
-pub(super) mod constant_driver;
+#[path = "constant_evaluator.rs"]
+pub(super) mod constant_evaluator;
 
 fn complete_constant_leaf(
     constant: &novarocks_functions::ConstantValue,

@@ -29,7 +29,7 @@ use crate::mv::domain::{
     },
 };
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorErrorKind, ConnectorOperationControl,
+    ConnectorControlPlanningPin, ConnectorErrorKind, ConnectorOperationControl,
     ConnectorRequestContext, ConnectorTableResolution,
 };
 use std::{collections::BTreeMap, sync::Arc};
@@ -38,7 +38,7 @@ use std::{collections::BTreeMap, sync::Arc};
 /// writer, publication identity or refresh admission enters this reader.
 pub(crate) struct MvCreatePreparationInput {
     pub(crate) ports: IcebergMvCorePorts,
-    pub(crate) planning: ConnectorControlPlanningLease,
+    pub(crate) planning: ConnectorControlPlanningPin,
     pub(crate) current_catalog: Option<String>,
     pub(crate) current_database: String,
     pub(crate) statement: MvCreateStatement,
@@ -65,7 +65,7 @@ async fn prepare_create_inner(
     )?;
     let lease = input.planning;
     if lease.binding().descriptor().instance_id.as_str() != target.catalog {
-        return Err("CREATE reader planning lease does not match its original target".into());
+        return Err("CREATE reader planning pin does not match its original target".into());
     }
     if lease.binding().descriptor().provider_id.as_str() != "iceberg" {
         return Err(
@@ -167,7 +167,7 @@ async fn prepare_create_inner(
                 .source_metadata
                 .as_ref()
                 .ok_or("CREATE base schema has no original metadata")?;
-            let lease = binding.admission.exact_planning_lease()?;
+            let lease = binding.admission.exact_planning_pin()?;
             crate::mv::domain::storage_observation::observe_source_schema(
                 input.ports.storage_observation(),
                 &lease,
@@ -191,8 +191,8 @@ async fn prepare_create_inner(
 #[cfg(test)]
 mod tests {
     use super::super::refresh_preparation::{
-        async_original::MvRefreshPreparationOriginal, driver::MvRefreshTurnCustody,
-        io_gate::MvRefreshPreparationServices,
+        async_original::MvRefreshPreparationOriginal, io_gate::MvRefreshPreparationServices,
+        turn_custody::MvRefreshTurnCustody,
     };
     use super::*;
     use crate::query_execution::{
@@ -384,7 +384,7 @@ mod tests {
         let source = MvRefreshPreparationOriginal::for_create(
             MvCreatePreparationInput {
                 ports,
-                planning: ConnectorControlPlanningLease::new(
+                planning: ConnectorControlPlanningPin::new(
                     Arc::new(
                         novarocks_catalog_application::test_support::test_control_binding_for(
                             novarocks_spi::connector::ConnectorInstanceId::parse("ice").unwrap(),

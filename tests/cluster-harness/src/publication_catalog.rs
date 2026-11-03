@@ -50,7 +50,7 @@ pub struct FixtureConfig {
     pub downstream: String,
 }
 
-pub struct FixtureHandle {
+pub struct PublicationCatalogFixture {
     uri: String,
     next_fault: Arc<Mutex<NextFaultState>>,
     mutations: Arc<Mutex<BTreeMap<(String, String), MutationCounts>>>,
@@ -266,7 +266,7 @@ struct ArmNextFaultResponse {
     arm_id: String,
 }
 
-impl FixtureHandle {
+impl PublicationCatalogFixture {
     pub fn start(downstream: String) -> Result<Self> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")
             .context("reserve publication catalog fixture listener")?;
@@ -637,7 +637,7 @@ impl Drop for FixtureFaultGuard {
     }
 }
 
-impl Drop for FixtureHandle {
+impl Drop for PublicationCatalogFixture {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown() {
             eprintln!("publication fixture cleanup failed: {error:#}");
@@ -1555,7 +1555,7 @@ mod tests {
                 .unwrap();
             }
         });
-        let mut fixture = FixtureHandle::start(format!("http://{address}")).unwrap();
+        let mut fixture = PublicationCatalogFixture::start(format!("http://{address}")).unwrap();
         let control = fixture.control().unwrap();
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
@@ -1674,7 +1674,7 @@ mod tests {
                 .unwrap();
             }
         });
-        let mut fixture = FixtureHandle::start(format!("http://{address}")).unwrap();
+        let mut fixture = PublicationCatalogFixture::start(format!("http://{address}")).unwrap();
         let control = fixture.control().unwrap();
         let guard = control
             .arm_next_for_table("table-load", "corrupt-package", "owned_ns", "a_mv")
@@ -1753,7 +1753,7 @@ mod tests {
                 .unwrap();
             }
         });
-        let mut fixture = FixtureHandle::start(format!("http://{address}")).unwrap();
+        let mut fixture = PublicationCatalogFixture::start(format!("http://{address}")).unwrap();
         let control = fixture.control().unwrap();
         let guard = control.arm_next("table-load", "corrupt-package").unwrap();
         let client = reqwest::blocking::Client::builder()
@@ -1844,7 +1844,8 @@ mod tests {
                 .unwrap();
         });
 
-        let fixture = FixtureHandle::start(format!("http://{downstream_address}")).unwrap();
+        let fixture =
+            PublicationCatalogFixture::start(format!("http://{downstream_address}")).unwrap();
         let control = fixture.control().unwrap();
         let guard = control
             .arm_next("table-commit", "after-commit-before-response")
@@ -1906,7 +1907,8 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let downstream_address = listener.local_addr().unwrap();
-        let fixture = FixtureHandle::start(format!("http://{downstream_address}")).unwrap();
+        let fixture =
+            PublicationCatalogFixture::start(format!("http://{downstream_address}")).unwrap();
         let control = fixture.control().unwrap();
         let guard = control.arm_next(action, fault).unwrap();
         let response = reqwest::blocking::Client::builder()
@@ -2014,7 +2016,7 @@ mod tests {
             )
             .unwrap();
         });
-        let mut fixture = FixtureHandle::start(format!("http://{address}")).unwrap();
+        let mut fixture = PublicationCatalogFixture::start(format!("http://{address}")).unwrap();
         let control = fixture.control().unwrap();
         let guard = control
             .arm_next("catalog-mutation", "stream-response")
@@ -2045,7 +2047,8 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let mut fixture =
-            FixtureHandle::start(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+            PublicationCatalogFixture::start(format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
         let control = fixture.control().unwrap();
         let guard = control
             .arm_next("table-commit", "before-dispatch-hold-for-concurrent-shell")
@@ -2087,7 +2090,7 @@ mod tests {
             headers_tx.send(()).unwrap();
             let _ = stop_rx.recv_timeout(Duration::from_secs(3));
         });
-        let mut fixture = FixtureHandle::start(format!("http://{address}")).unwrap();
+        let mut fixture = PublicationCatalogFixture::start(format!("http://{address}")).unwrap();
         let uri = fixture.uri().to_owned();
         let query = std::thread::spawn(move || {
             reqwest::blocking::Client::builder()
@@ -2113,7 +2116,7 @@ mod tests {
 
     #[test]
     fn publication_unused_arm_is_cleared_before_next_step() {
-        let fixture = FixtureHandle::start("http://127.0.0.1:9".to_owned()).unwrap();
+        let fixture = PublicationCatalogFixture::start("http://127.0.0.1:9".to_owned()).unwrap();
         let control = fixture.control().unwrap();
         let mut first = control.arm_next("table-commit", "stream-response").unwrap();
         assert!(
@@ -2159,7 +2162,7 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
                 .unwrap();
         });
-        let fixture = FixtureHandle::start(format!("http://{address}")).unwrap();
+        let fixture = PublicationCatalogFixture::start(format!("http://{address}")).unwrap();
         let control = fixture.control().unwrap();
         let uri = fixture.uri().to_owned();
         let commit = std::thread::spawn(move || {

@@ -26,9 +26,9 @@ use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader as ParquetChunkReader, Length};
 
 use crate::{
-    BoundFile, DataCacheContext, DataCacheManager, DataCachePageKey, FileError,
-    FileMetricsSnapshot, FileRangeOperation, FileReadContext, FileReadRange, FileResult,
-    PreparedFileInput, SMALL_FILE_PROBE_MAX_BYTES,
+    BoundFile, DataCacheManager, DataCachePageKey, DataCachePolicy, FileError, FileMetricsSnapshot,
+    FileRangeOperation, FileReadContext, FileReadRange, FileResult, PreparedFileInput,
+    SMALL_FILE_PROBE_MAX_BYTES,
 };
 
 const STREAM_CHUNK_SIZE: usize = 1024 * 1024;
@@ -119,7 +119,7 @@ pub(crate) type SmallFileBuffer = Arc<tokio::sync::OnceCell<Bytes>>;
 pub(crate) struct BoundChunkReader {
     file: BoundFile,
     context: FileReadContext,
-    cache: Option<DataCacheContext>,
+    cache: Option<DataCachePolicy>,
     range_cache_enabled: bool,
     metrics: Arc<ReaderMetrics>,
     small_file: SmallFileBuffer,
@@ -141,7 +141,7 @@ impl BoundChunkReader {
     pub(crate) fn new(
         file: BoundFile,
         context: FileReadContext,
-        cache: Option<DataCacheContext>,
+        cache: Option<DataCachePolicy>,
         range_cache_enabled: bool,
         metrics: Arc<ReaderMetrics>,
     ) -> Self {
@@ -298,7 +298,7 @@ impl BoundChunkReader {
             && !self
                 .cache
                 .as_ref()
-                .is_some_and(crate::DataCacheContext::datacache_requested)
+                .is_some_and(crate::DataCachePolicy::datacache_requested)
         {
             let start = usize::try_from(start).map_err(|_| {
                 FileError::new(
@@ -394,7 +394,7 @@ impl BoundChunkReader {
             length: u64::try_from(length)
                 .map_err(|_| FileError::invalid("file read length overflows u64"))?,
         };
-        let spawner = Arc::clone(&self.context.task_spawner);
+        let spawner = Arc::clone(&self.context.io_spawner);
         let range_binding = self.context.range.clone();
         let present = self.prepared_input.clone();
         let metrics = Arc::clone(&self.metrics);

@@ -102,7 +102,7 @@ impl DormantNativeAttemptOwner for BindingGateDormant {
     ) -> Poll<Result<(), NativeAttemptActivationFailure>> {
         assert!(
             schedule
-                .contexts()
+                .participations()
                 .iter()
                 .all(|c| c.backend_process_id() == self.inner.backend)
         );
@@ -151,7 +151,7 @@ impl super::super::ReplacementQualificationEffectReservation for BindingCheckedQ
         assert!(
             submission
                 .request()
-                .replacement_contexts()
+                .replacement_participations()
                 .iter()
                 .all(|c| c.backend_process_id() == self.expected)
         );

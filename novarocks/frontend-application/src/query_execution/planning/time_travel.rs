@@ -233,7 +233,7 @@ impl_kernel_time_travel_resolver!(DmlExecutionKernel);
 /// 1. Resolve `version` → `snapshot_id` via `resolve_read_binding`.
 /// 2. Encode a synthetic, query-local analyzer identity for that snapshot.
 ///    the query catalog materializer memoizes the corresponding exact binding and
-///    planning lease in its request-local binding store.
+///    planning pin in its request-local binding store.
 /// 3. Rewrite the `TableFactor::Table`:
 ///    - Replace `name` with `<catalog>.<namespace>.<synthetic name>` so the
 ///      provider resolves the overlay rather than shared local catalog state.
@@ -445,12 +445,12 @@ fn rewrite_time_travel_in_factor_async<'a>(
                 // Time-travel fact resolution is catalog admission.  Resolve all
                 // facts from one exact control generation; the synthetic table is
                 // subsequently admitted by the query-local materializer.
-                let lease = crate::connector::acquire_metadata_planning_lease(
+                let lease = crate::connector::acquire_metadata_planning_pin(
                     resolver.connector_control(),
                     &target.catalog,
                 )?;
                 let facts =
-                    crate::connector::metadata_read_reference_facts_with_planning_lease_async(
+                    crate::connector::metadata_read_reference_facts_with_planning_pin_async(
                         lease,
                         connector_context.clone(),
                         &target.namespace,

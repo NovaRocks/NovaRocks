@@ -25,7 +25,7 @@ use super::result_delivery_support::await_idle;
 use crate::actors::mysql_stream::{AsyncMysqlStream, ControlledPayloadReads, PayloadReadPermit};
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_result_contract::RootProfileV1;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};

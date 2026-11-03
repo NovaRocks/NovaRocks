@@ -37,8 +37,8 @@
 //! applies the consumers to rows, and the connector is handed the truthful
 //! complete-all filter, which never narrows a read.
 
-use novarocks_execution::runtime::fragment::ExecutionFailure;
-use novarocks_execution::runtime::fragment::connector_failure::{
+use novarocks_execution::runtime::task::ExecutionFailure;
+use novarocks_execution::runtime::task::connector_failure::{
     ConnectorCallFailure, ConnectorOperation,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,8 +51,8 @@ use novarocks_connector_contract::{
 };
 use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::node::scan::ScanSource;
-use novarocks_execution::runtime::fragment::scan::CompiledScanSources;
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_execution::runtime::task::scan::CompiledScanSources;
 use novarocks_execution::runtime_filter::{
     RuntimeFilterConsumerContract, RuntimeFilterContractViolation,
     RuntimeFilterContractViolationKind, RuntimeFilterSessionRef,
@@ -78,12 +78,12 @@ use crate::compiled_runtime_filter::{
 };
 
 /// The Task facts every compiled scan of one task binds with.
-pub(crate) struct CompiledScanTask<'a> {
+pub(crate) struct CompiledScanTaskFacts<'a> {
     pub(crate) runtime: &'a TypedScanRuntime,
     #[cfg(novarocks_dev_controls)]
     pub(crate) observation_controls:
         Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
-    pub(crate) fragment_instance_id: UniqueId,
+    pub(crate) task_key: UniqueId,
     pub(crate) query_options: &'a QueryOptions,
     pub(crate) stop: ConnectorStopView,
     /// The runtime-filter bindings the task's package numbers.
@@ -278,7 +278,7 @@ impl novarocks_execution_contract::failure::FailureProjection for ScanBindingCon
 /// read-execution registration of its scan.
 pub(crate) fn bind_compiled_scans(
     program: &LocalProgram,
-    task: &CompiledScanTask<'_>,
+    task: &CompiledScanTaskFacts<'_>,
 ) -> Result<CompiledScanSources, CompiledScanBindingError> {
     let nodes = program.graph().nodes();
     let mut sources = CompiledScanSources::new();
@@ -332,7 +332,7 @@ pub(crate) fn bind_compiled_scan(
     recipe: &ConnectorReadProgramRecipe,
     consumers: &[FilterConsumerAtExpr],
     layout: &StaticLayout,
-    task: &CompiledScanTask<'_>,
+    task: &CompiledScanTaskFacts<'_>,
 ) -> Result<Arc<dyn ScanSource>, CompiledScanBindingError> {
     let frozen: &FrozenConnectorRead = recipe.frozen();
     let scan = frozen.scan();
@@ -436,8 +436,8 @@ pub(crate) fn bind_compiled_scan(
         execution_id.query_id().high(),
         execution_id.query_id().low(),
         execution_id.attempt_id().get(),
-        task.fragment_instance_id.high(),
-        task.fragment_instance_id.low(),
+        task.task_key.high(),
+        task.task_key.low(),
         scan_node,
     )
     .map_err(|source| CompiledScanBindingError::at_domain(scan_node, source))?;
@@ -495,7 +495,13 @@ pub(crate) fn bind_compiled_scan(
         #[cfg(novarocks_dev_controls)]
         task.observation_controls
             .as_deref()
-            .map(|controls| controls.observation_for("reader-marker", task.runtime.execution_id()))
+            .map(|controls| {
+                controls.observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker
+                        .as_str(),
+                    task.runtime.execution_id(),
+                )
+            })
             .transpose()
             .map_err(|detail| {
                 CompiledScanBindingError::at_domain(

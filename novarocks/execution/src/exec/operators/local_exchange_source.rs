@@ -28,7 +28,7 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -143,7 +143,7 @@ impl OperatorLifecycle for LocalExchangeSourceOperator {
 impl SourceKernel for LocalExchangeSourceOperator {
     fn poll_output(
         &mut self,
-        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
     ) -> ExecutionResult<StepResult> {
         if self.finished {
             return Ok(StepResult::new(None, NextStep::Finished, 0));

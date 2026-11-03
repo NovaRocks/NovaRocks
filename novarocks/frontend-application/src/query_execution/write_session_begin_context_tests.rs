@@ -67,7 +67,7 @@ fn attempt_context(
     (context, sink)
 }
 
-fn unopened_begin() -> (ConnectorWriteStackLease, Arc<Mutex<Recorded>>) {
+fn unopened_begin() -> (ConnectorWriteStackPin, Arc<Mutex<Recorded>>) {
     let (lease, recorded) = unopened_fixture(1, 16, commit_unknown());
     recorded.lock().unwrap().capture_begin_context = true;
     (lease, recorded)
@@ -81,11 +81,11 @@ impl LegacyWriteControl for BoundLegacyControl {
 }
 
 fn exact_write_lease(
-    stack: &ConnectorWriteStackLease,
+    stack: &ConnectorWriteStackPin,
     properties: spi::CatalogProperties,
-) -> spi::ConnectorWriteLease {
+) -> spi::ConnectorWrite {
     let key = stack.session().binding_key().clone();
-    spi::ConnectorWriteLease::new_with_control_runtime_id(
+    spi::ConnectorWrite::new_with_control_runtime_id(
         stack.control_runtime_id(),
         key.clone(),
         Arc::new(BoundLegacyControl(key)),

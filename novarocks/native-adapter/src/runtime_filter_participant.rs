@@ -267,10 +267,10 @@ impl RuntimeFilterParticipant {
         }))
     }
 
-    pub fn session_for_fragment(
+    pub fn session_for_task(
         &self,
         execution_id: QueryExecutionId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         required: bool,
     ) -> Result<Option<RuntimeFilterSessionRef>, RuntimeFilterContractError> {
         if execution_id != self.execution_id {
@@ -283,31 +283,22 @@ impl RuntimeFilterParticipant {
             return Ok(None);
         }
         let outbound: Arc<dyn RuntimeFilterParticipantOutbound> = self.outbound.clone();
-        Ok(Some(
-            self.state
-                .session_for_fragment(fragment_instance_id, outbound),
-        ))
+        Ok(Some(self.state.session_for_fragment(task_key, outbound)))
     }
 
     /// The bindings this participant installed for one fragment instance:
     /// every producer and consumer binding whose expected fragment instances
     /// name it.
-    pub fn fragment_bindings(&self, fragment_instance_id: UniqueId) -> BTreeSet<u32> {
+    pub fn task_bindings(&self, task_key: UniqueId) -> BTreeSet<u32> {
         let mut bindings = BTreeSet::new();
         for channel in self.outbound.install.channels().values() {
             for (binding_id, producer) in channel.producers() {
-                if producer
-                    .expected_fragment_instances()
-                    .contains(&fragment_instance_id)
-                {
+                if producer.expected_tasks().contains(&task_key) {
                     bindings.insert(binding_id.get());
                 }
             }
             for (binding_id, consumer) in channel.consumers() {
-                if consumer
-                    .expected_fragment_instances()
-                    .contains(&fragment_instance_id)
-                {
+                if consumer.expected_tasks().contains(&task_key) {
                     bindings.insert(binding_id.get());
                 }
             }
@@ -324,10 +315,10 @@ impl RuntimeFilterParticipant {
     /// program does not bind would leave its channel waiting for an endpoint
     /// that never opens; both are refused before anything is prepared. An
     /// empty set is answered `None`.
-    pub fn session_for_fragment_bindings(
+    pub fn session_for_task_bindings(
         &self,
         execution_id: QueryExecutionId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         bindings: &BTreeSet<u32>,
     ) -> Result<Option<RuntimeFilterSessionRef>, RuntimeFilterContractError> {
         if execution_id != self.execution_id {
@@ -336,14 +327,14 @@ impl RuntimeFilterParticipant {
                 "runtime filter participant does not belong to this execution attempt",
             ));
         }
-        let hosted = self.fragment_bindings(fragment_instance_id);
+        let hosted = self.task_bindings(task_key);
         if hosted != *bindings {
             return Err(RuntimeFilterContractError::invalid_contract(format!(
-                "fragment instance {fragment_instance_id} binds runtime filters {bindings:?}, but \
+                "fragment instance {task_key} binds runtime filters {bindings:?}, but \
                  this backend's participant installed {hosted:?} for it"
             )));
         }
-        self.session_for_fragment(execution_id, fragment_instance_id, !bindings.is_empty())
+        self.session_for_task(execution_id, task_key, !bindings.is_empty())
     }
 
     pub fn dispatch_envelope(
@@ -444,7 +435,7 @@ impl RuntimeFilterParticipant {
         let route = participant_ingress::ProducerIngressRoute::new(
             envelope.channel_id(),
             identity.producer_binding_id(),
-            identity.fragment_instance_id(),
+            identity.task_key(),
             novarocks_execution::runtime_filter::PartitionId::new(identity.partition_id().get()),
             novarocks_execution::runtime_filter::ProducerSequence::new(identity.sequence().get()),
             open.local_partition_count().get(),
@@ -476,7 +467,7 @@ impl RuntimeFilterParticipant {
         self.state.dispatch_producer_failure(
             envelope.channel_id(),
             identity.producer_binding_id(),
-            identity.fragment_instance_id(),
+            identity.task_key(),
         )
     }
 
@@ -515,10 +506,10 @@ impl RuntimeFilterParticipant {
 
     pub fn record_row_effect(
         &self,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         effect: novarocks_execution::runtime_filter::RuntimeFilterRowEffect,
     ) {
-        self.state.record_row_effect(fragment_instance_id, effect);
+        self.state.record_row_effect(task_key, effect);
     }
 
     #[cfg(any(test, novarocks_dev_controls))]
@@ -576,7 +567,7 @@ impl BackendParticipantOutbound {
         &self,
         channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
         binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition: novarocks_execution::runtime_filter::PartitionId,
         sequence: novarocks_execution::runtime_filter::ProducerSequence,
         local_partition_count: u32,
@@ -588,7 +579,7 @@ impl BackendParticipantOutbound {
             channel_id,
             BackendNativeRouteIdentity::contribution(BackendNativeContributionRouteIdentity::new(
                 binding_id,
-                fragment_instance_id,
+                task_key,
                 partition,
                 novarocks_worker::runtime_filter::domain::BackendTransportSequence::new(
                     sequence.get(),
@@ -617,7 +608,7 @@ impl BackendParticipantOutbound {
         &self,
         channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
         binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition: novarocks_execution::runtime_filter::PartitionId,
         sequence: novarocks_execution::runtime_filter::ProducerSequence,
         local_partition_count: u32,
@@ -628,7 +619,7 @@ impl BackendParticipantOutbound {
             channel_id,
             BackendNativeRouteIdentity::contribution(BackendNativeContributionRouteIdentity::new(
                 binding_id,
-                fragment_instance_id,
+                task_key,
                 partition,
                 novarocks_worker::runtime_filter::domain::BackendTransportSequence::new(
                     sequence.get(),
@@ -657,7 +648,7 @@ impl BackendParticipantOutbound {
         &self,
         channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
         binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         reason: novarocks_execution::runtime_filter::RuntimeFilterProducerFailure,
     ) -> Result<(), RuntimeFilterContractViolation> {
         let envelope = BackendNativeRuntimeFilterEnvelope::new(
@@ -665,7 +656,7 @@ impl BackendParticipantOutbound {
             self.install.participant(),
             channel_id,
             BackendNativeRouteIdentity::producer_instance(
-                BackendNativeProducerInstanceRouteIdentity::new(binding_id, fragment_instance_id),
+                BackendNativeProducerInstanceRouteIdentity::new(binding_id, task_key),
             ),
             None,
             None,
@@ -910,7 +901,7 @@ impl RuntimeFilterParticipantOutbound for BackendParticipantOutbound {
         &self,
         channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
         binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition: novarocks_execution::runtime_filter::PartitionId,
         sequence: novarocks_execution::runtime_filter::ProducerSequence,
         local_partition_count: u32,
@@ -920,7 +911,7 @@ impl RuntimeFilterParticipantOutbound for BackendParticipantOutbound {
             self,
             channel_id,
             binding_id,
-            fragment_instance_id,
+            task_key,
             partition,
             sequence,
             local_partition_count,
@@ -932,7 +923,7 @@ impl RuntimeFilterParticipantOutbound for BackendParticipantOutbound {
         &self,
         channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
         binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition: novarocks_execution::runtime_filter::PartitionId,
         sequence: novarocks_execution::runtime_filter::ProducerSequence,
         local_partition_count: u32,
@@ -941,7 +932,7 @@ impl RuntimeFilterParticipantOutbound for BackendParticipantOutbound {
             self,
             channel_id,
             binding_id,
-            fragment_instance_id,
+            task_key,
             partition,
             sequence,
             local_partition_count,
@@ -952,15 +943,11 @@ impl RuntimeFilterParticipantOutbound for BackendParticipantOutbound {
         &self,
         channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
         binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         reason: novarocks_execution::runtime_filter::RuntimeFilterProducerFailure,
     ) -> Result<(), RuntimeFilterContractViolation> {
         BackendParticipantOutbound::forward_producer_failure(
-            self,
-            channel_id,
-            binding_id,
-            fragment_instance_id,
-            reason,
+            self, channel_id, binding_id, task_key, reason,
         )
     }
 }
@@ -1016,11 +1003,11 @@ mod tests {
     use novarocks_execution::runtime_filter::{
         LogicalVersion, RuntimeFilterBindOutcome, RuntimeFilterChannelId,
         RuntimeFilterConsumerContract, RuntimeFilterExecutionContract, RuntimeFilterFinalDomain,
-        RuntimeFilterFinalDomainCompletionHandle, RuntimeFilterFinalDomainOpenRequest,
-        RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics, RuntimeFilterProducerContract,
-        RuntimeFilterProducerFailure, RuntimeFilterProducerOpenRequest,
-        RuntimeFilterSubscriptionHandle, RuntimeFilterSubscriptionRequest, SnapshotAcquireOutcome,
-        UnavailableReason, contribution,
+        RuntimeFilterFinalDomainOpenRequest, RuntimeFilterMembershipSchema,
+        RuntimeFilterNullSemantics, RuntimeFilterProducerContract, RuntimeFilterProducerFailure,
+        RuntimeFilterProducerOpenRequest, RuntimeFilterSubscriptionPin,
+        RuntimeFilterSubscriptionRequest, SharedRuntimeFilterFinalDomainCompletion,
+        SnapshotAcquireOutcome, UnavailableReason, contribution,
     };
     use novarocks_proto_codec::lifecycle::AttemptId;
     use novarocks_types::QueryId;
@@ -1167,7 +1154,7 @@ mod tests {
         UniqueId,
     ) {
         let participant_identity = BackendParticipantIdentity::new(UniqueId::new(701, 703), 23);
-        let fragment_instance = UniqueId::new(709, 711);
+        let task_key = UniqueId::new(709, 711);
         let schema = RuntimeFilterMembershipSchema::new(
             &DataType::Int64,
             RuntimeFilterNullSemantics::NeverMatches,
@@ -1197,7 +1184,7 @@ mod tests {
                 novarocks_worker::runtime_filter::domain::BackendProducerInstall::new(
                     producer.clone(),
                     coverage_witness,
-                    [fragment_instance],
+                    [task_key],
                     max_contribution_bytes,
                 )
                 .expect("FinalDomain producer install"),
@@ -1214,7 +1201,7 @@ mod tests {
                 [BackendRouteRole::Producer(producer.binding_id())],
                 [],
                 [],
-                [((producer.binding_id(), fragment_instance), 1)],
+                [((producer.binding_id(), task_key), 1)],
             )
             .expect("FinalDomain routing channel")],
         )
@@ -1241,17 +1228,17 @@ mod tests {
             Arc::new(DiscardSink),
         )
         .expect("FinalDomain participant");
-        (participant, producer, fragment_instance)
+        (participant, producer, task_key)
     }
 
     fn open_final_domain_completion(
         participant: &Arc<RuntimeFilterParticipant>,
         producer: RuntimeFilterProducerContract,
-        fragment_instance: UniqueId,
+        task_key: UniqueId,
         local_partition_count: u32,
-    ) -> RuntimeFilterFinalDomainCompletionHandle {
+    ) -> SharedRuntimeFilterFinalDomainCompletion {
         let session = participant
-            .session_for_fragment(execution_id(), fragment_instance, true)
+            .session_for_task(execution_id(), task_key, true)
             .expect("participant session")
             .expect("required participant session");
         let RuntimeFilterBindOutcome::Bound(completion) = session
@@ -1287,46 +1274,39 @@ mod tests {
     // instance (709, 711) and nothing for any other instance.
     #[test]
     fn a_fragment_session_requires_exactly_the_bindings_installed_for_its_instance() {
-        let (participant, producer, fragment_instance) = final_domain_participant(1024);
+        let (participant, producer, task_key) = final_domain_participant(1024);
         let binding = producer.binding_id().get();
         assert_eq!(
-            participant.fragment_bindings(fragment_instance),
+            participant.task_bindings(task_key),
             BTreeSet::from([binding])
         );
 
         let session = participant
-            .session_for_fragment_bindings(
-                execution_id(),
-                fragment_instance,
-                &BTreeSet::from([binding]),
-            )
+            .session_for_task_bindings(execution_id(), task_key, &BTreeSet::from([binding]))
             .expect("the program binds exactly the installed binding");
         assert!(session.is_some(), "a binding program receives its session");
 
         let other = UniqueId::new(709, 712);
         assert!(
             participant
-                .session_for_fragment_bindings(execution_id(), other, &BTreeSet::new())
+                .session_for_task_bindings(execution_id(), other, &BTreeSet::new())
                 .expect("an instance with no installed binding binds none")
                 .is_none()
         );
 
         for (instance, bindings) in [
             // The program drops the installed producer.
-            (fragment_instance, BTreeSet::new()),
+            (task_key, BTreeSet::new()),
             // The program binds one the participant never installed.
-            (fragment_instance, BTreeSet::from([binding, binding + 1])),
+            (task_key, BTreeSet::from([binding, binding + 1])),
             // Another instance claims this instance's binding.
             (other, BTreeSet::from([binding])),
         ] {
-            let error = match participant.session_for_fragment_bindings(
-                execution_id(),
-                instance,
-                &bindings,
-            ) {
-                Ok(_) => panic!("{bindings:?} on {instance} is not what was installed"),
-                Err(error) => error,
-            };
+            let error =
+                match participant.session_for_task_bindings(execution_id(), instance, &bindings) {
+                    Ok(_) => panic!("{bindings:?} on {instance} is not what was installed"),
+                    Err(error) => error,
+                };
             assert_eq!(
                 error.code(),
                 RuntimeFilterContractErrorCode::InvalidContract
@@ -1344,11 +1324,7 @@ mod tests {
             AttemptId::new(24).expect("nonzero attempt"),
         )
         .expect("valid execution id");
-        match participant.session_for_fragment_bindings(
-            foreign,
-            fragment_instance,
-            &BTreeSet::from([binding]),
-        ) {
+        match participant.session_for_task_bindings(foreign, task_key, &BTreeSet::from([binding])) {
             Ok(_) => panic!("another attempt's fragment binds nothing here"),
             Err(error) => {
                 assert_eq!(
@@ -1361,8 +1337,8 @@ mod tests {
 
     #[test]
     fn final_domain_completion_requires_every_partition_to_seal_and_close() {
-        let (participant, producer, fragment_instance) = final_domain_participant(1024);
-        let completion = open_final_domain_completion(&participant, producer, fragment_instance, 2);
+        let (participant, producer, task_key) = final_domain_participant(1024);
+        let completion = open_final_domain_completion(&participant, producer, task_key, 2);
 
         let mut first = completion
             .claim_partition(novarocks_execution::runtime_filter::PartitionId::new(0))
@@ -1414,8 +1390,8 @@ mod tests {
 
     #[test]
     fn final_domain_completion_rejects_duplicate_and_out_of_range_claims() {
-        let (participant, producer, fragment_instance) = final_domain_participant(1024);
-        let completion = open_final_domain_completion(&participant, producer, fragment_instance, 2);
+        let (participant, producer, task_key) = final_domain_participant(1024);
+        let completion = open_final_domain_completion(&participant, producer, task_key, 2);
 
         completion
             .claim_partition(novarocks_execution::runtime_filter::PartitionId::new(0))
@@ -1526,8 +1502,8 @@ mod tests {
 
     #[test]
     fn final_domain_completion_rejects_double_seal_and_schema_or_digest_drift() {
-        let (participant, producer, fragment_instance) = final_domain_participant(1024);
-        let completion = open_final_domain_completion(&participant, producer, fragment_instance, 3);
+        let (participant, producer, task_key) = final_domain_participant(1024);
+        let completion = open_final_domain_completion(&participant, producer, task_key, 3);
 
         let mut schema_drift = completion
             .claim_partition(novarocks_execution::runtime_filter::PartitionId::new(0))
@@ -1599,8 +1575,8 @@ mod tests {
 
     #[test]
     fn final_domain_completion_rejects_payload_above_installed_canonical_budget() {
-        let (participant, producer, fragment_instance) = final_domain_participant(64);
-        let completion = open_final_domain_completion(&participant, producer, fragment_instance, 1);
+        let (participant, producer, task_key) = final_domain_participant(64);
+        let completion = open_final_domain_completion(&participant, producer, task_key, 1);
         let mut partition = completion
             .claim_partition(novarocks_execution::runtime_filter::PartitionId::new(0))
             .expect("partition claim");
@@ -1624,9 +1600,8 @@ mod tests {
 
     #[test]
     fn final_domain_completion_fail_opens_after_failure_or_participant_cancellation() {
-        let (participant, producer, fragment_instance) = final_domain_participant(1024);
-        let completion =
-            open_final_domain_completion(&participant, producer.clone(), fragment_instance, 1);
+        let (participant, producer, task_key) = final_domain_participant(1024);
+        let completion = open_final_domain_completion(&participant, producer.clone(), task_key, 1);
         assert_eq!(
             completion
                 .fail(RuntimeFilterProducerFailure::Cancelled)
@@ -1638,7 +1613,7 @@ mod tests {
             .close(QueryTerminationReason::QueryTerminationLocalFailure)
             .expect("participant cancellation");
         let session = participant
-            .session_for_fragment(execution_id(), fragment_instance, true)
+            .session_for_task(execution_id(), task_key, true)
             .expect("participant session")
             .expect("required participant session");
         assert!(matches!(
@@ -1838,19 +1813,18 @@ mod tests {
         .expect("source participant");
 
         let target_context = target
-            .session_for_fragment(execution_id(), consumer_instance, true)
+            .session_for_task(execution_id(), consumer_instance, true)
             .expect("target context")
             .expect("required target context");
-        let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionHandle::Blocking(
-            subscription,
-        )) = target_context
-            .subscribe(RuntimeFilterSubscriptionRequest::new(consumer_contract))
-            .expect("target subscription")
+        let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionPin::Blocking(subscription)) =
+            target_context
+                .subscribe(RuntimeFilterSubscriptionRequest::new(consumer_contract))
+                .expect("target subscription")
         else {
             panic!("target consumer must bind a blocking subscription");
         };
         let source_context = source
-            .session_for_fragment(execution_id(), source_instance, true)
+            .session_for_task(execution_id(), source_instance, true)
             .expect("source context")
             .expect("required source context");
         let RuntimeFilterBindOutcome::Bound(producer_handle) = source_context
@@ -2034,7 +2008,7 @@ mod tests {
         let snapshot = participant.capture_runtime_filter_observation();
         assert_eq!(snapshot.producer_streams().len(), 1);
         let stream = &snapshot.producer_streams()[0];
-        assert_eq!(stream.identity().fragment_instance_id(), source_instance);
+        assert_eq!(stream.identity().task_key(), source_instance);
         assert_eq!(stream.latest_accepted_sequence(), Some(0));
         assert_eq!(stream.accepted(), 1);
         assert_eq!(stream.duplicate(), 1);
@@ -2142,14 +2116,13 @@ mod tests {
         )
         .expect("target participant");
         let target_context = target
-            .session_for_fragment(execution_id(), consumer_instance, true)
+            .session_for_task(execution_id(), consumer_instance, true)
             .expect("target context")
             .expect("required target context");
-        let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionHandle::Blocking(
-            subscription,
-        )) = target_context
-            .subscribe(RuntimeFilterSubscriptionRequest::new(consumer_contract))
-            .expect("target subscription")
+        let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionPin::Blocking(subscription)) =
+            target_context
+                .subscribe(RuntimeFilterSubscriptionRequest::new(consumer_contract))
+                .expect("target subscription")
         else {
             panic!("target consumer must bind a blocking subscription");
         };

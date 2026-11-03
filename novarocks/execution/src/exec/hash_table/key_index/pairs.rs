@@ -28,7 +28,7 @@ use crate::{
         },
         pipeline::operator::InputConstructionOwner,
     },
-    runtime::fragment::ExecutionResult,
+    runtime::task::ExecutionResult,
 };
 use arrow::{
     array::*,

@@ -1929,7 +1929,7 @@ pub trait ConnectorWriteControl: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct ConnectorWriteLease {
+pub struct ConnectorWrite {
     /// FE-local effect owner.  This identity never crosses the native BE
     /// boundary and is deliberately independent of the BE-visible catalog
     /// handle and the provider-private generation key below.
@@ -1945,14 +1945,14 @@ pub struct ConnectorWriteLease {
     execution_provider_id: Option<ConnectorProviderId>,
     execution_distribution: Option<Arc<dyn ConnectorExecutionDistribution>>,
     metadata: Option<Arc<dyn super::ConnectorMetadata>>,
-    _release: Arc<ConnectorWriteLeaseRelease>,
+    _release: Arc<ConnectorWriteReleaseGuard>,
 }
 
-struct ConnectorWriteLeaseRelease {
+struct ConnectorWriteReleaseGuard {
     release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
 }
 
-impl ConnectorWriteLease {
+impl ConnectorWrite {
     pub fn new(
         binding_key: ConnectorProviderBindingKey,
         control: Arc<dyn ConnectorWriteControl>,
@@ -1990,7 +1990,7 @@ impl ConnectorWriteLease {
             execution_provider_id: None,
             execution_distribution: None,
             metadata: None,
-            _release: Arc::new(ConnectorWriteLeaseRelease {
+            _release: Arc::new(ConnectorWriteReleaseGuard {
                 release: Mutex::new(Some(Box::new(release))),
             }),
         })
@@ -2192,7 +2192,7 @@ impl ConnectorWriteLease {
     }
 
     /// Retain metadata from the same control generation as this writer.
-    /// Only `ConnectorControlPlanningLease::derive_write_lease` supplies this
+    /// Only `ConnectorControlPlanningPin::derive_write_lease` supplies this
     /// in production; standalone write-control tests may deliberately omit it.
     pub fn with_metadata(mut self, metadata: Arc<dyn super::ConnectorMetadata>) -> Self {
         self.metadata = Some(metadata);
@@ -2248,7 +2248,7 @@ impl ConnectorWriteLease {
     }
 }
 
-impl Drop for ConnectorWriteLeaseRelease {
+impl Drop for ConnectorWriteReleaseGuard {
     fn drop(&mut self) {
         let Ok(mut release) = self.release.lock() else {
             return;

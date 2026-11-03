@@ -15,27 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Original Root inventory cell for the shared host poller. Each Context
+//! Original Root inventory cell for the shared host poller. Each Participation
 //! transfer is prepared under Root, then bound with that Root guard released.
 
-use super::{ProcessControlOwner, RootRequestAdvanceError};
-use crate::QueryContextHostFactory;
+use super::{ControlRequestAdvanceError, ProcessControlOwner};
+use crate::ParticipationHostFactory;
 use crate::control_runtime::{
     actors::{WorkerAction, WorkerActor},
-    context_host::ContextHostError,
-    context_host_jobs::{ContextHostJob, ContextHostJobError, MaterializationCaptureRefusal},
     control_request::{ControlRequestError, RequestIoProgress},
     establish_executors::EstablishExecutorHandles,
     establish_route::EstablishRouteError,
-    service::ContextHostAddress,
+    participation_host::ParticipationHostError,
+    participation_host_jobs::{
+        MaterializationCaptureRefusal, ParticipationHostJob, ParticipationHostJobError,
+    },
+    service::ParticipationHostAddress,
 };
-use novarocks_control_runtime::driver::{
-    ActorHostTurn, ActorRegistration, DriverError, EffectCompletionRefusal, EffectTicket,
+use novarocks_control_runtime::actor_turn::{
+    ActorHostTurn, ActorRegistration, ActorTurnError, EffectCompletionRefusal, EffectTicket,
 };
 use novarocks_worker_protocol::control::ControlEffect;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub(crate) struct RootHostCell {
+pub(crate) struct ControlHostCell {
     owner: Mutex<ProcessControlOwner>,
     registration: ActorRegistration,
 }
@@ -50,25 +52,28 @@ pub(crate) struct RootHostProgress {
 }
 #[derive(Debug)]
 pub(crate) enum RootMaterializationError {
-    Driver(DriverError),
-    Context(ContextHostError),
+    ActorTurn(ActorTurnError),
+    Participation(ParticipationHostError),
     Control(ControlRequestError),
     WrongTarget,
 }
 impl std::fmt::Display for RootMaterializationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Driver(error) => {
+            Self::ActorTurn(error) => {
                 write!(f, "Root materialization actor operation failed: {error}")
             }
-            Self::Context(error) => {
-                write!(f, "Root materialization Context handoff failed: {error}")
+            Self::Participation(error) => {
+                write!(
+                    f,
+                    "Root materialization Participation handoff failed: {error}"
+                )
             }
             Self::Control(error) => {
                 write!(f, "Root materialization request operation failed: {error}")
             }
             Self::WrongTarget => {
-                f.write_str("Root materialization target does not match the original Context")
+                f.write_str("Root materialization target does not match the original Participation")
             }
         }
     }
@@ -76,8 +81,8 @@ impl std::fmt::Display for RootMaterializationError {
 impl std::error::Error for RootMaterializationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Driver(error) => Some(error),
-            Self::Context(error) => Some(error),
+            Self::ActorTurn(error) => Some(error),
+            Self::Participation(error) => Some(error),
             Self::Control(error) => Some(error),
             Self::WrongTarget => None,
         }
@@ -85,25 +90,25 @@ impl std::error::Error for RootMaterializationError {
 }
 
 /// Every refusal preserves the exclusive Root ticket. Captures which have
-/// already moved to the original Context inventory are never copied back.
+/// already moved to the original Participation inventory are never copied back.
 #[must_use = "Retain the original ticket and every refused capture"]
 pub(crate) enum RootMaterializationRefusal {
     Rejected {
         error: RootMaterializationError,
         ticket: EffectTicket<WorkerAction>,
-        _target: ContextHostAddress,
-        _factory: Arc<dyn QueryContextHostFactory>,
+        _target: ParticipationHostAddress,
+        _factory: Arc<dyn ParticipationHostFactory>,
     },
     Capture {
         ticket: EffectTicket<WorkerAction>,
-        _target: ContextHostAddress,
+        _target: ParticipationHostAddress,
         refusal: MaterializationCaptureRefusal,
     },
     Stage {
-        error: ContextHostJobError,
+        error: ParticipationHostJobError,
         ticket: EffectTicket<WorkerAction>,
-        _target: ContextHostAddress,
-        _job: ContextHostJob,
+        _target: ParticipationHostAddress,
+        _job: ParticipationHostJob,
     },
     Completion(EffectCompletionRefusal<WorkerAction>),
 }
@@ -131,7 +136,7 @@ impl std::fmt::Debug for RootMaterializationRefusal {
         }
     }
 }
-impl RootHostCell {
+impl ControlHostCell {
     pub(crate) fn new(owner: ProcessControlOwner) -> Self {
         let registration = owner.registration().clone();
         Self {
@@ -152,25 +157,25 @@ impl RootHostCell {
             .expect("original Root host inventory")
     }
     /// Move the original committed Materialize into its already-adopted
-    /// Context. Root and Context inventory guards never overlap. The factory
+    /// Participation. Root and Participation inventory guards never overlap. The factory
     /// is captured only after M/R/H and both callback directions are admitted;
     /// no foreign call or destructor runs in this metadata handoff.
     pub(crate) fn handoff_materialization(
         &self,
         ticket: EffectTicket<WorkerAction>,
-        target: ContextHostAddress,
-        factory: Arc<dyn QueryContextHostFactory>,
+        target: ParticipationHostAddress,
+        factory: Arc<dyn ParticipationHostFactory>,
     ) -> Result<(), RootMaterializationRefusal> {
-        let (context, admission) = match &ticket.effect {
+        let (participation, admission) = match &ticket.effect {
             WorkerAction::Control {
                 effect:
                     ControlEffect::Materialize {
-                        context,
+                        participation,
                         reservation,
                         ..
                     },
                 admitted: Some(original),
-            } if original == reservation => (*context, *reservation),
+            } if original == reservation => (*participation, *reservation),
             _ => {
                 return Err(RootMaterializationRefusal::Rejected {
                     error: RootMaterializationError::WrongTarget,
@@ -183,14 +188,15 @@ impl RootHostCell {
         let preflight = {
             let owner = self.lock();
             let runtime = owner.runtime();
-            if ticket.actor != self.registration.actor() || target.context() != context {
+            if ticket.actor != self.registration.actor() || target.participation() != participation
+            {
                 Err(RootMaterializationError::WrongTarget)
             } else {
                 runtime
                     .validate_effect_ticket(&ticket)
                     .and_then(|()| runtime.validate_registration(target.registration()))
                     .map(|()| runtime.clone())
-                    .map_err(RootMaterializationError::Driver)
+                    .map_err(RootMaterializationError::ActorTurn)
             }
         };
         let runtime = match preflight {
@@ -206,7 +212,7 @@ impl RootHostCell {
         };
 
         // Preparing a target admits only metadata and original empty roles.
-        // A partial remains in that Context; no source or factory moved yet.
+        // A partial remains in that Participation; no source or factory moved yet.
         let prepared = {
             match target.lock() {
                 Some(mut host)
@@ -219,7 +225,7 @@ impl RootHostCell {
                         Ok(())
                     };
                     prepared
-                        .map_err(RootMaterializationError::Context)
+                        .map_err(RootMaterializationError::Participation)
                         .and_then(|()| {
                             host.host_jobs()
                                 .cloned()
@@ -272,7 +278,7 @@ impl RootHostCell {
         };
         let staged = match target.lock() {
             Some(mut host) => host.stage_materialization(job),
-            None => Err((ContextHostJobError::WrongOwner, job)),
+            None => Err((ParticipationHostJobError::WrongOwner, job)),
         };
         if let Err((error, job)) = staged {
             return Err(RootMaterializationRefusal::Stage {
@@ -283,7 +289,7 @@ impl RootHostCell {
             });
         }
         // This completion acknowledges captured ownership, not M's physical
-        // execution or the Context Core's eventual establishment decision.
+        // execution or the Participation Core's eventual establishment decision.
         let input = ticket.input;
         runtime
             .effect_completed_for(&self.registration, ticket)
@@ -299,11 +305,11 @@ impl RootHostCell {
         handles: &EstablishExecutorHandles,
         protocol_events: Option<&crate::TaskExecutionPorts>,
         budget: usize,
-    ) -> Result<RootHostProgress, RootRequestAdvanceError> {
+    ) -> Result<RootHostProgress, ControlRequestAdvanceError> {
         if !turn.matches_registration(&self.registration)
             || !handles.belongs_to(self.lock().request_ready())
         {
-            return Err(RootRequestAdvanceError::WrongOwner);
+            return Err(ControlRequestAdvanceError::WrongOwner);
         }
         let mut progress = RootHostProgress::default();
         for _ in 0..budget {
@@ -316,7 +322,7 @@ impl RootHostCell {
                     progress.stale_targets += 1;
                     continue;
                 }
-                Err(error) => return Err(RootRequestAdvanceError::Control(error)),
+                Err(error) => return Err(ControlRequestAdvanceError::ControlRequestFailed(error)),
             };
             let Some(original) = original else {
                 break;
@@ -327,7 +333,7 @@ impl RootHostCell {
                 Err(ControlRequestError::Route(EstablishRouteError::TargetRemoved)) => {
                     progress.stale_targets += 1;
                 }
-                Err(error) => return Err(RootRequestAdvanceError::Control(error)),
+                Err(error) => return Err(ControlRequestAdvanceError::ControlRequestFailed(error)),
             }
         }
         let mut owner = self.lock();

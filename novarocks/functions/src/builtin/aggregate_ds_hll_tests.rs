@@ -407,7 +407,7 @@ fn ds_hll_host_sparse_frozen_shape_is_bounded_and_does_not_retain_the_type_owner
     );
     assert!(source.detail().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
     assert!(state.failed);
-    assert!(state.handle.is_none());
+    assert!(state.accumulator.is_none());
     assert_eq!(state.charge.bytes(), 0);
     assert_eq!(
         update(
@@ -482,7 +482,7 @@ fn ds_hll_host_every_observed_hash_checkpoint_all_seven_causes_no_tail() {
             );
             assert_eq!(control.trace.lock().unwrap().len(), at + 1);
             assert!(state.failed);
-            assert!(state.handle.is_none());
+            assert!(state.accumulator.is_none());
             assert_eq!(state.charge.bytes(), 0);
             drop(state);
             empty(&host);
@@ -603,7 +603,7 @@ fn ds_hll_host_serialization_real_lease_outlives_payload_and_output_control() {
     let mut state = kernel
         .create_state_with_allocator(Some(host.clone()), &Control::default())
         .unwrap();
-    let mut original = HllHandle::new_unreserved(4, HllTargetType::Hll4).unwrap();
+    let mut original = HllAccumulator::new_unreserved(4, HllTargetType::Hll4).unwrap();
     for hash in 0..321 {
         original.update_hash_unreserved(hash).unwrap();
     }
@@ -654,7 +654,7 @@ fn ds_hll_host_serialization_real_lease_outlives_payload_and_output_control() {
     empty(&host);
 }
 #[test]
-fn ds_hll_host_missing_capability_refuses_before_handle_or_metadata() {
+fn ds_hll_host_missing_capability_refuses_before_accumulator_or_metadata() {
     let kernel = kernel(
         "ds_hll_count_distinct",
         &[FunctionValueType::new(DataType::Int64, false)],
@@ -718,7 +718,7 @@ fn ds_hll_host_semantic_decoder_data_is_reserved_and_has_no_success_footer() {
             "merge aggregate state: ds_hll: failed to deserialize HLL payload: InvalidData => SET mode contains duplicate coupons"
         );
         assert_eq!(data.state_indices(), &[14]);
-        assert!(state.handle.is_none());
+        assert!(state.accumulator.is_none());
         assert_eq!(state.charge.bytes(), 0);
         drop(data);
         drop(prepared);
@@ -787,7 +787,7 @@ fn ds_hll_host_scalar_and_constant_carriers_use_actual_sparse_addresses() {
                 .update_row_evaluation(&mut state, &prepared, ordinal, &setup)
                 .unwrap();
         }
-        assert_eq!(state.handle.as_ref().unwrap().estimate().unwrap(), 1);
+        assert_eq!(state.accumulator.as_ref().unwrap().estimate().unwrap(), 1);
         drop(prepared);
         drop(state);
         empty(&host);

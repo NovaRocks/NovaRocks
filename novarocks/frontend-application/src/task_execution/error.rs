@@ -29,7 +29,7 @@ use crate::task_execution::status_validation::FinalInfoDisagreement;
 use novarocks_coordination_contract::StatusObservation;
 use novarocks_execution::task_execution::{
     DescriptorError, DomainConflict, ExchangeEdgeId, IdentityMismatch, OperationKind,
-    OperationOutcome, QueryContextRef, RequestError, TaskOperationId, TaskState,
+    OperationOutcome, ParticipationRef, RequestError, TaskOperationId, TaskState,
 };
 use novarocks_types::identity::BackendProcessId;
 
@@ -93,7 +93,7 @@ pub enum TaskExecutionError {
     /// decide whether independently observed process replacement permits a
     /// successor schedule.
     PreReadyEstablishRejected {
-        context: QueryContextRef,
+        participation: ParticipationRef,
         operation_id: TaskOperationId,
         rejection:
             novarocks_execution_contract::operation::OperationResult<std::convert::Infallible>,
@@ -133,7 +133,7 @@ pub enum TaskExecutionError {
     },
     /// A backend answered an operation with an outcome that fails the attempt.
     OperationFailed {
-        context: QueryContextRef,
+        participation: ParticipationRef,
         operation_id: TaskOperationId,
         kind: OperationKind,
         rejection:
@@ -175,8 +175,8 @@ pub enum CapacityBound {
     BackendOperations { limit: usize },
     /// Queued bytes across every backend of this query.
     BackendBytes { limit: usize },
-    /// Tasks in one query context.
-    TasksPerContext { limit: usize },
+    /// Tasks in one participation.
+    TasksPerParticipation { limit: usize },
     /// Active tasks this query places on one backend.
     ActiveTasksPerBackend {
         backend: BackendProcessId,
@@ -243,9 +243,9 @@ impl novarocks_execution_contract::failure::FailureProjection for CapacityBound 
                 None,
                 u64::try_from(limit).ok(),
             ),
-            // Context and query-on-one-backend cardinalities have no exact
+            // Participation and query-on-one-backend cardinalities have no exact
             // ResourceScope word. They are not a Task or Process measurement.
-            Self::TasksPerContext { limit } => {
+            Self::TasksPerParticipation { limit } => {
                 (44, None, None, D::Items, None, u64::try_from(limit).ok())
             }
             Self::ActiveTasksPerBackend { limit, .. } => {
@@ -308,8 +308,8 @@ impl fmt::Display for CapacityBound {
                 write!(formatter, "queued operations reached {limit}")
             }
             Self::BackendBytes { limit } => write!(formatter, "queued bytes reached {limit}"),
-            Self::TasksPerContext { limit } => {
-                write!(formatter, "tasks in one query context reached {limit}")
+            Self::TasksPerParticipation { limit } => {
+                write!(formatter, "tasks in one participation reached {limit}")
             }
             Self::ActiveTasksPerBackend { backend, limit } => write!(
                 formatter,
@@ -370,15 +370,15 @@ impl fmt::Display for TaskExecutionError {
             ),
             Self::PreReadyEstablishTransportUnknown { backend } => write!(
                 formatter,
-                "EstablishQueryContext for backend {backend} exhausted its exact replay budget with unknown Worker outcomes"
+                "EstablishParticipation for backend {backend} exhausted its exact replay budget with unknown Worker outcomes"
             ),
             Self::PreReadyEstablishRejected {
-                context,
+                participation,
                 operation_id,
                 rejection,
             } => write!(
                 formatter,
-                "EstablishQueryContext {operation_id} for context {context:?} was rejected before ControlReady with {:?}",
+                "EstablishParticipation {operation_id} for participation {participation:?} was rejected before ControlReady with {:?}",
                 rejection.outcome()
             ),
             Self::UnknownOperation => {
@@ -485,11 +485,11 @@ enum TaskProtocolFailureReason {
     OperationTimedOut,
     IdentityMismatch,
     CompatibilityMismatch,
-    ContextNotEstablished,
-    ContextConflict,
+    ParticipationNotEstablished,
+    ParticipationConflict,
     DomainConflict,
     LeaseExpired,
-    ContextTerminalReceipt,
+    ParticipationTerminalReceipt,
     InvalidStateOrRequest,
     TerminalRejected,
     Gone,
@@ -503,11 +503,11 @@ impl TaskProtocolFailureReason {
             OperationOutcome::OperationTimedOut => Self::OperationTimedOut,
             OperationOutcome::IdentityMismatch => Self::IdentityMismatch,
             OperationOutcome::CompatibilityMismatch => Self::CompatibilityMismatch,
-            OperationOutcome::ContextNotEstablished => Self::ContextNotEstablished,
-            OperationOutcome::ContextConflict => Self::ContextConflict,
+            OperationOutcome::ParticipationNotEstablished => Self::ParticipationNotEstablished,
+            OperationOutcome::ParticipationConflict => Self::ParticipationConflict,
             OperationOutcome::DomainConflict => Self::DomainConflict,
             OperationOutcome::LeaseExpired => Self::LeaseExpired,
-            OperationOutcome::ContextTerminalReceipt => Self::ContextTerminalReceipt,
+            OperationOutcome::ParticipationTerminalReceipt => Self::ParticipationTerminalReceipt,
             OperationOutcome::InvalidStateOrRequest => Self::InvalidStateOrRequest,
             OperationOutcome::TerminalRejected => Self::TerminalRejected,
             OperationOutcome::Gone => Self::Gone,
@@ -537,11 +537,11 @@ impl novarocks_execution_contract::failure::FailureProjection for TaskProtocolFa
                 novarocks_query_application::execution_error::TASK_PROTOCOL_IDENTITY_MISMATCH_REASON,
             ),
             Self::CompatibilityMismatch => (FailureClass::Invariant, 16),
-            Self::ContextNotEstablished => (FailureClass::Invariant, 17),
-            Self::ContextConflict => (FailureClass::Invariant, 18),
+            Self::ParticipationNotEstablished => (FailureClass::Invariant, 17),
+            Self::ParticipationConflict => (FailureClass::Invariant, 18),
             Self::DomainConflict => (FailureClass::Invariant, 19),
             Self::LeaseExpired => (FailureClass::Control, 20),
-            Self::ContextTerminalReceipt => (FailureClass::Control, 21),
+            Self::ParticipationTerminalReceipt => (FailureClass::Control, 21),
             Self::InvalidStateOrRequest => (FailureClass::Invariant, 22),
             Self::TerminalRejected => (FailureClass::Control, 23),
             Self::Gone => (FailureClass::Control, 24),
@@ -651,26 +651,26 @@ impl TaskExecutionError {
         }
         let operation = match self {
             Self::OperationFailed {
-                context,
+                participation,
                 operation_id,
                 kind,
                 rejection,
-            } => Some((*context, *operation_id, *kind, rejection)),
+            } => Some((*participation, *operation_id, *kind, rejection)),
             Self::PreReadyEstablishRejected {
-                context,
+                participation,
                 operation_id,
                 rejection,
             } => Some((
-                *context,
+                *participation,
                 *operation_id,
-                OperationKind::UpdateQueryContext,
+                OperationKind::UpdateParticipation,
                 rejection,
             )),
             _ => None,
         };
-        if let Some((context, operation_id, kind, rejection)) = operation {
+        if let Some((participation, operation_id, kind, rejection)) = operation {
             let site = ExecutionFailureSite::Operation {
-                context,
+                participation,
                 operation_id,
                 kind,
             };
@@ -787,9 +787,9 @@ mod canonical_input_tests {
         operation::{DomainFailureOutcome, OperationDomainFailure, OperationResult},
     };
     use novarocks_query_application::execution_error::{ExecutionFailureSite, QueryFailureReason};
-    fn context() -> QueryContextRef {
+    fn participation() -> ParticipationRef {
         use novarocks_types::{AttemptId, FrontendProcessId, QueryExecutionId, QueryId};
-        QueryContextRef::new(
+        ParticipationRef::new(
             QueryExecutionId::new(QueryId::new(51, 52), AttemptId::new(1).unwrap()).unwrap(),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
@@ -862,7 +862,7 @@ mod canonical_input_tests {
         let scan = ScanNodeKey::new(1, 7);
         let target = AssignmentTarget {
             backend_idx: 0,
-            fragment_instance_id: novarocks_types::UniqueId::new(11, 12),
+            task_key: novarocks_types::UniqueId::new(11, 12),
         };
         let raw = "BackendLost: private provider token must never be a recovery signal";
         for error in [
@@ -917,7 +917,7 @@ mod canonical_input_tests {
 
     #[test]
     fn domain_operation_keeps_original_fact_detail_and_exact_operation_identity() {
-        let context = context();
+        let participation = participation();
         let operation_id = TaskOperationId::new_v7();
         let fact = FailureFact::new(
             FailureClass::Resource,
@@ -935,7 +935,7 @@ mod canonical_input_tests {
         });
         let detail = SafeDetail::truncating("original Worker failure 申请位置");
         let input = TaskExecutionError::OperationFailed {
-            context,
+            participation,
             operation_id,
             kind: OperationKind::CreateTask,
             rejection: OperationResult::DomainFailure {
@@ -949,18 +949,18 @@ mod canonical_input_tests {
         assert_eq!(
             input.site(),
             ExecutionFailureSite::Operation {
-                context,
+                participation,
                 operation_id,
                 kind: OperationKind::CreateTask
             }
         );
     }
     #[test]
-    fn establish_rejection_keeps_request_context_and_operation_without_fake_task_phase() {
-        let context = context();
+    fn establish_rejection_keeps_request_participation_and_operation_without_fake_task_phase() {
+        let participation = participation();
         let operation_id = TaskOperationId::new_v7();
         let input = TaskExecutionError::PreReadyEstablishRejected {
-            context,
+            participation,
             operation_id,
             rejection: OperationResult::Verdict {
                 outcome: OperationOutcome::IdentityMismatch,
@@ -972,9 +972,9 @@ mod canonical_input_tests {
         assert_eq!(
             input.site(),
             ExecutionFailureSite::Operation {
-                context,
+                participation,
                 operation_id,
-                kind: OperationKind::UpdateQueryContext
+                kind: OperationKind::UpdateParticipation
             }
         );
         assert_eq!(input.fact().reason().code(), 15);
@@ -988,9 +988,9 @@ mod canonical_input_tests {
         use novarocks_coordination_contract::AttemptFailureClass;
         use novarocks_query_application::api::NativeAttemptTopologyRequirement;
         let input = TaskExecutionError::OperationFailed {
-            context: context(),
+            participation: participation(),
             operation_id: TaskOperationId::new_v7(),
-            kind: OperationKind::ReleaseQueryContext,
+            kind: OperationKind::ReleaseParticipation,
             rejection: OperationResult::Verdict {
                 outcome: OperationOutcome::OwnerFailed,
                 detail: None,
@@ -1013,7 +1013,7 @@ mod canonical_input_tests {
     #[test]
     fn ordinary_resource_verdict_is_a_protocol_fact_without_fabricated_resource_measurements() {
         let input = TaskExecutionError::OperationFailed {
-            context: context(),
+            participation: participation(),
             operation_id: TaskOperationId::new_v7(),
             kind: OperationKind::CreateTask,
             rejection: OperationResult::Verdict {
@@ -1036,7 +1036,7 @@ mod canonical_input_tests {
             OperationOutcome::AdmissionTicketStillActive,
         ] {
             let input = TaskExecutionError::OperationFailed {
-                context: context(),
+                participation: participation(),
                 operation_id: TaskOperationId::new_v7(),
                 kind: OperationKind::CreateTask,
                 rejection: OperationResult::Verdict {
@@ -1181,9 +1181,9 @@ mod capacity_projection_tests {
         }
     }
     #[test]
-    fn cardinality_bounds_do_not_invent_context_task_scope_or_request_usage() {
+    fn cardinality_bounds_do_not_invent_participation_task_scope_or_request_usage() {
         for bound in [
-            CapacityBound::TasksPerContext { limit: 0 },
+            CapacityBound::TasksPerParticipation { limit: 0 },
             CapacityBound::ActiveTasksPerBackend {
                 backend: BackendProcessId::new_v7(),
                 limit: usize::MAX,

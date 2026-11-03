@@ -21,7 +21,7 @@ use super::*;
 use crate::{
     native::{
         data_runtime::FrontendDataRuntime,
-        fragment_transport::{
+        task_result_transport::{
             DynamicFilterRead, DynamicFilterReadError, FinalTaskInfoRead, TaskResultTransport,
         },
     },

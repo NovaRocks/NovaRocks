@@ -22,7 +22,7 @@ mod completed_router_placement_fixture {
     use std::num::NonZeroU32;
     use std::sync::Arc;
 
-    use novarocks_execution_contract::{ExchangeEdgeId, QueryContextRef, TaskIdentity};
+    use novarocks_execution_contract::{ExchangeEdgeId, ParticipationRef, TaskIdentity};
     use novarocks_query_application::api::BackendTopologySnapshot;
     use novarocks_types::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -90,7 +90,7 @@ mod completed_router_placement_fixture {
                     std::array::from_fn(|_| BackendProcessId::new_v7());
                 let frontend = FrontendProcessId::new_v7();
                 let mut tasks_by_fragment = BTreeMap::new();
-                let mut contexts = BTreeMap::new();
+                let mut participations = BTreeMap::new();
                 let mut fragments = Vec::new();
                 let mut next_task = 1_u32;
                 for (index, &fragment) in prepared.fragments.iter().enumerate() {
@@ -111,9 +111,9 @@ mod completed_router_placement_fixture {
                     };
                     let mut tasks = Vec::new();
                     for (instance_index, &backend) in processes[..width].iter().enumerate() {
-                        let context = *contexts
+                        let participation = *participations
                             .entry(backend)
-                            .or_insert_with(|| QueryContextRef::new(execution, frontend, backend));
+                            .or_insert_with(|| ParticipationRef::new(execution, frontend, backend));
                         let identity = TaskIdentity::new(
                             execution,
                             stage_id,
@@ -123,7 +123,7 @@ mod completed_router_placement_fixture {
                         next_task += 1;
                         tasks.push(ProjectedTask {
                             identity,
-                            context,
+                            participation,
                             instance_index,
                             scan_work: Vec::new(),
                         });
@@ -184,7 +184,7 @@ mod completed_router_placement_fixture {
                     execution,
                     fragments,
                     edges,
-                    contexts: contexts.values().copied().collect(),
+                    participations: participations.values().copied().collect(),
                     root,
                 };
                 let targets = processes

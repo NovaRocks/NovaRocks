@@ -1333,7 +1333,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::{
         ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -2097,7 +2097,7 @@ mod tests {
             object_store_config,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
         )
     }
 

@@ -220,7 +220,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field};
     use bytes::Bytes;
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorManagedPartitionField,
         ConnectorManagedPartitionSpecObservation, ConnectorManagedPartitionSpecReplacement,
@@ -263,7 +263,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(executor.handle().clone())),
         );
         let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
         let runtime = Arc::new(

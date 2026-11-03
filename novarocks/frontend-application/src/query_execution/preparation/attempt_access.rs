@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use crate::query_execution::artifact::FragmentId;
 use novarocks_spi::connector::{
-    CatalogProperties, ConnectorControlPlanningLease, ConnectorReadAttemptAccess,
+    CatalogProperties, ConnectorControlPlanningPin, ConnectorReadAttemptAccess,
 };
 
 /// The single owner of everything that may open the immutable scans across
@@ -37,7 +37,7 @@ pub(crate) type ConnectorAttemptAccessPlan = LogicalExecutionAccessScope;
 
 pub(crate) struct ConnectorAttemptAccessEntry {
     catalog_properties: CatalogProperties,
-    planning_lease: ConnectorControlPlanningLease,
+    planning_pin: ConnectorControlPlanningPin,
     access: ConnectorReadAttemptAccess,
 }
 
@@ -51,7 +51,7 @@ pub(crate) struct ConnectorAttemptAccessEntry {
 pub(crate) type FrozenReadCapability = (
     novarocks_sql::binding::SqlTableBindingId,
     ConnectorReadAttemptAccess,
-    ConnectorControlPlanningLease,
+    ConnectorControlPlanningPin,
     CatalogProperties,
 );
 
@@ -120,7 +120,7 @@ impl PreparedAttemptAccess {
                     destination,
                     Arc::new(ConnectorAttemptAccessEntry {
                         catalog_properties: catalog,
-                        planning_lease: generation,
+                        planning_pin: generation,
                         access,
                     }),
                 );
@@ -159,7 +159,7 @@ pub(crate) fn attempt_access_for_completed_plan(
                     (fragment_id, node_id),
                     Arc::new(ConnectorAttemptAccessEntry {
                         catalog_properties: catalog,
-                        planning_lease: generation,
+                        planning_pin: generation,
                         access,
                     }),
                 )
@@ -196,7 +196,7 @@ impl ConnectorAttemptAccessEntry {
     #[cfg(test)]
     pub(crate) fn for_initializer_test(
         catalog_properties: CatalogProperties,
-        planning_lease: ConnectorControlPlanningLease,
+        planning_pin: ConnectorControlPlanningPin,
         access: ConnectorReadAttemptAccess,
     ) -> Arc<Self> {
         assert_eq!(
@@ -205,11 +205,11 @@ impl ConnectorAttemptAccessEntry {
         );
         assert_eq!(
             access.frozen().binding().descriptor(),
-            planning_lease.binding().descriptor()
+            planning_pin.binding().descriptor()
         );
         Arc::new(Self {
             catalog_properties,
-            planning_lease,
+            planning_pin,
             access,
         })
     }
@@ -222,7 +222,7 @@ impl ConnectorAttemptAccessEntry {
         &self.catalog_properties
     }
 
-    pub(crate) const fn planning_lease(&self) -> &ConnectorControlPlanningLease {
-        &self.planning_lease
+    pub(crate) const fn planning_pin(&self) -> &ConnectorControlPlanningPin {
+        &self.planning_pin
     }
 }

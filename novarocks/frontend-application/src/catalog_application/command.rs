@@ -481,7 +481,7 @@ fn execute_alter_iceberg_schema(
         },
         connector_context.clone(),
         |planning| {
-            crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context(
+            crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_pin_and_context(
                 executor.mv_storage_observation.as_ref(),
                 planning,
                 executor.mv_readiness.as_ref(),
@@ -511,7 +511,7 @@ fn execute_admitted_alter_schema(
     instance_id: &ConnectorInstanceId,
     operation: novarocks_spi::connector::ConnectorCatalogMutationOperation,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    guard: impl FnOnce(&novarocks_spi::connector::ConnectorControlPlanningLease) -> Result<(), String>,
+    guard: impl FnOnce(&novarocks_spi::connector::ConnectorControlPlanningPin) -> Result<(), String>,
 ) -> Result<crate::connector::mutation::CompletedCatalogMutation, String> {
     let planning = controls
         .acquire_current(instance_id)
@@ -901,20 +901,20 @@ mod tests {
             &self,
             _: &spi::ConnectorInstanceId,
         ) -> Result<spi::ConnectorProviderBindingKey, spi::ConnectorError> {
-            panic!("must retain a planning lease")
+            panic!("must retain a planning pin")
         }
         fn observe_current_control_runtime(
             &self,
             _: &spi::ConnectorInstanceId,
         ) -> Result<spi::ConnectorControlRuntimeId, spi::ConnectorError> {
-            panic!("must retain a planning lease")
+            panic!("must retain a planning pin")
         }
         fn acquire_current(
             &self,
             _: &spi::ConnectorInstanceId,
-        ) -> Result<spi::ConnectorControlPlanningLease, spi::ConnectorError> {
+        ) -> Result<spi::ConnectorControlPlanningPin, spi::ConnectorError> {
             let index = self.acquired.fetch_add(1, Ordering::AcqRel);
-            Ok(spi::ConnectorControlPlanningLease::new(
+            Ok(spi::ConnectorControlPlanningPin::new(
                 self.bindings[index.min(1)].clone(),
                 || {},
             ))
@@ -997,7 +997,7 @@ mod tests {
     }
 
     fn schema_alter_metadata_guard(
-        planning: &spi::ConnectorControlPlanningLease,
+        planning: &spi::ConnectorControlPlanningPin,
         operation: &spi::ConnectorCatalogMutationOperation,
         context: &spi::ConnectorRequestContext,
     ) -> Result<(), String> {

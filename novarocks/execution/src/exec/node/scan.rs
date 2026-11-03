@@ -57,7 +57,7 @@ pub struct ScanExitObservation {
 /// stream; neither is an empty chunk. `Ready(None)` means no more chunks.
 /// After an error the driver polls the stream no more.
 pub trait ScanChunkStream:
-    Stream<Item = crate::runtime::fragment::ExecutionResult<Chunk>> + Send
+    Stream<Item = crate::runtime::task::ExecutionResult<Chunk>> + Send
 {
     /// Acquire the original observation immediately after claim, before the first
     /// data poll. Register the original receiver before work can be observed.
@@ -65,8 +65,8 @@ pub trait ScanChunkStream:
     /// and whether close still owns an additional body that must exit.
     fn take_exit_observation(
         self: Pin<&mut Self>,
-        failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
-    ) -> crate::runtime::fragment::ExecutionResult<ScanExitObservation>;
+        failures: Arc<dyn crate::runtime::task::ExecutionFailureReporter>,
+    ) -> crate::runtime::task::ExecutionResult<ScanExitObservation>;
 
     /// Ends delivery and asks every operation of the scan to stop, before
     /// returning. Its result belongs to reader/close cleanup; originating work
@@ -76,8 +76,8 @@ pub trait ScanChunkStream:
     /// stay pending and retain its original responsibility.
     fn close(
         self: Pin<Box<Self>>,
-        failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
-    ) -> BoxFuture<'static, crate::runtime::fragment::ExecutionResult<()>>;
+        failures: Arc<dyn crate::runtime::task::ExecutionFailureReporter>,
+    ) -> BoxFuture<'static, crate::runtime::task::ExecutionResult<()>>;
 }
 
 /// A scan output stream owned by its driver.
@@ -93,7 +93,7 @@ pub trait ScanStreamSource: Send + Sync {
         budget: ConnectorPollBudget,
         profile: Option<RuntimeProfile>,
         construction: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
-    ) -> crate::runtime::fragment::ExecutionResult<ScanOutputStream>;
+    ) -> crate::runtime::task::ExecutionResult<ScanOutputStream>;
 }
 
 /// One bound scan: the stream its driver polls, and the hooks through which
@@ -105,7 +105,7 @@ pub trait ScanOp: Send + Sync {
 
     /// Starts terminal cleanup of the scan's reads without waiting for them:
     /// the scan's stream observes their exit when it is closed.
-    fn terminate(&self) -> crate::runtime::fragment::ExecutionResult<()> {
+    fn terminate(&self) -> crate::runtime::task::ExecutionResult<()> {
         Ok(())
     }
 
@@ -154,7 +154,7 @@ pub trait ScanSource: Send + Sync {
     fn bind(
         &self,
         ranges: BoundScanRanges,
-    ) -> crate::runtime::fragment::ExecutionResult<Arc<dyn ScanOp>>;
+    ) -> crate::runtime::task::ExecutionResult<Arc<dyn ScanOp>>;
 
     fn profile_name(&self) -> Option<String> {
         None
@@ -176,7 +176,7 @@ impl ScanStreamSource for UnusedScanStream {
         _budget: ConnectorPollBudget,
         _profile: Option<RuntimeProfile>,
         _construction: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
-    ) -> crate::runtime::fragment::ExecutionResult<ScanOutputStream> {
+    ) -> crate::runtime::task::ExecutionResult<ScanOutputStream> {
         Err(novarocks_functions::KernelFailure::Internal(
             novarocks_functions::KernelDiagnostic::new("this test scan is never run"),
         )

@@ -192,7 +192,7 @@ fn staged_path(
     let name = format!(
         "{}-{}-{:08x}-{:08x}-{:016x}.{extension}",
         handle.branch().as_str(),
-        uuid::Uuid::from_bytes(physical.fragment_instance_id()),
+        uuid::Uuid::from_bytes(physical.task_key()),
         physical.driver_id(),
         physical.writer_ordinal(),
         sequence

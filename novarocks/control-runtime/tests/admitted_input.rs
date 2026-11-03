@@ -20,9 +20,9 @@
 //! An admitted holder may finish its bounded neutral handoff after external
 //! closure. Scope identity and actual holder exits remain authoritative.
 use novarocks_control_runtime::{
-    actor::{Actor, ActorConfig, StepContext},
-    driver::{ActorRuntime, DriverError, InputPermit},
-    lease::{ReservationBundle, WorkLease},
+    actor::{Actor, ActorConfig, ActorStep},
+    actor_turn::{ActorRuntime, ActorTurnError, ReservedInputObligation},
+    obligation::{ReservationObligation, WorkObligation},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -40,11 +40,11 @@ impl Actor for Neutral {
     fn timer_input(_: Tick) {
         unreachable!("no timer in this fixture")
     }
-    fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut StepContext<'_, ()>) {}
+    fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut ActorStep<'_, ()>) {}
     fn next_deadline(&self) -> Option<Tick> {
         None
     }
-    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut StepContext<'_, ()>) {
+    fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {
         unreachable!("no failing pure step in this fixture")
     }
 }
@@ -58,8 +58,8 @@ struct Fixture {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
     runtime: ActorRuntime<Neutral>,
-    work: WorkLease,
-    capacity: ReservationBundle,
+    work: WorkObligation,
+    capacity: ReservationObligation,
     body_exited: bool,
     captures_exited: bool,
 }
@@ -105,13 +105,13 @@ impl Fixture {
             captures_exited: false,
         }
     }
-    fn admitted(&self) -> Result<InputPermit<Neutral>, DriverError> {
+    fn admitted(&self) -> Result<ReservedInputObligation<Neutral>, ActorTurnError> {
         self.runtime
             .reserve_admitted_input(actor(), actor(), InputClass::Control, &self.work)
     }
     fn finish(mut self) {
         assert_eq!(self.runtime.snapshot(actor()).unwrap().inputs, 0);
-        assert_eq!(self.runtime.snapshot(actor()).unwrap().roles, 0);
+        assert_eq!(self.runtime.snapshot(actor()).unwrap().standing_inputs, 0);
         self.runtime.close_actor_admission(actor()).unwrap();
         // A committed empty batch still delivered a real dispatcher wake.
         // Consume it after the original inputs retired, before sealing.
@@ -150,11 +150,11 @@ fn an_existing_holder_can_finish_after_all_external_gates_close_without_new_work
     let ordinary_closed = matches!(
         f.runtime
             .reserve_input(actor(), actor(), InputClass::Control),
-        Err(DriverError::Closed)
+        Err(ActorTurnError::Closed)
     );
-    let mut role = f.admitted().unwrap().into_role().unwrap();
+    let mut role = f.admitted().unwrap().into_standing_input().unwrap();
     let second = f.admitted().unwrap();
-    let full = matches!(f.admitted(), Err(DriverError::InputCapacity));
+    let full = matches!(f.admitted(), Err(ActorTurnError::InputCapacity));
     // The producer really ends before its already-admitted completion is
     // dispatched. No child Work can accidentally keep this header resident.
     f.work.body_exited().unwrap();
@@ -169,7 +169,7 @@ fn an_existing_holder_can_finish_after_all_external_gates_close_without_new_work
     assert!(f.scope.work_lifecycle(f.work.id()).unwrap().is_some());
     assert!(matches!(
         f.admitted(),
-        Err(DriverError::InputAuthorInactive)
+        Err(ActorTurnError::InputAuthorInactive)
     ));
     let first = role.fill(()).unwrap();
     f.runtime.poll_one(Tick(1)).unwrap();
@@ -202,7 +202,7 @@ fn matching_local_work_numbers_from_another_scope_or_ledger_cannot_author_an_inp
     let other_ledger = matches!(
         f.runtime
             .reserve_admitted_input(actor(), actor(), InputClass::Control, &foreign.work,),
-        Err(DriverError::InputAuthorMismatch)
+        Err(ActorTurnError::InputAuthorMismatch)
     );
     let other_scope = f.ledger.open_scope_next(None, generation()).unwrap();
     let (mut other_work, mut other_capacity) = other_scope
@@ -219,7 +219,7 @@ fn matching_local_work_numbers_from_another_scope_or_ledger_cannot_author_an_inp
     let other_owner = matches!(
         f.runtime
             .reserve_admitted_input(actor(), actor(), InputClass::Control, &other_work,),
-        Err(DriverError::InputAuthorMismatch)
+        Err(ActorTurnError::InputAuthorMismatch)
     );
     let after = f.runtime.snapshot(actor()).unwrap();
     other_work.body_exited().unwrap();
@@ -236,7 +236,7 @@ fn matching_local_work_numbers_from_another_scope_or_ledger_cannot_author_an_inp
     assert!(other_ledger);
     assert!(other_owner);
     assert_eq!(before.inputs, after.inputs);
-    assert_eq!(before.roles, after.roles);
+    assert_eq!(before.standing_inputs, after.standing_inputs);
 }
 
 #[test]
@@ -247,27 +247,27 @@ fn exited_unknown_failed_and_sealed_authors_do_not_gain_positions() {
             0 => {
                 f.work.body_exited().unwrap();
                 f.body_exited = true;
-                DriverError::InputAuthorInactive
+                ActorTurnError::InputAuthorInactive
             }
             1 => {
                 f.work.captures_exited().unwrap();
                 f.captures_exited = true;
-                DriverError::InputAuthorInactive
+                ActorTurnError::InputAuthorInactive
             }
             2 => {
                 f.work.mark_unresolved();
-                DriverError::InputAuthorInactive
+                ActorTurnError::InputAuthorInactive
             }
             3 => {
                 f.scope.fail().unwrap();
-                DriverError::ActorFailed
+                ActorTurnError::ActorFailed
             }
             4 => {
                 f.runtime.close_actor_admission(actor()).unwrap();
                 f.runtime.seal_actor(actor()).unwrap();
-                DriverError::Closed
+                ActorTurnError::Closed
             }
-            _ => DriverError::InvalidConfig,
+            _ => ActorTurnError::InvalidConfig,
         };
         let class = if mode == 5 {
             InputClass::Timer

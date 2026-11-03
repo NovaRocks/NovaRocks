@@ -17,7 +17,7 @@
 
 //! Original Native-backed disposal before any Worker RPC is admitted. Rich
 //! Drop runs only in the existing cleanup pool; this lane creates no RPC,
-//! input, Context, Source, or request charge. Native backing stays until the
+//! input, Participation, Source, or request charge. Native backing stays until the
 //! same role, independent report consumer and actual header have retired.
 
 use super::{LIFETIME, ProcessControlOwner};
@@ -32,10 +32,10 @@ use crate::control_runtime::{
     task::TaskHostBinding,
 };
 use novarocks_control_runtime::{
+    actor_turn::{ActorRegistration, ActorRuntime, ActorTurnError},
     completion::ReportSlot,
-    driver::{ActorRegistration, ActorRuntime, DriverError},
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
-    lease::{WorkLease, WorkRetirementObserver},
+    exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
+    obligation::{WorkObligation, WorkRetirementObserver},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
@@ -47,7 +47,7 @@ use novarocks_control_runtime_core::{
     scope::{WorkAdmission, WorkKind},
 };
 use novarocks_execution_contract::{
-    AdvanceQueryContextDomain, QueryContextRef, TaskOperationId, UpdateTask,
+    AdvanceParticipationDomain, ParticipationRef, TaskOperationId, UpdateTask,
 };
 use std::{
     any::Any,
@@ -69,14 +69,16 @@ pub(crate) enum RejectedIngressPayload {
         binding: Option<TaskHostBinding>,
     },
     TaskDomain(UpdateTask),
-    ContextDomain(AdvanceQueryContextDomain),
+    ParticipationDomain(AdvanceParticipationDomain),
 }
 impl RejectedIngressPayload {
     fn metadata(&self) -> (TaskOperationId, &'static str) {
         match self {
             Self::Create { payload, .. } => (payload.request.envelope().operation_id(), "create"),
             Self::TaskDomain(request) => (request.envelope().operation_id(), "task_domain"),
-            Self::ContextDomain(request) => (request.envelope().operation_id(), "context_domain"),
+            Self::ParticipationDomain(request) => {
+                (request.envelope().operation_id(), "participation_domain")
+            }
         }
     }
     /// All destructor boundaries execute on the physical host, outside every
@@ -105,7 +107,7 @@ impl RejectedIngressPayload {
                     dispose_one(domain, &mut panics);
                 }
             }
-            Self::ContextDomain(request) => {
+            Self::ParticipationDomain(request) => {
                 let (_, _, domain) = request.into_parts();
                 dispose_one(domain, &mut panics);
             }
@@ -117,7 +119,7 @@ impl RejectedIngressPayload {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RejectedIngressAdmissionError {
     WrongOwner,
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
     Runtime(RuntimeError),
 }
 impl std::fmt::Display for RejectedIngressAdmissionError {
@@ -126,7 +128,7 @@ impl std::fmt::Display for RejectedIngressAdmissionError {
             Self::WrongOwner => {
                 f.write_str("Rejected ingress does not belong to the original Root owner")
             }
-            Self::Driver(error) => write!(f, "Rejected ingress runtime binding failed: {error}"),
+            Self::ActorTurn(error) => write!(f, "Rejected ingress runtime binding failed: {error}"),
             Self::Runtime(error) => write!(f, "Rejected ingress cleanup admission failed: {error}"),
         }
     }
@@ -135,7 +137,7 @@ impl std::error::Error for RejectedIngressAdmissionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::WrongOwner => None,
-            Self::Driver(error) => Some(error),
+            Self::ActorTurn(error) => Some(error),
             Self::Runtime(error) => Some(error),
         }
     }
@@ -156,8 +158,8 @@ impl std::fmt::Debug for RejectedIngressRefusal {
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RejectedIngressFailure {
-    Start(ExitRoleError),
-    Exit(ExitRoleError),
+    Start(ExitCustodyError),
+    Exit(ExitCustodyError),
     DropPanicked,
     JobLost,
 }
@@ -192,7 +194,7 @@ pub(crate) enum RejectedIngressAdvanceError {
         error: RejectedIngressFailure,
     },
     Runtime(RuntimeError),
-    Exit(ExitRoleError),
+    Exit(ExitCustodyError),
 }
 impl std::fmt::Display for RejectedIngressAdvanceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -266,16 +268,16 @@ impl Ready {
 }
 struct State {
     payload: Option<ManuallyDrop<RejectedIngressPayload>>,
-    authority: Option<ExitAuthority>,
+    authority: Option<ExitObligation>,
     panics: Vec<PanicPayload>,
     failure: Option<RejectedIngressFailure>,
 }
 struct Custody {
     key: (ScopeId, WorkId),
-    context: QueryContextRef,
+    participation: ParticipationRef,
     operation: TaskOperationId,
     kind: &'static str,
-    role: ExitRole,
+    exit_custody: ExitCustody,
     report: ReportSlot,
     header: WorkRetirementObserver,
     namespace: ControlRequestReady,
@@ -333,7 +335,7 @@ impl RejectedIngressJob {
                         .expect("original rejected ingress exit")
                         .failure = Some(RejectedIngressFailure::Exit(error));
                 } else {
-                    tracing::debug!(context = ?self.owner.context,
+                    tracing::debug!(participation = ?self.owner.participation,
                         work = ?novarocks_control_runtime_core::identity::ScopedWorkRef {
                             scope: self.owner.key.0, work: self.owner.key.1 },
                         operation = %self.owner.operation, kind = self.owner.kind,
@@ -360,7 +362,7 @@ impl QueuedPreparation for RejectedIngressJob {
         self.owner.key
     }
     fn fairness_group(&self, _: ScopeId) -> HostFairnessGroup {
-        HostFairnessGroup::Context(self.owner.context)
+        HostFairnessGroup::Participation(self.owner.participation)
     }
 }
 impl Drop for RejectedIngressJob {
@@ -431,8 +433,8 @@ impl RejectedIngressLane {
     }
     fn adopt(
         &mut self,
-        parent: &WorkLease,
-        context: QueryContextRef,
+        parent: &WorkObligation,
+        participation: ParticipationRef,
         payload: RejectedIngressPayload,
         ingress: WorkerIngressResponsibility,
     ) -> Result<(), RejectedIngressRefusal> {
@@ -450,7 +452,7 @@ impl RejectedIngressLane {
         }
         if let Err(error) = self.runtime.validate_registration(&self.registration) {
             return Err(refusal(
-                RejectedIngressAdmissionError::Driver(error),
+                RejectedIngressAdmissionError::ActorTurn(error),
                 payload,
                 ingress,
             ));
@@ -511,19 +513,19 @@ impl RejectedIngressLane {
         });
         let key = (work.scope().id(), work.id());
         let header = work.retirement_observer();
-        let admitted = crate::control_runtime::admitted_role::adopt_reported_work(
+        let admitted = crate::control_runtime::reported_work_admission::adopt_reported_work(
             work,
             capacity,
             report.clone(),
         );
-        let (role, authority) = ExitRole::from_admitted(admitted);
+        let (exit_custody, authority) = ExitCustody::from_admitted(admitted);
         let (operation, kind) = payload.metadata();
         let owner = Arc::new(Custody {
             key,
-            context,
+            participation,
             operation,
             kind,
-            role,
+            exit_custody,
             report,
             header,
             namespace: self.namespace.clone(),
@@ -660,7 +662,7 @@ impl RejectedIngressLane {
                         if matches!(
                             error,
                             EstablishSubmitError::Host(HostSubmitError::Queue(
-                                FairQueueError::Full | FairQueueError::ContextFull
+                                FairQueueError::Full | FairQueueError::GroupFull
                             ))
                         ) {
                             original.waiting_revision = Some(before);
@@ -673,15 +675,15 @@ impl RejectedIngressLane {
                     }
                 }
             }
-            match original.owner.role.phase() {
-                ExitRolePhase::Admitted | ExitRolePhase::Started => continue,
-                ExitRolePhase::Unresolved => {
+            match original.owner.exit_custody.phase() {
+                ExitCustodyPhase::Admitted | ExitCustodyPhase::Started => continue,
+                ExitCustodyPhase::Unresolved => {
                     return Err(RejectedIngressAdvanceError::Unresolved {
                         work: key,
                         error: RejectedIngressFailure::JobLost,
                     });
                 }
-                ExitRolePhase::Exited => {
+                ExitCustodyPhase::Exited => {
                     if original
                         .owner
                         .report
@@ -697,14 +699,14 @@ impl RejectedIngressLane {
                     }
                     if !original
                         .owner
-                        .role
+                        .exit_custody
                         .try_retire()
                         .map_err(RejectedIngressAdvanceError::Exit)?
                     {
                         continue;
                     }
                 }
-                ExitRolePhase::Retired => {}
+                ExitCustodyPhase::Retired => {}
             }
             self.ledger
                 .reap_scope_ready(self.scope.id(), 1)
@@ -717,7 +719,7 @@ impl RejectedIngressLane {
                 .originals
                 .remove(&key)
                 .expect("same fully retired original");
-            tracing::debug!(context = ?original.owner.context,
+            tracing::debug!(participation = ?original.owner.participation,
                 work = ?novarocks_control_runtime_core::identity::ScopedWorkRef {
                     scope: original.owner.key.0, work: original.owner.key.1 },
                 operation = %original.owner.operation, kind = original.owner.kind,
@@ -739,10 +741,10 @@ impl RejectedIngressLane {
     }
 }
 impl ProcessControlOwner {
-    /// Node releases its Context guard before this synchronous whole handoff.
+    /// Node releases its Participation guard before this synchronous whole handoff.
     pub(crate) fn adopt_rejected_ingress(
         &mut self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         payload: RejectedIngressPayload,
         ingress: WorkerIngressResponsibility,
     ) -> Result<(), RejectedIngressRefusal> {
@@ -754,8 +756,8 @@ impl ProcessControlOwner {
             });
         };
         lane.adopt(
-            &self.resources.roles[LIFETIME].work,
-            context,
+            &self.resources.metadata_resources[LIFETIME].work,
+            participation,
             payload,
             ingress,
         )

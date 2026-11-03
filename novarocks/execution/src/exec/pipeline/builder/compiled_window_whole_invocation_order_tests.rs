@@ -21,8 +21,8 @@
 use super::super::window_fixture::package_typed;
 use super::*;
 use crate::exec::pipeline::test_driver::TestDriver;
-use crate::runtime::fragment::ExecutionFailureCause;
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::task::ExecutionFailureCause;
 use arrow::datatypes::DataType;
 use novarocks_functions::{FunctionKind, KernelFailure};
 use novarocks_physical_plan::LiteralValue;

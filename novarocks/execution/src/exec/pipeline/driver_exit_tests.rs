@@ -74,7 +74,7 @@ impl crate::exec::pipeline::shape::SourceKernel for Owner {
     }
     fn poll_output(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
     ) -> ExecutionResult<super::super::step::StepResult> {
         panic!("exit-only owner has no data work")
     }

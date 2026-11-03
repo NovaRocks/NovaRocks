@@ -786,7 +786,7 @@ fn original_provider_completion_fixture(
                     .unwrap(),
                     selector: ConnectorReadSelector::Current,
                     mv_partition_selection: None,
-                    planning_lease: lease.clone(),
+                    planning_pin: lease.clone(),
                 });
                 Ok(value)
             },
@@ -1235,7 +1235,7 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
         .unwrap(),
         selector: ConnectorReadSelector::SnapshotId(41),
         mv_partition_selection: None,
-        planning_lease: host.acquire_current(&instance).unwrap(),
+        planning_pin: host.acquire_current(&instance).unwrap(),
     };
     let session =
         ConnectorSession::try_new("mv-routing", "u", "UTC", "en_US", SystemTime::UNIX_EPOCH)
@@ -1609,7 +1609,7 @@ fn original_prepared_source_routing_uses_to_and_refuses_missing_or_foreign_facts
             table: metadata.table.clone(),
             selector: ConnectorReadSelector::SnapshotId(41),
             mv_partition_selection: None,
-            planning_lease: lease.clone(),
+            planning_pin: lease.clone(),
         });
         value
     };

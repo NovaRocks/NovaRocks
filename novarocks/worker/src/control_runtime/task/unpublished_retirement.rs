@@ -19,30 +19,31 @@
 
 use super::{TaskHostError, UnpublishedTask, WorkerAction, WorkerActor};
 use crate::control_runtime::{
-    context_host::failure::ScopePublicationsDrained, source_slot_issuer::SourceSlotIssuePartial,
-    task_disposal::TaskDisposalRole, task_host_call::TaskHostCall,
+    participation_host::failure::ScopePublicationsDrained,
+    source_slot_issuer::SourceSlotIssuePartial, task_disposal::TaskDisposalCustody,
+    task_host_call::TaskHostCall,
 };
 use novarocks_control_runtime::{
-    driver::{ActorRuntime, EffectTicket},
-    lease::{ReservationBundle, StepGuard, WorkLease},
+    actor_turn::{ActorRuntime, EffectTicket},
+    obligation::{ReservationObligation, StepRegistration, WorkObligation},
     transaction::{RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::identity::{ActorId, ReservationId, ScopedWorkRef, WorkId};
 use novarocks_execution_contract::TaskIdentity;
-use novarocks_worker_protocol::{context::ContextEffect, creation::PayloadId};
+use novarocks_worker_protocol::{creation::PayloadId, participation::ParticipationEffect};
 
 pub(super) struct BoundUnpublished {
-    pub(super) lifetime: WorkLease,
-    pub(super) active: ReservationBundle,
+    pub(super) lifetime: WorkObligation,
+    pub(super) active: ReservationObligation,
     pub(super) source_partials: Vec<SourceSlotIssuePartial>,
     pub(super) host_calls: Vec<TaskHostCall>,
-    pub(super) disposal: Option<TaskDisposalRole>,
+    pub(super) disposal: Option<TaskDisposalCustody>,
 }
 pub(super) enum UnpublishedCustody {
     Reserved {
-        guard: Option<StepGuard>,
+        guard: Option<StepRegistration>,
         // These same-guard origins survive its actual unused withdrawal.
-        // They observe its header; they never construct a bound WorkLease.
+        // They observe its header; they never construct a bound WorkObligation.
         scope: ScopeHandle,
         work: WorkId,
         reservation: ReservationId,
@@ -65,7 +66,7 @@ impl UnpublishedTask {
         task: TaskIdentity,
         payload: PayloadId,
         ticket: &EffectTicket<WorkerAction>,
-        guard: StepGuard,
+        guard: StepRegistration,
     ) -> Self {
         Self {
             task,
@@ -110,7 +111,7 @@ impl UnpublishedTask {
     ) -> Result<(), TaskHostError> {
         stage
             .validate_scope(runtime, actor, self.scope())
-            .map_err(TaskHostError::Driver)
+            .map_err(TaskHostError::ActorTurn)
     }
     /// Both actual custody variants are constructed before any Task port or
     /// loader exists. The raw incarnation is separately authenticated by the
@@ -128,7 +129,7 @@ impl UnpublishedTask {
             && ticket.descriptor.id == self.loading_action
             && ticket.descriptor.work == self.reference()
             && matches!(&ticket.effect,
-                WorkerAction::Context(ContextEffect::LoadInput { task, payload, reservation })
+                WorkerAction::Participation(ParticipationEffect::LoadInput { task, payload, reservation })
                     if *task == self.task && *payload == self.payload && *reservation == self.reservation())
     }
     /// Each unit advances one actual unused holder or one real local exit.
@@ -270,7 +271,7 @@ impl UnpublishedTask {
             UnpublishedRetirement::Input => {
                 if runtime
                     .input_custody(actor, self.loading_input)
-                    .map_err(TaskHostError::Driver)?
+                    .map_err(TaskHostError::ActorTurn)?
                     .is_some()
                 {
                     return Ok((false, false));
@@ -309,17 +310,17 @@ impl super::TaskHostRecord {
     ) -> Result<(), TaskHostError> {
         stage
             .validate_scope(self.resources.causal.runtime(), self.actor, &self.scope)
-            .map_err(TaskHostError::Driver)?;
+            .map_err(TaskHostError::ActorTurn)?;
         self.resources
             .causal
             .runtime()
             .effect_completion_observer(ticket)
-            .map_err(TaskHostError::Driver)?;
+            .map_err(TaskHostError::ActorTurn)?;
         if !self.loader_factory_not_entered()
             || ticket.actor != self.actor
             || ticket.generation != self.core_generation
             || ticket.descriptor.work != self.resources.lifetime.work().reference()
-            || !matches!(&ticket.effect, WorkerAction::Context(ContextEffect::LoadInput { task, payload, reservation })
+            || !matches!(&ticket.effect, WorkerAction::Participation(ParticipationEffect::LoadInput { task, payload, reservation })
                 if *task == self.task && *payload == self.payload && *reservation == self.resources.active.id())
         {
             return Err(TaskHostError::WrongTaskOrPayload);

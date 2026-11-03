@@ -1,0 +1,321 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! One prepaid, neutral parent-owner fence input. It has no callback or
+//! foreign capture. The original process admission author remains live until
+//! this role and its actual batch have closed, including the execution-retired
+//! handoff before Root consumes the original retirement fact.
+
+use super::{ParticipationHostError, ParticipationHostRecord};
+use crate::control_runtime::actors::{
+    ParticipationMessage, WorkerAction, WorkerActor, WorkerMessage,
+};
+use crate::control_runtime_policy::StorageNeed;
+use novarocks_control_runtime::{
+    actor_turn::{
+        ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket, ReservedInputObligation,
+        StandingInputObligation,
+    },
+    obligation::WorkObligation,
+};
+use novarocks_control_runtime_core::{
+    identity::{ActorId, InputId, ScopedWorkRef},
+    mailbox::InputClass,
+};
+use novarocks_execution_contract::ParticipationRef;
+use novarocks_worker_protocol::{control::ControlEffect, participation::ParticipationInput};
+
+pub(super) const OWNER_CONTROL_STORAGE: StorageNeed = StorageNeed {
+    inputs: 1,
+    batches: 1,
+    effects: crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
+    requests: 0,
+    cuts: 0,
+    replies: 0,
+    completions: 0,
+    captures: 0,
+    work: 0,
+};
+
+#[derive(Default)]
+pub(crate) struct OwnerControl {
+    binding: Option<OwnerBinding>,
+    permit: Option<ReservedInputObligation<WorkerActor>>,
+    input_obligation: Option<StandingInputObligation<WorkerActor>>,
+    input: Option<InputId>,
+    delivered: bool,
+    issuance_closed: bool,
+    failed: bool,
+    closed: bool,
+    unresolved: Option<ActorTurnError>,
+}
+struct OwnerBinding {
+    runtime: ActorRuntime<WorkerActor>,
+    registration: ActorRegistration,
+    root: ActorId,
+    participation: ParticipationRef,
+    author: ScopedWorkRef,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerFenceDelivery {
+    Delivered,
+    AlreadyDelivered,
+    FailedOwner,
+}
+impl OwnerControl {
+    pub(super) fn admit(
+        &mut self,
+        runtime: &ActorRuntime<WorkerActor>,
+        registration: &ActorRegistration,
+        source: ActorId,
+        participation: ParticipationRef,
+        author: &WorkObligation,
+    ) -> Result<(), ActorTurnError> {
+        runtime.validate_registration(registration)?;
+        self.binding = Some(OwnerBinding {
+            runtime: runtime.clone(),
+            registration: registration.clone(),
+            root: source,
+            participation,
+            author: author.reference(),
+        });
+        self.permit = Some(runtime.reserve_admitted_input_for(
+            registration,
+            source,
+            InputClass::Control,
+            author,
+        )?);
+        let permit = self.permit.take().expect("original parent-control input");
+        match permit.into_standing_input() {
+            Ok(standing_input) => self.input_obligation = Some(standing_input),
+            Err((error, permit)) => {
+                self.permit = Some(permit);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+    fn matches_owner(
+        &self,
+        runtime: &ActorRuntime<WorkerActor>,
+        registration: &ActorRegistration,
+    ) -> bool {
+        self.binding.as_ref().is_some_and(|original| {
+            original.runtime.same_runtime(runtime)
+                && original.registration.same_registration(registration)
+        })
+    }
+    /// The Root's actual RemoveHost decision ends future owner-fence issuance.
+    /// This grants no H callback/capture, Task, or Scope exit acknowledgement.
+    pub(in crate::control_runtime) fn authorize_removal(
+        &mut self,
+        ticket: &EffectTicket<WorkerAction>,
+    ) -> Result<(), ActorTurnError> {
+        let original = self
+            .binding
+            .as_ref()
+            .ok_or(ActorTurnError::PublicationTargetMismatch)?;
+        if ticket.actor != original.root
+            || !matches!(&ticket.effect, WorkerAction::Control {
+                effect: ControlEffect::RemoveHost { participation }, ..
+            } if *participation == original.participation)
+        {
+            return Err(ActorTurnError::PublicationTargetMismatch);
+        }
+        original.runtime.validate_effect_ticket(ticket)?;
+        self.issuance_closed = true;
+        Ok(())
+    }
+    /// Called only after the host validates the exact original Root
+    /// RetireReservation effect. Root has consumed ExecutionRetired and its
+    /// serialized effect lane has handed off all earlier owner fences.
+    pub(super) fn authorize_parent_retirement(&mut self) {
+        self.issuance_closed = true;
+    }
+    /// No arbitrary producer ever receives this role. Closing issuance and
+    /// consuming its exact neutral input is sufficient; no host body, source
+    /// or external delivery exit is inferred from an empty inbox.
+    pub(in crate::control_runtime) fn close(&mut self) -> Result<bool, ActorTurnError> {
+        if let Some(error) = self.unresolved {
+            return Err(error);
+        }
+        if self.closed {
+            return Ok(true);
+        }
+        // Empty is not proof that a live parent has no future fence to send.
+        if !self.delivered
+            && !self.issuance_closed
+            && !self.failed
+            && (self.input_obligation.is_some() || self.permit.is_some())
+        {
+            return Ok(false);
+        }
+        if let Some(input) = self.input {
+            let original = self
+                .binding
+                .as_ref()
+                .expect("original parent-control binding");
+            match original
+                .runtime
+                .retire_input(original.registration.actor(), input)
+            {
+                Ok(()) => self.input = None,
+                Err(
+                    ActorTurnError::InputStillQueued
+                    | ActorTurnError::EffectsRemain
+                    | ActorTurnError::ReservationsRemain,
+                ) => return Ok(false),
+                Err(error) => {
+                    self.unresolved = Some(error);
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(permit) = self.permit.take()
+            && let Err(error) = permit.revoke_unused()
+        {
+            self.unresolved = Some(error);
+            return Err(error);
+        }
+        if let Some(standing_input) = &mut self.input_obligation
+            && let Err(error) = standing_input.close_after_exit()
+        {
+            self.unresolved = Some(error);
+            return Err(error);
+        }
+        self.input_obligation = None;
+        self.closed = true;
+        Ok(true)
+    }
+    /// The actual completed failure-publication stage fences every future
+    /// Core consumer; a real filled input still retires through close().
+    pub(super) fn withdraw_failed(
+        &mut self,
+        stage: &super::failure::ScopePublicationsDrained<'_>,
+    ) -> Result<bool, ActorTurnError> {
+        let binding = self
+            .binding
+            .as_ref()
+            .ok_or(ActorTurnError::UnknownStandingInput)?;
+        stage.validate(&binding.runtime, binding.registration.actor())?;
+        self.failed = true;
+        self.close()
+    }
+    /// A stopped metadata component fixture has no producer beyond its own
+    /// serial driver. This is not production Root removal or a Scope exit.
+    #[cfg(test)]
+    pub(in crate::control_runtime) fn close_for_teardown(
+        &mut self,
+    ) -> Result<bool, ActorTurnError> {
+        self.issuance_closed = true;
+        self.close()
+    }
+}
+impl ParticipationHostRecord {
+    /// The original Root effect fills this Participation's prepaid role. Directory
+    /// generations do not replace the Participation's own protocol generation, and
+    /// an owner fence has no transport request or externally issued token.
+    pub(crate) fn handoff_owner_fence(
+        &mut self,
+        ticket: &EffectTicket<WorkerAction>,
+    ) -> Result<OwnerFenceDelivery, ParticipationHostError> {
+        let WorkerAction::Control {
+            effect: ControlEffect::AbortParticipation { participation, .. },
+            ..
+        } = &ticket.effect
+        else {
+            return Err(ParticipationHostError::WrongEffect);
+        };
+        if *participation != self.identity || ticket.actor != self.control {
+            return Err(ParticipationHostError::WrongParticipation);
+        }
+        self.control_runtime
+            .validate_effect_ticket(ticket)
+            .map_err(ParticipationHostError::ActorTurn)?;
+        if self
+            .control_runtime
+            .snapshot(self.actor)
+            .map_err(ParticipationHostError::ActorTurn)?
+            .failed
+        {
+            // The existing failed-owner inventory still owns every physical
+            // stop and capture obligation. This is not an exit acknowledgement.
+            return Ok(OwnerFenceDelivery::FailedOwner);
+        }
+        if !self
+            .resources
+            .owner_control
+            .matches_owner(&self.control_runtime, self.registration())
+        {
+            return Err(ParticipationHostError::WrongRuntime);
+        }
+        let source = &mut self.resources.owner_control;
+        if let Some(error) = source.unresolved {
+            return Err(ParticipationHostError::ActorTurn(error));
+        }
+        if source.delivered {
+            return Ok(OwnerFenceDelivery::AlreadyDelivered);
+        }
+        if source.closed {
+            return Err(ParticipationHostError::ActorTurn(ActorTurnError::Closed));
+        }
+        let standing_input =
+            source
+                .input_obligation
+                .as_ref()
+                .ok_or(ParticipationHostError::ActorTurn(
+                    ActorTurnError::UnknownStandingInput,
+                ))?;
+        let input = self
+            .control_runtime
+            .fill_from_effect(
+                ticket,
+                standing_input,
+                WorkerMessage::Participation(ParticipationMessage::Command {
+                    work: source
+                        .binding
+                        .as_ref()
+                        .expect("original parent-control binding")
+                        .author,
+                    request: None,
+                    command: ParticipationInput::OwnerFenced,
+                }),
+            )
+            .map_err(|(error, _neutral)| ParticipationHostError::ActorTurn(error))?;
+        source.input = Some(input);
+        source.delivered = true;
+        Ok(OwnerFenceDelivery::Delivered)
+    }
+    pub(crate) fn retire_owner_control(&mut self) -> Result<bool, ParticipationHostError> {
+        self.resources
+            .owner_control
+            .close()
+            .map_err(ParticipationHostError::ActorTurn)
+    }
+    pub(crate) fn authorize_owner_control_removal(
+        &mut self,
+        ticket: &EffectTicket<WorkerAction>,
+    ) -> Result<(), ActorTurnError> {
+        self.resources.owner_control.authorize_removal(ticket)?;
+        self.resources.internal.authorize_removal(ticket)?;
+        // Quiesce closes business intake, while Release and other admitted
+        // control operations must still converge. Root's actual RemoveHost
+        // handoff is the final gate for newly issued control requests.
+        self.resources.control_admission_closed = true;
+        Ok(())
+    }
+}

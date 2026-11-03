@@ -71,13 +71,13 @@ use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{ConstructionFailure, InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{Transform, TransformKernel},
     step::{NextStep, StepResult},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::ExecutionResult;
 
 /// TopN prunes its buffer to `offset + limit` rows once it holds at least
 /// `max(PRUNE_FACTOR * kept, PRUNE_MIN_ROWS)` rows, as the legacy TopN does.
@@ -196,7 +196,7 @@ impl CompiledSortProcessorFactory {
             );
         for (ordinal, key, partition) in keys {
             let key_ordinal = novarocks_local_program::checked_program_ordinal(ordinal)
-                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
+                .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
             sites.push(ProgramExpressionRootSite::Node {
                 node,
                 role: if partition {
@@ -512,7 +512,7 @@ impl InputEncodingPolicy for CompiledSortProcessor {}
 impl TransformKernel for CompiledSortProcessor {
     fn apply(
         &mut self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         let chunk = input.into_uncovered_chunk()?;
@@ -577,7 +577,7 @@ impl TransformKernel for CompiledSortProcessor {
         self.prune()?;
         Ok(StepResult::new(None, NextStep::NeedInput, rows))
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         self.prepared_output()?;
         let output = self.final_output()?;
         self.runs.clear();

@@ -19,7 +19,7 @@
 
 use novarocks_control_runtime::{
     completion::ReportSlot,
-    exit_role::{ExitAuthority, ExitRole, ExitRolePhase},
+    exit_custody::{ExitCustody, ExitCustodyPhase, ExitObligation},
     owned_return::{OwnedReturnReader, OwnedReturnSender},
     transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
@@ -67,8 +67,8 @@ fn reported_resources() -> ReservationResources {
 struct Fixture<T: Send + 'static> {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
-    role: ExitRole,
-    authority: Option<ExitAuthority>,
+    exit_custody: ExitCustody,
+    authority: Option<ExitObligation>,
     report: ReportSlot,
     sender: Option<OwnedReturnSender<T>>,
     reader: Option<OwnedReturnReader<T>>,
@@ -95,7 +95,7 @@ impl<T: Send + 'static> Fixture<T> {
         )
         .unwrap();
         let (sender, reader) = report.claim_owned_return().unwrap();
-        let (role, authority) = ExitRole::from_admitted(
+        let (exit_custody, authority) = ExitCustody::from_admitted(
             novarocks_control_runtime::reported_work::ReportedWork::try_new(
                 work,
                 capacity,
@@ -106,7 +106,7 @@ impl<T: Send + 'static> Fixture<T> {
         Self {
             ledger,
             scope,
-            role,
+            exit_custody,
             authority: Some(authority),
             report,
             sender: Some(sender),
@@ -123,7 +123,7 @@ impl<T: Send + 'static> Fixture<T> {
     }
     fn finish(mut self) {
         self.exit_and_consume();
-        assert!(self.role.try_retire().unwrap());
+        assert!(self.exit_custody.try_retire().unwrap());
         assert_eq!(self.ledger.reap_scope_ready(self.scope.id(), 4).unwrap(), 1);
         self.scope.close_external().unwrap();
         self.ledger.remove_scope(self.scope.id()).unwrap();
@@ -151,9 +151,9 @@ fn one_original_slot_claim_and_take_transfer_the_same_value_without_exit_or_ack(
     let value = f.reader.as_mut().unwrap().try_take().unwrap().unwrap();
     assert_eq!(std::ptr::from_ref(value.as_ref()), pointer);
     assert!(f.reader.as_mut().unwrap().try_take().unwrap().is_none());
-    assert_eq!(f.role.phase(), ExitRolePhase::Admitted);
-    assert!(!f.role.body_exited());
-    assert!(!f.role.captures_exited());
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Admitted);
+    assert!(!f.exit_custody.body_exited());
+    assert!(!f.exit_custody.captures_exited());
     assert_eq!(
         f.report.consumption(consumer()).unwrap(),
         Consumption::Pending
@@ -171,16 +171,16 @@ fn live_payload_blocks_report_and_capacity_retirement_after_all_other_legs() {
         .publish("same original value".into())
         .unwrap();
     f.exit_and_consume();
-    assert!(f.role.actual_exit_ready().unwrap());
+    assert!(f.exit_custody.actual_exit_ready().unwrap());
     assert!(!f.report.try_retire().unwrap());
-    assert!(!f.role.try_retire().unwrap());
+    assert!(!f.exit_custody.try_retire().unwrap());
     assert_eq!(f.ledger.used(dimension()), 1);
     assert_eq!(f.scope.snapshot().unwrap().storage, 1);
     assert_eq!(
         f.reader.as_mut().unwrap().try_take().unwrap().as_deref(),
         Some("same original value")
     );
-    assert!(f.role.try_retire().unwrap());
+    assert!(f.exit_custody.try_retire().unwrap());
     assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 4).unwrap(), 1);
     assert!(
         f.reader.as_mut().unwrap().try_take().unwrap().is_none(),
@@ -219,7 +219,7 @@ fn claim_requires_the_original_bound_not_started_producer_and_reserved_report() 
             Err(RuntimeError::Scope(ScopeError::InvalidTransition))
         ));
         let (work, capacity) = guard.bind(WorkKind::Cleanup).unwrap();
-        let (role, authority) = ExitRole::from_admitted(
+        let (exit_custody, authority) = ExitCustody::from_admitted(
             novarocks_control_runtime::reported_work::ReportedWork::try_new(
                 work,
                 capacity,
@@ -240,7 +240,7 @@ fn claim_requires_the_original_bound_not_started_producer_and_reserved_report() 
             authority.exited().unwrap();
         }
         report.consume(consumer()).unwrap();
-        assert!(role.try_retire().unwrap());
+        assert!(exit_custody.try_retire().unwrap());
         ledger.reap_scope_ready(scope.id(), 1).unwrap();
         scope.close_external().unwrap();
         ledger.remove_scope(scope.id()).unwrap();
@@ -259,7 +259,7 @@ fn old_admission_can_publish_after_close_or_failure_without_inventing_any_exit()
         f.sender.take().unwrap().publish(73).unwrap();
         assert_eq!(f.reader.as_mut().unwrap().try_take().unwrap(), Some(73));
         assert_eq!(f.scope.snapshot().unwrap().work, before.work);
-        assert_eq!(f.role.phase(), ExitRolePhase::Admitted);
+        assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Admitted);
         assert_eq!(f.ledger.used(dimension()), 1);
         assert_eq!(
             f.report.consumption(consumer()).unwrap(),
@@ -272,7 +272,7 @@ fn old_admission_can_publish_after_close_or_failure_without_inventing_any_exit()
 fn unresolved_original_work_can_return_a_fault_without_positive_exit_or_consumption() {
     let mut f = Fixture::<Result<(), usize>>::new();
     drop(f.authority.take());
-    assert_eq!(f.role.phase(), ExitRolePhase::Unresolved);
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Unresolved);
     assert_eq!(f.scope.snapshot().unwrap().unresolved, 1);
     f.scope.fail().unwrap();
     f.sender.take().unwrap().publish(Err(19)).unwrap();
@@ -280,13 +280,13 @@ fn unresolved_original_work_can_return_a_fault_without_positive_exit_or_consumpt
         f.reader.as_mut().unwrap().try_take().unwrap(),
         Some(Err(19))
     );
-    assert!(!f.role.body_exited());
-    assert!(!f.role.captures_exited());
+    assert!(!f.exit_custody.body_exited());
+    assert!(!f.exit_custody.captures_exited());
     assert_eq!(
         f.report.consumption(consumer()).unwrap(),
         Consumption::Pending
     );
-    assert!(!f.role.try_retire().unwrap());
+    assert!(!f.exit_custody.try_retire().unwrap());
     assert_eq!(f.ledger.used(dimension()), 1);
     // Returning the actual fault value cannot supply the missing Work exit.
     let _original = ManuallyDrop::new(f);
@@ -299,7 +299,7 @@ fn unused_return_revocation_neither_exits_the_original_role_nor_consumes_its_rep
         f.reader.as_ref().unwrap().state().unwrap(),
         ReturnState::RevokedUnused
     );
-    assert_eq!(f.role.phase(), ExitRolePhase::Admitted);
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Admitted);
     assert_eq!(
         f.report.consumption(consumer()).unwrap(),
         Consumption::Pending
@@ -342,7 +342,7 @@ fn lost_reader_preserves_the_filled_opaque_payload_and_paid_report_as_unknown() 
     drop(f.reader.take());
     f.exit_and_consume();
     assert_eq!(f.report.owned_return_state().unwrap(), ReturnState::Unknown);
-    assert!(!f.role.try_retire().unwrap());
+    assert!(!f.exit_custody.try_retire().unwrap());
     assert_eq!(f.ledger.used(dimension()), 1);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert_eq!(f.scope.snapshot().unwrap().storage, 1);
@@ -367,7 +367,7 @@ fn lost_producer_is_sticky_and_late_publish_returns_the_same_value_and_sender() 
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     drop(refusal.sender);
     f.exit_and_consume();
-    assert!(!f.role.try_retire().unwrap());
+    assert!(!f.exit_custody.try_retire().unwrap());
     let _original = ManuallyDrop::new(f);
 
     let mut unpublished = Fixture::<usize>::new();
@@ -378,7 +378,7 @@ fn lost_producer_is_sticky_and_late_publish_returns_the_same_value_and_sender() 
     );
     assert!(unpublished.reader.as_mut().unwrap().try_take().is_err());
     unpublished.exit_and_consume();
-    assert!(!unpublished.role.try_retire().unwrap());
+    assert!(!unpublished.exit_custody.try_retire().unwrap());
     let _unpublished = ManuallyDrop::new(unpublished);
 }
 struct BlockingDrop {
@@ -475,7 +475,7 @@ fn opaque_destructor_panic_occurs_only_after_take_unlocked_the_original_custody(
     let value = f.reader.as_mut().unwrap().try_take().unwrap().unwrap();
     assert!(catch_unwind(AssertUnwindSafe(|| drop(value))).is_err());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-    assert_eq!(f.role.phase(), ExitRolePhase::Admitted);
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Admitted);
     advance_peer(&f.ledger).unwrap();
     // Consumer-side destruction does not assert original producer capture exit.
     f.finish();

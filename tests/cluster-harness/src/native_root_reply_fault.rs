@@ -2241,7 +2241,7 @@ fn validate_covered_status(body: &Bytes, caller: FrontendProcessId) -> Result<()
         FieldPath::root("root_fault_covered_status_request"),
     )?;
     ensure!(
-        decoded.context.frontend_process_id() == caller,
+        decoded.participation.frontend_process_id() == caller,
         "covered status context differs from authenticated frontend process"
     );
     Ok(())
@@ -3480,8 +3480,8 @@ mod tests {
     }
 
     fn status_request(core: &Arc<Core>) -> Result<(Request<()>, Bytes, FrontendProcessId)> {
-        use novarocks_execution_contract::identity::QueryContextRef;
-        use novarocks_task_codec::identity::encode_query_context_ref;
+        use novarocks_execution_contract::identity::ParticipationRef;
+        use novarocks_task_codec::identity::encode_participation_ref;
         let caller = FrontendProcessId::new_v7();
         let trust = NativeTrust::new(
             DeploymentId::parse("root-actor-component")?,
@@ -3495,10 +3495,10 @@ mod tests {
         let mut metadata = Default::default();
         trust.apply_client_authorization(&mut metadata)?;
         let task = expected().root_task();
-        let context =
-            QueryContextRef::new(task.query_execution_id(), caller, task.backend_process_id());
+        let status_participation =
+            ParticipationRef::new(task.query_execution_id(), caller, task.backend_process_id());
         let wire = wire::SubscribeTaskStatusRequest {
-            query_context: Some(encode_query_context_ref(context)),
+            participation: Some(encode_participation_ref(status_participation)),
             generation: 1,
             required_identities: vec![novarocks_task_codec::identity::encode_task_identity(task)],
             ..Default::default()
@@ -3517,7 +3517,8 @@ mod tests {
     }
 
     #[test]
-    fn covered_status_requires_exact_route_auth_generation_and_all_context_scope() -> Result<()> {
+    fn covered_status_requires_exact_route_auth_generation_and_all_participation_scope()
+    -> Result<()> {
         let core = core();
         let (mut request, body, caller) = status_request(&core)?;
         assert_eq!(authenticated_normal_frontend(&request, &core), Some(caller));

@@ -22,9 +22,9 @@
 //! the application submission. This slot is only the application-to-runner
 //! handoff; it is not a process transport or control-progress reservation.
 //! Production composition must drain the intake and enqueue
-//! [`OperationIntent::AbortQueryContext`] through the runner's priority
+//! [`OperationIntent::AbortParticipation`] through the runner's priority
 //! lifecycle lane, where the process authority reserves those capacities.
-//! This module neither owns a wire nor creates a second context-lifecycle
+//! This module neither owns a wire nor creates a second participation-lifecycle
 //! state machine.
 
 use std::collections::VecDeque;
@@ -34,14 +34,14 @@ use std::sync::{Arc, Mutex};
 
 use crate::task_execution::operation::OperationDispatchResult;
 use novarocks_execution::task_execution::{
-    AbortCause, AbortQueryContext, OperationKind, OperationOutcome, QueryContextReceipt,
-    QueryContextState,
+    AbortCause, AbortParticipation, OperationKind, OperationOutcome, ParticipationReceipt,
+    ParticipationState,
 };
 use novarocks_query_application::coordination::{
-    AbortQueryContextEffectAdmission, AbortQueryContextEffectPort,
-    AbortQueryContextEffectReservation, AbortQueryContextEffectSubmission,
-    AbortQueryContextIssueIdentity, ContextStandDownCause, ContextStandDownError,
-    LateAbortQueryContextWorkerSettlement,
+    AbortParticipationEffectAdmission, AbortParticipationEffectPort,
+    AbortParticipationEffectReservation, AbortParticipationEffectSubmission,
+    AbortParticipationIssueIdentity, LateAbortParticipationWorkerSettlement,
+    ParticipationStandDownCause, ParticipationStandDownError,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -54,7 +54,8 @@ pub(crate) struct NativeAbortEffectAdapter {
     submission_order: Arc<Mutex<VecDeque<OperationIntent>>>,
     capacity_epoch: watch::Sender<u64>,
     wake: Arc<dyn StatusIntakeWake>,
-    worker_closed: Option<Arc<dyn Fn(novarocks_execution_contract::QueryContextRef) + Send + Sync>>,
+    worker_closed:
+        Option<Arc<dyn Fn(novarocks_execution_contract::ParticipationRef) + Send + Sync>>,
 }
 
 impl fmt::Debug for NativeAbortEffectAdapter {
@@ -95,7 +96,7 @@ impl NativeAbortEffectAdapter {
         wake: Arc<dyn StatusIntakeWake>,
         capacity_epoch: watch::Sender<u64>,
         worker_closed: Option<
-            Arc<dyn Fn(novarocks_execution_contract::QueryContextRef) + Send + Sync>,
+            Arc<dyn Fn(novarocks_execution_contract::ParticipationRef) + Send + Sync>,
         >,
     ) -> (Arc<Self>, NativeAbortEffectIntake) {
         let (effects, receiver) = mpsc::channel(capacity.get());
@@ -116,33 +117,33 @@ impl NativeAbortEffectAdapter {
     }
 }
 
-impl AbortQueryContextEffectPort for NativeAbortEffectAdapter {
+impl AbortParticipationEffectPort for NativeAbortEffectAdapter {
     fn subscribe_capacity(&self) -> watch::Receiver<u64> {
         self.capacity_epoch.subscribe()
     }
 
     fn try_reserve(
         &self,
-        identity: AbortQueryContextIssueIdentity,
-    ) -> AbortQueryContextEffectAdmission {
+        identity: AbortParticipationIssueIdentity,
+    ) -> AbortParticipationEffectAdmission {
         let Some(effects) = self.effects.as_ref() else {
-            return AbortQueryContextEffectAdmission::Closed;
+            return AbortParticipationEffectAdmission::Closed;
         };
         match effects.clone().try_reserve_owned() {
-            Ok(permit) => {
-                AbortQueryContextEffectAdmission::Admitted(Box::new(NativeAbortEffectReservation {
+            Ok(permit) => AbortParticipationEffectAdmission::Admitted(Box::new(
+                NativeAbortEffectReservation {
                     identity,
                     permit: Some(permit),
                     submission_order: Arc::clone(&self.submission_order),
                     capacity_epoch: self.capacity_epoch.clone(),
                     wake: Arc::clone(&self.wake),
                     worker_closed: self.worker_closed.clone(),
-                }))
-            }
+                },
+            )),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                AbortQueryContextEffectAdmission::Backpressured
+                AbortParticipationEffectAdmission::Backpressured
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => AbortQueryContextEffectAdmission::Closed,
+            Err(mpsc::error::TrySendError::Closed(_)) => AbortParticipationEffectAdmission::Closed,
         }
     }
 }
@@ -237,12 +238,13 @@ impl NativeAbortEffectIntake {
 }
 
 struct NativeAbortEffectReservation {
-    identity: AbortQueryContextIssueIdentity,
+    identity: AbortParticipationIssueIdentity,
     permit: Option<mpsc::OwnedPermit<NativeAbortEffect>>,
     submission_order: Arc<Mutex<VecDeque<OperationIntent>>>,
     capacity_epoch: watch::Sender<u64>,
     wake: Arc<dyn StatusIntakeWake>,
-    worker_closed: Option<Arc<dyn Fn(novarocks_execution_contract::QueryContextRef) + Send + Sync>>,
+    worker_closed:
+        Option<Arc<dyn Fn(novarocks_execution_contract::ParticipationRef) + Send + Sync>>,
 }
 
 impl fmt::Debug for NativeAbortEffectReservation {
@@ -254,21 +256,21 @@ impl fmt::Debug for NativeAbortEffectReservation {
     }
 }
 
-impl AbortQueryContextEffectReservation for NativeAbortEffectReservation {
-    fn submit(mut self: Box<Self>, submission: AbortQueryContextEffectSubmission) {
+impl AbortParticipationEffectReservation for NativeAbortEffectReservation {
+    fn submit(mut self: Box<Self>, submission: AbortParticipationEffectSubmission) {
         assert_eq!(
             submission.identity(),
             self.identity,
             "an Abort effect reservation may accept only its exact actor-owned identity"
         );
         let identity = submission.request().identity();
-        let request = AbortQueryContext::new(
+        let request = AbortParticipation::new(
             identity.operation_id(),
-            identity.context(),
+            identity.participation(),
             native_cause(identity.cause()),
         );
         let effect = NativeAbortEffect {
-            intent: OperationIntent::AbortQueryContext(request),
+            intent: OperationIntent::AbortParticipation(request),
             submission: Some(submission),
             worker_closed: self.worker_closed.clone(),
         };
@@ -280,7 +282,7 @@ impl AbortQueryContextEffectReservation for NativeAbortEffectReservation {
             .take()
             .expect("a live Abort reservation retains its bounded slot")
             .send(effect);
-        order.push_back(OperationIntent::AbortQueryContext(request));
+        order.push_back(OperationIntent::AbortParticipation(request));
         drop(order);
         self.wake.wake();
     }
@@ -308,10 +310,10 @@ fn release_permit_then_publish_capacity(
     }
 }
 
-fn native_cause(cause: ContextStandDownCause) -> AbortCause {
+fn native_cause(cause: ParticipationStandDownCause) -> AbortCause {
     match cause {
-        ContextStandDownCause::LogicalExecutionCancelled
-        | ContextStandDownCause::LogicalExecutionFailed => AbortCause::QueryFailed,
+        ParticipationStandDownCause::LogicalExecutionCancelled
+        | ParticipationStandDownCause::LogicalExecutionFailed => AbortCause::QueryFailed,
     }
 }
 
@@ -327,8 +329,9 @@ fn publish_capacity(capacity_epoch: &watch::Sender<u64>) {
 #[must_use = "a Native Abort effect must enter lifecycle dispatch or retain its settlement"]
 pub(crate) struct NativeAbortEffect {
     intent: OperationIntent,
-    submission: Option<AbortQueryContextEffectSubmission>,
-    worker_closed: Option<Arc<dyn Fn(novarocks_execution_contract::QueryContextRef) + Send + Sync>>,
+    submission: Option<AbortParticipationEffectSubmission>,
+    worker_closed:
+        Option<Arc<dyn Fn(novarocks_execution_contract::ParticipationRef) + Send + Sync>>,
 }
 
 impl fmt::Debug for NativeAbortEffect {
@@ -366,22 +369,22 @@ impl NativeAbortEffect {
         if acknowledgement.operation_id() != self.intent.operation_id() {
             return Err(NativeAbortEffectAckError::OperationIdentityMismatch);
         }
-        if acknowledgement.kind() != OperationKind::AbortQueryContext {
+        if acknowledgement.kind() != OperationKind::AbortParticipation {
             return Err(NativeAbortEffectAckError::OperationKindMismatch);
         }
         if acknowledgement.dispatch_result() == OperationDispatchResult::TransportUnknown {
             return Ok(());
         }
-        let expected_context = match &self.intent {
-            OperationIntent::AbortQueryContext(request) => request.context(),
+        let expected_participation = match &self.intent {
+            OperationIntent::AbortParticipation(request) => request.participation(),
             _ => unreachable!("a Native Abort effect always retains an Abort intent"),
         };
-        closing_receipt(expected_context, acknowledgement).map(drop)
+        closing_receipt(expected_participation, acknowledgement).map(drop)
     }
 
     /// Stops replay after a local protocol or dispatcher violation while the
-    /// actor's residual supervisor retains the exact context responsibility.
-    pub(crate) fn fail_closed(mut self) -> Result<(), ContextStandDownError> {
+    /// actor's residual supervisor retains the exact participation responsibility.
+    pub(crate) fn fail_closed(mut self) -> Result<(), ParticipationStandDownError> {
         self.submission
             .take()
             .expect("a live Native Abort retains actor settlement authority")
@@ -391,7 +394,7 @@ impl NativeAbortEffect {
     /// Returns an Abort that expired while still dispatcher-queued to the
     /// actor as definitely unsent. The actor may spend its next bounded
     /// authorization generation on the same immutable operation.
-    pub(crate) fn definitely_unsent(mut self) -> Result<(), ContextStandDownError> {
+    pub(crate) fn definitely_unsent(mut self) -> Result<(), ParticipationStandDownError> {
         self.submission
             .take()
             .expect("a live Native Abort retains actor settlement authority")
@@ -435,11 +438,11 @@ impl NativeAbortEffect {
                 ))
             }
             OperationDispatchResult::WorkerReceipt(_) => {
-                let expected_context = match &self.intent {
-                    OperationIntent::AbortQueryContext(request) => request.context(),
+                let expected_participation = match &self.intent {
+                    OperationIntent::AbortParticipation(request) => request.participation(),
                     _ => unreachable!("a Native Abort effect always retains an Abort intent"),
                 };
-                let receipt = closing_receipt(expected_context, acknowledgement)
+                let receipt = closing_receipt(expected_participation, acknowledgement)
                     .expect("Native Abort acknowledgement was validated before settlement");
                 self.submission
                     .take()
@@ -447,7 +450,7 @@ impl NativeAbortEffect {
                     .worker_settled(receipt)
                     .map_err(NativeAbortEffectSettleError::Application)?;
                 if let Some(observer) = &self.worker_closed {
-                    observer(expected_context);
+                    observer(expected_participation);
                 }
                 Ok(NativeAbortEffectSettlement::WorkerSettled)
             }
@@ -460,7 +463,7 @@ impl NativeAbortEffect {
 /// This path deliberately bypasses `QueryTaskExecution::acknowledge`: that
 /// dispatcher generation was already released by the unknown transport
 /// outcome. The retained application authority is exact in both operation and
-/// context, so only its matching closing receipt may resolve it.
+/// participation, so only its matching closing receipt may resolve it.
 pub(crate) fn settle_late_abort_receipt(
     settlement: NativeLateAbortEffect,
     acknowledgement: &OperationAcknowledgement,
@@ -472,7 +475,7 @@ pub(crate) fn settle_late_abort_receipt(
             settlement,
         ));
     }
-    if acknowledgement.kind() != OperationKind::AbortQueryContext {
+    if acknowledgement.kind() != OperationKind::AbortParticipation {
         return Err(NativeLateAbortEffectSettleError::rejected(
             NativeAbortEffectAckError::OperationKindMismatch,
             settlement,
@@ -484,7 +487,7 @@ pub(crate) fn settle_late_abort_receipt(
             settlement,
         ));
     }
-    let receipt = match closing_receipt(identity.context(), acknowledgement) {
+    let receipt = match closing_receipt(identity.participation(), acknowledgement) {
         Ok(receipt) => receipt,
         Err(reason) => {
             return Err(NativeLateAbortEffectSettleError::rejected(
@@ -500,8 +503,9 @@ pub(crate) fn settle_late_abort_receipt(
 /// Frontend ownership of a transport-unknown generation's late settlement.
 /// Dropping it is an explicit local failure, never another unknown outcome.
 pub(crate) struct NativeLateAbortEffect {
-    settlement: Option<LateAbortQueryContextWorkerSettlement>,
-    worker_closed: Option<Arc<dyn Fn(novarocks_execution_contract::QueryContextRef) + Send + Sync>>,
+    settlement: Option<LateAbortParticipationWorkerSettlement>,
+    worker_closed:
+        Option<Arc<dyn Fn(novarocks_execution_contract::ParticipationRef) + Send + Sync>>,
 }
 
 impl fmt::Debug for NativeLateAbortEffect {
@@ -515,9 +519,9 @@ impl fmt::Debug for NativeLateAbortEffect {
 
 impl NativeLateAbortEffect {
     fn new(
-        settlement: LateAbortQueryContextWorkerSettlement,
+        settlement: LateAbortParticipationWorkerSettlement,
         worker_closed: Option<
-            Arc<dyn Fn(novarocks_execution_contract::QueryContextRef) + Send + Sync>,
+            Arc<dyn Fn(novarocks_execution_contract::ParticipationRef) + Send + Sync>,
         >,
     ) -> Self {
         Self {
@@ -526,26 +530,29 @@ impl NativeLateAbortEffect {
         }
     }
 
-    pub(crate) fn identity(&self) -> AbortQueryContextIssueIdentity {
+    pub(crate) fn identity(&self) -> AbortParticipationIssueIdentity {
         self.settlement
             .as_ref()
             .expect("a live late Abort owner retains its settlement")
             .identity()
     }
 
-    fn worker_settled(mut self, receipt: QueryContextReceipt) -> Result<(), ContextStandDownError> {
-        let context = self.identity().context();
+    fn worker_settled(
+        mut self,
+        receipt: ParticipationReceipt,
+    ) -> Result<(), ParticipationStandDownError> {
+        let participation = self.identity().participation();
         self.settlement
             .take()
             .expect("a live late Abort owner retains its settlement")
             .worker_settled(receipt)?;
         if let Some(observer) = &self.worker_closed {
-            observer(context);
+            observer(participation);
         }
         Ok(())
     }
 
-    pub(crate) fn fail_closed(mut self) -> Result<(), ContextStandDownError> {
+    pub(crate) fn fail_closed(mut self) -> Result<(), ParticipationStandDownError> {
         self.settlement
             .take()
             .expect("a live late Abort owner retains its settlement")
@@ -567,29 +574,29 @@ impl Drop for NativeLateAbortEffect {
 }
 
 pub(crate) fn closing_receipt(
-    expected_context: novarocks_execution::task_execution::QueryContextRef,
+    expected_participation: novarocks_execution::task_execution::ParticipationRef,
     acknowledgement: &OperationAcknowledgement,
-) -> Result<QueryContextReceipt, NativeAbortEffectAckError> {
+) -> Result<ParticipationReceipt, NativeAbortEffectAckError> {
     let Some(outcome) = acknowledgement.worker_outcome() else {
         return Err(NativeAbortEffectAckError::MissingWorkerReceipt);
     };
     if !legal_abort_closing_outcome(outcome) {
         return Err(NativeAbortEffectAckError::NonClosingWorkerOutcome(outcome));
     }
-    let AckPayload::Context(receipt) = acknowledgement.payload() else {
-        return Err(NativeAbortEffectAckError::MissingContextReceipt);
+    let AckPayload::Participation(receipt) = acknowledgement.payload() else {
+        return Err(NativeAbortEffectAckError::MissingParticipationReceipt);
     };
-    if receipt.context() != expected_context {
-        return Err(NativeAbortEffectAckError::ContextReceiptIdentityMismatch);
+    if receipt.participation() != expected_participation {
+        return Err(NativeAbortEffectAckError::ParticipationReceiptIdentityMismatch);
     }
     if !matches!(
         receipt.state(),
-        QueryContextState::Aborting
-            | QueryContextState::Releasing
-            | QueryContextState::TerminalRetained
-            | QueryContextState::Gone
+        ParticipationState::Aborting
+            | ParticipationState::Releasing
+            | ParticipationState::TerminalRetained
+            | ParticipationState::Gone
     ) {
-        return Err(NativeAbortEffectAckError::NonClosingContextReceipt);
+        return Err(NativeAbortEffectAckError::NonClosingParticipationReceipt);
     }
     Ok(receipt.clone())
 }
@@ -599,7 +606,7 @@ fn legal_abort_closing_outcome(outcome: OperationOutcome) -> bool {
         outcome,
         OperationOutcome::Accepted
             | OperationOutcome::Idempotent
-            | OperationOutcome::ContextTerminalReceipt
+            | OperationOutcome::ParticipationTerminalReceipt
             | OperationOutcome::LeaseExpired
             | OperationOutcome::Gone
     )
@@ -618,9 +625,9 @@ pub(crate) enum NativeAbortEffectAckError {
     OperationKindMismatch,
     MissingWorkerReceipt,
     NonClosingWorkerOutcome(OperationOutcome),
-    MissingContextReceipt,
-    ContextReceiptIdentityMismatch,
-    NonClosingContextReceipt,
+    MissingParticipationReceipt,
+    ParticipationReceiptIdentityMismatch,
+    NonClosingParticipationReceipt,
 }
 
 #[derive(Debug)]
@@ -631,7 +638,7 @@ pub(crate) enum NativeLateAbortEffectSettleError {
         reason: NativeAbortEffectAckError,
         settlement: NativeLateAbortEffect,
     },
-    Application(ContextStandDownError),
+    Application(ParticipationStandDownError),
 }
 
 impl NativeLateAbortEffectSettleError {
@@ -639,7 +646,7 @@ impl NativeLateAbortEffectSettleError {
         Self::Rejected { reason, settlement }
     }
 
-    pub(crate) fn fail_closed(self) -> Result<(), ContextStandDownError> {
+    pub(crate) fn fail_closed(self) -> Result<(), ParticipationStandDownError> {
         match self {
             Self::Rejected { settlement, .. } => settlement.fail_closed(),
             Self::Application(error) => Err(error),
@@ -669,7 +676,7 @@ pub(crate) enum NativeAbortEffectSettleError {
         reason: NativeAbortEffectAckError,
         effect: Box<NativeAbortEffect>,
     },
-    Application(ContextStandDownError),
+    Application(ParticipationStandDownError),
 }
 
 impl NativeAbortEffectSettleError {
@@ -696,7 +703,7 @@ impl NativeAbortEffectSettleError {
         }
     }
 
-    pub(crate) fn fail_closed(self) -> Result<(), ContextStandDownError> {
+    pub(crate) fn fail_closed(self) -> Result<(), ParticipationStandDownError> {
         match self {
             Self::Rejected { effect, .. } => (*effect).fail_closed(),
             Self::Application(error) => Err(error),
@@ -724,13 +731,13 @@ mod tests {
     use crate::task_protocol_config::DispatchLane;
     use novarocks_coordination_contract::ExecutionEffect;
     use novarocks_execution::task_execution::{
-        AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
-        LeaseValidFor, QueryContextAdmissionTicketReceipt, QueryContextReceipt, QueryContextRef,
-        QueryContextState, TaskOperationId,
+        AcquireParticipationAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
+        LeaseValidFor, ParticipationAdmissionTicketReceipt, ParticipationReceipt, ParticipationRef,
+        ParticipationState, TaskOperationId,
     };
     use novarocks_query_application::coordination::{
-        AbortQueryContextEffectPort, AdmissionIssueSettlement, ContextClosureState,
-        LogicalConclusion, LogicalExecutionActorConfig,
+        AbortParticipationEffectPort, AdmissionIssueSettlement, LogicalConclusion,
+        LogicalExecutionActorConfig, ParticipationClosureState,
     };
     use novarocks_query_application::test_support::LogicalExecutionTestHarness;
     use novarocks_types::NativeCompatibilityId;
@@ -748,8 +755,8 @@ mod tests {
         QueryExecutionId::new(QueryId::new(89, 1), AttemptId::new(1).unwrap()).unwrap()
     }
 
-    fn context(backend: BackendProcessId) -> QueryContextRef {
-        QueryContextRef::new(execution(), FrontendProcessId::new_v7(), backend)
+    fn participation(backend: BackendProcessId) -> ParticipationRef {
+        ParticipationRef::new(execution(), FrontendProcessId::new_v7(), backend)
     }
 
     fn governed_execution() -> (WorkOwner, StagePermit) {
@@ -813,7 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn projects_actor_identity_and_replays_the_exact_native_abort() {
-        let exact_context = context(BackendProcessId::new_v7());
+        let exact_participation = participation(BackendProcessId::new_v7());
         let (adapter, mut intake) = NativeAbortEffectAdapter::bounded(
             NonZeroUsize::MIN,
             Arc::new(super::super::status_intake::CountingWake::default()),
@@ -823,28 +830,28 @@ mod tests {
             execution(),
             ExecutionEffect::None,
             NonZeroUsize::new(2).unwrap(),
-            vec![exact_context],
+            vec![exact_participation],
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             work_owner,
             execution_stage,
         )
         .expect("valid single-attempt actor configuration")
-        .with_abort_query_context_effect_port(
-            Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
+        .with_abort_participation_effect_port(
+            Arc::clone(&adapter) as Arc<dyn AbortParticipationEffectPort>,
             NonZeroUsize::new(2).unwrap(),
         );
         let mut logical = LogicalExecutionTestHarness::install(
             tokio::runtime::Handle::current(),
             config,
             execution(),
-            vec![exact_context],
+            vec![exact_participation],
         )
         .unwrap();
         logical.activate_initial().await.unwrap();
-        let admission = AcquireQueryContextAdmissionTicket::new(
+        let admission = AcquireParticipationAdmissionTicket::new(
             TaskOperationId::new_v7(),
-            exact_context,
+            exact_participation,
             LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
             NativeCompatibilityId::new([7; 32]),
             AdmissionEpochCapability::try_from_bytes([7; 16]).unwrap(),
@@ -860,9 +867,9 @@ mod tests {
                 AdmissionIssueSettlement::applied(
                     pending.operation_id(),
                     OperationOutcome::Accepted,
-                    QueryContextAdmissionTicketReceipt::new(
+                    ParticipationAdmissionTicketReceipt::new(
                         AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
-                        exact_context,
+                        exact_participation,
                         LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
                     ),
                 )
@@ -872,19 +879,19 @@ mod tests {
             .unwrap();
 
         let first = next_effect(&mut intake).await;
-        let OperationIntent::AbortQueryContext(first_request) = first.intent() else {
-            panic!("the adapter must emit an AbortQueryContext intent");
+        let OperationIntent::AbortParticipation(first_request) = first.intent() else {
+            panic!("the adapter must emit an AbortParticipation intent");
         };
         let first_request = *first_request;
         assert_eq!(first.intent().lane(), DispatchLane::Lifecycle);
         assert!(first.intent().requires_control_progress());
-        assert_eq!(first_request.context(), exact_context);
+        assert_eq!(first_request.participation(), exact_participation);
         assert_eq!(first_request.cause(), AbortCause::QueryFailed);
         let operation_id = first_request.envelope().operation_id();
         let late = match first
             .settle(&OperationAcknowledgement::transport_unknown(
                 operation_id,
-                OperationKind::AbortQueryContext,
+                OperationKind::AbortParticipation,
             ))
             .unwrap()
         {
@@ -895,22 +902,25 @@ mod tests {
         };
 
         let second = next_effect(&mut intake).await;
-        let OperationIntent::AbortQueryContext(second_request) = second.intent() else {
-            panic!("the exact replay remains an AbortQueryContext intent");
+        let OperationIntent::AbortParticipation(second_request) = second.intent() else {
+            panic!("the exact replay remains an AbortParticipation intent");
         };
         let second_request = *second_request;
         assert_eq!(second_request.envelope().operation_id(), operation_id);
-        assert_eq!(second_request.context(), first_request.context());
+        assert_eq!(
+            second_request.participation(),
+            first_request.participation()
+        );
         assert_eq!(second_request.cause(), first_request.cause());
         assert!(matches!(
             second
                 .settle(&OperationAcknowledgement::worker_receipt(
                     operation_id,
-                    OperationKind::AbortQueryContext,
-                    OperationOutcome::ContextTerminalReceipt,
-                    AckPayload::Context(QueryContextReceipt::new(
-                        exact_context,
-                        QueryContextState::TerminalRetained,
+                    OperationKind::AbortParticipation,
+                    OperationOutcome::ParticipationTerminalReceipt,
+                    AckPayload::Participation(ParticipationReceipt::new(
+                        exact_participation,
+                        ParticipationState::TerminalRetained,
                     )),
                 ))
                 .unwrap(),
@@ -920,10 +930,12 @@ mod tests {
 
         loop {
             if logical
-                .stand_down_snapshot(exact_context)
+                .stand_down_snapshot(exact_participation)
                 .await
                 .unwrap()
-                .is_some_and(|snapshot| snapshot.closure() == ContextClosureState::TerminalRetained)
+                .is_some_and(|snapshot| {
+                    snapshot.closure() == ParticipationClosureState::TerminalRetained
+                })
             {
                 break;
             }
@@ -941,18 +953,18 @@ mod tests {
             "a terminal Abort receipt does not prove actual Worker stop or process replacement"
         );
         logical
-            .observe_worker_stopped_and_context_fenced(exact_context)
+            .observe_worker_stopped_and_participation_fenced(exact_participation)
             .await
             .unwrap();
         logical
             .finish_until(std::time::Instant::now() + Duration::from_secs(1))
             .await
-            .expect("exact Worker stop and context fencing lets the owner finish");
+            .expect("exact Worker stop and participation fencing lets the owner finish");
     }
 
     #[tokio::test]
-    async fn invalid_context_receipts_are_rejected_without_losing_the_effect() {
-        let exact_context = context(BackendProcessId::new_v7());
+    async fn invalid_participation_receipts_are_rejected_without_losing_the_effect() {
+        let exact_participation = participation(BackendProcessId::new_v7());
         let (adapter, mut intake) = NativeAbortEffectAdapter::bounded(
             NonZeroUsize::MIN,
             Arc::new(super::super::status_intake::CountingWake::default()),
@@ -962,28 +974,28 @@ mod tests {
             execution(),
             ExecutionEffect::None,
             NonZeroUsize::new(2).unwrap(),
-            vec![exact_context],
+            vec![exact_participation],
             NonZeroUsize::MIN,
             NonZeroUsize::MIN,
             work_owner,
             execution_stage,
         )
         .expect("valid single-attempt actor configuration")
-        .with_abort_query_context_effect_port(
-            Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
+        .with_abort_participation_effect_port(
+            Arc::clone(&adapter) as Arc<dyn AbortParticipationEffectPort>,
             NonZeroUsize::MIN,
         );
         let mut logical = LogicalExecutionTestHarness::install(
             tokio::runtime::Handle::current(),
             config,
             execution(),
-            vec![exact_context],
+            vec![exact_participation],
         )
         .unwrap();
         logical.activate_initial().await.unwrap();
-        let admission = AcquireQueryContextAdmissionTicket::new(
+        let admission = AcquireParticipationAdmissionTicket::new(
             TaskOperationId::new_v7(),
-            exact_context,
+            exact_participation,
             LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
             NativeCompatibilityId::new([7; 32]),
             AdmissionEpochCapability::try_from_bytes([7; 16]).unwrap(),
@@ -999,9 +1011,9 @@ mod tests {
                 AdmissionIssueSettlement::applied(
                     pending.operation_id(),
                     OperationOutcome::Accepted,
-                    QueryContextAdmissionTicketReceipt::new(
+                    ParticipationAdmissionTicketReceipt::new(
                         AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
-                        exact_context,
+                        exact_participation,
                         LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
                     ),
                 )
@@ -1014,50 +1026,50 @@ mod tests {
         let error = effect
             .settle(&OperationAcknowledgement::worker_receipt(
                 operation_id,
-                OperationKind::AbortQueryContext,
+                OperationKind::AbortParticipation,
                 OperationOutcome::Accepted,
                 AckPayload::None,
             ))
             .unwrap_err();
         assert_eq!(
             error.reason(),
-            Some(NativeAbortEffectAckError::MissingContextReceipt)
+            Some(NativeAbortEffectAckError::MissingParticipationReceipt)
         );
         let effect = error.into_effect().expect("the exact effect is retained");
         assert_eq!(effect.intent().operation_id(), operation_id);
 
-        let foreign_context = context(BackendProcessId::new_v7());
+        let foreign_participation = participation(BackendProcessId::new_v7());
         let error = effect
             .settle(&OperationAcknowledgement::worker_receipt(
                 operation_id,
-                OperationKind::AbortQueryContext,
+                OperationKind::AbortParticipation,
                 OperationOutcome::Accepted,
-                AckPayload::Context(QueryContextReceipt::new(
-                    foreign_context,
-                    QueryContextState::Aborting,
+                AckPayload::Participation(ParticipationReceipt::new(
+                    foreign_participation,
+                    ParticipationState::Aborting,
                 )),
             ))
             .unwrap_err();
         assert_eq!(
             error.reason(),
-            Some(NativeAbortEffectAckError::ContextReceiptIdentityMismatch)
+            Some(NativeAbortEffectAckError::ParticipationReceiptIdentityMismatch)
         );
         let effect = error.into_effect().expect("the exact effect is retained");
 
         let error = effect
             .settle(&OperationAcknowledgement::worker_receipt(
                 operation_id,
-                OperationKind::AbortQueryContext,
+                OperationKind::AbortParticipation,
                 OperationOutcome::Accepted,
-                AckPayload::Context(QueryContextReceipt::new(
-                    exact_context,
-                    QueryContextState::Active,
+                AckPayload::Participation(ParticipationReceipt::new(
+                    exact_participation,
+                    ParticipationState::Active,
                 )),
             ))
             .unwrap_err();
         assert_eq!(
             error.reason(),
-            Some(NativeAbortEffectAckError::NonClosingContextReceipt)
+            Some(NativeAbortEffectAckError::NonClosingParticipationReceipt)
         );
         let effect = error.into_effect().expect("the exact effect is retained");
 
@@ -1066,14 +1078,14 @@ mod tests {
             .expect("a rejected protocol receipt explicitly fails the effect closed");
         loop {
             if logical
-                .stand_down_snapshot(exact_context)
+                .stand_down_snapshot(exact_participation)
                 .await
                 .unwrap()
                 .is_some_and(|snapshot| {
-                    snapshot.closure() == ContextClosureState::AbortIssueExhausted
+                    snapshot.closure() == ParticipationClosureState::AbortIssueExhausted
                         && snapshot.issue_state()
                             == Some(
-                                novarocks_query_application::coordination::AbortQueryContextIssueState::FailedClosed,
+                                novarocks_query_application::coordination::AbortParticipationIssueState::FailedClosed,
                             )
                 })
             {
@@ -1095,7 +1107,7 @@ mod tests {
             "a failed-closed Abort retains residual Worker responsibility"
         );
         logical
-            .observe_worker_process_replaced(exact_context)
+            .observe_worker_process_replaced(exact_participation)
             .await
             .unwrap();
         logical
@@ -1107,10 +1119,10 @@ mod tests {
     #[test]
     fn native_abort_projection_uses_the_actor_identity_without_reminting() {
         let backend = BackendProcessId::new_v7();
-        let context = context(backend);
+        let participation = participation(backend);
         let operation_id = TaskOperationId::new_v7();
-        let request = AbortQueryContext::new(operation_id, context, AbortCause::QueryFailed);
-        let intent = OperationIntent::AbortQueryContext(request);
+        let request = AbortParticipation::new(operation_id, participation, AbortCause::QueryFailed);
+        let intent = OperationIntent::AbortParticipation(request);
         assert_eq!(intent.operation_id(), operation_id);
         assert_eq!(intent.backend_process_id(), backend);
         assert_eq!(intent.lane(), DispatchLane::Lifecycle);

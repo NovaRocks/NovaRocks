@@ -97,7 +97,7 @@ pub use relation::{
     writer_output_schema,
 };
 pub use runtime::{
-    ConnectorCommitFragment, ConnectorWriteBinding, ConnectorWriteCommitHandle,
+    ConnectorCommitFragment, ConnectorWriteBinding, ConnectorWriteCommitSession,
     ConnectorWriterHandle,
 };
 pub use session::{

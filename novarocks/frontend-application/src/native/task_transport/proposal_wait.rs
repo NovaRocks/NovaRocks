@@ -159,13 +159,13 @@ impl OriginalProposalWait {
 // This is exceptional custody, not a normal shutdown/actual-exit receipt.
 pub(super) struct OriginalWaitExitFailure {
     cause: Option<Box<dyn std::any::Any + Send>>,
-    lease: Option<NativeTransportWaiter>,
+    waiter: Option<NativeTransportWaiter>,
 }
 impl OriginalWaitExitFailure {
     pub(super) fn new(cause: Box<dyn std::any::Any + Send>, lease: NativeTransportWaiter) -> Self {
         Self {
             cause: Some(cause),
-            lease: Some(lease),
+            waiter: Some(lease),
         }
     }
 }
@@ -173,10 +173,10 @@ impl Drop for OriginalWaitExitFailure {
     fn drop(&mut self) {
         let cause = self.cause.take();
         if let Err(cause) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(cause))) {
-            let lease = self.lease.take().expect("one original source lease");
+            let lease = self.waiter.take().expect("one original source lease");
             std::panic::resume_unwind(Box::new(Self::new(cause, lease)));
         }
-        drop(self.lease.take());
+        drop(self.waiter.take());
     }
 }
 

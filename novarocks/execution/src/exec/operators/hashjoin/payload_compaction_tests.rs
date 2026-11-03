@@ -146,7 +146,7 @@ fn compacted_payload_refuses_before_allocating_and_does_not_change_source() {
     let cause = retain_payload(&source, &work(owner.as_ref(), &tracker, &Control)).unwrap_err();
     assert!(matches!(
         cause.cause(),
-        crate::runtime::fragment::ExecutionFailureCause::Construction(
+        crate::runtime::task::ExecutionFailureCause::Construction(
             crate::exec::pipeline::operator::ConstructionFailure::Memory(_)
         )
     ));

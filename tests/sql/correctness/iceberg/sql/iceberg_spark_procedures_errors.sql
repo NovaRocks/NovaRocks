@@ -50,43 +50,52 @@ CREATE TABLE proc_err_${uuid0}.ns_${uuid0}.v2_orders (
 ) TBLPROPERTIES (
   "format-version" = "2"
 );
-INSERT INTO proc_err_${uuid0}.ns_${uuid0}.v2_orders VALUES (1), (2), (3);
-DELETE FROM proc_err_${uuid0}.ns_${uuid0}.v2_orders WHERE id = 2;
 
 -- query 2
+-- @skip_result_check=true
+-- @be_log_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
+-- @be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED
+-- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
+INSERT INTO proc_err_${uuid0}.ns_${uuid0}.v2_orders VALUES (1), (2), (3);
+
+-- query 3
+-- @skip_result_check=true
+DELETE FROM proc_err_${uuid0}.ns_${uuid0}.v2_orders WHERE id = 2;
+
+-- query 4
 -- @expect_error=Iceberg procedures must use system namespace
 CALL proc_err_${uuid0}.admin.rewrite_manifests(table => 'ns_${uuid0}.orders');
 
--- query 3
+-- query 5
 -- @expect_error=unsupported Iceberg system procedure
 CALL proc_err_${uuid0}.system.unknown_proc(table => 'ns_${uuid0}.orders');
 
--- query 4
+-- query 6
 -- @expect_error=where is not supported
 CALL proc_err_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}.orders', where => 'id = 1');
 
--- query 5
+-- query 7
 -- @expect_error=unsupported rewrite_position_delete_files option
 CALL proc_err_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}.orders', options => map('partial-progress.enabled', 'true'));
 
--- query 6
+-- query 8
 -- @expect_error=target-file-size-bytes
 CALL proc_err_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}.orders', options => map('target-file-size-bytes', '134217728'));
 
--- query 7
+-- query 9
 -- The original V2 refusal retains its typed Data fact through safe projection.
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
+-- @be_log_not_contains=NOVAROCKS_PARTICIPATION_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 CALL proc_err_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0}.v2_orders', options => map('rewrite-all', 'true'));
 
--- query 8
+-- query 10
 -- @db=proc_err_${uuid0}.ns_${uuid0}
 SELECT COUNT(*) AS n FROM v2_orders;
 
--- query 9
+-- query 11
 -- @skip_result_check=true
 DROP TABLE proc_err_${uuid0}.ns_${uuid0}.v2_orders FORCE;
 DROP TABLE proc_err_${uuid0}.ns_${uuid0}.orders FORCE;

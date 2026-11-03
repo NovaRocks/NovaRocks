@@ -10,7 +10,7 @@ use ::mysql::prelude::{FromRow, Queryable};
 use ::mysql::{Conn, Row};
 use anyhow::{Context, Result, bail, ensure};
 use control_plan::FeLaunchIntent;
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan;
 use reqwest::blocking::Client;
 use std::fs;
@@ -29,7 +29,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TASK_EXECUTION_FAILURE: &str = "task-execution-failure";
 
 /// Stable evidence that the injection above actually fired.
-const TASK_EXECUTION_FAILURE_MARKER: &str = "NOVAROCKS_TASK_EXECUTION_FAILURE_INJECTED";
+const TASK_EXECUTION_FAILURE_MARKER: &str =
+    novarocks_failpoint::observation_marker::TASK_EXECUTION_FAILURE_INJECTED;
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -837,7 +838,10 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         wait_for_fe_marker(
             context,
             &held_refresh,
-            "NOVAROCKS_MV_RECOVERY_PHASE phase=data-prepared token=before-configuration-write",
+            &format!(
+                "{} phase=data-prepared token=before-configuration-write",
+                novarocks_failpoint::observation_marker::MV_RECOVERY_PHASE
+            ),
             "wait for completed MV computation before configuration write",
         )?;
         execute(
@@ -1021,7 +1025,10 @@ fn source_window_interleavings(
             wait_for_fe_marker(
                 context,
                 &held,
-                &format!("NOVAROCKS_MV_RECOVERY_PHASE phase={phase} token=source-window-{mv}"),
+                &format!(
+                    "{} phase={phase} token=source-window-{mv}",
+                    novarocks_failpoint::observation_marker::MV_RECOVERY_PHASE
+                ),
                 "wait for exact original source window boundary",
             )?;
             execute(
@@ -1112,7 +1119,8 @@ fn source_window_interleavings(
                 context,
                 &held,
                 &format!(
-                    "NOVAROCKS_MV_RECOVERY_PHASE phase=source-prepared token=source-window-{mv}"
+                    "{} phase=source-prepared token=source-window-{mv}",
+                    novarocks_failpoint::observation_marker::MV_RECOVERY_PHASE
                 ),
                 "wait for negative exact prepared-source boundary",
             )?;
@@ -1609,7 +1617,10 @@ impl Scenario for MvCurrentDependencyRecheck {
         wait_for_fe_marker(
             context,
             &held_refresh,
-            "NOVAROCKS_MV_RECOVERY_PHASE phase=data-prepared token=before-current-dependency-recheck",
+            &format!(
+                "{} phase=data-prepared token=before-current-dependency-recheck",
+                novarocks_failpoint::observation_marker::MV_RECOVERY_PHASE
+            ),
             "wait for BE computation before Current recheck",
         )?;
         let before_injection =
@@ -1929,7 +1940,10 @@ impl Scenario for MvStagedPublishedRecovery {
         wait_for_fe_marker(
             context,
             &staged_refresh,
-            "NOVAROCKS_MV_RECOVERY_PHASE phase=write-committed token=staged-before-publication",
+            &format!(
+                "{} phase=write-committed token=staged-before-publication",
+                novarocks_failpoint::observation_marker::MV_RECOVERY_PHASE
+            ),
             "wait for committed-before-record barrier",
         )?;
         context.action("kill FE between the publication commit and its record");
@@ -1983,7 +1997,10 @@ impl Scenario for MvStagedPublishedRecovery {
         wait_for_fe_marker(
             context,
             &published_refresh,
-            "NOVAROCKS_MV_RECOVERY_PHASE phase=publication-committed token=published-before-cleanup",
+            &format!(
+                "{} phase=publication-committed token=published-before-cleanup",
+                novarocks_failpoint::observation_marker::MV_RECOVERY_PHASE
+            ),
             "wait for publication recovery barrier",
         )?;
         context.action("kill FE after MV main publication and before cleanup");

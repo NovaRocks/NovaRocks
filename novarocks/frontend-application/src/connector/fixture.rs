@@ -24,8 +24,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use novarocks_spi::connector::{
-    ConnectorControlBinding, ConnectorControlPlanningLease, ConnectorControlResolver,
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorProviderBindingKey,
+    ConnectorControlBinding, ConnectorControlPlanningPin, ConnectorControlResolver, ConnectorError,
+    ConnectorErrorKind, ConnectorInstanceId, ConnectorProviderBindingKey,
 };
 
 #[derive(Clone, Default)]
@@ -70,8 +70,8 @@ impl FixtureConnectorRegistry {
     fn acquire(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorControlPlanningLease, ConnectorError> {
-        Ok(ConnectorControlPlanningLease::new(
+    ) -> Result<ConnectorControlPlanningPin, ConnectorError> {
+        Ok(ConnectorControlPlanningPin::new(
             self.binding(instance_id)?,
             || {},
         ))
@@ -110,7 +110,7 @@ impl ConnectorControlResolver for FixtureControlResolver {
     fn acquire_current(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorControlPlanningLease, ConnectorError> {
+    ) -> Result<ConnectorControlPlanningPin, ConnectorError> {
         self.registry.acquire(instance_id)
     }
 }

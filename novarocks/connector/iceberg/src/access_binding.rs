@@ -26,9 +26,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks_fs::{
     AcquisitionFailure, AuthorityCapabilityPath, AuthorityMaterial, AuthorityMaterialSource,
-    FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
-    FsAccessResolver, FsAccessResources, FsScheme, ObjectStoreAccessContext,
-    ObjectStoreEndpointConfig, ObjectStoreSecretMaterial, RefreshExecutor, StorageAuthorityId,
+    FileIdentity, FileIoRuntime, FileIoSpawner, FileReadContext, FsAccessHandle, FsAccessResolver,
+    FsAccessResources, FsScheme, ObjectStoreAccessContext, ObjectStoreEndpointConfig,
+    ObjectStoreSecretMaterial, RefreshExecutor, StorageAuthorityId,
 };
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
@@ -524,7 +524,7 @@ impl IcebergReadBinding {
         object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
         access_resolver: FsAccessResolver,
         file_runtime: Arc<dyn FileIoRuntime>,
-        file_task_spawner: Arc<dyn FileTaskSpawner>,
+        file_io_spawner: Arc<dyn FileIoSpawner>,
     ) -> Self {
         let pool = Arc::new(
             novarocks_fs::ObjectStoreProviderPool::new(
@@ -533,7 +533,7 @@ impl IcebergReadBinding {
             .expect("build object-store provider pool"),
         );
         let resources =
-            FsAccessResources::new(pool, access_resolver, file_runtime, file_task_spawner);
+            FsAccessResources::new(pool, access_resolver, file_runtime, file_io_spawner);
         let access_domain = StorageAccessDomainId::from_bytes([0x54; 32]);
         let storage_access = match object_store_config.as_ref() {
             Some(config) => IcebergStorageAccess::StaticObjectStore {
@@ -1247,7 +1247,7 @@ impl IcebergReadBinding {
             cancellation,
             deadline: Some(deadline),
             runtime: Arc::clone(self.resources.file_runtime()),
-            task_spawner: Arc::clone(self.resources.file_task_spawner()),
+            io_spawner: Arc::clone(self.resources.file_io_spawner()),
             range,
         })
     }
@@ -1442,7 +1442,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use novarocks_fs::{FileCancellation, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FileCancellation, TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
         CatalogProperties, CatalogProperty, CatalogVersion, ConnectorInstanceId,
@@ -1453,8 +1453,8 @@ mod tests {
     #[test]
     fn be_range_service_requires_and_preserves_exact_scan_scope() {
         let runtime = tokio::runtime::Runtime::new().expect("scan runtime");
-        let spawner: Arc<dyn novarocks_fs::FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let spawner: Arc<dyn novarocks_fs::FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
         let range_service = novarocks_fs::FileRangeService::new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(1).unwrap(),
@@ -1895,7 +1895,7 @@ mod tests {
             ),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let binding = IcebergReadBinding::from_catalog_properties(
             resources,
@@ -2108,13 +2108,13 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("build explicit Tokio runtime");
         let file_runtime: Arc<dyn FileIoRuntime> =
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
-        let task_spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let io_spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
         let binding = IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
             Arc::clone(&file_runtime),
-            Arc::clone(&task_spawner),
+            Arc::clone(&io_spawner),
         );
 
         let context = binding
@@ -2125,7 +2125,7 @@ mod tests {
             .expect("build file read context");
 
         assert!(Arc::ptr_eq(&context.runtime, &file_runtime));
-        assert!(Arc::ptr_eq(&context.task_spawner, &task_spawner));
+        assert!(Arc::ptr_eq(&context.io_spawner, &io_spawner));
     }
 
     #[test]
@@ -2148,7 +2148,7 @@ mod tests {
             Some(config),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
 
         let selected = binding
@@ -2177,7 +2177,7 @@ mod tests {
             ),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let binding = IcebergReadBinding::from_catalog_properties(
             resources,
@@ -2208,7 +2208,7 @@ mod tests {
             ),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let binding = IcebergReadBinding::from_catalog_properties(
             resources,
@@ -2244,7 +2244,7 @@ mod catalog_control_tests {
     use std::sync::Arc;
 
     use super::*;
-    use novarocks_fs::{TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{TokioFileIoRuntime, TokioFileIoSpawner};
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
         CatalogProperties, CatalogProperty, CatalogVersion, ConnectorInstanceId,
@@ -2356,7 +2356,7 @@ mod catalog_control_tests {
             ),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         )
     }
 
@@ -2477,7 +2477,7 @@ mod catalog_control_tests {
 mod node_local_tests {
     use super::*;
     use novarocks_fs::{
-        AliyunEcsRamRoleConfig, ObjectStoreProviderPool, TokioFileIoRuntime, TokioFileTaskSpawner,
+        AliyunEcsRamRoleConfig, ObjectStoreProviderPool, TokioFileIoRuntime, TokioFileIoSpawner,
     };
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogHandle, CatalogProperty, CatalogVersion,
@@ -2541,7 +2541,7 @@ mod node_local_tests {
             ),
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         IcebergReadBinding::from_catalog_properties(
             resources,

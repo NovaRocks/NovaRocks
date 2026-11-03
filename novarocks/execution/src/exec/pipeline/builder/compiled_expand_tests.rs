@@ -178,10 +178,10 @@ fn compiled_repeat_expands_each_row_per_grouping_set_with_exact_grouping_values(
 #[test]
 fn compiled_repeat_steps_drain_one_accepted_input_before_eos_without_replaying_sets() {
     use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
         input::RawInput,
         operator_factory::OperatorFactory,
         step::{InputResult, NextStep},
-        step_context::{StepContext, TurnWork},
     };
     use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeState};
     let program = repeat_program();
@@ -222,7 +222,7 @@ fn compiled_repeat_steps_drain_one_accepted_input_before_eos_without_replaying_s
     let original = second.columns()[0].clone();
     let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
+    let mut ctx = DriverStep::new(&control, &mut turn, &mut value_conversions);
     let step = operator.as_mut();
     assert!(matches!(
         step.try_push(&mut ctx, RawInput::for_test(input)),
@@ -271,8 +271,8 @@ fn compiled_repeat_factory_refuses_a_node_that_is_not_a_repeat() {
 fn compiled_repeat_prepare_requires_actual_creator_and_releases_schema_at_last_reference() {
     use crate::exec::pipeline::operator::ConstructionFailure;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
-    use crate::runtime::fragment::ExecutionFailureCause;
     use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::task::ExecutionFailureCause;
     let program = repeat_program();
     let factory = CompiledRepeatProcessorFactory::try_new(&program, ProgramNodeId::new(1)).unwrap();
     let mut missing = factory.create(1, 0);
@@ -816,10 +816,10 @@ fn compiled_change_events_emit_selected_rows_per_event_with_exact_effects() {
 #[test]
 fn compiled_change_event_steps_keep_one_input_until_each_event_is_delivered() {
     use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
         input::RawInput,
         operator_factory::OperatorFactory,
         step::{InputResult, NextStep},
-        step_context::{StepContext, TurnWork},
     };
     use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeState};
     let program = change_program();
@@ -845,7 +845,7 @@ fn compiled_change_event_steps_keep_one_input_until_each_event_is_delivered() {
     operator.bind_runtime_state(&runtime).unwrap();
     let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&control, &mut turn, &mut value_conversions);
+    let mut ctx = DriverStep::new(&control, &mut turn, &mut value_conversions);
     let step = operator.as_mut();
     assert!(matches!(
         step.try_push(&mut ctx, RawInput::for_test(input)),
@@ -908,8 +908,8 @@ fn compiled_change_event_factory_refuses_a_node_that_is_not_an_expansion() {
 fn compiled_change_prepare_refuses_missing_owner_and_first_real_memory_limit() {
     use crate::exec::pipeline::operator::ConstructionFailure;
     use crate::exec::pipeline::operator_factory::OperatorFactory;
-    use crate::runtime::fragment::ExecutionFailureCause;
     use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::task::ExecutionFailureCause;
     let program = change_program();
     let factory = CompiledChangeEventProcessorFactory::try_new(
         program.clone(),

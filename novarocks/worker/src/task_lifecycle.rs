@@ -45,14 +45,14 @@ impl std::fmt::Debug for TaskStartPermit {
 }
 #[derive(Debug)]
 pub struct TaskLifecycleHandoffError {
-    role: &'static str,
+    input_kind: &'static str,
 }
 impl std::fmt::Display for TaskLifecycleHandoffError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "the original Task {} input could not be handed off",
-            self.role
+            self.input_kind
         )
     }
 }
@@ -92,7 +92,7 @@ impl TaskStartPermit {
         {
             if matches!(
                 error,
-                novarocks_control_runtime::exit_role::ExitRoleError::Runtime(
+                novarocks_control_runtime::exit_custody::ExitCustodyError::Runtime(
                     novarocks_control_runtime::transaction::RuntimeError::Scope(
                         novarocks_control_runtime_core::scope::ScopeError::Stopped
                     )
@@ -113,10 +113,14 @@ impl TaskStartPermit {
         self.author
             .take()
             .expect("one original dormant start input")
-            .publish(novarocks_worker_protocol::context::ContextInput::Running {
-                task: self.identity,
+            .publish(
+                novarocks_worker_protocol::participation::ParticipationInput::Running {
+                    task: self.identity,
+                },
+            )
+            .map_err(|_retained| TaskLifecycleHandoffError {
+                input_kind: "Running",
             })
-            .map_err(|_retained| TaskLifecycleHandoffError { role: "Running" })
     }
 }
 #[must_use = "A refused start retains its original authority for explicit withdrawal"]
@@ -126,7 +130,7 @@ pub enum TaskStartRefusal {
         permit: TaskStartPermit,
     },
     Start {
-        error: novarocks_control_runtime::exit_role::ExitRoleError,
+        error: novarocks_control_runtime::exit_custody::ExitCustodyError,
         permit: TaskStartPermit,
     },
     Handoff(TaskLifecycleHandoffError),
@@ -192,20 +196,21 @@ impl TaskTerminalPermit {
             .author
             .take()
             .expect("one original terminal observation");
-        let input = novarocks_worker_protocol::context::ContextInput::TerminalObservation {
-            task: self.identity,
-            observation,
-        };
+        let input =
+            novarocks_worker_protocol::participation::ParticipationInput::TerminalObservation {
+                task: self.identity,
+                observation,
+            };
         if !self.bound {
             author.reject(input);
             return Err(TaskLifecycleHandoffError {
-                role: "TerminalObservation",
+                input_kind: "TerminalObservation",
             });
         }
         author
             .publish(input)
             .map_err(|_retained| TaskLifecycleHandoffError {
-                role: "TerminalObservation",
+                input_kind: "TerminalObservation",
             })
     }
     /// Only the original completion owner, after proving it never invoked
@@ -291,7 +296,7 @@ impl std::fmt::Debug for CompletionExitNotice {
 impl CompletionExitNotice {
     /// Capacity and the original role already exist. This factory grants no
     /// ability to reserve more positions from a Task control/reporter clone.
-    pub fn from_admitted_role(
+    pub fn from_admitted_capability(
         identity: TaskIdentity,
         capability: Box<dyn CompletionExitCapability>,
     ) -> Self {
@@ -577,7 +582,7 @@ impl std::fmt::Debug for TaskRootDrainPermit {
     }
 }
 impl TaskRootDrainPermit {
-    pub(crate) fn from_admitted_role(
+    pub(crate) fn from_admitted_capability(
         identity: TaskIdentity,
         capability: Box<dyn TaskRootDrainCapability>,
     ) -> Self {

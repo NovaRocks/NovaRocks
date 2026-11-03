@@ -25,7 +25,7 @@ use super::{
 };
 use crate::{
     exec::{chunk::ArrayNormalizationStep, pipeline::operator::InputConstructionOwner},
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array, FixedSizeBinaryArray,

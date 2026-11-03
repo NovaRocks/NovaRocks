@@ -19,9 +19,9 @@
 
 use crate::{
     actor::Actor,
-    driver::{ActorRegistration, ActorRuntime, DriverError},
-    lease::WorkRetirementObserver,
+    actor_turn::{ActorRegistration, ActorRuntime, ActorTurnError},
     notify::Notify,
+    obligation::WorkRetirementObserver,
     sync::{Arc, Mutex},
     transaction::{RuntimeError, ScopeHandle},
 };
@@ -38,7 +38,7 @@ pub enum HeaderWaitState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HeaderReadyError {
     Runtime(RuntimeError),
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
     WrongObserver,
     WrongOwner,
     Cancelled,
@@ -48,9 +48,9 @@ impl From<RuntimeError> for HeaderReadyError {
         Self::Runtime(error)
     }
 }
-impl From<DriverError> for HeaderReadyError {
-    fn from(error: DriverError) -> Self {
-        Self::Driver(error)
+impl From<ActorTurnError> for HeaderReadyError {
+    fn from(error: ActorTurnError) -> Self {
+        Self::ActorTurn(error)
     }
 }
 impl std::fmt::Display for HeaderReadyError {
@@ -302,7 +302,7 @@ impl HeaderBinding {
     }
 }
 
-/// Signed once by the original actual WorkLease. No Clone, header pin, Work,
+/// Signed once by the original actual WorkObligation. No Clone, header pin, Work,
 /// report or execution author is created. First arm allocates routing metadata;
 /// cancel/Drop only withdraw that metadata, never observing physical exit.
 #[must_use = "Keep the original registration through notice consumption, then cancel before owner metadata refunds"]

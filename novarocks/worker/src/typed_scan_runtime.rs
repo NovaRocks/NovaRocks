@@ -20,7 +20,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use novarocks_execution::connector::TaskAttemptSplitQueues;
+use novarocks_execution::connector::SplitQueues;
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_spi::connector::read_stack::runtime::ConnectorReadAssignment;
@@ -29,13 +29,13 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorExecutionReadBinding,
-    ConnectorExecutionResources, ConnectorExecutionWriteBinding, ConnectorResourceCheckpoint,
-    ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+    ConnectorExecutionResources, ConnectorExecutionWriteBinding, ConnectorReservationBackend,
+    ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLedger,
     ConnectorStorageResolver,
 };
 use novarocks_types::QueryExecutionId;
 
-use crate::read_attempt::{ReceivedReadSplit, TypedReadAttemptContext};
+use crate::read_attempt::{ReceivedReadSplit, TaskReadBindingRegistry};
 
 /// Looks up an attempt's runtime-filter session at the moment a scan binds it.
 pub type RuntimeFilterSessionResolver = Arc<
@@ -193,12 +193,12 @@ impl WorkerConnectorResourceLedger {
     }
 }
 
-struct WorkerConnectorResourceLease {
+struct WorkerConnectorReservation {
     tracker: Arc<MemTracker>,
     bytes: i64,
 }
 
-impl ConnectorResourceLease for WorkerConnectorResourceLease {
+impl ConnectorReservationBackend for WorkerConnectorReservation {
     fn bytes(&self) -> u64 {
         u64::try_from(self.bytes).expect("connector resource lease bytes are non-negative")
     }
@@ -246,7 +246,7 @@ impl ConnectorResourceLease for WorkerConnectorResourceLease {
     }
 }
 
-impl Drop for WorkerConnectorResourceLease {
+impl Drop for WorkerConnectorReservation {
     fn drop(&mut self) {
         self.tracker.release(self.bytes);
     }
@@ -263,7 +263,7 @@ impl ConnectorResourceLedger for WorkerConnectorResourceLedger {
         &self,
         _class: ConnectorResourceClass,
         bytes: u64,
-    ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
+    ) -> Result<Box<dyn ConnectorReservationBackend>, ConnectorError> {
         let tracker = self.tracker.get().cloned().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -283,7 +283,7 @@ impl ConnectorResourceLedger for WorkerConnectorResourceLedger {
                 error,
             ));
         }
-        Ok(Box::new(WorkerConnectorResourceLease { tracker, bytes }))
+        Ok(Box::new(WorkerConnectorReservation { tracker, bytes }))
     }
 }
 
@@ -295,10 +295,10 @@ pub struct TypedScanRuntime {
     execution_id: QueryExecutionId,
     catalog_read_execution: CatalogReadExecutionResolver,
     catalog_write_execution: CatalogWriteExecutionResolver,
-    queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
+    queues: Arc<SplitQueues<ReceivedReadSplit>>,
     session: ConnectorSession,
     runtime_filter: RuntimeFilterSessionResolver,
-    read_context: Arc<TypedReadAttemptContext>,
+    read_context: Arc<TaskReadBindingRegistry>,
     storage_resolver: Arc<dyn ConnectorStorageResolver>,
     connector_resource_ledger: Arc<WorkerConnectorResourceLedger>,
     stream_host: ScanStreamHost,
@@ -400,10 +400,10 @@ impl TypedScanRuntime {
         execution_id: QueryExecutionId,
         catalog_read_execution: CatalogReadExecutionResolver,
         catalog_write_execution: CatalogWriteExecutionResolver,
-        queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
+        queues: Arc<SplitQueues<ReceivedReadSplit>>,
         session: ConnectorSession,
         runtime_filter: RuntimeFilterSessionResolver,
-        read_context: Arc<TypedReadAttemptContext>,
+        read_context: Arc<TaskReadBindingRegistry>,
         storage_resolver: Arc<dyn ConnectorStorageResolver>,
         stream_host: ScanStreamHost,
     ) -> Self {
@@ -444,7 +444,7 @@ impl TypedScanRuntime {
         (self.catalog_write_execution)(handle)
     }
 
-    pub fn queues(&self) -> Arc<TaskAttemptSplitQueues<ReceivedReadSplit>> {
+    pub fn queues(&self) -> Arc<SplitQueues<ReceivedReadSplit>> {
         Arc::clone(&self.queues)
     }
 
@@ -650,9 +650,7 @@ impl novarocks_execution_contract::failure::FailureProjection for ConnectorResou
         FailureFact::new(FailureClass::Invariant, reason.reason())
     }
 }
-impl From<ConnectorResourceBindingError>
-    for novarocks_execution::runtime::fragment::ExecutionFailure
-{
+impl From<ConnectorResourceBindingError> for novarocks_execution::runtime::task::ExecutionFailure {
     fn from(cause: ConnectorResourceBindingError) -> Self {
         Self::from_domain(cause)
     }

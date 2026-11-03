@@ -379,7 +379,7 @@ fn real_creation(
 #[test]
 fn project_prepare_requires_actual_factory_before_input() {
     use crate::exec::pipeline::operator::ConstructionFailure;
-    use crate::runtime::fragment::ExecutionFailureCause;
+    use crate::runtime::task::ExecutionFailureCause;
     let (program, node, input) = identity_fixture();
     let factory = prepare_project_factory_for_test(
         program,
@@ -414,7 +414,7 @@ fn project_prepare_requires_actual_factory_before_input() {
 #[test]
 fn compiled_project_prepare_header_refusal_rolls_back_owned_storage() {
     use crate::exec::pipeline::operator::ConstructionFailure;
-    use crate::runtime::fragment::ExecutionFailureCause;
+    use crate::runtime::task::ExecutionFailureCause;
     let (program, node, _) = identity_fixture();
     let factory = prepare_project_factory_for_test(
         program,

@@ -185,7 +185,7 @@ impl std::error::Error for SplitQueueError {}
 
 impl novarocks_failure_contract::FailureProjection for SplitQueueError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason as R;
+        use crate::runtime::task::ExecutionReason as R;
         use novarocks_failure_contract::*;
         let (class, reason) = match self.kind {
             SplitQueueErrorKind::PlanNodeMismatch => {
@@ -237,7 +237,7 @@ impl std::error::Error for TestConsumptionGateFailure {}
 #[cfg(novarocks_dev_controls)]
 impl novarocks_failure_contract::FailureProjection for TestConsumptionGateFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason as R;
+        use crate::runtime::task::ExecutionReason as R;
         use novarocks_failure_contract::*;
         match self {
             Self::Closed { .. } => FailureFact::stop_observation(R::SplitQueueClosed.reason()),
@@ -773,16 +773,16 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
 
 /// The task attempt one set of queues belongs to.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TaskAttemptKey {
+pub struct SplitQueueKey {
     execution_id: QueryExecutionId,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
 }
 
-impl TaskAttemptKey {
-    pub const fn new(execution_id: QueryExecutionId, fragment_instance_id: UniqueId) -> Self {
+impl SplitQueueKey {
+    pub const fn new(execution_id: QueryExecutionId, task_key: UniqueId) -> Self {
         Self {
             execution_id,
-            fragment_instance_id,
+            task_key,
         }
     }
 
@@ -790,19 +790,19 @@ impl TaskAttemptKey {
         self.execution_id
     }
 
-    pub const fn fragment_instance_id(&self) -> UniqueId {
-        self.fragment_instance_id
+    pub const fn task_key(&self) -> UniqueId {
+        self.task_key
     }
 }
 
-impl fmt::Display for TaskAttemptKey {
+impl fmt::Display for SplitQueueKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "query={} attempt={} finst={}",
+            "query={} attempt={} task_key={}",
             self.execution_id.query_id(),
             self.execution_id.attempt_id().get(),
-            self.fragment_instance_id
+            self.task_key
         )
     }
 }
@@ -813,15 +813,15 @@ impl fmt::Display for TaskAttemptKey {
 /// keys a different entry, which is allocated fresh with an empty sequence
 /// space. There is no reopen, so a handle to a closed
 /// attempt can never be revived into a live one.
-pub struct TaskAttemptSplitQueues<S> {
-    key: TaskAttemptKey,
+pub struct SplitQueues<S> {
+    key: SplitQueueKey,
     config: SplitQueueConfig,
     nodes: Mutex<HashMap<i32, Arc<SplitQueue<S>>>>,
     closed: AtomicBool,
 }
 
-impl<S: ScheduledSplitFacts> TaskAttemptSplitQueues<S> {
-    fn new(key: TaskAttemptKey, config: SplitQueueConfig) -> Arc<Self> {
+impl<S: ScheduledSplitFacts> SplitQueues<S> {
+    fn new(key: SplitQueueKey, config: SplitQueueConfig) -> Arc<Self> {
         Arc::new(Self {
             key,
             config,
@@ -830,7 +830,7 @@ impl<S: ScheduledSplitFacts> TaskAttemptSplitQueues<S> {
         })
     }
 
-    pub const fn key(&self) -> TaskAttemptKey {
+    pub const fn key(&self) -> SplitQueueKey {
         self.key
     }
 
@@ -918,7 +918,7 @@ impl<S: ScheduledSplitFacts> TaskAttemptSplitQueues<S> {
 /// created by whatever already owns query-scoped runtime state and dies with
 /// it.
 pub struct SplitQueueRegistry<S> {
-    attempts: Mutex<HashMap<TaskAttemptKey, Arc<TaskAttemptSplitQueues<S>>>>,
+    attempts: Mutex<HashMap<SplitQueueKey, Arc<SplitQueues<S>>>>,
 }
 
 impl<S: ScheduledSplitFacts> SplitQueueRegistry<S> {
@@ -935,25 +935,25 @@ impl<S: ScheduledSplitFacts> SplitQueueRegistry<S> {
     /// set of queues; no state from an earlier attempt can reach it.
     pub fn open_attempt(
         &self,
-        key: TaskAttemptKey,
+        key: SplitQueueKey,
         config: SplitQueueConfig,
-    ) -> Arc<TaskAttemptSplitQueues<S>> {
+    ) -> Arc<SplitQueues<S>> {
         let mut attempts = self.attempts.lock().expect("split queue registry lock");
         Arc::clone(
             attempts
                 .entry(key)
-                .or_insert_with(|| TaskAttemptSplitQueues::new(key, config)),
+                .or_insert_with(|| SplitQueues::new(key, config)),
         )
     }
 
-    pub fn attempt(&self, key: TaskAttemptKey) -> Option<Arc<TaskAttemptSplitQueues<S>>> {
+    pub fn attempt(&self, key: SplitQueueKey) -> Option<Arc<SplitQueues<S>>> {
         let attempts = self.attempts.lock().expect("split queue registry lock");
         attempts.get(&key).map(Arc::clone)
     }
 
     /// Drop one attempt's queues and close them. Idempotent; returns whether
     /// this call was the one that removed the entry.
-    pub fn close_attempt(&self, key: TaskAttemptKey) -> bool {
+    pub fn close_attempt(&self, key: SplitQueueKey) -> bool {
         let attempt = {
             let mut attempts = self.attempts.lock().expect("split queue registry lock");
             attempts.remove(&key)
@@ -1061,8 +1061,8 @@ mod tests {
         SplitQueue::new(NODE, SplitQueueConfig::default())
     }
 
-    fn attempt_key(attempt: u64) -> TaskAttemptKey {
-        TaskAttemptKey::new(
+    fn attempt_key(attempt: u64) -> SplitQueueKey {
+        SplitQueueKey::new(
             QueryExecutionId::new(
                 QueryId::new(1, 2),
                 AttemptId::new(attempt).expect("attempt"),
@@ -1558,7 +1558,7 @@ mod tests {
         let execution_id = attempt_key(1).execution_id();
         let first = registry.open_attempt(attempt_key(1), SplitQueueConfig::default());
         let sibling = registry.open_attempt(
-            TaskAttemptKey::new(execution_id, UniqueId::new(3, 5)),
+            SplitQueueKey::new(execution_id, UniqueId::new(3, 5)),
             SplitQueueConfig::default(),
         );
         let other = registry.open_attempt(attempt_key(2), SplitQueueConfig::default());

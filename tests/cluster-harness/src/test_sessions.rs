@@ -1590,7 +1590,7 @@ mod tests {
 
     struct OriginalLaunchOwner(ClusterTestSessionPlan);
 
-    impl crate::ServerHandle for OriginalLaunchOwner {
+    impl crate::TestClusterOwner for OriginalLaunchOwner {
         fn target_host(&self) -> Option<&str> {
             None
         }
@@ -1667,7 +1667,7 @@ mod tests {
         // The runner's common step-exit author consults this exact original owner.
         let mut owner = OriginalLaunchOwner(plan);
         assert!(
-            crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+            crate::TestClusterOwner::retire_unissued_role_launch_if_reserved(
                 &mut owner,
                 RoleSlot::Frontend,
                 &foreign,
@@ -1675,7 +1675,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+            crate::TestClusterOwner::retire_unissued_role_launch_if_reserved(
                 &mut owner,
                 RoleSlot::Backend(0),
                 &a,
@@ -1683,7 +1683,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+            crate::TestClusterOwner::retire_unissued_role_launch_if_reserved(
                 &mut owner,
                 RoleSlot::Frontend,
                 &a,
@@ -1744,7 +1744,7 @@ mod tests {
                 .is_err()
         );
         assert!(
-            !crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+            !crate::TestClusterOwner::retire_unissued_role_launch_if_reserved(
                 &mut owner,
                 RoleSlot::Frontend,
                 &b,
@@ -1843,7 +1843,7 @@ mod tests {
         );
         let mut owner = OriginalLaunchOwner(plan);
         assert!(
-            crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+            crate::TestClusterOwner::retire_unissued_role_launch_if_reserved(
                 &mut owner,
                 RoleSlot::Frontend,
                 &a,
@@ -1851,7 +1851,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+            crate::TestClusterOwner::retire_unissued_role_launch_if_reserved(
                 &mut owner,
                 RoleSlot::Backend(1),
                 &a,
@@ -1873,7 +1873,7 @@ mod tests {
             RoleLaunchProgress::Reserved
         );
         assert!(
-            crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+            crate::TestClusterOwner::retire_unissued_role_launch_if_reserved(
                 &mut owner,
                 RoleSlot::Backend(1),
                 &a_post,
@@ -1895,7 +1895,7 @@ mod tests {
             RoleLaunchProgress::Reserved
         );
         assert!(
-            !crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+            !crate::TestClusterOwner::retire_unissued_role_launch_if_reserved(
                 &mut owner,
                 RoleSlot::Frontend,
                 &fe,
@@ -1928,7 +1928,7 @@ mod tests {
             Some("statement-b".into())
         );
         assert!(
-            !crate::ServerHandle::retire_unissued_role_launch_if_reserved(
+            !crate::TestClusterOwner::retire_unissued_role_launch_if_reserved(
                 &mut owner,
                 RoleSlot::Backend(1),
                 &b,

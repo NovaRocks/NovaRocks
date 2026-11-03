@@ -40,7 +40,7 @@ fn exit_used_source(f: &mut Fixture, key: &SourcePositionKey, source_id: SourceI
 // This differs deliberately from Fixture::retire, which also removes its row.
 fn reap_without_releasing(f: &Fixture, key: &SourcePositionKey) -> ReapedPosition {
     let custody = f.bank().inspect(key).unwrap().custody;
-    assert_eq!(custody.phase(), ExitRolePhase::Exited);
+    assert_eq!(custody.phase(), ExitCustodyPhase::Exited);
     assert!(!custody.try_retire().unwrap());
     custody.report().consume(core()).unwrap();
     assert!(

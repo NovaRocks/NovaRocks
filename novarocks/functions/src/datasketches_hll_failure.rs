@@ -317,7 +317,7 @@ impl HllInvariantRecipe {
             Self::SerializePreflight => {
                 "ds_hll: serialize allocation preflight is stale or mismatched"
             }
-            Self::Generation => "ds_hll: handle generation overflow",
+            Self::Generation => "ds_hll: accumulator generation overflow",
         }
     }
 }

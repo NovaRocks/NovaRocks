@@ -68,7 +68,7 @@ impl Scenario for RepresentationRecoveryPolicy {
             faults: vec![],
             observations: (0..cluster_size)
                 .flat_map(|index| {
-                    [1, 2].map(move |attempt| (index, "grpc-fragment", Some(attempt)))
+                    [1, 2].map(move |attempt| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), Some(attempt)))
                 })
                 .collect(),
         };
@@ -76,7 +76,14 @@ impl Scenario for RepresentationRecoveryPolicy {
             sql: sql.into(),
             faults: vec![],
             observations: (0..cluster_size)
-                .map(|index| (index, "grpc-fragment", None))
+                .map(|index| {
+                    (
+                        index,
+                        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                            .as_str(),
+                        None,
+                    )
+                })
                 .collect(),
         };
         Ok(Some(self.intent.freeze(
@@ -131,7 +138,7 @@ fn assert_list_minimum_unit(terminal: &QueryLifecycleStructuredSnapshot) -> Resu
         "List extent changed its exact required/limit/layout or invented a usable input prefix: {representation:?}"
     );
     ensure!(
-        terminal.worker_contexts_converged,
+        terminal.worker_participations_converged,
         "Representation failure lacked actual Worker context convergence"
     );
     Ok(())

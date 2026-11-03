@@ -26,7 +26,7 @@
 //!
 //! Three values cross module boundaries, and each has a different reach:
 //!
-//! * [`ConnectorWriteCommitHandle`] never leaves the frontend. It is not
+//! * [`ConnectorWriteCommitSession`] never leaves the frontend. It is not
 //!   `Clone`, has no codec facet, and is borrowed rather than moved by every
 //!   terminal call, so it structurally cannot be duplicated into a native
 //!   fragment, a state store, a result row, or a backend binding.
@@ -85,26 +85,26 @@ impl OpaqueWritePayload {
 /// binding, which borrow it.
 ///
 /// ```compile_fail
-/// use novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle;
+/// use novarocks_spi::connector::write_stack::ConnectorWriteCommitSession;
 ///
-/// fn leak(handle: ConnectorWriteCommitHandle) {
+/// fn leak(handle: ConnectorWriteCommitSession) {
 ///     let _ = handle.payload;
 /// }
 /// ```
 ///
 /// ```compile_fail
-/// use novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle;
+/// use novarocks_spi::connector::write_stack::ConnectorWriteCommitSession;
 ///
-/// fn duplicate(handle: &ConnectorWriteCommitHandle) -> ConnectorWriteCommitHandle {
+/// fn duplicate(handle: &ConnectorWriteCommitSession) -> ConnectorWriteCommitSession {
 ///     handle.clone()
 /// }
 /// ```
-pub struct ConnectorWriteCommitHandle {
+pub struct ConnectorWriteCommitSession {
     binding: ConnectorWriteBinding,
     payload: OpaqueWritePayload,
 }
 
-impl ConnectorWriteCommitHandle {
+impl ConnectorWriteCommitSession {
     pub(super) const fn from_parts(
         binding: ConnectorWriteBinding,
         payload: OpaqueWritePayload,
@@ -121,10 +121,10 @@ impl ConnectorWriteCommitHandle {
     }
 }
 
-impl Debug for ConnectorWriteCommitHandle {
+impl Debug for ConnectorWriteCommitSession {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ConnectorWriteCommitHandle")
+            .debug_struct("ConnectorWriteCommitSession")
             .field("binding", &self.binding)
             .finish_non_exhaustive()
     }

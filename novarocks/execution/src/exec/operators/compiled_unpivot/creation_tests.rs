@@ -18,7 +18,7 @@
 use super::*;
 use crate::exec::pipeline::builder::{unpivot_program, unpivot_rows};
 use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
-use crate::runtime::fragment::ExecutionFailureCause;
+use crate::runtime::task::ExecutionFailureCause;
 use arrow::array::Int64Array;
 
 fn runtime_factory(
@@ -238,13 +238,13 @@ fn compiled_unpivot_cancel_preserves_original_caller_cause_before_candidate_crea
         &state,
     );
     use crate::exec::pipeline::{
+        driver_step::{DriverStep, TurnWork},
         input::RawInput,
         step::InputResult,
-        step_context::{StepContext, TurnWork},
     };
     let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
     let mut value_conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut context = StepContext::new(&error, &mut work, &mut value_conversions);
+    let mut context = DriverStep::new(&error, &mut work, &mut value_conversions);
     let step = operator.as_mut();
     assert!(matches!(
         step.try_push(&mut context, RawInput::for_test(source)),
@@ -260,7 +260,7 @@ fn compiled_unpivot_cancel_preserves_original_caller_cause_before_candidate_crea
         Ok(_) => panic!("stopped work must not create another Unpivot candidate"),
     };
     assert!(observed.same_occurrence(&original));
-    assert_eq!(observed.context(), original.context());
+    assert_eq!(observed.site(), original.site());
     assert_eq!(error.error(), Some(original));
     assert_eq!(tracker.current(), before);
     assert_eq!(tracker.allocated(), allocated_before);

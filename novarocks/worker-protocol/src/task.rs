@@ -45,14 +45,14 @@ pub struct TaskRecord {
     pub pending_reply_outcome: Option<OperationOutcome>,
     /// Original entity decision time, shared only by its actual Create waiters.
     pub creation_decided_at: Option<crate::lease::MonotonicInstant>,
-    pub creation_reply: Option<std::sync::Arc<crate::context::ContextReplyBody>>,
+    pub creation_reply: Option<std::sync::Arc<crate::participation::ParticipationReplyBody>>,
     pub initial_domain_receipts:
         std::sync::Arc<Vec<novarocks_execution_contract::TaskDomainReceipt>>,
     pub creation_refusal: Option<AdmissionRefusal>,
-    /// The original Context self-source observed physical rejection disposal;
+    /// The original Participation self-source observed physical rejection disposal;
     /// identity remains owned until its bounded neutral inventory drain ends.
     pub(crate) rejected_retirement_observed: bool,
-    pub(crate) initial_creation: Option<crate::context::InitialCreation>,
+    pub(crate) initial_creation: Option<crate::participation::InitialCreation>,
     pub state: TaskState,
     pub version: u64,
     pub installed: bool,
@@ -170,7 +170,7 @@ impl TaskRecord {
             && self.physical_exit_ready()
             && self.waiting_replies.is_empty()
     }
-    pub(crate) fn compose_status(&self) -> Result<TaskStatus, crate::context::CoreError> {
+    pub(crate) fn compose_status(&self) -> Result<TaskStatus, crate::participation::CoreError> {
         let termination = match self.conclusion.accepted.as_ref() {
             Some(novarocks_execution_contract::TaskConclusion::Terminated(detail)) => {
                 Some(detail.clone())
@@ -193,7 +193,7 @@ impl TaskRecord {
         self,
         status: TaskStatus,
         final_info: Option<std::sync::Arc<novarocks_execution_contract::FinalTaskInfo>>,
-    ) -> Result<crate::retention::DecidedTask, crate::context::CoreError> {
+    ) -> Result<crate::retention::DecidedTask, crate::participation::CoreError> {
         if !self.accepted()
             || self.phase != CreationPhase::Retained
             || !self.state.is_terminal()
@@ -206,7 +206,7 @@ impl TaskRecord {
             || self.creation_reply.is_none()
             || self.creation_decided_at.is_none()
         {
-            return Err(crate::context::CoreError::IllegalFact);
+            return Err(crate::participation::CoreError::IllegalFact);
         }
         Ok(crate::retention::DecidedTask {
             custody_payload: self.payload,
@@ -236,8 +236,8 @@ pub(crate) fn compose_status(
     resources: TaskResourceFacts,
     writer: Option<TaskWriterFacts>,
     filter: Option<DynamicFilterAdvertisement>,
-) -> Result<TaskStatus, crate::context::CoreError> {
-    use crate::context::CoreError;
+) -> Result<TaskStatus, crate::participation::CoreError> {
+    use crate::participation::CoreError;
     let mut status = TaskStatus::try_new_with_installed(
         identity,
         novarocks_execution_contract::TaskStatusVersion::new(version)

@@ -35,9 +35,9 @@ use novarocks_execution::runtime_filter::{
     LiveTerminal, LogicalVersion, PartitionId, ProducerSequence, RuntimeFilterBindOutcome,
     RuntimeFilterBindingId, RuntimeFilterConsumerContract, RuntimeFilterContractViolation,
     RuntimeFilterContractViolationKind, RuntimeFilterContribution, RuntimeFilterExecutionContract,
-    RuntimeFilterProducer, RuntimeFilterProducerFailure, RuntimeFilterProducerHandle,
-    RuntimeFilterProducerOpenRequest, RuntimeFilterSnapshot, RuntimeFilterSubmitOutcome,
-    RuntimeFilterSubscriptionHandle, RuntimeFilterSubscriptionRequest, SnapshotAcquireOutcome,
+    RuntimeFilterProducer, RuntimeFilterProducerFailure, RuntimeFilterProducerOpenRequest,
+    RuntimeFilterSnapshot, RuntimeFilterSubmitOutcome, RuntimeFilterSubscriptionPin,
+    RuntimeFilterSubscriptionRequest, SharedRuntimeFilterProducer, SnapshotAcquireOutcome,
     UnavailableReason,
 };
 use novarocks_types::UniqueId;
@@ -309,7 +309,7 @@ impl BackendRuntimeFilterSession {
                         *binding_id,
                         consumer.contract().activation(),
                         consumer.route_edge_ids().iter().copied(),
-                        consumer.expected_fragment_instances().iter().copied(),
+                        consumer.expected_tasks().iter().copied(),
                         Arc::clone(&events),
                     ),
                 },
@@ -404,17 +404,17 @@ impl BackendRuntimeFilterSession {
     /// expected instance authority all come from the sealed channel install.
     pub fn open_producer(
         self: &Arc<Self>,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         request: RuntimeFilterProducerOpenRequest,
-    ) -> Result<RuntimeFilterBindOutcome<RuntimeFilterProducerHandle>, RuntimeFilterContractViolation>
+    ) -> Result<RuntimeFilterBindOutcome<SharedRuntimeFilterProducer>, RuntimeFilterContractViolation>
     {
         let binding_id = request.contract().binding_id();
-        self.register_producer(binding_id, fragment_instance_id, request)?;
+        self.register_producer(binding_id, task_key, request)?;
         Ok(RuntimeFilterBindOutcome::Bound(Arc::new(
             BackendRuntimeFilterProducer {
                 session: Arc::clone(self),
                 binding_id,
-                fragment_instance_id,
+                task_key,
             },
         )))
     }
@@ -425,10 +425,10 @@ impl BackendRuntimeFilterSession {
     /// runtime route-unavailable outcome.
     pub fn subscribe(
         &self,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         request: RuntimeFilterSubscriptionRequest,
     ) -> Result<
-        RuntimeFilterBindOutcome<RuntimeFilterSubscriptionHandle>,
+        RuntimeFilterBindOutcome<RuntimeFilterSubscriptionPin>,
         RuntimeFilterContractViolation,
     > {
         let binding_id = request.contract().binding_id();
@@ -444,7 +444,7 @@ impl BackendRuntimeFilterSession {
                 "consumer execution contract does not match the installed Backend binding",
             ));
         }
-        let subscription = consumer.subscriptions.handle(fragment_instance_id).ok_or_else(|| {
+        let subscription = consumer.subscriptions.subscription_pin(task_key).ok_or_else(|| {
             contract_violation(
                 RuntimeFilterContractViolationKind::UnauthorizedBinding,
                 "consumer fragment instance is not authorized by the sealed Backend installation",
@@ -459,12 +459,12 @@ impl BackendRuntimeFilterSession {
     pub fn submit(
         &self,
         binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition: PartitionId,
         sequence: ProducerSequence,
         contribution: RuntimeFilterContribution,
     ) -> Result<BackendRuntimeFilterSessionSubmission, RuntimeFilterContractViolation> {
-        let stream = self.open_stream(binding_id, fragment_instance_id, partition)?;
+        let stream = self.open_stream(binding_id, task_key, partition)?;
         let reduction = self.reduction.as_ref().ok_or_else(|| {
             contract_violation(
                 RuntimeFilterContractViolationKind::UnauthorizedBinding,
@@ -503,7 +503,7 @@ impl BackendRuntimeFilterSession {
     pub fn close_partition(
         &self,
         binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition: PartitionId,
         terminal: ProducerSequence,
     ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation> {
@@ -522,15 +522,12 @@ impl BackendRuntimeFilterSession {
             if binding.terminal.is_some() {
                 return Ok(RuntimeFilterSubmitOutcome::TerminalNoop);
             }
-            let instance = binding
-                .instances
-                .get_mut(&fragment_instance_id)
-                .ok_or_else(|| {
-                    contract_violation(
-                        RuntimeFilterContractViolationKind::UnauthorizedBinding,
-                        "producer fragment instance has not been opened in this Backend session",
-                    )
-                })?;
+            let instance = binding.instances.get_mut(&task_key).ok_or_else(|| {
+                contract_violation(
+                    RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                    "producer fragment instance has not been opened in this Backend session",
+                )
+            })?;
             validate_open_partition(instance, partition)?;
             match instance.terminal_partitions.get(&partition) {
                 Some(previous) if *previous == terminal => {
@@ -544,15 +541,12 @@ impl BackendRuntimeFilterSession {
                 }
                 None => {
                     instance.terminal_partitions.insert(partition, terminal);
-                    let closed = install
-                        .expected_fragment_instances()
-                        .iter()
-                        .all(|expected| {
-                            binding
-                                .instances
-                                .get(expected)
-                                .is_some_and(BackendOpenedProducer::is_closed)
-                        });
+                    let closed = install.expected_tasks().iter().all(|expected| {
+                        binding
+                            .instances
+                            .get(expected)
+                            .is_some_and(BackendOpenedProducer::is_closed)
+                    });
                     if closed {
                         binding.terminal = Some(BackendProducerBindingTerminal::Closed);
                     }
@@ -599,7 +593,7 @@ impl BackendRuntimeFilterSession {
     pub fn fail(
         &self,
         binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         _reason: RuntimeFilterProducerFailure,
     ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation> {
         let install = self.producer_install(binding_id)?;
@@ -614,7 +608,7 @@ impl BackendRuntimeFilterSession {
                     "producer binding has not been opened in this Backend session",
                 )
             })?;
-            if !binding.instances.contains_key(&fragment_instance_id) {
+            if !binding.instances.contains_key(&task_key) {
                 return Err(contract_violation(
                     RuntimeFilterContractViolationKind::UnauthorizedBinding,
                     "producer fragment instance has not been opened in this Backend session",
@@ -1121,7 +1115,7 @@ impl BackendRuntimeFilterSession {
     fn register_producer(
         &self,
         binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         request: RuntimeFilterProducerOpenRequest,
     ) -> Result<(), RuntimeFilterContractViolation> {
         let install = self.producer_install(binding_id)?;
@@ -1143,10 +1137,7 @@ impl BackendRuntimeFilterSession {
                 "producer local partition count exceeds the Backend observation bound",
             ));
         }
-        if !install
-            .expected_fragment_instances()
-            .contains(&fragment_instance_id)
-        {
+        if !install.expected_tasks().contains(&task_key) {
             return Err(contract_violation(
                 RuntimeFilterContractViolationKind::UnauthorizedBinding,
                 "producer fragment instance is not authorized by the Backend installation",
@@ -1163,7 +1154,7 @@ impl BackendRuntimeFilterSession {
                 "producer binding is already terminal",
             ));
         }
-        if let Some(existing) = binding.instances.get(&fragment_instance_id) {
+        if let Some(existing) = binding.instances.get(&task_key) {
             if existing.partition_count == request.local_partition_count() {
                 return Ok(());
             }
@@ -1173,7 +1164,7 @@ impl BackendRuntimeFilterSession {
             ));
         }
         binding.instances.insert(
-            fragment_instance_id,
+            task_key,
             BackendOpenedProducer::new(request.local_partition_count()),
         );
         Ok(())
@@ -1182,7 +1173,7 @@ impl BackendRuntimeFilterSession {
     fn open_stream(
         &self,
         binding_id: RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
+        task_key: UniqueId,
         partition: PartitionId,
     ) -> Result<BackendProducerStreamIdentity, RuntimeFilterContractViolation> {
         self.producer_install(binding_id)?;
@@ -1202,19 +1193,16 @@ impl BackendRuntimeFilterSession {
                 "producer binding is already terminal",
             ));
         }
-        let instance = binding
-            .instances
-            .get(&fragment_instance_id)
-            .ok_or_else(|| {
-                contract_violation(
-                    RuntimeFilterContractViolationKind::UnauthorizedBinding,
-                    "producer fragment instance has not been opened in this Backend session",
-                )
-            })?;
+        let instance = binding.instances.get(&task_key).ok_or_else(|| {
+            contract_violation(
+                RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                "producer fragment instance has not been opened in this Backend session",
+            )
+        })?;
         validate_open_partition(instance, partition)?;
         Ok(BackendProducerStreamIdentity::new(
             BackendChannelIdentity::new(self.participant, binding_id, self.channel.channel_id()),
-            fragment_instance_id,
+            task_key,
             partition,
         ))
     }
@@ -1265,7 +1253,7 @@ impl BackendRuntimeFilterSession {
 struct BackendRuntimeFilterProducer {
     session: Arc<BackendRuntimeFilterSession>,
     binding_id: RuntimeFilterBindingId,
-    fragment_instance_id: UniqueId,
+    task_key: UniqueId,
 }
 
 impl RuntimeFilterProducer for BackendRuntimeFilterProducer {
@@ -1282,7 +1270,7 @@ impl RuntimeFilterProducer for BackendRuntimeFilterProducer {
         self.session
             .submit(
                 self.binding_id,
-                self.fragment_instance_id,
+                self.task_key,
                 partition,
                 sequence,
                 contribution,
@@ -1295,20 +1283,15 @@ impl RuntimeFilterProducer for BackendRuntimeFilterProducer {
         partition: PartitionId,
         terminal: ProducerSequence,
     ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation> {
-        self.session.close_partition(
-            self.binding_id,
-            self.fragment_instance_id,
-            partition,
-            terminal,
-        )
+        self.session
+            .close_partition(self.binding_id, self.task_key, partition, terminal)
     }
 
     fn fail(
         &self,
         reason: RuntimeFilterProducerFailure,
     ) -> Result<RuntimeFilterSubmitOutcome, RuntimeFilterContractViolation> {
-        self.session
-            .fail(self.binding_id, self.fragment_instance_id, reason)
+        self.session.fail(self.binding_id, self.task_key, reason)
     }
 }
 
@@ -1626,10 +1609,11 @@ mod tests {
             schema,
         )
         .unwrap();
-        let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionHandle::Blocking(handle)) =
-            session
-                .subscribe(instance(51), RuntimeFilterSubscriptionRequest::new(binding))
-                .unwrap()
+        let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionPin::Blocking(
+            subscription_pin,
+        )) = session
+            .subscribe(instance(51), RuntimeFilterSubscriptionRequest::new(binding))
+            .unwrap()
         else {
             panic!("installed consumer-only binding must subscribe")
         };
@@ -1641,7 +1625,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            handle.try_outcome(),
+            subscription_pin.try_outcome(),
             Some(SnapshotAcquireOutcome::Unavailable(
                 UnavailableReason::ProducerFailed
             ))
@@ -1933,22 +1917,21 @@ mod tests {
             let (session, fixture, deliveries) =
                 owned_complete_once_session(budget, profile.clone());
             let contract = fixture.producer_contract().contract().clone();
-            let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionHandle::Live(
-                subscription,
-            )) = session
-                .subscribe(
-                    instance(53),
-                    RuntimeFilterSubscriptionRequest::new(
-                        RuntimeFilterConsumerContract::membership_live(
-                            RuntimeFilterBindingId::new(71),
-                            RuntimeFilterChannelId::new(11),
-                            RuntimeFilterLateApplyGranularity::Batch,
-                            contract.clone(),
-                        )
-                        .unwrap(),
-                    ),
-                )
-                .unwrap()
+            let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionPin::Live(subscription)) =
+                session
+                    .subscribe(
+                        instance(53),
+                        RuntimeFilterSubscriptionRequest::new(
+                            RuntimeFilterConsumerContract::membership_live(
+                                RuntimeFilterBindingId::new(71),
+                                RuntimeFilterChannelId::new(11),
+                                RuntimeFilterLateApplyGranularity::Batch,
+                                contract.clone(),
+                            )
+                            .unwrap(),
+                        ),
+                    )
+                    .unwrap()
             else {
                 panic!("installed live consumer must bind")
             };
@@ -2211,14 +2194,13 @@ mod tests {
             session.channel().execution_contract().clone(),
         )
         .unwrap();
-        let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionHandle::Blocking(
-            subscription,
-        )) = session
-            .subscribe(
-                instance(51),
-                RuntimeFilterSubscriptionRequest::new(consumer_contract),
-            )
-            .unwrap()
+        let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionPin::Blocking(subscription)) =
+            session
+                .subscribe(
+                    instance(51),
+                    RuntimeFilterSubscriptionRequest::new(consumer_contract),
+                )
+                .unwrap()
         else {
             panic!("installed blocking consumer must bind")
         };
@@ -2293,13 +2275,13 @@ mod tests {
                     RuntimeFilterSubscriptionRequest::new(blocking)
                 )
                 .unwrap(),
-            RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionHandle::Blocking(_))
+            RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionPin::Blocking(_))
         ));
         assert!(matches!(
             session
                 .subscribe(instance(53), RuntimeFilterSubscriptionRequest::new(live))
                 .unwrap(),
-            RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionHandle::Live(_))
+            RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionPin::Live(_))
         ));
     }
 
@@ -2321,14 +2303,13 @@ mod tests {
             session.channel().execution_contract().clone(),
         )
         .unwrap();
-        let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionHandle::Blocking(
-            subscription,
-        )) = session
-            .subscribe(
-                instance(51),
-                RuntimeFilterSubscriptionRequest::new(blocking),
-            )
-            .unwrap()
+        let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionPin::Blocking(subscription)) =
+            session
+                .subscribe(
+                    instance(51),
+                    RuntimeFilterSubscriptionRequest::new(blocking),
+                )
+                .unwrap()
         else {
             panic!("installed blocking consumer must bind")
         };

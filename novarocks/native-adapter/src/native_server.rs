@@ -128,7 +128,7 @@ pub(crate) struct ListenerAdmission {
 /// The role provides its generated service and owns every domain handler. This
 /// adapter owns only the generic socket, authenticated transport, h2 serving,
 /// shutdown, and supervision mechanics.
-pub struct NativeRpcServerHandle {
+pub struct NativeRpcListener {
     bound_addr: SocketAddr,
     shutdown_tx: Option<watch::Sender<bool>>,
     failure_rx: mpsc::Receiver<String>,
@@ -136,7 +136,7 @@ pub struct NativeRpcServerHandle {
     stop_requested: Arc<AtomicBool>,
 }
 
-impl NativeRpcServerHandle {
+impl NativeRpcListener {
     #[expect(
         clippy::too_many_arguments,
         reason = "role identity and its authentication metric remain explicit composition inputs"
@@ -465,7 +465,7 @@ impl NativeRpcServerHandle {
     }
 }
 
-impl Drop for NativeRpcServerHandle {
+impl Drop for NativeRpcListener {
     fn drop(&mut self) {
         let _ = self.stop();
     }

@@ -174,7 +174,7 @@ impl LogicalFinish {
             || runnable(&self.core_next)
             || self.can_finalize()
     }
-    fn poll_children(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn poll_children(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         ctx.checkpoint()?;
         if matches!(self.writer.poll_control(ctx)?, ControlStep::Withdrawn)
             && !self.writer_state.normal_input_exhausted()
@@ -189,7 +189,7 @@ impl LogicalFinish {
         }
         Ok(())
     }
-    fn service_writer(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn service_writer(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         if self.writer_pending.is_none() && !self.writer.is_complete() {
             self.writer_pending = self.writer.advance(ctx)?.map(derived_raw_input);
         }
@@ -217,7 +217,7 @@ impl LogicalFinish {
         }
         Ok(())
     }
-    fn service_summary(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+    fn service_summary(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<()> {
         match self
             .summary
             .as_mut()
@@ -239,7 +239,7 @@ impl LogicalFinish {
         }
         Ok(())
     }
-    fn service_core(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<Option<Chunk>> {
+    fn service_core(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<Option<Chunk>> {
         let step = if self.receiver.is_occupied() {
             match self.receiver.prepare(ctx, &self.core)? {
                 ReceiverPreparation::Ready(input) => {
@@ -300,7 +300,7 @@ impl SourceKernel for LogicalFinish {
     fn control_observable(&self) -> Option<Arc<Observable>> {
         Some(self.observable.clone())
     }
-    fn poll_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         self.poll_children(ctx)?;
         Ok(
             if self.writer_ready() || self.summary_ready() || self.core_ready() {
@@ -310,7 +310,7 @@ impl SourceKernel for LogicalFinish {
             },
         )
     }
-    fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn poll_output(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -406,12 +406,9 @@ impl OperatorLifecycle for LogicalFinish {
         self.writer.bind_runtime_state(state)?;
         self.core.bind_runtime_state(state)
     }
-    fn set_fragment_event_sink(
-        &mut self,
-        sink: Arc<dyn crate::runtime::fragment::io::FragmentEventSink>,
-    ) {
-        self.writer.set_fragment_event_sink(sink.clone());
-        self.core.set_fragment_event_sink(sink);
+    fn set_task_event_sink(&mut self, sink: Arc<dyn crate::runtime::task::io::TaskEventSink>) {
+        self.writer.set_task_event_sink(sink.clone());
+        self.core.set_task_event_sink(sink);
     }
     fn prepare(&mut self) -> ExecutionResult<()> {
         if let Some(error) = &self.failure {

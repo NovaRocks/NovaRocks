@@ -19,15 +19,15 @@ use std::future::Future;
 
 use anyhow::anyhow;
 use tokio::sync::watch;
-type RoleTaskResult = anyhow::Result<()>;
+type RoleJobResult = anyhow::Result<()>;
 
 enum PrimaryRole {
-    Frontend(RoleTaskResult),
-    Backend(RoleTaskResult),
+    Frontend(RoleJobResult),
+    Backend(RoleJobResult),
     Shutdown,
 }
 
-fn role_outcome(role: &str, result: RoleTaskResult) -> Result<(), String> {
+fn role_outcome(role: &str, result: RoleJobResult) -> Result<(), String> {
     match result {
         Ok(()) => Ok(()),
         Err(error) => Err(format!("{role} role failed: {error:#}")),

@@ -1404,10 +1404,8 @@ fn decode_producer(
         path.clone().field("coverage_witness_id"),
         "coverage witness id",
     )?;
-    let instances = decode_unique_id_set(
-        &wire.expected_fragment_instances,
-        path.clone().field("expected_fragment_instances"),
-    )?;
+    let instances =
+        decode_unique_id_set(&wire.expected_tasks, path.clone().field("expected_tasks"))?;
     let binding_id = RuntimeFilterBindingId::new(wire.binding_id);
     let producer = match kind {
         RuntimeFilterProducerKind::Membership => {
@@ -1484,10 +1482,8 @@ fn decode_consumer(
             "consumer route edge ids must be nonempty",
         ));
     }
-    let instances = decode_unique_id_set(
-        &wire.expected_fragment_instances,
-        path.clone().field("expected_fragment_instances"),
-    )?;
+    let instances =
+        decode_unique_id_set(&wire.expected_tasks, path.clone().field("expected_tasks"))?;
     validate_consumer_capabilities(&contract, &capabilities, &profile, path.clone())?;
     let binding_id = RuntimeFilterBindingId::new(wire.binding_id);
     let consumer = match (contract, reduction, activation) {
@@ -1762,10 +1758,8 @@ fn decode_routing_channel(
             item_path.clone().field("binding_id"),
             "producer binding id",
         )?;
-        let instance = decode_unique_id(
-            route.fragment_instance_id.as_ref(),
-            item_path.clone().field("fragment_instance_id"),
-        )?;
+        let instance =
+            decode_unique_id(route.task_key.as_ref(), item_path.clone().field("task_key"))?;
         reject_zero(
             u64::from(route.participant_id),
             item_path.clone().field("participant_id"),

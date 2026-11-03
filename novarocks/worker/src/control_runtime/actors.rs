@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A context step has one protocol decision and one atomic responsibility
+//! A participation step has one protocol decision and one atomic responsibility
 //! handoff. Host jobs, rich sources and reply channels stay outside this actor.
 
 use crate::control_admission::{AdmissionStorage, ScopeAdmissionPort};
 use novarocks_control_runtime::{
-    actor::{Actor, StepContext},
-    driver::InputAuthor,
+    actor::{Actor, ActorStep},
+    actor_turn::InputAuthor,
     transaction::ScopeHandle,
 };
 use novarocks_control_runtime_core::{
@@ -29,22 +29,24 @@ use novarocks_control_runtime_core::{
     identity::{ActionId, Generation, InputId, ScopeId, ScopedWorkRef, Tick},
     mailbox::InputEnvelope,
 };
-use novarocks_execution_contract::{QueryContextState, TaskIdentity};
+use novarocks_execution_contract::{ParticipationState, TaskIdentity};
 use novarocks_worker_protocol::{
-    context::{ContextCore, ContextEffect, ContextInput, ContextRequestSettlement},
-    creation::RequestContext,
+    creation::RequestReplyTag,
     lease::MonotonicInstant,
+    participation::{
+        ParticipationCore, ParticipationEffect, ParticipationInput, ParticipationRequestSettlement,
+    },
 };
 use std::{collections::BTreeMap, time::Duration};
 
 pub(crate) use crate::task_proposal_ingress::RequestMetadata;
 
 #[derive(Debug)]
-pub(crate) enum ContextMessage {
+pub(crate) enum ParticipationMessage {
     Command {
         work: ScopedWorkRef,
         request: Option<RequestMetadata>,
-        command: ContextInput,
+        command: ParticipationInput,
     },
     /// A declared experimental action selects this same admitted R occurrence.
     /// It changes no pure protocol input and allocates no additional position.
@@ -52,7 +54,7 @@ pub(crate) enum ContextMessage {
     TestOwnerPanicOnRenew {
         work: ScopedWorkRef,
         request: RequestMetadata,
-        command: ContextInput,
+        command: ParticipationInput,
     },
     Timer,
 }
@@ -64,14 +66,14 @@ pub(crate) enum ContextMessage {
 #[derive(Clone, Debug)]
 pub(crate) enum WorkerAction {
     AdmissionEpoch(super::node_metrics::ControlAdmissionProjection),
-    Context(ContextEffect),
+    Participation(ParticipationEffect),
     Control {
         effect: novarocks_worker_protocol::control::ControlEffect,
-        /// Only actual Context materialization has an original guard in this
+        /// Only actual Participation materialization has an original guard in this
         /// batch. Ticket grants carry protocol metadata without a reservation.
         admitted: Option<novarocks_control_runtime_core::identity::ReservationId>,
     },
-    Reply(ContextRequestSettlement),
+    Reply(ParticipationRequestSettlement),
     ControlReply(novarocks_worker_protocol::control::ControlRequestSettlement),
     OwnerFailed {
         scope: ScopeId,
@@ -79,8 +81,8 @@ pub(crate) enum WorkerAction {
     },
 }
 
-pub(crate) struct ContextActor {
-    core: ContextCore,
+pub(crate) struct ParticipationActor {
+    core: ParticipationCore,
     // The only live port is the explicitly allowed synchronous ledger port.
     // Its generation is the runtime failure fence, not the protocol close epoch.
     scope: ScopeHandle,
@@ -95,26 +97,30 @@ pub(crate) struct ContextActor {
     // It allocates no Work or second self-mailbox position.
     retained_continuation: Option<Tick>,
 }
-impl ContextActor {
+impl ParticipationActor {
     // The pure bound includes its selector probes and representation swap.
     // The adapter adds at most one coalesced scheduling effect.
-    pub(crate) const MAX_STEP_WORK: usize = ContextCore::MAX_STEP_WORK + 1;
-    pub(crate) const MAX_STEP_ACTIONS: usize = ContextCore::MAX_STEP_ACTIONS + 1;
+    pub(crate) const MAX_STEP_WORK: usize = ParticipationCore::MAX_STEP_WORK + 1;
+    pub(crate) const MAX_STEP_ACTIONS: usize = ParticipationCore::MAX_STEP_ACTIONS + 1;
     pub(crate) const TURN_BUDGET: usize = 4 * (Self::MAX_STEP_WORK + 1);
     pub(crate) fn new(
-        core: ContextCore,
+        core: ParticipationCore,
         scope: ScopeHandle,
         storage: AdmissionStorage,
         timer_work: ScopedWorkRef,
         lifetime_work: ScopedWorkRef,
     ) -> Self {
-        assert_eq!(timer_work.scope, scope.id(), "original Context timer scope");
+        assert_eq!(
+            timer_work.scope,
+            scope.id(),
+            "original Participation timer scope"
+        );
         assert_eq!(
             lifetime_work.scope,
             scope.id(),
-            "original Context lifetime scope"
+            "original Participation lifetime scope"
         );
-        let runtime_generation = scope.gates().expect("live context scope").generation;
+        let runtime_generation = scope.gates().expect("live participation scope").generation;
         Self {
             core,
             scope,
@@ -127,40 +133,40 @@ impl ContextActor {
         }
     }
 }
-impl Actor for ContextActor {
-    type Input = ContextMessage;
+impl Actor for ParticipationActor {
+    type Input = ParticipationMessage;
     type Effect = WorkerAction;
     fn timer_input(_: Tick) -> Self::Input {
-        ContextMessage::Timer
+        ParticipationMessage::Timer
     }
     fn handle(
         &mut self,
         now: Tick,
         envelope: InputEnvelope,
-        message: ContextMessage,
-        step: &mut StepContext<'_, WorkerAction>,
+        message: ParticipationMessage,
+        step: &mut ActorStep<'_, WorkerAction>,
     ) {
         let now = MonotonicInstant::from_origin(Duration::from_nanos(now.0));
-        let metadata_timer = step.is_retained() && matches!(&message, ContextMessage::Timer);
+        let metadata_timer = step.is_retained() && matches!(&message, ParticipationMessage::Timer);
         if metadata_timer {
             assert!(
                 matches!(
                     self.core.state(),
-                    QueryContextState::TerminalRetained | QueryContextState::Gone
+                    ParticipationState::TerminalRetained | ParticipationState::Gone
                 ),
                 "an original retained actor keeps only terminal protocol state"
             );
         }
         #[cfg(novarocks_dev_controls)]
-        let panic_on_renew = matches!(&message, ContextMessage::TestOwnerPanicOnRenew { .. });
+        let panic_on_renew = matches!(&message, ParticipationMessage::TestOwnerPanicOnRenew { .. });
         let (work, request, command) = match message {
-            ContextMessage::Command {
+            ParticipationMessage::Command {
                 work,
                 request,
                 command,
             } => (work, request, command),
             #[cfg(novarocks_dev_controls)]
-            ContextMessage::TestOwnerPanicOnRenew {
+            ParticipationMessage::TestOwnerPanicOnRenew {
                 work,
                 request,
                 command,
@@ -168,22 +174,22 @@ impl Actor for ContextActor {
                 assert!(
                     matches!(
                         &command,
-                        ContextInput::Request(
-                            novarocks_worker_protocol::context::ContextCommand::Renew { .. }
+                        ParticipationInput::Request(
+                            novarocks_worker_protocol::participation::ParticipationCommand::Renew { .. }
                         )
                     ),
                     "the selected experimental turn retains its original Renew"
                 );
                 (work, Some(request), command)
             }
-            ContextMessage::Timer => {
+            ParticipationMessage::Timer => {
                 let command = if metadata_timer
                     && self.retained_continuation.take().is_some()
                     && self.core.has_internal_work()
                 {
-                    ContextInput::NextInternal
+                    ParticipationInput::NextInternal
                 } else {
-                    ContextInput::Tick
+                    ParticipationInput::Tick
                 };
                 (self.timer_work, None, command)
             }
@@ -198,13 +204,13 @@ impl Actor for ContextActor {
         // Keep failure diagnostics neutral and finite. The command may own
         // large domain inputs; never format its payload during unwinding.
         let (input_kind, input_task) = match &command {
-            ContextInput::RejectedCreationRetired { task, .. } => {
+            ParticipationInput::RejectedCreationRetired { task, .. } => {
                 ("RejectedCreationRetired", Some(*task))
             }
-            ContextInput::LoadedTask { task, .. } => ("LoadedTask", Some(*task)),
-            ContextInput::Loaded { task, .. } => ("Loaded", Some(*task)),
-            ContextInput::Request(_) => ("Request", None),
-            _ => ("OtherContextInput", None),
+            ParticipationInput::LoadedTask { task, .. } => ("LoadedTask", Some(*task)),
+            ParticipationInput::Loaded { task, .. } => ("Loaded", Some(*task)),
+            ParticipationInput::Request(_) => ("Request", None),
+            _ => ("OtherParticipationInput", None),
         };
         let current_author = step.input_author().cloned();
         if let Some(proof) = &current_author {
@@ -223,16 +229,16 @@ impl Actor for ContextActor {
         }
         let result = match request {
             Some(request) => {
-                let original = RequestContext {
+                let original = RequestReplyTag {
                     author: work,
                     token: envelope.input,
                     operation: request.operation,
                     deadline: request.deadline,
                 };
                 match command {
-                    ContextInput::Request(command) => self.core.handle_request(now, original, command, &mut admission),
-                    ContextInput::RootEndAcknowledged { task } => self.core.handle_root_end_acknowledged(now, original, task, &mut admission),
-                    _ => panic!("an admitted Context R carries its original command or End ACK"),
+                    ParticipationInput::Request(command) => self.core.handle_request(now, original, command, &mut admission),
+                    ParticipationInput::RootEndAcknowledged { task } => self.core.handle_root_end_acknowledged(now, original, task, &mut admission),
+                    _ => panic!("an admitted Participation R carries its original command or End ACK"),
                 }
             }
             None => self.core.handle(now, command, &mut admission),
@@ -240,7 +246,7 @@ impl Actor for ContextActor {
         .unwrap_or_else(|error| {
             self.request_authors.clear();
             panic!(
-                "context protocol input preserves its frozen invariants: input={input_kind}, task={input_task:?}, error={error:?}"
+                "participation protocol input preserves its frozen invariants: input={input_kind}, task={input_task:?}, error={error:?}"
             )
         });
         #[cfg(novarocks_dev_controls)]
@@ -249,7 +255,7 @@ impl Actor for ContextActor {
             // Common catches this panic and owns the actual scope-failure path.
             self.request_authors.clear();
             panic!(
-                "declared Context owner panic context={:?} operation={}",
+                "declared Participation owner panic participation={:?} operation={}",
                 self.core.identity(),
                 request.expect("original Renew metadata").operation
             );
@@ -258,9 +264,9 @@ impl Actor for ContextActor {
         if !step.is_retained()
             && matches!(
                 self.core.state(),
-                QueryContextState::Aborting
-                    | QueryContextState::Releasing
-                    | QueryContextState::TerminalRetained
+                ParticipationState::Aborting
+                    | ParticipationState::Releasing
+                    | ParticipationState::TerminalRetained
             )
         {
             // Commit the start fence with this same pure decision, before a
@@ -270,7 +276,7 @@ impl Actor for ContextActor {
         }
         assert!(
             step.charge(result.records_visited),
-            "bounded context traversal"
+            "bounded participation traversal"
         );
         let guards = admission.take_guards();
         let mut reservations = BTreeMap::new();
@@ -285,7 +291,7 @@ impl Actor for ContextActor {
             if let Err((error, guard)) = step.reservation(guard) {
                 // Still pure and unbound. Roll back outside every ledger lock.
                 drop(guard);
-                panic!("context reservation handoff invariant: {error:?}");
+                panic!("participation reservation handoff invariant: {error:?}");
             }
         }
         let mut next = 0u64;
@@ -296,25 +302,25 @@ impl Actor for ContextActor {
             // its cursors; one prepaid self-source selects the next slice.
             if matches!(
                 &effect,
-                ContextEffect::ContinueTaskDomain { .. }
-                    | ContextEffect::ContinueRequestReplies { .. }
-                    | ContextEffect::ContinueQuiesce
-                    | ContextEffect::ContinueClose { .. }
-                    | ContextEffect::ContinueReplies { .. }
+                ParticipationEffect::ContinueTaskDomain { .. }
+                    | ParticipationEffect::ContinueRequestReplies { .. }
+                    | ParticipationEffect::ContinueQuiesce
+                    | ParticipationEffect::ContinueClose { .. }
+                    | ParticipationEffect::ContinueReplies { .. }
             ) {
                 continue;
             }
             if step.is_retained()
                 && matches!(
                     &effect,
-                    ContextEffect::RetainContext { .. }
-                        | ContextEffect::Expired { .. }
-                        | ContextEffect::WakeInternal
+                    ParticipationEffect::RetainParticipation { .. }
+                        | ParticipationEffect::Expired { .. }
+                        | ParticipationEffect::WakeInternal
                 )
             {
-                step.metadata(WorkerAction::Context(effect))
+                step.metadata(WorkerAction::Participation(effect))
                     .unwrap_or_else(|(error, _)| {
-                        panic!("bounded Context metadata handoff: {error:?}")
+                        panic!("bounded Participation metadata handoff: {error:?}")
                     });
                 continue;
             }
@@ -325,13 +331,13 @@ impl Actor for ContextActor {
             let mut dependencies = Vec::new();
             let mut effect_work = work;
             let kind = match &effect {
-                ContextEffect::LoadInput { reservation, .. } => {
+                ParticipationEffect::LoadInput { reservation, .. } => {
                     effect_work = *reservations
                         .get(reservation)
                         .expect("original step reservation accompanies host admission");
                     EffectKind::Business
                 }
-                ContextEffect::EnqueuePreparation {
+                ParticipationEffect::EnqueuePreparation {
                     task, reservation, ..
                 } => {
                     effect_work = *reservations
@@ -344,36 +350,36 @@ impl Actor for ContextActor {
                     );
                     EffectKind::Business
                 }
-                ContextEffect::PublishTask { task, .. }
-                | ContextEffect::PublishMetrics { task, .. }
-                | ContextEffect::PublishTaskConvergence { task, .. }
-                | ContextEffect::SummaryConsumed { task, .. }
-                | ContextEffect::RetireTask { task, .. }
-                | ContextEffect::FinalizeTaskExecution { task, .. }
-                | ContextEffect::PublishConclusion { task, .. } => {
+                ParticipationEffect::PublishTask { task, .. }
+                | ParticipationEffect::PublishMetrics { task, .. }
+                | ParticipationEffect::PublishTaskConvergence { task, .. }
+                | ParticipationEffect::SummaryConsumed { task, .. }
+                | ParticipationEffect::RetireTask { task, .. }
+                | ParticipationEffect::FinalizeTaskExecution { task, .. }
+                | ParticipationEffect::PublishConclusion { task, .. } => {
                     if let Some(previous) = publications.get(task) {
                         dependencies.push(*previous);
                     }
                     EffectKind::Publication
                 }
-                ContextEffect::StopTask { task, .. } => {
+                ParticipationEffect::StopTask { task, .. } => {
                     if let Some(previous) = publications.get(task) {
                         dependencies.push(*previous);
                     }
                     EffectKind::Cleanup
                 }
-                ContextEffect::SettlementBarrier { task, work: role } => {
+                ParticipationEffect::SettlementBarrier { task, work: role } => {
                     assert_eq!(*role, work, "settlement uses its original admitted Work");
                     if let Some(previous) = publications.get(task) {
                         dependencies.push(*previous);
                     }
                     EffectKind::Publication
                 }
-                ContextEffect::DisposeSource { .. }
-                | ContextEffect::DisposeLoadedInput { .. }
-                | ContextEffect::CancelLoader { .. }
-                | ContextEffect::ReleaseHost { .. }
-                | ContextEffect::SealRoot { .. } => EffectKind::Cleanup,
+                ParticipationEffect::DisposeSource { .. }
+                | ParticipationEffect::DisposeLoadedInput { .. }
+                | ParticipationEffect::CancelLoader { .. }
+                | ParticipationEffect::ReleaseHost { .. }
+                | ParticipationEffect::SealRoot { .. } => EffectKind::Cleanup,
                 // These are neutral control/publication handoffs. Their actual
                 // subsystem jobs require their own originally admitted roles.
                 _ => EffectKind::Publication,
@@ -381,18 +387,18 @@ impl Actor for ContextActor {
             next += 1;
             let id = ActionId::new(next).unwrap();
             match &effect {
-                ContextEffect::PublishTask { task, .. }
-                | ContextEffect::PublishMetrics { task, .. }
-                | ContextEffect::PublishTaskConvergence { task, .. }
-                | ContextEffect::SummaryConsumed { task, .. }
-                | ContextEffect::RetireTask { task, .. }
-                | ContextEffect::FinalizeTaskExecution { task, .. }
-                | ContextEffect::PublishConclusion { task, .. } => {
+                ParticipationEffect::PublishTask { task, .. }
+                | ParticipationEffect::PublishMetrics { task, .. }
+                | ParticipationEffect::PublishTaskConvergence { task, .. }
+                | ParticipationEffect::SummaryConsumed { task, .. }
+                | ParticipationEffect::RetireTask { task, .. }
+                | ParticipationEffect::FinalizeTaskExecution { task, .. }
+                | ParticipationEffect::PublishConclusion { task, .. } => {
                     publications.insert(*task, id);
                 }
                 _ => {}
             }
-            if let ContextEffect::PrepareReadPayload { request, task, .. } = &effect {
+            if let ParticipationEffect::PrepareReadPayload { request, task, .. } = &effect {
                 // This is an actual mechanical read preparation, not a second
                 // copy of the Core-authored reply body. A real loan pin must be
                 // established before the corresponding reply can start.
@@ -408,9 +414,9 @@ impl Actor for ContextActor {
                     kind,
                     dependencies,
                 },
-                WorkerAction::Context(effect),
+                WorkerAction::Participation(effect),
             )
-            .unwrap_or_else(|(error, _)| panic!("bounded context effect handoff: {error:?}"));
+            .unwrap_or_else(|(error, _)| panic!("bounded participation effect handoff: {error:?}"));
         }
         for reply in result.requests {
             next += 1;
@@ -443,7 +449,7 @@ impl Actor for ContextActor {
                 },
                 WorkerAction::Reply(reply),
             )
-            .unwrap_or_else(|(error, _)| panic!("bounded context reply handoff: {error:?}"));
+            .unwrap_or_else(|(error, _)| panic!("bounded participation reply handoff: {error:?}"));
         }
         self.retained_continuation = (internal_ready && step.is_retained()).then_some(Tick(
             u64::try_from(now.since_origin().as_nanos()).expect("runtime Tick fits its origin"),
@@ -457,9 +463,9 @@ impl Actor for ContextActor {
                     kind: EffectKind::Publication,
                     dependencies: Vec::new(),
                 },
-                WorkerAction::Context(ContextEffect::WakeInternal),
+                WorkerAction::Participation(ParticipationEffect::WakeInternal),
             )
-            .unwrap_or_else(|(error, _)| panic!("bounded Context internal wake: {error:?}"));
+            .unwrap_or_else(|(error, _)| panic!("bounded Participation internal wake: {error:?}"));
         }
     }
     fn next_deadline(&self) -> Option<Tick> {
@@ -474,11 +480,11 @@ impl Actor for ContextActor {
         scope: ScopeId,
         generation: Generation,
         _: InputEnvelope,
-        step: &mut StepContext<'_, WorkerAction>,
+        step: &mut ActorStep<'_, WorkerAction>,
     ) {
-        let work = step
-            .failure_work()
-            .expect("context registration retains its original cleanup role outside the core");
+        let work = step.failure_work().expect(
+            "participation registration retains its original cleanup role outside the core",
+        );
         step.effect(
             EffectDescriptor {
                 id: ActionId::new(1).unwrap(),
@@ -488,7 +494,7 @@ impl Actor for ContextActor {
             },
             WorkerAction::OwnerFailed { scope, generation },
         )
-        .unwrap_or_else(|(error, _)| panic!("fixed context failure handoff: {error:?}"));
+        .unwrap_or_else(|(error, _)| panic!("fixed participation failure handoff: {error:?}"));
     }
 }
 

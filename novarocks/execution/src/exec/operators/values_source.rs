@@ -30,7 +30,7 @@
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::exec::pipeline::shape::{Source, SourceKernel, SourceStart};
 use crate::exec::pipeline::step::{NextStep, StepResult};
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 
 use crate::exec::chunk::Chunk;
 
@@ -96,7 +96,7 @@ impl SourceKernel for ValuesSourceOperator {
     }
     fn poll_output(
         &mut self,
-        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
     ) -> ExecutionResult<StepResult> {
         let chunk = self.chunk.take().ok_or_else(|| {
             novarocks_functions::KernelFailure::InvalidProgram(

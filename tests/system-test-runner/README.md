@@ -137,7 +137,7 @@ packet sequence、列数、行数、length-encoded 字段及数据摘要，不�
 和 BE reservation/ingress 快照。这里只证明 wire 正确性与公开资源收敛；closing
 满池、精确 alias 退出、全部 W=2 容量矩阵和 transport 测量仍是独立验收。
 
-`result-delivery/producer-exit-context-retention` 在严格校验 metadata 后暂停
+`result-delivery/producer-exit-participation-retention` 在严格校验 metadata 后暂停
 客户端读行。客户端在 connect 前申请 4 KiB receive buffer，并记录 OS 实际值；
 不修改 server profile。一个合法 1 MiB 字符串形成 S+8 Native 行字节，要求
 连续两次观测同一个仍由 context 持有的 root：两个 Data position、End 已发布、

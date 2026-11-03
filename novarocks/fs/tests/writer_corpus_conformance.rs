@@ -27,8 +27,8 @@ use arrow::array::{
     TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use novarocks_fs::{
-    FileCancellation, FileFormat, FileIdentity, FileIoRuntime, FileProjection, FileReadBudget,
-    FileReadContext, FileReadRange, FileReadRequest, FileTaskSpawner, FsAccessResolver,
+    FileCancellation, FileFormat, FileIdentity, FileIoRuntime, FileIoSpawner, FileProjection,
+    FileReadBudget, FileReadContext, FileReadRange, FileReadRequest, FsAccessResolver,
     PhysicalPruning, inspect_parquet_metadata, open_file_reader,
 };
 use novarocks_spi::connector::StorageAccessDomainId;
@@ -259,12 +259,12 @@ fn assert_writer_via_production_fs(writer: Writer) {
         .expect("bind immutable corpus file");
     let io = TestIo::new();
     let runtime: Arc<dyn FileIoRuntime> = io.clone();
-    let task_spawner: Arc<dyn FileTaskSpawner> = io;
+    let io_spawner: Arc<dyn FileIoSpawner> = io;
     let context = FileReadContext {
         cancellation: FileCancellation::new(),
         deadline: None,
         runtime,
-        task_spawner,
+        io_spawner,
         range: None,
     };
     let inspection = inspect_parquet_metadata(

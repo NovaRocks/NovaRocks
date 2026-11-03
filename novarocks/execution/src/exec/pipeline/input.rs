@@ -20,7 +20,7 @@
 use crate::runtime::mem_tracker::MemTracker;
 use crate::{
     exec::chunk::Chunk,
-    runtime::fragment::{ExecutionFailure, ExecutionResult, io::RootInputPermit},
+    runtime::task::{ExecutionFailure, ExecutionResult, io::RootInputPermit},
 };
 use std::{fmt, sync::Arc};
 
@@ -36,7 +36,7 @@ impl RawInput {
     pub fn rows(&self) -> usize {
         self.chunk.len()
     }
-    pub fn result_metadata(&self) -> crate::runtime::fragment::io::ResultInputMetadata {
+    pub fn result_metadata(&self) -> crate::runtime::task::io::ResultInputMetadata {
         (&self.chunk).into()
     }
     #[cfg(test)]

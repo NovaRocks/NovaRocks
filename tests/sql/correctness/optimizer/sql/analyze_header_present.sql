@@ -26,7 +26,7 @@ ANALYZE TABLE ${case_db}.t_analyze_header;
 -- @skip_result_check=true
 -- @result_contains=Planning:
 -- @result_contains=Rows: 1
--- @result_contains=Profile: fragments=
+-- @result_contains=Profile: tasks=
 -- @result_contains=PLAN FRAGMENT 0
 -- @result_contains=HASH AGGREGATE
 EXPLAIN ANALYZE

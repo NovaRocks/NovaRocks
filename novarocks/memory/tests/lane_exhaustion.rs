@@ -17,7 +17,7 @@
 
 mod common;
 use common::*;
-use novarocks_memory::lane::{CoverageError, ResponsibilityClass, StoreHandle, global_store};
+use novarocks_memory::lane::{CoverageError, RecordStorePin, ResponsibilityClass, global_store};
 
 #[test]
 fn real_process_record_exhaustion_is_a_coverage_error_without_funding_change() {
@@ -26,7 +26,7 @@ fn real_process_record_exhaustion_is_a_coverage_error_without_funding_change() {
     let before = a.pressure_projection();
     let mut held = Vec::new();
     loop {
-        match StoreHandle::Global.acquire(
+        match RecordStorePin::Global.acquire(
             1,
             ResponsibilityClass::Service,
             novarocks_memory::lane::RecordRegion::Observation,

@@ -21,7 +21,7 @@
 use super::{
     build_collection::{BeginClaim, BuildCollection},
     build_match_bitmap::{
-        BitmapFreeze, BitmapInitClaim, BuildMatchBitmap, BuildMatchBitmapInit, InitLease,
+        BitmapFreeze, BitmapInitClaim, BuildMatchBitmap, BuildMatchBitmapInit, InitObligation,
         InitProgress,
     },
     build_pages::{BuildInputReceipt, BuildRows, CapturesForGraphs, ProjectionKind},
@@ -38,11 +38,11 @@ use crate::{
     exec::{
         hash_table::key_index::{BulkWork, IndexPurpose},
         operators::local_exchanger::LocalExchanger,
-        pipeline::step_context::TurnWork,
+        pipeline::driver_step::TurnWork,
     },
     runtime::{
-        fragment::{ExecutionFailure, ExecutionResult},
         observable::{Observable, ObserverSubscription},
+        task::{ExecutionFailure, ExecutionResult},
     },
 };
 use novarocks_type_contract::ValueTypeStorageLifetime;
@@ -202,7 +202,7 @@ pub(crate) enum FinalizeStep {
 }
 pub(crate) struct FinalizeWorker {
     projections: [Option<ProjectionWorker>; 2],
-    bitmap: Option<InitLease>,
+    bitmap: Option<InitObligation>,
     next: usize,
     active: Option<Arc<ActiveBuild>>,
     key_calls: u64,
@@ -367,8 +367,10 @@ impl JoinBuildFrame {
         result.map_err(|cause| self.fail(cause))
     }
     fn begin(&self, work: &BulkWork<'_>) -> ExecutionResult<FinalizeStep> {
-        let BeginClaim::Claimed { inputs, mut lease } =
-            self.inputs.claim_begin(work.owner, work.control)?
+        let BeginClaim::Claimed {
+            inputs,
+            mut begin_obligation,
+        } = self.inputs.claim_begin(work.owner, work.control)?
         else {
             return Ok(FinalizeStep::Blocked);
         };
@@ -472,7 +474,7 @@ impl JoinBuildFrame {
                     State::Retiring | State::Retired => {
                         drop(state);
                         active.retire()?;
-                        lease.withdraw_after_demand_released()?;
+                        begin_obligation.withdraw_after_demand_released()?;
                         return Ok(FinalizeStep::Retired);
                     }
                     State::Failed(cause) => return Err(cause.clone()),
@@ -483,7 +485,7 @@ impl JoinBuildFrame {
                     }
                 }
             }
-            self.inputs.complete_begin(&mut lease)?;
+            self.inputs.complete_begin(&mut begin_obligation)?;
             let mut state = self.state()?;
             match &*state {
                 State::Installing(current) if Arc::ptr_eq(current, &active) => {
@@ -501,7 +503,7 @@ impl JoinBuildFrame {
             self.completion.finalized_step();
             Ok(FinalizeStep::Progressed)
         })();
-        result.map_err(|cause| lease.fail(cause))
+        result.map_err(|cause| begin_obligation.fail(cause))
     }
     fn publish(
         &self,

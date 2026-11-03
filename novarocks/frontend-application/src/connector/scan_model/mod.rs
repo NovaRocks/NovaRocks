@@ -954,7 +954,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use novarocks_spi::connector::{
-        ConnectorBatchBudget, ConnectorControlPlanningLease, ConnectorReadSelector,
+        ConnectorBatchBudget, ConnectorControlPlanningPin, ConnectorReadSelector,
         ConnectorScalarType, ConnectorScalarValue, ConnectorStaticPredicateColumn,
         ConnectorStaticPredicateId, ConnectorTableIdentity, ConnectorTableResolution,
     };
@@ -963,20 +963,20 @@ mod tests {
 
     const CATALOG: &str = "fixture_catalog";
 
-    fn lease(files: Vec<FixtureScanFile>) -> ConnectorControlPlanningLease {
+    fn lease(files: Vec<FixtureScanFile>) -> ConnectorControlPlanningPin {
         lease_for_tables(HashMap::from([(FIXTURE_ANY_TABLE.to_string(), files)]))
     }
 
     fn lease_for_tables(
         files_by_table: HashMap<String, Vec<FixtureScanFile>>,
-    ) -> ConnectorControlPlanningLease {
-        ConnectorControlPlanningLease::new(
+    ) -> ConnectorControlPlanningPin {
+        ConnectorControlPlanningPin::new(
             Arc::new(planned_files_fixture_binding(CATALOG, files_by_table, None)),
             || {},
         )
     }
 
-    fn load(lease: &ConnectorControlPlanningLease, table: &str) -> ConnectorTableMetadata {
+    fn load(lease: &ConnectorControlPlanningPin, table: &str) -> ConnectorTableMetadata {
         lease
             .binding()
             .metadata()
@@ -1026,7 +1026,7 @@ mod tests {
     }
 
     fn plan(
-        lease: &ConnectorControlPlanningLease,
+        lease: &ConnectorControlPlanningPin,
         scan: &ConnectorScan,
     ) -> ConnectorSplitPlanningResult {
         lease
@@ -1221,7 +1221,7 @@ mod tests {
             )]),
             Some(Arc::clone(&seen)),
         );
-        let lease = ConnectorControlPlanningLease::new(Arc::new(binding), || {});
+        let lease = ConnectorControlPlanningPin::new(Arc::new(binding), || {});
         let metadata = load(&lease, "orders");
         let scan = lease
             .binding()
@@ -1411,7 +1411,7 @@ mod tests {
             &controls,
             &ConnectorInstanceId::parse(CATALOG).expect("instance ID"),
         )
-        .expect("fixture planning lease");
+        .expect("fixture planning pin");
 
         for (table, expected) in [
             ("l", "s3://fixture/l.parquet"),
@@ -1447,7 +1447,7 @@ mod tests {
             &controls,
             &ConnectorInstanceId::parse(CATALOG).expect("instance ID"),
         )
-        .expect("fixture planning lease");
+        .expect("fixture planning pin");
         let metadata = load(&lease, "not_registered");
         let scan = lease
             .binding()

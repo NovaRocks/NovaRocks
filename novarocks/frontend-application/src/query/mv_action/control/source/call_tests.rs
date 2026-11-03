@@ -57,7 +57,7 @@ impl Fixture {
     }
     pub(in crate::query::mv_action::control) fn call(self: &Arc<Self>) -> CatalogCall {
         let call = CatalogCall::new();
-        let lease = ConnectorCatalogMutationLease::new(
+        let lease = ConnectorCatalogMutationSession::new(
             self.descriptor.clone(),
             ConnectorControlRuntimeId::new(),
             self.epoch,

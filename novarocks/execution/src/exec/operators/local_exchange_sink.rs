@@ -30,15 +30,15 @@
 use crate::exec::operators::local_exchanger::LocalExchanger;
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::{PreparedInput, RawInput},
     operator::{InputEncodingPolicy, Operator},
     operator_factory::OperatorFactory,
     schedule::observer::Observable,
     shape::{ControlStep, SinkKernel, SinkStep, Transform},
     step::{AdmissionNext, NextStep, WaitFact, WaitReason},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeState};
 use std::sync::Arc;
 use tracing::debug;
@@ -143,7 +143,7 @@ impl InputEncodingPolicy for LocalExchangeSinkOperator {
     }
 }
 impl SinkKernel for LocalExchangeSinkOperator {
-    fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+    fn poll_control(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<ControlStep> {
         if self.exchanger.all_consumers_closed() {
             self.finish_producer();
             Ok(ControlStep::Withdrawn)
@@ -156,7 +156,7 @@ impl SinkKernel for LocalExchangeSinkOperator {
     }
     fn admission(
         &self,
-        _: &mut StepContext<'_>,
+        _: &mut DriverStep<'_>,
         _: &RawInput,
     ) -> ExecutionResult<Option<AdmissionNext>> {
         let observable = self.exchanger.sink_observable();
@@ -174,7 +174,7 @@ impl SinkKernel for LocalExchangeSinkOperator {
     }
     fn consume(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<SinkStep> {
         let chunk = input.into_uncovered_chunk()?;
@@ -195,7 +195,7 @@ impl SinkKernel for LocalExchangeSinkOperator {
             );
         }
         let tracker = self.queue_tracker.as_ref().ok_or_else(|| {
-            crate::runtime::fragment::ExecutionFailure::from_domain(LocalExchangeBindingFailure)
+            crate::runtime::task::ExecutionFailure::from_domain(LocalExchangeBindingFailure)
         })?;
         let factory = self
             .construction
@@ -210,7 +210,7 @@ impl SinkKernel for LocalExchangeSinkOperator {
         )?;
         Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
-    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+    fn finish(&mut self, _: &mut DriverStep<'_>) -> ExecutionResult<SinkStep> {
         self.finish_producer();
         Ok(SinkStep::new(NextStep::Finished, 0))
     }
@@ -225,7 +225,7 @@ impl std::fmt::Display for LocalExchangeBindingFailure {
 impl std::error::Error for LocalExchangeBindingFailure {}
 impl novarocks_failure_contract::FailureProjection for LocalExchangeBindingFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         FailureFact::new(
             FailureClass::Invariant,
@@ -313,12 +313,12 @@ mod tests {
         source: &mut Box<dyn crate::exec::pipeline::operator::Operator>,
         rt: &RuntimeState,
     ) -> crate::exec::pipeline::step::StepResult {
-        use crate::exec::pipeline::step_context::{DEFAULT_TURN_WORK_UNITS, StepContext, TurnWork};
+        use crate::exec::pipeline::driver_step::{DEFAULT_TURN_WORK_UNITS, DriverStep, TurnWork};
         let control = rt.error_state();
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
         source
             .as_mut()
-            .drive(&mut StepContext::new(
+            .drive(&mut DriverStep::new(
                 &control,
                 &mut work,
                 &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -346,16 +346,16 @@ mod tests {
         chunk: Chunk,
     ) {
         use crate::exec::pipeline::{
+            driver_step::{DriverStep, TurnWork},
             input::RawInput,
             step::InputResult,
-            step_context::{StepContext, TurnWork},
         };
         sink.bind_runtime_state(rt).expect("install queue binding");
         let control = rt.error_state();
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
         assert!(matches!(
             sink.as_mut().try_push(&mut ctx, RawInput::for_test(chunk)),
             InputResult::Accepted(Ok(_))
@@ -371,14 +371,14 @@ mod tests {
         rt: &RuntimeState,
     ) {
         use crate::exec::pipeline::{
+            driver_step::{DriverStep, TurnWork},
             step::NextStep,
-            step_context::{StepContext, TurnWork},
         };
         let control = rt.error_state();
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
         sink.as_mut().finish(&mut ctx).unwrap();
         let step = sink.as_mut().drive(&mut ctx).unwrap();
         assert!(step.output.is_none());
@@ -388,11 +388,11 @@ mod tests {
         sink: &mut Box<dyn crate::exec::pipeline::operator::Operator>,
         rt: &RuntimeState,
     ) {
-        use crate::exec::pipeline::step_context::{StepContext, TurnWork};
+        use crate::exec::pipeline::driver_step::{DriverStep, TurnWork};
         let control = rt.error_state();
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
         sink.as_mut()
-            .poll_control(&mut StepContext::new(
+            .poll_control(&mut DriverStep::new(
                 &control,
                 &mut work,
                 &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -405,15 +405,15 @@ mod tests {
         chunk: Chunk,
     ) {
         use crate::exec::pipeline::{
+            driver_step::{DriverStep, TurnWork},
             input::RawInput,
             step::InputResult,
-            step_context::{StepContext, TurnWork},
         };
         let original = chunk.columns()[0].clone();
         let control = rt.error_state();
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
         match sink.as_mut().try_push(
-            &mut StepContext::new(
+            &mut DriverStep::new(
                 &control,
                 &mut work,
                 &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -442,9 +442,9 @@ mod tests {
     #[test]
     fn full_queue_defers_the_same_raw_input_until_capacity_changes() {
         use crate::exec::pipeline::{
+            driver_step::{DriverStep, TurnWork},
             input::RawInput,
             step::{AdmissionNext, InputResult, NextStep},
-            step_context::{StepContext, TurnWork},
         };
         let rt = RuntimeState::default();
         let exchanger = LocalExchanger::new_handoff(1, 1, 1);
@@ -461,7 +461,7 @@ mod tests {
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
         let mut value_conversions =
             novarocks_value_arrays::decode::ValueConversionContext::default();
-        let mut ctx = StepContext::new(&control, &mut work, &mut value_conversions);
+        let mut ctx = DriverStep::new(&control, &mut work, &mut value_conversions);
         let mut raw = RawInput::for_test(chunk);
         let mut observed = None;
         for _ in 0..2 {
@@ -832,7 +832,7 @@ mod tests {
         use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
         use crate::exec::pipeline::operator::BlockedReason;
         use crate::runtime::exchange::ExchangeKey;
-        use crate::runtime::fragment::io::exchange::test_support::Fixture;
+        use crate::runtime::task::io::exchange::test_support::Fixture;
         use std::time::Duration;
 
         let fixture = Fixture::new();
@@ -840,17 +840,17 @@ mod tests {
         let sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let local_source = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
         let key = ExchangeKey {
-            finst_id_hi: 97001,
-            finst_id_lo: 97002,
+            task_key_hi: 97001,
+            task_key_lo: 97002,
             node_id: 97003,
         };
-        let receiver_key = crate::runtime::fragment::io::ExchangeReceiverKey {
-            fragment_instance_id: novarocks_types::UniqueId::new(key.finst_id_hi, key.finst_id_lo),
+        let receiver_key = crate::runtime::task::io::ExchangeReceiverKey {
+            task_key: novarocks_types::UniqueId::new(key.task_key_hi, key.task_key_lo),
             node_id: key.node_id,
         };
-        let state = fixture.state(receiver_key.fragment_instance_id);
+        let state = fixture.state(receiver_key.task_key);
         let receiver_port = fixture.port.clone();
-        let creation_factory = fixture.creation(receiver_key.fragment_instance_id);
+        let creation_factory = fixture.creation(receiver_key.task_key);
         let layout = crate::exec::chunk::typed_fixture::layout(
             Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
             &[SlotId::new(1)],
@@ -863,7 +863,7 @@ mod tests {
             .create_compiled_chunk_schema(&layout)
             .unwrap();
         receiver_port
-            .register(crate::runtime::fragment::io::ExchangeReceiverRegistration {
+            .register(crate::runtime::task::io::ExchangeReceiverRegistration {
                 key: receiver_key,
                 expected_senders: 1,
                 wire_chunk_schema: schema.clone(),

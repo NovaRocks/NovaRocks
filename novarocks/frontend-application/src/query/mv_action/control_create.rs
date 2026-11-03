@@ -36,11 +36,11 @@ use crate::{
             create_preparation::MvCreatePreparationInput,
             refresh_preparation::{
                 async_original::{MvRefreshPreparationOriginal, MvRefreshPreparationOutput},
-                driver::{MvRefreshTurnCustody, MvTurnFailure},
                 io_gate::{
                     MvRefreshPreparationIo, MvRefreshPreparationServices,
                     provider_error as preparation_provider_error,
                 },
+                turn_custody::{MvRefreshTurnCustody, MvTurnFailure},
             },
         },
     },
@@ -61,7 +61,7 @@ use novarocks_query_application::{
     session_error::QueryServiceError,
 };
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorRequestContext, ExternalMutationEffect,
+    ConnectorControlPlanningPin, ConnectorRequestContext, ExternalMutationEffect,
 };
 use novarocks_sql::planning::mv::SqlMvTarget;
 use novarocks_state_store_api::StateStoreExecutionRequests;
@@ -95,7 +95,7 @@ pub(super) struct MvCreateStepOriginal {
     cpu: InternalResultCpu,
     wake: Arc<MvWake>,
     operation: uuid::Uuid,
-    planning: Option<ConnectorControlPlanningLease>,
+    planning: Option<ConnectorControlPlanningPin>,
     preparation: Option<Preparation>,
     plan: Option<Arc<IcebergMvCreatePlan>>,
     source: Option<Arc<CreateOriginal>>,

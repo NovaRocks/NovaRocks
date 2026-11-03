@@ -100,7 +100,7 @@ fn error<T>(result: ExecutionResult<T>) -> ExecutionFailure {
     }
 }
 fn assert_invariant(cause: &ExecutionFailure, expected: ValueViolation) {
-    let crate::runtime::fragment::ExecutionFailureCause::Domain(original) = cause.cause() else {
+    let crate::runtime::task::ExecutionFailureCause::Domain(original) = cause.cause() else {
         panic!("the original typed value error must remain recoverable");
     };
     assert!(matches!(original.downcast_ref::<ValueError>(),

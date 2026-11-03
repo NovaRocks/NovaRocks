@@ -27,12 +27,12 @@ use crate::exec::{
         },
     },
     pipeline::{
+        driver_step::{DriverStep, TurnWork},
         input::RawInput,
         operator::{ConstructionFailure, InputConstructionFactory, Operator},
         operator_factory::OperatorFactory,
         shape::ControlStep,
         step::{InputResult, NextStep},
-        step_context::{StepContext, TurnWork},
     },
 };
 use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeState};
@@ -104,7 +104,7 @@ fn finalize(sources: &mut [Box<dyn Operator>], runtime: &RuntimeState) {
             }
             let mut turn = TurnWork::new(NonZeroU64::MIN, 13);
             let step = source
-                .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+                .drive(&mut DriverStep::new(&error, &mut turn, &mut conversions))
                 .unwrap();
             assert!(step.output.is_none());
             done[i] = matches!(step.next, NextStep::Finished);
@@ -296,7 +296,7 @@ fn b3_b0_control_finishes_without_unadmitted_probe_input_or_upstream_eos() {
     let error = runtime.error_state();
     let mut turn = TurnWork::new(NonZeroU64::MIN, 0);
     let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&error, &mut turn, &mut conversions);
+    let mut ctx = DriverStep::new(&error, &mut turn, &mut conversions);
     assert!(matches!(
         q.poll_control(&mut ctx).unwrap(),
         ControlStep::Runnable
@@ -324,7 +324,7 @@ fn b3_b0_retains_receiver_owned_throwing_probe_key_and_original_required_error()
     let error = runtime.error_state();
     let mut turn = TurnWork::new(NonZeroU64::MIN, 30);
     let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
-    let mut ctx = StepContext::new(&error, &mut turn, &mut conversions);
+    let mut ctx = DriverStep::new(&error, &mut turn, &mut conversions);
     assert!(matches!(
         q.try_push(
             &mut ctx,
@@ -478,7 +478,7 @@ fn b3_independent_t_sources_wait_for_q_and_last_page_handoff_with_partial_consum
         let mut turn = TurnWork::new(NonZeroU64::MIN, 64);
         let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
         let pending = tails[0]
-            .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+            .drive(&mut DriverStep::new(&error, &mut turn, &mut conversions))
             .unwrap();
         assert!(matches!(pending.next, NextStep::Wait(_)));
         assert!(pending.output.is_none());
@@ -500,7 +500,7 @@ fn b3_independent_t_sources_wait_for_q_and_last_page_handoff_with_partial_consum
                 }
                 let mut turn = TurnWork::new(NonZeroU64::MIN, 64);
                 let step = tails[i]
-                    .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+                    .drive(&mut DriverStep::new(&error, &mut turn, &mut conversions))
                     .unwrap();
                 if let Some(page) = step.output {
                     assert!(
@@ -511,7 +511,7 @@ fn b3_independent_t_sources_wait_for_q_and_last_page_handoff_with_partial_consum
                         let other = 1 - i;
                         let mut turn = TurnWork::new(NonZeroU64::MIN, 64);
                         let before_transfer = tails[other]
-                            .drive(&mut StepContext::new(&error, &mut turn, &mut conversions))
+                            .drive(&mut DriverStep::new(&error, &mut turn, &mut conversions))
                             .unwrap();
                         assert!(before_transfer.output.is_none());
                         assert!(matches!(before_transfer.next, NextStep::Wait(_)));

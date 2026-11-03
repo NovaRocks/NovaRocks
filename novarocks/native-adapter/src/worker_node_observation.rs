@@ -71,14 +71,14 @@ pub(crate) fn subscribe_task_status(
         ));
     }
     let generation = decoded.generation.get();
-    let context = decoded.context;
+    let participation = decoded.participation;
     let position = NodeCoveredSubscriptionRequest {
         status: decoded.status_cursors,
         convergence: decoded.task_convergence_cursors,
-        context: decoded.context_cursor,
+        participation: decoded.participation_cursor,
         quiesce: decoded.quiesce_cursor.map(|cursor| {
             novarocks_worker::NodeQuiesceObservationCursor {
-                context: cursor.context,
+                participation: cursor.participation,
                 fence_version: cursor.fence_version,
             }
         }),
@@ -88,7 +88,7 @@ pub(crate) fn subscribe_task_status(
     // is not a Work, source, capacity or replay authority.
     let stream = control
         .begin_status_subscription(
-            context,
+            participation,
             novarocks_execution_contract::TaskOperationId::new_v7(),
             control.now().saturating_add(remaining),
             generation,
@@ -96,7 +96,7 @@ pub(crate) fn subscribe_task_status(
         )
         .map_err(crate::worker_node_ingress::request_status)?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    context.hash(&mut hasher);
+    participation.hash(&mut hasher);
     let stagger = Duration::from_millis(hasher.finish() % 750);
     let first = tokio::time::Instant::now() + Duration::from_millis(250) + stagger;
     // The real outer Observation lane stream guard remains with the HTTP
@@ -109,7 +109,7 @@ pub(crate) fn subscribe_task_status(
         bookmark_timer: Box::pin(tokio::time::sleep_until(first)),
         catch_up_complete: false,
         ended: false,
-        context,
+        participation,
         diagnostic: ObservationDiagnostic::default(),
         #[cfg(novarocks_dev_controls)]
         test_controls,
@@ -126,7 +126,7 @@ struct NodeObservationStream {
     catch_up_complete: bool,
     ended: bool,
     diagnostic: ObservationDiagnostic,
-    context: novarocks_execution_contract::QueryContextRef,
+    participation: novarocks_execution_contract::ParticipationRef,
     #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
     #[cfg(novarocks_dev_controls)]
@@ -189,8 +189,8 @@ impl FrameDiagnostic {
                 diagnostic.task = Some(receipt.identity());
                 diagnostic.convergence = Some(receipt.version().get());
             }
-            F::ContextConvergence(receipt) => {
-                diagnostic.fact = "context_convergence";
+            F::ParticipationConvergence(receipt) => {
+                diagnostic.fact = "participation_convergence";
                 diagnostic.convergence = Some(receipt.version().get());
             }
             F::Quiesce(receipt) => {
@@ -235,7 +235,7 @@ impl NodeObservationStream {
         };
         self.diagnostic.last_bookmark = Some(bookmark);
         if log {
-            tracing::debug!(pid = std::process::id(), context = ?self.context, generation = self.generation,
+            tracing::debug!(pid = std::process::id(), participation = ?self.participation, generation = self.generation,
                 delivery, phase = fact.phase, fact = fact.fact, revision = ?fact.revision,
                 task = ?fact.task, status = ?fact.status, convergence = ?fact.convergence,
                 quiesce = ?fact.quiesce, initial_cut = ?fact.initial_cut,
@@ -255,7 +255,7 @@ impl NodeObservationStream {
                 self.diagnostic.live_remaining -= 1;
             }
             self.diagnostic.bookmark_logged = true;
-            tracing::debug!(pid = std::process::id(), context = ?self.context, generation = bookmark.generation,
+            tracing::debug!(pid = std::process::id(), participation = ?self.participation, generation = bookmark.generation,
                 sequence = bookmark.sequence, covered_prefix = bookmark.covered_prefix, source_cut = bookmark.source_cut,
                 "Original covered source emitted a Native bookmark");
         }
@@ -301,7 +301,7 @@ impl Stream for NodeObservationStream {
             Poll::Pending => {
                 if !this.diagnostic.pending_logged {
                     this.diagnostic.pending_logged = true;
-                    tracing::debug!(pid = std::process::id(), context = ?this.context, generation = this.generation,
+                    tracing::debug!(pid = std::process::id(), participation = ?this.participation, generation = this.generation,
                         catch_up_complete = this.catch_up_complete,
                         "Original covered stream is awaiting its first unavailable frame");
                 }
@@ -314,7 +314,7 @@ impl Stream for NodeObservationStream {
         if !this.initial_fault_checked {
             this.initial_fault_checked = true;
             if let Some(controls) = &this.test_controls {
-                match crate::task_protocol_fault::task_status_subscription_dropped(controls, this.context) {
+                match crate::task_protocol_fault::task_status_subscription_dropped(controls, this.participation) {
                     Ok(true) => return this.end(Status::unavailable("runner-owned task status stream dropped after the subscription was established")),
                     Err(error) => return this.end(error),
                     Ok(false) => {}
@@ -369,7 +369,7 @@ impl Drop for NodeObservationStream {
     fn drop(&mut self) {
         // Read only the last actual receipt; requesting a fresh bookmark here
         // would change source sequence during diagnostic teardown.
-        tracing::debug!(pid = std::process::id(), context = ?self.context, generation = self.generation,
+        tracing::debug!(pid = std::process::id(), participation = ?self.participation, generation = self.generation,
             catch_up_complete = self.catch_up_complete, ended = self.ended,
             initial_frames = self.diagnostic.initial_frames,
             last_bookmark = ?self.diagnostic.last_bookmark,
@@ -385,18 +385,18 @@ fn observation_status(error: WorkerObservationError) -> Status {
             | E::FrameTooLarge { .. }
             | E::TargetLimitExceeded => Status::resource_exhausted(refusal.to_string()),
             E::InvalidGeneration
-            | E::MismatchedContext
+            | E::MismatchedParticipation
             | E::FutureTaskCursor(_)
             | E::FutureTaskConvergenceCursor(_)
-            | E::FutureContextCursor
+            | E::FutureParticipationCursor
             | E::FutureQuiesceCursor => Status::invalid_argument(refusal.to_string()),
             _ => Status::internal(refusal.to_string()),
         };
     }
     match error.kind() {
-        WorkerObservationErrorKind::ContextRemoved => {
-            Status::failed_precondition("the original status subscription Context was removed")
-        }
+        WorkerObservationErrorKind::ParticipationRemoved => Status::failed_precondition(
+            "the original status subscription Participation was removed",
+        ),
         WorkerObservationErrorKind::OwnerFailed => {
             Status::internal("the original status subscription owner failed")
         }
@@ -429,6 +429,6 @@ fn frame_task(
         | Fact::Gone(identity)
         | Fact::TaskConvergenceUnchanged(identity) => Some(*identity),
         Fact::TaskConvergence(receipt) => Some(receipt.identity()),
-        Fact::ContextConvergence(_) | Fact::Quiesce(_) => None,
+        Fact::ParticipationConvergence(_) | Fact::Quiesce(_) => None,
     }
 }

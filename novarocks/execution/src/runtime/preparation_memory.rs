@@ -19,9 +19,9 @@
 //! Pending retains only its unexecuted continuation, never an active writer.
 
 use super::{
-    fragment::{ExecutionFailure, ExecutionResult},
     kernel_memory::{KernelMemoryAdmission, KernelMemoryJournal, request_complete_operation},
     query_memory::QueryMemoryBinding,
+    task::{ExecutionFailure, ExecutionResult},
 };
 use novarocks_execution_contract::task_execution::status::{AbortCause, CancelReason};
 use novarocks_memory::{CapacityError, CoverageReceipt, ShortageReceipt};
@@ -44,7 +44,7 @@ impl std::error::Error for PreparationMemoryStop {}
 impl novarocks_failure_contract::FailureProjection for PreparationMemoryStop {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::stop_observation(
-            crate::runtime::fragment::ExecutionReason::PreparationStopped.reason(),
+            crate::runtime::task::ExecutionReason::PreparationStopped.reason(),
         )
     }
 }
@@ -241,7 +241,7 @@ mod tests;
 
 impl novarocks_failure_contract::FailureProjection for PreparationMemoryRefusal {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         match self {
             Self::MissingQueryMemory => FailureFact::new(

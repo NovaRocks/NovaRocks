@@ -9,8 +9,6 @@ pub mod exec_env;
 pub mod execution_health;
 pub mod execution_runtime;
 pub mod execution_services;
-pub mod fragment;
-pub mod io;
 pub mod kernel_memory;
 pub(crate) mod local_completion;
 pub mod mem_tracker;
@@ -25,6 +23,7 @@ pub mod runtime_state;
 pub mod scalar_memory;
 pub mod scan_stream_metrics;
 pub mod table_writer_metrics;
+pub mod task;
 pub mod task_control;
 pub(crate) mod tracked_state_allocator;
 #[cfg(novarocks_dev_controls)]

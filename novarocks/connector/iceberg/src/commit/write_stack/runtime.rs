@@ -29,7 +29,7 @@ use novarocks_spi::connector::write_stack::{ProviderWriteRuntime, WriteRuntimeAd
 use novarocks_spi::connector::{CatalogHandle, ConnectorInstanceDescriptor};
 
 use crate::commit::write_stack::domain::{
-    IcebergCommitFragment, IcebergCommitHandle, IcebergWriterHandle,
+    IcebergCommitFragment, IcebergWriteCommitSession, IcebergWriterHandle,
 };
 
 /// One exact Iceberg catalog generation's write domain.
@@ -51,7 +51,7 @@ impl IcebergWriteRuntime {
 }
 
 impl ProviderWriteRuntime for IcebergWriteRuntime {
-    type CommitHandle = IcebergCommitHandle;
+    type CommitSession = IcebergWriteCommitSession;
     type WriterHandle = IcebergWriterHandle;
     type CommitFragment = IcebergCommitFragment;
 

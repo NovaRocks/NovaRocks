@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_execution_contract::task_execution::identity::QueryContextRef;
+use novarocks_execution_contract::task_execution::identity::ParticipationRef;
 
 /// Adapter-owned gate that can hold task creation for one exact context.
 ///
@@ -23,18 +23,18 @@ use novarocks_execution_contract::task_execution::identity::QueryContextRef;
 /// expose a real process-lifecycle rendezvous without making the Worker depend
 /// on that adapter's fault model or transport implementation.
 pub trait TaskCreationGate: Send + Sync {
-    fn holds_task_creation(&self, context: QueryContextRef) -> bool;
+    fn holds_task_creation(&self, participation: ParticipationRef) -> bool;
 
-    fn wait_for_task_creation_release(&self, context: QueryContextRef);
+    fn wait_for_task_creation_release(&self, participation: ParticipationRef);
 }
 
 /// The production-neutral Worker default: no external gate holds admission.
 pub struct NoopTaskCreationGate;
 
 impl TaskCreationGate for NoopTaskCreationGate {
-    fn holds_task_creation(&self, _context: QueryContextRef) -> bool {
+    fn holds_task_creation(&self, _participation: ParticipationRef) -> bool {
         false
     }
 
-    fn wait_for_task_creation_release(&self, _context: QueryContextRef) {}
+    fn wait_for_task_creation_release(&self, _participation: ParticipationRef) {}
 }

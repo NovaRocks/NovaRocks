@@ -373,7 +373,7 @@ mod tests {
     fn source() -> Chunk {
         let pure = ValueTypeStorageLifetime::pure();
         Chunk::try_new_typed_with_columns_owned_observed::<
-            crate::runtime::fragment::ExecutionFailure,
+            crate::runtime::task::ExecutionFailure,
             _,
         >(
             Arc::new(ChunkSchema::try_new_typed(vec![], pure.clone()).unwrap()),
@@ -414,7 +414,7 @@ mod tests {
                 )
                 .is_err()
         );
-        let original = crate::runtime::fragment::ExecutionFailure::from(
+        let original = crate::runtime::task::ExecutionFailure::from(
             novarocks_functions::KernelFailure::Cancelled,
         );
         error.set_error(original.clone());

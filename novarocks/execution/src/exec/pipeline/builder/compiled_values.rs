@@ -54,8 +54,8 @@ use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::shape::{Source, SourceKernel, SourceStart};
 use crate::exec::pipeline::step::{NextStep, StepResult};
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 fn invalid(message: &str) -> ExecutionFailure {
     KernelFailure::InvalidProgram(KernelDiagnostic::new(message)).into()
@@ -74,7 +74,7 @@ impl CompiledValuesSourceFactory {
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> crate::runtime::fragment::ExecutionResult<Self> {
+    ) -> crate::runtime::task::ExecutionResult<Self> {
         let graph_node = program.graph().nodes().get(node.index()).ok_or_else(|| {
             crate::exec::fragment::error::program_binding_failure(
                 crate::exec::fragment::error::FragmentBindingErrorKind::MissingAssignment,
@@ -194,7 +194,7 @@ impl SourceKernel for CompiledValuesSource {
     }
     fn poll_output(
         &mut self,
-        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        _ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
     ) -> ExecutionResult<StepResult> {
         // The source pipeline has one driver; every row comes from it, so the
         // cells are evaluated once and rows keep their frozen order.
@@ -513,7 +513,7 @@ impl std::error::Error for ValuesConstructionFailure {
 }
 impl novarocks_failure_contract::FailureProjection for ValuesConstructionFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         use novarocks_failure_contract::{FailureClass, FailureFact};
         use novarocks_failure_contract::{
             RepresentationBoundary, RepresentationFacts, RepresentationLayout, domain,
@@ -577,7 +577,7 @@ mod allocation_domain_tests {
         assert_eq!(extent.required, Some(count as u64));
         assert_eq!(extent.extent_limit, Some(isize::MAX as u64));
         assert_eq!(extent.representable_prefix, None);
-        let crate::runtime::fragment::ExecutionFailureCause::Domain(shared) = error.cause() else {
+        let crate::runtime::task::ExecutionFailureCause::Domain(shared) = error.cause() else {
             panic!("the original Values author");
         };
         let original = shared.downcast_ref::<ValuesConstructionFailure>().unwrap();

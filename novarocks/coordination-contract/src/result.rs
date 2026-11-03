@@ -18,27 +18,27 @@
 use std::fmt;
 
 use crate::AttemptActivationIdentity;
-use novarocks_execution_contract::{QueryContextRef, TaskIdentity};
+use novarocks_execution_contract::{ParticipationRef, TaskIdentity};
 
 /// Exact result-demand withdrawal from the serialized frozen Task graph.
 /// This is a result prerequisite fact, not a Worker verdict or exit/grant proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResultContextWithdrawal {
+pub struct ResultParticipationWithdrawal {
     activation: AttemptActivationIdentity,
     root: TaskIdentity,
-    context: QueryContextRef,
+    participation: ParticipationRef,
 }
-impl ResultContextWithdrawal {
+impl ResultParticipationWithdrawal {
     /// Correlation data only; the original permit and graph owner authorize use.
     pub const fn new(
         activation: AttemptActivationIdentity,
         root: TaskIdentity,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Self {
         Self {
             activation,
             root,
-            context,
+            participation,
         }
     }
     pub const fn activation(self) -> AttemptActivationIdentity {
@@ -47,8 +47,8 @@ impl ResultContextWithdrawal {
     pub const fn root(self) -> TaskIdentity {
         self.root
     }
-    pub const fn context(self) -> QueryContextRef {
-        self.context
+    pub const fn participation(self) -> ParticipationRef {
+        self.participation
     }
 }
 

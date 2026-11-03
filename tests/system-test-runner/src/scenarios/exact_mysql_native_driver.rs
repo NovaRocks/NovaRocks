@@ -27,7 +27,7 @@ use crate::actors::mysql_stream::exact_result_reader::{ExactReadSnapshot, ExactR
 use crate::exact_mysql_target_binding;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
-use novarocks_cluster_harness::{CrossProcessChildEnvironment, LaunchProfile, ServerHandle};
+use novarocks_cluster_harness::{CrossProcessChildEnvironment, LaunchProfile, TestClusterOwner};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;

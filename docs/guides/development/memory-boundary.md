@@ -14,7 +14,7 @@ F = max(A - L - O, 0)
 C = A + E = L + O + F
 ```
 
-正常 funded 步只结算本域事实。量化 refill、新承诺、真实责任归还和债务变更才进入账户路径。资金 `ScopeLease` 是当前线程的独占 stock writer，其 stock 来自同一域，stock miss 不等于域越界。lease 必须在 await 或迁移线程前退出；free 可以来自其他线程。allocator hook 只发布成功分配或真实释放事实，处置在安全边界进行。独立的观测 owner 句柄与 `LaneShards::run` 不取得资金资格，也不消费 stock；资金结算读取同一份事实，不能再发布一份。
+正常 funded 步只结算本域事实。量化 refill、新承诺、真实责任归还和债务变更才进入账户路径。资金 `FundingScope` 是当前线程的独占 stock writer，其 stock 来自同一域，stock miss 不等于域越界。funding scope 必须在 await 或迁移线程前退出；free 可以来自其他线程。allocator hook 只发布成功分配或真实释放事实，处置在安全边界进行。独立的观测 owner 句柄与 `LaneShards::run` 不取得资金资格，也不消费 stock；资金结算读取同一份事实，不能再发布一份。
 
 `ExplicitGrant` 为可知的大分配提供操作前授权，成功分配不得超过剩余额度。`ExternalBound` 表示尚未能表达为 L 的责任上界，转换成功分配时同步扣 O、加 L；它不建立第二份承诺。`HolderPin` 保活稳定记录并提供曝光样本，不因为增加 holder 或 clone 而再次计 payload。
 
@@ -44,9 +44,9 @@ Server 的 `GLOBAL` 已安装 `AttributingAllocator<Jemalloc>`；`--no-default-f
 
 TLS 是无需析构的 const `Cell`，线程只有一个 Q=1 MiB 槽。切槽、同步作用域退出、没有 outer ambient 的显式 helper 退出及达到 Q 时直接发布或 flush。hook 返回后余额 <Q；在途的一笔操作没有先验大小上界。`Q × sampled pins` 排除了在途项，又是独立采样，不能当作瞬时物理峰值上界或结清证明。字节/序号先发布，count/unpin 合成最后一次状态更新。
 
-`AccountHandle::create_lane_shards` 总返回 owner 句柄：覆盖态带 16 条 lane，未覆盖态带原因。所有记录、成员节点与 Arc 外壳在账户 gate 外准备，在同一段路径共享 gate 内检查关闭并整组发布；发布段不分配。关闭/退役只看到整组或空组。观测不足经有预算追赶仍不足时报告缺口，不挤占资金区。真实分配（含 R1 small）、slot pin 或强句柄都能保留记录；不能从零 tagged 字节推断可回收。
+`Account::create_lane_shards` 总返回 owner 句柄：覆盖态带 16 条 lane，未覆盖态带原因。所有记录、成员节点与 Arc 外壳在账户 gate 外准备，在同一段路径共享 gate 内检查关闭并整组发布；发布段不分配。关闭/退役只看到整组或空组。观测不足经有预算追赶仍不足时报告缺口，不挤占资金区。真实分配（含 R1 small）、slot pin 或强句柄都能保留记录；不能从零 tagged 字节推断可回收。
 
-`LaneShards::run` 只暴露同步闭包；线程首次使用顺序取号模 16，之后固定选片，TLS 不可用才按栈选片。私有同线程 guard 在正常返回及 unwind flush 并恢复 outer。未覆盖或所选分片封口时，owner scope 遮蔽外层 ambient，带来源分配落到本线程角色的未归属；合法 explicit 仍优先，遮蔽本身不进槽、不解析、不 pin。资金域 `LaneHandle::run` 保留原有失败回落语义，应用须把它组合在同一 owner 的外层作用域内。资金 writer 仍独占。
+`LaneShards::run` 只暴露同步闭包；线程首次使用顺序取号模 16，之后固定选片，TLS 不可用才按栈选片。私有同线程 guard 在正常返回及 unwind flush 并恢复 outer。未覆盖或所选分片封口时，owner scope 遮蔽外层 ambient，带来源分配落到本线程角色的未归属；合法 explicit 仍优先，遮蔽本身不进槽、不解析、不 pin。资金域 `Lane::run` 保留原有失败回落语义，应用须把它组合在同一 owner 的外层作用域内。资金 writer 仍独占。
 
 `AttributedFuture::new(owner, make)` 在 owner 作用域调用构造闭包；每次 poll 与内部 future 就地 Drop 也安装 owner。Pending/Ready/unwind 后恢复外层，已 pin 的 future 不移动、不重复析构；取消和从未 poll 的 Drop 同样覆盖。spawn 不隐式继承。不能用跨 await 的公开 TLS guard。
 

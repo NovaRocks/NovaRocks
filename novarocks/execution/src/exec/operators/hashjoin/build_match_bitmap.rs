@@ -25,12 +25,12 @@ use super::{
 };
 use crate::{
     exec::{
-        phased_work::{PhasedRangeWork, RangeLease},
+        phased_work::{PhasedRangeWork, RangeObligation},
         pipeline::operator::InputConstructionOwner,
     },
     runtime::{
-        fragment::{ExecutionFailure, ExecutionResult},
         observable::Observable,
+        task::{ExecutionFailure, ExecutionResult},
     },
 };
 use novarocks_functions::KernelEvaluationControl;
@@ -160,7 +160,7 @@ pub(crate) enum BitmapInitClaim {
     Pending,
     Finished,
     Retired,
-    Range(InitLease),
+    Range(InitObligation),
 }
 pub(crate) enum BitmapFreeze {
     Pending,
@@ -177,10 +177,10 @@ pub(crate) enum InitProgress {
 }
 /// Only the original phase can issue this opaque lease. Its pending Arc never
 /// escapes before installation; Arc::get_mut is the sole mutable storage port.
-pub(crate) struct InitLease {
+pub(crate) struct InitObligation {
     pending: Option<Arc<Segment>>,
     owner: Arc<BuildMatchBitmapInit>,
-    lease: Option<RangeLease<ExecutionFailure, ValueTypeStorageLifetime>>,
+    obligation: Option<RangeObligation<ExecutionFailure, ValueTypeStorageLifetime>>,
     words: Range<usize>,
 }
 impl BuildMatchBitmapInit {
@@ -278,10 +278,10 @@ impl BuildMatchBitmapInit {
                 let count = words_for_rows(self.rows).map_err(|cause| self.ranges.latch(cause))?;
                 let words = segment_words(count, directory.len(), id)
                     .map_err(|cause| self.ranges.latch(cause))?;
-                InitLease {
+                InitObligation {
                     pending: None,
                     owner: Arc::clone(self),
-                    lease: Some(lease),
+                    obligation: Some(lease),
                     words,
                 }
             };
@@ -351,7 +351,7 @@ impl BuildMatchBitmapInit {
         result
     }
 }
-impl InitLease {
+impl InitObligation {
     #[cfg(test)]
     pub(crate) fn words(&self) -> Range<usize> {
         self.words.clone()
@@ -373,7 +373,7 @@ impl InitLease {
         let result = (|| {
             {
                 let state = self.owner.state()?;
-                let lease = self.lease.as_ref().ok_or_else(|| {
+                let lease = self.obligation.as_ref().ok_or_else(|| {
                     self.owner
                         .ranges
                         .latch(build_contract("join bitmap lease was already dropped"))
@@ -451,7 +451,7 @@ impl InitLease {
         let notify = self.owner.changed.defer_notify();
         let result = (|| {
             let state = self.owner.state()?;
-            let lease = self.lease.as_mut().ok_or_else(|| {
+            let lease = self.obligation.as_mut().ok_or_else(|| {
                 self.owner
                     .ranges
                     .latch(build_contract("join bitmap lease was already dropped"))
@@ -522,7 +522,7 @@ impl InitLease {
                         "join bitmap lease retired while demand remains",
                     )));
                 }
-                let lease = self.lease.as_ref().ok_or_else(|| {
+                let lease = self.obligation.as_ref().ok_or_else(|| {
                     self.owner
                         .ranges
                         .latch(build_contract("join bitmap lease was already dropped"))
@@ -534,18 +534,18 @@ impl InitLease {
             drop(self.pending.take());
             self.owner
                 .ranges
-                .complete(self.lease.as_mut().expect("private validated lease"))
+                .complete(self.obligation.as_mut().expect("private validated lease"))
         })();
         notify.arm();
         result
     }
 }
-impl Drop for InitLease {
+impl Drop for InitObligation {
     fn drop(&mut self) {
         // All safe Vec elements and their actual segment creator exit before
         // the original lease returns its inflight position and notifies.
         drop(self.pending.take());
-        if let Some(lease) = self.lease.take() {
+        if let Some(lease) = self.obligation.take() {
             let unfinished = !lease.is_settled();
             drop(lease);
             if unfinished {

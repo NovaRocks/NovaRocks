@@ -46,7 +46,7 @@ use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_execution::task_execution::status::{DynamicFilterAdvertisement, TaskStatus};
 use novarocks_types::identity::{BackendProcessId, TaskId};
 
-use crate::native::fragment_transport::{
+use crate::native::task_result_transport::{
     DynamicFilterRead, DynamicFilterReadError, NativeTaskResultTransport, TaskResultTransport,
 };
 use crate::runtime_filter::feedback::{

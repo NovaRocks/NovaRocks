@@ -17,7 +17,7 @@
 
 //! Execution-owned filter operations project their own contract, SDK and
 //! codec facts. Expression, Chunk and LARGEINT sources pass through unchanged.
-use crate::runtime::fragment::{ExecutionFailure, ExecutionReason};
+use crate::runtime::task::{ExecutionFailure, ExecutionReason};
 use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureFact, FailureProjection};
 use std::{error::Error, fmt};
 #[derive(Debug)]

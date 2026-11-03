@@ -17,7 +17,7 @@
 
 //! Sealed, provider-neutral observations for materialized-view storage facts.
 //!
-//! A caller supplies a retained exact planning lease and the metadata loaded
+//! A caller supplies a retained exact planning pin and the metadata loaded
 //! through that lease. Implementations must project that already-sealed value;
 //! they must not acquire a current generation, resolve a second table, or turn
 //! this read-only observation into provider runtime IO. The consumer owns
@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashSet};
 use bytes::Bytes;
 
 use super::{
-    ConnectorCommittedVersion, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+    ConnectorCommittedVersion, ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind,
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
     ConnectorTableObjectId,
 };
@@ -159,7 +159,7 @@ impl MvObservedSourceField {
     }
 }
 
-/// A provider projection from the same exact planning lease and metadata
+/// A provider projection from the same exact planning pin and metadata
 /// generation and its selected source schema. Target partition layout and OCC
 /// are separate observations. Frontend stamps SQL relation occurrences onto
 /// these fields; providers never receive or infer SQL aliases.
@@ -842,37 +842,37 @@ pub trait MvStorageObservationPort: Send + Sync {
     /// version does not exactly match that admitted metadata.
     fn observe_source_schema(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvSourceSchemaObservation, ConnectorError>;
     fn observe_created_target(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvCreatedTargetObservation, ConnectorError>;
     fn observe_schema_validation(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvSchemaValidationObservation, ConnectorError>;
     fn observe_refresh_base(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvRefreshBaseObservation, ConnectorError>;
     fn observe_refresh_target(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvRefreshTargetObservation, ConnectorError>;
     fn observe_maintenance_metadata(
         &self,
-        exact_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorControlPlanningPin,
         metadata: &ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<MvMaintenanceMetadataObservation, ConnectorError>;
@@ -892,7 +892,7 @@ fn unavailable() -> ConnectorError {
 impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
     fn observe_source_schema(
         &self,
-        _: &ConnectorControlPlanningLease,
+        _: &ConnectorControlPlanningPin,
         _: &ConnectorTableMetadata,
         _: ConnectorRequestContext,
     ) -> Result<MvSourceSchemaObservation, ConnectorError> {
@@ -900,7 +900,7 @@ impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
     }
     fn observe_created_target(
         &self,
-        _: &ConnectorControlPlanningLease,
+        _: &ConnectorControlPlanningPin,
         _: &ConnectorTableMetadata,
         _: ConnectorRequestContext,
     ) -> Result<MvCreatedTargetObservation, ConnectorError> {
@@ -908,7 +908,7 @@ impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
     }
     fn observe_schema_validation(
         &self,
-        _: &ConnectorControlPlanningLease,
+        _: &ConnectorControlPlanningPin,
         _: &ConnectorTableMetadata,
         _: ConnectorRequestContext,
     ) -> Result<MvSchemaValidationObservation, ConnectorError> {
@@ -916,7 +916,7 @@ impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
     }
     fn observe_refresh_base(
         &self,
-        _: &ConnectorControlPlanningLease,
+        _: &ConnectorControlPlanningPin,
         _: &ConnectorTableMetadata,
         _: ConnectorRequestContext,
     ) -> Result<MvRefreshBaseObservation, ConnectorError> {
@@ -924,7 +924,7 @@ impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
     }
     fn observe_refresh_target(
         &self,
-        _: &ConnectorControlPlanningLease,
+        _: &ConnectorControlPlanningPin,
         _: &ConnectorTableMetadata,
         _: ConnectorRequestContext,
     ) -> Result<MvRefreshTargetObservation, ConnectorError> {
@@ -932,7 +932,7 @@ impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
     }
     fn observe_maintenance_metadata(
         &self,
-        _: &ConnectorControlPlanningLease,
+        _: &ConnectorControlPlanningPin,
         _: &ConnectorTableMetadata,
         _: ConnectorRequestContext,
     ) -> Result<MvMaintenanceMetadataObservation, ConnectorError> {

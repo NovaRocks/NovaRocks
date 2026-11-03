@@ -78,7 +78,7 @@ impl novarocks_failure_contract::FailureProjection for AggregateRequestExtent {
         };
         FailureFact::new(
             FailureClass::Resource,
-            crate::runtime::fragment::ExecutionReason::AggregateRequestExtent.reason(),
+            crate::runtime::task::ExecutionReason::AggregateRequestExtent.reason(),
         )
         .with_resource(ResourceFacts {
             request_scope: None,

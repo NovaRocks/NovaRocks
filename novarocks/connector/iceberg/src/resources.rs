@@ -213,7 +213,7 @@ impl IcebergExecutionResources {
 mod tests {
     use std::sync::Arc;
 
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
 
     use super::*;
 
@@ -224,7 +224,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone())),
         );
         let control = IcebergMetadataResources::new(binding.clone(), runtime.handle().clone());
         let execution = IcebergExecutionResources::new(

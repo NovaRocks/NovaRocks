@@ -51,7 +51,8 @@ fn write_frontend_identity_marker(
         let mut target = std::io::Cursor::new(&mut bytes[..]);
         writeln!(
             target,
-            "NOVAROCKS_MEM_1_M07_EXACT_MYSQL_FE frontend_process_id={frontend}"
+            "{} frontend_process_id={frontend}",
+            novarocks_failpoint::observation_marker::MEM_1_M07_EXACT_MYSQL_FE
         )?;
         target.position() as usize
     };
@@ -73,12 +74,12 @@ pub(super) async fn serve<F>(
     session_factory: Arc<dyn QuerySessionFactory>,
     client_connections: Arc<MysqlClientConnectionRegistry>,
     shutdown: F,
-    report_server: &mut crate::native::report_server::FrontendReportServerHandle,
+    report_server: &mut crate::native::report_server::FrontendReportListener,
     management_server: &mut FrontendManagementServer,
     host: &FrontendApplicationHost,
     drain_timeout: Duration,
     cleanup_timeout: Duration,
-    trino_server: &mut novarocks_trino_adapter::TrinoServerHandle,
+    trino_server: &mut novarocks_trino_adapter::TrinoListener,
 ) -> Result<(), FrontendApplicationError>
 where
     F: Future<Output = ()> + Send,

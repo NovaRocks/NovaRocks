@@ -2539,7 +2539,7 @@ mod sdk_nested_representation_tests {
     };
     use arrow::array::{BinaryArray, ListArray, MapArray, StringArray, TimestampMicrosecondArray};
     use arrow::buffer::OffsetBuffer;
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     fn schema() -> Schema {
@@ -2692,7 +2692,7 @@ mod sdk_nested_representation_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
         );
         let facts = FrozenDataWriteFacts {
             format_version: 3,
@@ -2858,7 +2858,7 @@ mod sdk_nested_representation_tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
         );
         let context = staged_write_context_from_frozen_facts(
             &binding,

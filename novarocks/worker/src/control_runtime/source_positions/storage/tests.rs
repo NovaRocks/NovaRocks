@@ -19,9 +19,9 @@
 
 use super::*;
 use novarocks_control_runtime::{
-    exit_role::{ExitRole, ExitRolePhase},
-    lease::{ReservationBundle, WorkLease},
-    transaction::{RoleSpec, RuntimeLedger, ScopeHandle},
+    exit_custody::{ExitCustody, ExitCustodyPhase},
+    obligation::{ReservationObligation, WorkObligation},
+    transaction::{DeclaredInput, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
     capacity::{ReservationResources, ResourceVector},
@@ -34,8 +34,8 @@ use novarocks_control_runtime_core::{
 struct Fixture {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
-    payer: WorkLease,
-    payment: ReservationBundle,
+    payer: WorkObligation,
+    payment: ReservationObligation,
 }
 impl Fixture {
     fn new(units: usize) -> Self {
@@ -72,7 +72,7 @@ impl Fixture {
             .reserve_child_from(
                 &mut self.payment,
                 &self.payer,
-                RoleSpec {
+                DeclaredInput {
                     generation,
                     kind: WorkKind::Cleanup,
                     resources: ReservationResources::new(
@@ -109,7 +109,7 @@ impl Fixture {
     }
 }
 fn unused(reported: ReportedWork) {
-    let (role, authority) = ExitRole::from_admitted(reported);
+    let (role, authority) = ExitCustody::from_admitted(reported);
     authority.withdraw_unpublished_and_exit().unwrap();
     assert!(role.try_retire().unwrap());
 }
@@ -130,7 +130,7 @@ fn original_source_storage_follows_actual_report_consumers_and_work_reaping() {
     );
     let reported = admission.into_reported();
     assert_eq!(reported.work().reference(), original);
-    let (role, mut authority) = ExitRole::from_admitted(reported);
+    let (role, mut authority) = ExitCustody::from_admitted(reported);
     authority.start().unwrap();
     authority.exited().unwrap();
     report.consume(ConsumerId::new(1).unwrap()).unwrap();
@@ -142,7 +142,7 @@ fn original_source_storage_follows_actual_report_consumers_and_work_reaping() {
     assert!(!retirement.is_retired());
     report.consume(ConsumerId::new(2).unwrap()).unwrap();
     assert!(role.try_retire().unwrap());
-    assert_eq!(role.phase(), ExitRolePhase::Retired);
+    assert_eq!(role.phase(), ExitCustodyPhase::Retired);
     f.scope.reap_ready(8).unwrap();
     assert!(retirement.is_retired());
     assert_eq!(

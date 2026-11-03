@@ -36,7 +36,7 @@ use std::time::Duration;
 use std::sync::atomic::AtomicUsize;
 
 use novarocks_coordination_contract::MonotonicInstant;
-use novarocks_execution::task_execution::{QueryContextRef, TaskIdentity, TaskStatus};
+use novarocks_execution::task_execution::{ParticipationRef, TaskIdentity, TaskStatus};
 use novarocks_query_application::coordination::{
     AcceptedRootControlPort, AcceptedRootControlRequest,
 };
@@ -359,11 +359,11 @@ impl Drop for StatusIntakeRunner<'_> {
     }
 }
 
-/// One frame accepted from the single Context observation stream.
+/// One frame accepted from the single Participation observation stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ObservationFrame {
     Covered {
-        context: QueryContextRef,
+        participation: ParticipationRef,
         generation: u64,
         event: novarocks_task_codec::operation::CoveredStatusStreamEvent,
     },
@@ -445,7 +445,7 @@ struct ObservationIntakeInner {
     wake: Arc<dyn StatusIntakeWake>,
 }
 
-/// Bounded admission for one Context observation stream and its serial owner.
+/// Bounded admission for one Participation observation stream and its serial owner.
 ///
 /// The total budget reserves one control entry for a success seal. Each
 /// subscription may hold one pre-read reservation or one queue-full pending

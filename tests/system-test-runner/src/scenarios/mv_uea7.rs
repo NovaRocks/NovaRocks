@@ -22,7 +22,7 @@ use mysql::Conn;
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture;
 use novarocks_cluster_harness::{
-    CrossProcessChildEnvironment, CrossProcessConfigOverlay, ServerHandle,
+    CrossProcessChildEnvironment, CrossProcessConfigOverlay, TestClusterOwner,
 };
 use std::path::Path;
 use std::sync::Mutex;

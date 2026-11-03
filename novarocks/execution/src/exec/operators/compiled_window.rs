@@ -82,13 +82,13 @@ use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwne
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
+    driver_step::DriverStep,
     input::PreparedInput,
     shape::{Transform, TransformKernel},
     step::{NextStep, StepResult},
-    step_context::StepContext,
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use novarocks_type_contract::ValueTypeStorageLifetime;
 
 #[derive(Clone, Copy, Debug)]
@@ -116,11 +116,11 @@ impl novarocks_failure_contract::FailureProjection for WindowArrowFailure {
         let (class, reason) = match &self.source {
             arrow::error::ArrowError::MemoryError(_) => (
                 novarocks_failure_contract::FailureClass::Resource,
-                crate::runtime::fragment::ExecutionReason::WindowArrowAllocation,
+                crate::runtime::task::ExecutionReason::WindowArrowAllocation,
             ),
             _ => (
                 novarocks_failure_contract::FailureClass::Invariant,
-                crate::runtime::fragment::ExecutionReason::WindowArrow,
+                crate::runtime::task::ExecutionReason::WindowArrow,
             ),
         };
         novarocks_failure_contract::FailureFact::new(class, reason.reason())
@@ -216,7 +216,7 @@ impl CompiledWindowProcessorFactory {
         let mut calls = Vec::with_capacity(functions.len());
         for (ordinal, function) in functions.iter().enumerate() {
             let call = novarocks_local_program::checked_program_ordinal(ordinal)
-                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
+                .map_err(crate::runtime::task::ExecutionFailure::from_domain)?;
             if !matches!(function.kind, WindowFunctionKind::Prepared) {
                 return Err(program_binding_failure(
                     PlanBindingKind::InvalidAssignment,
@@ -1496,7 +1496,7 @@ impl InputEncodingPolicy for CompiledWindowProcessor {}
 impl TransformKernel for CompiledWindowProcessor {
     fn apply(
         &mut self,
-        ctx: &mut StepContext<'_>,
+        ctx: &mut DriverStep<'_>,
         input: PreparedInput,
     ) -> ExecutionResult<StepResult> {
         if let Some(cause) = &self.failed {
@@ -1522,7 +1522,7 @@ impl TransformKernel for CompiledWindowProcessor {
         Ok(StepResult::new(output, NextStep::NeedInput, rows))
     }
 
-    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn drive(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(cause) = &self.failed {
             return Err(cause.clone());
         }
@@ -1560,7 +1560,7 @@ impl TransformKernel for CompiledWindowProcessor {
         Ok(StepResult::new(Some(output), next, 0))
     }
 
-    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+    fn finish(&mut self, ctx: &mut DriverStep<'_>) -> ExecutionResult<StepResult> {
         if let Some(cause) = &self.failed {
             return Err(cause.clone());
         }
@@ -1783,7 +1783,7 @@ impl novarocks_failure_contract::FailureProjection for WindowOutputFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
             novarocks_failure_contract::FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::WindowKernelOutputContract.reason(),
+            crate::runtime::task::ExecutionReason::WindowKernelOutputContract.reason(),
         )
     }
 }

@@ -490,7 +490,7 @@ mod tests {
                 None,
                 novarocks_fs::FsAccessResolver::new(),
                 Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
-                Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
+                Arc::new(novarocks_fs::TokioFileIoSpawner::new(handle.clone())),
             );
             let configuration = crate::catalog_config::parse_catalog_configuration(
                 "ice",
@@ -746,7 +746,7 @@ mod tests {
         tempfile::TempDir,
         std::path::PathBuf,
         Arc<OriginalFixtureCapability>,
-        novarocks_spi::connector::ConnectorStagedCreateLease,
+        novarocks_spi::connector::ConnectorStagedCreateSession,
         ConnectorStagedCreatePublishRequest,
     ) {
         let mut fixture = Fixture::new(true);
@@ -770,14 +770,15 @@ mod tests {
             write: write.clone(),
             source: Mutex::new(None),
         });
-        let lease = novarocks_spi::connector::ConnectorStagedCreateLease::new_with_control_runtime(
-            capability.adapter.descriptor.clone(),
-            novarocks_spi::connector::ConnectorControlRuntimeId::new(),
-            capability.adapter.incarnation,
-            capability.clone(),
-            || {},
-        )
-        .unwrap();
+        let lease =
+            novarocks_spi::connector::ConnectorStagedCreateSession::new_with_control_runtime(
+                capability.adapter.descriptor.clone(),
+                novarocks_spi::connector::ConnectorControlRuntimeId::new(),
+                capability.adapter.incarnation,
+                capability.clone(),
+                || {},
+            )
+            .unwrap();
         lease
             .prepare(ConnectorStagedCreatePrepareRequest {
                 owner: lease.owner().clone(),

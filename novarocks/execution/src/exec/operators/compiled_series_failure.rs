@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Compiled series receiver invariants; function data causes remain Functions-owned.
-use crate::runtime::fragment::{ExecutionFailure, ExecutionReason};
+use crate::runtime::task::{ExecutionFailure, ExecutionReason};
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
 use std::{error::Error, fmt};
 #[derive(Debug)]

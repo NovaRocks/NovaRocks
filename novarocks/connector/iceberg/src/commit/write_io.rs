@@ -406,7 +406,7 @@ mod tests {
 
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::{unique_file_path, write_parquet_file};
@@ -528,7 +528,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
         );
         let mut metadata = HashMap::new();
         metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string());

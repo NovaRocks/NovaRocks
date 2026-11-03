@@ -32,7 +32,7 @@ use crate::{
         },
         pipeline::operator::ConstructionFailure,
     },
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use arrow::array::ArrayRef;
 #[cfg(test)]

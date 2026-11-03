@@ -55,7 +55,7 @@ pub struct MysqlRuntimeOwner {
     pub tokio_runtime_id: tokio::runtime::Id,
 }
 
-pub struct MysqlTestHandle {
+pub struct MysqlTestSlot {
     dropper: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -73,12 +73,12 @@ pub struct MysqlReadinessSnapshot {
 
 pub struct MysqlHeldConnection {
     connection: Option<MysqlPoolConnection>,
-    operation: Option<MysqlTestHandle>,
+    operation: Option<MysqlTestSlot>,
 }
 
 pub struct MysqlHeldAdvisoryLock {
     connection: Option<MysqlPoolConnection>,
-    operation: Option<MysqlTestHandle>,
+    operation: Option<MysqlTestSlot>,
     lock_name: String,
 }
 
@@ -88,7 +88,7 @@ pub struct MysqlHeldKvLock {
 #[cfg(feature = "state-store-test-hooks")]
 pub struct MysqlHeldCommitLedgerLock {
     connection: Option<MysqlPoolConnection>,
-    operation: Option<MysqlTestHandle>,
+    operation: Option<MysqlTestSlot>,
 }
 
 pub struct MysqlTransactionTestApi;
@@ -164,14 +164,14 @@ impl MysqlProviderTestHarness {
 
     pub(crate) fn mysql_test_acquire_provider_handle(
         &self,
-    ) -> Result<MysqlTestHandle, StateStoreError> {
+    ) -> Result<MysqlTestSlot, StateStoreError> {
         let guard = self.runtime.acquire_provider_handle()?;
-        Ok(MysqlTestHandle::new(move || drop(guard)))
+        Ok(MysqlTestSlot::new(move || drop(guard)))
     }
 
-    pub(crate) fn mysql_test_acquire_operation(&self) -> Result<MysqlTestHandle, StateStoreError> {
+    pub(crate) fn mysql_test_acquire_operation(&self) -> Result<MysqlTestSlot, StateStoreError> {
         let guard = self.runtime.acquire_operation()?;
-        Ok(MysqlTestHandle::new(move || drop(guard)))
+        Ok(MysqlTestSlot::new(move || drop(guard)))
     }
 
     pub(crate) fn mysql_test_is_accepting(&self) -> Result<bool, StateStoreError> {
@@ -1283,13 +1283,13 @@ pub fn pool_count(runtime: &MysqlProviderTestHarness) -> Result<usize, StateStor
 
 pub fn acquire_provider_handle(
     runtime: &MysqlProviderTestHarness,
-) -> Result<MysqlTestHandle, StateStoreError> {
+) -> Result<MysqlTestSlot, StateStoreError> {
     runtime.mysql_test_acquire_provider_handle()
 }
 
 pub fn acquire_operation(
     runtime: &MysqlProviderTestHarness,
-) -> Result<MysqlTestHandle, StateStoreError> {
+) -> Result<MysqlTestSlot, StateStoreError> {
     runtime.mysql_test_acquire_operation()
 }
 
@@ -1478,7 +1478,7 @@ fn fixture_control_error() -> StateStoreError {
     )
 }
 
-impl MysqlTestHandle {
+impl MysqlTestSlot {
     pub(crate) fn new(dropper: impl FnOnce() + Send + 'static) -> Self {
         Self {
             dropper: Some(Box::new(dropper)),
@@ -1486,13 +1486,13 @@ impl MysqlTestHandle {
     }
 }
 
-impl std::fmt::Debug for MysqlTestHandle {
+impl std::fmt::Debug for MysqlTestSlot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("MysqlTestHandle")
+        formatter.write_str("MysqlTestSlot")
     }
 }
 
-impl Drop for MysqlTestHandle {
+impl Drop for MysqlTestSlot {
     fn drop(&mut self) {
         if let Some(dropper) = self.dropper.take() {
             dropper();
@@ -1507,7 +1507,7 @@ impl std::fmt::Debug for MysqlHeldConnection {
 }
 
 impl MysqlHeldConnection {
-    pub(crate) fn new(connection: MysqlPoolConnection, operation: MysqlTestHandle) -> Self {
+    pub(crate) fn new(connection: MysqlPoolConnection, operation: MysqlTestSlot) -> Self {
         Self {
             connection: Some(connection),
             operation: Some(operation),
@@ -1551,7 +1551,7 @@ impl Drop for MysqlHeldConnection {
 impl MysqlHeldAdvisoryLock {
     pub(crate) fn new(
         connection: MysqlPoolConnection,
-        operation: MysqlTestHandle,
+        operation: MysqlTestSlot,
         lock_name: String,
     ) -> Self {
         Self {

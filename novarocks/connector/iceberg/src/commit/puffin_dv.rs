@@ -754,7 +754,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::iceberg::io::FileIO;
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
 
     fn local_file_io(location: &str) -> FileIO {
         let runtime = tokio::runtime::Handle::current();
@@ -762,7 +762,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
         );
         crate::fs_io::build_file_io_for_location(location, binding)
     }
@@ -810,7 +810,7 @@ mod tests {
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
+            Arc::new(TokioFileIoSpawner::new(runtime)),
         );
         binding
             .resolve_access(&format!("file://{}", dir.join("__binding__").display()))

@@ -20,8 +20,8 @@
 //! Native getter/delivery exit, RF loan or S8 recovery qualification.
 
 use super::*;
-use crate::control_runtime::admitted_role::dispose_unused_completion;
-use novarocks_control_runtime::exit_role::ExitRolePhase;
+use crate::control_runtime::reported_work_admission::dispose_unused_completion;
+use novarocks_control_runtime::exit_custody::ExitCustodyPhase;
 
 fn metadata() -> RequestMetadata {
     RequestMetadata {
@@ -45,7 +45,8 @@ fn admit_original(h: &Harness) -> (RpcAuthorAdmission, ReportSlot) {
                     captures: 1,
                     inputs: 2,
                     batches: 2,
-                    effects: 2 * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                    effects: 2
+                        * crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                     replies: 1,
                     ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
                 },
@@ -70,7 +71,7 @@ fn admit_original(h: &Harness) -> (RpcAuthorAdmission, ReportSlot) {
     )
     .unwrap();
     let (work, capacity) = guard.bind(WorkKind::Cleanup).unwrap();
-    let admitted = AdmittedCompletionRole {
+    let admitted = AdmittedCompletionTransfer {
         work,
         capacity,
         report,
@@ -91,12 +92,12 @@ fn admit_original(h: &Harness) -> (RpcAuthorAdmission, ReportSlot) {
         .unwrap();
     (rpc, report)
 }
-fn main_retired(h: &Harness, role: &ExitRole) -> bool {
+fn main_retired(h: &Harness, original_exit_custody: &ExitCustody) -> bool {
     h.fixture
         .ledger
         .reap_scope_ready(h.fixture.scope.id(), 256)
         .unwrap();
-    role.try_retire().unwrap()
+    original_exit_custody.try_retire().unwrap()
 }
 fn retire_cut(h: &Harness, cut: CutId) -> RetiredCut {
     h.inbox
@@ -117,7 +118,7 @@ fn complete_model_effects(h: &Harness, input: InputId) -> Vec<WorkerAction> {
                 actor(),
                 input,
                 None,
-                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
             )
             .unwrap();
         for (descriptor, state) in &inventory {
@@ -140,7 +141,7 @@ fn complete_model_effects(h: &Harness, input: InputId) -> Vec<WorkerAction> {
             .ready_effects(
                 actor(),
                 input,
-                crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
             )
             .unwrap();
         if ready.is_empty() {
@@ -165,7 +166,7 @@ fn rpc_sender_return_and_core_receipt_do_not_exit_or_consume_the_long_lived_main
     let (
         RpcAuthorAdmission {
             cut,
-            role,
+            original_exit_custody,
             mut authority,
             sender,
             input_author: _,
@@ -175,7 +176,7 @@ fn rpc_sender_return_and_core_receipt_do_not_exit_or_consume_the_long_lived_main
     authority.start().unwrap();
     let no_token_before_fill = h.inbox.lock().unwrap().rpc_delivery(cut).unwrap().is_none();
     let returned = sender
-        .send_input(ContextInput::Request(ContextCommand::Cancel {
+        .send_input(ParticipationInput::Request(ParticipationCommand::Cancel {
             task: h.task,
             reason: CancelReason::UpstreamNoLongerNeeded,
         }))
@@ -185,7 +186,7 @@ fn rpc_sender_return_and_core_receipt_do_not_exit_or_consume_the_long_lived_main
         .unwrap()
         .observe_rpc_author_return(returned)
         .unwrap();
-    let main_still_started = role.phase() == ExitRolePhase::Started;
+    let main_still_started = original_exit_custody.phase() == ExitCustodyPhase::Started;
     let before_event_pending =
         report.consumption(ConsumerId::new(1).unwrap()).unwrap() == Consumption::Pending;
     let delivery = h.inbox.lock().unwrap().deliver_next().unwrap().unwrap();
@@ -210,7 +211,7 @@ fn rpc_sender_return_and_core_receipt_do_not_exit_or_consume_the_long_lived_main
     authority.exited().unwrap();
     report.consume(ConsumerId::new(1).unwrap()).unwrap();
     report.consume(ConsumerId::new(2).unwrap()).unwrap();
-    let original_main_retired = main_retired(&h, &role);
+    let original_main_retired = main_retired(&h, &original_exit_custody);
     let header_still_present = h
         .fixture
         .runtime
@@ -253,7 +254,7 @@ fn unused_unique_rpc_return_rejects_another_inbox_and_never_fabricates_an_event(
     let (
         RpcAuthorAdmission {
             cut,
-            role,
+            original_exit_custody,
             authority,
             sender,
             input_author: _,
@@ -275,7 +276,7 @@ fn unused_unique_rpc_return_rejects_another_inbox_and_never_fabricates_an_event(
     let no_delivery = h.inbox.lock().unwrap().rpc_delivery(cut).unwrap().is_none();
     let no_event_consumption = h.inbox.lock().unwrap().event_core_consumed(cut).is_err();
     let no_event = no_delivery && no_event_consumption;
-    let main_not_exited = role.phase() == ExitRolePhase::Admitted;
+    let main_not_exited = original_exit_custody.phase() == ExitCustodyPhase::Admitted;
     let report_not_consumed =
         report.consumption(ConsumerId::new(1).unwrap()).unwrap() == Consumption::Pending;
     h.inbox.lock().unwrap().observe_effects_exited(cut).unwrap();
@@ -288,7 +289,7 @@ fn unused_unique_rpc_return_rejects_another_inbox_and_never_fabricates_an_event(
     authority.withdraw_unpublished_and_exit().unwrap();
     let unused_still_not_consumed =
         report.consumption(ConsumerId::new(1).unwrap()).unwrap() == Consumption::Pending;
-    let original_main_retired = main_retired(&h, &role);
+    let original_main_retired = main_retired(&h, &original_exit_custody);
     let retired = retire_cut(&h, cut);
     h.dispose_pair(retired);
     h.finish();
@@ -384,7 +385,9 @@ fn foreign_ledger_whole_author_with_the_same_numeric_scope_and_work_returns_ever
     assert!(same_numbers && whole_unchanged && untouched_actor && source_unchanged);
     assert!(matches!(
         error,
-        RpcAuthorAdmissionError::Causal(CausalError::Driver(DriverError::InputAuthorMismatch))
+        RpcAuthorAdmissionError::Causal(CausalError::ActorTurn(
+            ActorTurnError::InputAuthorMismatch
+        ))
     ));
 }
 
@@ -456,7 +459,7 @@ fn admitted_rpc_sender_can_fill_after_original_producer_storage_physically_exits
     let (
         RpcAuthorAdmission {
             cut,
-            role,
+            original_exit_custody,
             mut authority,
             sender,
             input_author,
@@ -465,14 +468,14 @@ fn admitted_rpc_sender_can_fill_after_original_producer_storage_physically_exits
     ) = admit_original(&h);
     authority.start().unwrap();
     retire_original_producer_pairs(&h);
-    let original_r_still_started = role.phase() == ExitRolePhase::Started;
+    let original_r_still_started = original_exit_custody.phase() == ExitCustodyPhase::Started;
     let original_cut_still_owned = h.inbox.lock().unwrap().last_cut() == Some(cut);
     let no_event_before_fill = h.inbox.lock().unwrap().rpc_delivery(cut).unwrap().is_none();
     let original_report_pending =
         report.consumption(ConsumerId::new(1).unwrap()).unwrap() == Consumption::Pending;
 
     let (sender_registered, original_input_returned, original_r_retired, core_replied) =
-        match sender.send_input(ContextInput::Request(ContextCommand::Cancel {
+        match sender.send_input(ParticipationInput::Request(ParticipationCommand::Cancel {
             task: h.task,
             reason: CancelReason::UpstreamNoLongerNeeded,
         })) {
@@ -501,7 +504,7 @@ fn admitted_rpc_sender_can_fill_after_original_producer_storage_physically_exits
                 authority.exited().unwrap();
                 report.consume(ConsumerId::new(1).unwrap()).unwrap();
                 report.consume(ConsumerId::new(2).unwrap()).unwrap();
-                let original_r_retired = main_retired(&h, &role);
+                let original_r_retired = main_retired(&h, &original_exit_custody);
                 if let Some(prefix) = delivery.prefix {
                     h.fixture.runtime.retire_input(actor(), prefix).unwrap();
                 }
@@ -515,7 +518,7 @@ fn admitted_rpc_sender_can_fill_after_original_producer_storage_physically_exits
             }
             Err(RpcInputRefusal { input, returned }) => {
                 let original_input_returned = matches!(&input,
-                    ContextInput::Request(ContextCommand::Cancel { task, reason })
+                    ParticipationInput::Request(ParticipationCommand::Cancel { task, reason })
                         if *task == h.task && *reason == CancelReason::UpstreamNoLongerNeeded);
                 // The failed send retained the same input and unique return.
                 // No publication occurred, so the original holder explicitly
@@ -530,7 +533,7 @@ fn admitted_rpc_sender_can_fill_after_original_producer_storage_physically_exits
                     .unwrap();
                 h.inbox.lock().unwrap().observe_effects_exited(cut).unwrap();
                 authority.withdraw_unpublished_and_exit().unwrap();
-                let original_r_retired = main_retired(&h, &role);
+                let original_r_retired = main_retired(&h, &original_exit_custody);
                 (false, original_input_returned, original_r_retired, false)
             }
         };

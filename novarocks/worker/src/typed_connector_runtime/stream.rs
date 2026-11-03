@@ -46,11 +46,11 @@ use novarocks_execution::exec::chunk::Chunk;
 use novarocks_execution::exec::node::scan::{
     ScanChunkStream, ScanExitBodyProof, ScanExitObservation, ScanOutputStream, ScanStreamSource,
 };
-use novarocks_execution::runtime::fragment::ExecutionResult;
-use novarocks_execution::runtime::fragment::connector_failure::{
+use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
+use novarocks_execution::runtime::task::ExecutionResult;
+use novarocks_execution::runtime::task::connector_failure::{
     ConnectorCallFailure, ConnectorOperation,
 };
-use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
     BudgetConsume, ConnectorPollBudget, ConnectorPreparationStart, ConnectorPreparedPageSource,
@@ -73,7 +73,7 @@ fn create_scan_stream<T>(
     schema: &novarocks_execution::exec::chunk::ChunkSchema,
     factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
     create: impl FnOnce(novarocks_type_contract::ValueTypeStorageLifetime) -> T,
-) -> novarocks_execution::runtime::fragment::ExecutionResult<Pin<Box<T>>> {
+) -> novarocks_execution::runtime::task::ExecutionResult<Pin<Box<T>>> {
     let owner = factory.begin_typed_construction(schema)?;
     owner.request(std::alloc::Layout::new::<T>())?;
     let stream = create(owner.storage_lifetime());
@@ -140,7 +140,7 @@ impl ScanStreamSource for TypedScanStreamSource {
         construction: std::sync::Arc<
             dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
         >,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<ScanOutputStream> {
+    ) -> novarocks_execution::runtime::task::ExecutionResult<ScanOutputStream> {
         if self.claimed.swap(true, Ordering::AcqRel) {
             return Err(super::TypedScanBindingFailure::ReclaimedStream.into());
         }
@@ -184,8 +184,7 @@ impl ScanStreamSource for TypedScanStreamSource {
 struct TypedConnectorScanStream {
     source_operations: ConnectorSourceOperations,
     source_failures: Option<novarocks_spi::connector::read_stack::ConnectorSourceFailureReceiver>,
-    failure_reporter:
-        Option<Arc<dyn novarocks_execution::runtime::fragment::ExecutionFailureReporter>>,
+    failure_reporter: Option<Arc<dyn novarocks_execution::runtime::task::ExecutionFailureReporter>>,
     shared: Arc<TypedConnectorScanShared>,
     provider: Arc<dyn ConnectorReadPageSourceProvider>,
     queue: Arc<SplitQueue<ReceivedReadSplit>>,
@@ -277,8 +276,8 @@ impl TypedConnectorScanStream {
     /// observes its exit.
     fn fail(
         &mut self,
-        error: impl Into<novarocks_execution::runtime::fragment::ExecutionFailure>,
-    ) -> Poll<Option<novarocks_execution::runtime::fragment::ExecutionResult<Chunk>>> {
+        error: impl Into<novarocks_execution::runtime::task::ExecutionFailure>,
+    ) -> Poll<Option<novarocks_execution::runtime::task::ExecutionResult<Chunk>>> {
         self.ended = true;
         self.flow.stop();
         Poll::Ready(Some(Err(error.into())))
@@ -362,7 +361,7 @@ impl TypedConnectorScanStream {
             TypedConnectorReaderMarker::for_split(split, self.shared.test_observation.clone());
         #[cfg(novarocks_dev_controls)]
         if let Some(marker) = reader_marker.as_ref() {
-            marker.emit("OPEN");
+            marker.emit(novarocks_failpoint::observation_marker::CONNECTOR_UNIT_READER_OPEN);
         }
         // Acceptance evidence: a distributed run proves a page stream was
         // opened on this backend for this exact scheduled split, which a
@@ -370,7 +369,7 @@ impl TypedConnectorScanStream {
         #[cfg(novarocks_dev_controls)]
         emit_page_source_marker(
             self.shared.test_observation.as_deref(),
-            "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN",
+            novarocks_failpoint::observation_marker::CONNECTOR_PAGE_SOURCE_OPEN,
             self.shared.plan_node_id,
             Some(split.sequence_id()),
         );
@@ -475,7 +474,7 @@ impl TypedConnectorScanStream {
     fn chunk_of(
         &mut self,
         page: SourcePage,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<Chunk> {
+    ) -> novarocks_execution::runtime::task::ExecutionResult<Chunk> {
         let chunk = self
             .converter
             .convert_with_factory(page, self.construction.as_ref())?;
@@ -485,7 +484,7 @@ impl TypedConnectorScanStream {
 }
 
 impl Stream for TypedConnectorScanStream {
-    type Item = novarocks_execution::runtime::fragment::ExecutionResult<Chunk>;
+    type Item = novarocks_execution::runtime::task::ExecutionResult<Chunk>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -598,11 +597,11 @@ impl Stream for TypedConnectorScanStream {
 async fn observe_scan_close(
     reader_exit: impl Future<Output = Result<(), ConnectorError>>,
     source_exit: impl Future<Output = novarocks_spi::connector::read_stack::ConnectorSourceExitProof>,
-    failures: Arc<dyn novarocks_execution::runtime::fragment::ExecutionFailureReporter>,
+    failures: Arc<dyn novarocks_execution::runtime::task::ExecutionFailureReporter>,
 ) -> ExecutionResult<()> {
     let reader = async {
         if let Err(error) = reader_exit.await {
-            let cause: novarocks_execution::runtime::fragment::ExecutionFailure =
+            let cause: novarocks_execution::runtime::task::ExecutionFailure =
                 ConnectorCallFailure::new(ConnectorOperation::CloseReader, error).into();
             failures.report_cleanup(&cause);
         }
@@ -620,7 +619,7 @@ async fn observe_source_exit(
     mut events: novarocks_spi::connector::read_stack::ConnectorSourceFailureReceiver,
     source: impl Future<Output = novarocks_spi::connector::read_stack::ConnectorSourceExitProof>,
     drained: impl Future<Output = novarocks_spi::connector::read_stack::ConnectorPreparationExit>,
-    failures: Arc<dyn novarocks_execution::runtime::fragment::ExecutionFailureReporter>,
+    failures: Arc<dyn novarocks_execution::runtime::task::ExecutionFailureReporter>,
 ) -> novarocks_execution::exec::node::scan::ScanExitProof {
     use novarocks_spi::connector::read_stack::{
         ConnectorSourceExitProof, ConnectorSourceFailureEvent,
@@ -639,7 +638,7 @@ async fn observe_source_exit(
                         );
                     }
                     Poll::Ready(Some(ConnectorSourceFailureEvent::CleanupUnresolved(error))) => {
-                        let cause: novarocks_execution::runtime::fragment::ExecutionFailure =
+                        let cause: novarocks_execution::runtime::task::ExecutionFailure =
                             ConnectorCallFailure::new(ConnectorOperation::SourceExit, error).into();
                         failures.report_cleanup(&cause);
                         failures.report_unresolved_exit(&cause);
@@ -692,7 +691,7 @@ async fn observe_source_exit(
 impl ScanChunkStream for TypedConnectorScanStream {
     fn take_exit_observation(
         self: Pin<&mut Self>,
-        failures: Arc<dyn novarocks_execution::runtime::fragment::ExecutionFailureReporter>,
+        failures: Arc<dyn novarocks_execution::runtime::task::ExecutionFailureReporter>,
     ) -> ExecutionResult<ScanExitObservation> {
         let this = self.get_mut();
         let events = this.source_failures.take().ok_or_else(|| {
@@ -714,8 +713,8 @@ impl ScanChunkStream for TypedConnectorScanStream {
     }
     fn close(
         self: Pin<Box<Self>>,
-        failures: Arc<dyn novarocks_execution::runtime::fragment::ExecutionFailureReporter>,
-    ) -> BoxFuture<'static, novarocks_execution::runtime::fragment::ExecutionResult<()>> {
+        failures: Arc<dyn novarocks_execution::runtime::task::ExecutionFailureReporter>,
+    ) -> BoxFuture<'static, novarocks_execution::runtime::task::ExecutionResult<()>> {
         let this = *Pin::into_inner(self);
         let runtime = this.shared.stream_host.runtime().clone();
         let _context = runtime.enter();
@@ -780,7 +779,7 @@ fn emit_split_close_markers(
     #[cfg(novarocks_dev_controls)]
     emit_page_source_marker(
         observation,
-        "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
+        novarocks_failpoint::observation_marker::CONNECTOR_PAGE_SOURCE_CLOSE,
         plan_node_id,
         None,
     );
@@ -809,13 +808,13 @@ mod stream_construction_tests {
     use novarocks_execution::exec::pipeline::operator::input_construction::{
         ConstructionFailure, InputConstructionFactory, try_runtime_input_construction_factory,
     };
-    use novarocks_execution::runtime::fragment::{ExecutionFailure, ExecutionFailureCause};
+    use novarocks_execution::runtime::task::{ExecutionFailure, ExecutionFailureCause};
     use novarocks_execution::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState};
     use novarocks_type_contract::ValueTypeStorageLifetime;
 
     #[test]
     fn close_failure_is_reported_while_sibling_exit_is_still_pending() {
-        use novarocks_execution::runtime::fragment::ExecutionFailureReporter;
+        use novarocks_execution::runtime::task::ExecutionFailureReporter;
         use novarocks_spi::connector::{
             ConnectorErrorKind,
             read_stack::{ConnectorOperationExit, ConnectorSourceExitProof},
@@ -926,7 +925,7 @@ mod stream_construction_tests {
     #[test]
     fn preparation_unknown_reports_cleanup_and_health_before_later_required_and_real_sibling_exit()
     {
-        use novarocks_execution::runtime::fragment::ExecutionFailureReporter;
+        use novarocks_execution::runtime::task::ExecutionFailureReporter;
         use novarocks_spi::connector::{
             ConnectorErrorKind,
             read_stack::{ConnectorOperationExit, ConnectorPreparationExit},

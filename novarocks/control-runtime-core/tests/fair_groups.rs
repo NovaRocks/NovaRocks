@@ -113,7 +113,7 @@ fn cancellation_and_body_finish_recover_job_capacity_with_dynamic_group_metadata
     let mut queue = FairWorkQueue::<GroupKey, OwnerJob>::new(3, 2);
     queue.enqueue(a, a1).unwrap();
     queue.enqueue(a, a2).unwrap();
-    assert_eq!(queue.enqueue(a, a3), Err(FairQueueError::ContextFull));
+    assert_eq!(queue.enqueue(a, a3), Err(FairQueueError::GroupFull));
     queue.enqueue(b, b1).unwrap();
     assert_eq!(queue.enqueue(c, c1), Err(FairQueueError::Full));
     queue.remove_queued(a, a2).unwrap();
@@ -174,7 +174,7 @@ fn default_api_keeps_scope_local_work_identity_and_zero_capacity_refusals() {
     assert!(queue.is_empty());
     for (jobs, per_group, expected) in [
         (0, 1, FairQueueError::Full),
-        (2, 0, FairQueueError::ContextFull),
+        (2, 0, FairQueueError::GroupFull),
     ] {
         let mut queue = FairWorkQueue::<GroupKey, OwnerJob>::new(jobs, per_group);
         assert_eq!(queue.enqueue(group(1), job(10, 1)), Err(expected));

@@ -587,10 +587,12 @@ fn emit_row_group_pruned_marker(
         DynamicFilterCheckpoint::NextRowGroup => "next_row_group",
     };
     slot.reader(scope, || {
-    println!(
-        "NOVAROCKS_RUNTIME_FILTER_ROW_GROUP_PRUNED scheduled_split_sequence_id={} row_group_ordinal={} checkpoint={checkpoint}",
-        row_group.scheduled_split_sequence_id, row_group.row_group_ordinal
-    );
+        println!(
+            "{} scheduled_split_sequence_id={} row_group_ordinal={} checkpoint={checkpoint}",
+            novarocks_failpoint::observation_marker::RUNTIME_FILTER_ROW_GROUP_PRUNED,
+            row_group.scheduled_split_sequence_id,
+            row_group.row_group_ordinal
+        );
     });
 }
 
@@ -851,7 +853,7 @@ pub struct IcebergPageSourceRequest<'a> {
     pub footers: Arc<ParquetFooterCache>,
     pub access_binding: IcebergReadBinding,
     pub context: FileReadContext,
-    pub cache: Option<novarocks_fs::DataCacheContext>,
+    pub cache: Option<novarocks_fs::DataCachePolicy>,
     pub budget: FileReadBudget,
     pub reader_options: FileReaderOptions,
     /// Names this split within its task attempt; the only scheduling identity.
@@ -960,7 +962,7 @@ struct ParquetSplitRequest {
     footers: Arc<ParquetFooterCache>,
     access_binding: IcebergReadBinding,
     context: FileReadContext,
-    cache: Option<novarocks_fs::DataCacheContext>,
+    cache: Option<novarocks_fs::DataCachePolicy>,
     budget: FileReadBudget,
     reader_options: FileReaderOptions,
     scheduled_split_sequence_id: u64,
@@ -1069,7 +1071,7 @@ pub(super) struct PreparedInputRequest<'a> {
     pub(super) footer: &'a ParquetMetadataInspection,
     pub(super) access_binding: &'a IcebergReadBinding,
     pub(super) context: FileReadContext,
-    pub(super) cache: Option<novarocks_fs::DataCacheContext>,
+    pub(super) cache: Option<novarocks_fs::DataCachePolicy>,
     pub(super) budget: FileReadBudget,
     pub(super) reader_options: FileReaderOptions,
     pub(super) row_group_ordinal: Option<u32>,
@@ -1509,7 +1511,7 @@ pub struct IcebergParquetPageSource {
     effective_predicate: TupleDomain<IcebergColumnHandle>,
     access_binding: IcebergReadBinding,
     context: FileReadContext,
-    cache: Option<novarocks_fs::DataCacheContext>,
+    cache: Option<novarocks_fs::DataCachePolicy>,
     footers: Arc<ParquetFooterCache>,
     budget: FileReadBudget,
     reader_options: FileReaderOptions,
@@ -2480,8 +2482,8 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use novarocks_fs::{
-        FileCancellation, FileIoRuntime, FileRangeScope, FileRangeService, FileTaskSpawner,
-        FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+        FileCancellation, FileIoRuntime, FileIoSpawner, FileRangeScope, FileRangeService,
+        FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner,
     };
     use novarocks_spi::connector::ConnectorErrorKind;
     use novarocks_spi::connector::read_stack::{
@@ -2500,7 +2502,7 @@ mod tests {
         IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileParams, IcebergSplitParams,
     };
     use crate::typed_read::table_handle::{IcebergTableHandle, IcebergTableHandleParams};
-    use crate::typed_read::test_spawners::{CountingTaskSpawner, GatedTaskSpawner};
+    use crate::typed_read::test_spawners::{CountingFileIoSpawner, GatedFileIoSpawner};
     use crate::typed_read::test_streams::DrivenStream;
 
     const ROWS_PER_GROUP: usize = 4;
@@ -2512,13 +2514,13 @@ mod tests {
     fn read_context(runtime: &tokio::runtime::Runtime) -> FileReadContext {
         let file_runtime: Arc<dyn FileIoRuntime> =
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
-        let task_spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let io_spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
         FileReadContext {
             cancellation: FileCancellation::new(),
             deadline: Some(Instant::now() + Duration::from_secs(60)),
             runtime: file_runtime,
-            task_spawner,
+            io_spawner,
             range: None,
         }
     }
@@ -2526,9 +2528,9 @@ mod tests {
     fn read_binding(runtime: &tokio::runtime::Runtime) -> IcebergReadBinding {
         let file_runtime: Arc<dyn FileIoRuntime> =
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
-        let task_spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
-        IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, task_spawner)
+        let io_spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
+        IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, io_spawner)
     }
 
     fn iceberg_schema() -> IcebergSchema {
@@ -3254,7 +3256,7 @@ mod tests {
                 NonZeroUsize::new(2).unwrap(),
                 NonZeroUsize::new(2).unwrap(),
                 NonZeroUsize::new(2).unwrap(),
-                Arc::clone(&harness.context.task_spawner),
+                Arc::clone(&harness.context.io_spawner),
                 harness._runtime.handle().clone(),
             )
             .bind(
@@ -4243,7 +4245,7 @@ mod tests {
 
         let mut harness = harness_of(write_large_data_file);
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let spawner = Arc::new(GatedTaskSpawner {
+        let spawner = Arc::new(GatedFileIoSpawner {
             handle: harness._runtime.handle().clone(),
             gate: Arc::clone(&gate),
             started: std::sync::atomic::AtomicUsize::new(0),
@@ -4255,7 +4257,7 @@ mod tests {
                 NonZeroUsize::new(2).unwrap(),
                 NonZeroUsize::new(2).unwrap(),
                 NonZeroUsize::new(8).unwrap(),
-                spawner.clone() as Arc<dyn FileTaskSpawner>,
+                spawner.clone() as Arc<dyn FileIoSpawner>,
                 harness._runtime.handle().clone(),
             )
             .bind(
@@ -4320,8 +4322,8 @@ mod tests {
 
     /// Routes a harness's data and delete reads through a range service whose
     /// every file task is spawned by `spawner`.
-    fn route_through(harness: &mut Harness, spawner: Arc<dyn FileTaskSpawner>) {
-        harness.context.task_spawner = Arc::clone(&spawner);
+    fn route_through(harness: &mut Harness, spawner: Arc<dyn FileIoSpawner>) {
+        harness.context.io_spawner = Arc::clone(&spawner);
         harness.context.range = Some(
             FileRangeService::new(
                 NonZeroUsize::new(2).unwrap(),
@@ -4347,7 +4349,7 @@ mod tests {
 
         let mut harness = harness_of(write_large_data_file);
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let spawner = Arc::new(GatedTaskSpawner {
+        let spawner = Arc::new(GatedFileIoSpawner {
             handle: harness._runtime.handle().clone(),
             gate: Arc::clone(&gate),
             started: std::sync::atomic::AtomicUsize::new(0),
@@ -4420,7 +4422,7 @@ mod tests {
     fn a_page_stream_issues_the_reads_its_page_source_issues() {
         let count_reads = |stream: bool| {
             let mut harness = harness_of(write_large_data_file);
-            let spawner = Arc::new(CountingTaskSpawner {
+            let spawner = Arc::new(CountingFileIoSpawner {
                 handle: harness._runtime.handle().clone(),
                 spawned: std::sync::atomic::AtomicUsize::new(0),
             });
@@ -4548,7 +4550,7 @@ mod tests {
     #[test]
     fn a_second_stream_over_a_file_reuses_its_footer() {
         let mut harness = harness_of(write_large_data_file);
-        let spawner = Arc::new(CountingTaskSpawner {
+        let spawner = Arc::new(CountingFileIoSpawner {
             handle: harness._runtime.handle().clone(),
             spawned: std::sync::atomic::AtomicUsize::new(0),
         });

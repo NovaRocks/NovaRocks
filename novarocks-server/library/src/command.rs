@@ -485,32 +485,40 @@ pub fn main(build: crate::build_information::BuildInformation) {
     #[cfg(feature = "mem-1-m07-hms-listing-observe")]
     if args.as_slice() == ["--mem-1-m07-hms-listing-build-identity"] {
         println!(
-            "NOVAROCKS_MEM_1_M07_HMS_LISTING_BUILD commit={} build_identity={} hms_listing_observe=true",
-            build.source_commit, build.native_build_identity
+            "{} commit={} build_identity={} hms_listing_observe=true",
+            novarocks_failpoint::observation_marker::MEM_1_M07_HMS_LISTING_BUILD,
+            build.source_commit,
+            build.native_build_identity
         );
         return;
     }
     #[cfg(feature = "mem-1-m07-closing-pressure")]
     if args.as_slice() == ["--mem-1-m07-closing-pressure-build-identity"] {
         println!(
-            "NOVAROCKS_MEM_1_M07_CLOSING_PRESSURE_BUILD commit={} build_identity={} closing_pressure=true",
-            build.source_commit, build.native_build_identity
+            "{} commit={} build_identity={} closing_pressure=true",
+            novarocks_failpoint::observation_marker::MEM_1_M07_CLOSING_PRESSURE_BUILD,
+            build.source_commit,
+            build.native_build_identity
         );
         return;
     }
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     if args.as_slice() == ["--mem-1-m07-build-identity"] {
         println!(
-            "NOVAROCKS_MEM_1_M07_BUILD commit={} build_identity={} exact_mysql_write=true",
-            build.source_commit, build.native_build_identity
+            "{} commit={} build_identity={} exact_mysql_write=true",
+            novarocks_failpoint::observation_marker::MEM_1_M07_BUILD,
+            build.source_commit,
+            build.native_build_identity
         );
         return;
     }
     #[cfg(feature = "mem-1-m07-root-observation")]
     if args.as_slice() == ["--mem-1-m07-root-observation-build-identity"] {
         println!(
-            "NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_BUILD commit={} build_identity={} root_observation=true",
-            build.source_commit, build.native_build_identity
+            "{} commit={} build_identity={} root_observation=true",
+            novarocks_failpoint::observation_marker::MEM_1_M07_ROOT_OBSERVATION_BUILD,
+            build.source_commit,
+            build.native_build_identity
         );
         return;
     }

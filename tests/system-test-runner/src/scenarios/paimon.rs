@@ -34,7 +34,7 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::TestClusterOwner;
 use scan_statement_actor::ScanActor;
 use serde_json::Value;
 use std::env;
@@ -51,10 +51,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const FIXTURE_MANIFEST_ENV: &str = "NOVAROCKS_PAIMON_FIXTURE_MANIFEST";
 const FIXTURE_ENV_FILE_ENV: &str = "NOVA_ENV_REST_ENV_FILE";
 const FIXTURE_KIND: &str = "novarocks-paimon-read-v1";
-const SPLIT_ACCEPTED: &str = "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED";
-const SPLIT_NO_MORE: &str = "NOVAROCKS_TASK_SPLIT_NO_MORE";
-const PAGE_SOURCE_OPEN: &str = "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN";
-const PAGE_SOURCE_CLOSE: &str = "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE";
+const SPLIT_ACCEPTED: &str =
+    novarocks_failpoint::observation_marker::TASK_SPLIT_ASSIGNMENT_ACCEPTED;
+const SPLIT_NO_MORE: &str = novarocks_failpoint::observation_marker::TASK_SPLIT_NO_MORE;
+const PAGE_SOURCE_OPEN: &str = novarocks_failpoint::observation_marker::CONNECTOR_PAGE_SOURCE_OPEN;
+const PAGE_SOURCE_CLOSE: &str =
+    novarocks_failpoint::observation_marker::CONNECTOR_PAGE_SOURCE_CLOSE;
 const ACCESS_KEY_ENV: &str = "AWS_S3_ACCESS_KEY_ID";
 const SECRET_KEY_ENV: &str = "AWS_S3_SECRET_ACCESS_KEY";
 const FIXTURE_SETUP_TIMEOUT: Duration = Duration::from_secs(600);
@@ -82,7 +84,14 @@ fn reader_spec(sql: String, cluster_size: usize) -> StatementSpec {
         sql,
         faults: vec![],
         observations: (0..cluster_size)
-            .map(|index| (index, "reader-marker", None))
+            .map(|index| {
+                (
+                    index,
+                    novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker
+                        .as_str(),
+                    None,
+                )
+            })
             .collect(),
     }
 }
@@ -754,7 +763,7 @@ impl Scenario for IcebergPaimonRead {
                     sql: cross_provider_sql(),
                     faults: vec![],
                     observations: (0..cluster_size)
-                        .map(|index| (index, "grpc-fragment", None))
+                        .map(|index| (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), None))
                         .collect(),
                 }],
             &[],
@@ -1426,7 +1435,7 @@ mod tests {
                     grants
                         .iter()
                         .all(|grant| grant["domain"] == "native-observation"
-                            && grant["action"] == "reader-marker")
+                            && grant["action"] == novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker.as_str())
                 );
             }
             assert!(!grants.iter().any(|grant| grant["domain"] == "native"));

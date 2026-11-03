@@ -19,10 +19,10 @@
 #[test]
 fn attribution_reconcile() {
     use novarocks_memory::attribution::{AttributingAllocator, binding};
-    use novarocks_memory::lane::{ResponsibilityClass, StoreHandle, global_store};
+    use novarocks_memory::lane::{RecordStorePin, ResponsibilityClass, global_store};
     use std::alloc::{GlobalAlloc, Layout, System};
     let a = std::sync::Arc::new(AttributingAllocator::new(System));
-    let o = StoreHandle::global()
+    let o = RecordStorePin::global()
         .acquire(
             7,
             ResponsibilityClass::Query,

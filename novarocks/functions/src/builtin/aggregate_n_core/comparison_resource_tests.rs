@@ -88,11 +88,11 @@ impl KernelEvaluationControl for Trace {
         panic!("N comparisons never wait")
     }
 }
-struct Lease {
+struct Reservation {
     trace: Arc<Trace>,
     kind: Kind,
 }
-impl Drop for Lease {
+impl Drop for Reservation {
     fn drop(&mut self) {
         let mut state = self.trace.state.lock().unwrap();
         match self.kind {
@@ -113,17 +113,17 @@ struct Resources {
     comparison_refusal: Option<(usize, KernelFailure)>,
 }
 impl NSortResources for Resources {
-    type Lease = Lease;
+    type Reservation = Reservation;
     fn before_sort(
         &mut self,
         _: usize,
         _: &mut ScalarWork<'_, '_>,
-    ) -> Result<Lease, KernelFailure> {
+    ) -> Result<Reservation, KernelFailure> {
         let mut state = self.trace.state.lock().unwrap();
         assert!(!state.sort && !state.comparison);
         state.sort = true;
         state.events.push(Event::Enter(Kind::Sort));
-        Ok(Lease {
+        Ok(Reservation {
             trace: self.trace.clone(),
             kind: Kind::Sort,
         })
@@ -131,7 +131,7 @@ impl NSortResources for Resources {
     fn before_comparison(
         &mut self,
         _: &mut ScalarWork<'_, '_>,
-    ) -> Result<Option<Lease>, KernelFailure> {
+    ) -> Result<Option<Reservation>, KernelFailure> {
         let mut state = self.trace.state.lock().unwrap();
         assert!(state.sort && !state.comparison);
         let index = state.comparisons;
@@ -144,7 +144,7 @@ impl NSortResources for Resources {
             }
         }
         state.comparison = true;
-        Ok(Some(Lease {
+        Ok(Some(Reservation {
             trace: self.trace.clone(),
             kind: Kind::Comparison(index),
         }))

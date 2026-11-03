@@ -86,7 +86,7 @@ INSERT INTO ${case_db}.fragment_execution_failure VALUES (3, 5);
 -- locally, so the frontend's abort reaches it as a replay and applies to
 -- nothing. ABORT_APPLIED therefore fires on the participants minus that one,
 -- which is why this is one fewer than the count above rather than equal to it.
--- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED,1
+-- @be_log_be_count_at_least=NOVAROCKS_PARTICIPATION_ABORT_APPLIED,1
 SELECT COUNT(*)
 FROM ${case_db}.fragment_execution_failure
 WHERE sleep(delay_s);

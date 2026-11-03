@@ -174,7 +174,7 @@ mod tests {
             None,
             novarocks_fs::FsAccessResolver::new(),
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(runtime)),
+            Arc::new(novarocks_fs::TokioFileIoSpawner::new(runtime)),
         );
         let table = crate::commit::write_stack::domain::IcebergWriteTableFacts::try_new(
             metadata.uuid().to_string(),

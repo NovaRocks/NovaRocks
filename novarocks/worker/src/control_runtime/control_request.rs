@@ -21,35 +21,35 @@
 mod source_io;
 pub(crate) use source_io::{RequestIoError, RequestIoProgress};
 
-use super::request_endpoint::{RequestDelivery, RequestEndpoint, RequestHandle};
+use super::request_endpoint::{RequestDelivery, RequestEndpoint, RequestExternalWait};
 pub(crate) use super::request_ready::ControlRequestReady;
 use super::request_ready::RequestExternalLeg;
 use super::{
     actors::{ControlMessage, RequestMetadata, WorkerAction, WorkerActor, WorkerMessage},
-    context_host_jobs::{ContextHostJobError, ContextHostJobs},
     establish_ingress::{
         EstablishDisposalJob, EstablishIngressJob, EstablishIngressOutcome, EstablishIngressOwner,
         EstablishIngressPartial, EstablishIngressReturned, ValidatedMaterializationSource,
     },
     establish_route::{
-        CONTEXT_ROUTE_ESCROW_STORAGE, EstablishRouteCustody, EstablishRouteError,
+        EstablishRouteCustody, EstablishRouteError, PARTICIPATION_ROUTE_ESCROW_STORAGE,
         ROOT_ROUTE_RETURN_STORAGE,
     },
+    participation_host_jobs::{ParticipationHostJobError, ParticipationHostJobs},
     process_control::ProcessControlOwner,
-    service::ContextHostAddress,
+    service::ParticipationHostAddress,
 };
 use crate::control_runtime_policy::{PolicyError, StorageNeed};
 use novarocks_control_runtime::{
-    completion::ReportSlot,
-    driver::{
-        ActorRegistration, ActorRuntime, DriverError, EffectCompletionRefusal, EffectTicket,
-        InputAuthor, InputPermit, InputRoleId,
+    actor_turn::{
+        ActorRegistration, ActorRuntime, ActorTurnError, EffectCompletionRefusal, EffectTicket,
+        InputAuthor, ReservedInputObligation, StandingInputId,
     },
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
+    completion::ReportSlot,
+    exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
     header_readiness::{
         HeaderReadyError, HeaderReadyNotice, HeaderReadyRegistration, HeaderWaitState,
     },
-    lease::{ReservationBundle, WorkLease, WorkRetirementObserver},
+    obligation::{ReservationObligation, WorkObligation, WorkRetirementObserver},
     owned_return::OwnedReturnReader,
     publication::PublishedReply,
     reported_work::{ReportedWork, ReportedWorkBindingError},
@@ -63,13 +63,13 @@ use novarocks_control_runtime_core::{
     scope::WorkKind,
 };
 use novarocks_execution_contract::{
-    EstablishQueryContext, LeaseValidFor, OperationOutcome, QueryContextRef, TaskOperationId,
+    EstablishParticipation, LeaseValidFor, OperationOutcome, ParticipationRef, TaskOperationId,
 };
 use novarocks_worker_protocol::{
-    context::{EstablishReplayRequest, RequestResult},
     control::{ControlCore, ControlEffect, ControlInput},
-    creation::{PayloadId, RequestContext},
+    creation::{PayloadId, RequestReplyTag},
     lease::MonotonicInstant,
+    participation::{EstablishReplayRequest, RequestResult},
 };
 use std::sync::Arc;
 
@@ -84,22 +84,22 @@ pub(crate) const CONTROL_REQUEST_STORAGE: StorageNeed = StorageNeed {
     captures: 4 + super::request_observation::REQUEST_OBSERVATION_CAPTURES,
     work: 1,
 };
-/// The same RPC position pays for its source child, one Context probe and
-/// its independent Root return. Context materialization and opaque current-
+/// The same RPC position pays for its source child, one Participation probe and
+/// its independent Root return. Participation materialization and opaque current-
 /// credential comparison require their own actual roles and storage.
 pub(crate) const ESTABLISH_REQUEST_STORAGE: StorageNeed = StorageNeed {
     inputs: CONTROL_REQUEST_STORAGE.inputs
-        + CONTEXT_ROUTE_ESCROW_STORAGE.inputs
+        + PARTICIPATION_ROUTE_ESCROW_STORAGE.inputs
         + ROOT_ROUTE_RETURN_STORAGE.inputs,
     batches: CONTROL_REQUEST_STORAGE.batches
-        + CONTEXT_ROUTE_ESCROW_STORAGE.batches
+        + PARTICIPATION_ROUTE_ESCROW_STORAGE.batches
         + ROOT_ROUTE_RETURN_STORAGE.batches,
     effects: CONTROL_REQUEST_STORAGE.effects
-        + CONTEXT_ROUTE_ESCROW_STORAGE.effects
+        + PARTICIPATION_ROUTE_ESCROW_STORAGE.effects
         + ROOT_ROUTE_RETURN_STORAGE.effects,
-    work: 3 + CONTEXT_ROUTE_ESCROW_STORAGE.work,
-    completions: 2 + CONTEXT_ROUTE_ESCROW_STORAGE.completions,
-    captures: CONTROL_REQUEST_STORAGE.captures + 1 + CONTEXT_ROUTE_ESCROW_STORAGE.captures,
+    work: 3 + PARTICIPATION_ROUTE_ESCROW_STORAGE.work,
+    completions: 2 + PARTICIPATION_ROUTE_ESCROW_STORAGE.completions,
+    captures: CONTROL_REQUEST_STORAGE.captures + 1 + PARTICIPATION_ROUTE_ESCROW_STORAGE.captures,
     ..CONTROL_REQUEST_STORAGE
 };
 fn core_consumer() -> ConsumerId {
@@ -113,10 +113,10 @@ fn external_consumer() -> ConsumerId {
 pub(crate) enum ControlRequestError {
     Policy(PolicyError),
     Runtime(RuntimeError),
-    Driver(DriverError),
+    ActorTurn(ActorTurnError),
     HeaderReady(HeaderReadyError),
     Binding(ReportedWorkBindingError),
-    Exit(ExitRoleError),
+    Exit(ExitCustodyError),
     ReadyFull,
     DuplicateReadySlot,
     UnknownReadySlot,
@@ -134,14 +134,14 @@ pub(crate) enum ControlRequestError {
     IngressPending,
     IngressUnresolved,
     Route(EstablishRouteError),
-    HostJob(ContextHostJobError),
+    HostJob(ParticipationHostJobError),
 }
 impl std::fmt::Display for ControlRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Policy(error) => write!(f, "Control request storage policy is invalid: {error}"),
             Self::Runtime(error) => write!(f, "Control request role operation failed: {error}"),
-            Self::Driver(error) => write!(
+            Self::ActorTurn(error) => write!(
                 f,
                 "Control request input or publication operation failed: {error}"
             ),
@@ -192,7 +192,9 @@ impl std::fmt::Display for ControlRequestError {
             Self::Route(error) => {
                 write!(f, "Control request establishment route failed: {error:?}")
             }
-            Self::HostJob(error) => write!(f, "Control request Context host job failed: {error}"),
+            Self::HostJob(error) => {
+                write!(f, "Control request Participation host job failed: {error}")
+            }
         }
     }
 }
@@ -201,7 +203,7 @@ impl std::error::Error for ControlRequestError {
         match self {
             Self::Policy(error) => Some(error),
             Self::Runtime(error) => Some(error),
-            Self::Driver(error) => Some(error),
+            Self::ActorTurn(error) => Some(error),
             Self::HeaderReady(error) => Some(error),
             Self::Binding(error) => Some(error),
             Self::Exit(error) => Some(error),
@@ -231,11 +233,11 @@ impl std::error::Error for ControlRequestError {
 /// In particular, a scope error does not authorize an unused-exit inference.
 #[must_use = "Retain or actually dispose every original partial admission"]
 pub(crate) struct ControlRequestPartial {
-    pub work: WorkLease,
-    pub capacity: ReservationBundle,
+    pub work: WorkObligation,
+    pub capacity: ReservationObligation,
     pub report: Option<ReportSlot>,
-    pub permit: Option<InputPermit<WorkerActor>>,
-    pub route_escrow: Option<ReservationBundle>,
+    pub permit: Option<ReservedInputObligation<WorkerActor>>,
+    pub route_escrow: Option<ReservationObligation>,
 }
 #[must_use = "A refused request may retain a complete original partial inventory"]
 pub(crate) struct ControlRequestAdmissionRefusal {
@@ -271,7 +273,7 @@ pub(crate) enum ControlRequestPublishRefusal {
         ticket: EffectTicket<WorkerAction>,
     },
     Publication {
-        error: DriverError,
+        error: ActorTurnError,
         ticket: EffectTicket<WorkerAction>,
         _original_body: Arc<ControlReplyBody>,
     },
@@ -298,17 +300,17 @@ impl std::fmt::Debug for ControlRequestPublishRefusal {
 pub(crate) use novarocks_worker_protocol::control::ControlReplyBody;
 
 type Endpoint = RequestEndpoint<ControlReplyBody>;
-pub(crate) type ControlRequestHandle = RequestHandle<ControlReplyBody>;
+pub(crate) type ControlRequestHandle = RequestExternalWait<ControlReplyBody>;
 pub(crate) type ControlRequestDelivery = RequestDelivery<ControlReplyBody>;
 pub(super) use super::request_endpoint::RequestNotice as ControlRequestNotice;
 
 #[must_use = "The original request remains owned on ingress refusal"]
 pub(crate) struct EstablishIngressBeginRefusal {
     pub error: ControlRequestError,
-    _original_request: std::mem::ManuallyDrop<EstablishQueryContext>,
+    _original_request: std::mem::ManuallyDrop<EstablishParticipation>,
 }
 impl EstablishIngressBeginRefusal {
-    pub(super) fn new(error: ControlRequestError, request: EstablishQueryContext) -> Self {
+    pub(super) fn new(error: ControlRequestError, request: EstablishParticipation) -> Self {
         Self {
             error,
             _original_request: std::mem::ManuallyDrop::new(request),
@@ -325,9 +327,9 @@ impl std::fmt::Debug for EstablishIngressBeginRefusal {
 #[derive(Clone, Copy)]
 enum RequestKind {
     ObserveTicket,
-    CreateWithoutContext,
+    CreateWithoutParticipation,
     Acquire {
-        context: QueryContextRef,
+        participation: ParticipationRef,
         valid_for: LeaseValidFor,
     },
     Establish,
@@ -336,16 +338,16 @@ enum RequestKind {
 /// Private fields prevent inventing a deferred route from numeric identities.
 pub(super) struct ValidatedEstablishRoute {
     root: ActorId,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     request: EstablishReplayRequest,
     order: u64,
 }
 /// Root already retains the same original route and return position. This
-/// transfer owns only the target address and neutral Context half; the driver
+/// transfer owns only the target address and neutral Participation half; the driver
 /// releases its Root inventory guard before binding the target inventory.
 #[must_use = "Bind the same original transfer outside the Root inventory lock"]
 pub(crate) struct PreparedEstablishRoute {
-    address: ContextHostAddress,
+    address: ParticipationHostAddress,
     route: Arc<EstablishRouteCustody>,
     initialization: Result<(), EstablishRouteError>,
 }
@@ -369,7 +371,7 @@ pub(crate) struct ControlRequestCustody {
     work: WorkId,
     author: InputAuthor,
     work_retirement: WorkRetirementObserver,
-    // Minted once from this actual fully admitted Work before ExitRole takes
+    // Minted once from this actual fully admitted Work before ExitCustody takes
     // custody. Lazy arm and exact notices grant no Work or physical exit.
     header_ready: HeaderReadyRegistration,
     header_owner: ActorRegistration,
@@ -378,9 +380,9 @@ pub(crate) struct ControlRequestCustody {
     pending_notification: Option<super::request_endpoint::RequestNotificationJob>,
     protocol_observation: super::request_observation::RequestObservation,
     pending_protocol_observation: Option<super::request_observation::RequestObservationJob>,
-    permit: Option<InputPermit<WorkerActor>>,
-    role: ExitRole,
-    authority: Option<ExitAuthority>,
+    permit: Option<ReservedInputObligation<WorkerActor>>,
+    exit_custody: ExitCustody,
+    authority: Option<ExitObligation>,
     report: ReportSlot,
     kind: Option<RequestKind>,
     submitted: bool,
@@ -402,11 +404,11 @@ pub(crate) struct ControlRequestCustody {
     ingress_owner: Option<EstablishIngressOwner>,
     ingress_partial: Option<EstablishIngressPartial>,
     ingress_return: Option<OwnedReturnReader<EstablishIngressReturned>>,
-    route_escrow: Option<ReservationBundle>,
+    route_escrow: Option<ReservationObligation>,
     route: Option<Arc<EstablishRouteCustody>>,
-    creator: Option<ContextHostJobs>,
+    creator: Option<ParticipationHostJobs>,
     creator_retirement: Option<WorkRetirementObserver>,
-    creator_return_role: Option<InputRoleId>,
+    creator_return_input: Option<StandingInputId>,
     creator_source_consumed: bool,
     route_cancelled: bool,
     route_issued: bool,
@@ -419,7 +421,7 @@ impl ControlRequestCustody {
     pub(crate) fn submit_ticket_observation(
         &mut self,
         ticket: novarocks_execution_contract::AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         preflight: bool,
     ) -> Result<(), ControlRequestError> {
         if self.submitted || self.started || self.ingress_enabled || self.permit.is_none() {
@@ -435,7 +437,7 @@ impl ControlRequestCustody {
             .as_ref()
             .expect("original observation R input")
             .bind()
-            .map_err(ControlRequestError::Driver)?;
+            .map_err(ControlRequestError::ActorTurn)?;
         self.kind = Some(RequestKind::ObserveTicket);
         let message = WorkerMessage::Control(ControlMessage::ObserveTicket {
             work: self.author.work(),
@@ -444,7 +446,7 @@ impl ControlRequestCustody {
                 deadline: self.request().deadline,
             },
             ticket,
-            context,
+            participation,
             preflight,
         });
         match self
@@ -460,7 +462,7 @@ impl ControlRequestCustody {
             }
             Err((error, original)) => {
                 self.failed_submission = Some(original);
-                Err(ControlRequestError::Driver(error))
+                Err(ControlRequestError::ActorTurn(error))
             }
         }
     }
@@ -551,7 +553,7 @@ impl ControlRequestCustody {
             Ok(permit) => permit,
             Err(error) => {
                 return Err(ControlRequestAdmissionRefusal {
-                    error: ControlRequestError::Driver(error),
+                    error: ControlRequestError::ActorTurn(error),
                     partial: Some(ControlRequestPartial {
                         work,
                         capacity,
@@ -563,7 +565,7 @@ impl ControlRequestCustody {
             }
         };
         let author = permit.author().unwrap_or_else(|_| std::process::abort());
-        let request = RequestContext {
+        let request = RequestReplyTag {
             author: author.work(),
             token: permit.id(),
             operation,
@@ -573,9 +575,9 @@ impl ControlRequestCustody {
         let work_retirement = work.retirement_observer();
         let route_escrow = if ingress_enabled {
             match capacity.split_next(
-                &CONTEXT_ROUTE_ESCROW_STORAGE
+                &PARTICIPATION_ROUTE_ESCROW_STORAGE
                     .resources()
-                    .expect("fixed Context route escrow"),
+                    .expect("fixed Participation route escrow"),
             ) {
                 Ok(escrow) => Some(escrow),
                 Err(error) => {
@@ -665,7 +667,7 @@ impl ControlRequestCustody {
         let header_ready = reported
             .header_readiness_registration()
             .unwrap_or_else(|_| std::process::abort());
-        let (role, authority) = ExitRole::from_admitted(reported);
+        let (exit_custody, authority) = ExitCustody::from_admitted(reported);
         Ok((
             Self {
                 runtime: root.runtime().clone(),
@@ -683,7 +685,7 @@ impl ControlRequestCustody {
                 protocol_observation: Default::default(),
                 pending_protocol_observation: None,
                 permit: Some(permit),
-                role,
+                exit_custody,
                 authority: Some(authority),
                 report,
                 kind: None,
@@ -710,7 +712,7 @@ impl ControlRequestCustody {
                 route: None,
                 creator: None,
                 creator_retirement: None,
-                creator_return_role: None,
+                creator_return_input: None,
                 creator_source_consumed: false,
                 route_cancelled: false,
                 route_issued: false,
@@ -726,7 +728,7 @@ impl ControlRequestCustody {
     }
     pub(crate) fn begin_establish_ingress(
         &mut self,
-        request: EstablishQueryContext,
+        request: EstablishParticipation,
         payload: PayloadId,
     ) -> Result<EstablishIngressJob, EstablishIngressBeginRefusal> {
         // A refusal or invariant must never unwind an opaque DTO on a poller.
@@ -741,7 +743,7 @@ impl ControlRequestCustody {
             || self.ingress_issued
             || !self.started
             || self.authority.is_none()
-            || self.role.phase() != ExitRolePhase::Started
+            || self.exit_custody.phase() != ExitCustodyPhase::Started
         {
             return Err(EstablishIngressBeginRefusal {
                 error: ControlRequestError::WrongPhase,
@@ -823,12 +825,16 @@ impl ControlRequestCustody {
         &mut self,
         ticket: &EffectTicket<WorkerAction>,
         order: u64,
-    ) -> Result<QueryContextRef, ControlRequestError> {
+    ) -> Result<ParticipationRef, ControlRequestError> {
         self.runtime
             .validate_effect_ticket(ticket)
-            .map_err(ControlRequestError::Driver)?;
+            .map_err(ControlRequestError::ActorTurn)?;
         let WorkerAction::Control {
-            effect: ControlEffect::RouteEstablish { context, request },
+            effect:
+                ControlEffect::RouteEstablish {
+                    participation,
+                    request,
+                },
             admitted: None,
         } = &ticket.effect
         else {
@@ -847,7 +853,7 @@ impl ControlRequestCustody {
         let projection = self
             .ingress_projection()
             .ok_or(ControlRequestError::IngressPending)?;
-        if projection.context != *context
+        if projection.participation != *participation
             || projection.operation != request.request.operation
             || projection.ticket != request.ticket
             || projection.payload != request.payload
@@ -857,28 +863,28 @@ impl ControlRequestCustody {
         }
         self.pending_route = Some(ValidatedEstablishRoute {
             root: self.actor,
-            context: *context,
+            participation: *participation,
             request: *request,
             order,
         });
         self.route_issued = true;
-        Ok(*context)
+        Ok(*participation)
     }
-    /// The elected creator lends its own raw input to the Context host job.
-    /// The ticket proves selection only; the Context issuer must separately
+    /// The elected creator lends its own raw input to the Participation host job.
+    /// The ticket proves selection only; the Participation issuer must separately
     /// admit its actual M Work, capture, return cell and input author before
-    /// capturing this loan. Root R and Context M retain independent lifetimes.
+    /// capturing this loan. Root R and Participation M retain independent lifetimes.
     pub(super) fn take_materialization_source(
         &self,
         ticket: &EffectTicket<WorkerAction>,
     ) -> Result<ValidatedMaterializationSource, ControlRequestError> {
         self.runtime
             .validate_effect_ticket(ticket)
-            .map_err(ControlRequestError::Driver)?;
+            .map_err(ControlRequestError::ActorTurn)?;
         let WorkerAction::Control {
             effect:
                 ControlEffect::Materialize {
-                    context,
+                    participation,
                     establishment,
                     reservation,
                     generation,
@@ -897,7 +903,7 @@ impl ControlRequestCustody {
             || !self.submitted
             || self.withdrawal
             || self.route_issued
-            || projection.context != *context
+            || projection.participation != *participation
             || projection.operation != establishment.operation
             || projection.ticket != establishment.ticket
             || projection.payload != establishment.payload
@@ -905,7 +911,7 @@ impl ControlRequestCustody {
         {
             return Err(ControlRequestError::WrongRequest);
         }
-        // This exact runtime-issued M descriptor names its new Context
+        // This exact runtime-issued M descriptor names its new Participation
         // admission Work. It must not equal the original R author: taking the
         // committed guard independently validates that M Work binding.
         let loan = self
@@ -922,36 +928,36 @@ impl ControlRequestCustody {
             loan,
         ))
     }
-    pub(super) fn pending_route(&self) -> Option<(QueryContextRef, u64)> {
+    pub(super) fn pending_route(&self) -> Option<(ParticipationRef, u64)> {
         self.pending_route
             .as_ref()
-            .map(|seed| (seed.context, seed.order))
+            .map(|seed| (seed.participation, seed.order))
     }
-    pub(super) fn route_return_role(&self) -> Option<InputRoleId> {
+    pub(super) fn route_return_input_id(&self) -> Option<StandingInputId> {
         self.route
             .as_ref()
-            .and_then(|route| route.return_role())
+            .and_then(|route| route.return_input_id())
             .or_else(|| {
-                self.creator_return_role.or_else(|| {
+                self.creator_return_input.or_else(|| {
                     self.creator
                         .as_ref()
-                        .and_then(ContextHostJobs::creator_role)
+                        .and_then(ParticipationHostJobs::creator_input_id)
                 })
             })
     }
     pub(super) fn bind_creator_return(
         &mut self,
         ticket: &EffectTicket<WorkerAction>,
-        jobs: ContextHostJobs,
-        author: &WorkLease,
+        jobs: ParticipationHostJobs,
+        author: &WorkObligation,
     ) -> Result<(), ControlRequestError> {
         self.runtime
             .validate_effect_ticket(ticket)
-            .map_err(ControlRequestError::Driver)?;
+            .map_err(ControlRequestError::ActorTurn)?;
         let WorkerAction::Control {
             effect:
                 ControlEffect::Materialize {
-                    context,
+                    participation,
                     establishment,
                     generation: _,
                     reservation,
@@ -971,7 +977,7 @@ impl ControlRequestCustody {
             || self.route_issued
             || self.creator.is_some()
             || self.withdrawal
-            || p.context != *context
+            || p.participation != *participation
             || p.operation != establishment.operation
             || p.ticket != establishment.ticket
             || p.payload != establishment.payload
@@ -985,7 +991,7 @@ impl ControlRequestCustody {
                 .map_err(ControlRequestError::HostJob)?,
         );
         self.creator = Some(jobs.clone());
-        let role = jobs
+        let creator_input_id = jobs
             .bind_creator(
                 ticket,
                 self.request(),
@@ -994,7 +1000,7 @@ impl ControlRequestCustody {
                 ControlRequestNotice(self.endpoint.external.slot().clone()),
             )
             .map_err(ControlRequestError::HostJob)?;
-        self.creator_return_role = Some(role);
+        self.creator_return_input = Some(creator_input_id);
         Ok(())
     }
     pub(crate) fn take_consumed_creator_disposal(
@@ -1004,7 +1010,7 @@ impl ControlRequestCustody {
             || self
                 .creator
                 .as_ref()
-                .map(ContextHostJobs::source_consumed)
+                .map(ParticipationHostJobs::source_consumed)
                 .transpose()
                 .map_err(ControlRequestError::HostJob)?
                 .unwrap_or(false);
@@ -1018,14 +1024,14 @@ impl ControlRequestCustody {
     }
     pub(super) fn prepare_pending_establish_route(
         &mut self,
-        address: ContextHostAddress,
-        root_author: &WorkLease,
+        address: ParticipationHostAddress,
+        root_author: &WorkObligation,
     ) -> Result<PreparedEstablishRoute, ControlRequestError> {
         let seed = self
             .pending_route
             .as_ref()
             .ok_or(ControlRequestError::WrongPhase)?;
-        if address.context() != seed.context || seed.root != self.actor {
+        if address.participation() != seed.participation || seed.root != self.actor {
             return Err(ControlRequestError::WrongRequest);
         }
         let ingress = self
@@ -1042,7 +1048,7 @@ impl ControlRequestCustody {
             self.ledger.clone(),
             self.actor,
             self.author.clone(),
-            seed.context,
+            seed.participation,
             address.registration().clone(),
             seed.request,
             escrow,
@@ -1053,8 +1059,8 @@ impl ControlRequestCustody {
             Err((error, original)) => {
                 self.route_escrow = Some(original);
                 return Err(ControlRequestError::Route(match error {
-                    EstablishRouteError::Driver(
-                        DriverError::UnknownActor | DriverError::EffectTicketOriginMismatch,
+                    EstablishRouteError::ActorTurn(
+                        ActorTurnError::UnknownActor | ActorTurnError::EffectTicketOriginMismatch,
                     ) => EstablishRouteError::TargetRemoved,
                     error => error,
                 }));
@@ -1075,9 +1081,13 @@ impl ControlRequestCustody {
     ) -> Result<(), ControlRequestError> {
         self.runtime
             .validate_effect_ticket(ticket)
-            .map_err(ControlRequestError::Driver)?;
+            .map_err(ControlRequestError::ActorTurn)?;
         let WorkerAction::Control {
-            effect: ControlEffect::CancelEstablishRoute { context, request },
+            effect:
+                ControlEffect::CancelEstablishRoute {
+                    participation,
+                    request,
+                },
             ..
         } = &ticket.effect
         else {
@@ -1088,23 +1098,23 @@ impl ControlRequestCustody {
             || !self.route_issued
             || self
                 .ingress_projection()
-                .is_none_or(|projection| projection.context != *context)
+                .is_none_or(|projection| projection.participation != *participation)
         {
             return Err(ControlRequestError::WrongRequest);
         }
         if let Some(route) = &self.route {
             route.cancel();
-            // A never-bound leg admitted no Context Work or capture. An
-            // admitted Context leg still exits through its actual owner.
+            // A never-bound leg admitted no Participation Work or capture. An
+            // admitted Participation leg still exits through its actual owner.
             route
-                .try_retire_unbound_context()
+                .try_retire_unbound_participation()
                 .map_err(ControlRequestError::Route)?;
         }
         self.pending_route = None;
         self.route_cancelled = true;
         Ok(())
     }
-    /// A replay can dispose its exclusive source only after its actual Context
+    /// A replay can dispose its exclusive source only after its actual Participation
     /// leg retires, including every comparison loan. A reply alone cannot.
     pub(crate) fn take_retired_route_disposal(&self) -> Option<EstablishDisposalJob> {
         if !self.route_issued
@@ -1112,7 +1122,7 @@ impl ControlRequestCustody {
             || self
                 .route
                 .as_ref()
-                .is_some_and(|route| !route.context_retired())
+                .is_some_and(|route| !route.participation_retired())
         {
             return None;
         }
@@ -1150,7 +1160,7 @@ impl ControlRequestCustody {
         }
         if let Some(route) = &self.route {
             route
-                .try_retire_unbound_context()
+                .try_retire_unbound_participation()
                 .map_err(ControlRequestError::Route)?;
         }
         if let Some(route) = &self.route
@@ -1195,7 +1205,7 @@ impl ControlRequestCustody {
     ) -> Result<Option<EstablishDisposalJob>, ControlRequestError> {
         self.runtime
             .validate_effect_ticket(ticket)
-            .map_err(ControlRequestError::Driver)?;
+            .map_err(ControlRequestError::ActorTurn)?;
         if ticket.actor != self.actor {
             return Err(ControlRequestError::WrongRoot);
         }
@@ -1222,7 +1232,7 @@ impl ControlRequestCustody {
             .as_ref()
             .and_then(EstablishIngressOwner::take_disposal))
     }
-    pub(super) fn ingress_source_phase(&self) -> Option<ExitRolePhase> {
+    pub(super) fn ingress_source_phase(&self) -> Option<ExitCustodyPhase> {
         self.ingress_owner
             .as_ref()
             .map(EstablishIngressOwner::phase)
@@ -1239,7 +1249,7 @@ impl ControlRequestCustody {
         }
         Ok(true)
     }
-    fn retire_original_role(&mut self) -> Result<bool, ControlRequestError> {
+    fn retire_original_work(&mut self) -> Result<bool, ControlRequestError> {
         // The upstream owner has observed its actual body/capture exit. The
         // canonical original-header gate also includes remaining children and
         // pins; arm before waiting on either, rather than losing their wake.
@@ -1270,7 +1280,7 @@ impl ControlRequestCustody {
                 HeaderWaitState::Retired => {}
             }
         }
-        // Withdraw original readiness metadata before ExitRole can refund
+        // Withdraw original readiness metadata before ExitCustody can refund
         // Requests or the owner can remove its actual R address.
         self.header_ready.cancel();
         if let Some(escrow) = &mut self.route_escrow {
@@ -1285,7 +1295,9 @@ impl ControlRequestCustody {
                 .map_err(ControlRequestError::Runtime)?;
             self.route_escrow = None;
         }
-        self.role.try_retire().map_err(ControlRequestError::Exit)
+        self.exit_custody
+            .try_retire()
+            .map_err(ControlRequestError::Exit)
     }
     pub(super) fn header_work(&self) -> novarocks_control_runtime_core::identity::ScopedWorkRef {
         self.header_ready.work()
@@ -1300,7 +1312,7 @@ impl ControlRequestCustody {
     pub(super) fn is_retired(&self) -> bool {
         self.retired
     }
-    pub(crate) fn request(&self) -> RequestContext {
+    pub(crate) fn request(&self) -> RequestReplyTag {
         self.endpoint.request
     }
     pub(crate) fn input_id(&self) -> InputId {
@@ -1354,12 +1366,12 @@ impl ControlRequestCustody {
         let observed_panic = self.ingress_panicked()
             && self.authority.is_some()
             && self.started
-            && self.role.phase() == ExitRolePhase::Started
+            && self.exit_custody.phase() == ExitCustodyPhase::Started
             && returned == ReturnState::Taken;
         let lost = self.authority.is_some()
             && self.started
-            && self.role.phase() == ExitRolePhase::Started
-            && self.ingress_source_phase() == Some(ExitRolePhase::Unresolved)
+            && self.exit_custody.phase() == ExitCustodyPhase::Started
+            && self.ingress_source_phase() == Some(ExitCustodyPhase::Unresolved)
             && returned == ReturnState::Unknown;
         if !observed_panic && !lost {
             return Err(ControlRequestSubmitRefusal {
@@ -1369,7 +1381,7 @@ impl ControlRequestCustody {
         }
         if let Err(error) = self.permit.as_ref().expect("original RPC permit").bind() {
             return Err(ControlRequestSubmitRefusal {
-                error: ControlRequestError::Driver(error),
+                error: ControlRequestError::ActorTurn(error),
                 command: Some(command),
             });
         }
@@ -1399,8 +1411,8 @@ impl ControlRequestCustody {
                 return Err(reject(ControlRequestError::IngressPending, command));
             };
             let matches_projection = matches!(&command,
-                ControlInput::Establish { request, context, ticket, payload, semantics, .. }
-                if *request == projection.operation && *context == projection.context && *ticket == projection.ticket
+                ControlInput::Establish { request, participation, ticket, payload, semantics, .. }
+                if *request == projection.operation && *participation == projection.participation && *ticket == projection.ticket
                     && *payload == projection.payload && *semantics == projection.semantics);
             if self.authority.is_none() || !self.started || !matches_projection {
                 return Err(reject(ControlRequestError::WrongRequest, command));
@@ -1411,14 +1423,16 @@ impl ControlRequestCustody {
                 if request.envelope().operation_id() == self.request().operation =>
             {
                 RequestKind::Acquire {
-                    context: request.context(),
+                    participation: request.participation(),
                     valid_for: request.valid_for(),
                 }
             }
             ControlInput::Establish { request, .. } if *request == self.request().operation => {
                 RequestKind::Establish
             }
-            ControlInput::CreateWithoutContextAddress { .. } => RequestKind::CreateWithoutContext,
+            ControlInput::CreateWithoutParticipationAddress { .. } => {
+                RequestKind::CreateWithoutParticipation
+            }
             _ => return Err(reject(ControlRequestError::WrongOperation, command)),
         };
         if !self.started {
@@ -1438,7 +1452,7 @@ impl ControlRequestCustody {
             .expect("original reserved input")
             .bind()
         {
-            return Err(reject(ControlRequestError::Driver(error), command));
+            return Err(reject(ControlRequestError::ActorTurn(error), command));
         }
         self.kind = Some(kind);
         self.fill_original_command(command, self.author.work())
@@ -1468,12 +1482,12 @@ impl ControlRequestCustody {
                 Ok(())
             }
             Err((error, original)) => {
-                // Common currently returns no InputPermit on a failed fill.
+                // Common currently returns no ReservedInputObligation on a failed fill.
                 // Keep its exact identity and neutral message unresolved; never
                 // manufacture unused revocation, a replacement ID or an ACK.
                 self.failed_submission = Some(original);
                 Err(ControlRequestSubmitRefusal {
-                    error: ControlRequestError::Driver(error),
+                    error: ControlRequestError::ActorTurn(error),
                     command: None,
                 })
             }
@@ -1490,7 +1504,7 @@ impl ControlRequestCustody {
         &mut self,
         ticket: EffectTicket<WorkerAction>,
     ) -> Result<
-        novarocks_control_runtime::driver::CompletedEffect<WorkerActor>,
+        novarocks_control_runtime::actor_turn::CompletedEffect<WorkerActor>,
         ControlRequestPublishRefusal,
     > {
         let reject = |error, ticket| ControlRequestPublishRefusal::Rejected { error, ticket };
@@ -1516,27 +1530,32 @@ impl ControlRequestCustody {
             // re-running publication would incorrectly require Started again.
         } else {
             if let Err(error) = self.runtime.validate_effect_ticket(&ticket) {
-                return Err(reject(ControlRequestError::Driver(error), ticket));
+                return Err(reject(ControlRequestError::ActorTurn(error), ticket));
             }
             if !decided_body.matches(settlement.result) {
                 return Err(reject(ControlRequestError::BodyResultMismatch, ticket));
             }
             match (self.kind, &decided_body) {
                 (
-                    Some(RequestKind::CreateWithoutContext),
-                    ControlReplyBody::CreateContext(_)
+                    Some(RequestKind::CreateWithoutParticipation),
+                    ControlReplyBody::CreateParticipation(_)
                     | ControlReplyBody::Verdict(RequestResult::Outcome(
                         OperationOutcome::OwnerFailed,
                     )),
                 ) => {}
-                (Some(RequestKind::CreateWithoutContext), _)
-                | (_, ControlReplyBody::CreateContext(_)) => {
+                (Some(RequestKind::CreateWithoutParticipation), _)
+                | (_, ControlReplyBody::CreateParticipation(_)) => {
                     return Err(reject(ControlRequestError::WrongEffect, ticket));
                 }
                 (
-                    Some(RequestKind::Acquire { context, valid_for }),
+                    Some(RequestKind::Acquire {
+                        participation,
+                        valid_for,
+                    }),
                     ControlReplyBody::Admission(Ok(receipt)),
-                ) if receipt.context() != context || receipt.valid_for() != valid_for => {
+                ) if receipt.participation() != participation
+                    || receipt.valid_for() != valid_for =>
+                {
                     return Err(reject(
                         ControlRequestError::AdmissionReceiptMismatch,
                         ticket,
@@ -1643,7 +1662,7 @@ impl ControlRequestCustody {
                     .map_err(ControlRequestError::Exit)?;
                 self.exit_observed = true;
             }
-            if !self.retire_original_role()? {
+            if !self.retire_original_work()? {
                 return Ok(false);
             }
             self.endpoint
@@ -1659,11 +1678,11 @@ impl ControlRequestCustody {
             match self.runtime.retire_input(self.actor, self.input_id()) {
                 Ok(()) => self.initial_retired = true,
                 Err(
-                    DriverError::InputStillQueued
-                    | DriverError::EffectsRemain
-                    | DriverError::ReservationsRemain,
+                    ActorTurnError::InputStillQueued
+                    | ActorTurnError::EffectsRemain
+                    | ActorTurnError::ReservationsRemain,
                 ) => return Ok(false),
-                Err(error) => return Err(ControlRequestError::Driver(error)),
+                Err(error) => return Err(ControlRequestError::ActorTurn(error)),
             }
         }
         if !self.reply_completed
@@ -1676,7 +1695,7 @@ impl ControlRequestCustody {
         if !self.close_ingress()? || !self.close_route()? {
             return Ok(false);
         }
-        if self.role.phase() == ExitRolePhase::Unresolved {
+        if self.exit_custody.phase() == ExitCustodyPhase::Unresolved {
             // All known output/source work may drain, while this original
             // failed physical call is still conservatively Unknown.
             return Ok(false);
@@ -1704,7 +1723,7 @@ impl ControlRequestCustody {
                 .map_err(ControlRequestError::Runtime)?;
             self.external_consumed = true;
         }
-        if !self.retire_original_role()? {
+        if !self.retire_original_work()? {
             return Ok(false);
         }
         self.endpoint
@@ -1733,7 +1752,7 @@ mod tests {
         scope::ScopeError,
     };
     use novarocks_execution_contract::{
-        AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
+        AcquireParticipationAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
     };
     use novarocks_types::{
         AttemptId, BackendProcessId, FrontendProcessId, NativeCompatibilityId, QueryExecutionId,
@@ -1761,12 +1780,12 @@ mod tests {
         root: ProcessControlOwner,
         requests: BTreeMap<InputId, ControlRequestCustody>,
         capability: AdmissionEpochCapability,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     }
     struct HostInput {
         input: InputId,
-        work: WorkLease,
-        capacity: ReservationBundle,
+        work: WorkObligation,
+        capacity: ReservationObligation,
     }
     impl Fixture {
         fn new(positions: usize, funded: usize) -> Self {
@@ -1776,7 +1795,7 @@ mod tests {
                 AdmissionStorage {
                     loading: Default::default(),
                     accepted: Default::default(),
-                    context: Default::default(),
+                    participation: Default::default(),
                 },
                 ReservationResources::default(),
             )
@@ -1851,7 +1870,7 @@ mod tests {
                 },
             )
             .unwrap();
-            let context = QueryContextRef::new(
+            let participation = ParticipationRef::new(
                 QueryExecutionId::new(QueryId::new(7001, 7002), AttemptId::new(1).unwrap())
                     .unwrap(),
                 FrontendProcessId::new_v7(),
@@ -1864,7 +1883,7 @@ mod tests {
                 root,
                 requests: BTreeMap::new(),
                 capability,
-                context,
+                participation,
             }
         }
         fn admit(&mut self) -> (InputId, ControlRequestHandle) {
@@ -1887,9 +1906,9 @@ mod tests {
         }
         fn command(&self) -> ControlInput {
             ControlInput::Acquire {
-                request: AcquireQueryContextAdmissionTicket::new(
+                request: AcquireParticipationAdmissionTicket::new(
                     operation(),
-                    self.context,
+                    self.participation,
                     // Core's five-second ticket limit produces the genuine
                     // neutral AdmissionReply without an unpaid ticket holder.
                     LeaseValidFor::new(Duration::from_secs(6)).unwrap(),
@@ -2070,7 +2089,7 @@ mod tests {
             use crate::control_runtime::control_internal::InternalAdvance;
             assert_eq!(
                 self.runtime.close_timer_source(actor()).unwrap(),
-                novarocks_control_runtime::driver::TimerSourceState::ClosedDrained
+                novarocks_control_runtime::actor_turn::TimerSourceState::ClosedDrained
             );
             // The real source selects the Core's own coalesced continuation.
             // This fixture never constructs a NextInternal command or cursor.
@@ -2122,14 +2141,19 @@ mod tests {
             &mut self,
             ticket: EffectTicket<WorkerAction>,
             route: &novarocks_control_runtime::publication::PublishedSnapshot<
-                novarocks_execution_contract::QueryContextState,
+                novarocks_execution_contract::ParticipationState,
             >,
         ) {
             let state = match &ticket.effect {
                 WorkerAction::Control {
-                    effect: ControlEffect::Route { context, state, .. },
+                    effect:
+                        ControlEffect::Route {
+                            participation,
+                            state,
+                            ..
+                        },
                     ..
-                } if *context == self.context => *state,
+                } if *participation == self.participation => *state,
                 _ => panic!("the actual directory route must precede its reply"),
             };
             drop(
@@ -2149,7 +2173,7 @@ mod tests {
             if let Some(source) = resources.internal.as_mut() {
                 assert_eq!(
                     self.runtime.close_timer_source(actor()).unwrap(),
-                    novarocks_control_runtime::driver::TimerSourceState::ClosedDrained
+                    novarocks_control_runtime::actor_turn::TimerSourceState::ClosedDrained
                 );
                 source.close_after_drain().unwrap();
             }
@@ -2158,7 +2182,7 @@ mod tests {
                 original_host_turn.release(false).unwrap();
             }
             self.runtime.seal_actor(actor()).unwrap();
-            for role in resources.roles.iter_mut().rev() {
+            for role in resources.metadata_resources.iter_mut().rev() {
                 role.work.body_exited().unwrap();
                 role.work.captures_exited().unwrap();
             }
@@ -2166,7 +2190,7 @@ mod tests {
                 .reap_scope_ready(resources.scope.id(), 32)
                 .unwrap();
             drop(self.runtime.remove_actor(actor()).unwrap());
-            for role in resources.roles.iter_mut().rev() {
+            for role in resources.metadata_resources.iter_mut().rev() {
                 role.capacity
                     .release_quota(&role.capacity.resources().unwrap().quota)
                     .unwrap();
@@ -2365,7 +2389,7 @@ mod tests {
             .unwrap();
         let ticket = match refusal {
             ControlRequestPublishRefusal::Rejected {
-                error: ControlRequestError::Driver(DriverError::EffectTicketOriginMismatch),
+                error: ControlRequestError::ActorTurn(ActorTurnError::EffectTicketOriginMismatch),
                 ticket,
             } => ticket,
             other => {
@@ -2455,10 +2479,10 @@ mod tests {
         use novarocks_control_runtime::publication::PublishedSnapshot;
         use novarocks_control_runtime_core::effect::EffectState;
         use novarocks_execution_contract::{
-            ContentFingerprint, CredentialEpoch, CredentialLeaseId, QueryContextState,
+            ContentFingerprint, CredentialDomainId, CredentialEpoch, ParticipationState,
         };
         use novarocks_worker_protocol::{control::EstablishSemanticFacts, creation::PayloadId};
-        let context_storage = StorageNeed {
+        let participation_storage = StorageNeed {
             inputs: 1,
             batches: 1,
             effects: ControlCore::MAX_STEP_WORK,
@@ -2476,7 +2500,7 @@ mod tests {
         // Each actual owner is funded independently of the original RPC.
         // The unpublished bootstrap Scope below actually stops and joins;
         // neither a grant nor an unexecuted host callback supplies that exit.
-        let additional = context_storage
+        let additional = participation_storage
             .resources()
             .unwrap()
             .checked_add(&host_storage.resources().unwrap())
@@ -2489,7 +2513,7 @@ mod tests {
             AdmissionStorage {
                 loading: Default::default(),
                 accepted: Default::default(),
-                context: context_storage.resources().unwrap(),
+                participation: participation_storage.resources().unwrap(),
             },
             additional,
         );
@@ -2498,9 +2522,9 @@ mod tests {
         f.root.enable_internal_source().unwrap();
         let (acquire, mut acquire_handle) = f.admit();
         let command = ControlInput::Acquire {
-            request: AcquireQueryContextAdmissionTicket::new(
+            request: AcquireParticipationAdmissionTicket::new(
                 operation(),
-                f.context,
+                f.participation,
                 LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
                 NativeCompatibilityId::new([3; 32]),
                 f.capability,
@@ -2525,7 +2549,7 @@ mod tests {
             } => *receipt,
             other => panic!("the original metadata-only ticket receipt: {other:?}"),
         };
-        assert_eq!(receipt.context(), f.context);
+        assert_eq!(receipt.participation(), f.participation);
         f.complete_ordered_body(grant);
         let reply = f.ordered_reply(acquire);
         let reference = EffectRef {
@@ -2553,17 +2577,17 @@ mod tests {
         bytes[8] = 0x80;
         let operation = TaskOperationId::try_from_bytes(bytes).unwrap();
         let (establish, external) = f.admit_operation(operation);
-        let context = f.context;
+        let participation = f.participation;
         let establish_command = || ControlInput::Establish {
             request: operation,
-            context,
+            participation,
             ticket: receipt.ticket_id(),
             payload: PayloadId(1),
             semantics: EstablishSemanticFacts {
                 catalog: ContentFingerprint::from_bytes([1; 16]),
                 shared_filter: ContentFingerprint::from_bytes([2; 16]),
                 query_options: ContentFingerprint::from_bytes([3; 16]),
-                credential_lease: CredentialLeaseId::new(1),
+                credential_domain_id: CredentialDomainId::new(1),
                 credential_epoch: CredentialEpoch::new(1).unwrap(),
                 initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
             },
@@ -2581,24 +2605,25 @@ mod tests {
             WorkerAction::Control {
                 effect:
                     ControlEffect::Materialize {
-                        context,
+                        participation,
                         reservation,
                         ..
                     },
                 admitted: Some(original),
-            } if *context == f.context && reservation == original => *reservation,
+            } if *participation == f.participation && reservation == original => *reservation,
             _ => panic!("the real establish must issue its own materialization guard"),
         };
         let guard = f
             .runtime
             .take_step_reservation(&materialize, reservation)
             .unwrap();
-        let (mut context_work, mut context_capacity) = guard.bind(WorkKind::Business).unwrap();
-        context_work.start().unwrap();
+        let (mut participation_work, mut participation_capacity) =
+            guard.bind(WorkKind::Business).unwrap();
+        participation_work.start().unwrap();
         let (bootstrap_scope, bootstrap_root) = f
             .ledger
             .open_child_scope_with_root(
-                &context_work,
+                &participation_work,
                 generation(),
                 WorkKind::Business,
                 ReservationResources::work_only(),
@@ -2617,7 +2642,7 @@ mod tests {
                 ReservationResources::work_only(),
             )
             .err()
-            .expect("the actual stopped Context bootstrap cannot derive new Business work");
+            .expect("the actual stopped Participation bootstrap cannot derive new Business work");
         assert_eq!(refusal, RuntimeError::Scope(ScopeError::Stopped));
         bootstrap_work.body_exited().unwrap();
         bootstrap_work.captures_exited().unwrap();
@@ -2632,21 +2657,22 @@ mod tests {
         f.ledger
             .reap_scope_ready(f.root.resources().scope.id(), 16)
             .unwrap();
-        assert!(!context_work.actual_exit_ready().unwrap());
+        assert!(!participation_work.actual_exit_ready().unwrap());
         drop((bootstrap_work, bootstrap_capacity, bootstrap_scope));
         let route = PublishedSnapshot::new(
             &f.root.resources().scope,
-            Arc::new(QueryContextState::Absent),
+            Arc::new(ParticipationState::Absent),
         );
         let materialized = f.host_input(
             ControlInput::EstablishmentDecided {
-                context: f.context,
-                decision: novarocks_worker_protocol::context::ContextEstablishmentDecision {
-                    state: QueryContextState::Aborting,
-                    outcome: Ok(OperationOutcome::OwnerFailed),
-                    acknowledgement: None,
-                    decided_at: MonotonicInstant::from_origin(Duration::from_nanos(3)),
-                },
+                participation: f.participation,
+                decision:
+                    novarocks_worker_protocol::participation::ParticipationEstablishmentDecision {
+                        state: ParticipationState::Aborting,
+                        outcome: Ok(OperationOutcome::OwnerFailed),
+                        acknowledgement: None,
+                        decided_at: MonotonicInstant::from_origin(Duration::from_nanos(3)),
+                    },
             },
             host_storage,
         );
@@ -2665,9 +2691,9 @@ mod tests {
         assert!(f.runtime.poll_one(Tick(3)).unwrap());
         f.root.index_control_effects(64).unwrap();
         assert!(f.root.take_control_effect(64).unwrap().is_none());
-        assert_eq!(*route.read(), QueryContextState::Absent);
+        assert_eq!(*route.read(), ParticipationState::Absent);
         f.publish_route(route_ticket, &route);
-        assert_eq!(*route.read(), QueryContextState::Aborting);
+        assert_eq!(*route.read(), ParticipationState::Aborting);
         let body = f.ordered_reply(materialized.input);
         f.complete_ordered_body(body);
         let final_reply = f.ordered_reply(materialized.input);
@@ -2690,19 +2716,23 @@ mod tests {
         let joined_body = f.ordered_reply(joined);
         let routed_request = match &joined_body.effect {
             WorkerAction::Control {
-                effect: ControlEffect::RouteEstablish { context, request },
+                effect:
+                    ControlEffect::RouteEstablish {
+                        participation,
+                        request,
+                    },
                 ..
-            } if *context == f.context => request.request,
+            } if *participation == f.participation => request.request,
             _ => panic!("the new RPC must route, not inherit the creation failure"),
         };
-        // This fixture's actual Context-scope bootstrap stopped and joined.
+        // This fixture's actual Participation-scope bootstrap stopped and joined.
         // The neutral route is handed off before the creator's independent
-        // unavailable-entity verdict returns; no Context or I/O exit is faked.
+        // unavailable-entity verdict returns; no Participation or I/O exit is faked.
         f.complete_ordered_body(joined_body);
         assert!(!f.retire(joined));
         let routed_result = f.host_input(
             ControlInput::RoutedEstablishFinished {
-                context: f.context,
+                participation: f.participation,
                 request: routed_request,
                 result: Ok(OperationOutcome::InvalidStateOrRequest),
                 acknowledgement: None,
@@ -2784,12 +2814,12 @@ mod tests {
 
         // The unpublished bootstrap Scope actually joined above. The failed
         // host has no child left to stop; its retained/removal facts retire the
-        // Context metadata holder elected by its corresponding effect.
+        // Participation metadata holder elected by its corresponding effect.
         let retained = f.host_input(
             ControlInput::ExecutionRetired {
-                context: f.context,
+                participation: f.participation,
                 retirement:
-                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                    novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                         close_epoch: generation(),
                     },
             },
@@ -2798,27 +2828,31 @@ mod tests {
         f.runtime.poll_one(Tick(4)).unwrap();
         let retained_route = f.ordered_reply(retained.input);
         f.publish_route(retained_route, &route);
-        assert_eq!(*route.read(), QueryContextState::TerminalRetained);
+        assert_eq!(*route.read(), ParticipationState::TerminalRetained);
 
-        let retire_context = f.ordered_reply(retained.input);
-        f.runtime.validate_effect_ticket(&retire_context).unwrap();
-        assert!(matches!(&retire_context.effect, WorkerAction::Control {
-            effect: ControlEffect::RetireReservation(actual), admitted: None,
-        } if *actual == context_capacity.id()));
-        context_work.body_exited().unwrap();
-        context_work.captures_exited().unwrap();
-        assert!(context_work.actual_exit_ready().unwrap());
-        context_capacity
-            .release_quota(&context_capacity.resources().unwrap().quota)
+        let retire_participation = f.ordered_reply(retained.input);
+        f.runtime
+            .validate_effect_ticket(&retire_participation)
             .unwrap();
-        context_capacity.finish().unwrap();
-        f.complete_ordered_body(retire_context);
+        assert!(
+            matches!(&retire_participation.effect, WorkerAction::Control {
+            effect: ControlEffect::RetireReservation(actual), admitted: None,
+        } if *actual == participation_capacity.id())
+        );
+        participation_work.body_exited().unwrap();
+        participation_work.captures_exited().unwrap();
+        assert!(participation_work.actual_exit_ready().unwrap());
+        participation_capacity
+            .release_quota(&participation_capacity.resources().unwrap().quota)
+            .unwrap();
+        participation_capacity.finish().unwrap();
+        f.complete_ordered_body(retire_participation);
         f.finish_ordered_host_input(retained);
         let expired = f.host_input(
-            ControlInput::ContextExpired {
-                context: f.context,
+            ControlInput::ParticipationExpired {
+                participation: f.participation,
                 retirement:
-                    novarocks_worker_protocol::retention::ContextRetirementIdentity::Protocol {
+                    novarocks_worker_protocol::retention::ParticipationRetirementIdentity::Protocol {
                         close_epoch: generation(),
                     },
             },
@@ -2827,22 +2861,24 @@ mod tests {
         f.runtime.poll_one(Tick(11_000_000_000)).unwrap();
         let remove_host = f.ordered_reply(expired.input);
         assert!(
-            matches!(&remove_host.effect, WorkerAction::Control { effect: ControlEffect::RemoveHost { context }, .. } if *context == f.context)
+            matches!(&remove_host.effect, WorkerAction::Control { effect: ControlEffect::RemoveHost { participation }, .. } if *participation == f.participation)
         );
         f.complete_ordered_body(remove_host);
         f.finish_ordered_host_input(expired);
         let removed = f.host_input(
-            ControlInput::HostRemoved { context: f.context },
+            ControlInput::HostRemoved {
+                participation: f.participation,
+            },
             host_storage,
         );
         f.runtime.poll_one(Tick(11_000_000_001)).unwrap();
         let removed_route = f.ordered_reply(removed.input);
         f.publish_route(removed_route, &route);
-        assert_eq!(*route.read(), QueryContextState::Gone);
+        assert_eq!(*route.read(), ParticipationState::Gone);
         f.finish_ordered_host_input(removed);
         drop(route);
-        assert!(context_capacity.is_released());
-        drop((context_work, context_capacity));
+        assert!(participation_capacity.is_released());
+        drop((participation_work, participation_capacity));
         f.drain_original_internal_source(Tick(11_000_000_001));
         assert!(f.root.resources().dispatch.is_empty());
         f.finish();

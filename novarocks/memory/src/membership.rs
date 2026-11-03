@@ -18,7 +18,7 @@
 //! Direct membership nodes. Nodes are allocated before admission, linked
 //! without allocation while lifecycle gates are held, and unlinked on final drop.
 use crate::{
-    account::{Account, AccountHandle},
+    account::{Account, AccountState},
     domain::Domain,
     lane::handle::LaneShared,
     sync::{Arc, Mutex, Weak},
@@ -26,7 +26,7 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) enum Member {
-    Account(Weak<Account>),
+    Account(Weak<AccountState>),
     Lane {
         lane: Weak<LaneShared>,
         funding: Option<Weak<Domain>>,
@@ -44,7 +44,7 @@ pub(crate) struct MemberNode {
     links: Mutex<Links>,
 }
 impl MemberNode {
-    pub fn account(account: &AccountHandle) -> Arc<Self> {
+    pub fn account(account: &Account) -> Arc<Self> {
         Arc::new(Self {
             member: Member::Account(Arc::downgrade(&account.0)),
             links: Mutex::new(Links::default()),
@@ -66,8 +66,8 @@ pub(crate) struct Membership {
 }
 #[derive(Debug)]
 pub(crate) enum HeldMember {
-    Account(AccountHandle),
-    Lane(crate::LaneHandle, Option<crate::FundingDomain>),
+    Account(Account),
+    Lane(crate::Lane, Option<crate::FundingDomain>),
 }
 impl Membership {
     /// The caller has preallocated node and holds its owner's lifecycle gates.
@@ -113,13 +113,13 @@ impl Membership {
             match &node.member {
                 Member::Account(account) => {
                     if let Some(account) = account.upgrade() {
-                        members.push(HeldMember::Account(AccountHandle(account)));
+                        members.push(HeldMember::Account(Account(account)));
                     }
                 }
                 Member::Lane { lane, funding } => {
                     if let Some(lane) = lane.upgrade() {
                         members.push(HeldMember::Lane(
-                            crate::LaneHandle(lane),
+                            crate::Lane(lane),
                             funding
                                 .as_ref()
                                 .and_then(|f| f.upgrade())
@@ -136,13 +136,13 @@ impl Membership {
 
 #[derive(Debug)]
 pub(crate) struct Subtree {
-    pub accounts: Vec<AccountHandle>,
-    pub lanes: Vec<crate::LaneHandle>,
+    pub accounts: Vec<Account>,
+    pub lanes: Vec<crate::Lane>,
     pub domains: Vec<crate::FundingDomain>,
     pub visited: usize,
 }
 impl Subtree {
-    pub fn collect(root: &AccountHandle) -> Self {
+    pub fn collect(root: &Account) -> Self {
         let mut result = Self {
             accounts: vec![root.clone()],
             lanes: Vec::new(),

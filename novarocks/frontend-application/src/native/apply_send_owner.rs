@@ -104,10 +104,10 @@ struct OriginalInput {
     raw_cause: Mutex<Option<RawValue>>,
     backing: Arc<ReservationBacking>,
 }
-struct OriginalTask {
+struct OriginalJob {
     input: Arc<OriginalInput>,
 }
-impl Future for OriginalTask {
+impl Future for OriginalJob {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
         let mut future = self.input.future.lock().unwrap_or_else(|e| e.into_inner());
@@ -612,7 +612,7 @@ impl ApplySlot {
             // No task can lose the original F on spawn unwind: Core already
             // owns it; dropping OriginalTask releases only its input Arc.
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.core.handle.spawn(OriginalTask {
+                self.core.handle.spawn(OriginalJob {
                     input: Arc::clone(&input),
                 })
             })) {

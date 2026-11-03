@@ -21,17 +21,17 @@
 use super::{
     build_pages::{BuildRows, ProjectionKind},
     build_state::build_contract,
-    csr_slots::{CsrSlots, CsrSlotsInit, SlotsClaim, SlotsFreeze, SlotsLease},
+    csr_slots::{CsrSlots, CsrSlotsInit, SlotsClaim, SlotsFreeze, SlotsObligation},
     join_completion::{arithmetic, funded_shared, funded_vec},
 };
 use crate::{
     exec::{
         hash_table::key_index::{BulkAssignments, BulkKey, BulkMatch, BulkWork, IndexView},
-        phased_work::{PhasedRangeWork, RangeLease},
+        phased_work::{PhasedRangeWork, RangeObligation},
     },
     runtime::{
-        fragment::{ExecutionFailure, ExecutionResult},
         observable::Observable,
+        task::{ExecutionFailure, ExecutionResult},
     },
 };
 use novarocks_type_contract::ValueTypeStorageLifetime;
@@ -45,7 +45,7 @@ use std::{
 };
 
 type Ranges = PhasedRangeWork<ExecutionFailure, ValueTypeStorageLifetime>;
-type Lease = RangeLease<ExecutionFailure, ValueTypeStorageLifetime>;
+type CsrRangeObligation = RangeObligation<ExecutionFailure, ValueTypeStorageLifetime>;
 
 struct Partition {
     start: usize,
@@ -164,16 +164,16 @@ pub(crate) struct CsrBuilder {
     _storage: ValueTypeStorageLifetime,
 }
 pub(crate) enum CsrClaim {
-    Initialize(SlotsLease),
-    Work(CsrLease),
+    Initialize(SlotsObligation),
+    Work(CsrObligation),
     Pending,
     Progressed,
     Ready,
     Retired,
 }
-pub(crate) struct CsrLease {
+pub(crate) struct CsrObligation {
     owner: Arc<CsrBuilder>,
-    lease: Lease,
+    obligation: CsrRangeObligation,
     stage: CsrStage,
     cells: Arc<CsrSlots>,
     scatter: Option<(Arc<Bases>, Arc<CsrSlots>)>,
@@ -360,7 +360,9 @@ impl CsrBuilder {
                     let init = Arc::clone(init);
                     drop(state);
                     match init.claim(work.owner, work.control)? {
-                        SlotsClaim::Range(lease) => return Ok(CsrClaim::Initialize(lease)),
+                        SlotsClaim::Range(obligation) => {
+                            return Ok(CsrClaim::Initialize(obligation));
+                        }
                         SlotsClaim::Pending => return Ok(CsrClaim::Pending),
                         SlotsClaim::Retired => return Ok(CsrClaim::Retired),
                         SlotsClaim::Finished => {}
@@ -381,7 +383,7 @@ impl CsrBuilder {
                     }
                 }
                 State::Count(_) | State::Prefix(_) | State::Scatter { .. } => {
-                    if let Some(lease) = self.ranges.claim()? {
+                    if let Some(obligation) = self.ranges.claim()? {
                         let (stage, cells, scatter) = match &*state {
                             State::Count(cells) => (CsrStage::Count, Arc::clone(cells), None),
                             State::Prefix(cells) => (CsrStage::Prefix, Arc::clone(cells), None),
@@ -393,13 +395,13 @@ impl CsrBuilder {
                             _ => unreachable!("phase locked"),
                         };
                         let cursor = if stage == CsrStage::Prefix {
-                            lease.range().start
+                            obligation.range().start
                         } else {
                             0
                         };
-                        return Ok(CsrClaim::Work(CsrLease {
+                        return Ok(CsrClaim::Work(CsrObligation {
                             owner: Arc::clone(self),
-                            lease,
+                            obligation,
                             stage,
                             cells,
                             scatter,
@@ -499,14 +501,14 @@ impl CsrBuilder {
         }
     }
 }
-impl CsrLease {
+impl CsrObligation {
     #[cfg(test)]
     pub(crate) fn stage(&self) -> CsrStage {
         self.stage
     }
     #[cfg(test)]
     pub(crate) fn range(&self) -> Range<usize> {
-        self.lease.range()
+        self.obligation.range()
     }
     pub(crate) fn advance(
         &mut self,
@@ -517,9 +519,9 @@ impl CsrLease {
         result.map_err(|cause| self.owner.fail(cause))
     }
     fn advance_inner(&mut self, quota: usize, work: &BulkWork<'_>) -> ExecutionResult<CsrProgress> {
-        self.owner.ranges.validate(&self.lease)?;
+        self.owner.ranges.validate(&self.obligation)?;
         work.control.checkpoint(0)?;
-        if self.lease.is_settled() {
+        if self.obligation.is_settled() {
             return Err(build_contract("CSR worker advanced a completed range"));
         }
         if matches!(&*self.owner.state()?, State::Retired) {
@@ -533,7 +535,7 @@ impl CsrLease {
             let end = self
                 .cursor
                 .saturating_add(quota)
-                .min(self.lease.range().end);
+                .min(self.obligation.range().end);
             while self.cursor < end {
                 work.control.checkpoint(1)?;
                 let count = layout
@@ -548,7 +550,7 @@ impl CsrLease {
                 self.sum = self.sum.checked_add(count).ok_or_else(arithmetic)?;
                 self.cursor += 1;
             }
-            return Ok(if self.cursor == self.lease.range().end {
+            return Ok(if self.cursor == self.obligation.range().end {
                 CsrProgress::Done
             } else {
                 CsrProgress::Progressed
@@ -558,7 +560,7 @@ impl CsrLease {
             .owner
             .source
             .assignments
-            .range(self.lease.range().start)?;
+            .range(self.obligation.range().start)?;
         let end = self.cursor.saturating_add(quota).min(chunk.matches().len());
         while self.cursor < end {
             work.control.checkpoint(1)?;
@@ -641,9 +643,9 @@ impl CsrLease {
     fn settle_inner(&mut self, allow_retired: bool) -> ExecutionResult<CsrProgress> {
         let result = (|| {
             let state = self.owner.state()?;
-            self.owner.ranges.validate(&self.lease)?;
+            self.owner.ranges.validate(&self.obligation)?;
             if matches!(&*state, State::Retired) && allow_retired {
-                self.owner.ranges.complete(&mut self.lease)?;
+                self.owner.ranges.complete(&mut self.obligation)?;
                 return Ok(CsrProgress::Retired);
             }
             if matches!(&*state, State::Retired) {
@@ -652,12 +654,12 @@ impl CsrLease {
                 ));
             }
             let expected = if self.stage == CsrStage::Prefix {
-                self.lease.range().end
+                self.obligation.range().end
             } else {
                 self.owner
                     .source
                     .assignments
-                    .range(self.lease.range().start)?
+                    .range(self.obligation.range().start)?
                     .matches()
                     .len()
             };
@@ -667,10 +669,10 @@ impl CsrLease {
                 ));
             }
             if self.stage == CsrStage::Prefix {
-                self.owner.sums[self.lease.range().start / self.owner.layout.width.get()]
+                self.owner.sums[self.obligation.range().start / self.owner.layout.width.get()]
                     .store(self.sum, Ordering::Relaxed);
             }
-            self.owner.ranges.complete(&mut self.lease)?;
+            self.owner.ranges.complete(&mut self.obligation)?;
             Ok(CsrProgress::Done)
         })();
         self.owner.changed.notify_observers();
@@ -682,14 +684,14 @@ impl CsrLease {
                 .owner
                 .fail(build_contract("CSR worker retired while demand remains")));
         }
-        let result = self.owner.ranges.complete(&mut self.lease);
+        let result = self.owner.ranges.complete(&mut self.obligation);
         self.owner.changed.notify_observers();
         result
     }
 }
-impl Drop for CsrLease {
+impl Drop for CsrObligation {
     fn drop(&mut self) {
-        if !self.lease.is_settled() {
+        if !self.obligation.is_settled() {
             self.owner
                 .fail(build_contract("CSR worker abandoned its original range"));
         }

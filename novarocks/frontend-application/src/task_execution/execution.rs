@@ -17,8 +17,8 @@
 
 //! The composition root of one query execution attempt's task protocol.
 //!
-//! It owns the graph, one stage execution per stage, one query context owner
-//! per context, the bounded dispatcher, the cross-stage edge-open decision,
+//! It owns the graph, one stage execution per stage, one participation owner
+//! per participation, the bounded dispatcher, the cross-stage edge-open decision,
 //! and the serial status runner. Everything it does is driven by one thread
 //! at a time: `pump` produces intents and releases bounded batches,
 //! `acknowledge` settles one released operation, and `apply_status` applies
@@ -36,12 +36,12 @@ use crate::task_execution::status_validation::GoneObservation;
 use crate::task_protocol_config::DispatchBudget;
 use novarocks_coordination_contract::{MonotonicInstant, StatusObservation};
 use novarocks_execution::task_execution::{
-    AdmissionEpochCapability, CancelReason, ExchangeEdgeId, OperationKind, QueryContextRef,
+    AdmissionEpochCapability, CancelReason, ExchangeEdgeId, OperationKind, ParticipationRef,
     TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskState, TaskStatus, TaskStatusCursor,
     TerminationDetail,
 };
 use novarocks_execution::task_execution::{
-    QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QuiesceQueryContextReceipt,
+    ParticipationConvergenceCursor, ParticipationConvergenceReceipt, QuiesceParticipationReceipt,
     TaskConvergenceCursor, TaskConvergenceReceipt,
 };
 use novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence;
@@ -58,13 +58,15 @@ use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContribution
 use novarocks_query_application::coordination::AcceptedRootControlRequest;
 use novarocks_types::identity::BackendProcessId;
 
-use super::context_owner::{ContextEstablishSource, QueryContextOwner, ReleaseSettlement};
 use super::dispatch::{DispatchOperationState, LocalQueueCapacity, OperationDispatcher};
 use super::error::TaskExecutionError;
 use super::graph::TaskGraph;
 use super::intent::{
     DispatchBatch, OperationAcknowledgement, OperationIntent, TaskOperationQueueAdmission,
     TaskOperationQueuePermit, TaskOperationQueueRequest, TaskOperationSink, TaskOperationSubmit,
+};
+use super::participation_owner::{
+    ParticipationEstablishSource, ParticipationOwner, ReleaseSettlement,
 };
 use super::remote_task::{
     CreateSettlement, RemoteTask, TaskTerminalReport, UpdateAdmission, UpdateSettlement,
@@ -75,15 +77,15 @@ use super::status_intake::{
 };
 
 #[derive(Debug, Default)]
-struct CoveredContextObservation {
+struct CoveredParticipationObservation {
     generation: u64,
     initial_complete: bool,
     bookmark_sequence: u64,
     applied_prefix: u64,
     source_cut: u64,
     actual_stopped: BTreeMap<TaskIdentity, TaskConvergenceReceipt>,
-    context_convergence: Option<QueryContextConvergenceReceipt>,
-    quiesce: Option<QuiesceQueryContextReceipt>,
+    participation_convergence: Option<ParticipationConvergenceReceipt>,
+    quiesce: Option<QuiesceParticipationReceipt>,
     /// An accepted fact that could not establish its task's required terminal
     /// evidence. Only a later complete catch-up with positive facts clears it.
     missing_terminal: BTreeSet<TaskIdentity>,
@@ -134,7 +136,7 @@ impl EdgeControlEffect {
     }
 }
 
-impl CoveredContextObservation {
+impl CoveredParticipationObservation {
     fn begin_generation(&mut self, generation: u64) {
         if generation <= self.generation {
             return;
@@ -176,7 +178,7 @@ enum OperationTarget {
         stage: StageId,
         task: TaskId,
     },
-    Context(QueryContextRef),
+    Participation(ParticipationRef),
     /// One shared-domain advance whose progression belongs to an attempt-local
     /// owner outside this state machine.
     ///
@@ -297,15 +299,15 @@ pub struct StatusReport {
 /// The release-carried runtime-filter contributions of one attempt.
 ///
 /// The observable supply point of this loop: `contributions().len()` against
-/// `contexts()` says whether the carrier is being fed at all. A query that ran
-/// runtime filters and reports zero contributions over three contexts is a
+/// `participations()` says whether the carrier is being fed at all. A query that ran
+/// runtime filters and reports zero contributions over three participations is a
 /// carrier that is not wired, which no per-part test can show.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReleasedRuntimeFilterContributions {
     contributions: Vec<(BackendProcessId, QueryTerminalProfileContributionTelemetry)>,
     complete: bool,
     #[cfg(test)]
-    contexts: usize,
+    participations: usize,
 }
 
 impl ReleasedRuntimeFilterContributions {
@@ -315,14 +317,14 @@ impl ReleasedRuntimeFilterContributions {
         &self.contributions
     }
 
-    /// Whether every context this attempt placed has answered its release.
+    /// Whether every participation this attempt placed has answered its release.
     pub const fn is_complete(&self) -> bool {
         self.complete
     }
 
     #[cfg(test)]
-    pub const fn contexts(&self) -> usize {
-        self.contexts
+    pub const fn participations(&self) -> usize {
+        self.participations
     }
 }
 
@@ -332,16 +334,16 @@ pub struct QueryTaskExecution {
     graph: TaskGraph,
     stages: BTreeMap<StageId, StageExecution>,
     stage_of_task: BTreeMap<TaskId, StageId>,
-    owners: BTreeMap<QueryContextRef, QueryContextOwner>,
+    owners: BTreeMap<ParticipationRef, ParticipationOwner>,
     dispatcher: OperationDispatcher,
     edges: EdgeOpenTracker,
     clock: Arc<dyn MonotonicClock>,
     sink: Arc<dyn TaskOperationSink>,
     intake: StatusIntake,
     covered_observation_active: bool,
-    covered_observation: BTreeMap<QueryContextRef, CoveredContextObservation>,
-    inbound_producers: BTreeMap<QueryContextRef, BTreeSet<TaskIdentity>>,
-    tasks_by_context: BTreeMap<QueryContextRef, Vec<TaskIdentity>>,
+    covered_observation: BTreeMap<ParticipationRef, CoveredParticipationObservation>,
+    inbound_producers: BTreeMap<ParticipationRef, BTreeSet<TaskIdentity>>,
+    tasks_by_participation: BTreeMap<ParticipationRef, Vec<TaskIdentity>>,
     deployment_window_limits: BTreeMap<BackendProcessId, usize>,
     deployment_window: BTreeMap<BackendProcessId, BTreeSet<TaskIdentity>>,
     /// The frozen graph bounds this by sum(producers * (destinations + 1)):
@@ -350,8 +352,8 @@ pub struct QueryTaskExecution {
     actor_abort_queue_preparation: super::intent::TaskOperationQueuePreparation,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
     expired_actor_aborts: Vec<TaskOperationId>,
-    status_reconciliations: BTreeSet<QueryContextRef>,
-    covered_reconciliations: BTreeSet<QueryContextRef>,
+    status_reconciliations: BTreeSet<ParticipationRef>,
+    covered_reconciliations: BTreeSet<ParticipationRef>,
     normal_drain_requested: bool,
     normal_drain_started: bool,
     profile_release_deadline: Option<MonotonicInstant>,
@@ -375,7 +377,7 @@ pub struct QueryTaskExecution {
 #[derive(Debug)]
 pub(crate) struct ActorAbortReservation {
     operation_id: TaskOperationId,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     queue_permit: Box<dyn TaskOperationQueuePermit>,
 }
 
@@ -385,17 +387,17 @@ pub(crate) enum ActorAbortDispatchState {
     InFlight,
 }
 
-/// How an acknowledgement relates to an exact context operation replay which
+/// How an acknowledgement relates to an exact participation operation replay which
 /// has not crossed the current generation's transport boundary yet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum QueuedContextAcknowledgement {
+pub(crate) enum QueuedParticipationAcknowledgement {
     NotQueued,
     IgnoreOlderTransportUnknown,
     ApplyDefinitive,
 }
 
 impl QueryTaskExecution {
-    /// Classifies a context acknowledgement against the dispatch owner before
+    /// Classifies a participation acknowledgement against the dispatch owner before
     /// acknowledgement observers consume it.
     ///
     /// After an unknown outcome, an exact replay may already be queued when an
@@ -403,44 +405,44 @@ impl QueryTaskExecution {
     /// queued generation and is ignored. A definitive Worker answer closes the
     /// exact operation and must cancel that definitely-unsent replay before the
     /// domain owner applies the answer.
-    pub(crate) fn classify_queued_context_acknowledgement(
+    pub(crate) fn classify_queued_participation_acknowledgement(
         &self,
         acknowledgement: &OperationAcknowledgement,
-    ) -> Result<QueuedContextAcknowledgement, TaskExecutionError> {
+    ) -> Result<QueuedParticipationAcknowledgement, TaskExecutionError> {
         if !matches!(
             acknowledgement.kind(),
-            OperationKind::AcquireQueryContextAdmissionTicket | OperationKind::UpdateQueryContext
+            OperationKind::AcquireParticipationAdmissionTicket | OperationKind::UpdateParticipation
         ) || !matches!(
             self.operation_targets.get(&acknowledgement.operation_id()),
-            Some(OperationTarget::Context(_))
+            Some(OperationTarget::Participation(_))
         ) {
-            return Ok(QueuedContextAcknowledgement::NotQueued);
+            return Ok(QueuedParticipationAcknowledgement::NotQueued);
         }
         if self
             .dispatcher
             .operation_state(acknowledgement.operation_id())?
             != DispatchOperationState::Queued
         {
-            return Ok(QueuedContextAcknowledgement::NotQueued);
+            return Ok(QueuedParticipationAcknowledgement::NotQueued);
         }
         Ok(
             if acknowledgement.dispatch_result() != OperationDispatchResult::TransportUnknown {
-                QueuedContextAcknowledgement::ApplyDefinitive
+                QueuedParticipationAcknowledgement::ApplyDefinitive
             } else {
-                QueuedContextAcknowledgement::IgnoreOlderTransportUnknown
+                QueuedParticipationAcknowledgement::IgnoreOlderTransportUnknown
             },
         )
     }
 
     /// Cancels the current definitely-unsent replay and applies the definitive
     /// settled acknowledgement which arrived from an older transport generation.
-    pub(crate) fn acknowledge_queued_context_replay(
+    pub(crate) fn acknowledge_queued_participation_replay(
         &mut self,
         acknowledgement: &OperationAcknowledgement,
     ) -> Result<(), TaskExecutionError> {
         if acknowledgement.dispatch_result() == OperationDispatchResult::TransportUnknown {
             return Err(TaskExecutionError::Schedule(
-                "a queued context replay can be closed only by a definitive acknowledgement"
+                "a queued participation replay can be closed only by a definitive acknowledgement"
                     .to_owned(),
             ));
         }
@@ -449,21 +451,21 @@ impl QueryTaskExecution {
             .operation_targets
             .get(&operation_id)
             .ok_or(TaskExecutionError::UnknownOperation)?;
-        let OperationTarget::Context(context) = target else {
+        let OperationTarget::Participation(participation) = target else {
             return Err(TaskExecutionError::UnknownOperation);
         };
         let intent = self.dispatcher.cancel_queued(operation_id)?;
         if intent.operation_id() != operation_id
             || intent.kind() != acknowledgement.kind()
-            || intent.backend_process_id() != context.backend_process_id()
+            || intent.backend_process_id() != participation.backend_process_id()
         {
             return Err(TaskExecutionError::Schedule(
-                "queued context replay differs from its definitive acknowledgement address"
+                "queued participation replay differs from its definitive acknowledgement address"
                     .to_owned(),
             ));
         }
         self.operation_targets.remove(&operation_id);
-        self.acknowledge_context(context, acknowledgement)
+        self.acknowledge_participation(participation, acknowledgement)
     }
 
     /// Builds the attempt's owners from its frozen graph.
@@ -479,8 +481,8 @@ impl QueryTaskExecution {
         intake: StatusIntake,
     ) -> Result<Self, TaskExecutionError> {
         let participants = graph
-            .contexts()
-            .map(|context| context.backend_process_id())
+            .participations()
+            .map(|participation| participation.backend_process_id())
             .collect::<BTreeSet<_>>();
         if preparing_positions.keys().copied().collect::<BTreeSet<_>>() != participants
             || preparing_positions
@@ -504,15 +506,15 @@ impl QueryTaskExecution {
                 TaskIdentity,
             )>,
         >::new();
-        let mut inbound_producers = BTreeMap::<QueryContextRef, BTreeSet<TaskIdentity>>::new();
+        let mut inbound_producers = BTreeMap::<ParticipationRef, BTreeSet<TaskIdentity>>::new();
         for edge in graph.edges() {
             for destination in edge.destinations() {
-                let context = graph
+                let participation = graph
                     .task(destination.task_id())
                     .ok_or(TaskExecutionError::UnknownOperation)?
-                    .context();
+                    .participation();
                 inbound_producers
-                    .entry(context)
+                    .entry(participation)
                     .or_default()
                     .extend(edge.producers().iter().copied());
             }
@@ -527,30 +529,32 @@ impl QueryTaskExecution {
             }
         }
         let root_task = graph.root_task();
-        let mut owners = BTreeMap::<QueryContextRef, QueryContextOwner>::new();
-        let mut tasks_per_context = BTreeMap::<QueryContextRef, usize>::new();
-        let mut tasks_by_context = BTreeMap::<QueryContextRef, Vec<TaskIdentity>>::new();
+        let mut owners = BTreeMap::<ParticipationRef, ParticipationOwner>::new();
+        let mut tasks_per_participation = BTreeMap::<ParticipationRef, usize>::new();
+        let mut tasks_by_participation = BTreeMap::<ParticipationRef, Vec<TaskIdentity>>::new();
         for task in graph.tasks() {
-            *tasks_per_context.entry(task.context()).or_default() += 1;
-            tasks_by_context
-                .entry(task.context())
+            *tasks_per_participation
+                .entry(task.participation())
+                .or_default() += 1;
+            tasks_by_participation
+                .entry(task.participation())
                 .or_default()
                 .push(task.identity());
         }
-        for (&context, &tasks) in &tasks_per_context {
+        for (&participation, &tasks) in &tasks_per_participation {
             let admission_epoch_capability = admission_epochs
-                .get(&context.backend_process_id())
+                .get(&participation.backend_process_id())
                 .copied()
                 .ok_or_else(|| {
                     TaskExecutionError::Schedule(format!(
                         "backend {} has no frozen admission epoch capability",
-                        context.backend_process_id()
+                        participation.backend_process_id()
                     ))
                 })?;
             owners.insert(
-                context,
-                QueryContextOwner::new(
-                    context,
+                participation,
+                ParticipationOwner::new(
+                    participation,
                     tasks,
                     native_compatibility_id,
                     admission_epoch_capability,
@@ -566,9 +570,9 @@ impl QueryTaskExecution {
             let node = graph
                 .task(task_id)
                 .ok_or_else(|| TaskExecutionError::Schedule(format!("task {task_id} is absent")))?;
-            if seed.identity() != node.identity() || seed.context() != node.context() {
+            if seed.identity() != node.identity() || seed.participation() != node.participation() {
                 return Err(TaskExecutionError::Schedule(format!(
-                    "task {task_id} creation seed names another task or context"
+                    "task {task_id} creation seed names another task or participation"
                 )));
             }
             dispatcher.register_task(node.identity().backend_process_id())?;
@@ -592,9 +596,9 @@ impl QueryTaskExecution {
         }
 
         let covered_observation = graph
-            .contexts()
+            .participations()
             .copied()
-            .map(|context| (context, CoveredContextObservation::default()))
+            .map(|participation| (participation, CoveredParticipationObservation::default()))
             .collect();
         Ok(Self {
             graph,
@@ -609,7 +613,7 @@ impl QueryTaskExecution {
             covered_observation_active: false,
             covered_observation,
             inbound_producers,
-            tasks_by_context,
+            tasks_by_participation,
             deployment_window_limits,
             deployment_window: BTreeMap::new(),
             edge_control_effects: VecDeque::new(),
@@ -645,18 +649,18 @@ impl QueryTaskExecution {
         let expected = self.owners.keys().copied().collect::<BTreeSet<_>>();
         let actual = admissions
             .iter()
-            .map(ReplacementWorkerAdmissionEvidence::context)
+            .map(ReplacementWorkerAdmissionEvidence::participation)
             .collect::<BTreeSet<_>>();
         if admissions.len() != actual.len() || actual != expected {
             return Err(TaskExecutionError::Schedule(
-                "qualified replacement admission set differs from the Task manifest contexts"
+                "qualified replacement admission set differs from the Task manifest participations"
                     .to_owned(),
             ));
         }
         let now = self.clock.now();
         for admission in admissions.iter() {
             self.owners
-                .get_mut(&admission.context())
+                .get_mut(&admission.participation())
                 .expect("the complete replacement admission set was validated")
                 .adopt_replacement_admission(admission.receipt(), now)?;
         }
@@ -695,11 +699,11 @@ impl QueryTaskExecution {
         self.stages.get(&stage_id)
     }
 
-    pub fn owner(&self, context: QueryContextRef) -> Option<&QueryContextOwner> {
-        self.owners.get(&context)
+    pub fn owner(&self, participation: ParticipationRef) -> Option<&ParticipationOwner> {
+        self.owners.get(&participation)
     }
 
-    /// Read an exact pre-ready context's original admission horizon using
+    /// Read an exact pre-ready participation's original admission horizon using
     /// the same Task clock that accepted its receipt, never an actor clock.
     pub(crate) fn pre_ready_observation_remaining(
         &self,
@@ -707,43 +711,43 @@ impl QueryTaskExecution {
     ) -> Option<Duration> {
         self.owners
             .iter()
-            .find(|(context, _)| context.backend_process_id() == backend)
+            .find(|(participation, _)| participation.backend_process_id() == backend)
             .and_then(|(_, owner)| owner.pre_ready_observation_remaining(self.clock.now()))
     }
 
     pub(crate) fn rejected_establish_observation_remaining(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         operation_id: TaskOperationId,
     ) -> Option<Duration> {
         self.owners
-            .get(&context)?
+            .get(&participation)?
             .rejected_establish_observation_remaining(operation_id, self.clock.now())
     }
 
     /// Only the Task that accepted this exact Create refusal retains its
-    /// snapshot. A context/op correlation cannot manufacture that evidence.
+    /// snapshot. A participation/op correlation cannot manufacture that evidence.
     pub(crate) fn rejected_create_observation_remaining(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         operation_id: TaskOperationId,
     ) -> Option<Duration> {
         self.graph
             .tasks()
-            .filter(|task| task.context() == context)
+            .filter(|task| task.participation() == participation)
             .find_map(|task| {
                 self.task_by_identity_ref(task.identity())?
                     .rejected_create_observation_remaining(operation_id, self.clock.now())
             })
     }
 
-    /// Takes contexts whose task-operation acknowledgement requires an
+    /// Takes participations whose task-operation acknowledgement requires an
     /// immediate status resubscription from the frontend's held cursors.
-    pub fn take_status_reconciliations(&mut self) -> BTreeSet<QueryContextRef> {
+    pub fn take_status_reconciliations(&mut self) -> BTreeSet<ParticipationRef> {
         std::mem::take(&mut self.status_reconciliations)
     }
 
-    pub(crate) fn take_covered_reconciliations(&mut self) -> BTreeSet<QueryContextRef> {
+    pub(crate) fn take_covered_reconciliations(&mut self) -> BTreeSet<ParticipationRef> {
         std::mem::take(&mut self.covered_reconciliations)
     }
 
@@ -754,11 +758,11 @@ impl QueryTaskExecution {
     /// Every backend's sealed runtime-filter observation, as its release
     /// reported it, with whether the set is complete.
     ///
-    /// A context contributes an entry only if its release settled *and*
+    /// A participation contributes an entry only if its release settled *and*
     /// carried a contribution. The two reasons an entry is missing are not the
-    /// same fact and are not collapsed here: a context that released without
+    /// same fact and are not collapsed here: a participation that released without
     /// one installed no participant on that backend, which is an ordinary
-    /// query with no runtime filter there; a context that never released has
+    /// query with no runtime filter there; a participation that never released has
     /// an answer still outstanding. `is_complete` is the second question, and
     /// it is what stops an outstanding release from reading as an absent
     /// filter.
@@ -767,15 +771,15 @@ impl QueryTaskExecution {
             contributions: self
                 .owners
                 .iter()
-                .filter_map(|(context, owner)| {
+                .filter_map(|(participation, owner)| {
                     owner
                         .runtime_filter_contribution()
-                        .map(|telemetry| (context.backend_process_id(), telemetry.clone()))
+                        .map(|telemetry| (participation.backend_process_id(), telemetry.clone()))
                 })
                 .collect(),
-            complete: self.owners.values().all(QueryContextOwner::is_released),
+            complete: self.owners.values().all(ParticipationOwner::is_released),
             #[cfg(test)]
-            contexts: self.owners.len(),
+            participations: self.owners.len(),
         }
     }
 
@@ -871,7 +875,7 @@ impl QueryTaskExecution {
     /// different order releases the same set.
     pub fn pump(
         &mut self,
-        establish: &dyn ContextEstablishSource,
+        establish: &dyn ParticipationEstablishSource,
     ) -> Result<PumpReport, TaskExecutionError> {
         self.advance_normal_drain();
         self.refresh_deployment_window();
@@ -880,7 +884,7 @@ impl QueryTaskExecution {
         let mut report = PumpReport::default();
         if self.terminal_cleanup_started {
             // Terminal cleanup forbids new normal work, but the actor can
-            // still enqueue Abort effects for contexts the Worker holds.
+            // still enqueue Abort effects for participations the Worker holds.
             // Those exact, capacity-reserved effects must cross transport.
             self.submit_queued_batches(&mut report)?;
             return Ok(report);
@@ -898,19 +902,21 @@ impl QueryTaskExecution {
 
         let mut lifecycle = Vec::<AdmissionCandidate>::new();
         if !self.normal_drain_started {
-            for (&context, owner) in &mut self.owners {
+            for (&participation, owner) in &mut self.owners {
                 if let Some(intent) = owner.admission_intent(now)? {
                     lifecycle.push(AdmissionCandidate::minted(
-                        OperationTarget::Context(context),
+                        OperationTarget::Participation(participation),
                         intent,
                     ));
                 }
                 if !owner.needs_establish() {
                     continue;
                 }
-                if let Some(intent) = owner.establish_intent(establish.facts_for(context)?, now)? {
+                if let Some(intent) =
+                    owner.establish_intent(establish.facts_for(participation)?, now)?
+                {
                     lifecycle.push(AdmissionCandidate::minted(
-                        OperationTarget::Context(context),
+                        OperationTarget::Participation(participation),
                         intent,
                     ));
                 }
@@ -964,39 +970,39 @@ impl QueryTaskExecution {
         }
         let release_ready = self
             .graph
-            .contexts()
+            .participations()
             .copied()
-            .map(|context| {
+            .map(|participation| {
                 Ok::<_, TaskExecutionError>((
-                    context,
-                    self.receiver_inputs_stopped(context)?
-                        && self.context_tasks_stopped(context)?,
+                    participation,
+                    self.receiver_inputs_stopped(participation)?
+                        && self.participation_tasks_stopped(participation)?,
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        for (&context, owner) in &mut self.owners {
+        for (&participation, owner) in &mut self.owners {
             if self.normal_drain_started
                 && let Some(intent) = owner.quiesce_intent()
             {
                 lifecycle.push(AdmissionCandidate::minted(
-                    OperationTarget::Context(context),
+                    OperationTarget::Participation(participation),
                     intent,
                 ));
             }
             if let Some(intent) = owner.renew_intent(now)? {
                 lifecycle.push(AdmissionCandidate::minted(
-                    OperationTarget::Context(context),
+                    OperationTarget::Participation(participation),
                     intent,
                 ));
             }
             if !self
                 .profile_release_deadline
                 .is_some_and(|deadline| !now.has_reached(deadline))
-                && release_ready.get(&context) == Some(&true)
+                && release_ready.get(&participation) == Some(&true)
                 && let Some(intent) = owner.release_intent(now)
             {
                 lifecycle.push(AdmissionCandidate::minted(
-                    OperationTarget::Context(context),
+                    OperationTarget::Participation(participation),
                     intent,
                 ));
             }
@@ -1148,15 +1154,15 @@ impl QueryTaskExecution {
         &mut self,
         intent: &OperationIntent,
     ) -> Result<Option<ActorAbortReservation>, TaskExecutionError> {
-        let OperationIntent::AbortQueryContext(request) = intent else {
+        let OperationIntent::AbortParticipation(request) = intent else {
             return Err(TaskExecutionError::Schedule(
-                "actor Abort intake preview is not an AbortQueryContext intent".to_owned(),
+                "actor Abort intake preview is not an AbortParticipation intent".to_owned(),
             ));
         };
-        if !self.owners.contains_key(&request.context()) {
+        if !self.owners.contains_key(&request.participation()) {
             return Err(TaskExecutionError::Schedule(format!(
-                "actor Abort names context {} outside this attempt",
-                request.context()
+                "actor Abort names participation {} outside this attempt",
+                request.participation()
             )));
         }
         if self.operation_targets.contains_key(&intent.operation_id()) {
@@ -1179,7 +1185,7 @@ impl QueryTaskExecution {
         };
         Ok(Some(ActorAbortReservation {
             operation_id: intent.operation_id(),
-            context: request.context(),
+            participation: request.participation(),
             queue_permit,
         }))
     }
@@ -1190,13 +1196,13 @@ impl QueryTaskExecution {
         intent: OperationIntent,
         reservation: ActorAbortReservation,
     ) -> Result<(), TaskExecutionError> {
-        let OperationIntent::AbortQueryContext(request) = &intent else {
+        let OperationIntent::AbortParticipation(request) = &intent else {
             return Err(TaskExecutionError::Schedule(
-                "actor Abort carrier is not an AbortQueryContext intent".to_owned(),
+                "actor Abort carrier is not an AbortParticipation intent".to_owned(),
             ));
         };
         if intent.operation_id() != reservation.operation_id
-            || request.context() != reservation.context
+            || request.participation() != reservation.participation
         {
             return Err(TaskExecutionError::Schedule(
                 "actor Abort carrier differs from its reserved preview".to_owned(),
@@ -1241,7 +1247,7 @@ impl QueryTaskExecution {
             return Err(TaskExecutionError::UnknownOperation);
         }
         let intent = self.dispatcher.cancel_queued(operation_id)?;
-        if intent.kind() != OperationKind::AbortQueryContext {
+        if intent.kind() != OperationKind::AbortParticipation {
             return Err(TaskExecutionError::Schedule(
                 "actor Abort dispatcher target retained a non-Abort carrier".to_owned(),
             ));
@@ -1253,14 +1259,14 @@ impl QueryTaskExecution {
     /// Applies the positive closure fact from a definitive actor-owned Abort
     /// receipt. The actor owns the Abort issue and settlement; this method
     /// only projects that already-validated Worker fact to the matching
-    /// context owner so normal attempt convergence can observe it.
-    pub(crate) fn observe_actor_abort_context_closed(
+    /// participation owner so normal attempt convergence can observe it.
+    pub(crate) fn observe_actor_abort_participation_closed(
         &mut self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<(), TaskExecutionError> {
         let owner = self
             .owners
-            .get_mut(&context)
+            .get_mut(&participation)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         owner.observe_actor_abort_closure();
         Ok(())
@@ -1321,11 +1327,11 @@ impl QueryTaskExecution {
     }
 
     /// Project only this sealed read's actual, complete output-demand
-    /// withdrawals. Context custody and Worker settlements remain untouched.
-    pub(crate) fn result_context_withdrawals(
+    /// withdrawals. Participation custody and Worker settlements remain untouched.
+    pub(crate) fn result_participation_withdrawals(
         &self,
         activation: novarocks_coordination_contract::AttemptActivationIdentity,
-    ) -> Vec<novarocks_coordination_contract::ResultContextWithdrawal> {
+    ) -> Vec<novarocks_coordination_contract::ResultParticipationWithdrawal> {
         let root = self.graph.root_identity();
         if !self.normal_drain_started
             || self.failure_cause().is_some()
@@ -1338,31 +1344,33 @@ impl QueryTaskExecution {
             return Vec::new();
         }
         let outputs = self.edges.normal_output_withdrawals(&self.graph);
-        let mut contexts = BTreeMap::<QueryContextRef, bool>::new();
+        let mut participations = BTreeMap::<ParticipationRef, bool>::new();
         for task in self.graph.tasks() {
             // No output edge supplies no result-withdrawal evidence.
             let withdrawn = outputs.get(&task.identity()) == Some(&true);
-            contexts
-                .entry(task.context())
+            participations
+                .entry(task.participation())
                 .and_modify(|all| *all &= withdrawn)
                 .or_insert(withdrawn);
         }
         self.graph
-            .contexts()
-            .filter(|&&context| {
-                context.backend_process_id() != root.backend_process_id()
-                    && contexts.get(&context) == Some(&true)
+            .participations()
+            .filter(|&&participation| {
+                participation.backend_process_id() != root.backend_process_id()
+                    && participations.get(&participation) == Some(&true)
             })
-            .map(|&context| {
-                novarocks_coordination_contract::ResultContextWithdrawal::new(
-                    activation, root, context,
+            .map(|&participation| {
+                novarocks_coordination_contract::ResultParticipationWithdrawal::new(
+                    activation,
+                    root,
+                    participation,
                 )
             })
             .collect()
     }
 
     /// Applies one exact local no-more-input authorization. An unknown Create
-    /// outcome is kept for Context fencing, but cannot keep this destination
+    /// outcome is kept for Participation fencing, but cannot keep this destination
     /// in the producer's opening barrier or revive its normal input need.
     pub(crate) fn stand_down_task_normally(
         &mut self,
@@ -1461,7 +1469,9 @@ impl QueryTaskExecution {
         self.operation_targets.remove(&ack.operation_id());
         match target {
             OperationTarget::Task { stage, task } => self.acknowledge_task(stage, task, ack),
-            OperationTarget::Context(context) => self.acknowledge_context(context, ack),
+            OperationTarget::Participation(participation) => {
+                self.acknowledge_participation(participation, ack)
+            }
             // The permit is already released above. The verdict belongs to the
             // domain owner, which read this acknowledgement from the observer
             // seam before the runner got here, so applying it a second time
@@ -1483,25 +1493,25 @@ impl QueryTaskExecution {
         let task = stage
             .task_mut(task_id)
             .ok_or(TaskExecutionError::UnknownOperation)?;
-        let context = task.context();
+        let participation = task.participation();
         match ack.kind() {
             OperationKind::CreateTask => {
                 let identity = task.identity();
-                let context = task.context();
+                let participation = task.participation();
                 let was_owned = task.create_ownership_proven();
-                let context_established = self
+                let participation_established = self
                     .owners
-                    .get(&context)
-                    .is_some_and(QueryContextOwner::establish_acknowledged);
+                    .get(&participation)
+                    .is_some_and(ParticipationOwner::establish_acknowledged);
                 let observation_horizon = self
                     .owners
-                    .get(&context)
-                    .and_then(QueryContextOwner::create_refusal_observation_horizon);
+                    .get(&participation)
+                    .and_then(ParticipationOwner::create_refusal_observation_horizon);
                 let previous_status = task.status().map(TaskStatus::version);
                 let settlement = task.on_create_ack(
                     ack,
                     self.clock.now(),
-                    context_established,
+                    participation_established,
                     observation_horizon,
                 )?;
                 let accepted_status_changed =
@@ -1509,7 +1519,7 @@ impl QueryTaskExecution {
                 if !matches!(settlement, CreateSettlement::Created) {
                     if let CreateSettlement::FailedClosed(_) = settlement {
                         return Err(TaskExecutionError::OperationFailed {
-                            context,
+                            participation,
                             operation_id: ack.operation_id(),
                             kind: OperationKind::CreateTask,
                             rejection: ack
@@ -1523,7 +1533,7 @@ impl QueryTaskExecution {
                 }
                 if !was_owned
                     && task.create_ownership_proven()
-                    && let Some(owner) = self.owners.get_mut(&context)
+                    && let Some(owner) = self.owners.get_mut(&participation)
                 {
                     owner.note_create_owned();
                 }
@@ -1539,7 +1549,7 @@ impl QueryTaskExecution {
             }
             OperationKind::UpdateTask => match task.on_update_ack(ack)? {
                 UpdateSettlement::FailedClosed(_) => Err(TaskExecutionError::OperationFailed {
-                    context,
+                    participation,
                     operation_id: ack.operation_id(),
                     kind: OperationKind::UpdateTask,
                     rejection: ack
@@ -1547,7 +1557,7 @@ impl QueryTaskExecution {
                         .expect("a checked Worker verdict has its original branch"),
                 }),
                 UpdateSettlement::AwaitingTerminalStatus => {
-                    self.status_reconciliations.insert(context);
+                    self.status_reconciliations.insert(participation);
                     Ok(())
                 }
                 _ => Ok(()),
@@ -1557,47 +1567,47 @@ impl QueryTaskExecution {
         }
     }
 
-    fn acknowledge_context(
+    fn acknowledge_participation(
         &mut self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         ack: &OperationAcknowledgement,
     ) -> Result<(), TaskExecutionError> {
         let now = self.clock.now();
         let owner = self
             .owners
-            .get_mut(&context)
+            .get_mut(&participation)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         match ack.kind() {
-            OperationKind::AcquireQueryContextAdmissionTicket => owner.on_admission_ack(ack, now),
-            OperationKind::UpdateQueryContext => {
-                owner.on_context_ack(ack)?;
+            OperationKind::AcquireParticipationAdmissionTicket => owner.on_admission_ack(ack, now),
+            OperationKind::UpdateParticipation => {
+                owner.on_participation_ack(ack)?;
                 if owner.establish_acknowledged() {
                     for stage in self.stages.values_mut() {
                         for (_, task) in stage.tasks_mut() {
-                            if task.context() == context {
-                                task.on_context_established();
+                            if task.participation() == participation {
+                                task.on_participation_established();
                             }
                         }
                     }
                 }
                 Ok(())
             }
-            OperationKind::QuiesceQueryContext => {
+            OperationKind::QuiesceParticipation => {
                 let receipt = owner.on_quiesce_ack(ack)?;
                 if let Some(receipt) = receipt {
-                    self.apply_quiesce_membership(context, &receipt)?;
+                    self.apply_quiesce_membership(participation, &receipt)?;
                 }
                 Ok(())
             }
-            OperationKind::ReleaseQueryContext => {
+            OperationKind::ReleaseParticipation => {
                 owner
                     .on_release_ack(ack, now)
                     .and_then(|settlement| match settlement {
                         ReleaseSettlement::FailedClosed(_) => {
                             Err(TaskExecutionError::OperationFailed {
-                                context,
+                                participation,
                                 operation_id: ack.operation_id(),
-                                kind: OperationKind::ReleaseQueryContext,
+                                kind: OperationKind::ReleaseParticipation,
                                 rejection: ack
                                     .worker_header()
                                     .expect("a checked Worker verdict has its original branch"),
@@ -1612,8 +1622,8 @@ impl QueryTaskExecution {
 
     fn apply_quiesce_membership(
         &mut self,
-        context: QueryContextRef,
-        receipt: &novarocks_execution::task_execution::QuiesceQueryContextReceipt,
+        participation: ParticipationRef,
+        receipt: &novarocks_execution::task_execution::QuiesceParticipationReceipt,
     ) -> Result<(), TaskExecutionError> {
         let accepted = receipt
             .accepted_tasks()
@@ -1631,16 +1641,16 @@ impl QueryTaskExecution {
                     "quiesce membership names an unscheduled task {identity}"
                 )));
             };
-            if task.context() != context {
+            if task.participation() != participation {
                 return Err(TaskExecutionError::DomainReceipt(format!(
-                    "quiesce membership names task {identity} in another context"
+                    "quiesce membership names task {identity} in another participation"
                 )));
             }
         }
         let mut drained = Vec::new();
         for (&stage_id, stage) in &mut self.stages {
             for (task_id, task) in stage.tasks_mut() {
-                if task.context() != context {
+                if task.participation() != participation {
                     continue;
                 }
                 let was_fenced_out = task.fenced_out();
@@ -1648,7 +1658,7 @@ impl QueryTaskExecution {
                     task.on_quiesce_membership(accepted.contains(&task.identity()))?;
                 let owner = self
                     .owners
-                    .get_mut(&context)
+                    .get_mut(&participation)
                     .ok_or(TaskExecutionError::UnknownOperation)?;
                 if became_owned {
                     owner.note_create_owned();
@@ -1667,11 +1677,11 @@ impl QueryTaskExecution {
     /// Applies an exact transport send fact on the same serial owner as ACKs.
     pub(crate) fn establish_send_started(
         &mut self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         operation_id: TaskOperationId,
     ) -> Result<(), TaskExecutionError> {
         self.owners
-            .get_mut(&context)
+            .get_mut(&participation)
             .ok_or(TaskExecutionError::UnknownOperation)?
             .on_establish_send_started(operation_id)
     }
@@ -1834,21 +1844,21 @@ impl QueryTaskExecution {
     /// applied, never from transport receipt or an unconsumed intake slot.
     pub(crate) fn covered_subscription_request(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         generation: NonZeroU64,
     ) -> Result<DecodedCoveredSubscription, TaskExecutionError> {
         let state = self
             .covered_observation
-            .get(&context)
+            .get(&participation)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         let request = DecodedCoveredSubscription {
-            context,
+            participation,
             generation,
-            status_cursors: self.status_cursors(context),
+            status_cursors: self.status_cursors(participation),
             task_convergence_cursors: self
                 .graph
                 .tasks()
-                .filter(|task| task.context() == context)
+                .filter(|task| task.participation() == participation)
                 .map(|task| {
                     let identity = task.identity();
                     state.actual_stopped.get(&identity).map_or_else(
@@ -1857,20 +1867,20 @@ impl QueryTaskExecution {
                     )
                 })
                 .collect(),
-            context_cursor: state
-                .context_convergence
-                .map(|receipt| QueryContextConvergenceCursor::at(context, receipt.version())),
+            participation_cursor: state.participation_convergence.map(|receipt| {
+                ParticipationConvergenceCursor::at(participation, receipt.version())
+            }),
             quiesce_cursor: state
                 .quiesce
                 .as_ref()
                 .map(|receipt| QuiesceObservationCursor {
-                    context,
+                    participation,
                     fence_version: NonZeroU64::new(receipt.fence_version()),
                 }),
             required_identities: self
                 .graph
                 .tasks()
-                .filter(|task| task.context() == context)
+                .filter(|task| task.participation() == participation)
                 .map(|task| task.identity())
                 .collect(),
         };
@@ -1881,11 +1891,11 @@ impl QueryTaskExecution {
 
     pub(crate) fn next_covered_generation(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<NonZeroU64, TaskExecutionError> {
         let observed = self
             .covered_observation
-            .get(&context)
+            .get(&participation)
             .ok_or(TaskExecutionError::UnknownOperation)?
             .generation;
         let next = observed.checked_add(1).ok_or_else(|| {
@@ -1897,17 +1907,17 @@ impl QueryTaskExecution {
     }
 
     /// Only a registered local observation gap affects the read success cut.
-    /// Ordinary reconnect or an unrelated Context's catch-up does not.
+    /// Ordinary reconnect or an unrelated Participation's catch-up does not.
     pub(crate) fn covered_observation_ready(&self) -> bool {
         self.covered_observation
             .values()
             .all(|state| !state.gap_pending())
     }
 
-    pub(crate) fn covered_gap_contexts(&self) -> impl Iterator<Item = QueryContextRef> + '_ {
+    pub(crate) fn covered_gap_participations(&self) -> impl Iterator<Item = ParticipationRef> + '_ {
         self.covered_observation
             .iter()
-            .filter_map(|(&context, state)| state.gap_pending().then_some(context))
+            .filter_map(|(&participation, state)| state.gap_pending().then_some(participation))
     }
 
     pub(crate) fn covered_recovery_expired(&self) -> bool {
@@ -1932,21 +1942,26 @@ impl QueryTaskExecution {
 
     pub(crate) fn task_actual_stopped(&self, identity: TaskIdentity) -> bool {
         self.task_by_identity_ref(identity)
-            .and_then(|task| self.covered_observation.get(&task.context()))
+            .and_then(|task| self.covered_observation.get(&task.participation()))
             .is_some_and(|state| state.actual_stopped.contains_key(&identity))
     }
 
-    /// A receiver Context may release only after every frozen inbound sender
+    /// A receiver Participation may release only after every frozen inbound sender
     /// that the Worker actually accepted has stopped. A Task fenced out by
     /// its own complete Quiesce receipt has no remote sender to wait for.
     fn receiver_inputs_stopped(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
     ) -> Result<bool, TaskExecutionError> {
         if !self.covered_observation_active {
             return Ok(true);
         }
-        for &producer in self.inbound_producers.get(&context).into_iter().flatten() {
+        for &producer in self
+            .inbound_producers
+            .get(&participation)
+            .into_iter()
+            .flatten()
+        {
             let task = self
                 .task_by_identity_ref(producer)
                 .ok_or(TaskExecutionError::UnknownOperation)?;
@@ -1957,14 +1972,22 @@ impl QueryTaskExecution {
         Ok(true)
     }
 
-    /// Keep this Context's own stopped facts until dependent receivers have
+    /// Keep this Participation's own stopped facts until dependent receivers have
     /// used them. A terminal status describes the Task's result, not the end
     /// of its local exchange and resource responsibilities.
-    fn context_tasks_stopped(&self, context: QueryContextRef) -> Result<bool, TaskExecutionError> {
+    fn participation_tasks_stopped(
+        &self,
+        participation: ParticipationRef,
+    ) -> Result<bool, TaskExecutionError> {
         if !self.covered_observation_active {
             return Ok(true);
         }
-        for &identity in self.tasks_by_context.get(&context).into_iter().flatten() {
+        for &identity in self
+            .tasks_by_participation
+            .get(&participation)
+            .into_iter()
+            .flatten()
+        {
             let remote = self
                 .task_by_identity_ref(identity)
                 .ok_or(TaskExecutionError::UnknownOperation)?;
@@ -1987,10 +2010,10 @@ impl QueryTaskExecution {
             match entry {
                 ObservationIntakeEntry::Frame(frame) => match *frame {
                     ObservationFrame::Covered {
-                        context,
+                        participation,
                         generation,
                         event,
-                    } => self.apply_covered_frame(context, generation, event, &mut report)?,
+                    } => self.apply_covered_frame(participation, generation, event, &mut report)?,
                     #[cfg(test)]
                     ObservationFrame::Status(_) | ObservationFrame::Gone(_) => {
                         return Err(TaskExecutionError::Schedule(
@@ -2012,7 +2035,7 @@ impl QueryTaskExecution {
 
     fn apply_covered_frame(
         &mut self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         generation: u64,
         event: CoveredStatusStreamEvent,
         report: &mut StatusReport,
@@ -2025,7 +2048,7 @@ impl QueryTaskExecution {
         let now = self.clock.now();
         let state = self
             .covered_observation
-            .get_mut(&context)
+            .get_mut(&participation)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         state.begin_generation(generation);
         let gap_before = state.gap_pending();
@@ -2050,18 +2073,18 @@ impl QueryTaskExecution {
         match event.fact {
             CoveredStatusStreamFact::Status(status) => {
                 let identity = status.identity();
-                self.verify_covered_task(context, identity)?;
+                self.verify_covered_task(participation, identity)?;
                 self.apply_published(&status, report)?;
                 if status.is_terminal() {
                     self.covered_observation
-                        .get_mut(&context)
-                        .expect("validated context")
+                        .get_mut(&participation)
+                        .expect("validated participation")
                         .missing_terminal
                         .remove(&identity);
                 }
             }
             CoveredStatusStreamFact::Gone(identity) => {
-                self.verify_covered_task(context, identity)?;
+                self.verify_covered_task(participation, identity)?;
                 if !current_generation {
                     report.ignored += 1;
                     return Ok(());
@@ -2074,21 +2097,21 @@ impl QueryTaskExecution {
                     let task = self.task_by_identity(identity).expect("validated task");
                     if matches!(task.observe_gone(), GoneObservation::TerminalNeverObserved) {
                         self.covered_observation
-                            .get_mut(&context)
+                            .get_mut(&participation)
                             .unwrap()
                             .note_status_gap(identity, now);
                     }
                 } else {
                     self.covered_observation
-                        .get_mut(&context)
+                        .get_mut(&participation)
                         .unwrap()
                         .note_status_gap(identity, now);
                 }
                 report.ignored += 1;
             }
             CoveredStatusStreamFact::TaskConvergence(receipt) => {
-                self.verify_covered_task(context, receipt.identity())?;
-                let state = self.covered_observation.get_mut(&context).unwrap();
+                self.verify_covered_task(participation, receipt.identity())?;
+                let state = self.covered_observation.get_mut(&participation).unwrap();
                 if let Some(previous) = state.actual_stopped.get(&receipt.identity()) {
                     if previous != &receipt {
                         return Err(TaskExecutionError::Schedule(
@@ -2100,31 +2123,33 @@ impl QueryTaskExecution {
                 }
                 report.ignored += 1;
             }
-            CoveredStatusStreamFact::ContextConvergence(receipt) => {
-                if receipt.context() != context {
+            CoveredStatusStreamFact::ParticipationConvergence(receipt) => {
+                if receipt.participation() != participation {
                     return Err(TaskExecutionError::Schedule(
-                        "Context convergence observation names another context".to_owned(),
+                        "Participation convergence observation names another participation"
+                            .to_owned(),
                     ));
                 }
-                let state = self.covered_observation.get_mut(&context).unwrap();
-                if let Some(previous) = state.context_convergence {
+                let state = self.covered_observation.get_mut(&participation).unwrap();
+                if let Some(previous) = state.participation_convergence {
                     if previous != receipt {
                         return Err(TaskExecutionError::Schedule(
-                            "Context convergence receipt changed after application".to_owned(),
+                            "Participation convergence receipt changed after application"
+                                .to_owned(),
                         ));
                     }
                 } else {
-                    state.context_convergence = Some(receipt);
+                    state.participation_convergence = Some(receipt);
                 }
                 report.ignored += 1;
             }
             CoveredStatusStreamFact::Quiesce(receipt) => {
-                if receipt.context() != context {
+                if receipt.participation() != participation {
                     return Err(TaskExecutionError::Schedule(
-                        "Quiesce observation names another context".to_owned(),
+                        "Quiesce observation names another participation".to_owned(),
                     ));
                 }
-                if let Some(previous) = &self.covered_observation[&context].quiesce
+                if let Some(previous) = &self.covered_observation[&participation].quiesce
                     && (previous.fence_version() != receipt.fence_version()
                         || previous.accepted_tasks() != receipt.accepted_tasks())
                 {
@@ -2132,16 +2157,19 @@ impl QueryTaskExecution {
                         "Quiesce observation changed its accepted membership".to_owned(),
                     ));
                 }
-                self.apply_quiesce_membership(context, &receipt)?;
+                self.apply_quiesce_membership(participation, &receipt)?;
                 self.owners
-                    .get_mut(&context)
-                    .expect("validated context")
+                    .get_mut(&participation)
+                    .expect("validated participation")
                     .observe_quiesce(&receipt)?;
-                self.covered_observation.get_mut(&context).unwrap().quiesce = Some(receipt);
+                self.covered_observation
+                    .get_mut(&participation)
+                    .unwrap()
+                    .quiesce = Some(receipt);
                 report.ignored += 1;
             }
             CoveredStatusStreamFact::StatusUnchanged(identity) => {
-                self.verify_covered_task(context, identity)?;
+                self.verify_covered_task(participation, identity)?;
                 if current_generation
                     && self
                         .task_by_identity_ref(identity)
@@ -2155,9 +2183,9 @@ impl QueryTaskExecution {
                 report.ignored += 1;
             }
             CoveredStatusStreamFact::TaskConvergenceUnchanged(identity) => {
-                self.verify_covered_task(context, identity)?;
+                self.verify_covered_task(participation, identity)?;
                 if current_generation
-                    && !self.covered_observation[&context]
+                    && !self.covered_observation[&participation]
                         .actual_stopped
                         .contains_key(&identity)
                 {
@@ -2169,7 +2197,7 @@ impl QueryTaskExecution {
                 report.ignored += 1;
             }
             CoveredStatusStreamFact::Unknown(identity) => {
-                self.verify_covered_task(context, identity)?;
+                self.verify_covered_task(participation, identity)?;
                 // The source's initial cut can precede an Accepted ACK that
                 // this serial owner applied before the Unknown frame arrived.
                 // This absence at an older cut cannot retract ownership.
@@ -2182,7 +2210,7 @@ impl QueryTaskExecution {
                     ));
                 }
                 if current_generation {
-                    let state = self.covered_observation.get_mut(&context).unwrap();
+                    let state = self.covered_observation.get_mut(&participation).unwrap();
                     if state.initial_complete {
                         return Err(TaskExecutionError::Schedule(
                             "covered catch-up boundary repeated".to_owned(),
@@ -2207,7 +2235,7 @@ impl QueryTaskExecution {
                     ));
                 }
                 if current_generation {
-                    let state = self.covered_observation.get_mut(&context).unwrap();
+                    let state = self.covered_observation.get_mut(&participation).unwrap();
                     if marker.sequence <= state.bookmark_sequence {
                         report.ignored += 1;
                         return Ok(());
@@ -2230,22 +2258,22 @@ impl QueryTaskExecution {
             }
         }
         self.covered_observation
-            .get_mut(&context)
+            .get_mut(&participation)
             .unwrap()
             .update_coverage_debt(now);
-        if !gap_before && self.covered_observation[&context].gap_pending() {
-            self.covered_reconciliations.insert(context);
+        if !gap_before && self.covered_observation[&participation].gap_pending() {
+            self.covered_reconciliations.insert(participation);
         }
         Ok(())
     }
 
     fn verify_covered_task(
         &self,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         identity: TaskIdentity,
     ) -> Result<(), TaskExecutionError> {
         identity
-            .verify_query_context(context)
+            .verify_participation(participation)
             .map_err(TaskExecutionError::Identity)?;
         self.locate(identity)
             .ok_or(TaskExecutionError::UnknownOperation)?;
@@ -2317,7 +2345,7 @@ impl QueryTaskExecution {
         };
         let became_owned = !was_owned && task.create_ownership_proven();
         let installed = task.installed();
-        if became_owned && let Some(owner) = self.owners.get_mut(&task.context()) {
+        if became_owned && let Some(owner) = self.owners.get_mut(&task.participation()) {
             owner.note_create_owned();
         }
         let terminal = task.terminal_report();
@@ -2356,7 +2384,7 @@ impl QueryTaskExecution {
         Ok(())
     }
 
-    /// Publishes one task's drain facts to its context owner, once each.
+    /// Publishes one task's drain facts to its participation owner, once each.
     fn settle_task_drain(&mut self, stage_id: StageId, task_id: TaskId) {
         let Some(stage) = self.stages.get(&stage_id) else {
             return;
@@ -2364,7 +2392,7 @@ impl QueryTaskExecution {
         let Some(task) = stage.task(task_id) else {
             return;
         };
-        let context = task.context();
+        let participation = task.participation();
         let terminal = task.is_terminal();
         // Only a task that FINISHED owes an output responsibility; that state
         // is constructible on the backend precisely when the responsibility is
@@ -2374,14 +2402,14 @@ impl QueryTaskExecution {
         //
         // The owner's counter has to agree with that, or it never reaches
         // `expected_tasks`, `locally_drained` stays false, and the release is
-        // never even requested: the context then holds its backend resources
+        // never even requested: the participation then holds its backend resources
         // until the lease expires while the frontend waits out its whole drain
-        // budget. This is the per-context half of the same fact the
+        // budget. This is the per-participation half of the same fact the
         // attempt-level `all_output_released` checks; the two are derived
         // separately on purpose, so both have to say it.
         let output_settled =
             terminal && (task.task_state() != TaskState::Finished || task.output_released());
-        let Some(owner) = self.owners.get_mut(&context) else {
+        let Some(owner) = self.owners.get_mut(&participation) else {
             return;
         };
         if terminal && self.drained_tasks.insert(task_id) {
@@ -2500,44 +2528,47 @@ impl QueryTaskExecution {
                 .stages
                 .values()
                 .all(StageExecution::all_output_released)
-            && self.owners.values().all(QueryContextOwner::is_released)
+            && self.owners.values().all(ParticipationOwner::is_released)
     }
 
     /// The exact immutable Worker proof applied by the original covered owner.
     /// Abort/Release acknowledgements settle control operations; they do not
     /// prove that preparation, root payload or asynchronous work really exited.
-    pub(crate) fn context_convergence_receipt(
+    pub(crate) fn participation_convergence_receipt(
         &self,
-        context: QueryContextRef,
-    ) -> Option<QueryContextConvergenceReceipt> {
-        self.covered_observation.get(&context)?.context_convergence
+        participation: ParticipationRef,
+    ) -> Option<ParticipationConvergenceReceipt> {
+        self.covered_observation
+            .get(&participation)?
+            .participation_convergence
     }
 
     #[cfg(test)]
-    pub(crate) fn worker_contexts_stopped(&self) -> bool {
-        self.graph
-            .contexts()
-            .all(|&context| self.context_convergence_receipt(context).is_some())
+    pub(crate) fn worker_participations_stopped(&self) -> bool {
+        self.graph.participations().all(|&participation| {
+            self.participation_convergence_receipt(participation)
+                .is_some()
+        })
     }
 
-    /// A context absent from the Worker for the entire attempt can close
+    /// A participation absent from the Worker for the entire attempt can close
     /// during cancellation without waiting for local planned Tasks to report
     /// terminal status: none of them could have been created there.
-    pub(crate) fn context_never_established(&self, context: QueryContextRef) -> bool {
+    pub(crate) fn participation_never_established(&self, participation: ParticipationRef) -> bool {
         self.owners
-            .get(&context)
-            .is_some_and(QueryContextOwner::never_attempted_establish)
+            .get(&participation)
+            .is_some_and(ParticipationOwner::never_attempted_establish)
     }
 
-    /// Where every task of one context has been observed to.
+    /// Where every task of one participation has been observed to.
     ///
     /// This is what a subscription starts from, so a transport that dropped
     /// resumes rather than replaying a task's whole version history.
-    pub fn status_cursors(&self, context: QueryContextRef) -> Vec<TaskStatusCursor> {
+    pub fn status_cursors(&self, participation: ParticipationRef) -> Vec<TaskStatusCursor> {
         self.stages
             .values()
             .flat_map(StageExecution::tasks)
-            .filter(|(_, task)| task.context() == context)
+            .filter(|(_, task)| task.participation() == participation)
             .map(|(_, task)| task.cursor())
             .collect()
     }
@@ -2713,9 +2744,9 @@ impl QueryTaskExecution {
                     &self.dispatcher,
                     self.sink.as_ref(),
                     match target {
-                        OperationTarget::Context(context) => self
+                        OperationTarget::Participation(participation) => self
                             .owners
-                            .get_mut(&context)
+                            .get_mut(&participation)
                             .ok_or(TaskExecutionError::UnknownOperation)?
                             .queue_preparation(&intent),
                         OperationTarget::Task { stage, task } => {
@@ -2749,16 +2780,16 @@ impl QueryTaskExecution {
                 Ok(CandidateAdmission::Admitted)
             }
             AdmissionCandidate::Create { stage, task } => {
-                let context = self
+                let participation = self
                     .stages
                     .get(&stage)
                     .and_then(|stage| stage.task(task))
                     .ok_or(TaskExecutionError::UnknownOperation)?
-                    .context();
+                    .participation();
                 if !self
                     .owners
-                    .get(&context)
-                    .is_some_and(QueryContextOwner::may_pipeline_first_create)
+                    .get(&participation)
+                    .is_some_and(ParticipationOwner::may_pipeline_first_create)
                 {
                     return Ok(CandidateAdmission::Nothing);
                 }
@@ -2912,8 +2943,8 @@ impl QueryTaskExecution {
                     task.rollback_unsent(operation_id);
                 }
             }
-            OperationTarget::Context(context) => {
-                if let Some(owner) = self.owners.get_mut(&context) {
+            OperationTarget::Participation(participation) => {
+                if let Some(owner) = self.owners.get_mut(&participation) {
                     owner.rollback_unsent(operation_id);
                 }
             }
@@ -2965,7 +2996,7 @@ mod covered_progress_tests {
 
     #[test]
     fn coverage_debt_keeps_first_target_and_age_across_cuts_and_generations() {
-        let mut state = CoveredContextObservation::default();
+        let mut state = CoveredParticipationObservation::default();
         state.begin_generation(1);
         state.source_cut = 10;
         state.applied_prefix = 4;

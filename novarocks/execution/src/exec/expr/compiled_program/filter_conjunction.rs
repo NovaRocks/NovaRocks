@@ -19,7 +19,7 @@
 use super::boolean_region::BooleanRows;
 use super::input_source::CompiledInputLoan;
 use super::*;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
 use novarocks_local_program::{ProgramNodeExpressionRole, ProgramNodeKind};
 use novarocks_type_contract::EvaluationDemand;
 
@@ -330,7 +330,7 @@ impl CompiledFilterConjunctionInstance {
         )
     }
     fn evaluate_required_controlled<
-        E: scalar_invocation::FrameFailure + Into<crate::runtime::fragment::ExecutionFailure>,
+        E: scalar_invocation::FrameFailure + Into<crate::runtime::task::ExecutionFailure>,
     >(
         &mut self,
         input: CompiledInputLoan<'_>,

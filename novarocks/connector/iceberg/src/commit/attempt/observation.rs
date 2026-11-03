@@ -2498,7 +2498,7 @@ mod tests {
                 None,
                 novarocks_fs::FsAccessResolver::new(),
                 Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
-                Arc::new(novarocks_fs::TokioFileTaskSpawner::new(runtime.clone())),
+                Arc::new(novarocks_fs::TokioFileIoSpawner::new(runtime.clone())),
             );
             let stop = ConnectorStopOwner::new();
             let operation = IcebergCommitOperation::new(

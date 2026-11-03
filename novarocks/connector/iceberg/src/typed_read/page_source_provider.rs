@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use novarocks_fs::{
-    BoundFile, CacheOptions, DataCacheContext, FileIdentity, FileReadBudget, FileReadContext,
+    BoundFile, CacheOptions, DataCachePolicy, FileIdentity, FileReadBudget, FileReadContext,
     FileReadRange, FileReaderOptions, ParquetMetadataInspection, PreparedFileInput,
     inspect_parquet_metadata_from_prepared, parquet_footer_range,
 };
@@ -214,7 +214,7 @@ impl IcebergPreparedPageSource {
             footer,
             access_binding: &self.access_binding,
             context: self.context.clone(),
-            cache: Some(DataCacheContext::external(
+            cache: Some(DataCachePolicy::external(
                 self.options.cache_options.clone(),
             )),
             budget: self.options.budget,
@@ -498,7 +498,7 @@ impl IcebergPreparedPageSource {
             footers: Arc::clone(&self.footers),
             access_binding: self.access_binding.clone(),
             context: self.context.clone(),
-            cache: Some(DataCacheContext::external(
+            cache: Some(DataCachePolicy::external(
                 self.options.cache_options.clone(),
             )),
             budget: self.options.budget,
@@ -683,7 +683,7 @@ impl IcebergPageSourceProvider {
             footers: Arc::clone(&self.footers),
             access_binding: self.access_binding.clone(),
             context: self.context.clone(),
-            cache: Some(DataCacheContext::external(
+            cache: Some(DataCachePolicy::external(
                 self.options.cache_options.clone(),
             )),
             budget: self.options.budget,
@@ -724,7 +724,7 @@ impl IcebergPageSourceProvider {
             footers: Arc::clone(&self.footers),
             access_binding: self.access_binding.clone(),
             context: self.context.clone(),
-            cache: Some(DataCacheContext::external(
+            cache: Some(DataCachePolicy::external(
                 self.options.cache_options.clone(),
             )),
             budget: self.options.budget,
@@ -758,8 +758,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
     use novarocks_fs::{
-        FileCancellation, FileIoRuntime, FileRangeScope, FileRangeService, FileTaskSpawner,
-        FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+        FileCancellation, FileIoRuntime, FileIoSpawner, FileRangeScope, FileRangeService,
+        FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner,
     };
     use novarocks_spi::connector::read_stack::{
         CompleteAllDynamicFilter, ConnectorSplit, SchemaTableName, SourcePage, SplitWeight,
@@ -780,19 +780,19 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let file_runtime: Arc<dyn FileIoRuntime> =
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
-        let task_spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let io_spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
         let binding = IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
             Arc::clone(&file_runtime),
-            Arc::clone(&task_spawner),
+            Arc::clone(&io_spawner),
         );
         let context = FileReadContext {
             cancellation: FileCancellation::new(),
             deadline: Some(Instant::now() + Duration::from_secs(60)),
             runtime: file_runtime,
-            task_spawner,
+            io_spawner,
             range: None,
         };
         let provider = IcebergPageSourceProvider::new(
@@ -914,27 +914,27 @@ mod tests {
         .expect("split");
         let file_runtime: Arc<dyn FileIoRuntime> =
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
-        let task_spawner: Arc<dyn FileTaskSpawner> =
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let io_spawner: Arc<dyn FileIoSpawner> =
+            Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
         let service = FileRangeService::new(
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
-            Arc::clone(&task_spawner),
+            Arc::clone(&io_spawner),
             runtime.handle().clone(),
         );
         let context = FileReadContext {
             cancellation: FileCancellation::new(),
             deadline: Some(Instant::now() + Duration::from_secs(10)),
             runtime: Arc::clone(&file_runtime),
-            task_spawner: Arc::clone(&task_spawner),
+            io_spawner: Arc::clone(&io_spawner),
             range: Some(service.bind(
                 FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
                 novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
             )),
         };
         let binding =
-            IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, task_spawner);
+            IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, io_spawner);
         let provider = IcebergPageSourceProvider::new(
             binding,
             context,

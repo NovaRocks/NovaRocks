@@ -259,7 +259,10 @@ impl FoundationDbRuntime {
                     "FoundationDB database creation failed",
                 )
             })?;
-            let lease = ProviderHandle::new(Arc::clone(&self.shared), Arc::new(database))?;
+            let lease = FoundationDbDatabaseRegistration::new(
+                Arc::clone(&self.shared),
+                Arc::new(database),
+            )?;
             Ok((opening, lease, request))
         })();
         Box::pin(async move {
@@ -585,7 +588,7 @@ impl FoundationDbRuntimeShared {
     }
 
     #[allow(dead_code)]
-    fn acquire_operation(self: &Arc<Self>) -> Result<OperationHandle, StateStoreError> {
+    fn acquire_operation(self: &Arc<Self>) -> Result<FoundationDbOperationPermit, StateStoreError> {
         self.validate_accepting()?;
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         if !self.accepting.load(Ordering::Acquire) || self.pid != std::process::id() {
@@ -596,20 +599,20 @@ impl FoundationDbRuntimeShared {
                 "FoundationDB runtime stopped accepting operations",
             ));
         }
-        Ok(OperationHandle {
+        Ok(FoundationDbOperationPermit {
             shared: Arc::clone(self),
         })
     }
 }
 
 #[cfg(feature = "foundationdb-provider")]
-pub(super) struct ProviderHandle {
+pub(super) struct FoundationDbDatabaseRegistration {
     shared: Arc<FoundationDbRuntimeShared>,
     database_id: u64,
 }
 
 #[cfg(feature = "foundationdb-provider")]
-impl ProviderHandle {
+impl FoundationDbDatabaseRegistration {
     fn new(
         shared: Arc<FoundationDbRuntimeShared>,
         database: Arc<Database>,
@@ -664,13 +667,13 @@ impl ProviderHandle {
     }
 
     #[allow(dead_code)]
-    pub(super) fn acquire_operation(&self) -> Result<OperationHandle, StateStoreError> {
+    pub(super) fn acquire_operation(&self) -> Result<FoundationDbOperationPermit, StateStoreError> {
         self.shared.acquire_operation()
     }
 }
 
 #[cfg(feature = "foundationdb-provider")]
-impl Drop for ProviderHandle {
+impl Drop for FoundationDbDatabaseRegistration {
     fn drop(&mut self) {
         let database = match self.shared.databases.lock() {
             Ok(mut databases) => databases.remove(&self.database_id),
@@ -684,12 +687,12 @@ impl Drop for ProviderHandle {
 
 #[cfg(feature = "foundationdb-provider")]
 #[allow(dead_code)]
-pub(super) struct OperationHandle {
+pub(super) struct FoundationDbOperationPermit {
     shared: Arc<FoundationDbRuntimeShared>,
 }
 
 #[cfg(feature = "foundationdb-provider")]
-impl Drop for OperationHandle {
+impl Drop for FoundationDbOperationPermit {
     fn drop(&mut self) {
         self.shared.in_flight.fetch_sub(1, Ordering::AcqRel);
         self.shared.drained.notify_one();

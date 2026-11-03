@@ -49,7 +49,7 @@ use crate::{
     },
 };
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
-use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorRequestContext};
+use novarocks_spi::connector::{ConnectorControlPlanningPin, ConnectorRequestContext};
 use std::sync::Arc;
 
 /// The prepared refresh is move-only and belongs to this original reader.
@@ -60,7 +60,7 @@ pub(crate) struct MvWriteAnalysisPreparationInput {
     pub(crate) ports: IcebergMvCorePorts,
     pub(crate) prepared: PreparedMvRefreshWrite,
     pub(crate) target: MvTargetBinding,
-    pub(crate) planning: ConnectorControlPlanningLease,
+    pub(crate) planning: ConnectorControlPlanningPin,
     pub(crate) execution: QueryExecutionContext,
     pub(crate) context: ConnectorRequestContext,
     pub(crate) session: Arc<ConnectorWriteSession>,
@@ -251,7 +251,8 @@ pub(crate) async fn prepare_analysis(
             )
             .map_err(contract_error)?;
             validate_target(&input.target, &input.planning, &identity)?;
-            if input.target.lease().control_runtime_id() != input.planning.control_runtime_id()
+            if input.target.planning_pin().control_runtime_id()
+                != input.planning.control_runtime_id()
                 || request.observed_binding.instance_id
                     != input.planning.binding().descriptor().instance_id
                 || request.observed_binding.incarnation != input.planning.binding().incarnation()
@@ -384,13 +385,13 @@ pub(crate) async fn prepare_analysis(
 
 fn validate_target(
     target: &MvTargetBinding,
-    planning: &ConnectorControlPlanningLease,
+    planning: &ConnectorControlPlanningPin,
     identity: &novarocks_types::naming::TableIdentity,
 ) -> Result<(), MvApplicationError> {
     if target.identity().instance_id.as_str() != identity.catalog
         || target.identity().namespace.as_ref() != identity.namespace
         || target.identity().table.as_ref() != identity.table
-        || target.lease().control_runtime_id() != planning.control_runtime_id()
+        || target.planning_pin().control_runtime_id() != planning.control_runtime_id()
     {
         return Err(contract_error(
             "MV activation retained a foreign exact target binding",

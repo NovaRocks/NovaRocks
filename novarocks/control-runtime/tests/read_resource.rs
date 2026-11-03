@@ -19,7 +19,7 @@
 
 use novarocks_control_runtime::{
     completion::ReportSlot,
-    exit_role::{ExitAuthority, ExitRole, ExitRolePhase},
+    exit_custody::{ExitCustody, ExitCustodyPhase, ExitObligation},
     read_resource::{ReadResourceError, ReadResourceStore},
     reported_work::ReportedWork,
     transaction::{RuntimeLedger, ScopeHandle},
@@ -52,8 +52,8 @@ struct Fixture {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
     report: ReportSlot,
-    role: ExitRole,
-    authority: Option<ExitAuthority>,
+    exit_custody: ExitCustody,
+    authority: Option<ExitObligation>,
     work: WorkId,
 }
 fn fixture() -> Fixture {
@@ -95,26 +95,26 @@ fn fixture() -> Fixture {
         ],
     )
     .unwrap();
-    let (role, authority) =
-        ExitRole::from_admitted(ReportedWork::try_new(work, capacity, report.clone()).unwrap());
+    let (exit_custody, authority) =
+        ExitCustody::from_admitted(ReportedWork::try_new(work, capacity, report.clone()).unwrap());
     Fixture {
         ledger,
         scope,
         report,
-        role,
+        exit_custody,
         authority: Some(authority),
         work: work_id,
     }
 }
-fn finish(f: Fixture, authority: ExitAuthority) {
+fn finish(f: Fixture, authority: ExitObligation) {
     authority.exited().unwrap();
-    assert_eq!(f.role.phase(), ExitRolePhase::Exited);
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Exited);
     assert_eq!(f.ledger.used(dimension()), 1);
     f.report.consume(ConsumerId::new(1).unwrap()).unwrap();
-    assert!(!f.role.try_retire().unwrap());
+    assert!(!f.exit_custody.try_retire().unwrap());
     assert_eq!(f.ledger.used(dimension()), 1);
     f.report.consume(ConsumerId::new(2).unwrap()).unwrap();
-    assert!(f.role.try_retire().unwrap());
+    assert!(f.exit_custody.try_retire().unwrap());
     assert_eq!(f.ledger.used(dimension()), 0);
     assert_eq!(f.ledger.reap_scope_ready(f.scope.id(), 1).unwrap(), 1);
     f.scope.close_external().unwrap();
@@ -169,10 +169,10 @@ fn a_read_transfers_the_original_paid_authority_and_reclaim_does_not_sign_exit()
     let alias = view.clone();
     let mut loan = alias.loan(f.authority.take().unwrap()).unwrap();
     assert_eq!(*loan.value(), 11);
-    assert_eq!(f.role.phase(), ExitRolePhase::Admitted);
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Admitted);
     assert_eq!(f.scope.snapshot().unwrap(), before);
     loan.start_original().unwrap();
-    assert_eq!(f.role.phase(), ExitRolePhase::Started);
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Started);
     assert_eq!(f.scope.snapshot().unwrap().work, before.work);
     store.seal_address(&address).unwrap();
     assert!(matches!(
@@ -186,8 +186,8 @@ fn a_read_transfers_the_original_paid_authority_and_reclaim_does_not_sign_exit()
         "sealing cannot revoke an actual existing loan"
     );
     let authority = loan.reclaim();
-    assert_eq!(f.role.phase(), ExitRolePhase::Started);
-    assert!(!f.role.body_exited() && !f.role.captures_exited());
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Started);
+    assert!(!f.exit_custody.body_exited() && !f.exit_custody.captures_exited());
     assert_eq!(f.ledger.used(dimension()), 1);
     let (error, authority) = view.loan(authority).unwrap_err();
     assert_eq!(error, ReadResourceError::Sealed);
@@ -249,7 +249,7 @@ fn a_sealed_owner_waits_for_the_last_arc_alias_of_the_same_actual_loan() {
     release.wait();
     let (observed, authority) = worker.join().unwrap();
     let notified = store.change_version() > changed_before_release;
-    let phase = f.role.phase();
+    let phase = f.exit_custody.phase();
     let value = match owner {
         Some(owner) => owner.try_take().unwrap(),
         None => premature_value.unwrap(),
@@ -262,7 +262,7 @@ fn a_sealed_owner_waits_for_the_last_arc_alias_of_the_same_actual_loan() {
     assert_eq!(during, before);
     assert_eq!(observed, 37);
     assert!(notified);
-    assert_eq!(phase, ExitRolePhase::Admitted);
+    assert_eq!(phase, ExitCustodyPhase::Admitted);
     assert_eq!(value, 37);
 }
 
@@ -293,7 +293,7 @@ fn reused_numeric_resource_identity_never_gives_an_old_view_the_new_payload() {
     );
     let (error, authority) = old_view.loan(f.authority.take().unwrap()).unwrap_err();
     assert_eq!(error, ReadResourceError::WrongIdentity);
-    assert_eq!(f.role.phase(), ExitRolePhase::Admitted);
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Admitted);
     let loan = next_view.loan(authority).unwrap();
     assert_eq!(*loan.value(), 9);
     let authority = loan.reclaim();
@@ -334,7 +334,7 @@ fn foreign_ledger_authority_is_returned_even_when_every_numeric_identity_matches
         .loan(foreign.authority.take().unwrap())
         .unwrap_err();
     assert_eq!(error, ReadResourceError::WrongAuthority);
-    assert_eq!(foreign.role.phase(), ExitRolePhase::Admitted);
+    assert_eq!(foreign.exit_custody.phase(), ExitCustodyPhase::Admitted);
     assert_eq!(foreign.ledger.used(dimension()), 1);
     let (error, returned) = store
         .insert(SlotId::new(2).unwrap(), &foreign.scope, generation(), 19u64)
@@ -413,7 +413,7 @@ fn recovering_a_dropped_original_owner_is_unique_and_still_waits_for_actual_loan
     assert_eq!(owner.try_take().unwrap(), 97);
     assert!(store.is_empty());
     assert_eq!(f.scope.snapshot().unwrap(), before);
-    assert_eq!(f.role.phase(), ExitRolePhase::Admitted);
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Admitted);
     assert_eq!(f.ledger.used(dimension()), 1);
     for consumer in [1, 2] {
         assert_eq!(
@@ -512,9 +512,9 @@ fn losing_a_loan_releases_only_its_pin_and_keeps_the_original_role_unknown_and_p
     let loan = owner.view().loan(f.authority.take().unwrap()).unwrap();
     owner.seal().unwrap();
     drop(loan);
-    assert_eq!(f.role.phase(), ExitRolePhase::Unresolved);
-    assert!(!f.role.body_exited() && !f.role.captures_exited());
-    assert!(!f.role.try_retire().unwrap());
+    assert_eq!(f.exit_custody.phase(), ExitCustodyPhase::Unresolved);
+    assert!(!f.exit_custody.body_exited() && !f.exit_custody.captures_exited());
+    assert!(!f.exit_custody.try_retire().unwrap());
     assert_eq!(f.ledger.used(dimension()), 1);
     for consumer in [1, 2] {
         assert_eq!(

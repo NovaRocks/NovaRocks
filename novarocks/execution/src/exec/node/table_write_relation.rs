@@ -43,7 +43,7 @@ use novarocks_spi::connector::write_stack::{
 use novarocks_types::SlotId;
 
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
-use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionReason, ExecutionResult};
 use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureFact, FailureProjection};
 
 #[derive(Clone, Copy, Debug)]
@@ -85,7 +85,7 @@ pub(crate) fn relation_failure(
     })
 }
 fn relation_connector(source: ConnectorError) -> ExecutionFailure {
-    use crate::runtime::fragment::connector_failure::{ConnectorCallFailure, ConnectorOperation};
+    use crate::runtime::task::connector_failure::{ConnectorCallFailure, ConnectorOperation};
     ConnectorCallFailure::new(ConnectorOperation::ValidateWriteRelation, source).into()
 }
 
@@ -106,7 +106,7 @@ pub enum TableWriteAggregateBoundary {
 
 /// Application-supplied rejection guard for composite-write aggregate work.
 #[cfg(novarocks_dev_controls)]
-pub trait TableWriteAggregateGuard: Send + Sync {
+pub trait TableWriteAggregateFaultHook: Send + Sync {
     fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError>;
 }
 
@@ -115,7 +115,7 @@ pub trait TableWriteAggregateGuard: Send + Sync {
 pub struct AllowTableWriteAggregates;
 
 #[cfg(novarocks_dev_controls)]
-impl TableWriteAggregateGuard for AllowTableWriteAggregates {
+impl TableWriteAggregateFaultHook for AllowTableWriteAggregates {
     fn check(&self, _boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
         Ok(())
     }
@@ -469,7 +469,7 @@ impl WriterMultiplexRelationTemplate {
                 novarocks_type_contract::owned_resources::hashmap::HashMapResourceError::Arithmetic(_)=>novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
                 novarocks_type_contract::owned_resources::hashmap::HashMapResourceError::SourceModel(_)=>novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
             }),
-            Failure::Contract(error)=>ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(error)),
+            Failure::Contract(error)=>ConstructionFailure::Source(crate::runtime::task::SharedDomainFailure::new(error)),
         }
         };
         for slot in schema.slots().iter().skip(WRITE_RELATION_COLUMN_COUNT) {
@@ -477,9 +477,7 @@ impl WriterMultiplexRelationTemplate {
                 slot.typed_binding().clone(),
             )
             .map_err(|error| {
-                ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(
-                    error,
-                ))
+                ConstructionFailure::Source(crate::runtime::task::SharedDomainFailure::new(error))
             })?;
             channels.push(
                 WriterAuxiliaryChannel::try_new_with_creator_work_in(
@@ -501,9 +499,7 @@ impl WriterMultiplexRelationTemplate {
         contract
             .validate_exact_arrow_schema(&schema.arrow_schema_ref())
             .map_err(|error| {
-                ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(
-                    error,
-                ))
+                ConstructionFailure::Source(crate::runtime::task::SharedDomainFailure::new(error))
             })?;
         if contract
             .auxiliary_channels()
@@ -566,7 +562,7 @@ impl WriterRelationPreparation {
         factory: Option<
             &std::sync::Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
         >,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
+    ) -> Result<(), crate::runtime::task::ExecutionFailure> {
         if let Self::Compiled { template, prepared } = self
             && prepared.is_none()
         {
@@ -1043,7 +1039,7 @@ mod writer_template_creator_tests {
         let error = relation.prepare(Some(&factory)).unwrap_err();
         assert!(matches!(
             error.cause(),
-            crate::runtime::fragment::ExecutionFailureCause::Construction(
+            crate::runtime::task::ExecutionFailureCause::Construction(
                 crate::exec::pipeline::operator::ConstructionFailure::Memory(_)
             )
         ));

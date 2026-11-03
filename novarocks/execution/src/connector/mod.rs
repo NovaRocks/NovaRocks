@@ -36,6 +36,6 @@ pub mod scan_queue;
 pub use page_adapter::{PageAdapterError, PageAdapterErrorKind, SourcePageConverter};
 pub use scan_queue::{
     ScheduledSplitFacts, SplitOfferOutcome, SplitPoll, SplitQueue, SplitQueueConfig,
-    SplitQueueError, SplitQueueErrorKind, SplitQueueRegistry, SplitQueueStats,
-    SplitSequenceEvidence, SplitSequencePreflight, TaskAttemptKey, TaskAttemptSplitQueues,
+    SplitQueueError, SplitQueueErrorKind, SplitQueueKey, SplitQueueRegistry, SplitQueueStats,
+    SplitQueues, SplitSequenceEvidence, SplitSequencePreflight,
 };

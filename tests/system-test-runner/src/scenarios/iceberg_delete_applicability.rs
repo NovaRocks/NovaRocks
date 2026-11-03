@@ -27,7 +27,7 @@ use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::delayed_s3::{DelayedS3Config, DelayedS3Proxy};
-use novarocks_cluster_harness::{CrossProcessConfigOverlay, ServerHandle};
+use novarocks_cluster_harness::{CrossProcessConfigOverlay, TestClusterOwner};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -437,7 +437,7 @@ impl Scenario for IcebergDeleteApplicability {
                     sql: scale_read_sql(case)?,
                     faults: vec![],
                     observations: (0..cluster_size)
-                        .map(|index| (index, "reader-marker", None))
+                        .map(|index| (index, novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker.as_str(), None))
                         .collect(),
                 })
             })
@@ -561,19 +561,19 @@ impl Scenario for IcebergDeleteApplicability {
                 .get(before.len()..)
                 .context("BE log truncated during exact placement observation")?;
             let accepted = added
-                .matches("NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED")
+                .matches(novarocks_failpoint::observation_marker::TASK_SPLIT_ASSIGNMENT_ACCEPTED)
                 .count();
             let opened = added
-                .matches("NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN")
+                .matches(novarocks_failpoint::observation_marker::CONNECTOR_PAGE_SOURCE_OPEN)
                 .count();
             let closed = added
-                .matches("NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE")
+                .matches(novarocks_failpoint::observation_marker::CONNECTOR_PAGE_SOURCE_CLOSE)
                 .count();
             ensure!(
                 accepted > 0
                     && opened > 0
                     && opened == closed
-                    && added.contains("NOVAROCKS_TASK_SPLIT_NO_MORE"),
+                    && added.contains(novarocks_failpoint::observation_marker::TASK_SPLIT_NO_MORE),
                 "BE[{index}] has no complete distributed read evidence: accepted={accepted}, open={opened}, close={closed}"
             );
             placements

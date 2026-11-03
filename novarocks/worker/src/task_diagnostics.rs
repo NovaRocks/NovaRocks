@@ -18,7 +18,7 @@
 //! Bounded Worker-local secondary facts, separate from Task acceptance and exit.
 //! Retired Task export and wire/Frontend projection are not connected here.
 
-use novarocks_execution::runtime::fragment::ExecutionFailure;
+use novarocks_execution::runtime::task::ExecutionFailure;
 use novarocks_execution_contract::failure::FailureFact;
 use novarocks_execution_contract::{SafeDetail, TaskFailurePhase};
 use std::{fmt, sync::Arc};
@@ -28,7 +28,7 @@ const MAX_DETAIL_BYTES: usize = 512;
 
 /// Why a secondary observation was recorded; neither role can accept a Task.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TaskDiagnosticRole {
+pub enum TaskDiagnosticKind {
     LateFailure,
     Cleanup,
 }
@@ -68,7 +68,7 @@ impl fmt::Debug for InlineSafeDetail {
 /// Fixed-layout neutral facts. No original source or runtime owner is retained.
 #[derive(Debug, Eq, PartialEq)]
 pub struct TaskSecondaryDiagnostic {
-    role: TaskDiagnosticRole,
+    kind: TaskDiagnosticKind,
     phase: TaskFailurePhase,
     fact: FailureFact,
     detail: InlineSafeDetail,
@@ -77,7 +77,7 @@ impl TaskSecondaryDiagnostic {
     fn prepare(
         cause: &ExecutionFailure,
         phase: TaskFailurePhase,
-        role: TaskDiagnosticRole,
+        kind: TaskDiagnosticKind,
         fact: FailureFact,
     ) -> Arc<Self> {
         // Both rendering and the cold fixed record allocation precede every
@@ -85,14 +85,14 @@ impl TaskSecondaryDiagnostic {
         // only ExecutionFailure's neutral safe summary enters this record.
         let detail = InlineSafeDetail::copy_safe(&cause.safe_detail_for_fact(fact));
         Arc::new(Self {
-            role,
+            kind,
             phase,
             fact,
             detail,
         })
     }
-    pub const fn role(&self) -> TaskDiagnosticRole {
-        self.role
+    pub const fn kind(&self) -> TaskDiagnosticKind {
+        self.kind
     }
     pub const fn phase(&self) -> TaskFailurePhase {
         self.phase
@@ -108,7 +108,7 @@ impl TaskSecondaryDiagnostic {
         phase: TaskFailurePhase,
         fact: FailureFact,
     ) -> Arc<Self> {
-        Self::prepare(cause, phase, TaskDiagnosticRole::LateFailure, fact)
+        Self::prepare(cause, phase, TaskDiagnosticKind::LateFailure, fact)
     }
 }
 
@@ -125,7 +125,7 @@ impl PreparedCleanupDiagnostic {
             record: Some(TaskSecondaryDiagnostic::prepare(
                 cause,
                 phase,
-                TaskDiagnosticRole::Cleanup,
+                TaskDiagnosticKind::Cleanup,
                 cause.failure_fact(),
             )),
         }
@@ -155,10 +155,10 @@ impl TaskSecondaryDiagnosticsSnapshot {
         let mut entries = std::array::from_fn(|_| None);
         for (slot, diagnostic) in entries.iter_mut().zip(&diagnostics.entries) {
             *slot = Some(Arc::new(TaskSecondaryDiagnostic {
-                role: if diagnostic.cleanup {
-                    TaskDiagnosticRole::Cleanup
+                kind: if diagnostic.cleanup {
+                    TaskDiagnosticKind::Cleanup
                 } else {
-                    TaskDiagnosticRole::LateFailure
+                    TaskDiagnosticKind::LateFailure
                 },
                 phase: diagnostic.phase,
                 fact: diagnostic.fact,

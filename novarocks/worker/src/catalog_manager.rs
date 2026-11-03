@@ -89,7 +89,8 @@ impl ConnectorExecutionRoleBindingFactorySet {
         #[cfg(novarocks_dev_controls)]
         if let Some(observer) = observation {
             observer.observe(&format!(
-                "NOVAROCKS_CATALOG_RUNTIME_MATERIALIZED catalog={:?}",
+                "{} catalog={:?}",
+                novarocks_failpoint::observation_marker::CATALOG_RUNTIME_MATERIALIZED,
                 properties.handle()
             ));
         }
@@ -223,9 +224,9 @@ pub struct CatalogManager<T> {
 /// queries. Retained warm runtimes are deliberately excluded: cache retention
 /// is not an execution authority.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CatalogLeaseSnapshot {
-    pub query_leases: usize,
-    pub handle_leases: usize,
+pub struct CatalogPinSnapshot {
+    pub query_pins: usize,
+    pub handle_pins: usize,
 }
 
 struct CatalogManagerState<T> {
@@ -251,7 +252,7 @@ enum CatalogCellState<T> {
     Materializing,
     Ready {
         runtime: Arc<T>,
-        registration_token: RegistrationToken,
+        registration_token: CatalogInstallStamp,
     },
     FailedSuppressed {
         error: CatalogManagerError,
@@ -265,13 +266,13 @@ enum CatalogCellState<T> {
 /// carried on the wire: it only proves an eviction still targets the exact
 /// local installation that was selected earlier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RegistrationToken(u64);
+struct CatalogInstallStamp(u64);
 
 #[derive(Clone)]
 struct ReadyCandidate<T> {
     handle: CatalogHandle,
     cell: Arc<CatalogCell<T>>,
-    registration_token: RegistrationToken,
+    registration_token: CatalogInstallStamp,
 }
 
 impl<T> CatalogCell<T> {
@@ -306,7 +307,7 @@ impl<T> CatalogCell<T> {
     fn complete(
         &self,
         result: Result<T, CatalogManagerError>,
-        registration_token: Option<RegistrationToken>,
+        registration_token: Option<CatalogInstallStamp>,
         attempts: u32,
         retry_after: Option<Instant>,
     ) -> Result<Arc<T>, CatalogManagerError> {
@@ -456,7 +457,7 @@ impl<T> CatalogManager<T> {
             if !active() {
                 return Err(cancelled_catalog_install_error());
             }
-            self.lease_ready(query, &handle, &cell)?;
+            self.pin_ready(query, &handle, &cell)?;
             return Ok(runtime);
         }
 
@@ -494,7 +495,7 @@ impl<T> CatalogManager<T> {
             if !active() {
                 return Err(cancelled_catalog_install_error());
             }
-            self.lease_ready(query, &handle, &cell)?;
+            self.pin_ready(query, &handle, &cell)?;
             return Ok(runtime);
         }
         {
@@ -654,15 +655,15 @@ impl<T> CatalogManager<T> {
 
     /// Return lease cardinalities without exposing the query-to-handle map.
     /// Metrics consume this snapshot after the manager lock is released.
-    pub fn lease_snapshot(&self) -> CatalogLeaseSnapshot {
+    pub fn pin_snapshot(&self) -> CatalogPinSnapshot {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        CatalogLeaseSnapshot {
-            query_leases: state.query_reachability.len(),
-            handle_leases: state.query_reachability.values().map(BTreeSet::len).sum(),
+        CatalogPinSnapshot {
+            query_pins: state.query_reachability.len(),
+            handle_pins: state.query_reachability.values().map(BTreeSet::len).sum(),
         }
     }
 
-    fn lease_ready(
+    fn pin_ready(
         &self,
         query: QueryExecutionId,
         handle: &CatalogHandle,
@@ -720,13 +721,13 @@ impl<T> CatalogManager<T> {
         self.provider_changed.notify_all();
     }
 
-    fn allocate_registration_token(&self) -> RegistrationToken {
+    fn allocate_registration_token(&self) -> CatalogInstallStamp {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.next_registration_token = state
             .next_registration_token
             .checked_add(1)
             .expect("catalog registration token exhausted");
-        RegistrationToken(state.next_registration_token)
+        CatalogInstallStamp(state.next_registration_token)
     }
 }
 
@@ -1395,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_snapshot_counts_queries_and_exact_catalog_handles() {
+    fn pin_snapshot_counts_queries_and_exact_catalog_handles() {
         let manager = CatalogManager::<usize>::default();
         let first = properties(1);
         let second = properties(2);
@@ -1411,19 +1412,19 @@ mod tests {
             .expect("second catalog is leased to query two");
 
         assert_eq!(
-            manager.lease_snapshot(),
-            super::CatalogLeaseSnapshot {
-                query_leases: 2,
-                handle_leases: 3,
+            manager.pin_snapshot(),
+            super::CatalogPinSnapshot {
+                query_pins: 2,
+                handle_pins: 3,
             }
         );
 
         manager.release_query(query(1));
         assert_eq!(
-            manager.lease_snapshot(),
-            super::CatalogLeaseSnapshot {
-                query_leases: 1,
-                handle_leases: 1,
+            manager.pin_snapshot(),
+            super::CatalogPinSnapshot {
+                query_pins: 1,
+                handle_pins: 1,
             }
         );
     }
@@ -1602,7 +1603,7 @@ mod tests {
         let observing = manager.clone();
         let (observed_tx, observed_rx) = mpsc::channel();
         let observer = thread::spawn(move || {
-            let snapshot = observing.lease_snapshot();
+            let snapshot = observing.pin_snapshot();
             observed_tx.send(snapshot).unwrap();
         });
         let observed_while_drop_blocked = observed_rx.recv_timeout(Duration::from_secs(5));
@@ -1624,7 +1625,7 @@ mod tests {
         let snapshot = observed_while_drop_blocked.expect(
             "another query's metadata access must progress while a provider destructor is stalled",
         );
-        assert_eq!(snapshot.query_leases, usize::from(!prune));
+        assert_eq!(snapshot.query_pins, usize::from(!prune));
     }
     #[test]
     fn release_final_runtime_drop_does_not_hold_the_manager_lock() {

@@ -231,8 +231,8 @@ pub(crate) fn current_snapshot_id_with_ports(
     context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<i64, String> {
     let exact_lease =
-        crate::connector::acquire_metadata_planning_lease(connector_control, &target.catalog)?;
-    let facts = crate::connector::metadata_read_reference_facts_with_planning_lease(
+        crate::connector::acquire_metadata_planning_pin(connector_control, &target.catalog)?;
+    let facts = crate::connector::metadata_read_reference_facts_with_planning_pin(
         exact_lease,
         context,
         &target.namespace,

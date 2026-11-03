@@ -20,16 +20,16 @@
 //! Predecessor, event consumption, author exit and report retirement stay separate.
 
 use super::causal::{CausalAuthorBinding, CausalError, TaskCausalInbox, TaskCausalSender};
-use crate::{task_completion_roles::AdmittedCompletionRole, task_port::TaskPendingNotice};
+use crate::{task_completion_set::AdmittedCompletionTransfer, task_port::TaskPendingNotice};
 use novarocks_control_runtime::{
     completion::ReportSlot,
-    exit_role::{ExitAuthority, ExitRole, ExitRoleError, ExitRolePhase},
+    exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
     transaction::RuntimeError,
 };
 use novarocks_control_runtime_core::{completion::Consumption, identity::ConsumerId};
 use novarocks_execution::runtime::execution_health::{ExecutionExitOrigin, ExecutionHealth};
 use novarocks_execution_contract::{TaskFailurePhase, TaskIdentity, failure::FailureFact};
-use novarocks_worker_protocol::{context::ContextInput, proposal_summary::CutId};
+use novarocks_worker_protocol::{participation::ParticipationInput, proposal_summary::CutId};
 use std::sync::{Arc, Mutex};
 
 pub(crate) struct CausalInputBinding {
@@ -44,12 +44,12 @@ struct Custody {
     scope: novarocks_control_runtime::transaction::ScopeHandle,
     cut: CutId,
     binding: CausalAuthorBinding,
-    role: ExitRole,
+    exit_custody: ExitCustody,
     report: ReportSlot,
     sender: Mutex<Option<TaskCausalSender>>,
     // A refused handoff retains its exact neutral input in this same prepaid
     // responsibility. It cannot be reconstructed as a consumed Core event.
-    rejected: Mutex<Option<ContextInput>>,
+    rejected: Mutex<Option<ParticipationInput>>,
     pending: Arc<dyn TaskPendingNotice>,
     health: Arc<ExecutionHealth>,
     unresolved: FailureFact,
@@ -62,7 +62,7 @@ pub(crate) struct CausalInputCustody(Arc<Custody>);
 pub(crate) enum CausalInputError {
     Causal(CausalError),
     HandoffRejected,
-    Role(ExitRoleError),
+    Role(ExitCustodyError),
     Report(RuntimeError),
 }
 impl std::fmt::Display for CausalInputError {
@@ -81,13 +81,13 @@ impl std::error::Error for CausalInputError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Causal(error) => match error {
-                CausalError::Driver(error) => Some(error),
-                CausalError::Role(error) => Some(error),
+                CausalError::ActorTurn(error) => Some(error),
+                CausalError::ExitCustody(error) => Some(error),
                 // These closed protocol leaves do not implement Error. Their
                 // original typed detail remains in this error's Display.
                 CausalError::Cut(_)
                 | CausalError::Source(_)
-                | CausalError::UnknownRole
+                | CausalError::MissingCutCustody
                 | CausalError::AlreadyAdmitted
                 | CausalError::NotDelivered
                 | CausalError::InputObservationMissing
@@ -107,14 +107,14 @@ impl std::error::Error for CausalInputError {
 #[must_use = "Publish, withdraw or retain the original author's Unknown responsibility"]
 pub(crate) struct InputAuthor {
     custody: CausalInputCustody,
-    authority: Option<ExitAuthority>,
+    authority: Option<ExitObligation>,
 }
 impl CausalInputCustody {
     /// The Accepted Task host supplies this exact Work, report and already
     /// bound Input-kind sender once, before attaching any completion action.
     /// This constructor acquires no capacity and signs no additional role.
     pub(crate) fn from_admitted(
-        admitted: AdmittedCompletionRole,
+        admitted: AdmittedCompletionTransfer,
         inbox: &mut TaskCausalInbox,
         cut: CutId,
         sender: TaskCausalSender,
@@ -134,17 +134,18 @@ impl CausalInputCustody {
             .expect("the original input author uses its exact admitted sender and Work");
         let scope = admitted.work.scope().clone();
         let report = admitted.report.clone();
-        let (role, authority) = ExitRole::from_admitted(super::admitted_role::adopt_reported_work(
-            admitted.work,
-            admitted.capacity,
-            admitted.report,
-        ));
+        let (exit_custody, authority) =
+            ExitCustody::from_admitted(super::reported_work_admission::adopt_reported_work(
+                admitted.work,
+                admitted.capacity,
+                admitted.report,
+            ));
         let custody = Arc::new(Custody {
             task,
             scope,
             cut,
             binding,
-            role,
+            exit_custody,
             report,
             sender: Mutex::new(Some(sender)),
             rejected: Mutex::new(None),
@@ -179,23 +180,25 @@ impl CausalInputCustody {
     pub(crate) fn report(&self) -> &ReportSlot {
         &self.0.report
     }
-    pub(crate) fn phase(&self) -> ExitRolePhase {
-        self.0.role.phase()
+    pub(crate) fn phase(&self) -> ExitCustodyPhase {
+        self.0.exit_custody.phase()
     }
-    pub(crate) fn actual_exit_ready(&self) -> Result<bool, ExitRoleError> {
-        self.0.role.actual_exit_ready()
+    pub(crate) fn actual_exit_ready(&self) -> Result<bool, ExitCustodyError> {
+        self.0.exit_custody.actual_exit_ready()
     }
     /// The unique holder really exited its own body and captures. Children
     /// and report consumers still retain their independent original duties.
     pub(crate) fn body_and_captures_exited(&self) -> bool {
-        matches!(self.phase(), ExitRolePhase::Exited | ExitRolePhase::Retired)
-            && self.0.role.body_exited()
-            && self.0.role.captures_exited()
+        matches!(
+            self.phase(),
+            ExitCustodyPhase::Exited | ExitCustodyPhase::Retired
+        ) && self.0.exit_custody.body_exited()
+            && self.0.exit_custody.captures_exited()
     }
     /// Removing the cut receipt is safe only after the same report resolves
     /// every original leg. This never retires its parent Work or children.
-    pub(crate) fn cut_tail_ready(&self) -> Result<bool, ExitRoleError> {
-        if self.phase() == ExitRolePhase::Retired {
+    pub(crate) fn cut_tail_ready(&self) -> Result<bool, ExitCustodyError> {
+        if self.phase() == ExitCustodyPhase::Retired {
             return Ok(true);
         }
         if !self.body_and_captures_exited() {
@@ -210,7 +213,7 @@ impl CausalInputCustody {
         &self,
         inbox: &mut TaskCausalInbox,
     ) -> Result<bool, CausalInputError> {
-        if self.phase() == ExitRolePhase::Retired {
+        if self.phase() == ExitCustodyPhase::Retired {
             return Ok(true);
         }
         if !self.body_and_captures_exited() {
@@ -256,7 +259,7 @@ impl CausalInputCustody {
         inbox
             .validate_failed_scope(stage, &self.0.scope)
             .map_err(CausalInputError::Causal)?;
-        if self.phase() == ExitRolePhase::Retired {
+        if self.phase() == ExitCustodyPhase::Retired {
             return Ok(true);
         }
         let core = ConsumerId::new(1).unwrap();
@@ -308,7 +311,7 @@ impl CausalInputCustody {
     /// Failure takeover can transfer the precise refused payload. Taking it
     /// supplies no positive action exit or input-consumption observation.
     #[cfg(test)]
-    pub(crate) fn take_rejected(&self) -> Option<ContextInput> {
+    pub(crate) fn take_rejected(&self) -> Option<ParticipationInput> {
         self.0
             .rejected
             .lock()
@@ -320,8 +323,9 @@ impl CausalInputCustody {
     /// event input to commit; its predecessor alone cannot authorize release.
     /// An unused cut instead requires the host's actual revocation/exit receipt,
     /// without inventing an event or its consumption.
-    pub(crate) fn try_retire(&self) -> Result<bool, ExitRoleError> {
-        let retired = self.phase() == ExitRolePhase::Retired || self.0.role.try_retire()?;
+    pub(crate) fn try_retire(&self) -> Result<bool, ExitCustodyError> {
+        let retired =
+            self.phase() == ExitCustodyPhase::Retired || self.0.exit_custody.try_retire()?;
         if retired {
             let retained = self
                 .0
@@ -348,7 +352,7 @@ impl InputAuthor {
     pub(crate) fn start_in_generation(
         &mut self,
         generation: novarocks_control_runtime_core::identity::Generation,
-    ) -> Result<(), ExitRoleError> {
+    ) -> Result<(), ExitCustodyError> {
         self.authority
             .as_mut()
             .expect("one original input authority")
@@ -362,7 +366,7 @@ impl InputAuthor {
     }
     /// A typed owner rejected its own exact neutral input before transfer.
     /// Retain it and the original sender without inventing an unused exit.
-    pub(crate) fn reject(mut self, input: ContextInput) {
+    pub(crate) fn reject(mut self, input: ParticipationInput) {
         *self
             .custody
             .0
@@ -383,7 +387,7 @@ impl InputAuthor {
     }
     /// The issuer has already chosen this author's exact neutral lifecycle
     /// input. Seal it synchronously at the same Task proposal-prefix fence.
-    pub(crate) fn publish(mut self, input: ContextInput) -> Result<(), CausalInputError> {
+    pub(crate) fn publish(mut self, input: ParticipationInput) -> Result<(), CausalInputError> {
         let sender = self.take_sender();
         if let Err(input) = sender.send_input(input) {
             *self
@@ -403,7 +407,7 @@ impl InputAuthor {
     pub(crate) fn publish_close(
         mut self,
         generation: novarocks_control_runtime_core::identity::Generation,
-        intent: novarocks_worker_protocol::context::TaskCloseIntent,
+        intent: novarocks_worker_protocol::participation::TaskCloseIntent,
     ) -> Result<(), CausalInputError> {
         if let Err(error) = self.take_sender().send_close(generation, intent) {
             *self
@@ -411,11 +415,12 @@ impl InputAuthor {
                 .0
                 .rejected
                 .lock()
-                .expect("original rejected close event") = Some(ContextInput::ApplyTaskClose {
-                task: self.task(),
-                generation,
-                intent,
-            });
+                .expect("original rejected close event") =
+                Some(ParticipationInput::ApplyTaskClose {
+                    task: self.task(),
+                    generation,
+                    intent,
+                });
             drop(self.authority.take());
             self.custody.unresolved();
             return Err(CausalInputError::Causal(error));
@@ -457,7 +462,7 @@ impl Drop for InputAuthor {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_worker_protocol::context::ContextCommand;
+    use novarocks_worker_protocol::participation::ParticipationCommand;
     mod generic_negative;
     mod terminal_observation;
     use super::*;
@@ -472,8 +477,8 @@ mod tests {
     };
     use novarocks_control_runtime::{
         actor::ActorConfig,
-        driver::ActorRuntime,
-        lease::{ReservationBundle, WorkLease},
+        actor_turn::ActorRuntime,
+        obligation::{ReservationObligation, WorkObligation},
         transaction::{RuntimeLedger, ScopeHandle},
     };
     use novarocks_control_runtime_core::{
@@ -486,15 +491,17 @@ mod tests {
     };
     use novarocks_execution_contract::failure::FailureClass;
     use novarocks_execution_contract::{
-        CancelReason, OperationOutcome, QueryContextRef, TaskConclusionProposal, TaskOperationId,
+        CancelReason, OperationOutcome, ParticipationRef, TaskConclusionProposal, TaskOperationId,
     };
     use novarocks_types::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
     use novarocks_worker_protocol::{
-        context::{ContextConfig, ContextCore, ContextEffect, RequestResult},
         creation::{CreationCost, PayloadId},
         lease::{LeaseBounds, MonotonicInstant},
+        participation::{
+            ParticipationConfig, ParticipationCore, ParticipationEffect, RequestResult,
+        },
     };
     use std::{
         collections::BTreeMap,
@@ -508,14 +515,14 @@ mod tests {
     fn actor() -> ActorId {
         ActorId::new(1).unwrap()
     }
-    fn context() -> QueryContextRef {
-        QueryContextRef::new(
+    fn participation() -> ParticipationRef {
+        ParticipationRef::new(
             QueryExecutionId::new(QueryId::new(7301, 7302), AttemptId::new(1).unwrap()).unwrap(),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         )
     }
-    fn task(c: QueryContextRef, n: u32) -> TaskIdentity {
+    fn task(c: ParticipationRef, n: u32) -> TaskIdentity {
         TaskIdentity::new(
             c.query_execution_id(),
             StageId::new(1).unwrap(),
@@ -537,10 +544,10 @@ mod tests {
         ledger: RuntimeLedger,
         scope: ScopeHandle,
         runtime: ActorRuntime<WorkerActor>,
-        registration: novarocks_control_runtime::driver::ActorRegistration,
-        identity: QueryContextRef,
-        roles: Vec<(WorkLease, ReservationBundle)>,
-        jobs: BTreeMap<ReservationId, (WorkLease, ReservationBundle)>,
+        registration: novarocks_control_runtime::actor_turn::ActorRegistration,
+        identity: ParticipationRef,
+        obligation_pairs: Vec<(WorkObligation, ReservationObligation)>,
+        jobs: BTreeMap<ReservationId, (WorkObligation, ReservationObligation)>,
     }
     impl RuntimeFixture {
         fn new() -> Self {
@@ -549,7 +556,7 @@ mod tests {
         fn with_byte_limits(bytes: u64) -> Self {
             Self::with_actor_turn_budget(
                 bytes,
-                crate::control_runtime::actors::ContextActor::TURN_BUDGET,
+                crate::control_runtime::actors::ParticipationActor::TURN_BUDGET,
             )
         }
         fn with_actor_turn_budget(bytes: u64, turn_budget: usize) -> Self {
@@ -562,33 +569,33 @@ mod tests {
                 .unwrap(),
             );
             let scope = ledger.open_scope_next(None, generation()).unwrap();
-            let mut roles = Vec::new();
+            let mut obligation_pairs = Vec::new();
             for (index, kind) in [WorkKind::Cleanup, WorkKind::Step, WorkKind::Step]
                 .into_iter()
                 .enumerate()
             {
                 let (mut work, capacity) = scope
-                    .reserve_next(generation(), novarocks_control_runtime_core::capacity::ReservationResources::new(ResourceVector::default(), novarocks_control_runtime_core::owned_storage::OwnedSlotNeed { work_headers: 1, inputs: if index == 2 {48} else if index == 1 {1} else {0}, batches: if index == 2 {48} else if index == 1 {1} else {0}, effects: (if index == 2 {48} else if index == 1 {1} else {0}) * ContextActor::MAX_STEP_ACTIONS, replies: if index == 2 {48} else {0}, ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default() }), kind, WorkAdmission::External)
+                    .reserve_next(generation(), novarocks_control_runtime_core::capacity::ReservationResources::new(ResourceVector::default(), novarocks_control_runtime_core::owned_storage::OwnedSlotNeed { work_headers: 1, inputs: if index == 2 {48} else if index == 1 {1} else {0}, batches: if index == 2 {48} else if index == 1 {1} else {0}, effects: (if index == 2 {48} else if index == 1 {1} else {0}) * ParticipationActor::MAX_STEP_ACTIONS, replies: if index == 2 {48} else {0}, ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default() }), kind, WorkAdmission::External)
                     .unwrap()
                     .bind(kind)
                     .unwrap();
                 if kind != WorkKind::Cleanup {
                     work.start().unwrap();
                 }
-                roles.push((work, capacity));
+                obligation_pairs.push((work, capacity));
             }
-            let identity = context();
-            let core = ContextCore::new(
+            let identity = participation();
+            let core = ParticipationCore::new(
                 identity,
                 generation(),
                 crate::control_runtime::actors::tests::initial_establishment(),
-                ContextConfig {
+                ParticipationConfig {
                     max_tasks: 4,
                     max_creation_waiters: 4,
                     max_pending_requests: 16,
                     max_preparing: 1,
                     max_task_bytes: bytes,
-                    step_budget: ContextCore::MAX_STEP_WORK,
+                    step_budget: ParticipationCore::MAX_STEP_WORK,
                     lease_bounds: LeaseBounds::DEFAULT,
                     metric_publish_interval: Duration::from_millis(100),
                     request_horizon: crate::RequestHorizon::DEFAULT,
@@ -596,12 +603,12 @@ mod tests {
             )
             .unwrap();
             let runtime = ActorRuntime::new();
-            let bound = ContextActor::new(
+            let bound = ParticipationActor::new(
                 core,
                 scope.clone(),
                 AdmissionStorage {
                     loading: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(
-                        crate::control_runtime_policy::IngressRoleLimits {
+                        crate::control_runtime_policy::IngressPositionLimits {
                             ordinary_running: 1,
                             ordinary_waiting: 0,
                             control_running: 1,
@@ -615,7 +622,7 @@ mod tests {
                     .resources()
                     .unwrap(),
                     accepted: (crate::control_runtime_policy::ControlRuntimePolicy::try_new(
-                        crate::control_runtime_policy::IngressRoleLimits {
+                        crate::control_runtime_policy::IngressPositionLimits {
                             ordinary_running: 1,
                             ordinary_waiting: 0,
                             control_running: 1,
@@ -628,40 +635,41 @@ mod tests {
                     .accepted
                     .resources()
                     .unwrap(),
-                    context: empty(),
+                    participation: empty(),
                 },
-                roles[1].0.reference(),
-                roles[2].0.reference(),
+                obligation_pairs[1].0.reference(),
+                obligation_pairs[2].0.reference(),
             );
             let registration = runtime
                 .register_supervised_bound(
                     actor(),
                     scope.clone(),
-                    WorkerActor::Context(Box::new(bound)),
+                    WorkerActor::Participation(Box::new(bound)),
                     ActorConfig {
                         mailbox: [16, 16, 16, 1],
                         max_batches: 49,
                         max_effects_per_step:
-                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                         max_dependencies_per_effect:
-                            crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                            crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                         turn_budget,
-                        max_step_work: crate::control_runtime::actors::ContextActor::MAX_STEP_WORK,
+                        max_step_work:
+                            crate::control_runtime::actors::ParticipationActor::MAX_STEP_WORK,
                     },
-                    &roles[0].0,
+                    &obligation_pairs[0].0,
                 )
-                .unwrap_or_else(|(e, _)| panic!("context registration: {e:?}"));
+                .unwrap_or_else(|(e, _)| panic!("participation registration: {e:?}"));
             let mut fixture = Self {
                 ledger,
                 scope,
                 runtime,
                 registration,
                 identity,
-                roles,
+                obligation_pairs,
                 jobs: BTreeMap::new(),
             };
             let input = fixture.send(
-                ContextInput::MaterializationFinished {
+                ParticipationInput::MaterializationFinished {
                     result: Ok(crate::control_runtime::actors::tests::initial_materialized()),
                 },
                 None,
@@ -674,7 +682,7 @@ mod tests {
         }
         fn send(
             &self,
-            command: ContextInput,
+            command: ParticipationInput,
             request: Option<TaskOperationId>,
             class: InputClass,
             source: u64,
@@ -684,22 +692,24 @@ mod tests {
                     &self.registration,
                     ActorId::new(source).unwrap(),
                     class,
-                    &self.roles[2].0,
+                    &self.obligation_pairs[2].0,
                 )
                 .unwrap()
-                .fill(WorkerMessage::Context(ContextMessage::Command {
-                    work: self.roles[2].0.reference(),
-                    request: request.map(|operation| RequestMetadata {
-                        operation,
-                        deadline: MonotonicInstant::from_origin(Duration::from_secs(10)),
-                    }),
-                    command,
-                }))
+                .fill(WorkerMessage::Participation(
+                    ParticipationMessage::Command {
+                        work: self.obligation_pairs[2].0.reference(),
+                        request: request.map(|operation| RequestMetadata {
+                            operation,
+                            deadline: MonotonicInstant::from_origin(Duration::from_secs(10)),
+                        }),
+                        command,
+                    },
+                ))
                 .unwrap()
         }
         fn run(
             &mut self,
-            command: ContextInput,
+            command: ParticipationInput,
             request: Option<TaskOperationId>,
         ) -> Vec<WorkerAction> {
             let input = self.send(command, request, InputClass::Ordinary, 2);
@@ -718,7 +728,7 @@ mod tests {
                         target,
                         input,
                         None,
-                        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                        crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                     )
                     .unwrap();
                 let states: BTreeMap<_, _> = inventory.iter().map(|(d, s)| (d.id, *s)).collect();
@@ -743,7 +753,7 @@ mod tests {
                     .ready_effects(
                         target,
                         input,
-                        crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                        crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                     )
                     .unwrap();
                 if ready.is_empty() {
@@ -752,9 +762,9 @@ mod tests {
                 for action in ready {
                     let ticket = self.runtime.take_effect(target, input, action).unwrap();
                     let admitted = match &ticket.effect {
-                        WorkerAction::Context(
-                            ContextEffect::LoadInput { reservation, .. }
-                            | ContextEffect::EnqueuePreparation { reservation, .. },
+                        WorkerAction::Participation(
+                            ParticipationEffect::LoadInput { reservation, .. }
+                            | ParticipationEffect::EnqueuePreparation { reservation, .. },
                         ) => Some(*reservation),
                         WorkerAction::Control { admitted, .. } => *admitted,
                         _ => None,
@@ -795,7 +805,7 @@ mod tests {
                     }
                     if let WorkerAction::OwnerFailed { scope, .. } = &ticket.effect {
                         assert_eq!(*scope, self.scope.id());
-                        self.roles[0].0.start().unwrap();
+                        self.obligation_pairs[0].0.start().unwrap();
                     }
                     outputs.push(ticket.effect.clone());
                     self.runtime.effect_completed(ticket).unwrap();
@@ -820,7 +830,7 @@ mod tests {
                     .unwrap();
                 capacity.finish().unwrap();
             }
-            for (mut work, mut capacity) in self.roles.drain(..) {
+            for (mut work, mut capacity) in self.obligation_pairs.drain(..) {
                 work.body_exited().unwrap();
                 work.captures_exited().unwrap();
                 self.ledger.reap_scope_ready(work.scope().id(), 32).unwrap();
@@ -836,7 +846,7 @@ mod tests {
             self.scope.close_external().unwrap();
             self.runtime
                 .remove_actor(actor())
-                .unwrap_or_else(|e| panic!("context removal: {e:?}"));
+                .unwrap_or_else(|e| panic!("participation removal: {e:?}"));
             self.ledger.reap_scope_ready(self.scope.id(), 3).unwrap();
             self.ledger.remove_scope(self.scope.id()).unwrap();
             assert!(self.ledger.is_empty());
@@ -898,7 +908,9 @@ mod tests {
             .unwrap();
             let (work, capacity) = guard.bind(WorkKind::Cleanup).unwrap();
             crate::control_runtime::source_positions::SourceSlotAdmission::from_admitted(
-                crate::control_runtime::admitted_role::adopt_reported_work(work, capacity, report),
+                crate::control_runtime::reported_work_admission::adopt_reported_work(
+                    work, capacity, report,
+                ),
             )
             .unwrap()
         })
@@ -913,7 +925,7 @@ mod tests {
         let mut runtime = RuntimeFixture::new();
         let task = task(runtime.identity, 1);
         let created = runtime.run(
-            ContextInput::Request(ContextCommand::Create {
+            ParticipationInput::Request(ParticipationCommand::Create {
                 task,
                 payload: PayloadId(1),
             }),
@@ -922,7 +934,7 @@ mod tests {
         let parent = created
             .iter()
             .find_map(|effect| match effect {
-                WorkerAction::Context(ContextEffect::LoadInput {
+                WorkerAction::Participation(ParticipationEffect::LoadInput {
                     task: owner,
                     reservation,
                     ..
@@ -932,7 +944,7 @@ mod tests {
             .expect("the real Create elected this Task's original loading lifetime");
         assert_eq!(runtime.jobs[&parent].1.id(), parent);
         let accepted = runtime.run(
-            ContextInput::Loaded {
+            ParticipationInput::Loaded {
                 task,
                 result: Ok(CreationCost {
                     input_retained_bytes: 1,
@@ -955,7 +967,8 @@ mod tests {
                         captures: 1,
                         inputs: 2,
                         batches: 2,
-                        effects: 2 * crate::control_runtime::actors::ContextActor::MAX_STEP_ACTIONS,
+                        effects: 2
+                            * crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS,
                         replies: 1,
                         ..novarocks_control_runtime_core::owned_storage::OwnedSlotNeed::default()
                     },
@@ -1011,7 +1024,7 @@ mod tests {
                 CutSourceAdmission::Fresh(source_roles(&runtime.scope, parent)),
             )
             .unwrap_or_else(|_| panic!("the actual cut pair was paid by this Task lifetime"));
-        let admitted = AdmittedCompletionRole {
+        let admitted = AdmittedCompletionTransfer {
             work,
             capacity,
             report,
@@ -1137,7 +1150,7 @@ mod tests {
             assert!(self.notice.is_none());
             assert!(self.author.is_none());
             assert!(self.inbox.is_empty());
-            assert_eq!(self.custody.phase(), ExitRolePhase::Retired);
+            assert_eq!(self.custody.phase(), ExitCustodyPhase::Retired);
             self.ingress.seal_source_admission();
             // Returned cut ownership was already discharged. These remaining
             // base addresses still owe their own unused holder/report exits.
@@ -1156,13 +1169,13 @@ mod tests {
     fn a_running_author_uses_its_original_causal_role_without_publishing_completion_exit() {
         let mut f = fixture_with_role(true, WorkKind::Business);
         let task = f.custody.task();
-        f.runtime.run(ContextInput::Installed { task }, None);
+        f.runtime.run(ParticipationInput::Installed { task }, None);
         let fees = f.runtime.ledger.used(Dimension::ActiveTasks.id());
         let start =
             crate::TaskStartPermit::from_admitted_author(f.author.take().unwrap(), generation());
         assert_eq!(start.identity(), task);
         start.authorize_running().unwrap();
-        assert_eq!(f.custody.phase(), ExitRolePhase::Exited);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Exited);
         assert!(f.custody.actual_exit_ready().unwrap());
         assert!(!f.custody.observe_consumers(&mut f.inbox).unwrap());
         assert_eq!(f.runtime.ledger.used(Dimension::ActiveTasks.id()), fees);
@@ -1175,10 +1188,10 @@ mod tests {
         f.inbox.observe_core(delivery.cut).unwrap();
         let effects = f.runtime.drain(delivery.event);
         assert!(effects.iter().any(|effect| matches!(effect,
-            WorkerAction::Context(ContextEffect::PublishTask { state, convergence, .. })
+            WorkerAction::Participation(ParticipationEffect::PublishTask { state, convergence, .. })
                 if *state == novarocks_execution_contract::TaskState::Running && !convergence.actual_stopped())));
         assert!(!effects.iter().any(|effect| matches!(effect,
-            WorkerAction::Context(ContextEffect::PublishTaskConvergence { snapshot, .. })
+            WorkerAction::Participation(ParticipationEffect::PublishTaskConvergence { snapshot, .. })
                 if snapshot.actual_stopped())));
         assert!(f.custody.observe_consumers(&mut f.inbox).unwrap());
         f.ingress
@@ -1194,7 +1207,7 @@ mod tests {
     #[test]
     fn actual_action_exit_seals_the_original_prefix_but_does_not_consume_its_report() {
         let mut f = fixture();
-        assert_eq!(f.custody.phase(), ExitRolePhase::Admitted);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Admitted);
         assert_eq!(f.runtime.ledger.used(Dimension::ActiveTasks.id()), 2);
         drop(f.ingress.submit(TaskConclusionProposal::Canceled(
             CancelReason::UpstreamNoLongerNeeded,
@@ -1202,7 +1215,7 @@ mod tests {
         let mut notice = f.notice.take().unwrap();
         notice.bind();
         notice.completed();
-        assert_eq!(f.custody.phase(), ExitRolePhase::Exited);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Exited);
         assert!(f.custody.actual_exit_ready().unwrap());
         let mut other = fixture();
         assert!(matches!(
@@ -1273,7 +1286,9 @@ mod tests {
             .expect("the original event receipt cannot be discarded before action ACK");
         assert_eq!(
             premature.error,
-            CausalError::Driver(novarocks_control_runtime::driver::DriverError::RoleBusy)
+            CausalError::ActorTurn(
+                novarocks_control_runtime::actor_turn::ActorTurnError::StandingInputBusy
+            )
         );
         assert!(matches!(
             premature.retirement,
@@ -1302,7 +1317,7 @@ mod tests {
             }
             assert!(f.ingress.event_unused(f.custody.cut()).unwrap());
             assert!(f.ingress.take_next_event(false).is_err());
-            assert_eq!(f.custody.phase(), ExitRolePhase::Exited);
+            assert_eq!(f.custody.phase(), ExitCustodyPhase::Exited);
             assert!(!f.custody.try_retire().unwrap());
             assert_eq!(f.runtime.ledger.used(Dimension::ActiveTasks.id()), 2);
             // The actual original revocation authorizes the unused report,
@@ -1331,7 +1346,7 @@ mod tests {
         let mut notice = f.notice.take().unwrap();
         notice.bind();
         drop(notice);
-        assert_eq!(f.custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
         assert!(f.custody.0.sender.lock().unwrap().is_some());
         assert!(!f.ingress.event_unused(f.custody.cut()).unwrap());
         assert!(!f.custody.try_retire().unwrap());
@@ -1348,8 +1363,8 @@ mod tests {
         let custody = f.custody.clone();
         drop(custody);
         assert_eq!(
-            retained.upgrade().unwrap().role.phase(),
-            ExitRolePhase::Unresolved
+            retained.upgrade().unwrap().exit_custody.phase(),
+            ExitCustodyPhase::Unresolved
         );
     }
     #[test]
@@ -1363,10 +1378,10 @@ mod tests {
         notice.bind();
         notice.completed();
         assert!(
-            matches!(f.custody.take_rejected(), Some(ContextInput::CompletionExited { task }) if task == f.custody.0.task)
+            matches!(f.custody.take_rejected(), Some(ParticipationInput::CompletionExited { task }) if task == f.custody.0.task)
         );
         assert!(f.custody.take_rejected().is_none());
-        assert_eq!(f.custody.phase(), ExitRolePhase::Unresolved);
+        assert_eq!(f.custody.phase(), ExitCustodyPhase::Unresolved);
         assert!(!f.custody.actual_exit_ready().unwrap());
         assert!(!f.custody.try_retire().unwrap());
         assert!(f.ingress.event_unused(f.custody.cut()).unwrap());

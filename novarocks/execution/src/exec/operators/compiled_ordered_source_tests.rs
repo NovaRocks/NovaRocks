@@ -22,11 +22,11 @@ use super::*;
 use crate::exec::node::scan::{ScanChunkStream, ScanOp, ScanOutputStream, ScanStreamSource};
 use crate::exec::operators::scan::StreamScanSourceFactory;
 use crate::exec::pipeline::OperatorInstance;
+use crate::exec::pipeline::driver_step::{DEFAULT_TURN_WORK_UNITS, DriverStep, TurnWork};
 use crate::exec::pipeline::operator::FinishWatch;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::shape::StepOperator;
-use crate::exec::pipeline::step_context::{DEFAULT_TURN_WORK_UNITS, StepContext, TurnWork};
-use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::task::ExecutionResult;
 use futures::{Stream, future::BoxFuture};
 use novarocks_spi::connector::read_stack::{
     BudgetConsume, ConnectorPollBudget, ConnectorSourceOperations,
@@ -109,7 +109,7 @@ impl Stream for PageStream {
 impl ScanChunkStream for PageStream {
     fn take_exit_observation(
         self: Pin<&mut Self>,
-        failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+        failures: Arc<dyn crate::runtime::task::ExecutionFailureReporter>,
     ) -> ExecutionResult<crate::exec::node::scan::ScanExitObservation> {
         Ok(crate::exec::node::scan::ScanExitObservation {
             // Pages retains the real queue of chunks; its body must also drop.
@@ -122,7 +122,7 @@ impl ScanChunkStream for PageStream {
     }
     fn close(
         self: Pin<Box<Self>>,
-        _failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+        _failures: Arc<dyn crate::runtime::task::ExecutionFailureReporter>,
     ) -> BoxFuture<'static, ExecutionResult<()>> {
         self.pages.closes.fetch_add(1, Ordering::SeqCst);
         self.pages.operations.seal();
@@ -241,7 +241,7 @@ impl SourceCase {
         operator.bind_poll_budget(turn.poll_budget());
         operator.set_mem_tracker(consumer.tracker.clone());
         operator.set_construction_factory(consumer._creation.clone());
-        operator.set_fragment_event_sink(consumer.effects.clone());
+        operator.set_task_event_sink(consumer.effects.clone());
         operator.prepare().unwrap();
         let tracker = consumer.tracker.clone();
         let runtime_error = consumer.state.error_state();
@@ -275,7 +275,7 @@ impl SourceCase {
     fn pull(&mut self) -> ExecutionResult<Option<Chunk>> {
         self.turn.begin_turn(DEFAULT_TURN_WORK_UNITS)?;
         let control = self.consumer.state.error_state();
-        let step = self.operator.drive(&mut StepContext::new(
+        let step = self.operator.drive(&mut DriverStep::new(
             &control,
             &mut self.turn,
             &mut novarocks_value_arrays::decode::ValueConversionContext::default(),
@@ -946,7 +946,7 @@ mod page_source_tests;
 
 async fn observe_fixture_source(
     operations: novarocks_spi::connector::read_stack::ConnectorSourceOperations,
-    failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+    failures: Arc<dyn crate::runtime::task::ExecutionFailureReporter>,
 ) -> crate::exec::node::scan::ScanExitProof {
     use novarocks_spi::connector::read_stack::{
         ConnectorSourceExitProof, ConnectorSourceFailureEvent,
@@ -959,11 +959,11 @@ async fn observe_fixture_source(
     futures::future::poll_fn(move |cx| {
         if !events_ended { loop { match events.poll_event(cx) {
             Poll::Ready(Some(ConnectorSourceFailureEvent::Required(cause))) => failures.report_failure(
-                crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
-                    crate::runtime::fragment::connector_failure::ConnectorOperation::SourceExit,cause).into()),
+                crate::runtime::task::connector_failure::ConnectorCallFailure::new(
+                    crate::runtime::task::connector_failure::ConnectorOperation::SourceExit,cause).into()),
             Poll::Ready(Some(ConnectorSourceFailureEvent::CleanupUnresolved(cause))) => {
-                let cause = crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
-                    crate::runtime::fragment::connector_failure::ConnectorOperation::SourceExit,cause).into();
+                let cause = crate::runtime::task::connector_failure::ConnectorCallFailure::new(
+                    crate::runtime::task::connector_failure::ConnectorOperation::SourceExit,cause).into();
                 failures.report_cleanup(&cause); failures.report_unresolved_exit(&cause);
             }
             Poll::Ready(None) => {events_ended=true;break;}, Poll::Pending=>break,

@@ -30,7 +30,6 @@ use novarocks_worker::{
 use crate::backend_metrics::BackendMetricsRegistry;
 use crate::backend_rpc_service::BackendRpcService;
 use crate::backend_task_execution::{CompiledPackageCompiler, CompiledPackageInterpreter};
-use crate::fragment_result_writer::native_result_writer;
 use crate::management_http::MetricsHttpServer;
 use crate::native_transport_admission::{NativeTransportAdmission, TransportClass};
 use crate::root_result_session::{RootProducerLimits, RootProducerPool};
@@ -38,34 +37,35 @@ use crate::runtime_filter_ingress::native_runtime_filter_envelope_ingress;
 use crate::runtime_filter_participant::NativeRuntimeFilterParticipantFactory;
 use crate::static_package_admission::StaticPackageAdmission;
 use crate::task_execution_observation::backend_task_execution_ports;
+use crate::task_result_writer::native_result_writer;
 use crate::worker_node_ingress::WorkerNodeTaskIngress;
 use crate::{
-    BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
+    BackendDataRuntime, BackendNativeTransport, NativeRpcListener,
     backend_announce::BackendAnnounceSupervisor, backend_heartbeat::BackendHeartbeatResponder,
     backend_readiness::wait_for_backend_native_endpoint_ready,
     runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress, task_protocol::TaskExecutionIngress,
 };
-use novarocks_execution::runtime::fragment::io::{
+use novarocks_execution::runtime::function_set::SealedExecutionFunctionSet;
+use novarocks_execution::runtime::task::io::{
     ExchangeReceiverPort, ExecutionRuntimeExchangeReceiverPort,
 };
-use novarocks_execution::runtime::function_set::SealedExecutionFunctionSet;
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::creation::TaskCreationInput;
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 #[cfg(test)]
-use novarocks_execution_contract::task_execution::identity::QueryContextRef;
+use novarocks_execution_contract::task_execution::identity::ParticipationRef;
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::operation::{
-    QueryContextDomainUpdate, TaskDomainUpdate,
+    ParticipationDomainUpdate, TaskDomainUpdate,
 };
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
 #[cfg(test)]
-use novarocks_worker::QueryContextHost;
+use novarocks_worker::ParticipationHost;
 #[cfg(test)]
-use novarocks_worker::ReleasedContextEvidence;
+use novarocks_worker::ReleasedParticipationEvidence;
 #[cfg(test)]
 use novarocks_worker::TaskStatusReporter;
 #[cfg(test)]
@@ -118,7 +118,7 @@ pub struct BackendServerConfig {
     pub exchange_flow_limits: ExchangeFlowLimits,
     pub scan_preparation_config: novarocks_worker::ScanPreparationConfig,
     /// The Server's scan I/O runtime. Typed scan streams are polled and
-    /// closed inside its context, where their I/O waits and timers live.
+    /// closed in its runtime context, where their I/O waits and timers live.
     pub scan_stream_runtime: tokio::runtime::Handle,
     /// Server-frozen bounded failure and provider-bind policy for the BE
     /// catalog manager.
@@ -236,8 +236,8 @@ pub struct BackendApplicationHost {
     #[cfg(novarocks_dev_controls)]
     test_session: Option<crate::backend_test_session::BackendTestSession>,
     ready_marker: String,
-    grpc_server: NativeRpcServerHandle,
-    control_grpc_server: NativeRpcServerHandle,
+    grpc_server: NativeRpcListener,
+    control_grpc_server: NativeRpcListener,
     execution_runtime: Arc<ExecutionRuntime>,
     root_producer_pool: Arc<RootProducerPool>,
     task_completion_supervisor: Arc<novarocks_worker::TaskCompletionSupervisor>,
@@ -275,9 +275,9 @@ struct BackendApplicationServices {
     /// task's inbound topology exists.
     task_inbound_capabilities: Arc<novarocks_worker::TaskInboundCapabilities>,
     /// The task substrate's runtime-filter participant owner. The RPC ingress
-    /// needs it directly, for the same reason: an `EstablishQueryContext`
+    /// needs it directly, for the same reason: an `EstablishParticipation`
     /// install is the only place a task-protocol query's participant exists.
-    query_context_host: Arc<crate::backend_task_execution::NativeQueryContextHost>,
+    participation_host: Arc<crate::backend_task_execution::NativeParticipationHost>,
 }
 
 /// What the two unrouted hosts below report.
@@ -306,7 +306,7 @@ impl novarocks_execution_contract::failure::FailureProjection for UnroutedBindin
     }
 }
 
-/// The query-context half of the execution binding the task protocol owner
+/// The participation half of the execution binding the task protocol owner
 /// does not have yet.
 ///
 /// The protocol is reachable over the wire, but the fragment-based lifecycle
@@ -319,10 +319,10 @@ impl novarocks_execution_contract::failure::FailureProjection for UnroutedBindin
 /// A host that installs nothing, for the one test that drives the deadline
 /// tick without binding a fragment.
 #[cfg(test)]
-struct UnroutedQueryContextHost;
+struct UnroutedParticipationHost;
 
 #[cfg(test)]
-impl QueryContextHost for UnroutedQueryContextHost {
+impl ParticipationHost for UnroutedParticipationHost {
     fn materialize(&self, _request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
         Err(HostRejection::from_domain(
             TaskFailureCategory::Internal,
@@ -330,14 +330,14 @@ impl QueryContextHost for UnroutedQueryContextHost {
         ))
     }
 
-    fn release(&self, _context: QueryContextRef) -> ReleasedContextEvidence {
-        ReleasedContextEvidence::none()
+    fn release(&self, _participation: ParticipationRef) -> ReleasedParticipationEvidence {
+        ReleasedParticipationEvidence::none()
     }
 
     fn advance_shared_domain(
         &self,
-        _context: QueryContextRef,
-        _domain: &QueryContextDomainUpdate,
+        _participation: ParticipationRef,
+        _domain: &ParticipationDomainUpdate,
     ) -> Result<(), HostRejection> {
         Err(HostRejection::from_domain(
             TaskFailureCategory::Internal,
@@ -352,11 +352,11 @@ struct UnroutedTaskExecutionHost;
 
 #[cfg(test)]
 impl TaskExecutionHost for UnroutedTaskExecutionHost {
-    fn close_context_admission(&self, _context: QueryContextRef) {}
+    fn close_participation_admission(&self, _participation: ParticipationRef) {}
 
-    fn retire_context_execution(&self, _context: QueryContextRef) {}
+    fn retire_participation_execution(&self, _participation: ParticipationRef) {}
 
-    fn forget_context_admission(&self, _context: QueryContextRef) {}
+    fn forget_participation_admission(&self, _participation: ParticipationRef) {}
 
     fn install_receiver(
         &self,
@@ -515,7 +515,7 @@ fn compose_backend_application_services(
     // One task protocol owner per process, on this process's own identity and
     // its monotonic clock, routed to the real execution owners.
     let runtime_filter_factory = NativeRuntimeFilterParticipantFactory::new(data_runtime.clone());
-    let queries = crate::native_fragment_query::NativeFragmentQueryRuntime::global(Arc::clone(
+    let queries = crate::native_query_context::NativeQueryContextRuntime::global(Arc::clone(
         &memory_authority,
     ));
     #[cfg(novarocks_dev_controls)]
@@ -528,7 +528,7 @@ fn compose_backend_application_services(
         Some(observation) => queries.with_observation_controls(Some(observation.clone())),
         None => queries,
     };
-    let context_host = crate::backend_task_execution::NativeQueryContextHost::new(
+    let native_participation_host = crate::backend_task_execution::NativeParticipationHost::new(
         queries.clone(),
         Arc::clone(&catalog_manager),
         Arc::clone(&execution_role_binding_factories),
@@ -538,16 +538,19 @@ fn compose_backend_application_services(
         data_runtime.clone(),
     );
     #[cfg(novarocks_dev_controls)]
-    let context_host = match test_session {
-        Some(session) => context_host.with_test_controls(Some(session.native.clone())),
-        None => context_host,
+    let native_participation_host = match test_session {
+        Some(session) => native_participation_host.with_test_controls(Some(session.native.clone())),
+        None => native_participation_host,
     };
     #[cfg(novarocks_dev_controls)]
-    let context_host = match test_session.and_then(|session| session.observation.as_ref()) {
-        Some(observation) => context_host.with_observation_controls(Some(observation.clone())),
-        None => context_host,
-    };
-    let context_host = Arc::new(context_host);
+    let native_participation_host =
+        match test_session.and_then(|session| session.observation.as_ref()) {
+            Some(observation) => {
+                native_participation_host.with_observation_controls(Some(observation.clone()))
+            }
+            None => native_participation_host,
+        };
+    let native_participation_host = Arc::new(native_participation_host);
     let inbound_capabilities = novarocks_worker::TaskInboundCapabilities::new();
     let root_producer_pool = RootProducerPool::try_new(
         root_producer_limits.threads(),
@@ -579,7 +582,8 @@ fn compose_backend_application_services(
     let execution_host = crate::backend_task_execution::NativeTaskExecutionHost::new(
         compiler,
         queries,
-        Arc::clone(&context_host) as Arc<dyn crate::backend_task_execution::TaskQueryContextFacts>,
+        Arc::clone(&native_participation_host)
+            as Arc<dyn crate::backend_task_execution::TaskParticipationFacts>,
         Arc::clone(&inbound_capabilities),
         novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
             data_runtime.clone(),
@@ -621,8 +625,8 @@ fn compose_backend_application_services(
         preparation_limits,
         novarocks_worker::NodeWorkers {
             pollers: worker_count(1)?,
-            context_materialization: worker_count(native_ingress.control_worker_threads)?,
-            context_cleanup: worker_count(native_ingress.control_worker_threads)?,
+            participation_materialization: worker_count(native_ingress.control_worker_threads)?,
+            participation_cleanup: worker_count(native_ingress.control_worker_threads)?,
             establish_getters: worker_count(native_ingress.worker_threads)?,
             establish_cleanup: worker_count(native_ingress.control_worker_threads)?,
             loading: worker_count(preparation_limits.workers())?,
@@ -650,7 +654,7 @@ fn compose_backend_application_services(
         compatibility: native_compatibility_id,
         initial_admission_epoch,
         clock: Arc::new(novarocks_worker::ProcessMonotonicClock::new()),
-        context_factory: context_host.clone(),
+        participation_factory: native_participation_host.clone(),
         execution: execution_host,
         execution_ports: backend_task_execution_ports(
             execution_runtime.execution_health(),
@@ -658,7 +662,7 @@ fn compose_backend_application_services(
             test_session.and_then(|session| session.observation.clone()),
         ),
         control: resolved.control,
-        context: resolved.context,
+        participation: resolved.participation,
         tickets: resolved.tickets,
         geometry: resolved.geometry,
         workers: resolved.workers,
@@ -692,7 +696,7 @@ fn compose_backend_application_services(
         task_completion_supervisor,
         task_execution_ingress,
         task_inbound_capabilities: inbound_capabilities,
-        query_context_host: context_host,
+        participation_host: native_participation_host,
     })
 }
 
@@ -1094,7 +1098,7 @@ impl BackendApplicationHost {
             native_trust.deployment_id().as_str(),
             &build_identity,
             native_compatibility_id,
-            preparation_limits.per_context(),
+            preparation_limits.per_participation(),
         )
         .map_err(|error| {
             BackendApplicationError::new(
@@ -1137,10 +1141,10 @@ impl BackendApplicationHost {
             )?;
         // The participant owner, because an attempt is reachable only
         // through the one that installed it, and every intent's participant is
-        // installed by the query-context host.
+        // installed by the participation host.
         let runtime_filter_authority: Arc<
             dyn crate::runtime_filter_ingress::BackendRuntimeFilterParticipantAuthority,
-        > = services.query_context_host.clone();
+        > = services.participation_host.clone();
         let runtime_filter_ingress =
             native_runtime_filter_envelope_ingress(runtime_filter_authority);
         #[cfg(novarocks_dev_controls)]
@@ -1157,7 +1161,7 @@ impl BackendApplicationHost {
             Arc::new(services.task_control.clone());
         let service = BackendRpcService::new(
             Arc::clone(&services.task_execution_ingress),
-            Arc::clone(&services.query_context_host)
+            Arc::clone(&services.participation_host)
                 as Arc<
                     dyn novarocks_native_adapter::catalog_prune_rpc::CatalogReachabilityAuthority,
                 >,
@@ -1186,7 +1190,7 @@ impl BackendApplicationHost {
                     .as_ref()
                     .and_then(|session| session.observation.clone()),
             );
-        let mut grpc_server = match NativeRpcServerHandle::start_with_admission(
+        let mut grpc_server = match NativeRpcListener::start_with_admission(
             &bind_host,
             grpc_port,
             service.clone(),
@@ -1216,7 +1220,7 @@ impl BackendApplicationHost {
             }
         };
 
-        let mut control_grpc_server = match NativeRpcServerHandle::start_with_admission(
+        let mut control_grpc_server = match NativeRpcListener::start_with_admission(
             &bind_host,
             control_grpc_port,
             service,
@@ -1288,7 +1292,8 @@ impl BackendApplicationHost {
             #[cfg(novarocks_dev_controls)]
             test_session,
             ready_marker: format!(
-                "NOVAROCKS_READY role=be grpc_port={grpc_port} control_grpc_port={control_grpc_port} advertise_host={} pid={}",
+                "{} role=be grpc_port={grpc_port} control_grpc_port={control_grpc_port} advertise_host={} pid={}",
+                novarocks_failpoint::observation_marker::READY,
                 advertise_endpoint.host,
                 std::process::id()
             ),
@@ -1365,8 +1370,8 @@ mod tests {
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-        BackendExecutionRuntimeInput, BackendServerConfig, CompiledStaticPlan, QueryContextRef,
-        UnroutedQueryContextHost, UnroutedTaskExecutionHost, combine_primary_and_shutdown,
+        BackendExecutionRuntimeInput, BackendServerConfig, CompiledStaticPlan, ParticipationRef,
+        UnroutedParticipationHost, UnroutedTaskExecutionHost, combine_primary_and_shutdown,
         compose_backend_application_services,
     };
     use crate::runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress;
@@ -1428,7 +1433,7 @@ mod tests {
             NativeNodeFixture, await_original, factory_from_host,
         };
         use novarocks_execution_contract::{
-            AcquireQueryContextAdmissionTicket, AdmissionTicketId, LeaseValidFor, TaskOperationId,
+            AcquireParticipationAdmissionTicket, AdmissionTicketId, LeaseValidFor, TaskOperationId,
         };
         use novarocks_types::identity::{FrontendProcessId, QueryExecutionId, QueryId};
         use novarocks_worker::{WorkerAdmissionEpochAuthority, WorkerControlReplyBody};
@@ -1436,13 +1441,13 @@ mod tests {
         let backend = novarocks_types::BackendProcessId::new_v7();
         let node = NativeNodeFixture::start(
             backend,
-            factory_from_host(Arc::new(UnroutedQueryContextHost)),
+            factory_from_host(Arc::new(UnroutedParticipationHost)),
             Arc::new(UnroutedTaskExecutionHost),
             Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
             17,
             1,
         );
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             QueryExecutionId::new(
                 QueryId::new(5, 6),
                 novarocks_types::identity::AttemptId::new(1).expect("nonzero attempt"),
@@ -1451,9 +1456,9 @@ mod tests {
             FrontendProcessId::new_v7(),
             backend,
         );
-        let request = AcquireQueryContextAdmissionTicket::new(
+        let request = AcquireParticipationAdmissionTicket::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             node.control.admission_epoch_capability(),
@@ -1605,7 +1610,7 @@ mod tests {
     /// that installed it.
     ///
     /// The task protocol installs its participant with
-    /// `EstablishQueryContext` and creates no `InitQuery` manifest, so the
+    /// `EstablishParticipation` and creates no `InitQuery` manifest, so the
     /// fragment query lifecycle holds nothing for such an attempt. With only
     /// that owner wired, every producer contribution and every materialized
     /// artifact is refused at the peer as query-unavailable. Nothing fails --
@@ -1616,7 +1621,7 @@ mod tests {
         use crate::runtime_filter_ingress::native_runtime_filter_envelope_ingress;
         use novarocks_execution_contract::CredentialUpdate;
         use novarocks_execution_contract::task_execution::domain::{
-            CodecOwnedContent, CredentialEpoch, CredentialLeaseId,
+            CodecOwnedContent, CredentialDomainId, CredentialEpoch,
         };
         use novarocks_native_adapter::runtime_filter_test_support::{
             delivery_envelope_for_test, participant_execution_id,
@@ -1626,7 +1631,7 @@ mod tests {
         use novarocks_proto_models::filter;
         use novarocks_task_codec::domain::{WireContent, WireCredential};
         use novarocks_types::identity::FrontendProcessId;
-        use novarocks_worker::QueryContextHost;
+        use novarocks_worker::ParticipationHost;
         use novarocks_worker::SharedFactsRequest;
         use novarocks_worker::runtime_filter::domain::BackendEnvelopeKind;
 
@@ -1679,7 +1684,7 @@ mod tests {
         // The exact attempt the fixture envelope is addressed to, established
         // the way the task protocol establishes one.
         let envelope = delivery_envelope_for_test(BackendEnvelopeKind::CompletedWithoutArtifact);
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             participant_execution_id(),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
@@ -1712,7 +1717,7 @@ mod tests {
             protocol::QueryOptions::default(),
         ));
         let credential = CredentialUpdate::new(
-            CredentialLeaseId::new(1),
+            CredentialDomainId::new(1),
             CredentialEpoch::FIRST,
             Arc::new(
                 WireCredential::decode(&[], FieldPath::root("credential"))
@@ -1720,19 +1725,19 @@ mod tests {
             ),
         );
         services
-            .query_context_host
+            .participation_host
             .materialize(SharedFactsRequest::new(
-                context,
+                participation,
                 &catalogs,
                 &filter,
                 &options,
                 &credential,
             ))
-            .expect("establishing a query context with a participant is legal");
+            .expect("establishing a participation with a participant is legal");
 
         let authority: Arc<
             dyn crate::runtime_filter_ingress::BackendRuntimeFilterParticipantAuthority,
-        > = services.query_context_host.clone();
+        > = services.participation_host.clone();
         let ingress = native_runtime_filter_envelope_ingress(authority);
         let reason = ingress
             .accept(envelope)
@@ -1743,7 +1748,7 @@ mod tests {
         // on its own route authority, which no composition refusal can say.
         assert!(
             reason.contains("[artifact-delivery]"),
-            "the envelope must be decided by the participant the query context \
+            "the envelope must be decided by the participant the participation \
              installed, not refused for having no owner: {reason}"
         );
     }
@@ -2063,7 +2068,7 @@ mod tests {
         };
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
         use novarocks_task_codec::identity::{
-            encode_query_context_ref, encode_task_identity, encode_task_operation_id,
+            encode_participation_ref, encode_task_identity, encode_task_operation_id,
         };
         use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
         use novarocks_types::identity::{
@@ -2173,7 +2178,7 @@ mod tests {
             AttemptId::new(1).expect("nonzero attempt"),
         )
         .expect("nonzero query");
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             execution,
             FrontendProcessId::new_v7(),
             services.backend_process_id,
@@ -2185,13 +2190,10 @@ mod tests {
             services.backend_process_id,
         );
         let metadata = protocol::CreationMetadata {
-            query_context: Some(encode_query_context_ref(context)),
+            participation: Some(encode_participation_ref(participation)),
             descriptor: Some(protocol::TaskDescriptor {
                 identity: Some(encode_task_identity(identity)),
-                fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
-                    hi: 41,
-                    lo: 42,
-                }),
+                task_key: Some(novarocks_proto_models::common::UniqueId { hi: 41, lo: 42 }),
                 pipeline_dop: 1,
                 split_plan_nodes: Vec::new(),
                 topology: Some(protocol::TaskExchangeTopology::default()),
@@ -2286,7 +2288,10 @@ mod tests {
             error.message()
         );
         assert!(
-            services.task_control.context_for_task(identity).is_none(),
+            services
+                .task_control
+                .participation_for_task(identity)
+                .is_none(),
             "a refused create leaves no task behind"
         );
         assert_eq!(

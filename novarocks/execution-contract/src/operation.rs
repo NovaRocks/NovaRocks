@@ -37,48 +37,48 @@ use novarocks_types::NativeCompatibilityId;
 
 use crate::task_execution::descriptor::TaskDescriptor;
 use crate::task_execution::domain::{
-    CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
-    DomainProgression, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer,
-    SplitWatermark, TaskDomainKind,
+    CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialDomainId,
+    CredentialEpoch, DomainProgression, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId,
+    SplitOffer, SplitWatermark, TaskDomainKind,
 };
 use crate::task_execution::identity::{
-    AdmissionEpochCapability, AdmissionTicketId, IdentityMismatch, QueryContextRef, TaskIdentity,
+    AdmissionEpochCapability, AdmissionTicketId, IdentityMismatch, ParticipationRef, TaskIdentity,
     TaskOperationId,
 };
 use crate::task_execution::lease::{LeaseReceipt, LeaseSequence, LeaseValidFor};
 use crate::task_execution::status::{AbortCause, CancelReason, TaskStatus};
-use crate::task_execution::transition::QueryContextState;
+use crate::task_execution::transition::ParticipationState;
 
 /// The operations that make up the task control and observation surface.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum OperationKind {
-    AcquireQueryContextAdmissionTicket,
+    AcquireParticipationAdmissionTicket,
     CreateTask,
     UpdateTask,
-    UpdateQueryContext,
+    UpdateParticipation,
     CancelTask,
-    AbortQueryContext,
-    QuiesceQueryContext,
-    ReleaseQueryContext,
+    AbortParticipation,
+    QuiesceParticipation,
+    ReleaseParticipation,
     FetchTaskDynamicFilters,
     GetFinalTaskInfo,
 }
 
 /// Closed semantic shape used by independent dispatch, transport, and BE
-/// method policies. It separates the three UpdateQueryContext commands that
+/// method policies. It separates the three UpdateParticipation commands that
 /// intentionally share one receipt kind.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum OperationShape {
-    AcquireQueryContextAdmissionTicket,
-    EstablishQueryContext,
+    AcquireParticipationAdmissionTicket,
+    EstablishParticipation,
     CreateTask,
     UpdateTask,
-    AdvanceQueryContextDomain,
-    RenewQueryExecutionLease,
+    AdvanceParticipationDomain,
+    RenewParticipationLease,
     CancelTask,
-    AbortQueryContext,
-    QuiesceQueryContext,
-    ReleaseQueryContext,
+    AbortParticipation,
+    QuiesceParticipation,
+    ReleaseParticipation,
     FetchTaskDynamicFilters,
     GetFinalTaskInfo,
 }
@@ -86,18 +86,18 @@ pub enum OperationShape {
 impl OperationShape {
     pub const fn kind(self) -> OperationKind {
         match self {
-            Self::AcquireQueryContextAdmissionTicket => {
-                OperationKind::AcquireQueryContextAdmissionTicket
+            Self::AcquireParticipationAdmissionTicket => {
+                OperationKind::AcquireParticipationAdmissionTicket
             }
-            Self::EstablishQueryContext
-            | Self::AdvanceQueryContextDomain
-            | Self::RenewQueryExecutionLease => OperationKind::UpdateQueryContext,
+            Self::EstablishParticipation
+            | Self::AdvanceParticipationDomain
+            | Self::RenewParticipationLease => OperationKind::UpdateParticipation,
             Self::CreateTask => OperationKind::CreateTask,
             Self::UpdateTask => OperationKind::UpdateTask,
             Self::CancelTask => OperationKind::CancelTask,
-            Self::AbortQueryContext => OperationKind::AbortQueryContext,
-            Self::QuiesceQueryContext => OperationKind::QuiesceQueryContext,
-            Self::ReleaseQueryContext => OperationKind::ReleaseQueryContext,
+            Self::AbortParticipation => OperationKind::AbortParticipation,
+            Self::QuiesceParticipation => OperationKind::QuiesceParticipation,
+            Self::ReleaseParticipation => OperationKind::ReleaseParticipation,
             Self::FetchTaskDynamicFilters => OperationKind::FetchTaskDynamicFilters,
             Self::GetFinalTaskInfo => OperationKind::GetFinalTaskInfo,
         }
@@ -107,14 +107,14 @@ impl OperationShape {
 impl OperationKind {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::AcquireQueryContextAdmissionTicket => "AcquireQueryContextAdmissionTicket",
+            Self::AcquireParticipationAdmissionTicket => "AcquireParticipationAdmissionTicket",
             Self::CreateTask => "CreateTask",
             Self::UpdateTask => "UpdateTask",
-            Self::UpdateQueryContext => "UpdateQueryContext",
+            Self::UpdateParticipation => "UpdateParticipation",
             Self::CancelTask => "CancelTask",
-            Self::AbortQueryContext => "AbortQueryContext",
-            Self::QuiesceQueryContext => "QuiesceQueryContext",
-            Self::ReleaseQueryContext => "ReleaseQueryContext",
+            Self::AbortParticipation => "AbortParticipation",
+            Self::QuiesceParticipation => "QuiesceParticipation",
+            Self::ReleaseParticipation => "ReleaseParticipation",
             Self::FetchTaskDynamicFilters => "FetchTaskDynamicFilters",
             Self::GetFinalTaskInfo => "GetFinalTaskInfo",
         }
@@ -234,10 +234,10 @@ impl MaxWait {
     /// The default wait for one operation kind.
     pub fn default_for(kind: OperationKind) -> Self {
         let value = match kind {
-            OperationKind::AcquireQueryContextAdmissionTicket | OperationKind::CreateTask => {
+            OperationKind::AcquireParticipationAdmissionTicket | OperationKind::CreateTask => {
                 Self::DEFAULT_CREATE
             }
-            OperationKind::UpdateQueryContext => Self::DEFAULT_CREATE,
+            OperationKind::UpdateParticipation => Self::DEFAULT_CREATE,
             _ => Self::DEFAULT_UPDATE,
         };
         Self(value)
@@ -310,11 +310,11 @@ pub enum OperationOutcome {
     /// The backend rejected the request before side effects because its
     /// immutable Native compatibility identity differs from the request.
     CompatibilityMismatch,
-    /// Advance or renew reached a genuinely absent context with no
+    /// Advance or renew reached a genuinely absent participation with no
     /// retirement fence.
-    ContextNotEstablished,
-    /// An establish conflicted with the context that already exists.
-    ContextConflict,
+    ParticipationNotEstablished,
+    /// An establish conflicted with the participation that already exists.
+    ParticipationConflict,
     /// A domain token was replayed with different content, skipped a value, or
     /// arrived after a seal.
     DomainConflict,
@@ -322,25 +322,25 @@ pub enum OperationOutcome {
     LeaseExpired,
     /// A release found tasks, output, reads, or operations still draining.
     ReleaseNotReady,
-    /// A late operation reached a retained terminal context without
+    /// A late operation reached a retained terminal participation without
     /// conflicting.
-    ContextTerminalReceipt,
+    ParticipationTerminalReceipt,
     /// Malformed, out of bounds, or an illegal state transition.
     InvalidStateOrRequest,
     /// A terminal task received a new update it never applied.
     TerminalRejected,
     /// The retained record was reaped, or a retirement fence rejected it.
     Gone,
-    /// A per-context or per-backend capacity bound was reached. This fails
+    /// A per-participation or per-backend capacity bound was reached. This fails
     /// closed rather than degrading: there is no older path to fall back to.
     ResourceExhausted,
-    /// Create arrived before its exact Context establishment became Active.
+    /// Create arrived before its exact Participation establishment became Active.
     /// No task was accepted; wait for the Establish receipt before retrying.
     NotReady,
     /// The bounded preparation queue is full while charged work can still
     /// leave it. No task was accepted by this operation.
     PreparationBusy,
-    /// Admission found an older unredeemed ticket for the same context. The
+    /// Admission found an older unredeemed ticket for the same participation. The
     /// new operation created no grant and may retry after bounded backoff.
     AdmissionTicketStillActive,
 }
@@ -424,9 +424,9 @@ impl TaskDomainReceipt {
     }
 }
 
-/// The receipt of one query-context domain.
+/// The receipt of one participation domain.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum QueryContextDomainReceipt {
+pub enum ParticipationDomainReceipt {
     CatalogBinding {
         accepted_version: Option<DomainVersion>,
         progression: DomainProgression,
@@ -438,13 +438,13 @@ pub enum QueryContextDomainReceipt {
     /// Only the lease and the accepted epoch are reported. No credential
     /// material, and no digest of any, ever appears in a receipt.
     Credential {
-        lease_id: CredentialLeaseId,
+        credential_domain_id: CredentialDomainId,
         accepted_epoch: CredentialEpoch,
         progression: DomainProgression,
     },
 }
 
-impl QueryContextDomainReceipt {
+impl ParticipationDomainReceipt {
     pub const fn progression(&self) -> DomainProgression {
         match self {
             Self::CatalogBinding { progression, .. }
@@ -528,19 +528,19 @@ impl UpdateTaskReceipt {
     }
 }
 
-/// The acknowledgement of a query context operation.
+/// The acknowledgement of a participation operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryContextReceipt {
-    context: QueryContextRef,
-    state: QueryContextState,
+pub struct ParticipationReceipt {
+    participation: ParticipationRef,
+    state: ParticipationState,
     lease: Option<LeaseReceipt>,
-    domains: Vec<QueryContextDomainReceipt>,
+    domains: Vec<ParticipationDomainReceipt>,
 }
 
-impl QueryContextReceipt {
-    pub const fn new(context: QueryContextRef, state: QueryContextState) -> Self {
+impl ParticipationReceipt {
+    pub const fn new(participation: ParticipationRef, state: ParticipationState) -> Self {
         Self {
-            context,
+            participation,
             state,
             lease: None,
             domains: Vec::new(),
@@ -552,16 +552,16 @@ impl QueryContextReceipt {
         self
     }
 
-    pub fn with_domains(mut self, domains: Vec<QueryContextDomainReceipt>) -> Self {
+    pub fn with_domains(mut self, domains: Vec<ParticipationDomainReceipt>) -> Self {
         self.domains = domains;
         self
     }
 
-    pub const fn context(&self) -> QueryContextRef {
-        self.context
+    pub const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
-    pub const fn state(&self) -> QueryContextState {
+    pub const fn state(&self) -> ParticipationState {
         self.state
     }
 
@@ -569,32 +569,32 @@ impl QueryContextReceipt {
         self.lease
     }
 
-    pub fn domains(&self) -> &[QueryContextDomainReceipt] {
+    pub fn domains(&self) -> &[ParticipationDomainReceipt] {
         &self.domains
     }
 }
 
 /// The immutable admission grant returned by the issuing worker.
 ///
-/// The context and validity are repeated deliberately. A caller validates the
+/// The participation and validity are repeated deliberately. A caller validates the
 /// receipt against its exact request instead of treating possession of an
 /// opaque ticket id as proof that it was issued for the right attempt.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct QueryContextAdmissionTicketReceipt {
+pub struct ParticipationAdmissionTicketReceipt {
     ticket_id: AdmissionTicketId,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     valid_for: LeaseValidFor,
 }
 
-impl QueryContextAdmissionTicketReceipt {
+impl ParticipationAdmissionTicketReceipt {
     pub const fn new(
         ticket_id: AdmissionTicketId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         valid_for: LeaseValidFor,
     ) -> Self {
         Self {
             ticket_id,
-            context,
+            participation,
             valid_for,
         }
     }
@@ -603,8 +603,8 @@ impl QueryContextAdmissionTicketReceipt {
         self.ticket_id
     }
 
-    pub const fn context(self) -> QueryContextRef {
-        self.context
+    pub const fn participation(self) -> ParticipationRef {
+        self.participation
     }
 
     pub const fn valid_for(self) -> LeaseValidFor {
@@ -615,14 +615,14 @@ impl QueryContextAdmissionTicketReceipt {
 /// How a release request was answered.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ReleaseOutcome {
-    /// Shared resources were released and the context is retained terminal.
+    /// Shared resources were released and the participation is retained terminal.
     Released,
     /// Local tasks, output, reads, or operations are still draining. The
-    /// context stays active, this operation was not applied, and it does not
+    /// participation stays active, this operation was not applied, and it does not
     /// occupy the first-wins position, so the identical request may be
     /// retried once state advances.
     NotReady,
-    /// The context was already terminal. The receipt reports the original
+    /// The participation was already terminal. The receipt reports the original
     /// cause.
     AlreadyTerminal,
 }
@@ -705,32 +705,32 @@ impl TaskDomainUpdate {
     }
 }
 
-/// A credential rotation of one query context.
+/// A credential rotation of one participation.
 ///
 /// The material is confidential, so this type has a hand-written `Debug` that
 /// renders a placeholder. Nothing here can fingerprint or print the secret.
 #[derive(Clone)]
 pub struct CredentialUpdate {
-    lease_id: CredentialLeaseId,
+    credential_domain_id: CredentialDomainId,
     epoch: CredentialEpoch,
     material: Arc<dyn ConfidentialContent>,
 }
 
 impl CredentialUpdate {
     pub const fn new(
-        lease_id: CredentialLeaseId,
+        credential_domain_id: CredentialDomainId,
         epoch: CredentialEpoch,
         material: Arc<dyn ConfidentialContent>,
     ) -> Self {
         Self {
-            lease_id,
+            credential_domain_id,
             epoch,
             material,
         }
     }
 
-    pub const fn lease_id(&self) -> CredentialLeaseId {
-        self.lease_id
+    pub const fn credential_domain_id(&self) -> CredentialDomainId {
+        self.credential_domain_id
     }
 
     pub const fn epoch(&self) -> CredentialEpoch {
@@ -751,16 +751,16 @@ impl fmt::Debug for CredentialUpdate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CredentialUpdate")
-            .field("lease_id", &self.lease_id)
+            .field("credential_domain_id", &self.credential_domain_id)
             .field("epoch", &self.epoch)
             .field("material", &"<redacted>")
             .finish()
     }
 }
 
-/// A closed query-context domain change.
+/// A closed participation domain change.
 #[derive(Clone, Debug)]
-pub enum QueryContextDomainUpdate {
+pub enum ParticipationDomainUpdate {
     CatalogBinding {
         version: DomainVersion,
         payload: Arc<dyn CodecOwnedContent>,
@@ -775,9 +775,9 @@ pub enum QueryContextDomainUpdate {
 /// Why a request is not a legal value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RequestError {
-    /// A create request's context reference does not address the same query
+    /// A create request's participation reference does not address the same query
     /// and backend process as its descriptor.
-    ContextMismatch(IdentityMismatch),
+    ParticipationMismatch(IdentityMismatch),
     /// An update carrying no domain change at all.
     EmptyUpdate,
     /// An edge-open naming no edge.
@@ -787,7 +787,7 @@ pub enum RequestError {
 impl fmt::Display for RequestError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ContextMismatch(mismatch) => write!(formatter, "create request {mismatch}"),
+            Self::ParticipationMismatch(mismatch) => write!(formatter, "create request {mismatch}"),
             Self::EmptyUpdate => formatter.write_str("update request carries no domain change"),
             Self::EmptyEdgeSet => formatter.write_str("edge-open request names no edge"),
         }
@@ -800,7 +800,7 @@ impl crate::failure::FailureProjection for RequestError {
     fn failure_fact(&self) -> crate::failure::FailureFact {
         use crate::failure::{FailureClass, FailureFact, FailureReason, domain};
         let code = match self {
-            Self::ContextMismatch(_) => 1032,
+            Self::ParticipationMismatch(_) => 1032,
             Self::EmptyUpdate => 1033,
             Self::EmptyEdgeSet => 1034,
         };
@@ -819,7 +819,7 @@ impl crate::failure::FailureProjection for RequestError {
 #[derive(Clone, Debug)]
 pub struct CreateTask {
     envelope: OperationEnvelope,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     descriptor: TaskDescriptor,
     initial_domains: Vec<TaskDomainUpdate>,
 }
@@ -827,17 +827,17 @@ pub struct CreateTask {
 impl CreateTask {
     pub fn try_new(
         operation_id: TaskOperationId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         descriptor: TaskDescriptor,
         initial_domains: Vec<TaskDomainUpdate>,
     ) -> Result<Self, RequestError> {
         descriptor
             .identity()
-            .verify_query_context(context)
-            .map_err(RequestError::ContextMismatch)?;
+            .verify_participation(participation)
+            .map_err(RequestError::ParticipationMismatch)?;
         Ok(Self {
             envelope: OperationEnvelope::with_default_wait(operation_id, OperationKind::CreateTask),
-            context,
+            participation,
             descriptor,
             initial_domains,
         })
@@ -851,8 +851,8 @@ impl CreateTask {
         self.descriptor.identity()
     }
 
-    pub const fn context(&self) -> QueryContextRef {
-        self.context
+    pub const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
     pub const fn descriptor(&self) -> &TaskDescriptor {
@@ -915,20 +915,20 @@ impl UpdateTask {
     }
 }
 
-/// Acquire worker-local capacity before creating a query context.
+/// Acquire worker-local capacity before creating a participation.
 #[derive(Copy, Clone, Debug)]
-pub struct AcquireQueryContextAdmissionTicket {
+pub struct AcquireParticipationAdmissionTicket {
     envelope: OperationEnvelope,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     valid_for: LeaseValidFor,
     native_compatibility_id: NativeCompatibilityId,
     admission_epoch_capability: AdmissionEpochCapability,
 }
 
-impl AcquireQueryContextAdmissionTicket {
+impl AcquireParticipationAdmissionTicket {
     pub fn new(
         operation_id: TaskOperationId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         valid_for: LeaseValidFor,
         native_compatibility_id: NativeCompatibilityId,
         admission_epoch_capability: AdmissionEpochCapability,
@@ -936,9 +936,9 @@ impl AcquireQueryContextAdmissionTicket {
         Self {
             envelope: OperationEnvelope::with_default_wait(
                 operation_id,
-                OperationKind::AcquireQueryContextAdmissionTicket,
+                OperationKind::AcquireParticipationAdmissionTicket,
             ),
-            context,
+            participation,
             valid_for,
             native_compatibility_id,
             admission_epoch_capability,
@@ -949,8 +949,8 @@ impl AcquireQueryContextAdmissionTicket {
         self.envelope
     }
 
-    pub const fn context(self) -> QueryContextRef {
-        self.context
+    pub const fn participation(self) -> ParticipationRef {
+        self.participation
     }
 
     pub const fn valid_for(self) -> LeaseValidFor {
@@ -969,14 +969,14 @@ impl AcquireQueryContextAdmissionTicket {
 /// Secret-free, typed equality projection for the semantic content of one
 /// establish request.
 ///
-/// Operation, context, admission ticket, and transport compatibility remain
+/// Operation, participation, admission ticket, and transport compatibility remain
 /// separate identities. Credential material is deliberately absent.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct EstablishSemanticIdentity {
     catalog_binding: ContentFingerprint,
     initial_runtime_filter: ContentFingerprint,
     query_options: ContentFingerprint,
-    credential_lease_id: CredentialLeaseId,
+    credential_domain_id: CredentialDomainId,
     credential_epoch: CredentialEpoch,
     initial_lease_valid_for: LeaseValidFor,
 }
@@ -994,8 +994,8 @@ impl EstablishSemanticIdentity {
         self.query_options
     }
 
-    pub const fn credential_lease_id(self) -> CredentialLeaseId {
-        self.credential_lease_id
+    pub const fn credential_domain_id(self) -> CredentialDomainId {
+        self.credential_domain_id
     }
 
     pub const fn credential_epoch(self) -> CredentialEpoch {
@@ -1007,14 +1007,14 @@ impl EstablishSemanticIdentity {
     }
 }
 
-/// Create one query context and install its shared facts atomically.
+/// Create one participation and install its shared facts atomically.
 ///
 /// The initial lease is not a parameter of this type beyond its duration: its
 /// sequence is always zero, so an establish cannot carry any other.
 #[derive(Clone, Debug)]
-pub struct EstablishQueryContext {
+pub struct EstablishParticipation {
     envelope: OperationEnvelope,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     admission_ticket_id: AdmissionTicketId,
     catalog_binding: Arc<dyn CodecOwnedContent>,
     initial_runtime_filter: Arc<dyn CodecOwnedContent>,
@@ -1027,9 +1027,9 @@ pub struct EstablishQueryContext {
 /// Moving these fields performs no opaque getter, clone or destructor. The
 /// carrier itself grants no admission, execution or retirement authority.
 /// Consumers must supervise each external field independently during disposal.
-pub struct EstablishQueryContextParts {
+pub struct EstablishParticipationParts {
     pub envelope: OperationEnvelope,
-    pub context: QueryContextRef,
+    pub participation: ParticipationRef,
     pub admission_ticket_id: AdmissionTicketId,
     pub catalog_binding: Arc<dyn CodecOwnedContent>,
     pub initial_runtime_filter: Arc<dyn CodecOwnedContent>,
@@ -1038,11 +1038,11 @@ pub struct EstablishQueryContextParts {
     pub initial_lease_valid_for: LeaseValidFor,
 }
 
-impl EstablishQueryContext {
-    pub fn into_owned_parts(self) -> EstablishQueryContextParts {
+impl EstablishParticipation {
+    pub fn into_owned_parts(self) -> EstablishParticipationParts {
         let Self {
             envelope,
-            context,
+            participation,
             admission_ticket_id,
             catalog_binding,
             initial_runtime_filter,
@@ -1050,9 +1050,9 @@ impl EstablishQueryContext {
             initial_credential,
             initial_lease_valid_for,
         } = self;
-        EstablishQueryContextParts {
+        EstablishParticipationParts {
             envelope,
-            context,
+            participation,
             admission_ticket_id,
             catalog_binding,
             initial_runtime_filter,
@@ -1063,7 +1063,7 @@ impl EstablishQueryContext {
     }
     pub fn new(
         operation_id: TaskOperationId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         admission_ticket_id: AdmissionTicketId,
         catalog_binding: Arc<dyn CodecOwnedContent>,
         initial_runtime_filter: Arc<dyn CodecOwnedContent>,
@@ -1074,9 +1074,9 @@ impl EstablishQueryContext {
         Self {
             envelope: OperationEnvelope::with_default_wait(
                 operation_id,
-                OperationKind::UpdateQueryContext,
+                OperationKind::UpdateParticipation,
             ),
-            context,
+            participation,
             admission_ticket_id,
             catalog_binding,
             initial_runtime_filter,
@@ -1090,8 +1090,8 @@ impl EstablishQueryContext {
         self.envelope
     }
 
-    pub const fn context(&self) -> QueryContextRef {
-        self.context
+    pub const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
     pub const fn admission_ticket_id(&self) -> AdmissionTicketId {
@@ -1106,7 +1106,7 @@ impl EstablishQueryContext {
         &self.initial_runtime_filter
     }
 
-    /// The immutable execution options shared by every task in this context.
+    /// The immutable execution options shared by every task in this participation.
     pub fn query_options(&self) -> &Arc<dyn CodecOwnedContent> {
         &self.query_options
     }
@@ -1127,7 +1127,7 @@ impl EstablishQueryContext {
     /// The typed, secret-free facts that decide whether two Establish
     /// requests have the same execution semantics.
     ///
-    /// Routing and replay coordinates remain separate: operation, context,
+    /// Routing and replay coordinates remain separate: operation, participation,
     /// admission ticket, and transport compatibility are deliberately absent.
     /// Credential material is confidential and therefore cannot participate.
     pub fn semantic_identity(&self) -> EstablishSemanticIdentity {
@@ -1135,40 +1135,46 @@ impl EstablishQueryContext {
             catalog_binding: self.catalog_binding.fingerprint(),
             initial_runtime_filter: self.initial_runtime_filter.fingerprint(),
             query_options: self.query_options.fingerprint(),
-            credential_lease_id: self.initial_credential.lease_id(),
+            credential_domain_id: self.initial_credential.credential_domain_id(),
             credential_epoch: self.initial_credential.epoch(),
             initial_lease_valid_for: self.initial_lease_valid_for,
         }
     }
 }
 
-/// Advance one shared domain of an existing query context.
+/// Advance one shared domain of an existing participation.
 ///
-/// This type cannot create a context. A backend that receives it against a
-/// genuinely absent context fails closed rather than establishing one.
+/// This type cannot create a participation. A backend that receives it against a
+/// genuinely absent participation fails closed rather than establishing one.
 #[derive(Clone, Debug)]
-pub struct AdvanceQueryContextDomain {
+pub struct AdvanceParticipationDomain {
     envelope: OperationEnvelope,
-    context: QueryContextRef,
-    domain: QueryContextDomainUpdate,
+    participation: ParticipationRef,
+    domain: ParticipationDomainUpdate,
 }
 
-impl AdvanceQueryContextDomain {
+impl AdvanceParticipationDomain {
     /// Transfer the original shared-domain capability to its admitted owner.
-    pub fn into_parts(self) -> (OperationEnvelope, QueryContextRef, QueryContextDomainUpdate) {
-        (self.envelope, self.context, self.domain)
+    pub fn into_parts(
+        self,
+    ) -> (
+        OperationEnvelope,
+        ParticipationRef,
+        ParticipationDomainUpdate,
+    ) {
+        (self.envelope, self.participation, self.domain)
     }
     pub fn new(
         operation_id: TaskOperationId,
-        context: QueryContextRef,
-        domain: QueryContextDomainUpdate,
+        participation: ParticipationRef,
+        domain: ParticipationDomainUpdate,
     ) -> Self {
         Self {
             envelope: OperationEnvelope::with_default_wait(
                 operation_id,
-                OperationKind::UpdateQueryContext,
+                OperationKind::UpdateParticipation,
             ),
-            context,
+            participation,
             domain,
         }
     }
@@ -1177,37 +1183,37 @@ impl AdvanceQueryContextDomain {
         self.envelope
     }
 
-    pub const fn context(&self) -> QueryContextRef {
-        self.context
+    pub const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
-    pub const fn domain(&self) -> &QueryContextDomainUpdate {
+    pub const fn domain(&self) -> &ParticipationDomainUpdate {
         &self.domain
     }
 }
 
-/// Renew the application lease of one query context.
+/// Renew the application lease of one participation.
 #[derive(Clone, Debug)]
-pub struct RenewQueryExecutionLease {
+pub struct RenewParticipationLease {
     envelope: OperationEnvelope,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     sequence: LeaseSequence,
     valid_for: LeaseValidFor,
 }
 
-impl RenewQueryExecutionLease {
+impl RenewParticipationLease {
     pub fn new(
         operation_id: TaskOperationId,
-        context: QueryContextRef,
+        participation: ParticipationRef,
         sequence: LeaseSequence,
         valid_for: LeaseValidFor,
     ) -> Self {
         Self {
             envelope: OperationEnvelope::with_default_wait(
                 operation_id,
-                OperationKind::UpdateQueryContext,
+                OperationKind::UpdateParticipation,
             ),
-            context,
+            participation,
             sequence,
             valid_for,
         }
@@ -1217,8 +1223,8 @@ impl RenewQueryExecutionLease {
         self.envelope
     }
 
-    pub const fn context(&self) -> QueryContextRef {
-        self.context
+    pub const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
 
     pub const fn sequence(&self) -> LeaseSequence {
@@ -1230,20 +1236,20 @@ impl RenewQueryExecutionLease {
     }
 }
 
-/// The closed command set of `UpdateQueryContext`.
+/// The closed command set of `UpdateParticipation`.
 #[derive(Clone, Debug)]
-pub enum UpdateQueryContext {
-    Establish(EstablishQueryContext),
-    AdvanceDomain(AdvanceQueryContextDomain),
-    RenewLease(RenewQueryExecutionLease),
+pub enum UpdateParticipation {
+    Establish(EstablishParticipation),
+    AdvanceDomain(AdvanceParticipationDomain),
+    RenewLease(RenewParticipationLease),
 }
 
-impl UpdateQueryContext {
+impl UpdateParticipation {
     pub const fn shape(&self) -> OperationShape {
         match self {
-            Self::Establish(_) => OperationShape::EstablishQueryContext,
-            Self::AdvanceDomain(_) => OperationShape::AdvanceQueryContextDomain,
-            Self::RenewLease(_) => OperationShape::RenewQueryExecutionLease,
+            Self::Establish(_) => OperationShape::EstablishParticipation,
+            Self::AdvanceDomain(_) => OperationShape::AdvanceParticipationDomain,
+            Self::RenewLease(_) => OperationShape::RenewParticipationLease,
         }
     }
 
@@ -1255,15 +1261,15 @@ impl UpdateQueryContext {
         }
     }
 
-    pub const fn context(&self) -> QueryContextRef {
+    pub const fn participation(&self) -> ParticipationRef {
         match self {
-            Self::Establish(request) => request.context(),
-            Self::AdvanceDomain(request) => request.context(),
-            Self::RenewLease(request) => request.context(),
+            Self::Establish(request) => request.participation(),
+            Self::AdvanceDomain(request) => request.participation(),
+            Self::RenewLease(request) => request.participation(),
         }
     }
 
-    /// Whether this command may create the context. Only an establish may.
+    /// Whether this command may create the participation. Only an establish may.
     pub const fn may_create(&self) -> bool {
         matches!(self, Self::Establish(_))
     }
@@ -1303,22 +1309,26 @@ impl CancelTask {
     }
 }
 
-/// Force one query context and all its tasks down.
+/// Force one participation and all its tasks down.
 #[derive(Copy, Clone, Debug)]
-pub struct AbortQueryContext {
+pub struct AbortParticipation {
     envelope: OperationEnvelope,
-    context: QueryContextRef,
+    participation: ParticipationRef,
     cause: AbortCause,
 }
 
-impl AbortQueryContext {
-    pub fn new(operation_id: TaskOperationId, context: QueryContextRef, cause: AbortCause) -> Self {
+impl AbortParticipation {
+    pub fn new(
+        operation_id: TaskOperationId,
+        participation: ParticipationRef,
+        cause: AbortCause,
+    ) -> Self {
         Self {
             envelope: OperationEnvelope::with_default_wait(
                 operation_id,
-                OperationKind::AbortQueryContext,
+                OperationKind::AbortParticipation,
             ),
-            context,
+            participation,
             cause,
         }
     }
@@ -1327,8 +1337,8 @@ impl AbortQueryContext {
         self.envelope
     }
 
-    pub const fn context(self) -> QueryContextRef {
-        self.context
+    pub const fn participation(self) -> ParticipationRef {
+        self.participation
     }
 
     pub const fn cause(self) -> AbortCause {
@@ -1338,19 +1348,19 @@ impl AbortQueryContext {
 
 /// Fence future task admission without claiming that owned work has stopped.
 #[derive(Copy, Clone, Debug)]
-pub struct QuiesceQueryContext {
+pub struct QuiesceParticipation {
     envelope: OperationEnvelope,
-    context: QueryContextRef,
+    participation: ParticipationRef,
 }
 
-impl QuiesceQueryContext {
-    pub fn new(operation_id: TaskOperationId, context: QueryContextRef) -> Self {
+impl QuiesceParticipation {
+    pub fn new(operation_id: TaskOperationId, participation: ParticipationRef) -> Self {
         Self {
             envelope: OperationEnvelope::with_default_wait(
                 operation_id,
-                OperationKind::QuiesceQueryContext,
+                OperationKind::QuiesceParticipation,
             ),
-            context,
+            participation,
         }
     }
 
@@ -1358,37 +1368,37 @@ impl QuiesceQueryContext {
         self.envelope
     }
 
-    pub const fn context(self) -> QueryContextRef {
-        self.context
+    pub const fn participation(self) -> ParticipationRef {
+        self.participation
     }
 }
 
 /// An immutable admission cut and its current closing state.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QuiesceQueryContextReceipt {
-    context: QueryContextRef,
+pub struct QuiesceParticipationReceipt {
+    participation: ParticipationRef,
     fence_version: u64,
     accepted_tasks: Vec<TaskIdentity>,
-    state: QueryContextState,
+    state: ParticipationState,
 }
 
-impl QuiesceQueryContextReceipt {
+impl QuiesceParticipationReceipt {
     pub fn new(
-        context: QueryContextRef,
+        participation: ParticipationRef,
         fence_version: u64,
         accepted_tasks: Vec<TaskIdentity>,
-        state: QueryContextState,
+        state: ParticipationState,
     ) -> Self {
         Self {
-            context,
+            participation,
             fence_version,
             accepted_tasks,
             state,
         }
     }
 
-    pub const fn context(&self) -> QueryContextRef {
-        self.context
+    pub const fn participation(&self) -> ParticipationRef {
+        self.participation
     }
     pub const fn fence_version(&self) -> u64 {
         self.fence_version
@@ -1396,34 +1406,34 @@ impl QuiesceQueryContextReceipt {
     pub fn accepted_tasks(&self) -> &[TaskIdentity] {
         &self.accepted_tasks
     }
-    pub const fn state(&self) -> QueryContextState {
+    pub const fn state(&self) -> ParticipationState {
         self.state
     }
 
-    pub fn with_state(mut self, state: QueryContextState) -> Self {
+    pub fn with_state(mut self, state: ParticipationState) -> Self {
         self.state = state;
         self
     }
 }
 
-/// Declare that no legal create can follow and close the shared context.
+/// Declare that no legal create can follow and close the shared participation.
 ///
 /// It carries no task manifest and no digest. The backend verifies only what
 /// it can observe locally, and answers `NotReady` while anything still drains.
 #[derive(Copy, Clone, Debug)]
-pub struct ReleaseQueryContext {
+pub struct ReleaseParticipation {
     envelope: OperationEnvelope,
-    context: QueryContextRef,
+    participation: ParticipationRef,
 }
 
-impl ReleaseQueryContext {
-    pub fn new(operation_id: TaskOperationId, context: QueryContextRef) -> Self {
+impl ReleaseParticipation {
+    pub fn new(operation_id: TaskOperationId, participation: ParticipationRef) -> Self {
         Self {
             envelope: OperationEnvelope::with_default_wait(
                 operation_id,
-                OperationKind::ReleaseQueryContext,
+                OperationKind::ReleaseParticipation,
             ),
-            context,
+            participation,
         }
     }
 
@@ -1431,8 +1441,8 @@ impl ReleaseQueryContext {
         self.envelope
     }
 
-    pub const fn context(self) -> QueryContextRef {
-        self.context
+    pub const fn participation(self) -> ParticipationRef {
+        self.participation
     }
 }
 
@@ -1549,21 +1559,21 @@ mod tests {
 #[cfg(test)]
 mod request_tests {
     use super::{
-        AbortQueryContext, AcquireQueryContextAdmissionTicket, AdvanceQueryContextDomain,
-        CancelTask, CreateTask, CredentialUpdate, EstablishQueryContext, FetchTaskDynamicFilters,
-        GetFinalTaskInfo, OperationKind, QueryContextAdmissionTicketReceipt,
-        QueryContextDomainUpdate, ReleaseQueryContext, RenewQueryExecutionLease, RequestError,
-        SplitAssignmentIntent, TaskDomainUpdate, UpdateQueryContext, UpdateTask,
+        AbortParticipation, AcquireParticipationAdmissionTicket, AdvanceParticipationDomain,
+        CancelTask, CreateTask, CredentialUpdate, EstablishParticipation, FetchTaskDynamicFilters,
+        GetFinalTaskInfo, OperationKind, ParticipationAdmissionTicketReceipt,
+        ParticipationDomainUpdate, ReleaseParticipation, RenewParticipationLease, RequestError,
+        SplitAssignmentIntent, TaskDomainUpdate, UpdateParticipation, UpdateTask,
     };
     use crate::task_execution::descriptor::{ExchangeTopology, TaskDescriptor};
     use crate::task_execution::domain::{
-        CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch,
-        CredentialLeaseId, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer,
+        CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialDomainId,
+        CredentialEpoch, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer,
         SplitSequence, TaskDomainKind,
     };
     use crate::task_execution::identity::{
         AdmissionEpochCapability, AdmissionTicketId, IdentityField, IdentityMismatch,
-        QueryContextRef, TaskIdentity, TaskOperationId,
+        ParticipationRef, TaskIdentity, TaskOperationId,
     };
     use crate::task_execution::lease::{LeaseSequence, LeaseValidFor};
     use crate::task_execution::status::{AbortCause, CancelReason};
@@ -1638,7 +1648,7 @@ mod request_tests {
 
     fn credential() -> CredentialUpdate {
         CredentialUpdate::new(
-            CredentialLeaseId::new(1),
+            CredentialDomainId::new(1),
             CredentialEpoch::FIRST,
             Arc::new(FakeSecret(SECRET_SENTINEL)),
         )
@@ -1653,27 +1663,27 @@ mod request_tests {
         let backend = BackendProcessId::new_v7();
         let frontend = FrontendProcessId::new_v7();
         let identity = task(1, backend);
-        let context = QueryContextRef::new(execution(), frontend, backend);
+        let participation = ParticipationRef::new(execution(), frontend, backend);
 
         let request = CreateTask::try_new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             descriptor(identity),
             Vec::new(),
         )
-        .expect("matching context");
+        .expect("matching participation");
         assert_eq!(request.identity(), identity);
-        assert_eq!(request.context(), context);
+        assert_eq!(request.participation(), participation);
         assert_eq!(request.envelope().kind(), OperationKind::CreateTask);
         assert_eq!(request.envelope().max_wait().get(), Duration::from_secs(15));
         assert!(request.initial_domains().is_empty());
     }
 
     #[test]
-    fn a_create_request_rejects_a_context_for_another_backend() {
+    fn a_create_request_rejects_a_participation_for_another_backend() {
         let backend = BackendProcessId::new_v7();
         let identity = task(1, backend);
-        let wrong = QueryContextRef::new(
+        let wrong = ParticipationRef::new(
             execution(),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
@@ -1686,7 +1696,9 @@ mod request_tests {
                 Vec::new()
             )
             .expect_err("mismatched backend must fail closed"),
-            RequestError::ContextMismatch(IdentityMismatch::new(IdentityField::BackendProcess))
+            RequestError::ParticipationMismatch(IdentityMismatch::new(
+                IdentityField::BackendProcess
+            ))
         );
     }
 
@@ -1757,15 +1769,15 @@ mod request_tests {
     }
 
     #[test]
-    fn only_establish_may_create_a_query_context() {
-        let context = QueryContextRef::new(
+    fn only_establish_may_create_a_participation() {
+        let participation = ParticipationRef::new(
             execution(),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         );
-        let establish = UpdateQueryContext::Establish(EstablishQueryContext::new(
+        let establish = UpdateParticipation::Establish(EstablishParticipation::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             AdmissionTicketId::try_from_bytes([0x51; 16]).expect("nonzero ticket"),
             content(),
             content(),
@@ -1773,17 +1785,17 @@ mod request_tests {
             credential(),
             valid_for(),
         ));
-        let advance = UpdateQueryContext::AdvanceDomain(AdvanceQueryContextDomain::new(
+        let advance = UpdateParticipation::AdvanceDomain(AdvanceParticipationDomain::new(
             TaskOperationId::new_v7(),
-            context,
-            QueryContextDomainUpdate::SharedDynamicFilter {
+            participation,
+            ParticipationDomainUpdate::SharedDynamicFilter {
                 version: DomainVersion::FIRST,
                 payload: content(),
             },
         ));
-        let renew = UpdateQueryContext::RenewLease(RenewQueryExecutionLease::new(
+        let renew = UpdateParticipation::RenewLease(RenewParticipationLease::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             LeaseSequence::new(1),
             valid_for(),
         ));
@@ -1792,21 +1804,24 @@ mod request_tests {
         assert!(!advance.may_create());
         assert!(!renew.may_create());
         for request in [&establish, &advance, &renew] {
-            assert_eq!(request.context(), context);
-            assert_eq!(request.envelope().kind(), OperationKind::UpdateQueryContext);
+            assert_eq!(request.participation(), participation);
+            assert_eq!(
+                request.envelope().kind(),
+                OperationKind::UpdateParticipation
+            );
         }
     }
 
     #[test]
     fn an_establish_can_only_ever_carry_lease_sequence_zero() {
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             execution(),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         );
-        let establish = EstablishQueryContext::new(
+        let establish = EstablishParticipation::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             AdmissionTicketId::try_from_bytes([0x52; 16]).expect("nonzero ticket"),
             content(),
             content(),
@@ -1825,7 +1840,7 @@ mod request_tests {
 
     #[test]
     fn establish_semantic_identity_tracks_each_public_semantic_fact() {
-        let context = QueryContextRef::new(
+        let participation = ParticipationRef::new(
             execution(),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
@@ -1835,19 +1850,19 @@ mod request_tests {
         let establish = |catalog,
                          runtime_filter,
                          query_options,
-                         credential_lease,
+                         credential_domain_id,
                          credential_epoch,
                          secret,
                          lease_seconds| {
-            EstablishQueryContext::new(
+            EstablishParticipation::new(
                 operation,
-                context,
+                participation,
                 ticket,
                 content_with(catalog),
                 content_with(runtime_filter),
                 content_with(query_options),
                 CredentialUpdate::new(
-                    credential_lease,
+                    credential_domain_id,
                     credential_epoch,
                     Arc::new(FakeSecret(secret)),
                 ),
@@ -1859,7 +1874,7 @@ mod request_tests {
             1,
             2,
             3,
-            CredentialLeaseId::new(4),
+            CredentialDomainId::new(4),
             CredentialEpoch::FIRST,
             "a",
             30,
@@ -1872,7 +1887,7 @@ mod request_tests {
                 9,
                 2,
                 3,
-                CredentialLeaseId::new(4),
+                CredentialDomainId::new(4),
                 CredentialEpoch::FIRST,
                 "a",
                 30,
@@ -1885,7 +1900,7 @@ mod request_tests {
                 1,
                 9,
                 3,
-                CredentialLeaseId::new(4),
+                CredentialDomainId::new(4),
                 CredentialEpoch::FIRST,
                 "a",
                 30,
@@ -1898,7 +1913,7 @@ mod request_tests {
                 1,
                 2,
                 9,
-                CredentialLeaseId::new(4),
+                CredentialDomainId::new(4),
                 CredentialEpoch::FIRST,
                 "a",
                 30,
@@ -1911,7 +1926,7 @@ mod request_tests {
                 1,
                 2,
                 3,
-                CredentialLeaseId::new(9),
+                CredentialDomainId::new(9),
                 CredentialEpoch::FIRST,
                 "a",
                 30,
@@ -1924,7 +1939,7 @@ mod request_tests {
                 1,
                 2,
                 3,
-                CredentialLeaseId::new(4),
+                CredentialDomainId::new(4),
                 CredentialEpoch::new(2).expect("nonzero"),
                 "a",
                 30,
@@ -1937,7 +1952,7 @@ mod request_tests {
                 1,
                 2,
                 3,
-                CredentialLeaseId::new(4),
+                CredentialDomainId::new(4),
                 CredentialEpoch::FIRST,
                 "a",
                 31,
@@ -1949,16 +1964,16 @@ mod request_tests {
             1,
             2,
             3,
-            CredentialLeaseId::new(4),
+            CredentialDomainId::new(4),
             CredentialEpoch::FIRST,
             SECRET_SENTINEL,
             30,
         );
         assert_eq!(baseline, same_facts_different_secret.semantic_identity());
 
-        let different_routing_identity = EstablishQueryContext::new(
+        let different_routing_identity = EstablishParticipation::new(
             TaskOperationId::new_v7(),
-            QueryContextRef::new(
+            ParticipationRef::new(
                 QueryExecutionId::new(
                     QueryId::new(8, 10),
                     AttemptId::new(2).expect("nonzero attempt"),
@@ -1972,7 +1987,7 @@ mod request_tests {
             content_with(2),
             content_with(3),
             CredentialUpdate::new(
-                CredentialLeaseId::new(4),
+                CredentialDomainId::new(4),
                 CredentialEpoch::FIRST,
                 Arc::new(FakeSecret("different secret")),
             ),
@@ -1992,7 +2007,7 @@ mod request_tests {
             baseline.query_options(),
             ContentFingerprint::from_bytes([3; 16])
         );
-        assert_eq!(baseline.credential_lease_id(), CredentialLeaseId::new(4));
+        assert_eq!(baseline.credential_domain_id(), CredentialDomainId::new(4));
         assert_eq!(baseline.credential_epoch(), CredentialEpoch::FIRST);
         assert_eq!(
             baseline.initial_lease_valid_for().get(),
@@ -2001,33 +2016,33 @@ mod request_tests {
     }
 
     #[test]
-    fn admission_ticket_request_and_receipt_bind_exact_context_and_validity() {
-        let context = QueryContextRef::new(
+    fn admission_ticket_request_and_receipt_bind_exact_participation_and_validity() {
+        let participation = ParticipationRef::new(
             execution(),
             FrontendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         );
         let valid_for = valid_for();
         let native_compatibility_id = NativeCompatibilityId::new([0x47; 32]);
-        let request = AcquireQueryContextAdmissionTicket::new(
+        let request = AcquireParticipationAdmissionTicket::new(
             TaskOperationId::new_v7(),
-            context,
+            participation,
             valid_for,
             native_compatibility_id,
             AdmissionEpochCapability::try_from_bytes([0x51; 16]).expect("nonzero epoch"),
         );
         assert_eq!(
             request.envelope().kind(),
-            OperationKind::AcquireQueryContextAdmissionTicket
+            OperationKind::AcquireParticipationAdmissionTicket
         );
-        assert_eq!(request.context(), context);
+        assert_eq!(request.participation(), participation);
         assert_eq!(request.valid_for(), valid_for);
         assert_eq!(request.native_compatibility_id(), native_compatibility_id);
 
         let ticket_id = AdmissionTicketId::try_from_bytes([0x53; 16]).expect("nonzero ticket");
-        let receipt = QueryContextAdmissionTicketReceipt::new(ticket_id, context, valid_for);
+        let receipt = ParticipationAdmissionTicketReceipt::new(ticket_id, participation, valid_for);
         assert_eq!(receipt.ticket_id(), ticket_id);
-        assert_eq!(receipt.context(), context);
+        assert_eq!(receipt.participation(), participation);
         assert_eq!(receipt.valid_for(), valid_for);
     }
 
@@ -2042,7 +2057,7 @@ mod request_tests {
         assert!(rendered.contains("<redacted>"), "{rendered}");
         assert!(rendered.contains("epoch"), "{rendered}");
 
-        let domain = QueryContextDomainUpdate::Credential(credential());
+        let domain = ParticipationDomainUpdate::Credential(credential());
         let rendered = format!("{domain:?}");
         assert!(!rendered.contains(SECRET_SENTINEL), "{rendered}");
 
@@ -2056,7 +2071,8 @@ mod request_tests {
     fn the_remaining_requests_carry_their_own_kind_and_deadline() {
         let backend = BackendProcessId::new_v7();
         let identity = task(1, backend);
-        let context = QueryContextRef::new(execution(), FrontendProcessId::new_v7(), backend);
+        let participation =
+            ParticipationRef::new(execution(), FrontendProcessId::new_v7(), backend);
 
         let cancel = CancelTask::new(
             TaskOperationId::new_v7(),
@@ -2066,17 +2082,20 @@ mod request_tests {
         assert_eq!(cancel.envelope().kind(), OperationKind::CancelTask);
         assert_eq!(cancel.reason(), CancelReason::UpstreamNoLongerNeeded);
 
-        let abort =
-            AbortQueryContext::new(TaskOperationId::new_v7(), context, AbortCause::LeaseExpired);
-        assert_eq!(abort.envelope().kind(), OperationKind::AbortQueryContext);
+        let abort = AbortParticipation::new(
+            TaskOperationId::new_v7(),
+            participation,
+            AbortCause::LeaseExpired,
+        );
+        assert_eq!(abort.envelope().kind(), OperationKind::AbortParticipation);
         assert_eq!(abort.cause(), AbortCause::LeaseExpired);
 
-        let release = ReleaseQueryContext::new(TaskOperationId::new_v7(), context);
+        let release = ReleaseParticipation::new(TaskOperationId::new_v7(), participation);
         assert_eq!(
             release.envelope().kind(),
-            OperationKind::ReleaseQueryContext
+            OperationKind::ReleaseParticipation
         );
-        assert_eq!(release.context(), context);
+        assert_eq!(release.participation(), participation);
 
         let fetch = FetchTaskDynamicFilters::new(
             TaskOperationId::new_v7(),
@@ -2229,7 +2248,9 @@ mod request_failure_projection_tests {
     fn request_shapes_keep_distinct_owner_reasons_without_task_acceptance() {
         for (error, code) in [
             (
-                RequestError::ContextMismatch(IdentityMismatch::new(IdentityField::BackendProcess)),
+                RequestError::ParticipationMismatch(IdentityMismatch::new(
+                    IdentityField::BackendProcess,
+                )),
                 1032,
             ),
             (RequestError::EmptyUpdate, 1033),

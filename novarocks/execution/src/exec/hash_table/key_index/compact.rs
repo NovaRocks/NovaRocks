@@ -34,7 +34,7 @@ use super::{
 };
 use crate::{
     exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner},
-    runtime::fragment::{ExecutionFailure, ExecutionResult},
+    runtime::task::{ExecutionFailure, ExecutionResult},
 };
 use arrow::array::{Array, BinaryViewArray, StringViewArray, new_empty_array};
 use novarocks_functions::{

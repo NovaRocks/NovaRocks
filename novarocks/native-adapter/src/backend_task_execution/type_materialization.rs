@@ -42,7 +42,7 @@ use novarocks_worker::PreparationControlLoan;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypeMaterializationRefusal {
-    Interrupted(novarocks_execution::runtime::fragment::ExecutionFailure),
+    Interrupted(novarocks_execution::runtime::task::ExecutionFailure),
     MissingQueryMemory,
     SharedShortage(ShortageReceipt),
     Capacity(CapacityError),

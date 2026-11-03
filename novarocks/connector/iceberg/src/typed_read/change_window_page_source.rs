@@ -72,7 +72,7 @@ pub struct IcebergChangeWindowPageSourceRequest<'a> {
     pub footers: Arc<ParquetFooterCache>,
     pub access_binding: IcebergReadBinding,
     pub context: FileReadContext,
-    pub cache: Option<novarocks_fs::DataCacheContext>,
+    pub cache: Option<novarocks_fs::DataCachePolicy>,
     pub budget: FileReadBudget,
     pub reader_options: FileReaderOptions,
     pub scheduled_split_sequence_id: u64,
@@ -342,8 +342,8 @@ mod tests {
     use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use novarocks_fs::{
-        FileCancellation, FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime,
-        TokioFileTaskSpawner,
+        FileCancellation, FileIoRuntime, FileIoSpawner, FsAccessResolver, TokioFileIoRuntime,
+        TokioFileIoSpawner,
     };
     use novarocks_spi::connector::ConnectorErrorKind;
     use novarocks_spi::connector::read_stack::{
@@ -563,19 +563,19 @@ mod tests {
             let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
             let file_runtime: Arc<dyn FileIoRuntime> =
                 Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
-            let task_spawner: Arc<dyn FileTaskSpawner> =
-                Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+            let io_spawner: Arc<dyn FileIoSpawner> =
+                Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
             let binding = IcebergReadBinding::new(
                 None,
                 FsAccessResolver::new(),
                 Arc::clone(&file_runtime),
-                Arc::clone(&task_spawner),
+                Arc::clone(&io_spawner),
             );
             let context = FileReadContext {
                 cancellation: FileCancellation::new(),
                 deadline: Some(Instant::now() + Duration::from_secs(60)),
                 runtime: file_runtime,
-                task_spawner,
+                io_spawner,
                 range: None,
             };
             let directory = tempfile::tempdir().expect("temporary directory");

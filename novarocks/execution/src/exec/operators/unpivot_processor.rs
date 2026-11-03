@@ -18,7 +18,7 @@
 //! Shared geometry, bounded output search, and typed construction helpers.
 //! Compiled Unpivot, Writer statistics, and table functions retain one owner.
 
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 use novarocks_failure_contract::{
     BoundedDetail, FailureClass, FailureFact, FailureProjection, ResourceDimension, ResourceFacts,
     ResourceScope,
@@ -35,7 +35,7 @@ impl FailureProjection for UnpivotContractFailure {
     fn failure_fact(&self) -> FailureFact {
         FailureFact::new(
             FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::UnpivotContract.reason(),
+            crate::runtime::task::ExecutionReason::UnpivotContract.reason(),
         )
     }
 }
@@ -64,7 +64,7 @@ impl FailureProjection for UnpivotLimit {
     fn failure_fact(&self) -> FailureFact {
         FailureFact::new(
             FailureClass::Resource,
-            crate::runtime::fragment::ExecutionReason::UnpivotLimit.reason(),
+            crate::runtime::task::ExecutionReason::UnpivotLimit.reason(),
         )
         .with_resource(ResourceFacts {
             request_scope: Some(ResourceScope::Request),
@@ -104,7 +104,7 @@ impl std::error::Error for UnpivotExtensionFailure {
 }
 impl FailureProjection for UnpivotExtensionFailure {
     fn failure_fact(&self) -> FailureFact {
-        use crate::runtime::fragment::ExecutionReason;
+        use crate::runtime::task::ExecutionReason;
         let (class, reason) = match &self.0 {
             arrow::error::ArrowError::MemoryError(_) => (
                 FailureClass::Resource,
@@ -407,7 +407,7 @@ pub(crate) fn unpivot_copy_failure(
     failure: novarocks_functions::selected_copy::CopyConstructionError<
         crate::exec::pipeline::operator::input_construction::ConstructionFailure,
     >,
-) -> crate::runtime::fragment::ExecutionFailure {
+) -> crate::runtime::task::ExecutionFailure {
     use crate::exec::pipeline::operator::input_construction::ConstructionFailure;
     use novarocks_functions::selected_copy::CopyConstructionError;
     match failure {

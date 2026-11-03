@@ -22,7 +22,9 @@ use crate::task_execution::{execution::ActorAbortDispatchState, round::TaskRound
 use novarocks_coordination_contract::AttemptFailureClass;
 use novarocks_execution_contract::{SafeDetail, failure::FailureClass};
 use novarocks_query_application::{
-    coordination::{AbortQueryContextIssueState, ContextClosureState, ContextStandDownSnapshot},
+    coordination::{
+        AbortParticipationIssueState, ParticipationClosureState, ParticipationStandDownSnapshot,
+    },
     execution_error::ExecutionFailureSite,
     test_support::LogicalExecutionTestHarness,
 };
@@ -42,10 +44,10 @@ fn owner_failed_ack(operation: TaskOperationId, kind: OperationKind) -> Operatio
 fn assert_exact_owner_failure(
     error: TaskExecutionError,
     original: &OperationAcknowledgement,
-    expected_context: QueryContextRef,
+    expected_participation: ParticipationRef,
 ) {
     let TaskExecutionError::OperationFailed {
-        context,
+        participation,
         operation_id,
         kind,
         rejection,
@@ -53,9 +55,9 @@ fn assert_exact_owner_failure(
     else {
         panic!("OwnerFailed lost its exact Worker verdict: {error:?}");
     };
-    assert_eq!(*context, expected_context);
+    assert_eq!(*participation, expected_participation);
     assert_eq!(*operation_id, original.operation_id());
-    assert_eq!(*kind, OperationKind::AbortQueryContext);
+    assert_eq!(*kind, OperationKind::AbortParticipation);
     assert_eq!(Some(rejection.clone()), original.worker_header());
     let input = error.preparation_input();
     assert_eq!(input.fact().class(), FailureClass::Invariant);
@@ -67,9 +69,9 @@ fn assert_exact_owner_failure(
     assert_eq!(
         input.site(),
         ExecutionFailureSite::Operation {
-            context: expected_context,
+            participation: expected_participation,
             operation_id: original.operation_id(),
-            kind: OperationKind::AbortQueryContext,
+            kind: OperationKind::AbortParticipation,
         }
     );
 }
@@ -77,13 +79,13 @@ fn assert_exact_owner_failure(
 async fn finish_residual(
     round: TaskRound,
     mut logical: LogicalExecutionTestHarness,
-    context: QueryContextRef,
+    participation: ParticipationRef,
 ) {
     // The failed runner releases its actual queued/frontend carriers. Only
     // the fixture's independent process replacement resolves remote custody.
     drop(round);
     logical
-        .observe_worker_process_replaced(context)
+        .observe_worker_process_replaced(participation)
         .await
         .unwrap();
     logical
@@ -104,15 +106,19 @@ async fn wait_for_adapter_replay(round: &TaskRound) {
 
 async fn wait_for_owner_failure(
     logical: &LogicalExecutionTestHarness,
-    context: QueryContextRef,
-) -> Result<ContextStandDownSnapshot, tokio::time::error::Elapsed> {
+    participation: ParticipationRef,
+) -> Result<ParticipationStandDownSnapshot, tokio::time::error::Elapsed> {
     // Settlement queues an event for the logical actor. Its snapshot command
     // is a separate input and does not acknowledge consumption of that event.
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let snapshot = logical.stand_down_snapshot(context).await.unwrap().unwrap();
-            if snapshot.issue_state() == Some(AbortQueryContextIssueState::FailedClosed)
-                && snapshot.closure() == ContextClosureState::AbortIssueExhausted
+            let snapshot = logical
+                .stand_down_snapshot(participation)
+                .await
+                .unwrap()
+                .unwrap();
+            if snapshot.issue_state() == Some(AbortParticipationIssueState::FailedClosed)
+                && snapshot.closure() == ParticipationClosureState::AbortIssueExhausted
             {
                 return snapshot;
             }
@@ -124,23 +130,27 @@ async fn wait_for_owner_failure(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_owner_failed_abort_settles_dispatch_and_preserves_remote_responsibility() {
-    let (mut round, _sink, acknowledgements, logical, context, abort, _clock) =
+    let (mut round, _sink, acknowledgements, logical, participation, abort, _clock) =
         actor_abort_round_at_first_dispatch().await;
-    let ack = owner_failed_ack(abort.operation_id(), OperationKind::AbortQueryContext);
+    let ack = owner_failed_ack(abort.operation_id(), OperationKind::AbortParticipation);
     acknowledgements.publish(ack.clone());
     let result = round.turn();
     let dispatch = round
         .execution()
         .actor_abort_dispatch_state(abort.operation_id());
-    let released = round.execution().owner(context).unwrap().is_released();
+    let released = round
+        .execution()
+        .owner(participation)
+        .unwrap()
+        .is_released();
     let converged = round
         .execution()
-        .context_convergence_receipt(context)
+        .participation_convergence_receipt(participation)
         .is_some();
-    let snapshot = wait_for_owner_failure(&logical, context).await;
-    finish_residual(round, logical, context).await;
+    let snapshot = wait_for_owner_failure(&logical, participation).await;
+    finish_residual(round, logical, participation).await;
 
-    assert_exact_owner_failure(result.unwrap_err(), &ack, context);
+    assert_exact_owner_failure(result.unwrap_err(), &ack, participation);
     assert!(matches!(
         dispatch,
         Err(TaskExecutionError::UnknownOperation)
@@ -150,37 +160,44 @@ async fn active_owner_failed_abort_settles_dispatch_and_preserves_remote_respons
     let snapshot = snapshot.expect("the original logical actor consumes the failed-closed event");
     assert_eq!(
         snapshot.issue_state(),
-        Some(AbortQueryContextIssueState::FailedClosed)
+        Some(AbortParticipationIssueState::FailedClosed)
     );
-    assert_eq!(snapshot.closure(), ContextClosureState::AbortIssueExhausted);
+    assert_eq!(
+        snapshot.closure(),
+        ParticipationClosureState::AbortIssueExhausted
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_owner_failed_abort_settles_its_original_late_authority_without_a_closure_receipt() {
-    let (mut round, _sink, acknowledgements, logical, context, abort, _clock) =
+    let (mut round, _sink, acknowledgements, logical, participation, abort, _clock) =
         actor_abort_round_at_first_dispatch().await;
     acknowledgements.publish(OperationAcknowledgement::transport_unknown(
         abort.operation_id(),
-        OperationKind::AbortQueryContext,
+        OperationKind::AbortParticipation,
     ));
     round
         .turn()
         .expect("the original transport exits with an unknown outcome");
-    let ack = owner_failed_ack(abort.operation_id(), OperationKind::AbortQueryContext);
+    let ack = owner_failed_ack(abort.operation_id(), OperationKind::AbortParticipation);
     acknowledgements.publish(ack.clone());
     let result = round.turn();
     let dispatch = round
         .execution()
         .actor_abort_dispatch_state(abort.operation_id());
-    let released = round.execution().owner(context).unwrap().is_released();
+    let released = round
+        .execution()
+        .owner(participation)
+        .unwrap()
+        .is_released();
     let converged = round
         .execution()
-        .context_convergence_receipt(context)
+        .participation_convergence_receipt(participation)
         .is_some();
-    let snapshot = wait_for_owner_failure(&logical, context).await;
-    finish_residual(round, logical, context).await;
+    let snapshot = wait_for_owner_failure(&logical, participation).await;
+    finish_residual(round, logical, participation).await;
 
-    assert_exact_owner_failure(result.unwrap_err(), &ack, context);
+    assert_exact_owner_failure(result.unwrap_err(), &ack, participation);
     assert!(matches!(
         dispatch,
         Err(TaskExecutionError::UnknownOperation)
@@ -190,18 +207,21 @@ async fn late_owner_failed_abort_settles_its_original_late_authority_without_a_c
     let snapshot = snapshot.expect("the original logical actor consumes the failed-closed event");
     assert_eq!(
         snapshot.issue_state(),
-        Some(AbortQueryContextIssueState::FailedClosed)
+        Some(AbortParticipationIssueState::FailedClosed)
     );
-    assert_eq!(snapshot.closure(), ContextClosureState::AbortIssueExhausted);
+    assert_eq!(
+        snapshot.closure(),
+        ParticipationClosureState::AbortIssueExhausted
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owner_failed_late_abort_cancels_the_actual_dispatcher_queued_replay() {
-    let (mut round, sink, acknowledgements, logical, context, abort, _clock) =
+    let (mut round, sink, acknowledgements, logical, participation, abort, _clock) =
         actor_abort_round_at_first_dispatch().await;
     acknowledgements.publish(OperationAcknowledgement::transport_unknown(
         abort.operation_id(),
-        OperationKind::AbortQueryContext,
+        OperationKind::AbortParticipation,
     ));
     round
         .turn()
@@ -212,7 +232,7 @@ async fn owner_failed_late_abort_cancels_the_actual_dispatcher_queued_replay() {
         .into_iter()
         .flat_map(|(_, operations)| operations)
     {
-        if intent.kind() == OperationKind::UpdateQueryContext {
+        if intent.kind() == OperationKind::UpdateParticipation {
             acknowledgements.publish(establish_ack(&intent));
         }
     }
@@ -224,24 +244,28 @@ async fn owner_failed_late_abort_cancels_the_actual_dispatcher_queued_replay() {
         .execution()
         .actor_abort_dispatch_state(abort.operation_id());
     let paid_queued = sink.live_queue_permits();
-    let ack = owner_failed_ack(abort.operation_id(), OperationKind::AbortQueryContext);
+    let ack = owner_failed_ack(abort.operation_id(), OperationKind::AbortParticipation);
     acknowledgements.publish(ack.clone());
     let result = round.turn();
     let dispatch = round
         .execution()
         .actor_abort_dispatch_state(abort.operation_id());
     let paid_after = sink.live_queue_permits();
-    let released = round.execution().owner(context).unwrap().is_released();
+    let released = round
+        .execution()
+        .owner(participation)
+        .unwrap()
+        .is_released();
     let converged = round
         .execution()
-        .context_convergence_receipt(context)
+        .participation_convergence_receipt(participation)
         .is_some();
-    let snapshot = wait_for_owner_failure(&logical, context).await;
-    finish_residual(round, logical, context).await;
+    let snapshot = wait_for_owner_failure(&logical, participation).await;
+    finish_residual(round, logical, participation).await;
 
     assert_eq!(queued.unwrap(), ActorAbortDispatchState::Queued);
     assert_eq!(paid_queued, 1);
-    assert_exact_owner_failure(result.unwrap_err(), &ack, context);
+    assert_exact_owner_failure(result.unwrap_err(), &ack, participation);
     assert!(matches!(
         dispatch,
         Err(TaskExecutionError::UnknownOperation)
@@ -252,32 +276,39 @@ async fn owner_failed_late_abort_cancels_the_actual_dispatcher_queued_replay() {
     let snapshot = snapshot.expect("the original logical actor consumes the failed-closed event");
     assert_eq!(
         snapshot.issue_state(),
-        Some(AbortQueryContextIssueState::FailedClosed)
+        Some(AbortParticipationIssueState::FailedClosed)
     );
-    assert_eq!(snapshot.closure(), ContextClosureState::AbortIssueExhausted);
+    assert_eq!(
+        snapshot.closure(),
+        ParticipationClosureState::AbortIssueExhausted
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owner_failed_abort_still_requires_its_original_operation_and_kind() {
     for wrong_kind in [true, false] {
-        let (mut round, _sink, acknowledgements, logical, context, abort, _clock) =
+        let (mut round, _sink, acknowledgements, logical, participation, abort, _clock) =
             actor_abort_round_at_first_dispatch().await;
         let (operation, kind) = if wrong_kind {
             (abort.operation_id(), OperationKind::CancelTask)
         } else {
-            (TaskOperationId::new_v7(), OperationKind::AbortQueryContext)
+            (TaskOperationId::new_v7(), OperationKind::AbortParticipation)
         };
         acknowledgements.publish(owner_failed_ack(operation, kind));
         let result = round.turn();
         let dispatch = round
             .execution()
             .actor_abort_dispatch_state(abort.operation_id());
-        let released = round.execution().owner(context).unwrap().is_released();
+        let released = round
+            .execution()
+            .owner(participation)
+            .unwrap()
+            .is_released();
         let converged = round
             .execution()
-            .context_convergence_receipt(context)
+            .participation_convergence_receipt(participation)
             .is_some();
-        finish_residual(round, logical, context).await;
+        finish_residual(round, logical, participation).await;
 
         if wrong_kind {
             assert!(matches!(result, Err(TaskExecutionError::Schedule(_))));

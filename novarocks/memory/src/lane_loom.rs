@@ -18,7 +18,7 @@
 //! Models execute the production SlotCore, lifetime word and reclaim CAS.
 //! Stable System backing has a separate Miri boundary. No copied token is
 //! accessed after its final free except a known-invalid generation probe.
-use crate::lane::{ResponsibilityClass, SlotCore, StoreHandle};
+use crate::lane::{RecordStorePin, ResponsibilityClass, SlotCore};
 use loom::{model::Builder, thread};
 
 fn model(f: impl Fn() + Send + Sync + 'static) {
@@ -34,7 +34,7 @@ fn model(f: impl Fn() + Send + Sync + 'static) {
 #[test]
 fn l1_remote_free_before_flush_never_reclaims_a_pinned_record() {
     model(|| {
-        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let store = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
         let owner = store
             .acquire(
                 1,
@@ -83,7 +83,7 @@ fn l1_remote_free_before_flush_never_reclaims_a_pinned_record() {
 #[test]
 fn l2_resize_keeps_its_allocation_count_while_another_allocation_frees() {
     model(|| {
-        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let store = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
         let owner = store
             .acquire(
                 1,
@@ -120,7 +120,7 @@ fn l2_resize_keeps_its_allocation_count_while_another_allocation_frees() {
 #[test]
 fn l5_true_token_access_prevents_reuse_then_old_generation_is_rejected() {
     model(|| {
-        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let store = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
         let owner = store
             .acquire(
                 1,
@@ -268,7 +268,7 @@ fn l4_query_handoff_late_free_flush_and_control_reclaim_keep_one_record() {
 #[test]
 fn l3_r1_cross_band_publication_remote_free_and_last_owner_preserve_lifetime() {
     model(|| {
-        let store = StoreHandle::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
+        let store = RecordStorePin::owned(crate::lane::UNATTRIBUTED_RECORDS + 2);
         let owner = store
             .acquire(
                 3,
@@ -333,7 +333,7 @@ fn l6_regions_publish_one_boundary_segment_and_never_replace_addresses() {
     model(|| {
         // Both first dynamic positions are in segment 4, with distinct region
         // locks. There is no backing yet when the two threads start.
-        let store = StoreHandle::owned(UNATTRIBUTED_RECORDS + 4);
+        let store = RecordStorePin::owned(UNATTRIBUTED_RECORDS + 4);
         let funding = store.clone();
         let observation = store.clone();
         let f = thread::spawn(move || {

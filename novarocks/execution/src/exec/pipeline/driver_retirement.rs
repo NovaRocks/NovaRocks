@@ -30,13 +30,13 @@ use super::{
 use crate::{
     exec::chunk::Chunk,
     runtime::{
-        fragment::{
-            ExecutionFailure,
-            io::{FragmentEventSink, RootInputPermit, RootWorkExitProgress},
-        },
         mem_tracker::MemTracker,
         query_memory::QueryMemoryBinding,
         runtime_state::{RuntimeErrorState, RuntimeState},
+        task::{
+            ExecutionFailure,
+            io::{RootInputPermit, RootWorkExitProgress, TaskEventSink},
+        },
     },
 };
 use std::{
@@ -255,15 +255,15 @@ pub(crate) struct RetainedDriverOwners {
     pub _runtime: Arc<RuntimeState>,
     pub _query_memory: Option<QueryMemoryBinding>,
     pub _edge_trackers: Vec<Option<Arc<MemTracker>>>,
-    pub _event_sink: Arc<dyn FragmentEventSink>,
+    pub _event_sink: Arc<dyn TaskEventSink>,
 }
 /// One original driver has exactly one slot. Only an unresolved Drop retains
 /// its own slot; there is no process-global list or unbounded parking service.
 struct DriverCustodyState {
     owners: Option<ManuallyDrop<RetainedDriverOwners>>,
-    task: Option<ManuallyDrop<Box<super::global_driver_executor::Retirement>>>,
-    task_installed: bool,
-    task_busy: bool,
+    driver: Option<ManuallyDrop<Box<super::global_driver_executor::Retirement>>>,
+    driver_installed: bool,
+    driver_busy: bool,
     parking: Option<ManuallyDrop<Box<super::global_driver_executor::ParkingPhase>>>,
     parking_active: bool,
 }
@@ -276,9 +276,9 @@ impl DriverExitCustody {
         Arc::new(Self {
             state: Mutex::new(DriverCustodyState {
                 owners: None,
-                task: None,
-                task_installed: false,
-                task_busy: false,
+                driver: None,
+                driver_installed: false,
+                driver_busy: false,
                 parking: None,
                 parking_active: false,
             }),
@@ -308,16 +308,16 @@ impl DriverExitCustody {
             .owners
             .is_some()
     }
-    pub(crate) fn retain_task_exit(
+    pub(crate) fn retain_driver_exit(
         self: &Arc<Self>,
         retirement: super::global_driver_executor::Retirement,
     ) {
         // Only a Pending/Unknown cold exit allocates this one original box.
         let retirement = ManuallyDrop::new(Box::new(retirement));
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(!state.task_installed, "one original task exit owner");
-        state.task_installed = true;
-        state.task = Some(retirement);
+        assert!(!state.driver_installed, "one original task exit owner");
+        state.driver_installed = true;
+        state.driver = Some(retirement);
         drop(state);
         self.pin();
     }
@@ -347,21 +347,21 @@ impl DriverExitCustody {
             self.pin();
         }
     }
-    pub(crate) fn poll_task_exit(&self) -> super::global_driver_executor::RetirementPoll {
+    pub(crate) fn poll_driver_exit(&self) -> super::global_driver_executor::RetirementPoll {
         use super::global_driver_executor::RetirementPoll;
         let value = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(value) = state.task.take() else {
-                return if state.task_busy {
+            let Some(value) = state.driver.take() else {
+                return if state.driver_busy {
                     RetirementPoll::Pending
                 } else {
                     RetirementPoll::Exited
                 };
             };
-            state.task_busy = true;
+            state.driver_busy = true;
             value
         };
-        let mut loan = TaskExitLoan {
+        let mut loan = DriverExitLoan {
             owner: self,
             value: Some(value),
         };
@@ -374,17 +374,18 @@ impl DriverExitCustody {
         progress
     }
 }
-struct TaskExitLoan<'a> {
+struct DriverExitLoan<'a> {
     owner: &'a DriverExitCustody,
     value: Option<ManuallyDrop<Box<super::global_driver_executor::Retirement>>>,
 }
-impl Drop for TaskExitLoan<'_> {
+impl Drop for DriverExitLoan<'_> {
     fn drop(&mut self) {
         let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(state.task.is_none(), "one original task exit loan");
-        state.task = self.value.take();
-        state.task_busy = false;
-        let release = if state.task.is_none() && state.owners.is_none() && state.parking.is_none() {
+        assert!(state.driver.is_none(), "one original task exit loan");
+        state.driver = self.value.take();
+        state.driver_busy = false;
+        let release = if state.driver.is_none() && state.owners.is_none() && state.parking.is_none()
+        {
             self.owner
                 .retained
                 .lock()

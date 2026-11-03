@@ -60,7 +60,7 @@ impl LeaseBounds {
         max: Duration::from_secs(30),
     };
 
-    /// Initial lease requested while shared context facts materialize.
+    /// Initial lease requested while shared Participation facts materialize.
     pub const INITIAL_REQUEST: Duration = Duration::from_secs(30);
 
     /// Steady-state lease requested by the frontend owner.
@@ -107,7 +107,7 @@ pub enum LeaseProgression {
     },
 }
 
-/// The lease currently installed in one worker-local query context.
+/// The lease currently installed in one worker-local Participation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct InstalledLease {
     receipt: LeaseReceipt,
@@ -115,7 +115,7 @@ pub struct InstalledLease {
 }
 
 impl InstalledLease {
-    /// Installs sequence zero at the context creation linearization point.
+    /// Installs sequence zero at the Participation creation linearization point.
     pub fn install_initial(
         requested: LeaseValidFor,
         bounds: LeaseBounds,

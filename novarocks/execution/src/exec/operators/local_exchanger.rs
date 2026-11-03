@@ -410,7 +410,7 @@ impl LocalExchanger {
         self: &Arc<Self>,
         queue_tracker: Option<&Arc<MemTracker>>,
         chunk: Chunk,
-    ) -> crate::runtime::fragment::ExecutionResult<()> {
+    ) -> crate::runtime::task::ExecutionResult<()> {
         self.accept_with(queue_tracker, chunk, |chunk| self.partition_chunk(chunk))
     }
     pub(crate) fn accept_created(
@@ -418,9 +418,9 @@ impl LocalExchanger {
         queue_tracker: Option<&Arc<MemTracker>>,
         chunk: Chunk,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         bypass_cursor: &mut usize,
-    ) -> crate::runtime::fragment::ExecutionResult<()> {
+    ) -> crate::runtime::task::ExecutionResult<()> {
         ctx.checkpoint()?;
         self.accept_with(queue_tracker, chunk, |chunk| {
             self.partition_chunk_created(chunk, factory, ctx, bypass_cursor)
@@ -430,11 +430,8 @@ impl LocalExchanger {
         self: &Arc<Self>,
         queue_tracker: Option<&Arc<MemTracker>>,
         chunk: Chunk,
-        mut partition: impl FnMut(
-            &Chunk,
-        )
-            -> crate::runtime::fragment::ExecutionResult<Vec<(usize, Chunk)>>,
-    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        mut partition: impl FnMut(&Chunk) -> crate::runtime::task::ExecutionResult<Vec<(usize, Chunk)>>,
+    ) -> crate::runtime::task::ExecutionResult<()> {
         if chunk.is_empty() || self.all_consumers_closed() {
             return Ok(());
         }
@@ -562,9 +559,9 @@ impl LocalExchanger {
         &self,
         chunk: &Chunk,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        control: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        control: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
         bypass_cursor: &mut usize,
-    ) -> crate::runtime::fragment::ExecutionResult<Vec<(usize, Chunk)>> {
+    ) -> crate::runtime::task::ExecutionResult<Vec<(usize, Chunk)>> {
         let partitioned = match &self.partition_spec {
             LocalExchangePartitionSpec::InputSlotIds(slots) => {
                 let arrays = slots
@@ -601,7 +598,7 @@ impl LocalExchanger {
                 );
             }
             LocalExchangePartitionSpec::Single => {
-                return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                return Err(crate::runtime::task::ExecutionFailure::from_domain(
                     LocalPartitionContract,
                 ));
             }
@@ -616,19 +613,19 @@ impl LocalExchanger {
         applies: Option<SlotId>,
         bypass_cursor: &mut usize,
         factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
-    ) -> crate::runtime::fragment::ExecutionResult<Vec<(usize, Chunk)>> {
+        ctx: &mut crate::exec::pipeline::driver_step::DriverStep<'_>,
+    ) -> crate::runtime::task::ExecutionResult<Vec<(usize, Chunk)>> {
         use crate::exec::hash_table::partition_keys::{
             native_tuple_hashes_observed, require_non_null_keys, source_key_owner,
         };
         use crate::exec::pipeline::operator::ConstructionFailure;
-        use crate::runtime::fragment::ExecutionFailure;
+        use crate::runtime::task::ExecutionFailure;
         use arrow::array::{Array, ArrayRef, BooleanArray};
         use novarocks_type_contract::{FunctionValueType, PartitionHashDomain};
         use novarocks_value_arrays::reachability::ReachableRows;
         let original_owner = factory.begin_input_construction(chunk)?;
         let owner = source_key_owner(chunk, original_owner.as_ref())?;
-        let request = |layout: Result<std::alloc::Layout, std::alloc::LayoutError>| -> crate::runtime::fragment::ExecutionResult<()> {
+        let request = |layout: Result<std::alloc::Layout, std::alloc::LayoutError>| -> crate::runtime::task::ExecutionResult<()> {
             owner.request(layout.map_err(|_| ConstructionFailure::from(
                 novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
             Ok(())
@@ -759,7 +756,7 @@ impl LocalExchanger {
     fn partition_chunk(
         &self,
         chunk: &Chunk,
-    ) -> crate::runtime::fragment::ExecutionResult<Vec<(usize, Chunk)>> {
+    ) -> crate::runtime::task::ExecutionResult<Vec<(usize, Chunk)>> {
         let partitioned = match &self.partition_spec {
             LocalExchangePartitionSpec::InputSlotIds(slot_ids) => {
                 let mut arrays = Vec::with_capacity(slot_ids.len());
@@ -771,7 +768,7 @@ impl LocalExchanger {
             LocalExchangePartitionSpec::Single
             | LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
             | LocalExchangePartitionSpec::ConditionalKey { .. } => {
-                return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                return Err(crate::runtime::task::ExecutionFailure::from_domain(
                     LocalPartitionContract,
                 ));
             }
@@ -1020,7 +1017,7 @@ impl novarocks_failure_contract::FailureProjection for LocalPartitionContract {
         use novarocks_failure_contract::{FailureClass, FailureFact};
         FailureFact::new(
             FailureClass::Invariant,
-            crate::runtime::fragment::ExecutionReason::LocalPartitionContract.reason(),
+            crate::runtime::task::ExecutionReason::LocalPartitionContract.reason(),
         )
     }
 }
@@ -1030,7 +1027,7 @@ mod hierarchical_tests {
     use super::*;
     use crate::exec::{
         hash_table::partition_keys::native_tuple_hashes_observed,
-        pipeline::step_context::{StepContext, TurnWork},
+        pipeline::driver_step::{DriverStep, TurnWork},
     };
     use arrow::{
         array::{ArrayRef, Int32Array},
@@ -1040,10 +1037,10 @@ mod hierarchical_tests {
     use novarocks_value_arrays::{decode::ValueConversionContext, reachability::ReachableRows};
     use std::collections::{HashMap, HashSet};
 
-    fn with_test_step<T>(rt: &RuntimeState, action: impl FnOnce(&mut StepContext<'_>) -> T) -> T {
+    fn with_test_step<T>(rt: &RuntimeState, action: impl FnOnce(&mut DriverStep<'_>) -> T) -> T {
         let control = rt.error_state();
         let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
-        action(&mut StepContext::new(
+        action(&mut DriverStep::new(
             &control,
             &mut work,
             &mut ValueConversionContext::default(),

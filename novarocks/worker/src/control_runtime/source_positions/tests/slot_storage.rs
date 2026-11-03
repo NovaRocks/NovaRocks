@@ -25,8 +25,8 @@ use novarocks_control_runtime_core::{
 struct PaidFixture {
     ledger: RuntimeLedger,
     scope: ScopeHandle,
-    payer: WorkLease,
-    payment: ReservationBundle,
+    payer: WorkObligation,
+    payment: ReservationObligation,
     bank: SourcePositions,
     task: TaskIdentity,
     pending: Arc<Pending>,
@@ -77,7 +77,7 @@ impl PaidFixture {
         }
     }
     fn reported(&mut self) -> ReportedWork {
-        let role = super::super::super::admitted_role::reserve_reported_role(
+        let role = super::super::super::reported_work_admission::reserve_reported_work(
             &self.scope,
             &mut self.payment,
             &self.payer,
@@ -86,7 +86,7 @@ impl PaidFixture {
             Some((self.scope.id(), Generation::new(1).unwrap())),
         )
         .unwrap();
-        super::super::super::admitted_role::adopt_reported_work(
+        super::super::super::reported_work_admission::adopt_reported_work(
             role.work,
             role.capacity,
             role.report,
