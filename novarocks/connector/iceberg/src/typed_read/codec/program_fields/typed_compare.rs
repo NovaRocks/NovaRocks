@@ -420,7 +420,7 @@ fn formal_field(
                 .map_err(|_| invalid("formal source initial default is invalid"))?;
             units(work, actual.as_json().len())?;
             let actual = opaque(work, || {
-                serde_json::from_str::<serde_json::Value>(actual.as_json())
+                crate::metadata_json::from_str::<serde_json::Value>(actual.as_json())
             })?
             .map_err(|_| invalid("public source initial default is invalid"))?;
             if actual != expected {

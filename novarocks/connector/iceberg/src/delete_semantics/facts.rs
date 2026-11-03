@@ -971,7 +971,8 @@ impl PinnedEndpointFacts {
                 "partition storage type is absent from the pinned endpoint",
             )
         })?;
-        serde_json::from_str(json).map_err(|e| Error::new(Kind::InvalidPartition, e.to_string()))
+        crate::metadata_json::from_str(json)
+            .map_err(|e| Error::new(Kind::InvalidPartition, e.to_string()))
     }
     pub const fn table_uuid(&self) -> uuid::Uuid {
         self.table_uuid
@@ -989,7 +990,7 @@ impl PinnedEndpointFacts {
         &self.partition_spec_jsons
     }
     pub fn schema(&self) -> Result<Schema> {
-        serde_json::from_str(&self.schema_json)
+        crate::metadata_json::from_str(&self.schema_json)
             .map_err(|e| Error::new(Kind::InvalidFieldBinding, e.to_string()))
     }
 
@@ -999,7 +1000,7 @@ impl PinnedEndpointFacts {
         self.partition_spec_jsons
             .iter()
             .map(|(id, json)| {
-                let spec: PartitionSpec = serde_json::from_str(json)
+                let spec: PartitionSpec = crate::metadata_json::from_str(json)
                     .map_err(|e| Error::new(Kind::InvalidPartition, e.to_string()))?;
                 let partition_type = self.partition_type(*id)?;
                 let fields = partition_type

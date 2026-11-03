@@ -88,7 +88,7 @@ impl IcebergInsertTableHandle {
                 "iceberg table schema json must be non-empty and bounded",
             ));
         }
-        serde_json::from_str::<Schema>(&table_schema_json)
+        crate::metadata_json::from_str::<Schema>(&table_schema_json)
             .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))?;
         if table_location.is_empty() || table_location.len() > MAX_PATH_BYTES {
             return Err(invalid(

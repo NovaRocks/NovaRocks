@@ -237,7 +237,7 @@ impl IcebergTableHandle {
         // Parsing here is the fail-fast point: a handle that cannot be turned
         // back into a schema would only fail later, on a worker, after the
         // split has already been scheduled.
-        let schema = serde_json::from_str::<Schema>(&table_schema_json)
+        let schema = crate::metadata_json::from_str::<Schema>(&table_schema_json)
             .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))?;
 
         if table_location.is_empty() || table_location.len() > MAX_PATH_BYTES {
@@ -300,10 +300,10 @@ impl IcebergTableHandle {
                     let Some(expected) = endpoint.partition_spec_jsons().get(spec_id) else {
                         return Err(invalid("iceberg read domain omits a pinned partition spec"));
                     };
-                    let expected: serde_json::Value = serde_json::from_str(expected)
+                    let expected: serde_json::Value = crate::metadata_json::from_str(expected)
                         .map_err(|error| invalid(error.to_string()))?;
-                    let received: serde_json::Value =
-                        serde_json::from_str(json).map_err(|error| invalid(error.to_string()))?;
+                    let received: serde_json::Value = crate::metadata_json::from_str(json)
+                        .map_err(|error| invalid(error.to_string()))?;
                     if expected != received {
                         return Err(invalid(
                             "iceberg read domain partition spec differs from the table",
@@ -495,7 +495,7 @@ impl IcebergTableHandle {
 
     /// The frozen table schema this handle pins.
     pub fn parse_table_schema(&self) -> Result<Schema, ConnectorError> {
-        serde_json::from_str::<Schema>(&self.table_schema_json)
+        crate::metadata_json::from_str::<Schema>(&self.table_schema_json)
             .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))
     }
 
@@ -847,7 +847,7 @@ fn parse_partition_spec(spec_json: &str) -> Result<PartitionSpec, ConnectorError
             "iceberg partition spec json must be non-empty and bounded",
         ));
     }
-    serde_json::from_str::<PartitionSpec>(spec_json)
+    crate::metadata_json::from_str::<PartitionSpec>(spec_json)
         .map_err(|error| invalid(format!("iceberg partition spec json is invalid: {error}")))
 }
 

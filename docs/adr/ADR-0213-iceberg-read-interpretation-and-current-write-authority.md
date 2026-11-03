@@ -13,6 +13,7 @@ code-anchors:
   - "novarocks/fs/src/cache/parquet_cache.rs (metadata caches)"
   - "novarocks/fs/src/physical_reader/parquet.rs (ParquetMetadataInspection)"
   - "novarocks/connector/iceberg/src/planning_facts.rs (PlanningAuthority)"
+  - "novarocks/connector/iceberg/src/metadata_json.rs (bounded complete metadata decoding)"
   - "tests/sql/fixtures/iceberg-read-policy/fixture.scala (MetadataHistoryFixture)"
 ---
 
@@ -49,7 +50,8 @@ code-anchors:
 2. **完整文件事实规则。** FS 保留完整原始 footer，不把 leaf ID 清单当作 schema 树，不丢 wrapper、父节点 ID、repetition、注解或重复 KV。提示不能补造无 ID 文件的身份，也不能擦掉真实 ID。
 3. **缓存语义隔离规则。** 原始缓存只按授权域和准确文件身份复用；解释缓存额外绑定完整政策与版本。selected snapshot/defaults/domain 映射属于 Connector 的表投射，不进入通用按文件缓存。reader、page-index 和所有 alias 保留其原政策及真实持有生命周期。
 4. **Historical 只读规则。** 目录加载请求以中立的 `HistoricalSnapshot` 选择准确 snapshot；分析前即投射它的 schema，不在 Current 列已绑定后只更换执行 selector。规划直接借用已加载、验证的 typed table metadata，不为读取分区源与约束再次解析序列化载体，也不把解析失败转成空事实。所选 snapshot/schema 决定历史关系。写默认值、写目标类型与当前分区源 membership 只能由 Current 事实提供。Historical 的写权威显式不适用，写消费者必须拒绝，不得用空 slice 假装可写且无分区限制。
-5. **验证分层规则。** FS 单测保护两政策同文件隔离、重复 KV 与淘汰后的 alias；Connector 单测保护读取入口和 Current/Historical 接缝；原生 1FE+3BE SQL 用官方 SDK 固定输入与完整行袋校验深 metadata、真实 ID、历史选择及当前写限制。设计记录本身不证明这些运行已经通过。
+5. **完整 metadata 的物理深度规则。** logical depth 64 经 Iceberg field/type/array 包装后超过 Serde 默认的 128 个 JSON 容器。Provider 的原迭代扫描器先校验完整语法与有限物理深度（`4 × MAX_VALUE_TYPE_DEPTH + 32`，包含 envelope 与 defaults），随后一次解析原 SDK 类型；不截断历史 schema，不在失败后重试，也不改变逻辑类型准入。REST 完整响应、Hadoop 原 I/O 及 Provider 内冻结 schema/metadata 的再解析共用此入口，原授权、取消与错误分类保留。
+6. **验证分层规则。** FS 单测保护两政策同文件隔离、重复 KV 与淘汰后的 alias；Connector 单测保护读取入口和 Current/Historical 接缝；原生 1FE+3BE SQL 用官方 SDK 固定输入与完整行袋校验深 metadata、真实 ID、历史选择及当前写限制。设计记录本身不证明这些运行已经通过。
 
 ## 接受的妥协（诚实记录）
 

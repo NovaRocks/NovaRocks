@@ -433,7 +433,7 @@ impl ConnectorMetadata for IcebergMetadata {
                     corrupt("Iceberg exact semantic revision is missing its frozen table metadata")
                 })?;
                 let metadata: crate::iceberg::spec::TableMetadata =
-                    serde_json::from_str(serialized).map_err(|error| {
+                    crate::metadata_json::from_str(serialized).map_err(|error| {
                         corrupt(format!(
                             "decode Iceberg exact semantic revision metadata: {error}"
                         ))
@@ -490,8 +490,8 @@ impl ConnectorMetadata for IcebergMetadata {
         let serialized = table_info.serialized_metadata.as_deref().ok_or_else(|| {
             corrupt("Iceberg exact revision selector is missing frozen table metadata")
         })?;
-        let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
-            .map_err(|error| {
+        let metadata: crate::iceberg::spec::TableMetadata =
+            crate::metadata_json::from_str(serialized).map_err(|error| {
                 corrupt(format!(
                     "decode Iceberg exact revision selector metadata: {error}"
                 ))
@@ -1878,8 +1878,8 @@ pub(crate) fn staged_target_metadata(
         .serialized_metadata
         .as_deref()
         .ok_or_else(|| corrupt("staged Iceberg write target is missing frozen metadata"))?;
-    let metadata: crate::iceberg::spec::TableMetadata =
-        serde_json::from_str(serialized).map_err(|error| {
+    let metadata: crate::iceberg::spec::TableMetadata = crate::metadata_json::from_str(serialized)
+        .map_err(|error| {
             corrupt(format!(
                 "decode staged Iceberg write target metadata: {error}"
             ))
@@ -2081,7 +2081,7 @@ pub(crate) fn projected_schema(
         .as_ref()
         .and_then(|table| table.serialized_metadata.as_deref())
         .ok_or_else(|| corrupt("Iceberg table handle has no serialized metadata"))?;
-    let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
+    let metadata: crate::iceberg::spec::TableMetadata = crate::metadata_json::from_str(serialized)
         .map_err(|error| corrupt(format!("decode Iceberg table metadata: {error}")))?;
     projected_schema_with_metadata(table, projection, &metadata)
 }
@@ -2196,7 +2196,7 @@ fn projected_metadata_schema(
         .as_ref()
         .and_then(|table| table.serialized_metadata.as_deref())
         .ok_or_else(|| corrupt("Iceberg metadata alias has no serialized table metadata"))?;
-    let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
+    let metadata: crate::iceberg::spec::TableMetadata = crate::metadata_json::from_str(serialized)
         .map_err(|error| corrupt(format!("decode Iceberg table metadata: {error}")))?;
     let columns = metadata_table_output_columns(metadata_table_type, &metadata, &mut creation)
         .map_err(metadata_creation_error)?;
@@ -2322,7 +2322,7 @@ fn split_name_mapping(table: &IcebergTablePayload) -> Result<Option<String>, Con
     else {
         return Ok(None);
     };
-    let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
+    let metadata: crate::iceberg::spec::TableMetadata = crate::metadata_json::from_str(serialized)
         .map_err(|error| corrupt(format!("decode Iceberg name mapping metadata: {error}")))?;
     metadata
         .properties()
@@ -2675,7 +2675,7 @@ fn decode_payload<T: for<'de> Deserialize<'de>>(
     payload: &[u8],
     subject: &str,
 ) -> Result<T, ConnectorError> {
-    serde_json::from_slice(payload).map_err(|error| {
+    crate::metadata_json::from_slice(payload).map_err(|error| {
         ConnectorError::new(
             ConnectorErrorKind::CorruptData,
             format!("decode Iceberg {subject}: {error}"),

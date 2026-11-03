@@ -121,7 +121,7 @@ pub fn decode_payload<T: for<'de> Deserialize<'de>>(
     payload: &Bytes,
     subject: &str,
 ) -> Result<T, ConnectorError> {
-    serde_json::from_slice(payload).map_err(|error| {
+    crate::metadata_json::from_slice(payload).map_err(|error| {
         ConnectorError::new(
             ConnectorErrorKind::CorruptData,
             format!("decode Iceberg {subject}: {error}"),

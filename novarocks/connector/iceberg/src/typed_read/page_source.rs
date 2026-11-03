@@ -1246,7 +1246,7 @@ fn parse_name_mapping(json: Option<&str>) -> Result<Option<Arc<NameMapping>>, Co
     let Some(json) = json else {
         return Ok(None);
     };
-    let mapping: NameMapping = serde_json::from_str(json)
+    let mapping: NameMapping = crate::metadata_json::from_str(json)
         .map_err(|error| invalid(format!("iceberg name mapping json is invalid: {error}")))?;
     Ok(Some(Arc::new(mapping)))
 }

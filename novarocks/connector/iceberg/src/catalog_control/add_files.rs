@@ -194,7 +194,7 @@ fn plan_manifest(
 ) -> Result<AddFilesManifest, String> {
     let mapping = canonical_name_mapping
         .as_deref()
-        .map(serde_json::from_str::<crate::iceberg::spec::NameMapping>)
+        .map(crate::metadata_json::from_str::<crate::iceberg::spec::NameMapping>)
         .transpose()
         .map_err(|error| format!("decode canonical ADD FILES name mapping: {error}"))?;
     if let Some(mapping) = mapping.as_ref() {

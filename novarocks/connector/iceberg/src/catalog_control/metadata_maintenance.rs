@@ -1229,7 +1229,7 @@ fn now_ms() -> Result<i64, ConnectorError> {
 fn decode_base_table_target(
     handle: &novarocks_spi::connector::ConnectorTableHandle,
 ) -> Result<(String, String), ConnectorError> {
-    let target: IcebergTablePayload = serde_json::from_slice(handle.payload())
+    let target: IcebergTablePayload = crate::metadata_json::from_slice(handle.payload())
         .map_err(|error| invalid(format!("decode Iceberg maintenance table handle: {error}")))?;
     if target.metadata_table_type.is_some() {
         return Err(invalid(
