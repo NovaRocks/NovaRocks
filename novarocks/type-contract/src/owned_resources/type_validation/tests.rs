@@ -23,10 +23,11 @@ use std::sync::Arc;
 #[test]
 fn dynamic_pending_has_independent_locked_growth_layouts() {
     assert_eq!(crate::MAX_VALUE_TYPE_NODES, 4096);
-    assert_eq!(Layout::new::<(&DataType, usize)>().size(), 16);
+    let item = Layout::new::<crate::TypeTraversalFrame<'_>>();
+    assert_eq!(item.size(), 32);
     let capacities = [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
     let expected: Vec<_> = capacities
-        .map(|capacity| Layout::from_size_align(16 * capacity, 8).unwrap())
+        .map(|capacity| Layout::from_size_align(32 * capacity, 8).unwrap())
         .into();
     let mut actual = Vec::new();
     let mut allocation = |layout, occurrences| {
@@ -40,22 +41,23 @@ fn dynamic_pending_has_independent_locked_growth_layouts() {
     )
     .unwrap();
     assert_eq!(actual, expected);
-    assert_eq!(total, 131024);
+    assert_eq!(total, 262048);
 
     // Actual Vec requests can only use the declared capacity sequence, even
     // with pop/push reuse. This is a source-profile regression, not an
     // allocator observation or an operation grant.
     let root = DataType::Int32;
-    let mut pending = vec![(&root, 1_usize)];
+    let frame = crate::TypeTraversalFrame::root(&root);
+    let mut pending = vec![frame];
     let mut actual_capacities = vec![pending.capacity()];
     for _ in 1..crate::MAX_VALUE_TYPE_NODES {
         let previous = pending.capacity();
-        pending.push((&root, 2));
+        pending.push(frame);
         if previous != pending.capacity() {
             actual_capacities.push(pending.capacity());
         }
         pending.pop();
-        pending.push((&root, 2));
+        pending.push(frame);
     }
     assert_eq!(actual_capacities, capacities);
 }

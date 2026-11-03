@@ -19,11 +19,13 @@
 //! Neither the fixed scratch nor the dynamic request bound grants memory.
 //! Callers admit initialization and the complete original operation separately.
 
+#[cfg(test)]
 use arrow_schema::DataType;
 use std::{alloc::Layout, mem::MaybeUninit};
 
 /// The original borrowed traversal stack, including every slot's occupancy.
-pub type TypeValidationScratch<'a> = [Option<(&'a DataType, usize)>; crate::MAX_VALUE_TYPE_NODES];
+pub type TypeValidationScratch<'a> =
+    [Option<crate::TypeTraversalFrame<'a>>; crate::MAX_VALUE_TYPE_NODES];
 
 /// Actual backing layout; this function does not initialize or allocate it.
 pub fn scratch_layout() -> Layout {
@@ -43,7 +45,9 @@ pub fn initialize_scratch_observed<'a, 'storage>(
     work: &mut crate::CompileCheckpoints<'_>,
 ) -> Result<&'storage mut TypeValidationScratch<'a>, crate::CompileControlError> {
     work.flush()?;
-    let slots = storage.as_mut_ptr().cast::<Option<(&'a DataType, usize)>>();
+    let slots = storage
+        .as_mut_ptr()
+        .cast::<Option<crate::TypeTraversalFrame<'a>>>();
     for index in 0..crate::MAX_VALUE_TYPE_NODES {
         // SAFETY: the exact original scratch backing has this many contiguous
         // slots. Each write initializes one slot without reading old contents.
@@ -57,7 +61,7 @@ pub fn initialize_scratch_observed<'a, 'storage>(
 }
 
 /// Cumulative heap-request upper bound for the original dynamic validator.
-/// Its initial `vec![(root, 1)]` requests one element. The sole walk checks
+/// Its initial `vec![TypeTraversalFrame::root(root)]` requests one element. The sole walk checks
 /// visited + pending before every child push, so pending length never exceeds
 /// MAX_VALUE_TYPE_NODES, including on a type or observer error. Pops cannot
 /// increase capacity. The locked growth sequence after the exact one-element
@@ -80,13 +84,13 @@ pub fn original_dynamic_pending_allocation_requests_observed<
         )
         .into());
     }
-    let initial = Layout::new::<(&DataType, usize)>();
+    let initial = Layout::new::<crate::TypeTraversalFrame<'_>>();
     if let Some(allocations) = allocations.as_deref_mut() {
         allocations(initial, 1)?;
     }
     observe()?;
     let growth = super::vec::original_fresh_push_allocation_requests_observed::<
-        (&DataType, usize),
+        crate::TypeTraversalFrame<'_>,
         E,
     >(crate::MAX_VALUE_TYPE_NODES, observe, allocations)?;
     initial.size().checked_add(growth).ok_or_else(|| {
@@ -162,7 +166,8 @@ mod scratch_tests {
                 let mut work =
                     CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
                 // Sentinels let this test inspect the actual untouched suffix.
-                let mut storage = MaybeUninit::new([Some((&ty, 7)); crate::MAX_VALUE_TYPE_NODES]);
+                let sentinel = crate::TypeTraversalFrame::root(&ty);
+                let mut storage = MaybeUninit::new([Some(sentinel); crate::MAX_VALUE_TYPE_NODES]);
                 assert!(
                     matches!(initialize_scratch_observed(&mut storage, &mut work), Err(actual) if actual == error)
                 );
@@ -173,7 +178,7 @@ mod scratch_tests {
                 assert!(
                     slots[completed..]
                         .iter()
-                        .all(|slot| *slot == Some((&ty, 7)))
+                        .all(|slot| *slot == Some(sentinel))
                 );
                 assert_eq!(control.trace.lock().unwrap().len(), at);
                 assert_eq!(work.flush(), Err(error.clone()));

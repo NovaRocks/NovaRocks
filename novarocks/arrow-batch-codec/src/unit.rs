@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Design: ADR-0214 (docs/adr/ADR-0214-schema-free-online-units-and-prepared-layout-recipes.md)
 use std::{alloc::Layout, collections::HashMap, sync::Arc};
 
 use arrow::{
@@ -107,6 +108,9 @@ pub trait UnitObserver {
     type Error;
     fn checkpoint(&mut self) -> Result<(), Self::Error>;
     fn before_allocation(&mut self, layout: Layout) -> Result<(), Self::Error>;
+    /// Finite initialization of the shared borrowed type stack. This is work,
+    /// not a heap allocation request or a grant derived from source bytes.
+    fn before_type_scratch(&mut self, work_upper: usize) -> Result<(), Self::Error>;
     fn before_metadata_verification(&mut self, metadata: &[u8]) -> Result<(), Self::Error>;
     /// The original role creates the body and attaches retained capacity to its
     /// actual aliases. Implementations must use the pinned Arrow alignment and
@@ -122,6 +126,14 @@ pub trait UnitObserver {
     ) -> Result<(), Self::Error>;
     fn before_recipe(&mut self, fields: &[RecipeField<'_>]) -> Result<(), Self::Error>;
     fn before_unit_recipe(&mut self, recipe: &BatchRecipe, tags: &[u8]) -> Result<(), Self::Error>;
+    /// The actual role's existing metadata projection author. This cannot
+    /// change values, scalar parameters, logical identity or representation.
+    fn project_carrier(
+        &mut self,
+        ordinal: usize,
+        source: &ArrayRef,
+        target: &arrow::datatypes::DataType,
+    ) -> Result<ArrayRef, Self::Error>;
     fn before_encode_batch(
         &mut self,
         recipe: &BatchRecipe,
@@ -203,18 +215,28 @@ pub fn encode_unit<O: UnitObserver>(
     observer.checkpoint().map_err(CodecError::Observer)?;
     let tags = recipe.representation_tags(batch, observer)?;
     let unit = recipe.unit_recipe(&tags, observer)?;
-    observer
-        .before_encode_batch(recipe, batch)
-        .map_err(CodecError::Observer)?;
     let mut columns = Vec::new();
     reserve(&mut columns, batch.num_columns(), observer)?;
-    columns.extend(batch.columns().iter().cloned());
+    for (ordinal, (source, field)) in batch.columns().iter().zip(unit.schema.fields()).enumerate() {
+        observer.checkpoint().map_err(CodecError::Observer)?;
+        let column = if source.data_type() == field.data_type() {
+            Arc::clone(source)
+        } else {
+            observer
+                .project_carrier(ordinal, source, field.data_type())
+                .map_err(CodecError::Observer)?
+        };
+        columns.push(column);
+    }
     let canonical = RecordBatch::try_new_with_options(
         Arc::clone(&unit.schema),
         columns,
         &arrow::array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
     )
     .map_err(CodecError::Arrow)?;
+    observer
+        .before_encode_batch(recipe, &canonical)
+        .map_err(CodecError::Observer)?;
     let mut tracker = DictionaryTracker::new(true);
     for dictionary in &unit.dictionaries {
         observer.checkpoint().map_err(CodecError::Observer)?;

@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{ConstructionFailure, InputConstructionFactory, InputConstructionOwner};
+use super::{
+    ConstructionFailure, DecodedInputSourceCustody, InputConstructionFactory,
+    InputConstructionOwner,
+};
 use crate::exec::chunk::{ArrayNormalizationStep, ArrayPathStep, ChunkSchema};
 use novarocks_type_contract::{
     CompileControlError, ValueTypeStorageHold, ValueTypeStorageLifetime,
@@ -160,6 +163,7 @@ pub struct ObservedInputConstructionFactory {
     host: Arc<dyn InputConstructionRequestHost>,
     control: Arc<dyn InputConstructionWorkControl>,
     model: Arc<dyn InputConstructionOperationModel>,
+    decoded_source_custody: Option<Arc<dyn DecodedInputSourceCustody>>,
     _creation: Arc<CreatorGuard>,
 }
 impl ObservedInputConstructionFactory {
@@ -181,6 +185,26 @@ impl ObservedInputConstructionFactory {
         control: Arc<dyn InputConstructionWorkControl>,
         model: Arc<dyn InputConstructionOperationModel>,
     ) -> Result<Arc<Self>, ConstructionFailure> {
+        Self::try_new_inner(profile, host, control, model, None)
+    }
+    /// The real runtime composition supplies this capability explicitly. Pure
+    /// observer-only factories do not acquire an allocator by inference.
+    pub fn try_new_with_decoded_source_custody(
+        profile: InputConstructionProfile,
+        host: Arc<dyn InputConstructionRequestHost>,
+        control: Arc<dyn InputConstructionWorkControl>,
+        model: Arc<dyn InputConstructionOperationModel>,
+        custody: Arc<dyn DecodedInputSourceCustody>,
+    ) -> Result<Arc<Self>, ConstructionFailure> {
+        Self::try_new_inner(profile, host, control, model, Some(custody))
+    }
+    fn try_new_inner(
+        profile: InputConstructionProfile,
+        host: Arc<dyn InputConstructionRequestHost>,
+        control: Arc<dyn InputConstructionWorkControl>,
+        model: Arc<dyn InputConstructionOperationModel>,
+        decoded_source_custody: Option<Arc<dyn DecodedInputSourceCustody>>,
+    ) -> Result<Arc<Self>, ConstructionFailure> {
         if profile.max_requests == 0
             || profile.max_request_bytes == 0
             || profile.max_work == 0
@@ -201,6 +225,7 @@ impl ObservedInputConstructionFactory {
             host,
             control,
             model,
+            decoded_source_custody,
             _creation: creation,
         }))
     }
@@ -235,6 +260,20 @@ impl ObservedInputConstructionFactory {
     }
 }
 impl InputConstructionFactory for ObservedInputConstructionFactory {
+    fn retain_decoded_source(
+        &self,
+        array: arrow::array::ArrayRef,
+        storage: ValueTypeStorageLifetime,
+        work: &dyn InputConstructionOwner,
+    ) -> Result<arrow::array::ArrayRef, ConstructionFailure> {
+        let custody = self
+            .decoded_source_custody
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        self.control.checkpoint(0)?;
+        custody.retain(array, storage, work)
+    }
+
     fn observe_input_work(&self, units: usize) -> Result<(), ConstructionFailure> {
         self.control.checkpoint(units)
     }

@@ -354,7 +354,9 @@ impl TypedValueBinding {
         )? {
             return Ok(false);
         }
-        crate::schema::arrow_data_types_exact_weighted_observed(
+        // Both immutable layouts passed their canonical construction owner.
+        // Reuse the exact borrowed body without reapplying a raw physical policy.
+        crate::schema::arrow_validated_data_types_exact_weighted_observed(
             self.layout.data_type(),
             other.layout.data_type(),
             observe,

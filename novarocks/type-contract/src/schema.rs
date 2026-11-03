@@ -114,6 +114,149 @@ pub fn arrow_data_types_exact(left: &DataType, right: &DataType) -> bool {
     .unwrap_or(false)
 }
 
+/// Compare complete carrier attributes under an explicitly selected type
+/// profile. Validation borrows the same structure grammar as recipe admission;
+/// the original comparison remains the sole attribute/metadata comparator.
+pub fn arrow_data_types_exact_with_profile_observed<E: From<crate::ValueTypeError>>(
+    left: &DataType,
+    right: &DataType,
+    profile: crate::ArrowTypeProfile,
+    observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    compare_types_with_profile(
+        left,
+        right,
+        profile,
+        FieldMode::Exact,
+        MetadataMode::Bucketed,
+        observe,
+    )
+}
+/// Exact expected-first comparison for an already prepared runtime port.
+/// Permissive permits only an expected required Field to have an actual nullable
+/// physical declaration. Names, metadata, encoding tags, dictionary attributes
+/// and every type parameter remain exact; this never peels Dict/REE wrappers.
+/// Map entries/key and REE ends keep their required format declarations.
+pub fn arrow_data_types_exact_with_profile_and_nullability_observed<
+    E: From<crate::ValueTypeError>,
+>(
+    expected: &DataType,
+    actual: &DataType,
+    profile: crate::ArrowTypeProfile,
+    nullability: crate::CarrierNullabilityPolicy,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    let mut weighted = |_: TypeComparisonStep| observe();
+    Walk {
+        observe: &mut weighted,
+        validate: &mut |depth: crate::ArrowTypeDepth, nodes| {
+            depth.check(profile)?;
+            if nodes > crate::MAX_VALUE_TYPE_NODES {
+                Err(crate::ValueTypeError::TooManyNodes.into())
+            } else {
+                Ok(())
+            }
+        },
+        nodes: 0,
+        mode: FieldMode::Exact,
+        metadata_mode: MetadataMode::Bucketed,
+        nullability,
+    }
+    .ty(expected, actual, crate::ArrowTypeDepth::ROOT)
+}
+
+/// The same expected-first physical NULL policy on an exact Field. As with the
+/// original observed Field author, schema/type admission belongs to its caller.
+pub fn arrow_fields_exact_with_nullability_observed<E>(
+    expected: &Field,
+    actual: &Field,
+    nullability: crate::CarrierNullabilityPolicy,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    let mut weighted = |_: TypeComparisonStep| observe();
+    Walk {
+        observe: &mut weighted,
+        validate: &mut |_, _| Ok(()),
+        nodes: 0,
+        mode: FieldMode::Exact,
+        metadata_mode: MetadataMode::Bucketed,
+        nullability,
+    }
+    .field(expected, actual, crate::ArrowTypeDepth::ROOT)
+}
+
+pub fn arrow_data_types_equal_with_profile_observed<E: From<crate::ValueTypeError>>(
+    left: &DataType,
+    right: &DataType,
+    profile: crate::ArrowTypeProfile,
+    observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    compare_types_with_profile(
+        left,
+        right,
+        profile,
+        FieldMode::Compatibility,
+        MetadataMode::Bucketed,
+        observe,
+    )
+}
+pub fn arrow_data_types_exact_borrowed_with_profile_observed<E: From<crate::ValueTypeError>>(
+    left: &DataType,
+    right: &DataType,
+    profile: crate::ArrowTypeProfile,
+    observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    compare_types_with_profile(
+        left,
+        right,
+        profile,
+        FieldMode::Exact,
+        MetadataMode::BorrowedLinear,
+        observe,
+    )
+}
+pub fn arrow_data_types_equal_borrowed_with_profile_observed<E: From<crate::ValueTypeError>>(
+    left: &DataType,
+    right: &DataType,
+    profile: crate::ArrowTypeProfile,
+    observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    compare_types_with_profile(
+        left,
+        right,
+        profile,
+        FieldMode::Compatibility,
+        MetadataMode::BorrowedLinear,
+        observe,
+    )
+}
+fn compare_types_with_profile<E: From<crate::ValueTypeError>>(
+    left: &DataType,
+    right: &DataType,
+    profile: crate::ArrowTypeProfile,
+    mode: FieldMode,
+    metadata_mode: MetadataMode,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    let mut weighted = |_: TypeComparisonStep| observe();
+    Walk {
+        observe: &mut weighted,
+        validate: &mut |depth: crate::ArrowTypeDepth, nodes| {
+            depth.check(profile)?;
+            if nodes > crate::MAX_VALUE_TYPE_NODES {
+                Err(crate::ValueTypeError::TooManyNodes.into())
+            } else {
+                Ok(())
+            }
+        },
+        nodes: 0,
+        mode,
+        metadata_mode,
+        nullability: crate::CarrierNullabilityPolicy::Exact,
+    }
+    .ty(left, right, crate::ArrowTypeDepth::ROOT)
+}
+
 /// Callback-only comparison for the private, already validated immutable value
 /// vocabulary. Keep this crate-private: raw provider or wire types must pass
 /// their original admission checks before they enter a typed holder.
@@ -179,8 +322,8 @@ fn compare_types_borrowed<E: From<crate::ValueTypeError>>(
     let mut weighted = |_: TypeComparisonStep| observe();
     Walk {
         observe: &mut weighted,
-        validate: &mut |depth, nodes| {
-            if depth > crate::MAX_VALUE_TYPE_DEPTH {
+        validate: &mut |depth: crate::ArrowTypeDepth, nodes| {
+            if depth.physical() > crate::MAX_VALUE_TYPE_DEPTH {
                 Err(crate::ValueTypeError::TooDeep.into())
             } else if nodes > crate::MAX_VALUE_TYPE_NODES {
                 Err(crate::ValueTypeError::TooManyNodes.into())
@@ -191,8 +334,9 @@ fn compare_types_borrowed<E: From<crate::ValueTypeError>>(
         nodes: 0,
         mode,
         metadata_mode: MetadataMode::BorrowedLinear,
+        nullability: crate::CarrierNullabilityPolicy::Exact,
     }
-    .ty(left, right, 1)
+    .ty(left, right, crate::ArrowTypeDepth::ROOT)
 }
 
 /// Exact Field comparison using borrowed metadata and the sole type traversal.
@@ -210,8 +354,9 @@ pub fn arrow_fields_exact_borrowed_observed<E>(
         nodes: 0,
         mode: FieldMode::Exact,
         metadata_mode: MetadataMode::BorrowedLinear,
+        nullability: crate::CarrierNullabilityPolicy::Exact,
     }
-    .field(left, right, 1)
+    .field(left, right, crate::ArrowTypeDepth::ROOT)
 }
 
 /// Observe Arrow schema compatibility equality. Unlike the frozen exact
@@ -256,8 +401,9 @@ pub fn arrow_fields_exact_observed<E>(
         nodes: 0,
         mode: FieldMode::Exact,
         metadata_mode: MetadataMode::Bucketed,
+        nullability: crate::CarrierNullabilityPolicy::Exact,
     }
-    .field(left, right, 1)
+    .field(left, right, crate::ArrowTypeDepth::ROOT)
 }
 
 fn compare_types<E>(
@@ -279,28 +425,13 @@ fn compare_types_weighted<E>(
 ) -> Result<bool, E> {
     Walk {
         observe: &mut observe,
-        validate: &mut validate,
+        validate: &mut |depth: crate::ArrowTypeDepth, nodes| validate(depth.physical(), nodes),
         nodes: 0,
         mode,
         metadata_mode: MetadataMode::Bucketed,
+        nullability: crate::CarrierNullabilityPolicy::Exact,
     }
-    .ty(left, right, 1)
-}
-
-pub(crate) fn arrow_data_types_exact_weighted_observed<E: From<crate::ValueTypeError>>(
-    left: &DataType,
-    right: &DataType,
-    observe: impl FnMut(TypeComparisonStep) -> Result<(), E>,
-) -> Result<bool, E> {
-    compare_types_weighted(left, right, FieldMode::Exact, observe, |depth, nodes| {
-        if depth > crate::MAX_VALUE_TYPE_DEPTH {
-            Err(crate::ValueTypeError::TooDeep.into())
-        } else if nodes > crate::MAX_VALUE_TYPE_NODES {
-            Err(crate::ValueTypeError::TooManyNodes.into())
-        } else {
-            Ok(())
-        }
-    })
+    .ty(left, right, crate::ArrowTypeDepth::ROOT)
 }
 
 pub(crate) fn arrow_validated_data_types_exact_weighted_observed<E>(
@@ -329,9 +460,13 @@ struct Walk<'a, F, B> {
     nodes: usize,
     mode: FieldMode,
     metadata_mode: MetadataMode,
+    nullability: crate::CarrierNullabilityPolicy,
 }
-impl<E, F: FnMut(TypeComparisonStep) -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>>
-    Walk<'_, F, B>
+impl<
+    E,
+    F: FnMut(TypeComparisonStep) -> Result<(), E>,
+    B: FnMut(crate::ArrowTypeDepth, usize) -> Result<(), E>,
+> Walk<'_, F, B>
 {
     fn bytes(&mut self, left: &[u8], right: &[u8]) -> Result<bool, E> {
         if left.len() != right.len() {
@@ -436,7 +571,12 @@ impl<E, F: FnMut(TypeComparisonStep) -> Result<(), E>, B: FnMut(usize, usize) ->
         }
         Ok(true)
     }
-    fn field(&mut self, left: &Field, right: &Field, depth: usize) -> Result<bool, E> {
+    fn field(
+        &mut self,
+        left: &Field,
+        right: &Field,
+        depth: crate::ArrowTypeDepth,
+    ) -> Result<bool, E> {
         (self.observe)(TypeComparisonStep::Header)?;
         #[allow(deprecated)]
         let dictionary_equal = match self.mode {
@@ -447,7 +587,9 @@ impl<E, F: FnMut(TypeComparisonStep) -> Result<(), E>, B: FnMut(usize, usize) ->
             FieldMode::Compatibility => true,
         };
         if !self.bytes(left.name().as_bytes(), right.name().as_bytes())?
-            || left.is_nullable() != right.is_nullable()
+            || (left.is_nullable() != right.is_nullable()
+                && !(self.nullability == crate::CarrierNullabilityPolicy::Permissive
+                    && right.is_nullable()))
             || !self.metadata(left, right)?
             || !dictionary_equal
         {
@@ -455,8 +597,16 @@ impl<E, F: FnMut(TypeComparisonStep) -> Result<(), E>, B: FnMut(usize, usize) ->
         }
         self.ty(left.data_type(), right.data_type(), depth)
     }
-    fn ty(&mut self, left: &DataType, right: &DataType, depth: usize) -> Result<bool, E> {
+    fn ty(
+        &mut self,
+        left: &DataType,
+        right: &DataType,
+        depth: crate::ArrowTypeDepth,
+    ) -> Result<bool, E> {
         (self.observe)(TypeComparisonStep::Header)?;
+        // Keep the original comparison occurrence count, including the
+        // entries Struct reached through a Map edge. Profile selection only
+        // changes depth coordinates, never this inherited node policy.
         self.nodes += 1;
         (self.validate)(depth, self.nodes)?;
         match (left, right) {
@@ -464,13 +614,13 @@ impl<E, F: FnMut(TypeComparisonStep) -> Result<(), E>, B: FnMut(usize, usize) ->
             | (DataType::ListView(left), DataType::ListView(right))
             | (DataType::LargeList(left), DataType::LargeList(right))
             | (DataType::LargeListView(left), DataType::LargeListView(right)) => {
-                self.field(left, right, depth + 1)
+                self.field(left, right, depth.comparison_child(true, false))
             }
             (DataType::FixedSizeList(left, ls), DataType::FixedSizeList(right, rs)) => {
                 if ls != rs {
                     Ok(false)
                 } else {
-                    self.field(left, right, depth + 1)
+                    self.field(left, right, depth.comparison_child(true, false))
                 }
             }
             (DataType::Struct(left), DataType::Struct(right)) => {
@@ -478,7 +628,7 @@ impl<E, F: FnMut(TypeComparisonStep) -> Result<(), E>, B: FnMut(usize, usize) ->
                     return Ok(false);
                 }
                 for (left, right) in left.iter().zip(right) {
-                    if !self.field(left, right, depth + 1)? {
+                    if !self.field(left, right, depth.comparison_child(true, false))? {
                         return Ok(false);
                     }
                 }
@@ -489,24 +639,47 @@ impl<E, F: FnMut(TypeComparisonStep) -> Result<(), E>, B: FnMut(usize, usize) ->
                     return Ok(false);
                 }
                 for ((li, left), (ri, right)) in left.iter().zip(right.iter()) {
-                    if li != ri || !self.field(left, right, depth + 1)? {
+                    if li != ri || !self.field(left, right, depth.comparison_child(true, false))? {
                         return Ok(false);
                     }
                 }
                 Ok(true)
             }
             (DataType::Dictionary(lk, lv), DataType::Dictionary(rk, rv)) => {
-                Ok(self.ty(lk, rk, depth + 1)? && self.ty(lv, rv, depth + 1)?)
+                Ok(self.ty(lk, rk, depth.comparison_child(false, true))?
+                    && self.ty(lv, rv, depth.comparison_child(false, true))?)
             }
             (DataType::Map(left, ls), DataType::Map(right, rs)) => {
+                if self.nullability == crate::CarrierNullabilityPolicy::Permissive {
+                    let (DataType::Struct(expected), DataType::Struct(actual)) =
+                        (left.data_type(), right.data_type())
+                    else {
+                        return Ok(false);
+                    };
+                    if left.is_nullable()
+                        || right.is_nullable()
+                        || expected.len() != 2
+                        || actual.len() != 2
+                        || expected[0].is_nullable()
+                        || actual[0].is_nullable()
+                    {
+                        return Ok(false);
+                    }
+                }
                 if ls != rs {
                     Ok(false)
                 } else {
-                    self.field(left, right, depth + 1)
+                    self.field(left, right, depth.comparison_child(false, false))
                 }
             }
             (DataType::RunEndEncoded(lr, lv), DataType::RunEndEncoded(rr, rv)) => {
-                Ok(self.field(lr, rr, depth + 1)? && self.field(lv, rv, depth + 1)?)
+                if self.nullability == crate::CarrierNullabilityPolicy::Permissive
+                    && (lr.is_nullable() || rr.is_nullable())
+                {
+                    return Ok(false);
+                }
+                Ok(self.field(lr, rr, depth.comparison_child(false, true))?
+                    && self.field(lv, rv, depth.comparison_child(false, true))?)
             }
             (DataType::Timestamp(lu, lt), DataType::Timestamp(ru, rt)) => {
                 if lu != ru {
@@ -770,6 +943,7 @@ mod tests {
                 nodes: 0,
                 mode: FieldMode::Exact,
                 metadata_mode: MetadataMode::Bucketed,
+                nullability: crate::CarrierNullabilityPolicy::Exact,
             }
             .metadata(&empty, &empty),
             Ok(true)
@@ -803,6 +977,7 @@ mod tests {
                 nodes: 0,
                 mode: FieldMode::Exact,
                 metadata_mode: MetadataMode::Bucketed,
+                nullability: crate::CarrierNullabilityPolicy::Exact,
             }
             .metadata_with_key_hash(&left, right, |walk, _| {
                 (walk.observe)(TypeComparisonStep::Header)?;
@@ -946,6 +1121,133 @@ mod tests {
                     Ok(left == right)
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod physical_nullability_exact_tests {
+    use super::*;
+    use crate::{ArrowTypeProfile, CarrierNullabilityPolicy, ValueTypeError};
+    use std::sync::Arc;
+    fn compare(expected: &DataType, actual: &DataType) -> bool {
+        arrow_data_types_exact_with_profile_and_nullability_observed::<ValueTypeError>(
+            expected,
+            actual,
+            ArrowTypeProfile::Value,
+            CarrierNullabilityPolicy::Permissive,
+            || Ok(()),
+        )
+        .unwrap()
+    }
+    fn structure(field: Field) -> DataType {
+        DataType::Struct(vec![Arc::new(field)].into())
+    }
+    #[test]
+    fn nullable_policy_is_expected_first_and_preserves_every_other_attribute() {
+        let expected = structure(Field::new("n", DataType::Int32, false));
+        let wider = structure(Field::new("n", DataType::Int32, true));
+        assert!(compare(&expected, &wider));
+        assert!(
+            !compare(&wider, &expected),
+            "physical NULL declarations cannot narrow a nullable expected field"
+        );
+        assert!(
+            !arrow_data_types_exact(&expected, &wider),
+            "the original raw exact API is unchanged"
+        );
+        for actual in [
+            structure(Field::new("renamed", DataType::Int32, true)),
+            structure(Field::new("n", DataType::Int64, true)),
+            structure(Field::new("n", DataType::Int32, true).with_metadata(
+                std::collections::HashMap::from([("foreign".into(), "annotation".into())]),
+            )),
+            structure(Field::new(
+                "n",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32)),
+                true,
+            )),
+            structure(Field::new(
+                "n",
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                    Arc::new(Field::new("values", DataType::Int32, true)),
+                ),
+                true,
+            )),
+        ] {
+            assert!(
+                !compare(&expected, &actual),
+                "only physical NULL flags may differ"
+            );
+        }
+        assert!(!compare(
+            &structure(Field::new("d", DataType::Decimal128(18, 2), false)),
+            &structure(Field::new("d", DataType::Decimal128(19, 2), true))
+        ));
+    }
+    #[test]
+    fn permissive_exact_map_and_run_end_formats_keep_required_scaffolding() {
+        let map = |entries_nullable, key_nullable, value_nullable| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", DataType::Int32, key_nullable)),
+                            Arc::new(Field::new("value", DataType::Int64, value_nullable)),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+        let expected = map(false, false, false);
+        assert!(compare(&expected, &map(false, false, true)));
+        assert!(!compare(&expected, &map(true, false, true)));
+        assert!(!compare(&expected, &map(false, true, true)));
+        let invalid = map(true, true, true);
+        assert!(
+            arrow_data_types_exact(&invalid, &invalid),
+            "raw comparison is not newly promoted into format admission"
+        );
+        let expected = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new("values", DataType::Int64, false)),
+        );
+        let actual = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, true)),
+            Arc::new(Field::new("values", DataType::Int64, true)),
+        );
+        assert!(!compare(&expected, &actual));
+    }
+    #[test]
+    fn permissive_exact_fields_keep_dictionary_id_and_order() {
+        #[expect(
+            deprecated,
+            reason = "Frozen field comparison still protects pinned Arrow dictionary attributes"
+        )]
+        let field = |id, ordered| {
+            Field::new_dict(
+                "d",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+                id,
+                ordered,
+            )
+        };
+        for actual in [field(8, false), field(7, true)] {
+            assert!(
+                !arrow_fields_exact_with_nullability_observed::<std::convert::Infallible>(
+                    &field(7, false),
+                    &actual,
+                    CarrierNullabilityPolicy::Permissive,
+                    || Ok(())
+                )
+                .unwrap()
+            );
         }
     }
 }

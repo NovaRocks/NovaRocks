@@ -34,8 +34,9 @@ use crate::value_type_table::{
 use arrow::datatypes::{DataType, Field, UnionMode};
 use novarocks_proto_models::{physical_type_v2 as wire, plan, value_type as logical_wire};
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, FunctionValueType, ValueTypeVisit,
-    validate_arrow_carrier_parameters_observed, validate_arrow_layout_structure_observed,
+    ArrowTypeProfile, CompileCheckpoints, CompileControlError, FunctionValueType, ValueTypeVisit,
+    validate_arrow_carrier_parameters_observed,
+    validate_arrow_layout_structure_with_profile_observed,
 };
 use std::alloc::Layout;
 use std::{collections::BTreeSet, sync::Arc};
@@ -157,7 +158,7 @@ fn add_child(nodes: &mut usize, child: usize) -> Result<(), Error> {
     Ok(())
 }
 
-// Validation precedes this recursion: Strict roots retain 64 levels/4096
+// Validation precedes this recursion: Strict roots retain their explicit depth/4096
 // nodes; immutable Writer recipes retain their original 32-level/schema law.
 // Counts include each
 // definition's full referenced subtree, including repeated FieldRef uses.
@@ -309,10 +310,11 @@ pub(super) fn strict_children(ty: &DataType) -> usize {
 /// actual type rather than the per-type node maximum.
 fn validate_strict_type<H>(
     ty: &DataType,
+    profile: ArrowTypeProfile,
     resources: &mut Option<Admission<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), HostError<H>> {
-    validate_arrow_layout_structure_observed(ty, |visit| {
+    validate_arrow_layout_structure_with_profile_observed(ty, profile, |visit| {
         if let Some(resources) = resources {
             match visit {
                 ValueTypeVisit::TypeNode(node) => resources.model.strict_carrier(node)?,
@@ -420,11 +422,16 @@ fn preflight<'a, H>(
             return Err(Error::InvalidShape("duplicate value type definition ID").into());
         }
         value.logical_type().validate_carrier(value.data_type())?;
-        validate_strict_type(value.data_type(), &mut counts.resources, work)?;
+        validate_strict_type(
+            value.data_type(),
+            ArrowTypeProfile::CanonicalValue,
+            &mut counts.resources,
+            work,
+        )?;
         let nodes = count_type(value.data_type(), &mut counts, work, SourceLaw::Strict)?;
         counts.expansion(nodes)?;
     }
-    for (_, field) in fields.iter() {
+    for (ordinal, (_, field)) in fields.iter().enumerate() {
         // The root node, whose visit pair is this root Field and its carrier.
         admit_strict_nodes(&mut counts.resources, 1)?;
         work.step()?;
@@ -433,7 +440,16 @@ fn preflight<'a, H>(
             resources.gate()?;
         }
         validate_field(field, work)?;
-        validate_strict_type(field.data_type(), &mut counts.resources, work)?;
+        validate_strict_type(
+            field.data_type(),
+            if fields.value_binding(ordinal).is_some() {
+                ArrowTypeProfile::CanonicalValue
+            } else {
+                ArrowTypeProfile::Physical
+            },
+            &mut counts.resources,
+            work,
+        )?;
         #[allow(deprecated)]
         let dictionary_id = field.dict_id();
         if dictionary_id.is_some() != field.dict_is_ordered().is_some() {
@@ -676,9 +692,10 @@ fn validate_associated_field<H>(
             Error::InvalidShape("execution field differs from its explicit value binding").into(),
         );
     }
-    if !novarocks_type_contract::arrow_data_types_exact_borrowed_observed::<Error>(
+    if !novarocks_type_contract::arrow_data_types_exact_borrowed_with_profile_observed::<Error>(
         field.data_type(),
         value.data_type(),
+        ArrowTypeProfile::CanonicalValue,
         || work.step().map_err(Into::into),
     )? {
         return Err(Error::InvalidShape(

@@ -143,9 +143,9 @@ impl SqlFunctionBinding {
                         hash.write_u8(u8::from(ty.nullable()));
                         work.step()?;
                         let carrier =
-                            novarocks_type_contract::arrow_data_type_fingerprint_observed::<
+                            novarocks_type_contract::arrow_data_type_fingerprint_with_profile_observed::<
                                 ConstantError,
-                            >(ty.data_type(), &mut || {
+                            >(ty.data_type(), novarocks_type_contract::ArrowTypeProfile::CanonicalValue, &mut || {
                                 work.step().map_err(Into::into)
                             })
                             .map_err(SqlCompileError::from)?;

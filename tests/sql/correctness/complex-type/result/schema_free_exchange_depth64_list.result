@@ -1,0 +1,11 @@
+-- query 2
+-- types	integer	array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(integer)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+id	deep_value
+7	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[7]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]
+19	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[19]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]
+
+-- query 3
+-- types	integer	array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(array(integer)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+id	deep_value
+7	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[7]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]
+19	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[19]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]

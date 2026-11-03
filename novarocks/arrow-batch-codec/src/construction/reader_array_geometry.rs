@@ -45,6 +45,30 @@ pub enum ReaderArrayHeaderClass {
     Temporary,
 }
 
+/// Pure request geometry returned by the same original decoder traversal.
+/// No source tree, allocation grant or retained owner is constructed here.
+#[derive(Clone, Copy, Default)]
+struct ReadNodeFacts {
+    logical_null_payload_upper: usize,
+}
+impl ReadNodeFacts {
+    fn bitmap(rows: usize) -> Result<usize, LayoutResourceError> {
+        // Union gather uses one-null/one-valid constants even for an empty
+        // output with a dictionary child's Some(empty) logical null bitmap.
+        rows.checked_add(7)
+            .map(|bits| (bits / 8).max(1))
+            .and_then(|bytes| bytes.checked_next_multiple_of(64))
+            .ok_or(LayoutResourceError::Arithmetic)
+    }
+    fn add(&mut self, bytes: usize) -> Result<(), LayoutResourceError> {
+        self.logical_null_payload_upper = self
+            .logical_null_payload_upper
+            .checked_add(bytes)
+            .ok_or(LayoutResourceError::Arithmetic)?;
+        Ok(())
+    }
+}
+
 pub struct ReaderArrayStructureObserver<'a, H> {
     pub request: &'a mut dyn FnMut(Layout, ReaderArrayHeaderClass) -> Result<(), H>,
     pub opaque: &'a mut dyn FnMut(usize, ReaderArrayHeaderClass) -> Result<(), H>,
@@ -426,6 +450,7 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         batch: arrow_ipc::RecordBatch<'_>,
         body: &[u8],
         class: ReaderArrayHeaderClass,
+        repair_payload: bool,
     ) -> Result<(), ReaderStructureFailure<H>> {
         let Some(buffers) = batch.buffers() else {
             return Ok(());
@@ -451,6 +476,19 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
             // Empty legacy offsets can allocate OffsetBuffer::new_empty;
             // include that mutually exclusive constructor in the same bound.
             self.private_headers(1, class)?;
+            if repair_payload {
+                // Arrow60.1 ArrayData::align_buffers may copy every descriptor
+                // separately, even when descriptors overlap the same body.
+                // Buffer::from_slice_ref rounds capacity to 64; empty offset
+                // reconstruction independently needs at most eight bytes.
+                // This is an operation upper bound, never an exact allocation
+                // invoice or permission derived from source retention.
+                let bytes = len
+                    .max(8)
+                    .checked_next_multiple_of(64)
+                    .ok_or(LayoutResourceError::Arithmetic)?;
+                (self.opaque)(bytes, class).map_err(ReaderStructureFailure::Creator)?;
+            }
             if batch.compression().is_some() && !source.is_empty() {
                 let prefix: [u8; 8] = source
                     .get(..8)
@@ -610,6 +648,19 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         }
         Ok(())
     }
+    fn logical_null_payload(
+        &mut self,
+        facts: ReadNodeFacts,
+    ) -> Result<(), ReaderStructureFailure<H>> {
+        if facts.logical_null_payload_upper != 0 {
+            (self.opaque)(
+                facts.logical_null_payload_upper,
+                ReaderArrayHeaderClass::Temporary,
+            )
+            .map_err(ReaderStructureFailure::Creator)?;
+        }
+        Ok(())
+    }
     fn validation_null_headers(&mut self, ty: &DataType) -> Result<(), ReaderStructureFailure<H>> {
         // ArrayDataBuilder::validate_data calls validate_nulls once for its
         // own root. It does not recurse child validate_nulls: child data has
@@ -678,33 +729,75 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         &mut self,
         field: &arrow_schema::Field,
         class: ReaderArrayHeaderClass,
+        node_rows: &mut Option<impl Iterator<Item = i64>>,
         variadic: &mut (impl Iterator<Item = i64> + Clone),
         dictionary_present: &mut impl FnMut(i64) -> Result<bool, H>,
-    ) -> Result<(), ReaderStructureFailure<H>> {
+    ) -> Result<ReadNodeFacts, ReaderStructureFailure<H>> {
         self.step()?;
+        // Header-only users keep the original traversal/callback sequence and
+        // never consume FieldNode lengths. Online uses this same DFS once.
+        let bitmap_upper = match node_rows.as_mut() {
+            Some(rows) => {
+                let rows = rows.next().ok_or(ReaderStructureFailure::SourceModel(
+                    "IPC array header FieldNode is missing",
+                ))?;
+                Some(ReadNodeFacts::bitmap(
+                    usize::try_from(rows).map_err(|_| LayoutResourceError::Arithmetic)?,
+                )?)
+            }
+            None => None,
+        };
+        let mut facts = ReadNodeFacts::default();
         let ty = field.data_type();
         match ty {
             DataType::Struct(fields) => {
                 for field in fields {
-                    self.read_node(field, class, variadic, dictionary_present)?;
-                }
-                self.pushes::<ArrayRef>(fields.len(), class)?;
-                for field in fields {
-                    if !field.is_nullable() {
+                    let child =
+                        self.read_node(field, class, node_rows, variadic, dictionary_present)?;
+                    if bitmap_upper.is_some() && !field.is_nullable() {
+                        // Borrow the original header author, then fund only
+                        // this actual child's independently synthesized bytes.
                         self.logical_null_headers(field.data_type())?;
+                        self.logical_null_payload(child)?;
                     }
                 }
-                return self.body(ty, class);
+                self.pushes::<ArrayRef>(fields.len(), class)?;
+                if bitmap_upper.is_none() {
+                    for field in fields {
+                        if !field.is_nullable() {
+                            self.logical_null_headers(field.data_type())?;
+                        }
+                    }
+                }
+                self.body(ty, class)?;
+                return Ok(facts);
             }
             DataType::Union(fields, mode) => {
                 self.array::<ArrayRef>(fields.len(), ReaderArrayHeaderClass::Temporary)?;
                 let mut child_variadic = variadic.clone();
                 for (_, field) in fields.iter() {
-                    self.read_node(
+                    let child = self.read_node(
                         field,
                         ReaderArrayHeaderClass::Temporary,
+                        node_rows,
                         variadic,
                         dictionary_present,
+                    )?;
+                    facts.add(child.logical_null_payload_upper)?;
+                }
+                if let Some(bytes) = bitmap_upper {
+                    // Same 0/3 branches as the original header author. Dense
+                    // gather needs two one-bit constants and its result;
+                    // sparse chunk collection can retain old + at most twice
+                    // that backing when it appends one final remainder.
+                    let outputs = usize::from(
+                        fields.len() > 1
+                            || (fields.len() == 1 && *mode == arrow_schema::UnionMode::Dense),
+                    ) * 3;
+                    facts.add(
+                        bytes
+                            .checked_mul(outputs)
+                            .ok_or(LayoutResourceError::Arithmetic)?,
                     )?;
                 }
                 let slots = self.union_slots(fields)?;
@@ -728,7 +821,8 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
                 for (_, field) in fields.iter() {
                     self.make_data(field.data_type(), class, &mut make_variadic)?;
                 }
-                return self.body(ty, class);
+                self.body(ty, class)?;
+                return Ok(facts);
             }
             DataType::List(child)
             | DataType::LargeList(child)
@@ -740,6 +834,7 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
                 self.read_node(
                     child,
                     ReaderArrayHeaderClass::Temporary,
+                    node_rows,
                     variadic,
                     dictionary_present,
                 )?;
@@ -763,6 +858,9 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
                 self.pushes::<ArrayData>(1, ReaderArrayHeaderClass::Temporary)?;
             }
             DataType::Dictionary(_, values) => {
+                if let Some(bytes) = bitmap_upper {
+                    facts.add(bytes)?;
+                }
                 #[expect(
                     deprecated,
                     reason = "Arrow 60.1 readers still use Field dictionary IDs; the prepared recipe reconstructs the same IDs"
@@ -792,16 +890,22 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
                 self.read_node(
                     ends,
                     ReaderArrayHeaderClass::Temporary,
+                    node_rows,
                     variadic,
                     dictionary_present,
                 )?;
                 let mut clone_variadic = variadic.clone();
-                self.read_node(
+                let values_facts = self.read_node(
                     values,
                     ReaderArrayHeaderClass::Temporary,
+                    node_rows,
                     variadic,
                     dictionary_present,
                 )?;
+                facts.add(values_facts.logical_null_payload_upper)?;
+                if let Some(bytes) = bitmap_upper {
+                    facts.add(bytes)?;
+                }
                 // The initial run-end PrimitiveArray is temporary. Its to_data
                 // buffer table is consumed inline by RunArray::from, without
                 // constructing another PrimitiveArray Arc.
@@ -811,7 +915,11 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
                 self.make_data(values.data_type(), class, &mut make_variadic)?;
                 self.pushes::<ArrayData>(2, ReaderArrayHeaderClass::Temporary)?;
             }
-            DataType::Null => {}
+            DataType::Null => {
+                if let Some(bytes) = bitmap_upper {
+                    facts.add(bytes)?;
+                }
+            }
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
                 self.array::<Buffer>(2, ReaderArrayHeaderClass::Temporary)?
             }
@@ -844,7 +952,8 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         if !matches!(ty, DataType::Null) {
             self.data_builder_tables(ty)?;
         }
-        self.body(ty, class)
+        self.body(ty, class)?;
+        Ok(facts)
     }
     fn field_lookup(
         &mut self,
@@ -951,7 +1060,33 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         batch: arrow_ipc::RecordBatch<'_>,
         body: &[u8],
     ) -> Result<(), ReaderStructureFailure<H>> {
-        self.buffer_branches(batch, body, ReaderArrayHeaderClass::Retained)?;
+        self.dictionary_batch_inner(schema, id, batch, body, false)
+    }
+    /// Online decoding additionally preadmits alignment repair payloads. The
+    /// existing constant/provider observer keeps its independent byte policy.
+    pub fn dictionary_batch_with_repair_payload(
+        &mut self,
+        schema: &Schema,
+        id: i64,
+        batch: arrow_ipc::RecordBatch<'_>,
+        body: &[u8],
+    ) -> Result<(), ReaderStructureFailure<H>> {
+        self.dictionary_batch_inner(schema, id, batch, body, true)
+    }
+    fn dictionary_batch_inner(
+        &mut self,
+        schema: &Schema,
+        id: i64,
+        batch: arrow_ipc::RecordBatch<'_>,
+        body: &[u8],
+        repair_payload: bool,
+    ) -> Result<(), ReaderStructureFailure<H>> {
+        self.buffer_branches(
+            batch,
+            body,
+            ReaderArrayHeaderClass::Retained,
+            repair_payload,
+        )?;
         let mut matches = 0usize;
         let mut capacity = 0usize;
         let mut value = None;
@@ -1038,9 +1173,37 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         batch: arrow_ipc::RecordBatch<'_>,
         body: &[u8],
         root_class: ReaderArrayHeaderClass,
-        mut dictionary_present: impl FnMut(i64) -> Result<bool, H>,
+        dictionary_present: impl FnMut(i64) -> Result<bool, H>,
     ) -> Result<(), ReaderStructureFailure<H>> {
-        self.buffer_branches(batch, body, root_class)?;
+        self.record_batch_inner(schema, batch, body, root_class, dictionary_present, false)
+    }
+    pub fn record_batch_with_repair_payload(
+        &mut self,
+        schema: &Schema,
+        batch: arrow_ipc::RecordBatch<'_>,
+        body: &[u8],
+        root_class: ReaderArrayHeaderClass,
+        dictionary_present: impl FnMut(i64) -> Result<bool, H>,
+    ) -> Result<(), ReaderStructureFailure<H>> {
+        self.record_batch_inner(schema, batch, body, root_class, dictionary_present, true)
+    }
+    fn record_batch_inner(
+        &mut self,
+        schema: &Schema,
+        batch: arrow_ipc::RecordBatch<'_>,
+        body: &[u8],
+        root_class: ReaderArrayHeaderClass,
+        mut dictionary_present: impl FnMut(i64) -> Result<bool, H>,
+        repair_payload: bool,
+    ) -> Result<(), ReaderStructureFailure<H>> {
+        self.buffer_branches(batch, body, root_class, repair_payload)?;
+        let mut node_rows = repair_payload.then(|| {
+            batch
+                .nodes()
+                .into_iter()
+                .flat_map(|nodes| nodes.iter())
+                .map(|node| node.length())
+        });
         let counts = batch.variadicBufferCounts();
         if let Some(counts) = counts
             && !counts.is_empty()
@@ -1049,7 +1212,18 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         }
         let mut variadic = counts.into_iter().flat_map(|counts| counts.iter());
         for field in schema.fields() {
-            self.read_node(field, root_class, &mut variadic, &mut dictionary_present)?;
+            self.read_node(
+                field,
+                root_class,
+                &mut node_rows,
+                &mut variadic,
+                &mut dictionary_present,
+            )?;
+        }
+        if node_rows.as_mut().is_some_and(|rows| rows.next().is_some()) {
+            return Err(ReaderStructureFailure::SourceModel(
+                "IPC array header FieldNodes remain",
+            ));
         }
         // Original root column Vec belongs to RecordBatch, which materializer
         // consumes and destroys. Nested array-owned tables use Retained above.
@@ -1399,6 +1573,104 @@ mod tests {
         );
     }
     #[test]
+    fn online_repair_payloads_count_overlapping_descriptors_and_empty_offsets_before_decode() {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let nodes = builder.create_vector(&[arrow_ipc::FieldNode::new(1, 0); 2]);
+        let buffers = builder.create_vector(&[
+            arrow_ipc::Buffer::new(0, 0),
+            arrow_ipc::Buffer::new(1, 4),
+            arrow_ipc::Buffer::new(0, 0),
+            arrow_ipc::Buffer::new(1, 4),
+        ]);
+        let record = arrow_ipc::RecordBatch::create(
+            &mut builder,
+            &arrow_ipc::RecordBatchArgs {
+                length: 1,
+                nodes: Some(nodes),
+                buffers: Some(buffers),
+                ..Default::default()
+            },
+        );
+        builder.finish(record, None);
+        let metadata =
+            flatbuffers::root::<arrow_ipc::RecordBatch>(builder.finished_data()).unwrap();
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        let body = [0, 1, 0, 0, 0];
+        let measure = |repair| {
+            let mut bytes = 0;
+            let mut observer = ReaderArrayStructureObserver {
+                request: &mut |_, _| Ok::<_, &'static str>(()),
+                opaque: &mut |count, _| {
+                    bytes += count;
+                    Ok(())
+                },
+                work: &mut || Ok(()),
+            };
+            if repair {
+                observer.record_batch_with_repair_payload(
+                    &schema,
+                    metadata,
+                    &body,
+                    ReaderArrayHeaderClass::Retained,
+                    |_| Ok(false),
+                )
+            } else {
+                observer.record_batch(
+                    &schema,
+                    metadata,
+                    &body,
+                    ReaderArrayHeaderClass::Retained,
+                    |_| Ok(false),
+                )
+            }
+            .unwrap();
+            bytes
+        };
+        assert_eq!(measure(true) - measure(false), 4 * 64);
+        let calls = std::cell::Cell::new(0);
+        let stopped = std::cell::Cell::new(false);
+        let failure = ReaderArrayStructureObserver {
+            request: &mut |_, _| {
+                assert!(!stopped.get());
+                Ok(())
+            },
+            opaque: &mut |_, _| {
+                assert!(!stopped.get());
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    stopped.set(true);
+                    Err("original repair capacity refusal")
+                } else {
+                    Ok(())
+                }
+            },
+            work: &mut || {
+                assert!(!stopped.get());
+                Ok(())
+            },
+        }
+        .record_batch_with_repair_payload(
+            &schema,
+            metadata,
+            &body,
+            ReaderArrayHeaderClass::Retained,
+            |_| Ok(false),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            ReaderStructureFailure::Creator("original repair capacity refusal")
+        ));
+        assert_eq!(
+            calls.get(),
+            2,
+            "no later descriptor work after the original refusal"
+        );
+    }
+    #[test]
     fn reader_validation_nullmask_headers_preserve_masked_fixed_list_and_dictionary_values_nulls() {
         let item = Arc::new(Field::new("item", DataType::Int32, false));
         let list: ArrayRef = Arc::new(
@@ -1503,6 +1775,193 @@ mod tests {
                 DataType::Struct(fields) => assert!(!fields[0].is_nullable()),
                 _ => unreachable!(),
             }
+        }
+    }
+    mod bitmap_payload_tests {
+        use super::*;
+        fn bitmap_model_bounds(
+            schema: &Schema,
+            rows: i64,
+            nodes: &[(i64, i64)],
+            buffers: &[(i64, i64)],
+            body: &[u8],
+            online: bool,
+        ) -> Vec<(usize, ReaderArrayHeaderClass)> {
+            let mut builder = flatbuffers::FlatBufferBuilder::new();
+            let nodes = builder.create_vector(
+                &nodes
+                    .iter()
+                    .map(|(len, nulls)| arrow_ipc::FieldNode::new(*len, *nulls))
+                    .collect::<Vec<_>>(),
+            );
+            let buffers = builder.create_vector(
+                &buffers
+                    .iter()
+                    .map(|(offset, len)| arrow_ipc::Buffer::new(*offset, *len))
+                    .collect::<Vec<_>>(),
+            );
+            let record = arrow_ipc::RecordBatch::create(
+                &mut builder,
+                &arrow_ipc::RecordBatchArgs {
+                    length: rows,
+                    nodes: Some(nodes),
+                    buffers: Some(buffers),
+                    ..Default::default()
+                },
+            );
+            builder.finish(record, None);
+            let record =
+                flatbuffers::root::<arrow_ipc::RecordBatch>(builder.finished_data()).unwrap();
+            let mut bounds = Vec::new();
+            let mut model = ReaderArrayStructureObserver {
+                request: &mut |_, _| Ok::<_, ()>(()),
+                opaque: &mut |bytes, class| {
+                    bounds.push((bytes, class));
+                    Ok(())
+                },
+                work: &mut || Ok(()),
+            };
+            if online {
+                model
+                    .record_batch_with_repair_payload(
+                        schema,
+                        record,
+                        body,
+                        ReaderArrayHeaderClass::Retained,
+                        |_| Ok(true),
+                    )
+                    .unwrap();
+            } else {
+                model
+                    .record_batch(
+                        schema,
+                        record,
+                        body,
+                        ReaderArrayHeaderClass::Retained,
+                        |_| Ok(true),
+                    )
+                    .unwrap();
+            }
+            bounds
+        }
+
+        #[test]
+        fn online_logical_bitmap_is_scoped_to_the_required_child_not_an_unrelated_nullable_subtree()
+        {
+            let nullable_list = DataType::List(Arc::new(Field::new("item", DataType::Null, true)));
+            let root = DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Null, false)),
+                    Arc::new(Field::new("unused", nullable_list, true)),
+                ]
+                .into(),
+            );
+            let schema = Schema::new(vec![Field::new("value", root, true)]);
+            let buffers = [(0, 0), (0, 0), (0, 8)];
+            let small = [(1, 0), (1, 1), (1, 0), (1, 1)];
+            let large = [(1, 0), (1, 1), (1, 0), (1 << 20, 1 << 20)];
+            let a = bitmap_model_bounds(&schema, 1, &small, &buffers, &[0; 8], true);
+            let b = bitmap_model_bounds(&schema, 1, &large, &buffers, &[0; 8], true);
+            assert_eq!(
+                a, b,
+                "unreachable nullable descendants do not authorize another child's huge bitmap"
+            );
+            assert!(!b.iter().any(|(bytes, _)| *bytes >= (1 << 20) / 8));
+            // The preserved constant/header-only author must not even inspect the rows.
+            assert_eq!(
+                bitmap_model_bounds(&schema, 1, &small, &buffers, &[0; 8], false),
+                bitmap_model_bounds(&schema, 1, &large, &buffers, &[0; 8], false),
+            );
+        }
+
+        #[test]
+        fn online_empty_dictionary_union_reserves_its_one_bit_constants() {
+            let dictionary =
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+            let fields =
+                UnionFields::try_new(vec![0], vec![Field::new("encoded", dictionary, true)])
+                    .unwrap();
+            let union = DataType::Union(fields.clone(), arrow_schema::UnionMode::Dense);
+            let root =
+                DataType::Struct(vec![Arc::new(Field::new("required", union, false))].into());
+            let schema = Schema::new(vec![Field::new("value", root, true)]);
+            let bounds = bitmap_model_bounds(
+                &schema,
+                0,
+                &[(0, 0), (0, 0), (0, 0)],
+                &[(0, 0); 5],
+                &[],
+                true,
+            );
+            assert!(
+                bounds.contains(&(4 * 64, ReaderArrayHeaderClass::Temporary)),
+                "dictionary child fact64 + dense Union constants/result fact3*64"
+            );
+            // This is the actual Arrow branch, independent of the model's byte count:
+            // installed nullable dictionary values return Some(empty logical nulls),
+            // and the dense Union gathers with one-null + one-valid constants.
+            let keys: ArrayRef = Arc::new(
+                DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(Vec::<i32>::new()),
+                    Arc::new(StringArray::from(vec![Some("x"), None])),
+                )
+                .unwrap(),
+            );
+            assert_eq!(keys.logical_nulls().unwrap().len(), 0);
+            let union = UnionArray::try_new(
+                fields,
+                Vec::<i8>::new().into(),
+                Some(Vec::<i32>::new().into()),
+                vec![keys],
+            )
+            .unwrap();
+            assert_eq!(union.logical_nulls().unwrap().len(), 0);
+        }
+
+        #[test]
+        fn online_run_value_fact_and_sparse_union_growth_use_their_own_row_geometry() {
+            let run = DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new("values", DataType::Null, true)),
+            );
+            let root = DataType::Struct(vec![Arc::new(Field::new("required", run, false))].into());
+            let schema = Schema::new(vec![Field::new("value", root, true)]);
+            let bounds = bitmap_model_bounds(
+                &schema,
+                1025,
+                &[(1025, 0), (1025, 0), (2, 0), (2, 2)],
+                &[(0, 0), (0, 0), (0, 8)],
+                &[0; 8],
+                true,
+            );
+            assert!(
+                bounds.contains(&(64 + 192, ReaderArrayHeaderClass::Temporary)),
+                "values fact is 2 bits/64 bytes; the expanded run output is 1025 bits/192 bytes"
+            );
+            let fields = UnionFields::try_new(
+                vec![0, 1],
+                vec![
+                    Field::new("number", DataType::Int32, true),
+                    Field::new("unused", DataType::Null, true),
+                ],
+            )
+            .unwrap();
+            let union = DataType::Union(fields, arrow_schema::UnionMode::Sparse);
+            let root =
+                DataType::Struct(vec![Arc::new(Field::new("required", union, false))].into());
+            let schema = Schema::new(vec![Field::new("value", root, true)]);
+            let bounds = bitmap_model_bounds(
+                &schema,
+                1025,
+                &[(1025, 0), (1025, 0), (1025, 0), (1025, 1025)],
+                &[(0, 0), (0, 1025), (0, 0), (0, 4100)],
+                &vec![0; 4100],
+                true,
+            );
+            assert!(bounds.contains(&(192 + 3 * 192, ReaderArrayHeaderClass::Temporary)));
+            // Pinned sparse helper initially collects floor(n/64) u64s, then pushes
+            // one remainder. MutableBuffer can grow128->256; cumulative384 <=3*192.
+            assert!(128 + 256 <= 3 * 192);
         }
     }
 }

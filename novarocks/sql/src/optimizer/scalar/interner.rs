@@ -417,9 +417,11 @@ fn bytes_hash(
     Ok(())
 }
 fn type_hash(ty: &DataType, work: &mut CompileCheckpoints<'_>) -> Result<u64, InternerError> {
-    novarocks_type_contract::arrow_data_type_fingerprint_observed(ty, &mut || {
-        work.step().map_err(InternerError::from)
-    })
+    novarocks_type_contract::arrow_data_type_fingerprint_with_profile_observed(
+        ty,
+        novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
+        &mut || work.step().map_err(InternerError::from),
+    )
 }
 fn fingerprint(
     tokens: &[Token<'_>],
@@ -486,9 +488,12 @@ fn tokens_equal(
             (Token::Number(a), Token::Number(b)) => a == b,
             (Token::Bytes(a), Token::Bytes(b)) => bytes_equal(a, b, work)?,
             (Token::Type(a), Token::Type(b)) => {
-                novarocks_type_contract::arrow_data_types_exact_observed(a, b, || {
-                    work.step().map_err(InternerError::from)
-                })?
+                novarocks_type_contract::arrow_data_types_exact_with_profile_observed(
+                    a,
+                    b,
+                    novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
+                    || work.step().map_err(InternerError::from),
+                )?
             }
             (Token::Constant(a), Token::Constant(b)) => {
                 work.flush()?;

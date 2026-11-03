@@ -37,7 +37,7 @@ use novarocks_type_contract::ValueSchemaCreation;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
     ValueSchemaCreationScope, ValueTypeError, ValueTypeStorageLifetime,
-    arrow_data_types_exact_observed,
+    arrow_data_types_exact_with_profile_observed,
 };
 use novarocks_types::SlotId;
 use std::{collections::BTreeMap, fmt, sync::Arc};
@@ -1101,9 +1101,12 @@ fn same_carrier(
     expected: &arrow_schema::DataType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramChannelTypeError> {
-    if arrow_data_types_exact_observed::<ProgramChannelTypeError>(actual, expected, || {
-        work.step().map_err(Into::into)
-    })? {
+    if arrow_data_types_exact_with_profile_observed::<ProgramChannelTypeError>(
+        actual,
+        expected,
+        novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
+        || work.step().map_err(Into::into),
+    )? {
         Ok(())
     } else {
         Err(ProgramChannelTypeError::TypeMismatch)

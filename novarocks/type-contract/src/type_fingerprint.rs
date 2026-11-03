@@ -23,7 +23,10 @@ use std::hash::{Hash, Hasher};
 
 use arrow_schema::{DataType, Field};
 
-use crate::{ValueTypeError, ValueTypeVisit, validate_value_type_structure_observed};
+use crate::{
+    ArrowTypeProfile, ValueTypeError, ValueTypeVisit,
+    validate_value_type_structure_with_profile_observed,
+};
 
 /// Hashes the actual type and Field facts without an opaque recursive Hash.
 /// Metadata order is immaterial, while field order, dictionary identity and
@@ -33,8 +36,19 @@ pub fn arrow_data_type_fingerprint_observed<E: From<ValueTypeError>>(
     ty: &DataType,
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<u64, E> {
+    arrow_data_type_fingerprint_with_profile_observed(ty, ArrowTypeProfile::Physical, observe)
+}
+
+/// Hash the same exact type/Field facts under the actual boundary's declared
+/// profile. Typed immutable layouts select CanonicalValue; this does not alter
+/// the original raw/constant/provider Physical policy or create encoding rights.
+pub fn arrow_data_type_fingerprint_with_profile_observed<E: From<ValueTypeError>>(
+    ty: &DataType,
+    profile: ArrowTypeProfile,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<u64, E> {
     let mut hash = DefaultHasher::new();
-    validate_value_type_structure_observed::<E>(ty, |visit| {
+    validate_value_type_structure_with_profile_observed::<E>(ty, profile, |visit| {
         observe()?;
         match visit {
             ValueTypeVisit::ChildEdge(_) => 0u8.hash(&mut hash),

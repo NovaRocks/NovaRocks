@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{ConstructionFailure, InputConstructionRequestHost, InputConstructionWorkControl};
+use super::{
+    ConstructionFailure, DecodedInputSourceCustody, InputConstructionOwner,
+    InputConstructionRequestHost, InputConstructionWorkControl,
+};
 use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState};
 use std::{
     alloc::Layout,
@@ -258,6 +261,109 @@ impl super::InputConstructionOperationModel for TrackedArrowModel {
     }
 }
 
+/// Borrow only the original construction signal and work scope during this
+/// synchronous continuation. The private kernel stop signal never replaces
+/// its original construction cause at the role boundary.
+struct DecodedCustodyControl<'a, S> {
+    original: &'a RuntimeInputConstructionControl<S>,
+    work: &'a dyn InputConstructionOwner,
+    observed: std::sync::OnceLock<ConstructionFailure>,
+}
+impl<S: ConstructionErrorSignal> DecodedCustodyControl<'_, S> {
+    fn finish<T>(
+        self,
+        result: Result<T, novarocks_functions::KernelFailure>,
+    ) -> Result<T, ConstructionFailure> {
+        match result {
+            Err(novarocks_functions::KernelFailure::Cancelled) => {
+                match self.observed.into_inner() {
+                    Some(original) => Err(original),
+                    None => Err(kernel_custody_failure(
+                        novarocks_functions::KernelFailure::Cancelled,
+                    )),
+                }
+            }
+            result => result.map_err(kernel_custody_failure),
+        }
+    }
+}
+impl<S: ConstructionErrorSignal> novarocks_functions::KernelEvaluationControl
+    for DecodedCustodyControl<'_, S>
+{
+    fn checkpoint(&self, units: u32) -> Result<(), novarocks_functions::KernelFailure> {
+        let result = self.original.checkpoint(0).and_then(|()| {
+            self.work.observe(
+                0,
+                &[],
+                crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
+                    units: units as usize,
+                },
+            )
+        });
+        if let Err(original) = result {
+            let _ = self.observed.set(original);
+            return Err(novarocks_functions::KernelFailure::Cancelled);
+        }
+        Ok(())
+    }
+    fn wait(&self, _: std::time::Duration) -> Result<(), novarocks_functions::KernelFailure> {
+        Err(novarocks_functions::KernelFailure::InvalidProgram(
+            novarocks_functions::KernelDiagnostic::new(
+                "decoded source custody has no waiting operation",
+            ),
+        ))
+    }
+}
+fn kernel_custody_failure(source: novarocks_functions::KernelFailure) -> ConstructionFailure {
+    crate::runtime::fragment::ExecutionFailure::from(source).into()
+}
+
+struct TrackedDecodedSourceCustody<S> {
+    control: Arc<RuntimeInputConstructionControl<S>>,
+    host: Arc<dyn novarocks_functions::AggregateStateAllocator>,
+    _creation: TrackedArcCharge,
+}
+impl<S: ConstructionErrorSignal> DecodedInputSourceCustody for TrackedDecodedSourceCustody<S> {
+    fn retain(
+        &self,
+        array: arrow::array::ArrayRef,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+        scope: &dyn InputConstructionOwner,
+    ) -> Result<arrow::array::ArrayRef, ConstructionFailure> {
+        use novarocks_functions::{
+            EvaluationCheckpoints, SourceBackingOwner, retain_source_backing,
+            source_custody_prefix_facts,
+        };
+        self.control.checkpoint(0)?;
+        let control = DecodedCustodyControl {
+            original: self.control.as_ref(),
+            work: scope,
+            observed: std::sync::OnceLock::new(),
+        };
+        let authority = novarocks_functions::opaque_memory::OpaqueRetainedCharge::try_new(
+            Arc::clone(&self.host),
+        )
+        .map_err(kernel_custody_failure)?;
+        // This is the existing custody author's prefix, not another payload
+        // invoice. Typed holder allocations still use this same real host.
+        let _prefix = authority
+            .reserve_operation(source_custody_prefix_facts().requests().bytes())
+            .map_err(kernel_custody_failure)?;
+        let result = (|| {
+            let mut work = EvaluationCheckpoints::new(&control);
+            let source = SourceBackingOwner::try_from_owned_direct(
+                storage,
+                Arc::clone(&self.host),
+                &mut work,
+            )?;
+            let array = retain_source_backing(array, &source, &control)?;
+            work.finish()?;
+            Ok(array)
+        })();
+        control.finish(result)
+    }
+}
+
 /// Production convenience constructor. Every newly allocated adapter, factory
 /// and creator holder is observed before its own Arc construction and retains
 /// its independent late-drop responsibility. No process-default tracker,
@@ -324,11 +430,30 @@ where
     // Establish the local guard as soon as the actual control exists, before
     // any subsequent model/factory request can refuse or unwind.
     let stop_owner = stop_owner(&control);
+    // These are actual host/port Arc requests. The host's inline keeper is
+    // retained by every SourceBackingOwner after the factory/control exit.
+    type CustodyHost =
+        crate::runtime::tracked_state_allocator::TrackedStateAllocator<TrackedArcCharge>;
+    let custody_host_charge = metadata_request::<CustodyHost>(&tracker)?;
+    let custody_host =
+        crate::runtime::tracked_state_allocator::expression_allocation_host_with_creation(
+            tracker.clone(),
+            custody_host_charge,
+        );
+    let custody_charge = metadata_request::<TrackedDecodedSourceCustody<S>>(&tracker)?;
+    let custody = Arc::new(TrackedDecodedSourceCustody {
+        control: control.clone(),
+        host: custody_host,
+        _creation: custody_charge,
+    });
     let model_charge = metadata_request::<TrackedArrowModel>(&tracker)?;
     let model = Arc::new(TrackedArrowModel {
         _creation: model_charge,
     });
-    super::ObservedInputConstructionFactory::try_new(profile, host, control, model).map(|factory| {
+    super::ObservedInputConstructionFactory::try_new_with_decoded_source_custody(
+        profile, host, control, model, custody,
+    )
+    .map(|factory| {
         (
             factory as Arc<dyn super::InputConstructionFactory>,
             stop_owner,
@@ -372,6 +497,66 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn decoded_custody_stop_bridge_preserves_the_observed_original_source() {
+        use novarocks_functions::{KernelEvaluationControl, KernelFailure};
+        let tracker = MemTracker::new_root("decoded custody original control");
+        let error = Arc::new(RuntimeErrorState::default());
+        let factory =
+            try_runtime_input_construction_factory(profile(), tracker, error.clone()).unwrap();
+        let owner = factory
+            .begin_typed_construction(source().chunk_schema())
+            .unwrap();
+        let original_control = RuntimeInputConstructionControl::new(error.clone());
+        let control = DecodedCustodyControl {
+            original: &original_control,
+            work: owner.as_ref(),
+            observed: std::sync::OnceLock::new(),
+        };
+        let original =
+            crate::runtime::fragment::ExecutionFailure::from(KernelFailure::Operational(
+                novarocks_functions::KernelDiagnostic::new("original decoded source stop"),
+            ));
+        error.set_error(original.clone());
+        assert!(matches!(
+            control.checkpoint(7),
+            Err(KernelFailure::Cancelled)
+        ));
+        let failure = control
+            .finish::<()>(Err(KernelFailure::Cancelled))
+            .unwrap_err();
+        assert!(
+            matches!(failure, ConstructionFailure::Caller(source) if source.same_occurrence(&original))
+        );
+    }
+
+    #[test]
+    fn decoded_custody_independent_failure_does_not_adopt_a_later_stop() {
+        use novarocks_functions::KernelFailure;
+        let tracker = MemTracker::new_root("decoded custody independent resource failure");
+        let error = Arc::new(RuntimeErrorState::default());
+        let factory =
+            try_runtime_input_construction_factory(profile(), tracker, error.clone()).unwrap();
+        let owner = factory
+            .begin_typed_construction(source().chunk_schema())
+            .unwrap();
+        let original_control = RuntimeInputConstructionControl::new(error.clone());
+        let control = DecodedCustodyControl {
+            original: &original_control,
+            work: owner.as_ref(),
+            observed: std::sync::OnceLock::new(),
+        };
+        error.set_error(KernelFailure::Operational(
+            novarocks_functions::KernelDiagnostic::new("later unrelated owner stop"),
+        ));
+        let failure = control
+            .finish::<()>(Err(KernelFailure::ResourceExhausted))
+            .unwrap_err();
+        assert!(
+            matches!(failure, ConstructionFailure::Caller(source) if matches!(source.cause(), crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)))
+        );
+    }
+
     #[test]
     fn production_metadata_is_observed_before_creation_and_all_late_drops_balance() {
         let tracker = MemTracker::new_root("construction metadata");

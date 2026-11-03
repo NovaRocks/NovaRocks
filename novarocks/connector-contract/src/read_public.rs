@@ -344,11 +344,8 @@ fn validate_nested_observed<O: OwnedCopy>(
     // This admits its actual fixed inline initialization and closed walker
     // work; it is neither a stack grant nor a second type checker.
     context.work(context.add(
-        context.mul(
-            MAX_VALUE_TYPE_NODES,
-            size_of::<Option<(&DataType, usize)>>() + 128,
-        )?,
-        128,
+        novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound(),
+        context.add(context.mul(MAX_VALUE_TYPE_NODES, 128)?, 128)?,
     )?)?;
     context.flush()?;
     let mut scratch = [None; MAX_VALUE_TYPE_NODES];

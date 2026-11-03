@@ -21,7 +21,9 @@ use arrow_schema::{
     DataType, Field, TimeUnit,
 };
 use novarocks_connector_contract::ConnectorEncodedPayload;
-use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
+use novarocks_type_contract::{
+    ArrowTypeDepth, ArrowTypeProfile, CompileCheckpoints, CompileControlError,
+};
 use std::collections::BTreeSet;
 
 use crate::validation::ValidationContext;
@@ -972,7 +974,14 @@ fn add_expression_usage_core<P: TypeValidationPolicy>(
             }
         }
         ExprKind::Cast { target, .. } => {
-            validate_data_type_core(target, &format!("{path}.target"), usage, errors, policy)?;
+            validate_data_type_with_profile_core(
+                target,
+                ArrowTypeProfile::CanonicalValue,
+                &format!("{path}.target"),
+                usage,
+                errors,
+                policy,
+            )?;
         }
         ExprKind::InList { list, .. } => usage.add_items(list.len()),
         ExprKind::Case { when_then, .. } => usage.add_items(when_then.len().saturating_mul(2)),
@@ -1742,21 +1751,25 @@ const fn type_message_bound(
     }
 }
 
+// The original plan-owned pending Vec now retains both semantic and physical
+// coordinates. Its own exact/amortized requests remain with this policy.
+type TypePending<'source> = (&'source DataType, ArrowTypeDepth);
+
 trait TypeValidationPolicy {
     type Error;
     const CALLER: bool;
     fn initial<'source>(
         &mut self,
         root: &'source DataType,
-    ) -> Result<Vec<(&'source DataType, usize)>, Self::Error>;
+    ) -> Result<Vec<TypePending<'source>>, Self::Error>;
     fn push<'source>(
         &mut self,
-        pending: &mut Vec<(&'source DataType, usize)>,
-        entry: (&'source DataType, usize),
+        pending: &mut Vec<TypePending<'source>>,
+        entry: TypePending<'source>,
     ) -> Result<(), Self::Error>;
     fn children(
         &mut self,
-        pending: &mut Vec<(&DataType, usize)>,
+        pending: &mut Vec<TypePending<'_>>,
         count: usize,
         allowed: bool,
     ) -> Result<(), Self::Error>;
@@ -1794,20 +1807,20 @@ impl TypeValidationPolicy for PlainTypeValidation {
     fn initial<'source>(
         &mut self,
         root: &'source DataType,
-    ) -> Result<Vec<(&'source DataType, usize)>, Self::Error> {
-        Ok(vec![(root, 1)])
+    ) -> Result<Vec<TypePending<'source>>, Self::Error> {
+        Ok(vec![(root, ArrowTypeDepth::ROOT)])
     }
     fn push<'source>(
         &mut self,
-        pending: &mut Vec<(&'source DataType, usize)>,
-        entry: (&'source DataType, usize),
+        pending: &mut Vec<TypePending<'source>>,
+        entry: TypePending<'source>,
     ) -> Result<(), Self::Error> {
         pending.push(entry);
         Ok(())
     }
     fn children(
         &mut self,
-        _: &mut Vec<(&DataType, usize)>,
+        _: &mut Vec<TypePending<'_>>,
         _: usize,
         _: bool,
     ) -> Result<(), Self::Error> {
@@ -1896,8 +1909,8 @@ impl TypeValidationPolicy for CallerTypeValidation<'_, '_> {
     fn initial<'source>(
         &mut self,
         root: &'source DataType,
-    ) -> Result<Vec<(&'source DataType, usize)>, Self::Error> {
-        self.resources.buffer::<(&DataType, usize)>(1, 1)?;
+    ) -> Result<Vec<TypePending<'source>>, Self::Error> {
+        self.resources.buffer::<TypePending<'_>>(1, 1)?;
         self.resources.work(1)?; // The actual initial borrowed tuple move.
         self.gate()?;
         self.work.flush()?;
@@ -1907,14 +1920,14 @@ impl TypeValidationPolicy for CallerTypeValidation<'_, '_> {
             self.work.step()?;
         }
         reserve_exit::<ControlResourceError>(reserved, self.work)?;
-        pending.push((root, 1));
+        pending.push((root, ArrowTypeDepth::ROOT));
         self.work.step()?;
         Ok(pending)
     }
     fn push<'source>(
         &mut self,
-        pending: &mut Vec<(&'source DataType, usize)>,
-        entry: (&'source DataType, usize),
+        pending: &mut Vec<TypePending<'source>>,
+        entry: TypePending<'source>,
     ) -> Result<(), Self::Error> {
         reserve_for_push_in::<_, ControlResourceError>(
             pending,
@@ -1932,7 +1945,7 @@ impl TypeValidationPolicy for CallerTypeValidation<'_, '_> {
     }
     fn children(
         &mut self,
-        pending: &mut Vec<(&DataType, usize)>,
+        pending: &mut Vec<TypePending<'_>>,
         count: usize,
         allowed: bool,
     ) -> Result<(), Self::Error> {
@@ -1942,7 +1955,7 @@ impl TypeValidationPolicy for CallerTypeValidation<'_, '_> {
         let needed = novarocks_type_contract::control_resource_add(pending.len(), count)?;
         let grows = needed > pending.capacity();
         if grows {
-            let layout = std::alloc::Layout::array::<(&DataType, usize)>(needed)
+            let layout = std::alloc::Layout::array::<TypePending<'_>>(needed)
                 .map_err(|_| ControlResourceError::from(CompileControlError::ResourceExhausted))?;
             // Rust 1.92 RawVec::try_reserve_exact requests len+additional.
             // No amortized geometry or source backing is reconstructed here.
@@ -2070,14 +2083,40 @@ fn validate_value_type_core<P: TypeValidationPolicy>(
     errors: &mut ValidationContext,
     policy: &mut P,
 ) -> Result<(), P::Error> {
-    validate_data_type_core(ty.data_type(), path, usage, errors, policy)?;
+    validate_data_type_with_profile_core(
+        ty.data_type(),
+        ArrowTypeProfile::CanonicalValue,
+        path,
+        usage,
+        errors,
+        policy,
+    )?;
     if !usage.exhausted() {
         policy.logical(ty, path, errors)?;
     }
     Ok(())
 }
+#[cfg(test)]
 fn validate_data_type_core<P: TypeValidationPolicy>(
     root: &DataType,
+    path: &str,
+    usage: &mut ResourceUsage,
+    errors: &mut ValidationContext,
+    policy: &mut P,
+) -> Result<(), P::Error> {
+    validate_data_type_with_profile_core(
+        root,
+        ArrowTypeProfile::Physical,
+        path,
+        usage,
+        errors,
+        policy,
+    )
+}
+
+fn validate_data_type_with_profile_core<P: TypeValidationPolicy>(
+    root: &DataType,
+    profile: ArrowTypeProfile,
     path: &str,
     usage: &mut ResourceUsage,
     errors: &mut ValidationContext,
@@ -2094,7 +2133,21 @@ fn validate_data_type_core<P: TypeValidationPolicy>(
         }
         nodes = nodes.saturating_add(1);
         usage.add_items(1);
-        if depth > MAX_DATA_TYPE_DEPTH {
+        if let Err(error) = depth.check(profile) {
+            if profile != ArrowTypeProfile::Physical {
+                let (category, message) = match error {
+                    novarocks_type_contract::ValueTypeError::InvalidType(_) => (
+                        ValidationErrorCategory::StructuralInvariant,
+                        "Arrow value layout contains runtime encoding",
+                    ),
+                    _ => (
+                        ValidationErrorCategory::ResourceLimit,
+                        "Arrow data type exceeds its logical or physical depth profile",
+                    ),
+                };
+                policy.message(category, path, message, errors)?;
+                return Ok(());
+            }
             policy.formatted(
                 ValidationErrorCategory::ResourceLimit,
                 path,
@@ -2112,6 +2165,9 @@ fn validate_data_type_core<P: TypeValidationPolicy>(
             report_type_nodes(path, errors, policy)?;
             return Ok(());
         }
+        // Logical depth and the existing visited-node policy have already
+        // been checked. Map scaffolding and runtime encodings still consume
+        // their actual visits without another physical-depth quota.
         match data_type {
             DataType::Timestamp(_, Some(timezone)) => {
                 usage.add_bytes(timezone.len());
@@ -2158,16 +2214,38 @@ fn validate_data_type_core<P: TypeValidationPolicy>(
                     invalid_fixed_size_core(path, *size, errors, policy)?;
                 }
                 validate_field_core(field, path, usage, errors, policy)?;
-                policy.push(&mut pending, (field.data_type(), depth.saturating_add(1)))?;
+                policy.push(
+                    &mut pending,
+                    (
+                        field.data_type(),
+                        depth.value_child().expect("bounded parent type depth"),
+                    ),
+                )?;
             }
             DataType::List(field)
             | DataType::ListView(field)
             | DataType::LargeList(field)
-            | DataType::LargeListView(field)
-            | DataType::Map(field, _) => {
+            | DataType::LargeListView(field) => {
                 policy.children(&mut pending, 1, true)?;
                 validate_field_core(field, path, usage, errors, policy)?;
-                policy.push(&mut pending, (field.data_type(), depth.saturating_add(1)))?;
+                policy.push(
+                    &mut pending,
+                    (
+                        field.data_type(),
+                        depth.value_child().expect("bounded parent type depth"),
+                    ),
+                )?;
+            }
+            DataType::Map(field, _) => {
+                policy.children(&mut pending, 1, true)?;
+                validate_field_core(field, path, usage, errors, policy)?;
+                policy.push(
+                    &mut pending,
+                    (
+                        field.data_type(),
+                        depth.map_entries().expect("bounded parent type depth"),
+                    ),
+                )?;
             }
             DataType::Struct(fields) => {
                 if data_type_children_exceed_budget_core(
@@ -2184,7 +2262,13 @@ fn validate_data_type_core<P: TypeValidationPolicy>(
                 usage.add_items(fields.len());
                 for field in fields {
                     validate_field_core(field, path, usage, errors, policy)?;
-                    policy.push(&mut pending, (field.data_type(), depth.saturating_add(1)))?;
+                    policy.push(
+                        &mut pending,
+                        (
+                            field.data_type(),
+                            depth.value_child().expect("bounded parent type depth"),
+                        ),
+                    )?;
                 }
             }
             DataType::Union(fields, _) => {
@@ -2202,7 +2286,13 @@ fn validate_data_type_core<P: TypeValidationPolicy>(
                 usage.add_items(fields.len());
                 for (_, field) in fields.iter() {
                     validate_field_core(field, path, usage, errors, policy)?;
-                    policy.push(&mut pending, (field.data_type(), depth.saturating_add(1)))?;
+                    policy.push(
+                        &mut pending,
+                        (
+                            field.data_type(),
+                            depth.value_child().expect("bounded parent type depth"),
+                        ),
+                    )?;
                 }
             }
             DataType::Dictionary(key, value) => {
@@ -2234,8 +2324,20 @@ fn validate_data_type_core<P: TypeValidationPolicy>(
                     report_type_nodes(path, errors, policy)?;
                     return Ok(());
                 }
-                policy.push(&mut pending, (key, depth.saturating_add(1)))?;
-                policy.push(&mut pending, (value, depth.saturating_add(1)))?;
+                policy.push(
+                    &mut pending,
+                    (
+                        key,
+                        depth.encoding_child().expect("bounded parent type depth"),
+                    ),
+                )?;
+                policy.push(
+                    &mut pending,
+                    (
+                        value,
+                        depth.encoding_child().expect("bounded parent type depth"),
+                    ),
+                )?;
             }
             DataType::RunEndEncoded(run_ends, values) => {
                 let allowed = P::CALLER.then(|| data_type_children_fit(nodes, pending.len(), 2));
@@ -2261,9 +2363,18 @@ fn validate_data_type_core<P: TypeValidationPolicy>(
                 validate_field_core(values, path, usage, errors, policy)?;
                 policy.push(
                     &mut pending,
-                    (run_ends.data_type(), depth.saturating_add(1)),
+                    (
+                        run_ends.data_type(),
+                        depth.encoding_child().expect("bounded parent type depth"),
+                    ),
                 )?;
-                policy.push(&mut pending, (values.data_type(), depth.saturating_add(1)))?;
+                policy.push(
+                    &mut pending,
+                    (
+                        values.data_type(),
+                        depth.encoding_child().expect("bounded parent type depth"),
+                    ),
+                )?;
             }
             DataType::Decimal32(precision, scale) => validate_decimal_core(
                 path,

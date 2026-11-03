@@ -39,7 +39,7 @@ use novarocks_physical_plan::{
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, PureCompileControl, SemanticParameterKey, SemanticParameters,
-    arrow_data_types_exact_borrowed_observed,
+    arrow_data_types_exact_borrowed_with_profile_observed,
 };
 use std::alloc::Layout;
 
@@ -1059,11 +1059,15 @@ fn prepare_core<'loan, 'source, 'control>(
                 // A raw target has no independent nullable/logical root flags.
                 admission.charge(&mut facts, verified.work_upper_bound(), work)?;
                 work.flush()?;
-                let matched =
-                    arrow_data_types_exact_borrowed_observed(node.ty.data_type(), target, || {
+                let matched = arrow_data_types_exact_borrowed_with_profile_observed(
+                    node.ty.data_type(),
+                    target,
+                    novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
+                    || {
                         work.step()
                             .map_err(crate::physical_type_v2::TypeCodecError::from)
-                    });
+                    },
+                );
                 let matched = match matched {
                     Err(crate::physical_type_v2::TypeCodecError::Control(cause)) => {
                         return Err(Error::Control(cause));

@@ -23,11 +23,17 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use novarocks_native_adapter::root_cow_selection_codec::{CowSelectionEncoder, CowSelectionTotals};
+use novarocks_native_adapter::root_cow_selection_codec::{
+    COW_SELECTION_HEADER_BYTES, CowSelectionEncoder, CowSelectionTotals,
+};
 use novarocks_native_adapter::root_record_assembly::{
     RootRecordAssembly, RootRecordAssemblyError, RootRecordDomain,
 };
 use novarocks_result_render::RenderTurnStatus;
+
+mod support {
+    include!("common/cow_recipe.rs");
+}
 
 fn cow_stream() -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![
@@ -46,11 +52,16 @@ fn cow_stream() -> Vec<u8> {
     };
     let mut totals = CowSelectionTotals::default();
     let mut stream = Vec::new();
+    // Both batches use the same prepared root declaration; their records
+    // carry data only and never introduce a separate Schema record.
+    let recipe = support::recipe(&schema);
     for input in [
         batch(vec!["s3://a", "s3://bb"], vec![1, 2]),
         batch(vec!["s3://ccc"], vec![7]),
     ] {
-        let mut encoder = CowSelectionEncoder::try_new(&input, totals, usize::MAX).unwrap();
+        let input = support::normalized(&input, &recipe);
+        let mut encoder =
+            CowSelectionEncoder::try_new(&input, &recipe, totals, usize::MAX).unwrap();
         let mut output = vec![0_u8; 1 << 16];
         loop {
             let turn = encoder.step(&mut output);
@@ -85,7 +96,11 @@ fn records(stream: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
 fn every_cut_position_reassembles_the_same_records() {
     let stream = cow_stream();
     let whole = records(&stream, &[]);
-    assert_eq!(whole.len(), 3, "one schema record and two batch records");
+    assert_eq!(
+        whole.len(),
+        2,
+        "exactly two data records and no Schema record"
+    );
     assert_eq!(whole.concat(), stream);
     for cut in 1..stream.len() {
         assert_eq!(records(&stream, &[cut]), whole, "cut at {cut}");
@@ -115,10 +130,10 @@ fn declared_length_is_bounded_before_assembly_reserves_it() {
     let mut assembly = RootRecordAssembly::new(RootRecordDomain::CowSelection, first - 1);
     // The header arrives alone; the oversized declaration is refused at once.
     let error = assembly
-        .push::<std::convert::Infallible>(&stream[..32], |_| Ok(()))
+        .push::<std::convert::Infallible>(&stream[..COW_SELECTION_HEADER_BYTES], |_| Ok(()))
         .unwrap_err();
     assert!(error.to_string().contains("assembly bound"), "{error}");
-    assert!(assembly.retained_bytes() <= 32);
+    assert!(assembly.retained_bytes() <= COW_SELECTION_HEADER_BYTES);
 }
 
 #[test]

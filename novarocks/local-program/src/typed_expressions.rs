@@ -35,7 +35,7 @@ use novarocks_type_contract::ValueSchemaCreation;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, FunctionArgumentTypes,
     PureCompileControl, ValueLogicalType, ValueSchemaCreationScope, ValueTypeError,
-    ValueTypeStorageLifetime, arrow_data_types_exact_observed,
+    ValueTypeStorageLifetime, arrow_data_types_exact_with_profile_observed,
 };
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
@@ -792,9 +792,12 @@ fn same_carrier(
     expected: &arrow_schema::DataType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramExpressionTypeError> {
-    if arrow_data_types_exact_observed::<ProgramExpressionTypeError>(actual, expected, || {
-        work.step().map_err(Into::into)
-    })? {
+    if arrow_data_types_exact_with_profile_observed::<ProgramExpressionTypeError>(
+        actual,
+        expected,
+        novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
+        || work.step().map_err(Into::into),
+    )? {
         Ok(())
     } else {
         Err(ProgramExpressionTypeError::TypeMismatch)

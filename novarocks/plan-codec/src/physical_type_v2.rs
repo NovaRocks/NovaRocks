@@ -27,7 +27,7 @@ use novarocks_type_contract::ValueLogicalType;
 use novarocks_type_contract::{
     CarrierParameterError, CompileCheckpoints, CompileControlError, CompilePhase,
     FunctionValueType, PureCompileControl, ValueTypeError, ValueTypeVisit,
-    validate_arrow_carrier_parameters_observed, validate_arrow_layout_structure_observed,
+    validate_arrow_carrier_parameters_observed,
 };
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
@@ -1471,7 +1471,10 @@ pub fn decode_type_table(
     decode_type_table_pure(table, limits, control)
 }
 
-/// Pure post-Prost projection for tests and pure callers; it holds no host stock.
+/// Legacy DTO-only post-Prost projection with the original Physical64 policy.
+/// A bare table has no original package root-occurrence loan. Complete typed
+/// roots use the package decoder, which selects their explicit value profile.
+/// This helper holds no host stock or execution-depth capability.
 pub fn decode_type_table_pure(
     table: &wire::TypeTable,
     limits: TypeProjectionLimits,
@@ -1660,7 +1663,23 @@ pub(crate) fn validate_type(
     ty: &DataType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), TypeCodecError> {
-    validate_arrow_layout_structure_observed(ty, |visit| validate_type_visit(visit, work))
+    validate_type_with_profile(
+        ty,
+        novarocks_type_contract::ArrowTypeProfile::Physical,
+        work,
+    )
+}
+
+fn validate_type_with_profile(
+    ty: &DataType,
+    profile: novarocks_type_contract::ArrowTypeProfile,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
+    novarocks_type_contract::validate_arrow_layout_structure_with_profile_observed(
+        ty,
+        profile,
+        |visit| validate_type_visit(visit, work),
+    )
 }
 
 /// The same carrier and Field author on the sole shared grammar. The caller
@@ -1713,7 +1732,7 @@ pub(crate) fn validate_type_with_scratch_host_observed<'source, H>(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
     let layout = std::alloc::Layout::new::<
-        [Option<(&DataType, usize)>; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+        novarocks_type_contract::owned_resources::type_validation::TypeValidationScratch<'_>,
     >();
     admit_scratch(layout)?;
     let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
@@ -1833,3 +1852,6 @@ pub(crate) fn encode_borrowed_type_namespaces_sources_in<'source>(
         writers,
     })
 }
+
+#[cfg(test)]
+mod depth_profile_tests;

@@ -32,10 +32,12 @@ mod comparison;
 mod comparison_coercion;
 mod compile_control;
 mod control_flow;
+mod depth_profile;
 mod effects;
 mod function;
 mod largeint;
 mod logical;
+pub use depth_profile::{ArrowTypeDepth, ArrowTypeProfile, TypeTraversalFrame};
 pub mod owned_resources;
 mod partition;
 mod schema;
@@ -48,8 +50,10 @@ pub use value_type_identity::{
 };
 mod value_layout_match;
 pub use value_layout_match::{
-    CarrierNullabilityPolicy, data_type_layout_matches_carrier_observed, dictionary_value_layout,
+    CarrierNullabilityPolicy, data_type_layout_matches_carrier_observed,
+    data_type_layout_matches_carrier_with_profile_observed, dictionary_value_layout,
     value_layout_matches_carrier_observed, value_layout_matches_carrier_with_nullability_observed,
+    value_layout_matches_carrier_with_profile_observed,
 };
 mod value_identity;
 pub use value_identity::{
@@ -73,7 +77,9 @@ mod value_arithmetic;
 mod value_projection;
 mod window;
 
-pub use type_fingerprint::arrow_data_type_fingerprint_observed;
+pub use type_fingerprint::{
+    arrow_data_type_fingerprint_observed, arrow_data_type_fingerprint_with_profile_observed,
+};
 
 pub use arithmetic::{
     ArithmeticOperator, DecimalOverflowPolicy, arithmetic_result_type,
@@ -109,8 +115,12 @@ pub use logical::{
     MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY, ValueLogicalType,
     ValueTypeError, ValueTypeVisit, field_logical_type, preserves_nested_logical_identity,
     preserves_nested_logical_identity_observed, validate_arrow_layout_structure_observed,
+    validate_arrow_layout_structure_with_profile_and_scratch_observed,
+    validate_arrow_layout_structure_with_profile_observed,
     validate_arrow_layout_structure_with_scratch_observed, validate_nested_logical_types,
     validate_nested_logical_types_observed, validate_value_type_structure_observed,
+    validate_value_type_structure_with_profile_and_scratch_observed,
+    validate_value_type_structure_with_profile_observed,
     validate_value_type_structure_with_scratch_observed,
     visit_original_data_type_clone_with_scratch_observed,
 };
@@ -123,10 +133,15 @@ pub use schema::{
     MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,
     MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
     MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, TypeComparisonStep,
-    arrow_data_types_equal_borrowed_observed, arrow_data_types_equal_observed,
-    arrow_data_types_exact, arrow_data_types_exact_borrowed_observed,
-    arrow_data_types_exact_observed, arrow_fields_exact, arrow_fields_exact_borrowed_observed,
-    arrow_fields_exact_observed, arrow_schemas_exact,
+    arrow_data_types_equal_borrowed_observed,
+    arrow_data_types_equal_borrowed_with_profile_observed, arrow_data_types_equal_observed,
+    arrow_data_types_equal_with_profile_observed, arrow_data_types_exact,
+    arrow_data_types_exact_borrowed_observed,
+    arrow_data_types_exact_borrowed_with_profile_observed, arrow_data_types_exact_observed,
+    arrow_data_types_exact_with_profile_and_nullability_observed,
+    arrow_data_types_exact_with_profile_observed, arrow_fields_exact,
+    arrow_fields_exact_borrowed_observed, arrow_fields_exact_observed,
+    arrow_fields_exact_with_nullability_observed, arrow_schemas_exact,
 };
 pub use semantics::{
     AggregateStateInterpretation, AggregateStateOrderKey, BooleanValue, EvaluationDemand,
@@ -184,3 +199,6 @@ pub use value_schema::BorrowedTypedValueBinding;
 
 #[cfg(test)]
 mod weighted_comparison_tests;
+
+#[cfg(test)]
+mod depth_profile_tests;

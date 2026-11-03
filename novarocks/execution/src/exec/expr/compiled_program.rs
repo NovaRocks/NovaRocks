@@ -39,7 +39,9 @@ use novarocks_local_program::{
     ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeId, ProgramRootInput,
     ProgramUseRef, StaticExprKind, root_input_layout,
 };
-use novarocks_type_contract::{ControlShape, FunctionNullBehavior, arrow_fields_exact_observed};
+use novarocks_type_contract::{
+    ControlShape, FunctionNullBehavior, arrow_fields_exact_with_nullability_observed,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -872,16 +874,21 @@ impl CompiledExpressionInstance {
         work.flush()?;
         let schema = input.schema();
         let frozen = layout.schema();
-        // Metadata equality is an opaque library operation over the admitted
-        // frozen domain. Field traversal uses the complete type owner's author,
-        // including root dictionary attributes ignored by ordinary Arrow Eq.
+        // The original exact Field author checks all names, metadata, encoding
+        // attributes and parameters; only physical NULL flags may widen. Active
+        // logical requiredness is checked below against the frozen channel FVT.
         let same_metadata = schema.metadata() == frozen.metadata();
         work.flush()?;
         if !same_metadata || schema.fields().len() != frozen.fields().len() {
             return Err(invalid("actual input fields differ from the frozen root port").into());
         }
         for (actual, expected) in schema.fields().iter().zip(frozen.fields()) {
-            if !arrow_fields_exact_observed(actual, expected, || work.step())? {
+            if !arrow_fields_exact_with_nullability_observed(
+                expected,
+                actual,
+                novarocks_type_contract::CarrierNullabilityPolicy::Permissive,
+                || work.step(),
+            )? {
                 return Err(invalid("actual input fields differ from the frozen root port").into());
             }
         }

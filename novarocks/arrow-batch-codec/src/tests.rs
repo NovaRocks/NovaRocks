@@ -90,6 +90,21 @@ struct Observed {
 }
 impl UnitObserver for Observed {
     type Error = Refusal;
+    fn before_type_scratch(&mut self, work_upper: usize) -> Result<(), Refusal> {
+        assert_eq!(
+            work_upper,
+            novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound()
+        );
+        self.checkpoint()
+    }
+    fn project_carrier(
+        &mut self,
+        _: usize,
+        _: &ArrayRef,
+        _: &DataType,
+    ) -> Result<ArrayRef, Refusal> {
+        Err(Refusal::Allocations)
+    }
     fn checkpoint(&mut self) -> Result<(), Refusal> {
         self.steps += 1;
         if self.cancel {
@@ -202,9 +217,11 @@ impl GeometryWork for Observed {
         self.checkpoint()
     }
     fn validate_root(&mut self, field: &Field) -> Result<(), Refusal> {
-        novarocks_type_contract::validate_arrow_layout_structure_observed(field.data_type(), |_| {
-            self.checkpoint()
-        })
+        novarocks_type_contract::validate_arrow_layout_structure_with_profile_observed(
+            field.data_type(),
+            novarocks_type_contract::ArrowTypeProfile::Value,
+            |_| self.checkpoint(),
+        )
     }
 }
 fn recipe(
@@ -267,6 +284,47 @@ fn multiple_columns_round_trip_and_root_names_are_local() {
     assert_eq!(output.columns(), input.columns());
     assert!(observer.metadata_bytes > 0);
     assert_eq!(observer.decode_calls, 1);
+}
+#[test]
+fn permissive_carrier_flags_do_not_change_the_frozen_logical_identity() {
+    let declared = DataType::Struct(
+        vec![Field::new(
+            "named",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+            false,
+        )]
+        .into(),
+    );
+    let permissive = DataType::Struct(
+        vec![Field::new(
+            "named",
+            DataType::List(Arc::new(Field::new("renamed_role", DataType::Int64, true))),
+            true,
+        )]
+        .into(),
+    );
+    let required = FunctionValueType::new(declared.clone(), false);
+    let logically_nullable = FunctionValueType::new(permissive.clone(), true);
+    let build = |carrier, value_type: &FunctionValueType| {
+        let field = Arc::new(Field::new("local", carrier, true));
+        BatchRecipe::try_new(
+            &[RecipeField {
+                field: &field,
+                value_type,
+                representation: RepresentationPolicy::Exact,
+                nullability: CarrierNullabilityPolicy::Permissive,
+            }],
+            &mut Observed::default(),
+        )
+        .unwrap()
+    };
+    let strict_carrier = build(declared, &required);
+    let loose_carrier = build(permissive.clone(), &required);
+    assert_eq!(strict_carrier.digest(), loose_carrier.digest());
+    assert_eq!(strict_carrier.schema(), loose_carrier.schema());
+    assert_eq!(strict_carrier.declarations(), &[required]);
+    let other_declaration = build(permissive, &logically_nullable);
+    assert_ne!(strict_carrier.digest(), other_declaration.digest());
 }
 #[test]
 fn zero_columns_keep_nonzero_rows_without_a_marker_column() {
@@ -489,6 +547,56 @@ fn depth_64_round_trips_and_65_is_rejected() {
         ),
         Err(CodecError::ValueType(ValueTypeError::TooDeep))
     ));
+}
+
+#[test]
+fn logical_depth_64_maps_keep_entries_and_key_nodes() {
+    use arrow::array::{Int32Array, MapArray};
+    use arrow::buffer::OffsetBuffer;
+    let mut array = Arc::new(Int64Array::from(vec![17])) as ArrayRef;
+    for _ in 1..64 {
+        let entries = StructArray::new(
+            vec![
+                Field::new("key", DataType::Int32, false),
+                Field::new("value", array.data_type().clone(), true),
+            ]
+            .into(),
+            vec![Arc::new(Int32Array::from(vec![1])), array],
+            None,
+        );
+        let field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
+        array = Arc::new(MapArray::new(
+            field,
+            OffsetBuffer::from_lengths([1]),
+            entries,
+            None,
+            false,
+        ));
+    }
+    let field = Arc::new(Field::new("root", array.data_type().clone(), true));
+    let mut observer = Observed::default();
+    let recipe = exact(&[field.clone()], &mut observer);
+    let input = batch(vec![field], vec![array]);
+    let wire = encode_unit(&recipe, &input, &mut observer).unwrap();
+    let output = decode_unit(&recipe, &wire, &mut observer).unwrap();
+    assert_eq!(input.columns(), output.columns());
+    let mut nodes = 0;
+    novarocks_type_contract::validate_arrow_layout_structure_with_profile_observed::<Refusal>(
+        output.column(0).data_type(),
+        novarocks_type_contract::ArrowTypeProfile::Value,
+        |visit| {
+            nodes += usize::from(matches!(
+                visit,
+                novarocks_type_contract::ValueTypeVisit::TypeNode(_)
+            ));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        nodes, 190,
+        "Map key leaves and entries scaffolds remain real nodes"
+    );
 }
 
 #[test]

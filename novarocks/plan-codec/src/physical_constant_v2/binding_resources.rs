@@ -21,7 +21,9 @@
 
 use super::PhysicalConstantCodecError;
 use crate::physical_type_v2::TypeCodecError;
-use arrow::datatypes::{DataType, Field};
+#[cfg(test)]
+use arrow::datatypes::DataType;
+use arrow::datatypes::Field;
 use novarocks_constant_contract::ConstantPool;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY,
@@ -227,7 +229,9 @@ fn preflight_core(
     // The fixed scratch request is known without inspecting source metadata.
     // Its numerical refusal precedes a pending original observation.
     if admission.parent.is_some() {
-        let scratch_bytes = mem::size_of::<[Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES]>();
+        let scratch_bytes = mem::size_of::<
+            novarocks_type_contract::owned_resources::type_validation::TypeValidationScratch<'_>,
+        >();
         let prefix = admission.numeric(add(source_retained_bytes, scratch_bytes))?;
         admission.known(prefix, max_work)?;
     }
@@ -239,7 +243,9 @@ fn preflight_core(
     if !covers_pool {
         return Err(shape("constant binding source invoice omits checked pool backing").into());
     }
-    let scratch_bytes = mem::size_of::<[Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES]>();
+    let scratch_bytes = mem::size_of::<
+        novarocks_type_contract::owned_resources::type_validation::TypeValidationScratch<'_>,
+    >();
     let prefix = admission.numeric(add(source_retained_bytes, scratch_bytes))?;
     admission.known(prefix, max_work)?;
     let admitted = cap(prefix, max_work);

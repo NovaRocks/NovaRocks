@@ -131,11 +131,34 @@ impl std::error::Error for ConstructionFailure {
     }
 }
 
+/// A separately installed source-custody operation. Its implementation owns a
+/// real allocation host; numerical construction observations grant no host.
+/// Only known decoder-produced built-in arrays enter this continuation.
+pub trait DecodedInputSourceCustody: Send + Sync {
+    fn retain(
+        &self,
+        array: arrow::array::ArrayRef,
+        storage: ValueTypeStorageLifetime,
+        work: &dyn InputConstructionOwner,
+    ) -> Result<arrow::array::ArrayRef, ConstructionFailure>;
+}
+
 /// Preparation installs this factory once. Each actual transformation obtains
 /// an independent construction scope. The scope's Box/holder creation itself
 /// is observed by the original factory before allocation; a caller cannot reset
 /// a shared current scope or reuse a preparation-wide cumulative byte allowance.
 pub trait InputConstructionFactory: Send + Sync {
+    /// Attach the original decoded storage to every result Buffer/Array alias,
+    /// including buffers newly allocated by Arrow alignment repair. An absent
+    /// explicitly installed custody capability fails before publication.
+    fn retain_decoded_source(
+        &self,
+        _array: arrow::array::ArrayRef,
+        _storage: ValueTypeStorageLifetime,
+        _work: &dyn InputConstructionOwner,
+    ) -> Result<arrow::array::ArrayRef, ConstructionFailure> {
+        Err(ConstructionFailure::MissingOwner)
+    }
     fn observe_input_work(&self, units: usize) -> Result<(), ConstructionFailure>;
     /// Begin one actual construction from an existing explicit binding. This
     /// does not retain the schema or fabricate an input chunk for source and

@@ -26,13 +26,19 @@ use super::{
 };
 use crate::btree_resources_v2::{self as btree, BTreeResourceError, InsertionOnlyFacts};
 use novarocks_proto_models::{physical_package_v2 as package_wire, physical_type_v2 as wire};
-use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
+use novarocks_type_contract::{ArrowTypeProfile, CompileCheckpoints, CompileControlError};
 use std::{alloc::Layout, collections::BTreeMap};
 
 const STRICT: u8 = 1;
 const WRITER: u8 = 2;
 // Original strict roots are recorded without enqueueing until W is complete.
 const STRICT_ROOT: u8 = 4;
+// Profiles follow actual root occurrences, independently of attribute laws.
+// A shared physical occurrence retains the original stricter physical policy.
+const TYPED: u8 = 8;
+const PHYSICAL: u8 = 16;
+const TYPED_ROOT: u8 = 32;
+const PHYSICAL_ROOT: u8 = 64;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct TypeGraphDomainFacts {
@@ -77,6 +83,20 @@ impl RootDomains<'_> {
     }
     pub(super) fn strict(&self, index: &Index<'_>, node: Node) -> Result<bool, TypeCodecError> {
         Ok(self.bits(index, node)? & STRICT != 0)
+    }
+    pub(super) fn depth_profile(
+        &self,
+        index: &Index<'_>,
+        node: Node,
+    ) -> Result<Option<ArrowTypeProfile>, TypeCodecError> {
+        let bits = self.bits(index, node)?;
+        Ok(if bits & PHYSICAL != 0 {
+            Some(ArrowTypeProfile::Physical)
+        } else if bits & TYPED != 0 {
+            Some(ArrowTypeProfile::CanonicalValue)
+        } else {
+            None
+        })
     }
     pub(super) fn writer(&self, index: &Index<'_>, node: Node) -> Result<bool, TypeCodecError> {
         Ok(self.bits(index, node)? & WRITER != 0)
@@ -153,13 +173,13 @@ fn domain_work(
     insertion: &InsertionOnlyFacts,
     lookup: usize,
 ) -> Result<usize, CompileControlError> {
-    // Three child-count passes, two edge walks, discovery flags and strict
-    // fallback. All ordered/repeated roots incur their own sparse lookups.
-    let lookups = add(add(mul(n, 32)?, mul(edges, 32)?)?, mul(roots, 16)?)?;
-    let inline = mul(add(add(mul(n, 4)?, mul(edges, 2)?)?, roots)?, 256)?;
+    // Five child-count passes, four edge walks, discovery flags and strict
+    // and profile fallback. All ordered/repeated roots incur their own sparse lookups.
+    let lookups = add(add(mul(n, 64)?, mul(edges, 64)?)?, mul(roots, 32)?)?;
+    let inline = mul(add(add(mul(n, 8)?, mul(edges, 4)?)?, roots)?, 256)?;
     // Two original Index iterations are opaque. The truthful union invoice
     // bounds their actual backing; occupied entries are never capacity.
-    let source_iterations = mul(source_bytes, 16)?;
+    let source_iterations = mul(source_bytes, 32)?;
     add(
         add(add(256, root_work)?, insertion.cumulative_work_upper_bound)?,
         add(add(mul(lookups, lookup)?, inline)?, source_iterations)?,
@@ -408,12 +428,59 @@ pub(super) fn prepare_domains_with_host<'source, H>(
             let node = root?;
             match source {
                 PackageTypeRootSource::WriterField { .. } => state.mark(node, WRITER, true, work),
-                _ => state.mark(node, STRICT_ROOT, false, work),
+                _ => {
+                    state.mark(node, STRICT_ROOT, false, work)?;
+                    // A complete Value binding authorizes semantic depth. A
+                    // bare carrier, logical tag or IPC schema does not.
+                    let typed = match source {
+                        PackageTypeRootSource::Value(_) => true,
+                        PackageTypeRootSource::SchemaField { field_id, .. } => {
+                            state.gate()?;
+                            work.flush()?;
+                            let field = state.index.field(field_id);
+                            work.step()?;
+                            work.flush()?;
+                            field?.value_binding_id.is_some()
+                        }
+                        _ => false,
+                    };
+                    state.mark(
+                        node,
+                        if typed { TYPED_ROOT } else { PHYSICAL_ROOT },
+                        false,
+                        work,
+                    )
+                }
             }
         },
         work,
     )?;
     state.drain(WRITER, work)?;
+    for node in index
+        .carriers
+        .keys()
+        .map(|&id| Node::Carrier(id))
+        .chain(index.fields.keys().map(|&id| Node::Field(id)))
+    {
+        if state.bits(node, work)? & TYPED_ROOT != 0 {
+            state.mark(node, TYPED, true, work)?;
+        }
+    }
+    state.drain(TYPED, work)?;
+    for node in index
+        .carriers
+        .keys()
+        .map(|&id| Node::Carrier(id))
+        .chain(index.fields.keys().map(|&id| Node::Field(id)))
+    {
+        let bits = state.bits(node, work)?;
+        // Uncovered definitions cannot borrow a semantic profile from an
+        // unrelated declaration. Writer-only definitions keep their own law.
+        if bits & PHYSICAL_ROOT != 0 || bits & (TYPED | WRITER) == 0 {
+            state.mark(node, PHYSICAL, true, work)?;
+        }
+    }
+    state.drain(PHYSICAL, work)?;
     // Every uncovered definition is a strict root; no unreferenced definition
     // is dropped. Descendants shared with Writer-only roots become intersection.
     for node in index

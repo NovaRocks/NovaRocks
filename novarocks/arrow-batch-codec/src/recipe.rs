@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Design: ADR-0214 (docs/adr/ADR-0214-schema-free-online-units-and-prepared-layout-recipes.md)
 use std::{alloc::Layout, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, UnionFields};
@@ -53,17 +54,22 @@ pub struct DictionarySlot {
     pub schema: SchemaRef,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BatchRecipe {
     schema: SchemaRef,
     dictionaries: Vec<DictionarySlot>,
     digest: [u8; 32],
     policies: Vec<RepresentationPolicy>,
+    nullability: Vec<CarrierNullabilityPolicy>,
+    declarations: Vec<FunctionValueType>,
 }
 
 impl BatchRecipe {
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
+    }
+    pub fn declarations(&self) -> &[FunctionValueType] {
+        &self.declarations
     }
     pub fn dictionaries(&self) -> &[DictionarySlot] {
         &self.dictionaries
@@ -91,7 +97,19 @@ impl BatchRecipe {
         let mut dictionaries = Vec::new();
         let mut policies = Vec::new();
         reserve(&mut policies, fields.len(), observer)?;
+        let mut nullability = Vec::new();
+        reserve(&mut nullability, fields.len(), observer)?;
+        let mut declarations = Vec::new();
+        reserve(&mut declarations, fields.len(), observer)?;
         let mut count = 0i64;
+        observer
+            .before_type_scratch(
+                novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound(
+                ),
+            )
+            .map_err(CodecError::Observer)?;
+        let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+        observer.checkpoint().map_err(CodecError::Observer)?;
         for input in fields {
             observer.checkpoint().map_err(CodecError::Observer)?;
             if !input.field.metadata().is_empty() {
@@ -99,10 +117,13 @@ impl BatchRecipe {
                     "runtime recipe root must be metadata-free; exact semantic identity is supplied separately",
                 ));
             }
+            observer.checkpoint().map_err(CodecError::Observer)?;
             // Shared traversal enforces current depth/node/field grammar before
             // recursive Arrow constructors can run. It allocates no shadow tree.
-            novarocks_type_contract::validate_arrow_layout_structure_observed(
+            novarocks_type_contract::validate_arrow_layout_structure_with_profile_and_scratch_observed(
                 input.field.data_type(),
+                novarocks_type_contract::ArrowTypeProfile::Value,
+                &mut scratch,
                 |visit| {
                     observer.checkpoint().map_err(CodecError::Observer)?;
                     if let ValueTypeVisit::Field(field) = visit {
@@ -168,8 +189,19 @@ impl BatchRecipe {
             }
             hash.update([input.representation as u8]);
             policies.push(input.representation);
-            let field = if contains_dictionary(input.field.data_type(), observer)? {
-                rebuild_field(input.field, None, &mut count, &mut dictionaries, observer)?
+            nullability.push(input.nullability);
+            declarations.push(input.value_type.clone());
+            let permissive = input.nullability == CarrierNullabilityPolicy::Permissive;
+            let field = if permissive || contains_dictionary(input.field.data_type(), observer)? {
+                rebuild_field(
+                    input.field,
+                    None,
+                    permissive,
+                    false,
+                    &mut count,
+                    &mut dictionaries,
+                    observer,
+                )?
             } else {
                 Arc::clone(input.field)
             };
@@ -182,6 +214,8 @@ impl BatchRecipe {
             dictionaries,
             digest: hash.finalize().into(),
             policies,
+            nullability,
+            declarations,
         })
     }
 }
@@ -211,17 +245,27 @@ pub(crate) fn reserve<T, O: UnitObserver>(
 fn rebuild_field<O: UnitObserver>(
     source: &Field,
     name: Option<&str>,
+    permissive: bool,
+    required: bool,
     count: &mut i64,
     dictionaries: &mut Vec<DictionarySlot>,
     observer: &mut O,
 ) -> Result<FieldRef, CodecError<O::Error>> {
-    let ty = rebuild_type(source.data_type(), count, dictionaries, observer)?;
-    finish_field(source, name, ty, count, dictionaries, observer)
+    let ty = rebuild_type(
+        source.data_type(),
+        permissive,
+        count,
+        dictionaries,
+        observer,
+    )?;
+    let nullable = !required && (permissive || source.is_nullable());
+    finish_field(source, name, ty, nullable, count, dictionaries, observer)
 }
 fn finish_field<O: UnitObserver>(
     source: &Field,
     name: Option<&str>,
     ty: DataType,
+    nullable: bool,
     count: &mut i64,
     dictionaries: &mut Vec<DictionarySlot>,
     observer: &mut O,
@@ -241,9 +285,9 @@ fn finish_field<O: UnitObserver>(
         fields.push(Arc::clone(&values));
         let schema = make_schema(fields, observer)?;
         dictionaries.push(DictionarySlot { id, values, schema });
-        dictionary_field(source, field_name, ty, id)
+        dictionary_field(source, field_name, ty, nullable, id)
     } else {
-        Field::new(field_name, ty, source.is_nullable())
+        Field::new(field_name, ty, nullable)
     };
     Ok(Arc::new(field))
 }
@@ -252,11 +296,11 @@ fn finish_field<O: UnitObserver>(
     deprecated,
     reason = "Arrow 60.1 readers still identify dictionaries by Field::dict_id; recipe reconstructs deterministic IDs without a Schema message"
 )]
-fn dictionary_field(source: &Field, name: String, ty: DataType, id: i64) -> Field {
+fn dictionary_field(source: &Field, name: String, ty: DataType, nullable: bool, id: i64) -> Field {
     Field::new_dict(
         name,
         ty,
-        source.is_nullable(),
+        nullable,
         id,
         source.dict_is_ordered().unwrap_or(false),
     )
@@ -264,24 +308,86 @@ fn dictionary_field(source: &Field, name: String, ty: DataType, id: i64) -> Fiel
 
 fn rebuild_type<O: UnitObserver>(
     source: &DataType,
+    permissive: bool,
     count: &mut i64,
     dictionaries: &mut Vec<DictionarySlot>,
     observer: &mut O,
 ) -> Result<DataType, CodecError<O::Error>> {
     observer.checkpoint().map_err(CodecError::Observer)?;
-    let mut child = |f: &FieldRef| rebuild_field(f, None, count, dictionaries, observer);
+    let mut child = |f: &FieldRef| {
+        rebuild_field(
+            f,
+            permissive.then_some("item"),
+            permissive,
+            false,
+            count,
+            dictionaries,
+            observer,
+        )
+    };
     Ok(match source {
         DataType::List(f) => DataType::List(child(f)?),
         DataType::LargeList(f) => DataType::LargeList(child(f)?),
         DataType::ListView(f) => DataType::ListView(child(f)?),
         DataType::LargeListView(f) => DataType::LargeListView(child(f)?),
         DataType::FixedSizeList(f, n) => DataType::FixedSizeList(child(f)?, *n),
-        DataType::Map(f, sorted) => DataType::Map(child(f)?, *sorted),
+        DataType::Map(entries, sorted) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(CodecError::Invalid("recipe Map entries are not Struct"));
+            };
+            if fields.len() != 2 {
+                return Err(CodecError::Invalid("recipe Map entries arity differs"));
+            }
+            let key = rebuild_field(
+                &fields[0],
+                permissive.then_some("key"),
+                permissive,
+                true,
+                count,
+                dictionaries,
+                observer,
+            )?;
+            let value = rebuild_field(
+                &fields[1],
+                permissive.then_some("value"),
+                permissive,
+                false,
+                count,
+                dictionaries,
+                observer,
+            )?;
+            let mut output = Vec::new();
+            reserve(&mut output, 2, observer)?;
+            output.push(key);
+            output.push(value);
+            observe_arc_slice::<FieldRef, O>(2, observer)?;
+            let ty = DataType::Struct(output.into());
+            DataType::Map(
+                finish_field(
+                    entries,
+                    permissive.then_some("entries"),
+                    ty,
+                    false,
+                    count,
+                    dictionaries,
+                    observer,
+                )?,
+                *sorted,
+            )
+        }
         DataType::Struct(fields) => {
             let mut output = Vec::new();
             reserve(&mut output, fields.len(), observer)?;
             for field in fields {
-                output.push(rebuild_field(field, None, count, dictionaries, observer)?);
+                output.push(rebuild_field(
+                    field,
+                    None,
+                    permissive,
+                    false,
+                    count,
+                    dictionaries,
+                    observer,
+                )?);
             }
             observe_arc_slice::<FieldRef, O>(output.len(), observer)?;
             DataType::Struct(output.into())
@@ -293,7 +399,15 @@ fn rebuild_type<O: UnitObserver>(
             reserve(&mut output, fields.len(), observer)?;
             for (id, field) in fields.iter() {
                 ids.push(id);
-                output.push(rebuild_field(field, None, count, dictionaries, observer)?);
+                output.push(rebuild_field(
+                    field,
+                    None,
+                    permissive,
+                    false,
+                    count,
+                    dictionaries,
+                    observer,
+                )?);
             }
             {
                 let shared = std::cell::RefCell::new(&mut *observer);
@@ -313,7 +427,25 @@ fn rebuild_type<O: UnitObserver>(
             )
         }
         DataType::RunEndEncoded(ends, values) => {
-            DataType::RunEndEncoded(child(ends)?, child(values)?)
+            let ends = rebuild_field(
+                ends,
+                permissive.then_some("run_ends"),
+                permissive,
+                true,
+                count,
+                dictionaries,
+                observer,
+            )?;
+            let values = rebuild_field(
+                values,
+                permissive.then_some("values"),
+                permissive,
+                false,
+                count,
+                dictionaries,
+                observer,
+            )?;
+            DataType::RunEndEncoded(ends, values)
         }
         DataType::Dictionary(key, values) => {
             if matches!(values.as_ref(), DataType::Dictionary(..)) {
@@ -325,7 +457,13 @@ fn rebuild_type<O: UnitObserver>(
             observe_box::<DataType, O>(observer)?;
             DataType::Dictionary(
                 key.clone(),
-                Box::new(rebuild_type(values, count, dictionaries, observer)?),
+                Box::new(rebuild_type(
+                    values,
+                    permissive,
+                    count,
+                    dictionaries,
+                    observer,
+                )?),
             )
         }
         leaf => leaf.clone(),
@@ -440,17 +578,42 @@ impl BatchRecipe {
         }
         let mut tags = Vec::new();
         reserve(&mut tags, self.policies.len(), observer)?;
-        for ((array, field), policy) in batch
+        observer
+            .before_type_scratch(
+                novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound(
+                ),
+            )
+            .map_err(CodecError::Observer)?;
+        let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+        observer.checkpoint().map_err(CodecError::Observer)?;
+        for (ordinal, ((array, field), policy)) in batch
             .columns()
             .iter()
             .zip(self.schema.fields())
             .zip(&self.policies)
+            .enumerate()
         {
             observer.checkpoint().map_err(CodecError::Observer)?;
-            let tag = if array.data_type() == field.data_type() {
+            let normalized;
+            let actual = if self.nullability[ordinal] == CarrierNullabilityPolicy::Permissive {
+                novarocks_type_contract::validate_arrow_layout_structure_with_profile_and_scratch_observed(array.data_type(), novarocks_type_contract::ArrowTypeProfile::Value, &mut scratch, |_| observer.checkpoint().map_err(CodecError::Observer))?;
+                let mut count = 0;
+                let mut dictionaries = Vec::new();
+                normalized = rebuild_type(
+                    array.data_type(),
+                    true,
+                    &mut count,
+                    &mut dictionaries,
+                    observer,
+                )?;
+                &normalized
+            } else {
+                array.data_type()
+            };
+            let tag = if actual == field.data_type() {
                 0
             } else if *policy == RepresentationPolicy::CanonicalOrInt32Utf8Dictionary
-                && matches!(array.data_type(),DataType::Dictionary(key,value) if key.as_ref()==&DataType::Int32 && value.as_ref()==field.data_type())
+                && matches!(actual,DataType::Dictionary(key,value) if key.as_ref()==&DataType::Int32 && value.as_ref()==field.data_type())
             {
                 1
             } else {
@@ -501,6 +664,7 @@ impl BatchRecipe {
                     field,
                     None,
                     physical,
+                    field.is_nullable(),
                     &mut count,
                     &mut dictionaries,
                     observer,
@@ -509,6 +673,8 @@ impl BatchRecipe {
                 fields.push(rebuild_field(
                     field,
                     None,
+                    false,
+                    false,
                     &mut count,
                     &mut dictionaries,
                     observer,

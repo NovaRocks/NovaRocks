@@ -389,9 +389,12 @@ fn assert_plain(fragment: &Fragment, actual: &Outcome) {
     assert_eq!(actual.errors, errors.into_vec());
 }
 fn assert_primitives(facts: ControlOwnedResourceFacts, data_roots: usize, logical_roots: usize) {
-    assert_eq!(Layout::new::<(&DataType, usize)>().size(), 16);
+    assert_eq!(Layout::new::<TypePending<'_>>().size(), 32);
     assert_eq!(facts.allocation_requests_upper_bound, data_roots);
-    assert_eq!(facts.allocation_request_bytes_upper_bound, 16 * data_roots);
+    assert_eq!(
+        facts.allocation_request_bytes_upper_bound,
+        Layout::new::<TypePending<'_>>().size() * data_roots
+    );
     assert!(facts.cumulative_work_upper_bound >= logical_roots);
 }
 

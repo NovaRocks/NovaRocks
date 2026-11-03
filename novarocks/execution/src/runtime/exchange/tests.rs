@@ -2455,6 +2455,15 @@ struct PausedDecoderFactory {
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 impl crate::exec::pipeline::operator::InputConstructionFactory for PausedDecoderFactory {
+    fn retain_decoded_source(
+        &self,
+        array: ArrayRef,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+        work: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+    ) -> Result<ArrayRef, crate::exec::pipeline::operator::ConstructionFailure> {
+        self.inner.retain_decoded_source(array, storage, work)
+    }
+
     fn observe_input_work(
         &self,
         units: usize,

@@ -272,7 +272,10 @@ pub(super) fn preflight<W: ResourceWork>(
     // bounded DFS pending vector. Conservatively include every source walk.
     if !work.parent() {
         for _ in 0..5 {
-            requests.growing_vec::<(&DataType, usize), _>(input.nodes.len(), work)?;
+            requests.growing_vec::<novarocks_type_contract::TypeTraversalFrame<'_>, _>(
+                input.nodes.len(),
+                work,
+            )?;
         }
     }
     let before_constant_owner = requests.bytes;

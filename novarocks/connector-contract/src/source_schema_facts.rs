@@ -564,9 +564,7 @@ fn validate_empty_metadata_shape<E: From<ConnectorError>>(
         )));
     }
     // Admit the exact fixed stack initialization before visiting any source.
-    work(std::mem::size_of::<
-        [Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES],
-    >())?;
+    work(novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound())?;
     let mut scratch = [None; MAX_VALUE_TYPE_NODES];
     for field in schema.fields() {
         work(1)?;

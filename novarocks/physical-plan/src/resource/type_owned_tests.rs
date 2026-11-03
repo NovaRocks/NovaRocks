@@ -239,7 +239,7 @@ fn real_pending_vec_initial_and_branch_exact_layouts_have_independent_goldens() 
     assert_eq!(primitive.facts.allocation_requests_upper_bound, 1);
     assert_eq!(
         primitive.facts.allocation_request_bytes_upper_bound,
-        Layout::array::<(&DataType, usize)>(1).unwrap().size()
+        Layout::array::<TypePending<'_>>(1).unwrap().size()
     );
     let (ty, source) = wide(MAX_DATA_TYPE_NODES - 1);
     let out = raw(ty.data_type(), source);
@@ -250,8 +250,8 @@ fn real_pending_vec_initial_and_branch_exact_layouts_have_independent_goldens() 
     assert_eq!(out.facts.allocation_requests_upper_bound, 2);
     assert_eq!(
         out.facts.allocation_request_bytes_upper_bound,
-        Layout::array::<(&DataType, usize)>(1).unwrap().size()
-            + Layout::array::<(&DataType, usize)>(MAX_DATA_TYPE_NODES - 1)
+        Layout::array::<TypePending<'_>>(1).unwrap().size()
+            + Layout::array::<TypePending<'_>>(MAX_DATA_TYPE_NODES - 1)
                 .unwrap()
                 .size()
     );
@@ -622,4 +622,60 @@ fn semantic_walk_is_source_independent_and_layout_header_work_remains_linear() {
             .is_none()
     );
     assert_eq!(two, work(receiver));
+}
+
+fn map_type(layers: usize) -> DataType {
+    let mut value = DataType::Int64;
+    for _ in 0..layers {
+        value = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Int32, false)),
+                        Arc::new(Field::new("value", value, false)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+    }
+    value
+}
+
+#[test]
+fn typed_map_logical64_keeps_plan_owned_nodes_names_and_pending_requests() {
+    let ty = ValueType::new(map_type(MAX_DATA_TYPE_DEPTH - 1), false);
+    let out = run(&ty, 1024 * 1024, OPEN, &Control::default()).unwrap();
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert_plain(&ty, &out);
+    // All 190 physical carriers and both entries fields for each Map remain
+    // in the original dynamic item quota; no scaffold visit was erased.
+    assert_eq!(out.items, 3 * 63 + 1 + 2 * 63);
+    assert_eq!(
+        out.bytes,
+        63 * ("entries".len() + "key".len() + "value".len())
+    );
+    assert_eq!(Layout::new::<TypePending<'_>>().size(), 32);
+    let mut under = OPEN;
+    under.bytes = out.facts.allocation_request_bytes_upper_bound - 1;
+    assert!(matches!(
+        run(&ty, 1024 * 1024, under, &Control::default()),
+        Err(ControlResourceError::Control(
+            CompileControlError::ResourceExhausted
+        ))
+    ));
+}
+
+#[test]
+fn raw_plan_type_policy_retains_physical64_for_constant_or_source_subtrees() {
+    assert!(raw(&map_type(31), 1024 * 1024).errors.is_empty());
+    let over = raw(&map_type(32), 1024 * 1024);
+    assert_eq!(
+        over.errors[0].category(),
+        ValidationErrorCategory::ResourceLimit
+    );
+    assert_eq!(over.errors[0].message(), "Arrow data type depth exceeds 64");
 }

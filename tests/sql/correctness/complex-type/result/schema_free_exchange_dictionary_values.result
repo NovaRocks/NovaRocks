@@ -1,0 +1,15 @@
+-- query 2
+-- types	integer	varchar
+id	label
+7	a
+19	a
+27	b
+35	NULL
+
+-- query 3
+-- types	integer	varchar
+id	label
+7	a
+19	a
+27	b
+35	NULL

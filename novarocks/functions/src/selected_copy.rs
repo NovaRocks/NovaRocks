@@ -33,14 +33,15 @@ pub use fixed_binary::preflight_fixed_binary_constructor_extent;
 #[path = "selected_copy/construction.rs"]
 mod construction;
 pub use construction::{
-    ValuesCopyKind, copy_nested_values_construction, preflight_arrow_node_structure_construction,
-    preflight_empty_construction, preflight_empty_construction_observed,
-    preflight_flat_array_structure_construction, preflight_flat_arrow_structure_construction,
-    preflight_interleave_construction, preflight_null_arrow_structure_observed,
+    ValuesCopyKind, copy_nested_values_construction, copy_nested_values_for_layout_construction,
+    preflight_arrow_node_structure_construction, preflight_empty_construction,
+    preflight_empty_construction_observed, preflight_flat_array_structure_construction,
+    preflight_flat_arrow_structure_construction, preflight_interleave_construction,
+    preflight_interleave_for_layout_construction, preflight_null_arrow_structure_observed,
     preflight_null_construction, preflight_null_structure_construction,
     preflight_null_structure_construction_observed, preflight_primitive_vec_adoption_construction,
     preflight_primitive_vec_adoption_construction_observed, preflight_uint64_indices_construction,
-    values_copy_kind_observed,
+    values_copy_kind_for_layout_observed, values_copy_kind_observed,
 };
 #[path = "selected_copy/copy_buffer_peak.rs"]
 mod copy_buffer_peak;
@@ -153,12 +154,23 @@ impl<H> From<novarocks_type_contract::owned_resources::layout::LayoutResourceErr
 
 enum WorkObservation<'a, E> {
     Legacy(&'a mut dyn FnMut(bool) -> Result<(), KernelFailure>),
+    Value(&'a mut dyn FnMut(bool) -> Result<(), KernelFailure>),
     Creator(&'a mut dyn FnMut(bool) -> Result<(), E>),
 }
 impl<E: From<CopyError>> WorkObservation<'_, E> {
+    fn type_profile(&self) -> novarocks_type_contract::ArrowTypeProfile {
+        match self {
+            Self::Value(_) => novarocks_type_contract::ArrowTypeProfile::Value,
+            Self::Legacy(_) | Self::Creator(_) => {
+                novarocks_type_contract::ArrowTypeProfile::Physical
+            }
+        }
+    }
     fn observe(&mut self, boundary: bool) -> Result<(), E> {
         match self {
-            Self::Legacy(work) => work(boundary).map_err(|cause| CopyError::Control(cause).into()),
+            Self::Legacy(work) | Self::Value(work) => {
+                work(boundary).map_err(|cause| CopyError::Control(cause).into())
+            }
             Self::Creator(work) => work(boundary),
         }
     }
@@ -181,11 +193,11 @@ struct CopyObservation<'a, E = CopyError>(
 );
 impl<'a, E: From<CopyError>> CopyObservation<'a, E> {
     fn exact_types(&mut self, left: &DataType, right: &DataType) -> Result<bool, E> {
-        novarocks_type_contract::arrow_data_types_exact_observed::<ExactComparisonFailure<E>>(
-            left,
-            right,
-            || self.step().map_err(ExactComparisonFailure::Work),
-        )
+        novarocks_type_contract::arrow_data_types_exact_with_profile_observed::<
+            ExactComparisonFailure<E>,
+        >(left, right, self.0.type_profile(), || {
+            self.step().map_err(ExactComparisonFailure::Work)
+        })
         .map_err(|cause| match cause {
             ExactComparisonFailure::Type(error) => {
                 CopyError::Control(KernelFailure::from(error)).into()
@@ -2235,6 +2247,46 @@ pub fn preflight_extend_multi_construction<H>(
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     control: &dyn crate::KernelEvaluationControl,
 ) -> Result<CopyOperationFacts, CopyConstructionError<H>> {
+    preflight_extend_multi_construction_with_layout(
+        sources,
+        segments,
+        constructor_capacity,
+        None,
+        creation,
+        control,
+    )
+}
+
+/// The original constructor for sources whose complete value binding has
+/// already been checked by the typed caller. The layout selects value depth;
+/// actual sources retain the original exact source-to-source comparison and
+/// encoding, metadata and physical null declarations. It grants no capacity.
+pub fn preflight_extend_multi_for_layout_construction<H>(
+    layout: &novarocks_type_contract::ValueLayout,
+    sources: &[&dyn Array],
+    segments: &[ExtendSegment],
+    constructor_capacity: usize,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    control: &dyn crate::KernelEvaluationControl,
+) -> Result<CopyOperationFacts, CopyConstructionError<H>> {
+    preflight_extend_multi_construction_with_layout(
+        sources,
+        segments,
+        constructor_capacity,
+        Some(layout),
+        creation,
+        control,
+    )
+}
+
+fn preflight_extend_multi_construction_with_layout<H>(
+    sources: &[&dyn Array],
+    segments: &[ExtendSegment],
+    constructor_capacity: usize,
+    expected: Option<&novarocks_type_contract::ValueLayout>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    control: &dyn crate::KernelEvaluationControl,
+) -> Result<CopyOperationFacts, CopyConstructionError<H>> {
     let observed = crate::KernelControlObservation::new(control);
     let mut checkpoints = crate::kernel_input::EvaluationCheckpoints::new(&observed);
     let mut source_metadata = 0;
@@ -2262,7 +2314,11 @@ pub fn preflight_extend_multi_construction<H>(
             }
         };
         let mut work = CopyObservation(
-            WorkObservation::Legacy(&mut observe),
+            if expected.is_some() {
+                WorkObservation::Value(&mut observe)
+            } else {
+                WorkObservation::Legacy(&mut observe)
+            },
             None,
             ScratchCoverage::RecursiveSelections,
             Some(&mut invoice),

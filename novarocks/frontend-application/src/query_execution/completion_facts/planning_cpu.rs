@@ -886,3 +886,116 @@ mod client_render_error_tests {
         assert!(matches!(error, FrontendQueryCompilerError::Engine(actual) if actual == message));
     }
 }
+
+#[cfg(test)]
+mod map64_planning_worker_tests {
+    use super::*;
+    use novarocks_physical_plan::{
+        MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
+    };
+    use novarocks_sql::compiler::{
+        DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileIntent, SqlStatementInput,
+        builtin_sql_function_catalog, noop_constant_evaluator,
+    };
+
+    fn request() -> SqlFinalPlanCompileRequest {
+        // Each installed aggregate creates one semantic Map level. Deriving from a
+        // scalar avoids fabricating a raw provider or ConstantPool with physical127.
+        let mut sql = "SELECT 7 AS m".to_owned();
+        for level in 0..63 {
+            sql = format!("SELECT map_agg(1, m) AS m FROM ({sql}) q{level}");
+        }
+        SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([43; 16]).unwrap(),
+            SqlStatementInput::sql(&sql),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: Default::default(),
+                current_catalog: None,
+                current_database: "db".into(),
+                optimizer_settings: SessionOptimizerSettings {
+                    disabled_rules: vec!["FoldConstant".into()],
+                    enable_materialized_view_rewrite: Some(false),
+                    ..Default::default()
+                },
+            },
+            SqlPlanningEnvironment::Distributed,
+            builtin_sql_function_catalog().snapshot(),
+            noop_constant_evaluator(),
+            crate::application::test_constant_policy(),
+            SqlCompileControl::unbounded(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        )
+    }
+
+    fn verify_on_original_cpu(
+        input: &mut Option<SqlCompileProgress>,
+        _: &ConnectorSourceCloseResult<'_>,
+    ) -> Option<()> {
+        assert!(
+            std::thread::current()
+                .name()
+                .is_some_and(|name| name.starts_with("novarocks-query-planning-"))
+        );
+        let SqlCompileProgress::Complete(completed) =
+            input.take().expect("original completion moved once")
+        else {
+            panic!("source-free derived maps must not request catalog observations");
+        };
+        let result = completed.plan().result_port().unwrap();
+        assert_eq!(result.fields.len(), 1);
+        let value = &result.fields[0].ty;
+        assert_eq!(value.value_type().depth(), 64);
+        assert!(
+            novarocks_type_contract::validate_arrow_layout_structure_observed::<
+                novarocks_type_contract::ValueTypeError,
+            >(value.data_type(), |_| Ok(()))
+            .is_err(),
+            "the raw physical policy remains unchanged"
+        );
+        novarocks_physical_plan::validate_plan(completed.plan()).unwrap();
+        // Validation and final deep-plan destruction use the same production
+        // CPU worker owner; no deep plan is returned to the Rust test thread.
+        drop(completed);
+        Some(())
+    }
+
+    #[tokio::test]
+    async fn public_sql_derived_map64_compiles_without_widening_raw_constant_or_provider_profiles()
+    {
+        let (mut owners, supervisor) =
+            crate::task_execution::blocking_io::tests::original_executors(
+                tokio::runtime::Handle::current(),
+            );
+        let planning = FrontendPlanningCpuSource::new(supervisor.clone());
+        // This is the real FE SqlCompletionCpuPort implementation and its
+        // preserving CPU receipt, using the production 16MiB worker factory.
+        let progress = planning
+            .start(request())
+            .await
+            .expect("original planning worker health")
+            .expect("public SQL completion");
+        let mut validation =
+            supervisor.prepare_cpu_owned(Vec::new(), Some(progress), verify_on_original_cpu);
+        let mut result = None;
+        validation.finish_in(&mut result).await;
+        result
+            .expect("same original validation output")
+            .expect("validation worker health");
+        assert!(validation.actual_exit_observed());
+        assert!(!validation.input_or_value_retained());
+        planning.close().await.expect("original planning CPU close");
+        drop(validation);
+        drop(planning);
+        owners.shutdown().await;
+    }
+}

@@ -938,3 +938,71 @@ fn pure_guarded_type_table_shares_the_original_arena_collection() {
         Some(&value(DataType::Boolean, true))
     );
 }
+
+#[test]
+fn complete_map64_definition_uses_canonical_depth_and_keeps_layout_mismatch() {
+    let map = |mut data_type: DataType| {
+        for _ in 1..64 {
+            data_type = DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", DataType::Int32, false)),
+                            Arc::new(Field::new("value", data_type, false)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            );
+        }
+        data_type
+    };
+    let expected = map(DataType::Utf8);
+    let source = || {
+        resolved(
+            vec![StaticExprNode::new(
+                StaticExprKind::Literal(StaticLiteral::Null),
+                expected.clone(),
+                None,
+            )],
+            None,
+        )
+    };
+    ProgramTypedExpressions::try_new(
+        source(),
+        main_types(vec![value(expected.clone(), true)]),
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        ProgramTypedExpressions::try_new(
+            source(),
+            main_types(vec![value(map(DataType::LargeUtf8), true)]),
+            &Control::default()
+        )
+        .unwrap_err(),
+        ProgramExpressionTypeError::TypeMismatch
+    );
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let control = Control {
+            at: Some(256),
+            failure: Some(cause.clone()),
+        };
+        assert_eq!(
+            ProgramTypedExpressions::try_new(
+                source(),
+                main_types(vec![value(expected.clone(), true)]),
+                &control
+            )
+            .unwrap_err(),
+            ProgramExpressionTypeError::Control(cause)
+        );
+    }
+}

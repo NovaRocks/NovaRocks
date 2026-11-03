@@ -34,7 +34,7 @@ mod validation;
 use tree::Node;
 pub use validation::{
     required_values_satisfied_observed, validate_required_observed,
-    validate_required_with_options_observed,
+    validate_required_rows_observed, validate_required_with_options_observed,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

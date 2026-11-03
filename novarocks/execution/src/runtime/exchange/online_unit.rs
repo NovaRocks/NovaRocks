@@ -126,8 +126,21 @@ impl GeometryWork for GeometryObserver<'_> {
         observe_work(self.0)
     }
     fn validate_root(&mut self, field: &arrow::datatypes::Field) -> Result<(), Self::Error> {
-        novarocks_type_contract::validate_arrow_layout_structure_observed(
+        observe_work(self.0)?;
+        self.0.observe(
+            0,
+            &[],
+            crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
+                units: novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound(),
+            },
+        )?;
+        let mut scratch: novarocks_type_contract::owned_resources::type_validation::TypeValidationScratch<'_> =
+            [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
+        observe_work(self.0)?;
+        novarocks_type_contract::validate_arrow_layout_structure_with_profile_and_scratch_observed(
             field.data_type(),
+            novarocks_type_contract::ArrowTypeProfile::Value,
+            &mut scratch,
             |_| observe_work(self.0),
         )?;
         Ok(())
@@ -142,29 +155,9 @@ fn observe_work(owner: &dyn InputConstructionOwner) -> Result<(), ExchangeFailur
     Ok(())
 }
 
-// Real immutable body custody follows every Arrow Buffer alias. The backing
-// drops before the finite construction lifetime; neither keeps Task control.
-struct DecodedBody {
-    buffer: arrow::buffer::Buffer,
-    _storage: ValueTypeStorageLifetime,
-}
-impl AsRef<[u8]> for DecodedBody {
-    fn as_ref(&self) -> &[u8] {
-        self.buffer.as_slice()
-    }
-}
-// Pinned bytes::Bytes::from_owner uses repr(C) Owned<T> { ref_cnt, owner }.
-// This is its actual wrapper request, not a payload-size estimate or grant.
-#[repr(C)]
-struct DecodedBodyOwnerLayout {
-    _references: std::sync::atomic::AtomicUsize,
-    _owner: DecodedBody,
-}
-
 struct UnitConstruction<'a> {
     schema: &'a dyn InputConstructionOwner,
     constructing_schema: bool,
-    body_storage: Option<ValueTypeStorageLifetime>,
     retained: &'a dyn InputConstructionOwner,
     temporary: &'a dyn InputConstructionOwner,
     control: Option<&'a dyn novarocks_functions::KernelEvaluationControl>,
@@ -178,6 +171,17 @@ impl UnitObserver for UnitConstruction<'_> {
                 .map_err(|error| ExchangeFailure::Execution(error.into()))?;
         }
         observe_work(self.temporary)
+    }
+    fn before_type_scratch(&mut self, work_upper: usize) -> Result<(), Self::Error> {
+        self.checkpoint()?;
+        self.temporary.observe(
+            0,
+            &[],
+            crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
+                units: work_upper,
+            },
+        )?;
+        Ok(())
     }
     fn before_allocation(&mut self, layout: Layout) -> Result<(), Self::Error> {
         if self.constructing_schema {
@@ -211,28 +215,7 @@ impl UnitObserver for UnitConstruction<'_> {
         self.retained.observe_opaque_upper_bound(
             novarocks_arrow_batch_codec::construction::original_reader_buffer_header_upper_bound()?,
         )?;
-        let storage = self
-            .body_storage
-            .as_ref()
-            .ok_or_else(|| {
-                failure::contract("exchange body decoder has no original storage owner")
-            })?
-            .clone();
-        self.retained
-            .request(Layout::new::<DecodedBodyOwnerLayout>())?;
-        self.retained.request(
-            novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<
-                bytes::Bytes,
-            >())?,
-        )?;
-        self.retained.observe_opaque_upper_bound(
-            novarocks_arrow_batch_codec::construction::original_reader_buffer_header_upper_bound()?,
-        )?;
-        let buffer = arrow::buffer::Buffer::from_slice_ref(body);
-        let output = arrow::buffer::Buffer::from(bytes::Bytes::from_owner(DecodedBody {
-            buffer,
-            _storage: storage,
-        }));
+        let output = arrow::buffer::Buffer::from_slice_ref(body);
         self.checkpoint()?;
         Ok(output)
     }
@@ -253,6 +236,31 @@ impl UnitObserver for UnitConstruction<'_> {
             self.checkpoint()?;
         }
         Ok(())
+    }
+    fn project_carrier(
+        &mut self,
+        ordinal: usize,
+        source: &ArrayRef,
+        target: &DataType,
+    ) -> Result<ArrayRef, Self::Error> {
+        self.constructing_schema = false;
+        self.checkpoint()?;
+        novarocks_functions::array_projection::rebuild_array_observed(
+            source,
+            target,
+            &mut |step: crate::exec::chunk::ArrayNormalizationStep<'_>| {
+                let path = match step {
+                    crate::exec::chunk::ArrayNormalizationStep::RebuildArray { path, .. }
+                    | crate::exec::chunk::ArrayNormalizationStep::ValueStructure { path, .. } => {
+                        path
+                    }
+                    _ => &[],
+                };
+                self.retained
+                    .observe(ordinal, path, step)
+                    .map_err(ExchangeFailure::from)
+            },
+        )
     }
     fn before_encode_batch(
         &mut self,
@@ -348,9 +356,9 @@ impl UnitObserver for UnitConstruction<'_> {
         };
         match kind {
             DecodeKind::Dictionary { id } => {
-                model.dictionary_batch(schema, id, batch, body.as_slice())
+                model.dictionary_batch_with_repair_payload(schema, id, batch, body.as_slice())
             }
-            DecodeKind::RecordBatch => model.record_batch(
+            DecodeKind::RecordBatch => model.record_batch_with_repair_payload(
                 schema,
                 batch,
                 body.as_slice(),
@@ -380,7 +388,6 @@ pub(crate) fn prepare_recipe(
     let mut observer = UnitConstruction {
         schema: owner.as_ref(),
         constructing_schema: true,
-        body_storage: None,
         retained: owner.as_ref(),
         temporary: temporary.as_ref(),
         control: None,
@@ -466,7 +473,6 @@ pub(crate) fn encode(
     let mut observer = UnitConstruction {
         schema: temporary.as_ref(),
         constructing_schema: false,
-        body_storage: None,
         retained: retained.as_ref(),
         temporary: temporary.as_ref(),
         control: Some(control),
@@ -501,22 +507,41 @@ pub(crate) fn decode(
     let retained = factory.begin_typed_construction(expected)?;
     let output = factory.begin_typed_construction(expected)?;
     let temporary = factory.begin_typed_construction(expected)?;
-    let body_storage = retained
-        .storage_lifetime()
-        .retaining_observed(&schema.storage_lifetime(), |layout| {
-            retained.request(layout)
-        })?
-        .retaining_observed(&recipe.storage, |layout| retained.request(layout))?;
     let mut observer = UnitConstruction {
         schema: schema.as_ref(),
         constructing_schema: true,
-        body_storage: Some(body_storage),
         retained: retained.as_ref(),
         temporary: temporary.as_ref(),
         control: None,
     };
     let batch = novarocks_arrow_batch_codec::decode_unit(&recipe.value, bytes, &mut observer)
         .map_err(|error| codec_error(error, failure::ArrowOperation::Decode))?;
+    let body_storage = retained
+        .storage_lifetime()
+        .retaining_observed(&schema.storage_lifetime(), |layout| {
+            retained.request(layout)
+        })?
+        .retaining_observed(&recipe.storage, |layout| retained.request(layout))?;
+    // Adopt every actual decoder-produced array before publication. This
+    // includes newly aligned/synthetic buffers, not only original body slices.
+    output.request(Layout::array::<ArrayRef>(batch.num_columns()).map_err(|_| {
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic
+    })?)?;
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for array in batch.columns() {
+        observe_work(temporary.as_ref())?;
+        columns.push(factory.retain_decoded_source(
+            Arc::clone(array),
+            body_storage.clone(),
+            temporary.as_ref(),
+        )?);
+    }
+    let batch = RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|source| failure::arrow(failure::ArrowOperation::Construct, source))?;
     output.request(
         Layout::array::<SlotId>(expected.slots().len()).map_err(|_| {
             novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic

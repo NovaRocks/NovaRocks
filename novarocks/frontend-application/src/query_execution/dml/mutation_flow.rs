@@ -5532,10 +5532,19 @@ mod tests {
                 .unwrap();
             // The existing fixture is the finite upstream relay input/expected
             // business value, not an arbitrarily adopted FE result backing.
+            let recipe = consumer.recipe_for_fixture();
             let mut totals = CowSelectionTotals::default();
             let mut packet = [0u8; 64];
             for batch in fixture.selection.batches() {
-                let mut encoder = CowSelectionEncoder::try_new(batch, totals, 64 * 1024).unwrap();
+                let batch = arrow::record_batch::RecordBatch::try_new_with_options(
+                    Arc::clone(recipe.schema()),
+                    batch.columns().to_vec(),
+                    &arrow::record_batch::RecordBatchOptions::new()
+                        .with_row_count(Some(batch.num_rows())),
+                )
+                .unwrap();
+                let mut encoder =
+                    CowSelectionEncoder::try_new(&batch, &recipe, totals, 64 * 1024).unwrap();
                 loop {
                     let turn = encoder.step(&mut packet);
                     consumer.push_body(&packet[..turn.emitted_bytes]).unwrap();

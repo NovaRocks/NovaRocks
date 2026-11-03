@@ -443,7 +443,7 @@ pub(super) fn preflight<W: ResourceWork>(
     // the same flat walker vec![(&DataType,1)] with no children. Prefix
     // admission and its actual lifetime remain separately owned by the host.
     if !work.parent() {
-        requests.exact_vec::<(&DataType, usize), _>(1, 5, work)?;
+        requests.exact_vec::<novarocks_type_contract::TypeTraversalFrame<'_>, _>(1, 5, work)?;
     }
     let before_constant_owner = requests.bytes;
     if !matches!(flat, FlatLayout::Null) {

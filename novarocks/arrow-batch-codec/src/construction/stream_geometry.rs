@@ -36,8 +36,8 @@ use arrow_array::{
 use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field, Schema};
 use novarocks_type_contract::{
-    MAX_VALUE_TYPE_NODES, ValueSchemaCreation, ValueTypeError, ValueTypeVisit,
-    validate_arrow_layout_structure_with_scratch_observed,
+    ArrowTypeProfile, MAX_VALUE_TYPE_NODES, ValueSchemaCreation, ValueTypeError, ValueTypeVisit,
+    validate_arrow_layout_structure_with_profile_and_scratch_observed,
 };
 use std::alloc::Layout;
 
@@ -124,6 +124,7 @@ pub struct IpcStreamSchemaFacts<'a> {
     source: &'a Schema,
     fields: usize,
     dictionaries: usize,
+    profile: ArrowTypeProfile,
 }
 #[derive(Default)]
 struct Counts {
@@ -169,6 +170,7 @@ impl Counts {
 
 fn declaration_counts<H, W: ConstructionWork + ?Sized>(
     schema: &Schema,
+    profile: ArrowTypeProfile,
     work: &mut W,
 ) -> Result<Counts, IpcConstructionError<H, W::Error>> {
     if !schema.metadata().is_empty() {
@@ -184,19 +186,17 @@ fn declaration_counts<H, W: ConstructionWork + ?Sized>(
         work.flush().map_err(IpcConstructionError::Control)?;
         let mut scratch = [None; MAX_VALUE_TYPE_NODES];
         work.flush().map_err(IpcConstructionError::Control)?;
-        validate_arrow_layout_structure_with_scratch_observed::<IpcConstructionError<H, W::Error>>(
-            field.data_type(),
-            &mut scratch,
-            |visit| {
-                work.step().map_err(IpcConstructionError::Control)?;
-                match visit {
-                    ValueTypeVisit::Field(field) => counts.field(field)?,
-                    ValueTypeVisit::TypeNode(ty) => counts.ty(ty)?,
-                    _ => {}
-                }
-                Ok(())
-            },
-        )?;
+        validate_arrow_layout_structure_with_profile_and_scratch_observed::<
+            IpcConstructionError<H, W::Error>,
+        >(field.data_type(), profile, &mut scratch, |visit| {
+            work.step().map_err(IpcConstructionError::Control)?;
+            match visit {
+                ValueTypeVisit::Field(field) => counts.field(field)?,
+                ValueTypeVisit::TypeNode(ty) => counts.ty(ty)?,
+                _ => {}
+            }
+            Ok(())
+        })?;
     }
     Ok(counts)
 }
@@ -207,11 +207,12 @@ pub fn observe_unit_writer_declaration<'a, H, W: ConstructionWork + ?Sized>(
     schema: &'a Schema,
     work: &mut W,
 ) -> Result<IpcStreamSchemaFacts<'a>, IpcConstructionError<H, W::Error>> {
-    let counts = declaration_counts::<H, W>(schema, work)?;
+    let counts = declaration_counts::<H, W>(schema, ArrowTypeProfile::Value, work)?;
     Ok(IpcStreamSchemaFacts {
         source: schema,
         fields: counts.fields,
         dictionaries: counts.dictionaries,
+        profile: ArrowTypeProfile::Value,
     })
 }
 
@@ -232,7 +233,7 @@ pub fn observe_stream_writer_schema_construction<'a, H, W: ConstructionWork + ?S
     creation: &mut ValueSchemaCreation<'_, H>,
     work: &mut W,
 ) -> Result<IpcStreamSchemaFacts<'a>, IpcConstructionError<H, W::Error>> {
-    let counts = declaration_counts::<H, W>(schema, work)?;
+    let counts = declaration_counts::<H, W>(schema, ArrowTypeProfile::Physical, work)?;
     let backing = schema_backing_upper_bound(
         counts.fields,
         counts.types,
@@ -291,6 +292,7 @@ pub fn observe_stream_writer_schema_construction<'a, H, W: ConstructionWork + ?S
         source: schema,
         fields: counts.fields,
         dictionaries: counts.dictionaries,
+        profile: ArrowTypeProfile::Physical,
     })
 }
 
@@ -356,16 +358,40 @@ fn concrete<T: 'static>(array: &dyn Array) -> Result<&T, IpcGeometryError> {
         .ok_or(IpcGeometryError::SourceModel)
 }
 
+#[derive(Clone, Copy)]
+struct PhysicalWalkDepth {
+    current: usize,
+    profile: ArrowTypeProfile,
+}
+impl PhysicalWalkDepth {
+    fn root(profile: ArrowTypeProfile) -> Self {
+        Self {
+            current: 1,
+            profile,
+        }
+    }
+    fn child(self) -> Self {
+        Self {
+            current: self.current + 1,
+            profile: self.profile,
+        }
+    }
+    fn exceeded(self) -> bool {
+        self.profile
+            .physical_depth_limit()
+            .is_some_and(|limit| self.current > limit)
+    }
+}
 fn window<H, W: ConstructionWork + ?Sized>(
     array: &dyn Array,
     start: usize,
     rows: usize,
     body: &mut Body,
     work: &mut W,
-    depth: usize,
+    depth: PhysicalWalkDepth,
 ) -> Result<(), IpcConstructionError<H, W::Error>> {
     work.step().map_err(IpcConstructionError::Control)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH || add(start, rows)? > array.len() {
+    if depth.exceeded() || add(start, rows)? > array.len() {
         return Err(IpcGeometryError::SourceModel.into());
     }
     body.nodes = add(body.nodes, 1)?;
@@ -440,7 +466,7 @@ fn window<H, W: ConstructionWork + ?Sized>(
                 if rows == 0 { 0 } else { child.len() },
                 body,
                 work,
-                depth + 1,
+                depth.child(),
             )?;
         }
         DataType::Union(fields, mode) => {
@@ -470,7 +496,7 @@ fn window<H, W: ConstructionWork + ?Sized>(
                             .map_err(IpcConstructionError::Control)?,
                     )?;
                 }
-                window::<H, W>(child.as_ref(), 0, child.len(), body, work, depth + 1)?;
+                window::<H, W>(child.as_ref(), 0, child.len(), body, work, depth.child())?;
             }
         }
         DataType::RunEndEncoded(ends, _) => {
@@ -503,7 +529,14 @@ fn window<H, W: ConstructionWork + ?Sized>(
                     if start != 0 || run.offset() != 0 || rows != run.run_ends().max_value() {
                         body.scratch = add(body.scratch, align(mul(count, $width)?)?)?;
                     }
-                    window::<H, W>(run.values().as_ref(), first, count, body, work, depth + 1)?;
+                    window::<H, W>(
+                        run.values().as_ref(),
+                        first,
+                        count,
+                        body,
+                        work,
+                        depth.child(),
+                    )?;
                 }};
             }
             match ends.data_type() {
@@ -523,7 +556,7 @@ fn window<H, W: ConstructionWork + ?Sized>(
                 if rows == 0 { 0 } else { count },
                 body,
                 work,
-                depth + 1,
+                depth.child(),
             )?;
         }
         DataType::LargeList(_) => {
@@ -536,7 +569,7 @@ fn window<H, W: ConstructionWork + ?Sized>(
                 if rows == 0 { 0 } else { count },
                 body,
                 work,
-                depth + 1,
+                depth.child(),
             )?;
         }
         DataType::Map(_, _) => {
@@ -549,7 +582,7 @@ fn window<H, W: ConstructionWork + ?Sized>(
                 if rows == 0 { 0 } else { count },
                 body,
                 work,
-                depth + 1,
+                depth.child(),
             )?;
         }
         DataType::FixedSizeList(_, width) => {
@@ -561,12 +594,12 @@ fn window<H, W: ConstructionWork + ?Sized>(
                 mul(rows, width)?,
                 body,
                 work,
-                depth + 1,
+                depth.child(),
             )?;
         }
         DataType::Struct(_) => {
             for child in concrete::<StructArray>(array)?.columns() {
-                window::<H, W>(child.as_ref(), start, rows, body, work, depth + 1)?;
+                window::<H, W>(child.as_ref(), start, rows, body, work, depth.child())?;
             }
         }
         DataType::Dictionary(keys, values)
@@ -662,10 +695,10 @@ fn dictionary_messages<H, W: ConstructionWork + ?Sized>(
     array: &dyn Array,
     requests: &mut SchemaRequestAccumulator,
     work: &mut W,
-    depth: usize,
+    depth: PhysicalWalkDepth,
 ) -> Result<(), IpcConstructionError<H, W::Error>> {
     work.step().map_err(IpcConstructionError::Control)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+    if depth.exceeded() {
         return Err(IpcGeometryError::SourceModel.into());
     }
     match array.data_type() {
@@ -692,20 +725,27 @@ fn dictionary_messages<H, W: ConstructionWork + ?Sized>(
                 requests.bytes = add(requests.bytes, metadata)?;
             }
             let mut body = Body::default();
-            window::<H, W>(values.as_ref(), 0, values.len(), &mut body, work, depth + 1)?;
+            window::<H, W>(
+                values.as_ref(),
+                0,
+                values.len(),
+                &mut body,
+                work,
+                depth.child(),
+            )?;
             message_upper(&body, true, requests, work)?;
         }
         DataType::List(_) => dictionary_messages::<H, W>(
             concrete::<ListArray>(array)?.values().as_ref(),
             requests,
             work,
-            depth + 1,
+            depth.child(),
         )?,
         DataType::LargeList(_) => dictionary_messages::<H, W>(
             concrete::<LargeListArray>(array)?.values().as_ref(),
             requests,
             work,
-            depth + 1,
+            depth.child(),
         )?,
         DataType::RunEndEncoded(ends, _) => {
             macro_rules! runs {
@@ -717,7 +757,12 @@ fn dictionary_messages<H, W: ConstructionWork + ?Sized>(
                         .source_metadata_bytes(array)
                         .map_err(IpcConstructionError::Control)?;
                     requests.bytes = add(requests.bytes, metadata)?;
-                    dictionary_messages::<H, W>(run.values().as_ref(), requests, work, depth + 1)?;
+                    dictionary_messages::<H, W>(
+                        run.values().as_ref(),
+                        requests,
+                        work,
+                        depth.child(),
+                    )?;
                 }};
             }
             match ends.data_type() {
@@ -731,36 +776,41 @@ fn dictionary_messages<H, W: ConstructionWork + ?Sized>(
             concrete::<ListViewArray>(array)?.values().as_ref(),
             requests,
             work,
-            depth + 1,
+            depth.child(),
         )?,
         DataType::LargeListView(_) => dictionary_messages::<H, W>(
             concrete::<LargeListViewArray>(array)?.values().as_ref(),
             requests,
             work,
-            depth + 1,
+            depth.child(),
         )?,
         DataType::Union(fields, _) => {
             let union = concrete::<UnionArray>(array)?;
             for (id, _) in fields.iter() {
                 work.step().map_err(IpcConstructionError::Control)?;
-                dictionary_messages::<H, W>(union.child(id).as_ref(), requests, work, depth + 1)?;
+                dictionary_messages::<H, W>(
+                    union.child(id).as_ref(),
+                    requests,
+                    work,
+                    depth.child(),
+                )?;
             }
         }
         DataType::FixedSizeList(_, _) => dictionary_messages::<H, W>(
             concrete::<FixedSizeListArray>(array)?.values().as_ref(),
             requests,
             work,
-            depth + 1,
+            depth.child(),
         )?,
         DataType::Map(_, _) => dictionary_messages::<H, W>(
             concrete::<MapArray>(array)?.entries(),
             requests,
             work,
-            depth + 1,
+            depth.child(),
         )?,
         DataType::Struct(_) => {
             for child in concrete::<StructArray>(array)?.columns() {
-                dictionary_messages::<H, W>(child.as_ref(), requests, work, depth + 1)?;
+                dictionary_messages::<H, W>(child.as_ref(), requests, work, depth.child())?;
             }
         }
         _ => {}
@@ -838,8 +888,20 @@ pub fn observe_stream_writer_batch_construction<'a, H, W: ConstructionWork + ?Si
         source_buffer_slots = add(source_buffer_slots, slots)?;
         to_data_metadata_upper = add(to_data_metadata_upper, metadata)?;
         requests.bytes = add(requests.bytes, metadata)?;
-        window::<H, W>(array.as_ref(), 0, array.len(), &mut body, work, 0)?;
-        dictionary_messages::<H, W>(array.as_ref(), &mut requests, work, 0)?;
+        window::<H, W>(
+            array.as_ref(),
+            0,
+            array.len(),
+            &mut body,
+            work,
+            PhysicalWalkDepth::root(schema.profile),
+        )?;
+        dictionary_messages::<H, W>(
+            array.as_ref(),
+            &mut requests,
+            work,
+            PhysicalWalkDepth::root(schema.profile),
+        )?;
     }
     // estimate_encoded_buffer_count reserves from the batch type. Its
     // ByteView estimate is three even for zero external regions; one extra

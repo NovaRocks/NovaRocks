@@ -98,9 +98,10 @@ impl<'a> CompiledInputLoan<'a> {
                         declared.slots()[original].typed_binding().borrowed(),
                         || control.checkpoint(1),
                     )?
-                || !novarocks_type_contract::arrow_fields_exact_observed(
-                    actual.field(physical),
+                || !novarocks_type_contract::arrow_fields_exact_with_nullability_observed(
                     frozen.field(original),
+                    actual.field(physical),
+                    novarocks_type_contract::CarrierNullabilityPolicy::Permissive,
                     || control.checkpoint(1),
                 )?
             {

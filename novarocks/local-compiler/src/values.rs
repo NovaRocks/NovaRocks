@@ -42,7 +42,7 @@ use novarocks_physical_plan::{
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ExpressionUseId, PureCompileControl,
     ValueTypeVisit, validate_arrow_carrier_parameters_observed,
-    validate_value_type_structure_observed,
+    validate_value_type_structure_with_profile_observed,
 };
 use novarocks_types::SlotId;
 use std::{collections::BTreeSet, sync::Arc};
@@ -295,9 +295,11 @@ fn lower_core_with_creation<H>(
                 Cell::Constant(_) => constant_cells[ordinal] += 1,
                 Cell::Dynamic(definition) => {
                     work.flush()?;
-                    selected_copy::values_copy_kind_observed(output.ty.data_type(), || {
-                        CompileCopyControl(work.control()).checkpoint(1)
-                    })
+                    selected_copy::values_copy_kind_for_layout_observed(
+                        output.ty.typed_binding().layout(),
+                        output.ty.data_type(),
+                        || CompileCopyControl(work.control()).checkpoint(1),
+                    )
                     .map_err(|cause| copy_error(cause, node.id))?;
                     work.flush()?;
                     if dynamic.len() == dynamic.capacity() {
@@ -330,8 +332,9 @@ fn lower_core_with_creation<H>(
             .ok_or(FragmentCompileError::Invalid("missing Values output type"))?
             .ty;
         work.flush()?;
-        validate_value_type_structure_observed::<crate::FragmentCreationError<H>>(
+        validate_value_type_structure_with_profile_observed::<crate::FragmentCreationError<H>>(
             ty.data_type(),
+            novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
             |visit| {
                 if let ValueTypeVisit::TypeNode(data_type) = visit {
                     validate_arrow_carrier_parameters_observed::<ConstantError>(data_type, || {
@@ -463,13 +466,16 @@ fn lower_core_with_creation<H>(
                 copied
             } else {
                 work.flush()?;
-                match selected_copy::values_copy_kind_observed(ty.data_type(), || {
-                    CompileCopyControl(work.control()).checkpoint(1)
-                })
+                match selected_copy::values_copy_kind_for_layout_observed(
+                    ty.typed_binding().layout(),
+                    ty.data_type(),
+                    || CompileCopyControl(work.control()).checkpoint(1),
+                )
                 .map_err(|cause| copy_error(cause, node.id))?
                 {
                     selected_copy::ValuesCopyKind::Interleave => {
-                        selected_copy::preflight_interleave_construction(
+                        selected_copy::preflight_interleave_for_layout_construction(
+                            ty.typed_binding().layout(),
                             ty.data_type(),
                             &sources,
                             &choices,
@@ -493,7 +499,8 @@ fn lower_core_with_creation<H>(
                     }
                     selected_copy::ValuesCopyKind::Extend => {
                         work.flush()?;
-                        let copied = selected_copy::copy_nested_values_construction(
+                        let copied = selected_copy::copy_nested_values_for_layout_construction(
+                            ty.typed_binding().layout(),
                             &sources,
                             &choices,
                             creation,

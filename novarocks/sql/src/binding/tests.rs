@@ -345,3 +345,52 @@ fn c16_p1_scalar_invocation_data_is_part_of_observed_binding_without_abi_admissi
     .unwrap();
     assert_eq!(positive_count, count + 1);
 }
+
+#[test]
+fn typed_map64_binding_fingerprint_preserves_real_map_aggregate_selection() {
+    fn input(mut leaf: DataType) -> DataType {
+        for _ in 0..62 {
+            leaf = DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", DataType::Int32, false)),
+                            Arc::new(Field::new("value", leaf, false)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            );
+        }
+        leaf
+    }
+    let select = |leaf| {
+        crate::functions::test_resolved_aggregate("map_agg", &[DataType::Int32, input(leaf)], false)
+    };
+    let binding = select(DataType::Int64);
+    let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
+        panic!("map aggregate scalar result")
+    };
+    assert_eq!(result.value_type().depth(), 64);
+    let original = binding
+        .fingerprint_observed(CompilePhase::Validate, &control())
+        .unwrap();
+    assert_eq!(
+        original,
+        select(DataType::Int64)
+            .fingerprint_observed(CompilePhase::Validate, &control())
+            .unwrap()
+    );
+    assert!(exact(&binding, &binding.clone()));
+    let different = select(DataType::Int32);
+    assert_ne!(
+        original,
+        different
+            .fingerprint_observed(CompilePhase::Validate, &control())
+            .unwrap()
+    );
+    assert!(!exact(&binding, &different));
+}

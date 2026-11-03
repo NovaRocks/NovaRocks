@@ -1531,9 +1531,15 @@ fn materialize_chunk_for_wire_meta(
                 )
             },
         )?;
-        if !novarocks_type_contract::value_layout_matches_carrier_observed(
+        let nullability = if carrier_contract == DecodeCarrierContract::Exchange {
+            novarocks_type_contract::CarrierNullabilityPolicy::Permissive
+        } else {
+            novarocks_type_contract::CarrierNullabilityPolicy::Exact
+        };
+        if !novarocks_type_contract::value_layout_matches_carrier_with_nullability_observed(
             expected_slot.typed_binding().layout(),
             source.data_type(),
+            nullability,
             |units| creation.work(units),
         )? {
             return Err(exchange_contract(format_args!(
@@ -1553,6 +1559,10 @@ fn materialize_chunk_for_wire_meta(
             // A real IPC occurrence publishes its own dictionary descriptor.
             // It never borrows an ID/order fact from the receiver's value type.
             let original = source_schema.field(ordinal);
+            // Root Field NULL metadata belongs to the frozen output. Arrays
+            // keep their canonical permissive nested types; typed ingress
+            // separately checks actual NULLs against the complete binding.
+            let nullable = expected_slot.nullable();
             creation.observe(
                 ordinal,
                 crate::exec::chunk::ArrayNormalizationStep::RebuildField {
@@ -1566,7 +1576,7 @@ fn materialize_chunk_for_wire_meta(
                 arrow::datatypes::Field::new_dict(
                     expected_slot.name(),
                     array.data_type().clone(),
-                    expected_slot.nullable(),
+                    nullable,
                     original.dict_id().ok_or_else(|| {
                         exchange_contract("exchange dictionary occurrence ID is missing")
                     })?,
@@ -1578,7 +1588,7 @@ fn materialize_chunk_for_wire_meta(
                 arrow::datatypes::Field::new(
                     expected_slot.name(),
                     array.data_type().clone(),
-                    expected_slot.nullable(),
+                    nullable,
                 )
             };
             reuses_prepared = false;

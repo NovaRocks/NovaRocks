@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::optimizer::scalar::ColumnId;
 use arrow::datatypes::Field;
 use std::sync::{Arc, Mutex};
 
@@ -572,4 +573,83 @@ fn actual_long_bytes_and_child_fanout_observe_256_and_keep_primary_control() {
             );
         }
     }
+}
+
+fn map64_carrier(mut leaf: DataType) -> DataType {
+    for _ in 0..63 {
+        leaf = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Int32, false)),
+                        Arc::new(Field::new("value", leaf, false)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+    }
+    leaf
+}
+
+#[test]
+fn typed_map64_interning_and_cast_target_collisions_keep_logical_depth() {
+    let value = FunctionValueType::new(map64_carrier(DataType::Int64), false);
+    assert_eq!(value.value_type().depth(), 64);
+    assert!(
+        novarocks_type_contract::arrow_data_type_fingerprint_observed::<
+            novarocks_type_contract::ValueTypeError,
+        >(value.data_type(), &mut || Ok(()))
+        .is_err(),
+        "raw physical policy stays separate"
+    );
+    let mut arena = ScalarArena::new();
+    let first = arena
+        .intern_observed(
+            ScalarNode::ColumnRef(ColumnId(7)),
+            value.clone(),
+            &Control::good(),
+        )
+        .unwrap();
+    assert_eq!(
+        first,
+        arena
+            .intern_observed(
+                ScalarNode::ColumnRef(ColumnId(7)),
+                value.clone(),
+                &Control::good()
+            )
+            .unwrap()
+    );
+    let cast = || ScalarNode::Cast {
+        child: first,
+        target: value.data_type().clone(),
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    };
+    let cast_id = arena
+        .intern_observed(cast(), value.clone(), &Control::good())
+        .unwrap();
+    assert_eq!(
+        cast_id,
+        arena
+            .intern_observed(cast(), value.clone(), &Control::good())
+            .unwrap()
+    );
+    let before = publication(&arena);
+    assert!(matches!(
+        arena.intern_observed(
+            cast(),
+            value,
+            &Control::new(Refusal::Positive, CompileControlError::Cancelled)
+        ),
+        Err(SqlCompileError::Cancelled)
+    ));
+    assert_eq!(
+        before,
+        publication(&arena),
+        "cancelled typed traversal must not publish an arena node"
+    );
 }

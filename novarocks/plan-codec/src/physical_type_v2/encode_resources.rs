@@ -262,7 +262,10 @@ impl Model {
     /// requests and <=4N cumulative tuples. This is the receiver's per-root
     /// summary bound, never the 4096-node per-type maximum.
     pub(super) fn strict_nodes(&mut self, count: usize) -> Result<(), E> {
-        self.request(array::<(&DataType, usize)>(4)?, count)?;
+        self.request(
+            array::<novarocks_type_contract::TypeTraversalFrame<'_>>(4)?,
+            count,
+        )?;
         self.work = add(self.work, mul(count, self.strict_node_work)?)?;
         Ok(())
     }
@@ -529,7 +532,7 @@ mod tests {
         let mut strict = Model::new(4096, 2, 3, 2, 4, limits()).unwrap();
         strict.strict_nodes(5).unwrap();
         let nodes = facts(&strict);
-        let tuple = std::mem::size_of::<(&DataType, usize)>();
+        let tuple = std::mem::size_of::<novarocks_type_contract::TypeTraversalFrame<'_>>();
         assert_eq!(
             nodes.allocation_requests_upper_bound - actual.allocation_requests_upper_bound,
             5
@@ -548,13 +551,13 @@ mod tests {
     /// and the cumulative requested tuples at the moment each growth happens.
     #[test]
     fn strict_node_charge_covers_the_real_validator_vec_growth() {
-        let tuple = std::mem::size_of::<(&DataType, usize)>();
+        let tuple = std::mem::size_of::<novarocks_type_contract::TypeTraversalFrame<'_>>();
         let ty = DataType::Int64;
-        let mut stack = vec![(&ty, 1usize)];
+        let mut stack = vec![novarocks_type_contract::TypeTraversalFrame::root(&ty)];
         let (mut requests, mut tuples) = (1usize, stack.capacity());
         for pushes in 1..=MAX_VALUE_TYPE_NODES - 1 {
             let before = stack.capacity();
-            stack.push((&ty, pushes));
+            stack.push(novarocks_type_contract::TypeTraversalFrame::root(&ty));
             if stack.capacity() != before {
                 requests += 1;
                 tuples += stack.capacity();
@@ -580,7 +583,7 @@ mod tests {
     /// still carry their original iterator bound.
     #[test]
     fn strict_nodes_keep_original_stack_upper_and_only_actual_source_maps_scale_with_invoice() {
-        let tuple = std::mem::size_of::<(&DataType, usize)>();
+        let tuple = std::mem::size_of::<novarocks_type_contract::TypeTraversalFrame<'_>>();
         let mut low = Model::new(1024, 1, 0, 0, 0, limits()).unwrap();
         let mut high = Model::new(4096, 1, 0, 0, 0, limits()).unwrap();
         let (low_base, high_base) = (facts(&low), facts(&high));

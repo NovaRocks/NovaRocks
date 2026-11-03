@@ -92,8 +92,24 @@ fn frozen_test_output(schema: &ChunkSchema) -> novarocks_local_program::StaticLa
             Ok(())
         }
     }
+    // Static output is the canonical projection of the frozen complete
+    // binding. Runtime Field carriers (for example Dictionary) stay on the
+    // actual input Chunk and cannot become ValueLayout projection authority.
+    let fields = schema
+        .slots()
+        .iter()
+        .map(|slot| {
+            let binding = slot.typed_binding();
+            Arc::new(Field::new(
+                slot.name(),
+                binding.layout().data_type().clone(),
+                binding.nullable(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let frozen_schema = Arc::new(Schema::new(fields));
     novarocks_local_program::StaticLayout::try_new_typed_for_compile(
-        schema.arrow_schema_ref(),
+        frozen_schema,
         schema
             .slots()
             .iter()
@@ -1984,6 +2000,27 @@ mod conditional_compiled_selection {
             )
             .unwrap(),
         );
+        compile_checked(
+            package,
+            ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        )
+    }
+
+    pub(super) fn compile_checked(
+        package: Arc<FragmentPackage>,
+        constants: ConstantPolicy,
+    ) -> Arc<LocalProgram> {
         let providers =
             PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
                 .unwrap();
@@ -2024,18 +2061,7 @@ mod conditional_compiled_selection {
                     pipeline_dop: NonZeroUsize::MIN,
                     root_sink_dop: Some(NonZeroUsize::MIN),
                     kernel_abi: KernelAbiVersion::CURRENT,
-                    constants: ConstantPolicy {
-                        max_rows: 16,
-                        max_array_nodes: 128,
-                        max_logical_elements: 1024,
-                        max_retained_buffer_bytes: 1 << 20,
-                        max_type_depth: 64,
-                        max_type_nodes: 4096,
-                        max_dictionary_depth: 64,
-                        max_metadata_bytes: 1 << 20,
-                        max_library_validation_work: 1 << 20,
-                        max_library_validation_bytes: 1 << 20,
-                    },
+                    constants,
                 },
                 &FixtureControl,
             )
@@ -2467,3 +2493,6 @@ fn required_withdrawal_cannot_skip_parked_payload_or_end_even_after_earlier_poll
         }
     }
 }
+
+#[path = "worker_stack_tests.rs"]
+mod worker_stack_tests;

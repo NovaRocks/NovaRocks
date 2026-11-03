@@ -1387,3 +1387,51 @@ fn every_channel_quote_preserves_first_caller_payload_and_original_type_failure(
         ))
     ));
 }
+
+#[test]
+fn canonical_map64_carrier_consistency_keeps_type_and_control_refusals() {
+    let map = |mut data_type: DataType| {
+        for _ in 1..64 {
+            data_type = DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", DataType::Int32, false)),
+                            Arc::new(Field::new("value", data_type, false)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            );
+        }
+        data_type
+    };
+    let left = map(DataType::Utf8);
+    let right = map(DataType::LargeUtf8);
+    let good = Control::default();
+    let mut work = CompileCheckpoints::try_new(&good, CompilePhase::LowerProgram).unwrap();
+    same_carrier(&left, &left, &mut work).unwrap();
+    assert_eq!(
+        same_carrier(&left, &right, &mut work),
+        Err(ProgramChannelTypeError::TypeMismatch)
+    );
+    work.finish().unwrap();
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let control = Control {
+            failure: Some((256, cause.clone())),
+            ..Control::default()
+        };
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        assert_eq!(
+            same_carrier(&left, &left, &mut work),
+            Err(ProgramChannelTypeError::Control(cause))
+        );
+    }
+}

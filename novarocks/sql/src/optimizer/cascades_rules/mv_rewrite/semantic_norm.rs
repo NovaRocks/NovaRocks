@@ -287,9 +287,12 @@ fn normalize_inner(
             target,
             decimal_overflow_policy,
         } => {
-            if !novarocks_type_contract::arrow_data_types_exact_observed::<ConstantError>(
+            if !novarocks_type_contract::arrow_data_types_exact_with_profile_observed::<
+                ConstantError,
+            >(
                 target,
                 value_type.data_type(),
+                novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
                 || work.step().map_err(Into::into),
             )? {
                 return Ok(None);
@@ -439,8 +442,9 @@ fn fingerprint(
     hash.write_u8(ty.logical_type() as u8);
     hash.write_u8(u8::from(ty.nullable()));
     hash.write_u64(
-        novarocks_type_contract::arrow_data_type_fingerprint_observed::<ConstantError>(
+        novarocks_type_contract::arrow_data_type_fingerprint_with_profile_observed::<ConstantError>(
             ty.data_type(),
+            novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
             &mut || work.step().map_err(Into::into),
         )?,
     );

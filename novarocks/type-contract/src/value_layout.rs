@@ -25,8 +25,8 @@ use std::{
 use arrow_schema::{DataType, Field, Fields, UnionFields};
 
 use crate::{
-    MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, MAX_VALUE_TYPE_DEPTH,
-    MAX_VALUE_TYPE_NODES,
+    ArrowTypeDepth, ArrowTypeProfile, MAX_ARROW_FIELD_NAME_BYTES,
+    MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, MAX_VALUE_TYPE_NODES,
     value_type::{ExecutionValueTypeError, ValueTypeStorageLifetime},
 };
 
@@ -82,7 +82,7 @@ impl ValueLayout {
         storage: ValueTypeStorageLifetime,
         observer: Option<&mut dyn FnMut(crate::ValueConstructionRequest) -> Result<(), E>>,
     ) -> Result<Self, crate::ValueConstructionFailure<E>> {
-        preflight(data_type, 1, &mut 0)?;
+        preflight(data_type, ArrowTypeDepth::ROOT, &mut 0)?;
         let mut construction = crate::value_construction::ValueConstruction::new(observer);
         let mut comparison_work = 0;
         let data_type = normalize(data_type, &mut comparison_work, &mut construction)?;
@@ -113,7 +113,8 @@ impl ValueLayout {
         storage: ValueTypeStorageLifetime,
         mut observe: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Self, E> {
-        let comparison_work = preflight_observed(&data_type, 1, &mut 0, true, &mut observe)?;
+        let comparison_work =
+            preflight_observed(&data_type, ArrowTypeDepth::ROOT, &mut 0, true, &mut observe)?;
         Ok(Self(Arc::new(LayoutStorage {
             data_type,
             comparison_work,
@@ -134,7 +135,8 @@ impl ValueLayout {
         storage: ValueTypeStorageLifetime,
         mut observe: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Self, E> {
-        let comparison_work = preflight_observed(&data_type, 1, &mut 0, true, &mut observe)?;
+        let comparison_work =
+            preflight_observed(&data_type, ArrowTypeDepth::ROOT, &mut 0, true, &mut observe)?;
         for (index, child) in children.iter().enumerate() {
             observe(1)?;
             let actual = normalized_child_type_at(&data_type, index).ok_or_else(|| {
@@ -226,7 +228,7 @@ impl ValueLayout {
         projection: &DataType,
         mut observe: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<bool, E> {
-        preflight_observed(projection, 1, &mut 0, true, &mut observe)?;
+        preflight_observed(projection, ArrowTypeDepth::ROOT, &mut 0, true, &mut observe)?;
         crate::schema::arrow_validated_data_types_exact_observed(
             self.data_type(),
             projection,
@@ -257,9 +259,11 @@ impl ValueLayout {
         let Some(data_type) = self.child_data_type(index) else {
             return Ok(None);
         };
-        let Ok(comparison_work) = preflight_observed(data_type, 1, &mut 0, true, &mut |_| {
-            Ok::<_, ExecutionValueTypeError>(())
-        }) else {
+        let Ok(comparison_work) =
+            preflight_observed(data_type, ArrowTypeDepth::ROOT, &mut 0, true, &mut |_| {
+                Ok::<_, ExecutionValueTypeError>(())
+            })
+        else {
             return Ok(None);
         };
         let mut creation = crate::value_construction::ValueConstruction::new(observer);
@@ -298,7 +302,7 @@ impl ValueLayout {
         // publishing that holder; hot binding replay then reads its cache.
         let comparison_work = preflight_observed::<LayoutProfileFailure<E>>(
             data_type,
-            1,
+            ArrowTypeDepth::ROOT,
             &mut 0,
             true,
             &mut |units| work(units).map_err(LayoutProfileFailure::Caller),
@@ -378,7 +382,7 @@ impl<E> From<crate::CarrierParameterError> for LayoutParameterFailure<E> {
 }
 fn preflight(
     data_type: &DataType,
-    depth: usize,
+    depth: ArrowTypeDepth,
     nodes: &mut usize,
 ) -> Result<(), ExecutionValueTypeError> {
     preflight_observed(data_type, depth, nodes, false, &mut |_| Ok(())).map(|_| ())
@@ -387,7 +391,7 @@ fn preflight_field<E: From<ExecutionValueTypeError>>(
     field: &Field,
     role: Option<&str>,
     named: bool,
-    depth: usize,
+    depth: ArrowTypeDepth,
     nodes: &mut usize,
     normalized: bool,
     observe: &mut impl FnMut(usize) -> Result<(), E>,
@@ -437,15 +441,22 @@ fn preflight_field<E: From<ExecutionValueTypeError>>(
 }
 fn preflight_observed<E: From<ExecutionValueTypeError>>(
     data_type: &DataType,
-    depth: usize,
+    depth: ArrowTypeDepth,
     nodes: &mut usize,
     normalized: bool,
     observe: &mut impl FnMut(usize) -> Result<(), E>,
 ) -> Result<usize, E> {
     observe(1)?;
-    if depth > MAX_VALUE_TYPE_DEPTH {
-        return Err(ExecutionValueTypeError::Depth.into());
-    }
+    depth
+        .check(if normalized {
+            ArrowTypeProfile::CanonicalValue
+        } else {
+            ArrowTypeProfile::Value
+        })
+        .map_err(|_| E::from(ExecutionValueTypeError::Depth))?;
+    // Preserve the existing source/layout occurrence budget. This counts
+    // physical DataTypes, including Map entries, independently of logical
+    // depth; changing that inherited policy belongs to its type owner.
     *nodes = nodes
         .checked_add(1)
         .ok_or_else(|| E::from(ExecutionValueTypeError::Nodes))?;
@@ -467,7 +478,15 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
     })?;
     let child =
         |field: &Field, role: Option<&str>, named: bool, nodes: &mut usize, observe: &mut _| {
-            preflight_field(field, role, named, depth + 1, nodes, normalized, observe)
+            preflight_field(
+                field,
+                role,
+                named,
+                depth.value_child().map_err(ExecutionValueTypeError::from)?,
+                nodes,
+                normalized,
+                observe,
+            )
         };
     let mut comparison_work = crate::schema::type_comparison_node_work(data_type)?;
     match data_type {
@@ -518,10 +537,14 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
                 }
             }
             observe(1)?;
-            let entries_depth = depth + 1;
-            if entries_depth > MAX_VALUE_TYPE_DEPTH {
-                return Err(ExecutionValueTypeError::Depth.into());
-            }
+            let entries_depth = depth.map_entries().map_err(ExecutionValueTypeError::from)?;
+            entries_depth
+                .check(if normalized {
+                    ArrowTypeProfile::CanonicalValue
+                } else {
+                    ArrowTypeProfile::Value
+                })
+                .map_err(|_| E::from(ExecutionValueTypeError::Depth))?;
             *nodes = nodes
                 .checked_add(1)
                 .ok_or_else(|| E::from(ExecutionValueTypeError::Nodes))?;
@@ -545,7 +568,9 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
                     &fields[0],
                     Some("key"),
                     false,
-                    depth + 2,
+                    entries_depth
+                        .value_child()
+                        .map_err(ExecutionValueTypeError::from)?,
                     nodes,
                     normalized,
                     observe,
@@ -557,7 +582,9 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
                     &fields[1],
                     Some("value"),
                     false,
-                    depth + 2,
+                    entries_depth
+                        .value_child()
+                        .map_err(ExecutionValueTypeError::from)?,
                     nodes,
                     normalized,
                     observe,
@@ -581,11 +608,27 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
             }
             comparison_work = crate::schema::comparison_work_add(
                 comparison_work,
-                preflight_observed(keys, depth + 1, nodes, normalized, observe)?,
+                preflight_observed(
+                    keys,
+                    depth
+                        .encoding_child()
+                        .map_err(ExecutionValueTypeError::from)?,
+                    nodes,
+                    normalized,
+                    observe,
+                )?,
             )?;
             comparison_work = crate::schema::comparison_work_add(
                 comparison_work,
-                preflight_observed(values, depth + 1, nodes, normalized, observe)?,
+                preflight_observed(
+                    values,
+                    depth
+                        .encoding_child()
+                        .map_err(ExecutionValueTypeError::from)?,
+                    nodes,
+                    normalized,
+                    observe,
+                )?,
             )?;
         }
         DataType::RunEndEncoded(ends, values) => {
@@ -597,11 +640,31 @@ fn preflight_observed<E: From<ExecutionValueTypeError>>(
             }
             comparison_work = crate::schema::comparison_work_add(
                 comparison_work,
-                child(ends, None, false, nodes, observe)?,
+                preflight_field(
+                    ends,
+                    None,
+                    false,
+                    depth
+                        .encoding_child()
+                        .map_err(ExecutionValueTypeError::from)?,
+                    nodes,
+                    normalized,
+                    observe,
+                )?,
             )?;
             comparison_work = crate::schema::comparison_work_add(
                 comparison_work,
-                child(values, None, false, nodes, observe)?,
+                preflight_field(
+                    values,
+                    None,
+                    false,
+                    depth
+                        .encoding_child()
+                        .map_err(ExecutionValueTypeError::from)?,
+                    nodes,
+                    normalized,
+                    observe,
+                )?,
             )?;
         }
         DataType::Timestamp(_, Some(timezone)) => {
@@ -763,6 +826,7 @@ pub(crate) fn normalized_child_type_at(data_type: &DataType, index: usize) -> Op
 
 #[cfg(test)]
 mod tests {
+    use crate::MAX_VALUE_TYPE_DEPTH;
     use std::{
         collections::hash_map::DefaultHasher,
         sync::atomic::{AtomicUsize, Ordering},
