@@ -980,7 +980,7 @@ async fn decode_document<T: DeserializeOwned>(
     body: ResponseBody,
 ) -> Result<T, ConnectorError> {
     let bytes = read_document_bytes(operation, body).await?;
-    serde_json::from_slice(&bytes).map_err(|_| {
+    crate::metadata_json::from_slice(&bytes).map_err(|_| {
         unavailable(format!(
             "Iceberg REST {operation} returned a response that could not be decoded"
         ))

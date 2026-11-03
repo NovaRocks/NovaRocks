@@ -45,7 +45,6 @@ class CloudAdapterTests(unittest.TestCase):
         self.storage = RunStorageScope.from_record(self.identity, self.state)
         self.owner.read_saved_state.return_value = self.state
         self.owner.backend.run_oss.return_value = '{"ok":true}\n'
-        self.args[self.args.index('--expected-version') + 1] = self.state['version']
         self.args[self.args.index('--expected-generation') + 1] = self.state['generation']
 
     def request(self, uri=None):

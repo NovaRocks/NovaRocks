@@ -49,6 +49,11 @@ pub struct RuntimeState {
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     #[cfg(novarocks_dev_controls)]
     exchange_test_observer: Option<std::sync::Arc<dyn crate::runtime::exchange::TestEventObserver>>,
+    #[cfg(novarocks_dev_controls)]
+    join_build_control:
+        Option<std::sync::Arc<dyn crate::runtime::join_test_control::JoinBuildPublicationControl>>,
+    #[cfg(novarocks_dev_controls)]
+    query_tracker_witness: std::sync::Weak<MemTracker>,
 }
 
 impl std::fmt::Debug for RuntimeState {
@@ -306,6 +311,10 @@ impl Default for RuntimeState {
             query_memory: None,
             #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
+            #[cfg(novarocks_dev_controls)]
+            join_build_control: None,
+            #[cfg(novarocks_dev_controls)]
+            query_tracker_witness: std::sync::Weak::new(),
         }
     }
 }
@@ -328,11 +337,40 @@ impl Clone for RuntimeState {
             query_memory: self.query_memory.clone(),
             #[cfg(novarocks_dev_controls)]
             exchange_test_observer: self.exchange_test_observer.clone(),
+            #[cfg(novarocks_dev_controls)]
+            join_build_control: self.join_build_control.clone(),
+            #[cfg(novarocks_dev_controls)]
+            query_tracker_witness: self.query_tracker_witness.clone(),
         }
     }
 }
 
 impl RuntimeState {
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn install_query_tracker_witness(&mut self, tracker: std::sync::Weak<MemTracker>) {
+        self.query_tracker_witness = tracker;
+    }
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn query_tracker_witness(&self) -> std::sync::Weak<MemTracker> {
+        self.query_tracker_witness.clone()
+    }
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn install_join_build_control(
+        &mut self,
+        control: Option<
+            std::sync::Arc<dyn crate::runtime::join_test_control::JoinBuildPublicationControl>,
+        >,
+    ) {
+        self.join_build_control = control;
+    }
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn join_build_control(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::runtime::join_test_control::JoinBuildPublicationControl>>
+    {
+        self.join_build_control.clone()
+    }
+
     #[cfg(novarocks_dev_controls)]
     pub fn with_exchange_test_observer(
         mut self,
@@ -414,6 +452,10 @@ impl RuntimeState {
             query_memory: None,
             #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
+            #[cfg(novarocks_dev_controls)]
+            join_build_control: None,
+            #[cfg(novarocks_dev_controls)]
+            query_tracker_witness: std::sync::Weak::new(),
         }
     }
 

@@ -91,6 +91,18 @@ pub(crate) struct InputRunWriter {
     table_storage: ValueTypeStorageLifetime,
 }
 impl InputRunWriter {
+    /// Read the original live keyed capture. Historical row counters do not
+    /// witness custody after latch/retirement has destroyed the actual pages.
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn retained_key_rows(&self) -> Option<usize> {
+        (self.failed.is_none()
+            && !self.pages.is_empty()
+            && matches!(
+                self.captures,
+                Some(OpenCaptures::Ordinary { .. } | OpenCaptures::Naa { .. })
+            ))
+        .then_some(self.rows)
+    }
     pub(crate) fn new(
         domains: &ProjectionDomains,
         run: B3RunId,

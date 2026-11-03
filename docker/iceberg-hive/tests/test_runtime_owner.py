@@ -93,13 +93,23 @@ class HiveOwnerTest(unittest.TestCase):
         definition = Path(record['compose_file']).read_text()
         self.assertIn('external: true', definition)
 
-    def test_prepare_without_docker_then_up_reuses_definition_and_port(self):
+    def test_prepare_without_docker_then_up_uses_recommendation_only_for_creation(self):
         with mock.patch.object(self.owner, 'assert_live_daemon', side_effect=AssertionError('offline Docker call')):
-            first = self.hive.up(self.manifest(), 'local-hms', prepare_only=True)
+            first = self.hive.up(self.manifest(), prepare_only=True)
         self.assertEqual(self.backend.calls, [])
-        second = self.hive.up(self.manifest(), 'local-hms')
+        prepared = {'derived_images': {'hive-metastore': {'image_id': 'sha256:created-hms'}}}
+        with mock.patch.object(hive.machine, 'prepare_inputs', return_value=prepared) as prepare, \
+                mock.patch.object(self.backend, 'healthy', side_effect=AssertionError('environment scan')):
+            second = self.hive.up(self.manifest())
+        self.assertEqual(prepare.call_args.kwargs, {'consumer': 'derived:hive-metastore'})
+        self.assertEqual(second['images']['hms']['image_id'], 'sha256:created-hms')
         self.assertEqual(first['ports'], second['ports'])
         self.assertEqual(first['compose_file'], second['compose_file'])
+        calls = list(self.backend.calls)
+        with mock.patch.object(hive.machine, 'prepare_inputs', side_effect=AssertionError('existing fixture build')), \
+                mock.patch.object(self.backend, 'healthy', side_effect=AssertionError('environment scan')):
+            self.assertEqual(self.hive.up(self.manifest(), 'different-recommendation'), second)
+        self.assertEqual(self.backend.calls, calls)
 
     def test_changed_machine_activation_needs_explicit_hms_lifecycle(self):
         self.hive.up(self.manifest(), 'local-hms')
@@ -155,23 +165,25 @@ class HiveOwnerTest(unittest.TestCase):
         with self.assertRaisesRegex(hive.runtime.RuntimeFailure, 'core-site.xml'):
             self.hive.render(record)
 
-    def test_interrupted_attachment_replays_same_owned_container(self):
-        attach = self.owner.attach_consumer
+    def test_interrupted_attachment_keeps_original_target_for_manual_maintenance(self):
         self.owner.attach_consumer = mock.Mock(side_effect=hive.runtime.RuntimeFailure('MachineUnavailable', 'injected'))
         with self.assertRaises(hive.runtime.RuntimeFailure):
             self.hive.up(self.manifest(), 'local-hms')
         first = self.hive.read(self.identity)
         self.assertEqual(first['state'], 'starting')
-        self.owner.attach_consumer = attach
-        second = self.hive.up(self.manifest(), 'local-hms')
-        self.assertEqual(first['container_id'], second['container_id'])
+        calls = list(self.backend.calls)
+        with self.assertRaisesRegex(hive.runtime.RuntimeFailure, 'manual maintenance'):
+            self.hive.up(self.manifest(), 'new-recommendation')
+        self.assertEqual(self.hive.read(self.identity), first)
+        self.assertEqual(self.backend.calls, calls)
 
 class ReadinessTests(unittest.TestCase):
     manifest = HiveOwnerTest.manifest
 
     def setUp(self):
         HiveOwnerTest.setUp(self)
-        self.record = self.hive.up(self.manifest(self.identity), "local-hms")
+        self.record = self.hive.prepare(self.manifest(self.identity), "local-hms")
+        self.record["container_id"] = self.record["project"] + "-exact-id"
         self.clock = 0.0
         self.listener = False
         self.running = True
@@ -223,21 +235,17 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(self.backend.timeout, 90)
         self.host_proxy.assert_not_called()
 
-    def test_actual_container_listener_is_required_and_recovers_failed_record(self):
+    def test_failed_creation_is_retained_until_manual_maintenance(self):
         with self.assertRaises(hive.runtime.RuntimeFailure):
             self.hive.up(self.manifest(self.identity), "local-hms")
-        self.assertEqual(self.hive.read(self.identity)["state"], "failed")
-        self.clock = 0
-        def become_ready(duration):
-            self.advance(duration)
-            self.listener = True
-        hive.time.sleep.side_effect = become_ready
+        failed = self.hive.read(self.identity)
+        self.assertEqual(failed["state"], "failed")
+        self.listener = True
         self.probes.clear()
-        ready = self.hive.up(self.manifest(self.identity), "local-hms")
-        self.assertEqual(ready["state"], "ready")
-        self.assertNotIn("failure", ready)
-        self.assertEqual(len(self.probes), 2)
-        self.assertEqual(self.clock, 1)
+        with self.assertRaisesRegex(hive.runtime.RuntimeFailure, "manual maintenance"):
+            self.hive.up(self.manifest(self.identity), "local-hms")
+        self.assertEqual(self.hive.read(self.identity), failed)
+        self.assertEqual(self.probes, [])
         self.assertEqual(self.backend.timeout, 90)
         self.host_proxy.assert_not_called()
 

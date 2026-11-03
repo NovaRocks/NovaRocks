@@ -280,7 +280,7 @@ fn build_field<E>(
     let (initial_default_json, write_default_json) = {
         let text = exact_json(field, length, scope)?;
         let raw: &serde_json::value::RawValue =
-            serde_json::from_str(&text).map_err(|_| Error::Json)?;
+            crate::metadata_json::from_str(&text).map_err(|_| Error::Json)?;
         let defaults = raw_defaults::defaults(raw).map_err(|_| Error::Json)?;
         let initial = defaults
             .initial

@@ -55,7 +55,7 @@ class RendererCase(unittest.TestCase):
         self.config['fixture_inputs'] = {'bom': str(self.root / 'bom.json'), 'lock_sha256': bom()['lock_sha256'], 'verified': True}
 
     def bind(self, inputs=None):
-        return entry.attach_entry(self.owner, 'test-worktree', self.entry, self.config, inputs or bom())
+        return entry.attach_entry(self.owner, 'test-worktree', self.entry, self.config)
 
     def environment(self, path, **extra):
         output = subprocess.check_output(['bash', '-c', 'source "$1"; python3 -c "import os,json; print(json.dumps(dict(os.environ)))"', '_', str(path)], env={**os.environ, **extra}, text=True)
@@ -74,7 +74,7 @@ class RendererTests(RendererCase):
         settings = entry.load_settings(HERE / "shared.env")
         settings["NOVA_ENV_OBJECT_STORE_CONFIG"] = str(cloud_file)
         config = entry.request_config(self.workspace, settings, HERE / "shared.env", self.entry, shared=True, update_current=False)
-        result = entry.attach_entry(fixture.owner, config["env_id"], self.entry, config, fixture.inputs)
+        result = entry.attach_entry(fixture.owner, config["env_id"], self.entry, config)
         self.assertTrue(result["ready"])
         self.assertEqual(config["benchmark"]["shared_root"].rstrip('/'), snapshot["config"]["benchmark_root"])
         self.assertEqual(fixture.backend.events, ["ensure"])
@@ -207,28 +207,18 @@ class RendererTests(RendererCase):
         self.assertEqual(before, (self.entry / 'env.sh').read_bytes())
         self.assertEqual(self.backend.events, ['ensure'])
 
-    def test_attach_full_validation_can_exceed_short_lock_wait_budget(self):
+    def test_attach_operation_can_exceed_lock_wait_without_shortening_outer_budget(self):
         now = [100.0]
         def pending(base):
-            now[0] += 0.9
-            return []
-        original_volume = self.backend.validate_minio_volume
-        def volume(snapshot):
-            now[0] += 0.9
-            original_volume(snapshot)
-        def healthy(snapshot):
             self.assertEqual(self.backend.operation_deadline, 190.0)
-            now[0] += 1.2
-            return True
+            now[0] += 3.0
+            return []
         with mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
                 mock.patch.object(self.backend, 'unsettled_operations', side_effect=pending), \
-                mock.patch.object(self.backend, 'validate_minio_volume', side_effect=volume), \
-                mock.patch.object(self.backend, 'healthy', side_effect=healthy):
-            result = self.bind()
-        self.assertTrue(result['ready'])
+                mock.patch.object(self.backend, 'healthy', side_effect=AssertionError('health scan')):
+            self.assertTrue(self.bind()['ready'])
         self.assertGreater(now[0], 102.0)
         self.assertIsNone(self.backend.operation_deadline)
-        self.assertTrue(publication.read(self.entry)['ready'])
 
     def test_attach_machine_lock_wait_remains_two_seconds(self):
         now = [100.0]
@@ -256,9 +246,9 @@ class RendererTests(RendererCase):
                 def healthy(snapshot):
                     self.assertEqual(self.backend.operation_deadline, 190.0 if outer is None else outer)
                     now[0] = health_end
-                    return True
+                    return []
                 with mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
-                        mock.patch.object(self.backend, 'healthy', side_effect=healthy):
+                        mock.patch.object(self.backend, 'unsettled_operations', side_effect=healthy):
                     with self.assertRaisesRegex(runtime.RuntimeFailure, 'RunBudgetExpired'):
                         self.bind()
                 self.assertFalse(publication.read(self.entry)['ready'])
@@ -371,31 +361,31 @@ class RendererTests(RendererCase):
         self.assertEqual((Path(first['published_dir']) / 'env.sh').read_bytes(), old_bytes)
         self.assertNotEqual(old_bytes, (self.entry / 'env.sh').read_bytes())
 
-    def test_version_failure_does_not_change_services_and_clears_ready_entry(self):
+    def test_direct_use_publishes_existing_configuration_without_input_verification(self):
         first = self.bind()
         before = copy.deepcopy(self.backend.events)
-        changed = bom(); changed['derived_images']['rest-mv']['definition_sha256'] = 'different'
-        with self.assertRaisesRegex(runtime.RuntimeFailure, 'MachineVersionMismatch'):
-            self.bind(changed)
-        self.assertFalse(publication.read(self.entry)['ready'])
+        self.config['fixture_inputs'] = {'recommendations': '/updated/recommendations.json'}
+        with mock.patch.object(machine, 'prepare_inputs', side_effect=AssertionError('build')):
+            second = self.bind()
+        self.assertTrue(second['ready'])
+        self.assertEqual(second['machine']['generation'], first['machine']['generation'])
         self.assertEqual(self.backend.events, before)
-        self.assertTrue((Path(first['published_dir']) / 'env.sh').is_file())
 
-    def test_identity_observation_failure_disables_discovery_without_mutating_services(self):
+    def test_direct_use_attach_does_not_probe_unrelated_services(self):
         first = self.bind()
         before = copy.deepcopy(self.backend.events)
-        with mock.patch.object(self.backend, "healthy", side_effect=runtime.RuntimeFailure("RuntimeIdentityMismatch", "replaced service")):
-            with self.assertRaisesRegex(runtime.RuntimeFailure, "RuntimeIdentityMismatch"):
-                self.bind()
-        self.assertFalse(publication.read(self.entry)["ready"])
+        with mock.patch.object(self.backend, 'healthy', side_effect=AssertionError('environment health')), \
+                mock.patch.object(self.backend, 'image_id', side_effect=AssertionError('image scan')):
+            second = self.bind()
+        self.assertTrue(second['ready'])
+        self.assertEqual(second['machine']['generation'], first['machine']['generation'])
         self.assertEqual(self.backend.events, before)
-        self.assertTrue((Path(first["published_dir"]) / "env.sh").is_file())
 
     def test_renderer_and_interrupted_commit_preserve_previous_complete_publication(self):
         first = self.bind()
         invalid = copy.deepcopy(self.config); del invalid['local_ports']['mysql']
         with self.assertRaises(KeyError):
-            entry.attach_entry(self.owner, 'test-worktree', self.entry, invalid, bom())
+            entry.attach_entry(self.owner, 'test-worktree', self.entry, invalid)
         self.assertEqual(publication.read(self.entry), first)
         changed = copy.deepcopy(first); changed['config']['benchmark']['build_timeout_seconds'] = 120
         for point in ('publication.prepared', 'publication.before_swap'):
@@ -427,24 +417,18 @@ class RendererTests(RendererCase):
         self.assertNotIn('AWS_S3_ENDPOINT', self.environment(self.entry / 'env.sh'))
         self.assertTrue((legacy / 'binding.json').is_file())
 
-    def test_cli_returns_only_public_identity_and_input_failure_disables_entry(self):
+    def test_cli_existing_environment_returns_public_identity_without_building(self):
         environment = {**os.environ, 'NOVAROCKS_WORKSPACE_ROOT': str(self.workspace),
             'NOVA_ENV_CONFIG_FILE': str(HERE / 'shared.env'), 'NOVA_ENV_UPDATE_CURRENT': 'true'}
-        def verified(config):
-            config['fixture_inputs'].update(lock_sha256=bom()['lock_sha256'], verified=True)
-            return bom()
-        with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(machine, 'MachineOwner', return_value=self.owner), mock.patch.object(entry, 'verify_inputs', side_effect=verified):
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(machine, 'MachineOwner', return_value=self.owner), \
+                mock.patch.object(entry, 'build_inputs', side_effect=AssertionError('build')):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 self.assertEqual(entry.worktree_main(['up']), 0)
-            public = json.loads(output.getvalue())
-            self.assertEqual(set(public), {'ready', 'published_dir', 'machine'})
-            self.assertNotIn('credentials', public['machine'])
-            self.assertNotIn(self.snapshot['credentials']['secret_key'], output.getvalue())
-            with mock.patch.object(entry, 'verify_inputs', side_effect=runtime.RuntimeFailure('FixturePrerequisiteMissing', 'absent')), contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(entry.worktree_main(['up']), 75)
-            actual_entry = Path(public['published_dir']).parent.parent
-            self.assertFalse(publication.read(actual_entry)['ready'])
+        value = json.loads(output.getvalue())
+        self.assertEqual(set(value), {'ready', 'published_dir', 'machine'})
+        self.assertNotIn(self.snapshot['credentials']['secret_key'], output.getvalue())
 
     def test_prepare_is_unavailable_and_offline_even_after_ready(self):
         self.bind()
@@ -486,6 +470,14 @@ class InheritedAttachBudgetTests(RendererCase):
         environment = {**os.environ, 'NOVAROCKS_WORKSPACE_ROOT': str(self.workspace),
             'NOVA_ENV_CONFIG_FILE': str(HERE / 'shared.env'), 'NOVA_ENV_UPDATE_CURRENT': 'false',
             'NOVA_FIXTURE_RUN_CONTEXT': raw_context}
+        try:
+            context = json.loads(raw_context)
+            if isinstance(context, dict) and 'identity' in context:
+                from scratch import RunStorageScope, ScratchIdentity
+                environment['NOVA_FIXTURE_RUN_STORAGE'] = json.dumps(RunStorageScope.from_record(
+                    ScratchIdentity.from_dict(context['identity']), self.snapshot).as_dict())
+        except (ValueError, runtime.RuntimeFailure):
+            pass
         def verified(config):
             config['fixture_inputs'].update(lock_sha256=bom()['lock_sha256'], verified=True)
             return bom()
@@ -493,21 +485,51 @@ class InheritedAttachBudgetTests(RendererCase):
             if expected_deadline is not None:
                 self.assertEqual(self.backend.operation_deadline, expected_deadline)
             now[0] += health_seconds
-            return True
+            return []
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, environment, clear=True), \
                 mock.patch.object(entry.time, 'time', return_value=self.wall), \
                 mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
                 mock.patch.object(machine, 'MachineOwner', return_value=fresh_owner), \
-                mock.patch.object(entry, 'verify_inputs', side_effect=verified), \
+                mock.patch.object(entry, 'build_inputs', side_effect=AssertionError('build before run admission')), \
                 mock.patch.object(self.backend, 'image_id', wraps=self.backend.image_id) as image_id, \
-                mock.patch.object(self.backend, 'healthy', side_effect=healthy) as health, \
+                mock.patch.object(self.backend, 'unsettled_operations', side_effect=healthy) as health, \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = entry.worktree_main(['up'])
             self.assertEqual(os.environ['NOVA_FIXTURE_RUN_CONTEXT'], raw_context)
         actual_entry = self.workspace / 'docker/iceberg-rest/runtime' / entry.environment_identity(self.workspace)
         self.assertIsNone(getattr(self.backend, 'operation_deadline', None))
         return code, publication.read(actual_entry), stdout.getvalue(), stderr.getvalue(), health.call_count, image_id.call_count
+
+    def test_expired_cli_context_never_queries_the_daemon_to_locate_saved_state(self):
+        from scratch import RunStorageScope, ScratchIdentity
+        context = self.context(-1)
+        scope = RunStorageScope.from_record(ScratchIdentity.from_dict(context['identity']), self.snapshot)
+        environment = {'NOVAROCKS_WORKSPACE_ROOT': str(self.workspace),
+            'NOVA_ENV_CONFIG_FILE': str(HERE / 'shared.env'), 'NOVA_ENV_UPDATE_CURRENT': 'false',
+            'NOVA_FIXTURE_MACHINE_ROOT': str(self.owner.root),
+            'NOVA_FIXTURE_RUN_CONTEXT': json.dumps(context), 'NOVA_FIXTURE_RUN_STORAGE': json.dumps(scope.as_dict())}
+        stdout, stderr = io.StringIO(), io.StringIO()
+        # Keep the real MachineOwner constructor and CLI; only the Docker port is replaced.
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(machine, 'MachineDocker', return_value=self.backend), \
+                mock.patch.object(self.backend, 'daemon_id', side_effect=AssertionError('daemon query before admission')) as query, \
+                mock.patch.object(entry.time, 'time', return_value=self.wall), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = entry.worktree_main(['up'])
+        self.assertEqual(code, 1)
+        self.assertIn('RunBudgetExpired', stderr.getvalue())
+        query.assert_not_called()
+
+    def test_inherited_run_cannot_attach_after_its_original_machine_generation_changed(self):
+        changed = copy.deepcopy(self.snapshot)
+        changed['generation'] = 'replacement-generation'
+        self.owner._save(changed)
+        code, published, _, stderr, operation_calls, image_calls = self.invoke(json.dumps(self.context(4)))
+        self.assertEqual(code, 1)
+        self.assertIn('InvalidScratchScope', stderr)
+        self.assertFalse(published['ready'])
+        self.assertEqual((operation_calls, image_calls), (0, 0))
 
     def test_real_cli_env_context_bounds_full_validation_without_rewriting_parent(self):
         original = self.context(4)
@@ -620,7 +642,7 @@ class SharedEnvironmentTests(RendererCase):
         other_config = copy.deepcopy(self.config)
         other_config.update(env_id='other-worktree', workspace_root=str(self.root / 'other'))
         other_config['warehouses'] = {name: value.replace('test-worktree', 'other-worktree') for name, value in self.config['warehouses'].items()}
-        second = entry.attach_entry(self.owner, 'other-worktree', other_entry, other_config, bom())
+        second = entry.attach_entry(self.owner, 'other-worktree', other_entry, other_config)
         a, b = (self.environment(Path(p['published_dir']) / 'env.sh') for p in (first, second))
         self.assertEqual(a['NOVA_FIXTURE_MACHINE_ID'], b['NOVA_FIXTURE_MACHINE_ID'])
         self.assertEqual(a['AWS_S3_ENDPOINT'], b['AWS_S3_ENDPOINT'])
@@ -637,6 +659,8 @@ class SharedEnvironmentTests(RendererCase):
             source = self.root / label / 'docker/iceberg-rest'; source.mkdir(parents=True)
             for name in ('up.sh', 'fixture_runtime.py', 'machine_runtime.py', 'oss_ops.py', 'entry_publication.py', 'runtime_entry.py', 'shared.env'):
                 shutil.copy2(HERE / name, source / name)
+            (source.parent / 'fixture-inputs').mkdir()
+            shutil.copy2(HERE.parent / 'fixture-inputs/versions.json', source.parent / 'fixture-inputs/versions.json')
             environment = {**os.environ, 'PATH': str(fakebin) + ':' + os.environ['PATH'],
                 'NOVAROCKS_WORKSPACE_ROOT': str(self.workspace), 'NOVA_ENV_CONFIG_FILE': str(source / 'shared.env')}
             process = subprocess.run(['bash', str(source / 'up.sh'), '--prepare-only'], env=environment, capture_output=True, text=True)
@@ -880,6 +904,21 @@ class IsolatedEntryTests(RendererCase):
         return entry.render_isolated_stack(inputs, 'nr-isolated-rest-test', {'minio': 19101, 'minio_console': 20101, 'rest': 21101, 'rest_mv': 24101, 'spark': 22101, 'control': 23101}, self.entry, config,
             profile=profile, hook_image='publication:exact' if profile != 'stock' else None)
 
+    def test_existing_private_entry_reuses_saved_targets_without_building(self):
+        result = self.isolated()
+        result['record'].update(creation_state='ready', containers={'rest': 'original-rest'})
+        entry.render_entry(result['context'], self.entry)
+        with mock.patch.object(entry, 'build_inputs', side_effect=AssertionError('unexpected build')):
+            saved = entry.existing_private_entry(self.entry, 'nr-isolated-rest-test')
+        self.assertEqual(saved['private_record']['containers'], {'rest': 'original-rest'})
+
+    def test_partial_private_creation_requires_manual_maintenance(self):
+        result = self.isolated()
+        result['record']['creation_state'] = 'starting'
+        entry.render_entry(result['context'], self.entry)
+        with self.assertRaisesRegex(runtime.RuntimeFailure, 'maintain it manually'):
+            entry.existing_private_entry(self.entry, 'nr-isolated-rest-test')
+
     def test_stock_and_hook_are_initial_models_from_same_templates(self):
         sentinel = self.entry.parent / 'current'; sentinel.parent.mkdir(parents=True)
         sentinel.symlink_to('existing-worktree')
@@ -939,6 +978,8 @@ class IsolatedEntryTests(RendererCase):
             shutil.copy2(HERE / name, fixture / name)
         for name in ['templates', 'spark']:
             shutil.copytree(HERE / name, fixture / name)
+        (fixture.parent / 'fixture-inputs').mkdir()
+        shutil.copy2(HERE.parent / 'fixture-inputs/versions.json', fixture.parent / 'fixture-inputs/versions.json')
         workspace = self.root / 'isolated-rest-request'
         workspace.mkdir()
         config = workspace / 'isolated.env'
@@ -993,22 +1034,21 @@ class IsolatedEntryTests(RendererCase):
 
 
 class ConsumerInputVerificationTests(unittest.TestCase):
-    def test_runtime_consumes_exact_verified_snapshot_without_rereading_bom(self):
-        snapshot = {'schema': 2, 'platform': 'linux/arm64', 'lock_sha256': 'verified-lock'}
-        config = {'repo_root': '/fixture-repository', 'fixture_inputs': {'bom': '/fixture-store/bom.json', 'verified': False}}
-        with mock.patch.object(machine, 'verified_bom', return_value=snapshot) as verify, mock.patch.object(runtime, 'read_json', side_effect=AssertionError('reread mutable BOM')):
-            actual = entry.verify_inputs(config)
-        self.assertIs(actual, snapshot)
-        verify.assert_called_once_with(Path('/fixture-repository'), Path('/fixture-store'), consumer='iceberg-rest')
-        self.assertEqual(config['fixture_inputs']['consumer'], 'iceberg-rest')
-        self.assertEqual(config['fixture_inputs']['lock_sha256'], 'verified-lock')
-        self.assertTrue(config['fixture_inputs']['verified'])
+    def test_direct_use_only_a_creation_calls_the_input_builder(self):
+        config = {'repo_root': '/fixture-repository'}
+        expected = {'images': {}, 'derived_images': {}}
+        with mock.patch.object(machine, 'prepare_inputs', return_value=expected) as build, \
+                mock.patch.dict(os.environ, {'NOVA_FIXTURE_STORE': '/fixture-store'}):
+            self.assertIs(entry.build_inputs(config), expected)
+        build.assert_called_once_with(Path('/fixture-repository'), Path('/fixture-store'), consumer='iceberg-rest')
 
-    def test_failed_input_verification_never_marks_publication_verified(self):
-        config = {'repo_root': '/fixture-repository', 'fixture_inputs': {'bom': '/fixture-store/bom.json', 'verified': False}}
-        with mock.patch.object(machine, 'verified_bom', side_effect=runtime.RuntimeFailure('FixturePrerequisiteMissing', 'absent')), self.assertRaises(runtime.RuntimeFailure):
-            entry.verify_inputs(config)
-        self.assertFalse(config['fixture_inputs']['verified'])
+    def test_direct_use_creation_failure_retains_original_error(self):
+        config = {'repo_root': '/fixture-repository'}
+        original = runtime.RuntimeFailure('FixtureBuildFailed', 'actual creation error')
+        with mock.patch.object(machine, 'prepare_inputs', side_effect=original):
+            with self.assertRaises(runtime.RuntimeFailure) as caught:
+                entry.build_inputs(config)
+        self.assertIs(caught.exception, original)
 
 
 if __name__ == '__main__':

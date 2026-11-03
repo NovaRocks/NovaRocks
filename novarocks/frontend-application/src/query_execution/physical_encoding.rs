@@ -1169,6 +1169,62 @@ mod tests {
         );
     }
 
+    /// The production FE completion and freeze authors must retain the hidden
+    /// JSON key call through real optimization, not only logical-plan tests.
+    /// Dynamic generated values keep that call demanded at execution time.
+    #[test]
+    fn json_mark_canonical_package_preserves_hash_join_and_json_key_call() {
+        use novarocks_plan_codec::physical_package_v2::decode_fragment_package;
+        use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
+        use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
+
+        let sql = r#"
+            SELECT p.id, parse_json(p.txt) IN (
+                SELECT parse_json(CONCAT('{"key":', CAST(generate_series AS STRING), '}'))
+                FROM TABLE(generate_series(0, 1))
+            ) AS present
+            FROM (
+                SELECT generate_series AS id,
+                    CASE WHEN generate_series=2 THEN NULL
+                         ELSE CONCAT('{"key":', CAST(generate_series AS STRING), '}') END AS txt
+                FROM TABLE(generate_series(1, 2))
+            ) p
+            ORDER BY p.id
+        "#;
+        let (_, packages) = frozen_packages(sql);
+        let control = SqlCompileControl::unbounded();
+        let model = FragmentDecodeResourceModel::try_new(&control).expect("decode model");
+        let mut mark = false;
+        let mut canonical = false;
+        for bytes in packages.values() {
+            let package = decode_fragment_package(bytes, &model, &decode_limits(), &control)
+                .expect("JSON mark package decodes through the original receiver");
+            mark |= package.fragment().nodes().values().any(|node| {
+                matches!(
+                    &node.kind,
+                    NodeKind::HashJoin {
+                        kind: novarocks_physical_plan::JoinKind::LeftMark,
+                        ..
+                    }
+                )
+            });
+            canonical |= package
+                .fragment()
+                .expressions()
+                .iter()
+                .any(|(_, expression)| {
+                    matches!(
+                        &expression.kind,
+                        novarocks_physical_plan::ExprKind::FunctionCall { function, .. }
+                            if function.function_id.as_str()
+                                == "builtin.scalar/__json_canonical_key/v1"
+                    )
+                });
+        }
+        assert!(mark, "the real FE packages retain the null-aware hash mark");
+        assert!(canonical, "the real FE packages retain the JSON key call");
+    }
+
     #[test]
     fn a_completed_statement_freezes_v2_packages_that_roundtrip_through_the_receiver() {
         use novarocks_plan_codec::physical_package_v2::test_support::{

@@ -60,7 +60,7 @@ tokio-stream.workspace = true
 tower.workspace = true
 
 [package.metadata.novarocks.test]
-runtime-inputs = ["tools/ci/fixtures/system-scenarios-base.toml", "docker/iceberg-rest/*.sh", "docker/iceberg-rest/*.py", "docker/iceberg-rest/templates/**", "docker/iceberg-rest/spark/Dockerfile", "docker/fixture-inputs/*.sh", "docker/fixture-inputs/*.py", "docker/fixture-inputs/lock.json", "tests/fixtures/iceberg-rest-publication/**", "target/debug/build/novarocks-test-support-*/out/novarocks-test-monitor"]
+runtime-inputs = ["tools/ci/fixtures/system-scenarios-base.toml", "docker/iceberg-rest/*.sh", "docker/iceberg-rest/*.py", "docker/iceberg-rest/templates/**", "docker/iceberg-rest/spark/Dockerfile", "docker/fixture-inputs/*.sh", "docker/fixture-inputs/*.py", "docker/fixture-inputs/versions.json", "tests/fixtures/iceberg-rest-publication/**", "target/debug/build/novarocks-test-support-*/out/novarocks-test-monitor"]
 env-inputs = [{ name = "NOVAROCKS_BIN", kind = "file-content" },{ name = "PATH", kind = "value" },{ name = "LANG", kind = "value" },{ name = "LC_ALL", kind = "value" },{ name = "SSL_CERT_FILE", kind = "file-content" },{ name = "DOCKER_CONTEXT", kind = "value" },{ name = "DOCKER_HOST", kind = "value" },{ name = "DOCKER_TLS_VERIFY", kind = "value" },{ name = "DOCKER_CERT_PATH", kind = "value" },{ name = "DOCKER_CONFIG", kind = "value" },{ name = "NOVA_FIXTURE_STORE", kind = "value" },{ name = "HOME", kind = "value" },{ name = "XDG_CACHE_HOME", kind = "value" }]
 ignored = [
   { filter = "test(=tests::native_proxy_cluster_keeps_advertisement_across_process_restarts)", class = "heavy", requires = ["binary:novarocks"], reason = "requires NOVAROCKS_BIN pointing to a built native server" },

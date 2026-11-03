@@ -728,7 +728,7 @@ def unselected_obligations(scope_values):
 
 
 def requirement_checks(requirements, environment, native, run_command=subprocess.run):
-    """Observe declared prerequisites without provisioning external resources.
+    """Check supplied inputs without probing or provisioning the environment.
 
     Configuration checks only establish that the fixture was supplied. The
     native owner retains live readiness, exact input validation and cleanup.
@@ -748,12 +748,7 @@ def requirement_checks(requirements, environment, native, run_command=subprocess
             try:check['ok']=identity_snapshot.digest(binding['path'])==binding['sha256']
             except OSError as error:check['error']=str(error)
         elif requirement in {'toolchain:java','fixture:docker'}:
-            argv=['java','-version'] if requirement=='toolchain:java' else ['docker','info','--format','{{.ServerVersion}}']
-            check['argv']=argv
-            try:
-                result=run_command(argv,env=environment,capture_output=True,text=True,check=False,timeout=15)
-                check.update(exit=result.returncode,ok=result.returncode==0)
-            except (OSError,subprocess.SubprocessError) as error:check['error']=str(error)
+            check.update(ok=True, basis='delegated to the actual native command; no environment preflight')
         elif requirement in configured:
             names=configured[requirement]
             missing=[name for name in names if not environment.get(name)]

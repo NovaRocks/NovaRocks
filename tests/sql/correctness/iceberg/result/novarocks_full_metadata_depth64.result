@@ -1,0 +1,35 @@
+-- query 3
+-- types	bigint	row(n1 row(n2 row(n3 row(n4 row(n5 row(n6 row(n7 row(n8 row(n9 row(n10 row(n11 row(n12 row(n13 row(n14 row(n15 row(n16 row(n17 row(n18 row(n19 row(n20 row(n21 row(n22 row(n23 row(n24 row(n25 row(n26 row(n27 row(n28 row(n29 row(n30 row(n31 row(n32 row(n33 row(n34 row(n35 row(n36 row(n37 row(n38 row(n39 row(n40 row(n41 row(n42 row(n43 row(n44 row(n45 row(n46 row(n47 row(n48 row(n49 row(n50 row(n51 row(n52 row(n53 row(n54 row(n55 row(n56 row(n57 row(n58 row(n59 row(n60 row(n61 row(n62 row(n63 tinyint)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+id	deep
+1	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[-128]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]
+1	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[-128]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]
+2	NULL
+
+-- query 4
+-- types	varchar	bigint
+leaf_type	row_count
+tinyint	3
+
+-- query 6
+-- types	bigint	row(n1 row(n2 row(n3 row(n4 row(n5 row(n6 row(n7 row(n8 row(n9 row(n10 row(n11 row(n12 row(n13 row(n14 row(n15 row(n16 row(n17 row(n18 row(n19 row(n20 row(n21 row(n22 row(n23 row(n24 row(n25 row(n26 row(n27 row(n28 row(n29 row(n30 row(n31 row(n32 row(n33 row(n34 row(n35 row(n36 row(n37 row(n38 row(n39 row(n40 row(n41 row(n42 row(n43 row(n44 row(n45 row(n46 row(n47 row(n48 row(n49 row(n50 row(n51 row(n52 row(n53 row(n54 row(n55 row(n56 row(n57 row(n58 row(n59 row(n60 row(n61 row(n62 row(n63 tinyint)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+id	deep
+1	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[-128]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]
+1	[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[-128]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]
+2	NULL
+3	NULL
+
+-- query 9
+-- types	bigint
+id
+1
+1
+2
+3
+4
+
+-- query 10
+-- types	bigint
+id
+1
+1
+2

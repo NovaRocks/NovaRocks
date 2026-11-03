@@ -38,3 +38,6 @@ pub use execution_runtime::{
 mod kernel_memory_observation_tests;
 
 pub mod function_set;
+
+#[cfg(novarocks_dev_controls)]
+pub mod join_test_control;

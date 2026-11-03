@@ -101,7 +101,7 @@ use an inert second-provider name remain enabled.
   selection before fixture/role startup: six connector scenes, five mixed
   catalog-planning scenes and two scan-readiness/cancellation scenes.
 - Full CI no longer prepares the Paimon fixture or replaces Iceberg runtime/SQL
-  configuration with it. BOM verification selects the iceberg-rest consumer.
+  configuration with it. 当前 fixture 输入规则由 ADR-0155 的 TST-G18a 更新维护：已有环境直接使用，缺失时选择 iceberg-rest 配方，不运行自动 BOM 验证。
 - Twenty-four Paimon fixture Python tests are skipped; their test entrypoint
   refuses execution. Manual fixture preparation/integrity tools and cleanup
   remain usable for existing private data; no automatic preparation remains.

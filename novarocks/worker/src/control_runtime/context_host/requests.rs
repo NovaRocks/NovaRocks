@@ -101,6 +101,7 @@ fn external_consumer() -> ConsumerId {
 
 pub(crate) type ContextRequestHandle = RequestHandle<ContextReplyBody>;
 pub(crate) type TaskContextRequestHandle = RequestHandle<ContextReplyBody, RequestMetadata>;
+type RequestAdmissionError = (ContextRequestError, Option<ContextRequestPartial>);
 
 #[derive(Debug)]
 pub(crate) enum ContextRequestError {
@@ -260,6 +261,7 @@ pub(crate) struct ContextRequestAdmissionRefusal {
 enum RequestAdmissionKind {
     Business(InputClass),
     CreationInspection,
+    TaskUpdateInspection,
 }
 pub(crate) enum ContextCreationInspectionRefusal {
     Admission(ContextRequestAdmissionRefusal),
@@ -545,6 +547,7 @@ pub(crate) struct ContextRequestCustody {
     work_retirement: WorkRetirementObserver,
     header_ready: HeaderReadyRegistration,
     expected_task: Option<TaskIdentity>,
+    task_update_inspection: Option<TaskIdentity>,
     submitted: bool,
     started: bool,
     failed_message: Option<RefusedRequestInput>,
@@ -665,8 +668,33 @@ impl ContextRequestCustody {
         class: InputClass,
         operation: TaskOperationId,
         deadline: MonotonicInstant,
-    ) -> Result<(Self, ContextRequestHandle), (ContextRequestError, Option<ContextRequestPartial>)>
-    {
+    ) -> Result<(Self, ContextRequestHandle), RequestAdmissionError> {
+        Self::admit_with_endpoint(
+            host,
+            ready,
+            source,
+            class,
+            RequestMetadata {
+                operation,
+                deadline,
+            },
+            |request| request,
+            ContextRequestEndpoint::Direct,
+        )
+    }
+    fn admit_with_endpoint<H: Copy>(
+        host: &ContextHostRecord,
+        ready: &ControlRequestReady,
+        source: ActorId,
+        class: InputClass,
+        metadata: RequestMetadata,
+        header: fn(RequestContext) -> H,
+        endpoint_kind: fn(Arc<RequestEndpoint<ContextReplyBody, H>>) -> ContextRequestEndpoint,
+    ) -> Result<(Self, RequestHandle<ContextReplyBody, H>), RequestAdmissionError> {
+        let RequestMetadata {
+            operation,
+            deadline,
+        } = metadata;
         if !ready.same_runtime(&host.control_runtime) {
             return Err((ContextRequestError::WrongRuntime, None));
         }
@@ -786,7 +814,7 @@ impl ContextRequestCustody {
             )
             .unwrap_or_else(|_| std::process::abort());
         let endpoint = Arc::new(RequestEndpoint {
-            request,
+            request: header(request),
             ready: ready.clone(),
             reply,
             external: RequestExternalLeg::new(slot),
@@ -814,7 +842,7 @@ impl ContextRequestCustody {
                     .unwrap_or_else(|_| std::process::abort()),
                 actor: host.actor,
                 work,
-                endpoint: ContextRequestEndpoint::Direct(endpoint),
+                endpoint: endpoint_kind(endpoint),
                 request: Some(request),
                 task_route: None,
                 domain: None,
@@ -825,6 +853,7 @@ impl ContextRequestCustody {
                 work_retirement: partial.work_retirement,
                 header_ready,
                 expected_task: None,
+                task_update_inspection: None,
                 submitted: false,
                 started: false,
                 failed_message: None,
@@ -879,6 +908,13 @@ impl ContextRequestCustody {
             || self.unresolved_revocation
         {
             return Err(reject(ContextRequestError::WrongPhase, command));
+        }
+        match (self.task_update_inspection, &command) {
+            (Some(expected), ContextCommand::InspectTaskUpdate { task }) if expected == *task => {}
+            (Some(_), _) | (None, ContextCommand::InspectTaskUpdate { .. }) => {
+                return Err(reject(ContextRequestError::WrongRequest, command));
+            }
+            (None, _) => {}
         }
         let sealed_command = matches!(&command,
             ContextCommand::Cancel { task, .. } | ContextCommand::GetFinalInfo { task } | ContextCommand::GetDynamicFilters { task, .. }
@@ -1130,11 +1166,44 @@ impl ContextRequestCustody {
         }) if *work==self.work && metadata.operation==original.operation && metadata.deadline==original.deadline);
         ordinary
     }
+    fn is_refused_task_update_inspection(
+        &self,
+        error: DriverError,
+        message: &WorkerMessage,
+    ) -> bool {
+        if !matches!(
+            error,
+            DriverError::ActorFailed
+                | DriverError::Closed
+                | DriverError::FailurePublicationRequired
+        ) || self.submitted
+            || !self.started
+            || self.task_route.is_some()
+            || self.domain.is_some()
+            || self.create.is_some()
+            || self.deferred_root.is_some()
+            || self.observation.is_some()
+            || self.read_payload.is_some()
+        {
+            return false;
+        }
+        let (Some(task), Some(original)) = (self.task_update_inspection, self.request) else {
+            return false;
+        };
+        self.expected_task == Some(task)
+            && original.author == self.work
+            && matches!(message, WorkerMessage::Context(ContextMessage::Command {
+                work, request: Some(metadata),
+                command: ContextInput::Request(ContextCommand::InspectTaskUpdate { task: target }),
+            }) if *work == self.work && *target == task && metadata.operation == original.operation
+                && metadata.deadline == original.deadline)
+    }
     fn is_refused_neutral_input(&self, error: DriverError, message: &WorkerMessage) -> bool {
         self.is_refused_root_ack(error, message)
             || self.is_refused_deferred_task_read(error, message)
             || self.is_refused_context_control(error, message)
             || self.is_refused_create_input(error, message)
+            || self.is_refused_task_update_inspection(error, message)
     }
     fn is_refused_create_input(&self, error: DriverError, message: &WorkerMessage) -> bool {
         if error != DriverError::ActorFailed
@@ -1186,11 +1255,12 @@ impl ContextRequestCustody {
             .map_err(ContextRequestError::Driver)?
             .ok_or(ContextRequestError::MissingCoreReceipt)?;
         let refused_create = self.is_refused_create_input(*error, message);
-        let expected_class = if refused_create {
-            InputClass::Ordinary
-        } else {
-            InputClass::Control
-        };
+        let expected_class =
+            if refused_create || self.is_refused_task_update_inspection(*error, message) {
+                InputClass::Ordinary
+            } else {
+                InputClass::Control
+            };
         if (self.is_refused_root_ack(*error, message) && actual.source != self.actor)
             || actual.class != expected_class
             || (refused_create && actual.runtime_metadata)
@@ -1248,6 +1318,15 @@ impl ContextRequestCustody {
                 // Every field of this exact variant is Copy neutral metadata;
                 // none owns a callback, payload, guard, Work or Source. This
                 // selected message has no custom Drop in the current types.
+                let _original_fields = (work, metadata, task, refused.error);
+            }
+            WorkerMessage::Context(ContextMessage::Command {
+                work,
+                request: Some(metadata),
+                command: ContextInput::Request(ContextCommand::InspectTaskUpdate { task }),
+            }) => {
+                // Fixed read-only resolution; original rich data and authority
+                // remain in this R's actual disposal custody.
                 let _original_fields = (work, metadata, task, refused.error);
             }
             WorkerMessage::Context(ContextMessage::Command {
@@ -1727,17 +1806,14 @@ impl ContextHostRecord {
             }),
         }
     }
-    fn admit_request_kind(
-        &mut self,
-        ready: &ControlRequestReady,
-        source: ActorId,
+    fn check_request_admission(
+        &self,
         kind: RequestAdmissionKind,
-        operation: TaskOperationId,
-        deadline: MonotonicInstant,
-    ) -> Result<(ScopedWorkRef, ContextRequestHandle), ContextRequestAdmissionRefusal> {
+    ) -> Result<InputClass, ContextRequestAdmissionRefusal> {
         let class = match kind {
             RequestAdmissionKind::Business(class) => class,
-            RequestAdmissionKind::CreationInspection => InputClass::Ordinary,
+            RequestAdmissionKind::CreationInspection
+            | RequestAdmissionKind::TaskUpdateInspection => InputClass::Ordinary,
         };
         if self.resources.failure.is_some() {
             return Err(ContextRequestAdmissionRefusal {
@@ -1773,6 +1849,55 @@ impl ContextHostRecord {
                 partial: None,
             });
         }
+        Ok(class)
+    }
+    /// This original R may resolve only the frozen Task's existing update
+    /// refusal. It carries no Task predecessor or host-application authority.
+    pub(crate) fn admit_task_update_inspection(
+        &mut self,
+        ready: &ControlRequestReady,
+        source: ActorId,
+        task: TaskIdentity,
+        operation: TaskOperationId,
+        deadline: MonotonicInstant,
+    ) -> Result<(ScopedWorkRef, TaskContextRequestHandle), ContextRequestAdmissionRefusal> {
+        let class = self.check_request_admission(RequestAdmissionKind::TaskUpdateInspection)?;
+        let (mut custody, handle) = ContextRequestCustody::admit_with_endpoint(
+            self,
+            ready,
+            source,
+            class,
+            RequestMetadata {
+                operation,
+                deadline,
+            },
+            |request| RequestMetadata {
+                operation: request.operation,
+                deadline: request.deadline,
+            },
+            ContextRequestEndpoint::Task,
+        )
+        .map_err(|(error, partial)| self.retain_request_partial(error, partial))?;
+        custody.expected_task = Some(task);
+        custody.task_update_inspection = Some(task);
+        let work = custody.work();
+        assert!(
+            self.request_inputs
+                .insert(custody.request().token, work)
+                .is_none()
+        );
+        assert!(self.resources.requests.insert(work, custody).is_none());
+        Ok((work, handle))
+    }
+    fn admit_request_kind(
+        &mut self,
+        ready: &ControlRequestReady,
+        source: ActorId,
+        kind: RequestAdmissionKind,
+        operation: TaskOperationId,
+        deadline: MonotonicInstant,
+    ) -> Result<(ScopedWorkRef, ContextRequestHandle), ContextRequestAdmissionRefusal> {
+        let class = self.check_request_admission(kind)?;
         match ContextRequestCustody::admit(self, ready, source, class, operation, deadline) {
             Ok((custody, handle)) => {
                 let work = custody.work();
@@ -1785,6 +1910,37 @@ impl ContextHostRecord {
                 Ok((work, handle))
             }
             Err((error, partial)) => Err(self.retain_request_partial(error, partial)),
+        }
+    }
+    pub(crate) fn submit_task_update_inspection(
+        &mut self,
+        work: ScopedWorkRef,
+        task: TaskIdentity,
+    ) -> Result<(), ContextRequestSubmitRefusal> {
+        match self.submit_request(work, ContextCommand::InspectTaskUpdate { task }) {
+            Ok(()) => Ok(()),
+            Err(refusal) => {
+                let failed = self
+                    .control_runtime
+                    .snapshot(self.actor)
+                    .is_ok_and(|snapshot| snapshot.failed);
+                let retained = self.resources.requests.get(&work).is_some_and(|original| {
+                    original.task_update_inspection == Some(task)
+                        && original.rejected_domain.is_some()
+                        && original.failed_message.as_ref().is_some_and(|refused| {
+                            original
+                                .is_refused_task_update_inspection(refused.error, &refused.message)
+                        })
+                });
+                if failed && retained && refusal.command.is_none() {
+                    // The actual actor failed during fill. The same R keeps
+                    // its refused input and raw data; S8 publishes OwnerFailed
+                    // to its original handle and joins their physical exit.
+                    Ok(())
+                } else {
+                    Err(refusal)
+                }
+            }
         }
     }
     pub(crate) fn submit_request(
@@ -2698,6 +2854,7 @@ impl ContextHostRecord {
                 .take()
                 .expect("same original deferred R header registration"),
             expected_task: Some(task),
+            task_update_inspection: None,
             submitted: false,
             started: false,
             failed_message: None,
@@ -2859,7 +3016,14 @@ impl ContextHostRecord {
         };
         Self::advance_protocol_observation_job(original, ports, &registration, self.identity)?;
         Self::advance_unused_create(original, ports, &registration, self.identity)?;
-        if let Some(capture) = &mut original.rejected_domain {
+        // An inspection can publish a refusal without waiting for the rich
+        // payload's Drop. Both physical jobs share this R's serial host lane,
+        // so its reply wake must finish before destruction may occupy it.
+        let disposal_ready = original.task_update_inspection.is_none()
+            || (original.reply_completed
+                && original.pending_notification.is_none()
+                && original.notification.is_idle());
+        if disposal_ready && let Some(capture) = &mut original.rejected_domain {
             capture.advance(ports, &registration, self.identity, &original.endpoint)?;
         }
         if original.pending_notification.is_none() {

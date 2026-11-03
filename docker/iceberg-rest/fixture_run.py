@@ -119,8 +119,8 @@ def cleanup_run(env_file, *, budget=None):
     record = manifest["runtime"]["machine"]
     owner = MachineOwner(record["control_root"], daemon=record["daemon_id"],
                          timeout=max(0.001, budget.remaining_seconds()))
-    with owner.ready_snapshot({"version":record["version"]}, deadline=budget.deadline,
-                              expected_generation=record["generation"]) as current:
+    with owner.operation_snapshot(deadline=budget.deadline,
+                                  expected_generation=record["generation"]) as current:
         scope = RunStorageScope.from_dict(json.loads(os.environ[RUN_STORAGE_ENV])).validate_against(budget.identity, current)
         return ScratchSweeper(current, owner.backend).cleanup_run(scope, [], budget.deadline)
 
@@ -139,31 +139,29 @@ def startup_sweep(env_file, *, budget=None):
     owner = MachineOwner(record["control_root"], daemon=record["daemon_id"],
                          timeout=max(0.001, deadline - time.monotonic()))
     try:
-        report = owner.sweep(deadline=deadline, expected_version=record["version"],
-                             expected_generation=record["generation"])
+        report = owner.sweep(deadline=deadline, expected_generation=record["generation"])
     except (SweepLockTimeout, SweepInventoryTimeout) as cause:
-        # No settlement or GC was dispatched. Readiness is a separate read-only
-        # admission, bounded by its normal timeout and this same run's work end.
+        # No settlement or GC was dispatched. Recheck only the original
+        # operation authority under its lock and the same run's work end.
         operation = "startup-sweep-lock" if isinstance(cause, SweepLockTimeout) else "startup-sweep-inventory"
         report = dict(complete=False, enumeration_complete=False, observations_unavailable=True,
                       removed=[], errors=[dict(operation=operation, code="ScratchSweepTimeout")])
         try:
             budget.check(work=True)
-            admission = MachineOwner(record["control_root"], daemon=record["daemon_id"])
-            admission_deadline = min(time.monotonic() + admission.timeout,
+            operation_owner = MachineOwner(record["control_root"], daemon=record["daemon_id"])
+            operation_deadline = min(time.monotonic() + operation_owner.timeout,
                                      budget.deadline - budget.cleanup_grace_seconds)
-            with admission.ready_snapshot({"version": record["version"]},
-                                          deadline=admission_deadline,
-                                          expected_generation=record["generation"]):
+            with operation_owner.operation_snapshot(deadline=operation_deadline,
+                                                     expected_generation=record["generation"]):
                 budget.check(work=True)
-            report["admission_complete"] = True
+            report["operation_scope_complete"] = True
         except runtime.RuntimeFailure as error:
-            report["errors"].append(dict(operation="startup-admission", code=error.code))
+            report["errors"].append(dict(operation="startup-operation-scope", code=error.code))
             error.report = report
             raise
         except OSError as cause:
-            error = runtime.RuntimeFailure("ScratchSweepIOFailed", "startup admission I/O failed; its report is retained")
-            report["errors"].append(dict(operation="startup-admission", code=error.code))
+            error = runtime.RuntimeFailure("ScratchSweepIOFailed", "startup operation scope I/O failed; its report is retained")
+            report["errors"].append(dict(operation="startup-operation-scope", code=error.code))
             error.report = report
             raise error from cause
     except runtime.RuntimeFailure as error:
@@ -380,9 +378,8 @@ def compose(env_file, arguments, *, data=None, capture=False, settlement_receipt
         from machine_runtime import MachineOwner
         record = manifest["runtime"]["machine"]
         owner = MachineOwner(record["control_root"], daemon=record["daemon_id"], timeout=max(0.001, budget.remaining_seconds(work=not cleanup)))
-        with owner.ready_snapshot({"version": record["version"]},
-                                  deadline=budget.deadline - (0 if cleanup else budget.cleanup_grace_seconds),
-                                  expected_generation=record["generation"]) as current:
+        with owner.operation_snapshot(deadline=budget.deadline - (0 if cleanup else budget.cleanup_grace_seconds),
+                                      expected_generation=record["generation"]) as current:
             output = owner.backend.run_mc(current, script,
                 deadline=budget.deadline - (0 if cleanup else budget.cleanup_grace_seconds), binary=True)
         if not capture:

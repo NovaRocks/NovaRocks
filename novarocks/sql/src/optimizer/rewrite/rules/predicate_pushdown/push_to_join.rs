@@ -242,7 +242,8 @@ fn push_filter_predicates_opt(
 
                 if matches!(
                     join.join_type,
-                    JoinKind::LeftOuter
+                    JoinKind::LeftMark { .. }
+                        | JoinKind::LeftOuter
                         | JoinKind::LeftSemi
                         | JoinKind::LeftAnti
                         | JoinKind::RightOuter

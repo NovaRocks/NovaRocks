@@ -145,7 +145,7 @@ fn prepare_schema_core(
     work: &mut SchemaWork<'_>,
 ) -> Result<PreparedFrozenWriteSchema, FrozenWriteSchemaError> {
     let target_schema: crate::iceberg::spec::Schema = work.opaque_source(|| {
-        serde_json::from_str(&facts.target_schema_json)
+        crate::metadata_json::from_str(&facts.target_schema_json)
             .map_err(|error| format!("decode frozen Iceberg target schema: {error}"))
     })?;
     let mut fields = Vec::with_capacity(input_schema.fields().len());

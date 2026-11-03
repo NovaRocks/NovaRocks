@@ -7,8 +7,8 @@
 - 源码：`apache-iceberg-1.10.1.tar.gz`，commit `ccb8bc435062171e64bc8b7e5f56e6aed9c5b934`，SHA-1 `09690aa963fd38cefdba69a0d4c7b4eabe0d9ed1`，9216396 字节。下载字节已对照 Apache 发布的 SHA-512。
 - 规范：[apache/iceberg#11041](https://github.com/apache/iceberg/pull/11041)，commit `f14886bb4c54d3e292df85161a0250fbb9ae6d12`。
 - PoC：[apache/iceberg#9830](https://github.com/apache/iceberg/pull/9830)，commit `bb460f9a9493ceef13d10b6afbf0ee677b8f3a37`。提取时核对 PR head，与补丁中声明的 commit 一致。
-- builder：官方 Gradle 8.14.3 + JDK 17，原生平台 `linux/amd64` / `linux/arm64`；digest 由 `docker/fixture-inputs/lock.json` 锁定。直接调用镜像中的 Gradle，避免源码包 `gradlew` 下载未校验的 wrapper JAR。
-- 运行 base：lock 中现有 `iceberg-rest`。最终镜像只覆盖 adapter JAR，继承用户、环境与启动方式。
+- builder：官方 Gradle 8.14.3 + JDK 17，原生平台 `linux/amd64` / `linux/arm64`；推荐版本与平台由 `docker/fixture-inputs/versions.json` 声明，不锁定运行环境 digest。直接调用镜像中的 Gradle，避免源码包 `gradlew` 下载未校验的 wrapper JAR。
+- 运行 base：推荐清单中的 `iceberg-rest`。最终镜像只覆盖 adapter JAR，继承用户、环境与启动方式。
 
 ## 补丁
 
@@ -30,16 +30,15 @@ Iceberg 官方 REST fixture 发版并通过本配方的合约与生命周期检�
 
 ## 运行与端点
 
-从仓库根目录显式 provision 输入后，正常启动 fixture 并固定本次 publication：
+从仓库根目录直接使用已有 fixture；确实缺失时按推荐创建，随后固定本次 publication：
 
 ```bash
-docker/fixture-inputs/provision.sh
 docker/iceberg-rest/up.sh
 fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/iceberg-rest/runtime/current/published").resolve(strict=True))')"
 source "$fixture_publication/env.sh"
 ```
 
-共享 catalog 和 runner 管理的私有隔离栈都包含 `rest-mv`；普通测试不下载或构建输入。服务使用独立 SQLite 卷，服务端 warehouse 与 stock `rest` 同级、以 `rest-mv` 结尾。接口如下：
+共享 catalog 和 runner 管理的私有隔离栈都包含 `rest-mv`；已有环境不做自动 digest/BOM/版本/健康/能力检查，缺失项才按推荐构建，实际失败交人工维护。服务使用独立 SQLite 卷，服务端 warehouse 与 stock `rest` 同级、以 `rest-mv` 结尾。接口如下：
 
 | 消费者 | 端点与 warehouse |
 |---|---|
@@ -57,7 +56,7 @@ source "$fixture_publication/env.sh"
 python3 docker/iceberg-rest/rest-mv/probe.py contract --manifest "$NOVA_ENV_MANIFEST"
 ```
 
-`contract` 创建带随机后缀的 namespace，检查创建、只改指针的新 version、历史、显式 null 和普通 view/table 行为；stock `rest` 必须丢弃 `storage-table`。探针在 `finally` 中清理本次对象，清理失败给出告警，不打印凭证，也不重启服务。CI 每轮在准备阶段运行此命令。
+`contract` 创建带随机后缀的 namespace，检查创建、只改指针的新 version、历史、显式 null 和普通 view/table 行为；stock `rest` 必须丢弃 `storage-table`。探针在 `finally` 中清理本次对象，清理失败给出告警，不打印凭证，也不重启服务。它是显式业务合约探针，普通 CI 不在准备阶段自动调用；只有明确选择相应验证时才运行。
 
 `lifecycle` 还检查非法形状返回 400、对象存储 metadata 与 REST 读回的一致性，以及重建 `rest-mv` 容器后 UUID 与历史仍可读取。它只接受 manifest 中 `shared_docker=false` 且项目名以 `nr-isolated-rest-` 开头的栈，通过该栈保存的 Compose 定义操作：
 
@@ -71,7 +70,7 @@ python3 docker/iceberg-rest/rest-mv/probe.py lifecycle --manifest /path/to/isola
 python3 docker/iceberg-rest/rest-mv/probe.py parity --manifest /path/to/reference/manifest.json --expect-dropped
 ```
 
-`--expect-dropped` 仅用于 `parity`。退出码为 0（通过）、1（合约不符）、2（环境或参数错误）；CI 将后两者归为准备阶段的 VERIFY FAILED。fixture 输入缺失的 exit 75 属于运行探针前的 BOM verify，归为 BLOCKED。
+`--expect-dropped` 仅用于 `parity`。退出码为 0（通过）、1（合约不符）、2（环境或参数错误）；保留实际结果与清理事实，不借历史 BOM exit 75 改判为环境前检 BLOCKED。
 
 ## 依赖校验文件维护
 
@@ -84,14 +83,14 @@ docker/iceberg-rest/rest-mv/update-verification-metadata.sh \
 git diff -- docker/iceberg-rest/rest-mv/build/verification-metadata.xml
 ```
 
-工具通过 provision 的 `--context-only rest-mv` 组装同一构建上下文，执行 Dockerfile 的 `verification-metadata-export` 目标，并用 `--refresh-dependencies` 重新解析父 POM，避免热缓存遗漏校验条目，再将结果写回 `build/verification-metadata.xml`。它会获取锁定的 base 和源码输入并联网解析依赖，但不发布 fixture store 的 BOM/READY，也不改写 derived image 别名。可选参数为 `--image-source NAME=REPOSITORY`（可重复，显式选择锁定镜像的下载仓库）、`--artifact-url-prefix ORIGINAL=TRANSPORT`（可重复）和 `--docker-pull-timeout-seconds <seconds>`。维护入口与 provision 共用同一前缀校验和 recipe ARG 作者；context-only 下载及 metadata 构建消费相同映射。镜像仍须匹配 lock 中的 digest。
+工具通过 provision 的 `--context-only rest-mv` 组装同一构建上下文，执行 Dockerfile 的 `verification-metadata-export` 目标，并用 `--refresh-dependencies` 重新解析父 POM，避免热缓存遗漏校验条目，再将结果写回 `build/verification-metadata.xml`。它按推荐配方取得缺失的 base 和源码输入并联网解析依赖；不发布消费准入 BOM/READY，也不改写 derived image 别名。可选参数为 `--image-source NAME=REPOSITORY`（可重复，显式选择推荐镜像的下载仓库）、`--artifact-url-prefix ORIGINAL=TRANSPORT`（可重复）和 `--docker-pull-timeout-seconds <seconds>`。维护入口与 provision 共用同一前缀校验和 recipe ARG 作者；context-only 下载及 metadata 构建消费相同映射。镜像不做环境 digest 比对；源码 artifact 与 Gradle 依赖的严格内容校验继续保留。
 
-维护者审查新增依赖、插件、来源与校验和后提交变更。正常 provision 使用严格校验，缺项或不符即失败；BuildKit 的 `/home/gradle/.gradle` 缓存可在严格校验下复用。修改探针或本 README 不改变构建身份；`build/` 中全部文件都属于 lock 的定义输入。
+维护者审查新增依赖、插件、来源与校验和后提交变更。正常 provision 使用严格校验，缺项或不符即失败；BuildKit 的 `/home/gradle/.gradle` 缓存可在严格校验下复用。修改探针或本 README 不改变构建身份；`build/` 中全部文件仍属于构建 recipe 的定义输入。
 
 ## 机器切换与旧实例退出
 
-输入仍只有当前lock/BOM。provision先完成全部derived image构建，再更新别名、BOM与READY；构建失败保持旧状态，提交段中断可能留下部分已改写别名，需显式重跑provision恢复。测试/verify不自行供给。
+输入推荐统一由 `versions.json` 维护。已有目标镜像直接复用，缺失时才构建其依赖并记录实际 image ID；构建中断或已有损坏保留实际失败，交人工维护，不建立自动重建或环境准入协议。
 
-输入改变后，维护者显式执行 `fixture-runtime.sh upgrade`；worktree普通up只核验同版本ready机器并发布不可变输入，旧lock或定义不符会BLOCKED。机器固定运行stock rest和rest-mv，各有准确SQLite状态卷。维护保存MinIO整卷及benchmark全部对象，撤销旧访问材料并在线清理scratch、切换及健康核验后才提交ready；不按旧catalog ID创建并存栈或执行stop/delete。
+推荐值变化不阻止使用已有机器；需要切换时维护者显式执行 `fixture-runtime.sh upgrade`。worktree 普通 up 使用保存配置并发布不可变输入，不比较当前推荐值或重新检查全环境。机器固定运行stock rest和rest-mv，各有准确SQLite状态卷。维护保存MinIO整卷及benchmark全部对象，撤销旧访问材料并在线清理scratch、切换并记录实际创建目标后才提交ready；不按旧catalog ID创建并存栈或执行stop/delete。
 
 旧项目和卷先形成准确保留清单，在维护窗口另行处理，不自动认领或删除。privatelifecycle探针仍只操作自身准确项目；共享contract探针使用本run namespace/location及原预算。回退代码本身不会恢复机器输入、凭证或已清理scratch。详见 [fixture README](../README.md#输入与机器维护) 和 [ADR-0191](../../../docs/adr/ADR-0191-machine-shared-fixture-and-bounded-scratch.md)。

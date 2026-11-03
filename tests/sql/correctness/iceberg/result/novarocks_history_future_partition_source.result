@@ -1,0 +1,39 @@
+-- query 3
+-- types	bigint
+id
+1
+
+-- query 4
+-- types	bigint	varchar
+id	id_type
+1	bigint
+
+-- query 5
+-- types	bigint
+id
+1
+
+-- query 6
+-- types	bigint	integer
+id	future
+1	NULL
+
+-- query 7
+-- types	bigint
+snapshot_count
+1
+
+-- query 10
+-- types	bigint
+snapshot_count
+3
+
+-- query 11
+-- types	bigint	integer
+id	future
+1	9
+
+-- query 12
+-- types	bigint
+id
+1

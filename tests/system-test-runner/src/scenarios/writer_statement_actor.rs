@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Distributed writer SQL actor with an exact statement nomination gate.
-use super::super::native_sql_controls::SelectedStatement;
+//! SQL actor with an exact statement nomination gate and joined failure cleanup.
+use super::native_sql_controls::SelectedStatement;
 use crate::{actors::mysql as mysql_actor, scenario::ScenarioContext};
 use anyhow::{Context, Result};
 use mysql::prelude::Queryable;
@@ -44,6 +44,21 @@ enum SqlOutcome {
     TransportError,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ReadSessionSettings {
+    pub pipeline_dop: u32,
+}
+impl ReadSessionSettings {
+    pub fn apply(self, connection: &mut mysql::Conn) -> Result<()> {
+        anyhow::ensure!(self.pipeline_dop > 0, "read control DOP must be positive");
+        // Only this original session property is supported. Memory is frozen
+        // by each statement's admitted hint; batch size remains its default.
+        // The scenario checks the actual build participant count separately.
+        connection.query_drop(format!("SET pipeline_dop={}", self.pipeline_dop))?;
+        Ok(())
+    }
+}
+
 pub(super) fn require_public_error_reentry(connection: &mut mysql::Conn) -> Result<()> {
     let rows: Vec<i64> = connection
         .query("SELECT 1")
@@ -55,11 +70,34 @@ pub(super) fn require_public_error_reentry(connection: &mut mysql::Conn) -> Resu
     Ok(())
 }
 impl WriterActor {
+    pub fn observation(&self) -> &QueryLifecycleStatementObservation {
+        &self.observation
+    }
+
     pub fn start(
         context: &mut ScenarioContext,
         sql: &str,
         selected: SelectedStatement,
         query_timeout_secs: Option<u64>,
+    ) -> Result<Self> {
+        Self::start_internal(context, sql, selected, query_timeout_secs, None, None)
+    }
+    pub fn start_read(
+        context: &mut ScenarioContext,
+        sql: &str,
+        selected: SelectedStatement,
+        rows: Arc<Mutex<Option<Vec<mysql::Row>>>>,
+        settings: Option<ReadSessionSettings>,
+    ) -> Result<Self> {
+        Self::start_internal(context, sql, selected, None, Some(rows), settings)
+    }
+    fn start_internal(
+        context: &mut ScenarioContext,
+        sql: &str,
+        selected: SelectedStatement,
+        query_timeout_secs: Option<u64>,
+        rows: Option<Arc<Mutex<Option<Vec<mysql::Row>>>>>,
+        read_settings: Option<ReadSessionSettings>,
     ) -> Result<Self> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (submit_tx, submit_rx) = mpsc::sync_channel(1);
@@ -79,6 +117,9 @@ impl WriterActor {
                 let connection =
                     mysql_actor::connect_for_cancellation_until(&actor_user, port, deadline)?;
                 connection.run(|connection| {
+                    if let Some(settings) = read_settings {
+                        settings.apply(connection)?;
+                    }
                     if let Some(seconds) = query_timeout_secs {
                         connection
                             .query_drop(format!("SET query_timeout = {seconds}"))
@@ -94,7 +135,12 @@ impl WriterActor {
                             anyhow::bail!("original SQL submission gate deadline expired")
                         }
                     }
-                    let outcome = connection.query_drop(actor_sql);
+                    let outcome = match rows {
+                        None => connection.query_drop(actor_sql),
+                        Some(rows) => connection.query::<mysql::Row, _>(actor_sql).map(|actual| {
+                            *rows.lock().expect("original read result owner") = Some(actual);
+                        }),
+                    };
                     let classification = match &outcome {
                         Ok(()) => SqlOutcome::Success,
                         Err(mysql::Error::MySqlError(_)) => SqlOutcome::PublicError,

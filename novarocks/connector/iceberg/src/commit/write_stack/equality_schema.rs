@@ -166,7 +166,7 @@ fn resolve_core(
     }
     // Observe JSON as one finite library call, preserving the original control.
     let target: crate::iceberg::spec::Schema = work
-        .opaque(|| serde_json::from_str(recipe.field_schema_json()))?
+        .opaque(|| crate::metadata_json::from_str(recipe.field_schema_json()))?
         .map_err(|error| {
             invalid(format!(
                 "decode frozen Iceberg equality-delete schema: {error}"

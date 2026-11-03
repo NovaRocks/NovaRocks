@@ -4911,7 +4911,11 @@ impl<'a> ContractLoweringVisitor<'a> {
             });
         }
         let kind = lower_join_kind(join.join_type);
-        if (kind == ContractJoinKind::NullAwareLeftAnti) != join.condition.is_null_aware() {
+        if matches!(
+            kind,
+            ContractJoinKind::NullAwareLeftAnti | ContractJoinKind::LeftMark
+        ) != join.condition.is_null_aware()
+        {
             return Err(ContractLoweringError::InvalidJoin {
                 node: "HashJoin",
                 detail: "hash join kind and condition variant disagree",
@@ -5063,6 +5067,10 @@ impl<'a> ContractLoweringVisitor<'a> {
         let lowered_output = self.lower_join_outputs(
             node,
             JoinOutputRequest {
+                mark_column: match join.join_type {
+                    crate::common::JoinKind::LeftMark { mark } => Some(mark),
+                    _ => None,
+                },
                 kind,
                 requested: &plan.output_columns,
                 left,
@@ -5213,6 +5221,12 @@ impl<'a> ContractLoweringVisitor<'a> {
         plan: &PhysicalPlanNode,
         join: &crate::planner::physical::PhysicalNestLoopJoinNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
+        if matches!(join.join_type, crate::common::JoinKind::LeftMark { .. }) {
+            return Err(ContractLoweringError::InvalidJoin {
+                node: "NestLoopJoin",
+                detail: "left mark join requires hash execution",
+            });
+        }
         expect_children(plan, 2)?;
         require_output_shape("NestLoopJoin", &plan.output_columns, &join.output_columns)?;
         let left = self.lower_node(&plan.children[0])?;
@@ -5300,6 +5314,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         } = self.lower_join_outputs(
             node,
             JoinOutputRequest {
+                mark_column: None,
                 kind,
                 requested: &plan.output_columns,
                 left: &left,
@@ -5357,6 +5372,16 @@ impl<'a> ContractLoweringVisitor<'a> {
         let mut columns = BTreeMap::new();
         let mut null_extended = Vec::new();
         for (ordinal, column) in request.requested.iter().enumerate() {
+            if request.kind == ContractJoinKind::LeftMark
+                && request.mark_column == Some(column.column_id)
+            {
+                let value = self
+                    .fragment_mut()
+                    .add_value(value_type(column), ValueOrigin::JoinMark { node })?;
+                columns.insert(column.column_id, value);
+                output.push(value);
+                continue;
+            }
             let matches = [
                 request
                     .left
@@ -10671,6 +10696,7 @@ struct LoweredWriterRelation {
 }
 
 struct JoinOutputRequest<'a> {
+    mark_column: Option<ColumnId>,
     kind: ContractJoinKind,
     requested: &'a [OutputColumn],
     left: &'a LoweredNode,
@@ -11220,6 +11246,7 @@ fn require_no_partition_expressions(
 
 fn lower_join_kind(kind: crate::common::JoinKind) -> ContractJoinKind {
     match kind {
+        crate::common::JoinKind::LeftMark { .. } => ContractJoinKind::LeftMark,
         crate::common::JoinKind::Cross => ContractJoinKind::Cross,
         crate::common::JoinKind::Inner => ContractJoinKind::Inner,
         crate::common::JoinKind::LeftOuter => ContractJoinKind::LeftOuter,
@@ -11307,7 +11334,8 @@ fn hash_join_required_inputs(
                 ContractJoinKind::LeftOuter
                 | ContractJoinKind::LeftSemi
                 | ContractJoinKind::LeftAnti
-                | ContractJoinKind::NullAwareLeftAnti => build_side == ContractJoinSide::Right,
+                | ContractJoinKind::NullAwareLeftAnti
+                | ContractJoinKind::LeftMark => build_side == ContractJoinSide::Right,
                 ContractJoinKind::RightOuter
                 | ContractJoinKind::RightSemi
                 | ContractJoinKind::RightAnti => build_side == ContractJoinSide::Left,
@@ -11464,7 +11492,8 @@ fn hash_join_output_distribution(
             | ContractJoinKind::LeftOuter
             | ContractJoinKind::LeftSemi
             | ContractJoinKind::LeftAnti
-            | ContractJoinKind::NullAwareLeftAnti,
+            | ContractJoinKind::NullAwareLeftAnti
+            | ContractJoinKind::LeftMark,
             _,
         ) => left.properties.distribution.clone(),
         (

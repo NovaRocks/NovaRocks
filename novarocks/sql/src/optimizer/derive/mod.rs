@@ -286,6 +286,7 @@ pub(crate) fn derive_required_alternatives(
         Operator::PhysicalHashJoin(o) => {
             o.derive_required_alternatives(scalars, parent_required, num_children)
         }
+
         _ => vec![ChildRequirementAlternative::default(derive_required(
             op,
             scalars,

@@ -104,7 +104,7 @@ fixture_publication_put s3://bucket/root/file {shlex.quote(str(body))}
             self.assertEqual([item["request"]["operation"] for item in requests], ["get", "stat", "list", "put"])
             for item in requests:
                 self.assertEqual(item["request"]["resolved"], contract)
-                self.assertEqual(item["args"], ["--root", "/original-machine", "--daemon", "original-daemon", "--expected-version", "original-version", "--expected-generation", "original-generation", "--benchmark-oss"])
+                self.assertEqual(item["args"], ["--root", "/original-machine", "--daemon", "original-daemon", "--expected-generation", "original-generation", "--benchmark-oss"])
 
 
 if __name__ == "__main__": unittest.main()

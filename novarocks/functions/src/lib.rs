@@ -88,6 +88,7 @@ mod higher_order_kernel;
 pub mod hll;
 pub mod invocation_arity;
 mod invocation_scalar_resources;
+pub mod json_canonical;
 pub mod json_object_core;
 mod json_object_resources;
 mod kernel_control;

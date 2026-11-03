@@ -373,7 +373,7 @@ pub(crate) async fn visit_parquet_batches_async_with_options(
         context.clone(),
     );
     request.predicates = predicates;
-    request.options = options;
+    request.options = iceberg_reader_options(options);
     let mut reader = open_file_reader_async(request, None)
         .await
         .map_err(map_file_error)?;
@@ -448,6 +448,17 @@ fn bind(access: &FsAccessHandle, path: &str, size: u64) -> Result<BoundFile, Str
         .map_err(|error| error.to_string())
 }
 
+/// Iceberg table metadata and the real Parquet schema own read semantics.
+/// Arrow's optional embedded schema must never assign or erase field IDs.
+// Design: ADR-0213 (docs/adr/ADR-0213-iceberg-read-interpretation-and-current-write-authority.md)
+pub(crate) fn iceberg_reader_options(
+    mut options: novarocks_fs::FileReaderOptions,
+) -> novarocks_fs::FileReaderOptions {
+    options.parquet_interpretation_policy =
+        novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint;
+    options
+}
+
 fn whole_file_request(
     file: BoundFile,
     projection: FileProjection,
@@ -464,7 +475,7 @@ fn whole_file_request(
         },
         predicates: Vec::new(),
         pruning: PhysicalPruning::default(),
-        options: Default::default(),
+        options: iceberg_reader_options(Default::default()),
         cache: None,
         prepared_input: None,
         context,
@@ -537,6 +548,127 @@ pub(crate) mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
+
+    // These are physical SDK fixtures: the row values and field IDs are the
+    // oracle, independently of the optional Arrow schema hint.
+    #[test]
+    fn iceberg_readers_ignore_bad_hints_and_keep_only_physical_ids() {
+        use novarocks_fs::{
+            FileCancellation, FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+        };
+        use parquet::arrow::arrow_writer::ArrowWriterOptions;
+        use parquet::arrow::{ARROW_SCHEMA_META_KEY, ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+        use parquet::file::metadata::KeyValue;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        for identified in [false, true] {
+            let mut field = Field::new("value", DataType::Int64, true);
+            if identified {
+                field =
+                    field.with_metadata([(PARQUET_FIELD_ID_META_KEY.to_owned(), "17".to_owned())]);
+            }
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+            for hint in ["absent", "bad", "conflicting-id"] {
+                let path = directory
+                    .path()
+                    .join(format!("id-{identified}-hint-{hint}.parquet"));
+                let mut writer = ArrowWriter::try_new_with_options(
+                    std::fs::File::create(&path).unwrap(),
+                    schema.clone(),
+                    ArrowWriterOptions::new().with_skip_arrow_metadata(true),
+                )
+                .unwrap();
+                writer
+                    .write(
+                        &RecordBatch::try_new(
+                            schema.clone(),
+                            vec![Arc::new(Int64Array::from(vec![Some(7), None, Some(-3)]))],
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                if hint != "absent" {
+                    let encoded = if hint == "bad" {
+                        "not-an-arrow-schema".to_owned()
+                    } else {
+                        // A valid hint claims a different ID for the same data.
+                        let field = Field::new("value", DataType::Int64, true).with_metadata([(
+                            PARQUET_FIELD_ID_META_KEY.to_owned(),
+                            "99".to_owned(),
+                        )]);
+                        parquet::arrow::encode_arrow_schema(&arrow::datatypes::Schema::new(vec![
+                            field,
+                        ]))
+                    };
+                    writer.append_key_value_metadata(KeyValue::new(
+                        ARROW_SCHEMA_META_KEY.to_owned(),
+                        encoded,
+                    ));
+                }
+                writer.close().unwrap();
+                let location = path.to_string_lossy();
+                let size = std::fs::metadata(&path).unwrap().len();
+                let access = FsAccessResolver::new()
+                    .resolve_location(
+                        novarocks_spi::connector::StorageAccessDomainId::from_bytes([17; 32]),
+                        location.as_ref(),
+                        None,
+                    )
+                    .unwrap();
+                let context = FileReadContext {
+                    cancellation: FileCancellation::new(),
+                    deadline: None,
+                    runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+                    task_spawner: Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+                    range: None,
+                };
+                let projection = if identified {
+                    FileProjection::FieldIds(vec![17])
+                } else {
+                    FileProjection::All
+                };
+                let synchronous = read_parquet_batches(
+                    &access,
+                    &location,
+                    Some(size),
+                    projection.clone(),
+                    context.clone(),
+                )
+                .unwrap();
+                let asynchronous = runtime
+                    .block_on(read_parquet_batches_async(
+                        &access,
+                        &location,
+                        Some(size),
+                        projection,
+                        context,
+                    ))
+                    .unwrap();
+                for batches in [&synchronous, &asynchronous] {
+                    assert_eq!(batches.len(), 1);
+                    assert_eq!(
+                        batches[0]
+                            .batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap(),
+                        &Int64Array::from(vec![Some(7), None, Some(-3)])
+                    );
+                    assert_eq!(
+                        batches[0]
+                            .batch
+                            .schema()
+                            .field(0)
+                            .metadata()
+                            .get(PARQUET_FIELD_ID_META_KEY),
+                        identified.then(|| "17".to_owned()).as_ref()
+                    );
+                }
+            }
+        }
+    }
 
     pub(crate) type RangeReceipt = (String, u64, Option<u64>);
     pub(crate) type RangeReceiptLog = Arc<std::sync::Mutex<Vec<RangeReceipt>>>;

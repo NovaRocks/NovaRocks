@@ -25,6 +25,7 @@ pub enum JoinType {
     LeftAnti,
     RightAnti,
     NullAwareLeftAnti,
+    LeftMark,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

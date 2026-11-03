@@ -32,7 +32,6 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', required=True, type=Path)
     parser.add_argument('--daemon', required=True)
-    parser.add_argument('--expected-version', required=True)
     parser.add_argument('--expected-generation', required=True)
     parser.add_argument('--context-file', type=Path)
     parser.add_argument('--script-file', type=Path)
@@ -70,7 +69,7 @@ def main(argv=None):
             script = sys.stdin.read(65537)
         if len(script) > 65536 or not script:
             raise runtime.RuntimeFailure('InvalidConfiguration', 'mc script is empty or exceeds its input bound')
-        with owner.ready_snapshot({'version': args.expected_version}, deadline=deadline,
+        with owner.operation_snapshot(deadline=deadline,
                                   expected_generation=args.expected_generation) as snapshot:
             inherited_storage = os.environ.get(RUN_STORAGE_ENV)
             if inherited_storage is not None:

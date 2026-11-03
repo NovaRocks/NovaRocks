@@ -326,3 +326,38 @@ against the owned MinIO bucket. These cases do not claim coverage for every
 expiry interleaving, all protection roots, or cross-generation coordination;
 those have additional provider/application tests and separate acceptance rows.
 A before-forward proxy hold cannot substitute for the late-request scene.
+
+
+### JSON membership lifecycle
+
+The explicit `query-lifecycle/json-membership-full-eos`, `json-membership-cancel`
+and `json-membership-capacity` scenarios protect the null-aware mark join's real
+build/probe lifecycle. Run them on the main dev artifact with native FE+3BE when
+changing SQL mark planning, signed JSON IN equality, join build/probe or the
+JSON normalization or Variant rendering. Each invocation creates private Hadoop Iceberg tables under
+its managed runtime; it needs no shared external fixture.
+
+The first two scenarios nominate an actual mark Task with an actual remote output
+destination from the frozen graph. An authenticated exact statement/Task action
+holds its sole build publication after normal build-input sealing, and the bounded
+existing observation channel records the mark probe's real scheduler Dependency
+wait. Ending that action releases the original publication. Cancellation uses
+public KILL and checks original-connection reentry. The capacity scenario builds many distinct small JSON keys, consumes
+all JSON producer values in an independent control and checks a small mark build
+under the same target query budget. The target preserves the original QueryRoot
+tracker's typed Resource failure and actual Task execution site; the original
+runtime ancestry identifies that unique limit owner. A read-only sample witnesses
+actual live mark build key pages on the same BE. It imposes no budget-percentage
+threshold and does not infer physical memory from conservative reservations.
+The producer may be the first allocation caller refused by the shared query
+budget. Samples from different events, slots, Tasks or BEs are not added to
+manufacture a memory peak. No sleep or backend-count
+formula supplies a stage-completion oracle; observation polling only waits for
+original facts. The shared SQL actor owns kill, socket close, actual join and
+statement-observation drain on success, public error, deadline and failure.
+
+Expected row values follow the fixed integer-key three-valued oracle in
+`json_membership.rs`; the SQL suite additionally distinguishes JSON `null` from
+SQL NULL and checks supported/rejected clauses. These are functional lifecycle
+assets, not performance evidence. Scenario evidence and independent teardown must
+both be inspected; a successful SQL prefix cannot discharge unfinished cleanup.

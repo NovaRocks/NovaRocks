@@ -131,6 +131,8 @@ pub(crate) struct FragmentFacts {
     #[cfg(test)]
     root_plan_node_id: i32,
     table_writers: Box<[StaticTableWriter]>,
+    #[cfg(novarocks_dev_controls)]
+    has_left_mark_join: bool,
     carries_runtime_filter_bindings: bool,
 }
 
@@ -173,6 +175,11 @@ impl FragmentFacts {
     #[cfg(test)]
     pub(crate) fn declares_table_writer(&self) -> bool {
         !self.table_writers.is_empty()
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) const fn has_left_mark_join(&self) -> bool {
+        self.has_left_mark_join
     }
 
     pub(crate) fn table_writers(&self) -> &[StaticTableWriter] {
@@ -251,6 +258,16 @@ impl FragmentArtifact {
             logical_summary_output,
             #[cfg(test)]
             root_plan_node_id: _validated_root_plan_node_id,
+            #[cfg(novarocks_dev_controls)]
+            has_left_mark_join: fragment.nodes().values().any(|node| {
+                matches!(
+                    &node.kind,
+                    NodeKind::HashJoin {
+                        kind: novarocks_physical_plan::JoinKind::LeftMark,
+                        ..
+                    }
+                )
+            }),
             table_writers: fragment
                 .nodes()
                 .values()

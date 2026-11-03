@@ -910,6 +910,7 @@ fn relational_all_closed_join_set_and_partition_topn_enums_keep_raw_payloads() {
     fixture.with_tokens(&c, |values, expressions, read| {
         for (kind, raw) in [
             (p::JoinKind::Cross, wire::JoinKind::Cross),
+            (p::JoinKind::LeftMark, wire::JoinKind::LeftMark),
             (p::JoinKind::Inner, wire::JoinKind::Inner),
             (p::JoinKind::LeftOuter, wire::JoinKind::LeftOuter),
             (p::JoinKind::RightOuter, wire::JoinKind::RightOuter),
@@ -936,7 +937,8 @@ fn relational_all_closed_join_set_and_partition_topn_enums_keep_raw_payloads() {
                     Some(wire::physical_node::Kind::NestLoopJoin(v)) => v.kind = raw as i32,
                     _ => unreachable!(),
                 };
-                if kind == p::JoinKind::NullAwareLeftAnti && at == 0 {
+                if matches!(kind, p::JoinKind::NullAwareLeftAnti | p::JoinKind::LeftMark) && at == 0
+                {
                     if let p::NodeKind::HashJoin { condition, .. } = &mut node.kind {
                         let p::HashJoinCondition::Ordinary { keys, residual } = condition.clone()
                         else {

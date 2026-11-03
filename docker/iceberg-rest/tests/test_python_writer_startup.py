@@ -59,7 +59,7 @@ class WriterStartupTests(unittest.TestCase):
                     return report
                 with patch.object(iceberg.support.governed_run,"restore_context",return_value=True), \
                         patch.object(iceberg.support,"load_runtime",return_value=runtime), \
-                        patch.object(iceberg,"install_verified_images"),patch.object(iceberg,"verify_ready",return_value=manifest), \
+                        patch.object(iceberg,"install_runtime_images"),patch.object(iceberg,"verify_ready",return_value=manifest), \
                         patch.object(iceberg,"spark_build",side_effect=lambda *args:exited.append(True)), \
                         patch.object(iceberg.support.governed_run,"cleanup_run",side_effect=clean), \
                         patch.object(iceberg,"remove_prefix") as remove:
@@ -72,31 +72,22 @@ class WriterStartupTests(unittest.TestCase):
                 remove.assert_not_called()
                 if not complete: self.assertTrue((root/"READY").exists())
 
-    def test_iceberg_rejected_inputs_cannot_reach_running_image_inspection(self):
-        with patch.object(iceberg.support, "run_command", side_effect=iceberg.support.FixtureError("rejected input")) as command, \
-                patch.object(iceberg.support, "read_json") as read:
-            with self.assertRaisesRegex(iceberg.support.FixtureError, "rejected input"):
-                iceberg.install_verified_images(Path("/unused/store"), object())
-            command.assert_called_once()
-            self.assertEqual(command.call_args.args[0][-2:], ["--consumer", "iceberg-rest"])
-            read.assert_not_called()
+    def test_iceberg_uses_original_image_binding_without_environment_commands(self):
+        publication = {"shared_docker": True, "runtime": {"machine": {"images": {
+            "spark": {"image_id": "sha256:original-spark"}, "mc": {"image_id": "sha256:original-mc"}}}}}
+        runtime = SimpleNamespace(env_file=Path("/original/publication/env.sh"))
+        with patch.dict(os.environ, {}, clear=True), patch.object(iceberg.support, "read_json", return_value=publication), \
+                patch.object(iceberg.support, "run_command", side_effect=AssertionError("environment preflight")):
+            inputs = iceberg.install_runtime_images(runtime)
+            self.assertEqual(inputs["spark_image_id"], "sha256:original-spark")
+            self.assertEqual(os.environ["MINIO_MC_IMAGE"], "sha256:original-mc")
 
-    def test_iceberg_consumer_still_rejects_a_different_running_spark_image(self):
-        bom = {"images": {},
-               "derived_images": {"minio-mc": {"image_id": "sha256:verified-mc"}, "iceberg-spark": {"image_id": "sha256:expected"}},
-               "lock_sha256": "locked"}
-        publication = {"shared_docker": True,
-                       "runtime": {"machine": {"containers": {"spark": "exact-spark"}}}}
-        runtime = SimpleNamespace(env_file=Path("/unused/publication/env.sh"))
-        with patch.dict(os.environ, {}, clear=True), \
-                patch.object(iceberg.support, "read_json", side_effect=[bom, publication]), \
-                patch.object(iceberg.support, "run_command", side_effect=[
-                    SimpleNamespace(stdout="verified"), SimpleNamespace(stdout="sha256:foreign\n")]) as command:
-            with self.assertRaisesRegex(iceberg.support.FixtureError, "running Spark container differs"):
-                iceberg.install_verified_images(Path("/unused/store"), runtime)
-            self.assertEqual(command.call_args_list[0].args[0][-2:], ["--consumer", "iceberg-rest"])
-            self.assertEqual(command.call_args_list[1].args[0],
-                             ["docker", "inspect", "exact-spark", "--format", "{{.Image}}"])
+    def test_iceberg_missing_original_image_binding_is_not_repaired(self):
+        runtime = SimpleNamespace(env_file=Path("/original/publication/env.sh"))
+        with patch.object(iceberg.support, "read_json", return_value={"runtime": {"catalog": {"images": {}}}}), \
+                patch.object(iceberg.support, "run_command", side_effect=AssertionError("unexpected repair")):
+            with self.assertRaises(KeyError):
+                iceberg.install_runtime_images(runtime)
 
     def test_iceberg_prepare_passes_original_budget_before_output_creation(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):

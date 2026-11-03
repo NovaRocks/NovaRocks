@@ -1,8 +1,6 @@
 # Iceberg Variant interoperability fixture
 
-This correctness fixture uses the BOM-pinned Iceberg Java 1.11.0 runtime inside
-the existing Spark 3.5 fixture. Java APIs create Variant/UUID tables; the optional generic reader probe has the
-BOM limitation described below.
+此正确性 fixture 的配方推荐 Iceberg Java 1.11.0 与 Spark 3.5，版本集中在 `docker/fixture-inputs/versions.json`。已有 Spark fixture 直接使用，不进行自动环境版本或 BOM 准入；实际 Java 写入与内容 oracle 仍须验证。Java API 创建 Variant/UUID 表；可选通用 reader 探针的既有观测限制见下文。
 Spark SQL does not need to represent Variant values.
 
 The protected product properties are reading externally authored unshredded and
@@ -91,7 +89,7 @@ claimed by this fixture. Focused data/equality writer tests independently inspec
 Parquet footer annotations with parquet-rs; this fixture retains the independent
 Java Variant read/write and no-side-effect checks.
 
-The current BOM image's generic Java Variant reader fails with
+此前 fixture 镜像的通用 Java Variant reader 已观测到以下失败；该历史观测不证明任意现有机器的当前状态：
 `NoSuchMethodError: commons.lang3.stream.Streams.of(Iterable)`. `observe` remains
 an explicit independent probe and is not called by the default SQL cases while
 the approved independent-read exception applies. No implicit host Maven jar or

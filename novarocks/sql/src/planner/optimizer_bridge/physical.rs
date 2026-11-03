@@ -608,6 +608,11 @@ fn join_output_columns_from_children(
     right: Vec<OutputColumn>,
 ) -> Vec<OutputColumn> {
     match join_type {
+        JoinKind::LeftMark { .. } => {
+            let mut output = left;
+            output.push(join_type.mark_output().expect("mark output"));
+            output
+        }
         JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left,
         JoinKind::RightSemi | JoinKind::RightAnti => right,
         JoinKind::LeftOuter => {

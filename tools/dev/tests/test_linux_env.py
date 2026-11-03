@@ -63,7 +63,7 @@ class FakeCommands:
         self.daemon_mirrors = ["https://mirror.test/"]
         self.required_version = "v1"
         self.machine = {"phase": "ready", "observed_healthy": True, "generation": "g1", "version": "v1"}
-        self.publication = {"ready": True, "machine": {"generation": "g1", "version": "v1"}}
+        self.diagnostic_error = None
         self.payloads = {"rustup": b"rustup-executable"}
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
@@ -134,14 +134,8 @@ class FakeCommands:
         elif command == "ldconfig":
             output = "libclang-21.so (libc6,x86-64) => /lib/libclang-21.so\n"
         elif command == "python3":
-            if "ctypes.CDLL" in args[2]:
-                pass
-            else:
-                if self.machine["version"] != self.required_version:
-                    raise linux.EnvironmentFailure("fixture machine version differs from current source/BOM")
-                if not self.machine["observed_healthy"]:
-                    raise linux.EnvironmentFailure("fixture machine is unhealthy")
-                output = json.dumps(self.machine)
+            if "ctypes.CDLL" not in args[2]:
+                raise AssertionError(f"unexpected Python probe: {args}")
         elif command == "id":
             output = "users docker\n"
         elif command == "usermod":
@@ -191,14 +185,14 @@ class FakeCommands:
                 code = 1
         elif command.endswith("fixture-runtime.sh"):
             if args[1] == "check":
-                if self.machine["version"] != self.required_version:
-                    raise linux.EnvironmentFailure("fixture machine version differs from current source/BOM")
-                if not self.machine["observed_healthy"]:
-                    raise linux.EnvironmentFailure("fixture machine is unhealthy")
-            output = json.dumps(self.machine)
-        elif command.endswith("status.sh"):
-            output = json.dumps(self.publication)
-        elif command.endswith(("provision.sh", "verify.sh", "up.sh")):
+                if self.diagnostic_error:
+                    raise linux.EnvironmentFailure(self.diagnostic_error)
+                output = json.dumps({"machine": self.machine, "observed_healthy": self.machine["observed_healthy"], "errors": [],
+                                     "recommended_versions": {"test": self.required_version},
+                                     "actual_versions": {"test": self.machine["version"]}})
+            else:
+                output = json.dumps(self.machine)
+        elif command.endswith("up.sh"):
             output = "{}"
         else:
             raise AssertionError(f"unexpected command: {args}")
@@ -258,8 +252,8 @@ class EnvironmentTests(unittest.TestCase):
         installer = linux.LinuxEnvironment(self.repo, self.inputs, profile, self.account,
             commands=self.commands, system_root=self.system, tools_only=True)
         result = installer.prepare()
-        installer.check()
-        self.assertIsNone(result["checks"]["docker"])
+        self.assertNotIn("checks", result)
+        self.assertIsNone(installer.check()["docker"])
         self.assertNotIn("NOVA_FIXTURE_STORE", installer.environment)
         self.assertNotIn("DOCKER_CONTEXT", installer.environment)
         for args, _ in self.commands.calls:
@@ -373,11 +367,11 @@ class EnvironmentTests(unittest.TestCase):
             "https://upstream.invalid/maven2/": "https://mirror.invalid/public/",
             "https://files.invalid/packages/": "https://mirror.invalid/packages/"}
         self.installer.fixture(prepare=True)
-        provision = [args for args, _ in self.commands.calls if args[0].endswith("/provision.sh")]
-        self.assertEqual(1, len(provision))
+        starts = [args for args, _ in self.commands.calls if args[0].endswith("/fixture-runtime.sh") and args[1] == "start"]
+        self.assertEqual(1, len(starts))
         for original, transport in self.profile["fixture_artifact_url_prefixes"].items():
-            index = provision[0].index(f"{original}={transport}")
-            self.assertEqual("--artifact-url-prefix", provision[0][index - 1])
+            index = starts[0].index(f"{original}={transport}")
+            self.assertEqual("--artifact-url-prefix", starts[0][index - 1])
         self.commands.calls.clear()
         self.installer.fixture(prepare=False)
         self.assertFalse(any("--artifact-url-prefix" in args for args, _ in self.commands.calls))
@@ -437,8 +431,6 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(json.loads(installer.object_store_path.read_text()), expected)
         self.assertEqual(json.loads(installer.fixture_machine_config_path.read_text()), {"object_store": expected})
         for args, environment in self.commands.calls:
-            if args[0].endswith(("provision.sh", "verify.sh")):
-                self.assertEqual(args[args.index("--consumer") + 1], "iceberg-rest-oss")
             if args[0].endswith("fixture-runtime.sh"):
                 self.assertEqual(args[args.index("--config") + 1], str(installer.fixture_machine_config_path))
             if args[0].endswith(("provision.sh", "verify.sh", "fixture-runtime.sh", "up.sh", "status.sh")):
@@ -494,9 +486,7 @@ class EnvironmentTests(unittest.TestCase):
     def test_generic_profile_keeps_local_minio_consumer(self):
         self.installer.fixture(prepare=True)
         for args, environment in self.commands.calls:
-            if args[0].endswith(("provision.sh", "verify.sh")):
-                self.assertEqual(args[args.index("--consumer") + 1], "iceberg-rest")
-                self.assertNotIn("NOVA_ENV_OBJECT_STORE_CONFIG", environment)
+            self.assertNotIn("NOVA_ENV_OBJECT_STORE_CONFIG", environment)
             if args[0].endswith("fixture-runtime.sh"):
                 self.assertNotIn("--config", args)
 
@@ -539,11 +529,22 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(self.installer.environment["RUSTUP_TOOLCHAIN"], "1.98.1")
         self.assertEqual(self.installer.check()["action"], "check")
 
+    def test_prepare_reuses_fixture_without_automatic_diagnostics(self):
+        self.commands.machine["observed_healthy"] = False
+        self.commands.required_version = "new-recommendation"
+        result = self.prepare()
+        self.assertNotIn("checks", result)
+        fixture_calls = [args for args, _ in self.commands.calls if "iceberg-rest/" in args[0]]
+        self.assertEqual([Path(args[0]).name for args in fixture_calls], ["fixture-runtime.sh", "up.sh"])
+        self.assertEqual(fixture_calls[0][1], "start")
+        self.assertFalse(any(args[:2] == ["docker", "info"] for args, _ in self.commands.calls))
+        self.assertFalse(any(args[0].endswith(("provision.sh", "verify.sh")) for args, _ in self.commands.calls))
+
     def test_fixture_transfers_use_the_configured_download_deadline(self):
         self.profile["download_timeout_seconds"] = 317
         self.installer.timeout = 317
         self.installer.fixture(prepare=True)
-        calls = [args for args, _ in self.commands.calls if args[0].endswith("provision.sh")]
+        calls = [args for args, _ in self.commands.calls if args[0].endswith("fixture-runtime.sh") and args[1] == "start"]
         self.assertEqual(len(calls), 1)
         position = calls[0].index("--docker-pull-timeout-seconds")
         self.assertEqual(calls[0][position + 1], "317")
@@ -681,15 +682,14 @@ class EnvironmentTests(unittest.TestCase):
             self.assertNotIn("install", args)
             self.assertNotIn("restart", args)
 
-    def test_check_refuses_unhealthy_machine_or_stale_publication(self):
+    def test_manual_check_surfaces_owner_failure_without_repair(self):
         self.prepare()
-        self.commands.machine["observed_healthy"] = False
-        with self.assertRaisesRegex(linux.EnvironmentFailure, "unhealthy"):
-            self.installer.check()
-        self.commands.machine["observed_healthy"] = True
-        self.commands.publication["machine"]["generation"] = "stale"
-        with self.assertRaisesRegex(linux.EnvironmentFailure, "differs from current"):
-            self.installer.check()
+        self.commands.diagnostic_error = "owner diagnostic failed"
+        self.commands.calls.clear()
+        with self.assertRaisesRegex(linux.EnvironmentFailure, "owner diagnostic failed"):
+            self.installer.fixture(prepare=False)
+        self.assertEqual(len(self.commands.calls), 1)
+        self.assertEqual(self.commands.calls[0][0][1], "check")
 
     def test_nextest_same_version_with_wrong_bytes_is_replaced_from_verified_archive(self):
         destination = self.home / ".cargo/bin/cargo-nextest"
@@ -746,11 +746,14 @@ class EnvironmentTests(unittest.TestCase):
         with self.assertRaisesRegex(linux.EnvironmentFailure, "unsupported login shell"):
             installer.ensure_account_environment()
 
-    def test_check_current_source_rejects_stale_healthy_machine_and_matching_publication(self):
+    def test_manual_check_reports_recommendation_drift_without_rejecting_existing_machine(self):
         self.prepare()
         self.commands.required_version = "new-source-version"
-        with self.assertRaisesRegex(linux.EnvironmentFailure, "differs from current source/BOM"):
-            self.installer.check()
+        self.commands.machine["observed_healthy"] = False
+        result = self.installer.check()["fixture"]
+        self.assertFalse(result["observed_healthy"])
+        self.assertEqual(result["recommended_versions"], {"test": "new-source-version"})
+        self.assertEqual(result["actual_versions"], {"test": "v1"})
 
     def test_cancelled_version_observation_cannot_trigger_installation(self):
         original = self.commands.run

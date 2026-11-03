@@ -212,7 +212,7 @@ fn sql_read_data_type(
 /// canonical serialization with the provider prevents catalog mutation and
 /// write planning callers from each accepting a slightly different mapping.
 pub fn canonical_name_mapping(raw: &str) -> Result<String, String> {
-    let value: serde_json::Value = serde_json::from_str(raw)
+    let value: serde_json::Value = crate::metadata_json::from_str(raw)
         .map_err(|error| format!("decode schema.name-mapping.default: {error}"))?;
     validate_name_mapping_json(&value)?;
     let mapping: NameMapping = serde_json::from_value(value)

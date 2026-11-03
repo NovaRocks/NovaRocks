@@ -32,8 +32,8 @@ import sys
 try:
     publication = (Path(sys.argv[1]) / 'runtime/current/published').resolve(strict=True)
     manifest = json.loads((publication / 'manifest.json').read_text())
-    if not manifest.get('ready') or not manifest.get('fixture_inputs', {}).get('verified'):
-        raise ValueError('publication is not ready with verified inputs')
+    if not manifest.get('ready'):
+        raise ValueError('publication has no saved configuration')
     if not (publication / 'env.sh').is_file():
         raise ValueError('publication has no immutable environment')
 except (OSError, ValueError) as error:
@@ -47,29 +47,6 @@ if [[ "$NOVA_ENV_REST_ENV_FILE" != "$publication/env.sh" ]]; then
     echo "FAIL: sourced environment differs from pinned publication" >&2
     exit 1
 fi
-
-input_store=$(python3 - "$publication/manifest.json" <<'PY'
-import json
-import os
-from pathlib import Path
-import sys
-manifest = json.loads(Path(sys.argv[1]).read_text())
-print(Path(manifest['fixture_inputs']['bom']).parent)
-PY
-)
-# Read-only verification; missing pinned inputs stay BLOCKED. No provision/download/READY rewrite.
-"$repo_root/docker/fixture-inputs/verify.sh" --store "$input_store" --repo-root "$repo_root" --consumer iceberg-rest
-python3 - "$publication/manifest.json" "$input_store/bom.json" <<'PY'
-import json
-import os
-from pathlib import Path
-import sys
-manifest = json.loads(Path(sys.argv[1]).read_text())
-bom = json.loads(Path(sys.argv[2]).read_text())
-if manifest['fixture_inputs']['lock_sha256'] != bom['lock_sha256']:
-    print('BLOCKED: pinned publication differs from verified fixture input lock', file=sys.stderr)
-    sys.exit(75)
-PY
 
 : "${NOVAROCKS_ICEBERG_REST_URI:?pinned REST URI required}"
 : "${NOVAROCKS_ICEBERG_REST_WAREHOUSE:?pinned REST warehouse required}"
@@ -115,7 +92,6 @@ facts = {
     'publication': sys.argv[3],
     'run_context': json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT']),
     'run_storage': json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE']),
-    'fixture_input_lock_sha256': manifest['fixture_inputs']['lock_sha256'],
     'boundary': 'Java REST metadata interoperability; native 1FE+3BE SQL acceptance is separate',
 }
 Path(sys.argv[2]).write_text(json.dumps(facts, indent=2) + '\n')

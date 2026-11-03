@@ -26,6 +26,7 @@ mod iceberg_delete_oracle;
 mod iceberg_delete_warm;
 #[cfg(unix)]
 mod independent_root_target;
+mod json_membership;
 mod listing;
 mod listing_real_rest;
 mod memory_attribution;
@@ -65,11 +66,13 @@ mod trino_protocol;
 mod uea4_catalog_planning;
 mod uea4_range_reads;
 mod uea4_scan_readiness;
+mod writer_statement_actor;
 
 pub fn all() -> Vec<Box<dyn Scenario>> {
     let mut scenarios = Vec::new();
     scenarios.extend(backend_membership::scenarios());
     scenarios.extend(query_lifecycle::scenarios());
+    scenarios.extend(json_membership::scenarios());
     scenarios.extend(query_concurrency::scenarios());
     scenarios.extend(query_output::scenarios());
     scenarios.extend(memory_attribution::scenarios());

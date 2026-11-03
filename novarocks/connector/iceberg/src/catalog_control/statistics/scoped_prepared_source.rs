@@ -154,7 +154,7 @@ impl Work {
             return Err(invalid("source pin belongs to another provider instance"));
         }
         let payload: crate::metadata::IcebergTablePayload =
-            serde_json::from_slice(self.request.observed_table().payload())
+            crate::metadata_json::from_slice(self.request.observed_table().payload())
                 .map_err(|e| invalid(format!("decode original source observation: {e}")))?;
         if payload.metadata_table_type.is_some()
             || payload.row_mutation_frozen_source
@@ -173,8 +173,9 @@ impl Work {
             .serialized_metadata
             .as_ref()
             .ok_or_else(|| invalid("source pin has no complete frozen metadata"))?;
-        let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
-            .map_err(|e| invalid(format!("decode frozen source metadata: {e}")))?;
+        let metadata: crate::iceberg::spec::TableMetadata =
+            crate::metadata_json::from_str(serialized)
+                .map_err(|e| invalid(format!("decode frozen source metadata: {e}")))?;
         let observed = self
             .request
             .observed_source_facts()

@@ -114,7 +114,7 @@ impl IcebergSessionMaterial {
             .data_recipe
             .target_schema_json()
             .ok_or_else(|| invalid("Iceberg data branch requires a frozen target schema"))?;
-        let schema: crate::iceberg::spec::Schema = serde_json::from_str(frozen)
+        let schema: crate::iceberg::spec::Schema = crate::metadata_json::from_str(frozen)
             .map_err(|error| invalid(format!("invalid frozen Iceberg target schema: {error}")))?;
         let table = format!("{}.{}", self.table.namespace(), self.table.table_name());
         crate::commit::validation::deny_unwritable_data_files(&schema, &table)?;

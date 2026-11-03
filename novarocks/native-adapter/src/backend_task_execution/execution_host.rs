@@ -1136,6 +1136,12 @@ impl NativeTaskExecutionHost {
             .with_result_identity(identity)
             .with_edge_gates(Arc::clone(&edges));
         #[cfg(novarocks_dev_controls)]
+        if let Some(controls) = &self.test_controls {
+            context = context.with_join_build_control(Some(Arc::new(
+                crate::join_build_test_control::JoinBuildHold::new(identity, Arc::clone(controls)),
+            )));
+        }
+        #[cfg(novarocks_dev_controls)]
         if let Some(observations) = self.queries.observation_controls()
             && let Some(observer) = observations
                 .observation_for("exchange-snapshot", execution)

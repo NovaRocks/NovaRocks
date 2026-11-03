@@ -393,6 +393,8 @@ impl<'a> AnalyzerContext<'a> {
         //    predicates remain in its WHERE; M1b's PushDownApplyFilter rule
         //    extracts them into the Apply node's correlation_conjuncts.
         select.apply_specs.push(ApplyScalarSpec {
+            mark_probe: None,
+            mark_key_bindings: None,
             subquery_id: sq_info.id,
             clause,
             output_column,
@@ -475,6 +477,16 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 let lhs = self.analyze_expr(in_expr, scope)?;
                 let inner_col = &resolved_sub.output_columns[0];
+                if super::resolve_expr::is_json_in_subquery_operand(&lhs, scope)
+                    || inner_col.value_type.logical_type()
+                        == novarocks_type_contract::ValueLogicalType::Json
+                {
+                    return Err(AnalyzeError::unsupported_query_shape(
+                        "JSON IN subquery requires a SELECT value or a WHERE/HAVING OR operand",
+                        sq_info.subquery.span,
+                    ));
+                }
+
                 if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
                     lhs.value_type.data_type(),
                     inner_col.value_type.data_type(),
@@ -686,6 +698,19 @@ impl<'a> AnalyzerContext<'a> {
         let (resolved_sub, inner_scope) =
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
 
+        if let Some(probe) = &sq_info.in_expr {
+            let probe = self.analyze_expr(probe, scope)?;
+            if super::resolve_expr::is_json_in_subquery_operand(&probe, scope)
+                || resolved_sub.output_columns.iter().any(|c| {
+                    c.value_type.logical_type() == novarocks_type_contract::ValueLogicalType::Json
+                })
+            {
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "JSON IN subquery is not supported in JOIN ON",
+                    sq_info.subquery.span,
+                ));
+            }
+        }
         let is_correlated = match resolved_sub.body {
             QueryBody::Select(ref sel) => sel
                 .filter
@@ -1800,7 +1825,36 @@ impl<'a> AnalyzerContext<'a> {
         };
         let lhs_typed_list: Vec<TypedExpr> = lhs_items_ast
             .iter()
-            .map(|e| self.analyze_expr(e, scope))
+            .map(|expr| match self.analyze_expr(expr, scope) {
+                Ok(expr) => Ok(expr),
+                Err(error) if error.control_error().is_some() => Err(error),
+                Err(error) => {
+                    if !select
+                        .having
+                        .as_ref()
+                        .is_some_and(|having| expr_contains_placeholder(having, sq_info.id))
+                    {
+                        return Err(error);
+                    }
+                    let mut aliases = scope.clone();
+                    for item in &select.projection {
+                        self.check_control()?;
+                        aliases.add_column_with_id(
+                            None,
+                            &item.output_name,
+                            item.output_column_id,
+                            item.expr.value_type.clone(),
+                        );
+                    }
+                    let typed = self.analyze_expr(expr, &aliases)?;
+                    let typed = self.substitute_select_aliases(typed, &select.projection);
+                    if super::resolve_expr::is_json_in_subquery_operand(&typed, &aliases) {
+                        Ok(typed)
+                    } else {
+                        Err(error)
+                    }
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         let (resolved_sub, inner_scope) =
@@ -1815,6 +1869,122 @@ impl<'a> AnalyzerContext<'a> {
                 ),
                 sq_info.subquery.span,
             ));
+        }
+
+        let has_json = lhs_typed_list
+            .iter()
+            .any(|e| super::resolve_expr::is_json_in_subquery_operand(e, scope))
+            || resolved_sub.output_columns.iter().any(|c| {
+                c.value_type.logical_type() == novarocks_type_contract::ValueLogicalType::Json
+            });
+        if has_json {
+            if lhs_typed_list.len() != 1
+                || !super::resolve_expr::is_json_in_subquery_operand(&lhs_typed_list[0], scope)
+                || resolved_sub.output_columns[0].value_type.logical_type()
+                    != novarocks_type_contract::ValueLogicalType::Json
+                || !(select
+                    .projection
+                    .iter()
+                    .any(|p| expr_contains_placeholder(&p.expr, sq_info.id))
+                    || select
+                        .filter
+                        .as_ref()
+                        .is_some_and(|f| json_placeholder_inside_or(f, sq_info.id))
+                    || select
+                        .having
+                        .as_ref()
+                        .is_some_and(|f| json_placeholder_inside_or(f, sq_info.id)))
+                || json_query_references_outer_scope(&resolved_sub, &inner_scope, scope)
+            {
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "JSON IN subquery requires uncorrelated scalar JSON operands in a value-form clause",
+                    sq_info.subquery.span,
+                ));
+            }
+            let clause = locate_scalar_placeholder_clause(select, sq_info.id).ok_or_else(|| {
+                AnalyzeError::unsupported_query_shape(
+                    "JSON IN requires a clause-owned insertion point",
+                    sq_info.subquery.span,
+                )
+            })?;
+            if clause == ApplyClause::AggregateInput {
+                return Err(AnalyzeError::unsupported_query_shape(
+                    "JSON IN is not supported as an aggregate input",
+                    sq_info.subquery.span,
+                ));
+            }
+
+            if matches!(clause, ApplyClause::Having | ApplyClause::Projection)
+                && self.expr_contains_aggregate(in_expr_ast)
+            {
+                select.has_aggregation = true;
+            }
+            let ty = novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true);
+            let mark = self.alloc_column_id(None, format!("__in_mark_{}", sq_info.id), ty.clone());
+            let output = JoinKind::LeftMark { mark }
+                .mark_output()
+                .expect("mark output");
+            let mut replacement = TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: mark,
+                    qualifier: None,
+                    column: output.name.clone(),
+                },
+                value_type: ty.clone(),
+            };
+            if negated {
+                replacement = TypedExpr {
+                    kind: ExprKind::UnaryOp {
+                        op: UnOp::Not,
+                        expr: Box::new(replacement),
+                    },
+                    value_type: ty,
+                };
+            }
+            Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
+            Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &replacement);
+            Self::replace_placeholder_in_projection(
+                &mut select.projection,
+                sq_info.id,
+                &replacement,
+            );
+            let mut key_bindings = Vec::new();
+            for value_type in [
+                lhs_typed_list[0].value_type.clone(),
+                resolved_sub.output_columns[0].value_type.clone(),
+            ] {
+                // Keys are computed from materialized columns, so there is no
+                // literal specialization to reconstruct at the planner seam.
+                let argument = novarocks_functions::FunctionArgument::Value {
+                    value_type,
+                    constant: None,
+                };
+                let binding = self
+                    .function_catalog
+                    .resolve_json_canonical_key_binding(&argument, self.control)
+                    .map_err(AnalyzeError::function_binding)?;
+                key_bindings.push(crate::binding::SqlFunctionBinding::new(
+                    binding,
+                    self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                ));
+            }
+            let mark_key_bindings = Some(
+                key_bindings
+                    .try_into()
+                    .expect("two authored JSON key bindings"),
+            );
+            select.apply_specs.push(ApplyScalarSpec {
+                mark_probe: Some(lhs_typed_list[0].clone()),
+                mark_key_bindings,
+                subquery_id: sq_info.id,
+                clause,
+                output_column: output,
+                inner: resolved_sub,
+                correlation_column_ids: Vec::new(),
+                need_check_max_rows: false,
+                subquery_text: printer::print_query(&sq_info.subquery),
+            });
+            return Ok(());
         }
         // Per-pair shape check: `x IN (SELECT y …)` is rewritten into an
         // EQ-join on (x, y). For composite types the two sides must have a
@@ -2447,6 +2617,8 @@ impl<'a> AnalyzerContext<'a> {
         // Reuse the scalar Apply's clause boundary: HAVING and projection
         // collections must be installed after Aggregate, never as group keys.
         select.apply_specs.push(ApplyScalarSpec {
+            mark_probe: None,
+            mark_key_bindings: None,
             subquery_id: sq_id,
             clause,
             output_column: collection_output,
@@ -3360,8 +3532,6 @@ fn qualify_inner_shadowing_column_refs(
     inner_scope: &AnalyzerScope,
     outer_scope: &AnalyzerScope,
 ) -> TypedExpr {
-    let data_type = expr.value_type.data_type().clone();
-    let nullable = expr.value_type.nullable();
     match expr.kind {
         ExprKind::ColumnRef {
             column_id,
@@ -3375,7 +3545,7 @@ fn qualify_inner_shadowing_column_refs(
                 .filter(|_| outer_scope.resolve(None, &column).is_ok())
                 .and_then(|_| inner_scope.qualifier_for_binding(&column, column_id));
             TypedExpr {
-                value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+                value_type: expr.value_type,
 
                 kind: ExprKind::ColumnRef {
                     column_id,
@@ -3390,7 +3560,7 @@ fn qualify_inner_shadowing_column_refs(
             right,
             decimal_overflow_policy,
         } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::BinaryOp {
                 left: Box::new(qualify_inner_shadowing_column_refs(
@@ -3408,7 +3578,7 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::UnaryOp {
                 op,
@@ -3426,7 +3596,7 @@ fn qualify_inner_shadowing_column_refs(
             binding,
             volatility,
         } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::FunctionCall {
                 name,
@@ -3440,7 +3610,7 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::LambdaFunction { params, body } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::LambdaFunction {
                 params,
@@ -3458,7 +3628,7 @@ fn qualify_inner_shadowing_column_refs(
             order_by,
             resolved,
         } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::AggregateCall {
                 name,
@@ -3476,7 +3646,7 @@ fn qualify_inner_shadowing_column_refs(
             target,
             decimal_overflow_policy,
         } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::Cast {
                 expr: Box::new(qualify_inner_shadowing_column_refs(
@@ -3492,7 +3662,7 @@ fn qualify_inner_shadowing_column_refs(
             expr: inner,
             negated,
         } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::IsNull {
                 expr: Box::new(qualify_inner_shadowing_column_refs(
@@ -3508,7 +3678,7 @@ fn qualify_inner_shadowing_column_refs(
             list,
             negated,
         } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::InList {
                 expr: Box::new(qualify_inner_shadowing_column_refs(
@@ -3529,7 +3699,7 @@ fn qualify_inner_shadowing_column_refs(
             high,
             negated,
         } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::Between {
                 expr: Box::new(qualify_inner_shadowing_column_refs(
@@ -3555,7 +3725,7 @@ fn qualify_inner_shadowing_column_refs(
             pattern,
             negated,
         } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::Like {
                 expr: Box::new(qualify_inner_shadowing_column_refs(
@@ -3576,7 +3746,7 @@ fn qualify_inner_shadowing_column_refs(
             when_then,
             else_expr,
         } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::Case {
                 operand: operand.map(|operand| {
@@ -3609,7 +3779,7 @@ fn qualify_inner_shadowing_column_refs(
             value,
             negated,
         } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::IsTruthValue {
                 expr: Box::new(qualify_inner_shadowing_column_refs(
@@ -3622,7 +3792,7 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::Nested(inner) => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::Nested(Box::new(qualify_inner_shadowing_column_refs(
                 *inner,
@@ -3642,7 +3812,7 @@ fn qualify_inner_shadowing_column_refs(
             window_frame,
             ignore_nulls,
         } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::WindowCall {
                 name,
@@ -3668,7 +3838,7 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::Lambda { params, body } => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind: ExprKind::Lambda {
                 params,
@@ -3687,7 +3857,7 @@ fn qualify_inner_shadowing_column_refs(
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::SubqueryPlaceholder { .. }) => TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: expr.value_type,
 
             kind,
         },
@@ -3897,6 +4067,55 @@ fn query_references_outer_scope(
 ) -> bool {
     let usage = collect_subquery_outer_ref_usage(query, inner_scope, outer_scope);
     usage.filter || usage.outside_filter
+}
+
+/// A JSON mark build must be independent throughout the RHS query tree,
+/// including nested clause-owned subqueries that have already been rewritten.
+fn json_query_references_outer_scope(
+    query: &ResolvedQuery,
+    inner: &AnalyzerScope,
+    outer: &AnalyzerScope,
+) -> bool {
+    if query_references_outer_scope(query, inner, outer) {
+        return true;
+    }
+    fn nested_relation(relation: &Relation, inner: &AnalyzerScope, outer: &AnalyzerScope) -> bool {
+        match relation {
+            Relation::Subquery { query, .. } => {
+                json_query_references_outer_scope(query, inner, outer)
+            }
+            Relation::Join(join) => {
+                nested_relation(&join.left, inner, outer)
+                    || nested_relation(&join.right, inner, outer)
+            }
+            _ => false,
+        }
+    }
+    match &query.body {
+        QueryBody::Select(select) => {
+            select.apply_specs.iter().any(|spec| {
+                json_query_references_outer_scope(&spec.inner, inner, outer)
+                    || spec
+                        .mark_probe
+                        .as_ref()
+                        .is_some_and(|probe| expr_references_outer_scope(probe, inner, outer))
+            }) || select.predicate_apply_specs.iter().any(|spec| {
+                json_query_references_outer_scope(&spec.inner, inner, outer)
+                    || spec
+                        .in_lhs
+                        .as_ref()
+                        .is_some_and(|probe| expr_references_outer_scope(probe, inner, outer))
+            }) || select
+                .from
+                .as_ref()
+                .is_some_and(|relation| nested_relation(relation, inner, outer))
+        }
+        QueryBody::SetOperation(set) => {
+            json_query_references_outer_scope(&set.left, inner, outer)
+                || json_query_references_outer_scope(&set.right, inner, outer)
+        }
+        QueryBody::Values(_) => false,
+    }
 }
 
 fn relation_references_outer_scope(
@@ -5416,6 +5635,43 @@ fn remove_correlation_preds_from_expr(
             }
         }
         _ => Some(expr.clone()),
+    }
+}
+
+/// JSON admission follows OR ownership even through an existing value wrapper.
+/// Ordinary predicate Apply routing retains its existing narrower shape rules.
+fn json_placeholder_inside_or(expr: &TypedExpr, id: usize) -> bool {
+    match &expr.kind {
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::Or,
+            right,
+            ..
+        } if expr_contains_placeholder(left, id) || expr_contains_placeholder(right, id) => true,
+        ExprKind::BinaryOp { left, right, .. } => {
+            json_placeholder_inside_or(left, id) || json_placeholder_inside_or(right, id)
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::Nested(expr) => json_placeholder_inside_or(expr, id),
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|e| json_placeholder_inside_or(e, id))
+                || when_then.iter().any(|(w, t)| {
+                    json_placeholder_inside_or(w, id) || json_placeholder_inside_or(t, id)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|e| json_placeholder_inside_or(e, id))
+        }
+        _ => false,
     }
 }
 

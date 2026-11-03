@@ -304,6 +304,15 @@ fn verify_hash_join(
             "PhysicalHashJoin other condition",
         )?;
     }
+    if let crate::common::JoinKind::LeftMark { mark } = op.join_type {
+        verify_output_id(mark, "PhysicalHashJoin mark output")?;
+        if left.contains(&mark) || right.contains(&mark) {
+            return Err("mark output reuses an input ColumnId".into());
+        }
+        let mut output = left.clone();
+        output.insert(mark);
+        return Ok(output);
+    }
     Ok(union_ids(left, right))
 }
 

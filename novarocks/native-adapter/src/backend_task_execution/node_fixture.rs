@@ -99,7 +99,7 @@ impl novarocks_worker::WorkerIngressBacking for ComponentIngressBacking {}
 pub struct NativeNodeFixture {
     owner: Option<WorkerNodeRuntime>,
     pub control: WorkerTaskControl,
-    pub clock: Arc<ManualClock>,
+    clock: Arc<ManualClock>,
     ingress: Arc<tokio::sync::Semaphore>,
 }
 impl NativeNodeFixture {
@@ -207,6 +207,15 @@ impl NativeNodeFixture {
     }
     pub fn deadline(&self) -> novarocks_worker::WorkerMonotonicInstant {
         self.control.now().saturating_add(Duration::from_secs(10))
+    }
+    /// Advancing this replaceable clock must wake the original production
+    /// pollers. They still read time and author their own due timer inputs.
+    pub fn advance_clock(&self, delta: Duration) {
+        self.clock.advance(delta);
+        self.owner
+            .as_ref()
+            .expect("the original Node runtime owns the fixture clock")
+            .notify_clock_changed();
     }
     pub fn create(
         &self,

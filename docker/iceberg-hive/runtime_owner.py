@@ -61,7 +61,7 @@ class HiveOwner:
     def save(self, record):
         runtime.atomic_json(self.directory(record["machine_id"]) / "manifest.json", record)
 
-    def prepare(self, manifest, image):
+    def prepare(self, manifest, image=None):
         snapshot = manifest['runtime']['machine']
         identity = self.owner.machine_id
         if snapshot['id'] != identity or snapshot['daemon_id'] != self.owner.daemon_id:
@@ -72,6 +72,8 @@ class HiveOwner:
             if existing['machine_generation'] != snapshot['generation']:
                 raise runtime.RuntimeFailure('MachineUnavailable', 'remove the old HMS scratch stack explicitly before attaching a new machine activation')
             return existing
+        if image is None:
+            image = 'novarocks/hive-metastore:' + machine.recommended_versions()['hive']
         project = f'nr-hms-{identity}'
         port = snapshot['ports']['hms']
         warehouse = snapshot['server_warehouses']['rest'].rstrip('/') + '/hms'
@@ -151,7 +153,7 @@ class HiveOwner:
                    "NOVAROCKS_SPARK_EXTRA_DEFAULTS": record["hms"]["spark_defaults"]}
         self.write_definition(directory / "env.sh", "".join(f"export {key}={shlex.quote(str(value))}\n" for key, value in exports.items()).encode())
 
-    def up(self, manifest, image, prepare_only=False):
+    def up(self, manifest, image=None, prepare_only=False):
         identity = manifest["runtime"]["machine"]["id"]
         with runtime.file_lock(self.owner.base / "hms.lock"):
             record = self.prepare(manifest, image)
@@ -160,13 +162,25 @@ class HiveOwner:
             if prepare_only:
                 return record
             snapshot = manifest['runtime']['machine']
-            with self.owner.ready_snapshot({'version': snapshot['version']}, expected_generation=snapshot['generation']):
-                pass
-            self.owner.assert_live_daemon()
-            image_id = self.backend.image_id(record["hms"]["image"])
-            saved = record["images"]["hms"]["image_id"]
-            if saved and image_id != saved:
-                raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "HMS image alias changed")
+            with self.owner.operation_snapshot(expected_generation=snapshot['generation']):
+                if record['state'] == 'ready':
+                    return record
+                if record['state'] != 'prepared':
+                    raise runtime.RuntimeFailure('MachineUnavailable', 'unfinished HMS creation requires manual maintenance')
+                saved = record['images']['hms']['image_id']
+                if saved is not None:
+                    raise runtime.RuntimeFailure('MachineUnavailable', 'partial HMS image binding requires manual maintenance')
+                try:
+                    if image is None:
+                        store = os.environ.get('NOVA_FIXTURE_STORE')
+                        prepared = machine.prepare_inputs(HERE.parent.parent, Path(store) if store else None, consumer='derived:hive-metastore')
+                        image_id = prepared['derived_images']['hive-metastore']['image_id']
+                    else:
+                        image_id = self.backend.image_id(record['hms']['image'])
+                except Exception as error:
+                    record.update(state='failed', failure={'code': getattr(error, 'code', type(error).__name__), 'message': str(error)})
+                    self.save(record)
+                    raise
             record["images"]["hms"]["image_id"] = image_id
             record["state"] = "starting"
             record.pop("failure", None)
@@ -296,7 +310,7 @@ def main():
     if args.command == "up":
         if identity != manifest["runtime"]["machine"]["id"]:
             raise runtime.RuntimeFailure("OwnerMismatch", "HMS request differs from publication machine")
-        result = hive.up(manifest, os.environ.get("HMS_IMAGE", "novarocks/hive-metastore:4.0.0"), args.prepare_only)
+        result = hive.up(manifest, os.environ.get("HMS_IMAGE"), args.prepare_only)
     elif args.command == "down":
         result = hive.down(identity, args.volumes or args.purge)
     else:

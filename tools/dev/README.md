@@ -53,9 +53,9 @@ sudo tools/dev/linux-env.sh prepare --user "$install_user" \
 
 `--object-store-config` 必须是绝对路径。字段与前缀由 [OSS 操作模块](../../docker/iceberg-rest/oss_ops.py) 的同一校验作者解析；缺失或错误时直接失败，不回退到 MinIO。准备在安装账户的 `~/.cache/novarocks/linux-env/` 原子保存规范化的 `object-store.json` 和含 `object_store` 的 `fixture-machine.json`，环境变量 `NOVA_ENV_OBJECT_STORE_CONFIG` 指向前者。它们是本次期望配置，不能替代各代 runtime publication 的不可变输入快照。
 
-准备 fixture 使用原 `provision -> verify -> fixture-runtime start -> up`；OSS profile 请求 `iceberg-rest-oss` 闭包，不供给 MinIO/mc。机器 start/check 显式传入上述 `fixture-machine.json`。SDK 及其固定依赖由 fixture provision 准备，运行和 check 不执行 pip 安装。没有 `object_store_kind` 的通用 profile 保持本地 MinIO/`iceberg-rest` 路径；向此类 profile 传入 OSS 配置会明确失败，避免参数被忽略。
+准备 fixture 直接调用 `fixture-runtime start -> up`：已有 ready 记录直接复用，确实缺失时才按 `versions.json` 推荐配方构建。OSS profile 请求 `iceberg-rest-oss` 闭包，不供给 MinIO/mc；首次创建传入上述 `fixture-machine.json`。不运行自动 BOM、版本、健康或能力检查，也不自动升级已有环境。没有 `object_store_kind` 的通用 profile 保持本地 MinIO/`iceberg-rest` 路径；向此类 profile 传入 OSS 配置会明确失败，避免参数被忽略。
 
-已有机器版本不同会要求显式维护；先确认资源、旧数据和维护窗口，再按 [fixture 文档](../../docker/iceberg-rest/README.md) 执行原 upgrade。不会自动清卷、删除云端旧数据、复制旧 READY 或创建第二套共享项目。释放旧 ECS 后，在新实例绑定同一角色，取得同一源码和非秘密配置，再执行相同准备命令；旧机器的磁盘、venv、BOM、READY 和 target 都不是恢复输入。
+推荐版本不同不会阻止使用已有机器；需要切换已有环境时，先确认资源、旧数据和维护窗口，再按 [fixture 文档](../../docker/iceberg-rest/README.md) 执行原 upgrade。不会自动清卷、删除云端旧数据、复制旧 READY 或创建第二套共享项目。释放旧 ECS 后，在新实例绑定同一角色，取得同一源码和非秘密配置，再执行相同准备命令；旧机器的磁盘、venv、运行状态和 target 都不能冒充新机器的创建事实。
 
 ## 日常使用与检查
 
@@ -72,15 +72,15 @@ tools/dev/linux-env.sh check --user "$install_user" \
 
 登录环境按账户实际 shell 与 Bash 启动文件优先级接线，保留原内容。SSH 非交互命令不保证读取登录配置，因此先显式求值 `env` 的输出。环境包含账户自己的工具目录和来源设置；专用配置按本机可用 CPU 导出 Cargo 并发，显式 `CARGO_BUILD_JOBS` 优先。通用开发入口的半核默认不变。`env` 只输出环境，不能证明 fixture ready。
 
-`fixture-runtime.sh check --store <store> --config <machine-config>` 由原机器 owner 只读核对当前源码/BOM 要求的版本与实际健康实例，避免仅凭旧 machine 和旧 publication 相互一致而误报。检查使用既有维护锁，不建立缺失状态。OSS check 同时比较准备时保存的两份配置与本次输入；缺失或不同只报错，不重写配置。
+`fixture-runtime.sh check` 是原机器 owner 的显式手动诊断，报告推荐版本、保存的实际版本事实、机器目标、健康观察和错误；实际版本未知时保持未知。它不建立缺失状态，不授予测试资格，也不与当前推荐值比较后要求升级。上面的 `linux-env.sh check` 是操作员主动检查 Linux 工具与配置的入口；prepare、普通测试和 CI 不自动调用它。固定全量 CI 机器以后可显式保存同一诊断报告。
 
-check 只观察本机实际工具、daemon、BOM、机器与 worktree publication，不访问外部下载源，不下载、构建、安装或重启。缺 Python 时 check/env 直接失败，不运行 apt。权限不足时使用具有观察权限的账户，不能用 root 的成功代替普通账户可用。修改 docker 组成员后须开启新会话。
+手动 check 只观察本机实际工具、daemon 和保存的机器配置，不访问外部下载源，不下载、构建、安装或重启。缺 Python 时 check/env 直接失败，不运行 apt。权限不足时使用具有观察权限的账户，不能用 root 的成功代替普通账户可用。修改 docker 组成员后须开启新会话。
 
-相同配置再次 prepare 应保留健康服务和 machine generation。Docker 配置只合并受管字段，保留不相关配置；配置相同时不重启。有活动容器且配置必须改变时先报告维护冲突，操作员安排窗口后重试。
+已有 ready 记录再次 prepare 直接保留原服务和 machine generation，不先做全栈健康检查。Docker 配置只合并受管字段，保留不相关配置；配置相同时不重启。有活动容器且配置必须改变时先报告维护冲突，操作员安排窗口后重试。
 
 ## 来源与失败诊断
 
-复制 profile 到自己的受管配置位置再修改来源，无需改锁定内容。`docker_registry_mirrors` 改 Docker Hub 传输路径；`fixture_image_sources` 按逻辑输入指定 repository；rustup 的 dist/update URL、Cargo registry index 及 `tool_download_urls` 可以调整下载位置。镜像 digest、工具 SHA-256 和 Maven 内容校验保持不变。第三方镜像站可用性由部署者维护；来源失败不是 Docker daemon 必然故障。401/403 表示先检查该 registry 的访问权限或同内容镜像来源；超时要检查路由和传输期限。某个锁定对象不可取得时明确停在供给阶段，不换任意 tag、不从旧机器复制 READY 冒充恢复。
+复制 profile 到自己的受管配置位置再修改来源，无需改锁定内容。`docker_registry_mirrors` 改 Docker Hub 传输路径；`fixture_image_sources` 按逻辑输入指定 repository；rustup 的 dist/update URL、Cargo registry index 及 `tool_download_urls` 可以调整下载位置。镜像版本取推荐清单，不锁定环境 digest；工具 SHA-256 和 Maven 构建输入内容校验继续保留。第三方镜像站可用性由部署者维护；来源失败不是 Docker daemon 必然故障。401/403 表示先检查该 registry 的访问权限或同内容镜像来源；超时要检查路由和传输期限。推荐的缺失输入无法取得时保留实际失败，交人工维护，不自动换 tag、回退来源或从旧机器复制状态冒充恢复。
 
 `download_timeout_seconds` 同时传给 curl 和原 fixture owner 的单次镜像传输期限，避免冷拉取大镜像仍落入供给工具的较短默认值；不为整个构建/维护进程另加会丢弃子进程的外层期限。下载校验失败不安装；重新执行会观察真实状态并续做未满足阶段。磁盘不足保留材料并失败，不 prune 镜像、删除源码/旧卷或诊断。失败时保留真实命令、退出与阶段日志，secret 不入库；不要将一次安装回执当作成功权威。
 
@@ -91,7 +91,7 @@ bash -n tools/dev/linux-env.sh
 python3 -m unittest discover -s tools/dev/tests -p 'test_*.py' -v
 ```
 
-这些标准库功能测试维护安装、账户与幂等合同；命令适配器不证明冷系统安装。实际部署还应检查 native 编译、nextest、Docker 拉取/构建/Compose 网络、fixture verify/status/attach 和最小 Spark SQL。独立空白机器必须从无旧镜像、BOM/READY 和 target 开始，成功后用相同配置复执行，对比 daemon 启动时间和 machine generation。已安装机器复验只证明当前条件。
+这些标准库功能测试维护安装、账户与幂等合同；命令适配器不证明冷系统安装。实际部署还应检查 native 编译、nextest、Docker 拉取/构建/Compose 网络、fixture 创建/status/attach 和最小 Spark SQL。专门验证首次创建的独立空白机器应从无旧镜像、运行状态和 target 开始，成功后用相同配置复执行，对比 daemon 启动时间和 machine generation。已安装机器复验只证明当前条件。
 
 实际部署保留机器规格、候选源码、非秘密 profile、命令和真实退出到实例外；旧机释放前核对材料可恢复。部署者负责网络与实例生命周期，本工具不申请/释放实例、不注册 GitHub Runner；未来 CI 平台可消费同一准备入口。Linux 扩展测试矩阵和整工作区构建不属于环境准备。
 

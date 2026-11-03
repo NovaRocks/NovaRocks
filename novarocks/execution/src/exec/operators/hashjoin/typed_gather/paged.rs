@@ -39,6 +39,7 @@ pub(crate) struct JoinPairRow {
 enum Column {
     Probe(usize),
     Build(usize),
+    Mark,
 }
 /// LocalCompiler's canonical output roles. The compiler assigns fresh output
 /// slots; these explicit roles, rather than matching those names to inputs,
@@ -48,6 +49,7 @@ pub(crate) enum CanonicalJoinOutput {
     Pairs,
     Probe,
     Build,
+    ProbeMark,
 }
 pub(crate) struct PagedJoinGather {
     schema: ChunkSchemaRef,
@@ -196,6 +198,11 @@ impl PagedJoinGather {
                 .checked_add(build.slots().len())
                 .ok_or_else(crate::exec::operators::hashjoin::join_completion::arithmetic)?,
             CanonicalJoinOutput::Probe => probe.slots().len(),
+            CanonicalJoinOutput::ProbeMark => probe
+                .slots()
+                .len()
+                .checked_add(1)
+                .ok_or_else(crate::exec::operators::hashjoin::join_completion::arithmetic)?,
             CanonicalJoinOutput::Build => build.slots().len(),
         };
         if schema.slots().len() != expected {
@@ -209,15 +216,28 @@ impl PagedJoinGather {
             work(owner, 1)?;
             let column = match output {
                 CanonicalJoinOutput::Probe => Column::Probe(ordinal),
+                CanonicalJoinOutput::ProbeMark if ordinal < probe.slots().len() => {
+                    Column::Probe(ordinal)
+                }
+                CanonicalJoinOutput::ProbeMark => Column::Mark,
                 CanonicalJoinOutput::Build => Column::Build(ordinal),
                 CanonicalJoinOutput::Pairs if ordinal < probe.slots().len() => {
                     Column::Probe(ordinal)
                 }
                 CanonicalJoinOutput::Pairs => Column::Build(ordinal - probe.slots().len()),
             };
+            if matches!(column, Column::Mark) {
+                if target.data_type() != &arrow::datatypes::DataType::Boolean || !target.nullable()
+                {
+                    return Err(gather_contract("left mark output must be nullable Boolean").into());
+                }
+                columns.push(column);
+                continue;
+            }
             let source = match column {
                 Column::Probe(column) => &probe.slots()[column],
                 Column::Build(column) => &build.slots()[column],
+                Column::Mark => unreachable!("mark validated separately"),
             };
             binding(source, target, owner)?;
             columns.push(column);
@@ -276,6 +296,28 @@ impl PagedJoinGather {
         host: &Arc<dyn novarocks_functions::AggregateStateAllocator>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<TypedJoinBatch, JoinGatherError> {
+        self.gather_with_marks(probe, build, pairs, None, owner, host, control)
+    }
+    /// A mark is a value authored by the join's complete reduction, rather
+    /// than a physical input column or NULL extension of that column.
+    pub(crate) fn gather_with_marks(
+        &self,
+        probe: Option<&Chunk>,
+        build: &BuildRows,
+        pairs: &[JoinPairRow],
+        marks: Option<&[Option<bool>]>,
+        owner: &dyn InputConstructionOwner,
+        host: &Arc<dyn novarocks_functions::AggregateStateAllocator>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<TypedJoinBatch, JoinGatherError> {
+        if self
+            .columns
+            .iter()
+            .any(|column| matches!(column, Column::Mark))
+            && marks.is_none_or(|marks| marks.len() != pairs.len())
+        {
+            return Err(gather_contract("left mark output lacks its complete row states").into());
+        }
         let needs_build = self
             .columns
             .iter()
@@ -347,6 +389,7 @@ impl PagedJoinGather {
                 owner,
                 match column {
                     Column::Probe(_) => 2,
+                    Column::Mark => 1,
                     Column::Build(_) => pages
                         .len()
                         .checked_add(1)
@@ -354,6 +397,29 @@ impl PagedJoinGather {
                 },
             )?;
             match column {
+                Column::Mark => {
+                    let mut request = |layout| owner.request(layout);
+                    let mut opaque = |bytes| owner.observe_opaque_upper_bound(bytes);
+                    let mut creation = ValueSchemaCreation::new(
+                        owner.storage_lifetime(),
+                        &mut request,
+                        &mut opaque,
+                    );
+                    // The finite three-value source has the same Boolean
+                    // buffers and validity geometry as a nullable source.
+                    selected_copy::preflight_null_construction(
+                        target.typed_binding().layout(),
+                        3,
+                        &mut creation,
+                        control,
+                    )
+                    .map_err(copy_error)?;
+                    let mut builder = arrow::array::BooleanBuilder::with_capacity(3);
+                    builder.append_value(false);
+                    builder.append_null();
+                    builder.append_value(true);
+                    sources.push(Arc::new(builder.finish()) as ArrayRef);
+                }
                 Column::Probe(column) => {
                     if let Some(probe) = probe {
                         let slot = probe
@@ -376,6 +442,7 @@ impl PagedJoinGather {
             }
             let nulls = match column {
                 Column::Probe(_) => pairs.iter().any(|pair| pair.probe.is_none()),
+                Column::Mark => false,
                 Column::Build(_) => pairs.iter().any(|pair| pair.build.is_none()),
             };
             let null_index = sources.len();
@@ -383,10 +450,18 @@ impl PagedJoinGather {
                 sources.push(null_source(target, owner, control)?);
             }
             let mut choices = funded_vec(owner, pairs.len())?;
-            for (pair, address) in pairs.iter().zip(&addresses) {
+            for (ordinal, (pair, address)) in pairs.iter().zip(&addresses).enumerate() {
                 control.checkpoint(1).map_err(JoinGatherError::Kernel)?;
                 let choice = match column {
                     Column::Probe(_) => pair.probe.map(|row| (0, row)),
+                    Column::Mark => Some((
+                        0,
+                        match marks.expect("validated complete marks")[ordinal] {
+                            Some(false) => 0,
+                            None => 1,
+                            Some(true) => 2,
+                        },
+                    )),
                     Column::Build(_) => address.map(|address: BuildPageAddress| {
                         let source = keys
                             .binary_search(&(address.run().index(), address.page()))

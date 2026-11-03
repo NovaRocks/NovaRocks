@@ -2,13 +2,14 @@
 # Adds the base image's Hadoop S3A jars to Hive's classpath so the metastore
 # can resolve s3a:// warehouse locations against MinIO. Backed by its Derby DB
 # (persisted in the catalog-scoped HMS volume).
-FROM apache/hive:4.0.0
+ARG HIVE_BASE
+FROM ${HIVE_BASE}
 
 USER root
 
 # These versions must match the jars bundled under /opt/hadoop/share/hadoop.
-ARG HADOOP_VERSION=3.3.6
-ARG AWS_SDK_VERSION=1.12.367
+ARG HADOOP_VERSION
+ARG AWS_SDK_VERSION
 ARG HMS_WAREHOUSE_DIR=s3a://warehouse/shared/hms
 
 RUN set -eux; \

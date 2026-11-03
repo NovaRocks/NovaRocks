@@ -257,10 +257,6 @@ class LinuxEnvironment:
     def fixture_machine_config_path(self) -> Path:
         return self.cache / "fixture-machine.json"
 
-    @property
-    def fixture_consumer(self) -> str:
-        return "iceberg-rest-oss" if self.object_store is not None else "iceberg-rest"
-
     def read_object_store_config(self, path: Path) -> dict:
         # Execute the one validation author without creating a bytecode cache.
         # The module uses only the standard library until an operation starts.
@@ -430,7 +426,6 @@ class LinuxEnvironment:
             groups = self.run(["id", "-nG", self.account.name]).stdout.split()
             if "docker" not in groups:
                 self.run(["usermod", "-a", "-G", "docker", self.account.name])
-        self.observe_docker()
 
     def observe_docker(self) -> dict:
         daemon = self.run(["docker", "info", "--format", "{{.OSType}}/{{.Architecture}}"], account=True).stdout.strip()
@@ -670,42 +665,28 @@ class LinuxEnvironment:
         return tools
 
     def observe_fixture_machine(self, store: str) -> dict:
-        # Original owner verifies exact source/BOM version, resources and health.
-        # Its check entry is an observation, not admission, repair or a lease.
+        # Explicit diagnostics belong to the fixture owner and never repair it.
         result = self.run([str(self.repo / "docker/iceberg-rest/fixture-runtime.sh"),
                            "check", "--store", store, *self.machine_config_arguments()], account=True)
         return json.loads(result.stdout)
 
-    def fixture(self, *, prepare: bool) -> None:
+    def fixture(self, *, prepare: bool) -> dict | None:
         self.object_store_configuration(prepare=prepare)
         store = str(self.fixture_store)
-        if prepare:
-            args = [str(self.repo / "docker/fixture-inputs/provision.sh"), "--consumer", self.fixture_consumer,
-                    "--platform", "linux/amd64", "--store", store,
-                    "--docker-pull-timeout-seconds", str(self.timeout)]
-            for logical, transport in sorted(self.profile.get("fixture_image_sources", {}).items()):
-                args += ["--image-source", f"{logical}={transport}"]
-            for original, transport in sorted(self.profile.get("fixture_artifact_url_prefixes", {}).items()):
-                args += ["--artifact-url-prefix", f"{original}={transport}"]
-            self.run(args, account=True)
-        self.run([str(self.repo / "docker/fixture-inputs/verify.sh"), "--consumer", self.fixture_consumer,
-                  "--platform", "linux/amd64", "--store", store], account=True)
-        if prepare:
-            self.run([str(self.repo / "docker/iceberg-rest/fixture-runtime.sh"), "start", "--store", store,
-                      *self.machine_config_arguments()], account=True)
-        else:
-            snapshot = self.observe_fixture_machine(store)
-            if not isinstance(snapshot, dict) or snapshot.get("phase") != "ready":
-                raise EnvironmentFailure("fixture machine is absent, under maintenance or unhealthy")
-        if prepare:
-            self.run([str(self.repo / "docker/iceberg-rest/up.sh")], account=True)
-        else:
-            result = self.run([str(self.repo / "docker/iceberg-rest/status.sh")], account=True)
-            binding = json.loads(result.stdout)
-            if not isinstance(binding, dict) or binding.get("ready") is not True:
-                raise EnvironmentFailure("worktree fixture publication is not bound and ready")
-            if binding.get("machine", {}).get("generation") != snapshot.get("generation") or binding.get("machine", {}).get("version") != snapshot.get("version"):
-                raise EnvironmentFailure("worktree publication differs from current fixture machine; attach explicitly")
+        if not prepare:
+            return self.observe_fixture_machine(store)
+        # The machine owner reuses saved state and prepares recommended inputs
+        # only when creating an absent environment.
+        args = [str(self.repo / "docker/iceberg-rest/fixture-runtime.sh"), "start",
+                "--platform", "linux/amd64", "--store", store,
+                "--docker-pull-timeout-seconds", str(self.timeout), *self.machine_config_arguments()]
+        for logical, transport in sorted(self.profile.get("fixture_image_sources", {}).items()):
+            args += ["--image-source", f"{logical}={transport}"]
+        for original, transport in sorted(self.profile.get("fixture_artifact_url_prefixes", {}).items()):
+            args += ["--artifact-url-prefix", f"{original}={transport}"]
+        self.run(args, account=True)
+        self.run([str(self.repo / "docker/iceberg-rest/up.sh")], account=True)
+        return None
 
     def prepare(self) -> dict:
         facts = self.preflight(prepare=True)
@@ -716,10 +697,9 @@ class LinuxEnvironment:
         self.ensure_rust()
         self.ensure_nextest()
         self.ensure_account_environment()
-        self.observe_native()
         if not self.tools_only:
             self.fixture(prepare=True)
-        return {"action": "prepare", "host": facts, "checks": self.check()}
+        return {"action": "prepare", "host": facts, "environment": str(self.env_path)}
 
     def check(self) -> dict:
         facts = self.preflight(prepare=False)
@@ -747,10 +727,9 @@ class LinuxEnvironment:
         expected_block = f"# BEGIN NOVAROCKS LINUX ENV\n. {shlex.quote(str(self.env_path))}\n# END NOVAROCKS LINUX ENV"
         if expected_block not in profile_text:
             raise EnvironmentFailure("account login profile does not source its managed environment")
-        if not self.tools_only:
-            self.fixture(prepare=False)
+        fixture = self.fixture(prepare=False) if not self.tools_only else None
         return {"action": "check", "host": facts, "native": native, "docker": daemon, "rust": rust,
-                "nextest": self.inputs["nextest"]["version"], "environment": str(self.env_path)}
+                "nextest": self.inputs["nextest"]["version"], "environment": str(self.env_path), "fixture": fixture}
 
 
 def main(argv: list[str] | None = None) -> int:

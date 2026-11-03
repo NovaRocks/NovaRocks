@@ -428,6 +428,9 @@ fn encode_core(
         work,
     )?;
     let (kind, references) = match source {
+        physical::ValueOrigin::JoinMark { node } => {
+            (wire::value_origin::Kind::JoinMarkNodeId(node.get()), 1)
+        }
         physical::ValueOrigin::LogicalSummary { field } => (
             wire::value_origin::Kind::LogicalSummary(
                 (match field {
@@ -632,6 +635,12 @@ fn decode_decision<'a>(
         ));
     }
     let (origin, references) = match kind {
+        wire::value_origin::Kind::JoinMarkNodeId(node) => (
+            physical::ValueOrigin::JoinMark {
+                node: physical::NodeId::new(*node),
+            },
+            1,
+        ),
         wire::value_origin::Kind::ProviderField(_) => {
             return Err(invalid("value origin provider branch is inconsistent"));
         }

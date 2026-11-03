@@ -27,6 +27,10 @@ pub enum JoinKind {
     LeftAnti,
     RightAnti,
     NullAwareLeftAnti,
+    /// Preserves each probe row and produces its SQL three-valued mark.
+    LeftMark {
+        mark: crate::column_id::ColumnId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -93,4 +97,21 @@ pub enum UnOp {
     Not,
     Negate,
     BitwiseNot,
+}
+
+impl JoinKind {
+    pub(crate) fn mark_output(self) -> Option<crate::common::OutputColumn> {
+        let Self::LeftMark { mark } = self else {
+            return None;
+        };
+        Some(crate::common::OutputColumn {
+            column_id: mark,
+            name: format!("__in_mark_{}", mark.0),
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Boolean,
+                true,
+            ),
+            is_internal: true,
+        })
+    }
 }

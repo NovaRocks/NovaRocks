@@ -121,7 +121,7 @@ pub fn decode_payload<T: for<'de> Deserialize<'de>>(
     payload: &Bytes,
     subject: &str,
 ) -> Result<T, ConnectorError> {
-    serde_json::from_slice(payload).map_err(|error| {
+    crate::metadata_json::from_slice(payload).map_err(|error| {
         ConnectorError::new(
             ConnectorErrorKind::CorruptData,
             format!("decode Iceberg {subject}: {error}"),
@@ -177,7 +177,13 @@ pub fn materialize_local_scan_units(
             FileCancellation::from_connector_request(&request.context),
             request.context.deadline(),
         )?;
-        let inspection = inspect_parquet_metadata(file, None, context).map_err(map_footer_error)?;
+        let inspection = inspect_parquet_metadata(
+            file,
+            None,
+            context,
+            novarocks_fs::ParquetInterpretationPolicy::SkipArrowHint,
+        )
+        .map_err(map_footer_error)?;
         let layout = inspection.row_groups();
         request.check_active()?;
         if layout.len() <= 1 {

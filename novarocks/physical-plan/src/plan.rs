@@ -46,6 +46,10 @@ pub const ROOT_WRITE_RESULT_SCHEMA_REVISION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ValueOrigin {
+    /// Nullable Boolean produced by this null-aware mark join.
+    JoinMark {
+        node: NodeId,
+    },
     /// A Task summary output; never a row in the relational root node.
     LogicalSummary {
         field: crate::LogicalChangeCountField,
@@ -454,6 +458,7 @@ pub enum JoinKind {
     LeftAnti,
     RightAnti,
     NullAwareLeftAnti,
+    LeftMark,
 }
 
 impl JoinKind {
@@ -484,6 +489,7 @@ impl JoinKind {
         !matches!(
             (self, side),
             (Self::LeftAnti | Self::NullAwareLeftAnti, JoinSide::Right)
+                | (Self::LeftMark, _)
                 | (Self::RightAnti, JoinSide::Left)
         )
     }

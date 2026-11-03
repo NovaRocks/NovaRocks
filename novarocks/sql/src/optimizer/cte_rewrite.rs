@@ -322,6 +322,11 @@ fn join_output_columns(
     work: &mut CteWork<'_>,
 ) -> Result<Vec<OutputColumn>, SqlCompileError> {
     match join_type {
+        JoinKind::LeftMark { .. } => {
+            let mut output = left;
+            output.push(join_type.mark_output().expect("mark output"));
+            return Ok(output);
+        }
         JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => return Ok(left),
         JoinKind::RightSemi | JoinKind::RightAnti => return Ok(right),
         JoinKind::LeftOuter => make_nullable(&mut right, work)?,

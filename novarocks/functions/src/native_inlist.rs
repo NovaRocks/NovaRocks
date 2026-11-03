@@ -502,7 +502,7 @@ impl PreparedNativeInListRecipe {
         Self::try_new_core::<false, std::convert::Infallible, _>(
             false, source, candidates, result, None, control,
         )
-        .map(|_| inlist_own_effects(context))
+        .map(|_| inlist_own_effects(source, context))
         .map_err(inlist_pure_failure)
     }
 
@@ -524,10 +524,15 @@ impl PreparedNativeInListRecipe {
                 .map_err(crate::ComparisonPrepareError::Kernel)?;
             crate::kernel_input::validate_type_observed(result, &mut work)
                 .map_err(crate::ComparisonPrepareError::Kernel)?;
-            if source.logical_type() != ValueLogicalType::Physical
-                || !(is_signed_integer_type(source.data_type())
-                    || source.data_type() == &DataType::Utf8)
-            {
+            let supported = match source.logical_type() {
+                ValueLogicalType::Physical => {
+                    is_signed_integer_type(source.data_type())
+                        || source.data_type() == &DataType::Utf8
+                }
+                ValueLogicalType::Json => source.data_type() == &DataType::Utf8,
+                _ => false,
+            };
+            if !supported {
                 return Err(crate::ComparisonPrepareError::Unsupported.into());
             }
             let mut nullable = source.nullable();
@@ -631,13 +636,25 @@ impl PreparedNativeInListRecipe {
         &self,
         context: novarocks_type_contract::ExpressionEffectContext,
     ) -> crate::ScopedExpressionEffects {
-        inlist_own_effects(context)
+        inlist_own_effects(&self.source, context)
     }
 }
 fn inlist_own_effects(
+    source: &novarocks_type_contract::FunctionValueType,
     context: novarocks_type_contract::ExpressionEffectContext,
 ) -> crate::ScopedExpressionEffects {
-    crate::ScopedExpressionEffects::pure_value(context)
+    // JSON normalization can reject malformed logical JSON as required Data.
+    // Unlike buffered row errors, that outer failure cannot be reordered or
+    // skipped by Boolean control. Physical Utf8 remains ordinary byte equality.
+    let json = source.logical_type() == novarocks_type_contract::ValueLogicalType::Json;
+    crate::ScopedExpressionEffects::primitive(
+        context,
+        novarocks_type_contract::ExpressionEffects {
+            may_raise_row_error: json,
+            may_raise_invocation_data: json,
+            ..novarocks_type_contract::ExpressionEffects::PURE_VALUE
+        },
+    )
 }
 #[cfg(test)]
 #[path = "native_inlist_tests.rs"]

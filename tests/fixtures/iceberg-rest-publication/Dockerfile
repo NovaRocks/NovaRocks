@@ -15,8 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG REST_IMAGE=apache/iceberg-rest-fixture:1.10.1
-ARG BUILDER_IMAGE=apache/spark:3.5.5-java17
+ARG REST_IMAGE
+ARG BUILDER_IMAGE
 
 FROM ${REST_IMAGE} AS rest_fixture
 

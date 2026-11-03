@@ -161,6 +161,3 @@ spark_dockerfile = "docker/iceberg-rest/spark/Dockerfile"
 ssb_schema = "tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"
 tpch_schema = "tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"
 tpcds_schema = "tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"
-
-[fixture.producer_lock_projections]
-spark = { lock = "docker/fixture-inputs/lock.json", derived_image = "iceberg-spark" }

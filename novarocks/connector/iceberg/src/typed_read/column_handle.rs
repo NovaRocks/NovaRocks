@@ -532,7 +532,7 @@ pub(crate) fn parse_type(json: &str, what: &'static str) -> Result<Type, Connect
             format!("iceberg column {what} exceeds the hard limit"),
         ));
     }
-    serde_json::from_str::<Type>(json).map_err(|error| {
+    crate::metadata_json::from_str::<Type>(json).map_err(|error| {
         invalid(format!(
             "iceberg column {what} is not a valid type: {error}"
         ))

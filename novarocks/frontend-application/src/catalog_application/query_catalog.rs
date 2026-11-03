@@ -168,7 +168,7 @@ pub fn load_connector_table_alias_materialization_with_lease_typed(
     )
 }
 
-fn load_connector_table_materialization_with_resolution_typed(
+pub(crate) fn load_connector_table_materialization_with_resolution_typed(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
@@ -218,7 +218,7 @@ fn load_connector_table_materialization_with_resolution_typed(
         // incident: render the vocabulary the rest of the engine already
         // recognizes instead of leaking the provider's own wording.
         .map_err(|error| connector_table_resolution_error(error, namespace, table))?;
-    connector_table_materialization_from_metadata(metadata, planning_lease)
+    connector_table_materialization_for_resolution(metadata, planning_lease, resolution)
         .map_err(CatalogResolutionError::failed)
 }
 
@@ -273,7 +273,7 @@ pub(crate) async fn load_connector_table_materialization_with_resolution_async(
     // incident: render the vocabulary the rest of the engine already
     // recognizes instead of leaking the provider's own wording.
     .map_err(|error| connector_table_resolution_error(error, namespace, table))?;
-    connector_table_materialization_from_metadata(metadata, planning_lease)
+    connector_table_materialization_for_resolution(metadata, planning_lease, resolution)
         .map_err(CatalogResolutionError::failed)
 }
 
@@ -288,6 +288,24 @@ fn connector_table_resolution_error(
         }
         _ => CatalogResolutionError::failed(error.to_string()),
     }
+}
+
+/// Keep the metadata schema and executable read selector from the same request.
+/// Callers must never bind a Historical schema and accidentally read Current.
+fn connector_table_materialization_for_resolution(
+    metadata: novarocks_spi::connector::ConnectorTableMetadata,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    resolution: novarocks_spi::connector::ConnectorTableResolution,
+) -> Result<ConnectorQueryTableMaterialization, String> {
+    let mut materialization =
+        connector_table_materialization_from_metadata(metadata, planning_lease)?;
+    if let novarocks_spi::connector::ConnectorTableResolution::HistoricalSnapshot(snapshot) =
+        resolution
+    {
+        materialization.read_selector =
+            novarocks_spi::connector::ConnectorReadSelector::SnapshotId(snapshot);
+    }
+    Ok(materialization)
 }
 
 pub fn connector_table_materialization_from_metadata(

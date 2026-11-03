@@ -692,3 +692,80 @@ fn inlist_actual_arrow_equality_error_retains_sdk_source_without_its_inputs() {
     assert!(source.downcast_ref::<arrow_schema::ArrowError>().is_some());
     assert_eq!(source.to_string(), original);
 }
+
+#[test]
+fn inlist_json_profile_preserves_nominal_evidence_and_rejects_plain_text_mixing() {
+    use novarocks_type_contract::{
+        CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
+    };
+    struct Compile;
+    impl PureCompileControl for Compile {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    let json =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+            .unwrap();
+    let plain = FunctionValueType::new(DataType::Utf8, true);
+    let boolean = FunctionValueType::new(DataType::Boolean, true);
+    let recipe =
+        super::PreparedNativeInListRecipe::try_new(false, &json, &[&json], &boolean, &Compile)
+            .unwrap();
+    assert_eq!(recipe.source_type(), &json);
+    assert_eq!(recipe.candidate_types(), &[json.clone()]);
+    assert!(
+        super::PreparedNativeInListRecipe::try_new(false, &json, &[&plain], &boolean, &Compile)
+            .is_err()
+    );
+    assert!(
+        super::PreparedNativeInListRecipe::try_new(false, &plain, &[&json], &boolean, &Compile)
+            .is_err()
+    );
+}
+
+#[test]
+fn json_inlist_required_data_effects_are_shared_by_owned_and_borrowed_profiles() {
+    use novarocks_type_contract::{
+        EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
+        FunctionValueType, ValueLogicalType,
+    };
+    let context = ExpressionEffectContext {
+        use_id: ExpressionUseId::new(760),
+        domain: EvaluationDomainId::new(14),
+        demand: EvaluationDemand::Value,
+    };
+    let result = FunctionValueType::new(DataType::Boolean, true);
+    for (carrier, logical, required) in [
+        (DataType::Utf8, ValueLogicalType::Json, true),
+        (DataType::Utf8, ValueLogicalType::Physical, false),
+        (DataType::Int64, ValueLogicalType::Physical, false),
+    ] {
+        let source = FunctionValueType::try_with_logical_type(carrier, true, logical).unwrap();
+        for negated in [false, true] {
+            let prepared = super::PreparedNativeInListRecipe::try_new(
+                negated,
+                &source,
+                &[&source],
+                &result,
+                crate::binding_test_control(),
+            )
+            .unwrap();
+            let own = prepared.own_effects(context);
+            let borrowed = super::PreparedNativeInListRecipe::refine_borrowed_profile(
+                &source,
+                [&source].into_iter(),
+                &result,
+                context,
+                crate::binding_test_control(),
+            )
+            .unwrap();
+            assert_eq!(own, borrowed);
+            let effects = own.for_use(context).unwrap();
+            assert_eq!(effects.may_raise_row_error, required);
+            assert_eq!(effects.may_raise_invocation_data, required);
+            assert_eq!(effects.permits_boolean_reordering(), !required);
+            assert_eq!(effects.permits_earlier_evaluation(), !required);
+        }
+    }
+}

@@ -810,3 +810,6 @@ fn value_has_plain_string_map_semantics(value: &crate::ValueType) -> bool {
     matches!(value.value_type().kind(),ValueKind::Map{key,value}
         if matches!(key.kind(),ValueKind::String) && matches!(value.kind(),ValueKind::String))
 }
+
+#[cfg(test)]
+mod mark_join_tests;

@@ -95,10 +95,12 @@ class SharedMinioTests(RendererCase):
                 "NOVA_FIXTURE_MACHINE_GENERATION": self.snapshot["generation"]}, clear=True), \
                 mock.patch.object(machine, "MachineOwner", return_value=self.owner), \
                 mock.patch.object(self.owner, "required_definition") as definition, \
-                mock.patch.object(self.owner, "ready_snapshot") as ready, \
-                mock.patch.object(entry, "start_private_stack") as start:
+                mock.patch.object(self.owner, "operation_snapshot") as ready, \
+                mock.patch.object(entry, "start_private_stack") as start, \
+                mock.patch.object(entry, "build_inputs") as build:
             with self.assertRaisesRegex(runtime.RuntimeFailure, "RunBudgetExpired"):
-                entry.isolated_start(self.config, "nr-isolated-rest-test", self.entry, "stock", None, bom())
+                entry.isolated_start(self.config, "nr-isolated-rest-test", self.entry, "stock", None)
+            build.assert_not_called()
             definition.assert_not_called()
             ready.assert_not_called()
             start.assert_not_called()

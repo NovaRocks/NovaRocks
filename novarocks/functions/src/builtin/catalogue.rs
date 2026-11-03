@@ -1171,6 +1171,8 @@ fn scalar_result_nullable_from_types(
             }
             _ => true,
         },
+        // Invalid JSON is a required Data failure, not a NULL result.
+        "__json_canonical_key" => first_value.is_some_and(FunctionValueType::nullable),
         // FIELD returns zero for NULL or absence, and a non-NULL first-match index otherwise.
         "field" => false,
         // A NULL predicate fails the assertion; successful evaluations are true.
@@ -3365,6 +3367,7 @@ pub(super) fn scalar_definition_parts(
                     "crc32" => Some(super::crc32_owner::effects()),
                     "bitmap_to_string" => Some(super::bitmap_to_string_owner::effects()),
                     "parse_json" => Some(super::parse_json_owner::effects()),
+                    "__json_canonical_key" => Some(super::json_canonical_owner::effects()),
                     "json_object" => Some(super::json_object_owner::effects()),
                     "array_sortby" => Some(super::array_sortby_owner::effects()),
                     "percentile_hash" => Some(super::percentile_hash_owner::effects()),
@@ -3724,6 +3727,9 @@ pub fn contribute_builtin_functions(
             "crc32" => super::crc32_owner::definition(declaration, resolver)?,
             "bitmap_to_string" => super::bitmap_to_string_owner::definition(declaration, resolver)?,
             "parse_json" => super::parse_json_owner::definition(declaration, resolver)?,
+            "__json_canonical_key" => {
+                super::json_canonical_owner::definition(declaration, resolver)?
+            }
             "json_object" => super::json_object_owner::definition(declaration, resolver)?,
             "array_sortby" => super::array_sortby_owner::definition(declaration, resolver)?,
             "percentile_hash" => super::percentile_hash_owner::definition(declaration, resolver)?,

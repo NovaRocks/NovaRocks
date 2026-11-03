@@ -30,6 +30,7 @@ pub(crate) struct JoinCommutativity;
 /// Map a join type to its commuted (left/right swapped) equivalent.
 fn commute_join_kind(kind: JoinKind) -> JoinKind {
     match kind {
+        JoinKind::LeftMark { .. } => kind,
         JoinKind::Inner => JoinKind::Inner,
         JoinKind::Cross => JoinKind::Cross,
         JoinKind::FullOuter => JoinKind::FullOuter,

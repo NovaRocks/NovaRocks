@@ -34,8 +34,12 @@
 
 use std::fmt;
 
-/// Deepest container nesting accepted; matches serde_json's recursion limit.
-pub(crate) const MAX_DEPTH: usize = 128;
+/// Physical JSON container depth, distinct from the logical value/type depth.
+/// Iceberg encodes a nested type through field objects, type objects and field
+/// arrays; defaults and REST envelopes add further containers. Four containers
+/// per supported logical level, plus 32 for the document envelope, retain a
+/// finite scanner stack while admitting the full supported type depth.
+pub(crate) const MAX_DEPTH: usize = 4 * novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 32;
 
 /// Longest object key compared against the sink's paths. Longer keys inside
 /// an interested object are reported as [`Key::Overlong`].
@@ -856,6 +860,43 @@ pub(crate) fn scan_complete<S: ViewSink>(sink: S, document: &[u8]) -> Result<S::
     scanner.finish()
 }
 
+/// Validate one complete document without constructing a retained JSON value.
+/// Uses the same grammar and finite physical-depth bound as streamed REST views.
+pub(crate) fn validate_document(document: &[u8]) -> Result<(), ScanError> {
+    scan_complete(SkippingSink, document)
+}
+
+/// Validates every byte while retaining no document values.
+struct SkippingSink;
+
+impl ViewSink for SkippingSink {
+    type Node = ();
+    type View = ();
+
+    fn retention_cap(&self) -> usize {
+        0
+    }
+    fn root(&self) {}
+    fn open(&mut self, _node: (), _kind: ValueKind) -> Result<usize, ScanError> {
+        Ok(0)
+    }
+    fn member(&mut self, _object: (), _key: Key<'_>) -> Result<Option<()>, ScanError> {
+        Ok(None)
+    }
+    fn element(&mut self, _array: (), _index: u64) -> Result<Option<()>, ScanError> {
+        Ok(None)
+    }
+    fn scalar(&mut self, _node: (), _value: Scalar<'_>) -> Result<(), ScanError> {
+        Ok(())
+    }
+    fn close(&mut self, _node: ()) -> Result<(), ScanError> {
+        Ok(())
+    }
+    fn finish(self) -> Result<(), ScanError> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,37 +954,6 @@ mod tests {
 
         fn finish(self) -> Result<Vec<String>, ScanError> {
             Ok(self.events)
-        }
-    }
-
-    /// Skips everything below the root object.
-    struct SkippingSink;
-
-    impl ViewSink for SkippingSink {
-        type Node = ();
-        type View = ();
-
-        fn retention_cap(&self) -> usize {
-            0
-        }
-        fn root(&self) {}
-        fn open(&mut self, _node: (), _kind: ValueKind) -> Result<usize, ScanError> {
-            Ok(0)
-        }
-        fn member(&mut self, _object: (), _key: Key<'_>) -> Result<Option<()>, ScanError> {
-            Ok(None)
-        }
-        fn element(&mut self, _array: (), _index: u64) -> Result<Option<()>, ScanError> {
-            Ok(None)
-        }
-        fn scalar(&mut self, _node: (), _value: Scalar<'_>) -> Result<(), ScanError> {
-            Ok(())
-        }
-        fn close(&mut self, _node: ()) -> Result<(), ScanError> {
-            Ok(())
-        }
-        fn finish(self) -> Result<(), ScanError> {
-            Ok(())
         }
     }
 
@@ -1021,6 +1031,7 @@ mod tests {
     fn valid_documents_agree_across_every_split() {
         for document in VALID {
             assert!(scan_whole(document.as_bytes()).is_ok(), "{document}");
+            assert_eq!(validate_document(document.as_bytes()), Ok(()), "{document}");
             assert_split_invariant(document.as_bytes());
         }
     }
@@ -1066,8 +1077,40 @@ mod tests {
                 "{:?} -> {whole:?}",
                 String::from_utf8_lossy(document)
             );
+            assert_eq!(validate_document(document), whole.map(|_| ()));
             assert_split_invariant(document);
         }
+    }
+
+    #[test]
+    fn validation_depth_counts_containers_and_not_escaped_string_content() {
+        let quoted = r#"\"[\u005b{]"#.repeat(MAX_DEPTH + 1);
+        let document = format!(r#"{{"text":"{quoted}","nested":[{{"v":1}}]}}"#);
+        assert_eq!(validate_document(document.as_bytes()), Ok(()));
+        let nested = |depth| format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+        assert_eq!(validate_document(nested(MAX_DEPTH).as_bytes()), Ok(()));
+        assert_eq!(
+            validate_document(nested(MAX_DEPTH + 1).as_bytes()),
+            Err(ScanError::NestingTooDeep {
+                offset: MAX_DEPTH as u64
+            }),
+        );
+    }
+
+    #[test]
+    fn validation_only_entry_requires_one_complete_grammatical_document() {
+        assert_eq!(
+            validate_document(b"{}[]"),
+            Err(ScanError::TrailingContent { offset: 2 })
+        );
+        assert_eq!(
+            validate_document(br#"[1,]"#),
+            Err(ScanError::Syntax { offset: 3 })
+        );
+        assert_eq!(
+            validate_document(br#"{"unfinished":["#),
+            Err(ScanError::Truncated)
+        );
     }
 
     #[test]

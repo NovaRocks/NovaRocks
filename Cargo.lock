@@ -3614,6 +3614,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "faststr",
+ "flate2",
  "futures",
  "hive_metastore",
  "iceberg",

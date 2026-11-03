@@ -285,7 +285,7 @@ fn planning_semantic_kind_follows_external_rename_by_source_id() {
             metadata_columns: &[],
             hidden_columns: &[],
             nominal_declarations: &document.nominals,
-            serialized_metadata: None,
+            table_metadata: Some(&metadata),
             namespace: &namespace,
             instance_id: &instance,
             context: &context,

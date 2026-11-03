@@ -47,7 +47,6 @@ fixture_publication_oss_operation() {
     python3 "$SOURCE_ROOT/docker/iceberg-rest/machine_mc.py" \
       --root "${NOVA_FIXTURE_MACHINE_ROOT:?original machine root is required}" \
       --daemon "${NOVA_FIXTURE_MACHINE_DAEMON:?original machine daemon is required}" \
-      --expected-version "${NOVA_FIXTURE_MACHINE_VERSION:?original machine version is required}" \
       --expected-generation "${NOVA_FIXTURE_MACHINE_GENERATION:?original machine generation is required}" \
       --benchmark-oss
 import json, sys

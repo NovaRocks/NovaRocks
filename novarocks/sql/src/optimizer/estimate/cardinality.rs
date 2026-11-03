@@ -39,6 +39,7 @@ pub fn estimate_join_cardinality(input: &JoinCardInput) -> (f64, Confidence) {
 
     let mut confidence_inputs = vec![input.left.1, input.right.1];
     let (rows, saturated, used_default_or_invalid) = match input.kind {
+        JoinKind::LeftMark { .. } => return input.left,
         JoinKind::Cross => {
             let (rows, saturated) = sat_mul(left_rows, right_rows);
             (rows, saturated, false)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared integrity primitives for fixture input provision and verification."""
+"""Recommended fixture recipes and operation-local build primitives."""
 
 from __future__ import annotations
 
@@ -68,23 +68,11 @@ def native_platform() -> str:
     return normalize_platform(f"linux/{host_platform.machine()}")
 
 
-def require_native_daemon(target: str) -> None:
-    """Observe the actual daemon; emulation is not native fixture readiness."""
-    native = native_platform()
-    actual = normalize_platform(run(
-        ["docker", "info", "--format", "{{.OSType}}/{{.Architecture}}"], capture=True
-    ).strip())
-    if target != native or actual != native:
-        raise FixtureInputError(
-            f"fixture native platform mismatch: target={target}, host={native}, daemon={actual}"
-        )
-
-
-def read_source_lock(path: Path) -> dict[str, Any]:
+def read_recommendations(path: Path) -> dict[str, Any]:
     lock = read_json(path)
-    if lock.get("schema") != 2:
+    if lock.get("schema") != 1:
         raise FixtureInputError(
-            f"unsupported fixture input lock schema: {lock.get('schema')!r}; reprovision with schema 2"
+            f"unsupported fixture recommendations schema: {lock.get('schema')!r}"
         )
     for key in ("images", "artifacts", "derived_images"):
         if not isinstance(lock.get(key), dict):
@@ -170,13 +158,13 @@ def read_source_lock(path: Path) -> dict[str, Any]:
     return lock
 
 
-def resolve_lock(
+def resolve_inputs(
     source: Mapping[str, Any], platform: str, *, consumer: str = "all"
-) -> tuple[dict[str, Any], str]:
+) -> dict[str, Any]:
     target = normalize_platform(platform)
     # Select variant facts before walking recipe dependencies. Missing variants
     # remain explicit unsupported nodes, never silently omitted from `all`.
-    potential: dict[str, Any] = {"schema": 2, "platform": target, "artifacts": source["artifacts"]}
+    potential: dict[str, Any] = {"schema": 1, "platform": target, "artifacts": source["artifacts"]}
     unavailable: set[tuple[str, str]] = set()
     for kind in ("images", "derived_images", "python_environments"):
         potential[kind] = {}
@@ -189,21 +177,21 @@ def resolve_lock(
                 **(variant or {}), "platform": target,
             }
     names = selected_input_names(potential, consumer)
-    effective: dict[str, Any] = {"schema": 2, "platform": target}
+    effective: dict[str, Any] = {"schema": 1, "platform": target}
     for kind, selected in names.items():
         effective[kind] = {}
         for name in sorted(selected):
             if (kind, name) in unavailable:
                 raise FixtureInputError(f"unsupported fixture input platform: {kind}/{name} has no {target} variant")
             effective[kind][name] = dict(potential[kind][name])
-    identity = sha256_bytes(canonical_bytes({"source_lock": source, "platform": target}))
-    return effective, identity
+    effective["versions"] = dict(source.get("versions", {}))
+    return effective
 
 
-def load_lock(
+def load_inputs(
     path: Path, *, platform: str | None = None, consumer: str = "all"
-) -> tuple[dict[str, Any], str]:
-    return resolve_lock(read_source_lock(path), platform or native_platform(), consumer=consumer)
+) -> dict[str, Any]:
+    return resolve_inputs(read_recommendations(path), platform or native_platform(), consumer=consumer)
 
 
 # A consumer declares its runtime roots; build dependencies come from the lock.
@@ -382,43 +370,27 @@ def run(
     return result.stdout if capture else ""
 
 
-def inspect_image(reference: str) -> Mapping[str, Any]:
-    output = run(["docker", "image", "inspect", reference, "--format", "{{json .}}"], capture=True)
+def inspect_image(reference: str) -> Mapping[str, Any] | None:
+    """Inspect the build target; only Docker's explicit absence permits creation."""
     try:
-        payload = json.loads(output)
-    except json.JSONDecodeError as error:
-        raise FixtureInputError(f"cannot parse docker image inspect output for {reference}") from error
-    if not isinstance(payload, dict):
-        raise FixtureInputError(f"unexpected docker image inspect output for {reference}")
-    return payload
-
-
-def image_platform(info: Mapping[str, Any]) -> str:
-    result = f"{info.get('Os')}/{info.get('Architecture')}"
-    if info.get("Variant"):
-        result += f"/{info['Variant']}"
-    return result
-
-
-def verify_image(info: Mapping[str, Any], item: Mapping[str, Any], *, derived: bool = False) -> None:
-    expected_platform = item["platform"]
-    actual_platform = image_platform(info)
-    # Docker may report the default ARM64 variant even when the locked
-    # platform and the pull request both spell it as linux/arm64.
-    if actual_platform != expected_platform and not (
-        expected_platform == "linux/arm64" and actual_platform == "linux/arm64/v8"
-    ):
-        raise FixtureInputError(
-            f"fixture image platform mismatch: expected {expected_platform}, found {actual_platform}"
+        result = subprocess.run(
+            ["docker", "image", "inspect", reference, "--format", "{{json .}}"],
+            text=True, capture_output=True, check=False,
         )
-    if derived:
-        return
-    expected_digest = item["manifest_digest"]
-    repo_digests = info.get("RepoDigests") or []
-    if info.get("Id") != expected_digest and not any(
-        isinstance(value, str) and value.endswith(f"@{expected_digest}") for value in repo_digests
-    ):
-        raise FixtureInputError(f"fixture image manifest mismatch: expected {expected_digest}")
+    except OSError as error:
+        raise FixtureInputError(f"cannot inspect fixture image {reference}: {error}") from error
+    if result.returncode:
+        detail = result.stderr.strip()
+        if detail.lower().startswith(("error response from daemon: no such image:", "error: no such image:")):
+            return None
+        raise FixtureInputError(f"cannot inspect fixture image {reference}: {detail}")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise FixtureInputError(f"invalid Docker response for {reference}") from error
+    if not isinstance(value, dict) or not value.get("Id"):
+        raise FixtureInputError(f"Docker image has no identity: {reference}")
+    return value
 
 
 def artifact_entry(path: Path) -> dict[str, Any]:

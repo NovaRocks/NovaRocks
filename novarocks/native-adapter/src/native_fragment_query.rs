@@ -523,7 +523,9 @@ impl NativeFragmentAdmissionResources {
         result_writer: Arc<dyn FragmentResultWriter>,
         event_sink: Arc<dyn FragmentEventSink>,
     ) -> FragmentPrepareContext {
-        FragmentPrepareContext::new(
+        #[cfg(novarocks_dev_controls)]
+        let query_tracker_witness = Arc::downgrade(&self.query_mem_tracker);
+        let context = FragmentPrepareContext::new(
             profiler,
             Some(self.fragment_mem_tracker),
             self.runtime_filter,
@@ -532,7 +534,10 @@ impl NativeFragmentAdmissionResources {
             event_sink,
         )
         .with_query_memory(self.query_memory)
-        .with_fragment_commit_port(Arc::new(WorkerSinkCommitPort))
+        .with_fragment_commit_port(Arc::new(WorkerSinkCommitPort));
+        #[cfg(novarocks_dev_controls)]
+        let context = context.with_query_tracker_witness(query_tracker_witness);
+        context
     }
 }
 

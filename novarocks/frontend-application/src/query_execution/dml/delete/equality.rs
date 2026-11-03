@@ -381,6 +381,7 @@ fn resolve_equality_delete_key_columns(
     column_names: &[String],
     rows: &[Vec<Literal>],
 ) -> Result<Vec<Field>, String> {
+    crate::connector::require_current_write_authority(&table_metadata.planning_facts)?;
     if column_names.is_empty() {
         return Err("ADD EQUALITY DELETE requires at least one equality column".to_string());
     }
@@ -863,6 +864,23 @@ mod tests {
             schema,
             bindings,
         )
+    }
+
+    #[test]
+    fn equality_delete_keys_reject_historical_read_authority() {
+        let mut metadata = plain_table();
+        let schema = Arc::new(metadata.schema().clone());
+        metadata.planning_facts = ConnectorTablePlanningFacts::try_new_snapshot_source(
+            &schema,
+            metadata.planning_facts.column_facts().to_vec(),
+            vec![],
+            vec![],
+            &request_context(),
+        )
+        .unwrap();
+        let error = super::resolve_equality_delete_key_columns(&metadata, &["id".to_string()], &[])
+            .unwrap_err();
+        assert!(error.contains("no current write authority"));
     }
 
     /// `id INT NOT NULL`, `category STRING NULL`, `amount BIGINT NULL`.

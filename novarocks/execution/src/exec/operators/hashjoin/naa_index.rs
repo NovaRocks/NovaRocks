@@ -223,6 +223,43 @@ impl NaaCandidateStore {
             _storage: work.owner.storage_lifetime(),
         })
     }
+    /// One-key mark truth reuses the original presence lookup and NULL facts.
+    /// No candidate rows are scanned and no required predicate is skipped:
+    /// the frozen mark condition has no scopes or eligibility expression.
+    pub(crate) fn mark_truth(
+        &self,
+        probe: &NaaProbePage,
+        row: usize,
+    ) -> ExecutionResult<Option<bool>> {
+        if self.eligibility || self.group.is_some() || self.values.len() != 1 {
+            return Err(build_contract(
+                "mark truth requires one unscoped NULL-aware key",
+            ));
+        }
+        let FullMatches::Presence(present) = &probe.full else {
+            return Err(build_contract(
+                "mark truth requires its original presence index",
+            ));
+        };
+        let probe_null = *probe
+            .ordinary_nulls
+            .get(row)
+            .ok_or_else(|| build_contract("mark probe row is outside its admitted page"))?;
+        let exact = *present
+            .present()
+            .get(row)
+            .ok_or_else(|| build_contract("mark lookup row is outside its admitted page"))?
+            != 0;
+        Ok(if self.rows.len() == 0 {
+            Some(false)
+        } else if !probe_null && exact {
+            Some(true)
+        } else if probe_null || self.rows.ordinary_null_count()? != 0 {
+            None
+        } else {
+            Some(false)
+        })
+    }
     pub(crate) fn start(&self, probe: &NaaProbePage, row: usize) -> ExecutionResult<NaaRowStart> {
         let null = *probe
             .ordinary_nulls

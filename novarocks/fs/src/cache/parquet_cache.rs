@@ -21,9 +21,14 @@ use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::StorageAccessDomainId;
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use parquet::file::metadata::ParquetMetaData;
 
-use crate::{DataCacheManager, DataCachePageCache, DataCachePageKey, FileIdentity};
+use crate::{
+    DataCacheManager, DataCachePageCache, DataCachePageKey, FileIdentity,
+    ParquetInterpretationPolicy,
+};
 
+const PARQUET_RAW_METADATA_CACHE_NAMESPACE: &str = "physical.parquet.raw-metadata";
 const PARQUET_METADATA_CACHE_NAMESPACE: &str = "physical.parquet.metadata";
 
 #[derive(Clone, Debug)]
@@ -41,6 +46,12 @@ impl Default for ParquetCacheOptions {
             enable_page: true,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct TimedRawMetadata {
+    metadata: Arc<ParquetMetaData>,
+    expire_at: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -143,13 +154,14 @@ pub(crate) fn metadata_get(
     access_domain: StorageAccessDomainId,
     identity: &FileIdentity,
     require_page_index: bool,
+    policy: ParquetInterpretationPolicy,
 ) -> Option<ArrowReaderMetadata> {
     if !request_cache_enabled || !options().enable_metadata {
         return None;
     }
     let cache = DataCacheManager::instance().page_cache()?;
     let cached =
-        cache.lookup::<TimedArrowReaderMetadata>(&metadata_key(access_domain, identity))?;
+        cache.lookup::<TimedArrowReaderMetadata>(&metadata_key(access_domain, identity, policy))?;
     if cached.expire_at <= Instant::now() {
         return None;
     }
@@ -175,6 +187,7 @@ pub(crate) fn metadata_put(
     access_domain: StorageAccessDomainId,
     identity: &FileIdentity,
     metadata: ArrowReaderMetadata,
+    policy: ParquetInterpretationPolicy,
 ) {
     if !request_cache_enabled || !options().enable_metadata {
         return;
@@ -187,7 +200,7 @@ pub(crate) fn metadata_put(
         .unwrap_or_else(Instant::now);
     let _ = insert_metadata(
         &cache,
-        metadata_key(access_domain, identity),
+        metadata_key(access_domain, identity, policy),
         metadata,
         expire_at,
     );
@@ -201,17 +214,100 @@ fn options() -> &'static ParquetCacheOptions {
     PARQUET_CACHE_OPTIONS.get_or_init(ParquetCacheOptions::default)
 }
 
-fn metadata_key(access_domain: StorageAccessDomainId, identity: &FileIdentity) -> DataCachePageKey {
-    let key = format!(
-        "{}\0{}\0{}",
-        identity.path(),
-        identity.file_size(),
-        identity.modification_time().unwrap_or_default()
-    );
+fn file_key(identity: &FileIdentity) -> Vec<u8> {
+    // Encode the optional timestamp's presence as well as its value.
+    let mut key = (identity.path().len() as u64).to_le_bytes().to_vec();
+    key.extend_from_slice(identity.path().as_bytes());
+    key.extend_from_slice(&identity.file_size().to_le_bytes());
+    match identity.modification_time() {
+        Some(time) => {
+            key.push(1);
+            key.extend_from_slice(&time.to_le_bytes());
+        }
+        None => key.push(0),
+    }
+    key
+}
+
+fn raw_metadata_key(
+    access_domain: StorageAccessDomainId,
+    identity: &FileIdentity,
+) -> DataCachePageKey {
     DataCachePageKey::new(
         access_domain,
-        PARQUET_METADATA_CACHE_NAMESPACE,
-        key.into_bytes(),
+        PARQUET_RAW_METADATA_CACHE_NAMESPACE,
+        file_key(identity),
+    )
+}
+
+fn metadata_key(
+    access_domain: StorageAccessDomainId,
+    identity: &FileIdentity,
+    policy: ParquetInterpretationPolicy,
+) -> DataCachePageKey {
+    let mut key = file_key(identity);
+    key.extend_from_slice(policy.cache_identity());
+    DataCachePageKey::new(access_domain, PARQUET_METADATA_CACHE_NAMESPACE, key)
+}
+
+pub(crate) fn raw_metadata_get(
+    request_cache_enabled: bool,
+    access_domain: StorageAccessDomainId,
+    identity: &FileIdentity,
+) -> Option<Arc<ParquetMetaData>> {
+    if !request_cache_enabled || !options().enable_metadata {
+        return None;
+    }
+    let cache = DataCacheManager::instance().page_cache()?;
+    let cached = cache.lookup::<TimedRawMetadata>(&raw_metadata_key(access_domain, identity))?;
+    (cached.expire_at > Instant::now()).then(|| Arc::clone(&cached.metadata))
+}
+
+pub(crate) fn raw_metadata_put(
+    request_cache_enabled: bool,
+    access_domain: StorageAccessDomainId,
+    identity: &FileIdentity,
+    metadata: Arc<ParquetMetaData>,
+) {
+    if !request_cache_enabled || !options().enable_metadata {
+        return;
+    }
+    let Some(cache) = DataCacheManager::instance().page_cache() else {
+        return;
+    };
+    let expire_at = Instant::now()
+        .checked_add(options().metadata_ttl)
+        .unwrap_or_else(Instant::now);
+    let _ = insert_raw_metadata(
+        &cache,
+        raw_metadata_key(access_domain, identity),
+        metadata,
+        expire_at,
+    );
+}
+
+fn raw_metadata_charge(metadata: &ParquetMetaData) -> usize {
+    metadata
+        .memory_size()
+        .saturating_add(size_of::<TimedRawMetadata>())
+        .max(1)
+}
+
+fn insert_raw_metadata(
+    cache: &DataCachePageCache,
+    key: DataCachePageKey,
+    metadata: Arc<ParquetMetaData>,
+    expire_at: Instant,
+) -> bool {
+    let charge = raw_metadata_charge(&metadata);
+    cache.insert(
+        key,
+        Arc::new(TimedRawMetadata {
+            metadata,
+            expire_at,
+        }),
+        charge,
+        None,
     )
 }
 
@@ -319,8 +415,16 @@ mod tests {
     #[test]
     fn metadata_key_is_scoped_before_physical_identity() {
         let identity = FileIdentity::new("s3://bucket/data.parquet", 42, Some(7));
-        let first = metadata_key(StorageAccessDomainId::from_bytes([1; 32]), &identity);
-        let second = metadata_key(StorageAccessDomainId::from_bytes([2; 32]), &identity);
+        let first = metadata_key(
+            StorageAccessDomainId::from_bytes([1; 32]),
+            &identity,
+            ParquetInterpretationPolicy::UseArrowHint,
+        );
+        let second = metadata_key(
+            StorageAccessDomainId::from_bytes([2; 32]),
+            &identity,
+            ParquetInterpretationPolicy::UseArrowHint,
+        );
         assert_ne!(first, second);
         assert_eq!(first.namespace(), second.namespace());
         assert_eq!(first.key(), second.key());
@@ -365,5 +469,61 @@ mod tests {
         );
         assert!(cache.lookup::<TimedArrowReaderMetadata>(&second).is_some());
         assert_eq!(cache.stats().size, charge);
+    }
+
+    #[test]
+    fn raw_keys_preserve_full_file_identity_and_interpretation_keys_include_policy() {
+        let domain = StorageAccessDomainId::from_bytes([1; 32]);
+        let without_time = FileIdentity::new("s3://bucket/data.parquet", 42, None);
+        let with_zero_time = FileIdentity::new("s3://bucket/data.parquet", 42, Some(0));
+        assert_ne!(
+            raw_metadata_key(domain, &without_time),
+            raw_metadata_key(domain, &with_zero_time)
+        );
+        assert_ne!(
+            metadata_key(
+                domain,
+                &without_time,
+                ParquetInterpretationPolicy::UseArrowHint
+            ),
+            metadata_key(
+                domain,
+                &without_time,
+                ParquetInterpretationPolicy::SkipArrowHint
+            ),
+        );
+    }
+
+    #[test]
+    fn raw_footer_eviction_keeps_reader_and_alias_metadata_alive() {
+        let interpreted = sample_metadata();
+        let raw = Arc::clone(interpreted.metadata());
+        let charge = raw_metadata_charge(&raw);
+        let cache = DataCachePageCache::new(crate::DataCachePageCacheOptions {
+            capacity: charge,
+            evict_probability: 100,
+        });
+        let domain = StorageAccessDomainId::from_bytes([1; 32]);
+        let first = raw_metadata_key(domain, &FileIdentity::new("first", 42, Some(7)));
+        let second = raw_metadata_key(domain, &FileIdentity::new("second", 42, Some(7)));
+        let expire_at = Instant::now() + Duration::from_secs(60);
+        assert!(insert_raw_metadata(
+            &cache,
+            first.clone(),
+            Arc::clone(&raw),
+            expire_at
+        ));
+        let alias = Arc::clone(&cache.lookup::<TimedRawMetadata>(&first).unwrap().metadata);
+        assert!(insert_raw_metadata(
+            &cache,
+            second.clone(),
+            Arc::clone(&raw),
+            expire_at
+        ));
+        assert!(cache.lookup::<TimedRawMetadata>(&first).is_none());
+        assert!(cache.lookup::<TimedRawMetadata>(&second).is_some());
+        assert!(Arc::ptr_eq(&alias, interpreted.metadata()));
+        assert_eq!(alias.file_metadata().num_rows(), 3);
+        assert_eq!(interpreted.schema().field(0).name(), "value");
     }
 }

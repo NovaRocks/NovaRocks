@@ -69,7 +69,7 @@ pub(crate) fn prepare_row_mutation(
         )
     })?;
     let metadata: TableMetadata =
-        serde_json::from_str(table.serialized_metadata.as_deref().ok_or_else(|| {
+        crate::metadata_json::from_str(table.serialized_metadata.as_deref().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "admitted Iceberg row-mutation table has no serialized metadata",

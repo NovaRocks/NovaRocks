@@ -395,6 +395,68 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn equality_delete_reader_ignores_bad_arrow_hint_and_binds_real_ids() {
+        use novarocks_fs::{
+            FileCancellation, FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+        };
+        use parquet::arrow::ArrowWriter;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("equality.parquet");
+        let data = batch(vec![(
+            17,
+            Arc::new(Int64Array::from(vec![Some(7), None, Some(7)])),
+        )]);
+        let mut writer =
+            ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), data.schema(), None)
+                .unwrap();
+        writer.write(&data).unwrap();
+        writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            parquet::arrow::ARROW_SCHEMA_META_KEY.to_owned(),
+            "not-an-arrow-schema".to_owned(),
+        ));
+        writer.close().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let location = path.to_string_lossy();
+        let access = FsAccessResolver::new()
+            .resolve_location(
+                novarocks_spi::connector::StorageAccessDomainId::from_bytes([18; 32]),
+                location.as_ref(),
+                None,
+            )
+            .unwrap();
+        let context = FileReadContext {
+            cancellation: FileCancellation::new(),
+            deadline: None,
+            runtime: Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            task_spawner: Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            range: None,
+        };
+        let spec = IcebergDeleteFileSpec {
+            path: location.to_string(),
+            file_format: IcebergFileFormat::Parquet,
+            file_content: IcebergFileContent::EqualityDeletes,
+            length: Some(std::fs::metadata(&path).unwrap().len()),
+            content_offset: None,
+            content_size_in_bytes: None,
+            referenced_data_file: None,
+        };
+        let (keys, rows) = runtime
+            .block_on(load_bound_equality_keys(
+                &spec,
+                &group(&[17], &[PrimitiveType::Long]),
+                &access,
+                &context,
+                |_| {},
+            ))
+            .unwrap();
+        assert_eq!(rows, 3);
+        assert_eq!(
+            keys.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([vec![Some(CanonicalScalar::Long(7))], vec![None]])
+        );
+    }
+
+    #[test]
     fn physical_reader_binding_reuses_indices_and_rejects_changed_batch_schema() {
         let group = group(&[1], &[PrimitiveType::Long]);
         let first = batch(vec![

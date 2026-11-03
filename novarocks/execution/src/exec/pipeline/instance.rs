@@ -318,6 +318,11 @@ impl DerefMut for OperatorInstance {
     }
 }
 impl StepOperator for OperatorInstance {
+    #[cfg(novarocks_dev_controls)]
+    fn is_mark_join_probe(&self) -> bool {
+        self.inner.is_live() && self.inner.is_mark_join_probe()
+    }
+
     fn control_observable(&self) -> Option<Arc<super::schedule::observer::Observable>> {
         self.inner.control_observable()
     }

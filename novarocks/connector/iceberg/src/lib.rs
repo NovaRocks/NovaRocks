@@ -76,6 +76,7 @@ pub mod metadata;
 pub mod metadata_batch_reader;
 pub mod metadata_context;
 pub mod metadata_factory;
+mod metadata_json;
 pub mod metadata_read;
 mod partition_row;
 pub mod planning_facts;

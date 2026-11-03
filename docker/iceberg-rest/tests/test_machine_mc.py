@@ -50,13 +50,13 @@ class AdapterTests(unittest.TestCase):
         self.owner.read_saved_state.return_value = self.state
         self.calls = []
         @contextmanager
-        def snapshot(definition, **kwargs):
-            self.calls.append((definition, kwargs))
+        def snapshot(**kwargs):
+            self.calls.append(((), kwargs))
             yield self.state
-        self.owner.ready_snapshot.side_effect = snapshot
+        self.owner.operation_snapshot.side_effect = snapshot
         self.owner.backend.run_mc.return_value = 'mc-output\n'
         self.args = ['--root', str(self.root), '--daemon', 'daemon-id',
-                     '--expected-version', 'version-id', '--expected-generation', 'generation-id']
+                     '--expected-generation', 'generation-id']
 
     def invoke(self, script='private-secret-payload', extra=(), context=None, storage=None, owner_expected=True):
         out, err = io.StringIO(), io.StringIO()
@@ -79,11 +79,22 @@ class AdapterTests(unittest.TestCase):
         status, out, err = self.invoke()
         self.assertEqual((status, out, err), (0, 'mc-output\n', ''))
         definition, kwargs = self.calls[0]
-        self.assertEqual(definition, {'version': 'version-id'})
+        self.assertEqual(definition, ())
         self.assertEqual(kwargs['expected_generation'], 'generation-id')
         self.assertAlmostEqual(kwargs['deadline'] - before, 370, delta=2)
         self.assertEqual(self.owner.backend.run_mc.call_args.args, (self.state, 'private-secret-payload'))
         self.assertEqual(self.owner.backend.run_mc.call_args.kwargs['deadline'], kwargs['deadline'])
+
+    def test_historical_version_does_not_gate_exact_cleanup(self):
+        storage = self.storage.as_dict()
+        storage['machine']['version'] = 'historical-version'
+        request = json.dumps({'identity': self.identity.as_dict(), 'storage': storage, 'users': []})
+        sweeper = mock.Mock()
+        sweeper.cleanup_run.return_value = {'complete': True, 'removed': [], 'errors': []}
+        with mock.patch.object(adapter, 'ScratchSweeper', return_value=sweeper):
+            status, _, error = self.invoke(request, ['--cleanup', '--cleanup-run'])
+        self.assertEqual((status, error), (0, ''))
+        self.assertEqual(sweeper.cleanup_run.call_args.args[0].machine['version'], 'historical-version')
 
     def test_invalid_admission_never_acquires_lock_or_runs_script(self):
         context = dict(self.context, cleanup_grace_seconds=40)
@@ -91,7 +102,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(status, 75)
         self.assertEqual(out, '')
         self.assertNotIn('private-secret-payload', err)
-        self.owner.ready_snapshot.assert_not_called()
+        self.owner.operation_snapshot.assert_not_called()
         self.owner.backend.run_mc.assert_not_called()
 
     def test_admitted_expiry_is_failure_and_cleanup_uses_original_reserve(self):
@@ -99,7 +110,7 @@ class AdapterTests(unittest.TestCase):
         context = dict(self.context, started_unix_ms=now_ms-390000, deadline_unix_ms=now_ms+10000)
         status, _, _ = self.invoke(context=context)
         self.assertEqual(status, 1)
-        self.owner.ready_snapshot.assert_not_called()
+        self.owner.operation_snapshot.assert_not_called()
         before = time.monotonic()
         status, _, _ = self.invoke(extra=['--cleanup'], context=context)
         self.assertEqual(status, 0)
@@ -126,7 +137,7 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn('private-secret-payload', err)
 
     def test_foreign_cleanup_storage_never_constructs_sweeper_or_runs_script(self):
-        for field in ('daemon_id', 'version', 'generation', 'control_root', 'id'):
+        for field in ('daemon_id', 'generation', 'control_root', 'id'):
             with self.subTest(field=field):
                 storage = self.storage.as_dict()
                 storage['machine'][field] = 'foreign-value'
@@ -186,7 +197,7 @@ class AdapterTests(unittest.TestCase):
                 self.assertNotEqual(status, 0)
                 self.assertEqual(out, '')
                 sweeper.assert_not_called()
-        self.owner.ready_snapshot.assert_not_called()
+        self.owner.operation_snapshot.assert_not_called()
         self.owner.backend.run_mc.assert_not_called()
 
     def test_exact_iam_ports_reject_foreign_context_or_storage_before_sweeper(self):
@@ -226,10 +237,10 @@ class AdapterTests(unittest.TestCase):
         self.owner.backend.run_mc.assert_not_called()
 
     def test_expected_activation_failure_is_not_silently_reattached(self):
-        self.owner.ready_snapshot.side_effect = adapter.runtime.RuntimeFailure('MachineVersionMismatch', 'activation changed')
+        self.owner.operation_snapshot.side_effect = adapter.runtime.RuntimeFailure('MachineUnavailable', 'activation changed')
         status, out, err = self.invoke()
         self.assertEqual((status, out), (75, ''))
-        self.assertIn('MachineVersionMismatch', err)
+        self.assertIn('MachineUnavailable', err)
         self.owner.backend.run_mc.assert_not_called()
 
 

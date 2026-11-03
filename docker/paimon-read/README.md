@@ -1,52 +1,32 @@
 # Paimon 外部只读 fixture
 
-当前 Paimon 测试暂停，等待详细 connector 设计。测试、SQL、oracle 和 writer 资产保留；生产 Paimon provider 仍启用。完整 CI 不再准备本 fixture；SQL/system runner 拒绝所有依赖 Paimon 的显式场景，`tests/run.sh` 明确退出 2，直接 Python unittest discovery 报告 SKIP。以下命令保留为历史 recipe，不代表当前测试可运行。`cleanup.sh` 仍可清理已存在的私有 fixture。
+当前 Paimon 读取与测试暂停；恢复条件由 ADR-0204 维护。测试、SQL、oracle 和 writer 配方保留，配置与 catalog 投影不代表读取能力。完整 CI 不再准备本 fixture；SQL/system runner 拒绝所有依赖 Paimon 的显式场景，`tests/run.sh` 明确退出 2，直接 Python unittest discovery 报告 SKIP。以下命令保留为历史 recipe，不代表当前测试可运行。`cleanup.sh` 仍可清理已存在的私有 fixture。
 
 这个目录用 Apache Spark 3.5.3 与 Apache Paimon 1.3.1 写出 PAI-1 的只读验收数据。Spark 负责写入和直接读取 oracle；NovaRocks 后续只消费已发布的 Paimon warehouse，因此不会用待测 Rust reader 自写自验。
 
-## 固定输入
+## 推荐输入与保留的配方
 
-- Spark 基础镜像固定为 `apache/spark:3.5.3` 的 Linux/amd64 manifest digest。所有主机都运行同一个 manifest，包括 Apple Silicon Docker Desktop。该 manifest 必须**预先存在于本机镜像库**：准备过程只从本地取镜像，绝不现场拉取。
-- `paimon-spark-3.5:1.3.1` 与 `paimon-s3:1.3.1` 固定 Maven Central 坐标、字节数和 SHA-1。镜像构建时同时校验长度和 checksum。
-- writer 使用独立镜像和一次性容器，不向共享 Iceberg Spark 服务安装 JAR。
-- warehouse 位于 `s3://novarocks/fixtures/paimon-read/<env>/<run>-<digest>`；生成器拒绝其他 bucket、共享 benchmark prefix、路径跳转和自由指定的清理目标。
+软件版本、平台和构建配方统一读取 [versions.json](../fixture-inputs/versions.json)。当前推荐 Spark 3.5.3、Paimon 1.3.1，writer 配方只声明 Linux/amd64。工具接口的迁移不恢复暂停的 Paimon 产品能力，不自动仿真或增加支持平台。
 
-## 显式供给输入
-
-首次或更新锁定输入时，在测试之外执行一次 provision：
+已有 writer 镜像直接使用，不做 digest、BOM、软件版本或整机健康检查。确实缺失时使用统一 builder 按推荐创建；Maven JAR 的长度和 checksum 仍用于实际构建输入完整性。已有损坏、状态未知或获取失败时保留错误，交人工维护，不自动覆盖、换版本或回退来源。
 
 ```bash
-docker/fixture-inputs/provision.sh
-docker/fixture-inputs/verify.sh
-```
-
-若 Docker Hub 不能作为传输端点、但镜像站提供**同一 manifest**，只在 provision 时显式指定该
-logical input 的 transport repository：
-
-```bash
-docker/fixture-inputs/provision.sh \
+# Explicit preparation of retained inputs; this does not enable Paimon tests.
+docker/fixture-inputs/provision.sh --consumer derived:paimon-writer --platform linux/amd64
+# Optional explicit transport selection; recommended versions remain unchanged.
+docker/fixture-inputs/provision.sh --consumer derived:paimon-writer --platform linux/amd64 \
   --image-source paimon-spark-base=dockerproxy.net/apache/spark
 ```
 
-该参数不接受 tag/digest 覆盖；lock 中的 Linux/amd64 manifest digest 仍是唯一身份，随后 verify
-也不会访问该镜像站。
-
-它从 [lock.json](../fixture-inputs/lock.json) 获取并校验固定 Linux/amd64 Spark manifest、Paimon JAR
-和 writer derived image，然后原子发布本机 `bom.json`/`READY`。`prepare.sh` 只接受这个 BOM；它不拉镜像、
-不下载 JAR、也不运行 Docker build。缺失或 hash/platform/definition 不一致时必须先重新 provision，而不是
-用另一个 tag、镜像站名称或临时下载替代。
-
-版本和 checksum 的唯一输入清单是 `docker/fixture-inputs/lock.json`；Paimon SQL 与 oracle 仍参与 fixture
-definition SHA，因此改变任一输入会产生新的对象前缀。
+writer 使用独立镜像与一次性容器，不向共享 Iceberg Spark 安装 JAR。数据 SQL、oracle、原 producer 事实、warehouse 与 READY 内容校验继续由本 fixture 维护，不能用推荐环境值替代。warehouse 仅限原 run 的准确对象前缀，不能扩大到共享 benchmark 或任意清理目标。
 
 ## 准备数据
 
-先完成输入 provision，再启动或复用标准 MinIO 环境并执行准备脚本：
+以下是暂停前保留的显式数据生成流程；缺失输入可由同一推荐 builder 创建，已有环境直接复用：
 
 生成器会直接检查 Parquet footer 与 Avro OCF header；运行它的 Python 环境必须安装 [requirements.txt](requirements.txt) 中固定版本的 `pyarrow` 和 `fastavro`。
 
 ```bash
-docker/fixture-inputs/verify.sh
 docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
 docker/paimon-read/prepare.sh \
@@ -76,7 +56,7 @@ docker/paimon-read/prepare.sh \
 ```bash
 docker/paimon-read/prepare.sh \
   --run-id dry-run \
-  --output-dir /tmp/paimon-dry-run \
+  --output-dir "$PWD/logs/experiments/paimon-dry-run" \
   --stop-after schema \
   --dry-run
 ```

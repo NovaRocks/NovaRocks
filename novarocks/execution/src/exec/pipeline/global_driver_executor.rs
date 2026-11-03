@@ -462,6 +462,11 @@ impl DriverTask {
         self.driver.driver_id()
     }
 
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn mark_probe_dependency(&self) -> bool {
+        self.driver.mark_probe_dependency()
+    }
+
     pub(crate) fn source_name(&self) -> &str {
         self.driver.source_name()
     }

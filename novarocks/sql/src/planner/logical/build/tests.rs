@@ -3581,3 +3581,67 @@ fn flattened_union_spine_keeps_each_original_complete_declaration() {
     verify(&plan, &original_layers, &mut seen);
     assert_eq!(seen, 2, "both original set-operation layers remain present");
 }
+
+#[test]
+fn json_mark_probe_is_materialized_after_its_aggregate() {
+    let plan = parse_analyze_and_plan_apply(
+        "select count(*) from orders having false or parse_json(cast(max(o_orderkey) as varchar)) in (select parse_json('1'))"
+    ).expect("HAVING mark plan");
+    fn find(plan: &LogicalPlanNode) -> Option<&LogicalPlanNode> {
+        if matches!(&plan.kind, LogicalPlanKind::Join(j) if matches!(j.join_type, JoinKind::LeftMark { .. }))
+        {
+            return Some(plan);
+        }
+        plan.children.iter().find_map(find)
+    }
+    let join = find(&plan).expect("mark join");
+    let LogicalPlanKind::Join(mark) = &join.kind else {
+        unreachable!()
+    };
+    assert!(matches!(
+        &mark.condition.as_ref().unwrap().kind,
+        ExprKind::BinaryOp { op: BinOp::Eq, .. }
+    ));
+    assert!(matches!(join.left().kind, LogicalPlanKind::Project(_)));
+    assert!(matches!(
+        join.left().unary_input().unary_input().kind,
+        LogicalPlanKind::Aggregate(_)
+    ));
+    let LogicalPlanKind::Project(keys) = &join.left().kind else {
+        unreachable!()
+    };
+    let ExprKind::FunctionCall {
+        name,
+        args: key_args,
+        ..
+    } = &keys.items.last().unwrap().expr.kind
+    else {
+        panic!("canonical key projection")
+    };
+    assert_eq!(name, novarocks_functions::json_canonical::FUNCTION_NAME);
+    assert!(matches!(key_args[0].kind, ExprKind::ColumnRef { .. }));
+    let LogicalPlanKind::Project(probe) = &join.left().unary_input().kind else {
+        unreachable!()
+    };
+    let ExprKind::FunctionCall { args, .. } = &probe.items.last().unwrap().expr.kind else {
+        panic!("parse_json probe");
+    };
+    let ExprKind::Cast { expr, .. } = &args[0].kind else {
+        panic!("aggregate value conversion");
+    };
+    assert!(matches!(expr.kind, ExprKind::ColumnRef { .. }));
+    assert!(first_aggregate_calls(join.left().unary_input().unary_input()).len() >= 2);
+    let outputs = super::output::plan_output_columns(join).unwrap();
+    assert_eq!(
+        outputs.len(),
+        super::output::plan_output_columns(join.left())
+            .unwrap()
+            .len()
+            + 1
+    );
+    assert_eq!(
+        outputs.last().unwrap().value_type.data_type(),
+        &DataType::Boolean
+    );
+    assert!(outputs.last().unwrap().value_type.nullable());
+}

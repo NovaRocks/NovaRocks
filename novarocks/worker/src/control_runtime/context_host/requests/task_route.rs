@@ -771,7 +771,47 @@ impl ContextRequestPartial {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TaskRequestAdmissionKind {
+    Causal(InputClass),
+    Domain,
+}
+
 impl ContextHostRecord {
+    /// A physical route selects a causal leg, never a protocol verdict. When
+    /// no live leg can be issued, the original Core must inspect the request.
+    pub(crate) fn task_domain_uses_live_route(
+        &self,
+        task: TaskIdentity,
+    ) -> Result<bool, ContextRequestError> {
+        let Some(scope) = self.resources.scope.as_ref() else {
+            return Ok(false);
+        };
+        let gates = scope.gates().map_err(ContextRequestError::Runtime)?;
+        if gates.failed {
+            return Err(ContextRequestError::OwnerFailed);
+        }
+        if !gates.external_open || gates.stopped {
+            return Ok(false);
+        }
+        Ok(matches!(self.tasks.get(&task),
+            Some(super::super::TaskHostOwner::Ready(host)) if host.request_admission_open()))
+    }
+    pub(crate) fn admit_task_domain_request(
+        &mut self,
+        ready: &ControlRequestReady,
+        task: TaskIdentity,
+        operation: TaskOperationId,
+        deadline: MonotonicInstant,
+    ) -> Result<(ScopedWorkRef, TaskContextRequestHandle), ContextRequestAdmissionRefusal> {
+        self.admit_task_request_kind(
+            ready,
+            task,
+            TaskRequestAdmissionKind::Domain,
+            operation,
+            deadline,
+        )
+    }
     pub(crate) fn admit_task_request(
         &mut self,
         ready: &ControlRequestReady,
@@ -780,6 +820,28 @@ impl ContextHostRecord {
         operation: TaskOperationId,
         deadline: MonotonicInstant,
     ) -> Result<(ScopedWorkRef, TaskContextRequestHandle), ContextRequestAdmissionRefusal> {
+        self.admit_task_request_kind(
+            ready,
+            task,
+            TaskRequestAdmissionKind::Causal(class),
+            operation,
+            deadline,
+        )
+    }
+    fn admit_task_request_kind(
+        &mut self,
+        ready: &ControlRequestReady,
+        task: TaskIdentity,
+        kind: TaskRequestAdmissionKind,
+        operation: TaskOperationId,
+        deadline: MonotonicInstant,
+    ) -> Result<(ScopedWorkRef, TaskContextRequestHandle), ContextRequestAdmissionRefusal> {
+        let class = match kind {
+            TaskRequestAdmissionKind::Causal(class) => class,
+            TaskRequestAdmissionKind::Domain => InputClass::Ordinary,
+        };
+        // Quiesce closes external admission, not an installed Task's domain
+        // protocol. Such updates retain their original ordinary FIFO/cut.
         use crate::control_runtime::causal::{RpcAuthorAdmissionError, RpcAuthorAdmissionRefusal};
         use crate::task_proposal_ingress::CutSourceAdmission;
         let no_partial = |error| ContextRequestAdmissionRefusal {
@@ -804,7 +866,8 @@ impl ContextHostRecord {
         }
         if snapshot.sealed
             || self.resources.control_admission_closed
-            || (class == InputClass::Ordinary && !snapshot.external_open)
+            || (matches!(kind, TaskRequestAdmissionKind::Causal(InputClass::Ordinary))
+                && !snapshot.external_open)
         {
             return Err(no_partial(ContextRequestError::AdmissionClosed));
         }
@@ -961,6 +1024,7 @@ impl ContextHostRecord {
                 .header_ready
                 .expect("same original Task R header registration"),
             expected_task: Some(task),
+            task_update_inspection: None,
             submitted: false,
             started: false,
             failed_message: None,

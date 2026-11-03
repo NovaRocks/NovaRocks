@@ -922,6 +922,10 @@ mod tests {
         let file = fs::File::create(path).expect("create delete file");
         let mut writer = ArrowWriter::try_new(file, schema, None).expect("create parquet writer");
         writer.write(&batch).expect("write delete batch");
+        writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            parquet::arrow::ARROW_SCHEMA_META_KEY.to_owned(),
+            "not-an-arrow-schema".to_owned(),
+        ));
         writer.close().expect("close parquet writer");
     }
 }

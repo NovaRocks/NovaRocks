@@ -52,13 +52,13 @@ class RuntimeBindingTests(unittest.TestCase):
                    "warehouse_uri":"s3://novarocks/worktree/scratch/nr_scratch_old/paimon-read"}
             (output/"manifest.json").write_text(json.dumps(saved)); (output/"READY").touch()
             args=SimpleNamespace(output_dir=str(output),env_file=str(root/"env.sh"),dry_run=False,
-                                 stop_after=fixture.STAGES[0],fixture_bom="saved-input",run_id="human-label")
+                                 stop_after=fixture.STAGES[0],fixture_store="unused",run_id="human-label")
             runtime=object()
             with patch.object(fixture,"load_versions",return_value={}), \
                     patch.object(fixture,"fixture_definition_sha256",return_value="definition"), \
                     patch.object(fixture,"parse_env_file",return_value={"NOVA_ENV_ID":"worktree"}), \
                     patch.object(fixture,"load_runtime",return_value=runtime), \
-                    patch.object(fixture,"load_writer_bom",return_value={"lock_sha256":"input-lock"}), \
+                    patch.object(fixture,"prepare_writer_image",side_effect=AssertionError("existing READY must not prepare images")), \
                     patch.object(fixture,"verify_ready",return_value=saved), \
                     patch.object(fixture,"verify_remote_inventory") as inventory, \
                     patch.object(fixture,"run_spark_stage") as writer, \

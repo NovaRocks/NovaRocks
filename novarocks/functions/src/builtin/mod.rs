@@ -136,6 +136,8 @@ mod date_owner;
 mod dround;
 pub mod dround_core;
 mod dround_owner;
+mod json_canonical_owner;
+mod json_canonical_selected;
 mod json_object_owner;
 mod json_object_selected;
 mod makedate;

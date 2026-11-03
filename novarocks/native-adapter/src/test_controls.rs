@@ -37,6 +37,7 @@ struct FaultGrant {
     bind: bool,
     replay_barrier: bool,
     remote_writer_sender: bool,
+    left_mark_build: bool,
     target_session_id: String,
     target_process_receipt: Option<PathBuf>,
     root: PathBuf,
@@ -510,8 +511,19 @@ impl NativeTestControls {
                 Some(serde_json::Value::Bool(true)) if matches!(action, "task-update-terminal-ack-drop" | "bind-task-update-terminal-ack-drop") => true,
                 Some(_) => return Err("split consumption refinement requires the terminal ACK-drop fault and literal true".into()),
             };
+            let left_mark_build = matches!(parameters.get("task_selector"), Some(serde_json::Value::String(value)) if value == "left-mark-build");
             let remote_writer_sender = match parameters.get("task_selector") {
                 None => false,
+                Some(serde_json::Value::String(value))
+                    if value == "left-mark-build"
+                        && matches!(
+                            action,
+                            "join-build-before-publish-hold"
+                                | "bind-join-build-before-publish-hold"
+                        ) =>
+                {
+                    true
+                }
                 Some(serde_json::Value::String(value))
                     if value == "remote-writer-sender"
                         && matches!(
@@ -529,6 +541,15 @@ impl NativeTestControls {
                         .into(),
                 ),
             };
+            if matches!(
+                action,
+                "join-build-before-publish-hold" | "bind-join-build-before-publish-hold"
+            ) && !left_mark_build
+            {
+                return Err(
+                    "join publication hold requires an exact left-mark-build Task selector".into(),
+                );
+            }
             if parameters.len()
                 != (if bind { 6 } else { 5 })
                     + usize::from(replay_barrier)
@@ -611,6 +632,7 @@ impl NativeTestControls {
                 bind,
                 replay_barrier,
                 remote_writer_sender,
+                left_mark_build,
                 target_session_id,
                 target_process_receipt,
                 root,
@@ -778,7 +800,7 @@ impl NativeTestControls {
         process: BackendProcessId,
         execution: QueryExecutionId,
     ) -> Result<usize, String> {
-        self.publish_binding(nomination, process, execution, None)
+        self.publish_binding(nomination, process, execution, None, false)
     }
 
     pub fn needs_remote_writer_selection(
@@ -793,6 +815,7 @@ impl NativeTestControls {
         Ok(self.faults.iter().enumerate().any(|(index, grant)| {
             grant.bind
                 && grant.remote_writer_sender
+                && !grant.left_mark_build
                 && grant.statement_run_token == nomination.statement_run_token
                 && grant.handle.cancellation().is_active()
                 && pins[index].selected_writer_task.is_none()
@@ -810,6 +833,39 @@ impl NativeTestControls {
             task.backend_process_id(),
             task.query_execution_id(),
             Some((task, remote_destination)),
+            false,
+        )
+    }
+
+    pub fn needs_mark_join_selection(
+        &self,
+        nomination: &StatementWorkNomination,
+    ) -> Result<bool, String> {
+        self.validate_frozen_nomination(nomination)?;
+        let pins = self
+            .nominations
+            .lock()
+            .map_err(|_| "Native first nomination lock failed")?;
+        Ok(self.faults.iter().enumerate().any(|(index, grant)| {
+            grant.bind
+                && grant.left_mark_build
+                && grant.statement_run_token == nomination.statement_run_token
+                && grant.handle.cancellation().is_active()
+                && pins[index].selected_writer_task.is_none()
+        }))
+    }
+    pub fn publish_nominated_mark_join_task(
+        &self,
+        nomination: &StatementWorkNomination,
+        task: TaskIdentity,
+        destination: BackendProcessId,
+    ) -> Result<usize, String> {
+        self.publish_binding(
+            nomination,
+            task.backend_process_id(),
+            task.query_execution_id(),
+            Some((task, destination)),
+            true,
         )
     }
 
@@ -819,6 +875,7 @@ impl NativeTestControls {
         process: BackendProcessId,
         execution: QueryExecutionId,
         selected: Option<(TaskIdentity, BackendProcessId)>,
+        mark_selection: bool,
     ) -> Result<usize, String> {
         self.validate_frozen_nomination(nomination)?;
         let mut published = 0;
@@ -829,6 +886,7 @@ impl NativeTestControls {
         for (index, grant) in self.faults.iter().enumerate().filter(|(_, grant)| {
             grant.bind
                 && grant.remote_writer_sender == selected.is_some()
+                && grant.left_mark_build == mark_selection
                 && grant.statement_run_token == nomination.statement_run_token
                 && grant.handle.cancellation().is_active()
         }) {
@@ -875,6 +933,7 @@ impl NativeTestControls {
                 let same_selection = |candidate: &FaultGrant| {
                     candidate.bind
                         && candidate.remote_writer_sender
+                        && candidate.left_mark_build == mark_selection
                         && candidate.statement_run_token == nomination.statement_run_token
                 };
                 if self
@@ -1789,6 +1848,92 @@ pub(crate) mod tests {
         );
         path
     }
+    #[test]
+    fn join_publication_action_requires_exact_task_selection_before_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        for selected in [false, true] {
+            let process = BackendProcessId::new_v7();
+            let mut parameters = serde_json::json!({"action":"join-build-before-publish-hold","root":directory.path(),"backend_index":0,"statement_run_token":"json-mark","target_session_id":"mark-action"});
+            if selected {
+                parameters["task_selector"] = serde_json::json!("left-mark-build");
+            }
+            let declaration = SessionDeclaration {
+                schema_version: 1,
+                session_id: "mark-action".into(),
+                launch_id: process.to_string(),
+                role: SessionRole::Be,
+                lifetime_millis: 10_000,
+                liveness_socket: directory.path().join(format!("{selected}.sock")),
+                handshake_secret: "01234567890123456789012345678901".into(),
+                domain_grants: vec![DomainGrant {
+                    domain: "native".into(),
+                    grant_id: "mark".into(),
+                    parameters,
+                }],
+            };
+            let path = directory.path().join(format!("{selected}.json"));
+            declaration.write_private(&path).unwrap();
+            let mut runner = RunnerSession::start(declaration).unwrap();
+            let mut role = PreparedRoleSession::read_and_claim(&path, SessionRole::Be)
+                .unwrap()
+                .bind(ProcessBinding::Backend(process))
+                .unwrap();
+            let controls = NativeTestControls::from_grants(role.scope().grants_for("native"));
+            if selected {
+                let controls = controls.unwrap();
+                let execution =
+                    QueryExecutionId::new(QueryId::new(123, 456), AttemptId::new(1).unwrap())
+                        .unwrap();
+                let stage = novarocks_types::StageId::new(1).unwrap();
+                let task = TaskIdentity::new(
+                    execution,
+                    stage,
+                    novarocks_types::TaskId::new(2).unwrap(),
+                    process,
+                );
+                let kind = QueryLifecycleFaultKind::JoinBuildBeforePublishHold;
+                let binding = StatementExecutionBinding::new(
+                    "mark-action".into(),
+                    "json-mark".into(),
+                    0,
+                    process,
+                    execution,
+                )
+                .unwrap();
+                let binding_path = fault_binding_path(directory.path(), kind, 0, "json-mark");
+                binding.write_private(&binding_path).unwrap();
+                assert!(controls.claim_task(kind, task, true).unwrap().is_none());
+                StatementTaskBinding::new(
+                    binding,
+                    stage,
+                    task.task_id(),
+                    BackendProcessId::new_v7(),
+                )
+                .unwrap()
+                .write_private(&binding_path.with_extension("task.json"))
+                .unwrap();
+                let foreign = TaskIdentity::new(
+                    execution,
+                    stage,
+                    novarocks_types::TaskId::new(3).unwrap(),
+                    process,
+                );
+                assert!(controls.claim_task(kind, foreign, true).unwrap().is_none());
+                assert!(controls.claim_task(kind, task, true).unwrap().is_some());
+                assert!(controls.claim_task(kind, foreign, true).unwrap().is_none());
+            } else {
+                assert!(
+                    controls
+                        .err()
+                        .unwrap()
+                        .contains("exact left-mark-build Task selector")
+                );
+            }
+            runner.end_and_join().unwrap();
+            role.close_and_join().unwrap();
+        }
+    }
+
     #[test]
     fn unbound_retirement_never_invents_execution_and_rejects_a_late_binding() {
         let kind = QueryLifecycleFaultKind::CreateTaskAckDrop;
