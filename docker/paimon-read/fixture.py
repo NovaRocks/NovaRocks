@@ -323,7 +323,6 @@ def validate_warehouse_uri(uri: str) -> tuple[str, str]:
 def definition_files() -> list[Path]:
     files = [
         SCRIPT_DIR / "Dockerfile",
-        SCRIPT_DIR / "versions.env",
         SCRIPT_DIR / "requirements.txt",
         Path(__file__),
     ]
@@ -348,69 +347,37 @@ def fixture_definition_sha256() -> str:
 
 
 def load_versions() -> dict[str, str]:
-    versions = parse_env_file(SCRIPT_DIR / "versions.env")
-    required = (
-        "SPARK_VERSION",
-        "SPARK_IMAGE_PLATFORM",
-        "SPARK_IMAGE_REPOSITORY",
-        "SPARK_IMAGE_MANIFEST_DIGEST",
-        "PAIMON_VERSION",
-        "PAIMON_SPARK_ARTIFACT",
-        "PAIMON_SPARK_JAR_SHA1",
-        "PAIMON_SPARK_JAR_SIZE",
-        "PAIMON_S3_ARTIFACT",
-        "PAIMON_S3_JAR_SHA1",
-        "PAIMON_S3_JAR_SIZE",
-        "MAVEN_REPOSITORY",
-    )
-    for name in required:
-        if not versions.get(name):
-            raise FixtureError(f"versions.env is missing {name}")
-    for digest_name in ("SPARK_IMAGE_MANIFEST_DIGEST",):
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", versions[digest_name]):
-            raise FixtureError(f"{digest_name} is not an immutable SHA-256 digest")
-    for checksum_name in ("PAIMON_SPARK_JAR_SHA1", "PAIMON_S3_JAR_SHA1"):
-        if not re.fullmatch(r"[0-9a-f]{40}", versions[checksum_name]):
-            raise FixtureError(f"{checksum_name} is not a SHA-1 checksum")
-    for size_name in ("PAIMON_SPARK_JAR_SIZE", "PAIMON_S3_JAR_SIZE"):
-        if int(versions[size_name]) <= 0:
-            raise FixtureError(f"{size_name} must be positive")
-    # prepare overrides SPARK_IMAGE_REPOSITORY with the selected registry path;
-    # keep the manifest's own value so the local lookup can try both names.
-    versions["SPARK_IMAGE_DEFAULT_REPOSITORY"] = versions["SPARK_IMAGE_REPOSITORY"]
-    return versions
-
-
-def load_writer_bom(path: Path, versions: Mapping[str, str]) -> dict[str, str]:
-    """Read the receipt produced by fixture-input provisioning, never Docker."""
-    bom = read_json(path)
-    if bom.get("schema") != 2:
-        raise FixtureError("unsupported fixture input BOM schema; explicitly reprovision with schema 2")
-    if bom.get("platform") != versions["SPARK_IMAGE_PLATFORM"]:
-        raise FixtureError("fixture input BOM platform does not match the native Paimon writer")
-    try:
-        receipt = bom["derived_images"]["paimon-writer"]
-        alias = receipt["alias"]
-        platform = receipt["platform"]
-        lock_sha = bom["lock_sha256"]
-    except (KeyError, TypeError) as error:
-        raise FixtureError("fixture input BOM has no Paimon writer receipt") from error
-    if not isinstance(alias, str) or not re.fullmatch(r"[a-z0-9][a-z0-9./:_-]+", alias):
-        raise FixtureError("fixture input BOM Paimon writer alias is invalid")
-    if platform != versions["SPARK_IMAGE_PLATFORM"]:
-        raise FixtureError(
-            f"fixture input BOM writer platform is {platform!r}, "
-            f"but Paimon requires {versions['SPARK_IMAGE_PLATFORM']!r}"
-        )
-    if not isinstance(lock_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", lock_sha):
-        raise FixtureError("fixture input BOM lock digest is invalid")
+    """Read creation recommendations from the project's single version source."""
+    source = read_json(SCRIPT_DIR.parent / "fixture-inputs/versions.json")
+    versions = source["versions"]
+    spark = source["artifacts"]["paimon-spark.jar"]
+    s3 = source["artifacts"]["paimon-s3.jar"]
+    base = source["images"]["paimon-spark-base"]
+    platforms = list(base["variants"])
+    if len(platforms) != 1:
+        raise FixtureError("Paimon writer requires one explicitly supported platform")
     return {
-        "alias": alias,
-        "platform": platform,
-        "lock_sha256": lock_sha,
-        "image_id": str(receipt.get("image_id", "")),
-        "definition_sha256": str(receipt.get("definition_sha256", "")),
+        "SPARK_VERSION": versions["paimon_spark"],
+        "SPARK_IMAGE_PLATFORM": platforms[0],
+        "SPARK_IMAGE_REPOSITORY": base["source"],
+        "PAIMON_VERSION": versions["paimon"],
+        "PAIMON_SPARK_ARTIFACT": "paimon-spark-3.5",
+        "PAIMON_SPARK_JAR_SHA1": spark["sha1"],
+        "PAIMON_SPARK_JAR_SIZE": str(spark["bytes"]),
+        "PAIMON_S3_ARTIFACT": "paimon-s3",
+        "PAIMON_S3_JAR_SHA1": s3["sha1"],
+        "PAIMON_S3_JAR_SIZE": str(s3["bytes"]),
     }
+
+
+def prepare_writer_image(store=None) -> dict[str, str]:
+    """Prepare only the image for a newly executing writer, never a BOM."""
+    sys.path.insert(0, str(SCRIPT_DIR.parent / "fixture-inputs"))
+    from provision import prepare_inputs
+    from fixture_inputs import fixture_store
+    prepared = prepare_inputs(fixture_store(store), SCRIPT_DIR.parent.parent,
+                              consumer="derived:paimon-writer")
+    return prepared["derived_images"]["paimon-writer"]
 
 
 def render_stage(stage: str) -> str:
@@ -1224,7 +1191,7 @@ def verify_ready(output_dir: Path) -> dict[str, Any]:
 
 
 def state_matches(
-    manifest: Mapping[str, Any], scope: Scope, definition_sha256: str, input_lock_sha256: str
+    manifest: Mapping[str, Any], scope: Scope, definition_sha256: str
 ) -> None:
     expected = {
         "fixture_kind": FIXTURE_KIND,
@@ -1233,7 +1200,6 @@ def state_matches(
         "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if os.environ.get("NOVA_FIXTURE_RUN_STORAGE") not in (None, "null") else None,
         "warehouse_uri": scope.warehouse_uri,
         "fixture_definition_sha256": definition_sha256,
-        "fixture_input_lock_sha256": input_lock_sha256,
     }
     for name, value in expected.items():
         if manifest.get(name) != value:
@@ -1286,21 +1252,9 @@ def write_manifest(
         "prefix": scope.prefix,
         "last_stage": last_stage,
         "fixture_definition_sha256": definition_sha256,
-        "fixture_input_lock_sha256": writer_receipt["lock_sha256"],
         "writer": {
-            "spark_version": versions["SPARK_VERSION"],
-            "spark_image_repository": versions["SPARK_IMAGE_REPOSITORY"],
-            "spark_image_platform": versions["SPARK_IMAGE_PLATFORM"],
-            "spark_image_index_digest": versions.get("SPARK_IMAGE_INDEX_DIGEST"),
-            "spark_image_manifest_digest": versions["SPARK_IMAGE_MANIFEST_DIGEST"],
-            "provisioned_alias": writer_receipt["alias"],
-            "provisioned_image_id": writer_receipt["image_id"],
-            "provisioned_definition_sha256": writer_receipt["definition_sha256"],
-            "paimon_version": versions["PAIMON_VERSION"],
-            "paimon_spark_jar_sha1": versions["PAIMON_SPARK_JAR_SHA1"],
-            "paimon_spark_jar_size": int(versions["PAIMON_SPARK_JAR_SIZE"]),
-            "paimon_s3_jar_sha1": versions["PAIMON_S3_JAR_SHA1"],
-            "paimon_s3_jar_size": int(versions["PAIMON_S3_JAR_SIZE"]),
+            **writer_receipt,
+            "recommended_versions": {"spark": versions["SPARK_VERSION"], "paimon": versions["PAIMON_VERSION"]},
         },
         "catalog": {
             "type": "filesystem",
@@ -1379,9 +1333,6 @@ def execute_prepare(args: argparse.Namespace) -> int:
                 "writer": {
                     "spark_version": versions["SPARK_VERSION"],
                     "spark_image_platform": versions["SPARK_IMAGE_PLATFORM"],
-                    "spark_image_manifest_digest": versions[
-                        "SPARK_IMAGE_MANIFEST_DIGEST"
-                    ],
                     "paimon_version": versions["PAIMON_VERSION"],
                 },
                 "ready_published": False,
@@ -1390,16 +1341,13 @@ def execute_prepare(args: argparse.Namespace) -> int:
             print(json.dumps(dry_run, sort_keys=True))
             return 0
 
-        if not args.fixture_bom:
-            raise FixtureError("fixture input BOM is required; run fixture-input provision before prepare")
-        writer_receipt = load_writer_bom(Path(args.fixture_bom).expanduser().resolve(), versions)
+        writer_receipt = None
 
         current_stage_number = -1
         if (output_dir / "READY").is_file():
             existing = verify_ready(output_dir)
             if stage_number(existing["last_stage"]) >= stage_number(target_stage):
-                for key, expected in {"run_id":args.run_id, "fixture_definition_sha256":definition_sha256,
-                                      "fixture_input_lock_sha256":writer_receipt["lock_sha256"]}.items():
+                for key, expected in {"run_id":args.run_id, "fixture_definition_sha256":definition_sha256}.items():
                     if existing.get(key) != expected:
                         raise FixtureError("exact READY producer binding differs: " + key)
                 verify_remote_inventory(output_dir, runtime, str(existing["warehouse_uri"]))
@@ -1407,7 +1355,8 @@ def execute_prepare(args: argparse.Namespace) -> int:
                 return 0
             if isinstance(runtime, Runtime):
                 runtime = dataclasses.replace(runtime, owns_fixture_run=existing.get("owns_fixture_run") is True)
-            state_matches(existing, scope, definition_sha256, writer_receipt["lock_sha256"])
+            state_matches(existing, scope, definition_sha256)
+            writer_receipt = existing["writer"]
             verify_remote_inventory(
                 output_dir, runtime, str(existing["warehouse_uri"])
             )
@@ -1423,19 +1372,25 @@ def execute_prepare(args: argparse.Namespace) -> int:
             )
             if isinstance(runtime, Runtime):
                 runtime = dataclasses.replace(runtime, owns_fixture_run=partial.get("owns_fixture_run") is True)
-            state_matches(partial, scope, definition_sha256, writer_receipt["lock_sha256"])
+            state_matches(partial, scope, definition_sha256)
+            writer_receipt = partial["writer"]
             if not cleanup_and_assert_empty(runtime, scope.warehouse_uri):
                 raise FixtureError("shared partial fixture files are retained for the original run owner; use a new run")
             remove_generated_paths(output_dir)
             current_stage_number = -1
         elif (output_dir / "dry-run.json").exists():
             dry_run = read_json(output_dir / "dry-run.json")
-            state_matches(dry_run, scope, definition_sha256, writer_receipt["lock_sha256"])
+            state_matches(dry_run, scope, definition_sha256)
             remove_generated_paths(output_dir)
         elif any(path.exists() for path in generated_paths(output_dir)):
             raise FixtureError(
                 "output directory contains unrecognized fixture artifacts; clean it explicitly"
             )
+
+        if writer_receipt is None:
+            writer_receipt = prepare_writer_image(getattr(args, "fixture_store", None))
+        if not writer_receipt.get("image_id"):
+            raise FixtureError("original writer image is unknown; maintain this producer manually")
 
         with contextlib.suppress(FileNotFoundError):
             (output_dir / "READY").unlink()
@@ -1457,14 +1412,14 @@ def execute_prepare(args: argparse.Namespace) -> int:
                 "owns_fixture_run": bool(getattr(runtime, "owns_fixture_run", False)),
                 "warehouse_uri": scope.warehouse_uri,
                 "fixture_definition_sha256": definition_sha256,
-                "fixture_input_lock_sha256": writer_receipt["lock_sha256"],
+                "writer": writer_receipt,
                 "last_stage": (
                     STAGES[current_stage_number] if current_stage_number >= 0 else None
                 ),
             },
         )
         try:
-            tag = writer_receipt["alias"]
+            tag = writer_receipt["image_id"]
             for stage in STAGES[current_stage_number + 1 : stage_number(target_stage) + 1]:
                 output = run_spark_stage(runtime, versions, scope, tag, stage)
                 atomic_write(output_dir / "logs" / f"{stage}.log", output.encode())
@@ -1481,7 +1436,7 @@ def execute_prepare(args: argparse.Namespace) -> int:
                         "owns_fixture_run": bool(getattr(runtime, "owns_fixture_run", False)),
                         "warehouse_uri": scope.warehouse_uri,
                         "fixture_definition_sha256": definition_sha256,
-                        "fixture_input_lock_sha256": writer_receipt["lock_sha256"],
+                        "writer": writer_receipt,
                         "last_stage": stage,
                     },
                 )
@@ -1588,7 +1543,7 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--run-id", required=True)
     prepare.add_argument("--output-dir", required=True)
     prepare.add_argument("--env-file", required=True)
-    prepare.add_argument("--fixture-bom")
+    prepare.add_argument("--fixture-store", default=os.environ.get("NOVA_FIXTURE_STORE"))
     prepare.add_argument("--fixture-budget-secs", type=int, default=3600)
     prepare.add_argument("--stop-after", choices=STAGES, default="schema")
     prepare.add_argument("--dry-run", action="store_true")

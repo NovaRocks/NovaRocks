@@ -90,53 +90,6 @@ def source_input_digests(workspace_root, producer_inputs):
     return digests
 
 
-def producer_lock_projections(workspace_root, declarations, *, platform=None, object_store_kind="minio"):
-    """Hash producer semantics, never transport aliases or unrelated fixtures."""
-    if not isinstance(declarations, dict) or not declarations:
-        raise ValueError("fixture.producer_lock_projections must be a non-empty table")
-    if object_store_kind not in ("minio", "aliyun-oss"):
-        raise ValueError("unsupported benchmark object-store kind")
-    result = []
-    for label, declaration in sorted(declarations.items()):
-        relative = Path(declaration["lock"])
-        if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError("producer lock must be a workspace relative path")
-        sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "docker/fixture-inputs"))
-        from fixture_inputs import load_lock
-        name = "iceberg-spark-oss" if label == "spark" and object_store_kind == "aliyun-oss" else declaration["derived_image"]
-        lock, _ = load_lock(workspace_root / relative, platform=platform, consumer=f"derived:{name}")
-        derived = lock["derived_images"][name]
-        base_names = list(derived["bases"].values())
-        bases = [{field: lock["images"][base][field] for field in
-                  ("source", "platform", "manifest_digest")} for base in base_names]
-        projection = {
-            "derived_image": name, "dockerfile": derived["dockerfile"],
-            "platform": derived["platform"],
-            "bases": sorted(bases, key=canonical_json),
-            "artifacts": [{"name": name, **{field: lock["artifacts"][name][field]
-                          for field in ("url", "bytes", "sha1")}}
-                          for name in sorted(derived["artifacts"])],
-        }
-        if object_store_kind == "aliyun-oss":
-            from fixture_inputs import definition_sha256
-            def closed_projection(selected):
-                value = lock["derived_images"][selected]
-                return {
-                    "derived_image": selected, "dockerfile": value["dockerfile"], "platform": value["platform"],
-                    "definition_sha256": definition_sha256(workspace_root, value["definition_files"]),
-                    "build_args": value.get("build_args", {}),
-                    "bases": [{"argument": argument, **{field: lock["images"][base][field] for field in ("source", "platform", "manifest_digest")}}
-                              for argument, base in sorted(value.get("bases", {}).items())],
-                    "artifacts": [{"name": artifact, **{field: lock["artifacts"][artifact][field] for field in ("url", "bytes", "sha1")}}
-                                  for artifact in sorted(value["artifacts"])],
-                    "derived_bases": [{"argument": argument, "projection": closed_projection(base)}
-                                      for argument, base in sorted(value.get("derived_bases", {}).items())],
-                }
-            projection = closed_projection(name)
-        result.append({"label": label, "projection": projection})
-    return result
-
-
 def validate_producer(workspace_root, resolved, publication, actual_image, actual_container):
     """Check the bound producer before consulting or publishing a READY object."""
     manifest = json.loads((publication / "manifest.json").read_text())
@@ -145,46 +98,16 @@ def validate_producer(workspace_root, resolved, publication, actual_image, actua
         raise ValueError("ProducerIdentityMismatch: publication is not ready or has moved")
     catalog = runtime["machine"] if manifest.get("shared_docker", "catalog" not in runtime) else runtime["catalog"]
     saved = catalog["images"]["spark"]
-    receipt = runtime["producer_receipt"]
-    bom = json.loads(Path(manifest["fixture_inputs"]["bom"]).read_text())
-    model = load_model(workspace_root / "tests/sql/fixtures/benchmarks/benchmark_tools.toml")
-    declarations = model["fixture"]["producer_lock_projections"]
     object_store_kind = "aliyun-oss" if catalog.get("config", {}).get("object_store", {}).get("kind") == "aliyun-oss" else "minio"
     if resolved["producer_fingerprint"].get("object_store_kind", "minio") != object_store_kind:
         raise ValueError("ProducerIdentityMismatch: object-store provider differs from resolved producer")
-    if resolved["producer_fingerprint"]["lock_projections"] != producer_lock_projections(workspace_root, declarations, object_store_kind=object_store_kind):
-        raise ValueError("ProducerIdentityMismatch: resolver producer inputs changed")
-    # The supply receipt binds a canonical lock and exact definition bytes.
-    # Compare those receipts before accepting the semantic projection above.
-    sys.path.insert(0, str(workspace_root / "docker/fixture-inputs"))
-    from fixture_inputs import load_lock, definition_sha256
-    declaration = dict(declarations["spark"])
-    if object_store_kind == "aliyun-oss":
-        declaration["derived_image"] = "iceberg-spark-oss"
-    lock, lock_hash = load_lock(workspace_root / declaration["lock"],
-                                platform=bom.get("platform"), consumer="derived:" + declaration["derived_image"])
-    derived = lock["derived_images"][declaration["derived_image"]]
-    bom_receipt = bom["derived_images"][declaration["derived_image"]]
-    if object_store_kind == "aliyun-oss":
-        def verify_definition(name):
-            value = lock["derived_images"][name]
-            supplied = bom["derived_images"][name]
-            if (supplied["definition_sha256"] != definition_sha256(workspace_root, value["definition_files"])
-                    or supplied["platform"] != value["platform"]):
-                raise ValueError("ProducerIdentityMismatch: OSS producer dependency definition changed")
-            for base in value.get("derived_bases", {}).values():
-                verify_definition(base)
-        verify_definition(declaration["derived_image"])
-    expected = {"lock_sha256": lock_hash, **bom_receipt}
-    if (bom.get("schema") != 2 or bom.get("platform") != lock["platform"]
-            or receipt != expected or saved["receipt"] != bom_receipt
-            or bom["lock_sha256"] != lock_hash
-            or bom_receipt["definition_sha256"] != definition_sha256(workspace_root, derived["definition_files"])
-            or bom_receipt["platform"] != derived["platform"]
-            or actual_container != catalog["containers"]["spark"]
-            or not actual_image
-            or actual_image != saved["image_id"] or actual_image != bom_receipt["image_id"]):
-        raise ValueError("ProducerIdentityMismatch: actual Spark, saved record and BOM disagree")
+    model = load_model(workspace_root / "tests/sql/fixtures/benchmarks/benchmark_tools.toml")
+    if resolved["producer_fingerprint"]["source_inputs"] != source_input_digests(workspace_root, model["fixture"]["producer_inputs"]):
+        raise ValueError("ProducerIdentityMismatch: dataset producer source recipe changed")
+    # Bind this actual producer to its original publication, not today's recommendations.
+    if (actual_container != catalog["containers"]["spark"] or not actual_image
+            or actual_image != saved["image_id"]):
+        raise ValueError("ProducerIdentityMismatch: actual Spark differs from the original publication")
 
 
 def normalized_layouts(layouts):
@@ -248,7 +171,6 @@ def resolve_fixture(model, workspace_root, suite, scale, shared_root=None, objec
     producer_fingerprint = {
         "schema_version": fixture.get("schema_version"),
         "source_inputs": producer_inputs,
-        "lock_projections": producer_lock_projections(workspace_root, fixture.get("producer_lock_projections"), object_store_kind=object_store_kind),
         "spark_runtime": runtime,
     }
     if object_store_kind == "aliyun-oss":

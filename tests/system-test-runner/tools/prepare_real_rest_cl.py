@@ -204,7 +204,9 @@ def validate_freeze(path):
              and wh.username is None and wh.password is None and not wh.query and not wh.fragment
              and not any(part in (".", "..") for part in wh.path.split("/")),
              "invalid private warehouse")
-    need(binding["rest_image_id"] == SOURCE["image_digest"], "private image differs from source")
+    need(isinstance(binding["rest_image_id"], str)
+         and binding["rest_image_id"].startswith("sha256:")
+         and digest_string(binding["rest_image_id"][7:]), "private owner omitted its actual image ID")
     need(digest_string(binding["owner_manifest_sha256"]), "invalid owner manifest digest")
     manifest_path = Path(binding["owner_manifest_path"])
     need(manifest_path.is_absolute(), "actual owner manifest path must be absolute")
@@ -223,14 +225,12 @@ def validate_freeze(path):
     try:
         image = owner["runtime"]["catalog"]["images"]["rest"]
         # The stock nonshared runtime entry resolves image_id through Docker
-        # at isolated_start while retaining the immutable BOM tag;
+        # at isolated_start while retaining its actual source reference;
         # this helper consumes that explicit binding, without invoking Docker.
-        need(image["image_id"] == SOURCE["image_digest"]
-             and image["tag"] == SOURCE["image_alias"], "owner REST image digest or alias mismatch")
+        need(image["image_id"] == binding["rest_image_id"], "owner REST image differs from original binding")
         need(owner["runtime"]["profile"] == "stock"
-             and owner["runtime"]["producer_receipt"]["lock_sha256"] == SOURCE["canonical_lock_sha256"]
              and owner["runtime"]["catalog"]["project"] == binding["compose_project"],
-             "owner stock profile or BOM mismatch")
+             "owner stock profile or project mismatch")
         need(Path(owner["runtime"]["publication_dir"]).resolve(strict=True) == manifest_path.parent.resolve(strict=True)
              and Path(owner["runtime"]["entry_root"]).resolve(strict=True)
              == Path(owner["current_dir"]).resolve(strict=True)
@@ -934,29 +934,7 @@ class ParserTests(unittest.TestCase):
         with self.assertRaises(Refusal):
             callback()
 
-    def test_source_matches_current_stock_fixture_input_owner(self):
-        # Resolve the current source lock through its original schema/platform
-        # author. This is local identity validation, not Docker or HTTP proof.
-        import importlib.util
-
-        repository = Path(__file__).resolve().parents[3]
-        module_path = repository / "docker/fixture-inputs/fixture_inputs.py"
-        spec = importlib.util.spec_from_file_location("real_rest_fixture_inputs", module_path)
-        self.assertIsNotNone(spec)
-        self.assertIsNotNone(spec.loader)
-        inputs = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(inputs)
-        lock, identity = inputs.load_lock(
-            repository / "docker/fixture-inputs/lock.json",
-            platform=SOURCE["platform"], consumer="iceberg-rest")
-        self.assertEqual(identity, SOURCE["canonical_lock_sha256"])
-        rest = lock["images"]["iceberg-rest"]
-        self.assertEqual(rest["source"], SOURCE["image_source"])
-        self.assertEqual(rest["platform"], SOURCE["platform"])
-        self.assertEqual(rest["manifest_digest"], SOURCE["image_digest"])
-        self.assertEqual(rest["alias"], SOURCE["image_alias"])
-
-    def test_private_owner_guard_keeps_stock_bom_and_image_exact(self):
+    def test_private_owner_guard_keeps_original_project_and_image_binding(self):
         repository = Path(__file__).resolve().parents[3]
         with tempfile.TemporaryDirectory() as directory:
             entry = Path(directory) / "private-fixture"
@@ -970,7 +948,7 @@ class ParserTests(unittest.TestCase):
                        "rest_uri": "http://127.0.0.1:21000",
                        "warehouse": "s3://warehouse/private-fixture/rest",
                        "server_default_warehouse": "s3://warehouse/private-fixture/rest/",
-                       "rest_image_id": SOURCE["image_digest"]}
+                       "rest_image_id": "sha256:" + "a" * 64}
             owner = {"ready": True, "shared_docker": False,
                      "compose_project": binding["compose_project"], "env_id": entry.name,
                      "current_dir": str(entry),
@@ -980,7 +958,7 @@ class ParserTests(unittest.TestCase):
                                  "entry_root": str(entry),
                                  "producer_receipt": {"lock_sha256": SOURCE["canonical_lock_sha256"]},
                                  "catalog": {"project": binding["compose_project"],
-                                             "images": {"rest": {"image_id": SOURCE["image_digest"],
+                                             "images": {"rest": {"image_id": binding["rest_image_id"],
                                                                  "tag": SOURCE["image_alias"]}}}}}
             owner["iceberg_rest"]["uri"] = owner["iceberg_rest"].pop("rest_uri")
             freeze = {"schema_version": 1, "task": "MEM-1-M07", "frozen_before_execution": True,
@@ -1000,17 +978,13 @@ class ParserTests(unittest.TestCase):
             write_owner(owner)
             self.assertEqual(validate_freeze(freeze_path)[0]["source"], SOURCE)
             for field, value, reason in (
-                ("profile", "publication-hook", "owner stock profile or BOM mismatch"),
-                ("lock", "76512c5eb0aaef5b918c0fb551e32e1d9b3d51cccbf74b9e8ad8364cabc7c25b",
-                 "owner stock profile or BOM mismatch"),
-                ("image", "sha256:" + "0" * 64, "owner REST image digest or alias mismatch"),
+                ("profile", "publication-hook", "owner stock profile or project mismatch"),
+                ("image", "sha256:" + "0" * 64, "owner REST image differs from original binding"),
             ):
                 with self.subTest(field=field):
                     changed = strict_json(encoded(owner))
                     if field == "profile":
                         changed["runtime"]["profile"] = value
-                    elif field == "lock":
-                        changed["runtime"]["producer_receipt"]["lock_sha256"] = value
                     else:
                         changed["runtime"]["catalog"]["images"]["rest"]["image_id"] = value
                     write_owner(changed)

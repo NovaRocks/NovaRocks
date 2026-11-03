@@ -23,12 +23,11 @@ Catalog 决定 Iceberg 元数据如何发现和提交。当前 provider 的 `Nov
 
 ## REST 本地测试
 
-`docker/iceberg-rest/` 提供 REST Catalog、MinIO、Spark fixture，供 `iceberg`、`iceberg-rest` 和 `iceberg-compatibility` 等 SQL 套件使用。共享 runtime 按输入版本化，host 端口由 owner 分配；不要在 worktree 中固定写 `localhost:8181` 或 `9000`。
+`docker/iceberg-rest/` 提供 REST Catalog、MinIO、Spark fixture，供 `iceberg`、`iceberg-rest` 和 `iceberg-compatibility` 等 SQL 套件使用。共享 runtime 由单一机器 owner 管理，host 端口来自保存的机器配置；不要在 worktree 中固定写 `localhost:8181` 或 `9000`。
 
-先显式供给缺失输入，普通运行只验证本机 BOM；再绑定并解析一次 publication：
+已有 fixture 直接使用，确实缺失时按中央推荐配方创建；不做自动 digest/BOM/版本/健康/能力预检。绑定并解析一次 publication：
 
 ```bash
-docker/fixture-inputs/provision.sh   # Explicit supply, when needed.
 docker/iceberg-rest/up.sh
 fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/iceberg-rest/runtime/current/published").resolve(strict=True))')"
 source "$fixture_publication/env.sh"
@@ -39,7 +38,7 @@ mysql -h 127.0.0.1 -P "$NOVA_ENV_MYSQL_PORT" -uroot < "$NOVAROCKS_ICE_REST_CATAL
 
 `runtime/current` 只是定位器，入口的 `published` 原子发布绑定和配置。`NOVA_ENV_REST_ENV_FILE` 和 `[env].fixture_env_file` 固定到本次 publication；`NOVA_ENV_RUNTIME_DIR` 存 SQLite 等稳定数据，不能用来拼接 env.sh。Spark 使用生成的容器网络端点，NovaRocks 使用 host 端点。
 
-`up.sh --prepare-only` 不调用 Docker，也不证明 BOM/健康；保存记录为 ready 才恢复端点，首次或缺失/deleting 记录发布 unbound。测试 fixture 的凭证不能被当作生产鉴权模型。REST 存储访问支持的静态/vended 模式由 provider 配置和消费方 `StorageAuthority` 契约决定，参见 [ADR-0151](../../adr/ADR-0151-credential-renewal-is-driven-by-the-consumer.md)；本指南不据本地匿名 fixture 推断全部远程服务的鉴权能力。
+`up.sh --prepare-only` 不调用 Docker，只发布 unbound 入口并清除端点；实际消费须正常 up 并固定一次 publication。测试 fixture 的凭证不能被当作生产鉴权模型。REST 存储访问支持的静态/vended 模式由 provider 配置和消费方 `StorageAuthority` 契约决定，参见 [ADR-0151](../../adr/ADR-0151-credential-renewal-is-driven-by-the-consumer.md)；本指南不据本地匿名 fixture 推断全部远程服务的鉴权能力。
 
 ```bash
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \

@@ -313,7 +313,7 @@ class RunTests(unittest.TestCase):
                 report = {"complete":complete,"catalog_barrier":{"complete":complete},"errors":[] if complete else [{"code":"ScratchRestUnavailable"}]}
                 with patch("machine_runtime.MachineOwner") as owner, patch("scratch.ScratchSweeper") as sweeper, \
                         patch.object(fixture_runtime,"install_signal_handlers"), contextlib.redirect_stdout(io.StringIO()) as output:
-                    owner.return_value.ready_snapshot.return_value.__enter__.return_value = self.manifest["runtime"]["machine"]
+                    owner.return_value.operation_snapshot.return_value.__enter__.return_value = self.manifest["runtime"]["machine"]
                     sweeper.return_value.cleanup_run.return_value = report
                     self.assertEqual(fixture_run.main(["cleanup-run","--env-file",str(self.env)]),0 if complete else 1)
                 self.assertEqual(json.loads(output.getvalue()), report)
@@ -352,7 +352,7 @@ class RunTests(unittest.TestCase):
             self.assertEqual(owner.call_args.args,(str(self.root/"machine"),))
             self.assertEqual(owner.call_args.kwargs["daemon"],"exact-daemon")
             kwargs=owner.return_value.sweep.call_args.kwargs
-            self.assertEqual(kwargs["expected_version"],"exact-version")
+            self.assertNotIn("expected_version", kwargs)
             self.assertEqual(kwargs["expected_generation"],"exact-generation")
             self.assertLessEqual(kwargs["deadline"],before+2.05)
             self.assertGreater(kwargs["deadline"],before)
@@ -381,7 +381,7 @@ class RunTests(unittest.TestCase):
         owner._save(state)
         return owner, backend
 
-    def test_competing_startup_sweep_waits_for_readiness_without_restarting_gc_or_budget(self):
+    def test_competing_startup_sweep_rechecks_operation_scope_without_restarting_gc_or_budget(self):
         import machine_runtime as machine
         with patch.dict(os.environ, {}, clear=True):
             admitted = self.sweep_input()
@@ -408,17 +408,17 @@ class RunTests(unittest.TestCase):
             def elapse(seconds):
                 clock[0] += seconds
                 # The peer uses its five-second GC window plus its existing
-                # settlement window. Readiness must not get another 2s cap.
+                # settlement window. The operation lock keeps its original cap.
                 if clock[0] >= 110 and not release.is_set():
                     release.set()
                     thread.join(2)
                     self.assertFalse(thread.is_alive())
             observed_deadlines = []
-            def healthy(state):
+            def unsettled(base):
                 self.assertIsNotNone(ready_backend.maintenance_fd)
                 observed_deadlines.append(ready_backend.operation_deadline)
-                return True
-            ready_backend.healthy.side_effect = healthy
+                return []
+            ready_backend.unsettled_operations.side_effect = unsettled
             try:
                 with patch.object(machine.time, "monotonic", side_effect=lambda: clock[0]), \
                         patch.object(machine.time, "sleep", side_effect=elapse), \
@@ -428,7 +428,7 @@ class RunTests(unittest.TestCase):
                     report = fixture_run.startup_sweep(self.env, budget=budget)
                 self.assertFalse(report["complete"])
                 self.assertTrue(report["pending"])
-                self.assertTrue(report["admission_complete"])
+                self.assertTrue(report["operation_scope_complete"])
                 self.assertEqual(report["errors"], [{"operation":"startup-sweep-lock", "code":"ScratchSweepTimeout"}])
                 self.assertEqual(report["removed"], [])
                 self.assertEqual(budget.as_dict(), original)
@@ -443,7 +443,7 @@ class RunTests(unittest.TestCase):
                 sweep_backend.settle_operations.assert_not_called()
                 sweep_backend.healthy.assert_not_called()
                 ready_backend.settle_operations.assert_not_called()
-                ready_backend.healthy.assert_called_once()
+                ready_backend.healthy.assert_not_called()
                 self.assertIsNone(getattr(sweep_backend, "operation_deadline", None))
                 self.assertIsNone(getattr(ready_backend, "operation_deadline", None))
             finally:
@@ -452,13 +452,12 @@ class RunTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             self.assertEqual(holder_errors, [])
 
-    def test_lock_pending_readiness_keeps_maintenance_identity_unknown_and_health_failures(self):
+    def test_lock_pending_operation_scope_keeps_maintenance_identity_unknown_and_deadline_failures(self):
         import machine_runtime as machine
         cases = [
-            ("maintenance", "MachineUnavailable"), ("version", "MachineVersionMismatch"),
+            ("maintenance", "MachineUnavailable"),
             ("generation", "MachineUnavailable"), ("unknown", "MachineUnavailable"),
             ("control-unknown", "MachineUnavailable"),
-            ("health", "MachineUnavailable"), ("observation", "DockerOperationTimeout"),
             ("io", "ScratchSweepIOFailed"), ("expired", "RunBudgetExpired"),
         ]
         for condition, code in cases:
@@ -469,19 +468,18 @@ class RunTests(unittest.TestCase):
                 original = budget.as_dict()
                 readiness, backend = self.ready_owner()
                 state = readiness.read_saved_state()
-                if condition in {"maintenance", "version", "generation"}:
-                    state[{"maintenance":"phase", "version":"version", "generation":"generation"}[condition]] = condition if condition=="maintenance" else "changed"
+                if condition in {"maintenance", "generation"}:
+                    state[{"maintenance":"phase", "generation":"generation"}[condition]] = condition if condition=="maintenance" else "changed"
                     readiness._save(state)
                 if condition in {"unknown", "control-unknown"}:
                     backend.unsettled_operations.return_value = [("owned", {"phase":"create-unknown" if condition=="unknown" else "command-unknown"})]
-                if condition=="health": backend.healthy.return_value = False
-                if condition=="observation": backend.healthy.side_effect = fixture_runtime.RuntimeFailure("DockerOperationTimeout", "readonly failed")
-                if condition=="io": backend.healthy.side_effect = OSError("private diagnostics")
-                if condition=="expired": backend.healthy.side_effect = lambda _: clock.__setitem__(0, 110.0) or True
+                backend.healthy.side_effect = AssertionError("operation scope must not inspect health")
+                if condition=="io": backend.unsettled_operations.side_effect = OSError("private diagnostics")
+                if condition=="expired": backend.unsettled_operations.side_effect = lambda _: clock.__setitem__(0, 110.0) or []
                 saved = (readiness.base / "state.json").read_bytes()
                 sweep = Mock()
                 def lock_timeout(**kwargs):
-                    self.assertEqual(kwargs["expected_version"], "exact-version")
+                    self.assertNotIn("expected_version", kwargs)
                     self.assertEqual(kwargs["expected_generation"], "exact-generation")
                     self.assertEqual(kwargs["deadline"], 105.0)
                     clock[0] = 105.0
@@ -493,24 +491,45 @@ class RunTests(unittest.TestCase):
                     with self.assertRaises(fixture_runtime.RuntimeFailure) as caught:
                         fixture_run.startup_sweep(self.env, budget=budget)
                 self.assertEqual(caught.exception.code, code)
-                self.assertEqual(caught.exception.report["errors"][-1], {"operation":"startup-admission", "code":code})
+                self.assertEqual(caught.exception.report["errors"][-1], {"operation":"startup-operation-scope", "code":code})
                 self.assertEqual(caught.exception.report["removed"], [])
                 self.assertEqual(budget.as_dict(), original)
                 self.assertEqual((readiness.base / "state.json").read_bytes(), saved)
                 sweep.sweep.assert_called_once()
                 backend.settle_operations.assert_not_called()
 
-    def test_lock_pending_readiness_is_capped_by_original_work_end(self):
+    def test_pending_sweep_ignores_historical_version_and_unrelated_health(self):
+        import machine_runtime as machine
+        with patch.dict(os.environ, {}, clear=True):
+            budget = self.sweep_input()
+            operation_owner, backend = self.ready_owner()
+            state = operation_owner.read_saved_state()
+            state["version"] = "historical-version"
+            operation_owner._save(state)
+            backend.healthy.side_effect = AssertionError("no environment health precheck")
+            backend.validate_minio_volume.side_effect = AssertionError("no unrelated volume precheck")
+            sweep_owner = Mock()
+            sweep_owner.sweep.side_effect = machine.SweepLockTimeout()
+            with patch.object(machine, "MachineOwner", side_effect=[sweep_owner, operation_owner]):
+                report = fixture_run.startup_sweep(self.env, budget=budget)
+            self.assertTrue(report["pending"])
+            self.assertTrue(report["operation_scope_complete"])
+            backend.unsettled_operations.assert_called_once()
+            backend.healthy.assert_not_called()
+            backend.validate_minio_volume.assert_not_called()
+            backend.settle_operations.assert_not_called()
+
+    def test_lock_pending_operation_scope_is_capped_by_original_work_end(self):
         import machine_runtime as machine
         with patch.dict(os.environ, {}, clear=True):
             admitted = self.sweep_input()
             clock = [100.0]
             budget = replace(admitted, deadline=410.0, monotonic=lambda: clock[0])
             readiness, backend = self.ready_owner()
-            def healthy(state):
+            def unsettled(base):
                 self.assertEqual(backend.operation_deadline, 110.0)
-                return True
-            backend.healthy.side_effect = healthy
+                return []
+            backend.unsettled_operations.side_effect = unsettled
             sweep = Mock()
             def lock_timeout(**kwargs):
                 clock[0] = 105.0
@@ -521,11 +540,11 @@ class RunTests(unittest.TestCase):
                     patch.object(machine, "MachineOwner", side_effect=[sweep, readiness]):
                 report = fixture_run.startup_sweep(self.env, budget=budget)
             self.assertTrue(report["pending"])
-            self.assertTrue(report["admission_complete"])
-            backend.healthy.assert_called_once()
+            self.assertTrue(report["operation_scope_complete"])
+            backend.healthy.assert_not_called()
             backend.settle_operations.assert_not_called()
 
-    def test_inventory_timeout_requires_fresh_complete_readonly_admission(self):
+    def test_inventory_timeout_rechecks_original_operation_scope(self):
         import machine_runtime as machine
         for pending in (False, True):
             with self.subTest(pending_mutation=pending), patch.dict(os.environ, {}, clear=True):
@@ -550,21 +569,21 @@ class RunTests(unittest.TestCase):
                     if pending:
                         with self.assertRaisesRegex(fixture_runtime.RuntimeFailure, "MachineUnavailable") as caught:
                             fixture_run.startup_sweep(self.env, budget=budget)
-                        self.assertEqual(caught.exception.report["errors"][-1]["operation"], "startup-admission")
+                        self.assertEqual(caught.exception.report["errors"][-1]["operation"], "startup-operation-scope")
                         backend.healthy.assert_not_called()
                     else:
                         report = fixture_run.startup_sweep(self.env, budget=budget)
                         self.assertTrue(report["pending"])
                         self.assertFalse(report["complete"])
-                        self.assertTrue(report["admission_complete"])
+                        self.assertTrue(report["operation_scope_complete"])
                         self.assertEqual(report["errors"], [{"operation": "startup-sweep-inventory", "code": "ScratchSweepTimeout"}])
-                        backend.healthy.assert_called_once()
+                        backend.healthy.assert_not_called()
                 backend.unsettled_operations.assert_called_once()
                 backend.settle_operations.assert_not_called()
                 self.assertEqual(budget.as_dict(), original)
                 self.assertEqual((readiness.base / "state.json").read_bytes(), saved)
 
-    def test_untyped_machine_maintaining_never_becomes_pending_readiness(self):
+    def test_untyped_machine_maintaining_never_becomes_pending_scope(self):
         with patch.dict(os.environ, {}, clear=True):
             budget = self.sweep_input()
             error = fixture_runtime.RuntimeFailure("MachineMaintaining", "not a proven lock timeout")
@@ -574,9 +593,9 @@ class RunTests(unittest.TestCase):
                     fixture_run.startup_sweep(self.env, budget=budget)
             self.assertIs(caught.exception, error)
             self.assertEqual(owner.call_count, 1)
-            owner.return_value.ready_snapshot.assert_not_called()
+            owner.return_value.operation_snapshot.assert_not_called()
 
-    def test_expired_run_after_lock_wait_never_dispatches_readiness(self):
+    def test_expired_run_after_lock_wait_never_dispatches_scope_check(self):
         import machine_runtime as machine
         with patch.dict(os.environ, {}, clear=True):
             admitted = self.sweep_input()
@@ -594,7 +613,7 @@ class RunTests(unittest.TestCase):
                 with self.assertRaisesRegex(fixture_runtime.RuntimeFailure, "RunBudgetExpired") as caught:
                     fixture_run.startup_sweep(self.env, budget=budget)
             self.assertEqual(owner.call_count, 1)
-            owner.return_value.ready_snapshot.assert_not_called()
+            owner.return_value.operation_snapshot.assert_not_called()
             self.assertEqual(budget.as_dict(), original)
             self.assertEqual(caught.exception.report["removed"], [])
 
@@ -609,10 +628,10 @@ class RunTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code,code)
                 self.assertEqual(caught.exception.report["errors"],report["errors"])
             with patch("machine_runtime.MachineOwner") as owner:
-                owner.return_value.sweep.side_effect=fixture_runtime.RuntimeFailure("MachineVersionMismatch","original snapshot changed")
+                owner.return_value.sweep.side_effect=fixture_runtime.RuntimeFailure("MachineUnavailable","original activation changed")
                 with self.assertRaises(fixture_runtime.RuntimeFailure) as caught: fixture_run.startup_sweep(self.env,budget=budget)
-                self.assertEqual(caught.exception.code,"MachineVersionMismatch")
-                self.assertEqual(caught.exception.report["errors"][0]["code"],"MachineVersionMismatch")
+                self.assertEqual(caught.exception.code,"MachineUnavailable")
+                self.assertEqual(caught.exception.report["errors"][0]["code"],"MachineUnavailable")
             with patch("machine_runtime.MachineOwner") as owner:
                 owner.return_value.sweep.side_effect=OSError("private native diagnostics")
                 with self.assertRaises(fixture_runtime.RuntimeFailure) as caught: fixture_run.startup_sweep(self.env,budget=budget)

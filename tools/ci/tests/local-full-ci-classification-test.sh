@@ -292,4 +292,59 @@ done
 unset -f python3
 unset FAKE_SOURCE_EXIT FAKE_STOP_EXIT FAKE_RUNTIME_EXIT FAKE_COLLECTION_WRITE_FAILURE
 
+# Runtime preparation delegates directly to the fixture owner. Missing Java,
+# Docker or unavailable services surface from their actual commands, including
+# exit 75, rather than becoming an input-BOM prerequisite result.
+prepare_root="$test_root/prepare-owner"; mkdir -p "$prepare_root/docker/iceberg-rest"
+cat >"$prepare_root/docker/iceberg-rest/up.sh" <<'UP'
+#!/usr/bin/env bash
+printf 'up\n' >>"$PREPARE_CALLS"
+exit "$PREPARE_EXIT"
+UP
+chmod +x "$prepare_root/docker/iceberg-rest/up.sh"
+for expected in 0 75 23; do
+  code=0
+  (
+    CI_RUN_DIR="$test_root/prepare-$expected"; mkdir -p "$CI_RUN_DIR"
+    CI_SUMMARY="$CI_RUN_DIR/summary.md"; ci_init_summary_state
+    export PREPARE_CALLS="$CI_RUN_DIR/calls" PREPARE_EXIT="$expected"
+    verify_fixture_inputs() { echo 'unexpected verifier' >>"$PREPARE_CALLS"; return 92; }
+    python3() { echo 'unexpected probe' >>"$PREPARE_CALLS"; return 93; }
+    load_fixture_publication() {
+      NOVAROCKS_FE_CONFIG=fe; NOVAROCKS_BE_CONFIG=be; NOVAROCKS_SQL_TEST_CONFIG=sql
+      NOVA_ENV_RUNTIME_DIR=runtime; NOVA_ENV_TRINO_PORT=8080
+      NOVAROCKS_ICEBERG_REST_URI=rest; NOVAROCKS_ICEBERG_REST_MV_URI=mv
+      NOVA_ENV_REST_ENV_FILE=env; NOVA_ENV_MANIFEST=manifest
+      NOVA_ENV_OBJECT_STORE_RUNTIME=store; NOVA_ENV_CATALOG_RUNTIME=catalog; AWS_S3_ENDPOINT=s3
+    }
+    record_fixture_runtime() { echo 'publication' >>"$PREPARE_CALLS"; }
+    cd "$prepare_root"
+    prepare_runtime
+    [ "$CI_RUNTIME_PREPARED" = true ]
+  ) >"$test_root/prepare-$expected.log" 2>&1 || code=$?
+  [ "$code" = "$expected" ]
+  calls="$(cat "$test_root/prepare-$expected/calls")"
+  if [ "$expected" = 0 ]; then
+    [ "$calls" = $'up\npublication' ]
+    grep -F '| prepare runtime | PASS |' "$test_root/prepare-$expected/summary.md" >/dev/null
+  else
+    [ "$calls" = up ]
+    grep -F '| prepare runtime | FAIL |' "$test_root/prepare-$expected/summary.md" >/dev/null
+    ! grep -F 'BLOCKED' "$test_root/prepare-$expected/summary.md" >/dev/null
+  fi
+done
+# Cargo-only reaches its original gates without creating or diagnosing a fixture.
+(
+  CI_FROM_RUN_DIR=""; CI_COLLECT_ALL=false; CARGO_ONLY=false
+  cleanup() { :; }
+  init_run_dir() { :; }
+  validate_explicit_suites_early() { :; }
+  prepare_runtime() { echo 'unexpected fixture' >&2; exit 94; }
+  run_cargo_gates() { printf 'cargo\n' >"$test_root/cargo-only"; }
+  ci_render_summary() { :; }
+  main --cargo-only
+  [ "$CI_RUN_REACHED_END" = true ]
+)
+[ "$(cat "$test_root/cargo-only")" = cargo ]
+
 echo 'local-full-ci-classification-test: PASS'

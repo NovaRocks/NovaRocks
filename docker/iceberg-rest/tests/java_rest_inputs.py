@@ -57,7 +57,7 @@ EXPECTED = frozenset({
 # environment inputs (including Java's PATH) remain in the static target binding.
 OWNED_ENV = frozenset({
     'NOVA_FIXTURE_RUN_CONTEXT', 'NOVA_FIXTURE_RUN_STORAGE', 'NOVA_ENV_MANIFEST',
-    'NOVA_ENV_REST_ENV_FILE', 'NOVA_FIXTURE_INPUT_BOM', 'AWS_S3_ENDPOINT',
+    'NOVA_ENV_REST_ENV_FILE', 'AWS_S3_ENDPOINT',
     'AWS_S3_ACCESS_KEY_ID', 'AWS_S3_SECRET_ACCESS_KEY',
     'NOVAROCKS_ICEBERG_REST_URI', 'NOVAROCKS_ICEBERG_REST_WAREHOUSE',
     'NR_JAVA_REST_INTEROP_RUN_ROOT',
@@ -101,8 +101,7 @@ class JavaRestInputs:
         self.budget, self.owns_run = budget, owns_run
         self.environment = dict(os.environ)
         self.input_files = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
-                            for path in (publication / 'env.sh', publication / 'manifest.json',
-                                         Path(self.environment['NOVA_FIXTURE_INPUT_BOM']))}
+                            for path in (publication / 'env.sh', publication / 'manifest.json')}
         self.status = dict(schema=1, owner=OWNER, owns_fixture_run=owns_run, command_attempted=False,
                            command_returned=False, exit_code=None,
                            cleanup=dict(summary='unknown', disposition='not_started'))
@@ -170,17 +169,11 @@ def own_inputs(repo, requested_artifact_root=None, environment=None):
     repo = Path(repo).resolve()
     publication = (repo / 'docker/iceberg-rest/runtime/current/published').resolve(strict=True)
     manifest = json.loads((publication / 'manifest.json').read_text())
-    if not manifest.get('ready') or not manifest.get('fixture_inputs', {}).get('verified'):
-        raise ValueError('pinned fixture publication is not ready with verified inputs')
+    if not manifest.get('ready'):
+        raise ValueError('pinned fixture publication has no published configuration')
     env_file = publication / 'env.sh'
     supplied = dict(os.environ if environment is None else environment)
     environment = publication_environment(env_file, supplied)
-    store = Path(manifest['fixture_inputs']['bom']).parent
-    subprocess.run([str(repo / 'docker/fixture-inputs/verify.sh'), '--store', str(store),
-                    '--repo-root', str(repo), '--consumer', 'iceberg-rest'], env=environment, check=True)
-    bom = store / 'bom.json'
-    if manifest['fixture_inputs']['lock_sha256'] != json.loads(bom.read_text())['lock_sha256']:
-        raise ValueError('pinned publication differs from verified fixture input lock')
     for key in ('NOVAROCKS_ICEBERG_REST_URI', 'NOVAROCKS_ICEBERG_REST_WAREHOUSE',
                 'AWS_S3_ENDPOINT', 'AWS_S3_ACCESS_KEY_ID', 'AWS_S3_SECRET_ACCESS_KEY'):
         if not environment.get(key):
@@ -202,7 +195,6 @@ def own_inputs(repo, requested_artifact_root=None, environment=None):
                     or Path(environment['NOVA_ENV_RUNTIME_DIR']) / ('iru13a-java-rest-' + run_id)).resolve()
         root.mkdir()  # Exclusive, including on resume; never reuse case artifacts.
         os.environ['NR_JAVA_REST_INTEROP_RUN_ROOT'] = str(root)
-        os.environ['NOVA_FIXTURE_INPUT_BOM'] = str(bom.resolve())
         os.environ['NOVA_FIXTURE_JAVA_DRIVER_OWNER'] = 'true'
         os.environ['NR_JAVA_REST_INTEROP_EXPECTED_TESTS'] = json.dumps(sorted(EXPECTED))
         for family in ('IRU5', 'IRU13A', 'IRU13B'):
@@ -214,9 +206,7 @@ def own_inputs(repo, requested_artifact_root=None, environment=None):
         write(root / 'fixture.json', dict(publication=str(publication),
             run_context=json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT']),
             run_storage=json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE']),
-            fixture_input_lock_sha256=manifest['fixture_inputs']['lock_sha256'],
             publication_sha256=hashlib.sha256((publication / 'manifest.json').read_bytes()).hexdigest(),
-            bom_sha256=hashlib.sha256(bom.read_bytes()).hexdigest(),
             boundary='Java REST acceptance of NovaRocks-issued REST requests; native 1FE+3BE SQL acceptance is separate'))
         owner = JavaRestInputs(repo, publication, root, budget, owns_run)
         yield owner

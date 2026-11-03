@@ -1,70 +1,54 @@
 ---
 id: ADR-0155
-title: "Fixture inputs are provisioned as a verified local BOM before offline test execution"
+title: "Fixture creation uses recommended versions without automatic environment admission"
 domain: [test-fixtures]
 status: active
 supersedes: [ADR-0141]
 superseded-by: null
 date: 2026-09-20
+updated: 2026-11-03
 provenance:
   - "discussion: 2026-09-20 fixture image and Maven input availability in local CI"
+  - "accepted design and approved plan: TST-G18a revision 1, 2026-11-03"
 code-anchors:
-  - "docker/fixture-inputs/lock.json"
-  - "docker/fixture-inputs/provision.py"
-  - "docker/fixture-inputs/verify.py"
-  - "docker/paimon-read/fixture.py (load_writer_bom)"
-  - "docker/iceberg-rest/up.sh (fixture input verification)"
+  - "docker/fixture-inputs/versions.json"
+  - "docker/fixture-inputs/provision.py (InputBuilder, prepare_inputs)"
+  - "docker/iceberg-rest/machine_runtime.py (ensure_created, operation_snapshot, check_environment)"
+  - "docker/iceberg-rest/runtime_entry.py"
   - "tools/ci/local-full-ci.sh (prepare_runtime)"
 ---
 
 ## 问题
 
-测试 fixture 如何既锁定镜像和 Maven 产物身份，又让验证阶段完全不依赖网络或临时 Docker 构建？
+如何让开发者直接使用已有 fixture，并在确实缺失时有统一的推荐版本和构建配方，而不让环境验证、升级和恢复成为每次测试的前置协议？
 
-## 背景与执行事实
+## 替代关系
 
-fixture 的输入不止 Compose 服务镜像。Paimon writer 需要特定平台的 Spark base 和两个 JAR；Iceberg
-Spark 需要 base、REST/MinIO 镜像与四个 JAR。镜像 tag 不是身份，Dockerfile 在运行期下载 JAR 或构建
-derived image 也会把网络和缓存状态混入测试结果。
-
-`docker/fixture-inputs/lock.json` 是唯一输入锁：每个外部镜像记录 manifest digest 与 platform，每个
-artifact 记录 URL、字节数和 SHA-1，derived image 记录 Dockerfile、输入 artifact 和定义文件。成功
-provision 在本机 store 发布一个不可变 generation，并以 `bom.json` + `READY` 作为可消费证据；BOM
-只记录 digest、平台、别名、hash、路径和生成时间，不能包含 secret。
-
-## 考虑过的选项
-
-**A. 各 fixture 在缺失时自行 pull、下载或 build。** 使用方便，但来源和时点随机器网络状态变化，且网络
-故障会伪装成测试失败。这是设计否决。
-
-**B. 只保持本机镜像预检。** 能避免 Compose 临时 pull，却不能约束 Maven JAR、derived image 与其
-Dockerfile 定义；输入身份仍分散。这是设计否决。
-
-**C. 以一个锁定的 provision/BOM 边界供给全部输入，验证者只消费。** provision 可联网获取并逐项
-验证，verify 和消费者只做本机 inspect/hash/label 校验。这是裁决。
+2026-11-03 的 TST-G18a 裁决替代本 ADR 原先的“digest 源锁、不可变 BOM/READY、离线 verify 后才消费”规则。旧记录只说明历史实现，不再构成当前开发、测试或普通 CI 的准入条件。ADR-0191 的单机器 owner、原运行预算和清理所有权继续有效。
 
 ## 裁决
 
-1. **供给规则**：仅 `docker/fixture-inputs/provision.sh` 可获取外部 fixture 输入并构建 derived image；
-   它必须按 lock 验证后才原子发布 READY BOM。
-2. **消费规则**：`verify.sh`、Paimon writer、Iceberg REST 环境和 local full CI 不得 pull、下载或 build；
-   必须先验证 BOM，缺失或不一致时 fail fast。
-3. **身份规则**：消费者只接受 BOM 中锁定的本机别名和 derived-image definition label；不能以 tag、
-   镜像站名称或当前 Docker cache 代替 manifest/platform/hash 身份。
-4. **平台与覆盖规则**：schema 2 源锁按准确平台声明变体，共享 artifacts；统一解析作者冻结平台绑定 lock_id，consumer 只选择依赖闭包，不改变身份。实际运行核对本机与 daemon 原生平台；缺变体在副作用前拒绝。部分 provision 不回退同锁/平台已验证覆盖，补齐时重新核验并合并有效回执和 artifact。旧 schema 1 BOM 明确重新供给，不猜测升级、不删除旧数据。
-5. **数据集身份规则**：运行供给证明与数据集语义 key 分开；producer 仅消费对应平台的 recipe/基础镜像/artifact 语义投影，传输来源或别名不构成内容身份。producer 源码摘要仍由原数据集 owner 维护。
-6. **CI 分类规则**：fixture 前置条件缺失是 `BLOCKED`，不是 Rust 或 SQL `VERIFY FAILED`；CI 不得为
-   解除 BLOCKED 自行 provision。
+1. `docker/fixture-inputs/versions.json` 是推荐软件版本、平台变体、下载输入和构建 recipe 的唯一声明来源。镜像使用可读版本 tag；不锁定环境镜像 digest。构建所需 artifact 的长度、校验和与 Gradle 依赖校验继续维护，确保取得的构建输入完整。
+2. 已有 fixture 直接使用保存的配置。普通入口不自动检查环境 digest、BOM、版本、健康或能力，也不把推荐版本、当前 recipe 或当前 checkout 与运行中环境比较后决定能否运行。
+3. 只有确实不存在的 fixture 或实际需要而缺失的输入，才由同一个输入 builder 按推荐版本创建。已有目标镜像直接复用，不递归检查其构建依赖。Docker inspect 的“不存在”与权限、daemon、网络等错误严格区分；后者保留实际失败。
+4. 已有但损坏、维护中、部分创建或状态不明的环境报错，交操作员维护。普通入口不自动修复、重建、升级、切换来源或创建第二套共享栈。修改推荐版本不会改写已有机器、数据卷或 publication。
+5. `fixture-runtime.sh check` 是显式手动诊断：报告推荐版本、已有实际版本事实、保存的机器目标、健康观察和错误；未知实际版本保留未知，不从 tag 或推荐值推造。它不修复环境，也不授予测试运行资格。普通 CI 不自动调用；固定全量 CI 机器以后可显式调用并保存结果。
+6. 操作仍绑定原 daemon、generation、容器、volume、网络、publication、run scope 与完整期限。持锁排序、未知 mutation、IAM 撤销、catalog 屏障和真实 writer 退出属于实际操作安全与清理责任，不能删除，也不能扩张为全机环境扫描。
+7. 数据集 READY、内容 oracle、producer 来源和原 publication 绑定仍由原数据集 owner 维护。它们证明具体数据或本次操作目标，不是当前推荐环境一致性的证明。已有 benchmark 消费者继续 check-only，不因本裁决重写 warehouse 或重建数据。
+8. 创建或实际消费失败保留原命令、退出、阶段与清理结果。普通 CI 不根据历史 fixture exit 75 将实际准备失败改成环境前检 BLOCKED；原预算在零副作用点的拒绝等具名语义仍按其 owner 分类。
 
-## 接受的妥协（诚实记录）
+## 输入创建与维护
 
-首次 provision 需要网络、磁盘和 Docker build 权限，并且针对不同平台需要分别 provision。这是为了把
-不稳定性隔离到显式供给阶段而承担的成本，不是测试运行期的能力。BOM 位于本机 cache，不是跨主机可移植
-artifact；若需要共享，后续应发布经过同一 lock 校验的受管缓存，而不是放宽 verify。
+显式预构建可以调用 `docker/fixture-inputs/provision.sh --consumer <name>`；普通创建入口复用同一个 builder，不存在第二套供给协议。平台只选择已声明 recipe，缺变体明确报错，不自动仿真或降级。OSS、MinIO、HMS 与暂停的 Paimon 工具分别选择实际所需闭包。
 
-## 何时重新评估
+已有 artifact 校验失败保留原件并报错，不能覆盖它来掩盖损坏。缺失下载在独占临时位置完成校验后原子移交。显式传输映射只改变下载位置，不改变 artifact 内容约束，失败不自动回退。
 
-- CI runner 能可靠预置并证明所有锁定输入时，可把 provision 移入 runner image 制作流程，但 verify/BOM
-  边界仍保留。
-- 需要支持新的 CPU 平台时，为该平台新增锁定输入和独立 provision 证据，不能以不同 manifest 替代。
-- 引入受管 artifact 镜像或缓存时，应让 provision 从该受管来源获取，同时保留 digest/hash 校验与原子发布。
+维护者需要切换已有机器时显式执行 `fixture-runtime.sh upgrade`。仍须遵守 ADR-0191 的原维护意图、旧写者退出、凭证和 catalog 屏障；新推荐值本身不授权升级。
+
+## 接受的代价与重新评估
+
+已有环境可能与推荐版本不同，实际执行也可能暴露环境问题；这是直接消费而不建立自动准入协议的明确选择。agent 无法继续时保存实际失败，交人工升级，不自动寻找兼容版本。
+
+缺失输入的创建可能联网和构建，失败不伪装成产品测试成功。空白机器首次构建、特定平台可用性和实际互操作仍须各有真实证据；mock、推荐清单和手动诊断均不能代替这些事实。
+
+若未来固定全量 CI 需要集中环境报告，调用同一个显式诊断入口；是否因此引入新的准入或升级政策须另行讨论，不能暗中恢复日常 gate。

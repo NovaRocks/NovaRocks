@@ -151,19 +151,10 @@ def spark_build(runtime: Any, versions: Mapping[str, str], image: str, uri: str,
     return writer.sanitize_output(result.stdout, runtime)
 
 
-def install_verified_mc_image(store: Path) -> None:
-    """Resolve the exact local image even when prepare-only wrote a stub env."""
-    writer.run_command(
-        [str(REPO / "docker" / "fixture-inputs" / "verify.sh"), "--store", str(store)]
-    )
-    bom = writer.read_json(store / "bom.json")
-    try:
-        alias = bom["derived_images"]["minio-mc"]["image_id"]
-    except (KeyError, TypeError) as error:
-        raise writer.FixtureError("verified input BOM has no MinIO mc image") from error
-    if not isinstance(alias, str) or not re.fullmatch(r"[a-z0-9][a-z0-9./:_-]+", alias):
-        raise writer.FixtureError("verified input BOM has an invalid MinIO mc image ID")
-    os.environ["MINIO_MC_IMAGE"] = alias
+def install_runtime_mc_image(runtime) -> None:
+    publication = writer.read_json(runtime.env_file.with_name("manifest.json"))
+    record = publication["runtime"]["machine"] if publication.get("shared_docker", "catalog" not in publication["runtime"]) else publication["runtime"]["catalog"]
+    os.environ["MINIO_MC_IMAGE"] = record["images"]["mc"]["image_id"]
 
 
 def summarize_oracle(output: str, files_per_table: int) -> dict[str, dict[str, int]]:
@@ -302,7 +293,7 @@ def prepare(args: argparse.Namespace) -> int:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         store = Path(args.fixture_store).expanduser().resolve()
         if not args.dry_run:
-            install_verified_mc_image(store)
+            install_runtime_mc_image(runtime)
         if (output_dir / "READY").exists():
             manifest = verify_ready(output_dir, runtime)
             if (manifest.get("run_id"), manifest.get("warehouse_uri"), manifest.get("definition_sha256")) != (args.run_id, uri, definition):
@@ -317,7 +308,7 @@ def prepare(args: argparse.Namespace) -> int:
             return 0
         if inventory(runtime, uri, allow_empty=True):
             raise writer.FixtureError("task-private prefix is already occupied")
-        receipt = writer.load_writer_bom(store / "bom.json", versions)
+        receipt = writer.prepare_writer_image(str(store))
         try:
             output = spark_build(runtime, versions, receipt["alias"], uri, sql)
             oracle = summarize_oracle(output, args.files_per_table)
@@ -355,10 +346,7 @@ def prepare(args: argparse.Namespace) -> int:
                 "objects_sha256": writer.sha256_file(output_dir / "objects.json"),
                 "writer": {
                     "provisioned_image_id": receipt["image_id"],
-                    "provisioned_definition_sha256": receipt["definition_sha256"],
-                    "input_lock_sha256": receipt["lock_sha256"],
-                    "spark_manifest_digest": versions["SPARK_IMAGE_MANIFEST_DIGEST"],
-                    "paimon_version": versions["PAIMON_VERSION"],
+                    "recommended_paimon_version": versions["PAIMON_VERSION"],
                 },
                 "artifacts": {
                     name: writer.sha256_file(output_dir / name)
@@ -378,8 +366,8 @@ def prepare(args: argparse.Namespace) -> int:
 
 
 def verify(args: argparse.Namespace) -> int:
-    install_verified_mc_image(Path(args.fixture_store).expanduser().resolve())
     runtime = writer.load_runtime(Path(args.env_file).expanduser().resolve())
+    install_runtime_mc_image(runtime)
     verify_ready(Path(args.output_dir).expanduser().resolve(), runtime)
     print(Path(args.output_dir).expanduser().resolve() / "manifest.json")
     return 0
@@ -387,8 +375,8 @@ def verify(args: argparse.Namespace) -> int:
 
 def cleanup(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir).expanduser().resolve()
-    install_verified_mc_image(Path(args.fixture_store).expanduser().resolve())
     runtime = writer.load_runtime(Path(args.env_file).expanduser().resolve())
+    install_runtime_mc_image(runtime)
     with (output_dir / ".fixture.lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         manifest = verify_ready(output_dir, runtime)

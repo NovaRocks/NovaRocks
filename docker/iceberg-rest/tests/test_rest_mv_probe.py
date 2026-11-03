@@ -211,8 +211,7 @@ class RestMVProbeTests(unittest.TestCase):
                 outer.assertGreater(timeout,0)
                 inner.backend=inner
             @contextmanager
-            def ready_snapshot(inner,definition,*,deadline,expected_generation):
-                outer.assertEqual(definition,{"version":snapshot["version"]})
+            def operation_snapshot(inner,*,deadline,expected_generation):
                 outer.assertEqual(expected_generation,snapshot["generation"])
                 if epoch is not None and epoch[0] != expected_generation:
                     raise probe.fixture_runtime.RuntimeFailure("MachineUnavailable","fixture activation changed")

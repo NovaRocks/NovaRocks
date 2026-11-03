@@ -535,8 +535,12 @@ impl RunStorageScope {
         identity: &ScratchIdentity,
         record: &serde_json::Value,
     ) -> Result<()> {
+        let mut expected = Self::from_record(identity, record)?;
+        // Version text is historical metadata. Activation, storage owner and
+        // exact ranges remain the authority for this operation.
+        expected.machine.version.clone_from(&self.machine.version);
         ensure!(
-            *self == Self::from_record(identity, record)?,
+            *self == expected,
             "FixtureBudgetRejected: inherited storage projection differs from the machine"
         );
         Ok(())
@@ -1156,6 +1160,19 @@ mod tests {
                 .unwrap()
         );
         assert!(restored.iam_policy().is_err());
+    }
+
+    #[test]
+    fn storage_scope_version_is_historical_without_changing_cleanup_authority() {
+        let (identity, record) = oss_storage_fixture();
+        let scope = RunStorageScope::from_record(&identity, &record).unwrap();
+        let mut wire = serde_json::to_value(&scope).unwrap();
+        wire["machine"]["version"] = serde_json::json!("historical-version");
+        let restored = RunStorageScope::from_json(&wire.to_string()).unwrap();
+        restored.validate_against(&identity, &record).unwrap();
+        assert_eq!(restored.machine.version, "historical-version");
+        assert_eq!(restored.ranges, scope.ranges);
+        assert_eq!(restored.storage_owner, scope.storage_owner);
     }
 
     #[test]

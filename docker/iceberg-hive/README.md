@@ -25,14 +25,13 @@ fixture owner namespace + catalog ID. It does not adopt the old
 the catalog network through the fixture owner's exact consumer API, using
 `hms` and `minio` aliases.
 
-Provision the local image explicitly before starting tests:
+HMS 推荐版本、基础镜像和构建参数统一声明在 `docker/fixture-inputs/versions.json`；当前配方只声明 amd64。已有 HMS 直接使用保存配置，只有确实缺失时按推荐构建，不自动检查 digest/BOM/软件版本或整栈健康。部分创建或已有损坏报错，交人工维护。可显式提前准备缺失镜像：
 
 ```bash
-docker image inspect apache/hive:4.0.0
-docker build --pull=false -t novarocks/hive-metastore:4.0.0 docker/iceberg-hive
+docker/fixture-inputs/provision.sh --consumer derived:hive-metastore --platform linux/amd64
 ```
 
-先由维护者显式启动ready机器，再附着REST publication并启动HMS：
+附着 REST publication，再启动或复用 HMS：
 
 ```bash
 publication=$(docker/iceberg-rest/up.sh | python3 -c 'import json,sys; print(json.load(sys.stdin)["published_dir"])')
@@ -43,7 +42,7 @@ hms_dir=$(printf '%s' "$hms_manifest" | python3 -c 'import json,sys,pathlib; pri
 source "$hms_dir/env.sh"
 ```
 
-HMS拥有自己的项目和Derby卷，只连接准确machine外部网络，不归REST核心栈计数。它使用机器配置的HMS端口（默认28005）；不再按旧catalog版本分配或扫描端口。普通up只使用本地镜像，不build/pull。`--prepare-only`只按已固定的ready publication生成文件，不调用Docker；REST未绑定时不能猜依赖。
+HMS拥有自己的项目和Derby卷，只连接准确machine外部网络，不归REST核心栈计数。它使用机器配置的HMS端口（默认28005）；不再按旧catalog版本分配或扫描端口。普通 up 复用已有记录，只有缺失的镜像才按统一配方构建。实际 HMS listener 的启动/退出仍由其原 owner 负责，不扩展成全机器环境检查。`--prepare-only`只按已固定的ready publication生成文件，不调用Docker；REST未绑定时不能猜依赖。
 
 保存目录为 `<machine-control-root>/<machine-id>/hms/<machine-id>/`，包含manifest、env、Compose、core-site、catalog SQL和Spark defaults。机器version/generation、网络ID及准确HMS容器共同约束连接。换activation前须通过HMS自身入口退出旧记录，不能由REST owner删除其Derby卷。
 

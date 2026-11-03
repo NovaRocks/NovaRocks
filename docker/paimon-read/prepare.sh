@@ -68,5 +68,4 @@ if [[ "$DRY_RUN" == "true" ]]; then
   exec python3 "$SCRIPT_DIR/fixture.py" prepare --env-file "$ENV_FILE" "${args[@]}"
 fi
 
-"$SCRIPT_DIR/../fixture-inputs/verify.sh" --store "$FIXTURE_STORE"
-exec python3 "$SCRIPT_DIR/fixture.py" prepare --env-file "$ENV_FILE" --fixture-bom "$FIXTURE_STORE/bom.json" "${args[@]}"
+exec python3 "$SCRIPT_DIR/fixture.py" prepare --env-file "$ENV_FILE" --fixture-store "$FIXTURE_STORE" "${args[@]}"

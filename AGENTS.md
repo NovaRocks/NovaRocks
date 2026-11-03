@@ -683,8 +683,8 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 新 Ubuntu 26.04 amd64 开发节点使用 [版本化准备入口](tools/dev/README.md)：
 `sudo tools/dev/linux-env.sh prepare --user <account> --profile tools/dev/profiles/aliyun-ubuntu26-amd64.json --fixture iceberg-rest`。
-prepare 才安装/联网供给；check/env 只观察/输出环境。显式账户和准确平台必须贯通 fixture schema 2，
-相同输入不无故重启服务；旧 BOM 明确重新 provision，现有机器版本变化沿原维护入口，不清卷。
+prepare 负责安装和缺失 fixture 的创建；check 是显式手动诊断，env 只输出环境。fixture 推荐版本与 recipe 集中在 `docker/fixture-inputs/versions.json`。
+已有 fixture 直接用，不做自动 digest/BOM/版本/健康/能力检查；只有确实缺失时按推荐构建。损坏、不完整或未知状态报错交人工维护，不自动重建、升级或清卷。
 专用 profile 使用本机可用 CPU，通用构建默认不变。该节点不因此成为正式 CI 来源。
 
 
@@ -693,9 +693,9 @@ the CI fixture for the `iceberg`, `iceberg-compatibility`, and `iceberg-rest`
 SQL suites. The Codex workspace manifest at
 `.codex/environments/environment.toml` points setup at this directory.
 
-共享 Docker fixture 由机器 owner 管理：每个 daemon 使用固定 `nr-fixture-machine` 项目和 `nr-fixture-machine_iceberg_net` 网络，运行一组 MinIO、REST、rest-mv、Spark 与 mc。控制目录默认 `${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/fixture-machine`，管理命令可显式 `--root`；换目录不能在同 daemon 创建第二套。固定服务端口来自机器配置（默认28000..28005），FE/BE端口仍按worktree/harness分配。普通 `up.sh` 只核验并附着ready同版本机器；显式 `fixture-runtime.sh start/upgrade` 才维护服务。完整版本含验证后的BOM/derived定义、实际image ID、模板和配置；输入变化不自动启动并存栈。见 [ADR-0191](docs/adr/ADR-0191-machine-shared-fixture-and-bounded-scratch.md)。
+共享 Docker fixture 由机器 owner 管理：每个 daemon 使用固定 `nr-fixture-machine` 项目和 `nr-fixture-machine_iceberg_net` 网络，运行一组 MinIO、REST、rest-mv、Spark 与 mc。控制目录默认 `${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/fixture-machine`，管理命令可显式 `--root`；换目录不能在同 daemon 创建第二套。固定服务端口来自机器配置（默认28000..28005），FE/BE端口仍按worktree/harness分配。普通 `up.sh` 复用保存的 ready 机器，缺失时才按推荐创建，不检查当前推荐版本与运行环境是否一致。`fixture-runtime.sh check` 仅供显式手动诊断，普通 CI 不调用；固定全量 CI 机器可显式保存环境报告。已有机器的升级仍走显式 `upgrade`；输入变化不自动启动并存栈。原 daemon、generation、操作 scope 与真实退出约束继续保留。见 [ADR-0191](docs/adr/ADR-0191-machine-shared-fixture-and-bounded-scratch.md)。
 
-Codex setup 的 `docker/iceberg-rest/up.sh --prepare-only` 不调用 Docker，只发布unbound入口并清除端点/镜像变量。真正消费者必须先运行正常 `up.sh`，核验本机BOM、机器version/generation、实际资源和健康后附着。离线prepare不证明健康，也不启动或修复机器。
+Codex setup 的 `docker/iceberg-rest/up.sh --prepare-only` 不调用 Docker，只发布unbound入口并清除端点/镜像变量。真正消费者先运行正常 `up.sh`，使用保存配置并固定一次 publication；实际操作核对原 owner/generation/scope，不能扩张为全环境预检。离线prepare不证明健康，也不启动或修复机器。
 
 `runtime/current` 定位本 worktree 的稳定入口，入口的 `published` 是唯一绑定提交点。消费者在启动时解析一次 publication，再 source 其中的 `env.sh`；所有配置路径指向同一不可变 publication。`NOVA_ENV_RUNTIME_DIR` 保存 SQLite 等稳定运行数据，不能拼接成 `NOVA_ENV_RUNTIME_DIR/env.sh`。推荐：
 
@@ -837,11 +837,11 @@ SQL.
 
 `docker/iceberg-rest/down.sh --runtime-only` 发布unbound，保留固定锁、SQLite及旧不可变publication。共享 `--purge` 不删除整个worktree的S3前缀；正常运行按原身份精确清理，崩溃遗留由显式 `fixture-runtime.sh sweep` 按TTL回收。benchmark根及全部对象（包括staging）受保护，不能按旧owner/data_locations删除。共享模式拒绝 `down.sh --docker/--volumes`。
 
-机器维护使用 `docker/iceberg-rest/fixture-runtime.sh [--root <control-root>] start/status/upgrade/sweep`，不再提供多版本stop/delete或owner locator协议。升级保存maintenance，停止共享writers、轮换旧root并撤销原IAM/STS后，先移除准确旧REST实例/状态卷，确认absence并持久记录catalog屏障，再保持MinIO在线清理准确scratch，切换并核实健康才提交ready。失败保持maintenance，真实unknown不猜成功；历史项目/网络/卷不自动接管或删除。HMS拥有自己的项目与Derby卷，只接入机器的外部网络；私有stock/publication-hook保留原生命周期，vended只共享准确MinIO。
+机器维护使用 `docker/iceberg-rest/fixture-runtime.sh [--root <control-root>] start/status/upgrade/sweep`，不再提供多版本stop/delete或owner locator协议。升级保存maintenance，停止共享writers、轮换旧root并撤销原IAM/STS后，先移除准确旧REST实例/状态卷，确认absence并持久记录catalog屏障，再保持MinIO在线清理准确scratch，切换并记录实际创建目标后才提交ready，不附加全环境健康预检。失败保持maintenance，真实unknown不猜成功；历史项目/网络/卷不自动接管或删除。HMS拥有自己的项目与Derby卷，只接入机器的外部网络；私有stock/publication-hook保留原生命周期，vended只共享准确MinIO。
 
 SQL/System/Spark/直接producer在首次scratch副作用前准入整次预算，默认3600秒、不得超过机器max-run（默认86400），原完整期限内预留300秒清理；嵌套继承同一run ID与期限。到期由原进程owner停止真实writer、确认退出并保留清理失败，不能只杀Docker客户端。scratch资源保留完整时间/run ID，`NOVA_FIXTURE_RUN_STORAGE`在开始前固定原run root与两个REST warehouse的run名称前缀；JDBC默认表/view位置、rename、显式位置与CTAS统一检查属于这三个范围，不依赖namespace location继承。正常/TTL递归删除文件前须完成跨两个共享REST的整运行catalog屏障及IAM撤销；未知命名不自动删除，共享Spark凭证不受运行IAM全面约束。只读READY warehouse保持原绑定。TTL默认604800秒，不替代正常teardown。
 
-真实验收基准仍为 1FE+3BE；all-in-one 只作 smoke。fixture verify 和测试不自行下载或构建缺失输入，BOM 前置条件失败为 BLOCKED（75），端口/身份/生命周期失败为 VERIFY FAILED。
+真实验收基准仍为 1FE+3BE；all-in-one 只作 smoke。普通入口不做环境预检；缺失输入按推荐构建，已有环境的实际失败保留原命令、退出和阶段，交人工维护，不因历史 fixture exit 75 改判为 BOM 前检 BLOCKED。原预算的零副作用拒绝、原 owner/generation/scope、IAM/catalog 屏障和真实退出仍由各 owner 严格维护。
 
 ---
 

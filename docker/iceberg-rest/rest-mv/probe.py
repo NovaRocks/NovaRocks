@@ -130,7 +130,7 @@ class Catalog:
             deadline = self.budget.deadline - (0 if self.cleanup_mode else self.budget.cleanup_grace_seconds)
             parsed = urllib.parse.urlparse(request.full_url)
             owner = self.owner(cleanup=self.cleanup_mode)
-            with owner.ready_snapshot({"version":self.machine["version"]}, deadline=deadline,
+            with owner.operation_snapshot(deadline=deadline,
                                       expected_generation=self.machine["generation"]):
                 connection = _DeadlineConnection(parsed.port, deadline, time.monotonic)
                 response = None
@@ -203,7 +203,7 @@ class Catalog:
         self.budget.check(work=not cleanup)
         deadline = self.budget.deadline - (0 if cleanup else self.budget.cleanup_grace_seconds)
         owner = self.owner(cleanup=cleanup)
-        with owner.ready_snapshot({"version":self.machine["version"]}, deadline=deadline,
+        with owner.operation_snapshot(deadline=deadline,
                                   expected_generation=self.machine["generation"]) as current:
             return owner.backend.run_mc(current, script, deadline=deadline, binary=True)
 
@@ -490,7 +490,7 @@ def run_probe(manifest: dict, mode: str, *, expect_dropped: bool = False, env_fi
             try:
                 owner = MachineOwner(machine["control_root"], daemon=machine["daemon_id"],
                                      timeout=max(0.001, budget.remaining_seconds()))
-                with owner.ready_snapshot({"version": machine["version"]}, deadline=budget.deadline,
+                with owner.operation_snapshot(deadline=budget.deadline,
                                           expected_generation=machine["generation"]) as current:
                     scope = RunStorageScope.from_record(budget.identity, current)
                     report = ScratchSweeper(current, owner.backend).cleanup_run(scope, [], budget.deadline)

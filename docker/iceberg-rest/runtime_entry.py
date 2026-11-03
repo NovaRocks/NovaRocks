@@ -207,7 +207,7 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
         warehouse = config["warehouses"]
         ports, trust = config["local_ports"], config["native_trust"]
         rest = warehouse["rest_client"]
-        versions = config["versions"]
+        versions = record.get("actual_versions", {"spark": "unknown", "iceberg": "unknown"})
         compose = {"compose_project": record["project"], "compose_file": record["compose_file"], "compose_env": record["compose_env"]}
         manifest.update(compose)
         manifest["runtime"]["machine" if shared else "catalog"] = copy.deepcopy(record)
@@ -257,7 +257,6 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
             "NOVAROCKS_SPARK_UI": endpoint["spark_ui"], "NOVAROCKS_SPARK_REST_URI": endpoint["container_rest_uri"],
             "NOVAROCKS_SPARK_S3_ENDPOINT": container_endpoint, "NOVAROCKS_SPARK_DEFAULTS": str(publication / "spark-defaults.conf"),
             "NOVAROCKS_SPARK_V3_SMOKE_SQL": str(publication / "spark-iceberg-v3-smoke.sql"), "NOVAROCKS_SPARK_SQL": manifest["spark"]["helper"],
-            "NOVA_FIXTURE_INPUT_BOM": config["fixture_inputs"]["bom"], "NOVA_FIXTURE_INPUT_LOCK_SHA256": config["fixture_inputs"]["lock_sha256"],
         })
         if cloud:
             exports.update(NOVA_ENV_OBJECT_STORE_KIND="aliyun-oss", NOVA_ENV_OBJECT_STORE_CONFIG=record["object_store_config_file"],
@@ -535,7 +534,7 @@ def render_isolated_stack(bom: dict, project: str, ports: dict, out: Path, confi
     context = {"ready": True, "worktree": config["env_id"], "env_id": config["env_id"],
         "config": config, "publication_dir": str(out), "stable_runtime_dir": str(out), "entry_root": str(out),
         "private_record": record,
-        "producer_receipt": {"lock_sha256": bom["lock_sha256"], **bom["derived_images"]["iceberg-spark"]},
+        "producer_receipt": dict(bom["derived_images"]["iceberg-spark"]),
         "profile": profile, "control_uri": f'http://127.0.0.1:{ports["control"]}' if profile == "publication-hook" else None,
         "template_model_sha256": model_hash(Path(config["repo_root"]))}
     return {"record": record, "context": context, "compose_file": record["compose_file"], "compose_env": record["compose_env"]}
@@ -624,8 +623,8 @@ def request_config(workspace: Path, settings: dict, config_file: Path, entry: Pa
             'credentials': None if cloud else {'access_key': settings['MINIO_ROOT_USER'], 'secret_key': settings['MINIO_ROOT_PASSWORD']}, 'buckets': ['warehouse', 'novarocks'],
             'local_ports': ports, 'native_trust': old_config.get('native_trust') or {'deployment_id': env_id, 'shared_secret': 'local-native-trust-fixture-' + hashlib.sha256(str(workspace).encode()).hexdigest()},
             'benchmark': {'shared_root': benchmark_root, 'build_timeout_seconds': timeout},
-            'versions': {'spark': settings.get('NOVA_ENV_SPARK_VERSION', '3.5.5-java17'), 'iceberg': settings.get('NOVA_ENV_ICEBERG_VERSION', '1.11.0')},
-            'fixture_inputs': old_config.get('fixture_inputs') or {'bom': str(store / 'bom.json'), 'lock_sha256': None, 'verified': False},
+            'versions': machine.recommended_versions(),
+            'fixture_inputs': {'recommendations': str(workspace / 'docker/fixture-inputs/versions.json')},
             'warehouses': {'catalog': f's3://novarocks/{env_id}/iceberg-catalog', 'test': f's3://novarocks/{env_id}/novarocks-sql-test-iceberg-extra',
                            'rest_client': f's3://warehouse/{env_id}/rest', 'rest_mv_client': f's3://warehouse/{env_id}/rest-mv'}}
     if cloud:
@@ -639,16 +638,13 @@ def request_config(workspace: Path, settings: dict, config_file: Path, entry: Pa
     return result
 
 
-def verify_inputs(config: dict) -> dict:
-    # Consume the verifier's locked snapshot, not a later read of mutable bom.json.
-    # The closed consumer and offline verification remain owned by ADR-0155.
+def build_inputs(config: dict) -> dict:
     consumer = 'iceberg-rest-oss' if config.get('object_store') else 'iceberg-rest'
-    bom = machine.verified_bom(Path(config['repo_root']), Path(config['fixture_inputs']['bom']).parent, consumer=consumer)
-    config['fixture_inputs'].update(lock_sha256=bom['lock_sha256'], platform=bom['platform'], verified=True, consumer=consumer)
-    return bom
+    store = os.environ.get('NOVA_FIXTURE_STORE')
+    return machine.prepare_inputs(Path(config['repo_root']), Path(store) if store else None, consumer=consumer)
 
 
-def isolated_start(config: dict, project: str, entry: Path, profile: str, hook_image: str | None, bom: dict) -> dict:
+def isolated_start(config: dict, project: str, entry: Path, profile: str, hook_image: str | None, bom: dict | None = None) -> dict:
     if os.environ.get("NOVA_ENV_PRIVATE_SHARED_MINIO") == "true":
         from scratch import ScratchIdentity, RunBudget
         inherited = json.loads(os.environ.get("NOVA_FIXTURE_RUN_CONTEXT", "null"))
@@ -665,12 +661,16 @@ def isolated_start(config: dict, project: str, entry: Path, profile: str, hook_i
             raise runtime.RuntimeFailure("MachineUnavailable", "shared MinIO has no saved authority")
         identity = ScratchIdentity.from_dict(inherited["identity"])
         budget = RunBudget.admit(saved, identity, inherited=inherited)
+        # Missing inputs are built only after the original run budget is admitted.
+        # Do not hold the machine operation lock while building them.
+        if bom is None:
+            bom = build_inputs(config)
+        budget.check(work=True)
         deadline = budget.deadline - budget.cleanup_grace_seconds
         previous_deadline = getattr(owner.backend, "operation_deadline", None)
         owner.backend.operation_deadline = min(previous_deadline, deadline) if previous_deadline is not None else deadline
         try:
-            definition = owner.required_definition(owner.load_config(), bom)
-            with owner.ready_snapshot(definition, deadline=deadline,
+            with owner.operation_snapshot(deadline=deadline,
                                       expected_generation=binding["GENERATION"]) as snapshot:
                 budget.check(work=True)
                 config = copy.deepcopy(config)
@@ -682,6 +682,8 @@ def isolated_start(config: dict, project: str, entry: Path, profile: str, hook_i
                 return start_private_stack(config, project, entry, profile, hook_image, bom, budget=budget)
         finally:
             owner.backend.operation_deadline = previous_deadline
+    if bom is None:
+        bom = build_inputs(config)
     return start_private_stack(config, project, entry, profile, hook_image, bom)
 
 
@@ -719,27 +721,48 @@ def start_private_stack(config, project, entry, profile, hook_image, bom, *, bud
     for image in record['images'].values():
         image['image_id'] = backend.image_id(image['tag'])
     # A generated manifest also identifies partial startup for harness teardown.
+    record["creation_state"] = "starting"
     render_entry(context, entry)
     if config.get("shared_minio"):
         backend.compose(record, ['create'])
         record["object_store_container"] = backend.attach(config["shared_minio"], record)
         render_entry(context, entry)
     backend.compose(record, ['up', '-d'])
-    deadline = time.monotonic() + min(120, budget.remaining_seconds(work=True) if budget else 120)
-    while not backend.healthy(record) or (context['control_uri'] and not backend.http_ready(context['control_uri'] + '/health')):
-        if budget:
-            budget.check(work=True)
-        if time.monotonic() > deadline:
-            raise runtime.RuntimeFailure('ReadinessTimeout', project)
-        time.sleep(0.1)
     record['containers'] = {name: backend.container(record, name)['Id'] for name in record['required_services']}
-    # The mc client remains a completed container for identity checks and run --rm.
+    # Join the actual one-shot command, not a readiness probe of the whole stack.
     mc = backend.container(record, 'mc')
-    if not mc or mc.get('State', {}).get('Status') != 'exited' or mc.get('State', {}).get('ExitCode') != 0:
-        raise runtime.RuntimeFailure('ReadinessTimeout', 'isolated mc did not complete successfully')
+    if not mc:
+        raise runtime.RuntimeFailure('RuntimeStateUnreadable', 'private creation omitted its mc container')
+    if mc.get('State', {}).get('Status') != 'exited':
+        result = backend.command(['wait', mc['Id']]).strip()
+        if result != '0':
+            raise runtime.RuntimeFailure('RuntimeCreationFailed', 'private mc command did not exit successfully')
+    elif mc.get('State', {}).get('ExitCode') != 0:
+        raise runtime.RuntimeFailure('RuntimeCreationFailed', 'private mc command did not exit successfully')
     record['containers']['mc'] = mc['Id']
+    record['creation_state'] = 'ready'
     render_entry(context, entry)
     return {'published_dir': str(entry), 'private_record': record, 'producer_receipt': context['producer_receipt']}
+
+
+def existing_private_entry(entry: Path, project: str):
+    path = entry / 'manifest.json'
+    if not path.exists():
+        return None
+    manifest = runtime.read_json(path)
+    record = manifest.get('runtime', {}).get('catalog')
+    if record is None and not manifest.get('ready'):
+        return None
+    if not isinstance(record, dict) or record.get('project') != project or manifest.get('shared_docker') is not False:
+        raise runtime.RuntimeFailure('RuntimeIdentityMismatch', 'private fixture configuration belongs to another owner')
+    complete = record.get('creation_state') == 'ready'
+    if record.get('creation_state') is None:
+        # Older owners published their actual target IDs only after creation returned.
+        complete = set(record.get('required_services', ())).issubset(record.get('containers', {})) and bool(record.get('containers'))
+    if not complete:
+        raise runtime.RuntimeFailure('RuntimeUnavailable', 'private fixture creation is incomplete; maintain it manually')
+    return {'published_dir': str(entry), 'private_record': record,
+            'producer_receipt': manifest.get('runtime', {}).get('producer_receipt')}
 
 
 def isolated_down(entry: Path, project: str, *, volumes: bool, purge: bool) -> dict:
@@ -804,13 +827,14 @@ def previous_publication(entry):
     return publication.read(Path(entry))
 
 
-def attach_entry(owner, env_id, entry, config, bom):
+def attach_entry(owner, env_id, entry, config):
     entry = Path(entry).resolve()
     with runtime.file_lock(entry / '.entry.lock'):
         try:
             started = time.monotonic()
             deadline = started + owner.timeout
             inherited = None
+            scope = None
             raw_context = os.environ.get('NOVA_FIXTURE_RUN_CONTEXT')
             if raw_context is not None:
                 if len(raw_context) > 16384:
@@ -820,7 +844,7 @@ def attach_entry(owner, env_id, entry, config, bom):
                 except ValueError as error:
                     raise runtime.RuntimeFailure('RunBudgetRejected', 'invalid inherited run context JSON') from error
             if inherited is not None:
-                from scratch import RunBudget, ScratchIdentity
+                from scratch import RunBudget, RunStorageScope, ScratchIdentity, RUN_STORAGE_ENV
                 if not isinstance(inherited, dict) or 'identity' not in inherited:
                     raise runtime.RuntimeFailure('RunBudgetRejected', 'attach requires the original run context')
                 saved = owner.read_saved_state()
@@ -830,27 +854,32 @@ def attach_entry(owner, env_id, entry, config, bom):
                 budget = RunBudget.admit(saved, identity, inherited=inherited,
                                          wall_clock=time.time, monotonic=time.monotonic)
                 deadline = min(deadline, budget.deadline - budget.cleanup_grace_seconds)
+                raw_scope = os.environ.get(RUN_STORAGE_ENV)
+                if raw_scope is None or len(raw_scope) > 16384:
+                    raise runtime.RuntimeFailure('InvalidScratchScope', 'attach requires its original bounded storage scope')
+                try:
+                    scope = RunStorageScope.from_dict(json.loads(raw_scope)).validate_against(identity, saved)
+                except ValueError as error:
+                    raise runtime.RuntimeFailure('InvalidScratchScope', 'invalid inherited storage scope JSON') from error
             previous = getattr(owner.backend, 'operation_deadline', None)
             owner.backend.operation_deadline = min(previous, deadline) if previous is not None else deadline
             try:
-                definition = owner.required_definition(owner.load_config(), bom)
-                # Lock contention stays short; full validation retains the original work deadline.
-                with owner.ready_snapshot(definition, deadline=deadline,
+                # The lock protects configuration publication, not environment health.
+                with owner.operation_snapshot(deadline=deadline,
+                                          expected_generation=scope.machine['generation'] if scope else None,
                                           lock_deadline=time.monotonic() + 2) as snapshot:
                     if inherited is not None:
+                        scope.validate_against(identity, snapshot)
                         RunBudget.admit(snapshot, identity, inherited=inherited,
                                         wall_clock=time.time, monotonic=time.monotonic).check(work=True)
-                    if config['benchmark']['shared_root'].rstrip('/') != snapshot['config']['benchmark_root']:
-                        raise runtime.RuntimeFailure('MachineVersionMismatch', 'worktree benchmark root differs from machine configuration')
                     return publication.publish(entry, {'worktree': env_id, 'ready': True,
                         'machine': snapshot, 'config': config, 'producer_receipt': snapshot['producer_receipt']}, render_entry)
             finally:
                 owner.backend.operation_deadline = previous
         except runtime.RuntimeFailure:
-            # Failed identity/health observation also invalidates discovery.
+            # Failed operation binding also invalidates discovery.
             # Pinned immutable publications stay readable for existing owners.
             unavailable = copy.deepcopy(config)
-            unavailable['fixture_inputs']['verified'] = False
             publication.publish(entry, {'worktree': env_id, 'ready': False,
                 'machine': None, 'config': unavailable, 'producer_receipt': None}, render_entry)
             raise
@@ -859,7 +888,6 @@ def attach_entry(owner, env_id, entry, config, bom):
 def prepare_entry(env_id, entry, config):
     # Offline preparation never labels saved facts as live readiness.
     config = copy.deepcopy(config)
-    config['fixture_inputs']['verified'] = False
     with runtime.file_lock(Path(entry) / '.entry.lock'):
         return publication.publish(Path(entry), {'worktree': env_id, 'ready': False,
             'machine': None, 'config': config, 'producer_receipt': None}, render_entry)
@@ -941,20 +969,32 @@ def worktree_main(argv: list[str] | None = None) -> int:
                     render_entry({'ready': False, 'worktree': env_id, 'config': config, 'publication_dir': str(entry), 'stable_runtime_dir': str(entry)}, entry)
                     result = {'ready': False, 'published_dir': str(entry)}
             else:
-                config['fixture_inputs'] = {'bom': str(Path(os.environ.get('NOVA_FIXTURE_STORE', str(Path(os.environ.get('XDG_CACHE_HOME', str(Path.home() / '.cache'))) / 'novarocks/fixture-inputs'))).resolve() / 'bom.json'), 'lock_sha256': None, 'verified': False}
-                try:
-                    bom = verify_inputs(config)
-                except runtime.RuntimeFailure:
-                    if shared:
-                        prepare_entry(env_id, entry, config)
-                    raise
                 if shared:
                     if args.profile != 'stock' or args.hook_image:
                         raise runtime.RuntimeFailure('InvalidConfiguration', 'hook profile requires an isolated request')
-                    owner = machine.MachineOwner(os.environ.get("NOVA_FIXTURE_MACHINE_ROOT"))
-                    result = attach_entry(owner, env_id, entry, config, bom)
+                    original_daemon = None
+                    if os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null"):
+                        from scratch import RunStorageScope
+                        raw_scope = os.environ.get("NOVA_FIXTURE_RUN_STORAGE")
+                        try:
+                            if raw_scope is None or len(raw_scope) > 16384:
+                                raise ValueError("missing bounded original storage binding")
+                            original_daemon = RunStorageScope.from_dict(json.loads(raw_scope)).machine["daemon_id"]
+                        except (ValueError, runtime.RuntimeFailure) as error:
+                            prepare_entry(env_id, entry, config)
+                            raise runtime.RuntimeFailure("RunBudgetRejected", "inherited attach requires its original storage binding") from error
+                    # Resolve saved authority without a daemon query before budget admission.
+                    owner = machine.MachineOwner(os.environ.get("NOVA_FIXTURE_MACHINE_ROOT"), daemon=original_daemon)
+                    store = os.environ.get("NOVA_FIXTURE_STORE")
+                    # An inherited run cannot create a replacement for its original fixture.
+                    if os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") in (None, "null"):
+                        owner.ensure_created(store=Path(store) if store else None)
+                    result = attach_entry(owner, env_id, entry, config)
                 else:
-                    result = isolated_start(config, settings['NOVA_ENV_COMPOSE_PROJECT'], entry, args.profile, args.hook_image, bom)
+                    with runtime.file_lock(entry / '.entry.lock'):
+                        result = existing_private_entry(entry, settings['NOVA_ENV_COMPOSE_PROJECT'])
+                        if result is None:
+                            result = isolated_start(config, settings['NOVA_ENV_COMPOSE_PROJECT'], entry, args.profile, args.hook_image)
         if result is None:
             output = None
         else:

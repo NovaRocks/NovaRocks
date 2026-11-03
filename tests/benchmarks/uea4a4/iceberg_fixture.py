@@ -126,27 +126,13 @@ def render_sql(database: str, location: str, files_per_table: int) -> str:
     return ";\n".join(statements) + ";\n"
 
 
-def install_verified_images(store: Path, runtime: Any) -> dict[str, Any]:
-    support.run_command(
-        [str(REPO / "docker" / "fixture-inputs" / "verify.sh"), "--store", str(store),
-         "--consumer", "iceberg-rest"]
-    )
-    bom = support.read_json(store / "bom.json")
-    try:
-        mc_alias = bom["derived_images"]["minio-mc"]["image_id"]
-        spark_id = bom["derived_images"]["iceberg-spark"]["image_id"]
-    except (KeyError, TypeError) as error:
-        raise support.FixtureError("verified input BOM lacks Iceberg Spark or MinIO mc") from error
-    if not isinstance(mc_alias, str) or not re.fullmatch(r"[a-z0-9][a-z0-9./:_-]+", mc_alias):
-        raise support.FixtureError("verified MinIO mc image ID is invalid")
-    os.environ["MINIO_MC_IMAGE"] = mc_alias
+def install_runtime_images(runtime: Any) -> dict[str, Any]:
+    """Use the images already bound to this actual fixture's publication."""
     publication = support.read_json(runtime.env_file.with_name("manifest.json"))
     record = publication["runtime"]["machine"] if publication.get("shared_docker", "catalog" not in publication["runtime"]) else publication["runtime"]["catalog"]
-    container = record["containers"]["spark"]
-    image = support.run_command(["docker", "inspect", container, "--format", "{{.Image}}"])
-    if image.stdout.strip() != spark_id:
-        raise support.FixtureError("running Spark container differs from the verified input BOM")
-    return {"spark_image_id": spark_id, "mc_alias": mc_alias, "lock_sha256": bom["lock_sha256"]}
+    images = record["images"]
+    os.environ["MINIO_MC_IMAGE"] = images["mc"]["image_id"]
+    return {"spark_image_id": images["spark"]["image_id"], "mc_alias": images["mc"]["image_id"]}
 
 
 def inventory(runtime: Any, location: str, *, allow_empty: bool = False) -> list[dict[str, Any]]:
@@ -320,7 +306,7 @@ def prepare(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / ".fixture.lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        inputs = install_verified_images(Path(args.fixture_store).expanduser().resolve(), runtime)
+        inputs = install_runtime_images(runtime)
         if (output_dir / "READY").exists():
             manifest = verify_ready(output_dir, runtime)
             if (manifest.get("run_id"), manifest.get("table_location"), manifest.get("definition_sha256")) != (
@@ -386,7 +372,7 @@ def prepare(args: argparse.Namespace) -> int:
 def verify(args: argparse.Namespace) -> int:
     env_file = Path(args.env_file).expanduser().resolve()
     runtime = support.load_runtime(env_file)
-    install_verified_images(Path(args.fixture_store).expanduser().resolve(), runtime)
+    install_runtime_images(runtime)
     output_dir = Path(args.output_dir).expanduser().resolve()
     verify_ready(output_dir, runtime)
     print(output_dir / "manifest.json")
@@ -402,7 +388,7 @@ def cleanup(args: argparse.Namespace) -> int:
           and support.read_json(env_file.with_name("manifest.json")).get("runtime", {}).get("machine")):
         raise support.FixtureError("shared producer cleanup needs its persisted original run context")
     runtime = support.load_runtime(env_file)
-    install_verified_images(Path(args.fixture_store).expanduser().resolve(), runtime)
+    install_runtime_images(runtime)
     with (output_dir / ".fixture.lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         manifest = verify_ready(output_dir, runtime)

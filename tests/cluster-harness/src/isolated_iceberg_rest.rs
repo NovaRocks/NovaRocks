@@ -158,7 +158,7 @@ pub struct IsolatedIcebergRestImageIdentity {
 ///
 /// This deliberately contains neither the compose project nor endpoints,
 /// ports, warehouses, access keys, or other generated configuration. Image
-/// identities come from live containers, while the three hashes bind the
+/// identities come from the original creation outputs, while the three hashes bind the
 /// checked-in fixture implementation that started them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct IsolatedIcebergRestRuntimeIdentity {
@@ -167,9 +167,8 @@ pub struct IsolatedIcebergRestRuntimeIdentity {
     pub compose_sha256: String,
     pub scripts_sha256: String,
     pub model_sha256: String,
-    pub rest_version: String,
-    pub minio_version: String,
-    pub capabilities: BTreeSet<String>,
+    pub rest_version: Option<String>,
+    pub minio_version: Option<String>,
 }
 
 impl fmt::Debug for IsolatedIcebergRestEndpoints {
@@ -672,98 +671,59 @@ impl IsolatedIcebergRestFixture {
         &self.workspace_root
     }
 
-    /// Observes the exact live provider runtime without returning generated
-    /// network or credential material.
+    /// Reads original saved provider facts without probing the environment or
+    /// returning network or credential material.
     pub fn runtime_identity(&self) -> Result<IsolatedIcebergRestRuntimeIdentity> {
         self.assert_owned_paths()?;
         ensure!(self.active, "isolated provider runtime is no longer active");
-        let services = if self.shared_machine.is_some() {
-            vec!["rest", "rest-mv", "spark"]
-        } else {
-            vec!["minio", "rest", "rest-mv", "spark"]
-        };
-        let mut images = services
-            .into_iter()
-            .map(|service| {
-                Ok((
-                    service.to_string(),
-                    live_service_image_until(
-                        &self.repo_root,
-                        &self.compose_project,
-                        service,
-                        self.work_limit(),
-                    )?,
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
-        let mc_container = completed_service_container_until(
-            &self.repo_root,
-            &self.compose_project,
-            "mc",
-            self.work_limit(),
-        )?;
-        images.insert(
-            "mc".to_string(),
-            container_image_until(&self.repo_root, &mc_container, "mc", self.work_limit())?,
-        );
-
-        let minio_container = if let Some(machine) = &self.shared_machine {
-            let container = machine["containers"]["minio"]
-                .as_str()
-                .context("shared MinIO snapshot omitted exact container")?
-                .to_string();
-            let image =
-                container_image_until(&self.repo_root, &container, "minio", self.work_limit())?;
-            ensure!(
-                Some(image.image_id.as_str()) == machine["images"]["minio"]["image_id"].as_str(),
-                "shared MinIO image differs from original machine snapshot"
+        let manifest_path = self.find_manifest()?;
+        let manifest = read_manifest(&manifest_path)?;
+        self.assert_isolated_manifest(&manifest)?;
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        let record = &value["runtime"]["catalog"];
+        let mut images = BTreeMap::new();
+        let saved = record["images"]
+            .as_object()
+            .context("fixture omitted saved image outputs")?;
+        for (service, image) in saved {
+            images.insert(
+                service.clone(),
+                IsolatedIcebergRestImageIdentity {
+                    image_id: image["image_id"]
+                        .as_str()
+                        .context("fixture image output has no ID")?
+                        .to_owned(),
+                    image_reference: image["tag"]
+                        .as_str()
+                        .context("fixture image output has no reference")?
+                        .to_owned(),
+                },
             );
-            images.insert("minio".into(), image);
-            container
-        } else {
-            live_service_container_until(
-                &self.repo_root,
-                &self.compose_project,
-                "minio",
-                self.work_limit(),
-            )?
-        };
+        }
+        if let Some(machine) = &self.shared_machine {
+            let image = &machine["images"]["minio"];
+            images.insert(
+                "minio".to_owned(),
+                IsolatedIcebergRestImageIdentity {
+                    image_id: image["image_id"]
+                        .as_str()
+                        .context("shared MinIO omitted saved image ID")?
+                        .to_owned(),
+                    image_reference: image["tag"]
+                        .as_str()
+                        .context("shared MinIO omitted saved reference")?
+                        .to_owned(),
+                },
+            );
+        }
+        // Missing version observations stay unknown; tags are not software self-reports.
+        let rest_version = record["actual_versions"]["rest"]
+            .as_str()
+            .map(str::to_owned);
         let minio_version =
-            minio_runtime_version_until(&self.repo_root, &minio_container, self.work_limit())?;
-        let rest_container = live_service_container_until(
-            &self.repo_root,
-            &self.compose_project,
-            "rest",
-            self.work_limit(),
-        )?;
-        let rest_environment = container_string_array_until(
-            &self.repo_root,
-            &rest_container,
-            "{{json .Config.Env}}",
-            "REST environment",
-            self.work_limit(),
-        )?;
-        let expected_io = if self.publication_control_uri.is_some() {
-            "CATALOG_IO__IMPL=org.apache.iceberg.rest.fixture.TracingFileIO"
-        } else {
-            "CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO"
-        };
-        ensure!(
-            rest_environment.iter().any(|value| value == expected_io)
-                && rest_environment
-                    .iter()
-                    .any(|value| value == "CATALOG_S3_PATH__STYLE__ACCESS=true"),
-            "isolated REST runtime does not expose the required FileIO path-style capability"
-        );
-        let rest_image = images
-            .get("rest")
-            .context("isolated REST image identity is absent")?;
-        let rest_version = image_tag(&rest_image.image_reference)
-            .context("isolated REST image reference has no immutable version tag")?;
-        ensure!(
-            rest_version != "latest",
-            "isolated REST image does not expose a concrete runtime version"
-        );
+            self.shared_machine.as_ref().unwrap_or(record)["actual_versions"]["minio"]
+                .as_str()
+                .map(str::to_owned);
 
         let fixture_root = self.repo_root.join("docker/iceberg-rest");
         let templates = fixture_template_paths(&self.repo_root);
@@ -789,15 +749,6 @@ impl IsolatedIcebergRestFixture {
         );
         let scripts_sha256 = hash_named_files(&self.repo_root, &scripts)?;
         let model_sha256 = fixture_template_model_hash(&self.repo_root)?;
-        let capabilities = [
-            "iceberg-rest-v1",
-            "minio-s3",
-            "path-style-s3",
-            "spark-iceberg-bootstrap",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
         Ok(IsolatedIcebergRestRuntimeIdentity {
             schema_version: 1,
             images,
@@ -806,7 +757,6 @@ impl IsolatedIcebergRestFixture {
             model_sha256,
             rest_version,
             minio_version,
-            capabilities,
         })
     }
 
@@ -1233,8 +1183,6 @@ impl IsolatedIcebergRestFixture {
             .arg(field("control_root")?)
             .arg("--daemon")
             .arg(field("daemon_id")?)
-            .arg("--expected-version")
-            .arg(field("version")?)
             .arg("--expected-generation")
             .arg(field("generation")?)
             .arg("--script-file")
@@ -1488,10 +1436,6 @@ impl IsolatedIcebergRestFixture {
                 );
             }
         }
-        ensure!(
-            manifest.runtime.template_model_sha256 == fixture_template_model_hash(&self.repo_root)?,
-            "isolated fixture template model differs from its generated manifest"
-        );
         Ok(())
     }
 
@@ -2026,165 +1970,6 @@ fn live_service_container_until(
     Ok(containers[0].clone())
 }
 
-fn completed_service_container_until(
-    repo_root: &Path,
-    compose_project: &str,
-    service: &str,
-    deadline: Option<Instant>,
-) -> Result<String> {
-    let project_label = format!("label=com.docker.compose.project={compose_project}");
-    let service_label = format!("label=com.docker.compose.service={service}");
-    let containers = docker_ids_until(
-        repo_root,
-        &[
-            "ps",
-            "-aq",
-            "--filter",
-            &project_label,
-            "--filter",
-            &service_label,
-        ],
-        deadline,
-    )?;
-    ensure!(
-        containers.len() == 1,
-        "isolated fixture service {service} has {} containers",
-        containers.len()
-    );
-    let container = containers[0].clone();
-    ensure!(
-        docker_inspect_scalar_until(
-            repo_root,
-            &container,
-            "{{.State.Status}}",
-            "completed service state",
-            deadline
-        )? == "exited"
-            && docker_inspect_scalar_until(
-                repo_root,
-                &container,
-                "{{.State.ExitCode}}",
-                "completed service exit code",
-                deadline
-            )? == "0",
-        "isolated fixture service {service} did not complete successfully"
-    );
-    Ok(container)
-}
-
-fn live_service_image_until(
-    repo_root: &Path,
-    compose_project: &str,
-    service: &str,
-    deadline: Option<Instant>,
-) -> Result<IsolatedIcebergRestImageIdentity> {
-    let container = live_service_container_until(repo_root, compose_project, service, deadline)?;
-    container_image_until(repo_root, &container, service, deadline)
-}
-
-fn container_image_until(
-    repo_root: &Path,
-    container: &str,
-    service: &str,
-    deadline: Option<Instant>,
-) -> Result<IsolatedIcebergRestImageIdentity> {
-    let image_id =
-        docker_inspect_scalar_until(repo_root, container, "{{.Image}}", "image id", deadline)?;
-    ensure!(
-        image_id.strip_prefix("sha256:").is_some_and(
-            |digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        ),
-        "isolated fixture service {service} did not report an immutable image id"
-    );
-    let image_reference = docker_inspect_scalar_until(
-        repo_root,
-        container,
-        "{{.Config.Image}}",
-        "image reference",
-        deadline,
-    )?;
-    ensure!(
-        !image_reference.trim().is_empty(),
-        "isolated fixture service {service} has an empty image reference"
-    );
-    Ok(IsolatedIcebergRestImageIdentity {
-        image_id,
-        image_reference,
-    })
-}
-
-fn docker_inspect_scalar_until(
-    repo_root: &Path,
-    object: &str,
-    format: &str,
-    fact: &str,
-    deadline: Option<Instant>,
-) -> Result<String> {
-    let output = run_docker_until(
-        repo_root,
-        &["inspect", "--format", format, object],
-        deadline,
-    )?;
-    ensure!(
-        output.status.success(),
-        "docker inspect for {fact} exited with {}",
-        output.status
-    );
-    let value = String::from_utf8(output.stdout)
-        .with_context(|| format!("decode Docker {fact}"))?
-        .trim()
-        .to_string();
-    ensure!(!value.is_empty(), "Docker {fact} is empty");
-    Ok(value)
-}
-
-fn container_string_array_until(
-    repo_root: &Path,
-    container: &str,
-    format: &str,
-    fact: &str,
-    deadline: Option<Instant>,
-) -> Result<Vec<String>> {
-    let json = docker_inspect_scalar_until(repo_root, container, format, fact, deadline)?;
-    serde_json::from_str(&json).with_context(|| format!("decode Docker {fact}"))
-}
-
-fn minio_runtime_version_until(
-    repo_root: &Path,
-    container: &str,
-    deadline: Option<Instant>,
-) -> Result<String> {
-    let output = run_docker_until(
-        repo_root,
-        &["exec", container, "minio", "--version"],
-        deadline,
-    )?;
-    ensure!(
-        output.status.success(),
-        "read isolated MinIO version exited with {}",
-        output.status
-    );
-    let stdout = String::from_utf8(output.stdout).context("decode isolated MinIO version")?;
-    let version = stdout
-        .lines()
-        .next()
-        .and_then(|line| line.trim().strip_prefix("minio version "))
-        .map(str::trim)
-        .filter(|version| !version.is_empty())
-        .context("isolated MinIO version output has no version")?;
-    Ok(version.to_string())
-}
-
-fn image_tag(reference: &str) -> Option<String> {
-    let (repository, tag) = reference.rsplit_once(':')?;
-    (!repository.is_empty()
-        && repository != "sha256"
-        && !reference.contains('@')
-        && !tag.is_empty()
-        && !tag.contains('/'))
-    .then(|| tag.to_string())
-}
-
 fn fixture_template_paths(repo_root: &Path) -> Vec<PathBuf> {
     ["object-store.yml", "catalog.yml"]
         .into_iter()
@@ -2202,28 +1987,29 @@ fn build_publication_hook_image_until(
     repo_root: &Path,
     deadline: Option<Instant>,
 ) -> Result<String> {
-    // --pull=false alone still permits Docker to fetch a missing FROM image.
-    // Verify the local inputs before invoking the hook-only compilation.
-    let mut inspect = controlled_command("docker");
-    inspect.current_dir(repo_root).args([
-        "image",
-        "inspect",
-        "apache/iceberg-rest-fixture:1.10.1",
-        "apache/spark:3.5.5-java17",
-    ]);
-    let inputs = run_bounded_command(
-        inspect,
-        remaining_command_timeout(FIXTURE_DOCKER_TIMEOUT, deadline)?,
-        "inspect local publication hook base images",
-        &[],
-    )?;
-    ensure!(
-        inputs.status.success(),
-        "publication hook requires locally prepared base images: {}",
-        safe_diagnostics(&inputs, &[])
-    );
+    let recommendation: serde_json::Value = serde_json::from_slice(&fs::read(
+        repo_root.join("docker/fixture-inputs/versions.json"),
+    )?)
+    .context("read recommended hook build versions")?;
+    let base = |name: &str| -> Result<String> {
+        let item = &recommendation["images"][name];
+        Ok(format!(
+            "{}:{}",
+            item["source"]
+                .as_str()
+                .context("hook image source is absent")?,
+            item["version"]
+                .as_str()
+                .context("hook image version is absent")?
+        ))
+    };
+    let rest_image = base("iceberg-rest")?;
+    let builder_image = base("iceberg-spark-base")?;
     let hook_root = repo_root.join("tests/fixtures/iceberg-rest-publication");
-    let mut inputs = vec![hook_root.join("Dockerfile")];
+    let mut inputs = vec![
+        hook_root.join("Dockerfile"),
+        repo_root.join("docker/fixture-inputs/versions.json"),
+    ];
     let source_root = hook_root.join("src/main/java/org/apache/iceberg/rest/fixture");
     for entry in fs::read_dir(&source_root).context("read publication hook sources")? {
         let path = entry?.path();
@@ -2239,10 +2025,31 @@ fn build_publication_hook_image_until(
         "novarocks/iceberg-rest-publication-fixture:uea7-{}",
         &source_hash[..16]
     );
+    let existing = run_docker_until(repo_root, &["image", "inspect", &image], deadline)?;
+    if existing.status.success() {
+        return Ok(image);
+    }
+    let error = String::from_utf8_lossy(&existing.stderr).to_ascii_lowercase();
+    ensure!(
+        error
+            .trim_start()
+            .starts_with("error response from daemon: no such image:")
+            || error.trim_start().starts_with("error: no such image:"),
+        "cannot inspect hook build target: {}",
+        safe_diagnostics(&existing, &[])
+    );
     let mut command = controlled_command("docker");
     command
         .current_dir(repo_root)
-        .args(["build", "--pull=false", "-t", &image])
+        .args([
+            "build",
+            "-t",
+            &image,
+            "--build-arg",
+            &format!("REST_IMAGE={rest_image}"),
+            "--build-arg",
+            &format!("BUILDER_IMAGE={builder_image}"),
+        ])
         .arg(&hook_root);
     let output = run_bounded_command(
         command,
@@ -2784,7 +2591,6 @@ struct ManifestRuntime {
     machine: Option<serde_json::Value>,
     profile: String,
     control_uri: Option<String>,
-    template_model_sha256: String,
     publication_dir: String,
     entry_root: String,
 }
@@ -3618,7 +3424,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_requires_owned_generated_compose_and_the_exact_model() {
+    fn manifest_requires_owned_generated_compose_without_current_recipe_matching() {
         let (_temp, fixture, mut value) = manifest_fixture();
         let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
         fixture
@@ -3633,9 +3439,11 @@ mod tests {
             Path::new(value["runtime_dir"].as_str().unwrap()).join("compose.yml"),
         )
         .unwrap();
-        value["runtime"]["template_model_sha256"] = serde_json::json!("wrong-model");
+        value["runtime"]["template_model_sha256"] = serde_json::json!("older-recipe");
         let manifest: Manifest = serde_json::from_value(value).unwrap();
-        assert!(fixture.assert_isolated_manifest(&manifest).is_err());
+        fixture
+            .assert_isolated_manifest(&manifest)
+            .expect("saved owner does not require current recipe equality");
     }
 
     #[test]
@@ -3999,9 +3807,8 @@ mod tests {
             compose_sha256: "b".repeat(64),
             scripts_sha256: "c".repeat(64),
             model_sha256: "d".repeat(64),
-            rest_version: "1.10.1".to_string(),
-            minio_version: "RELEASE.2025-09-07T16-13-09Z".to_string(),
-            capabilities: BTreeSet::from(["iceberg-rest-v1".to_string()]),
+            rest_version: Some("1.10.1".to_string()),
+            minio_version: None,
         };
         let value = serde_json::to_value(identity).expect("serialize runtime identity");
         let keys = value
@@ -4013,7 +3820,6 @@ mod tests {
         assert_eq!(
             keys,
             BTreeSet::from([
-                "capabilities",
                 "compose_sha256",
                 "images",
                 "minio_version",
@@ -4071,20 +3877,6 @@ mod tests {
             ])
         );
         assert!(scoped_s3_policy("s3://novarocks/benchmarks").is_err());
-    }
-
-    #[test]
-    fn provider_version_requires_an_explicit_image_tag() {
-        assert_eq!(
-            image_tag("apache/iceberg-rest-fixture:1.10.1").as_deref(),
-            Some("1.10.1")
-        );
-        assert_eq!(
-            image_tag("registry:5000/team/rest:2.0").as_deref(),
-            Some("2.0")
-        );
-        assert_eq!(image_tag("apache/iceberg-rest-fixture"), None);
-        assert_eq!(image_tag("sha256:abcdef"), None);
     }
 
     #[test]

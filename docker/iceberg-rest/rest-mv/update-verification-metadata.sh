@@ -34,18 +34,18 @@ parser.add_argument("--image-source", action="append", default=[], metavar="NAME
 parser.add_argument("--artifact-url-prefix", action="append", default=[], metavar="ORIGINAL=TRANSPORT")
 parser.add_argument("--docker-pull-timeout-seconds", type=int, default=180)
 args = parser.parse_args(sys.argv[2:])
-lock_path = repo / "docker/fixture-inputs/lock.json"
+versions_path = repo / "docker/fixture-inputs/versions.json"
 sys.path.insert(0, str(repo / "docker/fixture-inputs"))
-from fixture_inputs import load_lock
+from fixture_inputs import load_inputs
 from provision import parse_artifact_url_prefixes, artifact_url_prefix_build_args
 prefixes = parse_artifact_url_prefixes(args.artifact_url_prefix)
-lock, _ = load_lock(lock_path, consumer="derived:rest-mv")
+lock = load_inputs(versions_path, consumer="derived:rest-mv")
 recipe = lock["derived_images"]["rest-mv"]
 with tempfile.TemporaryDirectory(prefix="novarocks-rest-mv-verification-") as temporary:
     work = Path(temporary)
     context = work / "context"
     command = [sys.executable, str(repo / "docker/fixture-inputs/provision.py"),
-               "--repo-root", str(repo), "--lock", str(lock_path),
+               "--repo-root", str(repo), "--versions", str(versions_path),
                "--context-only", "rest-mv", "--out", str(context),
                "--docker-pull-timeout-seconds", str(args.docker_pull_timeout_seconds)]
     for source in args.image_source:
