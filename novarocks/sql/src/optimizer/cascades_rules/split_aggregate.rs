@@ -193,14 +193,12 @@ fn local_output_columns(agg: &LogicalAggregateOp, arena: &ScalarArena) -> Vec<Ou
 }
 
 fn local_aggregate_intermediate_type(call: &ScalarAggregateSpec) -> FunctionValueType {
-    let mut value_type = crate::functions::aggregate_selection(call.source.binding())
+    // The phase produces its selected state contract. Widening only this
+    // planner column would disagree with the producer's frozen ValueDef and
+    // give the two sides of an exchange different complete declarations.
+    crate::functions::aggregate_selection(call.source.binding())
         .intermediate_type
-        .clone();
-    // Preserve the existing phase-output root nullability widening.
-    value_type = value_type
-        .with_nullable(true)
-        .expect("validated root NULL contract");
-    value_type
+        .clone()
 }
 
 pub(crate) fn group_key_output_column_id(
@@ -720,6 +718,8 @@ mod tests {
         use std::sync::Arc;
 
         let sources = [
+            ("count", FunctionValueType::new(DataType::Int64, false)),
+            ("count", FunctionValueType::new(DataType::Int64, true)),
             (
                 "min",
                 FunctionValueType::try_with_logical_type(
@@ -771,10 +771,12 @@ mod tests {
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             );
             let result = crate::functions::aggregate_result_type(&resolved).clone();
-            let mut state = crate::functions::aggregate_selection(&resolved)
+            let state = crate::functions::aggregate_selection(&resolved)
                 .intermediate_type
                 .clone();
-            state = state.with_nullable(true).unwrap();
+            if name == "count" {
+                assert_eq!(state, FunctionValueType::new(DataType::Int64, false));
+            }
             let input = OutputColumn {
                 column_id: ColumnId(2),
                 name: "v".into(),

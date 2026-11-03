@@ -119,6 +119,108 @@ pub(super) fn online_unit(chunks: &[Chunk], _: bool) -> Result<Vec<u8>, super::E
     Ok(online_unit_as(&chunks[0], &schema))
 }
 
+#[test]
+fn compiled_recipe_ignores_root_aliases_but_preserves_logical_nullability() {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use novarocks_local_program::StaticLayout;
+    use novarocks_type_contract::{
+        CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
+        ValueTypeStorageLifetime,
+    };
+
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    let layout = |name: &str, slot, unique_id, nullable| {
+        // Each role freezes its own occurrence identity around the same full
+        // declaration. Neither role learns the declaration from the payload.
+        let value = FunctionValueType::new(DataType::Int32, nullable);
+        StaticLayout::try_new_typed_for_compile(
+            Arc::new(Schema::new(vec![Field::new(
+                name,
+                DataType::Int32,
+                nullable,
+            )])),
+            Arc::from([SlotId::new(slot)]),
+            vec![(value.typed_binding().clone(), Some(unique_id))],
+            ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &Control,
+        )
+        .unwrap()
+    };
+    let factory = crate::runtime::fragment::exchange::test_receiver_creation_factory();
+    let sender_schema = factory
+        .create_compiled_chunk_schema(&layout("sender_id", 17, 101, false))
+        .unwrap();
+    let receiver_schema = factory
+        .create_compiled_chunk_schema(&layout("receiver_alias", 93, 808, false))
+        .unwrap();
+    let nullable_schema = factory
+        .create_compiled_chunk_schema(&layout("receiver_alias", 93, 808, true))
+        .unwrap();
+    let prepare = |schema: &ChunkSchemaRef| {
+        super::online_unit::prepare_recipe(schema, &[], factory.as_ref()).unwrap()
+    };
+    let sender = prepare(&sender_schema);
+    let receiver = prepare(&receiver_schema);
+    let nullable = prepare(&nullable_schema);
+    assert_eq!(sender.value.digest(), receiver.value.digest());
+    // Permissive physical flags do not erase logical requiredness: these two
+    // recipes have equal canonical carrier schemas but different declarations.
+    assert_eq!(receiver.value.schema(), nullable.value.schema());
+    assert_ne!(receiver.value.digest(), nullable.value.digest());
+
+    let columns = vec![Arc::new(Int32Array::from(vec![7, 19])) as ArrayRef];
+    let owner = factory.begin_typed_construction(&sender_schema).unwrap();
+    let chunk = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+        sender_schema,
+        columns,
+        2,
+        owner.storage_lifetime(),
+        |step| owner.observe(0, &[], step),
+    )
+    .unwrap();
+    let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::new(
+        RuntimeErrorState::default(),
+    ));
+    let wire = super::online_unit::encode(&sender, &chunk, factory.as_ref(), &control).unwrap();
+    let decoded =
+        super::online_unit::decode(&receiver, &wire, &receiver_schema, factory.as_ref()).unwrap();
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].len(), 2);
+    assert_eq!(
+        decoded[0].columns()[0].to_data(),
+        chunk.columns()[0].to_data()
+    );
+    assert_eq!(
+        decoded[0].chunk_schema().slots()[0].slot_id(),
+        SlotId::new(93)
+    );
+    assert_eq!(
+        decoded[0].chunk_schema().slots()[0].name(),
+        "receiver_alias"
+    );
+    assert_eq!(decoded[0].chunk_schema().slots()[0].unique_id(), Some(808));
+
+    let error = super::online_unit::decode(&nullable, &wire, &nullable_schema, factory.as_ref())
+        .expect_err("logical nullability remains part of the prepared wire contract");
+    assert!(
+        error
+            .to_string()
+            .contains("recipe digest or version differs")
+    );
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(&error)
+            .reason()
+            .code(),
+        101
+    );
+}
+
 /// One explicit receiver instance: no global registry, inferred stream or raw
 /// queue publication. Every data item goes through its demand and decode lease.
 struct UnitFixture {
