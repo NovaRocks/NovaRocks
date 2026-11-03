@@ -85,6 +85,8 @@ struct Observed {
     cancel: bool,
     refuse_allocations: bool,
     max_source: Option<usize>,
+    copied_bodies: Vec<Buffer>,
+    cancel_after_body: bool,
 }
 impl UnitObserver for Observed {
     type Error = Refusal;
@@ -155,7 +157,12 @@ impl UnitObserver for Observed {
         self.before_allocation(
             Layout::from_size_align(body.len().max(1).next_multiple_of(64), 64).unwrap(),
         )?;
-        Ok(Buffer::from_slice_ref(body))
+        let buffer = Buffer::from_slice_ref(body);
+        self.copied_bodies.push(buffer.clone());
+        if self.cancel_after_body {
+            self.cancel = true;
+        }
+        Ok(buffer)
     }
     fn before_arrow_decode(
         &mut self,
@@ -544,4 +551,58 @@ fn prepared_carrier_cannot_change_declared_domain_parameters_or_child_identity()
         );
         assert_eq!(result.is_ok(), accepted);
     }
+}
+
+// The original Buffer allocation is observed directly, including independent
+// ArrayRef aliases; an encoder/decoder return alone is not its actual exit.
+#[test]
+fn decoded_body_lives_until_the_last_array_alias_really_exits() {
+    let field = Arc::new(Field::new("n", DataType::Int64, false));
+    let input = batch(
+        vec![field.clone()],
+        vec![Arc::new(Int64Array::from(vec![7, 11]))],
+    );
+    let mut sender = Observed::default();
+    let recipe = exact(&[field], &mut sender);
+    let wire = encode_unit(&recipe, &input, &mut sender).unwrap();
+    let mut receiver = Observed::default();
+    let decoded = decode_unit(&recipe, &wire, &mut receiver).unwrap();
+    assert_eq!(receiver.copied_bodies.len(), 1);
+    assert!(receiver.copied_bodies[0].strong_count() > 1);
+    let alias = decoded.column(0).clone();
+    drop(decoded);
+    assert!(receiver.copied_bodies[0].strong_count() > 1);
+    assert_eq!(
+        alias
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(1),
+        11
+    );
+    drop(alias);
+    assert_eq!(receiver.copied_bodies[0].strong_count(), 1);
+}
+
+#[test]
+fn cancellation_after_body_creation_releases_the_actual_decode_buffer() {
+    let field = Arc::new(Field::new("n", DataType::Int64, false));
+    let input = batch(
+        vec![field.clone()],
+        vec![Arc::new(Int64Array::from(vec![7]))],
+    );
+    let mut sender = Observed::default();
+    let recipe = exact(&[field], &mut sender);
+    let wire = encode_unit(&recipe, &input, &mut sender).unwrap();
+    let mut receiver = Observed {
+        cancel_after_body: true,
+        ..Observed::default()
+    };
+    assert!(matches!(
+        decode_unit(&recipe, &wire, &mut receiver),
+        Err(CodecError::Observer(Refusal::Cancelled))
+    ));
+    assert_eq!(receiver.decode_calls, 0);
+    assert_eq!(receiver.copied_bodies.len(), 1);
+    assert_eq!(receiver.copied_bodies[0].strong_count(), 1);
 }
