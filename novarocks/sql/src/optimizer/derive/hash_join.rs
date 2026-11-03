@@ -55,7 +55,10 @@ pub(crate) fn join_execution_distribution_for_alternative(
 /// preserved-left (see hash_join.rs derive_output's else branch).
 fn preserves_left(jk: &crate::common::JoinKind) -> bool {
     use crate::common::JoinKind::*;
-    matches!(jk, Inner | LeftOuter | LeftSemi | LeftAnti | Cross)
+    matches!(
+        jk,
+        Inner | LeftOuter | LeftSemi | LeftAnti | LeftMark { .. } | Cross
+    )
 }
 
 fn shuffle_join_column_ids(
@@ -195,7 +198,7 @@ fn hash_join_only_shuffle(join_type: crate::common::JoinKind) -> bool {
 
 fn hash_join_only_broadcast(join_type: crate::common::JoinKind) -> bool {
     use crate::common::JoinKind::*;
-    matches!(join_type, NullAwareLeftAnti)
+    matches!(join_type, NullAwareLeftAnti | LeftMark { .. })
 }
 
 /// Given a set of column ids representing a HashPartitioned key, and the
@@ -331,7 +334,7 @@ impl PhysicalHashJoinOp {
                     ordering: OrderingSpec::Any,
                 };
             }
-            LeftOuter | LeftSemi | LeftAnti | NullAwareLeftAnti => 0,
+            LeftOuter | LeftSemi | LeftAnti | NullAwareLeftAnti | LeftMark { .. } => 0,
             RightOuter | RightSemi | RightAnti => 1,
             FullOuter | Cross => return PhysicalPropertySet::any(),
         };
@@ -441,6 +444,17 @@ impl PhysicalHashJoinOp {
             ])];
         }
 
+        if matches!(self.join_type, crate::common::JoinKind::LeftMark { .. }) {
+            return match self.distribution {
+                JoinDistribution::Unknown => vec![
+                    Self::singleton_required_alternative(),
+                    Self::broadcast_required_alternative(),
+                ],
+                JoinDistribution::Singleton => vec![Self::singleton_required_alternative()],
+                JoinDistribution::Broadcast => vec![Self::broadcast_required_alternative()],
+                JoinDistribution::Shuffle | JoinDistribution::Colocate => Vec::new(),
+            };
+        }
         let hash_partitionable = shuffle_join_keys_are_supported(scalars, self.condition.keys());
         let partitioned_or_singleton = || {
             if hash_partitionable {
@@ -646,6 +660,37 @@ mod tests {
             vec![eq(col(eq_left), col(eq_right))],
             JoinDistribution::Broadcast,
         )
+    }
+
+    #[test]
+    fn mark_hash_join_offers_only_singleton_and_broadcast_and_preserves_probe() {
+        let mark = JoinKind::LeftMark { mark: ColumnId(99) };
+        let op = join_op(mark, vec![eq(col(10), col(20))], JoinDistribution::Unknown);
+        let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
+        assert_eq!(alternatives.len(), 2);
+        assert_eq!(alternatives[0].kind, PropertyAlternativeKind::SingletonJoin);
+        assert_eq!(alternatives[1].kind, PropertyAlternativeKind::BroadcastJoin);
+        let broadcast = join_op(
+            mark,
+            vec![eq(col(10), col(20))],
+            JoinDistribution::Broadcast,
+        );
+        let probe = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        assert_eq!(
+            broadcast.derive_output(&[&probe, &PhysicalPropertySet::gather()]),
+            probe
+        );
+        for distribution in [JoinDistribution::Shuffle, JoinDistribution::Colocate] {
+            let rejected = join_op(mark, vec![eq(col(10), col(20))], distribution);
+            assert!(
+                rejected
+                    .derive_required_alternatives(&PhysicalPropertySet::any(), 2)
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

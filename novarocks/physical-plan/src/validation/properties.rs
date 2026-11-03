@@ -1808,6 +1808,7 @@ fn derive_node_output_properties_from(
                     | crate::JoinKind::LeftOuter
                     | crate::JoinKind::LeftSemi
                     | crate::JoinKind::LeftAnti
+                    | crate::JoinKind::LeftMark
                     | crate::JoinKind::NullAwareLeftAnti,
                     _,
                     _,

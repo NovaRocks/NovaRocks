@@ -1355,6 +1355,7 @@ impl fmt::Display for ValueOriginDisplay<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         use novarocks_physical_plan::ValueOrigin;
         match self.0 {
+            ValueOrigin::JoinMark { node } => write!(formatter, "join-mark(n{})", node.get()),
             ValueOrigin::LogicalSummary { field } => {
                 write!(formatter, "logical-summary({field:?})")
             }
@@ -3476,6 +3477,7 @@ fn join_kind_label(kind: novarocks_physical_plan::JoinKind) -> &'static str {
         novarocks_physical_plan::JoinKind::RightSemi => "RIGHT SEMI",
         novarocks_physical_plan::JoinKind::LeftAnti => "LEFT ANTI",
         novarocks_physical_plan::JoinKind::RightAnti => "RIGHT ANTI",
+        novarocks_physical_plan::JoinKind::LeftMark => "NULL AWARE LEFT MARK",
         novarocks_physical_plan::JoinKind::NullAwareLeftAnti => "NULL AWARE LEFT ANTI",
     }
 }

@@ -101,6 +101,7 @@ impl RuntimeKernelControl {
     pub(crate) fn bind_runtime_memory(&mut self, state: &RuntimeState) {
         self.query_memory = state.query_memory().cloned();
     }
+
     pub(crate) fn bind_construction_factory(
         &mut self,
         factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,

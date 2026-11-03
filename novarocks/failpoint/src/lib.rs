@@ -188,10 +188,12 @@ pub enum QueryLifecycleFaultKind {
     /// is cancelled. This is a debug-only rendezvous used to prove that a
     /// query deadline aborts an already-open provider writer.
     ConnectorWriteAppendHold,
+    /// Holds the selected mark join at its original sole build publication point.
+    JoinBuildBeforePublishHold,
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::TerminalAckDrop,
         Self::TerminalSnapshotConflict,
         Self::RuntimeFilterContributionAckDrop,
@@ -222,6 +224,7 @@ impl QueryLifecycleFaultKind {
         Self::ConnectorWriteFinalMergeFailure,
         Self::ConnectorWriteFinalFinalizeFailure,
         Self::ConnectorWriteAppendHold,
+        Self::JoinBuildBeforePublishHold,
     ];
 
     pub const fn file_stem(self) -> &'static str {
@@ -268,6 +271,7 @@ impl QueryLifecycleFaultKind {
             Self::ConnectorWriteFinalMergeFailure => "connector-write-final-merge-failure",
             Self::ConnectorWriteFinalFinalizeFailure => "connector-write-final-finalize-failure",
             Self::ConnectorWriteAppendHold => "connector-write-append-hold",
+            Self::JoinBuildBeforePublishHold => "join-build-before-publish-hold",
         }
     }
 

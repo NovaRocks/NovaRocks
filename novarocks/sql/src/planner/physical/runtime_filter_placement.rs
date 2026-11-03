@@ -516,7 +516,8 @@ impl From<&JoinDistribution> for CrossExchangeMode {
 fn join_is_outer_or_anti_boundary(kind: JoinKind) -> bool {
     matches!(
         kind,
-        JoinKind::LeftOuter
+        JoinKind::LeftMark { .. }
+            | JoinKind::LeftOuter
             | JoinKind::RightOuter
             | JoinKind::FullOuter
             | JoinKind::LeftAnti

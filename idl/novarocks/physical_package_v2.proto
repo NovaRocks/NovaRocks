@@ -254,6 +254,7 @@ message ValueOrigin {
     CteImportOrigin cte_import = 8;
     WriterDerivedOrigin writer_derived = 9;
     LogicalChangeCountField logical_summary = 10;
+    uint32 join_mark_node_id = 11;
   }
 }
 enum LogicalChangeCountField {
@@ -702,6 +703,7 @@ enum JoinKind {
   JOIN_KIND_LEFT_ANTI = 8;
   JOIN_KIND_RIGHT_ANTI = 9;
   JOIN_KIND_NULL_AWARE_LEFT_ANTI = 10;
+  JOIN_KIND_LEFT_MARK = 11;
 }
 enum JoinSide {
   JOIN_SIDE_UNSPECIFIED = 0;

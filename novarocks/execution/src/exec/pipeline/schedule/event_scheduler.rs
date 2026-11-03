@@ -901,6 +901,8 @@ impl EventScheduler {
         let exchange_source_name = emit_exchange_marker.then(|| task.source_name().to_owned());
         #[cfg(novarocks_dev_controls)]
         let writer_diagnostic = task.writer_diagnostic();
+        #[cfg(novarocks_dev_controls)]
+        let mark_probe_dependency = task.mark_probe_dependency();
         let key = DriverKey::new(task.fragment_instance_id(), task.driver_id());
         let block_epoch = self
             .next_block_epoch
@@ -976,7 +978,7 @@ impl EventScheduler {
         #[cfg(novarocks_dev_controls)]
         if let Some((scope, source, sink)) = writer_diagnostic {
             scope.emit("driver_park", || format!(
-                "finst={:?} driver_id={} source={source:?} sink={sink:?} reason={reason:?} frozen_generation={generation} current_generation={} block_epoch={block_epoch}",
+                "finst={:?} driver_id={} source={source:?} sink={sink:?} reason={reason:?} mark_probe_dependency={mark_probe_dependency} frozen_generation={generation} current_generation={} block_epoch={block_epoch}",
                 key.finst, key.driver_id, observable.generation()
             ));
         }

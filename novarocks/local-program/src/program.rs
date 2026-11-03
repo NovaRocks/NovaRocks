@@ -243,6 +243,7 @@ pub enum JoinType {
     LeftAnti,
     RightAnti,
     NullAwareLeftAnti,
+    LeftMark,
 }
 
 /// One typed key pair. Its equality mode belongs to this pair, so a parallel
@@ -2129,10 +2130,35 @@ fn validate_shape(
             runtime_filter_consumers,
             ..
         } => {
+            if *join_type == JoinType::LeftMark {
+                let ProgramNodeKind::Join { left_layout, .. } = &node.kind else {
+                    unreachable!()
+                };
+                let width = left_layout.slots().len();
+                let fields = node.output_layout.schema().fields();
+                let bad = !matches!(condition, ProgramJoinCondition::NullAwareEqual { value_equal_keys, scope_keys, eligibility } if value_equal_keys.len() == 1 && scope_keys.is_empty() && eligibility.is_none() && !value_equal_keys[0].null_safe)
+                    || width.checked_add(1) != Some(fields.len())
+                    || fields.last().is_none_or(|field| {
+                        field.data_type() != &DataType::Boolean || !field.is_nullable()
+                    });
+                work.step()?;
+                if bad {
+                    return Err(LocalProgramError::InvalidNodeShape.into());
+                }
+                for (source, target) in left_layout.schema().fields().iter().zip(fields.iter()) {
+                    work.step()?;
+                    if source.data_type() != target.data_type()
+                        || source.is_nullable() != target.is_nullable()
+                    {
+                        return Err(LocalProgramError::InvalidNodeShape.into());
+                    }
+                }
+            }
             let keys = condition.keys();
             let bad = (!runtime_filter_consumers.is_empty()
                 && !matches!(join_type, JoinType::Inner | JoinType::LeftSemi))
-                || (*join_type == JoinType::NullAwareLeftAnti) != condition.is_null_aware()
+                || matches!(join_type, JoinType::NullAwareLeftAnti | JoinType::LeftMark)
+                    != condition.is_null_aware()
                 || (condition.is_null_aware() && keys.is_empty());
             work.step()?;
             if bad {

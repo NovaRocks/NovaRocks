@@ -2509,6 +2509,10 @@ impl RetainedAttemptInputs for SnapshotBoundDormantAttemptInputs {
         nomination: &novarocks_failpoint::target_binding::StatementWorkNomination,
     ) -> Result<(), NativeAttemptActivationFailure> {
         let publish = || -> Result<(), String> {
+            if controls.needs_mark_join_selection(nomination)? {
+                let (task,destination) = inputs.manifest().remote_mark_join_sender().ok_or("selected original manifest has no mark join with an actual remote output destination")?;
+                controls.publish_nominated_mark_join_task(nomination, task, destination)?;
+            }
             if controls.needs_remote_writer_selection(nomination)? {
                 let manifest = inputs.manifest();
                 let task = manifest.remote_writer_sender().ok_or(

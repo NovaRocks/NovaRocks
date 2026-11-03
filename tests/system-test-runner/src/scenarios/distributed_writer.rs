@@ -66,8 +66,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
-#[path = "writer_statement_actor.rs"]
-mod writer_statement_actor;
+use super::writer_statement_actor;
 use writer_statement_actor::{WriterActor, retain_write_result};
 #[path = "distributed_writer_row_level.rs"]
 mod row_level_contract;

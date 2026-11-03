@@ -194,11 +194,21 @@ struct Fixture {
     residual: Option<ExprId>,
 }
 
-fn values(builder: &mut FragmentBuilder, node: NodeId, rows: &[[i64; 2]]) -> [ValueId; 2] {
+fn values(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    rows: &[[i64; 2]],
+    canonical: bool,
+) -> [ValueId; 2] {
+    let ty = if canonical {
+        FunctionValueType::new(DataType::Utf8, false)
+    } else {
+        int64()
+    };
     let columns = [0u32, 1].map(|ordinal| {
         builder
             .add_value(
-                int64(),
+                ty.clone(),
                 ValueOrigin::NodeOutput {
                     node,
                     output_ordinal: ordinal,
@@ -214,8 +224,12 @@ fn values(builder: &mut FragmentBuilder, node: NodeId, rows: &[[i64; 2]]) -> [Va
                     builder
                         .add_expression(
                             node,
-                            int64(),
-                            ExprKind::Literal(LiteralValue::Int64(*cell)),
+                            ty.clone(),
+                            ExprKind::Literal(if canonical {
+                                LiteralValue::Utf8(cell.to_string().into())
+                            } else {
+                                LiteralValue::Int64(*cell)
+                            }),
                         )
                         .unwrap()
                 })
@@ -250,16 +264,22 @@ fn fixture(case: Case) -> Fixture {
 fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::ValidationErrors> {
     let fragment_id = FragmentId::new(41);
     let mut builder = FragmentBuilder::new(fragment_id);
-    let left = values(&mut builder, LEFT, &[[1, 10], [2, 20], [3, 30]]);
-    let right = values(&mut builder, RIGHT, &[[1, 15], [2, 5], [4, 40]]);
     let kind = kind_of(case.family);
+    let canonical = kind == JoinKind::LeftMark;
+    let key_ty = if canonical {
+        FunctionValueType::new(DataType::Utf8, false)
+    } else {
+        int64()
+    };
+    let left = values(&mut builder, LEFT, &[[1, 10], [2, 20], [3, 30]], canonical);
+    let right = values(&mut builder, RIGHT, &[[1, 15], [2, 5], [4, 40]], canonical);
     let key = match case.family {
         Family::Hash { null_safe, .. } => Some(JoinKey {
             left: builder
-                .add_expression(JOIN, int64(), ExprKind::Value(left[0]))
+                .add_expression(JOIN, key_ty.clone(), ExprKind::Value(left[0]))
                 .unwrap(),
             right: builder
-                .add_expression(JOIN, int64(), ExprKind::Value(right[0]))
+                .add_expression(JOIN, key_ty.clone(), ExprKind::Value(right[0]))
                 .unwrap(),
             null_safe,
         }),
@@ -316,6 +336,17 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
             (left.to_vec(), vec![])
         }
         JoinKind::RightSemi | JoinKind::RightAnti => (vec![], right.to_vec()),
+        JoinKind::LeftMark => (
+            left.to_vec(),
+            vec![
+                builder
+                    .add_value(
+                        FunctionValueType::new(DataType::Boolean, true),
+                        ValueOrigin::JoinMark { node: JOIN },
+                    )
+                    .unwrap(),
+            ],
+        ),
     };
     let output = match case.output {
         Output::Natural => left_out.iter().chain(&right_out).copied().collect(),
@@ -338,7 +369,7 @@ fn try_fixture(case: Case) -> Result<Fixture, novarocks_physical_plan::Validatio
             build_side,
             distribution: JoinDistribution::Singleton,
             null_extended,
-            condition: if kind == JoinKind::NullAwareLeftAnti {
+            condition: if matches!(kind, JoinKind::NullAwareLeftAnti | JoinKind::LeftMark) {
                 novarocks_physical_plan::HashJoinCondition::NullAwareEqual {
                     value_equal_keys: Box::from([key.clone().unwrap()]),
                     scope_keys: Box::default(),
@@ -1024,6 +1055,22 @@ fn nested_loop_kinds_lower_with_scope_predicates_and_singleton_mirroring() {
         assert_eq!(*left, local_of(&program, probe));
         assert_eq!(join_conjunct.is_some(), physical != JoinKind::Cross);
         if physical != JoinKind::Cross {
+            let snapshot = program
+                .checked()
+                .channels()
+                .expressions()
+                .resolved_calls()
+                .snapshot();
+            let root = snapshot.roots().sites()
+                [&site(join, ProgramNodeExpressionRole::NestedLoopPredicate)];
+            assert_eq!(
+                root.demand,
+                if matches!(physical, JoinKind::NullAwareLeftAnti) {
+                    novarocks_type_contract::EvaluationDemand::Value
+                } else {
+                    novarocks_type_contract::EvaluationDemand::TruthOnly
+                }
+            );
             let reads = slot_sources(
                 &program,
                 site(join, ProgramNodeExpressionRole::NestedLoopPredicate),
@@ -1188,5 +1235,55 @@ fn build_preserving_hash_kinds_keep_frozen_output_types_in_both_orientations() {
             assert_eq!(left_layout.slots().len(), 2);
             assert_eq!(right_layout.slots().len(), 2);
         }
+    }
+}
+
+#[test]
+fn hash_left_mark_lowers_canonical_keys_and_nullable_mark_without_build_output() {
+    let source = fixture(Case {
+        family: hash(JoinKind::LeftMark, JoinSide::Right),
+        residual: Residual::None,
+        output: Output::Natural,
+    });
+    let program = compile(&source.package);
+    let (join, kind) = join_node(&program);
+    let ProgramNodeKind::Join {
+        join_type,
+        condition,
+        left_layout,
+        ..
+    } = kind
+    else {
+        panic!("mark remains a hash join")
+    };
+    assert_eq!(*join_type, JoinType::LeftMark);
+    assert!(condition.is_null_aware());
+    assert_eq!(condition.keys().len(), 1);
+    assert!(condition.scope_keys().is_empty());
+    assert!(condition.residual_predicate().is_none());
+    let output = program.graph().nodes()[join.index()].output_layout();
+    assert_eq!(
+        output.schema().fields().len(),
+        left_layout.slots().len() + 1
+    );
+    assert_eq!(
+        output.schema().fields().last().unwrap().data_type(),
+        &DataType::Boolean
+    );
+    assert!(output.schema().fields().last().unwrap().is_nullable());
+    let snapshot = program
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .snapshot();
+    for role in [
+        ProgramNodeExpressionRole::NaaValueProbeKey { key: 0 },
+        ProgramNodeExpressionRole::NaaValueBuildKey { key: 0 },
+    ] {
+        assert_eq!(
+            snapshot.roots().sites()[&site(join, role)].demand,
+            novarocks_type_contract::EvaluationDemand::Value
+        );
     }
 }

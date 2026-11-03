@@ -42,6 +42,11 @@ pub enum ControlStep {
 }
 
 pub trait StepOperator: Send {
+    #[cfg(novarocks_dev_controls)]
+    fn is_mark_join_probe(&self) -> bool {
+        false
+    }
+
     #[cfg(test)]
     fn try_push_for_test(
         &mut self,
@@ -301,6 +306,11 @@ pub enum TransformInputEnd {
 }
 
 pub trait TransformKernel: Send {
+    #[cfg(novarocks_dev_controls)]
+    fn is_mark_join_probe(&self) -> bool {
+        false
+    }
+
     /// Read-only receiver state from this exact wrapper. A kernel can stop
     /// future demand only after accepted preparation has drained; an empty
     /// kernel cursor alone is not such a proof.
@@ -431,6 +441,11 @@ impl<K: TransformKernel, P: InputPreparation<K>> Transform<K, P> {
     }
 }
 impl<K: TransformKernel, P: InputPreparation<K>> StepOperator for Transform<K, P> {
+    #[cfg(novarocks_dev_controls)]
+    fn is_mark_join_probe(&self) -> bool {
+        self.kernel.is_mark_join_probe()
+    }
+
     fn poll_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
         if let Some(error) = &self.failure {
             return Err(error.clone());

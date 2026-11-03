@@ -103,7 +103,10 @@ impl JoinOrientation {
         matches!(
             self.kind,
             LocalJoinKind::Hash(
-                JoinType::LeftSemi | JoinType::LeftAnti | JoinType::NullAwareLeftAnti
+                JoinType::LeftSemi
+                    | JoinType::LeftAnti
+                    | JoinType::NullAwareLeftAnti
+                    | JoinType::LeftMark
             ) | LocalJoinKind::NestLoop(
                 NestedLoopJoinType::LeftSemi
                     | NestedLoopJoinType::LeftAnti
@@ -173,6 +176,7 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
                         JoinKind::FullOuter => JoinType::FullOuter,
                         JoinKind::RightSemi => JoinType::RightSemi,
                         JoinKind::RightAnti => JoinType::RightAnti,
+                        JoinKind::LeftMark => JoinType::LeftMark,
                         JoinKind::Cross => {
                             return Err(FragmentCompileError::Invalid(
                                 "cross join cannot use the hash-join node",
@@ -198,6 +202,11 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
                         JoinKind::FullOuter => JoinType::FullOuter,
                         JoinKind::LeftSemi => JoinType::RightSemi,
                         JoinKind::LeftAnti => JoinType::RightAnti,
+                        JoinKind::LeftMark => {
+                            return Err(FragmentCompileError::Invalid(
+                                "left mark join requires its probe on the left",
+                            ));
+                        }
                         JoinKind::Cross => {
                             return Err(FragmentCompileError::Invalid(
                                 "cross join cannot use the hash-join node",
@@ -222,7 +231,7 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
             }
             // Cross-instance null-key knowledge is not representable when
             // each instance holds only its partition of the build.
-            if local == JoinType::NullAwareLeftAnti
+            if matches!(local, JoinType::NullAwareLeftAnti | JoinType::LeftMark)
                 && matches!(
                     distribution,
                     JoinDistribution::Partitioned | JoinDistribution::Colocated
@@ -250,6 +259,11 @@ pub(crate) fn orient_join(node: &PhysicalNode) -> Result<JoinOrientation, Fragme
                 // The original complete predicate owns NAA guard/demand;
                 // the runtime never reconstructs C/E from its shape.
                 JoinKind::NullAwareLeftAnti => (0, NestedLoopJoinType::NullAwareLeftAnti),
+                JoinKind::LeftMark => {
+                    return Err(FragmentCompileError::Invalid(
+                        "left mark join requires hash execution",
+                    ));
+                }
                 // Only a singleton placement may swap: a broadcast right side
                 // would become the preserved side and duplicate its rows.
                 JoinKind::RightSemi | JoinKind::RightAnti
@@ -357,6 +371,15 @@ pub(crate) fn resource_bound(
     }
     let channels = sides
         .checked_mul(3)
+        .and_then(|channels| {
+            channels.checked_add(usize::from(matches!(
+                node.kind,
+                NodeKind::HashJoin {
+                    kind: JoinKind::LeftMark,
+                    ..
+                }
+            )))
+        })
         .ok_or(CompileControlError::ResourceExhausted)?;
     Ok(Some((1, channels, node.output.columns.len())))
 }
@@ -457,6 +480,14 @@ pub(crate) fn shape_join_with_creation<H>(
             work,
         )?;
     }
+    let mark = if orientation.kind == LocalJoinKind::Hash(JoinType::LeftMark) {
+        let mark = node.output.columns.iter().copied().find(|value| values.get(value).is_some_and(|definition| matches!(definition.origin, ValueOrigin::JoinMark { node: owner } if owner == node.id)))
+            .ok_or(FragmentCompileError::Invalid("left mark join has no original mark output"))?;
+        canonical_types.push((mark, true));
+        Some(mark)
+    } else {
+        None
+    };
     let mut sources = Vec::new();
     reserve_vec(&mut sources, node.output.columns.len(), work)?;
     for value in node.output.columns.iter() {
@@ -464,6 +495,9 @@ pub(crate) fn shape_join_with_creation<H>(
             .get(value)
             .ok_or(FragmentCompileError::Invalid("missing join output value"))?;
         let canonical = match definition.origin {
+            ValueOrigin::JoinMark { node: owner } if owner == node.id && mark == Some(*value) => {
+                probe_width
+            }
             ValueOrigin::NullExtended { node: owner, of } if owner == node.id => {
                 match (probe_port.get(&of), build_port.get(&of)) {
                     (Some(&ordinal), None) if orientation.null_extends_probe() => ordinal,
@@ -772,7 +806,7 @@ pub(crate) fn root_role(
 ) -> Result<(ProgramNodeExpressionRole, ProgramChannelLayoutRole), FragmentCompileError> {
     match (role, planned.orientation.kind) {
         (ExpressionRootRole::JoinKey { key, side }, LocalJoinKind::Hash(kind))
-            if kind != JoinType::NullAwareLeftAnti =>
+            if !matches!(kind, JoinType::NullAwareLeftAnti | JoinType::LeftMark) =>
         {
             Ok(if side == planned.orientation.probe_side() {
                 (
@@ -787,7 +821,7 @@ pub(crate) fn root_role(
             })
         }
         (ExpressionRootRole::HashJoinResidual, LocalJoinKind::Hash(kind))
-            if kind != JoinType::NullAwareLeftAnti =>
+            if !matches!(kind, JoinType::NullAwareLeftAnti | JoinType::LeftMark) =>
         {
             Ok((
                 ProgramNodeExpressionRole::JoinResidual,
@@ -796,7 +830,7 @@ pub(crate) fn root_role(
         }
         (
             ExpressionRootRole::NaaValueEqualKey { key, side },
-            LocalJoinKind::Hash(JoinType::NullAwareLeftAnti),
+            LocalJoinKind::Hash(JoinType::NullAwareLeftAnti | JoinType::LeftMark),
         ) => Ok(if side == planned.orientation.probe_side() {
             (
                 ProgramNodeExpressionRole::NaaValueProbeKey { key },
@@ -810,7 +844,7 @@ pub(crate) fn root_role(
         }),
         (
             ExpressionRootRole::NaaScopeKey { key, side },
-            LocalJoinKind::Hash(JoinType::NullAwareLeftAnti),
+            LocalJoinKind::Hash(JoinType::NullAwareLeftAnti | JoinType::LeftMark),
         ) => Ok(if side == planned.orientation.probe_side() {
             (
                 ProgramNodeExpressionRole::NaaScopeProbeKey { key },
@@ -822,12 +856,13 @@ pub(crate) fn root_role(
                 ProgramChannelLayoutRole::JoinRight,
             )
         }),
-        (ExpressionRootRole::NaaEligibility, LocalJoinKind::Hash(JoinType::NullAwareLeftAnti)) => {
-            Ok((
-                ProgramNodeExpressionRole::NaaEligibility,
-                ProgramChannelLayoutRole::JoinScope,
-            ))
-        }
+        (
+            ExpressionRootRole::NaaEligibility,
+            LocalJoinKind::Hash(JoinType::NullAwareLeftAnti | JoinType::LeftMark),
+        ) => Ok((
+            ProgramNodeExpressionRole::NaaEligibility,
+            ProgramChannelLayoutRole::JoinScope,
+        )),
         (ExpressionRootRole::NestLoopPredicate, LocalJoinKind::NestLoop(_)) => Ok((
             ProgramNodeExpressionRole::NestedLoopPredicate,
             ProgramChannelLayoutRole::JoinScope,

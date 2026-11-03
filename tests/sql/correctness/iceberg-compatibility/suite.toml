@@ -20,6 +20,8 @@ explicit_only = false
 [impact]
 paths = [
     "novarocks/connector/iceberg/**",
+    "novarocks/types/src/value/variant.rs",
+    "novarocks/result-render/src/encoder.rs",
     "novarocks/functions/src/evaluation.rs",
     "novarocks/functions/src/kernel_input.rs",
     "novarocks/execution/src/exec/expr/compiled_program.rs",

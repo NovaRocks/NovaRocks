@@ -4377,6 +4377,128 @@ mod tests {
     }
 
     #[test]
+    fn json_in_value_form_admission_preserves_clause_and_json_evidence() {
+        for (sql, clause) in [
+            (
+                "select parse_json('{}') in (select parse_json('{}'))",
+                ApplyClause::Projection,
+            ),
+            (
+                "select 1 where false or parse_json('{}') not in (select parse_json('null'))",
+                ApplyClause::Where,
+            ),
+            (
+                "select count(*) from orders having false or parse_json(cast(max(o_orderkey) as varchar)) in (select parse_json('1'))",
+                ApplyClause::Having,
+            ),
+            (
+                "select parse_json(cast(max(o_orderkey) as varchar)) as j from orders having false or j in (select parse_json('1'))",
+                ApplyClause::Having,
+            ),
+            (
+                "select false or parse_json('{}') in (select parse_json('{}'))",
+                ApplyClause::Projection,
+            ),
+        ] {
+            let resolved = parse_and_analyze(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            let spec = only_scalar_spec(select_body(&resolved));
+            assert_eq!(spec.clause, clause);
+            let probe = spec.mark_probe.as_ref().expect("JSON value-form probe");
+            assert_eq!(
+                probe.value_type.logical_type(),
+                novarocks_type_contract::ValueLogicalType::Json
+            );
+            assert_eq!(spec.inner.output_columns.len(), 1);
+            assert!(!spec.need_check_max_rows);
+            assert!(spec.output_column.value_type.nullable());
+            let bindings = spec
+                .mark_key_bindings
+                .as_ref()
+                .expect("two original key bindings");
+            for binding in bindings {
+                assert_eq!(
+                    binding.function_id.as_str(),
+                    novarocks_functions::json_canonical::FUNCTION_ID
+                );
+                let novarocks_functions::FunctionResultType::Scalar(result) =
+                    &binding.selected.result_type
+                else {
+                    panic!("scalar key")
+                };
+                assert_eq!(result.data_type(), &DataType::Utf8);
+                assert_eq!(
+                    result.logical_type(),
+                    novarocks_type_contract::ValueLogicalType::Physical
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_in_subquery_rejects_unsupported_positions_and_erased_identity() {
+        for sql in [
+            "select 1 where parse_json('{}') in (select parse_json('{}'))",
+            "select 1 where not (parse_json('{}') in (select parse_json('{}')))",
+            "select 1 where case when parse_json('{}') in (select parse_json('{}')) then true else false end",
+            "select parse_json('{}') in (select '{}')",
+            "select parse_json('1') in (select cast(1 as variant))",
+            "select cast(1 as variant) in (select parse_json('1'))",
+            "select '{}' in (select parse_json('{}'))",
+            "select parse_json('{}') in (select parse_json('{}'), parse_json('{}'))",
+            "select parse_json('{}') in (select parse_json(cast(o_orderkey as varchar))) from orders",
+            "select count(parse_json('{}') in (select parse_json('{}'))) from orders",
+            "select * from orders join lineitem on parse_json('{}') in (select parse_json('{}'))",
+        ] {
+            assert!(parse_and_analyze(sql).is_err(), "must reject: {sql}");
+        }
+    }
+
+    #[test]
+    fn json_typed_literals_preserve_the_declared_domain_and_original_bytes() {
+        for text in [
+            "1.00",
+            "123456789012345678901234567890",
+            "1E400",
+            "not JSON",
+        ] {
+            let sql = format!("select JSON '{text}'");
+            let resolved = parse_and_analyze(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            let item = &select_body(&resolved).projection[0].expr;
+            assert_eq!(
+                item.value_type.logical_type(),
+                novarocks_type_contract::ValueLogicalType::Json
+            );
+            assert!(!item.value_type.nullable());
+            assert!(
+                matches!(&item.kind, ExprKind::Literal(LiteralValue::String(actual)) if actual == text)
+            );
+        }
+        let resolved = parse_and_analyze("select JSON '1.00' in (select JSON '1.0')")
+            .expect("typed JSON mark admission");
+        let spec = only_scalar_spec(select_body(&resolved));
+        assert!(spec.mark_key_bindings.is_some());
+        assert!(
+            matches!(&spec.mark_probe.as_ref().unwrap().kind, ExprKind::Literal(LiteralValue::String(value)) if value == "1.00")
+        );
+    }
+
+    #[test]
+    fn json_comparison_rejects_foreign_domains_before_carrier_coercion() {
+        for sql in [
+            "select parse_json('1') in (cast(1 as variant))",
+            "select cast(1 as variant) in (parse_json('1'))",
+            "select parse_json('1') = cast(1 as variant)",
+            "select parse_json('1') in ('1')",
+            "select parse_json('1') in (1)",
+            "select __json_canonical_key(parse_json('1'))",
+        ] {
+            assert!(parse_and_analyze(sql).is_err(), "must reject {sql}");
+        }
+        assert!(parse_and_analyze("select parse_json('1') in (parse_json('1'), null)").is_ok());
+        assert!(parse_and_analyze("select '1.0' in ('1.00')").is_ok());
+    }
+
+    #[test]
     fn exists_subquery_rewrites_to_left_semi_join() {
         let sql = "SELECT o_orderpriority, count(*) FROM orders \
                     WHERE exists (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey) \

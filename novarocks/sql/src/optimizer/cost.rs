@@ -620,7 +620,10 @@ pub(crate) fn broadcast_decision(input: &CostInput<'_>) -> Option<BroadcastDecis
 }
 
 fn broadcast_decision_is_forced(join: &PhysicalHashJoinOp, input: &CostInput<'_>) -> bool {
-    if join.join_type == JoinKind::NullAwareLeftAnti {
+    if matches!(
+        join.join_type,
+        JoinKind::NullAwareLeftAnti | JoinKind::LeftMark { .. }
+    ) {
         return true;
     }
     let Some(scalars) = input.scalars else {

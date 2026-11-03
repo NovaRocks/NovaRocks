@@ -1,0 +1,119 @@
+-- query 1
+-- types	boolean
+included
+false
+
+-- query 2
+-- types	boolean
+included
+false
+
+-- query 3
+-- types	boolean
+included
+false
+
+-- query 4
+-- types	boolean
+included
+true
+
+-- query 5
+-- types	boolean
+included
+true
+
+-- query 6
+-- types	boolean
+included
+true
+
+-- query 7
+-- types	boolean
+included
+false
+
+-- query 8
+-- types	boolean
+included
+true
+
+-- query 9
+-- types	boolean
+included
+false
+
+-- query 10
+-- types	boolean
+included
+true
+
+-- query 11
+-- types	boolean
+included
+true
+
+-- query 12
+-- types	boolean
+included
+false
+
+-- query 13
+-- types	boolean
+included
+true
+
+-- query 14
+-- types	boolean
+included
+false
+
+-- query 15
+-- types	boolean
+included
+true
+
+-- query 16
+-- types	boolean
+included
+NULL
+
+-- query 17
+-- types	boolean
+included
+NULL
+
+-- query 18
+-- types	boolean
+included
+false
+
+-- query 19
+-- types	boolean
+included
+false
+
+-- query 20
+-- types	boolean
+included
+false
+
+-- query 21
+-- types	boolean
+included
+false
+
+-- query 22
+-- types	boolean
+included
+true
+
+-- query 23
+-- types	boolean
+included
+true
+
+-- query 24
+-- types	boolean
+included
+true

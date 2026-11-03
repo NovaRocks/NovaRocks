@@ -703,7 +703,7 @@ impl<H> RootCollector<'_, '_, H> {
                         node,
                         Role::NestedLoopPredicate,
                         *definition,
-                        if *join_type == NestedLoopJoinType::NullAwareLeftAnti {
+                        if matches!(join_type, NestedLoopJoinType::NullAwareLeftAnti) {
                             Value
                         } else {
                             TruthOnly

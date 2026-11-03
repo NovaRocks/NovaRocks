@@ -179,15 +179,48 @@ pub(super) fn plan_select_scoped_with_source(
             }
         }
 
+        // Mark probes belong to the post-aggregate row domain. Include their
+        // roots in the ordinary aggregate extraction, then retain the rewritten
+        // expression for the owning mark join instead of projecting it early.
+        let projected_count = select.projection.len();
+        let mut mark_spec_indices = Vec::new();
+        let mut aggregate_projection = select.projection.clone();
+        for (index, spec) in apply_specs.iter().enumerate() {
+            if matches!(spec.clause, ApplyClause::Having | ApplyClause::Projection)
+                && let Some(probe) = &spec.mark_probe
+            {
+                let id = factory.create(
+                    None,
+                    format!("__mark_aggregate_probe_{index}"),
+                    probe.value_type.clone(),
+                );
+                aggregate_projection.push(ProjectItem {
+                    expr: probe.clone(),
+                    output_name: format!("__mark_aggregate_probe_{index}"),
+                    output_column_id: id,
+                });
+                mark_spec_indices.push(index);
+                let mut extra = Vec::new();
+                collect_non_agg_column_refs(probe, &select.group_by, &mut extra, control)?;
+                select.group_by.extend(extra);
+            }
+        }
         let aggregate_group_by = dedup_group_by_exprs(&select.group_by, control)?;
-        let (project_items, agg_calls, output_columns, rewritten_having) =
+        let (mut project_items, agg_calls, output_columns, rewritten_having) =
             split_projection_for_aggregate(
-                &select.projection,
+                &aggregate_projection,
                 &aggregate_group_by,
                 select.having.as_ref(),
                 factory,
                 control,
             )?;
+
+        for (index, item) in mark_spec_indices
+            .into_iter()
+            .zip(project_items.drain(projected_count..))
+        {
+            apply_specs[index].mark_probe = Some(item.expr);
+        }
         current = LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: aggregate_group_by,

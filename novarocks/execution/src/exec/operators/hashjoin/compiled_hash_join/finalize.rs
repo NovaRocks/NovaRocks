@@ -83,10 +83,14 @@ impl OperatorFactory for CompiledJoinFinalizeSourceFactory {
             key_counters: None,
             reports_partitions: driver_id == 0,
             partitions_recorded: false,
+            #[cfg(novarocks_dev_controls)]
+            test_control: None,
         }))
     }
 }
 struct JoinFinalizeSource {
+    #[cfg(novarocks_dev_controls)]
+    test_control: Option<Arc<dyn crate::runtime::join_test_control::JoinBuildPublicationControl>>,
     name: String,
     declaration: Arc<CompiledJoinFrame>,
     frame: Option<Arc<JoinBuildFrame>>,
@@ -267,6 +271,10 @@ impl OperatorLifecycle for JoinFinalizeSource {
                 control: &self.control,
             };
             let frame = self.declaration.prepare(&work)?;
+            #[cfg(novarocks_dev_controls)]
+            if let Some(control) = &self.test_control {
+                frame.install_test_control(self.declaration.node().index(), Arc::clone(control));
+            }
             self.schema = Some(schema);
             self.frame = Some(frame);
             Ok(())
@@ -278,6 +286,24 @@ impl OperatorLifecycle for JoinFinalizeSource {
     }
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
+        #[cfg(novarocks_dev_controls)]
+        if matches!(
+            self.declaration
+                .program
+                .graph()
+                .nodes()
+                .get(self.declaration.node().index())
+                .map(|node| node.kind()),
+            Some(novarocks_local_program::ProgramNodeKind::Join {
+                join_type: novarocks_local_program::JoinType::LeftMark,
+                ..
+            })
+        ) {
+            self.test_control = state.join_build_control();
+            if let (Some(frame), Some(control)) = (&self.frame, &self.test_control) {
+                frame.install_test_control(self.declaration.node().index(), Arc::clone(control));
+            }
+        }
         Ok(())
     }
     fn activate(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
@@ -414,7 +440,21 @@ impl SourceKernel for JoinFinalizeSource {
                 reason: WaitReason::Dependency,
                 observable,
                 observed_generation,
-                deadline: None,
+                deadline: {
+                    #[cfg(novarocks_dev_controls)]
+                    {
+                        frame.publication_test_held().then(|| {
+                            crate::exec::pipeline::operator::DriverBlockDeadline::new(
+                                std::time::Instant::now() + std::time::Duration::from_millis(20),
+                                observed_generation,
+                            )
+                        })
+                    }
+                    #[cfg(not(novarocks_dev_controls))]
+                    {
+                        None
+                    }
+                },
             }),
         };
         Ok(StepResult::new(None, next, 0))

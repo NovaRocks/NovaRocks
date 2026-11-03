@@ -136,6 +136,7 @@ impl CompiledHashJoinPlan {
             novarocks_local_program::JoinType::LeftSemi => JoinType::LeftSemi,
             novarocks_local_program::JoinType::LeftAnti => JoinType::LeftAnti,
             novarocks_local_program::JoinType::NullAwareLeftAnti => JoinType::NullAwareLeftAnti,
+            novarocks_local_program::JoinType::LeftMark => JoinType::LeftMark,
             novarocks_local_program::JoinType::RightOuter => JoinType::RightOuter,
             novarocks_local_program::JoinType::FullOuter => JoinType::FullOuter,
             novarocks_local_program::JoinType::RightSemi => JoinType::RightSemi,
@@ -192,6 +193,22 @@ impl CompiledHashJoinPlan {
             .iter()
             .map(|site| root_value_type(program, *site).map_err(ExecutionFailure::from))
             .collect::<ExecutionResult<Vec<_>>>()?;
+        if join_type == JoinType::LeftMark
+            && (keys.len() != 1
+                || !condition.is_null_aware()
+                || !condition.scope_keys().is_empty()
+                || condition.residual_predicate().is_some()
+                || keys[0].null_safe
+                || probe_key_bindings
+                    .iter()
+                    .chain(&build_key_bindings)
+                    .any(|ty| ty.data_type() != &arrow::datatypes::DataType::Utf8))
+        {
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "mark join requires its frozen single NULL-aware Utf8 equality key",
+            ));
+        }
         let residual = condition.residual_predicate().map(|_| {
             site(if condition.is_null_aware() {
                 ProgramNodeExpressionRole::NaaEligibility

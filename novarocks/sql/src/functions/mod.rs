@@ -313,6 +313,23 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         )
     }
 
+    fn resolve_json_canonical_key_binding(
+        &self,
+        argument: &FunctionArgument,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
+        self.resolve_bound_trusted(
+            novarocks_functions::json_canonical::FUNCTION_NAME,
+            FunctionKind::Scalar,
+            FunctionBindingRequest {
+                arguments: std::slice::from_ref(argument),
+                logical_argument_count: 1,
+                expected_result_type: None,
+            },
+            control,
+        )
+    }
+
     fn resolve_window_binding(
         &self,
         name: &str,

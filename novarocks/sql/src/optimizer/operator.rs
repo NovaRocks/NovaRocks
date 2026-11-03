@@ -84,7 +84,8 @@ pub(crate) const fn exact_hash_join_build_side(join_type: JoinKind) -> Option<Ha
         | JoinKind::FullOuter
         | JoinKind::LeftSemi
         | JoinKind::LeftAnti
-        | JoinKind::NullAwareLeftAnti => Some(HashJoinBuildSide::Right),
+        | JoinKind::NullAwareLeftAnti
+        | JoinKind::LeftMark { .. } => Some(HashJoinBuildSide::Right),
     }
 }
 

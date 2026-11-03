@@ -2923,6 +2923,14 @@ pub trait ServerHandle: Send {
     ) -> Result<bool> {
         bail!("selected Native action observation is unsupported by this server mode")
     }
+    fn selected_query_lifecycle_fault_task(
+        &self,
+        _index: usize,
+        _kind: &'static str,
+        _run_token: &str,
+    ) -> Result<Option<novarocks_failpoint::target_binding::StatementTaskBinding>> {
+        bail!("selected Native Task observation is unsupported by this server mode")
+    }
     fn selected_native_observation_binding(
         &self,
         _index: usize,
@@ -5575,6 +5583,18 @@ impl ServerHandle for CrossProcessServerHandle {
             .as_ref()
             .context("Native action observation has no role session")?
             .native_fault_hit(index, kind, run_token)
+    }
+    fn selected_query_lifecycle_fault_task(
+        &self,
+        index: usize,
+        kind: &'static str,
+        run_token: &str,
+    ) -> Result<Option<novarocks_failpoint::target_binding::StatementTaskBinding>> {
+        self.ensure_be_index(index)?;
+        self.test_sessions
+            .as_ref()
+            .context("Native Task observation has no role session")?
+            .native_fault_task_binding(index, kind, run_token)
     }
     fn selected_native_observation_binding(
         &self,

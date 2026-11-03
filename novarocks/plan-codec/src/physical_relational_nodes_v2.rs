@@ -79,6 +79,7 @@ fn encode_join_kind(input: p::JoinKind) -> i32 {
         p::JoinKind::RightSemi => wire::JoinKind::RightSemi as i32,
         p::JoinKind::LeftAnti => wire::JoinKind::LeftAnti as i32,
         p::JoinKind::RightAnti => wire::JoinKind::RightAnti as i32,
+        p::JoinKind::LeftMark => wire::JoinKind::LeftMark as i32,
         p::JoinKind::NullAwareLeftAnti => wire::JoinKind::NullAwareLeftAnti as i32,
     }
 }
@@ -93,6 +94,7 @@ fn decode_join_kind(input: i32, w: &mut CompileCheckpoints<'_>) -> Result<p::Joi
         Ok(wire::JoinKind::RightSemi) => Ok(p::JoinKind::RightSemi),
         Ok(wire::JoinKind::LeftAnti) => Ok(p::JoinKind::LeftAnti),
         Ok(wire::JoinKind::RightAnti) => Ok(p::JoinKind::RightAnti),
+        Ok(wire::JoinKind::LeftMark) => Ok(p::JoinKind::LeftMark),
         Ok(wire::JoinKind::NullAwareLeftAnti) => Ok(p::JoinKind::NullAwareLeftAnti),
         _ => Err(invalid("relational enum is unspecified or unknown")),
     };
@@ -242,7 +244,9 @@ fn validate_physical_join_condition(
     kind: p::JoinKind,
     condition: &PhysicalHashCondition,
 ) -> Result<(), Error> {
-    if (kind == p::JoinKind::NullAwareLeftAnti) != condition.is_null_aware() {
+    if matches!(kind, p::JoinKind::NullAwareLeftAnti | p::JoinKind::LeftMark)
+        != condition.is_null_aware()
+    {
         return Err(invalid("hash join kind and condition variant disagree"));
     }
     if condition.is_null_aware() && condition.keys().is_empty() {
@@ -281,7 +285,10 @@ fn validate_wire_join_condition(node: &wire::HashJoinNode) -> Result<(), Error> 
         node.condition,
         Some(wire::hash_join_node::Condition::NullAwareEqual(_))
     );
-    if (node.kind == wire::JoinKind::NullAwareLeftAnti as i32) != naa {
+    if (node.kind == wire::JoinKind::NullAwareLeftAnti as i32
+        || node.kind == wire::JoinKind::LeftMark as i32)
+        != naa
+    {
         return Err(invalid("hash join kind and condition variant disagree"));
     }
     if naa && keys.is_empty() {

@@ -151,3 +151,81 @@ fn provider_free_statement_publishes_checked_packages_through_extraction() {
         assert_eq!(package.fragment().id(), *id);
     }
 }
+
+#[test]
+fn json_in_subquery_authors_a_null_aware_hash_mark_with_canonical_keys() {
+    use novarocks_physical_plan::{JoinDistribution, JoinKind, ValueOrigin};
+    let owner = table_free_owner(
+        "SELECT JSON '{\"a\":1,\"b\":2}' IN (SELECT JSON '{\"b\":2,\"a\":1}') AS present",
+    );
+    let mut count = 0;
+    for fragment in owner.plan().fragments().values() {
+        for node in fragment.nodes().values() {
+            if let NodeKind::HashJoin {
+                kind: JoinKind::LeftMark,
+                distribution,
+                condition,
+                ..
+            } = &node.kind
+            {
+                count += 1;
+                assert!(matches!(
+                    distribution,
+                    JoinDistribution::Singleton | JoinDistribution::BroadcastBuild
+                ));
+                let mark = node.output.columns.iter().filter_map(|id| fragment.values().get(id)).find(|value| matches!(value.origin, ValueOrigin::JoinMark { node: id } if id == node.id)).expect("authored mark output");
+                assert!(mark.ty.nullable());
+                assert_eq!(mark.ty.data_type(), &arrow::datatypes::DataType::Boolean);
+                let novarocks_physical_plan::HashJoinCondition::NullAwareEqual {
+                    value_equal_keys,
+                    scope_keys,
+                    eligibility,
+                } = condition
+                else {
+                    panic!("mark must preserve null-aware equality")
+                };
+                assert_eq!(value_equal_keys.len(), 1);
+                assert!(scope_keys.is_empty() && eligibility.is_none());
+                assert!(!value_equal_keys[0].null_safe);
+                for key in [value_equal_keys[0].left, value_equal_keys[0].right] {
+                    let ty = &fragment.expressions().get(key).unwrap().ty;
+                    assert_eq!(ty.data_type(), &arrow::datatypes::DataType::Utf8);
+                    assert_eq!(
+                        ty.logical_type(),
+                        novarocks_type_contract::ValueLogicalType::Physical
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(count, 1);
+    let control = SqlCompileControl::unbounded();
+    let contract = crate::explain::completed::render_completed_plan(
+        owner.plan(),
+        &[],
+        crate::explain::ExplainLevel::Contract,
+        None,
+        crate::explain::completed::ExplainRenderBudget::default(),
+        &control,
+    )
+    .expect("completed mark contract EXPLAIN");
+    let tree = crate::explain::completed_tree::render_completed_plan_tree(
+        owner.plan(),
+        crate::explain::ExplainLevel::Normal,
+        &control,
+    )
+    .expect("completed mark tree EXPLAIN");
+    for lines in [contract, tree] {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("NULL AWARE LEFT MARK"))
+        );
+    }
+    author_fragment_package_semantics(
+        &owner,
+        crate::constant::test_constant_policy(),
+        &SqlCompileControl::unbounded(),
+    )
+    .expect("JSON normalization calls and hash key roots are frozen");
+}

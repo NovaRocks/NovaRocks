@@ -897,6 +897,39 @@ impl TaskManifestBinding {
     }
 
     #[cfg(novarocks_dev_controls)]
+    pub(crate) fn remote_mark_join_sender(&self) -> Option<(TaskIdentity, BackendProcessId)> {
+        self.tasks
+            .iter()
+            .filter(|task| {
+                self.native_template
+                    .template
+                    .native_template
+                    .get(task.fragment_id())
+                    .is_some_and(|fragment| fragment.facts().has_left_mark_join())
+            })
+            .find_map(|task| {
+                self.edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.source_fragment_id() == task.fragment_id()
+                            && edge
+                                .producers()
+                                .iter()
+                                .any(|producer| producer.task() == task.identity())
+                    })
+                    .find_map(|edge| {
+                        edge.destinations()
+                            .iter()
+                            .find(|destination| {
+                                destination.backend_process_id()
+                                    != task.identity().backend_process_id()
+                            })
+                            .map(|destination| (task.identity(), destination.backend_process_id()))
+                    })
+            })
+    }
+
+    #[cfg(novarocks_dev_controls)]
     pub(crate) fn remote_writer_sender(&self) -> Option<TaskIdentity> {
         select_remote_writer_sender(self.writer_cohorts(), self.root, &self.edges)
     }

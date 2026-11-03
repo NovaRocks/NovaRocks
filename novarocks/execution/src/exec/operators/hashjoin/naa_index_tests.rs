@@ -539,3 +539,86 @@ fn empty_physical_domain_keeps_null_probes_and_no_eligibility_pairs() {
         );
     }
 }
+
+#[test]
+fn single_key_mark_truth_preserves_true_unknown_false_and_empty_build() {
+    let probe_rows = vec![vec![Some(1)], vec![Some(2)], vec![None], vec![Some(1)]];
+    for build_rows in [
+        vec![],
+        vec![vec![Some(1)], vec![Some(1)]],
+        vec![vec![None]],
+        vec![vec![Some(1)], vec![None]],
+    ] {
+        let (owner, tracker) = fixture();
+        let work = work(owner.as_ref(), &tracker, &Control);
+        let types = [FunctionValueType::new(DataType::Int32, true)];
+        let policies = [NullPolicy::Unmatchable];
+        let (data, group) = build(&build_rows, 0, &types, &policies, false, true, &work);
+        let store = NaaCandidateStore::new(&data, 0..1, false).unwrap();
+        let page = probe(&store, &probe_rows, &types, &group, &work);
+        for (row, values) in probe_rows.iter().enumerate() {
+            // An independent SQL ANY oracle over original row occurrences.
+            let comparisons = build_rows
+                .iter()
+                .map(|build| eq(values[0], build[0], policies[0]))
+                .collect::<Vec<_>>();
+            let expected = if comparisons.contains(&Some(true)) {
+                Some(true)
+            } else if comparisons.contains(&None) {
+                None
+            } else {
+                Some(false)
+            };
+            assert_eq!(store.mark_truth(&page, row).unwrap(), expected);
+        }
+    }
+}
+
+#[cfg(novarocks_dev_controls)]
+#[test]
+fn retained_key_observation_disappears_when_original_writer_latches_failure() {
+    let (owner, tracker) = fixture();
+    let work = work(owner.as_ref(), &tracker, &Control);
+    let types = [FunctionValueType::new(DataType::Int32, true)];
+    let domains = naa(
+        &types,
+        &[NullPolicy::Unmatchable],
+        0..1,
+        &[],
+        IndexPurpose::PresenceOnly,
+        &work,
+    );
+    let mut writer = InputRunWriter::new(
+        &domains,
+        B3RunId::from_input_slot(0, 1).unwrap(),
+        false,
+        &work,
+    )
+    .unwrap();
+    assert_eq!(writer.retained_key_rows(), None);
+    let columns = arrays(&[vec![Some(1)], vec![None]], 1);
+    writer
+        .push_evaluated(
+            &source(2),
+            EvaluatedJoinKeyPage::Naa {
+                scope: EvaluatedKeyProjection {
+                    arrays: &[],
+                    bindings: &[],
+                },
+                values: EvaluatedKeyProjection {
+                    arrays: &columns,
+                    bindings: &types,
+                },
+            },
+            &mut ValueConversionContext::default(),
+            &work,
+        )
+        .unwrap();
+    assert_eq!(writer.retained_key_rows(), Some(2));
+    assert!(writer.push_payload(&source(1), &work).is_err());
+    assert_eq!(
+        writer.retained_key_rows(),
+        None,
+        "historical rows cannot witness destroyed pages"
+    );
+}

@@ -1140,7 +1140,9 @@ impl ContractLoweringVisitor<'_> {
         self.work.flush()?;
         match origin {
             // Independently produced counters have no row-input NULL propagation.
-            ValueOrigin::LogicalSummary { .. } | ValueOrigin::ProviderField { .. } => {}
+            ValueOrigin::JoinMark { .. }
+            | ValueOrigin::LogicalSummary { .. }
+            | ValueOrigin::ProviderField { .. } => {}
             ValueOrigin::Expr { expr, .. } => {
                 if dirty_expressions.contains(&(fragment, expr)) {
                     revised = published_value_type(

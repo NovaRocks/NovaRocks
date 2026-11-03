@@ -261,6 +261,7 @@ impl Driver<'_> {
                 true,
                 1,
                 work,
+                None,
             )?;
         }
         let value = complete_node::<KernelFailure, _>(

@@ -20,6 +20,15 @@ explicit_only = false
 [impact]
 paths = [
     "novarocks/sql/src/optimizer/**",
+    "novarocks/sql/src/analyzer/**",
+    "novarocks/sql/src/planner/**",
+    "novarocks/execution/src/exec/expr/**",
+    "novarocks/execution/src/exec/operators/hashjoin/**",
+    "novarocks/types/src/value/variant*.rs",
+    "novarocks/functions/src/native_inlist*.rs",
+    "novarocks/functions/src/json_canonical*.rs",
+    "novarocks/functions/src/builtin/json_canonical*.rs",
+    "novarocks/parser/src/parser/pratt.rs",
     "novarocks/execution/src/exec/hash_table/**",
     "novarocks/execution/src/exec/operators/assert_num_rows_processor.rs",
 ]

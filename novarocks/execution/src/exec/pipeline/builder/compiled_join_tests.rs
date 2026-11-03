@@ -191,6 +191,7 @@ pub(super) fn oracle(spec: Spec, left: &[Row], right: &[Row]) -> Rows {
     let pair = |l: Row, r: Row| vec![l.0, l.1, r.0, r.1];
     let mut rows = Vec::new();
     match spec.kind {
+        JoinKind::LeftMark => panic!("mark output uses the Boolean row oracle"),
         JoinKind::Inner | JoinKind::Cross => {
             for &l in left {
                 for &r in right {
@@ -411,6 +412,15 @@ fn add_join(
             l.to_vec()
         }
         (JoinKind::RightSemi | JoinKind::RightAnti, false) => r.to_vec(),
+        (JoinKind::LeftMark, false) => {
+            let mark = builder
+                .add_value(
+                    FunctionValueType::new(DataType::Boolean, true),
+                    ValueOrigin::JoinMark { node: join },
+                )
+                .unwrap();
+            vec![l[0], l[1], mark]
+        }
         other => panic!("no fixture output for {other:?}"),
     };
     let null_extended = output
@@ -637,8 +647,11 @@ pub(super) fn single_plan_with_dop(
         .unwrap();
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(fragment).unwrap();
-    plan.set_result_port(result_port(SINGLE, join, &output))
-        .unwrap();
+    let mut port = result_port(SINGLE, join, &output);
+    if spec.kind == JoinKind::LeftMark {
+        port.fields.last_mut().unwrap().ty = FunctionValueType::new(DataType::Boolean, true);
+    }
+    plan.set_result_port(port).unwrap();
     plan.finish_observed(&FixtureControl)
         .unwrap_or_else(|error| panic!("the single-fragment join plan validates: {error:?}"))
 }
@@ -782,6 +795,7 @@ fn freeze(fragment: &Fragment) -> PhysicalRootUses {
         fragment: &'a Fragment,
         next: u32,
         uses: Vec<ExpressionInvocation<ExprId>>,
+        domains: Vec<ExpressionEvaluationDomain>,
     }
     impl Author<'_> {
         fn visit(
@@ -792,24 +806,37 @@ fn freeze(fragment: &Fragment) -> PhysicalRootUses {
         ) -> ExpressionUseId {
             let id = ExpressionUseId::new(self.next);
             self.next += 1;
-            let children = match &self.fragment.expressions().get(expr).unwrap().kind {
+            let source = &self.fragment.expressions().get(expr).unwrap().kind;
+            let shape = match source {
+                ExprKind::InList { negated, .. } => ControlShape::Membership { negated: *negated },
+                _ => ControlShape::Eager,
+            };
+            let children = match source {
                 ExprKind::Binary { left, right, .. } => vec![*left, *right],
                 ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
+                ExprKind::InList { expr, list, .. } => {
+                    std::iter::once(*expr).chain(list.iter().copied()).collect()
+                }
                 other => panic!("join fixture has no {other:?}"),
             };
             let arguments = children
                 .iter()
                 .enumerate()
                 .map(|(ordinal, &child)| {
-                    let (child_demand, guard) = control_argument_semantics(
-                        ControlShape::Eager,
-                        children.len(),
-                        ordinal,
-                        demand,
-                    )
-                    .unwrap();
-                    assert!(guard.is_none());
-                    self.visit(child, domain, child_demand)
+                    let (child_demand, guard) =
+                        control_argument_semantics(shape, children.len(), ordinal, demand).unwrap();
+                    let child_domain = if let Some(kind) = guard {
+                        let child_domain = EvaluationDomainId::new(self.domains.len() as u32);
+                        self.domains.push(ExpressionEvaluationDomain {
+                            id: child_domain,
+                            parent: Some(domain),
+                            guard: Some(novarocks_type_contract::DomainGuard { owner: id, kind }),
+                        });
+                        child_domain
+                    } else {
+                        domain
+                    };
+                    self.visit(child, child_domain, child_demand)
                 })
                 .collect::<Vec<_>>();
             self.uses.push(ExpressionInvocation {
@@ -819,7 +846,7 @@ fn freeze(fragment: &Fragment) -> PhysicalRootUses {
                     demand,
                 },
                 definition: expr,
-                control: ControlShape::Eager,
+                control: shape,
                 arguments: arguments.into_boxed_slice(),
             });
             id
@@ -830,6 +857,11 @@ fn freeze(fragment: &Fragment) -> PhysicalRootUses {
         fragment,
         next: 0,
         uses: Vec::new(),
+        domains: vec![ExpressionEvaluationDomain {
+            id: domain,
+            parent: None,
+            guard: None,
+        }],
     };
     let roots = PhysicalExpressionRoots::try_new(fragment, &FixtureControl).unwrap();
     let bindings = roots
@@ -838,11 +870,7 @@ fn freeze(fragment: &Fragment) -> PhysicalRootUses {
         .map(|(&site, root)| (site, author.visit(root.expr, domain, root.demand)))
         .collect::<Vec<_>>();
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
+        author.domains,
         author.uses,
         fragment.expressions(),
         CompilePhase::Validate,
@@ -1639,8 +1667,11 @@ fn compiled_join_schema_prepare_missing_owner_precedes_build_and_input() {
 fn compiled_join_schema_prepare_keeps_first_memory_refusal_and_rolls_back() {
     use crate::exec::pipeline::operator::ConstructionFailure;
     use crate::runtime::mem_tracker::MemTracker;
-    for nested in [false, true] {
-        let (_, mut operator, _, _, input, error) = schema_owner_join_operators(nested);
+    for spec in [
+        Spec::hash(JoinKind::LeftAnti, false),
+        Spec::nested(JoinKind::LeftAnti, false),
+    ] {
+        let (_, mut operator, _, _, input, error) = step_join_operators(spec, &LEFT_ROWS, &[]);
         let tracker = MemTracker::new_root("join first actual schema refusal");
         operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
             tracker.clone(),
@@ -3437,4 +3468,163 @@ fn b3_naa_required_eligibility_error_keeps_sparse_original_pair_row_after_earlie
         2,
         "C FALSE skipped row0; E keeps the original candidate-page row"
     );
+}
+
+/// JSON values deliberately use different object member order, SQL NULL and
+/// the JSON value `null`. Expected marks follow SQL ANY's three-valued table.
+#[test]
+fn hash_left_mark_preserves_probe_occurrences_and_reuses_null_aware_key_facts() {
+    use arrow::array::{Array, BooleanArray};
+    let lhs = [
+        Some("{\"a\":1,\"b\":2}"),
+        Some("null"),
+        Some("1"),
+        None,
+        Some("{\"x\":1}"),
+        Some("{\"a\":1,\"b\":2}"),
+    ];
+    let mut late = vec![Some("0"); 520];
+    late.push(Some("{\"a\":1,\"b\":2}"));
+    late.push(None);
+    for (rhs, expected) in [
+        (vec![], vec![Some(false); 6]),
+        (
+            vec![Some("null"), Some("1"), Some("1")],
+            vec![
+                Some(false),
+                Some(true),
+                Some(true),
+                None,
+                Some(false),
+                Some(false),
+            ],
+        ),
+        (vec![None], vec![None; 6]),
+        (
+            vec![Some("{\"a\":1,\"b\":2}"), Some("null"), None],
+            vec![Some(true), Some(true), None, None, None, Some(true)],
+        ),
+        (late, vec![Some(true), None, None, None, None, Some(true)]),
+    ] {
+        // The SQL projection has already normalized each JSON once. The
+        // hash owner consumes ordinary Utf8 canonical keys, not JSON text.
+        let json = FunctionValueType::new(DataType::Utf8, true);
+        let boolean = FunctionValueType::new(DataType::Boolean, true);
+        let mut builder = FragmentBuilder::new(SINGLE);
+        let left = builder.reserve_node_id().unwrap();
+        let literal = |value: Option<&str>| {
+            value.map_or(LiteralValue::Null, |text| LiteralValue::Utf8(text.into()))
+        };
+        let l = values(
+            &mut builder,
+            left,
+            std::slice::from_ref(&json),
+            &lhs.iter()
+                .map(|value| vec![literal(*value)])
+                .collect::<Vec<_>>(),
+        )[0];
+        let right = builder.reserve_node_id().unwrap();
+        let r = values(
+            &mut builder,
+            right,
+            std::slice::from_ref(&json),
+            &rhs.iter()
+                .map(|value| vec![literal(*value)])
+                .collect::<Vec<_>>(),
+        )[0];
+        let join = builder.reserve_node_id().unwrap();
+        let probe = builder
+            .add_expression(join, json.clone(), ExprKind::Value(l))
+            .unwrap();
+        let build = builder
+            .add_expression(join, json.clone(), ExprKind::Value(r))
+            .unwrap();
+        let mark = builder
+            .add_value(boolean.clone(), ValueOrigin::JoinMark { node: join })
+            .unwrap();
+        let left_properties = builder.node_output_properties(left).unwrap().clone();
+        let right_properties = builder.node_output_properties(right).unwrap().clone();
+        builder
+            .add_join(
+                join,
+                [left, right],
+                Box::from([left_properties, right_properties]),
+                Box::from([l, mark]),
+                Distribution::Singleton,
+                NodeKind::HashJoin {
+                    kind: JoinKind::LeftMark,
+                    distribution: JoinDistribution::Singleton,
+                    build_side: JoinSide::Right,
+                    condition: novarocks_physical_plan::HashJoinCondition::NullAwareEqual {
+                        value_equal_keys: Box::from([JoinKey {
+                            left: probe,
+                            right: build,
+                            null_safe: false,
+                        }]),
+                        scope_keys: Box::default(),
+                        eligibility: None,
+                    },
+                    null_extended: Box::default(),
+                },
+            )
+            .unwrap();
+        let fragment = builder
+            .finish_definition(
+                join,
+                FragmentSink::Result,
+                dop(1),
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            )
+            .unwrap();
+        let mut plan = PlanBuilder::new(version());
+        plan.add_fragment(fragment).unwrap();
+        plan.set_result_port(ResultPort {
+            scalar_schema: None,
+            fragment: SINGLE,
+            output: novarocks_physical_plan::OutputPort {
+                node: join,
+                columns: Box::from([l, mark]),
+            },
+            fields: Box::from([
+                ResultField {
+                    domain: crate::test_result_domain::result_value_domain(&json),
+                    name: "j".into(),
+                    alias: None,
+                    value: l,
+                    ty: json,
+                },
+                ResultField {
+                    domain: crate::test_result_domain::result_value_domain(&boolean),
+                    name: "mark".into(),
+                    alias: None,
+                    value: mark,
+                    ty: boolean,
+                },
+            ]),
+        })
+        .unwrap();
+        let plan = plan.finish_observed(&FixtureControl).unwrap();
+        let mut packages = packages(&plan);
+        let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
+        let output = ResultSinkHandle::new();
+        try_run(
+            &program,
+            result_sink(&program, SINGLE_FINST, &output),
+            ExchangeBindings::default(),
+            SINGLE_FINST,
+        )
+        .unwrap();
+        let actual = output
+            .take_chunks()
+            .iter()
+            .flat_map(|chunk| {
+                chunk.columns()[1]
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap()
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{} RHS physical rows", rhs.len());
+    }
 }

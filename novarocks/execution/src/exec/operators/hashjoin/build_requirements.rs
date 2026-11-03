@@ -84,9 +84,10 @@ pub(crate) fn required_build_components(
             JoinType::NullAwareLeftAnti if has_residual_predicate => {
                 row_matches(MatchFlagRequirement::NotNeeded)
             }
-            JoinType::NullAwareLeftAnti => BuildComponentRequirements {
+            JoinType::NullAwareLeftAnti | JoinType::LeftMark => BuildComponentRequirements {
                 // General NAA retains physical candidate topology even without E;
-                // signed linear modes decide membership without scanning it.
+                // the single-key mark/linear modes use its presence lookup and
+                // original NULL/empty facts without scanning candidate rows.
                 lookup: LookupRequirement::RowMatches,
                 row_payload: RowPayloadRequirement::NotNeeded,
                 match_flags: MatchFlagRequirement::NotNeeded,
@@ -164,4 +165,13 @@ mod tests {
         assert_eq!(req.lookup, LookupRequirement::RowMatches);
         assert_eq!(req.row_payload, RowPayloadRequirement::Required);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn left_mark_keeps_key_lookup_without_payload_or_build_match_flags() {
+    let req = required_build_components(JoinType::LeftMark, false, true, true);
+    assert_eq!(req.lookup, LookupRequirement::RowMatches);
+    assert_eq!(req.row_payload, RowPayloadRequirement::NotNeeded);
+    assert_eq!(req.match_flags, MatchFlagRequirement::NotNeeded);
 }

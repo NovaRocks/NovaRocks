@@ -1,0 +1,61 @@
+-- query 8
+-- types	bigint	boolean
+id	included
+0	true
+1	true
+2	true
+3	true
+4	true
+5	true
+6	true
+7	true
+8	true
+9	NULL
+10	NULL
+11	NULL
+12	NULL
+
+-- query 9
+-- types	bigint	boolean
+id	excluded
+0	false
+1	false
+2	false
+3	false
+4	false
+5	false
+6	false
+7	false
+8	false
+9	NULL
+10	NULL
+11	NULL
+12	NULL
+
+-- query 10
+-- types	boolean	boolean
+included	excluded
+false	true
+
+-- query 11
+-- types	boolean	boolean
+json_null	sql_null
+true	NULL
+
+-- query 12
+-- types	bigint
+id
+0
+1
+2
+3
+4
+5
+6
+7
+8
+
+-- query 13
+-- types	bigint
+hi
+12

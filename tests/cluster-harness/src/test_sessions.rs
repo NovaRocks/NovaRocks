@@ -822,6 +822,42 @@ impl ClusterTestSessionPlan {
         );
         Ok(true)
     }
+    pub(crate) fn native_fault_task_binding(
+        &self,
+        index: usize,
+        action: &str,
+        token: &str,
+    ) -> Result<Option<novarocks_failpoint::target_binding::StatementTaskBinding>> {
+        if !self.native_fault_hit(index, action, token)? {
+            return Ok(None);
+        }
+        let selected = self.original_native_selection(index, action, token)?;
+        let path = selected.root.join(format!(
+            "be-{index}.native-fault-{action}.{token}.execution.json"
+        ));
+        let binding =
+            read_private_action_json(&path)?.context("selected Task has no statement binding")?;
+        let value = read_private_action_json(&path.with_extension("task.json"))?
+            .context("selected action has no exact Task binding")?;
+        let task: novarocks_failpoint::target_binding::StatementTaskBinding =
+            serde_json::from_value(value)?;
+        ensure!(
+            serde_json::to_value(&task.statement)? == binding,
+            "Task selection differs from original statement binding"
+        );
+        let checked = novarocks_failpoint::target_binding::StatementTaskBinding::new(
+            task.statement.clone(),
+            novarocks_types::StageId::new(task.stage_id)?,
+            novarocks_types::TaskId::new(task.task_id)?,
+            task.remote_destination_process_id.parse()?,
+        )?;
+        ensure!(
+            checked == task,
+            "selected Task binding differs from validated source"
+        );
+        Ok(Some(task))
+    }
+
     pub(crate) fn selected_native_observation_binding(
         &self,
         index: usize,
