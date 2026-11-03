@@ -1,75 +1,71 @@
 {
-  "schema": 2,
+  "schema": 1,
   "images": {
     "paimon-spark-base": {
       "source": "apache/spark",
       "variants": {
         "linux/amd64": {
           "platform": "linux/amd64",
-          "manifest_digest": "sha256:b2da01c5855fdf791328a6fa1267b406336a535d39abc05699214a48bee95955",
-          "alias": "novarocks/fixture-paimon-spark-base:b2da01c5855f"
+          "alias": "novarocks/fixture-paimon-spark-base:3.5.3"
         }
-      }
+      },
+      "version": "3.5.3"
     },
     "iceberg-spark-base": {
       "source": "apache/spark",
       "variants": {
         "linux/arm64": {
           "platform": "linux/arm64",
-          "manifest_digest": "sha256:96dc2bada923824300e1ece564389258934655ba6f463d6daff8753ff0c639ce",
-          "alias": "novarocks/fixture-iceberg-spark-base:96dc2bada923"
+          "alias": "novarocks/fixture-iceberg-spark-base:3.5.5-java17"
         },
         "linux/amd64": {
           "platform": "linux/amd64",
-          "manifest_digest": "sha256:bb8a7f0e5a98a627dca8c1502b959a2ca010b59fe104901123934243e7cc3537",
-          "alias": "novarocks/fixture-iceberg-spark-base:bb8a7f0e5a98"
+          "alias": "novarocks/fixture-iceberg-spark-base:3.5.5-java17"
         }
-      }
+      },
+      "version": "3.5.5-java17"
     },
     "iceberg-rest": {
       "source": "apache/iceberg-rest-fixture",
       "variants": {
         "linux/arm64": {
           "platform": "linux/arm64",
-          "manifest_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
-          "alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9"
+          "alias": "novarocks/fixture-iceberg-rest:1.10.1"
         },
         "linux/amd64": {
           "platform": "linux/amd64",
-          "manifest_digest": "sha256:319afc30ef94300f79987b1d185c4911576db0cdfaa98246cb42757ec4d53463",
-          "alias": "novarocks/fixture-iceberg-rest:319afc30ef94"
+          "alias": "novarocks/fixture-iceberg-rest:1.10.1"
         }
-      }
+      },
+      "version": "1.10.1"
     },
     "gradle-builder": {
       "source": "gradle",
       "variants": {
         "linux/arm64": {
           "platform": "linux/arm64",
-          "manifest_digest": "sha256:ce50078d456e497bc86b76d386503e84aa45416d85069ad66bc072bf07566b25",
-          "alias": "novarocks/fixture-gradle-builder:ce50078d456e"
+          "alias": "novarocks/fixture-gradle-builder:8.14.3-jdk17"
         },
         "linux/amd64": {
           "platform": "linux/amd64",
-          "manifest_digest": "sha256:b6db376528d71be79c82e173c2e85769b8cc78fccbf3dc6810b9a54706076b99",
-          "alias": "novarocks/fixture-gradle-builder:b6db376528d7"
+          "alias": "novarocks/fixture-gradle-builder:8.14.3-jdk17"
         }
-      }
+      },
+      "version": "8.14.3-jdk17"
     },
     "minio-runtime": {
       "source": "alpine",
       "variants": {
         "linux/amd64": {
           "platform": "linux/amd64",
-          "manifest_digest": "sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f",
-          "alias": "novarocks/fixture-minio-runtime:amd64-2e0b81d60597"
+          "alias": "novarocks/fixture-minio-runtime:3.22.7"
         },
         "linux/arm64": {
           "platform": "linux/arm64",
-          "manifest_digest": "sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f",
-          "alias": "novarocks/fixture-minio-runtime:arm64-2e0b81d60597"
+          "alias": "novarocks/fixture-minio-runtime:3.22.7"
         }
-      }
+      },
+      "version": "3.22.7"
     }
   },
   "artifacts": {
@@ -484,6 +480,12 @@
           "platform": "linux/amd64",
           "alias": "novarocks/fixture-iceberg-spark:amd64"
         }
+      },
+      "build_args": {
+        "ICEBERG_VERSION": "1.11.0",
+        "ICEBERG_SPARK_RUNTIME": "iceberg-spark-runtime-3.5_2.12",
+        "HADOOP_VERSION": "3.3.4",
+        "AWS_SDK_BUNDLE_VERSION": "1.12.262"
       }
     },
     "rest-mv": {
@@ -878,5 +880,19 @@
         }
       }
     }
+  },
+  "versions": {
+    "spark": "3.5.5-java17",
+    "iceberg": "1.11.0",
+    "rest": "1.10.1",
+    "hadoop": "3.3.4",
+    "aws_sdk_bundle": "1.12.262",
+    "hive": "4.0.0",
+    "paimon_spark": "3.5.3",
+    "paimon": "1.3.1",
+    "gradle": "8.14.3-jdk17",
+    "alpine": "3.22.7",
+    "hms_hadoop": "3.3.6",
+    "hms_aws_sdk": "1.12.367"
   }
 }
