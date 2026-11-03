@@ -71,6 +71,7 @@ pub(crate) fn materialize_compiled_sink(
             },
         ) => materialize_stream_branch(
             program,
+            graph.nodes()[graph.root().index()].output_layout(),
             branch,
             0,
             destinations,
@@ -119,6 +120,7 @@ impl MaterializedCompiledSink {
 
 fn materialize_stream_branch(
     program: &std::sync::Arc<novarocks_local_program::LocalProgram>,
+    output_layout: &novarocks_local_program::StaticLayout,
     branch: &StaticStreamBranch,
     branch_index: u32,
     destinations: &[crate::runtime::endpoint::FragmentDestination],
@@ -149,7 +151,8 @@ fn materialize_stream_branch(
         sender_id,
         plan_node_id,
         transmitter,
-    );
+    )
+    .with_frozen_output(output_layout);
     let factory = match partition_keys {
         Some(keys) => factory
             .with_compiled_partition_keys(keys)
@@ -234,6 +237,7 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
             .ok_or_else(|| materialization_contract("router provider assignment is absent"))?;
         provider_factories.push(Arc::from(materialize_stream_branch(
             program,
+            program.graph().nodes()[program.graph().root().index()].output_layout(),
             branch,
             route.branch,
             destinations,
@@ -257,6 +261,7 @@ pub(crate) fn materialize_compiled_sink_for_pipeline(
         .ok_or_else(|| materialization_contract("router summary assignment is absent"))?;
     let summary_sink = materialize_stream_branch(
         program,
+        summary_layout,
         branch,
         *summary_branch,
         destinations,

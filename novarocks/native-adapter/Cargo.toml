@@ -11,6 +11,8 @@ workspace = true
 [features]
 
 [dependencies]
+novarocks-value-arrays.workspace = true
+novarocks-arrow-batch-codec.workspace = true
 novarocks-resource-contract.workspace = true
 novarocks-transport-io.workspace = true
 novarocks-result-contract.workspace = true
@@ -62,7 +64,6 @@ tonic-build.workspace = true
 [dev-dependencies]
 novarocks-test-support.workspace = true
 novarocks-worker-protocol.workspace = true
-novarocks-value-arrays.workspace = true
 tempfile.workspace = true
 novarocks-execution = { workspace = true }
 novarocks-plan-codec = { workspace = true }

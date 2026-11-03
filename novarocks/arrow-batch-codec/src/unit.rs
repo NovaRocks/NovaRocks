@@ -47,6 +47,7 @@ pub enum CodecError<E> {
     Invalid(&'static str),
     ValueType(ValueTypeError),
     Arrow(ArrowError),
+    Metadata(flatbuffers::InvalidFlatbuffer),
     Allocation(std::collections::TryReserveError),
     Layout(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
     Carrier(novarocks_type_contract::CarrierParameterError),
@@ -74,6 +75,7 @@ impl<E: std::fmt::Display> std::fmt::Display for CodecError<E> {
             Self::Invalid(e) => f.write_str(e),
             Self::ValueType(e) => write!(f, "invalid Arrow unit value type: {e:?}"),
             Self::Arrow(e) => e.fmt(f),
+            Self::Metadata(e) => e.fmt(f),
             Self::Allocation(e) => e.fmt(f),
             Self::Layout(e) => e.fmt(f),
             Self::Carrier(e) => e.fmt(f),
@@ -87,6 +89,7 @@ impl<E: std::error::Error + 'static> std::error::Error for CodecError<E> {
             Self::Observer(error) => Some(error),
             Self::ValueType(error) => Some(error),
             Self::Arrow(error) => Some(error),
+            Self::Metadata(error) => Some(error),
             Self::Allocation(error) => Some(error),
             Self::Layout(error) => Some(error),
             Self::Carrier(error) => Some(error),
@@ -171,7 +174,7 @@ fn read_message<'a, O: UnitObserver>(
         .map_err(CodecError::Observer)?;
     let message =
         novarocks_arrow_ipc_frame::verified_message(metadata, &VerifierOptions::default())
-            .map_err(|_| CodecError::Invalid("Arrow unit metadata verification failed"))?;
+            .map_err(CodecError::Metadata)?;
     if message.version() != MetadataVersion::V5
         || message.custom_metadata().is_some_and(|m| !m.is_empty())
     {

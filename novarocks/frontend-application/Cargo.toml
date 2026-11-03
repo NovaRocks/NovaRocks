@@ -17,6 +17,7 @@ mem-1-m07-root-observation = []
 mem-1-m07-exact-mysql-write = ["novarocks-mysql-adapter/mem-1-m07-exact-mysql-write"]
 
 [dependencies]
+novarocks-arrow-batch-codec.workspace = true
 novarocks-resource-contract.workspace = true
 novarocks-coordination-contract.workspace = true
 novarocks-type-contract.workspace = true
