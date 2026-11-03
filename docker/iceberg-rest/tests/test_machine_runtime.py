@@ -36,7 +36,7 @@ import machine_runtime as machine
 
 def bom():
     return {"schema": 2, "platform": "linux/arm64", "lock_sha256": "locked-inputs", "images": {
-        n: {"alias": n, "manifest_digest": "sha256:" + n, "platform": "linux/arm64"}
+        n: {"alias": n, "image_id": "sha256:" + n, "manifest_digest": "sha256:" + n, "platform": "linux/arm64"}
         for n in ("iceberg-rest",)}, "derived_images": {
         n: {"alias": n + ":current", "image_id": "sha256:" + n,
             "definition_sha256": "definition-" + n, "platform": "linux/arm64"}
@@ -702,7 +702,7 @@ class SnapshotDeadlineTests(unittest.TestCase):
             with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
                     mock.patch.object(backend, "healthy", side_effect=healthy), \
                     mock.patch.object(backend, "validate_minio_volume"):
-                with owner.ready_snapshot({"version": "v"}, deadline=190.0, lock_deadline=102.0):
+                with owner.operation_snapshot(deadline=190.0, lock_deadline=102.0):
                     self.assertEqual(backend.operation_deadline, 107.0)
                     self.assertGreater(now[0], 102.0)
             self.assertEqual(backend.operation_deadline, 107.0)
@@ -723,7 +723,7 @@ class SnapshotDeadlineTests(unittest.TestCase):
                     mock.patch.object(backend, "healthy", side_effect=healthy), \
                     mock.patch.object(backend, "validate_minio_volume"):
                 with self.assertRaisesRegex(runtime.RuntimeFailure, "RunBudgetExpired"):
-                    with owner.ready_snapshot({"version": "v"}, deadline=190.0, lock_deadline=102.0):
+                    with owner.operation_snapshot(deadline=190.0, lock_deadline=102.0):
                         self.fail("expired outer run budget yielded readiness")
             self.assertEqual(backend.operation_deadline, 104.0)
 
@@ -733,7 +733,7 @@ class SnapshotDeadlineTests(unittest.TestCase):
             owner = machine.MachineOwner(directory, backend=backend, daemon="local-daemon")
             with mock.patch.object(backend, "daemon_id") as probe:
                 with self.assertRaisesRegex(runtime.RuntimeFailure, "RunBudgetExpired"):
-                    with owner.ready_snapshot({}, deadline=time.monotonic() - 1):
+                    with owner.operation_snapshot(deadline=time.monotonic() - 1):
                         self.fail("expired scope must not be entered")
                 probe.assert_not_called()
             self.assertIsNone(backend.operation_deadline)
@@ -781,12 +781,12 @@ class SnapshotDeadlineTests(unittest.TestCase):
                 self.assertEqual(backend.operation_deadline, inner)
                 return True
             with mock.patch.object(backend, "healthy", side_effect=healthy), mock.patch.object(backend, "validate_minio_volume"):
-                with owner.ready_snapshot({"version": "v"}, deadline=inner):
+                with owner.operation_snapshot(deadline=inner):
                     self.assertEqual(backend.operation_deadline, inner)
             self.assertEqual(backend.operation_deadline, outer)
             with mock.patch.object(backend, "healthy", side_effect=RuntimeError("probe failed")), mock.patch.object(backend, "validate_minio_volume"):
                 with self.assertRaisesRegex(RuntimeError, "probe failed"):
-                    with owner.ready_snapshot({"version": "v"}, deadline=inner):
+                    with owner.operation_snapshot(deadline=inner):
                         pass
             self.assertEqual(backend.operation_deadline, outer)
 
@@ -826,55 +826,46 @@ class MachineTests(unittest.TestCase):
     def changed(self):
         return self.definition(ports={"rest": 31002})
 
-    def test_readonly_check_missing_machine_creates_no_state_or_lock(self):
+    def test_direct_use_missing_diagnostic_retains_report_without_creating_state(self):
         self.assertFalse(self.owner.root.exists())
-        self.assert_code("MachineUnavailable", lambda: self.owner.check_ready(bom()))
+        report = self.owner.check_environment()
+        self.assertIsNone(report["machine"])
+        self.assertTrue(report["errors"])
         self.assertFalse(self.owner.root.exists())
         self.assertEqual(self.backend.events, [])
-        self.assertIsNone(getattr(self.backend, "maintenance_fd", None))
 
-    def test_readonly_check_reuses_exact_readiness_without_rewrites_or_journals(self):
+    def test_direct_use_manual_check_observes_health_without_changing_state(self):
         original = self.start()
-        before = {str(path.relative_to(self.owner.root)): (path.stat().st_mtime_ns, path.read_bytes())
-                  for path in self.owner.root.rglob("*") if path.is_file()}
-        events = list(self.backend.events)
-        def healthy(state):
-            self.assertIsNone(getattr(self.backend, "maintenance_fd", None))
-            self.assertIsNone(getattr(self.backend, "maintenance_base", None))
-            return True
-        with mock.patch.object(self.backend, "healthy", side_effect=healthy):
-            actual = self.owner.check_ready(bom())
-        self.assertEqual(actual["generation"], original["generation"])
-        self.assertEqual(actual["version"], original["version"])
-        self.assertTrue(actual["observed_healthy"])
-        after = {str(path.relative_to(self.owner.root)): (path.stat().st_mtime_ns, path.read_bytes())
-                 for path in self.owner.root.rglob("*") if path.is_file()}
-        self.assertEqual(after, before)
-        self.assertEqual(self.backend.events, events)
-        changed = bom(); changed["lock_sha256"] = "another-source-lock"
-        self.assert_code("MachineVersionMismatch", lambda: self.owner.check_ready(changed))
-        self.assert_code("MachineVersionMismatch", lambda: self.owner.check_ready(bom(), {"ports": {"rest": 31002}}))
-        self.backend.failure = "health"
-        self.assert_code("MachineUnavailable", lambda: self.owner.check_ready(bom()))
+        before = {str(p): p.read_bytes() for p in self.owner.root.rglob("*") if p.is_file()}
+        with mock.patch.object(self.backend, "healthy", return_value=False) as healthy:
+            actual = self.owner.check_environment()
+        healthy.assert_called_once()
+        self.assertFalse(actual["observed_healthy"])
+        self.assertEqual(actual["machine"]["generation"], original["generation"])
+        self.assertEqual(before, {str(p): p.read_bytes() for p in self.owner.root.rglob("*") if p.is_file()})
 
-    def test_readonly_check_cannot_cross_an_existing_maintenance_lock(self):
-        self.start()
-        observer = machine.MachineOwner(self.owner.root, backend=copy.deepcopy(self.backend), timeout=0.01)
-        with self.owner.maintenance_lock():
-            self.assert_code("MachineMaintaining", lambda: observer.check_ready(bom()))
+    def test_direct_use_existing_fixture_never_builds_or_checks_health(self):
+        original = self.start()
+        with mock.patch.object(machine, "prepare_inputs", side_effect=AssertionError("build")), \
+                mock.patch.object(self.backend, "healthy", side_effect=AssertionError("health")):
+            self.assertEqual(original, self.owner.ensure_created())
+        broken = dict(original, phase="maintenance")
+        self.owner._save(broken)
+        with mock.patch.object(machine, "prepare_inputs", side_effect=AssertionError("build")):
+            self.assert_code("MachineMaintaining", self.owner.ensure_created)
 
-    def test_cli_check_uses_original_bom_and_safe_snapshot(self):
+    def test_direct_use_cli_check_is_explicit_and_does_not_build(self):
         original = self.start()
         with mock.patch.object(machine, "MachineOwner", return_value=self.owner), \
-                mock.patch.object(machine, "verified_bom", return_value=bom()) as verify, \
+                mock.patch.object(machine, "prepare_inputs", side_effect=AssertionError("build")), \
                 mock.patch.object(machine.runtime, "install_signal_handlers"), \
                 mock.patch("sys.stdout", new_callable=io.StringIO) as output:
-            self.assertEqual(machine.main(["check", "--store", "/original-store"]), 0)
-        verify.assert_called_once_with(runtime.SCRIPT_DIR.parent.parent, Path("/original-store"), consumer="iceberg-rest")
+            self.assertEqual(machine.main(["check"]), 0)
         actual = json.loads(output.getvalue())
-        self.assertEqual(actual["phase"], "ready")
-        self.assertEqual(actual["generation"], original["generation"])
-        self.assertNotIn("credentials", actual)
+        self.assertEqual(actual["machine"]["generation"], original["generation"])
+        self.assertTrue(actual["observed_healthy"])
+        self.assertIn("recommended_versions", actual)
+        self.assertNotIn("credentials", actual["machine"])
 
     def test_machine_configuration_rejects_protected_and_rest_domain_overlap_before_effects(self):
         for root in ("s3://warehouse/fixture-machine", "s3://warehouse/fixture-machine/rest/",
@@ -890,7 +881,7 @@ class MachineTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, code)
 
     def attach(self, definition, generation=None):
-        with self.owner.ready_snapshot(definition, expected_generation=generation) as state:
+        with self.owner.operation_snapshot(expected_generation=generation) as state:
             return state
 
     def test_repeated_explicit_start_preserves_fixed_resources_and_activation(self):
@@ -995,7 +986,7 @@ class MachineTests(unittest.TestCase):
 
     def test_attach_holds_maintenance_lock_until_publication_can_commit(self):
         self.start()
-        with self.owner.ready_snapshot(self.definition()):
+        with self.owner.operation_snapshot():
             other = machine.MachineOwner(self.owner.root, backend=self.backend,
                                          daemon=self.owner.daemon_id, timeout=0.001)
             with mock.patch.object(self.backend, "daemon_id") as daemon, \
@@ -1224,11 +1215,12 @@ class MachineTests(unittest.TestCase):
                 mock.patch.object(self.backend, "unsettled_operations", return_value=[("owned-journal", {"phase":"command-unknown"})]):
             self.assert_code("DockerOperationTimeout", lambda:self.owner.sweep(deadline=time.monotonic()+1))
 
-    def test_wrong_version_neither_attaches_nor_rebuilds_services(self):
+    def test_direct_use_ignores_recommendation_changes_without_rebuilding(self):
         first = self.start()
         before = copy.deepcopy(self.backend.events)
-        self.assert_code("MachineVersionMismatch", lambda: self.owner.activate(self.changed()))
-        self.assert_code("MachineVersionMismatch", lambda: self.attach(self.changed()))
+        with mock.patch.object(self.backend, "healthy", side_effect=AssertionError("environment check")):
+            self.assertEqual(first, self.owner.activate(self.changed()))
+            self.assertEqual(first, self.attach(self.changed()))
         self.assertEqual(self.backend.events, before)
         self.assertEqual(self.owner.read_saved_state(), first)
 

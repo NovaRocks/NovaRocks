@@ -87,6 +87,7 @@ class CloudMachineTests(unittest.TestCase):
         self.python = self.directory / "store/generations/g1/python-environments/oss-sdk/bin/python"
         self.python.parent.mkdir(parents=True)
         self.python.symlink_to(sys.executable)
+        self.inputs["python_environments"]["oss-sdk"]["path"] = str(self.python)
 
     def definition(self, **changes):
         return self.owner.required_definition(dict(object_store=CLOUD, **changes), self.inputs)
@@ -146,7 +147,7 @@ class CloudMachineTests(unittest.TestCase):
             inputs["python_environments"]["oss-sdk"]["path"] = "generations/rebuilt/python-environments/oss-sdk"
             definition = self.owner.required_definition({"object_store": CLOUD}, inputs)
             self.assertNotEqual(original["version"], definition["version"])
-            self.assert_code("MachineVersionMismatch", lambda: self.owner.check_ready(inputs, {"object_store": CLOUD}))
+            self.assert_code("MachineVersionMismatch", lambda: self.owner.check_environment())
             self.assert_code("MachineVersionMismatch", lambda: self.owner.activate(definition))
         self.assertEqual(original, self.owner.read_saved_state())
 
@@ -158,17 +159,17 @@ class CloudMachineTests(unittest.TestCase):
         self.assertNotEqual(original["oss_ops_python"], definition["oss_ops_python"])
         before = {path: path.read_bytes() for path in self.owner.root.rglob("*") if path.is_file()}
         events = list(self.backend.events)
-        self.assert_code("MachineVersionMismatch", lambda: self.owner.check_ready(inputs, {"object_store": CLOUD}))
+        self.assert_code("MachineVersionMismatch", lambda: self.owner.check_environment())
         self.assert_code("MachineVersionMismatch", lambda: self.owner.activate(definition))
         with self.assertRaises(runtime.RuntimeFailure) as caught:
-            with self.owner.ready_snapshot(definition):
+            with self.owner.operation_snapshot():
                 self.fail("new verification must not authorize the old SDK location")
         self.assertEqual("MachineVersionMismatch", caught.exception.code)
         self.assertEqual(before, {path: path.read_bytes() for path in self.owner.root.rglob("*") if path.is_file()})
         self.assertEqual(events, self.backend.events)
         # An already admitted run still observes its original pinned activation;
         # it is not rebound to the newer mutable BOM or cache location.
-        with self.owner.ready_snapshot({"version": original["version"]}, expected_generation=original["generation"]) as pinned:
+        with self.owner.operation_snapshot(expected_generation=original["generation"]) as pinned:
             self.assertEqual(original["oss_ops_python"], pinned["oss_ops_python"])
             self.assertNotEqual(str(python), pinned["oss_ops_python"])
 
@@ -180,8 +181,8 @@ class CloudMachineTests(unittest.TestCase):
         self.assertNotEqual(original["generation"], upgraded["generation"])
         self.assertEqual(str(python), upgraded["oss_ops_python"])
         self.assertEqual(str(self.python), original["oss_ops_python"])
-        self.assertEqual(upgraded["generation"], self.owner.check_ready(inputs, {"object_store": CLOUD})["generation"])
-        self.assert_code("MachineVersionMismatch", lambda: self.owner.check_ready(self.inputs, {"object_store": CLOUD}))
+        self.assertEqual(upgraded["generation"], self.owner.check_environment()["generation"])
+        self.assert_code("MachineVersionMismatch", lambda: self.owner.check_environment())
 
     def test_saved_maintenance_cannot_switch_to_a_different_verified_sdk_location(self):
         self.backend.failure = "ensure"
@@ -234,7 +235,7 @@ class CloudMachineTests(unittest.TestCase):
         original = self.start()
         before = {path: (path.stat().st_mtime_ns, path.read_bytes()) for path in self.owner.root.rglob("*") if path.is_file()}
         self.assertEqual(original, self.owner.activate(self.definition()))
-        checked = self.owner.check_ready(self.inputs, {"object_store": CLOUD})
+        checked = self.owner.check_environment()
         self.assertEqual(original["generation"], checked["generation"])
         self.assertTrue(checked["observed_healthy"])
         after = {path: (path.stat().st_mtime_ns, path.read_bytes()) for path in self.owner.root.rglob("*") if path.is_file()}
@@ -287,7 +288,7 @@ class CloudMachineTests(unittest.TestCase):
         desired = self.directory / "desired-object-store.json"
         desired.write_text(json.dumps({**CLOUD, "bucket": "another-bucket"}))
         with mock.patch.dict("os.environ", {"NOVA_ENV_OBJECT_STORE_CONFIG": str(desired)}):
-            self.assertEqual(record["generation"], self.owner.check_ready(self.inputs, {"object_store": CLOUD})["generation"])
+            self.assertEqual(record["generation"], self.owner.check_environment()["generation"])
         changed = copy.deepcopy(record)
         changed["object_store_config_file"] = str(desired)
         self.assert_code("RuntimeIdentityMismatch", lambda: machine.validate_cloud_snapshot(changed))
@@ -299,10 +300,10 @@ class CloudMachineTests(unittest.TestCase):
         record = self.start()
         path = Path(record["object_store_config_file"])
         path.write_text(json.dumps({**CLOUD, "bucket": "changed"}))
-        self.assert_code("RuntimeIdentityMismatch", lambda: self.owner.check_ready(self.inputs, {"object_store": CLOUD}))
+        self.assert_code("RuntimeIdentityMismatch", lambda: self.owner.check_environment())
         path.write_text(json.dumps(CLOUD))
         self.python.unlink()
-        self.assert_code("FixturePrerequisiteMissing", lambda: self.owner.check_ready(self.inputs, {"object_store": CLOUD}))
+        self.assert_code("FixturePrerequisiteMissing", lambda: self.owner.check_environment())
 
     def test_cross_provider_upgrade_is_rejected_before_effects(self):
         self.start()
@@ -367,7 +368,7 @@ class CloudMachineTests(unittest.TestCase):
     def test_native_writer_stop_can_repair_missing_sdk_without_relaxing_readiness(self):
         record = self.start()
         self.python.unlink()
-        self.assert_code("FixturePrerequisiteMissing", lambda: self.owner.check_ready(self.inputs, {"object_store": CLOUD}))
+        self.assert_code("FixturePrerequisiteMissing", lambda: self.owner.check_environment())
         backend = self.native_backend_for(record)
         self.assert_code("FixturePrerequisiteMissing", lambda: backend.validate_resources(record))
         backend.stop_writers(record)
@@ -381,7 +382,7 @@ class CloudMachineTests(unittest.TestCase):
         self.assertEqual("ready", upgraded["phase"])
         self.assertTrue(upgraded["steps"]["writers_stopped"])
         self.assertEqual(str(python), upgraded["oss_ops_python"])
-        self.assertEqual(upgraded["generation"], self.owner.check_ready(inputs, {"object_store": CLOUD})["generation"])
+        self.assertEqual(upgraded["generation"], self.owner.check_environment()["generation"])
 
     def test_native_missing_sdk_stop_still_rejects_foreign_docker_resources(self):
         record = self.start()

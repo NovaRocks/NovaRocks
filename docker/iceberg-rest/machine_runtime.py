@@ -189,64 +189,41 @@ def machine_config(value: dict[str, Any] | None = None) -> dict[str, Any]:
     return dict(ports=ports, policy=policy, benchmark_root=benchmark, minio_volume=volume)
 
 
-def input_facts(bom: dict[str, Any], backend: Any, *, cloud=False) -> tuple[dict, dict]:
-    """Consume already verified BOM facts; actual IDs never come from a mutable tag."""
-    if not bom.get("lock_sha256"):
-        raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "verified input lock identity is missing")
-    images, facts = {}, {"lock_sha256": bom["lock_sha256"], "platform": bom["platform"]}
-    sources = (
-        ("minio", "derived_images", "minio"), ("mc", "derived_images", "minio-mc"),
-        ("rest", "images", "iceberg-rest"),
-        ("spark", "derived_images", "iceberg-spark"),
-        ("rest-mv", "derived_images", "rest-mv"),
-    )
+def input_facts(prepared: dict[str, Any], backend: Any, *, cloud=False) -> tuple[dict, dict]:
+    """Use outputs of this creation, without certifying the surrounding environment."""
+    sources = (("minio", "derived_images", "minio"), ("mc", "derived_images", "minio-mc"),
+               ("rest", "images", "iceberg-rest"), ("spark", "derived_images", "iceberg-spark"),
+               ("rest-mv", "derived_images", "rest-mv"))
     if cloud:
         sources = (("rest", "derived_images", "iceberg-rest-oss"),
                    ("rest-mv", "derived_images", "rest-mv-oss"),
                    ("spark", "derived_images", "iceberg-spark-oss"))
-    for service, group, logical in sources:
-        receipt = bom.get(group, {}).get(logical)
-        if not isinstance(receipt, dict):
-            raise runtime.RuntimeFailure("FixturePrerequisiteMissing", logical)
-        reference = receipt.get("image_id") if group == "derived_images" else receipt.get("alias")
-        if not reference:
-            raise runtime.RuntimeFailure("FixturePrerequisiteMissing", logical)
-        actual = backend.image_id(reference)
-        if group == "derived_images" and actual != receipt["image_id"]:
-            raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "derived image differs from verified receipt")
-        # Times and cache paths identify supply operations, not runtime behavior.
-        semantic = {k: receipt[k] for k in (
-            "manifest_digest", "platform", "definition_sha256", "image_id",
-        ) if k in receipt}
-        if group == "derived_images" and not semantic.get("definition_sha256"):
-            raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "derived definition identity is missing")
-        facts[logical] = {"image_id": actual, "receipt": semantic}
-        images[service] = {"image_id": actual, "tag": actual, "receipt": copy.deepcopy(receipt)}
-    if cloud:
-        sdk = bom.get("python_environments", {}).get("oss-sdk")
-        if not isinstance(sdk, dict) or not sdk.get("definition_sha256") or not sdk.get("python_version") or not sdk.get("packages") or not isinstance(sdk.get("files"), dict) or not sdk["files"]:
-            raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "verified OSS SDK environment is missing")
-        facts["oss-sdk"] = {k: copy.deepcopy(sdk[k]) for k in ("definition_sha256", "python_version", "packages")}
-        facts["oss-sdk"]["files_sha256"] = runtime.digest(sdk["files"])
-    else:
+    images = {}
+    for service, kind, name in sources:
+        output = prepared.get(kind, {}).get(name)
+        if not isinstance(output, dict) or not output.get("image_id"):
+            raise runtime.RuntimeFailure("FixtureBuildFailed", f"creation has no image output: {name}")
+        actual = output["image_id"]
+        images[service] = dict(image_id=actual, tag=actual, receipt=copy.deepcopy(output))
+    if not cloud:
         images["mc-init"] = copy.deepcopy(images["mc"])
-    return images, facts
+    return images, {service: image["image_id"] for service, image in images.items()}
 
 
-def verified_bom(repo: Path, store: Path | None = None, *, consumer="iceberg-rest") -> dict:
+def recommended_versions(repo=None):
+    repo = Path(repo) if repo else runtime.SCRIPT_DIR.parent.parent
+    return runtime.read_json(repo / "docker/fixture-inputs/versions.json")["versions"]
+
+
+def prepare_inputs(repo: Path, store: Path | None = None, *, consumer="iceberg-rest") -> dict:
     directory = repo / "docker/fixture-inputs"
     sys.path.insert(0, str(directory))
     try:
-        spec = importlib.util.spec_from_file_location("machine_fixture_verify", directory / "verify.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        from provision import prepare_inputs as build
         from fixture_inputs import fixture_store
-        selected_store = fixture_store(str(store) if store else None).resolve()
-        result = module.verify(selected_store, repo, directory / "lock.json", consumer=consumer)
-        result["_verified_store_root"] = str(selected_store)
-        return result
+        return build(fixture_store(str(store) if store else None), repo, consumer=consumer)
     except Exception as error:
-        raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "local fixture BOM verification failed") from error
+        raise runtime.RuntimeFailure("FixtureBuildFailed", f"fixture creation failed: {error}") from error
     finally:
         sys.path.remove(str(directory))
 
@@ -412,7 +389,7 @@ class MachineDocker(runtime.Docker):
             self.validate_minio_volume(record)
         services = ["rest", "rest-mv", "spark"] if is_cloud(record) else ["minio", "mc-init", "rest", "rest-mv", "spark"]
         self.compose(record, ["up", "-d", "--force-recreate", *services])
-        self.await_health(record)
+        self.capture_created_targets(record)
 
     def activation_preflight(self, record, previous):
         """A saved activation intent authorizes its own partially created targets."""
@@ -438,15 +415,16 @@ class MachineDocker(runtime.Docker):
             ):
                 raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "activation has a foreign state volume")
 
-    def await_health(self, record):
-        # New activation is the only authorized place to acquire fresh exact IDs.
+    def capture_created_targets(self, record):
+        # Capture the objects created by this Compose action, without a health scan.
         record["containers"] = {}
-        deadline = time.monotonic() + self.timeout
-        while not self.healthy(record):
-            if time.monotonic() >= deadline:
-                raise runtime.RuntimeFailure("ReadinessTimeout", "machine services did not become healthy")
-            time.sleep(0.1)
-        record["containers"] = {s: self.container(record, s)["Id"] for s in record["required_services"]}
+        created = {}
+        for service in record["required_services"]:
+            info = self.container(record, service)
+            if not info:
+                raise runtime.RuntimeFailure("RuntimeStateUnreadable", f"creation returned no container: {service}")
+            created[service] = info["Id"]
+        record["containers"] = created
         record["network_id"] = self.own_network(record)["Id"]
 
     def stop_writers(self, record):
@@ -1179,30 +1157,36 @@ class MachineOwner:
         path = self.base / "config.json"
         return machine_config(runtime.read_json(path) if path.exists() else None)
 
-    def required_definition(self, config, verified_bom):
+    def required_definition(self, config, prepared):
         config = machine_config(config)
         cloud = bool(config.get("object_store"))
-        images, facts = input_facts(verified_bom, self.backend, cloud=cloud)
+        images, facts = input_facts(prepared, self.backend, cloud=cloud)
         template = runtime.SCRIPT_DIR / "templates/machine-oss.yml" if cloud and not self.custom_template else self.template
         text = template.read_text()
-        version = runtime.digest(dict(protocol=PROTOCOL, inputs=facts,
-                                      template_sha256=runtime.digest(text), config=config))
+        # This labels resources belonging to one creation intent, not a consumer gate.
+        version = runtime.digest(dict(protocol=PROTOCOL, images=facts, template=text, config=config))
         result = dict(version=version, config=config, images=images, template=text,
-                      producer_receipt={"lock_sha256": verified_bom["lock_sha256"],
-                                        **copy.deepcopy(verified_bom["derived_images"]["iceberg-spark-oss" if cloud else "iceberg-spark"])})
+                      producer_receipt=copy.deepcopy(prepared["derived_images"]["iceberg-spark-oss" if cloud else "iceberg-spark"]))
         if cloud:
-            receipt = verified_bom["python_environments"]["oss-sdk"]
-            relative = Path(receipt.get("path", ""))
-            root = verified_bom.get("_verified_store_root")
-            if not root or not Path(root).is_absolute() or relative.is_absolute() or not relative.parts or ".." in relative.parts:
-                raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "verified OSS SDK location is missing")
-            # Keep the venv symlink name: resolving bin/python would lose its site packages.
-            result["oss_ops_python"] = str(Path(root).resolve() / relative / "bin/python")
+            result["oss_ops_python"] = prepared["python_environments"]["oss-sdk"]["path"]
         return result
 
+    def ensure_created(self, *, store=None):
+        with self.maintenance_lock():
+            saved = self.read_saved_state()
+            if saved:
+                if saved["phase"] != "ready":
+                    raise runtime.RuntimeFailure("MachineMaintaining", "finish saved fixture maintenance manually")
+                return saved
+        config = self.load_config()
+        prepared = prepare_inputs(runtime.SCRIPT_DIR.parent.parent, store,
+            consumer="iceberg-rest-oss" if config.get("object_store") else "iceberg-rest")
+        return self.activate(self.required_definition(config, prepared))
+
     @contextmanager
-    def ready_snapshot(self, definition, deadline=None, *, expected_generation=None, lock_deadline=None,
-                       readonly_existing=False):
+    def operation_snapshot(self, *, deadline=None, expected_generation=None, lock_deadline=None,
+                           readonly_existing=False):
+        """Hold original operation authority; do not inspect unrelated services."""
         if lock_deadline is not None and (type(lock_deadline) not in (int, float) or not math.isfinite(lock_deadline)):
             raise runtime.RuntimeFailure("InvalidConfiguration", "machine lock deadline must be finite")
         previous = getattr(self.backend, "operation_deadline", None)
@@ -1220,31 +1204,30 @@ class MachineOwner:
             with self.maintenance_lock(lock_limit, **({"readonly_existing": True} if readonly_existing else {})):
                 state = self.read_saved_state()
                 if not state or state["phase"] != "ready":
-                    raise runtime.RuntimeFailure("MachineUnavailable", "start or finish machine maintenance explicitly")
-                if definition["version"] != state["version"]:
-                    raise runtime.RuntimeFailure("MachineVersionMismatch", "update the worktree or explicitly upgrade the machine")
+                    raise runtime.RuntimeFailure("MachineUnavailable", "fixture has no usable saved configuration; maintain it manually")
                 if expected_generation is not None and state["generation"] != expected_generation:
-                    raise runtime.RuntimeFailure("MachineUnavailable", "fixture activation changed")
+                    raise runtime.RuntimeFailure("MachineUnavailable", "original fixture activation changed")
                 if self.backend.unsettled_operations(self.base):
-                    raise runtime.RuntimeFailure("MachineUnavailable", "finish unsettled machine operations explicitly")
-                if is_cloud(state):
-                    validate_verified_sdk_location(state, definition)
-                    validate_cloud_snapshot(state)
-                else:
-                    self.backend.validate_minio_volume(state)
-                healthy = self.backend.healthy(state)
+                    raise runtime.RuntimeFailure("MachineUnavailable", "finish unsettled machine operations manually")
                 check_deadline()
-                if not healthy:
-                    raise runtime.RuntimeFailure("MachineUnavailable", "machine services are not healthy")
                 yield copy.deepcopy(state)
         finally:
             self.backend.operation_deadline = previous
 
-    def check_ready(self, verified_bom, config=None):
-        """Observe the original exact readiness contract without publishing state."""
-        definition = self.required_definition(self.load_config() if config is None else config, verified_bom)
-        with self.ready_snapshot(definition, readonly_existing=True) as state:
-            return {**state, "observed_healthy": True}
+    def check_environment(self):
+        """Explicit diagnostics only; never repair or grant permission to run tests."""
+        result = dict(recommended_versions=recommended_versions(), actual_versions={},
+                      machine=None, observed_healthy=None, errors=[])
+        try:
+            with self.maintenance_lock(readonly_existing=True):
+                state = self.read_saved_state()
+                result["machine"] = public_snapshot(state)
+                if state is not None:
+                    result["actual_versions"] = copy.deepcopy(state.get("actual_versions", {}))
+                    result["observed_healthy"] = self.backend.healthy(state)
+        except (runtime.RuntimeFailure, OSError) as error:
+            result["errors"].append(str(error))
+        return result
 
     def _save(self, record):
         runtime.atomic_json(self.base / "state.json", record)
@@ -1374,17 +1357,10 @@ class MachineOwner:
             old = self.read_saved_state()
             if old and not is_cloud(old):
                 raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "machine storage provider cannot change in place")
-            if old and old["phase"] == "ready" and old["version"] == definition["version"] and not upgrade:
-                validate_verified_sdk_location(old, definition)
-                validate_cloud_snapshot(old)
-                if self.backend.healthy(old):
+            if old and not upgrade:
+                if old["phase"] == "ready":
                     return old
-                record = self._record(definition)
-                record["previous"] = old
-                record["recover_only"] = True
-                # Recovery reuses the original catalog volume and its exact warehouse.
-                record["server_warehouse"] = old["server_warehouse"]
-                record["server_warehouses"] = copy.deepcopy(old["server_warehouses"])
+                raise runtime.RuntimeFailure("MachineMaintaining", "finish saved fixture maintenance manually")
             elif old and old["phase"] == "maintenance":
                 if old["version"] != definition["version"]:
                     raise runtime.RuntimeFailure("MachineMaintaining", "finish the saved maintenance definition first")
@@ -1421,8 +1397,6 @@ class MachineOwner:
             record["steps"]["activation_started"] = True
             self._save(record)
             self.backend.ensure_machine(record, previous)
-            if not self.backend.healthy(record):
-                raise runtime.RuntimeFailure("ReadinessTimeout", "activation health was not confirmed")
             record["phase"] = "ready"
             record.pop("previous", None)
             record.pop("recover_only", None)
@@ -1442,12 +1416,10 @@ class MachineOwner:
                 raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "upgrade cannot replace the preserved MinIO data volume")
             if old and (old.get("minio_volume_identity") or old["phase"] == "ready"):
                 self.backend.validate_minio_volume(old)
-            if old and old["phase"] == "ready" and old["version"] == definition["version"] and not upgrade:
-                if self.backend.healthy(old):
+            if old and not upgrade:
+                if old["phase"] == "ready":
                     return old
-                record = self._record(definition, credentials=old["credentials"])
-                record["previous"] = old
-                record["recover_only"] = True
+                raise runtime.RuntimeFailure("MachineMaintaining", "finish saved fixture maintenance manually")
             elif old and old["phase"] == "maintenance":
                 if old["version"] != definition["version"]:
                     raise runtime.RuntimeFailure("MachineMaintaining", "finish the saved maintenance definition first")
@@ -1518,8 +1490,6 @@ class MachineOwner:
             record["steps"]["activation_started"] = True
             self._save(record)
             self.backend.ensure_machine(record, previous)
-            if not self.backend.healthy(record):
-                raise runtime.RuntimeFailure("ReadinessTimeout", "activation health was not confirmed")
             record["phase"] = "ready"
             record.pop("previous", None)
             record.pop("fenced_store", None)
@@ -1556,15 +1526,11 @@ class MachineOwner:
                 observation_only = False
                 self.backend.settle_operations(self.base, inventory_deadline=inventory_deadline)
                 observation_only = True
-                healthy = self.backend.healthy(state)
-                # HTTP readiness can return False when its inherited deadline expires.
-                # Neither boolean authorizes GC after the observation window closes.
+                # Settlement and actual GC retain the original operation deadline.
                 if time.monotonic() >= deadline:
                     if self.backend.unsettled_operations(self.base):
                         raise runtime.RuntimeFailure("MachineUnavailable", "finish unsettled machine operations explicitly")
-                    raise runtime.RuntimeFailure("ScratchSweepTimeout", "bounded sweep health observation deadline elapsed")
-                if not healthy:
-                    raise runtime.RuntimeFailure("MachineUnavailable", "machine services are not healthy")
+                    raise runtime.RuntimeFailure("ScratchSweepTimeout", "bounded sweep operation deadline elapsed")
                 if is_cloud(state):
                     return {"complete": True, "status": "NOT_RUN", "scope": "cloud-ttl", "cleanup_performed": False,
                             "errors": [], "removed": [],
@@ -1639,14 +1605,22 @@ def main(argv=None):
     runtime.install_signal_handlers()
     try:
         owner = MachineOwner(args.root, timeout=args.timeout)
-        if args.operation in {"start", "upgrade", "check"}:
+        diagnostic_failed = False
+        if args.operation == "check":
+            result = owner.check_environment()
+            diagnostic_failed = bool(result["errors"])
+        elif args.operation == "start":
+            if args.config:
+                with owner.maintenance_lock():
+                    if owner.read_saved_state() is None:
+                        config = machine_config(runtime.read_json(args.config))
+                        runtime.atomic_json(owner.base / "config.json", config)
+            result = owner.ensure_created(store=args.store)
+        elif args.operation == "upgrade":
             config = machine_config(runtime.read_json(args.config)) if args.config else owner.load_config()
-            bom = verified_bom(runtime.SCRIPT_DIR.parent.parent, args.store,
+            prepared = prepare_inputs(runtime.SCRIPT_DIR.parent.parent, args.store,
                 consumer="iceberg-rest-oss" if config.get("object_store") else "iceberg-rest")
-            if args.operation == "check":
-                result = owner.check_ready(bom, config)
-            else:
-                result = owner.activate(owner.required_definition(config, bom), upgrade=args.operation == "upgrade")
+            result = owner.activate(owner.required_definition(config, prepared), upgrade=True)
         elif args.operation == "resolve-readonly-observation":
             result = owner.resolve_readonly_observation(args.journal)
         elif args.operation == "sweep":
@@ -1654,11 +1628,10 @@ def main(argv=None):
         else:
             result = owner.read_saved_state()
             if result:
-                result["observed_healthy"] = owner.backend.healthy(result) if result["phase"] == "ready" else False
                 result["scratch_observation"] = owner.scratch_observation(result)
                 result["failed_observations"] = owner.backend.failed_observation_status(owner.base)
         print(json.dumps(public_snapshot(result), sort_keys=True))
-        return 0
+        return 1 if diagnostic_failed else 0
     except runtime.RuntimeFailure as error:
         print(str(error), file=sys.stderr)
         return 75 if error.code in BLOCKED else 1

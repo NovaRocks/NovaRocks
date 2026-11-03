@@ -207,7 +207,7 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
         warehouse = config["warehouses"]
         ports, trust = config["local_ports"], config["native_trust"]
         rest = warehouse["rest_client"]
-        versions = config["versions"]
+        versions = record.get("actual_versions", {"spark": "unknown", "iceberg": "unknown"})
         compose = {"compose_project": record["project"], "compose_file": record["compose_file"], "compose_env": record["compose_env"]}
         manifest.update(compose)
         manifest["runtime"]["machine" if shared else "catalog"] = copy.deepcopy(record)
@@ -257,7 +257,6 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
             "NOVAROCKS_SPARK_UI": endpoint["spark_ui"], "NOVAROCKS_SPARK_REST_URI": endpoint["container_rest_uri"],
             "NOVAROCKS_SPARK_S3_ENDPOINT": container_endpoint, "NOVAROCKS_SPARK_DEFAULTS": str(publication / "spark-defaults.conf"),
             "NOVAROCKS_SPARK_V3_SMOKE_SQL": str(publication / "spark-iceberg-v3-smoke.sql"), "NOVAROCKS_SPARK_SQL": manifest["spark"]["helper"],
-            "NOVA_FIXTURE_INPUT_BOM": config["fixture_inputs"]["bom"], "NOVA_FIXTURE_INPUT_LOCK_SHA256": config["fixture_inputs"]["lock_sha256"],
         })
         if cloud:
             exports.update(NOVA_ENV_OBJECT_STORE_KIND="aliyun-oss", NOVA_ENV_OBJECT_STORE_CONFIG=record["object_store_config_file"],
@@ -535,7 +534,7 @@ def render_isolated_stack(bom: dict, project: str, ports: dict, out: Path, confi
     context = {"ready": True, "worktree": config["env_id"], "env_id": config["env_id"],
         "config": config, "publication_dir": str(out), "stable_runtime_dir": str(out), "entry_root": str(out),
         "private_record": record,
-        "producer_receipt": {"lock_sha256": bom["lock_sha256"], **bom["derived_images"]["iceberg-spark"]},
+        "producer_receipt": dict(bom["derived_images"]["iceberg-spark"]),
         "profile": profile, "control_uri": f'http://127.0.0.1:{ports["control"]}' if profile == "publication-hook" else None,
         "template_model_sha256": model_hash(Path(config["repo_root"]))}
     return {"record": record, "context": context, "compose_file": record["compose_file"], "compose_env": record["compose_env"]}
@@ -624,8 +623,8 @@ def request_config(workspace: Path, settings: dict, config_file: Path, entry: Pa
             'credentials': None if cloud else {'access_key': settings['MINIO_ROOT_USER'], 'secret_key': settings['MINIO_ROOT_PASSWORD']}, 'buckets': ['warehouse', 'novarocks'],
             'local_ports': ports, 'native_trust': old_config.get('native_trust') or {'deployment_id': env_id, 'shared_secret': 'local-native-trust-fixture-' + hashlib.sha256(str(workspace).encode()).hexdigest()},
             'benchmark': {'shared_root': benchmark_root, 'build_timeout_seconds': timeout},
-            'versions': {'spark': settings.get('NOVA_ENV_SPARK_VERSION', '3.5.5-java17'), 'iceberg': settings.get('NOVA_ENV_ICEBERG_VERSION', '1.11.0')},
-            'fixture_inputs': old_config.get('fixture_inputs') or {'bom': str(store / 'bom.json'), 'lock_sha256': None, 'verified': False},
+            'versions': machine.recommended_versions(),
+            'fixture_inputs': {'recommendations': str(workspace / 'docker/fixture-inputs/versions.json')},
             'warehouses': {'catalog': f's3://novarocks/{env_id}/iceberg-catalog', 'test': f's3://novarocks/{env_id}/novarocks-sql-test-iceberg-extra',
                            'rest_client': f's3://warehouse/{env_id}/rest', 'rest_mv_client': f's3://warehouse/{env_id}/rest-mv'}}
     if cloud:
@@ -639,13 +638,10 @@ def request_config(workspace: Path, settings: dict, config_file: Path, entry: Pa
     return result
 
 
-def verify_inputs(config: dict) -> dict:
-    # Consume the verifier's locked snapshot, not a later read of mutable bom.json.
-    # The closed consumer and offline verification remain owned by ADR-0155.
+def build_inputs(config: dict) -> dict:
     consumer = 'iceberg-rest-oss' if config.get('object_store') else 'iceberg-rest'
-    bom = machine.verified_bom(Path(config['repo_root']), Path(config['fixture_inputs']['bom']).parent, consumer=consumer)
-    config['fixture_inputs'].update(lock_sha256=bom['lock_sha256'], platform=bom['platform'], verified=True, consumer=consumer)
-    return bom
+    store = os.environ.get('NOVA_FIXTURE_STORE')
+    return machine.prepare_inputs(Path(config['repo_root']), Path(store) if store else None, consumer=consumer)
 
 
 def isolated_start(config: dict, project: str, entry: Path, profile: str, hook_image: str | None, bom: dict) -> dict:
@@ -669,8 +665,7 @@ def isolated_start(config: dict, project: str, entry: Path, profile: str, hook_i
         previous_deadline = getattr(owner.backend, "operation_deadline", None)
         owner.backend.operation_deadline = min(previous_deadline, deadline) if previous_deadline is not None else deadline
         try:
-            definition = owner.required_definition(owner.load_config(), bom)
-            with owner.ready_snapshot(definition, deadline=deadline,
+            with owner.operation_snapshot(deadline=deadline,
                                       expected_generation=binding["GENERATION"]) as snapshot:
                 budget.check(work=True)
                 config = copy.deepcopy(config)
@@ -804,7 +799,7 @@ def previous_publication(entry):
     return publication.read(Path(entry))
 
 
-def attach_entry(owner, env_id, entry, config, bom):
+def attach_entry(owner, env_id, entry, config):
     entry = Path(entry).resolve()
     with runtime.file_lock(entry / '.entry.lock'):
         try:
@@ -833,15 +828,12 @@ def attach_entry(owner, env_id, entry, config, bom):
             previous = getattr(owner.backend, 'operation_deadline', None)
             owner.backend.operation_deadline = min(previous, deadline) if previous is not None else deadline
             try:
-                definition = owner.required_definition(owner.load_config(), bom)
-                # Lock contention stays short; full validation retains the original work deadline.
-                with owner.ready_snapshot(definition, deadline=deadline,
+                # The lock protects configuration publication, not environment health.
+                with owner.operation_snapshot(deadline=deadline,
                                           lock_deadline=time.monotonic() + 2) as snapshot:
                     if inherited is not None:
                         RunBudget.admit(snapshot, identity, inherited=inherited,
                                         wall_clock=time.time, monotonic=time.monotonic).check(work=True)
-                    if config['benchmark']['shared_root'].rstrip('/') != snapshot['config']['benchmark_root']:
-                        raise runtime.RuntimeFailure('MachineVersionMismatch', 'worktree benchmark root differs from machine configuration')
                     return publication.publish(entry, {'worktree': env_id, 'ready': True,
                         'machine': snapshot, 'config': config, 'producer_receipt': snapshot['producer_receipt']}, render_entry)
             finally:
@@ -850,7 +842,6 @@ def attach_entry(owner, env_id, entry, config, bom):
             # Failed identity/health observation also invalidates discovery.
             # Pinned immutable publications stay readable for existing owners.
             unavailable = copy.deepcopy(config)
-            unavailable['fixture_inputs']['verified'] = False
             publication.publish(entry, {'worktree': env_id, 'ready': False,
                 'machine': None, 'config': unavailable, 'producer_receipt': None}, render_entry)
             raise
@@ -859,7 +850,6 @@ def attach_entry(owner, env_id, entry, config, bom):
 def prepare_entry(env_id, entry, config):
     # Offline preparation never labels saved facts as live readiness.
     config = copy.deepcopy(config)
-    config['fixture_inputs']['verified'] = False
     with runtime.file_lock(Path(entry) / '.entry.lock'):
         return publication.publish(Path(entry), {'worktree': env_id, 'ready': False,
             'machine': None, 'config': config, 'producer_receipt': None}, render_entry)
@@ -941,20 +931,16 @@ def worktree_main(argv: list[str] | None = None) -> int:
                     render_entry({'ready': False, 'worktree': env_id, 'config': config, 'publication_dir': str(entry), 'stable_runtime_dir': str(entry)}, entry)
                     result = {'ready': False, 'published_dir': str(entry)}
             else:
-                config['fixture_inputs'] = {'bom': str(Path(os.environ.get('NOVA_FIXTURE_STORE', str(Path(os.environ.get('XDG_CACHE_HOME', str(Path.home() / '.cache'))) / 'novarocks/fixture-inputs'))).resolve() / 'bom.json'), 'lock_sha256': None, 'verified': False}
-                try:
-                    bom = verify_inputs(config)
-                except runtime.RuntimeFailure:
-                    if shared:
-                        prepare_entry(env_id, entry, config)
-                    raise
                 if shared:
                     if args.profile != 'stock' or args.hook_image:
                         raise runtime.RuntimeFailure('InvalidConfiguration', 'hook profile requires an isolated request')
                     owner = machine.MachineOwner(os.environ.get("NOVA_FIXTURE_MACHINE_ROOT"))
-                    result = attach_entry(owner, env_id, entry, config, bom)
+                    store = os.environ.get("NOVA_FIXTURE_STORE")
+                    owner.ensure_created(store=Path(store) if store else None)
+                    result = attach_entry(owner, env_id, entry, config)
                 else:
-                    result = isolated_start(config, settings['NOVA_ENV_COMPOSE_PROJECT'], entry, args.profile, args.hook_image, bom)
+                    prepared = build_inputs(config)
+                    result = isolated_start(config, settings['NOVA_ENV_COMPOSE_PROJECT'], entry, args.profile, args.hook_image, prepared)
         if result is None:
             output = None
         else:

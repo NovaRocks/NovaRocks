@@ -55,7 +55,7 @@ class RendererCase(unittest.TestCase):
         self.config['fixture_inputs'] = {'bom': str(self.root / 'bom.json'), 'lock_sha256': bom()['lock_sha256'], 'verified': True}
 
     def bind(self, inputs=None):
-        return entry.attach_entry(self.owner, 'test-worktree', self.entry, self.config, inputs or bom())
+        return entry.attach_entry(self.owner, 'test-worktree', self.entry, self.config)
 
     def environment(self, path, **extra):
         output = subprocess.check_output(['bash', '-c', 'source "$1"; python3 -c "import os,json; print(json.dumps(dict(os.environ)))"', '_', str(path)], env={**os.environ, **extra}, text=True)
@@ -74,7 +74,7 @@ class RendererTests(RendererCase):
         settings = entry.load_settings(HERE / "shared.env")
         settings["NOVA_ENV_OBJECT_STORE_CONFIG"] = str(cloud_file)
         config = entry.request_config(self.workspace, settings, HERE / "shared.env", self.entry, shared=True, update_current=False)
-        result = entry.attach_entry(fixture.owner, config["env_id"], self.entry, config, fixture.inputs)
+        result = entry.attach_entry(fixture.owner, config["env_id"], self.entry, config)
         self.assertTrue(result["ready"])
         self.assertEqual(config["benchmark"]["shared_root"].rstrip('/'), snapshot["config"]["benchmark_root"])
         self.assertEqual(fixture.backend.events, ["ensure"])
@@ -371,31 +371,31 @@ class RendererTests(RendererCase):
         self.assertEqual((Path(first['published_dir']) / 'env.sh').read_bytes(), old_bytes)
         self.assertNotEqual(old_bytes, (self.entry / 'env.sh').read_bytes())
 
-    def test_version_failure_does_not_change_services_and_clears_ready_entry(self):
+    def test_direct_use_publishes_existing_configuration_without_input_verification(self):
         first = self.bind()
         before = copy.deepcopy(self.backend.events)
-        changed = bom(); changed['derived_images']['rest-mv']['definition_sha256'] = 'different'
-        with self.assertRaisesRegex(runtime.RuntimeFailure, 'MachineVersionMismatch'):
-            self.bind(changed)
-        self.assertFalse(publication.read(self.entry)['ready'])
+        self.config['fixture_inputs'] = {'recommendations': '/updated/recommendations.json'}
+        with mock.patch.object(machine, 'prepare_inputs', side_effect=AssertionError('build')):
+            second = self.bind()
+        self.assertTrue(second['ready'])
+        self.assertEqual(second['machine']['generation'], first['machine']['generation'])
         self.assertEqual(self.backend.events, before)
-        self.assertTrue((Path(first['published_dir']) / 'env.sh').is_file())
 
-    def test_identity_observation_failure_disables_discovery_without_mutating_services(self):
+    def test_direct_use_attach_does_not_probe_unrelated_services(self):
         first = self.bind()
         before = copy.deepcopy(self.backend.events)
-        with mock.patch.object(self.backend, "healthy", side_effect=runtime.RuntimeFailure("RuntimeIdentityMismatch", "replaced service")):
-            with self.assertRaisesRegex(runtime.RuntimeFailure, "RuntimeIdentityMismatch"):
-                self.bind()
-        self.assertFalse(publication.read(self.entry)["ready"])
+        with mock.patch.object(self.backend, 'healthy', side_effect=AssertionError('environment health')), \
+                mock.patch.object(self.backend, 'image_id', side_effect=AssertionError('image scan')):
+            second = self.bind()
+        self.assertTrue(second['ready'])
+        self.assertEqual(second['machine']['generation'], first['machine']['generation'])
         self.assertEqual(self.backend.events, before)
-        self.assertTrue((Path(first["published_dir"]) / "env.sh").is_file())
 
     def test_renderer_and_interrupted_commit_preserve_previous_complete_publication(self):
         first = self.bind()
         invalid = copy.deepcopy(self.config); del invalid['local_ports']['mysql']
         with self.assertRaises(KeyError):
-            entry.attach_entry(self.owner, 'test-worktree', self.entry, invalid, bom())
+            entry.attach_entry(self.owner, 'test-worktree', self.entry, invalid)
         self.assertEqual(publication.read(self.entry), first)
         changed = copy.deepcopy(first); changed['config']['benchmark']['build_timeout_seconds'] = 120
         for point in ('publication.prepared', 'publication.before_swap'):
@@ -620,7 +620,7 @@ class SharedEnvironmentTests(RendererCase):
         other_config = copy.deepcopy(self.config)
         other_config.update(env_id='other-worktree', workspace_root=str(self.root / 'other'))
         other_config['warehouses'] = {name: value.replace('test-worktree', 'other-worktree') for name, value in self.config['warehouses'].items()}
-        second = entry.attach_entry(self.owner, 'other-worktree', other_entry, other_config, bom())
+        second = entry.attach_entry(self.owner, 'other-worktree', other_entry, other_config)
         a, b = (self.environment(Path(p['published_dir']) / 'env.sh') for p in (first, second))
         self.assertEqual(a['NOVA_FIXTURE_MACHINE_ID'], b['NOVA_FIXTURE_MACHINE_ID'])
         self.assertEqual(a['AWS_S3_ENDPOINT'], b['AWS_S3_ENDPOINT'])
@@ -993,22 +993,21 @@ class IsolatedEntryTests(RendererCase):
 
 
 class ConsumerInputVerificationTests(unittest.TestCase):
-    def test_runtime_consumes_exact_verified_snapshot_without_rereading_bom(self):
-        snapshot = {'schema': 2, 'platform': 'linux/arm64', 'lock_sha256': 'verified-lock'}
-        config = {'repo_root': '/fixture-repository', 'fixture_inputs': {'bom': '/fixture-store/bom.json', 'verified': False}}
-        with mock.patch.object(machine, 'verified_bom', return_value=snapshot) as verify, mock.patch.object(runtime, 'read_json', side_effect=AssertionError('reread mutable BOM')):
-            actual = entry.verify_inputs(config)
-        self.assertIs(actual, snapshot)
-        verify.assert_called_once_with(Path('/fixture-repository'), Path('/fixture-store'), consumer='iceberg-rest')
-        self.assertEqual(config['fixture_inputs']['consumer'], 'iceberg-rest')
-        self.assertEqual(config['fixture_inputs']['lock_sha256'], 'verified-lock')
-        self.assertTrue(config['fixture_inputs']['verified'])
+    def test_direct_use_only_a_creation_calls_the_input_builder(self):
+        config = {'repo_root': '/fixture-repository'}
+        expected = {'images': {}, 'derived_images': {}}
+        with mock.patch.object(machine, 'prepare_inputs', return_value=expected) as build, \
+                mock.patch.dict(os.environ, {'NOVA_FIXTURE_STORE': '/fixture-store'}):
+            self.assertIs(entry.build_inputs(config), expected)
+        build.assert_called_once_with(Path('/fixture-repository'), Path('/fixture-store'), consumer='iceberg-rest')
 
-    def test_failed_input_verification_never_marks_publication_verified(self):
-        config = {'repo_root': '/fixture-repository', 'fixture_inputs': {'bom': '/fixture-store/bom.json', 'verified': False}}
-        with mock.patch.object(machine, 'verified_bom', side_effect=runtime.RuntimeFailure('FixturePrerequisiteMissing', 'absent')), self.assertRaises(runtime.RuntimeFailure):
-            entry.verify_inputs(config)
-        self.assertFalse(config['fixture_inputs']['verified'])
+    def test_direct_use_creation_failure_retains_original_error(self):
+        config = {'repo_root': '/fixture-repository'}
+        original = runtime.RuntimeFailure('FixtureBuildFailed', 'actual creation error')
+        with mock.patch.object(machine, 'prepare_inputs', side_effect=original):
+            with self.assertRaises(runtime.RuntimeFailure) as caught:
+                entry.build_inputs(config)
+        self.assertIs(caught.exception, original)
 
 
 if __name__ == '__main__':
