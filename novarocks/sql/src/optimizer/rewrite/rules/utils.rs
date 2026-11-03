@@ -297,9 +297,13 @@ pub(crate) fn collect_output_ids_ordered_opt(expr: &OptExpr) -> Vec<ColumnId> {
             ids.extend(t.output_columns.iter().map(|c| c.column_id));
             ids
         }
-        Operator::LogicalJoin(_) => {
+        Operator::LogicalJoin(join) => {
             let mut ids = collect_output_ids_ordered_opt(expr.left());
-            ids.extend(collect_output_ids_ordered_opt(expr.right()));
+            if let crate::common::JoinKind::LeftMark { mark } = join.join_type {
+                ids.push(mark);
+            } else {
+                ids.extend(collect_output_ids_ordered_opt(expr.right()));
+            }
             ids
         }
         Operator::LogicalCTEAnchor(_) => collect_output_ids_ordered_opt(expr.child(1)),
@@ -345,9 +349,13 @@ fn collect_qualified_output_columns_opt_inner(expr: &OptExpr, out: &mut HashSet<
                 out.insert((None, item.output_name.to_lowercase()));
             }
         }
-        Operator::LogicalJoin(_) => {
+        Operator::LogicalJoin(join) => {
             collect_qualified_output_columns_opt_inner(expr.left(), out);
-            collect_qualified_output_columns_opt_inner(expr.right(), out);
+            if let Some(mark) = join.join_type.mark_output() {
+                out.insert((None, mark.name.to_lowercase()));
+            } else {
+                collect_qualified_output_columns_opt_inner(expr.right(), out);
+            }
         }
         Operator::LogicalAggregate(a) => {
             for c in &a.output_columns {

@@ -177,6 +177,11 @@ enum State {
     Failed(ExecutionFailure),
 }
 pub(crate) struct JoinBuildFrame {
+    #[cfg(novarocks_dev_controls)]
+    test_control: OnceLock<(
+        usize,
+        Arc<dyn crate::runtime::join_test_control::JoinBuildPublicationControl>,
+    )>,
     tail_ranges: OnceLock<ExecutionResult<Arc<super::tail_ranges::TailRanges<FinalizedBuild>>>>,
     pub(crate) domains: ProjectionDomains,
     pub(crate) completion: Arc<JoinCompletion<FinalizedBuild>>,
@@ -204,6 +209,21 @@ pub(crate) struct FinalizeWorker {
     key_progress: u64,
 }
 impl JoinBuildFrame {
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn install_test_control(
+        &self,
+        node: usize,
+        control: Arc<dyn crate::runtime::join_test_control::JoinBuildPublicationControl>,
+    ) {
+        self.test_control.get_or_init(|| (node, control));
+    }
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn publication_test_held(&self) -> bool {
+        self.test_control
+            .get()
+            .is_some_and(|(_, control)| control.is_held())
+    }
+
     pub(crate) fn new(
         domains: ProjectionDomains,
         options: FinalizeOptions,
@@ -226,6 +246,8 @@ impl JoinBuildFrame {
                 completion,
                 inputs,
                 state: Mutex::new(State::Collecting),
+                #[cfg(novarocks_dev_controls)]
+                test_control: OnceLock::new(),
                 live_slots: options.live_slots,
                 match_bits: options.match_bits,
                 activation: OnceLock::new(),
@@ -497,6 +519,12 @@ impl JoinBuildFrame {
         } else {
             None
         };
+        #[cfg(novarocks_dev_controls)]
+        if let Some((node, control)) = self.test_control.get()
+            && !control.before_publish(*node)?
+        {
+            return Ok(FinalizeStep::Blocked);
+        }
         {
             let mut state = self.state()?;
             match &*state {

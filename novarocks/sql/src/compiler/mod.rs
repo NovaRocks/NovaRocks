@@ -420,6 +420,22 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
+    /// Planner-only normalization selected after JSON membership admission.
+    fn resolve_json_canonical_key_binding(
+        &self,
+        _argument: &novarocks_functions::FunctionArgument,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
     fn resolve_window_binding(
         &self,
         _name: &str,

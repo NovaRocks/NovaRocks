@@ -51,6 +51,11 @@ pub struct FragmentPrepareContext {
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
     #[cfg(novarocks_dev_controls)]
     exchange_test_observer: Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>,
+    #[cfg(novarocks_dev_controls)]
+    join_build_control:
+        Option<Arc<dyn crate::runtime::join_test_control::JoinBuildPublicationControl>>,
+    #[cfg(novarocks_dev_controls)]
+    query_tracker_witness: std::sync::Weak<MemTracker>,
     result_writer: Arc<dyn FragmentResultWriter>,
     root_result_session: Option<Arc<dyn crate::runtime::fragment::io::RootResultSession>>,
     event_sink: Arc<dyn FragmentEventSink>,
@@ -2337,6 +2342,10 @@ impl Default for FragmentPrepareContext {
                 crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
             #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
+            #[cfg(novarocks_dev_controls)]
+            join_build_control: None,
+            #[cfg(novarocks_dev_controls)]
+            query_tracker_witness: std::sync::Weak::new(),
             edge_gates: None,
             result_writer: crate::runtime::fragment::io::result::discard_result_writer(),
             event_sink: Arc::new(NoopFragmentEventSink),
@@ -2382,6 +2391,10 @@ impl FragmentPrepareContext {
             exchange_transmitter,
             #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
+            #[cfg(novarocks_dev_controls)]
+            join_build_control: None,
+            #[cfg(novarocks_dev_controls)]
+            query_tracker_witness: std::sync::Weak::new(),
             result_writer,
             event_sink,
             edge_gates: None,
@@ -2425,6 +2438,21 @@ impl FragmentPrepareContext {
             "one original completion role set"
         );
         self.completion_roles = Some(roles);
+        self
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub fn with_query_tracker_witness(mut self, tracker: std::sync::Weak<MemTracker>) -> Self {
+        self.query_tracker_witness = tracker;
+        self
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub fn with_join_build_control(
+        mut self,
+        control: Option<Arc<dyn crate::runtime::join_test_control::JoinBuildPublicationControl>>,
+    ) -> Self {
+        self.join_build_control = control;
         self
     }
 
@@ -2565,6 +2593,10 @@ impl FragmentPrepareContext {
             exchange_transmitter,
             #[cfg(novarocks_dev_controls)]
             exchange_test_observer: None,
+            #[cfg(novarocks_dev_controls)]
+            join_build_control: None,
+            #[cfg(novarocks_dev_controls)]
+            query_tracker_witness: std::sync::Weak::new(),
             result_writer,
             event_sink,
             edge_gates: None,

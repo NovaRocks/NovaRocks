@@ -733,8 +733,9 @@ pub(crate) enum ApplyClause {
     Projection,
 }
 
-/// A scalar subquery the analyzer routed to the Apply framework.
-/// The planner consumes these to emit `LogicalPlanKind::Apply`. The inner query is
+/// A clause-owned scalar subquery or JSON value-form mark probe.
+/// The planner emits `LogicalPlanKind::Apply` for scalar results and a
+/// null-aware mark join for `mark_probe`. The inner query is
 /// left INTACT — correlation predicates remain in its WHERE; M1b's
 /// PushDownApplyFilter rule extracts them into the Apply's correlation_conjuncts.
 // All fields are consumed by the M1a planner (Task 4) and M1b runtime (Task 5+).
@@ -743,6 +744,10 @@ pub(crate) enum ApplyClause {
 // from the non-test dead-code analysis).
 #[derive(Clone, Debug)]
 pub(crate) struct ApplyScalarSpec {
+    /// JSON value-form IN uses the same clause insertion points, with a mark join.
+    pub mark_probe: Option<TypedExpr>,
+    /// Exact hidden-call selection for the materialized probe and RHS values.
+    pub mark_key_bindings: Option<[crate::binding::SqlFunctionBinding; 2]>,
     /// Placeholder id this spec replaced (matches the original SubqueryInfo.id).
     /// Read by M1b (AssertOneRow error message); unused in M1a production code.
     #[allow(dead_code)]

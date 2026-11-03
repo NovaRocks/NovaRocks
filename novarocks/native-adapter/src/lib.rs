@@ -483,3 +483,6 @@ mod frontend_selected_origin_tests {
 
 #[cfg(test)]
 mod root_unknown_test;
+
+#[cfg(novarocks_dev_controls)]
+mod join_build_test_control;

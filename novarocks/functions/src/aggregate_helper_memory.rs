@@ -59,7 +59,7 @@ pub(crate) fn reserve_observation_backing(
 /// payload as c_long plus 56 opaque bytes, size 64 and alignment 8. This fact
 /// applies only to exclusive initialization before any handle is published;
 /// racing OnceBox initialization can allocate additional losing candidates.
-fn private_mutex_backing_bytes() -> Result<usize, KernelFailure> {
+pub(crate) fn private_mutex_backing_bytes() -> Result<usize, KernelFailure> {
     #[cfg(target_os = "linux")]
     {
         Ok(0)

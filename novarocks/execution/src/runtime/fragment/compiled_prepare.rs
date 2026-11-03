@@ -480,6 +480,17 @@ fn prepare_compiled_fragment_in(
                 error,
             )
         })?;
+        #[cfg(novarocks_dev_controls)]
+        let runtime_state = {
+            let mut state = runtime_state;
+            Arc::get_mut(&mut state)
+                .expect("newly constructed runtime state has no aliases")
+                .install_join_build_control(context.join_build_control.clone());
+            Arc::get_mut(&mut state)
+                .expect("newly constructed runtime state has no aliases")
+                .install_query_tracker_witness(context.query_tracker_witness.clone());
+            state
+        };
         // Both receiver lifetimes use the same tracker, model and creation
         // author. Native explicitly retains its stop owner through retirement.
         let (receiver_creation, receiver_construction_stop) =

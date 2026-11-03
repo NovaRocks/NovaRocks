@@ -18,9 +18,7 @@ use arrow_schema::DataType;
 #[cfg(test)]
 use arrow_schema::TimeUnit;
 use base64::Engine;
-use chrono::{
-    DateTime, Datelike, FixedOffset, Local, NaiveDate, NaiveDateTime, Offset, Timelike, Utc,
-};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, Timelike, Utc};
 
 #[derive(Debug, PartialEq)]
 pub struct VariantFailure(Box<VariantFailureCause>);
@@ -403,18 +401,15 @@ impl VariantValue {
         &self.value
     }
 
-    pub fn to_json_local(&self) -> Result<String, VariantFailure> {
-        let tz = Local::now().offset().fix();
-        self.to_json(Some(tz))
-    }
-
-    pub fn to_json(&self, tz: Option<FixedOffset>) -> Result<String, VariantFailure> {
+    /// Renders timestamp values in the canonical Trino UTC representation.
+    /// Rendering never reads a session or process-local time zone.
+    pub fn to_json(&self) -> Result<String, VariantFailure> {
         let mut out = String::new();
         let variant = VariantRef {
             metadata: &self.metadata,
             value: &self.value,
         };
-        variant_to_json(&variant, &mut out, tz)?;
+        variant_to_json(&variant, &mut out)?;
         Ok(out)
     }
 }
@@ -914,9 +909,27 @@ pub fn variant_to_string(value: &VariantValue) -> Result<String, VariantFailure>
         BasicType::ShortString => bytes_to_string(variant.get_string()?),
         BasicType::Primitive => match variant.primitive_type()? {
             VariantPrimitiveType::String => bytes_to_string(variant.get_string()?),
-            _ => value.to_json_local(),
+            VariantPrimitiveType::TimestampTz
+            | VariantPrimitiveType::TimestampNtz
+            | VariantPrimitiveType::TimestampTzNanos
+            | VariantPrimitiveType::TimestampNtzNanos => {
+                let primitive = variant.primitive_type()?;
+                format_variant_timestamp(
+                    variant.get_int64()?,
+                    matches!(
+                        primitive,
+                        VariantPrimitiveType::TimestampTzNanos
+                            | VariantPrimitiveType::TimestampNtzNanos
+                    ),
+                    matches!(
+                        primitive,
+                        VariantPrimitiveType::TimestampTz | VariantPrimitiveType::TimestampTzNanos
+                    ),
+                )
+            }
+            _ => value.to_json(),
         },
-        _ => value.to_json_local(),
+        _ => value.to_json(),
     }
 }
 
@@ -1491,11 +1504,7 @@ fn read_le_u32(data: &[u8], size: u8) -> Result<u32, VariantFailure> {
     Ok(out)
 }
 
-fn variant_to_json(
-    variant: &VariantRef<'_>,
-    out: &mut String,
-    tz: Option<FixedOffset>,
-) -> Result<(), VariantFailure> {
+fn variant_to_json(variant: &VariantRef<'_>, out: &mut String) -> Result<(), VariantFailure> {
     match variant.basic_type()? {
         BasicType::Primitive => match variant.primitive_type()? {
             VariantPrimitiveType::Null => out.push_str("null"),
@@ -1563,24 +1572,28 @@ fn variant_to_json(
                 out.push_str(&date.format("%Y-%m-%d").to_string());
                 out.push('"');
             }
-            VariantPrimitiveType::TimestampTz => {
-                let micros = variant.get_timestamp_micros()?;
-                let tz = tz.unwrap_or_else(|| Local::now().offset().fix());
-                let ts = format_timestamp_tz(micros, tz)?;
-                out.push('"');
-                out.push_str(&ts);
-                out.push('"');
-            }
-            VariantPrimitiveType::TimestampNtz => {
-                let micros = variant.get_timestamp_micros_ntz()?;
-                let ts = format_timestamp_ntz(micros, 6)?;
-                out.push('"');
-                out.push_str(&ts);
-                out.push('"');
-            }
-            VariantPrimitiveType::TimeNtz
+            VariantPrimitiveType::TimestampTz
+            | VariantPrimitiveType::TimestampNtz
             | VariantPrimitiveType::TimestampTzNanos
             | VariantPrimitiveType::TimestampNtzNanos => {
+                let primitive = variant.primitive_type()?;
+                let ts = format_variant_timestamp(
+                    variant.get_int64()?,
+                    matches!(
+                        primitive,
+                        VariantPrimitiveType::TimestampTzNanos
+                            | VariantPrimitiveType::TimestampNtzNanos
+                    ),
+                    matches!(
+                        primitive,
+                        VariantPrimitiveType::TimestampTz | VariantPrimitiveType::TimestampTzNanos
+                    ),
+                )?;
+                out.push('"');
+                out.push_str(&ts);
+                out.push('"');
+            }
+            VariantPrimitiveType::TimeNtz => {
                 return Err(VariantFailure::encoding("Unsupported variant type"));
             }
         },
@@ -1615,7 +1628,7 @@ fn variant_to_json(
                     metadata: variant.metadata,
                     value: &variant.value[start..],
                 };
-                variant_to_json(&sub, out, tz)?;
+                variant_to_json(&sub, out)?;
             }
             out.push('}');
         }
@@ -1636,7 +1649,7 @@ fn variant_to_json(
                     metadata: variant.metadata,
                     value: &variant.value[start..],
                 };
-                variant_to_json(&sub, out, tz)?;
+                variant_to_json(&sub, out)?;
             }
             out.push(']');
         }
@@ -1804,59 +1817,28 @@ fn uuid_to_string(bytes: [u8; 16]) -> String {
     )
 }
 
-fn format_timestamp_tz(micros: i64, tz: FixedOffset) -> Result<String, VariantFailure> {
-    let seconds = micros.div_euclid(1_000_000);
-    let micros_rem = micros.rem_euclid(1_000_000) as u32;
-    let dt_utc = DateTime::<Utc>::from_timestamp(seconds, micros_rem * 1000).ok_or_else(|| {
-        VariantFailure(Box::new(VariantFailureCause::NumericTimestamp {
-            micros,
-            offset_seconds: tz.local_minus_utc(),
-        }))
-    })?;
-    timestamp_tz_to_local_naive(micros, tz)?;
-    let dt = dt_utc.with_timezone(&tz);
-    let base = dt.format("%Y-%m-%d %H:%M:%S").to_string();
-    let frac = format_fraction_trim(micros_rem, 6);
-    let offset = dt.format("%:z").to_string();
-    Ok(if frac.is_empty() {
-        format!("{}{}", base, offset)
+fn format_variant_timestamp(
+    value: i64,
+    nanos: bool,
+    with_zone: bool,
+) -> Result<String, VariantFailure> {
+    let (units_per_second, width, nanos_per_unit) = if nanos {
+        (1_000_000_000, 9, 1)
     } else {
-        format!("{}.{}{}", base, frac, offset)
-    })
-}
-
-fn format_timestamp_ntz(micros: i64, width: usize) -> Result<String, VariantFailure> {
-    let seconds = micros.div_euclid(1_000_000);
-    let micros_rem = micros.rem_euclid(1_000_000) as u32;
-    let dt = DateTime::<Utc>::from_timestamp(seconds, micros_rem * 1000)
-        .ok_or_else(|| {
+        (1_000_000, 6, 1000)
+    };
+    let seconds = value.div_euclid(units_per_second);
+    let fraction = value.rem_euclid(units_per_second) as u32;
+    let dt =
+        DateTime::<Utc>::from_timestamp(seconds, fraction * nanos_per_unit).ok_or_else(|| {
             VariantFailure(Box::new(VariantFailureCause::NumericTimestamp {
-                micros,
+                micros: if nanos { value.div_euclid(1000) } else { value },
                 offset_seconds: 0,
             }))
-        })?
-        .naive_utc();
-    let base = dt.format("%Y-%m-%d %H:%M:%S").to_string();
-    if width == 0 {
-        return Ok(base);
-    }
-    let frac = format_fraction_fixed(micros_rem, width);
-    Ok(format!("{}.{}", base, frac))
-}
-
-fn format_fraction_trim(value: u32, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let mut s = format!("{:0width$}", value, width = width);
-    while s.ends_with('0') {
-        s.pop();
-    }
-    s
-}
-
-fn format_fraction_fixed(value: u32, width: usize) -> String {
-    format!("{:0width$}", value, width = width)
+        })?;
+    let base = dt.format("%Y-%m-%d %H:%M:%S");
+    let suffix = if with_zone { " UTC" } else { "" };
+    Ok(format!("{base}.{fraction:0width$}{suffix}"))
 }
 
 /// Whether an Arrow type can carry raw variant metadata or value bytes.
@@ -1896,6 +1878,63 @@ pub fn is_variant_struct_data_type(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn variant_timestamp_rendering_matches_trino_utc_and_precision() {
+        for (primitive, value, expected) in [
+            (
+                VariantPrimitiveType::TimestampTz,
+                DateTime::parse_from_rfc3339("2026-07-01T08:00:00+08:00")
+                    .unwrap()
+                    .timestamp_micros(),
+                "2026-07-01 00:00:00.000000 UTC",
+            ),
+            (
+                VariantPrimitiveType::TimestampTz,
+                DateTime::parse_from_rfc3339("2026-01-01T08:00:00.123-05:00")
+                    .unwrap()
+                    .timestamp_micros(),
+                "2026-01-01 13:00:00.123000 UTC",
+            ),
+            (
+                VariantPrimitiveType::TimestampNtz,
+                DateTime::parse_from_rfc3339("2026-07-01T08:00:00Z")
+                    .unwrap()
+                    .timestamp_micros(),
+                "2026-07-01 08:00:00.000000",
+            ),
+            (
+                VariantPrimitiveType::TimestampTz,
+                -1,
+                "1969-12-31 23:59:59.999999 UTC",
+            ),
+            (
+                VariantPrimitiveType::TimestampNtz,
+                -1,
+                "1969-12-31 23:59:59.999999",
+            ),
+            (
+                VariantPrimitiveType::TimestampTzNanos,
+                1,
+                "1970-01-01 00:00:00.000000001 UTC",
+            ),
+            (
+                VariantPrimitiveType::TimestampNtzNanos,
+                -1,
+                "1969-12-31 23:59:59.999999999",
+            ),
+        ] {
+            let mut bytes = vec![primitive_header(primitive)];
+            bytes.extend_from_slice(&value.to_le_bytes());
+            let variant = VariantValue::create(&[1, 0, 0], &bytes).unwrap();
+            assert_eq!(variant.to_json().unwrap(), format!("\"{expected}\""));
+            assert_eq!(variant_to_string(&variant).unwrap(), expected);
+            assert_eq!(
+                try_variant_to_json(&variant).unwrap(),
+                Some(format!("\"{expected}\""))
+            );
+        }
+    }
+
+    #[test]
     fn variant_temporal_extremes_refuse_without_epoch_fallback_or_panic() {
         use novarocks_failure_contract::FailureProjection;
         for days in [i32::MIN, i32::MAX] {
@@ -1903,7 +1942,7 @@ mod tests {
             bytes.extend_from_slice(&days.to_le_bytes());
             let value = VariantValue::create(&[1, 0, 0], &bytes).unwrap();
             assert_eq!(
-                value.to_json(None).unwrap_err().failure_fact(),
+                value.to_json().unwrap_err().failure_fact(),
                 novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
             );
         }
@@ -1917,7 +1956,7 @@ mod tests {
                 bytes.extend_from_slice(&micros.to_le_bytes());
                 let value = VariantValue::create(&[1, 0, 0], &bytes).unwrap();
                 assert_eq!(
-                    value.to_json(Some(tz)).unwrap_err().failure_fact(),
+                    value.to_json().unwrap_err().failure_fact(),
                     novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
                 );
                 if matches!(primitive, VariantPrimitiveType::TimestampTz) {
@@ -1930,13 +1969,12 @@ mod tests {
     }
     #[test]
     fn variant_temporal_checked_offset_preserves_negative_fraction_bytes() {
-        let tz = FixedOffset::east_opt(0).unwrap();
         assert_eq!(
-            format_timestamp_tz(-1, tz).unwrap(),
-            "1969-12-31 23:59:59.999999+00:00"
+            format_variant_timestamp(-1, false, true).unwrap(),
+            "1969-12-31 23:59:59.999999 UTC"
         );
         assert_eq!(
-            format_timestamp_ntz(-1, 6).unwrap(),
+            format_variant_timestamp(-1, false, false).unwrap(),
             "1969-12-31 23:59:59.999999"
         );
         let max = NaiveDateTime::MAX.and_utc().timestamp_micros();
@@ -2162,7 +2200,7 @@ pub fn try_variant_to_time_micros(
 /// Nullable JSON rendering for a value that has no supported conversion.
 /// Malformed storage and format/resource limits cannot become SQL NULL.
 pub fn try_variant_to_json(value: &VariantValue) -> Result<Option<String>, VariantFailure> {
-    nullable_conversion(value.to_json_local())
+    nullable_conversion(value.to_json())
 }
 
 #[cfg(test)]

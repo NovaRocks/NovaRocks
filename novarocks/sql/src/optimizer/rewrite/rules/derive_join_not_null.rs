@@ -48,7 +48,8 @@ fn safe_sides(join_type: JoinKind) -> (bool, bool) {
         JoinKind::Inner => (true, true),
         JoinKind::LeftSemi => (false, true),
         JoinKind::RightSemi => (true, false),
-        JoinKind::LeftAnti
+        JoinKind::LeftMark { .. }
+        | JoinKind::LeftAnti
         | JoinKind::RightAnti
         | JoinKind::NullAwareLeftAnti
         | JoinKind::LeftOuter
@@ -275,7 +276,8 @@ fn spine_not_null_inner(expr: &OptExpr, arena: &ScalarArena, ids: &mut HashSet<C
         Operator::LogicalJoin(join) if expr.children.len() == 2 => {
             let (preserve_left, preserve_right) = match join.join_type {
                 JoinKind::Inner | JoinKind::Cross => (true, true),
-                JoinKind::LeftOuter
+                JoinKind::LeftMark { .. }
+                | JoinKind::LeftOuter
                 | JoinKind::LeftSemi
                 | JoinKind::LeftAnti
                 | JoinKind::NullAwareLeftAnti => (true, false),

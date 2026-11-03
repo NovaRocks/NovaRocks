@@ -120,6 +120,7 @@ pub(in crate::scenarios) struct SqlIntentOwner(Mutex<Option<Frozen>>);
 enum StatementRefinement {
     BeforeSchemaFailure,
     RemoteWriterSender(usize),
+    MarkJoinBuild(usize),
 }
 impl SqlIntentOwner {
     pub fn freeze(
@@ -193,6 +194,34 @@ impl SqlIntentOwner {
         )
     }
 
+    pub fn freeze_mark_join_build(
+        &self,
+        specs: Vec<StatementSpec>,
+        statement_index: usize,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<ClusterTestSessionPlan> {
+        let selected = specs
+            .get(statement_index)
+            .context("mark join statement is absent")?;
+        ensure!(
+            selected.faults.iter().copied().collect::<BTreeSet<_>>()
+                == (0..cluster_size)
+                    .map(|index| (index, "join-build-before-publish-hold"))
+                    .collect(),
+            "mark join hold requires finite candidates on actual roles"
+        );
+        self.freeze_internal(
+            specs,
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+            Some(StatementRefinement::MarkJoinBuild(statement_index)),
+        )
+    }
+
     fn freeze_internal(
         &self,
         specs: Vec<StatementSpec>,
@@ -262,6 +291,11 @@ impl SqlIntentOwner {
                 {
                     bind["task_selector"] = json!("remote-writer-sender");
                     fault["task_selector"] = json!("remote-writer-sender");
+                }
+                if matches!(refinement,Some(StatementRefinement::MarkJoinBuild(selected)) if selected == statement_index)
+                {
+                    bind["task_selector"] = json!("left-mark-build");
+                    fault["task_selector"] = json!("left-mark-build");
                 }
                 add(
                     launches.get_mut(&RoleSlot::Frontend).unwrap(),

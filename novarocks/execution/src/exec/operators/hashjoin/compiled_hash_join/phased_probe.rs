@@ -143,6 +143,7 @@ impl ProbeDefinition {
                     novarocks_local_program::JoinType::NullAwareLeftAnti => {
                         JoinType::NullAwareLeftAnti
                     }
+                    novarocks_local_program::JoinType::LeftMark => JoinType::LeftMark,
                 };
                 naa = condition.is_null_aware();
                 scope_keys = condition.scope_keys().len();
@@ -262,12 +263,30 @@ enum RowCandidates {
     Physical(Range<usize>),
     Naa(NaaCandidates),
 }
+/// Original per-probe match state. A mark reads its three-valued result from
+/// the admitted single-key presence lookup; ordinary/NAA candidates retain
+/// their existing complete-predicate evaluation and required-error ordering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeMatch {
+    False,
+    Unknown,
+    True,
+}
+impl ProbeMatch {
+    fn value(self) -> Option<bool> {
+        match self {
+            Self::False => Some(false),
+            Self::Unknown => None,
+            Self::True => Some(true),
+        }
+    }
+}
 struct ProbeCursor {
     input: Chunk,
     lookup: ProbeLookup,
     row: usize,
     candidate: Option<RowCandidates>,
-    matched: Vec<bool>,
+    matched: Vec<ProbeMatch>,
     _storage: ValueTypeStorageLifetime,
 }
 struct JoinProbe {
@@ -431,6 +450,7 @@ impl OperatorLifecycle for JoinProbe {
                     CanonicalJoinOutput::Probe
                 }
                 JoinType::RightSemi | JoinType::RightAnti => CanonicalJoinOutput::Build,
+                JoinType::LeftMark => CanonicalJoinOutput::ProbeMark,
                 _ => CanonicalJoinOutput::Pairs,
             };
             let output = PagedJoinGather::new_canonical(
@@ -507,6 +527,22 @@ impl OperatorLifecycle for JoinProbe {
 }
 impl InputEncodingPolicy for JoinProbe {}
 impl TransformKernel for JoinProbe {
+    #[cfg(novarocks_dev_controls)]
+    fn is_mark_join_probe(&self) -> bool {
+        matches!(
+            self.declaration
+                .program
+                .graph()
+                .nodes()
+                .get(self.declaration.node().index())
+                .map(|node| node.kind()),
+            Some(ProgramNodeKind::Join {
+                join_type: novarocks_local_program::JoinType::LeftMark,
+                ..
+            })
+        )
+    }
+
     fn control_observable(&self) -> Option<Arc<crate::runtime::observable::Observable>> {
         self.frame
             .as_ref()
@@ -642,7 +678,7 @@ impl TransformKernel for JoinProbe {
                 &self.control,
             )?;
             let mut matched = funded_vec(owner.as_ref(), chunk.len())?;
-            matched.resize(chunk.len(), false);
+            matched.resize(chunk.len(), ProbeMatch::False);
             let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
             self.cursor = Some(ProbeCursor {
                 input: accepted.take().expect("original admitted input"),
@@ -847,14 +883,22 @@ fn prepare_lookup(
         }
     }
 }
-fn begin_row(cursor: &mut ProbeCursor, loaded: &Loaded) -> ExecutionResult<RowCandidates> {
+fn begin_row(
+    cursor: &mut ProbeCursor,
+    loaded: &Loaded,
+    mark: bool,
+) -> ExecutionResult<RowCandidates> {
     let row = cursor.row;
     Ok(match (&cursor.lookup, &loaded.lookup) {
         (ProbeLookup::PayloadOnly, LoadedLookup::PayloadOnly) => {
             RowCandidates::Physical(0..loaded.data.rows.len())
         }
         (ProbeLookup::Membership(present), LoadedLookup::Ordinary(_)) => {
-            cursor.matched[row] = present.present()[row] != 0;
+            cursor.matched[row] = if present.present()[row] != 0 {
+                ProbeMatch::True
+            } else {
+                ProbeMatch::False
+            };
             RowCandidates::Empty
         }
         (ProbeLookup::Ordinary(matches), LoadedLookup::Ordinary(index)) => {
@@ -869,9 +913,21 @@ fn begin_row(cursor: &mut ProbeCursor, loaded: &Loaded) -> ExecutionResult<RowCa
                 BulkMatch::Miss | BulkMatch::Unmatchable => RowCandidates::Empty,
             }
         }
+        (ProbeLookup::Naa(page), LoadedLookup::Naa(store)) if mark => {
+            cursor.matched[row] = match store.mark_truth(page, row)? {
+                Some(true) => ProbeMatch::True,
+                Some(false) => ProbeMatch::False,
+                None => ProbeMatch::Unknown,
+            };
+            RowCandidates::Empty
+        }
         (ProbeLookup::Naa(page), LoadedLookup::Naa(store)) => match store.start(page, row)? {
             NaaRowStart::Decided { suppressed } => {
-                cursor.matched[row] = suppressed;
+                cursor.matched[row] = if suppressed {
+                    ProbeMatch::True
+                } else {
+                    ProbeMatch::False
+                };
                 RowCandidates::Empty
             }
             NaaRowStart::Candidates(cursor) => RowCandidates::Naa(cursor),
@@ -936,13 +992,20 @@ fn advance_probe(
     let closed_start = cursor.row;
     let mut pairs = funded_vec(work.owner, PAIR_PAGE.min(turn.remaining() as usize))?;
     let mut yielded = false;
-    while cursor.row < cursor.input.len() && pairs.len() < PAIR_PAGE {
+    while cursor.row < cursor.input.len()
+        && pairs.len() < PAIR_PAGE
+        && cursor.row - closed_start < PAIR_PAGE
+    {
         if cursor.candidate.is_none() {
             if !turn.try_consume(1) {
                 yielded = true;
                 break;
             }
-            cursor.candidate = Some(begin_row(cursor, loaded)?);
+            cursor.candidate = Some(begin_row(
+                cursor,
+                loaded,
+                prep.definition.kind == JoinType::LeftMark,
+            )?);
         }
         match next_row(
             cursor.candidate.as_mut().expect("started original row"),
@@ -1063,7 +1126,7 @@ fn advance_probe(
         };
         if suppress {
             let pair = pairs[position];
-            cursor.matched[pair.probe.expect("actual probe row")] = true;
+            cursor.matched[pair.probe.expect("actual probe row")] = ProbeMatch::True;
             if let Some(bits) = &loaded.data.matches {
                 bits.mark(pair.build.expect("actual build row").index())?;
             }
@@ -1074,13 +1137,14 @@ fn advance_probe(
     }
     for row in closed_start..cursor.row {
         control.checkpoint(1)?;
-        let matched = cursor.matched[row];
+        let matched = cursor.matched[row] == ProbeMatch::True;
         let emit = match prep.definition.kind {
             JoinType::LeftOuter
             | JoinType::FullOuter
             | JoinType::LeftAnti
             | JoinType::NullAwareLeftAnti => !matched,
             JoinType::LeftSemi => matched,
+            JoinType::LeftMark => true,
             _ => false,
         };
         if emit {
@@ -1091,21 +1155,32 @@ fn advance_probe(
         }
     }
     if prep.definition.naa
+        && prep.definition.kind != JoinType::LeftMark
         && prep.definition.predicate.is_none()
         && cursor.row < cursor.input.len()
-        && cursor.matched[cursor.row]
+        && cursor.matched[cursor.row] == ProbeMatch::True
     {
         cursor.candidate = Some(RowCandidates::Empty);
     }
+    let marks = if prep.definition.kind == JoinType::LeftMark {
+        let mut marks = funded_vec(work.owner, output.len())?;
+        for pair in &output {
+            marks.push(cursor.matched[pair.probe.expect("mark output preserves probe")].value());
+        }
+        Some(marks)
+    } else {
+        None
+    };
     let output = if output.is_empty() {
         None
     } else {
         Some(
             prep.output
-                .gather(
+                .gather_with_marks(
                     Some(&cursor.input),
                     &loaded.data.rows,
                     &output,
+                    marks.as_deref(),
                     work.owner,
                     &work.host,
                     control,

@@ -656,7 +656,10 @@ impl Rule for JoinToHashJoin {
         let Operator::LogicalJoin(op) = &expr.op else {
             return Ok(vec![]);
         };
-        if op.join_type == JoinKind::NullAwareLeftAnti {
+        if matches!(
+            op.join_type,
+            JoinKind::NullAwareLeftAnti | JoinKind::LeftMark { .. }
+        ) {
             if expr.children.len() != 2 {
                 return Ok(vec![]);
             }
@@ -791,6 +794,9 @@ impl Rule for JoinToNestLoop {
         let Operator::LogicalJoin(op) = &expr.op else {
             return Ok(vec![]);
         };
+        if matches!(op.join_type, JoinKind::LeftMark { .. }) {
+            return Ok(vec![]);
+        }
         // NestLoop is used for cross joins or joins without equality
         // conditions. We must check feasibility after `orient_eq_pair`,
         // not just the raw equality count — a `=` whose two sides each

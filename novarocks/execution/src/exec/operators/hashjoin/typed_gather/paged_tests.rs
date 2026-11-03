@@ -484,3 +484,79 @@ fn paged_gather_uses_dictionary_values_across_different_codes_and_underlying_nul
     let output = output.into_chunk(owner.as_ref()).unwrap();
     assert_eq!(output.columns()[0].logical_nulls().unwrap().null_count(), 2);
 }
+
+#[test]
+fn paged_left_mark_gather_authors_nullable_boolean_and_preserves_duplicate_probe_occurrences() {
+    let (owner, tracker) = fixture();
+    let work = work(owner.as_ref(), &tracker, &Control);
+    let ty = FunctionValueType::new(DataType::Int64, true);
+    let probe_schema = schema(std::slice::from_ref(&ty), &[1], owner.as_ref());
+    let build_schema = schema(std::slice::from_ref(&ty), &[2], owner.as_ref());
+    let output_schema = schema(
+        &[ty, FunctionValueType::new(DataType::Boolean, true)],
+        &[7, 8],
+        owner.as_ref(),
+    );
+    let probe = chunk(
+        probe_schema.clone(),
+        Arc::new(Int64Array::from(vec![Some(5), None, Some(9)])),
+        owner.as_ref(),
+    );
+    let source = chunk(
+        build_schema.clone(),
+        Arc::new(Int64Array::from(vec![1, 2, 3])),
+        owner.as_ref(),
+    );
+    let rows = pages(&source, &work);
+    let gather = PagedJoinGather::new_canonical(
+        output_schema,
+        &probe_schema,
+        &build_schema,
+        CanonicalJoinOutput::ProbeMark,
+        owner.as_ref(),
+    )
+    .unwrap();
+    let pairs = [0, 1, 0, 2].map(|row| JoinPairRow {
+        probe: Some(row),
+        build: None,
+    });
+    let marks = [Some(true), None, Some(false), Some(true)];
+    let output = gather
+        .gather_with_marks(
+            Some(&probe),
+            &rows,
+            &pairs,
+            Some(&marks),
+            owner.as_ref(),
+            &work.host,
+            &Control,
+        )
+        .unwrap();
+    assert_eq!(
+        output.record_batch().column(0).to_data(),
+        Int64Array::from(vec![Some(5), None, Some(5), Some(9)]).to_data()
+    );
+    assert_eq!(
+        output
+            .record_batch()
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        marks
+    );
+    assert!(
+        gather
+            .gather(
+                Some(&probe),
+                &rows,
+                &pairs,
+                owner.as_ref(),
+                &work.host,
+                &Control
+            )
+            .is_err()
+    );
+}

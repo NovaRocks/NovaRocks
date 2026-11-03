@@ -211,6 +211,7 @@ mod tests {
         assert!(matches!(parse("left('value', 2)"), Expr::FunctionCall(_)));
         assert!(matches!(parse("right('value', 2)"), Expr::FunctionCall(_)));
         assert!(matches!(parse("DATE '2024-01-10'"), Expr::TypedString(_)));
+        assert!(matches!(parse("JSON '1.00'"), Expr::TypedString(_)));
         assert!(matches!(
             parse("EXTRACT(YEAR FROM created_at)"),
             Expr::FunctionCall(_)

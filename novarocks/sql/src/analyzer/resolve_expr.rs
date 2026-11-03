@@ -485,6 +485,12 @@ impl<'a> super::AnalyzerContext<'a> {
                 let mut list_typed = Vec::with_capacity(in_list.list.len());
                 for item in &in_list.list {
                     let item_typed = self.analyze_expr(item, scope)?;
+                    check_json_comparison_domains(
+                        &expr_typed.value_type,
+                        &item_typed.value_type,
+                        "IN",
+                        in_list.span,
+                    )?;
                     list_typed.push(coerce_literal_for_comparison(&expr_typed, item_typed));
                 }
                 // BITMAP / HLL operands cannot participate in IN / NOT IN
@@ -573,6 +579,18 @@ impl<'a> super::AnalyzerContext<'a> {
                 let expr_typed = self.analyze_expr(&between.expr, scope)?;
                 let low_typed = self.analyze_expr(&between.low, scope)?;
                 let high_typed = self.analyze_expr(&between.high, scope)?;
+                for (left, right) in [
+                    (&expr_typed, &low_typed),
+                    (&expr_typed, &high_typed),
+                    (&low_typed, &high_typed),
+                ] {
+                    check_json_comparison_domains(
+                        &left.value_type,
+                        &right.value_type,
+                        "BETWEEN",
+                        between.span,
+                    )?;
+                }
                 // StarRocks-aligned implicit literal coercion: for
                 // `column BETWEEN lit AND lit`, coerce each string literal
                 // to the column's type. The helper gates on the LHS being a
@@ -762,6 +780,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
                     _ => false,
                 };
+                let mut json_probe = false;
                 if !lhs_is_tuple {
                     // BITMAP / HLL operands cannot participate in IN subquery
                     // because they have no scalar identity. Reject upfront by
@@ -769,12 +788,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     // is dropped before the subquery is planned so we cannot
                     // wait until later.
                     let in_expr_typed = self.analyze_expr(&in_subquery.expr, scope)?;
-                    if is_json_in_subquery_operand(&in_expr_typed, scope) {
-                        return Err(AnalyzeError::unsupported_expression(
-                            "In predicate of JSON does not support subquery",
-                            in_subquery.span,
-                        ));
-                    }
+                    json_probe = is_json_in_subquery_operand(&in_expr_typed, scope);
                     if let Some(logical) = scope
                         .logical_type_of_expr(&in_expr_typed)
                         .filter(is_bitmap_or_hll_type)
@@ -808,7 +822,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     },
                     value_type: novarocks_type_contract::FunctionValueType::new(
                         DataType::Boolean,
-                        false,
+                        json_probe,
                     ),
                 })
             }
@@ -846,6 +860,20 @@ impl<'a> super::AnalyzerContext<'a> {
                     ));
                 };
                 let value = value.clone();
+                let declared = super::helpers::sql_type_to_value_type(
+                    &typed_str.data_type,
+                    false,
+                    self.control,
+                )?;
+                if declared.logical_type() == novarocks_type_contract::ValueLogicalType::Json {
+                    // The explicit literal owns this nominal domain. Preserve
+                    // its bytes; canonical JSON semantics belong to the one
+                    // Functions normalization owner at the consuming call.
+                    return Ok(TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::String(value)),
+                        value_type: declared,
+                    });
+                }
                 // For DATE literals, constant-fold to Date32 integer value
                 if target == DataType::Date32 {
                     let date_str = value.trim_matches(|c| c == '\'' || c == '"');
@@ -1624,6 +1652,12 @@ impl<'a> super::AnalyzerContext<'a> {
                     ast::BinaryOperator::NullSafeEqual => "<=>",
                     _ => unreachable!(),
                 };
+                check_json_comparison_domains(
+                    &left_typed.value_type,
+                    &right_typed.value_type,
+                    op_sym,
+                    left.span(),
+                )?;
                 if let Some(logical) = scope
                     .logical_type_of_expr(&left_typed)
                     .filter(is_bitmap_or_hll_type)
@@ -1986,6 +2020,7 @@ impl<'a> super::AnalyzerContext<'a> {
             let mut common = value.value_type.clone();
             for (label, _) in &when_then {
                 self.check_control()?;
+                check_json_comparison_domains(&common, &label.value_type, "=", span)?;
                 common = wider_comparison_value_type(&common, &label.value_type)
                     .map_err(|error| AnalyzeError::type_mismatch_source(error, span))?;
             }
@@ -4598,7 +4633,39 @@ fn json_semantic_group_by_type_name(expr: &TypedExpr) -> Option<String> {
     }
 }
 
-fn is_json_in_subquery_operand(expr: &TypedExpr, scope: &AnalyzerScope) -> bool {
+/// A carrier-compatible value is not authority to cross the JSON domain.
+fn check_json_comparison_domains(
+    left: &novarocks_type_contract::FunctionValueType,
+    right: &novarocks_type_contract::FunctionValueType,
+    operator: &str,
+    span: novarocks_parser::Span,
+) -> Result<(), AnalyzeError> {
+    use novarocks_type_contract::ValueLogicalType;
+    let left_json = left.logical_type() == ValueLogicalType::Json;
+    let right_json = right.logical_type() == ValueLogicalType::Json;
+    if left_json != right_json
+        && left.data_type() != &DataType::Null
+        && right.data_type() != &DataType::Null
+    {
+        let label = |value: &novarocks_type_contract::FunctionValueType| match value.logical_type()
+        {
+            ValueLogicalType::Json => "json".to_string(),
+            ValueLogicalType::Variant => "variant".to_string(),
+            _ => format!("{:?}", value.data_type()),
+        };
+        return Err(AnalyzeError::type_mismatch(
+            format!(
+                "Cannot apply operator: {} {operator} {}",
+                label(left),
+                label(right)
+            ),
+            span,
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn is_json_in_subquery_operand(expr: &TypedExpr, scope: &AnalyzerScope) -> bool {
     matches!(
         scope.logical_type_of_expr(expr),
         Some(novarocks_types::schema::SqlType::Json)
@@ -8600,7 +8667,7 @@ mod tests {
     }
 
     #[test]
-    fn json_text_comparison_channels_invoke_exact_semantic_conversion() {
+    fn explicit_json_text_comparison_channels_invoke_exact_semantic_conversion() {
         use novarocks_type_contract::ValueLogicalType;
         let catalog = UnaryInputCatalog {
             key_type: DataType::Utf8,
@@ -8608,10 +8675,10 @@ mod tests {
             logical_type: Some(novarocks_types::schema::SqlType::Json),
         };
         for sql in [
-            "select k='text' from unary_input",
-            "select k IN ('text','other') from unary_input",
-            "select k BETWEEN 'a' AND 'z' from unary_input",
-            "select CASE k WHEN 'text' THEN 7 ELSE 9 END from unary_input",
+            "select CAST(k AS STRING)='text' from unary_input",
+            "select CAST(k AS STRING) IN ('text','other') from unary_input",
+            "select CAST(k AS STRING) BETWEEN 'a' AND 'z' from unary_input",
+            "select CASE CAST(k AS STRING) WHEN 'text' THEN 7 ELSE 9 END from unary_input",
         ] {
             let expression = analyze_projection_expr_with_catalog(
                 sql,
@@ -8620,7 +8687,7 @@ mod tests {
             )
             .unwrap();
             let operands = comparison_operands(&expression);
-            for operand in &operands {
+            for (ordinal, operand) in operands.iter().enumerate() {
                 assert_eq!(
                     operand.value_type.logical_type(),
                     ValueLogicalType::Physical,
@@ -8631,7 +8698,9 @@ mod tests {
                     DataType::Utf8,
                     "{sql}"
                 );
-                assert!(!operand.value_type.nullable(), "{sql}");
+                // Explicit CAST declares a nullable result; literal labels
+                // retain their original non-null declaration.
+                assert_eq!(operand.value_type.nullable(), ordinal == 0, "{sql}");
             }
             let ExprKind::FunctionCall { binding, args, .. } = &operands[0].kind else {
                 panic!("JSON identity cannot be erased by a carrier CAST: {sql}");
@@ -8648,6 +8717,32 @@ mod tests {
                     "{sql}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn implicit_json_comparison_channels_reject_foreign_domains() {
+        let catalog = UnaryInputCatalog {
+            key_type: DataType::Utf8,
+            nullable: false,
+            logical_type: Some(novarocks_types::schema::SqlType::Json),
+        };
+        for sql in [
+            "select k='text' from unary_input",
+            "select k IN ('text','other') from unary_input",
+            "select k BETWEEN 'a' AND 'z' from unary_input",
+            "select CASE k WHEN 'text' THEN 7 ELSE 9 END from unary_input",
+        ] {
+            let error = analyze_projection_expr_with_catalog(
+                sql,
+                &catalog,
+                crate::functions::builtin_sql_function_catalog(),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("Cannot apply operator: json"),
+                "{sql}: {error}"
+            );
         }
     }
 

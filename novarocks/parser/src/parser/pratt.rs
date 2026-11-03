@@ -729,7 +729,9 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
         if self.current_is_word("EXTRACT") && self.peek_nontrivia_is_symbol(1, Symbol::LParen) {
             return self.parse_extract_expression();
         }
-        if self.current_is_word("DATETIME") && self.peek_nontrivia_is_string(1) {
+        if (self.current_is_word("DATETIME") || self.current_is_word("JSON"))
+            && self.peek_nontrivia_is_string(1)
+        {
             return self.parse_typed_string_expression();
         }
         let token = self.current().cloned();

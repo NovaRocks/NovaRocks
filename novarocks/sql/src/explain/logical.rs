@@ -184,6 +184,7 @@ fn visit(
         }
         LogicalPlanKind::Join(node) => {
             let kind = match node.join_type {
+                JoinKind::LeftMark { .. } => "NULL AWARE LEFT MARK JOIN",
                 JoinKind::Inner => "INNER JOIN",
                 JoinKind::LeftOuter => "LEFT OUTER JOIN",
                 JoinKind::RightOuter => "RIGHT OUTER JOIN",

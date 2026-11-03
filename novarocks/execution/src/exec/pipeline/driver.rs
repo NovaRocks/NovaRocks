@@ -999,6 +999,14 @@ impl PipelineDriver {
         Ok(())
     }
 
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn mark_probe_dependency(&self) -> bool {
+        self.operators.iter().any(|operator| operator.is_mark_join_probe() && (
+            matches!(operator.admission_next(), Some(AdmissionNext::Wait(wait)) if wait.reason == super::step::WaitReason::Dependency)
+            || matches!(operator.work_next(), Some(NextStep::Wait(wait)) if wait.reason == super::step::WaitReason::Dependency)
+        ))
+    }
+
     pub(crate) fn source_name(&self) -> &str {
         self.operators
             .first()

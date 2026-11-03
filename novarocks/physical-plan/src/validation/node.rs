@@ -105,6 +105,23 @@ pub(crate) fn validate_value(
         value.id.get()
     );
     match &value.origin {
+        ValueOrigin::JoinMark { node } => {
+            if !matches!(
+                fragment.nodes().get(node).map(|owner| &owner.kind),
+                Some(NodeKind::HashJoin {
+                    kind: crate::JoinKind::LeftMark,
+                    ..
+                })
+            ) || *value.ty.data_type() != DataType::Boolean
+                || !value.ty.nullable()
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "join mark must be a nullable Boolean owned by a hash left mark join",
+                ));
+            }
+        }
+
         ValueOrigin::ProviderField { scan_node, field } => {
             match fragment.nodes().get(scan_node) {
                 Some(node) if matches!(node.kind, NodeKind::Scan { .. }) => {}
@@ -576,6 +593,22 @@ pub(crate) fn validate_join_output_closure(
             "join NULL-extended declarations differ from its output values",
         ));
     }
+    if kind == crate::JoinKind::LeftMark {
+        let marks = node.output.columns.iter().filter(|value| fragment.values().get(value).is_some_and(|definition| matches!(definition.origin, ValueOrigin::JoinMark { node: owner } if owner == node.id))).count();
+        if marks != 1
+            || !declared_nulls.is_empty()
+            || left
+                .output
+                .columns
+                .iter()
+                .any(|value| !node.output.columns.contains(value))
+        {
+            errors.push(ValidationError::new(
+                path,
+                "left mark join must preserve every probe column and produce exactly one mark",
+            ));
+        }
+    }
     for value in &node.output.columns {
         let allowed_original = match kind {
             crate::JoinKind::Cross | crate::JoinKind::Inner => {
@@ -584,13 +617,16 @@ pub(crate) fn validate_join_output_closure(
             crate::JoinKind::LeftOuter
             | crate::JoinKind::LeftSemi
             | crate::JoinKind::LeftAnti
-            | crate::JoinKind::NullAwareLeftAnti => left_values.contains(value),
+            | crate::JoinKind::NullAwareLeftAnti
+            | crate::JoinKind::LeftMark => left_values.contains(value),
             crate::JoinKind::RightOuter
             | crate::JoinKind::RightSemi
             | crate::JoinKind::RightAnti => right_values.contains(value),
             crate::JoinKind::FullOuter => false,
         };
-        if allowed_original {
+        let valid_mark = kind == crate::JoinKind::LeftMark
+            && fragment.values().get(value).is_some_and(|definition| matches!(definition.origin, ValueOrigin::JoinMark { node: owner } if owner == node.id));
+        if allowed_original || valid_mark {
             continue;
         }
         let valid_null_extension = declared.contains(value)
@@ -610,6 +646,7 @@ pub(crate) fn validate_join_output_closure(
                                 | crate::JoinKind::LeftSemi
                                 | crate::JoinKind::LeftAnti
                                 | crate::JoinKind::NullAwareLeftAnti
+                                | crate::JoinKind::LeftMark
                                 | crate::JoinKind::RightSemi
                                 | crate::JoinKind::RightAnti => false,
                             }
@@ -636,6 +673,14 @@ pub(crate) fn value_origin_allowed(
     repeat_grouping_values: &BTreeSet<(ValueId, ValueId)>,
 ) -> bool {
     match (&node.kind, &definition.origin) {
+        (
+            NodeKind::HashJoin {
+                kind: crate::JoinKind::LeftMark,
+                ..
+            },
+            ValueOrigin::JoinMark { node: owner },
+        ) => *owner == node.id,
+
         (NodeKind::Scan { .. }, ValueOrigin::ProviderField { scan_node, .. }) => {
             *scan_node == node.id
         }
@@ -852,9 +897,33 @@ pub(crate) fn validate_node_semantics(
             null_extended,
             ..
         } => {
+            if *kind == crate::JoinKind::LeftMark {
+                let supported = *build_side == crate::JoinSide::Right
+                    && matches!(
+                        distribution,
+                        crate::JoinDistribution::Singleton
+                            | crate::JoinDistribution::BroadcastBuild
+                    )
+                    && matches!(condition, crate::HashJoinCondition::NullAwareEqual { value_equal_keys, scope_keys, eligibility } if value_equal_keys.len() == 1 && scope_keys.is_empty() && eligibility.is_none())
+                    && condition.keys().iter().all(|key| {
+                        !key.null_safe
+                            && [key.left, key.right].iter().all(|id| {
+                                fragment.expressions().get(*id).is_some_and(|expression| {
+                                    *expression.ty.data_type() == DataType::Utf8
+                                })
+                            })
+                    });
+                if !supported {
+                    errors.push(ValidationError::new(path, "left mark hash join requires one null-aware Utf8 key, a right build and singleton or broadcast placement"));
+                }
+            }
             let keys = condition.keys();
             let residual = condition.residual();
-            if (*kind == crate::JoinKind::NullAwareLeftAnti) != condition.is_null_aware() {
+            if matches!(
+                kind,
+                crate::JoinKind::NullAwareLeftAnti | crate::JoinKind::LeftMark
+            ) != condition.is_null_aware()
+            {
                 errors.push(ValidationError::new(
                     path,
                     "hash join kind and condition variant disagree",
@@ -871,7 +940,8 @@ pub(crate) fn validate_node_semantics(
                 crate::JoinKind::LeftOuter
                 | crate::JoinKind::LeftSemi
                 | crate::JoinKind::LeftAnti
-                | crate::JoinKind::NullAwareLeftAnti => *build_side == crate::JoinSide::Right,
+                | crate::JoinKind::NullAwareLeftAnti
+                | crate::JoinKind::LeftMark => *build_side == crate::JoinSide::Right,
                 crate::JoinKind::RightOuter
                 | crate::JoinKind::RightSemi
                 | crate::JoinKind::RightAnti => *build_side == crate::JoinSide::Left,
@@ -1045,6 +1115,12 @@ pub(crate) fn validate_node_semantics(
             predicate,
             null_extended,
         } => {
+            if *kind == crate::JoinKind::LeftMark {
+                errors.push(ValidationError::new(
+                    path,
+                    "left mark join requires hash execution",
+                ));
+            }
             if *kind == crate::JoinKind::NullAwareLeftAnti && predicate.is_none() {
                 errors.push(ValidationError::new(
                     path,

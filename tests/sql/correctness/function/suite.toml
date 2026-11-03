@@ -46,6 +46,7 @@ paths = [
     "novarocks/functions/src/datetime_value.rs",
     "novarocks/functions/src/calendar_*.rs",
     "novarocks/functions/src/parse_json_*.rs",
+    "novarocks/functions/src/json_canonical*.rs",
     "novarocks/functions/src/json_object_*.rs",
     "novarocks/functions/src/string_*_core.rs",
     "novarocks/functions/src/string_reverse_shared.rs",

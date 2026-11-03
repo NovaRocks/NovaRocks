@@ -1979,6 +1979,11 @@ fn register_json_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "parse_json",
         Signature::new(vec![TypeSpec::Utf8], TypeSpec::Json),
     );
+    add(
+        m,
+        crate::json_canonical::FUNCTION_NAME,
+        Signature::new(vec![TypeSpec::Json], TypeSpec::Utf8),
+    );
 }
 
 // ---------------------------------------------------------------------------

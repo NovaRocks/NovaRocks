@@ -2003,10 +2003,22 @@ fn merge_join_column_statistics(
     join_type: JoinKind,
     eq_key_pairs: &[(ColumnId, ColumnId)],
 ) -> HashMap<ColumnId, ColumnStatistic> {
+    if let JoinKind::LeftMark { mark } = join_type {
+        let mut statistics = left_stats.column_statistics.clone();
+        statistics.insert(
+            mark,
+            ColumnStatistic {
+                average_row_size: 1.0,
+                ..ColumnStatistic::unknown()
+            },
+        );
+        return statistics;
+    }
     let mut column_statistics = match join_type {
-        JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
-            left_stats.column_statistics.clone()
-        }
+        JoinKind::LeftMark { .. }
+        | JoinKind::LeftSemi
+        | JoinKind::LeftAnti
+        | JoinKind::NullAwareLeftAnti => left_stats.column_statistics.clone(),
         JoinKind::RightSemi | JoinKind::RightAnti => right_stats.column_statistics.clone(),
         _ => {
             let mut stats = left_stats.column_statistics.clone();
@@ -2580,6 +2592,11 @@ fn widen_for_join_kind(
             .collect()
     }
     match join_type {
+        LeftMark { .. } => {
+            let mut output = left_cols;
+            output.push(join_type.mark_output().expect("mark output"));
+            output
+        }
         Inner | Cross => {
             let mut out = left_cols;
             out.extend(right_cols);

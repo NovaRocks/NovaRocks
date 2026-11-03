@@ -107,6 +107,12 @@ fn wrap(kind: wire::value_origin::Kind) -> wire::ValueOrigin {
 fn nonprovider_cases() -> Vec<(physical::ValueOrigin, wire::ValueOrigin)> {
     vec![
         (
+            physical::ValueOrigin::JoinMark {
+                node: physical::NodeId::new(19),
+            },
+            wrap(wire::value_origin::Kind::JoinMarkNodeId(19)),
+        ),
+        (
             physical::ValueOrigin::LogicalSummary {
                 field: physical::LogicalChangeCountField::Inserted,
             },

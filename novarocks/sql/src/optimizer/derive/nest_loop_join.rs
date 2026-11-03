@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! NestLoopJoin: always Gather both inputs; output Gather.
+//! Nested-loop joins require complete gathered inputs.
 
 use crate::optimizer::operator::PhysicalNestLoopJoinOp;
 use crate::optimizer::property::PhysicalPropertySet;

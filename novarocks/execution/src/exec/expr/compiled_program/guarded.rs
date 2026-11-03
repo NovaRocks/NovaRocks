@@ -686,6 +686,7 @@ impl<K> Frame<K> {
         recipes: &dyn NodeRecipes,
         batch_rows: usize,
         work: &mut Work<'_, '_>,
+        allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     ) -> Result<(), KernelFailure> {
         use novarocks_functions::native_inlist::{InRows, signed_equality_observed};
         let ordinal = self
@@ -769,24 +770,37 @@ impl<K> Frame<K> {
             &mut |event| in_event(event, work),
         ))?;
         let equalities = if expected.data_type() == &DataType::Utf8 {
+            if work.scalar_scope.is_some() && allocator.is_none() {
+                return Err(invalid(
+                    "Task IN comparison has no original allocation owner",
+                ));
+            }
+            work.flush()?;
+            let control = work.control;
             in_observed(super::utf8_inlist::utf8_equality_observed(
                 left.values(),
                 right.values(),
+                recipe.source_type().logical_type()
+                    == novarocks_type_contract::ValueLogicalType::Json,
+                allocator.cloned(),
+                control,
                 &mut |event| in_event(event, work),
             ))?
         } else {
-            in_observed(signed_equality_observed(
-                left.values(),
-                right.values(),
-                &mut |event| in_event(event, work),
-            ))?
-            .ok_or_else(|| invalid("checked signed IN comparison lost its domain"))?
+            super::utf8_inlist::Utf8Equalities::without_reservation(
+                in_observed(signed_equality_observed(
+                    left.values(),
+                    right.values(),
+                    &mut |event| in_event(event, work),
+                ))?
+                .ok_or_else(|| invalid("checked signed IN comparison lost its domain"))?,
+            )
         };
-        in_observed(
-            state.equalities_selected_observed(&equalities, &parents, &mut |event| {
-                in_event(event, work)
-            }),
-        )?;
+        in_observed(state.equalities_selected_observed(
+            equalities.array(),
+            &parents,
+            &mut |event| in_event(event, work),
+        ))?;
         // A match never suppresses the next original candidate invocation.
         work.flush()?;
         drop(equalities);
@@ -804,9 +818,10 @@ impl<K> Frame<K> {
         child_is_pure: bool,
         batch_rows: usize,
         work: &mut Work<'_, '_>,
+        allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     ) -> Result<(), KernelFailure> {
         if let ControlShape::Membership { .. } = shape {
-            return self.attach_membership(child, recipes, batch_rows, work);
+            return self.attach_membership(child, recipes, batch_rows, work, allocator);
         }
         if let ControlShape::Between { negated } = shape {
             return self.attach_between(child, recipes, negated, batch_rows, work);
@@ -1838,6 +1853,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                 child_is_pure,
                 input.num_rows(),
                 work,
+                allocator,
             )?;
         } else {
             let value = value.into_value(selection, work)?;

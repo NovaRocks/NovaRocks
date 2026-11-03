@@ -264,6 +264,11 @@ fn join_output_columns(
         ));
     };
     Ok(match join_type {
+        crate::analysis::JoinKind::LeftMark { .. } => {
+            let mut output = left.output_columns.clone();
+            output.push(join_type.mark_output().expect("mark output"));
+            output
+        }
         crate::analysis::JoinKind::LeftSemi
         | crate::analysis::JoinKind::LeftAnti
         | crate::analysis::JoinKind::NullAwareLeftAnti => left.output_columns.clone(),

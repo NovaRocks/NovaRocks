@@ -14,28 +14,53 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! UTF-8 membership equality, including JSON and Variant value equality.
-
+//! Utf8 membership compares the recipe's logical domain on its original host.
 use arrow::array::{Array, ArrayRef, BooleanArray, BooleanBuilder, StringArray};
-use novarocks_types::value::variant::VariantValue;
-use serde_json::Value as JsonValue;
+use novarocks_functions::native_inlist::{InError, InObservation};
+use novarocks_functions::{AggregateStateAllocator, KernelEvaluationControl, KernelFailure};
+use std::sync::Arc;
 
-fn row_index(row: usize, len: usize) -> usize {
-    if len == 1 { 0 } else { row }
+/// Arrow backing is destroyed before its original reservation is returned.
+pub(crate) struct Utf8Equalities {
+    array: BooleanArray,
+    _reservation: Option<novarocks_functions::opaque_memory::OpaqueReservation>,
 }
-
+impl Utf8Equalities {
+    pub(crate) fn without_reservation(array: BooleanArray) -> Self {
+        Self {
+            array,
+            _reservation: None,
+        }
+    }
+    pub(crate) fn array(&self) -> &BooleanArray {
+        &self.array
+    }
+}
+fn boolean_buffer_bytes(rows: usize, has_nulls: bool) -> Result<usize, KernelFailure> {
+    use novarocks_functions::selected_copy::{CopyError, fixed_interleave_extent};
+    fixed_interleave_extent(&arrow::datatypes::DataType::Boolean, rows)
+        .map_err(CopyError::into_kernel)?;
+    let one = rows
+        .div_ceil(8)
+        .checked_next_multiple_of(64)
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    one.checked_mul(1 + usize::from(has_nulls))
+        .ok_or(KernelFailure::ResourceExhausted)
+}
 pub(crate) fn utf8_equality_observed<E>(
     array: &ArrayRef,
     candidate: &ArrayRef,
-    observe: &mut dyn FnMut(novarocks_functions::native_inlist::InObservation) -> Result<(), E>,
-) -> Result<BooleanArray, novarocks_functions::native_inlist::InError<E>> {
-    use novarocks_functions::native_inlist::{InError, InObservation};
+    json: bool,
+    host: Option<Arc<dyn AggregateStateAllocator>>,
+    control: &dyn KernelEvaluationControl,
+    observe: &mut dyn FnMut(InObservation) -> Result<(), E>,
+) -> Result<Utf8Equalities, InError<E>> {
     let input = array
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| {
             InError::Operation(novarocks_functions::native_inlist::contract(
-                "failed to downcast IN input to StringArray",
+                "IN input is not Utf8",
             ))
         })?;
     let values = candidate
@@ -43,123 +68,201 @@ pub(crate) fn utf8_equality_observed<E>(
         .downcast_ref::<StringArray>()
         .ok_or_else(|| {
             InError::Operation(novarocks_functions::native_inlist::contract(
-                "failed to downcast IN candidate to StringArray",
+                "IN candidate is not Utf8",
             ))
         })?;
     if values.len() != 1 && values.len() != input.len() {
         return Err(InError::Operation(
-            novarocks_functions::native_inlist::contract(format_args!(
-                "IN predicate value length mismatch: input has {}, value has {}",
-                input.len(),
-                values.len()
-            )),
+            novarocks_functions::native_inlist::contract("IN candidate length differs from input"),
         ));
     }
+    control.checkpoint(0).map_err(InError::Operation)?;
     observe(InObservation::OpaqueBoundary).map_err(InError::Host)?;
+    let bytes = boolean_buffer_bytes(
+        input.len(),
+        !input.is_empty() && (input.null_count() != 0 || values.null_count() != 0),
+    )
+    .map_err(InError::Operation)?;
+    let reservation = match host.as_ref().filter(|_| bytes != 0) {
+        Some(host) => Some(
+            novarocks_functions::opaque_memory::OpaqueRetainedCharge::try_new(Arc::clone(host))
+                .and_then(|charge| charge.reserve_operation(bytes))
+                .map_err(InError::Operation)?,
+        ),
+        None => None,
+    };
+    // Direct non-runtime evaluation uses the same original process heap policy.
+    // Runtime callers must pass their installed Frame allocator.
+    let host =
+        host.unwrap_or_else(|| Arc::new(novarocks_functions::UnaccountedAggregateStateAllocator));
     let mut builder = BooleanBuilder::with_capacity(input.len());
-    observe(InObservation::OpaqueBoundary).map_err(InError::Host)?;
     for row in 0..input.len() {
+        control.checkpoint(1).map_err(InError::Operation)?;
         observe(InObservation::Step).map_err(InError::Host)?;
-        let candidate_row = row_index(row, values.len());
-        if input.is_null(row) || values.is_null(candidate_row) {
+        let rhs = if values.len() == 1 { 0 } else { row };
+        if json {
+            // Every demanded non-NULL JSON value is normalized, even beside
+            // SQL NULL. UNKNOWN cannot authorize hiding an invalid JSON value.
+            let left = if input.is_null(row) {
+                None
+            } else {
+                Some(
+                    novarocks_functions::json_canonical::normalize_json_key(
+                        input.value(row),
+                        Arc::clone(&host),
+                        control,
+                    )
+                    .map_err(InError::Operation)?,
+                )
+            };
+            let right = if values.is_null(rhs) {
+                None
+            } else {
+                Some(
+                    novarocks_functions::json_canonical::normalize_json_key(
+                        values.value(rhs),
+                        Arc::clone(&host),
+                        control,
+                    )
+                    .map_err(InError::Operation)?,
+                )
+            };
+            match (left, right) {
+                (Some(left), Some(right)) => {
+                    builder.append_value(left.as_bytes() == right.as_bytes())
+                }
+                _ => builder.append_null(),
+            }
+        } else if input.is_null(row) || values.is_null(rhs) {
             builder.append_null();
-            continue;
-        }
-        let lhs = input.value(row);
-        let rhs = values.value(candidate_row);
-        observe(InObservation::OpaqueBoundary).map_err(InError::Host)?;
-        let equal = if let (Some(lhs_json), Some(rhs_json)) = (
-            json_value_from_text_or_variant(lhs),
-            json_value_from_text_or_variant(rhs),
-        ) {
-            lhs_json == rhs_json
         } else {
-            lhs == rhs
-        };
-        observe(InObservation::OpaqueBoundary).map_err(InError::Host)?;
-        builder.append_value(equal);
+            builder.append_value(input.value(row) == values.value(rhs));
+        }
     }
+    control.checkpoint(0).map_err(InError::Operation)?;
     observe(InObservation::OpaqueBoundary).map_err(InError::Host)?;
-    let result = builder.finish();
-    observe(InObservation::OpaqueBoundary).map_err(InError::Host)?;
-    Ok(result)
-}
-
-pub(crate) fn variant_json_value(bytes: &[u8]) -> Option<JsonValue> {
-    let text = VariantValue::from_serialized(bytes)
-        .ok()?
-        .to_json_local()
-        .ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-pub(crate) fn json_value_from_text_or_variant(text: &str) -> Option<JsonValue> {
-    serde_json::from_str(text)
-        .ok()
-        .or_else(|| variant_json_value(text.as_bytes()))
+    Ok(Utf8Equalities {
+        array: builder.finish(),
+        _reservation: reservation,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
+    struct Active;
+    impl KernelEvaluationControl for Active {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+    }
+    fn values(text: &str) -> ArrayRef {
+        Arc::new(StringArray::from(vec![text]))
+    }
+    fn compare(left: &str, right: &str, json: bool) -> bool {
+        utf8_equality_observed(
+            &values(left),
+            &values(right),
+            json,
+            None,
+            &Active,
+            &mut |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .array()
+        .value(0)
+    }
     #[test]
-    fn observed_utf8_in_preserves_original_json_text_nulls_and_scalar_broadcast() {
-        let source: ArrayRef = Arc::new(StringArray::from(vec![
-            Some("{\"a\":1,\"b\":2}"),
-            Some("ASIA"),
+    fn varchar_is_byte_equal_while_json_uses_canonical_keys() {
+        assert!(!compare("1.0", "1.00", false));
+        assert!(!compare(r#"{"b":1,"a":2}"#, r#"{"a":2,"b":1}"#, false));
+        assert!(compare(r#"{"b":1,"a":2}"#, r#"{"a":2,"b":1}"#, true));
+        assert!(!compare("1.0", "1.00", true));
+        assert!(compare("1.5e-7", "0.00000015", true));
+        assert!(compare("-0.0", "0.0", true));
+    }
+    #[test]
+    fn invalid_json_is_data_failure_without_text_fallback() {
+        let result = utf8_equality_observed(
+            &values("bad"),
+            &values("bad"),
+            true,
             None,
-            Some("x"),
-        ]));
-        let column: ArrayRef = Arc::new(StringArray::from(vec![
-            Some("{\"b\":2,\"a\":1}"),
-            Some("AMERICA"),
-            Some("ASIA"),
-            None,
-        ]));
-        let actual = utf8_equality_observed(&source, &column, &mut |_| Ok::<_, ()>(())).unwrap();
-        assert_eq!(
-            actual.iter().collect::<Vec<_>>(),
-            vec![Some(true), Some(false), None, None]
+            &Active,
+            &mut |_| Ok::<_, ()>(()),
         );
-        let scalar: ArrayRef = Arc::new(StringArray::from(vec![Some("ASIA")]));
-        let actual = utf8_equality_observed(&source, &scalar, &mut |_| Ok::<_, ()>(())).unwrap();
+        let Err(InError::Operation(cause)) = result else {
+            panic!("invalid JSON must fail")
+        };
+        use novarocks_failure_contract::FailureProjection;
         assert_eq!(
-            actual.iter().collect::<Vec<_>>(),
-            vec![Some(false), Some(true), None, Some(false)]
+            cause.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Data
         );
     }
-
     #[test]
-    fn observed_utf8_in_retains_control_cause_at_original_opaque_boundaries() {
-        use novarocks_functions::native_inlist::{InError, InObservation};
-        let source: ArrayRef = Arc::new(StringArray::from(vec![Some("{\"a\":1}")]));
-        let mut observations = Vec::new();
-        utf8_equality_observed(&source, &source, &mut |event| {
-            observations.push(event);
-            Ok::<_, ()>(())
-        })
-        .unwrap();
-        for stop in 0..observations.len() {
-            let mut reached = 0;
-            let error = utf8_equality_observed(&source, &source, &mut |_| {
-                let current = reached;
-                reached += 1;
-                if current == stop {
-                    Err("original cancellation")
-                } else {
-                    Ok(())
-                }
-            })
-            .unwrap_err();
-            assert!(matches!(error, InError::Host("original cancellation")));
-            assert_eq!(reached, stop + 1);
+    fn sql_null_does_not_hide_a_demanded_invalid_json_value() {
+        let nulls: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>]));
+        for (left, right) in [
+            (values("bad"), Arc::clone(&nulls)),
+            (Arc::clone(&nulls), values("bad")),
+        ] {
+            let result =
+                utf8_equality_observed(
+                    &left,
+                    &right,
+                    true,
+                    None,
+                    &Active,
+                    &mut |_| Ok::<_, ()>(()),
+                );
+            let Err(InError::Operation(cause)) = result else {
+                panic!("SQL NULL cannot hide JSON data failure")
+            };
+            use novarocks_failure_contract::FailureProjection;
+            assert_eq!(
+                cause.failure_fact().class(),
+                novarocks_failure_contract::FailureClass::Data
+            );
         }
+    }
+    #[test]
+    fn output_uses_the_original_budget_until_its_array_is_destroyed() {
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("IN original budget");
+        let host = crate::runtime::tracked_state_allocator::expression_allocation_host(Arc::clone(
+            &tracker,
+        ));
+        let result = utf8_equality_observed(
+            &values("x"),
+            &values("x"),
+            false,
+            Some(host),
+            &Active,
+            &mut |_| Ok::<_, ()>(()),
+        )
+        .unwrap();
+        assert!(result.array().value(0));
+        assert_eq!(tracker.current(), 64);
+        drop(result);
+        assert_eq!(tracker.current(), 0);
+        tracker.install_limit_once(1).unwrap();
+        let host = crate::runtime::tracked_state_allocator::expression_allocation_host(Arc::clone(
+            &tracker,
+        ));
         assert!(
-            observations
-                .iter()
-                .any(|event| matches!(event, InObservation::Step))
+            utf8_equality_observed(
+                &values("x"),
+                &values("x"),
+                false,
+                Some(host),
+                &Active,
+                &mut |_| Ok::<_, ()>(())
+            )
+            .is_err()
         );
+        assert_eq!(tracker.current(), 0);
     }
 }

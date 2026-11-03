@@ -92,6 +92,12 @@ impl OperatorFactory for CompiledJoinInputSinkFactory {
         });
         Box::new(Transform::hydrating(JoinInputSink {
             name: self.name.clone(),
+            #[cfg(novarocks_dev_controls)]
+            diagnostics: None,
+            #[cfg(novarocks_dev_controls)]
+            query_tracker_witness: None,
+            #[cfg(novarocks_dev_controls)]
+            observed_retained_rows: 0,
             declaration: Arc::clone(&self.declaration),
             frame: None,
             slot,
@@ -120,6 +126,12 @@ impl OperatorFactory for CompiledJoinInputSinkFactory {
     }
 }
 struct JoinInputSink {
+    #[cfg(novarocks_dev_controls)]
+    diagnostics: Option<crate::runtime::writer_diagnostics::WriterDiagnostics>,
+    #[cfg(novarocks_dev_controls)]
+    query_tracker_witness: Option<std::sync::Weak<MemTracker>>,
+    #[cfg(novarocks_dev_controls)]
+    observed_retained_rows: usize,
     name: String,
     declaration: Arc<CompiledJoinFrame>,
     frame: Option<Arc<JoinBuildFrame>>,
@@ -144,6 +156,39 @@ struct JoinInputSink {
     _prepared_storage: Option<ValueTypeStorageLifetime>,
 }
 impl JoinInputSink {
+    /// Closing paths add one last sample so the doubling cadence cannot hide
+    /// its final partial interval. This is successful custody before release,
+    /// not current memory after failure or an atomic failure-time peak.
+    #[cfg(novarocks_dev_controls)]
+    fn observe_retained_payload(&self, closing: bool) -> Option<usize> {
+        let scope = self.diagnostics.as_ref()?;
+        if !matches!(
+            self.declaration.program.graph().nodes()[self.declaration.node().index()].kind(),
+            ProgramNodeKind::Join {
+                join_type: novarocks_local_program::JoinType::LeftMark,
+                ..
+            }
+        ) {
+            return None;
+        }
+        let rows = self.writer.as_ref()?.retained_key_rows()?;
+        if rows == 0
+            || (!closing
+                && self.observed_retained_rows != 0
+                && rows < self.observed_retained_rows.saturating_mul(2))
+        {
+            return None;
+        }
+        let root = self.query_tracker_witness.as_ref()?.upgrade()?;
+        let task = self.error.task_identity()?;
+        let tracker = self.tracker.as_ref()?;
+        let slot = self.slot?;
+        scope.emit("join_build_keys_retained", || format!(
+            "attempt={} node={} slot={slot} input_slots={} retained_rows={rows} closing={closing} query_limit={} unique_query_limit={}",
+            task.query_execution_id().attempt_id().get(), self.declaration.node().index(), self.declaration.participants.inputs, root.limit(), tracker.is_unique_limit_owner(&root)
+        ));
+        Some(rows)
+    }
     fn validate_payload(&self, chunk: &Chunk) -> ExecutionResult<()> {
         use novarocks_functions::{
             EvaluatedArgument, Selection, validate_evaluated_argument_observed,
@@ -238,6 +283,8 @@ impl JoinInputSink {
             }
             Ok(())
         })();
+        #[cfg(novarocks_dev_controls)]
+        let _ = self.observe_retained_payload(true);
         // Always destroy actual partial data, including when disposition
         // itself failed. An exit diagnostic is never proof of this destruction.
         self.writer = None;
@@ -343,6 +390,12 @@ impl OperatorLifecycle for JoinInputSink {
     }
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
+        #[cfg(novarocks_dev_controls)]
+        {
+            self.diagnostics =
+                crate::runtime::writer_diagnostics::WriterDiagnostics::from_runtime(state);
+            self.query_tracker_witness = Some(state.query_tracker_witness());
+        }
         Ok(())
     }
     fn activate(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
@@ -543,6 +596,10 @@ impl SinkKernel for JoinInputSink {
                 .expect("actual E writer")
                 .push_evaluated(&chunk, page, &mut self.conversions, &work)?;
             self.conversions.clear();
+            #[cfg(novarocks_dev_controls)]
+            if let Some(rows) = self.observe_retained_payload(false) {
+                self.observed_retained_rows = rows;
+            }
             if let Some(producers) = &mut self.producers {
                 producers.submit(&values)?;
             }
@@ -598,6 +655,8 @@ impl SinkKernel for JoinInputSink {
                     &work,
                 )?);
             }
+            #[cfg(novarocks_dev_controls)]
+            let _ = self.observe_retained_payload(true);
             let receipt = self.writer.as_mut().expect("actual E writer").seal(&work)?;
             if let Some(producers) = &mut self.producers {
                 producers.finish()?;

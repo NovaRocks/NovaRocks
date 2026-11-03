@@ -291,6 +291,26 @@ impl MemTracker {
         self.limit.load(Ordering::Acquire)
     }
 
+    /// Read-only evidence for an original runtime owner, never a new limit.
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn is_unique_limit_owner(&self, owner: &Self) -> bool {
+        let limit = owner.limit();
+        if limit <= 0 {
+            return false;
+        }
+        let mut found = false;
+        let mut current = Some(self);
+        while let Some(tracker) = current {
+            let same = std::ptr::eq(tracker, owner);
+            found |= same;
+            if tracker.limit() == limit && !same {
+                return false;
+            }
+            current = tracker.parent.as_deref();
+        }
+        found
+    }
+
     /// Installs the immutable positive byte limit for this tracker.
     ///
     /// Replaying the same query contract is idempotent. A different limit is
@@ -650,6 +670,22 @@ pub fn query_tracker_label(high: i64, low: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{MemTracker, MemTrackerLimitInstallError};
+
+    #[cfg(novarocks_dev_controls)]
+    #[test]
+    fn unique_limit_witness_requires_the_original_ancestor() {
+        let process = MemTracker::new_root("process");
+        process.install_limit_once(1024).unwrap();
+        let query = MemTracker::new_child("query", &process);
+        query.install_limit_once(128).unwrap();
+        let operator = MemTracker::new_child("operator", &query);
+        assert!(operator.is_unique_limit_owner(&query));
+        let foreign = MemTracker::new_child("query", &process);
+        foreign.install_limit_once(128).unwrap();
+        assert!(!operator.is_unique_limit_owner(&foreign));
+        operator.install_limit_once(128).unwrap();
+        assert!(!operator.is_unique_limit_owner(&query));
+    }
 
     #[test]
     fn nominal_limit_projection_preserves_every_ancestor_counter() {

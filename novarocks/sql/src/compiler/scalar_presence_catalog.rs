@@ -308,6 +308,19 @@ impl SqlFunctionCatalog for ScalarPresenceCatalog {
             .resolve_value_conversion_binding(_argument, _target, control)?;
         self.admit(binding, control)
     }
+    fn resolve_json_canonical_key_binding(
+        &self,
+        argument: &novarocks_functions::FunctionArgument,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        let binding = self
+            .original
+            .resolve_json_canonical_key_binding(argument, control)?;
+        self.admit(binding, control)
+    }
     fn resolve_window_binding(
         &self,
         _name: &str,

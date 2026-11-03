@@ -320,7 +320,7 @@ fn ordinal(value: usize) -> Result<u32, ExpressionRootError> {
     u32::try_from(value).map_err(|_| ExpressionRootError::TooManyRoots)
 }
 fn join_demand(kind: JoinKind) -> EvaluationDemand {
-    if kind == JoinKind::NullAwareLeftAnti {
+    if matches!(kind, JoinKind::NullAwareLeftAnti | JoinKind::LeftMark) {
         EvaluationDemand::Value
     } else {
         EvaluationDemand::TruthOnly
