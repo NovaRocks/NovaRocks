@@ -90,9 +90,10 @@ impl InsertEngine for DmlExecutionKernel {
 ///   projects onto the neutral catalog vocabulary variant-for-variant.
 pub(crate) fn insert_columns_from_connector_metadata(
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
-) -> Vec<ColumnDef> {
+) -> Result<Vec<ColumnDef>, String> {
+    crate::connector::require_current_write_authority(&metadata.planning_facts)?;
     let column_facts = metadata.planning_facts.column_facts();
-    metadata
+    Ok(metadata
         .schema()
         .fields()
         .iter()
@@ -122,7 +123,7 @@ pub(crate) fn insert_columns_from_connector_metadata(
             ),
             logical_type: None,
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]

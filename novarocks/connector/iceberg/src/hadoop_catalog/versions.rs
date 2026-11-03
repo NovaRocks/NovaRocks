@@ -259,11 +259,34 @@ impl HadoopFileSystemCatalog {
         }
         let file_io = crate::fs_io::build_file_io_for_location(&location, binding.clone());
         active(&binding)?;
-        let metadata = crate::fs_io::catalog_read(
-            &binding,
-            TableMetadata::read_from(&file_io, &selected.path),
-        )
-        .await??;
+        let input = file_io.new_input(&selected.path)?;
+        let bytes = crate::fs_io::catalog_read(&binding, input.read()).await??;
+        active(&binding)?;
+        // Preserve the SDK reader's gzip magic-number detection, independent
+        // of which supported Hadoop metadata filename selected this file.
+        let mut decompressed = Vec::new();
+        let document = if bytes.len() > 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+            let mut decoder = flate2::read::GzDecoder::new(bytes.as_ref());
+            std::io::Read::read_to_end(&mut decoder, &mut decompressed).map_err(|error| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Trying to read compressed metadata file",
+                )
+                .with_context("file_path", &selected.path)
+                .with_source(error)
+            })?;
+            decompressed.as_slice()
+        } else {
+            bytes.as_ref()
+        };
+        let metadata: TableMetadata =
+            crate::metadata_json::from_slice(document).map_err(|error| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Failed to parse table metadata JSON",
+                )
+                .with_source(error)
+            })?;
         active(&binding)?;
         self.validate_table_root(table, metadata.location())?;
         if expected_uuid.is_some_and(|uuid| uuid != metadata.uuid()) {

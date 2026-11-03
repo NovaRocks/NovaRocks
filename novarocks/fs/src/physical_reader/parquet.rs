@@ -23,7 +23,7 @@ use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use parquet::DecodeResult;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowSelection};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, RowSelection};
 use parquet::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder};
 use parquet::basic::{SortOrder, Type as ParquetType};
 use parquet::file::FOOTER_SIZE;
@@ -39,8 +39,8 @@ use super::range_io::{coalesce_ranges, read_decoder_ranges, read_decoder_ranges_
 use crate::{
     BoundFile, DataCacheContext, FileBatch, FileBatchReader, FileError, FileErrorKind, FileFormat,
     FileIdentity, FileMetricsSnapshot, FileProjection, FileReadContext, FileReadRange,
-    FileReadRequest, FileReaderOptions, FileResult, MinMaxPredicateValue, PreparedFileInput,
-    ScanPredicate, ScanPredicateDomain,
+    FileReadRequest, FileReaderOptions, FileResult, MinMaxPredicateValue,
+    ParquetInterpretationPolicy, PreparedFileInput, ScanPredicate, ScanPredicateDomain,
 };
 use novarocks_spi::connector::StorageAccessDomainId;
 
@@ -191,6 +191,7 @@ impl ParquetColumnStatistics {
 #[derive(Clone, Debug)]
 pub struct ParquetMetadataInspection {
     footer: Arc<ArrowReaderMetadata>,
+    policy: ParquetInterpretationPolicy,
     access_domain: StorageAccessDomainId,
     identity: FileIdentity,
     /// The footer with its page indexes, loaded once for every reader of this
@@ -204,6 +205,17 @@ pub struct ParquetMetadataInspection {
 }
 
 impl ParquetMetadataInspection {
+    /// The provider-selected interpretation used by this inspection.
+    pub fn interpretation_policy(&self) -> ParquetInterpretationPolicy {
+        self.policy
+    }
+
+    /// Complete original physical footer, including the schema tree and ordered
+    /// key/value pairs. Arrow hints never rewrite these file facts.
+    pub fn raw_metadata(&self) -> &Arc<ParquetMetaData> {
+        self.footer.metadata()
+    }
+
     pub fn access_domain(&self) -> StorageAccessDomainId {
         self.access_domain
     }
@@ -255,7 +267,8 @@ impl ParquetMetadataInspection {
         if let Some(metadata) = self.ready_metadata(file, page_index_policy, context)? {
             return Ok(metadata);
         }
-        let metadata = load_page_indexes_blocking(&self.footer, chunk_reader, page_index_policy)?;
+        let metadata =
+            load_page_indexes_blocking(&self.footer, chunk_reader, page_index_policy, self.policy)?;
         context.check_active()?;
         let _ = self.indexed_footer.set(metadata);
         Ok(self
@@ -279,7 +292,13 @@ impl ParquetMetadataInspection {
         let metadata = self
             .indexed_footer
             .get_or_try_init(|| {
-                load_page_indexes(&self.footer, chunk_reader, page_index_policy, context)
+                load_page_indexes(
+                    &self.footer,
+                    chunk_reader,
+                    page_index_policy,
+                    context,
+                    self.policy,
+                )
             })
             .await?
             .clone();
@@ -311,8 +330,11 @@ fn load_page_indexes_blocking(
     footer: &ArrowReaderMetadata,
     chunk_reader: &BoundChunkReader,
     page_index_policy: PageIndexPolicy,
+    policy: ParquetInterpretationPolicy,
 ) -> FileResult<ArrowReaderMetadata> {
-    let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
+    let options = policy
+        .arrow_options()
+        .with_page_index_policy(page_index_policy);
     let mut reader = ParquetMetaDataReader::new_with_metadata(footer.metadata().as_ref().clone())
         .with_page_index_policy(page_index_policy);
     reader
@@ -335,8 +357,11 @@ async fn load_page_indexes(
     chunk_reader: &BoundChunkReader,
     page_index_policy: PageIndexPolicy,
     context: &FileReadContext,
+    policy: ParquetInterpretationPolicy,
 ) -> FileResult<ArrowReaderMetadata> {
-    let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
+    let options = policy
+        .arrow_options()
+        .with_page_index_policy(page_index_policy);
     let mut decoder = ParquetMetaDataPushDecoder::try_new_with_metadata(
         chunk_reader.file_size(),
         footer.metadata().as_ref().clone(),
@@ -354,21 +379,117 @@ async fn load_page_indexes(
         .map_err(|error| parquet_error("bind Parquet page indexes", error))
 }
 
-/// Awaited `ArrowReaderMetadata::load`: the 8-byte footer, then the metadata,
-/// then the page indexes `options` ask for, each through the chunk reader.
-async fn load_arrow_metadata(
-    chunk_reader: &BoundChunkReader,
-    page_index_policy: PageIndexPolicy,
-    context: &FileReadContext,
-    operation: &'static str,
-) -> FileResult<ArrowReaderMetadata> {
-    let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
-    let mut decoder = ParquetMetaDataPushDecoder::try_new(chunk_reader.file_size())
-        .map_err(|error| parquet_error(operation, error))?
-        .with_page_index_policy(page_index_policy);
-    let metadata = decode_metadata(&mut decoder, chunk_reader, context, operation).await?;
-    ArrowReaderMetadata::try_new(Arc::new(metadata), options)
+/// Raw footer cache access precedes interpretation, so even a hint that cannot
+/// be interpreted cannot prevent another policy from consuming physical facts.
+struct MetadataCache<'a> {
+    enabled: bool,
+    access_domain: StorageAccessDomainId,
+    identity: &'a FileIdentity,
+}
+
+impl MetadataCache<'_> {
+    fn raw(&self) -> Option<Arc<ParquetMetaData>> {
+        crate::cache::parquet_cache::raw_metadata_get(
+            self.enabled,
+            self.access_domain,
+            self.identity,
+        )
+    }
+
+    fn remember_raw(&self, metadata: &Arc<ParquetMetaData>) {
+        crate::cache::parquet_cache::raw_metadata_put(
+            self.enabled,
+            self.access_domain,
+            self.identity,
+            Arc::clone(metadata),
+        );
+    }
+
+    fn load(
+        &self,
+        chunk_reader: &BoundChunkReader,
+        page_index_policy: PageIndexPolicy,
+        policy: ParquetInterpretationPolicy,
+        operation: &'static str,
+    ) -> FileResult<ArrowReaderMetadata> {
+        let metadata = match self.raw() {
+            Some(metadata) => {
+                if page_index_policy == PageIndexPolicy::Skip
+                    || metadata
+                        .page_index()
+                        .is_some_and(|index| index.is_complete())
+                {
+                    metadata
+                } else {
+                    let mut reader =
+                        ParquetMetaDataReader::new_with_metadata(metadata.as_ref().clone())
+                            .with_page_index_policy(page_index_policy);
+                    reader
+                        .read_page_indexes(chunk_reader)
+                        .map_err(|error| parquet_error(operation, error))?;
+                    Arc::new(
+                        reader
+                            .finish()
+                            .map_err(|error| parquet_error(operation, error))?,
+                    )
+                }
+            }
+            None => Arc::new(
+                ParquetMetaDataReader::new()
+                    .with_page_index_policy(page_index_policy)
+                    .parse_and_finish(chunk_reader)
+                    .map_err(|error| parquet_error(operation, error))?,
+            ),
+        };
+        self.remember_raw(&metadata);
+        ArrowReaderMetadata::try_new(
+            metadata,
+            policy
+                .arrow_options()
+                .with_page_index_policy(page_index_policy),
+        )
         .map_err(|error| parquet_error(operation, error))
+    }
+
+    async fn load_async(
+        &self,
+        chunk_reader: &BoundChunkReader,
+        page_index_policy: PageIndexPolicy,
+        policy: ParquetInterpretationPolicy,
+        context: &FileReadContext,
+        operation: &'static str,
+    ) -> FileResult<ArrowReaderMetadata> {
+        let metadata = match self.raw() {
+            Some(metadata)
+                if page_index_policy == PageIndexPolicy::Skip
+                    || metadata
+                        .page_index()
+                        .is_some_and(|index| index.is_complete()) =>
+            {
+                metadata
+            }
+            cached => {
+                let mut decoder = match cached {
+                    Some(metadata) => ParquetMetaDataPushDecoder::try_new_with_metadata(
+                        chunk_reader.file_size(),
+                        metadata.as_ref().clone(),
+                    ),
+                    None => ParquetMetaDataPushDecoder::try_new(chunk_reader.file_size()),
+                }
+                .map_err(|error| parquet_error(operation, error))?
+                .with_page_index_policy(page_index_policy);
+                Arc::new(decode_metadata(&mut decoder, chunk_reader, context, operation).await?)
+            }
+        };
+        self.remember_raw(&metadata);
+        ArrowReaderMetadata::try_new(
+            metadata,
+            policy
+                .arrow_options()
+                .with_page_index_policy(page_index_policy),
+        )
+        .map_err(|error| parquet_error(operation, error))
+    }
 }
 
 async fn decode_metadata(
@@ -422,6 +543,11 @@ pub fn plan_parquet_input_ranges(
         ));
     }
     request.context.check_active()?;
+    if inspection.policy != request.options.parquet_interpretation_policy {
+        return Err(FileError::invalid(
+            "Parquet inspection interpretation policy does not match reader policy",
+        ));
+    }
     let cache_enabled = request
         .cache
         .as_ref()
@@ -552,8 +678,9 @@ pub fn inspect_parquet_metadata(
     file: BoundFile,
     cache: Option<DataCacheContext>,
     context: FileReadContext,
+    policy: ParquetInterpretationPolicy,
 ) -> FileResult<ParquetMetadataInspection> {
-    inspect_parquet_metadata_inner(file, cache, context, None)
+    inspect_parquet_metadata_inner(file, cache, context, None, policy)
 }
 
 /// Awaited [`inspect_parquet_metadata`] for a caller that must not block: the
@@ -563,18 +690,22 @@ pub async fn inspect_parquet_metadata_async(
     file: BoundFile,
     cache: Option<DataCacheContext>,
     context: FileReadContext,
+    policy: ParquetInterpretationPolicy,
 ) -> FileResult<ParquetMetadataInspection> {
-    let inspection = InspectionReader::try_new(file, cache, context, None)?;
+    let inspection = InspectionReader::try_new(file, cache, context, None, policy)?;
     let metadata = match inspection.cached() {
         Some(metadata) => metadata,
         None => {
-            let metadata = load_arrow_metadata(
-                &inspection.chunk_reader,
-                PageIndexPolicy::Skip,
-                &inspection.context,
-                "inspect Parquet metadata",
-            )
-            .await?;
+            let metadata = inspection
+                .metadata_cache()
+                .load_async(
+                    &inspection.chunk_reader,
+                    PageIndexPolicy::Skip,
+                    inspection.policy,
+                    &inspection.context,
+                    "inspect Parquet metadata",
+                )
+                .await?;
             inspection.remember(&metadata);
             metadata
         }
@@ -635,6 +766,7 @@ pub fn inspect_parquet_metadata_from_prepared(
     file: BoundFile,
     prepared: PreparedFileInput,
     context: FileReadContext,
+    policy: ParquetInterpretationPolicy,
 ) -> FileResult<ParquetMetadataInspection> {
     let required = parquet_footer_range(&file, &prepared)?;
     let FileReadRange::Bounded { offset, .. } = required else {
@@ -647,7 +779,7 @@ pub fn inspect_parquet_metadata_from_prepared(
     }
     let mut context = context;
     context.range = None;
-    inspect_parquet_metadata_inner(file, None, context, Some(prepared))
+    inspect_parquet_metadata_inner(file, None, context, Some(prepared), policy)
 }
 
 fn inspect_parquet_metadata_inner(
@@ -655,14 +787,18 @@ fn inspect_parquet_metadata_inner(
     cache: Option<DataCacheContext>,
     context: FileReadContext,
     prepared: Option<PreparedFileInput>,
+    policy: ParquetInterpretationPolicy,
 ) -> FileResult<ParquetMetadataInspection> {
-    let inspection = InspectionReader::try_new(file, cache, context, prepared)?;
+    let inspection = InspectionReader::try_new(file, cache, context, prepared, policy)?;
     let metadata = match inspection.cached() {
         Some(metadata) => metadata,
         None => {
-            let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
-            let metadata = ArrowReaderMetadata::load(&inspection.chunk_reader, options)
-                .map_err(|error| parquet_error("inspect Parquet metadata", error))?;
+            let metadata = inspection.metadata_cache().load(
+                &inspection.chunk_reader,
+                PageIndexPolicy::Skip,
+                inspection.policy,
+                "inspect Parquet metadata",
+            )?;
             inspection.remember(&metadata);
             metadata
         }
@@ -678,6 +814,7 @@ struct InspectionReader {
     cache_enabled: bool,
     access_domain: StorageAccessDomainId,
     identity: FileIdentity,
+    policy: ParquetInterpretationPolicy,
 }
 
 impl InspectionReader {
@@ -686,6 +823,7 @@ impl InspectionReader {
         cache: Option<DataCacheContext>,
         context: FileReadContext,
         prepared: Option<PreparedFileInput>,
+        policy: ParquetInterpretationPolicy,
     ) -> FileResult<Self> {
         context.check_active()?;
         let cache_enabled = cache
@@ -707,7 +845,16 @@ impl InspectionReader {
             cache_enabled,
             access_domain,
             identity,
+            policy,
         })
+    }
+
+    fn metadata_cache(&self) -> MetadataCache<'_> {
+        MetadataCache {
+            enabled: self.cache_enabled,
+            access_domain: self.access_domain,
+            identity: &self.identity,
+        }
     }
 
     fn cached(&self) -> Option<ArrowReaderMetadata> {
@@ -716,6 +863,7 @@ impl InspectionReader {
             self.access_domain,
             &self.identity,
             false,
+            self.policy,
         )
     }
 
@@ -725,6 +873,7 @@ impl InspectionReader {
             self.access_domain,
             &self.identity,
             metadata.clone(),
+            self.policy,
         );
     }
 
@@ -734,9 +883,17 @@ impl InspectionReader {
             context,
             access_domain,
             identity,
+            policy,
             ..
         } = self;
-        finish_inspection(metadata, &chunk_reader, &context, access_domain, identity)
+        finish_inspection(
+            metadata,
+            &chunk_reader,
+            &context,
+            access_domain,
+            identity,
+            policy,
+        )
     }
 }
 
@@ -746,6 +903,7 @@ fn finish_inspection(
     context: &FileReadContext,
     access_domain: StorageAccessDomainId,
     identity: FileIdentity,
+    policy: ParquetInterpretationPolicy,
 ) -> FileResult<ParquetMetadataInspection> {
     context.check_active()?;
     let parquet = metadata.metadata();
@@ -875,6 +1033,7 @@ fn finish_inspection(
     let schema = metadata.schema().clone();
     Ok(ParquetMetadataInspection {
         footer: Arc::new(metadata),
+        policy,
         access_domain,
         identity,
         indexed_footer: Arc::default(),
@@ -912,6 +1071,7 @@ struct ReaderOpen {
     identity: FileIdentity,
     automatic_page_pruning: bool,
     page_index_policy: PageIndexPolicy,
+    policy: ParquetInterpretationPolicy,
 }
 
 impl ReaderOpen {
@@ -920,6 +1080,13 @@ impl ReaderOpen {
         inspection: Option<&ParquetMetadataInspection>,
     ) -> FileResult<Self> {
         request.context.check_active()?;
+        if inspection.is_some_and(|inspection| {
+            inspection.policy != request.options.parquet_interpretation_policy
+        }) {
+            return Err(FileError::invalid(
+                "Parquet inspection interpretation policy does not match reader policy",
+            ));
+        }
         let metrics = Arc::new(ReaderMetrics::default());
         let cache_enabled = request
             .cache
@@ -955,7 +1122,16 @@ impl ReaderOpen {
             identity,
             automatic_page_pruning,
             page_index_policy,
+            policy: request.options.parquet_interpretation_policy,
         })
+    }
+
+    fn metadata_cache(&self) -> MetadataCache<'_> {
+        MetadataCache {
+            enabled: self.cache_enabled,
+            access_domain: self.access_domain,
+            identity: &self.identity,
+        }
     }
 
     fn cached(&self) -> Option<ArrowReaderMetadata> {
@@ -964,6 +1140,7 @@ impl ReaderOpen {
             self.access_domain,
             &self.identity,
             self.page_index_policy != PageIndexPolicy::Skip,
+            self.policy,
         )
     }
 
@@ -973,6 +1150,7 @@ impl ReaderOpen {
             self.access_domain,
             &self.identity,
             metadata.clone(),
+            self.policy,
         );
     }
 
@@ -1047,10 +1225,12 @@ impl ParquetPhysicalReader {
             None => match open.cached() {
                 Some(metadata) => metadata,
                 None => {
-                    let options =
-                        ArrowReaderOptions::new().with_page_index_policy(open.page_index_policy);
-                    let metadata = ArrowReaderMetadata::load(&open.chunk_reader, options)
-                        .map_err(|error| parquet_error("open Parquet metadata", error))?;
+                    let metadata = open.metadata_cache().load(
+                        &open.chunk_reader,
+                        open.page_index_policy,
+                        open.policy,
+                        "open Parquet metadata",
+                    )?;
                     open.remember(&metadata);
                     metadata
                 }
@@ -1080,13 +1260,16 @@ impl ParquetPhysicalReader {
             None => match open.cached() {
                 Some(metadata) => metadata,
                 None => {
-                    let metadata = load_arrow_metadata(
-                        &open.chunk_reader,
-                        open.page_index_policy,
-                        &request.context,
-                        "open Parquet metadata",
-                    )
-                    .await?;
+                    let metadata = open
+                        .metadata_cache()
+                        .load_async(
+                            &open.chunk_reader,
+                            open.page_index_policy,
+                            open.policy,
+                            &request.context,
+                            "open Parquet metadata",
+                        )
+                        .await?;
                     open.remember(&metadata);
                     metadata
                 }
@@ -2069,7 +2252,7 @@ mod page_index_tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
     use parquet::file::metadata::page_index::PageIndexProvider;
     use parquet::file::page_index::offset_index::OffsetIndexMetaData;
     use parquet::file::properties::WriterProperties;

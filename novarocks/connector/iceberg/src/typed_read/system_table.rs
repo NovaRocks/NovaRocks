@@ -1091,7 +1091,7 @@ fn validate_shared_files_table_facts(
             "iceberg table schema json must be non-empty and bounded",
         ));
     }
-    serde_json::from_str::<Schema>(table_schema_json)
+    crate::metadata_json::from_str::<Schema>(table_schema_json)
         .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))?;
     parse_json_value("iceberg metadata table schema", metadata_table_schema_json)?;
     if partition_spec_jsons.len() > MAX_PARTITION_SPECS {
@@ -1124,7 +1124,7 @@ fn parse_json_value(what: &'static str, json: &str) -> Result<(), ConnectorError
             "{what} json must be non-empty and bounded"
         )));
     }
-    serde_json::from_str::<serde_json::Value>(json)
+    crate::metadata_json::from_str::<serde_json::Value>(json)
         .map_err(|error| invalid(format!("{what} json is invalid: {error}")))?;
     Ok(())
 }
@@ -1135,7 +1135,7 @@ fn parse_partition_spec(spec_json: &str) -> Result<PartitionSpec, ConnectorError
             "iceberg partition spec json must be non-empty and bounded",
         ));
     }
-    serde_json::from_str::<PartitionSpec>(spec_json)
+    crate::metadata_json::from_str::<PartitionSpec>(spec_json)
         .map_err(|error| invalid(format!("iceberg partition spec json is invalid: {error}")))
 }
 

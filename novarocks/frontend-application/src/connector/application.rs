@@ -736,6 +736,18 @@ pub(crate) fn sql_columns_from_connector_metadata(
         .collect()
 }
 
+/// Require the provider's Current metadata before consuming any write facts.
+/// The same marker distinguishes an unpartitioned Current table (`Some([])`)
+/// from a Historical read projection (`None`).
+pub(crate) fn require_current_write_authority(
+    planning_facts: &novarocks_spi::connector::ConnectorTablePlanningFacts,
+) -> Result<(), String> {
+    if planning_facts.partition_source_column_ordinals().is_none() {
+        return Err("historical snapshot metadata has no current write authority".to_string());
+    }
+    Ok(())
+}
+
 /// Project the provider's complete value contract to its declared write layout.
 /// A physical target override changes representation and preserves every
 /// semantic child; it cannot infer or erase a domain from format annotations.
@@ -744,6 +756,7 @@ pub(crate) fn connector_write_column(
     ordinal: usize,
     write_default: Option<novarocks_types::schema::ColumnDefault>,
 ) -> Result<novarocks_types::schema::ColumnDef, String> {
+    require_current_write_authority(&metadata.planning_facts)?;
     let field = metadata
         .schema()
         .fields()
@@ -1096,6 +1109,95 @@ mod source_value_type_tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn historical_read_metadata_cannot_supply_write_columns_even_without_partitions() {
+        use novarocks_spi::connector::*;
+        let source = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            true,
+        )]));
+        let current = ConnectorTablePlanningFacts::try_new(
+            &source,
+            vec![
+                ConnectorTableColumnPlanningFact::new(
+                    0,
+                    V::Sql,
+                    K::None,
+                    ConnectorTableColumnRole::Ordinary,
+                )
+                .with_write_default(Some(ConnectorColumnDefault::Binary(
+                    bytes::Bytes::from_static(&[7]),
+                )))
+                .with_write_target_type(Some(DataType::LargeBinary)),
+            ],
+            vec![],
+            vec![],
+            vec![],
+            &test_request_context(),
+        )
+        .unwrap();
+        let historical = ConnectorTablePlanningFacts::try_new_snapshot_source(
+            &source,
+            current.column_facts().to_vec(),
+            vec![],
+            vec![],
+            &test_request_context(),
+        )
+        .unwrap();
+        let instance = ConnectorInstanceId::parse("test").unwrap();
+        let metadata = crate::connector::schema_creation::declared_test_metadata(
+            ConnectorTableMetadataHeader {
+                identity: ConnectorTableIdentity {
+                    instance_id: instance.clone(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("source"),
+                },
+                planning_facts: historical,
+                definition_facts: ConnectorTableDefinitionFacts::empty(),
+                version: None,
+                statistics_data_version: None,
+                table: ConnectorTableHandle::try_new(instance, bytes::Bytes::from_static(b"table"))
+                    .unwrap(),
+            },
+            source,
+            vec![FunctionValueType::new(DataType::Binary, true)],
+        );
+        // The source remains a valid read declaration. A snapshot carrying
+        // stale write facts still cannot become a Current write target.
+        assert_eq!(
+            sql_columns_from_connector_metadata(&metadata).unwrap()[0].data_type,
+            DataType::Binary
+        );
+        assert!(
+            super::connector_write_column(&metadata, 0, None)
+                .unwrap_err()
+                .contains("no current write authority")
+        );
+        assert!(
+            crate::query_execution::dml::insert::insert_columns_from_connector_metadata(&metadata)
+                .unwrap_err()
+                .contains("no current write authority")
+        );
+        assert!(super::require_current_write_authority(&current).is_ok());
+        let mut current_metadata = metadata;
+        current_metadata.planning_facts = current;
+        assert_eq!(
+            super::connector_write_column(&current_metadata, 0, None)
+                .unwrap()
+                .data_type,
+            DataType::LargeBinary
+        );
+        assert_eq!(
+            crate::query_execution::dml::insert::insert_columns_from_connector_metadata(
+                &current_metadata
+            )
+            .unwrap()[0]
+                .write_default,
+            Some(ColumnDefault::Binary(vec![7]))
+        );
     }
 
     #[test]

@@ -56,9 +56,13 @@ fn prepared_footer_stages_exact_suffix_and_parses_without_second_get() {
     let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
     let before = fixture.io.block_on_bytes_calls();
     std::fs::remove_file(fixture.file.location().path()).expect("remove source");
-    let inspection =
-        inspect_parquet_metadata_from_prepared(fixture.file.clone(), complete, request.context)
-            .expect("parse prepared footer");
+    let inspection = inspect_parquet_metadata_from_prepared(
+        fixture.file.clone(),
+        complete,
+        request.context,
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+    )
+    .expect("parse prepared footer");
     assert_eq!(inspection.row_groups().len(), 2);
     assert_eq!(fixture.io.block_on_bytes_calls(), before);
 }
@@ -80,6 +84,7 @@ fn prepared_footer_rejects_incomplete_or_wrong_identity() {
             fixture.file.clone(),
             tail.clone(),
             request.context,
+            novarocks_fs::ParquetInterpretationPolicy::UseArrowHint
         )
         .expect_err("only trailer cannot parse complete metadata")
         .kind(),
@@ -105,8 +110,13 @@ fn prepared_footer_rejects_incomplete_or_wrong_identity() {
 fn inspection_reuses_footer_across_row_group_runs_and_preserves_positions() {
     let fixture = Fixture::parquet();
     let request = fixture.request(FileFormat::Parquet, FileProjection::All, 2, 1024 * 1024);
-    let inspection = inspect_parquet_metadata(fixture.file.clone(), None, request.context.clone())
-        .expect("inspect file once");
+    let inspection = inspect_parquet_metadata(
+        fixture.file.clone(),
+        None,
+        request.context.clone(),
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+    )
+    .expect("inspect file once");
 
     for (group, expected) in [(0, vec![0, 1, 2, 3]), (1, vec![4, 5, 6, 7])] {
         let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 2, 1024 * 1024);
@@ -140,8 +150,13 @@ fn small_file_probe_serves_footer_and_later_runs_from_one_file_read() {
     assert!(fixture.file.identity().file_size() <= 64 * 1024);
     let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
     let before = fixture.io.block_on_bytes_calls();
-    let inspection = inspect_parquet_metadata(fixture.file.clone(), None, request.context)
-        .expect("inspect small file");
+    let inspection = inspect_parquet_metadata(
+        fixture.file.clone(),
+        None,
+        request.context,
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+    )
+    .expect("inspect small file");
     assert_eq!(fixture.io.block_on_bytes_calls() - before, 1);
 
     for group in [0, 1] {
@@ -162,8 +177,13 @@ fn small_file_probe_serves_footer_and_later_runs_from_one_file_read() {
 fn inspection_rejects_different_file_identity() {
     let fixture = Fixture::parquet();
     let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
-    let inspection = inspect_parquet_metadata(fixture.file.clone(), None, request.context.clone())
-        .expect("inspect file");
+    let inspection = inspect_parquet_metadata(
+        fixture.file.clone(),
+        None,
+        request.context.clone(),
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+    )
+    .expect("inspect file");
     let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
     let identity = fixture.file.identity();
     request.file = fixture
@@ -205,6 +225,7 @@ fn inspection_upgrades_page_index_once_for_later_runs() {
         fixture.file.clone(),
         Some(cache.clone()),
         request.context.clone(),
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
     )
     .expect("inspect footer without page indexes");
 
@@ -243,8 +264,13 @@ fn metadata_only_plan_uses_projected_column_range_without_decoder() {
     );
     request.pruning.row_groups = Some(vec![0]);
     request.options.coalesce_reads = false;
-    let inspection = inspect_parquet_metadata(fixture.file.clone(), None, request.context.clone())
-        .expect("inspect footer");
+    let inspection = inspect_parquet_metadata(
+        fixture.file.clone(),
+        None,
+        request.context.clone(),
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+    )
+    .expect("inspect footer");
     let file = std::fs::File::open(fixture.file.location().path()).expect("fixture file");
     let footer = ParquetRecordBatchReaderBuilder::try_new(file).expect("fixture metadata");
     let (start, length) = footer.metadata().row_group(0).column(0).byte_range();
@@ -276,8 +302,13 @@ fn metadata_only_plan_uses_page_index_for_selected_pages() {
             page_indices: vec![1],
         });
     request.options.coalesce_reads = false;
-    let inspection = inspect_parquet_metadata(fixture.file.clone(), None, request.context.clone())
-        .expect("inspect footer");
+    let inspection = inspect_parquet_metadata(
+        fixture.file.clone(),
+        None,
+        request.context.clone(),
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+    )
+    .expect("inspect footer");
     let planned = plan_parquet_input_ranges(&request, &inspection).expect("plan selected page");
     let file = std::fs::File::open(fixture.file.location().path()).expect("fixture file");
     let footer = ParquetRecordBatchReaderBuilder::try_new(file).expect("fixture metadata");
@@ -307,8 +338,13 @@ fn push_decoder_preserves_values_and_absolute_positions_across_disjoint_groups()
                 page_indices: vec![1],
             });
     }
-    let inspection = inspect_parquet_metadata(fixture.file.clone(), None, request.context.clone())
-        .expect("inspect three-group file");
+    let inspection = inspect_parquet_metadata(
+        fixture.file.clone(),
+        None,
+        request.context.clone(),
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+    )
+    .expect("inspect three-group file");
     let mut reader = open_file_reader_with_parquet_inspection(request, Some(&inspection))
         .expect("open disjoint row groups");
     let batches = collect(reader.as_mut()).expect("decode selected pages");

@@ -929,8 +929,9 @@ impl CpuWork {
                         context.clone(),
                     )?,
                 };
-                let target = serde_json::from_slice(request.operation().table().payload())
-                    .map_err(|_| invalid("invalid cleanup physical table payload"))?;
+                let target =
+                    crate::metadata_json::from_slice(request.operation().table().payload())
+                        .map_err(|_| invalid("invalid cleanup physical table payload"))?;
                 Ok(CpuOutput::Request(Box::new(request), target))
             }
             CpuInput::Payload { adapter, plan } => {

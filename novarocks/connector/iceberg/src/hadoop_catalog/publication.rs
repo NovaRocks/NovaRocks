@@ -324,16 +324,17 @@ impl FrozenInstallation {
         }
         let io = crate::fs_io::build_file_io_for_location(&self.location, binding.clone());
         let bytes = io.new_input(&self.location)?.read().await?;
-        let metadata = serde_json::from_slice::<TableMetadata>(&bytes).map_err(|error| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                "Hadoop exact metadata readback is invalid",
-            )
-            .with_source(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::CorruptData,
-                error.to_string(),
-            ))
-        })?;
+        let metadata =
+            crate::metadata_json::from_slice::<TableMetadata>(&bytes).map_err(|error| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Hadoop exact metadata readback is invalid",
+                )
+                .with_source(ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                    error.to_string(),
+                ))
+            })?;
         Ok((metadata, hex_digest(&bytes)))
     }
     fn proof(&self) -> CommitProof {

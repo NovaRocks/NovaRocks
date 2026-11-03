@@ -79,12 +79,13 @@ pub(crate) fn prepare_write(
             "admitted Iceberg write table is missing frozen metadata",
         )
     })?;
-    let metadata: TableMetadata = serde_json::from_str(serialized_metadata).map_err(|error| {
-        ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            format!("decode admitted Iceberg write metadata: {error}"),
-        )
-    })?;
+    let metadata: TableMetadata =
+        crate::metadata_json::from_str(serialized_metadata).map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("decode admitted Iceberg write metadata: {error}"),
+            )
+        })?;
     let managed = match crate::document_storage::keyed::view::management_marker(&metadata) {
         Ok(marker) => marker.is_some(),
         Err(error) => {

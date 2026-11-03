@@ -194,7 +194,7 @@ fn plan_manifest(
 ) -> Result<AddFilesManifest, String> {
     let mapping = canonical_name_mapping
         .as_deref()
-        .map(serde_json::from_str::<crate::iceberg::spec::NameMapping>)
+        .map(crate::metadata_json::from_str::<crate::iceberg::spec::NameMapping>)
         .transpose()
         .map_err(|error| format!("decode canonical ADD FILES name mapping: {error}"))?;
     if let Some(mapping) = mapping.as_ref() {
@@ -773,8 +773,11 @@ fn read_parquet_footer(
             let row_count = u64::try_from(metadata.file_metadata().num_rows()).map_err(|_| {
                 format!("ADD FILES Parquet file has negative row count: {location}")
             })?;
-            let arrow = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
-                .map_err(|error| format!("decode ADD FILES Arrow schema: {error}"))?;
+            let arrow = ArrowReaderMetadata::try_new(
+                metadata,
+                ArrowReaderOptions::new().with_skip_arrow_metadata(true),
+            )
+            .map_err(|error| format!("decode ADD FILES Arrow schema: {error}"))?;
             let mut hasher = Sha256::new();
             hasher.update(&suffix);
             Ok(ParquetFooterFacts {
@@ -1308,7 +1311,12 @@ mod tests {
     fn parquet_footer_carries_rows_schema_and_digest() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("rows.parquet");
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata([(
+                parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_owned(),
+                "7".to_owned(),
+            )]),
+        ]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -1318,6 +1326,10 @@ mod tests {
             ArrowWriter::try_new(std::fs::File::create(&path).expect("file"), schema, None)
                 .expect("writer");
         writer.write(&batch).expect("write");
+        writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            parquet::arrow::ARROW_SCHEMA_META_KEY.to_owned(),
+            "not-an-arrow-schema".to_owned(),
+        ));
         writer.close().expect("close");
         let size = std::fs::metadata(&path).expect("metadata").len();
         let (owner, runtime) = catalog_runtime();
@@ -1330,6 +1342,15 @@ mod tests {
         )
         .expect("footer");
         assert_eq!(footer.row_count, 3);
+        assert_eq!(
+            footer
+                .schema
+                .field(0)
+                .metadata()
+                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+                .map(String::as_str),
+            Some("7")
+        );
         assert_ne!(footer.footer_digest, [0; 32]);
     }
 

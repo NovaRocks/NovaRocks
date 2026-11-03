@@ -42,6 +42,7 @@ arrow = { workspace = true, features = ["prettyprint", "ipc", "ipc_compression"]
 async-trait.workspace = true
 bytes.workspace = true
 crc32fast = "1"
+flate2 = "1.1.5"
 futures.workspace = true
 ordered-float = "4"
 parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
@@ -50,7 +51,7 @@ rand.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls"] }
 roaring.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, features = ["raw_value"] }
+serde_json = { workspace = true, features = ["raw_value", "unbounded_depth"] }
 sha2.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

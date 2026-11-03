@@ -85,13 +85,13 @@ pub(crate) fn decode_read_domain(
     let table_uuid = uuid::Uuid::from_slice(&raw.table_uuid)
         .map_err(|_| invalid("Iceberg read table UUID must contain 16 bytes"))?;
     let schema: Schema =
-        serde_json::from_str(&raw.schema_json).map_err(|e| invalid(e.to_string()))?;
+        crate::metadata_json::from_str(&raw.schema_json).map_err(|e| invalid(e.to_string()))?;
     let specs = raw
         .partition_spec_jsons
         .iter()
         .map(|(id, json)| {
             let spec: PartitionSpec =
-                serde_json::from_str(json).map_err(|e| invalid(e.to_string()))?;
+                crate::metadata_json::from_str(json).map_err(|e| invalid(e.to_string()))?;
             if spec.spec_id() != *id {
                 return Err(invalid(
                     "Iceberg domain spec key differs from its definition",
@@ -104,7 +104,7 @@ pub(crate) fn decode_read_domain(
         .partition_type_jsons
         .iter()
         .map(|(id, json)| {
-            serde_json::from_str(json)
+            crate::metadata_json::from_str(json)
                 .map(|ty| (*id, ty))
                 .map_err(|e| invalid(format!("invalid partition storage type: {e}")))
         })

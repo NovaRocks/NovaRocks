@@ -127,7 +127,7 @@ pub(crate) fn validate_referenced_specs(
             .ok_or_else(|| {
                 corrupt("Iceberg used partition spec is absent from the prepared domain")
             })?;
-        let domain_spec: PartitionSpec = serde_json::from_str(encoded)
+        let domain_spec: PartitionSpec = crate::metadata_json::from_str(encoded)
             .map_err(|_| corrupt("Iceberg prepared partition spec cannot be decoded"))?;
         if selected.as_ref() != fresh.as_ref() || selected.as_ref() != &domain_spec {
             return Err(corrupt("Iceberg prepared partition spec changed"));
@@ -275,7 +275,7 @@ fn selected_name_mapping(
         .map_err(|_| corrupt("Iceberg prepared name mapping cannot be decoded"))?;
     // Reuse the SDK value shape after original validation; do not implement a
     // second name-mapping decoder or accept different malformed declarations.
-    let mapping: NameMapping = serde_json::from_str(&canonical)
+    let mapping: NameMapping = crate::metadata_json::from_str(&canonical)
         .map_err(|_| corrupt("Iceberg prepared name mapping cannot be decoded"))?;
     let fields = selected_mapping_fields(mapping.fields(), query, control)?;
     Ok((!fields.is_empty()).then(|| NameMapping::new(fields)))

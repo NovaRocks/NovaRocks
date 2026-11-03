@@ -70,7 +70,7 @@ impl WriteStatementFamily for InsertFamily {
         let resolved = crate::connector::backend::ResolvedTable {
             columns: crate::query_execution::dml::insert::insert_columns_from_connector_metadata(
                 &table,
-            ),
+            )?,
         };
         let mode = match input.command.overwrite_mode {
             crate::query_execution::dml::insert::InsertOverwriteMode::Append => {

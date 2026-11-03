@@ -878,12 +878,13 @@ fn parse_metadata(
     reference: &IcebergSystemTableReference,
     bytes: &Bytes,
 ) -> Result<TableMetadata, ConnectorError> {
-    let metadata: TableMetadata = serde_json::from_slice(bytes.as_ref()).map_err(|error| {
-        corrupt(format!(
-            "iceberg metadata file {} is not table metadata: {error}",
-            reference.metadata_file_location()
-        ))
-    })?;
+    let metadata: TableMetadata =
+        crate::metadata_json::from_slice(bytes.as_ref()).map_err(|error| {
+            corrupt(format!(
+                "iceberg metadata file {} is not table metadata: {error}",
+                reference.metadata_file_location()
+            ))
+        })?;
     reference.verify_loaded_metadata(&metadata)?;
     Ok(metadata)
 }
@@ -2440,7 +2441,7 @@ impl FilesSplitRelation {
         split: &SystemManifestSplit,
         columns: &[IcebergColumnHandle],
     ) -> Result<Self, ConnectorError> {
-        let table_schema: Schema = serde_json::from_str(split.table_schema_json())
+        let table_schema: Schema = crate::metadata_json::from_str(split.table_schema_json())
             .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))?;
         let spec = split.parse_partition_spec(split.manifest().partition_spec_id())?;
         let specs = split

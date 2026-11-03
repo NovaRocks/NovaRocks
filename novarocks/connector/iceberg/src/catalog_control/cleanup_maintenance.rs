@@ -300,7 +300,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         validate_context(&request.context)?;
         self.ensure_owner(request.owner())?;
         let target: IcebergTablePayload =
-            serde_json::from_slice(request.operation().table().payload())
+            crate::metadata_json::from_slice(request.operation().table().payload())
                 .map_err(|error| invalid(format!("decode Iceberg cleanup table: {error}")))?;
         if request.operation().table().owner() != &self.key.instance_id
             || target.metadata_table_type.is_some()

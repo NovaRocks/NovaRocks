@@ -56,10 +56,20 @@ fn parquet_metadata_inspection_reports_stable_footer_facts() {
             .collect::<Vec<_>>()
     };
 
-    let first = inspect_parquet_metadata(fixture.file.clone(), None, request.context.clone())
-        .expect("inspect fixture footer");
-    let second = inspect_parquet_metadata(fixture.file.clone(), None, request.context)
-        .expect("inspect fixture footer again");
+    let first = inspect_parquet_metadata(
+        fixture.file.clone(),
+        None,
+        request.context.clone(),
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+    )
+    .expect("inspect fixture footer");
+    let second = inspect_parquet_metadata(
+        fixture.file.clone(),
+        None,
+        request.context,
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+    )
+    .expect("inspect fixture footer again");
 
     assert_eq!(
         first.schema(),
@@ -122,8 +132,13 @@ fn parquet_metadata_inspection_rejects_corrupt_footer() {
     std::fs::write(path, bytes).expect("corrupt footer marker");
     let request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
 
-    let error = inspect_parquet_metadata(fixture.file.clone(), None, request.context)
-        .expect_err("corrupt footer must not produce a layout");
+    let error = inspect_parquet_metadata(
+        fixture.file.clone(),
+        None,
+        request.context,
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
+    )
+    .expect_err("corrupt footer must not produce a layout");
 
     assert_eq!(error.kind(), FileErrorKind::Corrupt);
     assert!(
@@ -140,18 +155,28 @@ fn parquet_metadata_inspection_honors_cancel_and_deadline_before_footer_io() {
     let cancelled = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     cancelled.context.cancellation.cancel();
     assert_eq!(
-        inspect_parquet_metadata(fixture.file.clone(), None, cancelled.context)
-            .expect_err("cancelled inspection must not load a footer")
-            .kind(),
+        inspect_parquet_metadata(
+            fixture.file.clone(),
+            None,
+            cancelled.context,
+            novarocks_fs::ParquetInterpretationPolicy::UseArrowHint
+        )
+        .expect_err("cancelled inspection must not load a footer")
+        .kind(),
         FileErrorKind::Cancelled
     );
 
     let mut expired = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     expired.context.deadline = Some(Instant::now() - Duration::from_millis(1));
     assert_eq!(
-        inspect_parquet_metadata(fixture.file.clone(), None, expired.context)
-            .expect_err("expired inspection must not load a footer")
-            .kind(),
+        inspect_parquet_metadata(
+            fixture.file.clone(),
+            None,
+            expired.context,
+            novarocks_fs::ParquetInterpretationPolicy::UseArrowHint
+        )
+        .expect_err("expired inspection must not load a footer")
+        .kind(),
         FileErrorKind::DeadlineExceeded
     );
 }
@@ -573,6 +598,7 @@ fn parquet_page_index_read_does_not_reuse_a_footer_only_metadata_cache_entry() {
         fixture.file.clone(),
         Some(cache.clone()),
         inspection.context,
+        novarocks_fs::ParquetInterpretationPolicy::UseArrowHint,
     )
     .expect("populate footer-only metadata cache entry");
 

@@ -502,7 +502,7 @@ pub fn build_iceberg_default_array(
     else {
         return Ok(new_null_array(target_field.data_type(), row_count));
     };
-    let json_value: serde_json::Value = serde_json::from_str(json).map_err(|error| {
+    let json_value: serde_json::Value = crate::metadata_json::from_str(json).map_err(|error| {
         format!(
             "corrupted initial-default JSON for column {}: {error}",
             target_field.name()

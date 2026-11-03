@@ -96,6 +96,7 @@ impl ConnectorWriteTargetBinding {
     /// projection here avoids loading or decoding a concrete provider table in
     /// statement planning.
     pub fn dml_target_columns(&self) -> Result<Vec<novarocks_types::schema::ColumnDef>, String> {
+        crate::connector::require_current_write_authority(&self.metadata.planning_facts)?;
         self.metadata
             .schema()
             .fields()

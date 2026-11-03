@@ -131,7 +131,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
         let serialized = table_info.serialized_metadata.as_deref().ok_or_else(|| {
             corrupt("admitted Iceberg repartition target is missing frozen metadata")
         })?;
-        let metadata = serde_json::from_str(serialized).map_err(|error| {
+        let metadata = crate::metadata_json::from_str(serialized).map_err(|error| {
             corrupt(format!(
                 "decode admitted Iceberg repartition target metadata: {error}"
             ))

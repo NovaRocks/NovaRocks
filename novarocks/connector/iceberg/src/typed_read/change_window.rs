@@ -569,8 +569,8 @@ impl IcebergChangeWindowHandle {
         } = params;
 
         validate_change_columns(&table_schema_json, &columns, name_mapping_json.as_deref())?;
-        let schema: Schema =
-            serde_json::from_str(&table_schema_json).map_err(|error| invalid(error.to_string()))?;
+        let schema: Schema = crate::metadata_json::from_str(&table_schema_json)
+            .map_err(|error| invalid(error.to_string()))?;
         for (snapshot, domain) in [
             (from_snapshot_id_exclusive, &from_read_domain),
             (to_snapshot_id_inclusive, &to_read_domain),
@@ -594,10 +594,10 @@ impl IcebergChangeWindowHandle {
                     .ok_or_else(|| {
                         invalid("iceberg change-window domain omits a partition spec")
                     })?;
-                let expected: serde_json::Value =
-                    serde_json::from_str(expected).map_err(|error| invalid(error.to_string()))?;
-                let received: serde_json::Value =
-                    serde_json::from_str(json).map_err(|error| invalid(error.to_string()))?;
+                let expected: serde_json::Value = crate::metadata_json::from_str(expected)
+                    .map_err(|error| invalid(error.to_string()))?;
+                let received: serde_json::Value = crate::metadata_json::from_str(json)
+                    .map_err(|error| invalid(error.to_string()))?;
                 if expected != received {
                     return Err(invalid(
                         "iceberg change-window domain partition spec differs",
@@ -680,7 +680,7 @@ impl IcebergChangeWindowHandle {
     }
 
     pub fn parse_table_schema(&self) -> Result<Schema, ConnectorError> {
-        serde_json::from_str::<Schema>(&self.table_schema_json)
+        crate::metadata_json::from_str::<Schema>(&self.table_schema_json)
             .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))
     }
 
@@ -702,7 +702,7 @@ impl IcebergChangeWindowHandle {
                 "iceberg partition spec json must be non-empty and bounded",
             ));
         }
-        let spec: PartitionSpec = serde_json::from_str(spec_json)
+        let spec: PartitionSpec = crate::metadata_json::from_str(spec_json)
             .map_err(|error| invalid(format!("iceberg partition spec json is invalid: {error}")))?;
         if spec.spec_id() != spec_id {
             return Err(invalid(format!(
@@ -1220,7 +1220,7 @@ fn validate_change_columns(
             "iceberg table schema json must be non-empty and bounded",
         ));
     }
-    serde_json::from_str::<Schema>(table_schema_json)
+    crate::metadata_json::from_str::<Schema>(table_schema_json)
         .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))?;
     if columns.is_empty() {
         return Err(invalid(
