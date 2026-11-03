@@ -501,6 +501,26 @@ class InheritedAttachBudgetTests(RendererCase):
         self.assertIsNone(getattr(self.backend, 'operation_deadline', None))
         return code, publication.read(actual_entry), stdout.getvalue(), stderr.getvalue(), health.call_count, image_id.call_count
 
+    def test_expired_cli_context_never_queries_the_daemon_to_locate_saved_state(self):
+        from scratch import RunStorageScope, ScratchIdentity
+        context = self.context(-1)
+        scope = RunStorageScope.from_record(ScratchIdentity.from_dict(context['identity']), self.snapshot)
+        environment = {'NOVAROCKS_WORKSPACE_ROOT': str(self.workspace),
+            'NOVA_ENV_CONFIG_FILE': str(HERE / 'shared.env'), 'NOVA_ENV_UPDATE_CURRENT': 'false',
+            'NOVA_FIXTURE_MACHINE_ROOT': str(self.owner.root),
+            'NOVA_FIXTURE_RUN_CONTEXT': json.dumps(context), 'NOVA_FIXTURE_RUN_STORAGE': json.dumps(scope.as_dict())}
+        stdout, stderr = io.StringIO(), io.StringIO()
+        # Keep the real MachineOwner constructor and CLI; only the Docker port is replaced.
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(machine, 'MachineDocker', return_value=self.backend), \
+                mock.patch.object(self.backend, 'daemon_id', side_effect=AssertionError('daemon query before admission')) as query, \
+                mock.patch.object(entry.time, 'time', return_value=self.wall), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = entry.worktree_main(['up'])
+        self.assertEqual(code, 1)
+        self.assertIn('RunBudgetExpired', stderr.getvalue())
+        query.assert_not_called()
+
     def test_inherited_run_cannot_attach_after_its_original_machine_generation_changed(self):
         changed = copy.deepcopy(self.snapshot)
         changed['generation'] = 'replacement-generation'

@@ -972,7 +972,19 @@ def worktree_main(argv: list[str] | None = None) -> int:
                 if shared:
                     if args.profile != 'stock' or args.hook_image:
                         raise runtime.RuntimeFailure('InvalidConfiguration', 'hook profile requires an isolated request')
-                    owner = machine.MachineOwner(os.environ.get("NOVA_FIXTURE_MACHINE_ROOT"))
+                    original_daemon = None
+                    if os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null"):
+                        from scratch import RunStorageScope
+                        raw_scope = os.environ.get("NOVA_FIXTURE_RUN_STORAGE")
+                        try:
+                            if raw_scope is None or len(raw_scope) > 16384:
+                                raise ValueError("missing bounded original storage binding")
+                            original_daemon = RunStorageScope.from_dict(json.loads(raw_scope)).machine["daemon_id"]
+                        except (ValueError, runtime.RuntimeFailure) as error:
+                            prepare_entry(env_id, entry, config)
+                            raise runtime.RuntimeFailure("RunBudgetRejected", "inherited attach requires its original storage binding") from error
+                    # Resolve saved authority without a daemon query before budget admission.
+                    owner = machine.MachineOwner(os.environ.get("NOVA_FIXTURE_MACHINE_ROOT"), daemon=original_daemon)
                     store = os.environ.get("NOVA_FIXTURE_STORE")
                     # An inherited run cannot create a replacement for its original fixture.
                     if os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") in (None, "null"):
