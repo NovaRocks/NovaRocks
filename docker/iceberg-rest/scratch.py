@@ -331,7 +331,13 @@ class RunStorageScope:
                     storage_owner=dict(self.storage_owner), ranges=json.loads(json.dumps(self.ranges)))
 
     def validate_against(self, identity, record):
-        if self.as_dict() != self.from_record(identity, record).as_dict():
+        actual = self.as_dict()
+        expected = self.from_record(identity, record).as_dict()
+        # Version text is historical metadata, not operation authority. The
+        # original activation, storage owner and exact ranges still must agree.
+        actual["machine"].pop("version")
+        expected["machine"].pop("version")
+        if actual != expected:
             raise runtime.RuntimeFailure("InvalidScratchScope", "inherited storage projection differs from the machine")
         return self
 

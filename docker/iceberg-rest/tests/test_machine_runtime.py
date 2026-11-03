@@ -141,36 +141,23 @@ class Backend:
 
 
 class DerivedObjectStoreInputTests(unittest.TestCase):
-    def test_object_store_uses_exact_derived_ids_and_definition_facts(self):
-        inputs = bom()
-        inputs["derived_images"]["minio"]["alias"] = "mutable-minio-alias"
-        inputs["derived_images"]["minio-mc"]["alias"] = "mutable-mc-alias"
+    def test_object_store_uses_creation_outputs_without_environment_inspection(self):
         backend = Backend()
-        with mock.patch.object(backend, "image_id", wraps=backend.image_id) as inspect:
-            images, facts = machine.input_facts(inputs, backend)
-        self.assertEqual(images["minio"]["image_id"], "sha256:minio")
-        self.assertEqual(images["mc"]["image_id"], "sha256:minio-mc")
-        self.assertEqual(images["mc-init"], images["mc"])
-        self.assertEqual(facts["minio"]["receipt"]["definition_sha256"], "definition-minio")
-        self.assertEqual(facts["minio-mc"]["receipt"]["definition_sha256"], "definition-minio-mc")
-        self.assertIn(mock.call("sha256:minio"), inspect.call_args_list)
-        self.assertIn(mock.call("sha256:minio-mc"), inspect.call_args_list)
-        self.assertNotIn(mock.call("mutable-minio-alias"), inspect.call_args_list)
-        self.assertNotIn(mock.call("mutable-mc-alias"), inspect.call_args_list)
+        with mock.patch.object(backend, 'image_id', side_effect=AssertionError('image scan')):
+            images, facts = machine.input_facts(bom(), backend)
+        self.assertEqual(images['minio']['image_id'], 'sha256:minio')
+        self.assertEqual(images['mc']['image_id'], 'sha256:minio-mc')
+        self.assertEqual(images['mc-init'], images['mc'])
+        self.assertEqual(facts['minio'], 'sha256:minio')
 
-    def test_object_store_requires_derived_definition_and_exact_installed_id(self):
-        for name in ("minio", "minio-mc"):
-            with self.subTest(name=name, fault="definition"):
-                inputs = bom()
-                inputs["derived_images"][name].pop("definition_sha256")
-                with self.assertRaisesRegex(runtime.RuntimeFailure, "derived definition identity is missing"):
-                    machine.input_facts(inputs, Backend())
-            with self.subTest(name=name, fault="image"):
-                backend = Backend()
-                original = backend.image_id
-                with mock.patch.object(backend, "image_id", side_effect=lambda reference: "sha256:other" if reference == "sha256:" + name else original(reference)):
-                    with self.assertRaisesRegex(runtime.RuntimeFailure, "derived image differs from verified receipt"):
-                        machine.input_facts(bom(), backend)
+    def test_object_store_creation_requires_actual_outputs_not_definition_proofs(self):
+        for name in ('minio', 'minio-mc'):
+            supplied = bom()
+            supplied['derived_images'][name].pop('definition_sha256')
+            machine.input_facts(supplied, Backend())
+            supplied['derived_images'][name].pop('image_id')
+            with self.assertRaisesRegex(runtime.RuntimeFailure, 'FixtureBuildFailed'):
+                machine.input_facts(supplied, Backend())
 
 
 class SupervisionPrerequisiteTests(unittest.TestCase):
@@ -698,9 +685,9 @@ class SnapshotDeadlineTests(unittest.TestCase):
             def healthy(state):
                 self.assertEqual(backend.operation_deadline, 107.0)
                 now[0] = 103.0
-                return True
+                return []
             with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
-                    mock.patch.object(backend, "healthy", side_effect=healthy), \
+                    mock.patch.object(backend, "unsettled_operations", side_effect=healthy), \
                     mock.patch.object(backend, "validate_minio_volume"):
                 with owner.operation_snapshot(deadline=190.0, lock_deadline=102.0):
                     self.assertEqual(backend.operation_deadline, 107.0)
@@ -718,9 +705,9 @@ class SnapshotDeadlineTests(unittest.TestCase):
             def healthy(state):
                 self.assertEqual(backend.operation_deadline, 104.0)
                 now[0] = 104.0
-                return True
+                return []
             with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
-                    mock.patch.object(backend, "healthy", side_effect=healthy), \
+                    mock.patch.object(backend, "unsettled_operations", side_effect=healthy), \
                     mock.patch.object(backend, "validate_minio_volume"):
                 with self.assertRaisesRegex(runtime.RuntimeFailure, "RunBudgetExpired"):
                     with owner.operation_snapshot(deadline=190.0, lock_deadline=102.0):
@@ -768,26 +755,19 @@ class SnapshotDeadlineTests(unittest.TestCase):
             worker.join(timeout=3)
         self.assertFalse(worker.is_alive())
 
-    def test_snapshot_deadline_covers_health_and_body_then_restores_outer_clock(self):
+    def test_operation_deadline_covers_body_and_restores_outer_clock(self):
         backend = Backend()
         with tempfile.TemporaryDirectory() as directory:
-            owner = machine.MachineOwner(directory, backend=backend, daemon="local-daemon")
+            owner = machine.MachineOwner(directory, backend=backend, daemon='local-daemon')
             owner._save(dict(schema=machine.PROTOCOL, daemon_id=owner.daemon_id,
-                control_root=str(owner.root), phase="ready", version="v", generation="g"))
-            outer = time.monotonic() + 20
-            inner = time.monotonic() + 5
+                control_root=str(owner.root), phase='ready', version='v', generation='g'))
+            outer, inner = time.monotonic()+20, time.monotonic()+5
             backend.operation_deadline = outer
-            def healthy(state):
-                self.assertEqual(backend.operation_deadline, inner)
-                return True
-            with mock.patch.object(backend, "healthy", side_effect=healthy), mock.patch.object(backend, "validate_minio_volume"):
-                with owner.operation_snapshot(deadline=inner):
-                    self.assertEqual(backend.operation_deadline, inner)
-            self.assertEqual(backend.operation_deadline, outer)
-            with mock.patch.object(backend, "healthy", side_effect=RuntimeError("probe failed")), mock.patch.object(backend, "validate_minio_volume"):
-                with self.assertRaisesRegex(RuntimeError, "probe failed"):
+            with mock.patch.object(backend, 'healthy', side_effect=AssertionError('health scan')):
+                with self.assertRaisesRegex(RuntimeError, 'actual operation failed'):
                     with owner.operation_snapshot(deadline=inner):
-                        pass
+                        self.assertEqual(backend.operation_deadline, inner)
+                        raise RuntimeError('actual operation failed')
             self.assertEqual(backend.operation_deadline, outer)
 
 
@@ -911,7 +891,7 @@ class MachineTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.start()
         identity = self.owner.read_saved_state()["minio_volume_identity"]
-        final = self.start()
+        final = self.owner.activate(self.definition(), upgrade=True)
         self.assertEqual(final["minio_volume_identity"], identity)
         self.assertEqual(self.backend.events, ["ensure"])
 
@@ -930,7 +910,7 @@ class MachineTests(unittest.TestCase):
                         self.backend.volumes[name]["CreatedAt"] = "2026-10-21T02:00:00Z"
                     self.backend.events.clear()
                     if operation == "recover": self.backend.online = False
-                    call = (lambda: self.attach(self.definition())) if operation == "attach" else (
+                    call = (lambda: self.backend.validate_minio_volume(self.owner.read_saved_state())) if operation == "attach" else (
                         lambda: self.owner.activate(self.changed(), upgrade=True)) if operation == "upgrade" else self.start
                     self.assert_code("RuntimeIdentityMismatch", call)
                     self.assertEqual(self.backend.events, [])
@@ -958,26 +938,26 @@ class MachineTests(unittest.TestCase):
         self.backend.volumes[name] = copy.deepcopy(initial)
         self.assertEqual(self.owner.activate(definition), recovered)
 
-    def test_default_recovery_preserves_frozen_facts(self):
+    def test_existing_unavailable_service_is_not_automatically_recovered(self):
         state = self.start()
+        before = list(self.backend.events)
         self.backend.online = False
-        recovered = self.start()
-        self.assertEqual(recovered["minio_volume_identity"], state["minio_volume_identity"])
-        self.assertNotEqual(recovered["generation"], state["generation"])
+        self.assertEqual(self.owner.ensure_created(), state)
+        self.assertEqual(self.backend.events, before)
 
     def test_unstarted_create_crash_can_freeze_volume_but_started_missing_facts_cannot(self):
         record = self.owner._record(self.definition())
         self.owner._save(record)
         self.backend.ensure_authority_volume(record)
         identity = self.backend.ensure_minio_volume(record)
-        recovered = self.start()
+        recovered = self.owner.activate(self.definition(), upgrade=True)
         self.assertEqual(recovered["minio_volume_identity"], identity)
         recovered["phase"] = "maintenance"
         recovered["steps"]["activation_started"] = True
         recovered.pop("minio_volume_identity")
         self.owner._save(recovered)
         self.backend.events.clear()
-        self.assert_code("RuntimeIdentityMismatch", self.start)
+        self.assert_code("RuntimeIdentityMismatch", lambda: self.owner.activate(self.definition(), upgrade=True))
         self.assertEqual(self.backend.events, [])
 
     def test_absent_attach_has_no_service_effect(self):
@@ -1003,24 +983,19 @@ class MachineTests(unittest.TestCase):
     def test_sweep_does_not_reclassify_an_in_lock_timeout_as_unstarted(self):
         self.start()
         error = machine.MaintenanceLockTimeout()
-        with mock.patch.object(self.backend, "healthy", side_effect=error):
+        with mock.patch.object(self.backend, "validate_minio_volume", side_effect=error):
             with self.assertRaises(machine.MaintenanceLockTimeout) as caught:
                 self.owner.sweep(deadline=time.monotonic()+1)
         self.assertIs(caught.exception, error)
         self.assertNotIsInstance(caught.exception, machine.SweepLockTimeout)
         self.assertNotIn(("sweep", True), self.backend.events)
 
-    def test_startup_sweep_pins_version_and_activation_before_cleanup(self):
-        state = self.owner.activate(self.definition())
+    def test_startup_sweep_pins_original_activation_before_cleanup(self):
+        state = self.start()
         before = list(self.backend.events)
-        with self.assertRaisesRegex(runtime.RuntimeFailure, "MachineVersionMismatch"):
-            self.owner.sweep(expected_version="another", expected_generation=state["generation"])
-        with self.assertRaisesRegex(runtime.RuntimeFailure, "MachineUnavailable"):
-            self.owner.sweep(expected_version=state["version"], expected_generation="old-activation")
+        self.assert_code('MachineUnavailable', lambda: self.owner.sweep(expected_generation='other'))
         self.assertEqual(self.backend.events, before)
-        report = self.owner.sweep(expected_version=state["version"], expected_generation=state["generation"])
-        self.assertTrue(report["complete"])
-        self.assertIn(("sweep", True), self.backend.events)
+        self.assertTrue(self.owner.sweep(expected_generation=state['generation'])['complete'])
 
     def test_sweep_projects_only_confirmed_readonly_timeout_without_extending_deadline(self):
         state = self.start()
@@ -1032,9 +1007,9 @@ class MachineTests(unittest.TestCase):
             self.assertLessEqual(self.backend.operation_deadline, deadline)
             raise failure
         deadline = time.monotonic() + 1
-        with mock.patch.object(self.backend, "healthy", side_effect=timed_out):
+        with mock.patch.object(self.backend, "validate_minio_volume", side_effect=timed_out):
             with self.assertRaisesRegex(runtime.RuntimeFailure, "ScratchSweepTimeout") as caught:
-                self.owner.sweep(deadline=deadline, expected_version=state["version"], expected_generation=state["generation"])
+                self.owner.sweep(deadline=deadline, expected_generation=state["generation"])
         self.assertIs(caught.exception.__cause__, failure)
         self.assertEqual(self.backend.operation_deadline, original)
         self.assertEqual(self.owner.read_saved_state(), state)
@@ -1052,18 +1027,16 @@ class MachineTests(unittest.TestCase):
                     now[0] = 105.0
                     return result
                 with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
-                        mock.patch.object(self.backend, "healthy", side_effect=health):
+                        mock.patch.object(self.backend, "validate_minio_volume", side_effect=health):
                     self.assert_code("ScratchSweepTimeout", lambda: self.owner.sweep(deadline=105.0))
                 self.assertEqual(self.backend.operation_deadline, original)
                 self.assertEqual(self.owner.read_saved_state(), state)
                 self.assertNotIn(("sweep", True), self.backend.events)
 
-    def test_sweep_timely_unhealthy_observation_remains_a_real_failure(self):
-        state = self.start()
-        with mock.patch.object(self.backend, "healthy", return_value=False):
-            self.assert_code("MachineUnavailable", lambda: self.owner.sweep(deadline=time.monotonic()+1))
-        self.assertEqual(self.owner.read_saved_state(), state)
-        self.assertNotIn(("sweep", True), self.backend.events)
+    def test_sweep_does_not_require_unrelated_service_health(self):
+        self.start()
+        with mock.patch.object(self.backend, 'healthy', side_effect=AssertionError('health scan')):
+            self.assertTrue(self.owner.sweep(deadline=time.monotonic()+1)['complete'])
 
     def test_slow_local_inventory_stops_before_health_or_recovery_consumes_sweep_window(self):
         state = self.start()
@@ -1139,7 +1112,7 @@ class MachineTests(unittest.TestCase):
             now[0] = 105.0
             return False
         with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
-                mock.patch.object(self.backend, "healthy", side_effect=health), \
+                mock.patch.object(self.backend, "validate_minio_volume", side_effect=health), \
                 mock.patch.object(self.backend, "unsettled_operations", return_value=[("owned-journal", {"phase":"command-unknown"})]):
             self.assert_code("MachineUnavailable", lambda: self.owner.sweep(deadline=105.0))
         self.assertEqual(self.backend.operation_deadline, original)
@@ -1153,7 +1126,7 @@ class MachineTests(unittest.TestCase):
             with self.subTest(code=code):
                 failure = runtime.RuntimeFailure(code, "actual failure")
                 failure.readonly_deadline_settled = evidence
-                with mock.patch.object(self.backend, "healthy", side_effect=failure):
+                with mock.patch.object(self.backend, "validate_minio_volume", side_effect=failure):
                     self.assert_code(code, lambda:self.owner.sweep(deadline=time.monotonic()+1))
 
     def test_sweep_defers_readonly_command_not_dispatched_after_lock_window(self):
@@ -1170,7 +1143,7 @@ class MachineTests(unittest.TestCase):
             backend.operation_deadline = self.backend.operation_deadline
             return backend.command(["container", "inspect", "owned"])
         with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
-                mock.patch.object(self.backend, "healthy", side_effect=health_after_window), \
+                mock.patch.object(self.backend, "validate_minio_volume", side_effect=health_after_window), \
                 mock.patch.object(machine.subprocess, "Popen") as spawn, \
                 mock.patch.object(runtime, "atomic_json") as journal:
             with self.assertRaisesRegex(runtime.RuntimeFailure, "ScratchSweepTimeout") as caught:
@@ -1188,7 +1161,7 @@ class MachineTests(unittest.TestCase):
         for condition in ("mutation", "recovery", "unknown"):
             with self.subTest(condition=condition):
                 error = machine.MachineCommandDeadlineExpired(readonly=condition != "mutation")
-                failing = "settle_operations" if condition == "recovery" else "healthy"
+                failing = "settle_operations" if condition == "recovery" else "validate_minio_volume"
                 pending = [("owned-journal", {"phase":"command-unknown"})] if condition == "unknown" else []
                 with mock.patch.object(self.backend, failing, side_effect=error), \
                         mock.patch.object(self.backend, "unsettled_operations", return_value=pending):
@@ -1211,7 +1184,7 @@ class MachineTests(unittest.TestCase):
         failure.readonly_deadline_settled = True
         with mock.patch.object(self.backend, "settle_operations", side_effect=failure):
             self.assert_code("DockerOperationTimeout", lambda:self.owner.sweep(deadline=time.monotonic()+1))
-        with mock.patch.object(self.backend, "healthy", side_effect=failure), \
+        with mock.patch.object(self.backend, "validate_minio_volume", side_effect=failure), \
                 mock.patch.object(self.backend, "unsettled_operations", return_value=[("owned-journal", {"phase":"command-unknown"})]):
             self.assert_code("DockerOperationTimeout", lambda:self.owner.sweep(deadline=time.monotonic()+1))
 
@@ -1224,16 +1197,13 @@ class MachineTests(unittest.TestCase):
         self.assertEqual(self.backend.events, before)
         self.assertEqual(self.owner.read_saved_state(), first)
 
-    def test_same_lock_different_definition_or_actual_image_is_a_new_version(self):
-        first = self.definition()["version"]
-        for field in ("definition_sha256", "image_id"):
-            supplied = bom()
-            supplied["derived_images"]["rest-mv"][field] = "sha256:different"
-            self.assertNotEqual(first, self.owner.required_definition({}, supplied)["version"])
-        template = self.root / "model.yml"
-        template.write_text(self.owner.template.read_text() + "\n# changed model\n")
-        self.owner.template = template
-        self.assertNotEqual(first, self.definition()["version"])
+    def test_creation_labels_follow_actual_outputs_not_definition_checksums(self):
+        first = self.definition()['version']
+        supplied = bom()
+        supplied['derived_images']['rest-mv']['definition_sha256'] = 'different-source'
+        self.assertEqual(first, self.owner.required_definition({}, supplied)['version'])
+        supplied['derived_images']['rest-mv']['image_id'] = 'sha256:different-image'
+        self.assertNotEqual(first, self.owner.required_definition({}, supplied)['version'])
 
     def test_supply_timestamps_and_cache_paths_do_not_change_runtime_identity(self):
         supplied = bom()
@@ -1330,20 +1300,13 @@ class MachineTests(unittest.TestCase):
         self.owner.sweeper_factory = factory
         self.owner.activate(self.changed(), upgrade=True)
 
-    def test_upgrade_health_failure_resumes_target_catalogs_without_repurging(self):
+    def test_upgrade_records_returned_targets_without_an_environment_health_gate(self):
         self.start()
-        self.backend.failure = "health"
-        self.assert_code("ReadinessTimeout", lambda: self.owner.activate(self.changed(), upgrade=True))
-        failed = self.owner.read_saved_state()
-        self.assertTrue(failed["steps"]["purged"])
-        self.assertTrue(failed["steps"]["activation_started"])
-        self.assertTrue(self.backend.catalog_present)
-        self.backend.events.clear()
-        self.backend.failure = None
-        final = self.owner.activate(self.changed(), upgrade=True)
-        self.assertEqual(final["generation"], failed["generation"])
-        self.assertEqual(final["phase"], "ready")
-        self.assertEqual(self.backend.events, ["ensure"])
+        with mock.patch.object(self.backend, 'healthy', side_effect=AssertionError('health scan')):
+            final = self.owner.activate(self.changed(), upgrade=True)
+        self.assertEqual(final['phase'], 'ready')
+        self.assertTrue(final['steps']['purged'])
+        self.assertEqual(self.backend.events.count('rotate-root'), 1)
 
     def test_cancelled_target_activation_resumes_without_deleting_new_catalogs(self):
         self.start()
@@ -1372,12 +1335,10 @@ class MachineTests(unittest.TestCase):
         self.owner.activate(self.changed(), upgrade=True)
         self.assertEqual(self.backend.events.count("rotate-root"), 1)
 
-    def test_port_and_health_failures_do_not_commit_ready(self):
-        for failure, code in (("ensure", "PortUnavailable"), ("health", "ReadinessTimeout")):
-            with self.subTest(failure=failure):
-                self.backend.failure = failure
-                self.assert_code(code, self.start)
-                self.assertEqual(self.owner.read_saved_state()["phase"], "maintenance")
+    def test_actual_creation_failure_does_not_commit_ready(self):
+        self.backend.failure = 'ensure'
+        self.assert_code('PortUnavailable', self.start)
+        self.assertEqual(self.owner.read_saved_state()['phase'], 'maintenance')
 
     def test_second_control_directory_cannot_create_a_second_machine_stack(self):
         self.start()
@@ -1423,8 +1384,8 @@ class MachineTests(unittest.TestCase):
 
     def test_incomplete_input_or_unsafe_lifetime_policy_is_rejected(self):
         supplied = bom()
-        del supplied["derived_images"]["rest-mv"]["definition_sha256"]
-        self.assert_code("FixturePrerequisiteMissing", lambda: self.owner.required_definition({}, supplied))
+        del supplied["derived_images"]["rest-mv"]["image_id"]
+        self.assert_code("FixtureBuildFailed", lambda: self.owner.required_definition({}, supplied))
         self.assert_code("InvalidConfiguration", lambda: self.definition(policy={"scratch_ttl_seconds": 100}))
         self.assert_code("InvalidConfiguration", lambda: self.definition(ports={"rest": 28000}))
         for timeout in (float("nan"), float("inf"), 0, -1, True):

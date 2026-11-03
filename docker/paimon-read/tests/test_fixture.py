@@ -38,34 +38,24 @@ sys.modules[SPEC.name] = fixture
 SPEC.loader.exec_module(fixture)
 
 
-class WriterBomReaderTest(unittest.TestCase):
-    """Offline supply-reader coverage remains active independently of writer runs."""
+class WriterInputTest(unittest.TestCase):
+    """Tooling contracts stay active without resuming Paimon product suites."""
 
-    def test_schema2_requires_matching_native_and_writer_platforms(self):
+    def test_new_writer_prepares_only_its_requested_image(self):
+        sys.path.insert(0, str(ROOT.parent / "fixture-inputs"))
+        import provision
+        receipt = {"alias": "writer:existing", "image_id": "sha256:original", "platform": "linux/amd64"}
+        with mock.patch.object(provision, "prepare_inputs", return_value={"derived_images": {"paimon-writer": receipt}}) as prepare:
+            self.assertEqual(fixture.prepare_writer_image("/local/store"), receipt)
+        self.assertEqual(prepare.call_args.kwargs, {"consumer": "derived:paimon-writer"})
+        self.assertEqual(prepare.call_args.args[0], Path("/local/store"))
+
+    def test_writer_recommendations_come_from_central_versions(self):
+        source = fixture.read_json(ROOT.parent / "fixture-inputs/versions.json")
         versions = fixture.load_versions()
-        value = {"schema": 2, "platform": "linux/amd64", "lock_sha256": "a" * 64,
-                 "derived_images": {"paimon-writer": {
-                     "alias": "novarocks/fixture-paimon-writer:current", "platform": "linux/amd64",
-                     "image_id": "sha256:image", "definition_sha256": "b" * 64}}}
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "bom.json"
-            path.write_text(json.dumps(value))
-            receipt = fixture.load_writer_bom(path, versions)
-            self.assertEqual(receipt["image_id"], "sha256:image")
-            for target in ("platform", "writer"):
-                with self.subTest(target=target):
-                    changed = json.loads(json.dumps(value))
-                    if target == "platform":
-                        changed["platform"] = "linux/arm64"
-                    else:
-                        changed["derived_images"]["paimon-writer"]["platform"] = "linux/arm64"
-                    path.write_text(json.dumps(changed))
-                    with self.assertRaises(fixture.FixtureError):
-                        fixture.load_writer_bom(path, versions)
-            value["schema"] = 1
-            path.write_text(json.dumps(value))
-            with self.assertRaisesRegex(fixture.FixtureError, "reprovision"):
-                fixture.load_writer_bom(path, versions)
+        self.assertEqual(versions["SPARK_VERSION"], source["versions"]["paimon_spark"])
+        self.assertEqual(versions["PAIMON_VERSION"], source["versions"]["paimon"])
+        self.assertEqual(int(versions["PAIMON_SPARK_JAR_SIZE"]), source["artifacts"]["paimon-spark.jar"]["bytes"])
 
 
 @unittest.skip("Paimon fixture tests are suspended pending detailed connector design")
@@ -172,10 +162,6 @@ class FixtureContractTest(unittest.TestCase):
     def test_writer_versions_are_locked_but_dockerfile_has_no_network_add(self) -> None:
         versions = fixture.load_versions()
         self.assertEqual(versions["PAIMON_VERSION"], "1.3.1")
-        self.assertEqual(
-            versions["SPARK_IMAGE_MANIFEST_DIGEST"],
-            "sha256:b2da01c5855fdf791328a6fa1267b406336a535d39abc05699214a48bee95955",
-        )
         self.assertEqual(versions["PAIMON_SPARK_JAR_SIZE"], "41895267")
         self.assertEqual(versions["PAIMON_S3_JAR_SIZE"], "31776897")
         dockerfile = (ROOT / "Dockerfile").read_text()
@@ -184,26 +170,7 @@ class FixtureContractTest(unittest.TestCase):
         self.assertNotIn("ADD http", dockerfile)
         self.assertNotIn("MAVEN_REPOSITORY", dockerfile)
 
-    def test_writer_bom_requires_exact_platform_and_alias(self) -> None:
-        versions = fixture.load_versions()
-        with tempfile.TemporaryDirectory() as temporary:
-            bom = Path(temporary) / "bom.json"
-            bom.write_text(json.dumps({
-                "schema": 2, "platform": "linux/amd64", "lock_sha256": "a" * 64,
-                "derived_images": {"paimon-writer": {
-                    "alias": "novarocks/fixture-paimon-writer:current",
-                    "platform": "linux/amd64",
-                    "image_id": "sha256:image",
-                    "definition_sha256": "b" * 64,
-                }},
-            }))
-            receipt = fixture.load_writer_bom(bom, versions)
-            self.assertEqual(receipt["alias"], "novarocks/fixture-paimon-writer:current")
-            foreign = json.loads(bom.read_text())
-            foreign["derived_images"]["paimon-writer"]["platform"] = "linux/arm64"
-            bom.write_text(json.dumps(foreign))
-            with self.assertRaises(fixture.FixtureError):
-                fixture.load_writer_bom(bom, versions)
+
 
     def test_container_commands_never_pull(self) -> None:
         versions = fixture.load_versions()
@@ -592,19 +559,11 @@ access_key_secret = "test-secret"
                 env_file=str(env_file),
                 stop_after="s1",
                 dry_run=False,
-                fixture_bom=str(output_dir / "fixture-bom.json"),
+                fixture_store=str(root / "inputs"),
             )
             output_dir.mkdir()
-            Path(args.fixture_bom).write_text(json.dumps({
-                "schema": 2, "platform": "linux/amd64", "lock_sha256": "a" * 64,
-                "derived_images": {"paimon-writer": {
-                    "alias": "fixture:image",
-                    "platform": "linux/amd64",
-                    "image_id": "sha256:image",
-                    "definition_sha256": "b" * 64,
-                }},
-            }))
             with (
+                mock.patch.object(fixture, "prepare_writer_image", return_value={"alias":"fixture:image", "image_id":"sha256:image", "platform":"linux/amd64"}),
                 mock.patch.object(fixture, "load_runtime", return_value=runtime),
                 mock.patch.object(fixture, "run_spark_stage", return_value=spark_output),
                 mock.patch.object(

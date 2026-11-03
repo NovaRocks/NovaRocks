@@ -87,7 +87,7 @@ runtime-inputs = [
     "docker/iceberg-rest/spark/Dockerfile",
     "docker/fixture-inputs/*.sh",
     "docker/fixture-inputs/*.py",
-    "docker/fixture-inputs/lock.json",
+    "docker/fixture-inputs/versions.json",
     "tests/fixtures/iceberg-rest-publication/Dockerfile",
     "tests/fixtures/iceberg-rest-publication/src/**",
 ]

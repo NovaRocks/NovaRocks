@@ -204,7 +204,7 @@ def run_owner(root):
             (root / "owner-locked").write_text(str(owner.base / "maintenance.lock"))
             if options.get("operation") == "control":
                 arguments = options.get("control_args", ["volume", "create", "fixture-test-volume"])
-                if options.get("gate_plugin_deadline"):
+                if options.get("gate_plugin_deadline") or options.get("gate_control_deadline"):
                     original_popen = machine.subprocess.Popen
                     expected = [sys.executable, str(HERE.parents[1] / "machine_operation.py")]
                     def clocked_monitor(argv, **kwargs):
@@ -247,16 +247,20 @@ def run_owner(root):
 
 
 def run_clocked_monitor(root, arguments):
-    """Exercise entered-plugin expiry, not Python startup's wall-clock budget."""
+    """Exercise entered-work expiry, separately from startup deadline tests."""
     import machine_operation
 
     options = json.loads((root / "fake-config.json").read_text())
     plugin_mode = (options.get("gate_plugin_deadline") and options.get("plugin")
                    and options.get("plugin_ignore_term") and options.get("operation") == "control")
     start_mode = options.get("gate_start_deadline") and options.get("hold_start") and options.get("operation") != "control"
-    if not (plugin_mode or start_mode):
-        raise AssertionError("clock helper requires an original entered-plugin or entered-start timeout case")
-    gate = "plugin-deadline-release" if plugin_mode else "start-deadline-release"
+    control_mode = (options.get("gate_control_deadline") and options.get("hold_control")
+                    and options.get("operation") == "control")
+    if sum(bool(mode) for mode in (plugin_mode, start_mode, control_mode)) != 1:
+        raise AssertionError("clock helper requires one original entered-work timeout case")
+    gate = ("control-deadline-release" if control_mode else
+            "plugin-deadline-release" if plugin_mode else "start-deadline-release")
+    clock_fact = "control-clock-expired.json" if control_mode else "plugin-clock-expired.json"
     journal = Path(arguments[0])
     if not journal.resolve().is_relative_to((root / "state").resolve()):
         raise AssertionError("clock helper journal is outside this test owner")
@@ -275,7 +279,7 @@ def run_clocked_monitor(root, arguments):
             # One existence gate, one real anchor. Never reread a timestamp,
             # extend the original deadline, or freeze the TERM/KILL interval.
             resumed_at = real_monotonic()
-            runtime.atomic_json(root / "plugin-clock-expired.json", {
+            runtime.atomic_json(root / clock_fact, {
                 "original_deadline_monotonic": deadline,
                 "real_anchor_monotonic": resumed_at,
                 "original_request_sha256": hashlib.sha256(original_request).hexdigest(),
@@ -383,7 +387,8 @@ class MachineOperationTests(unittest.TestCase):
         # Every gate belongs to this test's fake CLI; release before reaping.
         # A failed setup must not leave a clock-frozen creating=True monitor
         # retaining its inherited flock after this test's owner is killed.
-        for name in ("plugin-deadline-release", "start-deadline-release", "create-release", "start-release", "rm-release",
+        for name in ("plugin-deadline-release", "start-deadline-release", "control-deadline-release",
+                     "create-release", "start-release", "rm-release",
                      "late-release", "control-release", "plugin-release"):
             self.release(name)
         if self.owner_process is not None and self.owner_process.poll() is None:
@@ -766,17 +771,31 @@ class MachineOperationTests(unittest.TestCase):
         self.assertFalse((self.root / "control-side-effect").exists())
 
     def test_control_rpc_does_not_receive_mc_create_reply_settlement_window(self):
-        self.start_owner(operation="control", hold_control=True, timeout=0.8)
+        self.start_owner(operation="control", hold_control=True, timeout=0.8,
+                         gate_control_deadline=True)
         self.until(lambda: self.event("control.entered"), "original control RPC")
         request = next((self.root / "state").glob("*/operations/control-*.request"))
-        deadline = json.loads(request.read_text())["deadline_monotonic"]
+        original_request = request.read_bytes()
+        deadline = json.loads(original_request)["deadline_monotonic"]
+        self.assertTrue(self.lock_held())
+        self.release("control-deadline-release")
         self.wait_owner(1)
-        self.assertLess(time.monotonic(), deadline + 2)
+        clock = json.loads((self.root / "control-clock-expired.json").read_text())
+        self.assertEqual(clock["original_deadline_monotonic"], deadline)
+        self.assertEqual(clock["original_request_sha256"], hashlib.sha256(original_request).hexdigest())
+        self.assertEqual(request.read_bytes(), original_request)
+        # Compare in the monitor's clock coordinates. The original bound stays
+        # two seconds after expiry; interpreter startup is a separate scenario.
+        observed_now = deadline + time.monotonic() - clock["real_anchor_monotonic"]
+        self.assertLess(observed_now, deadline + 2)
         fact = self.control_fact()
         self.assertEqual(fact["phase"], "command-unknown")
         self.assertTrue(fact["timed_out"])
         self.assertTrue(fact["command_dispatched"])
         self.assertNotIn("create_reply_deadline_monotonic", fact)
+        self.assertTrue(fact["leader_waited"])
+        self.assertTrue(fact["group_exit_observed"])
+        self.assertFalse(self.lock_held())
         self.assertFalse((self.root / "control-side-effect").exists())
 
     def test_control_leader_stays_unreaped_until_plugin_actually_exits(self):

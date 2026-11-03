@@ -482,8 +482,6 @@ prepare_runtime() {
 
   start="$(ci_epoch)"
   {
-    echo "+ docker/fixture-inputs/verify.sh --consumer iceberg-rest"
-    verify_fixture_inputs &&
     echo "+ docker/iceberg-rest/up.sh" &&
     docker/iceberg-rest/up.sh &&
       echo "+ resolve and source fixture publication" &&
@@ -500,9 +498,7 @@ prepare_runtime() {
       require_runtime_var NOVA_ENV_OBJECT_STORE_RUNTIME &&
       require_runtime_var NOVA_ENV_CATALOG_RUNTIME &&
       require_runtime_var AWS_S3_ENDPOINT &&
-      record_fixture_runtime &&
-      echo "+ python3 docker/iceberg-rest/rest-mv/probe.py contract --manifest <runtime-manifest>" &&
-      python3 docker/iceberg-rest/rest-mv/probe.py contract --manifest "$NOVA_ENV_MANIFEST"
+      record_fixture_runtime
     code=$?
     if [ "$code" -eq 0 ]; then
       echo "PAIMON_TESTS=DISABLED (pending detailed connector design; fixtures are not prepared)"
@@ -526,15 +522,9 @@ prepare_runtime() {
   duration=$(($(ci_epoch) - start))
 
   if [ "$code" -ne 0 ]; then
-    if [ "$code" -eq 75 ]; then
-      ci_record_stage "fixture prerequisites" "BLOCKED" "$duration" "$log_path"
-      ci_record_blocked "fixture input BOM missing or invalid" "$log_path"
-      ci_render_summary "BLOCKED"
-    else
-      ci_record_stage "prepare runtime" "VERIFY FAILED" "$duration" "$log_path"
-      ci_mark_failure_tail "prepare runtime verification failed" "$log_path"
-      ci_render_summary "VERIFY FAILED"
-    fi
+    ci_record_stage "prepare runtime" "FAIL" "$duration" "$log_path"
+    ci_mark_failure_tail "prepare runtime failed" "$log_path"
+    ci_render_summary "FAIL"
     exit "$code"
   fi
 
@@ -542,10 +532,6 @@ prepare_runtime() {
   ci_set_runtime_context "$NOVAROCKS_FE_CONFIG" "$NOVAROCKS_SQL_TEST_CONFIG" "$NOVA_ENV_TRINO_PORT"
   ci_record_stage "prepare runtime" "PASS" "$duration" "$log_path"
   ci_render_summary "RUNNING"
-}
-
-verify_fixture_inputs() {
-  docker/fixture-inputs/verify.sh --consumer iceberg-rest
 }
 
 load_fixture_publication() {
@@ -1362,7 +1348,7 @@ main() {
   # System Scenarios run before the SQL suites so a topology, readiness,
   # restart, fault or cleanup break surfaces before the much longer SQL tier.
   # Most default scenarios use local warehouses. Target replacement owns an
-  # isolated REST/S3 fixture using the inputs verified during runtime preparation.
+  # isolated REST/S3 fixture through its original fixture owner.
   run_system_scenario_fixture_stage || return $?
   run_system_scenarios_stage || return $?
   reset_frontend_state_store_stage

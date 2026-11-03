@@ -1156,6 +1156,14 @@ class FixedStorageTests(RuntimeAssertions, unittest.TestCase):
                     self.identity.scope_root + "/table*", "https://warehouse/service/table"):
             self.assert_code("InvalidScratchScope", lambda uri=uri: self.scope.belongs(uri))
 
+    def test_historical_version_does_not_change_original_storage_authority(self):
+        value = self.scope.as_dict()
+        value["machine"]["version"] = "historical-software-version"
+        restored = scratch.RunStorageScope.from_dict(value)
+        self.assertIs(restored.validate_against(self.identity, self.record), restored)
+        self.assertEqual(restored.machine["version"], "historical-software-version")
+        self.assertEqual(restored.iam_policy(), self.scope.iam_policy())
+
     def test_inherited_storage_owner_or_ranges_cannot_change(self):
         for change in ("machine", "owner", "warehouse", "prefix", "run_root", "schema"):
             value = self.scope.as_dict()

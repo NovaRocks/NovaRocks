@@ -66,6 +66,16 @@
         }
       },
       "version": "3.22.7"
+    },
+    "hive-base": {
+      "source": "apache/hive",
+      "version": "4.0.0",
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-hive-base:4.0.0"
+        }
+      }
     }
   },
   "artifacts": {
@@ -443,8 +453,7 @@
       "dockerfile": "docker/paimon-read/Dockerfile",
       "definition_files": [
         "docker/paimon-read/Dockerfile",
-        "docker/paimon-read/fixture.py",
-        "docker/paimon-read/versions.env"
+        "docker/paimon-read/fixture.py"
       ],
       "artifacts": [
         "paimon-spark.jar",
@@ -751,6 +760,30 @@
       },
       "derived_bases": {
         "SERVICE_BASE": "rest-mv"
+      }
+    },
+    "hive-metastore": {
+      "bases": {
+        "HIVE_BASE": "hive-base"
+      },
+      "dockerfile": "docker/iceberg-hive/Dockerfile",
+      "definition_files": [
+        "docker/iceberg-hive/Dockerfile",
+        "docker/iceberg-hive/core-site.xml"
+      ],
+      "copy_inputs": {
+        "docker/iceberg-hive/core-site.xml": "core-site.xml"
+      },
+      "build_args": {
+        "HADOOP_VERSION": "3.3.6",
+        "AWS_SDK_VERSION": "1.12.367"
+      },
+      "artifacts": [],
+      "variants": {
+        "linux/amd64": {
+          "platform": "linux/amd64",
+          "alias": "novarocks/fixture-hive-metastore:4.0.0"
+        }
       }
     }
   },

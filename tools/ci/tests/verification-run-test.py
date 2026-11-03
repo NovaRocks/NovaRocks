@@ -73,6 +73,17 @@ class Run(unittest.TestCase):
         self.assertIn('native owner validates runtime facts',result[0]['basis'])
         probe.assert_not_called()
 
+    def test_java_and_docker_are_deferred_while_binary_identity_is_still_checked(self):
+        probe=mock.Mock(side_effect=AssertionError('must execute the selected owner without a preflight'))
+        requirements=['toolchain:java','fixture:docker','binary:novarocks']
+        checks=run.requirement_checks(requirements,{},self.native,probe)
+        self.assertTrue(all(check['ok'] for check in checks))
+        self.assertTrue(all('delegated' in check['basis'] for check in checks[:2]))
+        self.native['receipt']['novarocks']['sha256']='different executable'
+        checks=run.requirement_checks(requirements,{},self.native,probe)
+        self.assertFalse(checks[-1]['ok'])
+        probe.assert_not_called()
+
     def test_cli_direct_module_and_shell_entrypoints_start_from_another_directory(self):
         ci=Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(prefix='verification-cli-') as directory:

@@ -503,7 +503,6 @@ fn cleanup_scratch_run(budget: &RunBudget, machine: &MachineBinding, root: &Path
     for (argument, value) in [
         ("--root", &machine.root),
         ("--daemon", &machine.daemon),
-        ("--expected-version", &machine.version),
         ("--expected-generation", &machine.generation),
     ] {
         command.arg(argument).arg(value);

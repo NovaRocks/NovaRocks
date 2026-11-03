@@ -215,13 +215,13 @@ def recommended_versions(repo=None):
     return runtime.read_json(repo / "docker/fixture-inputs/versions.json")["versions"]
 
 
-def prepare_inputs(repo: Path, store: Path | None = None, *, consumer="iceberg-rest") -> dict:
+def prepare_inputs(repo: Path, store: Path | None = None, *, consumer="iceberg-rest", **build_options) -> dict:
     directory = repo / "docker/fixture-inputs"
     sys.path.insert(0, str(directory))
     try:
         from provision import prepare_inputs as build
         from fixture_inputs import fixture_store
-        return build(fixture_store(str(store) if store else None), repo, consumer=consumer)
+        return build(fixture_store(str(store) if store else None), repo, consumer=consumer, **build_options)
     except Exception as error:
         raise runtime.RuntimeFailure("FixtureBuildFailed", f"fixture creation failed: {error}") from error
     finally:
@@ -1168,10 +1168,13 @@ class MachineOwner:
         result = dict(version=version, config=config, images=images, template=text,
                       producer_receipt=copy.deepcopy(prepared["derived_images"]["iceberg-spark-oss" if cloud else "iceberg-spark"]))
         if cloud:
-            result["oss_ops_python"] = prepared["python_environments"]["oss-sdk"]["path"]
+            sdk = prepared.get("python_environments", {}).get("oss-sdk", {})
+            if not isinstance(sdk.get("path"), str) or not Path(sdk["path"]).is_absolute():
+                raise runtime.RuntimeFailure("FixtureBuildFailed", "creation has no configured SDK interpreter output")
+            result["oss_ops_python"] = sdk["path"]
         return result
 
-    def ensure_created(self, *, store=None):
+    def ensure_created(self, *, store=None, **build_options):
         with self.maintenance_lock():
             saved = self.read_saved_state()
             if saved:
@@ -1180,7 +1183,7 @@ class MachineOwner:
                 return saved
         config = self.load_config()
         prepared = prepare_inputs(runtime.SCRIPT_DIR.parent.parent, store,
-            consumer="iceberg-rest-oss" if config.get("object_store") else "iceberg-rest")
+            consumer="iceberg-rest-oss" if config.get("object_store") else "iceberg-rest", **build_options)
         return self.activate(self.required_definition(config, prepared))
 
     @contextmanager
@@ -1216,14 +1219,15 @@ class MachineOwner:
 
     def check_environment(self):
         """Explicit diagnostics only; never repair or grant permission to run tests."""
-        result = dict(recommended_versions=recommended_versions(), actual_versions={},
+        recommendations = recommended_versions()
+        result = dict(recommended_versions=recommendations, actual_versions=dict.fromkeys(recommendations),
                       machine=None, observed_healthy=None, errors=[])
         try:
             with self.maintenance_lock(readonly_existing=True):
                 state = self.read_saved_state()
                 result["machine"] = public_snapshot(state)
                 if state is not None:
-                    result["actual_versions"] = copy.deepcopy(state.get("actual_versions", {}))
+                    result["actual_versions"].update(copy.deepcopy(state.get("actual_versions", {})))
                     result["observed_healthy"] = self.backend.healthy(state)
         except (runtime.RuntimeFailure, OSError) as error:
             result["errors"].append(str(error))
@@ -1497,7 +1501,7 @@ class MachineOwner:
             self._save(record)
             return record
 
-    def sweep(self, *, deadline=None, expected_version=None, expected_generation=None):
+    def sweep(self, *, deadline=None, expected_generation=None):
         deadline = time.monotonic() + min(5, self.timeout) if deadline is None else deadline
         previous_deadline = getattr(self.backend, "operation_deadline", None)
         deadline = min(deadline, previous_deadline) if previous_deadline is not None else deadline
@@ -1511,8 +1515,6 @@ class MachineOwner:
                 state = self.read_saved_state()
                 if not state or state["phase"] != "ready":
                     raise runtime.RuntimeFailure("MachineUnavailable", "machine is not available for sweep")
-                if expected_version is not None and state["version"] != expected_version:
-                    raise runtime.RuntimeFailure("MachineVersionMismatch", "sweep publication version differs")
                 if expected_generation is not None and state["generation"] != expected_generation:
                     raise runtime.RuntimeFailure("MachineUnavailable", "sweep publication activation changed")
                 if is_cloud(state):
@@ -1597,6 +1599,11 @@ def main(argv=None):
         sub = commands.add_parser(operation)
         sub.add_argument("--config", type=Path)
         sub.add_argument("--store", type=Path)
+        if operation in {"start", "upgrade"}:
+            sub.add_argument("--platform")
+            sub.add_argument("--image-source", action="append", default=[])
+            sub.add_argument("--artifact-url-prefix", action="append", default=[])
+            sub.add_argument("--docker-pull-timeout-seconds", type=int, default=180)
     commands.add_parser("status")
     commands.add_parser("sweep")
     resolve = commands.add_parser("resolve-readonly-observation")
@@ -1615,11 +1622,15 @@ def main(argv=None):
                     if owner.read_saved_state() is None:
                         config = machine_config(runtime.read_json(args.config))
                         runtime.atomic_json(owner.base / "config.json", config)
-            result = owner.ensure_created(store=args.store)
+            result = owner.ensure_created(store=args.store, platform=args.platform,
+                image_source_specs=args.image_source, artifact_url_prefix_specs=args.artifact_url_prefix,
+                pull_timeout_seconds=args.docker_pull_timeout_seconds)
         elif args.operation == "upgrade":
             config = machine_config(runtime.read_json(args.config)) if args.config else owner.load_config()
             prepared = prepare_inputs(runtime.SCRIPT_DIR.parent.parent, args.store,
-                consumer="iceberg-rest-oss" if config.get("object_store") else "iceberg-rest")
+                consumer="iceberg-rest-oss" if config.get("object_store") else "iceberg-rest",
+                platform=args.platform, image_source_specs=args.image_source,
+                artifact_url_prefix_specs=args.artifact_url_prefix, pull_timeout_seconds=args.docker_pull_timeout_seconds)
             result = owner.activate(owner.required_definition(config, prepared), upgrade=True)
         elif args.operation == "resolve-readonly-observation":
             result = owner.resolve_readonly_observation(args.journal)

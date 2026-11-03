@@ -644,7 +644,7 @@ def build_inputs(config: dict) -> dict:
     return machine.prepare_inputs(Path(config['repo_root']), Path(store) if store else None, consumer=consumer)
 
 
-def isolated_start(config: dict, project: str, entry: Path, profile: str, hook_image: str | None, bom: dict) -> dict:
+def isolated_start(config: dict, project: str, entry: Path, profile: str, hook_image: str | None, bom: dict | None = None) -> dict:
     if os.environ.get("NOVA_ENV_PRIVATE_SHARED_MINIO") == "true":
         from scratch import ScratchIdentity, RunBudget
         inherited = json.loads(os.environ.get("NOVA_FIXTURE_RUN_CONTEXT", "null"))
@@ -661,6 +661,11 @@ def isolated_start(config: dict, project: str, entry: Path, profile: str, hook_i
             raise runtime.RuntimeFailure("MachineUnavailable", "shared MinIO has no saved authority")
         identity = ScratchIdentity.from_dict(inherited["identity"])
         budget = RunBudget.admit(saved, identity, inherited=inherited)
+        # Missing inputs are built only after the original run budget is admitted.
+        # Do not hold the machine operation lock while building them.
+        if bom is None:
+            bom = build_inputs(config)
+        budget.check(work=True)
         deadline = budget.deadline - budget.cleanup_grace_seconds
         previous_deadline = getattr(owner.backend, "operation_deadline", None)
         owner.backend.operation_deadline = min(previous_deadline, deadline) if previous_deadline is not None else deadline
@@ -677,6 +682,8 @@ def isolated_start(config: dict, project: str, entry: Path, profile: str, hook_i
                 return start_private_stack(config, project, entry, profile, hook_image, bom, budget=budget)
         finally:
             owner.backend.operation_deadline = previous_deadline
+    if bom is None:
+        bom = build_inputs(config)
     return start_private_stack(config, project, entry, profile, hook_image, bom)
 
 
@@ -714,27 +721,48 @@ def start_private_stack(config, project, entry, profile, hook_image, bom, *, bud
     for image in record['images'].values():
         image['image_id'] = backend.image_id(image['tag'])
     # A generated manifest also identifies partial startup for harness teardown.
+    record["creation_state"] = "starting"
     render_entry(context, entry)
     if config.get("shared_minio"):
         backend.compose(record, ['create'])
         record["object_store_container"] = backend.attach(config["shared_minio"], record)
         render_entry(context, entry)
     backend.compose(record, ['up', '-d'])
-    deadline = time.monotonic() + min(120, budget.remaining_seconds(work=True) if budget else 120)
-    while not backend.healthy(record) or (context['control_uri'] and not backend.http_ready(context['control_uri'] + '/health')):
-        if budget:
-            budget.check(work=True)
-        if time.monotonic() > deadline:
-            raise runtime.RuntimeFailure('ReadinessTimeout', project)
-        time.sleep(0.1)
     record['containers'] = {name: backend.container(record, name)['Id'] for name in record['required_services']}
-    # The mc client remains a completed container for identity checks and run --rm.
+    # Join the actual one-shot command, not a readiness probe of the whole stack.
     mc = backend.container(record, 'mc')
-    if not mc or mc.get('State', {}).get('Status') != 'exited' or mc.get('State', {}).get('ExitCode') != 0:
-        raise runtime.RuntimeFailure('ReadinessTimeout', 'isolated mc did not complete successfully')
+    if not mc:
+        raise runtime.RuntimeFailure('RuntimeStateUnreadable', 'private creation omitted its mc container')
+    if mc.get('State', {}).get('Status') != 'exited':
+        result = backend.command(['wait', mc['Id']]).strip()
+        if result != '0':
+            raise runtime.RuntimeFailure('RuntimeCreationFailed', 'private mc command did not exit successfully')
+    elif mc.get('State', {}).get('ExitCode') != 0:
+        raise runtime.RuntimeFailure('RuntimeCreationFailed', 'private mc command did not exit successfully')
     record['containers']['mc'] = mc['Id']
+    record['creation_state'] = 'ready'
     render_entry(context, entry)
     return {'published_dir': str(entry), 'private_record': record, 'producer_receipt': context['producer_receipt']}
+
+
+def existing_private_entry(entry: Path, project: str):
+    path = entry / 'manifest.json'
+    if not path.exists():
+        return None
+    manifest = runtime.read_json(path)
+    record = manifest.get('runtime', {}).get('catalog')
+    if record is None and not manifest.get('ready'):
+        return None
+    if not isinstance(record, dict) or record.get('project') != project or manifest.get('shared_docker') is not False:
+        raise runtime.RuntimeFailure('RuntimeIdentityMismatch', 'private fixture configuration belongs to another owner')
+    complete = record.get('creation_state') == 'ready'
+    if record.get('creation_state') is None:
+        # Older owners published their actual target IDs only after creation returned.
+        complete = set(record.get('required_services', ())).issubset(record.get('containers', {})) and bool(record.get('containers'))
+    if not complete:
+        raise runtime.RuntimeFailure('RuntimeUnavailable', 'private fixture creation is incomplete; maintain it manually')
+    return {'published_dir': str(entry), 'private_record': record,
+            'producer_receipt': manifest.get('runtime', {}).get('producer_receipt')}
 
 
 def isolated_down(entry: Path, project: str, *, volumes: bool, purge: bool) -> dict:
@@ -936,11 +964,15 @@ def worktree_main(argv: list[str] | None = None) -> int:
                         raise runtime.RuntimeFailure('InvalidConfiguration', 'hook profile requires an isolated request')
                     owner = machine.MachineOwner(os.environ.get("NOVA_FIXTURE_MACHINE_ROOT"))
                     store = os.environ.get("NOVA_FIXTURE_STORE")
-                    owner.ensure_created(store=Path(store) if store else None)
+                    # An inherited run cannot create a replacement for its original fixture.
+                    if os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") in (None, "null"):
+                        owner.ensure_created(store=Path(store) if store else None)
                     result = attach_entry(owner, env_id, entry, config)
                 else:
-                    prepared = build_inputs(config)
-                    result = isolated_start(config, settings['NOVA_ENV_COMPOSE_PROJECT'], entry, args.profile, args.hook_image, prepared)
+                    with runtime.file_lock(entry / '.entry.lock'):
+                        result = existing_private_entry(entry, settings['NOVA_ENV_COMPOSE_PROJECT'])
+                        if result is None:
+                            result = isolated_start(config, settings['NOVA_ENV_COMPOSE_PROJECT'], entry, args.profile, args.hook_image)
         if result is None:
             output = None
         else:

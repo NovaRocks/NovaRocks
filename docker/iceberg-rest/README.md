@@ -37,7 +37,7 @@ under the License.
 
 `root_prefix` 限定本环境的对象范围，规范化后带尾 `/`；benchmark、worktree、私有 catalog 和机器 warehouse 分别位于其 `benchmarks/`、`worktrees/`、`catalogs/` 和 `machines/<machine-id>/<generation>/` 子域。不要在配置中加入 AccessKey、SecretKey 或临时 token。FE、BE 各自通过节点本地 ECS RAM Role 来源取得和刷新材料；REST、Spark 和 host 对象操作各用官方 Alibaba provider。各入口固定启用 IMDSv2，凭证只保留在各自进程内存中。容器也须能访问 ECS 的 IMDSv2 服务。
 
-手动维护时，先将这份五字段 JSON 保存到绝对路径，再生成机器输入。以下命令使用默认账户 fixture store；若显式选择 store，provision、verify、机器和 worktree 必须消费同一位置。
+手动维护时，先将这份五字段 JSON 保存到绝对路径，再生成机器输入。以下命令使用默认账户 fixture store；若显式选择 store，构建入口和首次创建的机器必须使用同一位置；已有机器直接复用保存的 SDK/服务配置。
 
 ```bash
 object_store_config=/absolute/path/object-store.json
@@ -54,20 +54,20 @@ docker/fixture-inputs/provision.sh --consumer iceberg-rest-oss --platform linux/
   --artifact-url-prefix https://repo.maven.apache.org/maven2/=https://maven.aliyun.com/repository/public/ \
   --artifact-url-prefix https://files.pythonhosted.org/packages/=https://mirrors.aliyun.com/pypi/packages/ \
   --artifact-url-prefix https://plugins.gradle.org/m2/=https://maven.aliyun.com/repository/gradle-plugin/
-docker/fixture-inputs/verify.sh --consumer iceberg-rest-oss --platform linux/amd64
 docker/iceberg-rest/fixture-runtime.sh start --config "$machine_config"
 export NOVA_ENV_OBJECT_STORE_CONFIG="$object_store_config"
 docker/iceberg-rest/up.sh
+# Optional manual diagnostics; not a test prerequisite.
 docker/iceberg-rest/fixture-runtime.sh check --config "$machine_config"
 ```
 
-手动 provision 的 `--artifact-url-prefix` 仅选择传输位置，原锁的长度和 hash、BOM identity、内容缓存键不变，错误镜像直接失败且不回退。Linux prepare 从 profile 的 `fixture_artifact_url_prefixes` 显式转发相同设置，check/verify 不下载；完整约束见 [输入来源说明](../fixture-inputs/README.md)。
+手动 provision 的 `--artifact-url-prefix` 仅选择传输位置，artifact 长度和 hash 约束不变，失败不自动回退。Linux prepare 从 profile 的 `fixture_artifact_url_prefixes` 显式转发到缺失输入的创建；已有机器直接复用，手动 check 不下载。完整约束见 [输入来源说明](../fixture-inputs/README.md)。
 
-当前 OSS host SDK 闭包仅声明 Ubuntu 26.04、原生 amd64、Python 3.14。provision 准备固定依赖的独立 venv 和 REST/Spark 凭证桥接镜像；verify、check、运行层不会临时执行 pip/Maven 下载。`iceberg-rest-oss` 只选择对应闭包，不拉取或编译 MinIO/mc；普通本地 MinIO 仍选择 `iceberg-rest`。OSS 配置缺失或错误时明确失败，不回退到 MinIO。
+当前 OSS host SDK 闭包仅声明 Ubuntu 26.04、原生 amd64、Python 3.14。缺失时按推荐 recipe 准备独立 venv 和 REST/Spark 凭证桥接镜像；已有环境直接消费，手动 check 不下载或修复。`iceberg-rest-oss` 只选择对应闭包，不拉取或编译 MinIO/mc；普通本地 MinIO 仍选择 `iceberg-rest`。OSS 配置缺失或错误时明确失败，不回退到 MinIO。
 
-机器将规范化五字段配置保存为 activation 目录中的不可变 `object-store.json`。publication 中的 `NOVA_ENV_OBJECT_STORE_CONFIG` 和 host SDK 路径固定到原激活输入，不能通过改写安装器的期望配置切换旧运行。配置或输入版本变化须显式 `upgrade --config "$machine_config"`，随后重新 attach；同一健康定义的 `start` 复用原 generation。升级停止原共享 writer，确认旧 REST catalog 屏障，再使用新的机器 warehouse，保留旧 OSS 对象；不创建或撤销云 IAM，也不把换代当成旧 token 已失效。MinIO 与 OSS 的机器 owner 不在原地互相转换。
+机器将规范化五字段配置保存为 activation 目录中的不可变 `object-store.json`。publication 中的 `NOVA_ENV_OBJECT_STORE_CONFIG` 和 host SDK 路径固定到原激活输入，不能通过改写安装器的期望配置切换旧运行。需要切换已有机器的配置或输入时须显式 `upgrade --config "$machine_config"`，随后重新 attach；修改推荐清单不强制升级，已有 ready 记录的 `start` 直接复用原 generation。升级停止原共享 writer，确认旧 REST catalog 屏障，再使用新的机器 warehouse，保留旧 OSS 对象；不创建或撤销云 IAM，也不把换代当成旧 token 已失效。MinIO 与 OSS 的机器 owner 不在原地互相转换。
 
-旧 ECS 释放后，在新 ECS 绑定同一 RAM 角色，取得相同源码、profile 和五字段配置，再执行同一 Linux prepare 命令。新机器重新取得本机 BOM、image ID、daemon 身份和 catalog generation，不复制旧 READY、SQLite 或运行定位信息。
+旧 ECS 释放后，在新 ECS 绑定同一 RAM 角色，取得相同源码、profile 和五字段配置，再执行同一 Linux prepare 命令。新机器在缺失时按推荐构建输入并取得自己的 image ID、daemon 身份和 catalog generation；不复制旧 SQLite 或运行定位信息冒充已创建状态。
 
 OSS 的 S3 兼容接口不接受 AWS SDK 的可选 checksum trailer 编码 `STREAMING-UNSIGNED-PAYLOAD-TRAILER`。cloud REST、REST-MV、Spark 及生成的 env 显式设置 `AWS_REQUEST_CHECKSUM_CALCULATION=WHEN_REQUIRED`、`AWS_RESPONSE_CHECKSUM_VALIDATION=WHEN_REQUIRED`，只保留 API 要求的 checksum 行为；本地 MinIO 不强加这项配置。该设置沿用 SDK 的官方开关，不改变 SDK 版本或生产 Rust 签名逻辑。设置及必需校验边界见 [AWS Java SDK checksum 文档](https://docs.aws.amazon.com/sdk-for-java/latest/developer-guide/s3-checksums.html)。
 
@@ -77,18 +77,19 @@ OSS 的普通启动不扫描并删除 TTL 遗留；显式 sweep 返回 `status=N
 
 ## 输入与机器维护
 
-[ADR-0155](../../docs/adr/ADR-0155-fixture-provisioning-and-offline-verification.md) 继续拥有输入供给。只有显式 provision 可以下载、pull/build；verify、机器运行层、普通测试只消费本机已验证的 lock/BOM、derived 定义和实际 image ID。
+[ADR-0155](../../docs/adr/ADR-0155-fixture-provisioning-and-offline-verification.md) 的现行规则由 TST-G18a 更新：`docker/fixture-inputs/versions.json` 统一声明推荐版本和构建配方，已有 fixture 直接使用保存配置，不做任何自动 digest/BOM/版本/健康/能力检查。只有确实缺失时才按推荐创建；已有损坏、维护中、部分创建或未知状态报错，交人工处理。
 
 ```bash
-docker/fixture-inputs/provision.sh --consumer iceberg-rest  # Explicit acquisition/build only.
-docker/fixture-inputs/verify.sh --consumer iceberg-rest
-docker/iceberg-rest/fixture-runtime.sh start  # Explicit machine maintenance.
-docker/iceberg-rest/up.sh                     # Attach this worktree only.
+docker/iceberg-rest/up.sh  # Reuse the saved machine; create only when absent.
+# Optional: build missing inputs in advance using the same builder.
+docker/fixture-inputs/provision.sh --consumer iceberg-rest
+# Explicit creation also reuses an existing ready record.
+docker/iceberg-rest/fixture-runtime.sh start
 ```
 
 机器工具需要 Python 3.10 或更新版本，并提供 POSIX `waitid/WNOWAIT` 与进程组观察能力；本机验证使用 Python 3.14。macOS 的 CLT Python 3.9 不满足原生监督与跨进程单调时钟合同，工具在调用 Docker 前返回 BLOCKED。请在调用环境的 PATH 明确选择已安装且满足能力的 Python；工具不自动安装或切换解释器。
 
-普通 `up.sh` 要求机器已经 ready、健康且完整版本匹配，不启动、修复或升级服务。机器未就绪、维护中、输入缺失或版本不符返回 BLOCKED（75）。实际生命周期、身份或执行错误保留失败，准入后的期限耗尽不改称 BLOCKED。CI 仍 verify→attach→读取一次 publication，不自行 provision/upgrade。
+普通 `up.sh` 复用已有 ready 记录，不重新检查其镜像、软件版本或整栈健康；没有机器时复用统一 builder 创建缺失项。已有不完整或 maintenance 状态不自动恢复。CI 直接 attach 并固定一次 publication，缺失时走同一创建路径，不运行环境预检或自动 upgrade。实际创建/消费失败保留命令、退出和清理结果，不按历史 exit 75 统一改判为前检 BLOCKED；原预算在零副作用点的具名拒绝仍按预算 owner 分类。
 
 共享 REST 与 rest-mv 各自使用独立的 SQLite catalog 卷，并设置 `CATALOG_CLIENTS=1`，让同一 catalog 的 JDBC 操作排队使用一个连接。当前固定镜像在重新打开已有数据库时，初始化查询可能留下活动结果集；多连接会因此持续遇到 `SQLITE_BUSY`，仅延长锁等待或启用 WAL 不能保证恢复。此配置保留 REST 请求与对象存储访问的并发，不修改 Java 实现，也不增加 HTTP 500 的盲重试。模板属于机器 version，已有机器须显式 upgrade 后重新附着。
 
@@ -96,7 +97,7 @@ docker/iceberg-rest/up.sh                     # Attach this worktree only.
 
 ```bash
 docker/iceberg-rest/fixture-runtime.sh status
-docker/iceberg-rest/fixture-runtime.sh check  # Read-only: current source/BOM, exact version and health.
+docker/iceberg-rest/fixture-runtime.sh check  # Optional manual diagnostics; never grants test admission.
 docker/iceberg-rest/fixture-runtime.sh upgrade
 docker/iceberg-rest/fixture-runtime.sh --timeout 5 sweep
 ```
@@ -109,9 +110,9 @@ docker/iceberg-rest/fixture-runtime.sh resolve-readonly-observation --journal /a
 
 此命令只在原机器维护锁内核对当前 daemon、机器身份和该 journal 的原请求，以原 owner 共用的只读命令分类验证后记录处置；重复调用返回已验证的原处置，不重写记录。它不运行 start、upgrade、sweep，不遍历或结算其他操作。原失败、phase 及原进程退出事实完整保留，缺少退出证明仍为 Unknown；status 分别展示失败和处置。未知 mutation、外来或不可信请求继续报错。该处置不证明 CLI 或远程 writer 已退出，不提供 scratch 清理权限，也不改写旧运行的 cleanup violation；后续运行清理仍须满足原 context、期限、writer 退出及准确 scope 条件。
 
-`start` 幂等恢复同一输入定义，版本不同要求显式 `upgrade`。首次维护可在 start 后传 `--config /absolute/machine.json`；本地 MinIO JSON 字段为 `ports`、`policy`、`benchmark_root`、`minio_volume`；OSS 使用上述 `object_store`，不接受 `minio_volume`。端口是准确固定配置，默认 MinIO API/console=28000/28001、REST/rest-mv=28002/28003、Spark UI=28004、HMS接入槽=28005；冲突报错，不扫描替代端口。FE/BE listener 仍由 worktree/harness 分配。`shared.env` 属于 worktree/private 输入，不是机器端口、root凭证或维护状态的权威。
+`start` 对已有 ready 机器直接返回保存记录，缺失时才构建并创建；不恢复已有不完整状态，也不因推荐版本变化升级。已有机器切换须显式 `upgrade`。首次维护可在 start 后传 `--config /absolute/machine.json`；本地 MinIO JSON 字段为 `ports`、`policy`、`benchmark_root`、`minio_volume`；OSS 使用上述 `object_store`，不接受 `minio_volume`。端口是准确固定配置，默认 MinIO API/console=28000/28001、REST/rest-mv=28002/28003、Spark UI=28004、HMS接入槽=28005；冲突报错，不扫描替代端口。FE/BE listener 仍由 worktree/harness 分配。`shared.env` 属于 worktree/private 输入，不是机器端口、root凭证或维护状态的权威。
 
-完整 version 包含协议、验证后的有效 BOM/derived 定义、实际 image ID、机器模板和配置，不把时间、cache路径或可变tag当版本。generation标记一次实际激活。以下 root/IAM 维护步骤属于本地 MinIO；OSS 的维护与保留范围见上节。MinIO 升级先持稳定维护锁并保存maintenance，再停止共享writer、持久化新材料并轮换旧root、撤销run IAM/STS；确认旧root被真实拒绝后，先移除准确旧REST实例及数据库卷，原生确认absence并持久记录catalog屏障，再保持准确MinIO在线清理scratch。benchmark全部对象保留；切换服务、核实资源/image/端点/健康后才提交ready。固定REST恢复后旧请求仍可能成功重建scratch，不承诺这些请求失效。失败留maintenance；未知mutation不伪结算。明确的daemon端口终态失败也须在同一保存的维护意图下重新检查准确资源才可重试。
+机器 version 是创建时实际 image ID、模板和配置的定义标识，不再与当前推荐版本比较后决定消费资格；generation 标记一次实际激活。原运行仍绑定准确 daemon、generation 和 scope，避免操作换代后的其他目标。以下 root/IAM 维护步骤属于本地 MinIO；OSS 的维护与保留范围见上节。MinIO 升级先持稳定维护锁并保存maintenance，再停止共享writer、持久化新材料并轮换旧root、撤销run IAM/STS；确认旧root被真实拒绝后，先移除准确旧REST实例及数据库卷，原生确认absence并持久记录catalog屏障，再保持准确MinIO在线清理scratch。benchmark全部对象保留；切换服务、记录实际创建目标后才提交 ready，不附加全栈健康预检。固定REST恢复后旧请求仍可能成功重建scratch，不承诺这些请求失效。失败留maintenance；未知mutation不伪结算。明确的daemon端口终态失败也须在同一保存的维护意图下重新检查准确资源才可重试。
 
 已有 MinIO 卷只有维护者明确指定准确来源才可迁入，原卷和全部 benchmark 数据保留；不猜“最近一个”。历史版本化项目、旧 `nr-iceberg-rest` / `nr-iceberg-hive` 资源不自动认领、迁移或删除。首次切换须先记录资源/数据清单和维护窗口。
 
@@ -149,7 +150,7 @@ env导出 `NOVA_FIXTURE_MACHINE_ID/DAEMON/VERSION/GENERATION/ROOT`、TTL/max-run
 docker/iceberg-rest/up.sh --prepare-only
 ```
 
-离线prepare不调用Docker、不验证BOM或健康，只发布unbound并清除端点/镜像变量。它不能给测试启动提供ready证明；后续正常up才真正附着。
+离线prepare不调用Docker，只发布unbound并清除端点/镜像变量。它不能给测试启动提供ready证明；后续正常up才真正附着。
 
 ## Scratch、累计预算与消费者
 
@@ -189,7 +190,7 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 
 HMS只接入准确machine网络，使用机器预留HMS端口；其Derby卷和项目由HMS入口自己管理，不计为核心栈。机器换activation后先显式退出旧HMS记录再附着，不由REST owner递归删除。
 
-本地 MinIO 的共享 benchmark 默认 `s3://novarocks/shared/benchmarks`，OSS 默认为配置 Bucket/root_prefix 下的 `benchmarks`；显式输入owner按BOM producer供给；已有消费者只check准确READY，不bind/up/ensure或改写warehouse。见 [ADR-0173](../../docs/adr/ADR-0173-prepared-dataset-consumption-is-check-only.md)。
+本地 MinIO 的共享 benchmark 默认 `s3://novarocks/shared/benchmarks`，OSS 默认为配置 Bucket/root_prefix 下的 `benchmarks`；显式数据输入 owner 按自己的 recipe 与原 producer 事实供给；已有消费者只check准确READY，不bind/up/ensure或改写warehouse。见 [ADR-0173](../../docs/adr/ADR-0173-prepared-dataset-consumption-is-check-only.md)。
 
 ```bash
 docker/iceberg-rest/down.sh --runtime-only
@@ -281,7 +282,7 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 
 ### Java REST 提交互操作
 
-`tests/iru13a-rest-interop-test.sh` 沿用固定 publication 和本地 BOM，执行 provider 内全部 14 个 ignored Java REST 用例。调用方先运行 `up.sh`，然后设置本 worktree 的 `CARGO_TARGET_DIR`（推荐当前 worktree 的 `target/`，使用 `dev` profile）与可选 `NR_IRU13A_INTEROP_ARTIFACT_DIR` 独占材料根；入口拒绝已存在目录，并为三个测试族建立独立 namespace/材料子目录。入口不启动或重绑 fixture、不下载缺失输入。
+`tests/iru13a-rest-interop-test.sh` 沿用固定 publication 和原运行上下文，执行 provider 内全部 14 个 ignored Java REST 用例。调用方先运行 `up.sh`，然后设置本 worktree 的 `CARGO_TARGET_DIR`（推荐当前 worktree 的 `target/`，使用 `dev` profile）与可选 `NR_IRU13A_INTEROP_ARTIFACT_DIR` 独占材料根；入口拒绝已存在目录，并为三个测试族建立独立 namespace/材料子目录。入口不启动或重绑 fixture、不下载缺失输入。
 
 材料保留 Cargo 实际报告的测试二进制路径/hash、源码 HEAD/diff、构建 profile、完整用例清单、构建/运行双流和真实退出。14 个 exact 名称必须全部通过；零用例、少例、额外用例或 ignored 均不算成功。Java 独立读回 UUID、metadata location、snapshot/ref/retention 与物理格式事实，prepared owner/journal 的 receipt、NoOp 和独立收尾失败也在既有用例中验证；这些不替代原生 1FE+3BE 的 FE 核查与 SQL 验收。变更发布、维护或 REST 协议时显式运行，普通 unit 仍保留 ignored 边界。失败材料由调用方持有，不随 fixture 自动删除。
 

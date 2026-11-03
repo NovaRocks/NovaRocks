@@ -16,15 +16,15 @@
 # under the License.
 
 # This Dockerfile is used only by docker/fixture-inputs/provision.py. Its
-# SPARK_BASE alias and artifacts/ inputs have already passed the immutable lock
-# and BOM checks; verify consumers never build it.
+# SPARK_BASE and artifacts/ come from the centralized creation recipe.
+# Existing writers are used without environment preflight.
 ARG SPARK_BASE
 FROM --platform=linux/amd64 ${SPARK_BASE}
 
-ARG PAIMON_VERSION=1.3.1
-ARG PAIMON_SPARK_ARTIFACT=paimon-spark-3.5
+ARG PAIMON_VERSION
+ARG PAIMON_SPARK_ARTIFACT
 ARG PAIMON_SPARK_JAR_SHA1=4a85e61ee8535df9756d2700760cc6d2e232f166
-ARG PAIMON_SPARK_JAR_SIZE=41895267
+ARG PAIMON_SPARK_JAR_SIZE
 ARG PAIMON_S3_ARTIFACT=paimon-s3
 ARG PAIMON_S3_JAR_SHA1=1be7c161970d2e909958d7e38679d679779a679b
 ARG PAIMON_S3_JAR_SIZE=31776897

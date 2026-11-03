@@ -207,28 +207,18 @@ class RendererTests(RendererCase):
         self.assertEqual(before, (self.entry / 'env.sh').read_bytes())
         self.assertEqual(self.backend.events, ['ensure'])
 
-    def test_attach_full_validation_can_exceed_short_lock_wait_budget(self):
+    def test_attach_operation_can_exceed_lock_wait_without_shortening_outer_budget(self):
         now = [100.0]
         def pending(base):
-            now[0] += 0.9
-            return []
-        original_volume = self.backend.validate_minio_volume
-        def volume(snapshot):
-            now[0] += 0.9
-            original_volume(snapshot)
-        def healthy(snapshot):
             self.assertEqual(self.backend.operation_deadline, 190.0)
-            now[0] += 1.2
-            return True
+            now[0] += 3.0
+            return []
         with mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
                 mock.patch.object(self.backend, 'unsettled_operations', side_effect=pending), \
-                mock.patch.object(self.backend, 'validate_minio_volume', side_effect=volume), \
-                mock.patch.object(self.backend, 'healthy', side_effect=healthy):
-            result = self.bind()
-        self.assertTrue(result['ready'])
+                mock.patch.object(self.backend, 'healthy', side_effect=AssertionError('health scan')):
+            self.assertTrue(self.bind()['ready'])
         self.assertGreater(now[0], 102.0)
         self.assertIsNone(self.backend.operation_deadline)
-        self.assertTrue(publication.read(self.entry)['ready'])
 
     def test_attach_machine_lock_wait_remains_two_seconds(self):
         now = [100.0]
@@ -256,9 +246,9 @@ class RendererTests(RendererCase):
                 def healthy(snapshot):
                     self.assertEqual(self.backend.operation_deadline, 190.0 if outer is None else outer)
                     now[0] = health_end
-                    return True
+                    return []
                 with mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
-                        mock.patch.object(self.backend, 'healthy', side_effect=healthy):
+                        mock.patch.object(self.backend, 'unsettled_operations', side_effect=healthy):
                     with self.assertRaisesRegex(runtime.RuntimeFailure, 'RunBudgetExpired'):
                         self.bind()
                 self.assertFalse(publication.read(self.entry)['ready'])
@@ -427,24 +417,18 @@ class RendererTests(RendererCase):
         self.assertNotIn('AWS_S3_ENDPOINT', self.environment(self.entry / 'env.sh'))
         self.assertTrue((legacy / 'binding.json').is_file())
 
-    def test_cli_returns_only_public_identity_and_input_failure_disables_entry(self):
+    def test_cli_existing_environment_returns_public_identity_without_building(self):
         environment = {**os.environ, 'NOVAROCKS_WORKSPACE_ROOT': str(self.workspace),
             'NOVA_ENV_CONFIG_FILE': str(HERE / 'shared.env'), 'NOVA_ENV_UPDATE_CURRENT': 'true'}
-        def verified(config):
-            config['fixture_inputs'].update(lock_sha256=bom()['lock_sha256'], verified=True)
-            return bom()
-        with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(machine, 'MachineOwner', return_value=self.owner), mock.patch.object(entry, 'verify_inputs', side_effect=verified):
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(machine, 'MachineOwner', return_value=self.owner), \
+                mock.patch.object(entry, 'build_inputs', side_effect=AssertionError('build')):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 self.assertEqual(entry.worktree_main(['up']), 0)
-            public = json.loads(output.getvalue())
-            self.assertEqual(set(public), {'ready', 'published_dir', 'machine'})
-            self.assertNotIn('credentials', public['machine'])
-            self.assertNotIn(self.snapshot['credentials']['secret_key'], output.getvalue())
-            with mock.patch.object(entry, 'verify_inputs', side_effect=runtime.RuntimeFailure('FixturePrerequisiteMissing', 'absent')), contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(entry.worktree_main(['up']), 75)
-            actual_entry = Path(public['published_dir']).parent.parent
-            self.assertFalse(publication.read(actual_entry)['ready'])
+        value = json.loads(output.getvalue())
+        self.assertEqual(set(value), {'ready', 'published_dir', 'machine'})
+        self.assertNotIn(self.snapshot['credentials']['secret_key'], output.getvalue())
 
     def test_prepare_is_unavailable_and_offline_even_after_ready(self):
         self.bind()
@@ -493,15 +477,15 @@ class InheritedAttachBudgetTests(RendererCase):
             if expected_deadline is not None:
                 self.assertEqual(self.backend.operation_deadline, expected_deadline)
             now[0] += health_seconds
-            return True
+            return []
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, environment, clear=True), \
                 mock.patch.object(entry.time, 'time', return_value=self.wall), \
                 mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
                 mock.patch.object(machine, 'MachineOwner', return_value=fresh_owner), \
-                mock.patch.object(entry, 'verify_inputs', side_effect=verified), \
+                mock.patch.object(entry, 'build_inputs', side_effect=AssertionError('build before run admission')), \
                 mock.patch.object(self.backend, 'image_id', wraps=self.backend.image_id) as image_id, \
-                mock.patch.object(self.backend, 'healthy', side_effect=healthy) as health, \
+                mock.patch.object(self.backend, 'unsettled_operations', side_effect=healthy) as health, \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = entry.worktree_main(['up'])
             self.assertEqual(os.environ['NOVA_FIXTURE_RUN_CONTEXT'], raw_context)
@@ -637,6 +621,8 @@ class SharedEnvironmentTests(RendererCase):
             source = self.root / label / 'docker/iceberg-rest'; source.mkdir(parents=True)
             for name in ('up.sh', 'fixture_runtime.py', 'machine_runtime.py', 'oss_ops.py', 'entry_publication.py', 'runtime_entry.py', 'shared.env'):
                 shutil.copy2(HERE / name, source / name)
+            (source.parent / 'fixture-inputs').mkdir()
+            shutil.copy2(HERE.parent / 'fixture-inputs/versions.json', source.parent / 'fixture-inputs/versions.json')
             environment = {**os.environ, 'PATH': str(fakebin) + ':' + os.environ['PATH'],
                 'NOVAROCKS_WORKSPACE_ROOT': str(self.workspace), 'NOVA_ENV_CONFIG_FILE': str(source / 'shared.env')}
             process = subprocess.run(['bash', str(source / 'up.sh'), '--prepare-only'], env=environment, capture_output=True, text=True)
@@ -880,6 +866,21 @@ class IsolatedEntryTests(RendererCase):
         return entry.render_isolated_stack(inputs, 'nr-isolated-rest-test', {'minio': 19101, 'minio_console': 20101, 'rest': 21101, 'rest_mv': 24101, 'spark': 22101, 'control': 23101}, self.entry, config,
             profile=profile, hook_image='publication:exact' if profile != 'stock' else None)
 
+    def test_existing_private_entry_reuses_saved_targets_without_building(self):
+        result = self.isolated()
+        result['record'].update(creation_state='ready', containers={'rest': 'original-rest'})
+        entry.render_entry(result['context'], self.entry)
+        with mock.patch.object(entry, 'build_inputs', side_effect=AssertionError('unexpected build')):
+            saved = entry.existing_private_entry(self.entry, 'nr-isolated-rest-test')
+        self.assertEqual(saved['private_record']['containers'], {'rest': 'original-rest'})
+
+    def test_partial_private_creation_requires_manual_maintenance(self):
+        result = self.isolated()
+        result['record']['creation_state'] = 'starting'
+        entry.render_entry(result['context'], self.entry)
+        with self.assertRaisesRegex(runtime.RuntimeFailure, 'maintain it manually'):
+            entry.existing_private_entry(self.entry, 'nr-isolated-rest-test')
+
     def test_stock_and_hook_are_initial_models_from_same_templates(self):
         sentinel = self.entry.parent / 'current'; sentinel.parent.mkdir(parents=True)
         sentinel.symlink_to('existing-worktree')
@@ -939,6 +940,8 @@ class IsolatedEntryTests(RendererCase):
             shutil.copy2(HERE / name, fixture / name)
         for name in ['templates', 'spark']:
             shutil.copytree(HERE / name, fixture / name)
+        (fixture.parent / 'fixture-inputs').mkdir()
+        shutil.copy2(HERE.parent / 'fixture-inputs/versions.json', fixture.parent / 'fixture-inputs/versions.json')
         workspace = self.root / 'isolated-rest-request'
         workspace.mkdir()
         config = workspace / 'isolated.env'

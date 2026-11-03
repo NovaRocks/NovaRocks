@@ -117,18 +117,13 @@ class CloudMachineTests(unittest.TestCase):
         self.assert_code("InvalidConfiguration", lambda: self.definition(benchmark_root="s3://other/prefix"))
         self.definition(benchmark_root="s3://fixture-tests/isolated/fixtures/my-benchmarks")
 
-    def test_definition_freezes_only_verified_three_images_and_sdk_semantics(self):
+    def test_creation_uses_three_actual_images_and_configured_sdk_path(self):
         definition = self.definition()
-        self.assertEqual({"rest", "rest-mv", "spark"}, set(definition["images"]))
-        self.assertEqual(str(self.python), definition["oss_ops_python"])
-        self.assertNotEqual(str(self.python.resolve()), definition["oss_ops_python"])
+        self.assertEqual({'rest', 'rest-mv', 'spark'}, set(definition['images']))
+        self.assertEqual(str(self.python), definition['oss_ops_python'])
         changed = copy.deepcopy(self.inputs)
-        changed["_verified_store_root"] = str(self.directory / "different-cache")
-        changed["python_environments"]["oss-sdk"]["path"] = "generations/elsewhere/sdk"
-        other = self.owner.required_definition({"object_store": CLOUD}, changed)
-        self.assertEqual(definition["version"], other["version"])
-        changed["python_environments"]["oss-sdk"]["definition_sha256"] = "changed-sdk-source"
-        self.assertNotEqual(definition["version"], self.owner.required_definition({"object_store": CLOUD}, changed)["version"])
+        changed['python_environments']['oss-sdk']['definition_sha256'] = 'different-source'
+        self.assertEqual(definition['version'], self.owner.required_definition({'object_store': CLOUD}, changed)['version'])
 
     def relocated_sdk(self):
         inputs = copy.deepcopy(self.inputs)
@@ -137,41 +132,27 @@ class CloudMachineTests(unittest.TestCase):
         python = self.directory / "new-store/generations/g2/python-environments/oss-sdk/bin/python"
         python.parent.mkdir(parents=True)
         python.symlink_to(sys.executable)
+        inputs["python_environments"]["oss-sdk"]["path"] = str(python)
         return inputs, python
 
-    def test_actual_sdk_and_interpreter_file_hashes_change_machine_version(self):
+    def test_existing_sdk_metadata_differences_are_not_environment_admission(self):
         original = self.start()
-        for name in ("bin/python", "lib/oss2/api.py"):
-            inputs = copy.deepcopy(self.inputs)
-            inputs["python_environments"]["oss-sdk"]["files"][name] = "c" * 64
-            inputs["python_environments"]["oss-sdk"]["path"] = "generations/rebuilt/python-environments/oss-sdk"
-            definition = self.owner.required_definition({"object_store": CLOUD}, inputs)
-            self.assertNotEqual(original["version"], definition["version"])
-            self.assert_code("MachineVersionMismatch", lambda: self.owner.check_environment())
-            self.assert_code("MachineVersionMismatch", lambda: self.owner.activate(definition))
-        self.assertEqual(original, self.owner.read_saved_state())
+        inputs = copy.deepcopy(self.inputs)
+        inputs['python_environments']['oss-sdk']['files'] = {'bin/python': 'different'}
+        definition = self.owner.required_definition({'object_store': CLOUD}, inputs)
+        self.assertEqual(original['version'], definition['version'])
+        self.assertEqual(original, self.owner.ensure_created())
 
-    def test_rebuilt_sdk_cannot_reuse_old_path_even_when_semantic_files_match(self):
+    def test_new_recommendations_do_not_retarget_original_sdk(self):
         original = self.start()
         inputs, python = self.relocated_sdk()
-        definition = self.owner.required_definition({"object_store": CLOUD}, inputs)
-        self.assertEqual(original["version"], definition["version"])
-        self.assertNotEqual(original["oss_ops_python"], definition["oss_ops_python"])
-        before = {path: path.read_bytes() for path in self.owner.root.rglob("*") if path.is_file()}
-        events = list(self.backend.events)
-        self.assert_code("MachineVersionMismatch", lambda: self.owner.check_environment())
-        self.assert_code("MachineVersionMismatch", lambda: self.owner.activate(definition))
-        with self.assertRaises(runtime.RuntimeFailure) as caught:
-            with self.owner.operation_snapshot():
-                self.fail("new verification must not authorize the old SDK location")
-        self.assertEqual("MachineVersionMismatch", caught.exception.code)
-        self.assertEqual(before, {path: path.read_bytes() for path in self.owner.root.rglob("*") if path.is_file()})
-        self.assertEqual(events, self.backend.events)
-        # An already admitted run still observes its original pinned activation;
-        # it is not rebound to the newer mutable BOM or cache location.
-        with self.owner.operation_snapshot(expected_generation=original["generation"]) as pinned:
-            self.assertEqual(original["oss_ops_python"], pinned["oss_ops_python"])
-            self.assertNotEqual(str(python), pinned["oss_ops_python"])
+        definition = self.owner.required_definition({'object_store': CLOUD}, inputs)
+        before = list(self.backend.events)
+        self.assertEqual(original, self.owner.activate(definition))
+        with self.owner.operation_snapshot(expected_generation=original['generation']) as pinned:
+            self.assertEqual(str(self.python), pinned['oss_ops_python'])
+            self.assertNotEqual(str(python), pinned['oss_ops_python'])
+        self.assertEqual(before, self.backend.events)
 
     def test_explicit_upgrade_binds_new_verified_sdk_without_retargeting_old_run(self):
         original = self.start()
@@ -181,8 +162,8 @@ class CloudMachineTests(unittest.TestCase):
         self.assertNotEqual(original["generation"], upgraded["generation"])
         self.assertEqual(str(python), upgraded["oss_ops_python"])
         self.assertEqual(str(self.python), original["oss_ops_python"])
-        self.assertEqual(upgraded["generation"], self.owner.check_environment()["generation"])
-        self.assert_code("MachineVersionMismatch", lambda: self.owner.check_environment())
+        self.assertEqual(upgraded["generation"], self.owner.check_environment()["machine"]["generation"])
+        self.assertEqual(str(python), self.owner.ensure_created()["oss_ops_python"])
 
     def test_saved_maintenance_cannot_switch_to_a_different_verified_sdk_location(self):
         self.backend.failure = "ensure"
@@ -191,20 +172,20 @@ class CloudMachineTests(unittest.TestCase):
         inputs, _ = self.relocated_sdk()
         self.backend.failure = None
         self.assert_code("MachineVersionMismatch", lambda: self.owner.activate(
-            self.owner.required_definition({"object_store": CLOUD}, inputs)))
+            self.owner.required_definition({"object_store": CLOUD}, inputs), upgrade=True))
         self.assertEqual(saved, self.owner.read_saved_state())
 
-    def test_sdk_without_file_proof_is_not_a_verified_prerequisite(self):
-        for files in (None, {}, [], "hash"):
-            inputs = copy.deepcopy(self.inputs)
-            inputs["python_environments"]["oss-sdk"]["files"] = files
-            self.assert_code("FixturePrerequisiteMissing", lambda: self.owner.required_definition({"object_store": CLOUD}, inputs))
+    def test_creation_does_not_require_whole_sdk_file_proof(self):
+        inputs = copy.deepcopy(self.inputs)
+        inputs['python_environments']['oss-sdk'].pop('files')
+        inputs['python_environments']['oss-sdk'].pop('definition_sha256')
+        self.assertEqual(str(self.python), self.owner.required_definition({'object_store': CLOUD}, inputs)['oss_ops_python'])
 
     def test_missing_sdk_or_wrapper_is_a_prerequisite_failure(self):
         for group, name in (("derived_images", "iceberg-rest-oss"), ("python_environments", "oss-sdk")):
             inputs = copy.deepcopy(self.inputs)
             del inputs[group][name]
-            self.assert_code("FixturePrerequisiteMissing", lambda: self.owner.required_definition({"object_store": CLOUD}, inputs))
+            self.assert_code("FixtureBuildFailed", lambda: self.owner.required_definition({"object_store": CLOUD}, inputs))
         self.assertFalse(self.owner.root.exists())
 
     def test_record_has_real_storage_owner_and_no_static_credentials_or_minio(self):
@@ -236,7 +217,7 @@ class CloudMachineTests(unittest.TestCase):
         before = {path: (path.stat().st_mtime_ns, path.read_bytes()) for path in self.owner.root.rglob("*") if path.is_file()}
         self.assertEqual(original, self.owner.activate(self.definition()))
         checked = self.owner.check_environment()
-        self.assertEqual(original["generation"], checked["generation"])
+        self.assertEqual(original["generation"], checked["machine"]["generation"])
         self.assertTrue(checked["observed_healthy"])
         after = {path: (path.stat().st_mtime_ns, path.read_bytes()) for path in self.owner.root.rglob("*") if path.is_file()}
         self.assertEqual(before, after)
@@ -256,7 +237,7 @@ class CloudMachineTests(unittest.TestCase):
         original = self.start()
         self.backend.online = False
         recovered = self.owner.activate(self.definition())
-        self.assertNotEqual(original["generation"], recovered["generation"])
+        self.assertEqual(original["generation"], recovered["generation"])
         self.assertEqual(original["server_warehouses"], recovered["server_warehouses"])
         self.assertNotIn("remove-rest-state", self.backend.events)
 
@@ -288,7 +269,7 @@ class CloudMachineTests(unittest.TestCase):
         desired = self.directory / "desired-object-store.json"
         desired.write_text(json.dumps({**CLOUD, "bucket": "another-bucket"}))
         with mock.patch.dict("os.environ", {"NOVA_ENV_OBJECT_STORE_CONFIG": str(desired)}):
-            self.assertEqual(record["generation"], self.owner.check_environment()["generation"])
+            self.assertEqual(record["generation"], self.owner.check_environment()["machine"]["generation"])
         changed = copy.deepcopy(record)
         changed["object_store_config_file"] = str(desired)
         self.assert_code("RuntimeIdentityMismatch", lambda: machine.validate_cloud_snapshot(changed))
@@ -296,14 +277,14 @@ class CloudMachineTests(unittest.TestCase):
             "config": {**record["config"], "object_store": {**CLOUD, "bucket": "another-bucket"}}}))
         self.assertEqual(CLOUD, json.loads(Path(record["object_store_config_file"]).read_text()))
 
-    def test_changed_activation_config_or_missing_sdk_is_rejected(self):
+    def test_actual_sdk_operation_validates_its_original_storage_configuration(self):
         record = self.start()
-        path = Path(record["object_store_config_file"])
-        path.write_text(json.dumps({**CLOUD, "bucket": "changed"}))
-        self.assert_code("RuntimeIdentityMismatch", lambda: self.owner.check_environment())
+        path = Path(record['object_store_config_file'])
+        path.write_text(json.dumps({**CLOUD, 'bucket': 'changed'}))
+        self.assert_code('RuntimeIdentityMismatch', lambda: machine.validate_cloud_snapshot(record))
         path.write_text(json.dumps(CLOUD))
         self.python.unlink()
-        self.assert_code("FixturePrerequisiteMissing", lambda: self.owner.check_environment())
+        self.assert_code('FixturePrerequisiteMissing', lambda: machine.validate_cloud_snapshot(record))
 
     def test_cross_provider_upgrade_is_rejected_before_effects(self):
         self.start()
@@ -316,10 +297,11 @@ class CloudMachineTests(unittest.TestCase):
         config_file = self.directory / "machine.json"
         config_file.write_text(json.dumps({"object_store": CLOUD}))
         with mock.patch.object(machine, "MachineOwner", return_value=self.owner), \
-                mock.patch.object(machine, "verified_bom", return_value=self.inputs) as verify, \
+                mock.patch.object(machine, "prepare_inputs", return_value=self.inputs) as verify, \
                 mock.patch.object(runtime, "install_signal_handlers"), mock.patch("sys.stdout", new_callable=io.StringIO):
             self.assertEqual(0, machine.main(["start", "--config", str(config_file), "--store", "/verified-store"]))
-        verify.assert_called_once_with(runtime.SCRIPT_DIR.parent.parent, Path("/verified-store"), consumer="iceberg-rest-oss")
+        self.assertEqual(verify.call_args.args, (runtime.SCRIPT_DIR.parent.parent, Path("/verified-store")))
+        self.assertEqual(verify.call_args.kwargs["consumer"], "iceberg-rest-oss")
 
     def test_native_activation_starts_only_three_services_and_keeps_authority(self):
         record = self.start()
@@ -328,7 +310,7 @@ class CloudMachineTests(unittest.TestCase):
         backend.activation_preflight = mock.Mock()
         backend.validate_minio_volume = mock.Mock(side_effect=AssertionError("MinIO accessed"))
         backend.compose = mock.Mock()
-        backend.await_health = mock.Mock()
+        backend.capture_created_targets = mock.Mock()
         backend.ensure_machine(record)
         backend.ensure_authority_volume.assert_called_once_with(record)
         backend.activation_preflight.assert_called_once_with(record, None)
@@ -368,7 +350,7 @@ class CloudMachineTests(unittest.TestCase):
     def test_native_writer_stop_can_repair_missing_sdk_without_relaxing_readiness(self):
         record = self.start()
         self.python.unlink()
-        self.assert_code("FixturePrerequisiteMissing", lambda: self.owner.check_environment())
+        self.assert_code("FixturePrerequisiteMissing", lambda: machine.validate_cloud_snapshot(record))
         backend = self.native_backend_for(record)
         self.assert_code("FixturePrerequisiteMissing", lambda: backend.validate_resources(record))
         backend.stop_writers(record)
@@ -382,7 +364,7 @@ class CloudMachineTests(unittest.TestCase):
         self.assertEqual("ready", upgraded["phase"])
         self.assertTrue(upgraded["steps"]["writers_stopped"])
         self.assertEqual(str(python), upgraded["oss_ops_python"])
-        self.assertEqual(upgraded["generation"], self.owner.check_environment()["generation"])
+        self.assertEqual(upgraded["generation"], self.owner.check_environment()["machine"]["generation"])
 
     def test_native_missing_sdk_stop_still_rejects_foreign_docker_resources(self):
         record = self.start()

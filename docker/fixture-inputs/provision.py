@@ -122,6 +122,15 @@ def build_context(
             if destination == Path("Dockerfile") and relative != dockerfile:
                 raise FixtureInputError("fixture build context Dockerfile differs from the declared Dockerfile")
             sources.append((path, destination))
+    for source_name, destination_name in item.get("copy_inputs", {}).items():
+        source_relative = require_relative(source_name)
+        destination = require_relative(destination_name)
+        source = repo_root / source_relative
+        if source_relative not in definitions or not source.resolve().is_relative_to(repo_root) or not source.is_file():
+            raise FixtureInputError(f"fixture copy source is not declared: {source_name}")
+        if destination.parts[0] == "artifacts" or destination == Path("Dockerfile"):
+            raise FixtureInputError(f"fixture copy destination conflicts with build inputs: {destination_name}")
+        sources.append((source, destination))
     source_dockerfile = repo_root / dockerfile
     if not source_dockerfile.resolve().is_relative_to(repo_root) or not source_dockerfile.is_file():
         raise FixtureInputError(f"fixture Dockerfile is missing from the repository: {dockerfile}")
