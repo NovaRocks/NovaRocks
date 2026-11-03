@@ -20,6 +20,16 @@
 use crate::{CarrierParameterError, ValueLayout, ValueTypeError};
 use arrow_schema::{DataType, Field};
 
+/// The physical NULL declaration selected by a prepared carrier recipe.
+/// Logical requiredness remains with the complete value declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CarrierNullabilityPolicy {
+    Exact,
+    /// Physical nullable fields may carry required logical values. This never
+    /// relaxes Map entries/key constraints or logical value validation.
+    Permissive,
+}
+
 /// Compare actual value shape to a checked, normalized immutable layout.
 ///
 /// Dictionary and run-end wrappers are validated, then traversed as runtime
@@ -31,7 +41,28 @@ pub fn value_layout_matches_carrier_observed<E: From<ValueTypeError>>(
     actual: &DataType,
     observe: impl FnMut(usize) -> Result<(), E>,
 ) -> Result<bool, E> {
-    data_type_layout_matches_carrier_observed(expected.data_type(), actual, observe)
+    value_layout_matches_carrier_with_nullability_observed(
+        expected,
+        actual,
+        CarrierNullabilityPolicy::Exact,
+        observe,
+    )
+}
+
+/// Compare an explicitly selected physical representation to its complete
+/// normalized layout using the same structural and parameter walker.
+pub fn value_layout_matches_carrier_with_nullability_observed<E: From<ValueTypeError>>(
+    expected: &ValueLayout,
+    actual: &DataType,
+    nullability: CarrierNullabilityPolicy,
+    mut observe: impl FnMut(usize) -> Result<(), E>,
+) -> Result<bool, E> {
+    Walk {
+        observe: &mut observe,
+        nodes: 0,
+        nullability,
+    }
+    .ty(expected.data_type(), actual, 1)
 }
 
 /// Compare to an already borrowed normalized plain value layout.
@@ -49,6 +80,7 @@ pub fn data_type_layout_matches_carrier_observed<E: From<ValueTypeError>>(
     Walk {
         observe: &mut observe,
         nodes: 0,
+        nullability: CarrierNullabilityPolicy::Exact,
     }
     .ty(expected, actual, 1)
 }
@@ -77,6 +109,7 @@ impl<E> From<CarrierParameterError> for ParameterFailure<E> {
 struct Walk<'a, F> {
     observe: &'a mut F,
     nodes: usize,
+    nullability: CarrierNullabilityPolicy,
 }
 impl<E: From<ValueTypeError>, F: FnMut(usize) -> Result<(), E>> Walk<'_, F> {
     fn node(&mut self, actual: &DataType, depth: usize) -> Result<(), E> {
@@ -127,7 +160,9 @@ impl<E: From<ValueTypeError>, F: FnMut(usize) -> Result<(), E>> Walk<'_, F> {
         depth: usize,
     ) -> Result<bool, E> {
         (self.observe)(1)?;
-        if expected.is_nullable() != actual.is_nullable() {
+        if expected.is_nullable() != actual.is_nullable()
+            && !(self.nullability == CarrierNullabilityPolicy::Permissive && actual.is_nullable())
+        {
             return Ok(false);
         }
         if named && !self.bytes(expected.name().as_bytes(), actual.name().as_bytes())? {
@@ -196,6 +231,11 @@ impl<E: From<ValueTypeError>, F: FnMut(usize) -> Result<(), E>> Walk<'_, F> {
                 if expected.len() != 2 || actual.len() != 2 {
                     return Ok(false);
                 }
+                if self.nullability == CarrierNullabilityPolicy::Permissive
+                    && actual[0].is_nullable()
+                {
+                    return Ok(false);
+                }
                 self.field(&expected[0], &actual[0], false, depth + 2)?
                     && self.field(&expected[1], &actual[1], false, depth + 2)?
             }
@@ -242,6 +282,121 @@ mod tests {
     use crate::ValueTypeStorageLifetime;
     use arrow_schema::{Field, TimeUnit, UnionFields, UnionMode};
     use std::sync::Arc;
+    #[test]
+    fn permissive_carrier_widens_null_declarations_without_changing_values() {
+        let required = DataType::Struct(
+            vec![Arc::new(Field::new(
+                "v",
+                DataType::Decimal128(20, 4),
+                false,
+            ))]
+            .into(),
+        );
+        let physical = DataType::Struct(
+            vec![Arc::new(Field::new("v", DataType::Decimal128(20, 4), true))].into(),
+        );
+        let layout = ValueLayout::try_new(&required, ValueTypeStorageLifetime::pure()).unwrap();
+        assert!(
+            !value_layout_matches_carrier_observed::<ValueTypeError>(
+                &layout,
+                &physical,
+                |_| Ok(())
+            )
+            .unwrap()
+        );
+        assert!(
+            value_layout_matches_carrier_with_nullability_observed::<ValueTypeError>(
+                &layout,
+                &physical,
+                CarrierNullabilityPolicy::Permissive,
+                |_| Ok(())
+            )
+            .unwrap()
+        );
+        for wrong in [
+            DataType::Struct(
+                vec![Arc::new(Field::new(
+                    "other",
+                    DataType::Decimal128(20, 4),
+                    true,
+                ))]
+                .into(),
+            ),
+            DataType::Struct(
+                vec![Arc::new(Field::new("v", DataType::Decimal128(20, 3), true))].into(),
+            ),
+        ] {
+            assert!(
+                !value_layout_matches_carrier_with_nullability_observed::<ValueTypeError>(
+                    &layout,
+                    &wrong,
+                    CarrierNullabilityPolicy::Permissive,
+                    |_| Ok(())
+                )
+                .unwrap()
+            );
+        }
+        let optional = ValueLayout::try_new(&physical, ValueTypeStorageLifetime::pure()).unwrap();
+        assert!(
+            !value_layout_matches_carrier_with_nullability_observed::<ValueTypeError>(
+                &optional,
+                &required,
+                CarrierNullabilityPolicy::Permissive,
+                |_| Ok(())
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn permissive_carrier_keeps_map_key_and_entry_declarations_required() {
+        let map = |key_nullable, value_nullable, entries_nullable| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", DataType::Int32, key_nullable)),
+                            Arc::new(Field::new("value", DataType::Utf8, value_nullable)),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+        let expected = map(false, false, false);
+        let layout = ValueLayout::try_new(&expected, ValueTypeStorageLifetime::pure()).unwrap();
+        assert!(
+            value_layout_matches_carrier_with_nullability_observed::<ValueTypeError>(
+                &layout,
+                &map(false, true, false),
+                CarrierNullabilityPolicy::Permissive,
+                |_| Ok(())
+            )
+            .unwrap()
+        );
+        assert!(
+            !value_layout_matches_carrier_with_nullability_observed::<ValueTypeError>(
+                &layout,
+                &map(true, true, false),
+                CarrierNullabilityPolicy::Permissive,
+                |_| Ok(())
+            )
+            .unwrap()
+        );
+        assert!(
+            value_layout_matches_carrier_with_nullability_observed::<ValueTypeError>(
+                &layout,
+                &map(false, true, true),
+                CarrierNullabilityPolicy::Permissive,
+                |_| Ok(())
+            )
+            .is_err()
+        );
+    }
+
     fn matches(expected: &DataType, actual: &DataType) -> Result<bool, ValueTypeError> {
         let layout = ValueLayout::try_new(expected, ValueTypeStorageLifetime::pure()).unwrap();
         value_layout_matches_carrier_observed(&layout, actual, |_| Ok(()))

@@ -253,7 +253,10 @@ pub fn type_header_geometry(ty: &DataType) -> TypeHeaderGeometry {
 // unchanged from the original codec allocation model. This is a private
 // implementation operation layout, not a wire grammar or allocator fact.
 #[doc(hidden)]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "The pinned FlatBuffers field-location model is used only for its allocation layout"
+)]
 pub struct LockedFieldLocation {
     offset: u32,
     slot: u16,

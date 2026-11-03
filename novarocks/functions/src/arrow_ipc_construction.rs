@@ -20,43 +20,18 @@
 //! or semantic declarations. Caller source provenance and receiving policy stay
 //! at their original boundary.
 
-mod schema_geometry;
-mod stream_geometry;
-pub use schema_geometry::{
-    LockedFieldLocation, SchemaAllocationMetrics, SchemaGeometry, SchemaRequestAccumulator,
-    SchemaResourceSource, TypeHeaderGeometry, locked_field_location_layout,
+pub use novarocks_arrow_batch_codec::construction::{
+    FieldVerificationFailure, FieldVerificationPurpose, IpcFieldRole, IpcGeometryError,
+    LockedFieldLocation, ReaderArrayHeaderClass, ReaderArrayStructureObserver,
+    ReaderStructureClass, ReaderStructureFailure, ReaderStructureObserver, SchemaAllocationMetrics,
+    SchemaGeometry, SchemaRequestAccumulator, SchemaResourceSource, TypeHeaderGeometry,
+    locked_field_location_layout, original_reader_buffer_header_upper_bound,
     schema_backing_upper_bound, schema_writer_allocation_metrics, type_header_geometry,
+    verify_field,
 };
+mod stream_geometry;
 pub use stream_geometry::{
     IpcConstructionError, IpcStreamBatchFacts, IpcStreamSchemaFacts,
     observe_stream_logical_size_construction, observe_stream_writer_batch_construction,
-    observe_stream_writer_schema_construction,
-};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IpcGeometryError {
-    Overflow,
-    SourceModel,
-}
-impl std::fmt::Display for IpcGeometryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Overflow => f.write_str("Arrow IPC construction geometry overflow"),
-            Self::SourceModel => f.write_str("Arrow IPC construction source model changed"),
-        }
-    }
-}
-impl std::error::Error for IpcGeometryError {}
-
-mod schema_verification;
-pub use schema_verification::{
-    FieldVerificationFailure, FieldVerificationPurpose, IpcFieldRole, verify_field,
-};
-
-mod reader_geometry;
-pub use reader_geometry::{ReaderStructureClass, ReaderStructureFailure, ReaderStructureObserver};
-
-mod reader_array_geometry;
-pub use reader_array_geometry::{
-    ReaderArrayHeaderClass, ReaderArrayStructureObserver, original_reader_buffer_header_upper_bound,
+    observe_stream_writer_schema_construction, observe_unit_batch_construction,
 };

@@ -34,8 +34,9 @@ use std::alloc::Layout;
 /// ONE pinned private Bytes/Arc structural upper from the original custody
 /// author. Payload storage is excluded; this does not authorize bytes itself.
 pub fn original_reader_buffer_header_upper_bound() -> Result<usize, LayoutResourceError> {
-    crate::arrow_result_custody::original_buffer_header_upper_bound()
-        .map_err(|_| LayoutResourceError::Arithmetic)
+    std::mem::size_of::<usize>()
+        .checked_mul(8)
+        .ok_or(LayoutResourceError::Arithmetic)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -475,7 +476,10 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
         id: i64,
     ) -> Result<(), ReaderStructureFailure<H>> {
         fn find(field: &arrow_schema::Field, id: i64) -> Option<&DataType> {
-            #[allow(deprecated)]
+            #[expect(
+                deprecated,
+                reason = "Arrow 60.1 readers still use Field dictionary IDs; the prepared recipe reconstructs the same IDs"
+            )]
             if field.dict_id() == Some(id)
                 && let DataType::Dictionary(_, value) = field.data_type()
             {
@@ -759,7 +763,10 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
                 self.pushes::<ArrayData>(1, ReaderArrayHeaderClass::Temporary)?;
             }
             DataType::Dictionary(_, values) => {
-                #[allow(deprecated)]
+                #[expect(
+                    deprecated,
+                    reason = "Arrow 60.1 readers still use Field dictionary IDs; the prepared recipe reconstructs the same IDs"
+                )]
                 let id = field.dict_id().ok_or(ReaderStructureFailure::SourceModel(
                     "IPC dictionary occurrence id missing",
                 ))?;
@@ -954,7 +961,10 @@ impl<H> ReaderArrayStructureObserver<'_, H> {
             count: &mut usize,
             value: &mut Option<&'a DataType>,
         ) -> Result<(), LayoutResourceError> {
-            #[allow(deprecated)]
+            #[expect(
+                deprecated,
+                reason = "Arrow 60.1 readers still use Field dictionary IDs; the prepared recipe reconstructs the same IDs"
+            )]
             if field.dict_id() == Some(id)
                 && let DataType::Dictionary(_, values) = field.data_type()
             {

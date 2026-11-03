@@ -29,68 +29,123 @@ use crate::{
     physical_type_v2::{TypeCodecError, validate_field, validate_type},
 };
 use arrow::datatypes::{DataType, Field};
-use novarocks_arrow_ipc_frame::{VerifierOptions, checked_range, nonnegative_length};
+use novarocks_arrow_ipc_frame::{VerifierOptions, nonnegative_length};
 use novarocks_type_contract::CompileControlError;
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
-/// Explicit geometric admission, with no application defaults.
-#[derive(Clone, Copy, Debug)]
-pub struct FlatBatchProjectionLimits {
-    pub max_metadata_bytes: usize,
-    pub max_body_bytes: usize,
-    pub max_rows: usize,
-    pub max_buffer_descriptors: usize,
-    /// Sum of every view's declared byte length, including NULL and repeated
-    /// references. This is inspection work, not unique retained backing.
-    pub max_view_validation_bytes: usize,
-}
+pub(crate) use neutral::Layout;
+pub use neutral::{FlatBatchGeometry, FlatBatchProjectionLimits};
+use novarocks_arrow_batch_codec::record_geometry::{self as neutral, GeometryWork};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FlatBatchGeometry {
-    pub rows: usize,
-    pub null_count: usize,
-    pub buffer_descriptors: usize,
-    pub variadic_buffers: usize,
-    pub body_bytes: usize,
-    /// Sum of descriptor extents, counting overlap/repeated descriptions.
-    /// Unreferenced body padding remains in body_bytes.
-    pub described_buffer_bytes: usize,
-    pub view_validation_bytes: usize,
-}
-
-pub(crate) enum Layout {
-    Null,
-    Bits,
-    Fixed(usize),
-    Offsets(usize),
-    Views,
-}
-
-pub(crate) fn layout(ty: &DataType) -> Result<Layout, TypeCodecError> {
-    match ty {
-        DataType::Null => Ok(Layout::Null),
-        DataType::Boolean => Ok(Layout::Bits),
-        DataType::FixedSizeBinary(width) => usize::try_from(*width)
-            .map(Layout::Fixed)
-            .map_err(|_| TypeCodecError::InvalidShape("negative fixed binary width")),
-        DataType::Utf8 | DataType::Binary => Ok(Layout::Offsets(4)),
-        DataType::LargeUtf8 | DataType::LargeBinary => Ok(Layout::Offsets(8)),
-        DataType::Utf8View | DataType::BinaryView => Ok(Layout::Views),
-        _ => ty
-            .primitive_width()
-            .map(Layout::Fixed)
-            .ok_or(TypeCodecError::InvalidShape(
-                "constant RecordBatch is not a flat non-dictionary carrier",
-            )),
+fn geometry_error(cause: neutral::GeometryError) -> TypeCodecError {
+    match cause {
+        neutral::GeometryError::InvalidShape(message) => TypeCodecError::InvalidShape(message),
+        neutral::GeometryError::ResourceExhausted => CompileControlError::ResourceExhausted.into(),
     }
 }
-
+pub(crate) fn layout(ty: &DataType) -> Result<Layout, TypeCodecError> {
+    neutral::layout(ty).map_err(geometry_error)
+}
+pub(crate) struct CallerGeometryFailure<E>(pub(crate) E);
+impl<E: From<TypeCodecError>> From<neutral::GeometryError> for CallerGeometryFailure<E> {
+    fn from(cause: neutral::GeometryError) -> Self {
+        Self(E::from(geometry_error(cause)))
+    }
+}
+impl<E: From<CompileControlError>> From<CompileControlError> for CallerGeometryFailure<E> {
+    fn from(cause: CompileControlError) -> Self {
+        Self(E::from(cause))
+    }
+}
+pub(crate) struct GeometryAdapter<'a, 'b, 'c, 'd, 'e, E> {
+    pub(crate) admission: Option<&'a mut Admission<'b, 'c, E>>,
+    pub(crate) work: &'d mut CompileCheckpoints<'e>,
+}
+impl<E: ReaderGeometryFailure> GeometryWork for GeometryAdapter<'_, '_, '_, '_, '_, E> {
+    type Error = CallerGeometryFailure<E>;
+    fn has_admission(&self) -> bool {
+        self.admission.is_some()
+    }
+    fn step(&mut self) -> Result<(), Self::Error> {
+        parent_step(&mut self.admission, self.work).map_err(CallerGeometryFailure)
+    }
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.work
+            .flush()
+            .map_err(|cause| CallerGeometryFailure(E::from(cause)))
+    }
+    fn geometry_request(
+        &mut self,
+        layout: std::alloc::Layout,
+        construction: bool,
+    ) -> Result<(), Self::Error> {
+        if let Some(a) = self.admission.as_deref_mut() {
+            a.requests(0, layout.size(), usize::from(layout.size() != 0))
+                .map_err(CallerGeometryFailure)?;
+            if construction {
+                if layout.size() != 0 {
+                    a.construction_request(layout)
+                        .map_err(CallerGeometryFailure)?;
+                }
+                a.batch_work_add(layout.size())
+                    .map_err(CallerGeometryFailure)?;
+            }
+        }
+        Ok(())
+    }
+    fn source_work(&mut self) -> Result<(), Self::Error> {
+        if let Some(a) = self.admission.as_deref_mut() {
+            let amount = a
+                .source()
+                .checked_add(1)
+                .ok_or(CompileControlError::ResourceExhausted)?;
+            a.batch_work_add(amount).map_err(CallerGeometryFailure)?;
+        }
+        Ok(())
+    }
+    fn validate_root(&mut self, expected: &Field) -> Result<(), Self::Error> {
+        validate_field(expected, self.work)
+            .map_err(|cause| CallerGeometryFailure(E::from(cause)))?;
+        if let Some(a) = self.admission.as_deref_mut() {
+            let shared = std::cell::RefCell::new(a);
+            let scratch =
+                |layout: std::alloc::Layout| shared.borrow_mut().batch_work_add(layout.size());
+            let capture = |visit| {
+                let mut a = shared.borrow_mut();
+                let upper = if matches!(visit, novarocks_type_contract::ValueTypeVisit::Field(_)) {
+                    a.source()
+                        .checked_add(1)
+                        .ok_or(CompileControlError::ResourceExhausted)?
+                } else {
+                    1
+                };
+                a.batch_work_add(upper)
+            };
+            crate::physical_type_v2::validate_type_with_scratch_host_observed(
+                expected.data_type(),
+                &mut |layout| {
+                    scratch(layout).map_err(crate::host_projection_v2::ProjectionFailure::Host)
+                },
+                &mut |visit| {
+                    capture(visit).map_err(crate::host_projection_v2::ProjectionFailure::Host)
+                },
+                self.work,
+            )
+            .map_err(|error| {
+                CallerGeometryFailure(match error {
+                    crate::host_projection_v2::ProjectionFailure::Host(error) => error,
+                    crate::host_projection_v2::ProjectionFailure::Codec(error) => E::from(error),
+                })
+            })?;
+        } else {
+            validate_type(expected.data_type(), self.work)
+                .map_err(|cause| CallerGeometryFailure(E::from(cause)))?;
+        }
+        Ok(())
+    }
+}
 fn add(left: usize, right: usize) -> Result<usize, TypeCodecError> {
     left.checked_add(right)
-        .ok_or(TypeCodecError::InvalidShape("IPC batch extent overflow"))
-}
-fn mul(left: usize, right: usize) -> Result<usize, TypeCodecError> {
-    left.checked_mul(right)
         .ok_or(TypeCodecError::InvalidShape("IPC batch extent overflow"))
 }
 fn length(value: i64) -> Result<usize, TypeCodecError> {
@@ -152,29 +207,6 @@ fn limit_parent<E: ReaderGeometryFailure>(
     }
     require_parent(condition, message, admission, work)
 }
-pub(crate) fn buffer<'a>(
-    batch: arrow::ipc::RecordBatch<'_>,
-    body: &'a [u8],
-    index: usize,
-) -> Result<&'a [u8], TypeCodecError> {
-    let buffers = batch.buffers().ok_or(TypeCodecError::InvalidShape(
-        "IPC batch buffer descriptors are missing",
-    ))?;
-    if index >= buffers.len() {
-        return Err(TypeCodecError::InvalidShape(
-            "IPC batch buffer index is invalid",
-        ));
-    }
-    let descriptor = buffers.get(index);
-    let range = checked_range(
-        body.len(),
-        length(descriptor.offset())?,
-        length(descriptor.length())?,
-    )
-    .map_err(|_| TypeCodecError::InvalidShape("IPC batch buffer range exceeds body"))?;
-    Ok(&body[range])
-}
-
 /// Checks one V5 uncompressed metadata/body pair without copying body bytes.
 /// Overlapping, nonsequential and unaligned legal descriptors remain allowed;
 /// this is independent of the NRX1 result writer's alignment profile. Exact
@@ -227,49 +259,14 @@ fn source_layout(
 }
 fn source_layout_core<E: ReaderGeometryFailure>(
     expected: &Field,
-    mut admission: Option<&mut Admission<'_, '_, E>>,
+    admission: Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Layout, E> {
-    if let Some(a) = admission.as_deref_mut() {
-        a.batch_work_add(
-            a.source()
-                .checked_add(1)
-                .ok_or(CompileControlError::ResourceExhausted)?,
-        )?;
-    }
-    validate_field(expected, work)?;
-    if let Some(a) = admission.as_deref_mut() {
-        let shared = std::cell::RefCell::new(a);
-        let scratch =
-            |layout: std::alloc::Layout| shared.borrow_mut().batch_work_add(layout.size());
-        let capture = |visit| {
-            let mut a = shared.borrow_mut();
-            let upper = if matches!(visit, novarocks_type_contract::ValueTypeVisit::Field(_)) {
-                a.source()
-                    .checked_add(1)
-                    .ok_or(CompileControlError::ResourceExhausted)?
-            } else {
-                1
-            };
-            a.batch_work_add(upper)
-        };
-        crate::physical_type_v2::validate_type_with_scratch_host_observed(
-            expected.data_type(),
-            &mut |layout| {
-                scratch(layout).map_err(crate::host_projection_v2::ProjectionFailure::Host)
-            },
-            &mut |visit| capture(visit).map_err(crate::host_projection_v2::ProjectionFailure::Host),
-            work,
-        )
-        .map_err(|error| match error {
-            crate::host_projection_v2::ProjectionFailure::Host(error) => error,
-            crate::host_projection_v2::ProjectionFailure::Codec(error) => E::from(error),
-        })?;
-    } else {
-        validate_type(expected.data_type(), work)?;
-    }
+    let mut adapter = GeometryAdapter { admission, work };
+    adapter.source_work().map_err(|cause| cause.0)?;
+    adapter.validate_root(expected).map_err(|cause| cause.0)?;
     let layout = layout(expected.data_type())?;
-    parent_step(&mut admission, work)?;
+    adapter.step().map_err(|cause| cause.0)?;
     Ok(layout)
 }
 
@@ -460,8 +457,7 @@ fn preflight_message_core<E: ReaderGeometryFailure>(
     )
 }
 
-/// Inspect one already paired leaf occurrence in a larger recursive batch.
-/// Shared layout and buffer rules remain the flat owner's sole author.
+/// Constant stream boundary adapter to the shared neutral leaf geometry.
 pub(crate) fn inspect_leaf_at_core<E: ReaderGeometryFailure>(
     batch: arrow::ipc::RecordBatch<'_>,
     body: &[u8],
@@ -471,161 +467,21 @@ pub(crate) fn inspect_leaf_at_core<E: ReaderGeometryFailure>(
     buffer_start: usize,
     variadic_buffers: usize,
     limits: Option<FlatBatchProjectionLimits>,
-    mut admission: Option<&mut Admission<'_, '_, E>>,
+    admission: Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<FlatBatchGeometry, E> {
-    let parent = admission.is_some();
-    let count = match layout {
-        Layout::Null => 0,
-        Layout::Bits | Layout::Fixed(_) => 2,
-        Layout::Offsets(_) => 3,
-        Layout::Views => numeric_parent(parent, add(2, variadic_buffers))?,
-    };
-    let buffers = batch.buffers().ok_or(TypeCodecError::InvalidShape(
-        "IPC batch buffer descriptors are missing",
-    ))?;
-    require_parent(
-        numeric_parent(parent, add(buffer_start, count))? <= buffers.len(),
-        "IPC leaf descriptor range exceeds batch",
-        admission.as_deref_mut(),
-        work,
-    )?;
-    let leaf_buffer = |index| {
-        buffer(
-            batch,
-            body,
-            numeric_parent(parent, add(buffer_start, index))?,
-        )
-    };
-    let mut described_buffer_bytes = 0;
-    for index in 0..count {
-        let bytes = leaf_buffer(index)?;
-        described_buffer_bytes = numeric_parent(parent, add(described_buffer_bytes, bytes.len()))?;
-        parent_step(&mut admission, work)?;
-    }
-    let bitmap_bytes = numeric_parent(parent, add(rows / 8, usize::from(!rows.is_multiple_of(8))))?;
-    if !matches!(layout, Layout::Null) && null_count != 0 {
-        require_parent(
-            leaf_buffer(0)?.len() >= bitmap_bytes,
-            "IPC batch validity bitmap is too short",
-            admission.as_deref_mut(),
-            work,
-        )?;
-    }
-    let mut view_validation_bytes = 0;
-    match layout {
-        Layout::Null => require_parent(
-            null_count == rows,
-            "IPC Null node must mark every row null",
-            admission.as_deref_mut(),
-            work,
-        )?,
-        Layout::Bits => require_parent(
-            leaf_buffer(1)?.len() >= bitmap_bytes,
-            "IPC Boolean values are too short",
-            admission.as_deref_mut(),
-            work,
-        )?,
-        Layout::Fixed(width) => require_parent(
-            leaf_buffer(1)?.len() >= numeric_parent(parent, mul(rows, width))?,
-            "IPC fixed-width values are too short",
-            admission.as_deref_mut(),
-            work,
-        )?,
-        Layout::Offsets(width) => {
-            let offsets = leaf_buffer(1)?;
-            // Arrow's typed_offsets converts the entire descriptor before
-            // selecting N+1 entries. A partial trailing element would panic
-            // in Buffer::typed_data even when the useful prefix is complete.
-            require_parent(
-                offsets.len() % width == 0,
-                "IPC byte offsets contain a partial element",
-                admission.as_deref_mut(),
-                work,
-            )?;
-            // Arrow accepts an empty offsets buffer for an empty array and
-            // constructs its empty OffsetBuffer later. Do not reject it here.
-            let minimum = if rows == 0 && offsets.is_empty() {
-                0
-            } else {
-                numeric_parent(parent, mul(numeric_parent(parent, add(rows, 1))?, width))?
-            };
-            require_parent(
-                offsets.len() >= minimum,
-                "IPC byte offsets are too short",
-                admission.as_deref_mut(),
-                work,
-            )?;
-        }
-        Layout::Views => {
-            let views = leaf_buffer(1)?;
-            // The same whole-buffer typed conversion is used for u128 views.
-            // Extra complete records are allowed; a partial one is unsafe.
-            require_parent(
-                views.len() % 16 == 0,
-                "IPC view records contain a partial element",
-                admission.as_deref_mut(),
-                work,
-            )?;
-            let extent = numeric_parent(parent, mul(rows, 16))?;
-            require_parent(
-                views.len() >= extent,
-                "IPC view records are too short",
-                admission.as_deref_mut(),
-                work,
-            )?;
-            for record in views[..extent].as_chunks::<16>().0 {
-                let read = |start| {
-                    u32::from_le_bytes([
-                        record[start],
-                        record[start + 1],
-                        record[start + 2],
-                        record[start + 3],
-                    ])
-                };
-                let bytes = usize::try_from(read(0)).map_err(|_| {
-                    TypeCodecError::InvalidShape("IPC view length is unrepresentable")
-                })?;
-                view_validation_bytes = numeric_parent(parent, add(view_validation_bytes, bytes))?;
-                limit_parent(
-                    limits.is_none_or(|limits| {
-                        view_validation_bytes <= limits.max_view_validation_bytes
-                    }),
-                    "IPC view validation byte envelope exceeded",
-                    admission.as_deref_mut(),
-                    work,
-                )?;
-                if bytes > 12 {
-                    let index = usize::try_from(read(8)).map_err(|_| {
-                        TypeCodecError::InvalidShape("IPC view index is unrepresentable")
-                    })?;
-                    require_parent(
-                        index < variadic_buffers,
-                        "IPC view references an invalid buffer",
-                        admission.as_deref_mut(),
-                        work,
-                    )?;
-                    let payload = leaf_buffer(numeric_parent(parent, add(index, 2))?)?;
-                    let start = usize::try_from(read(12)).map_err(|_| {
-                        TypeCodecError::InvalidShape("IPC view offset is unrepresentable")
-                    })?;
-                    checked_range(payload.len(), start, bytes).map_err(|_| {
-                        TypeCodecError::InvalidShape("IPC view range exceeds its buffer")
-                    })?;
-                    parent_step(&mut admission, work)?;
-                }
-            }
-        }
-    }
-    Ok(FlatBatchGeometry {
+    neutral::inspect_leaf(
+        batch,
+        body,
+        layout,
         rows,
         null_count,
-        buffer_descriptors: count,
+        buffer_start,
         variadic_buffers,
-        body_bytes: body.len(),
-        described_buffer_bytes,
-        view_validation_bytes,
-    })
+        limits,
+        &mut GeometryAdapter { admission, work },
+    )
+    .map_err(|cause| cause.0)
 }
 
 #[cfg(test)]

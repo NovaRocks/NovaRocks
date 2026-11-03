@@ -86,9 +86,8 @@ fn extent_mul(a: usize, b: usize) -> Result<usize, ScalarResourceError> {
 /// Arc headers are two atomic usize counters; padding is covered by one extra
 /// machine word per object. No amount here authorizes an allocation itself.
 pub(crate) fn original_buffer_header_upper_bound() -> Result<usize, KernelFailure> {
-    // Same pinned Bytes + Arc arithmetic used by the original custody route:
-    // pointer, length, three-word Deallocation, two counters and padding.
-    checked_mul(size_of::<usize>(), 8)
+    novarocks_arrow_batch_codec::construction::original_reader_buffer_header_upper_bound()
+        .map_err(|_| KernelFailure::ResourceExhausted)
 }
 /// Prefund ONLY the private immutable Buffer header created by the original
 /// `Buffer::from_vec` adoption. Existing payload backing, public Array headers,
