@@ -1032,6 +1032,37 @@ pub struct CatalogRelationFact {
 }
 
 impl CatalogRelationFact {
+    /// Re-answer another exact need from the same immutable pure selection
+    /// refusal. The application memo cannot manufacture an arbitrary error or
+    /// reuse a refusal for another relation/request, and no provider is polled.
+    pub fn selection_refusal_for(
+        &self,
+        need: &CatalogRelationNeed,
+    ) -> Result<Self, CompletionProtocolError> {
+        let CatalogRelationOutcome::SelectionRefused(error) = &self.outcome else {
+            return Err(CompletionProtocolError::InvalidFact {
+                id: need.id,
+                reason: "memo is not a pure time travel selection refusal",
+            });
+        };
+        if self.relation != need.relation
+            || self.selection_key() != need.selection_key()
+            || need.version().is_none()
+            || !matches!(need.target, CatalogLookupTarget::Table { .. })
+        {
+            return Err(CompletionProtocolError::CatalogLookupTargetMismatch { id: need.id });
+        }
+        Ok(Self {
+            id: need.id,
+            relation: need.relation.clone(),
+            target: need.target,
+            local_view_shadow: need.local_view_shadow,
+            selection: need.selection.clone(),
+            selected_snapshot: None,
+            outcome: CatalogRelationOutcome::SelectionRefused(error.clone()),
+        })
+    }
+
     pub fn resolved(
         need: &CatalogRelationNeed,
         table: ResolvedAnalyzerTable,
@@ -1046,13 +1077,38 @@ impl CatalogRelationFact {
         table: ResolvedAnalyzerTable,
         binding: &crate::planning::catalog::SqlTimeTravelSnapshotBindingFacts,
     ) -> Result<Self, CompletionProtocolError> {
-        Self::resolved_with_selection(need, table, Some(binding))
+        Self::resolved_with_selection(
+            need,
+            table,
+            Some((
+                binding.selection(),
+                binding.relation_fqn(),
+                binding.snapshot_id(),
+            )),
+        )
+    }
+
+    /// An admitted frozen input already proves the existence of its numeric
+    /// snapshot. It cannot establish the current meaning of a ref/timestamp.
+    pub fn resolved_captured_snapshot(
+        need: &CatalogRelationNeed,
+        table: ResolvedAnalyzerTable,
+    ) -> Result<Self, CompletionProtocolError> {
+        let Some(key @ crate::planning::catalog::SqlTimeTravelSelection::SnapshotId(snapshot)) =
+            need.selection_key()
+        else {
+            return Err(CompletionProtocolError::InvalidFact {
+                id: need.id,
+                reason: "captured snapshot cannot resolve a named reference or timestamp",
+            });
+        };
+        Self::resolved_with_selection(need, table, Some((key, &need.relation.fqn(), *snapshot)))
     }
 
     fn resolved_with_selection(
         need: &CatalogRelationNeed,
         table: ResolvedAnalyzerTable,
-        binding: Option<&crate::planning::catalog::SqlTimeTravelSnapshotBindingFacts>,
+        binding: Option<(&crate::planning::catalog::SqlTimeTravelSelection, &str, i64)>,
     ) -> Result<Self, CompletionProtocolError> {
         if table.catalog.identity != need.relation {
             return Err(CompletionProtocolError::CatalogRelationMismatch {
@@ -1066,21 +1122,22 @@ impl CatalogRelationFact {
         }
         let selected_snapshot = match (need.selection_key(), binding) {
             (None, None) => None,
-            (Some(request), Some(binding))
-                if request == binding.selection()
-                    && need.relation.fqn() == binding.relation_fqn() =>
+            (Some(request), Some((selection, relation, selected_snapshot)))
+                if request == selection && need.relation.fqn() == relation =>
             {
                 let crate::planner::table::ScanSource::Sql(source) = &table.planner.source;
                 if !matches!(&source.kind,
                     crate::planner::table::SqlScanKind::Data {
                         version: crate::planner::table::SqlTableVersionSelector::Snapshot(snapshot), ..
-                    } if *snapshot == binding.snapshot_id())
+                    } | crate::planner::table::SqlScanKind::FrozenInputSet {
+                        version: crate::planner::table::SqlTableVersionSelector::Snapshot(snapshot), ..
+                    } if *snapshot == selected_snapshot)
                 {
                     return Err(CompletionProtocolError::CatalogLookupTargetMismatch {
                         id: need.id,
                     });
                 }
-                Some(binding.snapshot_id())
+                Some(selected_snapshot)
             }
             _ => return Err(CompletionProtocolError::CatalogLookupTargetMismatch { id: need.id }),
         };

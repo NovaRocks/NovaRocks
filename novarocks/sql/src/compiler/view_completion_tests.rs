@@ -542,11 +542,13 @@ fn selection_table(
                     need.relation().table.clone(),
                 )
                 .unwrap(),
-                SqlScanKind::Data {
-                    version: snapshot.map_or(
-                        SqlTableVersionSelector::Current,
-                        SqlTableVersionSelector::Snapshot,
-                    ),
+                match snapshot {
+                    Some(snapshot) => SqlScanKind::FrozenInputSet {
+                        version: SqlTableVersionSelector::Snapshot(snapshot),
+                    },
+                    None => SqlScanKind::Data {
+                        version: SqlTableVersionSelector::Current,
+                    },
                 },
             )),
         },
@@ -617,6 +619,38 @@ fn selected_fact_requires_the_same_sql_request_and_actual_historical_selector() 
                 first,
                 selection_table(first, 1, snapshot, arrow::datatypes::DataType::Int32),
                 &binding
+            )
+            .is_err()
+        );
+        assert!(
+            CatalogRelationFact::resolved_captured_snapshot(
+                first,
+                selection_table(first, 1, snapshot, arrow::datatypes::DataType::Int32)
+            )
+            .is_err()
+        );
+    }
+    CatalogRelationFact::resolved_captured_snapshot(
+        first,
+        selection_table(first, 1, Some(10), arrow::datatypes::DataType::Int32),
+    )
+    .unwrap();
+    for sql in [
+        "SELECT x FROM ice.db.orders FOR VERSION AS OF 'backup'",
+        "SELECT x FROM ice.db.orders FOR SYSTEM_TIME AS OF 1000",
+    ] {
+        let source = SqlCapturedCatalogPreparation::try_new(
+            query(sql),
+            Some("ice"),
+            "db",
+            SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let need = &source.needs()[0];
+        assert!(
+            CatalogRelationFact::resolved_captured_snapshot(
+                need,
+                selection_table(need, 1, Some(10), arrow::datatypes::DataType::Int32)
             )
             .is_err()
         );
@@ -930,4 +964,44 @@ fn unsupported_version_consumers_never_silently_use_current_or_cte_facts() {
     assert!(
         matches!(result, Err(SqlCompileError::Analyze(error)) if error.kind() == crate::analyze_error::AnalyzeErrorKind::UnsupportedQueryShape)
     );
+}
+
+#[test]
+fn statement_memo_reanswers_only_the_same_pure_selection_refusal_with_the_new_need_id() {
+    let first = SqlCapturedCatalogPreparation::try_new(
+        query("SELECT x FROM ice.db.orders FOR VERSION AS OF 'missing'"),
+        Some("ice"),
+        "db",
+        SqlCompileControl::unbounded(),
+    )
+    .unwrap();
+    let CatalogTimeTravelResolution::Rejected(original) = first.needs()[0]
+        .resolve_time_travel(&selection_reference_facts())
+        .unwrap()
+    else {
+        panic!("missing ref")
+    };
+    let next = SqlCapturedCatalogPreparation::try_new(
+        query(
+            "SELECT x FROM ice.db.other a JOIN ice.db.orders FOR VERSION AS OF 'missing' b ON 1=1",
+        ),
+        Some("ice"),
+        "db",
+        SqlCompileControl::unbounded(),
+    )
+    .unwrap();
+    let next_need = &next.needs()[1];
+    assert_ne!(original.id(), next_need.id());
+    let answer = original.selection_refusal_for(next_need).unwrap();
+    assert_eq!(answer.id(), next_need.id());
+    assert_eq!(answer.relation(), next_need.relation());
+    assert!(original.selection_refusal_for(&next.needs()[0]).is_err());
+    let current = SqlCapturedCatalogPreparation::try_new(
+        query("SELECT x FROM ice.db.orders"),
+        Some("ice"),
+        "db",
+        SqlCompileControl::unbounded(),
+    )
+    .unwrap();
+    assert!(original.selection_refusal_for(&current.needs()[0]).is_err());
 }

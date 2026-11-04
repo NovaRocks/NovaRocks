@@ -563,12 +563,57 @@ struct StoredBinding {
     id: SqlTableBindingId,
 }
 
+/// A relation request is distinct from the canonical scan input it may select.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct QueryRelationRequestKey {
+    relation: novarocks_types::naming::TableIdentity,
+    selection: Option<novarocks_sql::planning::catalog::SqlTimeTravelSelection>,
+}
+impl QueryRelationRequestKey {
+    pub(crate) fn from_need(
+        need: &novarocks_sql::compiler::CatalogRelationNeed,
+    ) -> Result<Self, novarocks_sql::compiler::SqlCompileError> {
+        let selection = need
+            .version()
+            .map(|version| {
+                novarocks_sql::planning::catalog::parse_time_travel_selection(
+                    version,
+                    &need.relation().fqn(),
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            relation: need.relation().clone(),
+            selection,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum MemoizedQueryRelation {
+    Table {
+        binding: SqlTableBindingId,
+        selection: Option<novarocks_sql::planning::catalog::SqlTimeTravelSnapshotBindingFacts>,
+    },
+    View(crate::catalog_application::query_catalog::relation::ConnectorQueryViewMaterialization),
+    SelectionRefused(Arc<novarocks_sql::compiler::CatalogRelationFact>),
+}
+
 /// Exact application authority paired with one compiler request.
 pub struct QueryTableBindingStore {
     allocator: Mutex<SqlTableBindingAllocator>,
     exact_binding_receipts: ExactBindingReceiptStore,
     entries: Mutex<HashMap<QueryTableBindingKey, Result<StoredBinding, String>>>,
     by_id: Mutex<HashMap<SqlTableBindingId, Arc<QueryTableBinding>>>,
+    pub(crate) relations: Mutex<
+        HashMap<
+            QueryRelationRequestKey,
+            Result<
+                MemoizedQueryRelation,
+                crate::catalog_application::query_catalog::CatalogResolutionError,
+            >,
+        >,
+    >,
     /// Once a statement enters a topology-only replan, an unknown lookup must
     /// not materialize a newer catalog/connector `Current` state. Existing
     /// request-local bindings remain readable and keep their exact leases.
@@ -587,6 +632,7 @@ impl QueryTableBindingStore {
             exact_binding_receipts,
             entries: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
+            relations: Mutex::new(HashMap::new()),
             #[cfg(test)]
             sealed_for_topology_replan: AtomicBool::new(false),
         })
@@ -648,6 +694,13 @@ impl QueryTableBindingStore {
             .lock()
             .expect("query table binding allocator lock")
             .scope()
+    }
+
+    pub(crate) fn require_catalog_observation_allowed(&self) -> Result<(), String> {
+        if self.exact_binding_receipts.sealed_view().is_some() {
+            return Err("topology replan attempted to observe a relation absent from its admitted catalog facts".into());
+        }
+        Ok(())
     }
 
     /// Observe a completed binding without starting another provider load.

@@ -59,8 +59,8 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, MvStorageObservationPort, read_stack::ConnectorSession,
 };
 use novarocks_sql::compiler::{
-    CatalogLookupTarget, CatalogRelationFact, CatalogRelationNeed, MaterializedViewFact,
-    MaterializedViewNeed, StatisticsFact, StatisticsNeed,
+    CatalogRelationFact, CatalogRelationNeed, MaterializedViewFact, MaterializedViewNeed,
+    StatisticsFact, StatisticsNeed,
 };
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
@@ -256,29 +256,7 @@ impl CatalogFactPort for FrontendCatalogFacts {
         .with_catalog_application(self.owners.catalog_application.as_deref());
         let mut facts = Vec::with_capacity(needs.len());
         for need in needs {
-            let relation = need.relation();
-            let resolved = match need.target() {
-                CatalogLookupTarget::Table { .. } => {
-                    materializer
-                        .resolve_table_for_analysis_async(
-                            Some(&relation.catalog),
-                            &relation.namespace,
-                            &relation.table,
-                        )
-                        .await
-                }
-                CatalogLookupTarget::IcebergMetadata { kind } => {
-                    materializer
-                        .resolve_metadata_table_async(
-                            Some(&relation.catalog),
-                            &relation.namespace,
-                            &relation.table,
-                            kind,
-                        )
-                        .await
-                }
-            };
-            facts.push(catalog_fact_from(need, resolved)?);
+            facts.push(materializer.resolve_relation_fact_async(need).await?);
         }
         Ok(facts)
     }

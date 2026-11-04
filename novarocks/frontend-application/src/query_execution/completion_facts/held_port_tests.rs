@@ -22,6 +22,7 @@ use novarocks_catalog_application::{
 };
 use novarocks_mv_application::state_store_repository::StateStoreMvRepository;
 use novarocks_spi::connector::{ConnectorInstanceId, ConnectorStopOwner};
+use novarocks_sql::compiler::CatalogLookupTarget;
 use novarocks_state_store_api::{
     AttemptSupervisor, Direction, Key, KeyRange, RangePage, RangeRequest, ReadTransaction,
     StateRecord, StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity,

@@ -416,26 +416,7 @@ impl ViewEngine for FrontendViewEngine {
             let facts = preparation
                 .needs()
                 .iter()
-                .map(|need| {
-                    let relation = need.relation();
-                    let table = match need.target() {
-                        novarocks_sql::compiler::CatalogLookupTarget::Table { .. } => provider
-                            .resolve_table_for_analysis_typed(
-                                Some(&relation.catalog),
-                                &relation.namespace,
-                                &relation.table,
-                            ),
-                        novarocks_sql::compiler::CatalogLookupTarget::IcebergMetadata { kind } => {
-                            provider.resolve_metadata_table_typed(
-                                Some(&relation.catalog),
-                                &relation.namespace,
-                                &relation.table,
-                                kind,
-                            )
-                        }
-                    };
-                    crate::query_execution::completion_facts::catalog_fact_from(need, table)
-                })
+                .map(|need| provider.resolve_relation_fact(need))
                 .collect::<Result<Vec<_>, novarocks_sql::compiler::SqlCompileError>>()?;
             preparation = preparation.continue_catalog(facts.into_boxed_slice())?;
         }

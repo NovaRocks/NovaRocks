@@ -549,6 +549,44 @@ pub fn project_query_local_overlay_name(
     Ok(materialization)
 }
 
+/// Project one application-verified alias of the same frozen snapshot. The
+/// original binding remains the physical/read authority; only this need's SQL
+/// identity changes. Applications must first verify the canonical input key.
+pub fn project_frozen_snapshot_sql_name(
+    mut materialization: crate::catalog::ResolvedAnalyzerTable,
+    target: &TableIdentity,
+    snapshot: i64,
+) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+    use crate::planner::table::{ScanSource, SqlScanKind, SqlTableVersionSelector};
+    for name in [&target.catalog, &target.namespace, &target.table] {
+        if novarocks_types::naming::normalize_identifier(name)? != *name {
+            return Err("snapshot SQL alias requires canonical catalog identifiers".into());
+        }
+    }
+    let original = &materialization.catalog.identity;
+    if original.catalog != target.catalog || original.namespace != target.namespace {
+        return Err("snapshot SQL alias cannot change the captured catalog or namespace".into());
+    }
+    let ScanSource::Sql(source) = &mut materialization.planner.source;
+    if source.table.catalog != original.catalog
+        || source.table.namespace != original.namespace
+        || source.table.table != original.table
+        || materialization.planner.name != original.table
+    {
+        return Err("snapshot SQL alias has inconsistent original identity carriers".into());
+    }
+    if !matches!(source.kind,
+        SqlScanKind::FrozenInputSet { version: SqlTableVersionSelector::Snapshot(actual) }
+        | SqlScanKind::Data { version: SqlTableVersionSelector::Snapshot(actual) } if actual == snapshot)
+    {
+        return Err("snapshot SQL alias cannot change the captured input selector".into());
+    }
+    source.table.table = target.table.clone();
+    materialization.planner.name = target.table.clone();
+    materialization.catalog.identity = target.clone();
+    Ok(materialization)
+}
+
 /// Attach one application-reserved token to a local SQL relation.
 ///
 /// Local catalog relations have no connector authority, but their scan source

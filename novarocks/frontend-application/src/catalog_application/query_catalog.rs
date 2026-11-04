@@ -38,6 +38,7 @@ use novarocks_types::schema::CatalogTable;
 use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
 
 mod registry;
+pub(crate) mod relation;
 mod schema_cache;
 mod service;
 #[cfg(test)]

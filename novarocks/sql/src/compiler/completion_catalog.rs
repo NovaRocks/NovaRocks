@@ -1274,6 +1274,8 @@ fn validate_resolved_target(
     if let Some(expected) = fact.selected_snapshot()
         && !matches!(&source.kind, SqlScanKind::Data {
             version: crate::planner::table::SqlTableVersionSelector::Snapshot(actual), ..
+        } | SqlScanKind::FrozenInputSet {
+            version: crate::planner::table::SqlTableVersionSelector::Snapshot(actual), ..
         } if *actual == expected)
     {
         return Err(SqlCompileError::Compilation(
