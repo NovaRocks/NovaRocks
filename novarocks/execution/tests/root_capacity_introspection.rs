@@ -168,6 +168,86 @@ fn borrowed_ipc_batch_counts_shared_full_backing_without_allocating() {
         no_allocation(|| borrowed_root_batch_storage(&batch, storage_limits(backing - 1))),
         Err(RootArrayStorageError::CapacityExceeded)
     );
+
+    // Production receiver custody pins every original Buffer but declares
+    // only its initialized base prefix. Shared IPC slices consequently keep
+    // the same base with different capacities, unlike the raw reader above.
+    use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+    use novarocks_execution::exec::pipeline::{
+        operator::input_construction::try_runtime_input_construction_factory,
+        pipeline::representation_construction_profile,
+    };
+    use novarocks_execution::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState};
+    use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+    let storage = ValueTypeStorageLifetime::pure();
+    let value_type = FunctionValueType::new(DataType::Utf8, false);
+    let slots = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, field)| {
+            ChunkSlotSchema::try_new_typed(
+                novarocks_types::SlotId::new(u32::try_from(ordinal).unwrap()),
+                Arc::clone(field),
+                value_type.typed_binding().clone(),
+                None,
+                storage.clone(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let declared = ChunkSchema::try_new_typed(slots, storage).unwrap();
+    let factory = try_runtime_input_construction_factory(
+        representation_construction_profile().unwrap(),
+        MemTracker::new_root("IPC root custody regression"),
+        Arc::new(RuntimeErrorState::default()),
+    )
+    .unwrap();
+    let owner = factory.begin_typed_construction(&declared).unwrap();
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|array| {
+            factory
+                .retain_decoded_source(Arc::clone(array), owner.storage_lifetime(), owner.as_ref())
+                .unwrap()
+        })
+        .collect();
+    let retained = RecordBatch::try_new(batch.schema(), columns).unwrap();
+    let base = first.values().data_ptr();
+    let mut previous = 0;
+    for array in retained.columns() {
+        let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+        for buffer in [array.offsets().inner().inner(), array.values()] {
+            assert_eq!(buffer.data_ptr(), base);
+            assert!(buffer.capacity() > previous);
+            previous = buffer.capacity();
+        }
+    }
+    assert_eq!(previous, backing);
+    let forward =
+        no_allocation(|| borrowed_root_batch_storage(&retained, storage_limits(96 * 1024 * 1024)))
+            .expect("custody's same-base prefixes must fit the original backing allowance");
+    assert!(forward >= backing + 34 * ARROW_BUFFER_OWNER_METADATA_BOUND);
+    assert!(forward < backing + 64 * 1024);
+    assert_eq!(
+        no_allocation(|| borrowed_root_batch_storage(&retained, storage_limits(forward - 1))),
+        Err(RootArrayStorageError::CapacityExceeded)
+    );
+    let reversed = RecordBatch::try_new(
+        retained.schema(),
+        retained.columns().iter().rev().cloned().collect(),
+    )
+    .unwrap();
+    let backward =
+        no_allocation(|| borrowed_root_batch_storage(&reversed, storage_limits(96 * 1024 * 1024)))
+            .unwrap();
+    assert_eq!(backward, forward);
+    assert_eq!(
+        no_allocation(|| borrowed_root_batch_storage(&reversed, storage_limits(backing - 1))),
+        Err(RootArrayStorageError::CapacityExceeded)
+    );
 }
 
 #[test]
