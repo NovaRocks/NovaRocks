@@ -28,7 +28,9 @@
 -- r.payload. lower_join_outputs creates new NullExtended left values named
 -- id/score, so only the preserved r.payload stays qualified in its PROJECT.
 -- Query 10 keeps its pushed left TopN; queries 13/15/16 keep their existing
--- non-pushed plans. No operator, RF binding, sort direction or estimate changes.
+-- non-pushed plans. RIGHT OUTER builds on the left and must not filter its
+-- preserved right probe, so query 11 has no runtime filter graph. No operator,
+-- sort direction or estimate changes.
 
 DROP TABLE IF EXISTS ${case_db}.topn_outer_left;
 DROP TABLE IF EXISTS ${case_db}.topn_outer_right;

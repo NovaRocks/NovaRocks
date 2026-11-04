@@ -17,8 +17,8 @@
 
 -- @tags=join,optimizer,topn,outer_join
 -- Test Objective:
--- Rule on/off result equivalence for LEFT and RIGHT OUTER preserved-side TopN
--- pushdown, including unmatched preserved-side rows.
+-- LEFT preserved-side TopN pushdown and rule on/off result equivalence for
+-- LEFT and RIGHT OUTER JOINs, including unmatched preserved-side rows.
 
 DROP TABLE IF EXISTS ${case_db}.topn_outer_result_left;
 DROP TABLE IF EXISTS ${case_db}.topn_outer_result_right;
@@ -56,8 +56,12 @@ LIMIT 4;
 
 SET disable_optimizer_rules = '';
 
--- @explain_contains=RIGHT OUTER
--- @explain_contains=stats={rows=4}
+-- RIGHT preserved-side pushdown remains disabled. Equivalent plans may use
+-- either LEFT or RIGHT physical orientation. These checks protect the outer
+-- join and TopN ordering/window, not the TopN's subtree placement.
+-- @explain_contains=OUTER, eq:
+-- @explain_not_contains=FULL OUTER
+-- @explain_contains=TOP-N (limit=4, offset=0) [r.payload DESC NULLS LAST, r.id ASC NULLS FIRST]
 SELECT l.id, l.score, r.payload
 FROM ${case_db}.topn_outer_result_left l
 RIGHT JOIN ${case_db}.topn_outer_result_right r ON l.id = r.id

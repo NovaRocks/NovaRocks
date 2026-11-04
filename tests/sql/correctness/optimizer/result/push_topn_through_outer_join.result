@@ -41,10 +41,6 @@ PLAN FRAGMENT 2
 -- query 11
 -- types	varchar
 Explain String
-RUNTIME FILTER GRAPH
-  runtime filter channel 1
-    producer binding 1, fragment = 1, node = 4, expr = (r.id)
-    consumer binding 1, fragment = 2, node = 7, expr = (l.id), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   STAGE PLACEMENT: singleton
