@@ -744,13 +744,16 @@ impl HadoopFileSystemCatalog {
             .await
             .map_err(|error| map_read_failure(&error))?;
         check()?;
-        let metadata: TableMetadata =
-            crate::metadata_json::from_slice(&bytes).map_err(|error| {
-                novarocks_spi::connector::ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::CorruptData,
-                    format!("decode authoritative Hadoop v1 metadata: {error}"),
-                )
-            })?;
+        let metadata: TableMetadata = crate::metadata_json::from_slice_document(
+            &bytes,
+            crate::metadata_json::Document::TableMetadata,
+        )
+        .map_err(|error| {
+            novarocks_spi::connector::ConnectorError::new(
+                error.connector_kind(novarocks_spi::connector::ConnectorErrorKind::CorruptData),
+                format!("decode authoritative Hadoop v1 metadata: {error}"),
+            )
+        })?;
         if metadata.uuid().to_string() != expected_uuid
             || hex_digest(&bytes) != expected_metadata_digest
         {

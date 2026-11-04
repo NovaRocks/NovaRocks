@@ -5,6 +5,7 @@ domain: [provider-spi]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0214]
 date: 2026-11-03
 provenance:
   - "discussion: 2026-11-02 accepted Iceberg read interpretation and Historical/Current authority design"

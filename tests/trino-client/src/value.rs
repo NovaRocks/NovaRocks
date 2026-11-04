@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::StatementFailure;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::value::RawValue;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TrinoValue {
@@ -34,14 +35,136 @@ pub enum TrinoValue {
     Variant(String),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TypeSignature {
     pub raw_type: String,
     #[serde(default)]
     pub arguments: Vec<TypeArgument>,
 }
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+// JSON metadata adds several protocol containers per logical type level.
+// Capture the original subtree once, then parse shallow borrowed views with an
+// explicit postorder stack. RawValue's lexical reader is iterative; children
+// borrow that one capture rather than copying each ancestor's entire subtree.
+impl<'de> Deserialize<'de> for TypeSignature {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        decode_signature(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignatureWire<'a> {
+    raw_type: String,
+    #[serde(default, borrow)]
+    arguments: Vec<ArgumentWire<'a>>,
+}
+#[derive(Deserialize)]
+struct ArgumentWire<'a> {
+    kind: String,
+    #[serde(borrow)]
+    value: &'a RawValue,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NamedWire<'a> {
+    field_name: Option<RowFieldName>,
+    #[serde(borrow)]
+    type_signature: &'a RawValue,
+}
+
+enum SignatureWork<'a> {
+    Type(&'a RawValue),
+    Argument(ArgumentWire<'a>),
+    FinishType { raw_type: String, arguments: usize },
+    FinishArgument,
+    FinishNamed(Option<RowFieldName>),
+}
+enum SignaturePart {
+    Type(TypeSignature),
+    Argument(TypeArgument),
+}
+fn decode_signature(raw: &RawValue) -> Result<TypeSignature, serde_json::Error> {
+    let SignaturePart::Type(signature) = decode_signature_part(SignatureWork::Type(raw))? else {
+        unreachable!("postorder root type");
+    };
+    Ok(signature)
+}
+fn decode_signature_part(root: SignatureWork<'_>) -> Result<SignaturePart, serde_json::Error> {
+    use SignaturePart as P;
+    use SignatureWork as W;
+    let mut work = vec![root];
+    let mut parts = Vec::new();
+    while let Some(next) = work.pop() {
+        match next {
+            W::Type(raw) => {
+                let wire: SignatureWire<'_> = serde_json::from_str(raw.get())?;
+                work.push(W::FinishType {
+                    raw_type: wire.raw_type,
+                    arguments: wire.arguments.len(),
+                });
+                work.extend(wire.arguments.into_iter().rev().map(W::Argument));
+            }
+            W::Argument(argument) => match argument.kind.as_str() {
+                "LONG" => parts.push(P::Argument(TypeArgument::Long(serde_json::from_str(
+                    argument.value.get(),
+                )?))),
+                "TYPE" => {
+                    work.push(W::FinishArgument);
+                    work.push(W::Type(argument.value));
+                }
+                "NAMED_TYPE" => {
+                    let wire: NamedWire<'_> = serde_json::from_str(argument.value.get())?;
+                    work.push(W::FinishNamed(wire.field_name));
+                    work.push(W::Type(wire.type_signature));
+                }
+                other => {
+                    return Err(serde::de::Error::unknown_variant(
+                        other,
+                        &["LONG", "TYPE", "NAMED_TYPE"],
+                    ));
+                }
+            },
+            W::FinishType {
+                raw_type,
+                arguments,
+            } => {
+                let start = parts
+                    .len()
+                    .checked_sub(arguments)
+                    .expect("postorder arguments");
+                let arguments = parts
+                    .drain(start..)
+                    .map(|part| match part {
+                        P::Argument(argument) => argument,
+                        P::Type(_) => unreachable!("postorder argument"),
+                    })
+                    .collect();
+                parts.push(P::Type(TypeSignature {
+                    raw_type,
+                    arguments,
+                }));
+            }
+            W::FinishArgument | W::FinishNamed(_) => {
+                let P::Type(signature) = parts.pop().expect("postorder child") else {
+                    unreachable!("postorder child type");
+                };
+                let argument = match next {
+                    W::FinishNamed(field_name) => TypeArgument::NamedType(NamedTypeSignature {
+                        field_name,
+                        type_signature: signature,
+                    }),
+                    _ => TypeArgument::Type(signature),
+                };
+                parts.push(P::Argument(argument));
+            }
+        }
+    }
+    Ok(parts.pop().expect("postorder root"))
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value")]
 pub enum TypeArgument {
     #[serde(rename = "LONG")]
@@ -50,6 +173,18 @@ pub enum TypeArgument {
     Type(TypeSignature),
     #[serde(rename = "NAMED_TYPE")]
     NamedType(NamedTypeSignature),
+}
+impl<'de> Deserialize<'de> for TypeArgument {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        let wire = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+        let part = decode_signature_part(SignatureWork::Argument(wire))
+            .map_err(serde::de::Error::custom)?;
+        let SignaturePart::Argument(argument) = part else {
+            unreachable!("postorder root argument");
+        };
+        Ok(argument)
+    }
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -91,32 +226,40 @@ impl TypeSignature {
     }
     pub fn validate(&self) -> Result<(), StatementFailure> {
         use TypeArgument as A;
-        let supported = match self.raw_type.as_str() {
-            "unknown" | "boolean" | "tinyint" | "smallint" | "integer" | "bigint" | "real"
-            | "double" | "varbinary" | "date" | "json" | "variant" => self.arguments.is_empty(),
-            "varchar" => matches!(self.arguments.as_slice(), [] | [A::Long(_)]),
-            "char" => matches!(self.arguments.as_slice(), [A::Long(_)]),
-            "decimal" => {
-                matches!(self.arguments.as_slice(), [A::Long(p), A::Long(s)] if (1..=38).contains(p) && s <= p)
+        let mut work = vec![self];
+        while let Some(signature) = work.pop() {
+            let supported = match signature.raw_type.as_str() {
+                "unknown" | "boolean" | "tinyint" | "smallint" | "integer" | "bigint" | "real"
+                | "double" | "varbinary" | "date" | "json" | "variant" => {
+                    signature.arguments.is_empty()
+                }
+                "varchar" => matches!(signature.arguments.as_slice(), [] | [A::Long(_)]),
+                "char" => matches!(signature.arguments.as_slice(), [A::Long(_)]),
+                "decimal" => {
+                    matches!(signature.arguments.as_slice(), [A::Long(p), A::Long(s)] if (1..=38).contains(p) && s <= p)
+                }
+                "time" | "time with time zone" | "timestamp" | "timestamp with time zone" => {
+                    matches!(signature.arguments.as_slice(), [] | [A::Long(0..=12)])
+                }
+                "array" => matches!(signature.arguments.as_slice(), [A::Type(_)]),
+                "map" => matches!(signature.arguments.as_slice(), [A::Type(_), A::Type(_)]),
+                "row" => signature
+                    .arguments
+                    .iter()
+                    .all(|a| matches!(a, A::NamedType(_))),
+                _ => false,
+            };
+            if !supported {
+                return Err(StatementFailure::protocol(format!(
+                    "unsupported Trino type signature: {signature:?}"
+                )));
             }
-            "time" | "time with time zone" | "timestamp" | "timestamp with time zone" => {
-                matches!(self.arguments.as_slice(), [] | [A::Long(0..=12)])
-            }
-            "array" => matches!(self.arguments.as_slice(), [A::Type(_)]),
-            "map" => matches!(self.arguments.as_slice(), [A::Type(_), A::Type(_)]),
-            "row" => self.arguments.iter().all(|a| matches!(a, A::NamedType(_))),
-            _ => false,
-        };
-        if !supported {
-            return Err(StatementFailure::protocol(format!(
-                "unsupported Trino type signature: {self:?}"
-            )));
-        }
-        for arg in &self.arguments {
-            match arg {
-                A::Type(child) => child.validate()?,
-                A::NamedType(child) => child.type_signature.validate()?,
-                A::Long(_) => {}
+            for arg in signature.arguments.iter().rev() {
+                match arg {
+                    A::Type(child) => work.push(child),
+                    A::NamedType(child) => work.push(&child.type_signature),
+                    A::Long(_) => {}
+                }
             }
         }
         Ok(())

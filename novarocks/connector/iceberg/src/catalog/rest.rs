@@ -185,10 +185,19 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         document: Vec<u8>,
     ) -> Result<super::StagedCreateMaterial, ConnectorError> {
         let invalid = |message: &str| ConnectorError::new(ConnectorErrorKind::CorruptData, message);
-        let response = crate::metadata_json::from_slice::<
+        let response = crate::metadata_json::from_slice_document::<
             crate::rest_protocol::wire::LoadTableResult,
-        >(&document)
-        .map_err(|_| invalid("REST stage-create response could not be decoded"))?;
+        >(&document, crate::metadata_json::Document::TableResponse)
+        .map_err(|error| {
+            ConnectorError::new(
+                error.connector_kind(ConnectorErrorKind::CorruptData),
+                if error.is_unsupported() {
+                    error.to_string()
+                } else {
+                    "REST stage-create response could not be decoded".to_owned()
+                },
+            )
+        })?;
         let initialization_updates =
             crate::commit::staging::staged_create_updates(&response.metadata)
                 .map_err(|_| invalid("REST stage-create response has invalid initial metadata"))?;

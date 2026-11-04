@@ -39,6 +39,25 @@ impl std::fmt::Display for ReadFailure {
     }
 }
 impl ReadFailure {
+    /// Preserve provider classification and original source custody through
+    /// ordinary scan preparation without formatting either domain cause.
+    pub(crate) fn into_connector(self) -> ConnectorError {
+        match self {
+            Self::Original(ConnectorCowBeginCause::Provider(error)) => error,
+            Self::Original(ConnectorCowBeginCause::OriginalResult(error)) => {
+                ConnectorError::from_domain_static(
+                    ConnectorErrorKind::Internal,
+                    error,
+                    "Iceberg original result check failed",
+                )
+            }
+            Self::Semantic(message) => {
+                ConnectorError::new(ConnectorErrorKind::Unavailable, message)
+                    .with_retryable_before_progress()
+            }
+        }
+    }
+
     pub(crate) fn into_cause(self) -> ConnectorCowBeginCause {
         match self {
             Self::Original(cause) => cause,
@@ -70,4 +89,26 @@ pub(crate) fn active(scope: Option<&CaptureScope<'_>>) -> Result<(), ReadFailure
         scope.active()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_read_keeps_the_original_unsupported_provider_error() {
+        let original = ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            crate::schema_capability::UNSUPPORTED_SCHEMA,
+        );
+        let actual = ReadFailure::Original(original.clone().into()).into_connector();
+        assert_eq!(actual, original);
+    }
+
+    #[test]
+    fn semantic_snapshot_failure_retains_existing_unavailable_classification() {
+        let error = ReadFailure::Semantic("snapshot is absent".to_owned()).into_connector();
+        assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
+        assert_eq!(error.message(), "snapshot is absent");
+    }
 }

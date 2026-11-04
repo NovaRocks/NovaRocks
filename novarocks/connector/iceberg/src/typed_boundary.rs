@@ -237,10 +237,10 @@ impl IcebergTypedBoundary {
 
     fn complete_sdk_read<T>(
         &self,
-        result: Result<Result<T, String>, String>,
+        result: Result<Result<T, ConnectorError>, String>,
     ) -> Result<T, ConnectorError> {
         self.check_request_active()?;
-        result.map_err(unavailable)?.map_err(unavailable)
+        result.map_err(unavailable)?
     }
 
     /// The composition-root entry point.
@@ -706,7 +706,7 @@ impl IcebergTypedBoundary {
         let control = self.request_context.clone();
         let result = plan_pinned_snapshot(table, domain, control.as_ref()).await;
         self.check_request_active()?;
-        let read_snapshot = result.map_err(unavailable)?;
+        let read_snapshot = result?;
         projection.plan(read_snapshot.files, self.request_context.as_ref())
     }
 
@@ -1547,7 +1547,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     )
                     .await;
                     self.check_request_active()?;
-                    Some(snapshot.map_err(unavailable)?)
+                    Some(snapshot?)
                 }
             } else {
                 None
@@ -2714,7 +2714,7 @@ impl IcebergTypedBoundary {
         let result =
             (async move { plan_pinned_snapshot(table, domain, control.as_ref()).await }).await;
         self.check_request_active()?;
-        let read_snapshot = result.map_err(unavailable)?;
+        let read_snapshot = result?;
         self.planned_files_from_observation(
             handle,
             snapshot_id,
@@ -3927,7 +3927,7 @@ async fn plan_pinned_snapshot(
     table: Table,
     domain: Arc<crate::delete_semantics::ReadDomain>,
     control: Option<&ConnectorRequestContext>,
-) -> Result<IcebergReadSnapshot, String> {
+) -> Result<IcebergReadSnapshot, ConnectorError> {
     let operation_control = control.map(|control| control as &dyn ConnectorOperationControl);
     crate::read_snapshot::build_read_snapshot_in_domain(&table, domain, operation_control).await
 }

@@ -3,9 +3,17 @@
 The `iceberg` cases `novarocks_full_metadata_depth64` and
 `novarocks_history_future_partition_source`, and the `iceberg-ddl` case
 `full_metadata_depth64_hadoop`, protect file/table identity, deep metadata and
-the separation between historical reads and current write authority. They are
-ordinary correctness cases, maintained by the Iceberg suite owner and run with
-their suites. SQL tests are the lowest layer that can cover the complete
+the separation between historical reads and current write authority. They
+are maintained by the Iceberg suite owner. The two depth64 cases are
+temporarily outside the finite support scope by the user decision on
+2026-11-03; the historical partition case remains ordinary suite coverage.
+The exact depth cases are registered in `tools/ci/baselines/dispositions.json`
+with an owner, review date and exit condition. Quarantine excludes admission
+judgment only; it does not make raw full-suite results pass. Local B validation
+uses the existing `--skip` option below, retaining the original SQL, goldens,
+SDK inputs and every failed attempt. No maximum-depth expansion is required.
+
+SQL tests are the lowest layer that can cover the complete
 catalog, FE planning, native 1FE+3BE, Parquet reading and commit paths together;
 the FS and Connector unit tests separately protect policy/cache behavior.
 
@@ -24,13 +32,15 @@ introduced.
 
 The expected data is fixed before NovaRocks reads or writes it:
 
-- The depth schema has 63 optional struct containers and an integer leaf,
-  with the leaf declared as `tinyint` by its actual Iceberg field ID. The SDK
-  writes `(1, -128)`, `(1, -128)`, `(2, NULL-parent)`. Native append adds
-  `(3, NULL-parent)` and CTAS must preserve the same four-row bag. The Java SDK
-  checks both complete bags, depth, leaf declaration, table identities and
-  actual Parquet footer IDs. After dropping the deep column and appending
-  `4`, the current IDs are `1,1,2,3,4`, while the initial tag returns `1,1,2`.
+- The depth schema has 63 optional ARRAY containers and an `INT` leaf,
+  exactly logical depth 64. Its schema JSON is 66 containers deep, within the
+  SDK manifest reader's 127-container boundary. The SDK writes `(1, -128)`,
+  `(1, -128)`, `(2, NULL-parent)`. Native appends add `(3, NULL-parent)` and
+  `(5, 7)` in separate commits; CTAS preserves the same five-row bag. Each
+  non-NULL scalar is wrapped in 63 singleton arrays. The Java SDK checks both
+  complete bags, depth, table identities and actual Parquet footer IDs. After
+  dropping the deep column and appending `4`, current IDs are `1,1,2,3,4,5`;
+  the initial tag returns the complete original three-row bag.
 - The future-partition case has one SDK-written `id BIGINT` row (`1`) in S0.
   Adding optional `future INT` and `identity(future)` are metadata-only
   commits. The SDK checks that the sole S0 snapshot still binds the old schema,
@@ -44,23 +54,27 @@ The expected data is fixed before NovaRocks reads or writes it:
   rejection expectations were replaced with this existing behavior rather
   than introducing a new write prohibition. The expected snapshot count is
   three (initial append, UPDATE and MERGE).
-- The Hadoop case uses the same 63-container shape with an ordinary `INT`
-  leaf and only NULL parent values. Its written IDs are `1,1,2`, then `3` after
-  dropping the deep field. Current IDs are `1,1,2,3`; the saved tag returns
-  `1,1,2`. An official SDK Hadoop catalog reads that exact native-created
-  table, checks both complete bags, retained schema depth/IDs and actual
-  Parquet footer IDs. It is explicitly restricted to the MinIO fixture and
-  remains a single-writer test catalog under ADR-0196. S3A is used only for
-  Hadoop's file discovery; the original run's configured S3FileIO reads the
-  table's original S3 locations.
+- The Hadoop case uses the same ARRAY shape and ordinary `INT` leaf. Native
+  id-only append writes `1,1,2` with NULL parents; another native append writes
+  `(4, 7)` with 63 singleton arrays. After DROP and append `3`, current IDs are
+  `1,1,2,3,4`; the saved tag retains the complete four-row deep bag. The SDK
+  checks all three snapshots, both complete bags, retained schema depth/IDs
+  and actual Parquet footer IDs. This remains a MinIO-only, single-writer
+  test catalog under ADR-0196. S3A serves only file discovery; the original
+  run's S3FileIO reads the table's original S3 locations.
+- Both depth cases also submit a logical64 pure STRUCT definition. Its schema
+  JSON has 192 containers, exceeding the SDK manifest boundary, so CREATE must
+  return the typed Unsupported reason before metadata publication. A subsequent
+  same-name shallow CREATE without `IF NOT EXISTS`, then DROP, verifies no
+  catalog object survived. Connector unit tests protect refusal before I/O.
 
 Typed goldens are derived from these SDK declarations and fixed rows: `id`
-and counts are `bigint`, `future` is `integer`, `typeof` is `varchar`; a struct
-is a Trino `row` and its value is a positional JSON array. Nested row type
-names come directly from `n1` through `n63`; the REST leaf is `tinyint` and the
-Hadoop leaf is `integer`. Their `typeof` text remains the engine's declared
-SQL names `tinyint` and `int`. These checked-in expectations are not a claim
-that the current product or fixture has already passed.
+and counts are `bigint`, `future` is `integer`, `typeof` is `varchar`; `deep`
+is 63 nested Trino `array` types around `integer`. Values are the corresponding
+63 nested JSON arrays or SQL `NULL`; leaf `typeof` is `int`. Native historical
+queries read `deep` as well as `id`, and the SDK independently validates their
+complete historical bags. These checked-in expectations do not claim that the
+current product or fixture has already passed.
 
 Run through the prepared, hash-bound SQL runner with a verified immutable
 fixture publication and explicit `NOVAROCKS_BIN`:
@@ -68,12 +82,18 @@ fixture publication and explicit `NOVAROCKS_BIN`:
 ```bash
 "$sql_runner" --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg,iceberg-ddl --mode verify \
+  --skip novarocks_full_metadata_depth64,full_metadata_depth64_hadoop \
   --cluster-mode cross-process --cluster-size 3 -j 1 \
   --results-file "$attempt/iceberg-read-policy.results.jsonl"
 ```
 
-`--only` with the three case names is useful for diagnosis; complete suite
-runs remain the required combination evidence. Shell logs and SDK receipts
+`--only` with the ordinary history case is useful for diagnosis; complete suite
+runs with the two declared depth exclusions remain the B combination scope.
+Restoring the depth cases requires a separate capability review after the
+upstream manifest API/version is suitable, followed by complete native
+1FE+3BE verification and cleanup. The unresolved Hadoop DML Invariant is
+retained as unconfirmed; do not attribute it to the SDK or Writer32 without
+evidence. Shell logs and SDK receipts
 are retained below `tests/sql/.runtime/iceberg-read-policy/<case UUID>/`; each
 stage uses a distinct filename. Failed attempts are retained, and reruns have
 fresh case UUIDs. The old WIP inputs were audited at commit `28e444127`; only

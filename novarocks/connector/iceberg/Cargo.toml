@@ -34,6 +34,7 @@ mem-1-m07-hms-listing-observe = []
 [dependencies]
 novarocks-failpoint = { workspace = true, features = ["typed"] }
 anyhow.workspace = true
+apache-avro.workspace = true
 base64.workspace = true
 iceberg = "0.11.0"
 iceberg-catalog-hms = "0.11.0"

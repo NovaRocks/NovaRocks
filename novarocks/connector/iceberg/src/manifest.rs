@@ -110,13 +110,20 @@ pub async fn load_manifest(
     decode_manifest(&bytes, descriptor)
 }
 
+/// Parse the original SDK representation after the provider capability check.
+/// Consumers that do not apply descriptor inheritance use this same entry.
+pub(crate) fn parse_manifest_checked(bytes: &[u8]) -> crate::iceberg::Result<Manifest> {
+    crate::schema_capability::preflight_manifest(bytes)?;
+    Manifest::parse_avro(bytes)
+}
+
 pub(crate) fn decode_manifest(
     bytes: &[u8],
     descriptor: &ManifestFile,
 ) -> crate::iceberg::Result<Manifest> {
     // Iceberg's initial sequence is zero; the SDK keeps this constant private.
     const INITIAL_SEQUENCE_NUMBER: i64 = 0;
-    let (entries, metadata) = Manifest::parse_avro(bytes)?.into_parts();
+    let (entries, metadata) = parse_manifest_checked(bytes)?.into_parts();
     let entries = entries
         .into_iter()
         .map(|entry| {
@@ -269,16 +276,25 @@ fn equality_delete_column_names_for_field_ids(
 }
 
 pub async fn current_equality_delete_column_names(table: &Table) -> Result<Vec<String>, String> {
-    current_equality_delete_column_names_with_control(table, None).await
+    current_equality_delete_column_names_with_control(table, None)
+        .await
+        .map_err(|error| error.message().to_owned())
 }
 
 pub(crate) async fn current_equality_delete_column_names_with_control(
     table: &Table,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
-) -> Result<Vec<String>, String> {
-    let check_active = || -> Result<(), String> {
+) -> Result<Vec<String>, novarocks_spi::connector::ConnectorError> {
+    let unavailable = |message| {
+        novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+            message,
+        )
+        .with_retryable_before_progress()
+    };
+    let check_active = || -> Result<(), novarocks_spi::connector::ConnectorError> {
         if let Some(control) = control {
-            control.check_active().map_err(|error| error.to_string())?;
+            control.check_active()?;
         }
         Ok(())
     };
@@ -297,7 +313,7 @@ pub(crate) async fn current_equality_delete_column_names_with_control(
     let file_io = table.file_io();
     let manifest_list = crate::manifest::load_manifest_list(snapshot, file_io, metadata)
         .await
-        .map_err(|error| format!("load manifest list: {error}"))?;
+        .map_err(|error| unavailable(format!("load manifest list: {error}")))?;
     check_active()?;
     let mut columns = Vec::new();
     for manifest_file in manifest_list.entries() {
@@ -308,7 +324,11 @@ pub(crate) async fn current_equality_delete_column_names_with_control(
         let manifest = crate::manifest::load_manifest(manifest_file, file_io)
             .await
             .map_err(|error| {
-                with_variant_statistics_hint(format!("load manifest: {error}"), metadata)
+                if error.kind() == crate::iceberg::ErrorKind::FeatureUnsupported {
+                    crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::raw_read_failure(error)
+                } else {
+                    unavailable(with_variant_statistics_hint(format!("load manifest: {error}"), metadata))
+                }
             })?;
         check_active()?;
         for entry in manifest.entries() {
@@ -321,17 +341,20 @@ pub(crate) async fn current_equality_delete_column_names_with_control(
                 continue;
             }
             if data_file.file_format() != DataFileFormat::Parquet {
-                return Err(format!(
+                return Err(unavailable(format!(
                     "unsupported iceberg equality-delete file format {:?}: {}",
                     data_file.file_format(),
                     data_file.file_path()
-                ));
+                )));
             }
-            columns.extend(equality_delete_column_names_for_field_ids(
-                data_file.file_path(),
-                data_file.equality_ids(),
-                &field_id_to_name,
-            )?);
+            columns.extend(
+                equality_delete_column_names_for_field_ids(
+                    data_file.file_path(),
+                    data_file.equality_ids(),
+                    &field_id_to_name,
+                )
+                .map_err(unavailable)?,
+            );
         }
     }
     check_active()?;
@@ -440,7 +463,9 @@ pub async fn extract_data_files_with_stats_at(
     table: &Table,
     snapshot_id: i64,
 ) -> Result<Vec<DataFileWithStats>, String> {
-    extract_data_files_with_stats_at_with_control(table, snapshot_id, None).await
+    extract_data_files_with_stats_at_with_control(table, snapshot_id, None)
+        .await
+        .map_err(|error| error.message().to_owned())
 }
 
 /// Original statistics and the original typed facts they do not expose.
@@ -490,7 +515,7 @@ pub(crate) async fn extract_data_files_with_stats_at_with_control(
     table: &Table,
     snapshot_id: i64,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
-) -> Result<Vec<DataFileWithStats>, String> {
+) -> Result<Vec<DataFileWithStats>, novarocks_spi::connector::ConnectorError> {
     extract_data_files_with_stats_at_projected(table, snapshot_id, control, |stats, _, _| stats)
         .await
 }
@@ -507,7 +532,7 @@ pub(crate) async fn extract_data_files_with_stats_at_projected<O>(
         std::sync::Arc<crate::read_model::IcebergDataFileMetadata>,
         crate::delete_semantics::LoadView,
     ) -> O,
-) -> Result<Vec<O>, String> {
+) -> Result<Vec<O>, novarocks_spi::connector::ConnectorError> {
     let read_snapshot =
         crate::read_snapshot::build_read_snapshot_at_with_control(table, snapshot_id, control)
             .await?;
@@ -518,6 +543,13 @@ pub(crate) async fn extract_data_files_with_stats_at_projected<O>(
         control,
         project,
     )
+    .map_err(|message| {
+        novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+            message,
+        )
+        .with_retryable_before_progress()
+    })
 }
 
 /// The original pure projection, shared by scoped CPU continuations after the
@@ -542,7 +574,9 @@ pub(crate) fn finish_data_files_with_stats_from_original_files<O>(
         .into_iter()
         .map(|file| {
             if let Some(control) = control {
-                control.check_active().map_err(|error| error.to_string())?;
+                control
+                    .check_active()
+                    .map_err(|error| error.message().to_owned())?;
             }
             let partition_field_values =
                 match (file.partition_spec_id, file.partition_values.as_ref()) {
@@ -610,7 +644,9 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_control(
         .into_iter()
         .map(|file| {
             if let Some(control) = control {
-                control.check_active().map_err(|error| error.to_string())?;
+                control
+                    .check_active()
+                    .map_err(|error| error.message().to_owned())?;
             }
             let partition_field_values =
                 match (file.partition_spec_id, file.partition_values.as_ref()) {
@@ -740,15 +776,17 @@ pub(crate) fn finish_checked_cow_data_files_from_original_files(
 pub async fn extract_data_files_with_stats(
     table: &Table,
 ) -> Result<Vec<DataFileWithStats>, String> {
-    extract_data_files_with_stats_with_control(table, None).await
+    extract_data_files_with_stats_with_control(table, None)
+        .await
+        .map_err(|error| error.message().to_owned())
 }
 
 pub(crate) async fn extract_data_files_with_stats_with_control(
     table: &Table,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
-) -> Result<Vec<DataFileWithStats>, String> {
+) -> Result<Vec<DataFileWithStats>, novarocks_spi::connector::ConnectorError> {
     if let Some(control) = control {
-        control.check_active().map_err(|error| error.to_string())?;
+        control.check_active()?;
     }
     let files = match table.metadata().current_snapshot() {
         Some(snapshot) => {
@@ -758,7 +796,7 @@ pub(crate) async fn extract_data_files_with_stats_with_control(
         None => Ok(Vec::new()),
     }?;
     if let Some(control) = control {
-        control.check_active().map_err(|error| error.to_string())?;
+        control.check_active()?;
     }
     Ok(files)
 }

@@ -68,19 +68,20 @@ pub(crate) fn prepare_row_mutation(
             "admitted Iceberg row-mutation table is missing frozen metadata",
         )
     })?;
-    let metadata: TableMetadata =
-        crate::metadata_json::from_str(table.serialized_metadata.as_deref().ok_or_else(|| {
+    let metadata: TableMetadata = crate::metadata_json::from_metadata_str(
+        table.serialized_metadata.as_deref().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "admitted Iceberg row-mutation table has no serialized metadata",
             )
-        })?)
-        .map_err(|error| {
-            ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                format!("decode admitted Iceberg row-mutation metadata: {error}"),
-            )
-        })?;
+        })?,
+    )
+    .map_err(|error| {
+        ConnectorError::new(
+            error.connector_kind(ConnectorErrorKind::CorruptData),
+            format!("decode admitted Iceberg row-mutation metadata: {error}"),
+        )
+    })?;
     // The managed-materialized-view rejection deliberately does NOT live here.
     // Incremental MV refresh drives its own change-stream writes through this
     // same admission, so a check at this level cannot tell a user DML statement
