@@ -1433,8 +1433,10 @@ fn start_real_unit_receiver_service(
 #[cfg(novarocks_dev_controls)]
 #[tokio::test]
 async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_decoder_failure() {
+    use crate::backend_task_execution::execution_host::tests::{
+        declared_exchange_recipe, encode_declared_exchange_unit,
+    };
     use novarocks_execution::exec::chunk::Chunk;
-    use novarocks_execution::runtime::exchange::encode_chunks;
     use novarocks_execution_contract::ordered_retained_stream::exchange::{
         ExchangeAdmissionVerdict, ExchangeUnitDemand, ExchangeUnitItem,
     };
@@ -1467,15 +1469,24 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
         .install_test_observer(registry_key, observation.clone())
         .unwrap();
     let receiver = port.receiver_handle(key, 1).unwrap();
-    // An actual, well-formed IPC Int32 field violates the receiver's frozen
-    // Int64 declaration. The original reader, rather than a test callback,
-    // must reject it after the first RPC's outcome has become unknown.
+    // Keep the receiver's valid NRU1 header and recipe digest, but give its
+    // Int64 decoder an actual Int32 batch body. With no Schema message, the
+    // four-byte values buffer must fail the receiver's eight-byte geometry
+    // check after the first RPC's outcome has become unknown.
     let chunk = Chunk::try_new_with_columns(
         real_unit_schema(factory.as_ref(), arrow::datatypes::DataType::Int32),
         vec![Arc::new(arrow::array::Int32Array::from(vec![7]))],
     )
     .unwrap();
-    let payload = Bytes::from(encode_chunks(&[chunk], true).unwrap());
+    let mut payload = encode_declared_exchange_unit(&chunk);
+    let receiver_recipe = declared_exchange_recipe(&real_unit_schema(
+        factory.as_ref(),
+        arrow::datatypes::DataType::Int64,
+    ));
+    assert_eq!(&payload[..4], b"NRU1");
+    payload[4..36].copy_from_slice(receiver_recipe.digest());
+    assert_eq!(&payload[4..36], receiver_recipe.digest());
+    let payload = Bytes::from(payload);
     let demand = ExchangeUnitDemand {
         sequence: ExchangeUnitSequence::FIRST,
         wire_bytes: payload.len() as u64,
@@ -1526,7 +1537,8 @@ async fn authenticated_tonic_unknown_reply_and_decoding_replay_preserve_real_dec
         let original = accepted.originating_failure().expect("an originating decoder failure");
         let projected = failure.error().unwrap();
         assert!(std::ptr::eq(projected.cause(), original.cause()));
-        assert!(original.detail().contains("expected=Int64") && original.detail().contains("actual=Int32"), "the original IPC field type guard must author the failure: {original}");
+        assert!(original.detail().contains("IPC fixed-width values are too short"), "the original unit body geometry guard must author the failure: {original}");
+        assert!(!original.detail().contains("recipe digest or version differs"), "the valid receiver header must reach body validation: {original}");
         assert_eq!(observation.exits.load(Ordering::Acquire), 1);
         assert!(receiver.try_pop_next_with_stats(1).unwrap().is_none());
         assert_eq!(registry.unit_sender_states(stream.source().task().backend_process_id(), None, 1)[0].facts.custody_through, 0);
