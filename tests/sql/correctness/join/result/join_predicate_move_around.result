@@ -74,7 +74,7 @@ v1	v2	v3	v4	v5	v6
 v1	v2	v3	v4	v5	v6
 
 -- query 35
--- legacy
+-- types	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6
 1	1	1	NULL	NULL	NULL
 
@@ -83,7 +83,7 @@ v1	v2	v3	v4	v5	v6
 v1	v2	v3	v4	v5	v6
 
 -- query 37
--- legacy
+-- types	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6
 
 -- query 38
@@ -270,7 +270,7 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	1	1	1	511	511	511	2	6	3
 
 -- query 52
--- legacy
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	1	1	1	10	10	10	2	2	2
 2	2	2	1	1	1	10	10	10	2	6	3
@@ -326,7 +326,7 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 0	0	0	NULL	NULL	NULL	511	511	511	NULL	NULL	NULL
 
 -- query 53
--- legacy
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 1	1	1	0	0	0	10	10	10	2	2	2
 1	1	1	0	0	0	20	20	20	2	2	2
@@ -491,7 +491,7 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	1	1	1	511	511	511	2	6	3
 
 -- query 55
--- legacy
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	1	1	1	10	10	10	2	2	2
 2	2	2	1	1	1	20	20	20	2	2	2
@@ -523,7 +523,7 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 1	1	1	0	0	0	511	511	511	2	6	3
 
 -- query 56
--- legacy
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 2	2	2	1	1	1	10	10	10	2	2	2
 2	2	2	1	1	1	20	20	20	2	2	2
@@ -556,7 +556,7 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	511	511	511
 
 -- query 57
--- legacy
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 1	1	1	0	0	0	10	10	10	2	2	2
 1	1	1	0	0	0	20	20	20	2	2	2
@@ -686,7 +686,7 @@ v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 10	10	10	10	10	10	10	10	10	10	10	10
 
 -- query 59
--- legacy
+-- types	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint	bigint
 v1	v2	v3	v4	v5	v6	v7	v8	v9	v10	v11	v12
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	75	75	75
 NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	-20	-5	-30

@@ -5,36 +5,36 @@ id	amount
 3	70
 
 -- query 6
--- legacy
+-- types	integer	bigint
 id	amount
 1	100
 3	70
 4	60
 
 -- query 8
--- legacy
+-- types	integer	bigint
 id	amount
 3	70
 4	60
 
 -- query 10
--- legacy
+-- types	integer	bigint
 id	amount
 3	90
 4	60
 
 -- query 12
--- legacy
+-- types	integer	bigint
 id	amount
 3	90
 
 -- query 14
--- legacy
+-- types	integer	bigint
 id	amount
 2	55
 3	90
 
 -- query 16
--- legacy
+-- types	integer	bigint
 id	amount
 2	55

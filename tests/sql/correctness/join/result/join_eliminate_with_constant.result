@@ -72,14 +72,14 @@ col1
 2000-01-01
 
 -- query 15
--- legacy
+-- types	integer	integer	integer	date	varchar
 l_orderkey	l_partkey	l_suppkey	l_shipdate	col1
 1	1	1	2000-01-01	2000-01-01
 1	2	1	2000-01-01	2000-01-01
 1	3	2	2000-01-02	NULL
 
 -- query 16
--- legacy
+-- types	integer	integer	integer	date	varchar
 l_orderkey	l_partkey	l_suppkey	l_shipdate	col1
 11	1	11	2000-01-01	2000-01-01
 11	2	1	2000-01-02	NULL

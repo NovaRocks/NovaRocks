@@ -49,7 +49,7 @@ id1	id2
 9	900
 
 -- query 13
--- legacy
+-- types	integer	integer	varchar	integer	varchar	decimal(10, 2)	varchar	varchar	decimal(8, 2)
 id1	id2	name	age	city	salary	status	dept	bonus
 3	300	Charlie	35	Chicago	7000.00	Inactive	NULL	NULL
 4	NULL	David	28	Denver	5500.00	Active	NULL	NULL
@@ -128,7 +128,7 @@ id1	name	age	city	id2	salary	status	dept	bonus	id2
 9	NULL	NULL	NULL	NULL	NULL	NULL	Finance	NULL	900
 
 -- query 23
--- legacy
+-- types	integer	varchar	integer	varchar	integer	decimal(10, 2)	varchar	varchar	decimal(8, 2)	integer
 id1	name	age	city	id2	salary	status	dept	bonus	id2
 3	Charlie	35	Chicago	300	7000.00	Inactive	NULL	NULL	NULL
 4	David	28	Denver	NULL	5500.00	Active	NULL	NULL	NULL

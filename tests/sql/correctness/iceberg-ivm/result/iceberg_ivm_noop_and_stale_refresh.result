@@ -21,7 +21,7 @@ order_id	amount	region
 2	20	west
 
 -- query 10
--- legacy
+-- types	integer	bigint	varchar
 order_id	amount	region
 1	10	east
 2	20	west

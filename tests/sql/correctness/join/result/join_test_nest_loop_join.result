@@ -1,5 +1,5 @@
 -- query 1
--- legacy
+-- types	varchar	bigint	bigint	bigint	bigint	bigint
 scenario	row_count	left_non_null	right_non_null	sum_left	sum_right
 01_inner	7	7	7	26	10
 02_left_outer	8	8	7	27	10
@@ -11,7 +11,7 @@ scenario	row_count	left_non_null	right_non_null	sum_left	sum_right
 08_right_anti	4	0	4	0	26
 
 -- query 2
--- legacy
+-- types	varchar	bigint	bigint	bigint	bigint	bigint
 scenario	row_count	left_non_null	right_non_null	sum_left	sum_right
 01_inner	0	0	0	0	0
 02_left_outer	5	5	0	15	0
@@ -23,7 +23,7 @@ scenario	row_count	left_non_null	right_non_null	sum_left	sum_right
 08_right_anti	0	0	0	0	0
 
 -- query 3
--- legacy
+-- types	varchar	bigint	bigint	bigint	bigint	bigint
 scenario	row_count	left_non_null	right_non_null	sum_left	sum_right
 01_inner	0	0	0	0	0
 02_left_outer	0	0	0	0	0

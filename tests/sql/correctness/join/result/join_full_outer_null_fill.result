@@ -1,5 +1,5 @@
 -- query 7
--- legacy
+-- types	integer	varchar	varchar
 id_key	lv	rv
 1	L1	NULL
 2	L2	R2

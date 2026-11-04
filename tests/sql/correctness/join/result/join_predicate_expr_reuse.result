@@ -44,7 +44,7 @@ count(*)
 0
 
 -- query 16
--- legacy
+-- types	bigint
 count(*)
 44
 
@@ -74,7 +74,7 @@ count(*)
 0
 
 -- query 22
--- legacy
+-- types	bigint	bigint
 count(*)	abs(${case_db}.pre_t0.v1)
 1	6
 1	7
@@ -82,5 +82,5 @@ count(*)	abs(${case_db}.pre_t0.v1)
 1	9
 
 -- query 23
--- legacy
+-- types	bigint	bigint
 count(*)	abs(${case_db}.pre_t0.v1)

@@ -11,12 +11,12 @@ APAC	466	303135
 EMEA	234	152215
 
 -- query 8
--- legacy
+-- types	bigint
 updated_in_mv
 50
 
 -- query 9
--- legacy
+-- types	varchar	bigint	bigint
 region	cnt	total
 APAC	494	335142
 EMEA	248	167546
