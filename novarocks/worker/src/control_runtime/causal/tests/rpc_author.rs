@@ -387,3 +387,167 @@ fn foreign_ledger_whole_author_with_the_same_numeric_scope_and_work_returns_ever
         RpcAuthorAdmissionError::Causal(CausalError::Driver(DriverError::InputAuthorMismatch))
     ));
 }
+
+/// End only the original producer positions. The independent, already-admitted
+/// RPC still owns its original cut, Source2 and whole R author throughout.
+fn retire_original_producer_pairs(h: &Harness) {
+    use crate::task_proposal_ingress::PairRoute;
+
+    h.ingress.seal_source_admission();
+    assert!(h.ingress.open_summary_drained());
+    for route in [PairRoute::Open, PairRoute::ConsumingOpen] {
+        h.inbox
+            .lock()
+            .unwrap()
+            .observe_closed_source_pair(route)
+            .unwrap();
+        h.fixture
+            .ledger
+            .reap_scope_ready(h.fixture.scope.id(), 256)
+            .unwrap();
+        let reaped = h
+            .ingress
+            .prepare_pair_reap(route)
+            .unwrap()
+            .map(|probe| probe.observe_reaped().unwrap());
+        let storage = h
+            .ingress
+            .release_physically_closed_producer_pair(route, reaped)
+            .unwrap();
+        // These exact original Source headers/reports and backing storage have
+        // really exited before the same admitted RPC sender is invoked.
+        drop(storage);
+    }
+}
+
+/// The two producer pairs were already physically detached by the actual
+/// original API. Do not mint substitutes merely to use the ordinary wrapper.
+fn finish_after_producer_storage_exit(mut h: Harness) {
+    use crate::task_proposal_ingress::{IngressError, PairRoute};
+    use novarocks_worker_protocol::proposal_summary::CutError;
+
+    h.exit_author();
+    assert!(h.inbox.lock().unwrap().is_empty());
+    for route in [PairRoute::Open, PairRoute::ConsumingOpen] {
+        assert!(matches!(
+            h.ingress.pair_inventory(route),
+            Err(IngressError::Cut(CutError::Unknown))
+        ));
+    }
+    assert_eq!(h.ingress.retained_sources(), 0);
+    drop(h.inbox);
+    drop(h.ingress);
+    h.fixture
+        .ledger
+        .reap_scope_ready(h.fixture.scope.id(), 256)
+        .unwrap();
+    h.capacity
+        .release_quota(&h.capacity.resources().unwrap().quota)
+        .unwrap();
+    h.capacity.finish().unwrap();
+    // This original fixture closes/removes the actual actor and Scope and
+    // asserts that its complete real ledger is empty before returning.
+    h.fixture.finish();
+}
+
+#[test]
+fn admitted_rpc_sender_can_fill_after_original_producer_storage_physically_exits() {
+    let h = Harness::new();
+    let (
+        RpcAuthorAdmission {
+            cut,
+            role,
+            mut authority,
+            sender,
+            input_author,
+        },
+        report,
+    ) = admit_original(&h);
+    authority.start().unwrap();
+    retire_original_producer_pairs(&h);
+    let original_r_still_started = role.phase() == ExitRolePhase::Started;
+    let original_cut_still_owned = h.inbox.lock().unwrap().last_cut() == Some(cut);
+    let no_event_before_fill = h.inbox.lock().unwrap().rpc_delivery(cut).unwrap().is_none();
+    let original_report_pending =
+        report.consumption(ConsumerId::new(1).unwrap()).unwrap() == Consumption::Pending;
+
+    let (sender_registered, original_input_returned, original_r_retired, core_replied) =
+        match sender.send_input(ContextInput::Request(ContextCommand::Cancel {
+            task: h.task,
+            reason: CancelReason::UpstreamNoLongerNeeded,
+        })) {
+            Ok(returned) => {
+                h.inbox
+                    .lock()
+                    .unwrap()
+                    .observe_rpc_author_return(returned)
+                    .unwrap();
+                let delivery = h.inbox.lock().unwrap().deliver_next().unwrap().unwrap();
+                h.fixture.runtime.poll_one(Tick(2)).unwrap();
+                assert_eq!(
+                    h.inbox.lock().unwrap().observe_core(cut).unwrap(),
+                    Consumption::Consumed
+                );
+                if let Some(prefix) = delivery.prefix {
+                    complete_model_effects(&h, prefix);
+                }
+                let effects = complete_model_effects(&h, delivery.event);
+                let core_replied = effects.iter().any(|effect| {
+                    matches!(effect,
+                        WorkerAction::Reply(reply)
+                            if reply.request.token == delivery.event
+                                && reply.request.operation == metadata().operation)
+                });
+                authority.exited().unwrap();
+                report.consume(ConsumerId::new(1).unwrap()).unwrap();
+                report.consume(ConsumerId::new(2).unwrap()).unwrap();
+                let original_r_retired = main_retired(&h, &role);
+                if let Some(prefix) = delivery.prefix {
+                    h.fixture.runtime.retire_input(actor(), prefix).unwrap();
+                }
+                h.fixture
+                    .runtime
+                    .retire_input(actor(), delivery.event)
+                    .unwrap();
+                h.inbox.lock().unwrap().observe_effects_exited(cut).unwrap();
+                h.ingress.consume_cut(cut, 0).unwrap();
+                (true, true, original_r_retired, core_replied)
+            }
+            Err(RpcInputRefusal { input, returned }) => {
+                let original_input_returned = matches!(&input,
+                    ContextInput::Request(ContextCommand::Cancel { task, reason })
+                        if *task == h.task && *reason == CancelReason::UpstreamNoLongerNeeded);
+                // The failed send retained the same input and unique return.
+                // No publication occurred, so the original holder explicitly
+                // revokes its still-reserved event rather than inventing a
+                // Core receipt or dropping an unresolved author.
+                drop(input);
+                h.ingress.revoke_event(cut).unwrap();
+                h.inbox
+                    .lock()
+                    .unwrap()
+                    .observe_rpc_author_return(returned)
+                    .unwrap();
+                h.inbox.lock().unwrap().observe_effects_exited(cut).unwrap();
+                authority.withdraw_unpublished_and_exit().unwrap();
+                let original_r_retired = main_retired(&h, &role);
+                (false, original_input_returned, original_r_retired, false)
+            }
+        };
+    drop(input_author);
+    let retired = retire_cut(&h, cut);
+    h.dispose_pair(retired);
+    finish_after_producer_storage_exit(h);
+    eprintln!("RPC producer-storage fixture cleanup complete: ledger_empty=true");
+
+    // Every expected-RED assertion follows original input/R/Source2 disposal
+    // and the complete real actor/Scope/ledger cleanup above.
+    assert!(original_r_still_started && original_cut_still_owned);
+    assert!(no_event_before_fill && original_report_pending);
+    assert!(original_input_returned && original_r_retired);
+    assert!(
+        sender_registered,
+        "an already-admitted original RPC sender was refused after original producer storage exit"
+    );
+    assert!(core_replied);
+}
