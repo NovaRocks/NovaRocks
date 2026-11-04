@@ -42,7 +42,7 @@ use crate::query_execution::package_freeze::CompiledPackageCarrier;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_query_application::api::BackendTopologyService;
 use novarocks_query_application::api::{BackendCommandExecutor, BackendTopologyCommandPort};
-use novarocks_query_application::system_catalog::SystemCatalog;
+use novarocks_query_application::system_catalog::SystemCatalogRelations;
 use novarocks_query_application::view::ViewService;
 use novarocks_spi::connector::MvStorageObservationPort;
 
@@ -70,7 +70,7 @@ pub(crate) struct QueryCompilerPorts {
     backend_topology: BackendTopologyService,
     exchange_port: u16,
     view_service: Arc<dyn ViewService>,
-    system_catalog: Arc<dyn SystemCatalog>,
+    system_relations: SystemCatalogRelations,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_candidate_reader: MvCandidateReader,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -92,7 +92,7 @@ impl QueryCompilerPorts {
         backend_topology: BackendTopologyService,
         exchange_port: u16,
         view_service: Arc<dyn ViewService>,
-        system_catalog: Arc<dyn SystemCatalog>,
+        system_relations: SystemCatalogRelations,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         mv_candidate_reader: MvCandidateReader,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -112,7 +112,7 @@ impl QueryCompilerPorts {
             backend_topology,
             exchange_port,
             view_service,
-            system_catalog,
+            system_relations,
             mv_readiness,
             mv_candidate_reader,
             mv_storage_observation,
@@ -142,15 +142,10 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         Arc::clone(&ports.connector_control),
         ports.view_service,
         ports.constant_policy,
+        ports.system_relations.clone(),
     );
     let system_tables = domain::SystemTableQueryKernel::new(
-        Arc::new(
-            crate::catalog_application::system_catalog_facts::FrontendSystemCatalogFacts::new(
-                ports.catalog_service,
-                ports.connector_control,
-            ),
-        ),
-        ports.system_catalog,
+        ports.system_relations.clone(),
         Arc::clone(&ports.mv_readiness),
     );
     FrontendQueryCompiler::new(
@@ -174,6 +169,7 @@ pub struct DmlEnginePorts {
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     view_service: Arc<dyn ViewService>,
+    system_relations: SystemCatalogRelations,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
@@ -208,9 +204,11 @@ impl DmlEnginePorts {
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
         view_service: Arc<dyn ViewService>,
+        system_relations: SystemCatalogRelations,
     ) -> Self {
         Self {
             view_service,
+            system_relations,
             functions,
             constant_policy,
             static_plan_carrier,
@@ -244,6 +242,7 @@ impl DmlEnginePorts {
                 self.constant_policy,
                 self.static_plan_carrier.clone(),
                 Arc::clone(&self.view_service),
+                self.system_relations.clone(),
             ),
             self.catalog_application.clone(),
             Arc::clone(&self.connector_control),
@@ -492,6 +491,7 @@ pub fn maintenance_read_command_executor(
 #[derive(Clone)]
 pub struct MvCommandPorts {
     view_service: Arc<dyn ViewService>,
+    system_relations: SystemCatalogRelations,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
@@ -529,9 +529,11 @@ impl MvCommandPorts {
         >,
         constant_policy: novarocks_functions::ConstantPolicy,
         view_service: Arc<dyn ViewService>,
+        system_relations: SystemCatalogRelations,
     ) -> Self {
         Self {
             view_service,
+            system_relations,
             functions,
             constant_policy,
             catalog_service,
@@ -561,6 +563,7 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
             Arc::clone(&ports.management_entrance),
             ports.constant_policy,
             ports.view_service,
+            ports.system_relations.clone(),
         );
     mv_command::MvCommandExecutor::new(
         iceberg_ports,
@@ -580,6 +583,7 @@ pub struct ViewCommandPorts {
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     view_service: Arc<dyn ViewService>,
+    system_relations: SystemCatalogRelations,
 }
 
 impl ViewCommandPorts {
@@ -590,6 +594,7 @@ impl ViewCommandPorts {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         view_service: Arc<dyn ViewService>,
         constant_policy: novarocks_functions::ConstantPolicy,
+        system_relations: SystemCatalogRelations,
     ) -> Self {
         Self {
             constant_policy,
@@ -598,6 +603,7 @@ impl ViewCommandPorts {
             catalog_application,
             connector_control,
             view_service,
+            system_relations,
         }
     }
 }
@@ -610,6 +616,7 @@ pub(crate) fn view_command_executor(ports: ViewCommandPorts) -> ViewCommandExecu
         ports.connector_control,
         ports.view_service,
         ports.constant_policy,
+        ports.system_relations.clone(),
     ))
 }
 
@@ -672,6 +679,7 @@ pub fn bind_catalog_runtime_projection(
 #[derive(Clone)]
 pub(crate) struct MvRefreshProviderActivationPorts {
     view_service: Arc<dyn ViewService>,
+    system_relations: SystemCatalogRelations,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: CompiledPackageCarrier,
@@ -711,9 +719,11 @@ impl MvRefreshProviderActivationPorts {
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
         view_service: Arc<dyn ViewService>,
+        system_relations: SystemCatalogRelations,
     ) -> Self {
         Self {
             view_service,
+            system_relations,
             functions,
             constant_policy,
             static_plan_carrier,
@@ -761,6 +771,7 @@ pub(crate) fn mv_refresh_provider_activation(
             ports.mv_management_entrance,
             ports.constant_policy,
             ports.view_service,
+            ports.system_relations.clone(),
         );
     Arc::new(
         crate::query_execution::mv_assembly::iceberg_activation::IcebergMvRefreshProviderActivation::new(
@@ -892,6 +903,7 @@ fn original_maintenance_context(
 #[derive(Clone)]
 pub(crate) struct MvBackgroundPorts {
     view_service: Arc<dyn ViewService>,
+    system_relations: SystemCatalogRelations,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
@@ -913,9 +925,11 @@ impl MvBackgroundPorts {
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
         constant_policy: novarocks_functions::ConstantPolicy,
         view_service: Arc<dyn ViewService>,
+        system_relations: SystemCatalogRelations,
     ) -> Self {
         Self {
             view_service,
+            system_relations,
             functions,
             constant_policy,
             catalog_service,
@@ -947,6 +961,7 @@ impl MvBackgroundPorts {
             self.management_entrance,
             self.constant_policy,
             self.view_service,
+            self.system_relations.clone(),
         )
     }
 }

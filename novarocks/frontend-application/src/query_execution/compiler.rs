@@ -1108,7 +1108,10 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
     crate::query_execution::completion_facts::install_frontend_fact_source(
         provider_source,
         state.completion_fact_owners()?,
-        scope,
+        scope.with_definition_owned(
+            state.constant_policy(),
+            crate::query_execution::planning::sql_compile_control_from_execution(execution),
+        ),
         typed_connector_session()?,
     )?;
     let mut prepared = query.clone();

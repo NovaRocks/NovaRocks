@@ -41,6 +41,7 @@ use novarocks_sql::planning::catalog::{
 };
 
 mod relation;
+mod system;
 
 /// Project a provider-neutral SPI metadata materialization into the
 /// request-local SQL binding. Provider aliases retain their separately frozen
@@ -244,6 +245,8 @@ pub struct CatalogServiceMaterializer<'a> {
     bindings: Arc<QueryTableBindingStore>,
     loader: Box<dyn QueryTableBindingLoader + 'a>,
     local_views: Option<novarocks_query_application::view::LocalViewSnapshot>,
+    system_relations: Option<novarocks_query_application::system_catalog::SystemCatalogRelations>,
+    definition_inputs: Option<system::DefinitionInputs>,
     /// Typed classification paired with binding-store failure memoization.
     /// The binding store owns the canonical at-most-once load; this sidecar
     /// retains the original typed producer failure at legacy string-compatible
@@ -348,6 +351,8 @@ impl<'a> CatalogServiceMaterializer<'a> {
             bindings,
             loader,
             local_views: None,
+            system_relations: None,
+            definition_inputs: None,
             resolution_errors: Mutex::new(HashMap::new()),
             original_resolution_errors: Mutex::new(HashMap::new()),
             catalog_application: None,
@@ -356,6 +361,27 @@ impl<'a> CatalogServiceMaterializer<'a> {
                 .map(|overlay| (overlay.key(), overlay))
                 .collect(),
         }
+    }
+
+    pub(crate) fn with_system_relations(
+        mut self,
+        source: novarocks_query_application::system_catalog::SystemCatalogRelations,
+    ) -> Self {
+        self.system_relations = Some(source);
+        self
+    }
+    pub(crate) fn with_definition_inputs(
+        mut self,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+        policy: novarocks_functions::ConstantPolicy,
+        control: novarocks_sql::compiler::SqlCompileControl,
+    ) -> Self {
+        self.definition_inputs = Some(system::DefinitionInputs {
+            context,
+            policy,
+            control,
+        });
+        self
     }
 
     pub(crate) fn with_local_views(

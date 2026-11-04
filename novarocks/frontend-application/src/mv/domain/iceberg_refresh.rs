@@ -128,6 +128,7 @@ use novarocks_types::naming::{TableIdentity, normalize_identifier};
 #[derive(Clone)]
 pub struct IcebergMvCorePorts {
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
+    system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
@@ -146,6 +147,10 @@ impl IcebergMvCorePorts {
     /// Construct a complete MV capability graph from the original role leaves.
     /// Source preparation and staged publication share the exact typed host;
     /// a background refresh cannot be composed with only the erased registry.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Composition explicitly names the original role leaves rather than introducing a service locator for the shared system relation source."
+    )]
     pub(crate) fn new_with_management_entrance(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -157,9 +162,11 @@ impl IcebergMvCorePorts {
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
         constant_policy: novarocks_functions::ConstantPolicy,
         view_service: Arc<dyn novarocks_query_application::view::ViewService>,
+        system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
     ) -> Self {
         Self {
             view_service,
+            system_relations,
             functions,
             constant_policy,
             catalog_service,
@@ -170,6 +177,12 @@ impl IcebergMvCorePorts {
             storage_observation,
             management_entrance: Some(management_entrance),
         }
+    }
+
+    pub(crate) fn system_relations(
+        &self,
+    ) -> &novarocks_query_application::system_catalog::SystemCatalogRelations {
+        &self.system_relations
     }
 
     pub(crate) fn view_service(&self) -> &Arc<dyn novarocks_query_application::view::ViewService> {

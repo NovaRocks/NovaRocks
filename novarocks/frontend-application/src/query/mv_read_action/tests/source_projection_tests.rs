@@ -490,31 +490,54 @@ impl SourceFixture {
         if self.background_composition {
             // Exercise the same composition factory used by the production
             // background bindings, then the real SourceRead/public adapter path.
-            return crate::capabilities::MvBackgroundPorts::new(
+            return {
+                let trc_catalog = Arc::new(
+                    crate::catalog_application::query_catalog::new_query_catalog_service(),
+                );
+                let trc_controls = host.clone();
+                let trc_system_relations = crate::query_execution::kernels::test_system_relations(
+                    trc_catalog.clone(),
+                    trc_controls.clone(),
+                );
+                crate::capabilities::MvBackgroundPorts::new(
+                    Arc::new(
+                        novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap(),
+                    ),
+                    trc_catalog.clone(),
+                    None,
+                    trc_controls.clone(),
+                    readiness,
+                    self.clone(),
+                    entrance,
+                    crate::application::test_constant_policy(),
+                    Arc::new(novarocks_query_application::view::QueryViewService::new()),
+                    trc_system_relations,
+                )
+            }
+            .into_core_ports(host);
+        }
+        {
+            let trc_catalog =
+                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
+            let trc_controls = host.clone();
+            let trc_system_relations = crate::query_execution::kernels::test_system_relations(
+                trc_catalog.clone(),
+                trc_controls.clone(),
+            );
+            IcebergMvCorePorts::new_with_management_entrance(
                 Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
-                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
+                trc_catalog.clone(),
                 None,
-                host.clone(),
+                trc_controls.clone(),
+                host,
                 readiness,
                 self.clone(),
                 entrance,
                 crate::application::test_constant_policy(),
                 Arc::new(novarocks_query_application::view::QueryViewService::new()),
+                trc_system_relations,
             )
-            .into_core_ports(host);
         }
-        IcebergMvCorePorts::new_with_management_entrance(
-            Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),
-            Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
-            None,
-            host.clone(),
-            host,
-            readiness,
-            self.clone(),
-            entrance,
-            crate::application::test_constant_policy(),
-            Arc::new(novarocks_query_application::view::QueryViewService::new()),
-        )
     }
 }
 // The retained control generation authenticates this closed fixture author.

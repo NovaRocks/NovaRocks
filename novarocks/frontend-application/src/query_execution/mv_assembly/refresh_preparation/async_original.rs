@@ -358,7 +358,13 @@ pub(crate) async fn capture_catalog(
         input.overlays,
         input.ports.catalog_application(),
     )
-    .with_local_views(local_views);
+    .with_local_views(local_views)
+    .with_system_relations(input.ports.system_relations().clone())
+    .with_definition_inputs(
+        input.context.clone(),
+        input.ports.constant_policy(),
+        input.control.clone(),
+    );
     while !preparation.needs().is_empty() {
         let mut facts = Vec::with_capacity(preparation.needs().len());
         for need in preparation.needs() {

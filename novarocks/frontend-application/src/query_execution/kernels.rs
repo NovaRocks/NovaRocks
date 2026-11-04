@@ -33,8 +33,7 @@ use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_query_application::api::BackendTopologyService;
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_query_application::sql::catalog::SessionCatalogPort;
-use novarocks_query_application::system_catalog::SystemCatalog;
-use novarocks_query_application::system_catalog_rewrite::SystemCatalogFactsPort;
+use novarocks_query_application::system_catalog::SystemCatalogRelations;
 use novarocks_query_application::view::ViewService;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::MvStorageObservationPort;
@@ -65,32 +64,33 @@ pub struct QueryPreparationKernel {
 /// or MV mutation capability.
 #[derive(Clone)]
 pub struct SystemTableQueryKernel {
-    facts_port: Arc<dyn SystemCatalogFactsPort>,
-    system_catalog: Arc<dyn SystemCatalog>,
+    system_relations: SystemCatalogRelations,
     mv_readiness: Arc<MvReadinessPort>,
 }
 
 impl SystemTableQueryKernel {
     pub fn new(
-        facts_port: Arc<dyn SystemCatalogFactsPort>,
-        system_catalog: Arc<dyn SystemCatalog>,
+        system_relations: SystemCatalogRelations,
         mv_readiness: Arc<MvReadinessPort>,
     ) -> Self {
         Self {
-            facts_port,
-            system_catalog,
+            system_relations,
             mv_readiness,
         }
     }
-
-    pub fn facts_port(&self) -> &Arc<dyn SystemCatalogFactsPort> {
-        &self.facts_port
+    pub fn system_relations(&self) -> &SystemCatalogRelations {
+        &self.system_relations
     }
-
-    pub fn system_catalog(&self) -> &Arc<dyn SystemCatalog> {
-        &self.system_catalog
+    pub fn facts_port(
+        &self,
+    ) -> &Arc<dyn novarocks_query_application::system_catalog_rewrite::SystemCatalogFactsPort> {
+        self.system_relations.facts_port()
     }
-
+    pub fn system_catalog(
+        &self,
+    ) -> &Arc<dyn novarocks_query_application::system_catalog::SystemCatalog> {
+        self.system_relations.system_catalog()
+    }
     pub(crate) fn mv_readiness(&self) -> &Arc<MvReadinessPort> {
         &self.mv_readiness
     }
@@ -177,6 +177,7 @@ pub struct DmlExecutionKernel {
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     view_service: Arc<dyn ViewService>,
+    system_relations: SystemCatalogRelations,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<ConnectorControlHost>,
@@ -200,6 +201,7 @@ pub struct DmlPlanningServices {
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     view_service: Arc<dyn ViewService>,
+    system_relations: SystemCatalogRelations,
 }
 
 impl DmlPlanningServices {
@@ -209,6 +211,7 @@ impl DmlPlanningServices {
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
         view_service: Arc<dyn ViewService>,
+        system_relations: SystemCatalogRelations,
     ) -> Self {
         Self {
             functions,
@@ -216,6 +219,7 @@ impl DmlPlanningServices {
             static_plan_carrier,
             catalog_service,
             view_service,
+            system_relations,
         }
     }
 }
@@ -232,6 +236,7 @@ impl DmlExecutionKernel {
     ) -> Self {
         let DmlPlanningServices {
             view_service,
+            system_relations,
             functions,
             constant_policy,
             static_plan_carrier,
@@ -239,6 +244,7 @@ impl DmlExecutionKernel {
         } = planning;
         Self {
             view_service,
+            system_relations,
             functions,
             constant_policy,
             static_plan_carrier,
@@ -293,6 +299,7 @@ impl DmlExecutionKernel {
                 Arc::clone(&self.mv_storage_observation),
                 blocking.clone(),
                 Arc::clone(&self.view_service),
+                self.system_relations.clone(),
             ),
         )
     }
@@ -385,9 +392,13 @@ pub struct ViewExecutionKernel {
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     view_service: Arc<dyn ViewService>,
+    system_relations: SystemCatalogRelations,
 }
 
 impl ViewExecutionKernel {
+    pub(crate) fn system_relations(&self) -> &SystemCatalogRelations {
+        &self.system_relations
+    }
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -395,6 +406,7 @@ impl ViewExecutionKernel {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         view_service: Arc<dyn ViewService>,
         constant_policy: novarocks_functions::ConstantPolicy,
+        system_relations: SystemCatalogRelations,
     ) -> Self {
         Self {
             constant_policy,
@@ -403,6 +415,7 @@ impl ViewExecutionKernel {
             catalog_application,
             connector_control,
             view_service,
+            system_relations,
         }
     }
 
@@ -738,4 +751,22 @@ mod session_catalog_tests {
         assert_eq!(error.kind(), QueryServiceErrorKind::Internal);
         assert!(error.message().contains("connector request was cancelled"));
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_system_relations(
+    catalog_service: Arc<QueryCatalogService>,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+) -> SystemCatalogRelations {
+    SystemCatalogRelations::new(
+        Arc::new(
+            crate::catalog_application::system_catalog_facts::FrontendSystemCatalogFacts::new(
+                catalog_service,
+                connector_control,
+            ),
+        ),
+        Arc::new(
+            novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+        ),
+    )
 }

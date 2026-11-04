@@ -162,7 +162,15 @@ struct LogicalCatalogInput {
     session: SqlSessionContext,
     control: SqlCompileControl,
 }
+struct SystemRelationInput {
+    source: novarocks_query_application::system_catalog::SystemCatalogRelations,
+    need: novarocks_sql::compiler::CatalogRelationNeed,
+    facts: novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts,
+    policy: novarocks_functions::ConstantPolicy,
+    control: SqlCompileControl,
+}
 enum PlanningCpuInput {
+    SystemRelation(Box<SystemRelationInput>),
     Start(Box<SqlFinalPlanCompileRequest>),
     Finish {
         compilation: SqlCompilation,
@@ -182,6 +190,9 @@ enum PlanningCpuInput {
     LogicalFinish(Box<LogicalFinishInput>),
 }
 enum PlanningCpuOutput {
+    SystemRelation(
+        Result<Option<Arc<novarocks_sql::planning::catalog::SqlInlineRelation>>, SqlCompileError>,
+    ),
     Progress(Result<SqlCompileProgress, FinalPlanCompletionError>),
     Candidate(Result<CompletedPhysicalPlanCandidate, FinalPlanCompletionError>),
     Encoded(Box<Result<ReadEncodedParts, FrontendQueryCompilerError>>),
@@ -245,6 +256,11 @@ impl PlanningCpuOriginal {
         body.started = true;
         let input = body.input.take().expect("original planning input");
         let output = match input {
+            PlanningCpuInput::SystemRelation(input) => PlanningCpuOutput::SystemRelation(
+                input
+                    .source
+                    .materialize(&input.need, input.facts, input.policy, &input.control),
+            ),
             PlanningCpuInput::Start(request) => {
                 PlanningCpuOutput::Progress(SqlCompletionPureSteps::start(*request))
             }
@@ -777,6 +793,31 @@ impl FrontendPlanningCpuSource {
             panic!("original explain returned another phase")
         };
         // The original candidate/access remain in this Source through its close.
+        Ok(result)
+    }
+    pub(crate) async fn system_relation(
+        &self,
+        source: novarocks_query_application::system_catalog::SystemCatalogRelations,
+        need: novarocks_sql::compiler::CatalogRelationNeed,
+        facts: novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts,
+        policy: novarocks_functions::ConstantPolicy,
+        control: SqlCompileControl,
+    ) -> Result<
+        Result<Option<Arc<novarocks_sql::planning::catalog::SqlInlineRelation>>, SqlCompileError>,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::SystemRelation(Box::new(
+            SystemRelationInput {
+                source,
+                need,
+                facts,
+                policy,
+                control,
+            },
+        )));
+        let PlanningCpuOutput::SystemRelation(result) = self.receive().await? else {
+            panic!("system relation returned another CPU phase")
+        };
         Ok(result)
     }
     pub(crate) async fn logical_catalog(

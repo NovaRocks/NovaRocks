@@ -393,16 +393,26 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
         runtime.handle().clone(),
         product.management_entrance().unwrap(),
     );
-    let owners = CompletionFactOwners::new(
-        Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
-        application,
-        Arc::new(ConnectorControlHost::new()),
-        Arc::new(UnifiedStatisticsResolver::default()),
-        inventory.candidate_reader(),
-        Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
-        blocking.clone(),
-        Arc::new(novarocks_query_application::view::QueryViewService::new()),
-    );
+    let owners = {
+        let trc_catalog =
+            Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
+        let trc_controls = Arc::new(ConnectorControlHost::new());
+        let trc_system_relations = crate::query_execution::kernels::test_system_relations(
+            trc_catalog.clone(),
+            trc_controls.clone(),
+        );
+        CompletionFactOwners::new(
+            trc_catalog.clone(),
+            application,
+            trc_controls.clone(),
+            Arc::new(UnifiedStatisticsResolver::default()),
+            inventory.candidate_reader(),
+            Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
+            blocking.clone(),
+            Arc::new(novarocks_query_application::view::QueryViewService::new()),
+            trc_system_relations,
+        )
+    };
     drop(inventory);
     drop(product); // The actual port/closure now owns the only repository/store aliases.
     let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());

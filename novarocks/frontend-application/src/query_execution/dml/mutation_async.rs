@@ -475,7 +475,10 @@ fn install_fact_source(
     crate::query_execution::completion_facts::install_frontend_fact_source(
         provider,
         state.completion_fact_owners()?,
-        scope,
+        scope.with_definition_owned(
+            state.constant_policy(),
+            crate::query_execution::planning::sql_compile_control_from_execution(facts.execution()),
+        ),
         crate::query_execution::compiler::typed_connector_session()?,
     )
 }

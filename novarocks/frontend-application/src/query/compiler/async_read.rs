@@ -215,7 +215,12 @@ impl FrontendQueryCompiler {
                     })?,
                     state_store,
                 )
-                .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
+                .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?
+                .with_definition_planning(
+                    self.constant_policy(),
+                    sql_compile_control_from_execution(execution),
+                    Arc::clone(planning_cpu),
+                ),
                 crate::query_execution::compiler::typed_connector_session()
                     .map_err(FrontendQueryCompilerError::Engine)?,
             )
@@ -250,7 +255,7 @@ impl FrontendQueryCompiler {
         };
         let encoding_control = request.control().clone();
         provider_source
-            .complete_in(request, scope, planning_cpu)
+            .complete_in(request, scope, planning_cpu.as_ref())
             .await?;
         if let Some(error) = provider_source.completed_error() {
             return Ok(Err(FrontendQueryCompilerError::from_completion(&error)));

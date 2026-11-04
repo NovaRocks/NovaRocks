@@ -1175,7 +1175,10 @@ async fn plan_query_for_ctas_source_async(
     crate::query_execution::completion_facts::install_frontend_fact_source(
         provider_source,
         state.completion_fact_owners().map_err(internal_failure)?,
-        scope,
+        scope.with_definition_owned(
+            state.constant_policy(),
+            crate::query_execution::planning::sql_compile_control_from_execution(execution),
+        ),
         crate::query_execution::compiler::typed_connector_session().map_err(internal_failure)?,
     )
     .map_err(internal_failure)?;

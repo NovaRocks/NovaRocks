@@ -3781,27 +3781,39 @@ mod tests {
     fn test_dml_kernel() -> DmlExecutionKernel {
         let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default());
-        DmlExecutionKernel::new(
-            crate::query_execution::kernels::DmlPlanningServices::new(
+        {
+            let trc_catalog =
+                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
+            let trc_controls = Arc::clone(&connector_control);
+            let trc_system_relations = crate::query_execution::kernels::test_system_relations(
+                trc_catalog.clone(),
+                trc_controls.clone(),
+            );
+            DmlExecutionKernel::new(
+                crate::query_execution::kernels::DmlPlanningServices::new(
+                    Arc::new(
+                        novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                            .expect("builtin function catalog"),
+                    ),
+                    trc_catalog.clone(),
+                    crate::application::test_constant_policy(),
+                    crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
+                        novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+                        novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+                    ),
+                    Arc::new(novarocks_query_application::view::QueryViewService::new()),
+                    trc_system_relations,
+                ),
+                None,
+                trc_controls.clone(),
+                std::sync::Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
                 Arc::new(
-                    novarocks_sql::compiler::build_builtin_engine_function_catalog()
-                        .expect("builtin function catalog"),
+                    crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
                 ),
-                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
-                crate::application::test_constant_policy(),
-                crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
-                    novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-                    novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
-                ),
-                Arc::new(novarocks_query_application::view::QueryViewService::new()),
-            ),
-            None,
-            Arc::clone(&connector_control),
-            std::sync::Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
-            Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
-            Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
-            crate::mv::domain::test_admission::test_readiness(),
-        )
+                Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
+                crate::mv::domain::test_admission::test_readiness(),
+            )
+        }
     }
 
     fn connector_context_for_test() -> novarocks_spi::connector::ConnectorRequestContext {
@@ -5725,31 +5737,41 @@ mod tests {
                 let registry: Arc<dyn spi::ConnectorControlRegistry> = Arc::new(
                     crate::query_execution::compiler::TestConnectorControlRegistry::default(),
                 );
-                let state = DmlExecutionKernel::new(
-                    crate::query_execution::kernels::DmlPlanningServices::new(
-                        Arc::new(
+                let state = {
+                    let trc_catalog = Arc::new(
+                        crate::catalog_application::query_catalog::new_query_catalog_service(),
+                    );
+                    let trc_controls = registry;
+                    let trc_system_relations =
+                        crate::query_execution::kernels::test_system_relations(
+                            trc_catalog.clone(),
+                            trc_controls.clone(),
+                        );
+                    DmlExecutionKernel::new(
+crate::query_execution::kernels::DmlPlanningServices::new(
+Arc::new(
                             novarocks_sql::compiler::build_builtin_engine_function_catalog()
                                 .unwrap(),
                         ),
-                        Arc::new(
-                            crate::catalog_application::query_catalog::new_query_catalog_service(),
-                        ),
-                        crate::application::test_constant_policy(),
-                        crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
+trc_catalog.clone(),
+crate::application::test_constant_policy(),
+crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
                             novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
                             novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
                         ),
-                        Arc::new(novarocks_query_application::view::QueryViewService::new()),
-                    ),
-                    None,
-                    registry,
-                    host.clone(),
-                    Arc::new(
+Arc::new(novarocks_query_application::view::QueryViewService::new()),
+trc_system_relations,
+),
+None,
+trc_controls.clone(),
+host.clone(),
+Arc::new(
                         crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
                     ),
-                    Arc::new(spi::UnavailableMvStorageObservationPort),
-                    crate::mv::domain::test_admission::test_readiness(),
-                );
+Arc::new(spi::UnavailableMvStorageObservationPort),
+crate::mv::domain::test_admission::test_readiness(),
+)
+                };
                 let execution = QueryExecutionContext::new(
                     novarocks_types::ClusterRole::Fe,
                     novarocks_query_application::api::BackendTopologySnapshot::empty(3),

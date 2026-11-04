@@ -407,9 +407,16 @@ impl ViewEngine for FrontendViewEngine {
                 novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
                 self.catalog_application(),
             );
-        let provider = provider.with_local_views(request.local_views.clone());
         let control =
             crate::query_execution::planning::sql_compile_control_from_connector_request(context);
+        let provider = provider
+            .with_local_views(request.local_views.clone())
+            .with_system_relations(self.kernel.system_relations().clone())
+            .with_definition_inputs(
+                context.clone(),
+                self.kernel.constant_policy(),
+                control.clone(),
+            );
         let mut preparation =
             novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new_definition(
                 request.query.clone(),
@@ -420,7 +427,7 @@ impl ViewEngine for FrontendViewEngine {
                     namespace: request.target.database.clone(),
                     table: request.target.view.clone(),
                 }),
-                control,
+                control.clone(),
             )?;
         while !preparation.needs().is_empty() {
             let facts = preparation

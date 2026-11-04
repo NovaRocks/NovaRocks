@@ -148,7 +148,7 @@ pub(super) async fn prepare_read(
             &input.scope,
             FrontendCompletionPorts {
                 provider: &input.provider,
-                cpu: input.planning_cpu.as_ref(),
+                cpu: &input.planning_cpu,
             },
             input.io,
             input.state_store,

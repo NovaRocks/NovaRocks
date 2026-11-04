@@ -27,7 +27,7 @@ use novarocks_query_application::api::StatementNativeHealthFailure;
 
 pub(crate) struct ExplainPreparationPorts<'a> {
     pub(crate) provider: &'a crate::query_execution::completion_facts::FrontendCompletionCustody,
-    pub(crate) cpu: &'a FrontendPlanningCpuSource,
+    pub(crate) cpu: &'a Arc<FrontendPlanningCpuSource>,
     pub(crate) io: Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>,
     pub(crate) state_store: Option<Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>>,
 }
@@ -161,7 +161,7 @@ impl FrontendQueryCompiler {
                     .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
                 let catalog = crate::query_execution::completion_facts::FrontendCatalogFacts::new(
                     self.completion_fact_owners(),
-                    scope,
+                    scope.with_definition_planning(self.constant_policy(), sql_compile_control_from_execution(execution), Arc::clone(planning_cpu)),
                 );
                 Ok(catalog)
             }
@@ -257,7 +257,12 @@ impl FrontendQueryCompiler {
                     })?,
                     state_store,
                 )
-                .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
+                .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?
+                .with_definition_planning(
+                    self.constant_policy(),
+                    sql_compile_control_from_execution(execution),
+                    Arc::clone(planning_cpu),
+                ),
                 crate::query_execution::compiler::typed_connector_session()
                     .map_err(FrontendQueryCompilerError::Engine)?,
             )
@@ -291,7 +296,7 @@ impl FrontendQueryCompiler {
         };
         let control = request.control().clone();
         provider_source
-            .complete_in(request, scope, planning_cpu)
+            .complete_in(request, scope, planning_cpu.as_ref())
             .await?;
         if let Some(error) = provider_source.completed_error() {
             return Ok(Err(FrontendQueryCompilerError::from_completion(&error)));
@@ -361,7 +366,12 @@ impl FrontendQueryCompiler {
                     })?,
                     state_store,
                 )
-                .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
+                .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?
+                .with_definition_planning(
+                    self.constant_policy(),
+                    sql_compile_control_from_execution(execution),
+                    Arc::clone(planning_cpu),
+                ),
                 crate::query_execution::compiler::typed_connector_session()
                     .map_err(FrontendQueryCompilerError::Engine)?,
             )
@@ -399,7 +409,7 @@ impl FrontendQueryCompiler {
         };
         let encoding_control = request.control().clone();
         provider_source
-            .complete_in(request, scope, planning_cpu)
+            .complete_in(request, scope, planning_cpu.as_ref())
             .await?;
         if let Some(error) = provider_source.completed_error() {
             return Ok(Err(FrontendQueryCompilerError::from_completion(&error)));

@@ -43,7 +43,7 @@ pub(crate) use provider_source::FrontendCompletionCustody;
 /// Borrow the original Provider and pure CPU sources for one completion.
 pub(crate) struct FrontendCompletionPorts<'a> {
     pub(crate) provider: &'a FrontendCompletionCustody,
-    pub(crate) cpu: &'a FrontendPlanningCpuSource,
+    pub(crate) cpu: &'a Arc<FrontendPlanningCpuSource>,
 }
 
 use std::sync::Arc;
@@ -86,6 +86,7 @@ use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 #[derive(Clone)]
 pub(crate) struct CompletionFactOwners {
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
+    system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<ConnectorControlHost>,
@@ -96,6 +97,11 @@ pub(crate) struct CompletionFactOwners {
 }
 
 impl CompletionFactOwners {
+    pub(crate) fn system_relations(
+        &self,
+    ) -> &novarocks_query_application::system_catalog::SystemCatalogRelations {
+        &self.system_relations
+    }
     pub(crate) const fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -105,9 +111,11 @@ impl CompletionFactOwners {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         blocking: ConnectorBlockingIoSupervisor,
         view_service: Arc<dyn novarocks_query_application::view::ViewService>,
+        system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
     ) -> Self {
         Self {
             view_service,
+            system_relations,
             catalog_service,
             catalog_application,
             connector_control,
@@ -132,10 +140,17 @@ pub(crate) struct StatementFactScope {
     connector_context: ConnectorRequestContext,
     current_catalog: Option<Arc<str>>,
     capacity: QueryResultCapacityBinding,
+    definition: Option<DefinitionFactInputs>,
     query_local_overlays:
         Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
 }
 
+#[derive(Clone)]
+struct DefinitionFactInputs {
+    policy: novarocks_functions::ConstantPolicy,
+    control: novarocks_sql::compiler::SqlCompileControl,
+    cpu: Option<Arc<FrontendPlanningCpuSource>>,
+}
 #[derive(Clone)]
 enum StatementStateStore {
     Legacy,
@@ -159,6 +174,7 @@ impl StatementFactScope {
             connector_context,
             current_catalog: current_catalog.map(Arc::from),
             capacity,
+            definition: None,
             query_local_overlays: Vec::new(),
         })
     }
@@ -209,6 +225,31 @@ impl StatementFactScope {
         scope.creator_mode = ProviderCreatorMode::GovernedReadIo;
         scope.state_store = StatementStateStore::Governed(state_store);
         Ok(scope)
+    }
+    pub(crate) fn with_definition_owned(
+        mut self,
+        policy: novarocks_functions::ConstantPolicy,
+        control: novarocks_sql::compiler::SqlCompileControl,
+    ) -> Self {
+        self.definition = Some(DefinitionFactInputs {
+            policy,
+            control,
+            cpu: None,
+        });
+        self
+    }
+    pub(crate) fn with_definition_planning(
+        mut self,
+        policy: novarocks_functions::ConstantPolicy,
+        control: novarocks_sql::compiler::SqlCompileControl,
+        cpu: Arc<FrontendPlanningCpuSource>,
+    ) -> Self {
+        self.definition = Some(DefinitionFactInputs {
+            policy,
+            control,
+            cpu: Some(cpu),
+        });
+        self
     }
     pub(crate) fn with_query_local_overlays(
         mut self,
@@ -265,9 +306,37 @@ impl CatalogFactPort for FrontendCatalogFacts {
             self.scope.query_local_overlays.clone(),
         )
         .with_catalog_application(self.owners.catalog_application.as_deref())
-        .with_local_views(self.local_views.clone()?);
+        .with_local_views(self.local_views.clone()?)
+        .with_system_relations(self.owners.system_relations().clone());
+        let materializer = if let Some(input) = self.scope.definition.as_ref() {
+            materializer.with_definition_inputs(
+                self.scope.connector_context.clone(),
+                input.policy,
+                input.control.clone(),
+            )
+        } else {
+            materializer
+        };
         let mut facts = Vec::with_capacity(needs.len());
         for need in needs {
+            // Local views and generated overlays retain their precedence.
+            if let Some(fact) = materializer.local_view_fact(need) {
+                facts.push(fact?);
+                continue;
+            }
+            if let Some(input) = self.scope.definition.as_ref() {
+                let cpu = input.cpu.as_ref().ok_or_else(|| {
+                    novarocks_sql::compiler::SqlCompileError::Compilation(
+                        "definition CPU source is not installed in its original custody".into(),
+                    )
+                })?;
+                if let Some(result) = materializer.system_relation_fact_on_cpu(need, cpu).await
+                    && let Some(fact) = result?
+                {
+                    facts.push(fact);
+                    continue;
+                }
+            }
             facts.push(materializer.resolve_relation_fact_async(need).await?);
         }
         Ok(facts)
@@ -402,6 +471,15 @@ pub(crate) fn install_frontend_fact_source(
     scope: StatementFactScope,
     session: ConnectorSession,
 ) -> Result<(), String> {
+    let mut scope = scope;
+    let owned_catalog_cpu = scope.definition.as_mut().and_then(|input| {
+        if input.cpu.is_some() {
+            return None;
+        }
+        let cpu = FrontendPlanningCpuSource::new(owners.blocking.clone());
+        input.cpu = Some(Arc::clone(&cpu));
+        Some(cpu)
+    });
     let provider = Arc::new(
         FrontendProviderReadFacts::binding_only(
             Arc::clone(&owners.connector_control),
@@ -414,12 +492,14 @@ pub(crate) fn install_frontend_fact_source(
         .with_creator_mode(scope.creator_mode),
     );
     let facts = Arc::new(statement_fact_source(owners, scope, provider.clone()));
-    custody.install(facts, provider).map_err(|original| {
-        // No work can have been issued by this rejected new port. Destruction
-        // is outside the fixed custody lock; the old source remains unchanged.
-        drop(original);
-        "completion Provider source is already installed".to_owned()
-    })
+    custody
+        .install(facts, provider, owned_catalog_cpu)
+        .map_err(|original| {
+            // No work can have been issued by this rejected new port. Destruction
+            // is outside the fixed custody lock; the old source remains unchanged.
+            drop(original);
+            "completion Provider source is already installed".to_owned()
+        })
 }
 
 /// The one fact source one statement's completion is driven with.

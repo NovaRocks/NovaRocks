@@ -142,16 +142,26 @@ fn empty_completion_owners(
     );
     drop(repository);
     drop(product);
-    CompletionFactOwners::new(
-        Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
-        None,
-        Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
-        Arc::new(UnifiedStatisticsResolver::default()),
-        inventory.candidate_reader(),
-        Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
-        blocking,
-        Arc::new(novarocks_query_application::view::QueryViewService::new()),
-    )
+    {
+        let trc_catalog =
+            Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
+        let trc_controls = Arc::new(novarocks_catalog_application::ConnectorControlHost::new());
+        let trc_system_relations = crate::query_execution::kernels::test_system_relations(
+            trc_catalog.clone(),
+            trc_controls.clone(),
+        );
+        CompletionFactOwners::new(
+            trc_catalog.clone(),
+            None,
+            trc_controls.clone(),
+            Arc::new(UnifiedStatisticsResolver::default()),
+            inventory.candidate_reader(),
+            Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
+            blocking,
+            Arc::new(novarocks_query_application::view::QueryViewService::new()),
+            trc_system_relations,
+        )
+    }
 }
 
 #[derive(Debug)]

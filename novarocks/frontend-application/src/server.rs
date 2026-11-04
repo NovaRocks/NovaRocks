@@ -165,6 +165,7 @@ struct FrontendRoleProducts {
     topology: novarocks_query_application::api::BackendTopologyService,
     role: novarocks_types::ClusterRole,
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
+    system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
     dml_service: Arc<crate::dml::DmlService>,
     statistics_application: Arc<crate::statistics_jobs::service::FrontendStatisticsApplicationPort>,
     maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService>,
@@ -209,6 +210,7 @@ impl FrontendRoleProducts {
                         .expect("serving MV product owns document-management authority"),
                     self.constant_policy,
                     Arc::clone(&self.view_service),
+                    self.system_relations.clone(),
                 ),
                 self.mv_execution_services.clone(),
             ))
@@ -325,6 +327,7 @@ async fn build_frontend_role_products(
     host: &mut FrontendApplicationHost,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    system_catalog: Arc<dyn novarocks_query_application::system_catalog::SystemCatalog>,
 ) -> Result<FrontendRoleProducts, FrontendApplicationError> {
     let catalog_service =
         Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
@@ -336,6 +339,15 @@ async fn build_frontend_role_products(
     // Constructor-supplied, exactly once: query preparation receives the
     // registry here and never resolves it from the host at request time.
     let typed_connector_control = host.typed_connector_control();
+    let system_relations = novarocks_query_application::system_catalog::SystemCatalogRelations::new(
+        Arc::new(
+            crate::catalog_application::system_catalog_facts::FrontendSystemCatalogFacts::new(
+                catalog_service.clone(),
+                connector_control.clone(),
+            ),
+        ),
+        system_catalog,
+    );
     let query_application_control = Arc::new(
         novarocks_query_application::query_control::QueryApplicationControl::new(
             host.frontend_process_id(),
@@ -458,6 +470,7 @@ async fn build_frontend_role_products(
             host.constant_policy(),
             host.static_plan_carrier(),
             Arc::clone(&view_service),
+            system_relations.clone(),
         ),
     );
     let mv_service = Arc::new(
@@ -527,6 +540,7 @@ async fn build_frontend_role_products(
             mv_storage_observation.clone(),
             host.connector_blocking_io_supervisor(),
             view_service.clone(),
+            system_relations.clone(),
         ),
         execution: (
             host.connector_blocking_io_supervisor(),
@@ -575,6 +589,7 @@ async fn build_frontend_role_products(
                         mv_storage_observation.clone(),
                         host.connector_blocking_io_supervisor(),
                         view_service.clone(),
+                        system_relations.clone(),
                     ),
                     (
                         host.connector_blocking_io_supervisor(),
@@ -608,6 +623,7 @@ async fn build_frontend_role_products(
             mv_storage_observation.clone(),
             host.connector_blocking_io_supervisor(),
             view_service.clone(),
+            system_relations.clone(),
         ),
         connector_control: typed_connector_control.clone(),
         blocking: host.connector_blocking_io_supervisor(),
@@ -631,6 +647,7 @@ async fn build_frontend_role_products(
         topology,
         role,
         view_service,
+        system_relations,
         dml_service,
         statistics_application,
         maintenance_service,
@@ -683,7 +700,7 @@ fn build_frontend_query_session_factory_from_role_products(
             topology.clone(),
             exchange_port,
             view_service.clone(),
-            system_catalog,
+            products.system_relations.clone(),
             Arc::clone(&mv_readiness),
             mv_candidate_reader,
             Arc::clone(&mv_storage_observation),
@@ -718,6 +735,7 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&connector_control),
             Arc::clone(&products.view_service),
             host.constant_policy(),
+            products.system_relations.clone(),
         ));
     let iceberg_ref_command_executor = core_capabilities::iceberg_ref_command_executor(
         core_capabilities::IcebergRefCommandPorts::new(
@@ -743,6 +761,7 @@ fn build_frontend_query_session_factory_from_role_products(
             host.mv_management_audit_sink(),
             host.constant_policy(),
             Arc::clone(&view_service),
+            products.system_relations.clone(),
         ))
         .with_execution_services(products.mv_execution_services.clone());
     let mv_command_consumer: Arc<
@@ -783,6 +802,7 @@ fn build_frontend_query_session_factory_from_role_products(
             host.constant_policy(),
             host.static_plan_carrier(),
             view_service.clone(),
+            products.system_relations.clone(),
         )
         .with_write_runtime(
             host.connector_blocking_io_supervisor(),
@@ -839,8 +859,13 @@ async fn build_frontend_query_session_factory(
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
 ) -> Result<(Arc<dyn QuerySessionFactory>, FrontendRoleProducts), FrontendApplicationError> {
-    let products =
-        build_frontend_role_products(host, exchange_port, mv_storage_observation).await?;
+    let products = build_frontend_role_products(
+        host,
+        exchange_port,
+        mv_storage_observation,
+        system_catalog.clone(),
+    )
+    .await?;
     products.start_background_workers()?;
     let session_factory =
         build_frontend_query_session_factory_from_role_products(host, &products, system_catalog)?;
@@ -1050,16 +1075,22 @@ where
         Arc::new(
             novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
         );
-    let mut products =
-        match build_frontend_role_products(host, exchange_port, mv_storage_observation).await {
-            Ok(products) => products,
-            Err(error) => {
-                let stop_result = report_server
-                    .stop()
-                    .map_err(FrontendApplicationError::server);
-                return combine_server_and_shutdown(Err(error), stop_result);
-            }
-        };
+    let mut products = match build_frontend_role_products(
+        host,
+        exchange_port,
+        mv_storage_observation,
+        system_catalog.clone(),
+    )
+    .await
+    {
+        Ok(products) => products,
+        Err(error) => {
+            let stop_result = report_server
+                .stop()
+                .map_err(FrontendApplicationError::server);
+            return combine_server_and_shutdown(Err(error), stop_result);
+        }
+    };
     if let Err(error) = products.start_background_workers() {
         let product_shutdown = shutdown_frontend_role_products_to_convergence(
             &mut products,
