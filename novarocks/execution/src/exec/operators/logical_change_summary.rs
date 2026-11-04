@@ -778,7 +778,13 @@ pub(crate) mod tests {
             let factory = creator(state);
             let schema = factory.create_compiled_chunk_schema(&layout).unwrap();
             registry
-                .register_expected_chunk_schema(key, sources, schema.clone(), factory.clone())
+                .register_expected_chunk_schema(
+                    key,
+                    sources,
+                    (schema.clone()).clone(),
+                    schema.clone(),
+                    factory.clone(),
+                )
                 .unwrap();
             let streams: Vec<_> = (0..sources)
                 .map(|i| {

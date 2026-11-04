@@ -30,10 +30,10 @@ use novarocks_functions::{
     PureImplementationId, PureKernelAbi,
 };
 use novarocks_local_program::{
-    BindingRequirement, CompiledExchangeInput, DataStreamPartitionType, KernelAbiVersion,
-    LocalProgram, ProgramChannelLayoutRole, ProgramChannelSite, ProgramExprId,
-    ProgramExpressionArena, ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeId,
-    ProgramNodeKind, ProgramUseRef, StaticExprKind, StaticSinkProgram,
+    BindingRequirement, DataStreamPartitionType, KernelAbiVersion, LocalProgram,
+    ProgramChannelLayoutRole, ProgramChannelSite, ProgramExprId, ProgramExpressionArena,
+    ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeId, ProgramNodeKind, ProgramUseRef,
+    StaticExprKind, StaticSinkProgram,
 };
 use novarocks_physical_plan::{
     Distribution, Edge, EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprId,
@@ -590,21 +590,25 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
         .map(|field| field.name().as_str())
         .collect::<Vec<_>>();
     assert_eq!(names, ["bee", "a"]);
+    assert_eq!(consumer.exchange_inputs().len(), 1);
+    let input = &consumer.exchange_inputs()[&ProgramNodeId::new(0)];
     assert_eq!(
-        consumer.exchange_inputs(),
-        &BTreeMap::from([(
-            ProgramNodeId::new(0),
-            CompiledExchangeInput {
-                role: novarocks_local_program::ProgramOutputRole::Relational,
-                delivery: novarocks_local_program::ExchangeDeliveryRequirement::DemandDriven,
-                routing: novarocks_local_program::CompiledExchangeRouting::Unpartitioned,
-                receiver_node: RECEIVER.get(),
-                edge: EDGE.get(),
-                source_fragment: PRODUCER.get(),
-                hash_partition_slots: Box::default(),
-            },
-        )])
+        input.role,
+        novarocks_local_program::ProgramOutputRole::Relational
     );
+    assert_eq!(
+        input.delivery,
+        novarocks_local_program::ExchangeDeliveryRequirement::DemandDriven
+    );
+    assert_eq!(
+        input.routing,
+        novarocks_local_program::CompiledExchangeRouting::Unpartitioned
+    );
+    assert_eq!(input.receiver_node, RECEIVER.get());
+    assert_eq!(input.edge, EDGE.get());
+    assert_eq!(input.source_fragment, PRODUCER.get());
+    assert!(input.hash_partition_slots.is_empty());
+    assert_eq!(input.wire_layout.slots(), layout.slots());
     let requirements = consumer.graph().requirements().entries();
     assert_eq!(requirements.len(), 2);
     assert!(requirements.iter().any(|requirement| matches!(

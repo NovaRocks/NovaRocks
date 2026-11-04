@@ -985,6 +985,7 @@ mod receiver_construction_tests {
         ExchangeReceiverRegistration {
             key,
             expected_senders: 1,
+            wire_chunk_schema: schema.clone(),
             expected_chunk_schema: schema.clone(),
             column_binding: ExchangeColumnBinding::Positional,
             creation_factory: factory.clone(),

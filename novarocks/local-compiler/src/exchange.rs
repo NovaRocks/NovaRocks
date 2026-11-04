@@ -260,8 +260,9 @@ fn lower_core_with_creation<H>(
             runtime_filters: Vec::new().into(),
             hash_partition_exprs: Vec::new(),
         },
-        layout,
+        layout: layout.clone(),
         input: CompiledExchangeInput {
+            wire_layout: layout,
             role: crate::stream_sink::cut_role(cut.payload.role()),
             delivery: crate::stream_sink::cut_delivery(cut.delivery),
             routing: match &cut.partitioning.destination {

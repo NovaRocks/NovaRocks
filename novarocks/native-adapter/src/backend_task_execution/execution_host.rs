@@ -6402,6 +6402,7 @@ pub(crate) mod tests {
                 port.register(ExchangeReceiverRegistration {
                     key,
                     expected_senders: 1,
+                    wire_chunk_schema: schema.clone(),
                     expected_chunk_schema: schema.clone(),
                     column_binding:
                         novarocks_execution::runtime::exchange::ExchangeColumnBinding::Positional,

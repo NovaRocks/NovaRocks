@@ -56,8 +56,10 @@ pub enum CompiledExchangeRouting {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct CompiledExchangeInput {
+    /// Complete cut-source declarations in wire ordinal order, mapped to local slots.
+    pub wire_layout: crate::StaticLayout,
     pub role: crate::ProgramOutputRole,
     pub delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
     pub routing: CompiledExchangeRouting,
@@ -494,6 +496,7 @@ fn validate_exchange_inputs(
         for (id, input) in exchange_inputs {
             let layout = graph.nodes()[id.index()].output_layout();
             let slots = layout.slots();
+            validate_exchange_wire_layout(*id, &input.wire_layout, layout, &mut work)?;
             let requirement = declarations.get(id).copied();
             if requirement != Some((input.role, input.delivery))
                 || (input.role != crate::ProgramOutputRole::Relational
@@ -582,6 +585,39 @@ fn validate_exchange_inputs(
     }
     work.finish().map_err(LocalProgramCompileError::Control)?;
     result
+}
+
+/// The wire retains the source's complete binding; only its root NULL promise
+/// may widen at the receiver. Names and source-fragment slot IDs are not wire identity.
+fn validate_exchange_wire_layout(
+    id: ProgramNodeId,
+    wire: &crate::StaticLayout,
+    local: &crate::StaticLayout,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), LocalProgramCompileError> {
+    if !wire.is_typed() || !local.is_typed() || wire.slots() != local.slots() {
+        return Err(LocalProgramCompileError::ExchangeInputMismatch(id));
+    }
+    for ordinal in 0..local.slots().len() {
+        work.step().map_err(LocalProgramCompileError::Control)?;
+        let source = wire
+            .value_binding_at(ordinal)
+            .ok_or(LocalProgramCompileError::ExchangeInputMismatch(id))?;
+        let destination = local
+            .value_binding_at(ordinal)
+            .ok_or(LocalProgramCompileError::ExchangeInputMismatch(id))?;
+        if (source.nullable() && !destination.nullable())
+            || !source
+                .borrowed()
+                .same_physical_binding_ignoring_root_nullability_observed(
+                    destination.borrowed(),
+                    || work.step().map_err(LocalProgramCompileError::Control),
+                )?
+        {
+            return Err(LocalProgramCompileError::ExchangeInputMismatch(id));
+        }
+    }
+    Ok(())
 }
 
 /// Require one address per actual scan and per declared scan requirement, and

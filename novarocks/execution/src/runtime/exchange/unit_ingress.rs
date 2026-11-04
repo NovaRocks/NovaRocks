@@ -598,6 +598,7 @@ mod tests {
                 .try_register_expected_chunk_schema_with_binding(
                     key,
                     1,
+                    (schema.clone()).clone(),
                     schema.clone(),
                     ExchangeColumnBinding::Positional,
                     crate::runtime::fragment::exchange::test_receiver_creation_factory(),

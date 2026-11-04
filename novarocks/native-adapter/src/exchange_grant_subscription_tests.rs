@@ -1295,15 +1295,17 @@ fn real_unit_receiver_fixture(
         fragment_instance_id: stream.destination_fragment_instance_id(),
         node_id: stream.destination_node().get(),
     };
-    port.register(ExchangeReceiverRegistration {
-        key,
-        expected_senders: 1,
-        expected_chunk_schema: real_unit_schema(
-            factory.as_ref(),
-            arrow::datatypes::DataType::Int64,
-        ),
-        column_binding: ExchangeColumnBinding::Positional,
-        creation_factory: factory.clone(),
+    port.register({
+        let expected_chunk_schema =
+            real_unit_schema(factory.as_ref(), arrow::datatypes::DataType::Int64);
+        ExchangeReceiverRegistration {
+            key,
+            expected_senders: 1,
+            wire_chunk_schema: expected_chunk_schema.clone(),
+            expected_chunk_schema,
+            column_binding: ExchangeColumnBinding::Positional,
+            creation_factory: factory.clone(),
+        }
     })
     .unwrap();
     port.bind_unit_receiver(key, vec![stream], failure.clone(), 64 * 1024 * 1024)

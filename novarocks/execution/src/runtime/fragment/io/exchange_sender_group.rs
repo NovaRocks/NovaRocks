@@ -634,12 +634,17 @@ mod tests {
         );
         fixture
             .port
-            .register(ExchangeReceiverRegistration {
-                key,
-                expected_senders: 1,
-                expected_chunk_schema: factory.create_compiled_chunk_schema(&declaration).unwrap(),
-                column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
-                creation_factory: factory,
+            .register({
+                let expected_chunk_schema =
+                    factory.create_compiled_chunk_schema(&declaration).unwrap();
+                ExchangeReceiverRegistration {
+                    key,
+                    expected_senders: 1,
+                    wire_chunk_schema: expected_chunk_schema.clone(),
+                    expected_chunk_schema,
+                    column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
+                    creation_factory: factory,
+                }
             })
             .unwrap();
         fixture.bind(key, &[source]);

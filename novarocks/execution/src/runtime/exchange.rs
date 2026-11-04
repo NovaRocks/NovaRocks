@@ -550,6 +550,7 @@ impl ExecutionExchangeRegistry {
         &self,
         key: ExchangeKey,
         expected_senders: usize,
+        wire_chunk_schema: ChunkSchemaRef,
         chunk_schema: ChunkSchemaRef,
         creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) -> Result<(), ExchangeFailure> {
@@ -557,6 +558,7 @@ impl ExecutionExchangeRegistry {
             self,
             key,
             expected_senders,
+            wire_chunk_schema,
             chunk_schema,
             ExchangeColumnBinding::Positional,
             false,
@@ -570,12 +572,14 @@ impl ExecutionExchangeRegistry {
         &self,
         key: ExchangeKey,
         expected_senders: usize,
+        wire_chunk_schema: ChunkSchemaRef,
         chunk_schema: ChunkSchemaRef,
         creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) -> Result<(), ExchangeFailure> {
         self.try_register_expected_chunk_schema_with_binding(
             key,
             expected_senders,
+            wire_chunk_schema,
             chunk_schema,
             ExchangeColumnBinding::Positional,
             creation_factory,
@@ -587,6 +591,7 @@ impl ExecutionExchangeRegistry {
         &self,
         key: ExchangeKey,
         expected_senders: usize,
+        wire_chunk_schema: ChunkSchemaRef,
         chunk_schema: ChunkSchemaRef,
         column_binding: ExchangeColumnBinding,
         creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
@@ -595,6 +600,7 @@ impl ExecutionExchangeRegistry {
             self,
             key,
             expected_senders,
+            wire_chunk_schema,
             chunk_schema,
             column_binding,
             true,
@@ -609,6 +615,7 @@ impl ExecutionExchangeRegistry {
         &self,
         key: ExchangeKey,
         expected_senders: usize,
+        wire_chunk_schema: ChunkSchemaRef,
         chunk_schema: ChunkSchemaRef,
         column_binding: ExchangeColumnBinding,
         creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
@@ -617,6 +624,7 @@ impl ExecutionExchangeRegistry {
             self,
             key,
             expected_senders,
+            wire_chunk_schema,
             chunk_schema,
             column_binding,
             true,
@@ -627,6 +635,7 @@ impl ExecutionExchangeRegistry {
         registry: &ExecutionExchangeRegistry,
         key: ExchangeKey,
         expected_senders: usize,
+        wire_chunk_schema: ChunkSchemaRef,
         chunk_schema: ChunkSchemaRef,
         column_binding: ExchangeColumnBinding,
         reject_existing: bool,
@@ -2191,11 +2200,13 @@ pub fn cancel_exchange_key(key: ExchangeKey) {
 pub fn register_expected_chunk_schema(
     key: ExchangeKey,
     expected_senders: usize,
+    wire_chunk_schema: ChunkSchemaRef,
     chunk_schema: ChunkSchemaRef,
 ) -> Result<(), ExchangeFailure> {
     test_registry().register_expected_chunk_schema(
         key,
         expected_senders,
+        tests::plain_declaration(&wire_chunk_schema),
         tests::plain_declaration(&chunk_schema),
         crate::runtime::fragment::exchange::test_receiver_creation_factory(),
     )
@@ -2390,6 +2401,7 @@ mod typed_receiver_header_tests {
             .try_register_expected_chunk_schema_with_binding(
                 key(),
                 1,
+                (expected).clone(),
                 expected,
                 ExchangeColumnBinding::Positional,
                 factory.clone(),

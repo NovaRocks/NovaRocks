@@ -136,14 +136,18 @@ pub(crate) fn materialize_compiled_exchange_receivers(
             fragment_instance_id,
             node_id: receiver,
         };
-        registrations.push(ExchangeReceiverRegistration {
-            key,
-            expected_senders,
-            expected_chunk_schema: creation
+        registrations.push({
+            let expected_chunk_schema = creation
                 .ok_or(ConstructionFailure::MissingOwner)?
-                .create_compiled_chunk_schema(node.output_layout())?,
-            column_binding: ExchangeColumnBinding::Positional,
-            creation_factory: Arc::clone(creation.ok_or(ConstructionFailure::MissingOwner)?),
+                .create_compiled_chunk_schema(node.output_layout())?;
+            ExchangeReceiverRegistration {
+                key,
+                expected_senders,
+                wire_chunk_schema: expected_chunk_schema.clone(),
+                expected_chunk_schema,
+                column_binding: ExchangeColumnBinding::Positional,
+                creation_factory: Arc::clone(creation.ok_or(ConstructionFailure::MissingOwner)?),
+            }
         });
         bindings.insert(
             receiver,

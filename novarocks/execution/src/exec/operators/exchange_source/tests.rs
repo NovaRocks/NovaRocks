@@ -70,6 +70,7 @@ fn register_int32_receiver(binding: &ExchangeBinding, fixture: &Fixture, sources
         .register(crate::runtime::fragment::io::ExchangeReceiverRegistration {
             key: receiver_key(binding.key),
             expected_senders: binding.expected_senders,
+            wire_chunk_schema: expected_chunk_schema.clone(),
             expected_chunk_schema,
             column_binding: exchange::ExchangeColumnBinding::Positional,
             creation_factory,

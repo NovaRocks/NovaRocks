@@ -263,6 +263,7 @@ impl UnitFixture {
             .try_register_expected_chunk_schema_with_binding(
                 key,
                 senders,
+                (schema).clone(),
                 schema,
                 super::ExchangeColumnBinding::Positional,
                 factory,
@@ -1163,7 +1164,13 @@ fn m07_root_ipc_preserves_large_string_dictionary_without_changing_exchange_admi
         finst_id_lo: 1704,
         node_id: 78,
     };
-    register_expected_chunk_schema(key, 1, logical_status_schema(SlotId::new(72))).unwrap();
+    register_expected_chunk_schema(
+        key,
+        1,
+        (logical_status_schema(SlotId::new(72))).clone(),
+        logical_status_schema(SlotId::new(72)),
+    )
+    .unwrap();
     let error = decode_chunks_for_sender(key, 9, 1, &bytes).unwrap_err();
     assert!(
         error
@@ -1185,8 +1192,13 @@ fn decode_chunks_for_sender_preserves_dictionary_carrier_with_logical_expected_s
         vec![Some(0), Some(1), Some(0)],
         vec!["SHIPPED", "PAID"],
     );
-    register_expected_chunk_schema(key, 1, logical_status_schema(SlotId::new(72)))
-        .expect("register schema");
+    register_expected_chunk_schema(
+        key,
+        1,
+        (logical_status_schema(SlotId::new(72))).clone(),
+        logical_status_schema(SlotId::new(72)),
+    )
+    .expect("register schema");
 
     let payload = online_unit(&[chunk], true).expect("encode dictionary payload");
     let decoded = decode_chunks_for_sender(key, 9, 1, &payload).expect("decode sender payload");
@@ -1287,7 +1299,13 @@ fn encode_chunks_normalizes_runtime_nullable_widening() {
         node_id: 27,
     };
     let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
-    register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
+    register_expected_chunk_schema(
+        key,
+        1,
+        (expected_chunk_schema).clone(),
+        expected_chunk_schema,
+    )
+    .expect("register schema");
 
     let strict = exchange_test_chunk("_cse_0");
     let schema = Arc::new(Schema::new(vec![
@@ -1412,7 +1430,8 @@ fn decode_chunks_for_sender_rejects_decimal_precision_drift() {
         )])
         .expect("expected chunk schema"),
     );
-    register_expected_chunk_schema(key, 1, expected_schema).expect("register expected schema");
+    register_expected_chunk_schema(key, 1, (expected_schema).clone(), expected_schema)
+        .expect("register expected schema");
 
     let chunk = decimal128_chunk_with_over_precision_value(1234_i128);
     let payload = online_unit(&[chunk], true).expect("encode drifted decimal chunk");
@@ -1625,6 +1644,7 @@ fn native_exchange_publication_retains_descriptor_metadata_ownership() {
         .register_expected_chunk_schema(
             key,
             1,
+            (Arc::clone(&expected)).clone(),
             Arc::clone(&expected),
             crate::runtime::fragment::exchange::test_receiver_creation_factory(),
         )
@@ -1792,7 +1812,13 @@ fn decode_chunks_for_sender_uses_slot_id_map_without_field_metadata() {
     };
 
     let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
-    register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
+    register_expected_chunk_schema(
+        key,
+        1,
+        (expected_chunk_schema).clone(),
+        expected_chunk_schema,
+    )
+    .expect("register schema");
 
     let first = exchange_test_chunk_without_metadata("_cse_0");
     let first_bytes = online_unit(&[first], true).expect("encode first");
@@ -1825,7 +1851,13 @@ fn decode_chunks_for_sender_rejects_partial_expected_schema_match() {
         node_id: 77,
     };
     let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
-    register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
+    register_expected_chunk_schema(
+        key,
+        1,
+        (expected_chunk_schema).clone(),
+        expected_chunk_schema,
+    )
+    .expect("register schema");
 
     let schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Int32, true)]));
     let batch = RecordBatch::try_new(
@@ -1859,7 +1891,13 @@ fn decode_chunks_for_sender_accepts_runtime_nullable_widening() {
         node_id: 17,
     };
     let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
-    register_expected_chunk_schema(key, 1, expected_chunk_schema.clone()).expect("register schema");
+    register_expected_chunk_schema(
+        key,
+        1,
+        (expected_chunk_schema.clone()).clone(),
+        expected_chunk_schema.clone(),
+    )
+    .expect("register schema");
 
     let strict = exchange_test_chunk_without_metadata("_cse_0");
     let widened_schema = Arc::new(Schema::new(vec![
@@ -1937,7 +1975,8 @@ fn decode_chunks_for_sender_rejects_numeric_for_opaque_descriptor() {
         )])
         .expect("expected chunk schema"),
     );
-    register_expected_chunk_schema(key, 1, expected_schema).expect("register expected schema");
+    register_expected_chunk_schema(key, 1, (expected_schema).clone(), expected_schema)
+        .expect("register expected schema");
 
     let payload = online_unit(&[wire_chunk], true).expect("encode drifted chunk");
     let err = decode_chunks_for_sender(key, 3, 1, &payload)
@@ -1962,6 +2001,7 @@ fn decode_chunks_for_sender_decodes_with_wire_meta_before_schema_registration() 
     register_expected_chunk_schema(
         key,
         1,
+        (plain_declaration(exchange_test_chunk("_cse_0").chunk_schema())).clone(),
         plain_declaration(exchange_test_chunk("_cse_0").chunk_schema()),
     )
     .unwrap();
@@ -2170,6 +2210,7 @@ fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
         .try_register_expected_chunk_schema_with_binding(
             positional,
             1,
+            (Arc::clone(&expected)).clone(),
             Arc::clone(&expected),
             ExchangeColumnBinding::Positional,
             crate::runtime::fragment::exchange::test_receiver_creation_factory(),
@@ -2208,6 +2249,7 @@ fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
         .try_register_expected_chunk_schema_with_binding(
             late,
             1,
+            (Arc::clone(&expected)).clone(),
             Arc::clone(&expected),
             ExchangeColumnBinding::Positional,
             crate::runtime::fragment::exchange::test_receiver_creation_factory(),
@@ -2238,6 +2280,7 @@ fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
         .try_register_expected_chunk_schema(
             default_key,
             1,
+            (expected.clone()).clone(),
             expected.clone(),
             crate::runtime::fragment::exchange::test_receiver_creation_factory(),
         )
@@ -2252,6 +2295,7 @@ fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
             .try_register_expected_chunk_schema(
                 positional,
                 1,
+                (expected).clone(),
                 expected,
                 crate::runtime::fragment::exchange::test_receiver_creation_factory()
             )

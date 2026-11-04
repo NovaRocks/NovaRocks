@@ -866,6 +866,7 @@ mod tests {
             .register(crate::runtime::fragment::io::ExchangeReceiverRegistration {
                 key: receiver_key,
                 expected_senders: 1,
+                wire_chunk_schema: schema.clone(),
                 expected_chunk_schema: schema,
                 column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
                 creation_factory,

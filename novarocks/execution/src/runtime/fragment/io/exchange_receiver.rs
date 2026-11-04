@@ -19,6 +19,9 @@ pub struct ExchangeReceiverKey {
 pub struct ExchangeReceiverRegistration {
     pub key: ExchangeReceiverKey,
     pub expected_senders: usize,
+    /// Complete source declaration for the prepared wire recipe.
+    pub wire_chunk_schema: ChunkSchemaRef,
+    /// Local output declaration consumed after positional decoding.
     pub expected_chunk_schema: ChunkSchemaRef,
     /// How decoded wire columns bind to the complete frozen declaration.
     pub column_binding: ExchangeColumnBinding,
@@ -241,6 +244,7 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
             .try_register_expected_chunk_schema_with_close_observer(
                 key,
                 registration.expected_senders,
+                registration.wire_chunk_schema,
                 registration.expected_chunk_schema,
                 registration.column_binding,
                 registration.creation_factory,
@@ -469,6 +473,7 @@ mod tests {
             .register_with_close_observer(ExchangeReceiverRegistration {
                 key,
                 expected_senders: 2,
+                wire_chunk_schema: expected.clone(),
                 expected_chunk_schema: expected,
                 column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
                 creation_factory: factory.clone(),
