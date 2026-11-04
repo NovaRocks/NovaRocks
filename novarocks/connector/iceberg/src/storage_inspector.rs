@@ -927,7 +927,7 @@ fn decoded_table_generation(
             "Iceberg storage inspection metadata exceeds the request payload budget",
         ));
     }
-    let table = crate::metadata_json::from_str(&serialized).map_err(|error| {
+    let table = crate::metadata_json::from_metadata_str(&serialized).map_err(|error| {
         corrupt(format!(
             "decode Iceberg storage inspection metadata: {error}"
         ))

@@ -161,7 +161,7 @@ impl StatisticsReader for IcebergMetadata {
             )
             .await;
             self.validate_context(&request.context)?;
-            let files = files_result.map_err(unavailable)?;
+            let files = files_result?;
             project_statistics_evidence(
                 metadata,
                 table_info,

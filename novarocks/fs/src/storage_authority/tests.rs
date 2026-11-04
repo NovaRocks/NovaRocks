@@ -1821,10 +1821,11 @@ fn acquisition_reasons_survive_borrowed_and_owned_file_conversion() {
     use std::error::Error;
 
     fn originating_cause(error: &ConnectorError) -> &SharedFailureCause {
+        // The original shared cause's identity is the contract, regardless of
+        // how many adapter layers carry it. SharedFailureCause::new preserves
+        // an existing shared cause rather than introducing another wrapper.
         error
             .source()
-            .unwrap()
-            .downcast_ref::<SharedFailureCause>()
             .unwrap()
             .downcast_ref::<SharedFailureCause>()
             .unwrap()

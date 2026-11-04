@@ -145,7 +145,7 @@ impl IcebergDistributedRewriteControl {
                 .await
             });
         validate_context(&request.context)?;
-        let files = files_result.map_err(unavailable)?.map_err(unavailable)?;
+        let files = files_result.map_err(unavailable)??;
         let live_delete_paths = if matches!(
             request.operation(),
             ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
@@ -1216,17 +1216,16 @@ fn live_delete_file_paths_of(
     let metadata = table.metadata().clone();
     let control = context.cloned();
     let result = runtime.resources().catalog_runtime().block_on(async move {
-        let check_active = || -> Result<(), String> {
+        let check_active = || -> Result<(), ConnectorError> {
             if let Some(control) = &control {
-                ConnectorOperationControl::check_active(control)
-                    .map_err(|error| error.to_string())?;
+                ConnectorOperationControl::check_active(control)?;
             }
             Ok(())
         };
         check_active()?;
         let manifest_list = crate::manifest::load_manifest_list(&snapshot, &file_io, &metadata)
             .await
-            .map_err(|error| format!("load Iceberg rewrite manifest list: {error}"))?;
+            .map_err(|error| unavailable(format!("load Iceberg rewrite manifest list: {error}")))?;
         check_active()?;
         let mut paths = BTreeSet::new();
         for manifest_file in manifest_list.entries() {
@@ -1236,28 +1235,34 @@ fn live_delete_file_paths_of(
             }
             let manifest = crate::manifest::load_manifest(manifest_file, &file_io)
                 .await
-                .map_err(|error| format!("load Iceberg rewrite delete manifest: {error}"))?;
+                .map_err(|error| {
+                    if error.kind() == crate::iceberg::ErrorKind::FeatureUnsupported {
+                        crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::raw_read_failure(error)
+                    } else {
+                        unavailable(format!("load Iceberg rewrite delete manifest: {error}"))
+                    }
+                })?;
             check_active()?;
             for entry in manifest.entries() {
                 check_active()?;
                 if entry.is_alive() {
                     let identity = EntryIdentity::try_from(entry.data_file())
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| unavailable(error.to_string()))?;
                     if !paths.insert(identity) {
-                        return Err(
-                            "Iceberg rewrite snapshot repeats a logical delete entry".to_string()
-                        );
+                        return Err(unavailable(
+                            "Iceberg rewrite snapshot repeats a logical delete entry",
+                        ));
                     }
                 }
             }
         }
         check_active()?;
-        Ok::<_, String>(paths)
+        Ok::<_, ConnectorError>(paths)
     });
     if let Some(context) = context {
         validate_context(context)?;
     }
-    result.map_err(unavailable)?.map_err(unavailable)
+    result.map_err(unavailable)?
 }
 
 async fn live_delete_file_paths_at_with_control_async(
@@ -1274,17 +1279,16 @@ async fn live_delete_file_paths_at_with_control_async(
     let metadata = table.metadata().clone();
     let control = context.cloned();
     let result = (async move {
-        let check_active = || -> Result<(), String> {
+        let check_active = || -> Result<(), ConnectorError> {
             if let Some(control) = &control {
-                ConnectorOperationControl::check_active(control)
-                    .map_err(|error| error.to_string())?;
+                ConnectorOperationControl::check_active(control)?;
             }
             Ok(())
         };
         check_active()?;
         let manifest_list = crate::manifest::load_manifest_list(&snapshot, &file_io, &metadata)
             .await
-            .map_err(|error| format!("load Iceberg rewrite manifest list: {error}"))?;
+            .map_err(|error| unavailable(format!("load Iceberg rewrite manifest list: {error}")))?;
         check_active()?;
         let mut paths = BTreeSet::new();
         for manifest_file in manifest_list.entries() {
@@ -1294,29 +1298,35 @@ async fn live_delete_file_paths_at_with_control_async(
             }
             let manifest = crate::manifest::load_manifest(manifest_file, &file_io)
                 .await
-                .map_err(|error| format!("load Iceberg rewrite delete manifest: {error}"))?;
+                .map_err(|error| {
+                    if error.kind() == crate::iceberg::ErrorKind::FeatureUnsupported {
+                        crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::raw_read_failure(error)
+                    } else {
+                        unavailable(format!("load Iceberg rewrite delete manifest: {error}"))
+                    }
+                })?;
             check_active()?;
             for entry in manifest.entries() {
                 check_active()?;
                 if entry.is_alive() {
                     let identity = EntryIdentity::try_from(entry.data_file())
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| unavailable(error.to_string()))?;
                     if !paths.insert(identity) {
-                        return Err(
-                            "Iceberg rewrite snapshot repeats a logical delete entry".to_string()
-                        );
+                        return Err(unavailable(
+                            "Iceberg rewrite snapshot repeats a logical delete entry",
+                        ));
                     }
                 }
             }
         }
         check_active()?;
-        Ok::<_, String>(paths)
+        Ok::<_, ConnectorError>(paths)
     })
     .await;
     if let Some(context) = context {
         validate_context(context)?;
     }
-    result.map_err(unavailable)
+    result
 }
 
 fn validate_frozen_rewrite_table(

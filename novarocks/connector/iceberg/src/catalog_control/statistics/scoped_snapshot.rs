@@ -194,13 +194,23 @@ pub(crate) fn raw_read_failure(error: crate::iceberg::Error) -> ConnectorError {
         crate::iceberg::ErrorKind::PreconditionFailed => ConnectorErrorKind::InvalidRequest,
         _ => ConnectorErrorKind::Unavailable,
     };
+    // Only the provider-authored nesting refusal has a fixed safe explanation.
+    // Classification comes from the SDK kind above; no response diagnostic is
+    // formatted and the original typed cause remains available to its owner.
+    let detail = if kind == ConnectorErrorKind::Unsupported
+        && error.message() == crate::schema_capability::UNSUPPORTED_SCHEMA
+    {
+        crate::schema_capability::UNSUPPORTED_SCHEMA
+    } else {
+        SNAPSHOT_RAW_DETAIL
+    };
     ConnectorError::from_domain_static(
         kind,
         SnapshotRawFailure {
             original: error,
             kind,
         },
-        SNAPSHOT_RAW_DETAIL,
+        detail,
     )
 }
 enum IoState {
@@ -607,10 +617,18 @@ async fn drive_read_snapshot_observed(
 pub(crate) fn raw_read_failure_backing_bytes(
     message_clones: usize,
 ) -> Result<usize, ConnectorError> {
-    let base =
-        ConnectorError::static_domain_backing_bytes::<SnapshotRawFailure>(SNAPSHOT_RAW_DETAIL)
-            .map_err(|_| internal("snapshot error layout overflow"))?;
-    novarocks_failure_contract::BoundedDetail::truncating_backing_len(SNAPSHOT_RAW_DETAIL)
+    // The source author has two closed static diagnostics. Reserve the larger
+    // actual representation before reading; never size an arbitrary SDK Display.
+    let detail = [
+        SNAPSHOT_RAW_DETAIL,
+        crate::schema_capability::UNSUPPORTED_SCHEMA,
+    ]
+    .into_iter()
+    .max_by_key(|detail| detail.len())
+    .expect("closed snapshot diagnostics are nonempty");
+    let base = ConnectorError::static_domain_backing_bytes::<SnapshotRawFailure>(detail)
+        .map_err(|_| internal("snapshot error layout overflow"))?;
+    novarocks_failure_contract::BoundedDetail::truncating_backing_len(detail)
         .checked_mul(message_clones)
         .and_then(|extra| base.checked_add(extra))
         .ok_or_else(|| internal("snapshot error layout overflow"))
@@ -695,6 +713,48 @@ mod tests {
                 .unwrap()
         );
     }
+    #[test]
+    fn manifest_schema_capability_preserves_kind_reason_and_sdk_source() {
+        use novarocks_failure_contract::SharedFailureCause;
+        use std::error::Error;
+        let error = raw_read_failure(crate::iceberg::Error::new(
+            crate::iceberg::ErrorKind::FeatureUnsupported,
+            crate::schema_capability::UNSUPPORTED_SCHEMA,
+        ));
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(
+            error.message(),
+            crate::schema_capability::UNSUPPORTED_SCHEMA
+        );
+        assert!(error.message().len() <= 512);
+        let shared = error
+            .source()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        let raw = shared.downcast_ref::<SnapshotRawFailure>().unwrap();
+        let sdk = raw
+            .source()
+            .unwrap()
+            .downcast_ref::<crate::iceberg::Error>()
+            .unwrap();
+        assert_eq!(sdk.kind(), crate::iceberg::ErrorKind::FeatureUnsupported);
+        assert!(
+            raw_read_failure_backing_bytes(0).unwrap()
+                >= ConnectorError::static_domain_backing_bytes::<SnapshotRawFailure>(
+                    crate::schema_capability::UNSUPPORTED_SCHEMA,
+                )
+                .unwrap()
+        );
+        // Unrelated upstream Unsupported diagnostics remain private.
+        let private = raw_read_failure(crate::iceberg::Error::new(
+            crate::iceberg::ErrorKind::FeatureUnsupported,
+            "private upstream context",
+        ));
+        assert_eq!(private.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(private.message(), SNAPSHOT_RAW_DETAIL);
+    }
+
     #[test]
     fn referenced_spec_inventory_compacts_in_place_without_retiring_backing() {
         let guard = ConnectorPayloadRetentionGuard::from_shared(Arc::new(()));

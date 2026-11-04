@@ -980,11 +980,15 @@ async fn decode_document<T: DeserializeOwned>(
     body: ResponseBody,
 ) -> Result<T, ConnectorError> {
     let bytes = read_document_bytes(operation, body).await?;
-    crate::metadata_json::from_slice(&bytes).map_err(|_| {
-        unavailable(format!(
-            "Iceberg REST {operation} returned a response that could not be decoded"
-        ))
-    })
+    crate::metadata_json::from_slice_document(&bytes, crate::metadata_json::Document::TableResponse)
+        .map_err(|error| {
+            if error.is_unsupported() {
+                return ConnectorError::new(ConnectorErrorKind::Unsupported, error.to_string());
+            }
+            unavailable(format!(
+                "Iceberg REST {operation} returned a response that could not be decoded"
+            ))
+        })
 }
 
 async fn read_document_bytes(

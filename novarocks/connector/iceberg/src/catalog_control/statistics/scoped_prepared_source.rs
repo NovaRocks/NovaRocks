@@ -174,7 +174,7 @@ impl Work {
             .as_ref()
             .ok_or_else(|| invalid("source pin has no complete frozen metadata"))?;
         let metadata: crate::iceberg::spec::TableMetadata =
-            crate::metadata_json::from_str(serialized)
+            crate::metadata_json::from_metadata_str(serialized)
                 .map_err(|e| invalid(format!("decode frozen source metadata: {e}")))?;
         let observed = self
             .request

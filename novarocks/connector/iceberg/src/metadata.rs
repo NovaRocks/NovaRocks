@@ -433,7 +433,7 @@ impl ConnectorMetadata for IcebergMetadata {
                     corrupt("Iceberg exact semantic revision is missing its frozen table metadata")
                 })?;
                 let metadata: crate::iceberg::spec::TableMetadata =
-                    crate::metadata_json::from_str(serialized).map_err(|error| {
+                    crate::metadata_json::from_metadata_str(serialized).map_err(|error| {
                         corrupt(format!(
                             "decode Iceberg exact semantic revision metadata: {error}"
                         ))
@@ -491,7 +491,7 @@ impl ConnectorMetadata for IcebergMetadata {
             corrupt("Iceberg exact revision selector is missing frozen table metadata")
         })?;
         let metadata: crate::iceberg::spec::TableMetadata =
-            crate::metadata_json::from_str(serialized).map_err(|error| {
+            crate::metadata_json::from_metadata_str(serialized).map_err(|error| {
                 corrupt(format!(
                     "decode Iceberg exact revision selector metadata: {error}"
                 ))
@@ -1833,15 +1833,12 @@ impl IcebergMetadata {
                         .await
                     });
                 self.validate_context(request_context)?;
-                result
-                    .map_err(unavailable)?
-                    .map_err(unavailable)
-                    .map(|files| {
-                        files
-                            .into_iter()
-                            .map(data_file_with_stats_to_iceberg_data_file_info)
-                            .collect()
-                    })
+                result.map_err(unavailable)?.map(|files| {
+                    files
+                        .into_iter()
+                        .map(data_file_with_stats_to_iceberg_data_file_info)
+                        .collect()
+                })
             }
         }
     }
@@ -1878,8 +1875,8 @@ pub(crate) fn staged_target_metadata(
         .serialized_metadata
         .as_deref()
         .ok_or_else(|| corrupt("staged Iceberg write target is missing frozen metadata"))?;
-    let metadata: crate::iceberg::spec::TableMetadata = crate::metadata_json::from_str(serialized)
-        .map_err(|error| {
+    let metadata: crate::iceberg::spec::TableMetadata =
+        crate::metadata_json::from_metadata_str(serialized).map_err(|error| {
             corrupt(format!(
                 "decode staged Iceberg write target metadata: {error}"
             ))
@@ -2081,8 +2078,9 @@ pub(crate) fn projected_schema(
         .as_ref()
         .and_then(|table| table.serialized_metadata.as_deref())
         .ok_or_else(|| corrupt("Iceberg table handle has no serialized metadata"))?;
-    let metadata: crate::iceberg::spec::TableMetadata = crate::metadata_json::from_str(serialized)
-        .map_err(|error| corrupt(format!("decode Iceberg table metadata: {error}")))?;
+    let metadata: crate::iceberg::spec::TableMetadata =
+        crate::metadata_json::from_metadata_str(serialized)
+            .map_err(|error| corrupt(format!("decode Iceberg table metadata: {error}")))?;
     projected_schema_with_metadata(table, projection, &metadata)
 }
 
@@ -2196,8 +2194,9 @@ fn projected_metadata_schema(
         .as_ref()
         .and_then(|table| table.serialized_metadata.as_deref())
         .ok_or_else(|| corrupt("Iceberg metadata alias has no serialized table metadata"))?;
-    let metadata: crate::iceberg::spec::TableMetadata = crate::metadata_json::from_str(serialized)
-        .map_err(|error| corrupt(format!("decode Iceberg table metadata: {error}")))?;
+    let metadata: crate::iceberg::spec::TableMetadata =
+        crate::metadata_json::from_metadata_str(serialized)
+            .map_err(|error| corrupt(format!("decode Iceberg table metadata: {error}")))?;
     let columns = metadata_table_output_columns(metadata_table_type, &metadata, &mut creation)
         .map_err(metadata_creation_error)?;
     let schema = metadata_output_schema(&columns).map_err(corrupt)?;
@@ -2322,8 +2321,9 @@ fn split_name_mapping(table: &IcebergTablePayload) -> Result<Option<String>, Con
     else {
         return Ok(None);
     };
-    let metadata: crate::iceberg::spec::TableMetadata = crate::metadata_json::from_str(serialized)
-        .map_err(|error| corrupt(format!("decode Iceberg name mapping metadata: {error}")))?;
+    let metadata: crate::iceberg::spec::TableMetadata =
+        crate::metadata_json::from_metadata_str(serialized)
+            .map_err(|error| corrupt(format!("decode Iceberg name mapping metadata: {error}")))?;
     metadata
         .properties()
         .get(crate::iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING)

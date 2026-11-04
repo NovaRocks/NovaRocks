@@ -29,6 +29,7 @@ use crate::iceberg::spec::{
 use crate::iceberg::table::Table;
 #[cfg(test)]
 use async_trait::async_trait;
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 struct LiveManifestEntry {
     data_file: DataFile,
@@ -58,9 +59,10 @@ pub async fn current_live_data_file_compaction_stats(
     table: &Table,
     file_io: &FileIO,
     preserve_row_lineage: bool,
-) -> Result<LiveDataFileCompactionStats, String> {
+) -> Result<LiveDataFileCompactionStats, ConnectorError> {
     let live = enumerate_live_files(table, file_io).await?;
-    compactable_file_groups(&live, preserve_row_lineage).map_err(|error| error.to_string())
+    compactable_file_groups(&live, preserve_row_lineage)
+        .map_err(|error| unavailable_compaction(error.to_string()))
 }
 
 /// The same grouping author serves the original CPU source and legacy caller.
@@ -91,7 +93,10 @@ pub(crate) fn compactable_file_groups(
     })
 }
 
-async fn enumerate_live_files(table: &Table, file_io: &FileIO) -> Result<LiveFiles, String> {
+async fn enumerate_live_files(
+    table: &Table,
+    file_io: &FileIO,
+) -> Result<LiveFiles, ConnectorError> {
     let mut out = LiveFiles::default();
     let m = table.metadata();
     let snapshot = match m.current_snapshot() {
@@ -100,15 +105,26 @@ async fn enumerate_live_files(table: &Table, file_io: &FileIO) -> Result<LiveFil
     };
     let list = crate::manifest::load_manifest_list(snapshot, file_io, m)
         .await
-        .map_err(|e| format!("load manifest list failed: {e}"))?;
+        .map_err(|e| unavailable_compaction(format!("load manifest list failed: {e}")))?;
 
     for mf in list.entries() {
         let manifest = crate::manifest::load_manifest(mf, file_io)
             .await
-            .map_err(|e| format!("load manifest {} failed: {e}", mf.manifest_path))?;
+            .map_err(|error| {
+                if error.kind() == crate::iceberg::ErrorKind::FeatureUnsupported {
+                    crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::raw_read_failure(error)
+                } else {
+                    unavailable_compaction(format!("load manifest {} failed: {error}", mf.manifest_path))
+                }
+            })?;
         append_live_manifest(&mut out, mf, &manifest);
     }
     Ok(out)
+}
+
+fn unavailable_compaction(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::Unavailable, message.into())
+        .with_retryable_before_progress()
 }
 
 /// Preserve exact live-file and inherited-sequence semantics in one author.

@@ -878,13 +878,19 @@ fn parse_metadata(
     reference: &IcebergSystemTableReference,
     bytes: &Bytes,
 ) -> Result<TableMetadata, ConnectorError> {
-    let metadata: TableMetadata =
-        crate::metadata_json::from_slice(bytes.as_ref()).map_err(|error| {
-            corrupt(format!(
+    let metadata: TableMetadata = crate::metadata_json::from_slice_document(
+        bytes.as_ref(),
+        crate::metadata_json::Document::TableMetadata,
+    )
+    .map_err(|error| {
+        ConnectorError::new(
+            error.connector_kind(ConnectorErrorKind::CorruptData),
+            format!(
                 "iceberg metadata file {} is not table metadata: {error}",
                 reference.metadata_file_location()
-            ))
-        })?;
+            ),
+        )
+    })?;
     reference.verify_loaded_metadata(&metadata)?;
     Ok(metadata)
 }
@@ -927,11 +933,15 @@ fn manifest_length(manifest: &TrinoManifestFile) -> Result<u64, ConnectorError> 
 }
 
 fn parse_manifest(manifest: &TrinoManifestFile, bytes: &Bytes) -> Result<Manifest, ConnectorError> {
-    Manifest::parse_avro(bytes.as_ref()).map_err(|error| {
-        corrupt(format!(
-            "iceberg manifest {} is invalid: {error}",
-            manifest.path()
-        ))
+    crate::manifest::parse_manifest_checked(bytes.as_ref()).map_err(|error| {
+        if error.kind() == crate::iceberg::ErrorKind::FeatureUnsupported {
+            crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::raw_read_failure(error)
+        } else {
+            corrupt(format!(
+                "iceberg manifest {} is invalid: {error}",
+                manifest.path(),
+            ))
+        }
     })
 }
 

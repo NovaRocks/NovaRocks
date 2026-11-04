@@ -35,11 +35,11 @@
 use std::fmt;
 
 /// Physical JSON container depth, distinct from the logical value/type depth.
-/// Iceberg encodes a nested type through field objects, type objects and field
-/// arrays; defaults and REST envelopes add further containers. Four containers
-/// per supported logical level, plus 32 for the document envelope, retain a
-/// finite scanner stack while admitting the full supported type depth.
-pub(crate) const MAX_DEPTH: usize = 4 * novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 32;
+/// A table response adds root/metadata/schemas/schema/fields/field (six
+/// containers) before a top-level type. Each further STRUCT adds type/fields/
+/// field (three); LIST/MAP and their defaults cannot exceed that path.
+/// Streaming confirmation views use this same complete table-response grammar.
+pub(crate) const MAX_DEPTH: usize = 6 + 3 * (novarocks_type_contract::MAX_VALUE_TYPE_DEPTH - 1);
 
 /// Longest object key compared against the sink's paths. Longer keys inside
 /// an interested object are reported as [`Key::Overlong`].
@@ -62,7 +62,7 @@ pub(crate) enum ScanError {
     /// Content after the complete top-level value.
     TrailingContent { offset: u64 },
     /// Containers nested deeper than [`MAX_DEPTH`].
-    NestingTooDeep { offset: u64 },
+    NestingTooDeep { offset: u64, limit: usize },
     /// The input ended before one complete top-level value.
     Truncated,
     /// A field the view uses occurred more than once.
@@ -96,11 +96,8 @@ impl fmt::Display for ScanError {
             Self::TrailingContent { offset } => {
                 write!(f, "trailing content after JSON document at byte {offset}")
             }
-            Self::NestingTooDeep { offset } => {
-                write!(
-                    f,
-                    "JSON nesting exceeds {MAX_DEPTH} levels at byte {offset}"
-                )
+            Self::NestingTooDeep { offset, limit } => {
+                write!(f, "JSON nesting exceeds {limit} levels at byte {offset}")
             }
             Self::Truncated => f.write_str("JSON document is truncated"),
             Self::DuplicateField(field) => write!(f, "JSON field `{field}` occurs more than once"),
@@ -321,6 +318,7 @@ enum Mode {
 pub(crate) struct JsonScanner<S: ViewSink> {
     sink: S,
     frames: Vec<Frame<S::Node>>,
+    max_depth: usize,
     mode: Mode,
     /// Node of the member value that follows the current key.
     member_node: Option<S::Node>,
@@ -337,10 +335,15 @@ pub(crate) struct JsonScanner<S: ViewSink> {
 
 impl<S: ViewSink> JsonScanner<S> {
     pub(crate) fn new(sink: S) -> Self {
+        Self::with_max_depth(sink, MAX_DEPTH)
+    }
+
+    fn with_max_depth(sink: S, max_depth: usize) -> Self {
         let scratch_cap = sink.retention_cap().max(MAX_KEY_LEN);
         Self {
             sink,
-            frames: Vec::with_capacity(MAX_DEPTH),
+            frames: Vec::with_capacity(max_depth),
+            max_depth,
             mode: Mode::Between(Expect::Value),
             member_node: None,
             scalar_node: None,
@@ -511,8 +514,11 @@ impl<S: ViewSink> JsonScanner<S> {
             }
             _ => return Err(ScanError::Syntax { offset }),
         };
-        if self.frames.len() >= MAX_DEPTH {
-            return Err(ScanError::NestingTooDeep { offset });
+        if self.frames.len() >= self.max_depth {
+            return Err(ScanError::NestingTooDeep {
+                offset,
+                limit: self.max_depth,
+            });
         }
         if let Some(node) = node {
             self.sink.open(node, kind)?;
@@ -862,8 +868,18 @@ pub(crate) fn scan_complete<S: ViewSink>(sink: S, document: &[u8]) -> Result<S::
 
 /// Validate one complete document without constructing a retained JSON value.
 /// Uses the same grammar and finite physical-depth bound as streamed REST views.
+pub(crate) fn validate_document_with_depth(
+    document: &[u8],
+    max_depth: usize,
+) -> Result<(), ScanError> {
+    let mut scanner = JsonScanner::with_max_depth(SkippingSink, max_depth);
+    scanner.feed(document)?;
+    scanner.finish()
+}
+
+#[cfg(test)]
 pub(crate) fn validate_document(document: &[u8]) -> Result<(), ScanError> {
-    scan_complete(SkippingSink, document)
+    validate_document_with_depth(document, MAX_DEPTH)
 }
 
 /// Validates every byte while retaining no document values.
@@ -1092,7 +1108,8 @@ mod tests {
         assert_eq!(
             validate_document(nested(MAX_DEPTH + 1).as_bytes()),
             Err(ScanError::NestingTooDeep {
-                offset: MAX_DEPTH as u64
+                offset: MAX_DEPTH as u64,
+                limit: MAX_DEPTH,
             }),
         );
     }
@@ -1210,7 +1227,8 @@ mod tests {
         assert_eq!(
             scan_whole(nested(MAX_DEPTH + 1).as_bytes()),
             Err(ScanError::NestingTooDeep {
-                offset: MAX_DEPTH as u64
+                offset: MAX_DEPTH as u64,
+                limit: MAX_DEPTH,
             })
         );
         // Skipped subtrees count too.

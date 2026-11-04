@@ -649,6 +649,7 @@ fn prepare_table_creation(
         .with_fields(super::type_mapping::schema_fields(columns).map_err(invalid)?)
         .build()
         .map_err(|error| invalid(format!("build Iceberg schema: {error}")))?;
+    crate::schema_capability::admit_schema(&schema)?;
     let document = crate::schema_mapping::nominal_declaration::TableNominalDocument::from_columns(
         &schema, columns,
     )
@@ -1622,9 +1623,7 @@ fn prepare_schema_change(
             .await
         });
         validate_context(context)?;
-        let equality_delete_columns = equality_delete_result
-            .map_err(unavailable)?
-            .map_err(unavailable)?;
+        let equality_delete_columns = equality_delete_result.map_err(unavailable)??;
         if path.segments.len() == 1
             && equality_delete_columns
                 .iter()
@@ -1699,6 +1698,7 @@ pub(crate) fn prepare_schema_updates(
         .with_identifier_field_ids(metadata.current_schema().identifier_field_ids())
         .build()
         .map_err(|error| invalid(format!("build evolved Iceberg schema: {error}")))?;
+    crate::schema_capability::admit_schema(&new_schema)?;
     // Scalar integer domain validation above must precede this schema
     // comparison. An unchanged MODIFY has no schema publication to dispatch.
     if matches!(change, ConnectorSchemaChange::ModifyColumn { .. })
@@ -8282,6 +8282,90 @@ mod tests {
                 assert!(matches!(cleanup, ExternalMutationFinalization::Complete));
             }
             _ => panic!("definition refusal must be known uncommitted"),
+        }
+    }
+
+    #[test]
+    fn schema_nesting_admission_covers_create_and_top_level_and_nested_alter() {
+        fn column(nesting: usize, arrays: bool) -> ConnectorColumnDefinition {
+            let mut data_type = ConnectorDataType::Int;
+            for level in (0..nesting).rev() {
+                data_type = if arrays {
+                    ConnectorDataType::Array(Box::new(data_type))
+                } else {
+                    ConnectorDataType::Struct(vec![
+                        novarocks_spi::connector::ConnectorStructField {
+                            name: format!("n{level}").into(),
+                            data_type,
+                            nullable: true,
+                        },
+                    ])
+                };
+            }
+            ConnectorColumnDefinition {
+                name: "deep".into(),
+                data_type,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }
+        }
+        let table = ConnectorTableIdentity {
+            instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+            namespace: "db".into(),
+            table: "t".into(),
+        };
+        for (nesting, arrays, admitted) in [(41, false, true), (42, false, false), (63, true, true)]
+        {
+            let definition = column(nesting, arrays);
+            let create =
+                prepare_table_creation(&table, std::slice::from_ref(&definition), None, &[], &[]);
+            assert_eq!(create.is_ok(), admitted);
+            if let Err(error) = create {
+                assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            }
+            let add = prepare_schema_updates(
+                &test_metadata(HashMap::new()),
+                &ConnectorSchemaChange::AddColumn {
+                    parent: ConnectorColumnPath { segments: vec![] },
+                    column: definition,
+                    position: ConnectorColumnPosition::Default,
+                },
+            );
+            assert_eq!(add.is_ok(), admitted);
+            if let Err(error) = add {
+                assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            }
+        }
+        let (_, creation) =
+            prepare_table_creation(&table, &[column(41, false)], None, &[], &[]).unwrap();
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+            creation.schema,
+            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "memory:///nested-admission".into(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let mut parent = vec![Arc::from("deep")];
+        parent.extend((0..40).map(|level| Arc::from(format!("n{level}"))));
+        for (extra, admitted) in [(0, true), (1, false)] {
+            let change = ConnectorSchemaChange::AddColumn {
+                parent: ConnectorColumnPath {
+                    segments: parent.clone(),
+                },
+                column: column(extra, false),
+                position: ConnectorColumnPosition::Default,
+            };
+            let result = prepare_schema_updates(&metadata, &change);
+            assert_eq!(result.is_ok(), admitted);
+            if let Err(error) = result {
+                assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            }
         }
     }
 
