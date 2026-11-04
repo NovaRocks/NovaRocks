@@ -29,14 +29,12 @@ use crate::query_execution::kernels::{
     QueryPreparationKernel, SystemTableQueryKernel, ViewExecutionKernel,
 };
 use crate::query_execution::planning::sql_compile_control_from_execution;
-use crate::query_execution::planning::time_travel::{TimeTravelRewriteError, has_time_travel_refs};
 use novarocks_parser::ast::{ExplainFormat, ExplainQuery, Query, Statement};
 use novarocks_physical_plan::{
     MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, ScanReadBudget,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::{QueryExecutionContext, RequestContext};
-use novarocks_query_application::view::ViewRequestContext;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_sql::compiler::{
@@ -156,15 +154,6 @@ impl FrontendQueryCompilerError {
 impl From<String> for FrontendQueryCompilerError {
     fn from(error: String) -> Self {
         Self::Engine(error)
-    }
-}
-
-impl From<TimeTravelRewriteError> for FrontendQueryCompilerError {
-    fn from(error: TimeTravelRewriteError) -> Self {
-        match error {
-            TimeTravelRewriteError::Engine(error) => Self::Engine(error),
-            TimeTravelRewriteError::Analyze(error) => Self::Analyze(error),
-        }
     }
 }
 

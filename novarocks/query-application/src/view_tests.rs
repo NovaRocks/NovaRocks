@@ -22,38 +22,24 @@ use std::time::{Duration, Instant};
 use crate::api::QueryResult;
 use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::view::{
-    CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
-    ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
+    CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition, ViewEngine,
+    ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };
 use crate::view_service::QueryViewService;
 use arrow::array::{Array, StringArray};
-use novarocks_parser::{
-    ast::{Query, SetExpr, Statement as ParsedStatement},
-    printer::print_query,
-};
+use novarocks_parser::ast::{Query, SetExpr, Statement as ParsedStatement};
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
 
 #[derive(Default)]
 struct FakeViewEngine {
     analyze_local_sql: bool,
-    rest_catalogs: Mutex<HashSet<String>>,
     tables: Mutex<HashSet<ViewTarget>>,
     views: Mutex<HashMap<ViewTarget, ResolvedExternalView>>,
     created: Mutex<Vec<CreateExternalViewRequest>>,
-    table_probe_failures: Mutex<HashSet<ViewTarget>>,
-    analyzed_queries: Mutex<Vec<String>>,
-    async_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    analyzed_count: Mutex<usize>,
 }
 
 impl FakeViewEngine {
-    fn with_rest_catalog(self, catalog: &str) -> Self {
-        self.rest_catalogs
-            .lock()
-            .unwrap()
-            .insert(catalog.to_string());
-        self
-    }
-
     fn insert_view(&self, target: ViewTarget, sql: &str, default_database: &str) {
         let definition = PersistedQueryDefinition::new(
             sql,
@@ -75,48 +61,6 @@ impl FakeViewEngine {
 }
 
 impl ViewEngine for FakeViewEngine {
-    fn resolve_external_view(
-        &self,
-        target: &ViewTarget,
-        _context: &ConnectorRequestContext,
-    ) -> Result<ExternalViewResolution, String> {
-        if !self.rest_catalogs.lock().unwrap().contains(&target.catalog) {
-            return Err("Unsupported: connector has no view metadata capability".to_string());
-        }
-        if self.table_probe_failures.lock().unwrap().contains(target) {
-            return Err("table probe failed".to_string());
-        }
-        if self.tables.lock().unwrap().contains(target) {
-            return Ok(ExternalViewResolution::Table);
-        }
-        Ok(self
-            .views
-            .lock()
-            .unwrap()
-            .get(target)
-            .cloned()
-            .map(ExternalViewResolution::View)
-            .unwrap_or(ExternalViewResolution::Missing))
-    }
-
-    fn resolve_external_view_async<'a>(
-        &'a self,
-        target: &'a ViewTarget,
-        context: &'a ConnectorRequestContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ExternalViewResolution, String>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            let gate = self.async_gate.lock().unwrap().take();
-            if let Some(gate) = gate {
-                gate.await
-                    .map_err(|_| "view observation gate closed".to_string())?;
-            }
-            // This fixture's resolver only reads its local immutable test facts.
-            self.resolve_external_view(target, context)
-        })
-    }
-
     fn create_external_view(
         &self,
         request: CreateExternalViewRequest,
@@ -187,13 +131,10 @@ impl ViewEngine for FakeViewEngine {
         request: crate::view::ViewDefinitionAnalysisRequest<'_>,
         _context: &ConnectorRequestContext,
     ) -> Result<Vec<ViewColumnDefinition>, novarocks_sql::compiler::SqlCompileError> {
+        *self.analyzed_count.lock().unwrap() += 1;
         if self.analyze_local_sql {
             return declarations::analyze_local_definition(request);
         }
-        self.analyzed_queries
-            .lock()
-            .unwrap()
-            .push(print_query(request.query));
         let width = match request.query.body.as_ref() {
             SetExpr::Select(select) => select.projection.len(),
             _ => 1,
@@ -339,24 +280,25 @@ fn query_rows_at(result: &QueryResult, column: usize) -> Vec<String> {
 }
 
 #[test]
-fn session_view_ddl_show_and_rewrite_preserve_existing_behavior() {
+fn session_view_ddl_and_show_preserve_registry_behavior() {
     let service = QueryViewService::new();
-    let engine = FakeViewEngine::default();
+    let engine = FakeViewEngine {
+        analyze_local_sql: true,
+        ..Default::default()
+    };
     let ctx = context(None, "db");
-
-    service
-        .try_handle_statement(&engine, "CREATE VIEW v2 AS SELECT 2 AS a", ctx)
-        .unwrap();
-    service
-        .try_handle_statement(&engine, "CREATE VIEW v1 AS SELECT * FROM v2", ctx)
-        .unwrap();
+    for sql in [
+        "CREATE VIEW v2 AS SELECT 2 AS a",
+        "CREATE VIEW v1 AS SELECT * FROM v2",
+    ] {
+        service.try_handle_statement(&engine, sql, ctx).unwrap();
+    }
     assert_eq!(
         service
             .try_handle_statement(&engine, "CREATE VIEW v1 AS SELECT 1", ctx)
             .unwrap_err(),
         "view already exists: db.v1"
     );
-
     let show = query_result(
         service
             .try_handle_statement(&engine, "SHOW   VIEWS", ctx)
@@ -364,127 +306,143 @@ fn session_view_ddl_show_and_rewrite_preserve_existing_behavior() {
     );
     assert_eq!(show.columns[0].name(), "Views_in_db");
     assert_eq!(query_rows(&show), vec!["v1", "v2"]);
-
-    let mut query = parse_query("SELECT x.a FROM v1 AS x");
-    service
-        .rewrite_query(
-            &engine,
-            &mut query,
-            ctx,
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    assert_eq!(
-        print_query(&query),
-        "SELECT x.a FROM (SELECT * FROM (SELECT 2 AS a) v2) AS x"
-    );
-
+    declarations::analyze_snapshot_query(
+        &service.catalog_snapshot().unwrap(),
+        "SELECT x.a FROM v1 AS x",
+        "db",
+        &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+    )
+    .unwrap();
     service
         .try_handle_statement(&engine, "CREATE OR REPLACE VIEW v1 AS SELECT 3 AS a", ctx)
         .unwrap();
-    let mut replaced = parse_query("SELECT * FROM v1");
-    service
-        .rewrite_query(
-            &engine,
-            &mut replaced,
-            ctx,
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    assert_eq!(print_query(&replaced), "SELECT * FROM (SELECT 3 AS a) v1");
-
+    let replaced = service.catalog_snapshot().unwrap();
+    assert_eq!(
+        replaced
+            .get(&novarocks_types::naming::TableIdentity::new(
+                "default_catalog",
+                "db",
+                "v1"
+            ))
+            .unwrap()
+            .raw_sql
+            .as_ref(),
+        "SELECT 3 AS a"
+    );
     service
         .try_handle_statement(&engine, "DROP VIEW v1", ctx)
         .unwrap();
-    let mut dropped = parse_query("SELECT * FROM v1");
-    service
-        .rewrite_query(
-            &engine,
-            &mut dropped,
-            ctx,
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    assert_eq!(print_query(&dropped), "SELECT * FROM v1");
-}
-
-#[test]
-fn default_catalog_one_two_and_three_part_names_share_session_registry() {
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default();
-
-    service
-        .try_handle_statement(
-            &engine,
-            "CREATE VIEW default_catalog.db.v AS SELECT 1 AS a",
-            context(None, "other"),
-        )
-        .unwrap();
-    let mut two_part = parse_query("SELECT * FROM db.v");
-    service
-        .rewrite_query(
-            &engine,
-            &mut two_part,
-            context(None, "other"),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    assert_eq!(print_query(&two_part), "SELECT * FROM (SELECT 1 AS a) v");
-
-    service
-        .try_handle_statement(
-            &engine,
-            "CREATE VIEW local AS SELECT 2 AS a",
-            context(Some("default_catalog"), "db"),
-        )
-        .unwrap();
-    let mut one_part = parse_query("SELECT * FROM local");
-    service
-        .rewrite_query(
-            &engine,
-            &mut one_part,
-            context(Some("default_catalog"), "db"),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    assert_eq!(
-        print_query(&one_part),
-        "SELECT * FROM (SELECT 2 AS a) local"
+    assert!(
+        service
+            .catalog_snapshot()
+            .unwrap()
+            .get(&novarocks_types::naming::TableIdentity::new(
+                "default_catalog",
+                "db",
+                "v1"
+            ))
+            .is_none()
     );
 }
 
 #[test]
-fn session_view_rewrite_uses_its_frozen_creation_database() {
+fn local_views_do_not_exist_on_a_new_service_instance() {
     let service = QueryViewService::new();
-    let engine = FakeViewEngine::default();
-
+    let engine = FakeViewEngine {
+        analyze_local_sql: true,
+        ..Default::default()
+    };
     service
         .try_handle_statement(
             &engine,
-            "CREATE VIEW default_catalog.creation.v AS SELECT * FROM base",
-            context(None, "caller"),
+            "CREATE VIEW v AS SELECT 1 AS a",
+            context(None, "db"),
         )
         .unwrap();
-
-    let mut query = parse_query("SELECT * FROM creation.v");
-    service
-        .rewrite_query(
-            &engine,
-            &mut query,
-            context(None, "other"),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    assert_eq!(
-        print_query(&query),
-        "SELECT * FROM (SELECT * FROM default_catalog.caller.base) v"
+    let identity = novarocks_types::naming::TableIdentity::new("default_catalog", "db", "v");
+    let original = service.catalog_snapshot().unwrap();
+    assert!(original.get(&identity).is_some());
+    drop(service);
+    let restarted = QueryViewService::new();
+    assert!(
+        restarted
+            .catalog_snapshot()
+            .unwrap()
+            .get(&identity)
+            .is_none()
     );
+    assert!(original.get(&identity).is_some());
+    let show = query_result(
+        restarted
+            .try_handle_statement(&engine, "SHOW VIEWS", context(None, "db"))
+            .unwrap(),
+    );
+    assert!(query_rows(&show).is_empty());
+}
+
+#[test]
+fn ignore_nulls_uses_the_original_parser_and_preserves_local_and_external_raw_source() {
+    // This checks parsing and persisted source, not first_value execution capability.
+    let body = "SELECT /* original */ first_value(a IGNORE NULLS) OVER () AS x FROM t";
+    let parsed = parse_query(body);
+    let SetExpr::Select(select) = parsed.body.as_ref() else {
+        panic!("select")
+    };
+    let novarocks_parser::ast::SelectItem::ExprWithAlias {
+        expr: novarocks_parser::ast::Expr::FunctionCall(call),
+        ..
+    } = &select.projection[0]
+    else {
+        panic!("original function call")
+    };
+    assert_eq!(
+        call.null_treatment,
+        Some(novarocks_parser::ast::NullTreatment::IgnoreNulls)
+    );
+    assert!(call.over.is_some());
+    let service = QueryViewService::new();
+    let engine = FakeViewEngine::default();
+    service
+        .try_handle_statement(
+            &engine,
+            &format!("CREATE VIEW dialect_view AS {body}"),
+            context(None, "db"),
+        )
+        .unwrap();
+    let snapshot = service.catalog_snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .get(&novarocks_types::naming::TableIdentity::new(
+                "default_catalog",
+                "db",
+                "dialect_view"
+            ))
+            .unwrap()
+            .raw_sql
+            .as_ref(),
+        body
+    );
+    let target = ViewTarget {
+        catalog: "ice".into(),
+        database: "db".into(),
+        view: "external_dialect_view".into(),
+    };
+    engine.insert_view(target.clone(), body, "db");
+    let external = engine
+        .load_external_view(&target, connector_context())
+        .unwrap()
+        .unwrap();
+    assert_eq!(external.definition.raw_query_source, body);
+    assert_eq!(parse_query(&external.definition.raw_query_source), parsed);
 }
 
 #[test]
 fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
     let service = QueryViewService::new();
-    let engine = FakeViewEngine::default().with_rest_catalog("ice");
+    let engine = FakeViewEngine {
+        analyze_local_sql: true,
+        ..Default::default()
+    };
     let shadow = ViewTarget {
         catalog: "ice".to_string(),
         database: "db".to_string(),
@@ -496,7 +454,7 @@ fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
         service
             .try_handle_statement(
                 &engine,
-                "CREATE VIEW ice.db.shadow AS SELECT 1",
+                "CREATE VIEW ice.db.shadow AS SELECT 1 AS a",
                 context(None, "db"),
             )
             .unwrap_err(),
@@ -531,35 +489,32 @@ fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
     );
     drop(created);
 
-    assert!(
-        service
-            .try_handle_statement(
-                &engine,
-                "CREATE VIEW ice.db.bad (only_one) AS SELECT 1, 2",
-                context(None, "db"),
-            )
-            .unwrap_err()
-            .contains("view column list has 1 names but the SELECT produces 2 columns")
+    let error = declarations::execute(
+        &service,
+        &engine,
+        "CREATE VIEW ice.db.bad (only_one) AS SELECT 1, 2",
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.analyze_error().map(|error| error.kind()),
+        Some(novarocks_sql::analyze_error::AnalyzeErrorKind::MismatchedColumnAliases)
     );
 
-    let analyzed_before = engine.analyzed_queries.lock().unwrap().len();
+    let analyzed_before = *engine.analyzed_count.lock().unwrap();
     service
         .try_handle_statement(
             &engine,
-            "CREATE VIEW IF NOT EXISTS ice.db.v AS SELECT 9",
+            "CREATE VIEW IF NOT EXISTS ice.db.v AS SELECT 9 AS a",
             context(None, "db"),
         )
         .unwrap();
-    assert_eq!(
-        engine.analyzed_queries.lock().unwrap().len(),
-        analyzed_before + 1
-    );
+    assert_eq!(*engine.analyzed_count.lock().unwrap(), analyzed_before + 1);
 }
 
 #[test]
 fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
     let service = QueryViewService::new();
-    let engine = FakeViewEngine::default().with_rest_catalog("ice");
+    let engine = FakeViewEngine::default();
     let target = ViewTarget {
         catalog: "ice".to_string(),
         database: "db".to_string(),
@@ -618,288 +573,6 @@ fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
 }
 
 #[test]
-fn rewrite_is_session_first_and_preserves_external_resolution_rules() {
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default().with_rest_catalog("ice");
-    service
-        .try_handle_statement(
-            &engine,
-            "CREATE VIEW local AS SELECT 7 AS a",
-            context(None, "db"),
-        )
-        .unwrap();
-    engine.insert_view(
-        ViewTarget {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            view: "local".to_string(),
-        },
-        "SELECT 8 AS a",
-        "db",
-    );
-    engine.insert_view(
-        ViewTarget {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            view: "base".to_string(),
-        },
-        "SELECT 1 AS a",
-        "db",
-    );
-    engine.insert_view(
-        ViewTarget {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            view: "nested".to_string(),
-        },
-        "SELECT * FROM base",
-        "db",
-    );
-
-    let mut local = parse_query("SELECT * FROM local");
-    service
-        .rewrite_query(
-            &engine,
-            &mut local,
-            context(Some("ice"), "db"),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    assert_eq!(print_query(&local), "SELECT * FROM (SELECT 7 AS a) local");
-
-    let mut nested = parse_query("SELECT * FROM nested");
-    service
-        .rewrite_query(
-            &engine,
-            &mut nested,
-            context(Some("ice"), "db"),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    assert_eq!(
-        print_query(&nested),
-        "SELECT * FROM (SELECT * FROM (SELECT 1 AS a) base) nested"
-    );
-
-    let mut cte = parse_query("WITH nested AS (SELECT 3 AS a) SELECT * FROM nested");
-    service
-        .rewrite_query(
-            &engine,
-            &mut cte,
-            context(Some("ice"), "db"),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    assert_eq!(
-        print_query(&cte),
-        "WITH nested AS (SELECT 3 AS a) SELECT * FROM nested"
-    );
-}
-
-#[test]
-fn session_cte_shadows_a_same_named_session_view() {
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default();
-    service
-        .try_handle_statement(
-            &engine,
-            "CREATE VIEW nested AS SELECT 7 AS a",
-            context(None, "db"),
-        )
-        .unwrap();
-
-    let mut query = parse_query("WITH nested AS (SELECT 3 AS a) SELECT * FROM nested");
-    service
-        .rewrite_query(
-            &engine,
-            &mut query,
-            context(None, "db"),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    assert_eq!(
-        print_query(&query),
-        "WITH nested AS (SELECT 3 AS a) SELECT * FROM nested"
-    );
-}
-
-#[test]
-fn session_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default();
-    for view in ["nested", "first", "second"] {
-        service
-            .try_handle_statement(
-                &engine,
-                &format!("CREATE VIEW {view} AS SELECT 7 AS a"),
-                context(None, "db"),
-            )
-            .unwrap();
-    }
-
-    for sql in [
-        "WITH nested AS (SELECT 3 AS a) \
-         SELECT * FROM (SELECT * FROM nested) AS s",
-        "WITH first AS (SELECT 1 AS a), \
-         second AS (SELECT * FROM (SELECT * FROM first) AS s) \
-         SELECT * FROM second",
-        "WITH RECURSIVE nested AS (\
-         SELECT 1 AS a UNION ALL SELECT * FROM nested\
-         ) SELECT * FROM nested",
-    ] {
-        let mut query = parse_query(sql);
-        let expected = print_query(&query);
-        service
-            .rewrite_query(
-                &engine,
-                &mut query,
-                context(None, "db"),
-                &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-            )
-            .unwrap();
-        assert_eq!(print_query(&query), expected, "input: {sql}");
-    }
-}
-
-#[test]
-fn external_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default().with_rest_catalog("ice");
-    for view in ["nested", "first", "second"] {
-        engine.insert_view(
-            ViewTarget {
-                catalog: "ice".to_string(),
-                database: "db".to_string(),
-                view: view.to_string(),
-            },
-            "SELECT 7 AS a",
-            "db",
-        );
-    }
-
-    for sql in [
-        "WITH nested AS (SELECT 3 AS a) \
-         SELECT * FROM (SELECT * FROM nested) AS s",
-        "WITH first AS (SELECT 1 AS a), \
-         second AS (SELECT * FROM (SELECT * FROM first) AS s) \
-         SELECT * FROM second",
-        "WITH RECURSIVE nested AS (\
-         SELECT 1 AS a UNION ALL SELECT * FROM nested\
-         ) SELECT * FROM nested",
-    ] {
-        let mut query = parse_query(sql);
-        let expected = print_query(&query);
-        service
-            .rewrite_query(
-                &engine,
-                &mut query,
-                context(Some("ice"), "db"),
-                &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-            )
-            .unwrap();
-        assert_eq!(print_query(&query), expected, "input: {sql}");
-    }
-}
-
-#[test]
-fn external_view_qualification_preserves_ctes_inside_nested_queries() {
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default().with_rest_catalog("ice");
-    engine.insert_view(
-        ViewTarget {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            view: "wrapper".to_string(),
-        },
-        "WITH nested AS (SELECT 3 AS a) \
-         SELECT * FROM (SELECT * FROM nested) AS s",
-        "db",
-    );
-
-    let mut query = parse_query("SELECT * FROM wrapper");
-    service
-        .rewrite_query(
-            &engine,
-            &mut query,
-            context(Some("ice"), "db"),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    let rendered = print_query(&query);
-    assert!(!rendered.contains("ice.db.nested"), "got: {rendered}");
-    assert!(rendered.contains("FROM nested"), "got: {rendered}");
-}
-
-#[test]
-fn spi5b_rewrite_resolves_table_view_and_admission_failure_with_one_control_result() {
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default().with_rest_catalog("ice");
-    let table = ViewTarget {
-        catalog: "ice".to_string(),
-        database: "db".to_string(),
-        view: "table_wins".to_string(),
-    };
-    engine.tables.lock().unwrap().insert(table.clone());
-    engine.insert_view(table, "SELECT 1", "db");
-    let failed = ViewTarget {
-        catalog: "ice".to_string(),
-        database: "db".to_string(),
-        view: "probe_failed".to_string(),
-    };
-    engine
-        .table_probe_failures
-        .lock()
-        .unwrap()
-        .insert(failed.clone());
-    engine.insert_view(failed, "SELECT 2", "db");
-    engine.insert_view(
-        ViewTarget {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            view: "cycle_a".to_string(),
-        },
-        "SELECT * FROM cycle_b",
-        "db",
-    );
-    engine.insert_view(
-        ViewTarget {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            view: "cycle_b".to_string(),
-        },
-        "SELECT * FROM cycle_a",
-        "db",
-    );
-
-    let mut unchanged = parse_query("SELECT * FROM table_wins JOIN probe_failed ON true");
-    service
-        .rewrite_query(
-            &engine,
-            &mut unchanged,
-            context(Some("ice"), "db"),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    assert_eq!(
-        print_query(&unchanged),
-        "SELECT * FROM table_wins JOIN probe_failed ON TRUE"
-    );
-
-    let mut cycle = parse_query("SELECT * FROM cycle_a");
-    assert_eq!(
-        service
-            .rewrite_query(
-                &engine,
-                &mut cycle,
-                context(Some("ice"), "db"),
-                &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-            )
-            .unwrap_err(),
-        "circular view reference: ice.db.cycle_a"
-    );
-}
-
-#[test]
 fn dropping_external_database_does_not_remove_default_catalog_views() {
     let service = QueryViewService::new();
     let engine = FakeViewEngine::default();
@@ -926,380 +599,6 @@ fn dropping_external_database_does_not_remove_default_catalog_views() {
             .unwrap(),
     );
     assert!(query_rows(&show).is_empty());
-}
-
-#[test]
-fn local_views_do_not_exist_on_a_new_service_instance() {
-    // The durable half of this case retired with `ViewRepository`. A local view
-    // is process runtime state, so the observable contract is the opposite one:
-    // a new service instance starts from an empty registry.
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default();
-    service
-        .try_handle_statement(
-            &engine,
-            "CREATE VIEW v AS SELECT 1 AS a",
-            context(None, "db"),
-        )
-        .unwrap();
-    let mut visible = parse_query("SELECT * FROM v");
-    service
-        .rewrite_query(
-            &engine,
-            &mut visible,
-            context(None, "db"),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    assert_eq!(print_query(&visible), "SELECT * FROM (SELECT 1 AS a) v");
-    drop(service);
-
-    let restarted = QueryViewService::new();
-    let mut absent = parse_query("SELECT * FROM v");
-    restarted
-        .rewrite_query(
-            &engine,
-            &mut absent,
-            context(None, "db"),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    assert_eq!(
-        print_query(&absent),
-        "SELECT * FROM v",
-        "a local view must not outlive the frontend incarnation that defined it"
-    );
-    let show = query_result(
-        restarted
-            .try_handle_statement(&engine, "SHOW VIEWS", context(None, "db"))
-            .unwrap(),
-    );
-    assert!(query_rows(&show).is_empty());
-}
-
-#[test]
-fn starrocks_view_sql_uses_the_same_parser_for_local_and_external_views() {
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default().with_rest_catalog("ice");
-    service
-        .try_handle_statement(
-            &engine,
-            "CREATE VIEW dialect_view AS \
-             SELECT first_value(a IGNORE NULLS) OVER () AS x FROM t",
-            context(None, "db"),
-        )
-        .unwrap();
-    let mut query = parse_query("SELECT * FROM dialect_view");
-    service
-        .rewrite_query(
-            &engine,
-            &mut query,
-            context(None, "db"),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    let rendered = print_query(&query);
-    assert!(
-        rendered.contains("first_value(a IGNORE NULLS) OVER ()"),
-        "got: {rendered}"
-    );
-
-    engine.insert_view(
-        ViewTarget {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            view: "external_dialect_view".to_string(),
-        },
-        "SELECT first_value(a IGNORE NULLS) OVER () AS x FROM t",
-        "db",
-    );
-    // Deliberately a different name from the local view above. Sharing one
-    // name let the local expansion satisfy this assertion, so the external
-    // path - now the only durable view mechanism - was never exercised.
-    let mut external = parse_query("SELECT * FROM external_dialect_view");
-    service
-        .rewrite_query(
-            &engine,
-            &mut external,
-            context(Some("ice"), "db"),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .unwrap();
-    let rendered = print_query(&external);
-    assert!(
-        rendered.contains("first_value(a IGNORE NULLS) OVER ()"),
-        "got: {rendered}"
-    );
-}
-
-#[test]
-fn view_read_checks_frozen_lexical_semantics_before_expansion() {
-    use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default();
-    let ctx = context(None, "db");
-    service
-        .try_handle_statement(&engine, "CREATE VIEW v AS SELECT 1 AS a", ctx)
-        .unwrap();
-    let modern = SqlSemanticSettings::default();
-    let legacy = modern
-        .clone()
-        .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY"));
-    for sql in [
-        "SELECT * FROM v",
-        "WITH c AS (SELECT * FROM v) SELECT * FROM c",
-        "SELECT * FROM (SELECT * FROM v) d",
-        "SELECT 1 UNION ALL SELECT * FROM v",
-    ] {
-        let mut query = parse_query(sql);
-        assert!(
-            service
-                .rewrite_query(&engine, &mut query, ctx, &legacy)
-                .unwrap_err()
-                .starts_with("Unsupported:")
-        );
-        assert_eq!(
-            print_query(&query),
-            print_query(&parse_query(sql)),
-            "rejected body is never installed"
-        );
-    }
-    for sql in [
-        "SELECT /*+ SET_VAR(sql_mode=32) */ * FROM v",
-        "SELECT /*+ SET_VAR(sql_mode=32) */ * FROM v UNION ALL SELECT /*+ SET_VAR(sql_mode=32) */ * FROM v",
-    ] {
-        let mut query = parse_query(sql);
-        service
-            .rewrite_query(&engine, &mut query, ctx, &legacy)
-            .unwrap();
-        assert!(!print_query(&query).contains("FROM v"));
-    }
-    let mut query = parse_query("SELECT * FROM physical_table");
-    let before = print_query(&query);
-    service
-        .rewrite_query(&engine, &mut query, ctx, &legacy)
-        .unwrap();
-    assert_eq!(print_query(&query), before);
-    let mut query = parse_query("SELECT * FROM v");
-    service
-        .rewrite_query(&engine, &mut query, ctx, &modern)
-        .unwrap();
-    assert!(!print_query(&query).contains("FROM v"));
-    assert_eq!(legacy.sql_mode().assignment(), "GROUP_CONCAT_LEGACY");
-}
-
-#[test]
-fn external_view_read_rejects_stored_legacy_hints_under_modern_caller() {
-    use novarocks_sql::sql_mode::SqlSemanticSettings;
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default().with_rest_catalog("ice");
-    engine.insert_view(
-        ViewTarget {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            view: "legacy_v".to_string(),
-        },
-        "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ 1 AS a",
-        "db",
-    );
-    let mut query = parse_query("SELECT * FROM legacy_v");
-    let before = print_query(&query);
-    let error = service
-        .rewrite_query(
-            &engine,
-            &mut query,
-            context(Some("ice"), "db"),
-            &SqlSemanticSettings::default(),
-        )
-        .unwrap_err();
-    assert!(error.starts_with("Unsupported:"));
-    assert_eq!(print_query(&query), before);
-    assert!(engine.analyzed_queries.lock().unwrap().is_empty());
-}
-
-#[test]
-fn view_read_checks_decimal_snapshot_before_expansion() {
-    use novarocks_sql::sql_mode::SqlSemanticSettings;
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default();
-    let ctx = context(None, "db");
-    service
-        .try_handle_statement(&engine, "CREATE VIEW v AS SELECT 1 AS a", ctx)
-        .unwrap();
-    let modern = SqlSemanticSettings::default();
-    let legacy = modern.clone().with_decimal_overflow_to_double(true);
-    for sql in [
-        "SELECT * FROM v",
-        "WITH c AS (SELECT * FROM v) SELECT * FROM c",
-        "SELECT * FROM (SELECT * FROM v) d",
-        "SELECT 1 UNION ALL SELECT * FROM v",
-    ] {
-        let mut query = parse_query(sql);
-        assert!(
-            service
-                .rewrite_query(&engine, &mut query, ctx, &legacy)
-                .unwrap_err()
-                .starts_with("Unsupported:")
-        );
-        assert_eq!(
-            print_query(&query),
-            print_query(&parse_query(sql)),
-            "rejected body is never installed"
-        );
-    }
-    for sql in [
-        "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ * FROM v",
-        "SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ * FROM v UNION ALL SELECT /*+ SET_VAR(decimal_overflow_to_double=false) */ * FROM v",
-    ] {
-        let mut query = parse_query(sql);
-        service
-            .rewrite_query(&engine, &mut query, ctx, &legacy)
-            .unwrap();
-        assert!(!print_query(&query).contains("FROM v"));
-    }
-    let mut query = parse_query("SELECT * FROM physical_table");
-    let before = print_query(&query);
-    service
-        .rewrite_query(&engine, &mut query, ctx, &legacy)
-        .unwrap();
-    assert_eq!(print_query(&query), before);
-    let mut query = parse_query("SELECT * FROM v");
-    service
-        .rewrite_query(&engine, &mut query, ctx, &modern)
-        .unwrap();
-    assert!(!print_query(&query).contains("FROM v"));
-    assert!(legacy.decimal_overflow_to_double());
-}
-
-#[test]
-fn external_view_read_rejects_stored_decimal_hints() {
-    use novarocks_sql::sql_mode::SqlSemanticSettings;
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default().with_rest_catalog("ice");
-    engine.insert_view(
-        ViewTarget {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            view: "decimal_v".to_string(),
-        },
-        "SELECT /*+ SET_VAR(decimal_overflow_to_double=true) */ 1 AS a",
-        "db",
-    );
-    let mut query = parse_query("SELECT * FROM decimal_v");
-    let before = print_query(&query);
-    let error = service
-        .rewrite_query(
-            &engine,
-            &mut query,
-            context(Some("ice"), "db"),
-            &SqlSemanticSettings::default(),
-        )
-        .unwrap_err();
-    assert!(error.starts_with("Unsupported:"));
-    assert_eq!(print_query(&query), before);
-    assert!(engine.analyzed_queries.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn asynchronous_view_rewrite_waits_for_the_original_observation_and_keeps_resolution_rules() {
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default().with_rest_catalog("ice");
-    engine.insert_view(
-        ViewTarget {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            view: "nested".to_string(),
-        },
-        "SELECT * FROM base",
-        "db",
-    );
-    engine.insert_view(
-        ViewTarget {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            view: "base".to_string(),
-        },
-        "SELECT 1 AS a",
-        "db",
-    );
-    service
-        .try_handle_statement(
-            &engine,
-            "CREATE VIEW local AS SELECT 7 AS a",
-            context(None, "db"),
-        )
-        .unwrap();
-    let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
-    let (release, blocked) = tokio::sync::oneshot::channel();
-    *engine.async_gate.lock().unwrap() = Some(blocked);
-    let mut query = parse_query("SELECT * FROM nested");
-    let mut observation =
-        service.rewrite_query_async(&engine, &mut query, context(Some("ice"), "db"), &semantics);
-    assert!(futures::poll!(&mut observation).is_pending());
-    release.send(()).unwrap();
-    observation.await.unwrap();
-    assert_eq!(
-        print_query(&query),
-        "SELECT * FROM (SELECT * FROM (SELECT 1 AS a) base) nested"
-    );
-    for sql in [
-        "SELECT * FROM local",
-        "WITH nested AS (SELECT 3 AS a) SELECT * FROM nested",
-        "SELECT * FROM (SELECT * FROM nested) AS s",
-        "SELECT * FROM nested UNION ALL SELECT * FROM base",
-    ] {
-        let mut expected = parse_query(sql);
-        service
-            .rewrite_query(
-                &engine,
-                &mut expected,
-                context(Some("ice"), "db"),
-                &semantics,
-            )
-            .unwrap();
-        let mut actual = parse_query(sql);
-        service
-            .rewrite_query_async(&engine, &mut actual, context(Some("ice"), "db"), &semantics)
-            .await
-            .unwrap();
-        assert_eq!(print_query(&actual), print_query(&expected));
-    }
-}
-
-#[tokio::test]
-async fn asynchronous_view_rewrite_preserves_circular_and_unsupported_errors() {
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default().with_rest_catalog("ice");
-    engine.insert_view(
-        ViewTarget {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            view: "cycle".to_string(),
-        },
-        "SELECT * FROM cycle",
-        "db",
-    );
-    let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
-    for sql in [
-        "SELECT * FROM ice.db.cycle",
-        "SELECT * FROM undeclared.db.t",
-    ] {
-        let mut expected = parse_query(sql);
-        let expected = service
-            .rewrite_query(
-                &engine,
-                &mut expected,
-                context(Some("ice"), "db"),
-                &semantics,
-            )
-            .unwrap_err();
-        let mut actual = parse_query(sql);
-        let actual = service
-            .rewrite_query_async(&engine, &mut actual, context(Some("ice"), "db"), &semantics)
-            .await
-            .unwrap_err();
-        assert_eq!(actual, expected);
-    }
 }
 
 #[test]

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Query-application-owned view DDL, metadata, and query rewrite service.
+//! Query-application-owned view DDL, metadata, and declaration service.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::api::{QueryResult, build_utf8_query_result};
 use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
-use novarocks_parser::ast::{CreateView, Query, Statement, ViewStatement};
+use novarocks_parser::ast::{CreateView, ViewStatement};
 use novarocks_types::naming::normalize_identifier;
 
 pub(crate) const DEFAULT_CATALOG: &str = "default_catalog";
@@ -37,8 +37,6 @@ pub(crate) struct SessionViewKey {
 
 #[derive(Clone, Debug)]
 pub(crate) struct StoredView {
-    pub(crate) definition: PersistedQueryDefinition,
-    pub(crate) query: Box<Query>,
     pub(crate) declaration: Arc<novarocks_sql::planning::catalog::SqlViewDefinition>,
 }
 
@@ -104,8 +102,6 @@ impl QueryViewService {
     fn create_session_view(
         &self,
         key: SessionViewKey,
-        definition: PersistedQueryDefinition,
-        query: Box<Query>,
         declaration: Arc<novarocks_sql::planning::catalog::SqlViewDefinition>,
         or_replace: bool,
     ) -> Result<(), String> {
@@ -123,14 +119,7 @@ impl QueryViewService {
                 key.database, key.view
             ));
         }
-        Arc::make_mut(&mut registry).insert(
-            key,
-            StoredView {
-                definition,
-                query,
-                declaration,
-            },
-        );
+        Arc::make_mut(&mut registry).insert(key, StoredView { declaration });
         Ok(())
     }
 
@@ -201,8 +190,7 @@ impl QueryViewService {
             columns: columns.into(),
         });
         declaration.validate()?;
-        let query = parse_query(&definition.raw_query_source)?;
-        self.create_session_view(key, definition, query, declaration, create_view.or_replace)?;
+        self.create_session_view(key, declaration, create_view.or_replace)?;
         Ok(ViewStatementResult::Ok)
     }
 
@@ -322,43 +310,6 @@ impl ViewService for QueryViewService {
         }
     }
 
-    fn rewrite_query(
-        &self,
-        engine: &dyn ViewEngine,
-        query: &mut Query,
-        context: ViewRequestContext<'_>,
-        sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
-    ) -> Result<(), String> {
-        let registry = self.registry_snapshot()?;
-        crate::view_rewrite::expand_session_views(
-            query,
-            &registry,
-            context.current_database,
-            sql_semantics,
-        )?;
-        crate::view_rewrite::expand_external_views(engine, query, context, sql_semantics)
-    }
-
-    fn rewrite_query_async<'a>(
-        &'a self,
-        engine: &'a dyn ViewEngine,
-        query: &'a mut Query,
-        context: ViewRequestContext<'a>,
-        sql_semantics: &'a novarocks_sql::sql_mode::SqlSemanticSettings,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            let registry = self.registry_snapshot()?;
-            crate::view_rewrite::expand_session_views(
-                query,
-                &registry,
-                context.current_database,
-                sql_semantics,
-            )?;
-            crate::view_rewrite::expand_external_views_async(engine, query, context, sql_semantics)
-                .await
-        })
-    }
-
     fn drop_database(&self, catalog: &str, database: &str) -> Result<(), String> {
         if !catalog.eq_ignore_ascii_case(DEFAULT_CATALOG) {
             return Ok(());
@@ -376,15 +327,6 @@ impl ViewService for QueryViewService {
         Arc::make_mut(&mut registry)
             .retain(|key, _| key.catalog != catalog || key.database != database);
         Ok(())
-    }
-}
-
-pub(crate) fn parse_query(sql: &str) -> Result<Box<Query>, String> {
-    let statements =
-        novarocks_parser::parse(sql).map_err(|error| format!("query parse failed: {error}"))?;
-    match statements.as_slice() {
-        [Statement::Query(query)] => Ok(Box::new(query.clone())),
-        _ => Err("view SQL must contain exactly one query statement".to_string()),
     }
 }
 

@@ -25,14 +25,10 @@ use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
 };
-use novarocks_parser::{
-    ast::{Query, Statement as ParsedStatement},
-    parse as parse_typed_statement,
-    printer::print_query,
-};
+use novarocks_parser::parse as parse_typed_statement;
 use novarocks_query_application::view::{
-    CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
-    ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
+    CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition, ViewEngine,
+    ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };
 use novarocks_secret::SecretValue;
 use novarocks_state_store_api::{CommitOutcome, Key, Precondition, Value};
@@ -108,24 +104,6 @@ fn fe_backend_config() -> ClusterBackendOpenConfig {
 struct SessionViewEngine;
 
 impl ViewEngine for SessionViewEngine {
-    fn resolve_external_view(
-        &self,
-        _target: &ViewTarget,
-        _context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ExternalViewResolution, String> {
-        unreachable!("session view must not resolve external views")
-    }
-
-    fn resolve_external_view_async<'a>(
-        &'a self,
-        target: &'a ViewTarget,
-        context: &'a novarocks_spi::connector::ConnectorRequestContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ExternalViewResolution, String>> + Send + 'a>,
-    > {
-        Box::pin(async move { self.resolve_external_view(target, context) })
-    }
-
     fn create_external_view(
         &self,
         _request: CreateExternalViewRequest,
@@ -225,14 +203,6 @@ fn execute_view_statement(
     service
         .execute_statement(engine, statement, context)
         .map_err(|error| error.to_string())
-}
-
-fn parse_query(sql: &str) -> Query {
-    let statements = parse_typed_statement(sql).expect("parse typed query");
-    let [ParsedStatement::Query(query)] = statements.as_slice() else {
-        panic!("expected typed query");
-    };
-    query.clone()
 }
 
 fn state_store_input() -> StateStoreHostInput {
@@ -553,31 +523,24 @@ fn local_view_service_does_not_restore_state_across_process_instances() {
         view_context(),
     )
     .expect("local view service must register the view");
-    let mut visible = parse_query("SELECT * FROM local_view");
-    host.rewrite_query(
-        &SessionViewEngine,
-        &mut visible,
-        view_context(),
-        &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-    )
-    .expect("the defining process instance must expand its own view");
-    assert_eq!(
-        print_query(&visible),
-        "SELECT * FROM (SELECT 42 AS answer) local_view"
-    );
-    // A local view is process runtime state: it ends with the process instance
-    // that defined it. Durable views live in an external catalog.
+    let identity =
+        novarocks_types::naming::TableIdentity::new("default_catalog", "db", "local_view");
+    let snapshot = host.catalog_snapshot().expect("original process snapshot");
+    let view = snapshot
+        .get(&identity)
+        .expect("the original process retains its declaration");
+    assert_eq!(view.columns[0].name.as_ref(), "answer");
+    assert_eq!(view.raw_sql.as_ref(), "SELECT 42 AS answer");
+    // Local views are process runtime facts; an independent process starts empty.
     let reopened = novarocks_query_application::view::QueryViewService::new();
-    let mut query = parse_query("SELECT * FROM local_view");
-    reopened
-        .rewrite_query(
-            &SessionViewEngine,
-            &mut query,
-            view_context(),
-            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .expect("new process instance must rewrite without the local view");
-    assert_eq!(print_query(&query), "SELECT * FROM local_view");
+    assert!(
+        reopened
+            .catalog_snapshot()
+            .unwrap()
+            .get(&identity)
+            .is_none()
+    );
+    assert!(snapshot.get(&identity).is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

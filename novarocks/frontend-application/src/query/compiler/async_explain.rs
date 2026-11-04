@@ -74,31 +74,7 @@ impl FrontendQueryCompiler {
                         .with_io_admission(Arc::clone(&ports.io)),
                 )
                 .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
-            let connector_context = connector_planning_context.request();
-            let mut query = explain.query.as_ref().clone();
-            self.view
-                .view_service()
-                .rewrite_query_async(
-                    &crate::view::engine::FrontendViewEngine::new(self.view.clone()),
-                    &mut query,
-                    ViewRequestContext {
-                        current_catalog,
-                        current_database,
-                        connector_context: Some(connector_context),
-                    },
-                    execution.sql_semantics(),
-                )
-                .await?;
-            if has_time_travel_refs(&query) {
-                crate::query_execution::planning::time_travel::rewrite_time_travel_refs_async(
-                    &self.query,
-                    current_catalog,
-                    current_database,
-                    &mut query,
-                    connector_context,
-                )
-                .await?;
-            }
+            let query = explain.query.as_ref().clone();
             Ok((connector_planning_context, query))
         }
         .await;

@@ -66,7 +66,7 @@ fn engine() -> FakeViewEngine {
     }
 }
 
-fn execute(
+pub(super) fn execute(
     service: &QueryViewService,
     engine: &FakeViewEngine,
     sql: &str,
@@ -233,4 +233,228 @@ fn local_view_public_alias_does_not_hide_a_changed_dependency_header() {
             .get(&identity("consumer"))
             .is_none()
     );
+}
+
+// Capture uses the original SQL dependency collector and only the immutable
+// snapshot's declarations. No test walker qualifies or expands stored SQL.
+fn capture_snapshot_query(
+    snapshot: &crate::view::LocalViewSnapshot,
+    sql: &str,
+    database: &str,
+) -> Result<
+    (
+        novarocks_sql::compiler::SqlCapturedCatalog,
+        Vec<TableIdentity>,
+    ),
+    SqlCompileError,
+> {
+    let mut preparation = SqlCapturedCatalogPreparation::try_new(
+        parse_query(sql),
+        Some("default_catalog"),
+        database,
+        SqlCompileControl::unbounded(),
+    )?;
+    let mut lookups = Vec::new();
+    while !preparation.needs().is_empty() {
+        let facts = preparation
+            .needs()
+            .iter()
+            .map(|need| {
+                lookups.push(need.relation().clone());
+                match snapshot.get(need.relation()) {
+                    Some(view) => CatalogRelationFact::view(need, view.clone()),
+                    None => CatalogRelationFact::missing(need, "absent local fixture relation"),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
+        preparation = preparation.continue_catalog(facts.into_boxed_slice())?;
+    }
+    Ok((preparation.capture(&[])?, lookups))
+}
+
+pub(super) fn analyze_snapshot_query(
+    snapshot: &crate::view::LocalViewSnapshot,
+    sql: &str,
+    database: &str,
+    semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
+) -> Result<(), SqlCompileError> {
+    use novarocks_sql::compiler::{
+        SessionOptimizerSettings, SqlAnalyzeRequest, SqlCompileIntent, SqlCompiler,
+        SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
+        noop_constant_evaluator,
+    };
+    let (catalog, _) = capture_snapshot_query(snapshot, sql, database)?;
+    SqlCompiler::analyze(SqlAnalyzeRequest::new(
+        SqlStatementInput::parsed_query(Box::new(parse_query(sql))),
+        SqlCompileIntent::AnalyzeOnly,
+        SqlSessionContext {
+            current_catalog: Some("default_catalog".into()),
+            current_database: database.into(),
+            optimizer_settings: SessionOptimizerSettings::default(),
+            sql_semantics: semantics.clone(),
+        },
+        SqlPlanningEnvironment::Distributed,
+        &catalog,
+        builtin_sql_function_catalog(),
+        noop_constant_evaluator(),
+        None,
+        crate::completed_plan_fixture::test_constant_policy(),
+        SqlCompileControl::unbounded(),
+    ))
+    .map(|_| ())
+}
+
+#[test]
+fn one_two_and_three_part_names_use_the_same_registry_declaration_through_sql() {
+    let service = QueryViewService::new();
+    let engine = engine();
+    service
+        .try_handle_statement(
+            &engine,
+            "CREATE VIEW default_catalog.db.v AS SELECT 1 AS a",
+            context(None, "other"),
+        )
+        .unwrap();
+    let snapshot = service.catalog_snapshot().unwrap();
+    let original = snapshot.get(&identity("v")).unwrap();
+    for (sql, database, lookup_catalog) in [
+        ("SELECT * FROM v", "db", None),
+        ("SELECT * FROM db.v", "other", None),
+        (
+            "SELECT * FROM default_catalog.db.v",
+            "other",
+            Some("default_catalog"),
+        ),
+    ] {
+        let (catalog, lookups) = capture_snapshot_query(&snapshot, sql, database).unwrap();
+        assert_eq!(lookups, [identity("v")]);
+        let selected = catalog
+            .provider()
+            .resolve_view_for_analysis(lookup_catalog, "db", "v")
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected, original.as_ref());
+        analyze_snapshot_query(
+            &snapshot,
+            sql,
+            database,
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn creation_database_is_distinct_from_target_and_consumer_databases() {
+    let service = QueryViewService::new();
+    let engine = engine();
+    for (sql, database) in [
+        ("CREATE VIEW base AS SELECT 1 AS a", "caller"),
+        (
+            "CREATE VIEW base AS SELECT 'different namespace' AS a",
+            "creation",
+        ),
+        (
+            "CREATE VIEW default_catalog.creation.v AS SELECT * FROM base",
+            "caller",
+        ),
+    ] {
+        service
+            .try_handle_statement(&engine, sql, context(None, database))
+            .unwrap();
+    }
+    let snapshot = service.catalog_snapshot().unwrap();
+    let target = TableIdentity::new("default_catalog", "creation", "v");
+    let saved = snapshot.get(&target).unwrap();
+    assert_eq!(saved.default_database.as_ref(), "caller");
+    let (_, lookups) =
+        capture_snapshot_query(&snapshot, "SELECT * FROM creation.v", "other").unwrap();
+    assert_eq!(
+        lookups,
+        [
+            target,
+            TableIdentity::new("default_catalog", "caller", "base")
+        ]
+    );
+    analyze_snapshot_query(
+        &snapshot,
+        "SELECT * FROM creation.v",
+        "other",
+        &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn saved_with_and_derived_cte_scopes_are_analyzed_without_physical_cte_lookups() {
+    let service = QueryViewService::new();
+    let engine = engine();
+    for (name, body) in [
+        (
+            "nested",
+            "WITH t AS (SELECT 1 AS a) SELECT a FROM (SELECT * FROM t) d",
+        ),
+        (
+            "preceding",
+            "WITH t AS (SELECT 1 AS a), u AS (SELECT * FROM (SELECT * FROM t) d) SELECT * FROM u",
+        ),
+    ] {
+        execute(&service, &engine, &format!("CREATE VIEW {name} AS {body}")).unwrap();
+        let snapshot = service.catalog_snapshot().unwrap();
+        let sql = format!("WITH t AS (SELECT 'caller CTE' AS a) SELECT * FROM {name}");
+        let (_, lookups) = capture_snapshot_query(&snapshot, &sql, "db").unwrap();
+        assert_eq!(lookups, [identity(name)]);
+        analyze_snapshot_query(
+            &snapshot,
+            &sql,
+            "db",
+            &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn actual_saved_view_analysis_respects_caller_legacy_semantics_and_select_local_overrides() {
+    use novarocks_sql::sql_mode::{SqlMode, SqlSemanticSettings};
+    let service = QueryViewService::new();
+    let engine = engine();
+    execute(&service, &engine, "CREATE VIEW v AS SELECT 1 AS a").unwrap();
+    let snapshot = service.catalog_snapshot().unwrap();
+    for (caller, hint) in [
+        (
+            SqlSemanticSettings::default()
+                .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY")),
+            "sql_mode=32",
+        ),
+        (
+            SqlSemanticSettings::default().with_decimal_overflow_to_double(true),
+            "decimal_overflow_to_double=false",
+        ),
+    ] {
+        let original_caller = caller.clone();
+        for sql in [
+            "SELECT * FROM v",
+            "WITH c AS (SELECT * FROM v) SELECT * FROM c",
+            "SELECT * FROM (SELECT * FROM v) d",
+            "SELECT 1 AS a UNION ALL SELECT * FROM v",
+        ] {
+            let error = analyze_snapshot_query(&snapshot, sql, "db", &caller).unwrap_err();
+            let SqlCompileError::Analyze(error) = error else {
+                panic!("original analysis refusal")
+            };
+            assert_eq!(error.kind(), AnalyzeErrorKind::UnsupportedExpression);
+            analyze_snapshot_query(&snapshot, sql, "db", &SqlSemanticSettings::default()).unwrap();
+        }
+        for sql in [
+            format!("SELECT /*+ SET_VAR({hint}) */ * FROM v"),
+            format!("WITH c AS (SELECT /*+ SET_VAR({hint}) */ * FROM v) SELECT * FROM c"),
+            format!("SELECT * FROM (SELECT /*+ SET_VAR({hint}) */ * FROM v) d"),
+            format!("SELECT 1 AS a UNION ALL SELECT /*+ SET_VAR({hint}) */ * FROM v"),
+        ] {
+            analyze_snapshot_query(&snapshot, &sql, "db", &caller).unwrap();
+        }
+        assert_eq!(caller, original_caller);
+    }
 }

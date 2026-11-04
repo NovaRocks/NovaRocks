@@ -82,13 +82,6 @@ pub struct ResolvedExternalView {
     pub properties: HashMap<String, String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum ExternalViewResolution {
-    Table,
-    View(ResolvedExternalView),
-    Missing,
-}
-
 /// Pure SHOW preparation, before any selected Provider is called.
 /// Local names and external names share the same original result author.
 pub enum ShowViewsSource {
@@ -110,7 +103,7 @@ impl PreparedShowViews {
     }
 }
 
-/// Query-application-owned view command and rewrite service.
+/// Query-application-owned view command and declaration service.
 pub trait ViewService: Send + Sync {
     fn catalog_snapshot(&self) -> Result<LocalViewSnapshot, String>;
 
@@ -127,43 +120,11 @@ pub trait ViewService: Send + Sync {
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, crate::api::CommandError>;
 
-    fn rewrite_query(
-        &self,
-        engine: &dyn ViewEngine,
-        query: &mut Query,
-        context: ViewRequestContext<'_>,
-        sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
-    ) -> Result<(), String>;
-
-    fn rewrite_query_async<'a>(
-        &'a self,
-        engine: &'a dyn ViewEngine,
-        query: &'a mut Query,
-        context: ViewRequestContext<'a>,
-        sql_semantics: &'a novarocks_sql::sql_mode::SqlSemanticSettings,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
-
     fn drop_database(&self, catalog: &str, database: &str) -> Result<(), String>;
 }
 
 /// Role-local external-view metadata and mutation adapter.
 pub trait ViewEngine: Send + Sync {
-    /// Resolve a table-or-view name through exactly one connector control
-    /// generation. Missing view metadata is not equivalent to an undeclared
-    /// view capability; the latter remains a typed Unsupported error.
-    fn resolve_external_view(
-        &self,
-        target: &ViewTarget,
-        context: &ConnectorRequestContext,
-    ) -> Result<ExternalViewResolution, String>;
-    fn resolve_external_view_async<'a>(
-        &'a self,
-        target: &'a ViewTarget,
-        context: &'a ConnectorRequestContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ExternalViewResolution, String>> + Send + 'a>,
-    >;
-
     fn create_external_view(
         &self,
         request: CreateExternalViewRequest,

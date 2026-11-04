@@ -19,20 +19,18 @@
 //!
 //! The public traits and DTOs are the dependency-inversion boundary used by
 //! the Frontend role application: core exposes only the engine capabilities required by
-//! view DDL and rewrite, without leaking the retired Core application facade, connector
+//! view DDL and declarations, without leaking the retired Core application facade, connector
 //! backends, or parser-internal column definitions.
 
 use std::sync::Arc;
 
 use crate::catalog_application::query_catalog::CatalogServiceSource;
 use crate::query_execution::kernels::ViewExecutionKernel;
-#[cfg(test)]
-use novarocks_parser::ast::Query;
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_query_application::view::{
-    CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
+    CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition,
     ViewDefinitionAnalysisRequest, ViewEngine, ViewTarget,
 };
 #[cfg(test)]
@@ -72,26 +70,6 @@ impl ViewService for EmptyViewService {
         _context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, novarocks_query_application::api::CommandError> {
         Err("view service is not injected".to_string().into())
-    }
-
-    fn rewrite_query(
-        &self,
-        _engine: &dyn ViewEngine,
-        _query: &mut Query,
-        _context: ViewRequestContext<'_>,
-        _sql_semantics: &novarocks_sql::sql_mode::SqlSemanticSettings,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn rewrite_query_async<'a>(
-        &'a self,
-        engine: &'a dyn ViewEngine,
-        query: &'a mut Query,
-        context: ViewRequestContext<'a>,
-        semantics: &'a novarocks_sql::sql_mode::SqlSemanticSettings,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move { self.rewrite_query(engine, query, context, semantics) })
     }
 
     fn drop_database(&self, _catalog: &str, _database: &str) -> Result<(), String> {
@@ -149,126 +127,6 @@ impl ViewExecutionContext for FrontendViewEngine {
 }
 
 impl ViewEngine for FrontendViewEngine {
-    fn resolve_external_view(
-        &self,
-        target: &ViewTarget,
-        context: &ConnectorRequestContext,
-    ) -> Result<ExternalViewResolution, String> {
-        let lease = crate::connector::acquire_metadata_planning_pin(
-            self.connector_control(),
-            &target.catalog,
-        )?;
-        if crate::connector::metadata_table_exists_with_planning_pin(
-            lease.clone(),
-            context.clone(),
-            &target.database,
-            &target.view,
-        )? {
-            return Ok(ExternalViewResolution::Table);
-        }
-        let binding = lease.binding();
-        let Some(capability) = binding.view_metadata() else {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "connector control generation does not declare view metadata",
-            )
-            .to_string());
-        };
-        let instance_id = binding.descriptor().instance_id.clone();
-        match crate::connector::schema_creation::load_frontend_view(
-            capability.as_ref(),
-            ConnectorViewRequest {
-                view: ConnectorViewIdentity {
-                    instance_id,
-                    namespace: Arc::from(target.database.as_str()),
-                    view: Arc::from(target.view.as_str()),
-                },
-                context: context.clone(),
-            },
-        ) {
-            Ok(view) => Ok(ExternalViewResolution::View(resolved_external_view(
-                target, view,
-            )?)),
-            // A catalog that cannot host views has none, so resolution treats
-            // that exactly like an absent view and the name falls through to
-            // the ordinary unknown-relation error. Creating a view still fails
-            // loudly with the provider's capability error.
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ConnectorErrorKind::NotFound | ConnectorErrorKind::Unsupported
-                ) =>
-            {
-                Ok(ExternalViewResolution::Missing)
-            }
-            Err(error) => Err(error.to_string()),
-        }
-    }
-
-    fn resolve_external_view_async<'a>(
-        &'a self,
-        target: &'a ViewTarget,
-        context: &'a ConnectorRequestContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ExternalViewResolution, String>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            let lease = crate::connector::acquire_metadata_planning_pin(
-                self.connector_control(),
-                &target.catalog,
-            )?;
-            if crate::connector::metadata_table_exists_with_planning_pin_async(
-                lease.clone(),
-                context.clone(),
-                &target.database,
-                &target.view,
-            )
-            .await?
-            {
-                return Ok(ExternalViewResolution::Table);
-            }
-            let binding = lease.binding();
-            let Some(capability) = binding.view_metadata() else {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::Unsupported,
-                    "connector control generation does not declare view metadata",
-                )
-                .to_string());
-            };
-            let instance_id = binding.descriptor().instance_id.clone();
-            match crate::connector::schema_creation::load_frontend_view_async(
-                capability.as_ref(),
-                ConnectorViewRequest {
-                    view: ConnectorViewIdentity {
-                        instance_id,
-                        namespace: Arc::from(target.database.as_str()),
-                        view: Arc::from(target.view.as_str()),
-                    },
-                    context: context.clone(),
-                },
-            )
-            .await
-            {
-                Ok(view) => Ok(ExternalViewResolution::View(resolved_external_view(
-                    target, view,
-                )?)),
-                // A catalog that cannot host views has none, so resolution treats
-                // that exactly like an absent view and the name falls through to
-                // the ordinary unknown-relation error. Creating a view still fails
-                // loudly with the provider's capability error.
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        ConnectorErrorKind::NotFound | ConnectorErrorKind::Unsupported
-                    ) =>
-                {
-                    Ok(ExternalViewResolution::Missing)
-                }
-                Err(error) => Err(error.to_string()),
-            }
-        })
-    }
-
     fn create_external_view(
         &self,
         request: CreateExternalViewRequest,
@@ -486,34 +344,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use novarocks_parser::printer::Printer;
 
     #[derive(Default)]
     struct FakeViewEngine;
 
     impl ViewEngine for FakeViewEngine {
-        fn resolve_external_view(
-            &self,
-            _target: &ViewTarget,
-            _context: &ConnectorRequestContext,
-        ) -> Result<ExternalViewResolution, String> {
-            unreachable!("empty view service must not access the engine")
-        }
-
-        fn resolve_external_view_async<'a>(
-            &'a self,
-            target: &'a ViewTarget,
-            context: &'a ConnectorRequestContext,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<ExternalViewResolution, String>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async move { self.resolve_external_view(target, context) })
-        }
-
         fn create_external_view(
             &self,
             _request: CreateExternalViewRequest,
@@ -554,14 +389,6 @@ mod tests {
         for kind in crate::catalog_application::statement::external_listing_tests::error_kinds() {
             crate::query::view_read_action::tests::assert_listing_error_text(kind).await;
         }
-    }
-
-    fn parse_query(sql: &str) -> Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected query");
-        };
-        query.clone()
     }
 
     #[test]
@@ -611,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_view_service_rejects_view_ddl_but_leaves_queries_unchanged() {
+    fn empty_view_service_rejects_view_ddl_and_exposes_an_empty_snapshot() {
         let service: Arc<dyn ViewService> = Arc::new(EmptyViewService);
         let engine = FakeViewEngine;
         let ctx = ViewRequestContext {
@@ -630,18 +457,7 @@ mod tests {
                 .to_string()
                 .contains("view service is not injected")
         );
-        let mut query = parse_query("SELECT * FROM t");
-        service
-            .rewrite_query(
-                &engine,
-                &mut query,
-                ctx,
-                &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-            )
-            .unwrap();
-        assert_eq!(
-            Printer::new().statement(&novarocks_parser::ast::Statement::Query(query)),
-            "SELECT * FROM t"
-        );
+        let identity = novarocks_types::naming::TableIdentity::new("default_catalog", "db", "t");
+        assert!(service.catalog_snapshot().unwrap().get(&identity).is_none());
     }
 }

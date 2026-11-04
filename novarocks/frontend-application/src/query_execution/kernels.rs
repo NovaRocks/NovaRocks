@@ -682,6 +682,24 @@ impl SessionCatalogPort for SessionCatalogResolver {
 }
 
 #[cfg(test)]
+pub(crate) fn test_system_relations(
+    catalog_service: Arc<QueryCatalogService>,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+) -> SystemCatalogRelations {
+    SystemCatalogRelations::new(
+        Arc::new(
+            crate::catalog_application::system_catalog_facts::FrontendSystemCatalogFacts::new(
+                catalog_service,
+                connector_control,
+            ),
+        ),
+        Arc::new(
+            novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+        ),
+    )
+}
+
+#[cfg(test)]
 mod session_catalog_tests {
     use std::sync::Arc;
 
@@ -751,22 +769,4 @@ mod session_catalog_tests {
         assert_eq!(error.kind(), QueryServiceErrorKind::Internal);
         assert!(error.message().contains("connector request was cancelled"));
     }
-}
-
-#[cfg(test)]
-pub(crate) fn test_system_relations(
-    catalog_service: Arc<QueryCatalogService>,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
-) -> SystemCatalogRelations {
-    SystemCatalogRelations::new(
-        Arc::new(
-            crate::catalog_application::system_catalog_facts::FrontendSystemCatalogFacts::new(
-                catalog_service,
-                connector_control,
-            ),
-        ),
-        Arc::new(
-            novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
-        ),
-    )
 }
