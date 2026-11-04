@@ -290,8 +290,9 @@ code-anchors:
 - ADR-0135 — 分布式工作为何以 task 为单位创建、驱动与终结，而不是 query-wide participant 状态机（superseded → ADR-0146）
 ### sql-compiler
 
-领域哲学：SQL compiler 只消费一次 statement admission 冻结的 SQL 事实，并只产出 SQL facts；application owner 保留 session、view rewrite、topology、native encoding 与 lifecycle assembly。catalog、statistics 与 scan preparation 对同一表必须复用同一 exact Connector binding，缺失事实必须显式失败或保守降级，不能重新读取 latest。
+领域哲学：SQL compiler 只消费一次 statement admission 冻结的 SQL 事实，并只产出 SQL facts；application owner 保留 session、目录观察、topology、native encoding 与 lifecycle assembly。catalog、statistics 与 scan preparation 对同一表必须复用同一 exact Connector binding，缺失事实必须显式失败或保守降级，不能重新读取 latest。
 
+- [ADR-0215](ADR-0215-sql-output-declarations-and-stored-view-analysis.md) — SQL 为何分离自然名称、内部标签与冻结根，并从同版本完整事实分析视图声明（active；应用接线与验证状态独立核对，部分替代 ADR-0095 的 MV String 例外）
 - [ADR-0192](ADR-0192-provider-work-units-share-one-runtime-split-path.md) — Provider 工作单元为何统一走 runtime split，单例提示为何只影响放置，分布聚合与恢复为何各守原 owner（active）
 - [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）
 - [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
@@ -582,7 +583,7 @@ statement family。边界层只能传递或编码 owner 的事实，测试只能
 - [ADR-0193](ADR-0193-task-conclusion-proposals-and-settled-points.md) — Task 结论为何只交接提议、以结算屏障支撑定局，并由唯一 owner 推进终止（active；仅部分替代 ADR-0187 规则 5 的隐含同步收据；同步 Worker/就地结算通知与无角色凭证登记由 ADR-0211 部分替代，提议全序、裁决、最新退役读取与原来源保留）
 - [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留；规则 5 的隐含同步收据由 ADR-0193 部分替代，单一接受事务、细化及其余规则保留）
 - ADR-0088 — SQL、Iceberg 与 MV 的错误为何必须在各自 owner 内、跨域 fallback 前收敛（active）
-- ADR-0095 — SQL analyze 错误为何以 typed code/span 穿过 Frontend、由 MySQL 边界映射（active；已知非 Analyze 执行事实的不透明化由 ADR-0187 部分替代，MySQL wire 映射由 ADR-0217 部分替代，Analyze 与历史 MV 规则保留）
+- ADR-0095 — SQL analyze 错误为何以 typed code/span 穿过 Frontend、由 MySQL 边界映射（active；已知非 Analyze 执行事实的不透明化由 ADR-0187 部分替代，MySQL wire 映射由 ADR-0217 部分替代，Analyze 规则保留；MV String 例外由 ADR-0215 部分替代）
 
 ### test-fixtures
 

@@ -63,7 +63,7 @@ impl SqlCompletionFactSource for NoFacts {
         &self,
         _: &SqlNeedBatch,
         _: &ReadAccessSink<()>,
-    ) -> Result<SqlFactBatch, String> {
+    ) -> Result<SqlFactBatch, novarocks_sql::compiler::SqlCompileError> {
         panic!("a VALUES plan asks for nothing")
     }
 }

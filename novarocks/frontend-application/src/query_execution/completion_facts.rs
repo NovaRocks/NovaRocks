@@ -240,7 +240,7 @@ impl CatalogFactPort for FrontendCatalogFacts {
     async fn resolve_relations(
         &self,
         needs: &[CatalogRelationNeed],
-    ) -> Result<Vec<CatalogRelationFact>, String> {
+    ) -> Result<Vec<CatalogRelationFact>, novarocks_sql::compiler::SqlCompileError> {
         let _round = self.resolving.lock().await;
         let loader = iceberg_table_binding_loader(
             self.owners.connector_control.as_ref(),
@@ -291,20 +291,24 @@ impl CatalogFactPort for FrontendCatalogFacts {
 /// query, while a catalog that could not say is a fact about this process. The
 /// second must not be flattened into the first, or a query over a healthy table
 /// would report that the table does not exist whenever the catalog is down.
-pub(super) fn catalog_fact_from(
+pub(crate) fn catalog_fact_from(
     need: &CatalogRelationNeed,
     resolved: CatalogResolutionResult<novarocks_sql::planning::catalog::ResolvedAnalyzerTable>,
-) -> Result<CatalogRelationFact, String> {
+) -> Result<CatalogRelationFact, novarocks_sql::compiler::SqlCompileError> {
     match resolved {
         Ok(table) => CatalogRelationFact::resolved(need, table),
         Err(CatalogResolutionError::Missing { reason }) => {
             CatalogRelationFact::missing(need, reason)
         }
         Err(error @ CatalogResolutionError::Failed { .. }) => {
-            return Err(error.into_message());
+            return Err(error.into_compile());
         }
     }
-    .map_err(|error| format!("build catalog completion fact: {error}"))
+    .map_err(|error| {
+        novarocks_sql::compiler::SqlCompileError::Compilation(format!(
+            "build catalog completion fact: {error}"
+        ))
+    })
 }
 
 /// Answers statistics questions from the one unified resolver.
@@ -492,7 +496,33 @@ mod tests {
             Err(CatalogResolutionError::failed("REST timeout")),
         )
         .expect_err("a catalog that could not say has answered nothing");
-        assert!(error.contains("REST timeout"), "{error}");
+        assert!(error.to_string().contains("REST timeout"), "{error}");
+    }
+
+    #[test]
+    fn a_provider_source_is_not_an_absent_relation_or_a_string_failure() {
+        use novarocks_type_contract::{
+            CompileControlError, owned_resources::layout::LayoutResourceError,
+        };
+        let original = CompileControlError::from_domain(LayoutResourceError::SourceModel);
+        let error = catalog_fact_from(
+            &a_need(),
+            Err(CatalogResolutionError::from_connector(
+                novarocks_spi::connector::ConnectorError::compile_interruption(original.clone()),
+            )),
+        )
+        .expect_err("the original provider refusal is not a catalog fact");
+        assert_eq!(
+            error,
+            novarocks_sql::compiler::SqlCompileError::from(original)
+        );
+        let novarocks_sql::compiler::SqlCompileError::CompilationSource(source) = error else {
+            panic!("original domain source");
+        };
+        assert_eq!(
+            source.downcast_ref::<LayoutResourceError>(),
+            Some(&LayoutResourceError::SourceModel)
+        );
     }
 }
 

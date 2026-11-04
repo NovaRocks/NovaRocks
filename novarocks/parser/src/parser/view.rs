@@ -76,7 +76,16 @@ fn parse_create(parser: &mut StatementParser<'_, '_>) -> Result<Statement, Parse
         None
     };
     parser.consume_word("AS")?;
+    let body_start = parser.current_offset();
     let query = query::parse_query(parser)?;
+    let body_end = parser.tokens[..parser.position]
+        .iter()
+        .rfind(|token| !matches!(token.kind, crate::TokenKind::Trivia(_)))
+        .expect("a parsed query consumed at least one significant token")
+        .span
+        .end();
+    let query_source_span = Span::new(body_start, body_end);
+    let raw_query_source = parser.source_slice(query_source_span).to_owned();
     let span = Span::new(start, query.span.end());
     Ok(Statement::View(ViewStatement::Create(CreateView {
         or_replace,
@@ -85,6 +94,8 @@ fn parse_create(parser: &mut StatementParser<'_, '_>) -> Result<Statement, Parse
         columns,
         comment,
         query,
+        raw_query_source,
+        query_source_span,
         span,
     })))
 }
@@ -162,4 +173,53 @@ fn consume_if_exists(parser: &mut StatementParser<'_, '_>) -> Result<bool, Parse
     }
     parser.consume_word("EXISTS")?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn view_body_source_keeps_internal_trivia_spelling_and_statement_boundaries() {
+        let source = "CREATE VIEW v AS /* before */\nSELECT /* inside */ `MiXeD`  FROM t -- after\n; SELECT 9";
+        let statements = crate::parse(source).unwrap();
+        let Statement::View(ViewStatement::Create(create)) = &statements[0] else {
+            panic!("view")
+        };
+        assert_eq!(
+            create.raw_query_source,
+            "SELECT /* inside */ `MiXeD`  FROM t"
+        );
+        assert_eq!(
+            source.get(create.query_source_span.start()..create.query_source_span.end()),
+            Some(create.raw_query_source.as_str())
+        );
+        assert_eq!(statements.len(), 2);
+    }
+
+    #[test]
+    fn view_body_source_at_eof_excludes_trivia_outside_its_token_range() {
+        let source = "CREATE VIEW v AS SELECT 1 /* tail */  ";
+        let statements = crate::parse(source).unwrap();
+        let Statement::View(ViewStatement::Create(create)) = &statements[0] else {
+            panic!("view")
+        };
+        assert_eq!(create.raw_query_source, "SELECT 1");
+    }
+
+    #[test]
+    fn view_body_source_uses_consumed_tokens_including_parentheses_and_offset_rows() {
+        for body in [
+            "(SELECT 1 AS x)",
+            "SELECT 1 AS x OFFSET 0 ROWS",
+            "SELECT 1 AS x FETCH FIRST 2 ROWS ONLY",
+        ] {
+            let statements =
+                crate::parse(&format!("CREATE VIEW v AS /* before */ {body} -- after\n;")).unwrap();
+            let Statement::View(ViewStatement::Create(create)) = &statements[0] else {
+                panic!("view")
+            };
+            assert_eq!(create.raw_query_source, body);
+        }
+    }
 }

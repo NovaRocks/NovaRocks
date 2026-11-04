@@ -1993,7 +1993,7 @@ mod tests {
                 &self,
                 _: &SqlNeedBatch,
                 _: &ReadAccessSink<Self::Access>,
-            ) -> Result<SqlFactBatch, String> {
+            ) -> Result<SqlFactBatch, novarocks_sql::compiler::SqlCompileError> {
                 panic!("the literal SQL fixture must not request provider facts")
             }
         }

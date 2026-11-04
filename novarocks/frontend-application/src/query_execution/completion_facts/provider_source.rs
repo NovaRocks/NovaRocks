@@ -90,17 +90,23 @@ impl FrontendCompletionCustody {
     pub(crate) async fn resolve_catalog_relations(
         &self,
         needs: &[novarocks_sql::compiler::CatalogRelationNeed],
-    ) -> Result<Vec<novarocks_sql::compiler::CatalogRelationFact>, String> {
+    ) -> Result<
+        Vec<novarocks_sql::compiler::CatalogRelationFact>,
+        novarocks_sql::compiler::SqlCompileError,
+    > {
         use novarocks_query_application::preparation::SqlCompletionFactSource;
         let facts = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.joined || state.health.is_some() {
-                return Err("completion fact source is closed or unhealthy".into());
+                return Err(novarocks_sql::compiler::SqlCompileError::Compilation(
+                    "completion fact source is closed or unhealthy".into(),
+                ));
             }
-            state
-                .facts
-                .clone()
-                .ok_or_else(|| "completion fact source is not installed".to_owned())?
+            state.facts.clone().ok_or_else(|| {
+                novarocks_sql::compiler::SqlCompileError::Compilation(
+                    "completion fact source is not installed".to_owned(),
+                )
+            })?
         };
         let batch = novarocks_sql::compiler::SqlNeedBatch::CatalogRelations(
             needs.to_vec().into_boxed_slice(),
@@ -110,7 +116,9 @@ impl FrontendCompletionCustody {
             novarocks_sql::compiler::SqlFactBatch::CatalogRelations(answer) => {
                 Ok(answer.into_vec())
             }
-            _ => Err("completion catalog port returned another fact family".into()),
+            _ => Err(novarocks_sql::compiler::SqlCompileError::Compilation(
+                "completion catalog port returned another fact family".into(),
+            )),
         }
     }
 

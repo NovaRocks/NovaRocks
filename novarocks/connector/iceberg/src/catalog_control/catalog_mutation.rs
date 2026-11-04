@@ -2256,7 +2256,6 @@ fn execute_view_publication(
                 let seed = receipt(provider, request.operation_id, request.operation.kind())?;
                 let publication = match &request.operation {
                     ConnectorCatalogMutationOperation::CreateView {
-                        columns,
                         definition,
                         comment,
                         properties,
@@ -2278,12 +2277,11 @@ fn execute_view_publication(
                             }
                         }
                         let (definition, properties) = super::views::prepare_definition(
-                            columns,
                             definition,
                             comment.as_deref(),
                             &view_properties(properties)?,
-                        )
-                        .map_err(invalid)?;
+                            &request.context,
+                        )?;
                         if exists {
                             let current = super::views::load_view_metadata_for_request(
                                 provider.runtime(),
@@ -3788,13 +3786,13 @@ mod tests {
             operations.push((
                 ConnectorCatalogMutationOperation::CreateView {
                     view: view.clone(),
-                    columns: Vec::new(),
                     definition: ConnectorViewDefinition {
                         dialect: ConnectorViewDialect::StarRocks,
                         raw_sql: "SELECT 1".into(),
                         default_catalog: None,
                         default_namespace: table.namespace.clone(),
                         source_format: None,
+                        columns: Vec::new().into(),
                     },
                     comment: None,
                     properties: Vec::new(),
@@ -4427,11 +4425,14 @@ mod tests {
                 }
             } else {
                 ConnectorCatalogMutationOperation::CreateView { view,
-                columns: vec![ConnectorColumnDefinition { name: "a".into(), data_type: ConnectorDataType::Int, nullable: true, aggregation: None, default: None }],
                 definition: novarocks_spi::connector::ConnectorViewDefinition {
                     dialect: novarocks_spi::connector::ConnectorViewDialect::StarRocks,
                     raw_sql: "select 1 as a".into(), default_catalog: Some("source".into()), default_namespace: "source_db".into(),
                     source_format: Some(novarocks_spi::connector::ConnectorViewSourceFormat::EffectiveUserSourceV1),
+                    columns: vec![novarocks_spi::connector::ConnectorViewColumn {
+                        source_field_name: Some("a".into()), name: "a".into(),
+                        value_type: novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int32, true),
+                    }].into(),
                 }, comment: None, properties: vec![],
                 policy: if mode == "replace" { CreateOrReplacePolicy::ReplaceIfExists } else { CreateOrReplacePolicy::FailIfExists },
             }
@@ -4868,7 +4869,9 @@ mod tests {
                         let error = if action == "exists" {
                             novarocks_spi::connector::ConnectorViewMetadata::view_exists(&provider, request).unwrap_err()
                         } else {
-                            novarocks_spi::connector::ConnectorViewMetadata::load_view(&provider, request).unwrap_err()
+                            crate::metadata::with_pure_schema_creation(&request.context.clone(), |creation|
+                                novarocks_spi::connector::ConnectorViewMetadata::load_view(&provider, request, creation)
+                                    .map_err(crate::metadata::metadata_creation_error)).unwrap_err()
                         };
                         assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
                     }

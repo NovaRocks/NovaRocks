@@ -151,13 +151,11 @@ impl ViewEngine for SessionViewEngine {
         Ok(None)
     }
 
-    fn analyze_external_view(
+    fn analyze_view_definition(
         &self,
-        _catalog: &str,
-        _database: &str,
-        _query: &Query,
+        _request: novarocks_query_application::view::ViewDefinitionAnalysisRequest<'_>,
         _context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<Vec<ViewColumnDefinition>, String> {
+    ) -> Result<Vec<ViewColumnDefinition>, novarocks_sql::compiler::SqlCompileError> {
         unreachable!("session view must not analyze external views")
     }
 }
@@ -194,7 +192,9 @@ fn execute_view_statement(
         };
         return prepared.finish(names).map(ViewStatementResult::Query);
     }
-    service.execute_statement(engine, statement, context)
+    service
+        .execute_statement(engine, statement, context)
+        .map_err(|error| error.to_string())
 }
 
 fn parse_query(sql: &str) -> Query {

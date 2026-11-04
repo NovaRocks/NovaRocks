@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use novarocks_parser::ast::{Query, TypeName, ViewStatement};
+use novarocks_parser::ast::{Query, ViewStatement};
 use novarocks_spi::connector::{ConnectorRequestContext, DropPolicy};
 
 use crate::api::QueryResult;
@@ -52,11 +52,14 @@ pub struct ViewTarget {
     pub view: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ViewColumnDefinition {
-    pub name: String,
-    pub data_type: TypeName,
-    pub nullable: bool,
+pub use novarocks_sql::planning::catalog::SqlViewColumn as ViewColumnDefinition;
+
+pub struct ViewDefinitionAnalysisRequest<'a> {
+    pub catalog: &'a str,
+    pub database: &'a str,
+    pub target: &'a ViewTarget,
+    pub query: &'a Query,
+    pub columns: &'a [novarocks_parser::ast::Ident],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -119,7 +122,7 @@ pub trait ViewService: Send + Sync {
         engine: &dyn ViewEngine,
         statement: &ViewStatement,
         context: ViewRequestContext<'_>,
-    ) -> Result<ViewStatementResult, String>;
+    ) -> Result<ViewStatementResult, crate::api::CommandError>;
 
     fn rewrite_query(
         &self,
@@ -175,11 +178,9 @@ pub trait ViewEngine: Send + Sync {
         context: &ConnectorRequestContext,
     ) -> Result<Option<ResolvedExternalView>, String>;
 
-    fn analyze_external_view(
+    fn analyze_view_definition(
         &self,
-        catalog: &str,
-        database: &str,
-        query: &Query,
+        request: ViewDefinitionAnalysisRequest<'_>,
         context: &ConnectorRequestContext,
-    ) -> Result<Vec<ViewColumnDefinition>, String>;
+    ) -> Result<Vec<ViewColumnDefinition>, novarocks_sql::compiler::SqlCompileError>;
 }

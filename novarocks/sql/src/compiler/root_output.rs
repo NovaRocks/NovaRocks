@@ -25,6 +25,7 @@ use crate::column_id::{ColumnId, ColumnRefFactory};
 use crate::common::OutputColumn;
 
 #[derive(Clone, Debug)]
+// Design: ADR-0215 (docs/adr/ADR-0215-sql-output-declarations-and-stored-view-analysis.md)
 pub(crate) struct RootOutputSemantics {
     occurrences: Box<[(ColumnId, FunctionValueType, ResultValueDomain)]>,
     field_names: Box<[Option<String>]>,

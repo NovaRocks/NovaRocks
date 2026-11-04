@@ -280,7 +280,7 @@ pub trait SqlCompletionFactSource: Send + Sync {
         &self,
         needs: &SqlNeedBatch,
         taken: &ReadAccessSink<Self::Access>,
-    ) -> Result<SqlFactBatch, String>;
+    ) -> Result<SqlFactBatch, novarocks_sql::compiler::SqlCompileError>;
 }
 
 /// A business verdict and the original physical-worker health are independent.
@@ -441,13 +441,13 @@ impl<A: Send> FinalPlanCompletionDriver<A> {
                 tokio::select! {
                     reason = cancellation.cancelled() => Err(FinalPlanCompletionError::Cancelled { reason: Arc::from(format!("{reason:?}")) }),
                     _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => Err(FinalPlanCompletionError::DeadlineExceeded),
-                    result = future => result.map_err(|message| FinalPlanCompletionError::FactSource { message: Arc::from(message) }),
+                    result = future => result.map_err(compiler_error),
                 }
             }
             None => {
                 tokio::select! {
                     reason = cancellation.cancelled() => Err(FinalPlanCompletionError::Cancelled { reason: Arc::from(format!("{reason:?}")) }),
-                    result = future => result.map_err(|message| FinalPlanCompletionError::FactSource { message: Arc::from(message) }),
+                    result = future => result.map_err(compiler_error),
                 }
             }
         }
@@ -771,9 +771,11 @@ mod tests {
             &self,
             _needs: &SqlNeedBatch,
             _taken: &ReadAccessSink<()>,
-        ) -> Result<SqlFactBatch, String> {
+        ) -> Result<SqlFactBatch, novarocks_sql::compiler::SqlCompileError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Err("VALUES completion must not request facts".to_string())
+            Err("VALUES completion must not request facts"
+                .to_string()
+                .into())
         }
     }
 
@@ -1195,6 +1197,57 @@ mod tests {
 
     struct PendingFactSource;
 
+    struct RefusingFactSource(novarocks_sql::compiler::SqlCompileError);
+
+    #[async_trait]
+    impl SqlCompletionFactSource for RefusingFactSource {
+        type Access = ();
+
+        async fn resolve(
+            &self,
+            _: &SqlNeedBatch,
+            _: &ReadAccessSink<()>,
+        ) -> Result<SqlFactBatch, novarocks_sql::compiler::SqlCompileError> {
+            Err(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_driver_preserves_catalog_analysis_and_original_source_refusals() {
+        use novarocks_sql::{analyze_error::AnalyzeError, compiler::SqlCompileError};
+        use novarocks_type_contract::{
+            CompileControlError, owned_resources::layout::LayoutResourceError,
+        };
+        for original in [
+            SqlCompileError::Cancelled,
+            SqlCompileError::DeadlineExceeded,
+            SqlCompileError::ResourceExhausted,
+            SqlCompileError::from(CompileControlError::from_domain(
+                LayoutResourceError::SourceModel,
+            )),
+            SqlCompileError::Analyze(AnalyzeError::invalid_view("stored definition", None)),
+            SqlCompileError::Analyze(AnalyzeError::view_is_stale("stored schema", None)),
+            SqlCompileError::Analyze(AnalyzeError::view_is_recursive("stored cycle", None)),
+        ] {
+            let driver =
+                FinalPlanCompletionDriver::new(Arc::new(RefusingFactSource(original.clone())));
+            let (_root, scope) = scope();
+            let error = driver
+                .complete_for_test(
+                    request(
+                        "SELECT * FROM iceberg.db.orders",
+                        SqlCompileControl::new(None, Arc::new(NeverCancelled)),
+                        SqlCompileIntent::Query,
+                    ),
+                    &scope,
+                )
+                .await
+                .expect_err("catalog refusal must terminate the same completion");
+            assert_eq!(error.error(), &compiler_error(original));
+            assert!(error.into_taken().is_empty());
+        }
+    }
+
     #[async_trait]
     impl SqlCompletionFactSource for PendingFactSource {
         type Access = ();
@@ -1203,7 +1256,7 @@ mod tests {
             &self,
             _needs: &SqlNeedBatch,
             _taken: &ReadAccessSink<()>,
-        ) -> Result<SqlFactBatch, String> {
+        ) -> Result<SqlFactBatch, novarocks_sql::compiler::SqlCompileError> {
             std::future::pending().await
         }
     }

@@ -391,7 +391,8 @@ impl PreparedMorMutationWrite {
         while !preparation.needs().is_empty() {
             let facts = provider
                 .resolve_catalog_relations(preparation.needs())
-                .await?;
+                .await
+                .map_err(DmlError::from_compile)?;
             preparation = preparation
                 .continue_catalog(facts.into_boxed_slice())
                 .map_err(DmlError::from_compile)?;
@@ -516,7 +517,8 @@ impl PreparedCowSelection {
         while !preparation.needs().is_empty() {
             let facts = provider
                 .resolve_catalog_relations(preparation.needs())
-                .await?;
+                .await
+                .map_err(DmlError::from_compile)?;
             preparation = preparation
                 .continue_catalog(facts.into_boxed_slice())
                 .map_err(DmlError::from_compile)?;

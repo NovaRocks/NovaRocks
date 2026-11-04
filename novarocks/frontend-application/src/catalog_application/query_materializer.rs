@@ -914,7 +914,11 @@ impl CatalogServiceMaterializer<'_> {
                 }
                 .create(binding)
             })
-            .map_err(|error| contract_error(error.into_message()))?;
+            .map_err(|error| {
+                crate::mv::domain::application::MvApplicationError::from_compile(
+                    error.into_compile(),
+                )
+            })?;
         if self.original_catalog_admission(&relation.catalog)? != lookup.observation {
             return Err(contract_error(
                 "catalog attachment generation changed while acquiring its planning pin",
@@ -947,7 +951,9 @@ fn original_catalog_fact(
             CatalogRelationFact::missing(need, reason)
                 .map_err(|error| contract_error(error.to_string()))
         }
-        Err(error) => Err(contract_error(error.into_message())),
+        Err(error) => Err(
+            crate::mv::domain::application::MvApplicationError::from_compile(error.into_compile()),
+        ),
     }
 }
 

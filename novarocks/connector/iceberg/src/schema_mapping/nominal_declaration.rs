@@ -176,7 +176,6 @@ impl TableNominalDocument {
         }
         Ok(document)
     }
-    #[cfg(test)]
     pub(crate) fn from_properties_checked<E: From<ConnectorError>>(
         schema: &Schema,
         properties: &HashMap<String, String>,

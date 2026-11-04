@@ -241,10 +241,10 @@ pub use mutation::{
     ConnectorMutationOperationId, ConnectorPartitionTransform, ConnectorPropertyAuthority,
     ConnectorPropertyChange, ConnectorRefAction, ConnectorRefKind,
     ConnectorRefreshPublicationGuard, ConnectorSchemaChange, ConnectorStructField,
-    ConnectorTableKey, ConnectorTableKeyKind, ConnectorViewDefinition, ConnectorViewDialect,
-    ConnectorViewIdentity, ConnectorViewSourceFormat, CreateOrReplacePolicy, CreatePolicy,
-    DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ConnectorTableKey, ConnectorTableKeyKind, ConnectorViewColumn, ConnectorViewDefinition,
+    ConnectorViewDialect, ConnectorViewIdentity, ConnectorViewSourceFormat, CreateOrReplacePolicy,
+    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 pub use mv_storage_observation::{
     MAX_MV_OBSERVATION_FIELDS, MAX_MV_OBSERVATION_PARTITION_FIELDS, MAX_MV_OBSERVATION_REFS,
@@ -368,7 +368,7 @@ pub use statistics::{
 };
 pub use view_metadata::{
     ConnectorListViewsRequest, ConnectorViewMetadata, ConnectorViewMetadataValue,
-    ConnectorViewRequest,
+    ConnectorViewPreparation, ConnectorViewPreparationFuture, ConnectorViewRequest,
 };
 pub use write::{
     ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,

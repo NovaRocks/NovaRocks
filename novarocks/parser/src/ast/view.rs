@@ -55,6 +55,11 @@ pub struct CreateView {
     pub columns: Vec<Ident>,
     pub comment: Option<Literal>,
     pub query: Query,
+    /// Effective user query token range, including internal trivia, captured
+    /// before normalization or AST printing. Envelope and outer trivia are excluded.
+    pub raw_query_source: String,
+    /// Original body byte range for admission's exact occurrence substitutions.
+    pub query_source_span: Span,
     pub span: Span,
 }
 

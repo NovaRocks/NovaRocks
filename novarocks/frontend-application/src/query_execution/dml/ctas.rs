@@ -1197,7 +1197,7 @@ async fn plan_query_for_ctas_source_async(
         let facts = provider_source
             .resolve_catalog_relations(preparation.needs())
             .await
-            .map_err(internal_failure)?;
+            .map_err(CtasFailure::from_compile)?;
         preparation = preparation
             .continue_catalog(facts.into_boxed_slice())
             .map_err(CtasFailure::from_compile)?;

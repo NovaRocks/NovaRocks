@@ -283,6 +283,7 @@ impl SessionSqlState {
 
         struct Substituter {
             values: BTreeMap<String, ast::Expr>,
+            source_patches: Option<Vec<(novarocks_parser::Span, String)>>,
         }
 
         impl Fold for Substituter {
@@ -290,13 +291,56 @@ impl SessionSqlState {
                 if let ast::Expr::UserVariable(variable) = &expression
                     && let Some(value) = self.values.get(&variable.value.to_ascii_lowercase())
                 {
+                    if let Some(patches) = &mut self.source_patches {
+                        // Only replace the actual parsed occurrence. Group the
+                        // scalar expression just as insertion into this AST does;
+                        // every other source byte, including trivia, is retained.
+                        patches.push((
+                            variable.span,
+                            format!("({})", novarocks_parser::printer::print_expr(value)),
+                        ));
+                    }
                     return value.clone();
                 }
                 ast::fold_expr(self, expression)
             }
         }
 
-        Ok(Substituter { values }.fold_statement(statement))
+        let capture_source = matches!(&statement, Statement::View(ast::ViewStatement::Create(_)));
+        let mut substituter = Substituter {
+            values,
+            source_patches: capture_source.then(Vec::new),
+        };
+        let mut statement = substituter.fold_statement(statement);
+        if let ast::Statement::View(ast::ViewStatement::Create(create)) = &mut statement {
+            let mut patches = substituter
+                .source_patches
+                .expect("same CREATE VIEW source capture");
+            patches.sort_by_key(|(span, _)| span.start());
+            let mut previous_end = create.query_source_span.start();
+            for (span, _) in &patches {
+                if span.start() < previous_end || span.end() > create.query_source_span.end() {
+                    return Err(
+                        "view variable substitution does not match its original source occurrence"
+                            .into(),
+                    );
+                }
+                previous_end = span.end();
+            }
+            for (span, replacement) in patches.into_iter().rev() {
+                let start = span.start() - create.query_source_span.start();
+                let end = span.end() - create.query_source_span.start();
+                if create.raw_query_source.get(start..end).is_none() {
+                    return Err(
+                        "view variable substitution has an invalid original byte range".into(),
+                    );
+                }
+                create
+                    .raw_query_source
+                    .replace_range(start..end, &replacement);
+            }
+        }
+        Ok(statement)
     }
 }
 
@@ -883,6 +927,37 @@ mod tests {
                 .expect("substitute session variable"),
         );
         assert_eq!(rendered, "SELECT 7");
+    }
+
+    #[test]
+    fn view_variable_substitution_preserves_nonoccurrence_source_and_expression_grouping() {
+        let mut state = SessionSqlState::default();
+        state.set_user_variable("@x", "2 + 3".into()).unwrap();
+        state.set_user_variable("@short", "7".into()).unwrap();
+        let sql = "CREATE VIEW v AS /* before */\nWITH c AS (SELECT /* @x 中文 */ @short AS x) SELECT @x * x AS y, '@x' AS text FROM c -- @short\n";
+        let statement = novarocks_parser::parse(sql).unwrap().remove(0);
+        let statement = state.substitute_user_variables(statement).unwrap();
+        let ast::Statement::View(ast::ViewStatement::Create(create)) = statement else {
+            panic!("view")
+        };
+        assert_eq!(
+            create.raw_query_source,
+            "WITH c AS (SELECT /* @x 中文 */ (7) AS x) SELECT (2 + 3) * x AS y, '@x' AS text FROM c"
+        );
+        novarocks_parser::parse(&create.raw_query_source).unwrap();
+    }
+
+    #[test]
+    fn view_source_with_no_bound_variable_occurrences_is_not_reprinted() {
+        let mut state = SessionSqlState::default();
+        state.set_user_variable("@other", "7".into()).unwrap();
+        let sql = "CREATE VIEW v AS /* before */ SELECT `MiXeD`  FROM t /* after */";
+        let statement = novarocks_parser::parse(sql).unwrap().remove(0);
+        let statement = state.substitute_user_variables(statement).unwrap();
+        let ast::Statement::View(ast::ViewStatement::Create(create)) = statement else {
+            panic!("view")
+        };
+        assert_eq!(create.raw_query_source, "SELECT `MiXeD`  FROM t");
     }
 
     #[test]

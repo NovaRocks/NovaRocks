@@ -39,22 +39,16 @@ use crate::metadata_context::IcebergMetadataContext;
 
 #[path = "views/async_listing.rs"]
 pub(crate) mod async_listing;
+#[path = "views/declaration_projection.rs"]
+mod declaration_projection;
+#[path = "views/output_contract.rs"]
+mod output_contract;
+#[path = "views/version_identity.rs"]
+mod version_identity;
 
 const NOVAROCKS_ENGINE_NAME: &str = "novarocks";
 const NOVAROCKS_SOURCE_FORMAT_KEY: &str = "novarocks.source-format";
 const EFFECTIVE_USER_SOURCE_V1: &str = "effective-user-source-v1";
-
-#[derive(Clone, Debug)]
-pub(crate) struct LoadedIcebergView {
-    pub raw_sql: String,
-    pub dialect: String,
-    pub default_catalog: Option<String>,
-    pub default_namespace: String,
-    pub source_format: Option<ConnectorViewSourceFormat>,
-    pub column_names: Vec<String>,
-    pub comment: Option<String>,
-    pub properties: HashMap<String, String>,
-}
 
 /// Poll one catalog call on the generation's runtime.
 ///
@@ -129,7 +123,7 @@ fn novarocks_source_context(
 fn source_format_from_summary(
     ident: &TableIdent,
     summary: &HashMap<String, String>,
-) -> Result<Option<ConnectorViewSourceFormat>, String> {
+) -> Result<Option<ConnectorViewSourceFormat>, ConnectorError> {
     if summary.get("engine-name").map(String::as_str) != Some(NOVAROCKS_ENGINE_NAME) {
         return Ok(None);
     }
@@ -137,50 +131,118 @@ fn source_format_from_summary(
         Some(EFFECTIVE_USER_SOURCE_V1) => {
             Ok(Some(ConnectorViewSourceFormat::EffectiveUserSourceV1))
         }
-        None => Err(format!(
-            "corrupt NovaRocks Iceberg view {ident}: missing {NOVAROCKS_SOURCE_FORMAT_KEY}"
+        None => Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!(
+                "corrupt NovaRocks Iceberg view {ident}: missing {NOVAROCKS_SOURCE_FORMAT_KEY}"
+            ),
         )),
-        Some(value) => Err(format!(
-            "unsupported NovaRocks Iceberg view {ident}: unknown {NOVAROCKS_SOURCE_FORMAT_KEY} `{value}`"
+        Some(value) => Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            format!(
+                "unsupported NovaRocks Iceberg view {ident}: unknown {NOVAROCKS_SOURCE_FORMAT_KEY} `{value}`"
+            ),
         )),
     }
 }
 
 pub(super) fn prepare_definition(
-    columns: &[ConnectorColumnDefinition],
     definition: &ConnectorViewDefinition,
     comment: Option<&str>,
     extra_properties: &[(String, String)],
-) -> Result<(ViewDefinition, HashMap<String, String>), String> {
-    let (source_catalog, source_namespace, source_format) = novarocks_source_context(definition)?;
-    let schema = build_view_schema(columns)?;
-    let mut properties = extra_properties.iter().cloned().collect::<HashMap<_, _>>();
-    if let Some(comment) = comment
-        && properties
-            .insert("comment".to_string(), comment.to_string())
-            .is_some()
-    {
-        return Err("duplicate Iceberg view comment property".to_string());
-    }
-    let timestamp_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("system clock before epoch: {error}"))?
-        .as_millis() as i64;
-    let definition = ViewDefinition {
-        schema,
-        sql: definition.raw_sql.to_string(),
-        summary: HashMap::from([
-            ("engine-name".to_string(), NOVAROCKS_ENGINE_NAME.to_string()),
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(ViewDefinition, HashMap<String, String>), ConnectorError> {
+    crate::metadata::with_pure_schema_creation(context, |creation| {
+        let invalid = |message| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message);
+        let (source_catalog, source_namespace, source_format) =
+            novarocks_source_context(definition).map_err(invalid)?;
+        definition
+            .validate_output_declaration()
+            .map_err(|message| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message))?;
+        let columns = declaration_projection::columns(definition, creation)
+            .map_err(crate::metadata::metadata_creation_error)?;
+        let schema = build_view_schema(&columns).map_err(invalid)?;
+        let document =
+            crate::schema_mapping::nominal_declaration::TableNominalDocument::from_columns(
+                &schema, &columns,
+            )?;
+        let summary = HashMap::from([
+            ("engine-name".to_owned(), NOVAROCKS_ENGINE_NAME.to_owned()),
             (
-                NOVAROCKS_SOURCE_FORMAT_KEY.to_string(),
-                source_format.to_string(),
+                NOVAROCKS_SOURCE_FORMAT_KEY.to_owned(),
+                source_format.to_owned(),
             ),
-        ]),
-        default_catalog: Some(source_catalog),
-        default_namespace: source_namespace,
-        timestamp_ms,
-    };
-    Ok((definition, properties))
+            (
+                output_contract::KEY.to_owned(),
+                output_contract::encode(
+                    definition
+                        .columns
+                        .iter()
+                        .map(|column| column.source_field_name.as_deref()),
+                )?,
+            ),
+            (
+                crate::schema_mapping::nominal_declaration::PROPERTY.to_owned(),
+                document.encode()?,
+            ),
+        ]);
+        let decoded = {
+            let creation = std::cell::RefCell::new(&mut *creation);
+            crate::schema_mapping::nominal_declaration::TableNominalDocument::from_properties_checked(
+            &schema, &summary, &|_| creation.borrow_mut().work(1),
+        ).map_err(crate::metadata::metadata_creation_error)?
+        };
+        for (field, declared) in schema
+            .as_struct()
+            .fields()
+            .iter()
+            .zip(definition.columns.iter())
+        {
+            let observed = crate::schema_mapping::typed_value::from_field(
+                field,
+                !field.required,
+                &decoded.nominals,
+                decoded.integers.get(&field.id).copied(),
+                creation,
+            )
+            .map_err(crate::metadata::metadata_creation_error)?;
+            if field.name != declared.name.as_ref()
+                || !declared
+                    .value_type
+                    .exactly_equals_checked_observed(&observed.binding, || creation.work(1))
+                    .map_err(crate::metadata::metadata_creation_error)?
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "Iceberg view schema cannot round-trip the exact public type and nullability declaration",
+                ));
+            }
+        }
+        // The summary and this exact schema publish in one version operation.
+        let mut properties = extra_properties.iter().cloned().collect::<HashMap<_, _>>();
+        if let Some(comment) = comment
+            && properties
+                .insert("comment".to_string(), comment.to_string())
+                .is_some()
+        {
+            return Err(invalid(
+                "duplicate Iceberg view comment property".to_string(),
+            ));
+        }
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| invalid(format!("system clock before epoch: {error}")))?
+            .as_millis() as i64;
+        let definition = ViewDefinition {
+            schema,
+            sql: definition.raw_sql.to_string(),
+            summary,
+            default_catalog: Some(source_catalog),
+            default_namespace: source_namespace,
+            timestamp_ms,
+        };
+        Ok((definition, properties))
+    })
 }
 
 #[cfg(test)]
@@ -188,15 +250,13 @@ pub(crate) fn create_view(
     runtime: &IcebergMetadataContext,
     namespace: &str,
     view: &str,
-    columns: &[ConnectorColumnDefinition],
     definition: &ConnectorViewDefinition,
     comment: Option<&str>,
     replace: bool,
     extra_properties: &[(String, String)],
+    context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<CatalogOutcome<crate::catalog::transaction::CommitProof>, String> {
     let (namespace_ident, ident) = view_ident(namespace, view)?;
-    let (definition, properties) =
-        prepare_definition(columns, definition, comment, extra_properties)?;
     let owner = Arc::clone(runtime.novarocks_catalog());
 
     let target = CatalogTableName::from_identifier(&ident);
@@ -208,6 +268,9 @@ pub(crate) fn create_view(
     if let Err(reason) = owner.admit_operation(&operation, &target.into()) {
         return Ok(CatalogOutcome::Unsupported(reason));
     }
+    let (definition, properties) =
+        prepare_definition(definition, comment, extra_properties, context)
+            .map_err(|error| error.to_string())?;
     if replace {
         let target = CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
         let current = runtime
@@ -266,10 +329,8 @@ pub(crate) fn load_view(
     namespace: &str,
     view: &str,
     context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<LoadedIcebergView, ConnectorError> {
-    let (_, ident) = view_ident(namespace, view).map_err(unavailable)?;
-    let metadata = load_view_metadata_for_request(runtime, namespace, view, context)?;
-    loaded_view_from_metadata(&ident, &metadata).map_err(unavailable)
+) -> Result<ViewMetadata, ConnectorError> {
+    load_view_metadata_for_request(runtime, namespace, view, context)
 }
 
 pub(super) fn load_view_metadata_for_request(
@@ -278,7 +339,7 @@ pub(super) fn load_view_metadata_for_request(
     view: &str,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<ViewMetadata, ConnectorError> {
-    let (_, ident) = view_ident(namespace, view).map_err(unavailable)?;
+    let (_, ident) = view_ident(namespace, view).map_err(invalid_view_request)?;
     let owner = std::sync::Arc::clone(runtime.novarocks_catalog());
     let target =
         crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
@@ -305,7 +366,7 @@ pub(super) async fn load_view_metadata_for_request_async(
     view: &str,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<ViewMetadata, ConnectorError> {
-    let (_, ident) = view_ident(namespace, view).map_err(unavailable)?;
+    let (_, ident) = view_ident(namespace, view).map_err(invalid_view_request)?;
     let owner = std::sync::Arc::clone(runtime.novarocks_catalog());
     let target =
         crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
@@ -407,46 +468,144 @@ pub(crate) fn list_views(
     })
 }
 
-fn loaded_view_from_metadata(
-    ident: &TableIdent,
+pub(crate) fn materialize_view_metadata(
+    request: ConnectorViewRequest,
     metadata: &ViewMetadata,
-) -> Result<LoadedIcebergView, String> {
-    let version = metadata.current_version();
-    let mut selected = None;
-    for representation in version.representations().iter() {
-        let ViewRepresentation::Sql(sql) = representation;
-        if sql.dialect.eq_ignore_ascii_case(VIEW_DIALECT_STARROCKS) {
-            selected = Some(sql);
-            break;
-        }
-        selected.get_or_insert(sql);
-    }
-    let selected =
-        selected.ok_or_else(|| format!("Iceberg view {ident} has no SQL representation"))?;
-    let default_namespace = version
-        .default_namespace()
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<
+    ConnectorViewMetadataValue,
+    novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+> {
+    creation.work(0)?;
+    let (_, ident) =
+        view_ident(&request.view.namespace, &request.view.view).map_err(invalid_view_request)?;
+    let version = metadata
+        .version_by_id(metadata.current_version_id())
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg view current version is absent from its same metadata observation",
+            )
+        })?;
+    let selected = version
+        .representations()
         .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(".");
-    let properties = metadata.properties().clone();
-    let source_format = source_format_from_summary(ident, version.summary())?;
-    Ok(LoadedIcebergView {
-        raw_sql: selected.sql.clone(),
-        dialect: selected.dialect.clone(),
-        default_catalog: version.default_catalog().cloned(),
-        default_namespace,
-        source_format,
-        column_names: metadata
-            .current_schema()
+        .map(|representation| {
+            let ViewRepresentation::Sql(sql) = representation;
+            sql
+        })
+        .find(|sql| sql.dialect.eq_ignore_ascii_case(VIEW_DIALECT_STARROCKS))
+        .ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                format!("Iceberg view {ident} has no supported SQL representation"),
+            )
+        })?;
+    let source_format = source_format_from_summary(&ident, version.summary())?;
+    let schema = metadata.schema_by_id(version.schema_id()).ok_or_else(|| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "Iceberg view version schema is absent from its same metadata observation",
+        )
+    })?;
+    if version.default_namespace().iter().count() != 1 {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg view requires one exact default namespace component",
+        )
+        .into());
+    }
+    let source_names = if source_format.is_some() {
+        let header = version
+            .summary()
+            .get(output_contract::KEY)
+            .map(String::as_str);
+        if header.is_some_and(|value| value.len() > request.context.max_total_payload_bytes()) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "view output contract exceeds original request payload budget",
+            )
+            .into());
+        }
+        output_contract::decode(header, schema.as_struct().fields().len())?
+    } else {
+        schema
             .as_struct()
             .fields()
             .iter()
-            .map(|field| field.name.clone())
+            .map(|field| Some(field.name.clone()))
+            .collect()
+    };
+    let empty = HashMap::new();
+    let declarations = if source_format.is_some() {
+        if !version
+            .summary()
+            .contains_key(crate::schema_mapping::nominal_declaration::PROPERTY)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "NovaRocks view version is missing its formal type declaration",
+            )
+            .into());
+        }
+        version.summary()
+    } else {
+        &empty
+    };
+    let document = {
+        let creation = std::cell::RefCell::new(&mut *creation);
+        crate::schema_mapping::nominal_declaration::TableNominalDocument::from_properties_checked(
+            schema,
+            declarations,
+            &|_| creation.borrow_mut().work(1),
+        )?
+    };
+    let mut columns = Vec::with_capacity(source_names.len());
+    for (field, source_field_name) in schema.as_struct().fields().iter().zip(source_names) {
+        creation.work(1)?;
+        let declared = crate::schema_mapping::typed_value::from_field(
+            field,
+            !field.required,
+            &document.nominals,
+            document.integers.get(&field.id).copied(),
+            creation,
+        )?;
+        columns.push(novarocks_spi::connector::ConnectorViewColumn {
+            source_field_name: source_field_name.map(Into::into),
+            name: field.name.as_str().into(),
+            value_type: declared.binding,
+        });
+    }
+    let version_identity = version_identity::observed(metadata, version, &columns, creation)?;
+    ConnectorViewMetadataValue::try_new(
+        request.view,
+        ConnectorViewDefinition {
+            dialect: ConnectorViewDialect::StarRocks,
+            raw_sql: selected.sql.as_str().into(),
+            default_catalog: version.default_catalog().map(|value| value.as_str().into()),
+            default_namespace: version
+                .default_namespace()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(".")
+                .into(),
+            source_format,
+            columns: columns.into(),
+        },
+        version_identity,
+        metadata
+            .properties()
+            .get("comment")
+            .map(|value| value.as_str().into()),
+        metadata
+            .properties()
+            .iter()
+            .map(|(key, value)| (key.as_str().into(), value.as_str().into()))
             .collect(),
-        comment: properties.get("comment").cloned(),
-        properties,
-    })
+        &request.context,
+    )
+    .map_err(Into::into)
 }
 
 use crate::metadata::IcebergMetadata;
@@ -481,57 +640,27 @@ impl ConnectorViewMetadata for IcebergMetadata {
     fn load_view(
         &self,
         request: ConnectorViewRequest,
-    ) -> Result<ConnectorViewMetadataValue, ConnectorError> {
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorViewMetadataValue,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         ensure_request(self, &request.view.instance_id, &request.context)?;
-        let loaded = load_view(
+        let metadata = load_view(
             self.runtime(),
             &request.view.namespace,
             &request.view.view,
             &request.context,
         )?;
-        if !loaded.dialect.eq_ignore_ascii_case(VIEW_DIALECT_STARROCKS) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                format!(
-                    "Iceberg view uses unsupported SQL dialect {}",
-                    loaded.dialect
-                ),
-            ));
-        }
-        ConnectorViewMetadataValue::try_new(
-            request.view,
-            ConnectorViewDefinition {
-                dialect: ConnectorViewDialect::StarRocks,
-                raw_sql: loaded.raw_sql.into(),
-                default_catalog: loaded.default_catalog.map(Into::into),
-                default_namespace: loaded.default_namespace.into(),
-                source_format: loaded.source_format,
-            },
-            loaded.column_names.into_iter().map(Into::into).collect(),
-            loaded.comment.map(Into::into),
-            loaded
-                .properties
-                .into_iter()
-                .map(|(key, value)| (key.into(), value.into()))
-                .collect(),
-            &request.context,
-        )
+        self.create_prepared_view_metadata(self.prepared_view_facts(request, metadata), creation)
     }
 
-    fn load_view_async(
+    fn prepare_view(
         &self,
         request: ConnectorViewRequest,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<ConnectorViewMetadataValue, ConnectorError>>
-                + Send
-                + '_,
-        >,
-    > {
+    ) -> novarocks_spi::connector::ConnectorViewPreparationFuture<'_> {
         Box::pin(async move {
             ensure_request(self, &request.view.instance_id, &request.context)?;
-            let (_, ident) =
-                view_ident(&request.view.namespace, &request.view.view).map_err(unavailable)?;
             let metadata = load_view_metadata_for_request_async(
                 self.runtime(),
                 &request.view.namespace,
@@ -539,35 +668,19 @@ impl ConnectorViewMetadata for IcebergMetadata {
                 &request.context,
             )
             .await?;
-            let loaded = loaded_view_from_metadata(&ident, &metadata).map_err(unavailable)?;
-            if !loaded.dialect.eq_ignore_ascii_case(VIEW_DIALECT_STARROCKS) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::Unsupported,
-                    format!(
-                        "Iceberg view uses unsupported SQL dialect {}",
-                        loaded.dialect
-                    ),
-                ));
-            }
-            ConnectorViewMetadataValue::try_new(
-                request.view,
-                ConnectorViewDefinition {
-                    dialect: ConnectorViewDialect::StarRocks,
-                    raw_sql: loaded.raw_sql.into(),
-                    default_catalog: loaded.default_catalog.map(Into::into),
-                    default_namespace: loaded.default_namespace.into(),
-                    source_format: loaded.source_format,
-                },
-                loaded.column_names.into_iter().map(Into::into).collect(),
-                loaded.comment.map(Into::into),
-                loaded
-                    .properties
-                    .into_iter()
-                    .map(|(key, value)| (key.into(), value.into()))
-                    .collect(),
-                &request.context,
-            )
+            Ok(self.prepared_view_facts(request, metadata))
         })
+    }
+
+    fn create_prepared_view(
+        &self,
+        preparation: novarocks_spi::connector::ConnectorViewPreparation,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorViewMetadataValue,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        self.create_prepared_view_metadata(preparation, creation)
     }
 
     fn list_views(
@@ -646,19 +759,10 @@ fn ensure_request(
 }
 
 fn unavailable(error: String) -> ConnectorError {
-    let kind = if error.starts_with("unknown view:") {
-        ConnectorErrorKind::NotFound
-    } else if error.starts_with("corrupt NovaRocks Iceberg view") {
-        ConnectorErrorKind::CorruptData
-    } else if error.contains("require a REST")
-        || error.contains("unsupported SQL dialect")
-        || error.starts_with("unsupported NovaRocks Iceberg view")
-    {
-        ConnectorErrorKind::Unsupported
-    } else {
-        ConnectorErrorKind::Unavailable
-    };
-    ConnectorError::new(kind, error)
+    ConnectorError::new(ConnectorErrorKind::Unavailable, error)
+}
+fn invalid_view_request(error: String) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::InvalidRequest, error)
 }
 
 #[cfg(test)]
@@ -669,17 +773,29 @@ mod tests {
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::resources::IcebergMetadataResources;
 
-    fn novarocks_definition(raw_sql: &str) -> ConnectorViewDefinition {
+    pub(super) fn novarocks_definition(
+        raw_sql: &str,
+        source_field_name: Option<&str>,
+    ) -> ConnectorViewDefinition {
         ConnectorViewDefinition {
             dialect: ConnectorViewDialect::StarRocks,
             raw_sql: raw_sql.into(),
             default_catalog: Some("source_catalog".into()),
             default_namespace: "source_namespace".into(),
             source_format: Some(ConnectorViewSourceFormat::EffectiveUserSourceV1),
+            columns: vec![novarocks_spi::connector::ConnectorViewColumn {
+                source_field_name: source_field_name.map(Into::into),
+                name: "a".into(),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int32,
+                    true,
+                ),
+            }]
+            .into(),
         }
     }
 
-    fn test_context() -> novarocks_spi::connector::ConnectorRequestContext {
+    pub(super) fn test_context() -> novarocks_spi::connector::ConnectorRequestContext {
         novarocks_spi::connector::ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(30),
             novarocks_spi::connector::ConnectorStopOwner::new().view(),
@@ -689,7 +805,7 @@ mod tests {
         .unwrap()
     }
 
-    fn hadoop_runtime() -> (
+    pub(super) fn hadoop_runtime() -> (
         tokio::runtime::Runtime,
         tempfile::TempDir,
         IcebergMetadataContext,
@@ -745,11 +861,11 @@ mod tests {
             &runtime,
             "db",
             "v",
-            &[],
-            &novarocks_definition("select 1"),
+            &novarocks_definition("select 1", None),
             None,
             false,
             &[],
+            &test_context(),
         ));
         assert_unsupported_outcome(drop_view(&runtime, "db", "v"));
         let loaded = load_view(&runtime, "db", "v", &test_context())
@@ -783,37 +899,25 @@ mod tests {
     }
 
     #[test]
-    fn view_error_mapping_keeps_capability_and_lookup_failures_typed() {
-        assert_eq!(
-            unavailable("view operations require a REST iceberg catalog".to_string()).kind(),
-            ConnectorErrorKind::Unsupported
-        );
-        assert_eq!(
-            unavailable("unsupported SQL dialect: spark".to_string()).kind(),
-            ConnectorErrorKind::Unsupported
-        );
-        assert_eq!(
-            unavailable("unknown view: db.v".to_string()).kind(),
-            ConnectorErrorKind::NotFound
-        );
-        assert_eq!(
-            unavailable("corrupt NovaRocks Iceberg view db.v: missing format".to_string()).kind(),
-            ConnectorErrorKind::CorruptData
-        );
-        assert_eq!(
-            unavailable("unsupported NovaRocks Iceberg view db.v: unknown format".to_string())
-                .kind(),
-            ConnectorErrorKind::Unsupported
-        );
-        assert_eq!(
-            unavailable("REST response lost".to_string()).kind(),
-            ConnectorErrorKind::Unavailable
-        );
+    fn bridge_diagnostics_are_not_reclassified_as_sql_or_provider_facts() {
+        for message in [
+            "view operations require a REST iceberg catalog",
+            "unsupported SQL dialect: spark",
+            "unknown view: db.v",
+            "corrupt NovaRocks Iceberg view db.v: missing format",
+            "unsupported NovaRocks Iceberg view db.v: unknown format",
+            "REST response lost",
+        ] {
+            assert_eq!(
+                unavailable(message.to_owned()).kind(),
+                ConnectorErrorKind::Unavailable
+            );
+        }
     }
 
     #[test]
     fn novarocks_view_source_context_is_frozen_independently_of_target() {
-        let definition = novarocks_definition("SELECT  /* preserve */ 1");
+        let definition = novarocks_definition("SELECT  /* preserve */ 1", None);
         let (catalog, namespace, format) =
             novarocks_source_context(&definition).expect("valid NovaRocks source context");
 
@@ -836,10 +940,7 @@ mod tests {
             HashMap::from([("engine-name".to_string(), NOVAROCKS_ENGINE_NAME.to_string())]);
         let error = source_format_from_summary(&ident, &old_novarocks)
             .expect_err("NovaRocks provenance without format is corrupt");
-        assert!(
-            error.starts_with("corrupt NovaRocks Iceberg view"),
-            "{error}"
-        );
+        assert!(error.kind() == ConnectorErrorKind::CorruptData, "{error}");
 
         let unknown_novarocks = HashMap::from([
             ("engine-name".to_string(), NOVAROCKS_ENGINE_NAME.to_string()),
@@ -850,10 +951,7 @@ mod tests {
         ]);
         let error = source_format_from_summary(&ident, &unknown_novarocks)
             .expect_err("unknown NovaRocks format is unsupported");
-        assert!(
-            error.starts_with("unsupported NovaRocks Iceberg view"),
-            "{error}"
-        );
+        assert!(error.kind() == ConnectorErrorKind::Unsupported, "{error}");
     }
 
     /// The SPI keeps the owner's `Unsupported`: callers read it as "no such
@@ -870,24 +968,28 @@ mod tests {
             ProviderBindingEpoch::from_bytes([3; 16]),
             Arc::new(runtime),
         );
-        let error = ConnectorViewMetadata::load_view(
-            &provider,
-            ConnectorViewRequest {
-                view: ConnectorViewIdentity {
-                    instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("ice")
-                        .unwrap(),
-                    namespace: Arc::from("db"),
-                    view: Arc::from("v"),
+        let error = crate::metadata::with_pure_schema_creation(&test_context(), |creation| {
+            ConnectorViewMetadata::load_view(
+                &provider,
+                ConnectorViewRequest {
+                    view: ConnectorViewIdentity {
+                        instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("ice")
+                            .unwrap(),
+                        namespace: Arc::from("db"),
+                        view: Arc::from("v"),
+                    },
+                    context: novarocks_spi::connector::ConnectorRequestContext::try_new(
+                        std::time::Instant::now() + std::time::Duration::from_secs(5),
+                        novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                        1024,
+                        4096,
+                    )
+                    .unwrap(),
                 },
-                context: novarocks_spi::connector::ConnectorRequestContext::try_new(
-                    std::time::Instant::now() + std::time::Duration::from_secs(5),
-                    novarocks_spi::connector::ConnectorStopOwner::new().view(),
-                    1024,
-                    4096,
-                )
-                .unwrap(),
-            },
-        )
+                creation,
+            )
+            .map_err(crate::metadata::metadata_creation_error)
+        })
         .expect_err("Hadoop holds no views");
         assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
         assert_eq!(
@@ -900,7 +1002,7 @@ mod tests {
         use super::*;
         use crate::catalog::error::CatalogOutcome;
         use crate::rest_protocol::test_server::{Reply, Script, TestServer};
-        use novarocks_spi::connector::{ConnectorDataType, ConnectorMutationFailureKind as Kind};
+        use novarocks_spi::connector::ConnectorMutationFailureKind as Kind;
 
         /// `db.v`, whose current version also carries a Spark definition.
         fn load_view_reply() -> Reply {
@@ -1078,16 +1180,6 @@ mod tests {
             }
         }
 
-        fn column() -> ConnectorColumnDefinition {
-            ConnectorColumnDefinition {
-                name: "a".into(),
-                data_type: ConnectorDataType::Int,
-                nullable: true,
-                aggregation: None,
-                default: None,
-            }
-        }
-
         fn refused_as_invalid(
             outcome: Result<CatalogOutcome<crate::catalog::transaction::CommitProof>, String>,
         ) -> String {
@@ -1113,11 +1205,11 @@ mod tests {
                 &runtime,
                 "db",
                 "v",
-                &[column()],
-                &novarocks_definition("select 2 as a"),
+                &novarocks_definition("select 2 as a", Some("a")),
                 None,
                 true,
                 &[],
+                &test_context(),
             ));
             assert!(message.contains("spark"), "{message}");
             assert!(
@@ -1148,11 +1240,11 @@ mod tests {
                     &runtime,
                     "db",
                     "v",
-                    &[column()],
-                    &novarocks_definition("select 2 as a"),
+                    &novarocks_definition("select 2 as a", Some("a")),
                     None,
                     replace,
                     &invalid,
+                    &test_context(),
                 ));
                 assert!(message.contains("version.history.num-entries"), "{message}");
             }
@@ -1161,7 +1253,7 @@ mod tests {
         }
     }
 
-    fn view_provider(runtime: IcebergMetadataContext) -> IcebergMetadata {
+    pub(super) fn view_provider(runtime: IcebergMetadataContext) -> IcebergMetadata {
         IcebergMetadata::new(
             ConnectorInstanceDescriptor {
                 provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
@@ -1391,5 +1483,518 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::Cancelled
         );
+    }
+}
+
+#[cfg(test)]
+mod declaration_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_spi::connector::{ConnectorDataType, ConnectorStructField, ConnectorViewColumn};
+    use novarocks_type_contract::{
+        FunctionValueType, ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+
+    fn pair(
+        storage: ConnectorDataType,
+        value: FunctionValueType,
+    ) -> (Vec<ConnectorColumnDefinition>, ConnectorViewDefinition) {
+        let mut definition =
+            super::tests::novarocks_definition("SELECT  /* exact source */ 1", None);
+        definition.columns = vec![ConnectorViewColumn {
+            source_field_name: None,
+            name: "a".into(),
+            value_type: value.clone(),
+        }]
+        .into();
+        (
+            vec![ConnectorColumnDefinition {
+                name: "a".into(),
+                data_type: storage,
+                nullable: value.nullable(),
+                aggregation: None,
+                default: None,
+            }],
+            definition,
+        )
+    }
+    fn metadata(definition: ViewDefinition, version: i32) -> ViewMetadata {
+        serde_json::from_value(serde_json::json!({
+            "view-uuid": "fa6506c3-7681-40c8-86dc-e36561f83385", "format-version":1,
+            "location":"s3://warehouse/db/v", "current-version-id":version,
+            "versions":[{"version-id":version, "schema-id":definition.schema.schema_id(),
+                "timestamp-ms":1_600_000_000_000_i64, "summary":definition.summary,
+                "representations":[{"type":"sql", "sql":definition.sql, "dialect":"starrocks"}],
+                "default-catalog":definition.default_catalog,
+                "default-namespace":definition.default_namespace}],
+            "version-log":[{"version-id":version,"timestamp-ms":1_600_000_000_000_i64}],
+            "schemas":[definition.schema], "properties":{}
+        }))
+        .unwrap()
+    }
+    fn request() -> ConnectorViewRequest {
+        ConnectorViewRequest {
+            view: ConnectorViewIdentity {
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("ice").unwrap(),
+                namespace: "db".into(),
+                view: "v".into(),
+            },
+            context: super::tests::test_context(),
+        }
+    }
+    fn load(metadata: &ViewMetadata) -> Result<ConnectorViewMetadataValue, ConnectorError> {
+        let request = request();
+        crate::metadata::with_pure_schema_creation(&request.context.clone(), |creation| {
+            materialize_view_metadata(request, metadata, creation)
+                .map_err(crate::metadata::metadata_creation_error)
+        })
+    }
+    fn prepared(storage: ConnectorDataType, value: FunctionValueType) -> ViewDefinition {
+        let (columns, definition) = pair(storage, value);
+        crate::metadata::with_pure_schema_creation(&request().context, |creation| {
+            let actual = declaration_projection::columns(&definition, creation)
+                .map_err(crate::metadata::metadata_creation_error)?;
+            assert_eq!(actual, columns);
+            Ok(())
+        })
+        .unwrap();
+        let (prepared, properties) =
+            prepare_definition(&definition, None, &[], &request().context).unwrap();
+        assert!(properties.is_empty());
+        assert!(prepared.summary.contains_key(output_contract::KEY));
+        assert!(
+            prepared
+                .summary
+                .contains_key(crate::schema_mapping::nominal_declaration::PROPERTY)
+        );
+        prepared
+    }
+
+    #[test]
+    fn one_version_round_trips_anonymous_header_exact_raw_context_and_public_type() {
+        let expected = FunctionValueType::new(DataType::Int16, true);
+        let stored = prepared(ConnectorDataType::SmallInt, expected.clone());
+        let (_, schema, version, properties) =
+            ViewCreate::validate("v".into(), stored.clone(), HashMap::new())
+                .unwrap()
+                .into_parts();
+        assert_eq!(schema.schema_id(), version.schema_id);
+        assert_eq!(
+            version.summary[output_contract::KEY],
+            stored.summary[output_contract::KEY]
+        );
+        assert_eq!(
+            version.summary[crate::schema_mapping::nominal_declaration::PROPERTY],
+            stored.summary[crate::schema_mapping::nominal_declaration::PROPERTY]
+        );
+        assert!(!properties.contains_key(output_contract::KEY));
+        let observed = load(&metadata(stored, 1)).unwrap();
+        assert_eq!(
+            observed.definition.raw_sql.as_ref(),
+            "SELECT  /* exact source */ 1"
+        );
+        assert_eq!(
+            observed.definition.default_catalog.as_deref(),
+            Some("source_catalog")
+        );
+        assert_eq!(
+            observed.definition.default_namespace.as_ref(),
+            "source_namespace"
+        );
+        assert_eq!(observed.definition.columns[0].source_field_name, None);
+        assert_eq!(observed.definition.columns[0].name.as_ref(), "a");
+        assert_eq!(observed.definition.columns[0].value_type, expected);
+    }
+
+    #[test]
+    fn reused_schema_id_does_not_reuse_another_versions_formal_integer_declaration() {
+        let tiny = metadata(
+            prepared(
+                ConnectorDataType::TinyInt,
+                FunctionValueType::new(DataType::Int8, true),
+            ),
+            1,
+        );
+        let small = metadata(
+            prepared(
+                ConnectorDataType::SmallInt,
+                FunctionValueType::new(DataType::Int16, true),
+            ),
+            2,
+        );
+        assert_eq!(
+            tiny.current_schema().schema_id(),
+            small.current_schema().schema_id()
+        );
+        let tiny = load(&tiny).unwrap();
+        let small = load(&small).unwrap();
+        assert_ne!(tiny.version, small.version);
+        assert_eq!(
+            tiny.definition.columns[0].value_type.data_type(),
+            &DataType::Int8
+        );
+        assert_eq!(
+            small.definition.columns[0].value_type.data_type(),
+            &DataType::Int16
+        );
+    }
+
+    #[test]
+    fn recursive_nominal_declaration_uses_original_formal_field_ids() {
+        let hll =
+            FunctionValueType::try_with_logical_type(DataType::Binary, true, ValueLogicalType::Hll)
+                .unwrap();
+        let value = FunctionValueType::try_from_value(
+            ValueTypeRef::try_new(
+                ValueKind::Struct(
+                    vec![ValueField::new(
+                        "sketch",
+                        hll.value_type().clone(),
+                        ValueTypeStorageLifetime::pure(),
+                    )]
+                    .into(),
+                ),
+                true,
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+            ValueLayout::try_from_normalized_arrow(
+                DataType::Struct(
+                    vec![Arc::new(Field::new("sketch", DataType::Binary, true))].into(),
+                ),
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let stored = prepared(
+            ConnectorDataType::Struct(vec![ConnectorStructField {
+                name: "sketch".into(),
+                data_type: ConnectorDataType::Hll,
+                nullable: true,
+            }]),
+            value.clone(),
+        );
+        let observed = load(&metadata(stored, 1)).unwrap();
+        assert_eq!(observed.definition.columns[0].value_type, value);
+    }
+
+    #[test]
+    fn missing_nova_header_or_formal_map_cannot_fall_back_to_global_properties() {
+        for key in [
+            output_contract::KEY,
+            crate::schema_mapping::nominal_declaration::PROPERTY,
+        ] {
+            let original = metadata(
+                prepared(
+                    ConnectorDataType::SmallInt,
+                    FunctionValueType::new(DataType::Int16, true),
+                ),
+                1,
+            );
+            let mut value = serde_json::to_value(original).unwrap();
+            let declaration = value["versions"][0]["summary"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key)
+                .unwrap();
+            value["properties"][key] = declaration;
+            let corrupt: ViewMetadata = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                load(&corrupt).unwrap_err().kind(),
+                ConnectorErrorKind::CorruptData
+            );
+        }
+    }
+
+    #[test]
+    fn third_party_schema_uses_its_actual_physical_declaration_and_natural_names() {
+        let original = metadata(
+            prepared(
+                ConnectorDataType::Hll,
+                FunctionValueType::try_with_logical_type(
+                    DataType::Binary,
+                    true,
+                    ValueLogicalType::Hll,
+                )
+                .unwrap(),
+            ),
+            1,
+        );
+        let mut value = serde_json::to_value(original).unwrap();
+        let formal = value["versions"][0]["summary"]
+            [crate::schema_mapping::nominal_declaration::PROPERTY]
+            .clone();
+        value["versions"][0]["summary"] = serde_json::json!({});
+        value["versions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("default-catalog");
+        value["properties"][crate::schema_mapping::nominal_declaration::PROPERTY] = formal;
+        let third_party: ViewMetadata = serde_json::from_value(value).unwrap();
+        let observed = load(&third_party).unwrap();
+        assert_eq!(observed.definition.source_format, None);
+        assert_eq!(observed.definition.default_catalog, None);
+        assert_eq!(
+            observed.definition.columns[0].source_field_name.as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            observed.definition.columns[0].value_type,
+            FunctionValueType::new(DataType::Binary, true)
+        );
+    }
+
+    #[test]
+    fn unsupported_child_nullability_is_refused_before_publication() {
+        let value = FunctionValueType::new(
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+            true,
+        );
+        let (_columns, definition) = pair(
+            ConnectorDataType::Array(Box::new(ConnectorDataType::BigInt)),
+            value,
+        );
+        assert_eq!(
+            prepare_definition(&definition, None, &[], &request().context)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn same_descriptor_and_epoch_do_not_substitute_for_the_original_generation_owner() {
+        let (_executor, _warehouse, runtime) = super::tests::hadoop_runtime();
+        let provider = super::tests::view_provider(runtime.clone());
+        let other = IcebergMetadata::new(
+            provider.descriptor().clone(),
+            provider.incarnation(),
+            Arc::new(runtime),
+        );
+        let raw = || {
+            metadata(
+                prepared(
+                    ConnectorDataType::Int,
+                    FunctionValueType::new(DataType::Int32, true),
+                ),
+                1,
+            )
+        };
+        let preparation = provider.prepared_view_facts(request(), raw());
+        let error = crate::metadata::with_pure_schema_creation(&request().context, |creation| {
+            other
+                .create_prepared_view(preparation, creation)
+                .map_err(crate::metadata::metadata_creation_error)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        let preparation = provider.prepared_view_facts(request(), raw());
+        crate::metadata::with_pure_schema_creation(&request().context, |creation| {
+            provider
+                .clone()
+                .create_prepared_view(preparation, creation)
+                .map_err(crate::metadata::metadata_creation_error)
+        })
+        .unwrap();
+    }
+    #[test]
+    fn original_schema_control_and_source_refusals_survive_without_reclassification() {
+        use novarocks_connector_contract::PureProviderCompileError;
+        use novarocks_type_contract::{
+            CompileControlError, owned_resources::layout::LayoutResourceError,
+        };
+        let raw = metadata(
+            prepared(
+                ConnectorDataType::Int,
+                FunctionValueType::new(DataType::Int32, true),
+            ),
+            1,
+        );
+        for expected in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            CompileControlError::from_domain(LayoutResourceError::SourceModel),
+        ] {
+            let mut allocations = |_: std::alloc::Layout| Ok(());
+            let mut work = |units: usize| {
+                if units > 0 {
+                    Err(expected.clone())
+                } else {
+                    Ok(())
+                }
+            };
+            let mut creation =
+                novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    ValueTypeStorageLifetime::pure(),
+                    &mut allocations,
+                    &mut work,
+                );
+            let error = materialize_view_metadata(request(), &raw, &mut creation).unwrap_err();
+            assert!(
+                matches!(error, PureProviderCompileError::Control(actual) if actual == expected)
+            );
+        }
+    }
+    #[test]
+    fn public_header_shape_is_refused_before_the_provider_can_publish_an_unreadable_view() {
+        let (_columns, definition) = pair(
+            ConnectorDataType::Int,
+            FunctionValueType::new(DataType::Int32, true),
+        );
+        for public_name in ["A", ""] {
+            let mut definition = definition.clone();
+            let mut other = definition.columns[0].clone();
+            other.name = public_name.into();
+            definition.columns = vec![definition.columns[0].clone(), other].into();
+            assert_eq!(
+                prepare_definition(&definition, None, &[], &request().context)
+                    .unwrap_err()
+                    .kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+        }
+    }
+    #[test]
+    fn ordinary_string_and_binary_declarations_do_not_acquire_a_nominal_domain() {
+        for (storage, value) in [
+            (
+                ConnectorDataType::String,
+                FunctionValueType::new(DataType::Utf8, true),
+            ),
+            (
+                ConnectorDataType::Binary,
+                FunctionValueType::new(DataType::Binary, false),
+            ),
+        ] {
+            let raw = metadata(prepared(storage, value.clone()), 1);
+            assert_eq!(load(&raw).unwrap().definition.columns[0].value_type, value);
+        }
+    }
+
+    #[test]
+    fn reused_numeric_version_and_schema_ids_still_bind_the_actual_observed_definition() {
+        let first = metadata(
+            prepared(
+                ConnectorDataType::SmallInt,
+                FunctionValueType::new(DataType::Int16, true),
+            ),
+            1,
+        );
+        let changed_type = metadata(
+            prepared(
+                ConnectorDataType::TinyInt,
+                FunctionValueType::new(DataType::Int8, true),
+            ),
+            1,
+        );
+        let mut value = serde_json::to_value(&first).unwrap();
+        value["versions"][0]["representations"][0]["sql"] = "SELECT 2".into();
+        let changed_source: ViewMetadata = serde_json::from_value(value).unwrap();
+        let observed = load(&first).unwrap();
+        assert_eq!(observed.version, load(&first).unwrap().version);
+        assert_ne!(observed.version, load(&changed_type).unwrap().version);
+        assert_ne!(observed.version, load(&changed_source).unwrap().version);
+    }
+    #[test]
+    fn original_nominal_roots_round_trip_through_the_same_formal_author() {
+        for (storage, carrier, logical) in [
+            (
+                ConnectorDataType::Hll,
+                DataType::Binary,
+                ValueLogicalType::Hll,
+            ),
+            (
+                ConnectorDataType::Bitmap,
+                DataType::Binary,
+                ValueLogicalType::Bitmap,
+            ),
+            (
+                ConnectorDataType::LargeInt,
+                DataType::FixedSizeBinary(16),
+                ValueLogicalType::LargeInt,
+            ),
+        ] {
+            let expected =
+                FunctionValueType::try_with_logical_type(carrier, false, logical).unwrap();
+            let raw = metadata(prepared(storage, expected.clone()), 1);
+            assert_eq!(
+                load(&raw).unwrap().definition.columns[0].value_type,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn observed_version_binds_header_context_and_nullability_but_not_global_comment() {
+        let raw = metadata(
+            prepared(
+                ConnectorDataType::SmallInt,
+                FunctionValueType::new(DataType::Int16, true),
+            ),
+            1,
+        );
+        let expected = load(&raw).unwrap().version;
+        let base = serde_json::to_value(&raw).unwrap();
+        for field in ["catalog", "namespace", "header", "nullability"] {
+            let mut changed = base.clone();
+            match field {
+                "catalog" => changed["versions"][0]["default-catalog"] = "another_catalog".into(),
+                "namespace" => {
+                    changed["versions"][0]["default-namespace"] = serde_json::json!(["another_db"])
+                }
+                "header" => {
+                    changed["versions"][0]["summary"][output_contract::KEY] =
+                        output_contract::encode([Some("original")]).unwrap().into()
+                }
+                "nullability" => changed["schemas"][0]["fields"][0]["required"] = true.into(),
+                _ => unreachable!(),
+            }
+            let changed: ViewMetadata = serde_json::from_value(changed).unwrap();
+            assert_ne!(expected, load(&changed).unwrap().version, "{field}");
+        }
+        let mut changed = base;
+        changed["properties"]["comment"] = "global comment changes independently".into();
+        let changed: ViewMetadata = serde_json::from_value(changed).unwrap();
+        assert_eq!(expected, load(&changed).unwrap().version);
+    }
+
+    #[test]
+    fn declaration_identity_sink_preserves_the_original_source_and_stops_before_later_bytes() {
+        use novarocks_connector_contract::PureProviderCompileError;
+        use novarocks_type_contract::{
+            CompileControlError, owned_resources::layout::LayoutResourceError,
+        };
+        let raw = metadata(
+            prepared(
+                ConnectorDataType::Int,
+                FunctionValueType::new(DataType::Int32, true),
+            ),
+            1,
+        );
+        let columns = load(&raw).unwrap().definition.columns;
+        let expected = CompileControlError::from_domain(LayoutResourceError::SourceModel);
+        let calls = std::cell::Cell::new(0usize);
+        let mut allocations = |_: std::alloc::Layout| Ok(());
+        let mut work = |_: usize| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 4 {
+                Err(expected.clone())
+            } else {
+                Ok(())
+            }
+        };
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut allocations,
+            &mut work,
+        );
+        let error =
+            version_identity::observed(&raw, raw.current_version(), &columns, &mut creation)
+                .unwrap_err();
+        assert!(matches!(error, PureProviderCompileError::Control(actual) if actual == expected));
+        assert_eq!(calls.get(), 4);
     }
 }

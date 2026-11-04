@@ -19,14 +19,11 @@ use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQuery
 use crate::view::{
     CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewStatementResult, ViewTarget,
 };
-use novarocks_parser::{
-    ast::{CreateView, ObjectName},
-    printer,
-};
+use novarocks_parser::ast::{CreateView, ObjectName};
 use novarocks_spi::connector::DropPolicy;
 use novarocks_types::naming::normalize_identifier;
 
-use crate::view_service::{DEFAULT_CATALOG, build_query_result, parse_query};
+use crate::view_service::{DEFAULT_CATALOG, build_query_result};
 
 pub(crate) fn resolve_external_target_parts(
     _engine: &dyn ViewEngine,
@@ -70,18 +67,18 @@ pub(crate) fn create_external_view(
     target: ViewTarget,
     statement: &CreateView,
     context: ViewRequestContext<'_>,
-) -> Result<ViewStatementResult, String> {
+) -> Result<ViewStatementResult, crate::api::CommandError> {
     let connector_context = context
         .connector_context
         .ok_or_else(|| "external view mutation requires connector request context".to_string())?;
 
     let definition = PersistedQueryDefinition::new(
-        printer::print_query(&statement.query),
+        statement.raw_query_source.clone(),
         PersistedQueryDialect::StarRocks,
         context.current_catalog.unwrap_or(DEFAULT_CATALOG),
         context.current_database,
     )?;
-    let mut analyzed_query = parse_query(&definition.raw_query_source)?.as_ref().clone();
+    let mut analyzed_query = statement.query.clone();
     crate::view_rewrite::expand_external_views(
         engine,
         &mut analyzed_query,
@@ -95,27 +92,16 @@ pub(crate) fn create_external_view(
         // not an inferred semantic snapshot for the persisted definition.
         &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
     )?;
-    let mut columns = engine.analyze_external_view(
-        &definition.resolution.default_catalog,
-        &definition.resolution.default_database,
-        &analyzed_query,
+    let columns = engine.analyze_view_definition(
+        crate::view::ViewDefinitionAnalysisRequest {
+            catalog: &definition.resolution.default_catalog,
+            database: &definition.resolution.default_database,
+            target: &target,
+            query: &analyzed_query,
+            columns: &statement.columns,
+        },
         connector_context,
     )?;
-    if columns.is_empty() {
-        return Err("CREATE VIEW: SELECT produced no output columns".to_string());
-    }
-    if !statement.columns.is_empty() && statement.columns.len() != columns.len() {
-        return Err(format!(
-            "view column list has {} names but the SELECT produces {} columns",
-            statement.columns.len(),
-            columns.len()
-        ));
-    }
-    if !statement.columns.is_empty() {
-        for (column, alias) in columns.iter_mut().zip(&statement.columns) {
-            column.name = alias.value.clone();
-        }
-    }
     engine.create_external_view(
         CreateExternalViewRequest {
             target,

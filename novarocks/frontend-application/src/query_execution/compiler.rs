@@ -1159,7 +1159,8 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
     while !preparation.needs().is_empty() {
         let facts = provider_source
             .resolve_catalog_relations(preparation.needs())
-            .await?;
+            .await
+            .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
         preparation = preparation
             .continue_catalog(facts.into_boxed_slice())
             .map_err(crate::dml::error::DmlExecutionError::from_compile)?;

@@ -2336,6 +2336,7 @@ impl FrontendQuerySession {
                 let result = command_executor
                     .execute_view(&statement, &context, &command_context)
                     .await
+                    .map_err(|error| error.with_analysis_source(&sql))
                     .map_err(product_command_error);
                 Ok((result, execution_owner))
             }),

@@ -23,10 +23,7 @@ use std::sync::{Mutex, RwLock};
 use crate::api::{QueryResult, build_utf8_query_result};
 use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::view::{ViewEngine, ViewRequestContext, ViewService, ViewStatementResult};
-use novarocks_parser::{
-    ast::{CreateView, Query, Statement, ViewStatement},
-    printer,
-};
+use novarocks_parser::ast::{CreateView, Query, Statement, ViewStatement};
 use novarocks_types::naming::normalize_identifier;
 
 pub(crate) const DEFAULT_CATALOG: &str = "default_catalog";
@@ -124,7 +121,7 @@ impl QueryViewService {
         engine: &dyn ViewEngine,
         create_view: &CreateView,
         context: ViewRequestContext<'_>,
-    ) -> Result<ViewStatementResult, String> {
+    ) -> Result<ViewStatementResult, crate::api::CommandError> {
         let parts = view_object_name_parts(&create_view.name);
         if let Some(target) =
             crate::view_iceberg::resolve_external_target_parts(engine, &parts, context)?
@@ -132,7 +129,7 @@ impl QueryViewService {
             return crate::view_iceberg::create_external_view(engine, target, create_view, context);
         }
         let key = session_view_key(&create_view.name, context.current_database)?;
-        let definition = query_definition(&printer::print_query(&create_view.query), context)?;
+        let definition = query_definition(&create_view.raw_query_source, context)?;
         let query = parse_query(&definition.raw_query_source)?;
         self.create_session_view(key, definition, query, create_view.or_replace)?;
         Ok(ViewStatementResult::Ok)
@@ -143,7 +140,7 @@ impl QueryViewService {
         engine: &dyn ViewEngine,
         drop_view: &novarocks_parser::ast::DropView,
         context: ViewRequestContext<'_>,
-    ) -> Result<ViewStatementResult, String> {
+    ) -> Result<ViewStatementResult, crate::api::CommandError> {
         let parts = view_object_name_parts(&drop_view.name);
         if let Some(target) =
             crate::view_iceberg::resolve_external_target_parts(engine, &parts, context)?
@@ -235,15 +232,16 @@ impl ViewService for QueryViewService {
         engine: &dyn ViewEngine,
         statement: &ViewStatement,
         context: ViewRequestContext<'_>,
-    ) -> Result<ViewStatementResult, String> {
+    ) -> Result<ViewStatementResult, crate::api::CommandError> {
         match statement {
             ViewStatement::Create(create_view) => self.handle_create(engine, create_view, context),
             ViewStatement::Drop(drop_view) => self.handle_drop(engine, drop_view, context),
-            ViewStatement::Show(_) => {
-                Err("SHOW VIEWS requires its original governed read source".to_string())
-            }
+            ViewStatement::Show(_) => Err("SHOW VIEWS requires its original governed read source"
+                .to_string()
+                .into()),
             ViewStatement::ShowCreate(show_create) => {
                 crate::view_iceberg::show_create_view(engine, &show_create.name, context)
+                    .map_err(Into::into)
             }
         }
     }

@@ -173,7 +173,7 @@ impl FrontendQueryCompiler {
             while !logical.needs().is_empty() {
                 let facts = match catalog.resolve_relations(logical.needs()).await {
                     Ok(facts) => facts,
-                    Err(error) => return Ok(Err(FrontendQueryCompilerError::Engine(error))),
+                    Err(error) => return Ok(Err(FrontendQueryCompilerError::from_compile(error))),
                 };
                 logical = match planning_cpu
                     .logical_continue(logical, facts.into_boxed_slice())

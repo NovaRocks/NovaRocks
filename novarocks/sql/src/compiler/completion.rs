@@ -3212,86 +3212,16 @@ fn arc_slice_bytes<T>(len: usize) -> Result<u64, CompletionProtocolError> {
 fn function_value_type_bytes(
     value: &novarocks_type_contract::FunctionValueType,
 ) -> Result<u64, CompletionProtocolError> {
-    checked_sum([
-        semantic_value_bytes(value.value_type()),
-        value_layout_bytes(value.typed_binding().layout()),
-    ])
+    representation_bytes(
+        novarocks_type_contract::owned_resources::type_representation::function_value_type_retained_bytes(value),
+    )
 }
-fn type_layout_bytes(
-    layout: Result<
-        std::alloc::Layout,
-        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
-    >,
-) -> Result<u64, CompletionProtocolError> {
-    layout
-        .map_err(|_| {
-            CompletionProtocolError::ResourceCountOverflow(CompletionResource::ExchangeBytes)
-        })
-        .and_then(|layout| checked_size(layout.size()))
-}
-fn semantic_value_bytes(
-    value: &novarocks_type_contract::ValueTypeRef,
-) -> Result<u64, CompletionProtocolError> {
-    use novarocks_type_contract::ValueKind;
-    let own =
-        type_layout_bytes(novarocks_type_contract::ValueTypeRef::storage_allocation_layout())?;
-    let shape = match value.kind() {
-        ValueKind::Scalar(data_type) => data_type_dynamic_bytes(data_type),
-        ValueKind::Struct(fields) => checked_sum([
-            checked_mul(
-                fields.len(),
-                std::mem::size_of::<novarocks_type_contract::ValueField>(),
-            ),
-            checked_sum(fields.iter().map(|field| {
-                checked_sum([
-                    type_layout_bytes(
-                        novarocks_type_contract::ValueField::storage_allocation_layout(),
-                    ),
-                    checked_size(field.name().len()),
-                    semantic_value_bytes(field.value_type()),
-                ])
-            })),
-        ]),
-        ValueKind::Union(fields) => checked_sum([
-            checked_mul(
-                fields.len(),
-                std::mem::size_of::<novarocks_type_contract::ValueUnionField>(),
-            ),
-            checked_sum(fields.iter().map(|field| {
-                checked_sum([
-                    type_layout_bytes(
-                        novarocks_type_contract::ValueField::storage_allocation_layout(),
-                    ),
-                    checked_size(field.field.name().len()),
-                    semantic_value_bytes(field.field.value_type()),
-                ])
-            })),
-        ]),
-        _ => checked_sum((0..value.child_count()).map(|index| {
-            semantic_value_bytes(value.child_type_at(index).expect("checked semantic child"))
-        })),
-    }?;
-    checked_sum([Ok(own), Ok(shape)])
-}
-fn value_layout_bytes(
-    value: &novarocks_type_contract::ValueLayout,
-) -> Result<u64, CompletionProtocolError> {
-    let mut bytes = checked_sum([
-        type_layout_bytes(novarocks_type_contract::ValueLayout::storage_allocation_layout()),
-        data_type_dynamic_bytes(value.data_type()),
-    ])?;
-    let mut index = 0;
-    while let Some(child) = value.materialized_child_at(index) {
-        bytes = checked_add(
-            bytes,
-            checked_sum([
-                checked_size(std::mem::size_of::<novarocks_type_contract::ValueLayout>()),
-                value_layout_bytes(child),
-            ])?,
-        )?;
-        index += 1;
-    }
-    Ok(bytes)
+fn representation_bytes(bytes: Option<usize>) -> Result<u64, CompletionProtocolError> {
+    bytes
+        .ok_or(CompletionProtocolError::ResourceCountOverflow(
+            CompletionResource::ExchangeBytes,
+        ))
+        .and_then(checked_size)
 }
 
 fn statistics_fact_bytes(fact: &StatisticsFact) -> Result<u64, CompletionProtocolError> {
@@ -3485,65 +3415,19 @@ fn provider_properties_bytes(
 fn data_type_dynamic_bytes(
     data_type: &arrow::datatypes::DataType,
 ) -> Result<u64, CompletionProtocolError> {
-    use arrow::datatypes::DataType;
-    match data_type {
-        DataType::Timestamp(_, timezone) => timezone
-            .as_ref()
-            .map_or(Ok(0), |timezone| arc_slice_bytes::<u8>(timezone.len())),
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => field_ref_bytes(field),
-        DataType::Struct(fields) => checked_sum([
-            arc_slice_bytes::<arrow::datatypes::FieldRef>(fields.len()),
-            checked_sum(fields.iter().map(field_ref_bytes)),
-        ]),
-        DataType::Union(fields, _) => checked_sum([
-            std::alloc::Layout::array::<(i8, arrow::datatypes::FieldRef)>(fields.len())
-                .ok()
-                .and_then(|payload| {
-                    novarocks_type_contract::owned_resources::layout::arc_layout(payload).ok()
-                })
-                .ok_or(CompletionProtocolError::ResourceCountOverflow(
-                    CompletionResource::ExchangeBytes,
-                ))
-                .and_then(|layout| checked_size(layout.size())),
-            checked_sum(fields.iter().map(|(_, field)| field_ref_bytes(field))),
-        ]),
-        DataType::Dictionary(key, value) => checked_sum([
-            checked_mul(2, std::mem::size_of::<DataType>()),
-            data_type_dynamic_bytes(key),
-            data_type_dynamic_bytes(value),
-        ]),
-        DataType::RunEndEncoded(run_ends, values) => {
-            checked_sum([field_ref_bytes(run_ends), field_ref_bytes(values)])
-        }
-        _ => Ok(0),
-    }
+    representation_bytes(
+        novarocks_type_contract::owned_resources::type_representation::arrow_type_dynamic_bytes(
+            data_type,
+        ),
+    )
 }
-
+#[cfg(test)]
 fn field_ref_bytes(field: &arrow::datatypes::FieldRef) -> Result<u64, CompletionProtocolError> {
-    let metadata =
-        checked_sum([
-            novarocks_type_contract::owned_resources::arrow_metadata::retained_backing_upper_bound(
-                field.metadata().len(),
-            )
-            .map_err(|_| {
-                CompletionProtocolError::ResourceCountOverflow(CompletionResource::ExchangeBytes)
-            })
-            .and_then(checked_size),
-            checked_sum(field.metadata().iter().map(|(key, value)| {
-                checked_sum([checked_size(key.len()), checked_size(value.len())])
-            })),
-        ])?;
-    checked_sum([
-        arc_slice_bytes::<arrow::datatypes::Field>(1),
-        checked_size(field.name().len()),
-        data_type_dynamic_bytes(field.data_type()),
-        Ok(metadata),
-    ])
+    representation_bytes(
+        novarocks_type_contract::owned_resources::type_representation::arrow_field_retained_bytes(
+            field,
+        ),
+    )
 }
 
 fn column_def_bytes(

@@ -28,8 +28,7 @@ use crate::view::{
 use crate::view_service::QueryViewService;
 use arrow::array::{Array, StringArray};
 use novarocks_parser::{
-    Span,
-    ast::{Ident, ObjectName, Query, SetExpr, Statement as ParsedStatement, TypeName},
+    ast::{Query, SetExpr, Statement as ParsedStatement},
     printer::print_query,
 };
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
@@ -142,7 +141,7 @@ impl ViewEngine for FakeViewEngine {
                 column_names: request
                     .columns
                     .iter()
-                    .map(|column| column.name.clone())
+                    .map(|column| column.name.to_string())
                     .collect(),
                 comment: request.comment.clone(),
                 properties: request.properties.iter().cloned().collect(),
@@ -179,39 +178,40 @@ impl ViewEngine for FakeViewEngine {
         Ok(self.views.lock().unwrap().get(target).cloned())
     }
 
-    fn analyze_external_view(
+    fn analyze_view_definition(
         &self,
-        _catalog: &str,
-        _database: &str,
-        query: &Query,
+        request: crate::view::ViewDefinitionAnalysisRequest<'_>,
         _context: &ConnectorRequestContext,
-    ) -> Result<Vec<ViewColumnDefinition>, String> {
+    ) -> Result<Vec<ViewColumnDefinition>, novarocks_sql::compiler::SqlCompileError> {
         self.analyzed_queries
             .lock()
             .unwrap()
-            .push(print_query(query));
-        let width = match query.body.as_ref() {
+            .push(print_query(request.query));
+        let width = match request.query.body.as_ref() {
             SetExpr::Select(select) => select.projection.len(),
             _ => 1,
         };
+        if !request.columns.is_empty() && request.columns.len() != width {
+            return Err(novarocks_sql::compiler::SqlCompileError::Compilation(
+                format!(
+                    "view column list has {} names but the SELECT produces {width} columns",
+                    request.columns.len()
+                ),
+            ));
+        }
         Ok((0..width)
             .map(|index| ViewColumnDefinition {
-                name: format!("c{}", index + 1),
-                data_type: TypeName {
-                    name: ObjectName {
-                        parts: vec![Ident {
-                            value: "BIGINT".to_owned(),
-                            quoted: false,
-                            quote_style: None,
-                            span: Span::new(0, 0),
-                        }],
-                        span: Span::new(0, 0),
-                    },
-                    arguments: Vec::new(),
-                    argument_separator_spaces: Vec::new(),
-                    span: Span::new(0, 0),
-                },
-                nullable: false,
+                source_field_name: Some(format!("c{}", index + 1).into()),
+                name: request
+                    .columns
+                    .get(index)
+                    .map(|name| name.value.clone())
+                    .unwrap_or_else(|| format!("c{}", index + 1))
+                    .into(),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             })
             .collect())
     }
@@ -276,7 +276,9 @@ impl ViewServiceTestExt for QueryViewService {
                 .map(ViewStatementResult::Query)
                 .map(Some);
         }
-        self.execute_statement(engine, statement, context).map(Some)
+        self.execute_statement(engine, statement, context)
+            .map(Some)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -504,7 +506,10 @@ fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
     let created = engine.created.lock().unwrap();
     assert_eq!(created[0].target.catalog, "ice");
     assert_eq!(created[0].target.database, "db");
-    assert_eq!(created[0].definition.raw_query_source, "SELECT 1, 2");
+    assert_eq!(
+        created[0].definition.raw_query_source,
+        "SELECT /* preserve */ 1,\n  2"
+    );
     assert_eq!(
         created[0].definition.resolution.default_catalog, "ice",
         "external view must freeze its creation catalog"
@@ -513,7 +518,7 @@ fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
         created[0]
             .columns
             .iter()
-            .map(|column| column.name.as_str())
+            .map(|column| column.name.as_ref())
             .collect::<Vec<_>>(),
         vec!["left_col", "right_col"]
     );
@@ -1335,7 +1340,8 @@ fn show_views_cannot_fall_back_to_synchronous_statement_dispatch() {
     assert_eq!(
         service
             .execute_statement(&engine, show, context(None, "db"))
-            .unwrap_err(),
+            .unwrap_err()
+            .to_string(),
         "SHOW VIEWS requires its original governed read source"
     );
 }

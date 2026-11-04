@@ -26,18 +26,14 @@ use std::sync::Arc;
 
 use crate::catalog_application::query_catalog::CatalogServiceSource;
 use crate::query_execution::kernels::ViewExecutionKernel;
-use novarocks_parser::{
-    Span,
-    ast::{
-        Ident, Literal, LiteralKind, ObjectName, Query, StructField, TypeName, TypeNameArgument,
-    },
-};
+#[cfg(test)]
+use novarocks_parser::ast::Query;
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_query_application::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
-    ViewEngine, ViewTarget,
+    ViewDefinitionAnalysisRequest, ViewEngine, ViewTarget,
 };
 #[cfg(test)]
 use novarocks_query_application::view::{ViewRequestContext, ViewService, ViewStatementResult};
@@ -46,8 +42,6 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
     ConnectorViewRequest, ConnectorViewSourceFormat, CreateOrReplacePolicy, DropPolicy,
 };
-use novarocks_sql::literal::arrow_data_type_to_sql_type;
-use novarocks_sql::semantic::TableColumnDef;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg(test)]
@@ -68,8 +62,8 @@ impl ViewService for EmptyViewService {
         _engine: &dyn ViewEngine,
         _statement: &novarocks_parser::ast::ViewStatement,
         _context: ViewRequestContext<'_>,
-    ) -> Result<ViewStatementResult, String> {
-        Err("view service is not injected".to_string())
+    ) -> Result<ViewStatementResult, novarocks_query_application::api::CommandError> {
+        Err("view service is not injected".to_string().into())
     }
 
     fn rewrite_query(
@@ -173,14 +167,17 @@ impl ViewEngine for FrontendViewEngine {
             .to_string());
         };
         let instance_id = binding.descriptor().instance_id.clone();
-        match capability.load_view(ConnectorViewRequest {
-            view: ConnectorViewIdentity {
-                instance_id,
-                namespace: Arc::from(target.database.as_str()),
-                view: Arc::from(target.view.as_str()),
+        match crate::connector::schema_creation::load_frontend_view(
+            capability.as_ref(),
+            ConnectorViewRequest {
+                view: ConnectorViewIdentity {
+                    instance_id,
+                    namespace: Arc::from(target.database.as_str()),
+                    view: Arc::from(target.view.as_str()),
+                },
+                context: context.clone(),
             },
-            context: context.clone(),
-        }) {
+        ) {
             Ok(view) => Ok(ExternalViewResolution::View(resolved_external_view(
                 target, view,
             )?)),
@@ -231,16 +228,18 @@ impl ViewEngine for FrontendViewEngine {
                 .to_string());
             };
             let instance_id = binding.descriptor().instance_id.clone();
-            match capability
-                .load_view_async(ConnectorViewRequest {
+            match crate::connector::schema_creation::load_frontend_view_async(
+                capability.as_ref(),
+                ConnectorViewRequest {
                     view: ConnectorViewIdentity {
                         instance_id,
                         namespace: Arc::from(target.database.as_str()),
                         view: Arc::from(target.view.as_str()),
                     },
                     context: context.clone(),
-                })
-                .await
+                },
+            )
+            .await
             {
                 Ok(view) => Ok(ExternalViewResolution::View(resolved_external_view(
                     target, view,
@@ -267,22 +266,16 @@ impl ViewEngine for FrontendViewEngine {
         request: CreateExternalViewRequest,
         context: &ConnectorRequestContext,
     ) -> Result<(), String> {
-        let columns = request
+        let columns: Arc<[novarocks_spi::connector::ConnectorViewColumn]> = request
             .columns
             .into_iter()
-            .map(|column| {
-                let column = TableColumnDef {
-                    name: column.name,
-                    data_type: crate::catalog_application::statement::lower_typed_sql_type(
-                        &column.data_type,
-                    )?,
-                    nullable: column.nullable,
-                    aggregation: None,
-                    default: None,
-                };
-                crate::catalog_application::statement::connector_column(&column)
+            .map(|column| novarocks_spi::connector::ConnectorViewColumn {
+                source_field_name: column.source_field_name,
+                name: column.name,
+                value_type: column.value_type,
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Vec<_>>()
+            .into();
         let instance_id = ConnectorInstanceId::parse(&request.target.catalog)
             .map_err(|error| error.to_string())?;
         crate::connector::mutation::execute_catalog_mutation(
@@ -294,13 +287,13 @@ impl ViewEngine for FrontendViewEngine {
                     namespace: Arc::from(request.target.database),
                     view: Arc::from(request.target.view),
                 },
-                columns,
                 definition: ConnectorViewDefinition {
                     dialect: ConnectorViewDialect::StarRocks,
                     raw_sql: Arc::from(request.definition.raw_query_source),
                     default_catalog: Some(Arc::from(request.definition.resolution.default_catalog)),
                     default_namespace: Arc::from(request.definition.resolution.default_database),
                     source_format: Some(ConnectorViewSourceFormat::EffectiveUserSourceV1),
+                    columns,
                 },
                 comment: request.comment.map(Arc::from),
                 properties: request
@@ -363,14 +356,17 @@ impl ViewEngine for FrontendViewEngine {
             .to_string());
         };
         let instance_id = binding.descriptor().instance_id.clone();
-        match capability.load_view(ConnectorViewRequest {
-            view: ConnectorViewIdentity {
-                instance_id,
-                namespace: Arc::from(target.database.as_str()),
-                view: Arc::from(target.view.as_str()),
+        match crate::connector::schema_creation::load_frontend_view(
+            capability.as_ref(),
+            ConnectorViewRequest {
+                view: ConnectorViewIdentity {
+                    instance_id,
+                    namespace: Arc::from(target.database.as_str()),
+                    view: Arc::from(target.view.as_str()),
+                },
+                context: context.clone(),
             },
-            context: context.clone(),
-        }) {
+        ) {
             Ok(view) => Ok(Some(resolved_external_view(target, view)?)),
             // See `resolve_external_view`: a catalog without view support has
             // no view to find.
@@ -386,18 +382,16 @@ impl ViewEngine for FrontendViewEngine {
         }
     }
 
-    fn analyze_external_view(
+    fn analyze_view_definition(
         &self,
-        catalog: &str,
-        database: &str,
-        query: &Query,
+        request: ViewDefinitionAnalysisRequest<'_>,
         context: &ConnectorRequestContext,
-    ) -> Result<Vec<ViewColumnDefinition>, String> {
+    ) -> Result<Vec<ViewColumnDefinition>, novarocks_sql::compiler::SqlCompileError> {
         let catalog_service_snapshot =
             crate::catalog_application::query_catalog::catalog_service_snapshot(self);
         let provider =
             crate::catalog_application::query_materializer::build_catalog_service_provider(
-                Some(catalog),
+                Some(request.catalog),
                 &catalog_service_snapshot,
                 self.connector_control(),
                 context.clone(),
@@ -406,28 +400,52 @@ impl ViewEngine for FrontendViewEngine {
             );
         let control =
             crate::query_execution::planning::sql_compile_control_from_connector_request(context);
-        let columns = novarocks_sql::planning::catalog::analyze_view_query(
-            query,
-            &provider,
-            database,
-            self.function_catalog(),
-            self.kernel.constant_policy(),
-            &control,
-        )
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .map(|column| {
-            Ok(ViewColumnDefinition {
-                name: column.name,
-                data_type: view_type_name(&column.data_type)?,
-                nullable: column.nullable,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-        if columns.is_empty() {
-            return Err("CREATE VIEW: SELECT produced no output columns".to_string());
+        let mut preparation =
+            novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new_definition(
+                request.query.clone(),
+                request.catalog,
+                request.database,
+                Some(novarocks_types::naming::TableIdentity {
+                    catalog: request.target.catalog.clone(),
+                    namespace: request.target.database.clone(),
+                    table: request.target.view.clone(),
+                }),
+                control,
+            )?;
+        while !preparation.needs().is_empty() {
+            let facts = preparation
+                .needs()
+                .iter()
+                .map(|need| {
+                    let relation = need.relation();
+                    let table = match need.target() {
+                        novarocks_sql::compiler::CatalogLookupTarget::Table { .. } => provider
+                            .resolve_table_for_analysis_typed(
+                                Some(&relation.catalog),
+                                &relation.namespace,
+                                &relation.table,
+                            ),
+                        novarocks_sql::compiler::CatalogLookupTarget::IcebergMetadata { kind } => {
+                            provider.resolve_metadata_table_typed(
+                                Some(&relation.catalog),
+                                &relation.namespace,
+                                &relation.table,
+                                kind,
+                            )
+                        }
+                    };
+                    crate::query_execution::completion_facts::catalog_fact_from(need, table)
+                })
+                .collect::<Result<Vec<_>, novarocks_sql::compiler::SqlCompileError>>()?;
+            preparation = preparation.continue_catalog(facts.into_boxed_slice())?;
         }
-        Ok(columns)
+        preparation
+            .analyze_view_definition(
+                request.columns,
+                self.function_catalog(),
+                self.kernel.constant_policy(),
+            )
+            .map(|columns| columns.into_vec())
     }
 }
 
@@ -451,9 +469,10 @@ fn resolved_external_view(
     Ok(ResolvedExternalView {
         definition,
         column_names: view
-            .column_names
-            .into_iter()
-            .map(|name| name.to_string())
+            .definition
+            .columns
+            .iter()
+            .map(|column| column.name.to_string())
             .collect(),
         comment: view.comment.map(|comment| comment.to_string()),
         properties: view
@@ -464,110 +483,12 @@ fn resolved_external_view(
     })
 }
 
-fn view_type_name(data_type: &arrow::datatypes::DataType) -> Result<TypeName, String> {
-    use novarocks_types::schema::SqlType;
-
-    fn span() -> Span {
-        Span::new(0, 0)
-    }
-
-    fn ident(value: impl Into<String>) -> Ident {
-        Ident {
-            value: value.into(),
-            quoted: false,
-            quote_style: None,
-            span: span(),
-        }
-    }
-
-    fn type_name(name: &str, arguments: Vec<TypeNameArgument>) -> TypeName {
-        TypeName {
-            name: ObjectName {
-                parts: vec![ident(name)],
-                span: span(),
-            },
-            argument_separator_spaces: vec![true; arguments.len().saturating_sub(1)],
-            arguments,
-            span: span(),
-        }
-    }
-
-    fn number(value: impl Into<String>) -> TypeNameArgument {
-        TypeNameArgument::Literal(Literal {
-            kind: LiteralKind::Number(value.into()),
-            span: span(),
-        })
-    }
-
-    fn convert(data_type: SqlType) -> Result<TypeName, String> {
-        Ok(match data_type {
-            SqlType::TinyInt => type_name("TINYINT", vec![]),
-            SqlType::SmallInt => type_name("SMALLINT", vec![]),
-            SqlType::Int => type_name("INT", vec![]),
-            SqlType::BigInt => type_name("BIGINT", vec![]),
-            SqlType::LargeInt => type_name("LARGEINT", vec![]),
-            SqlType::Float => type_name("FLOAT", vec![]),
-            SqlType::Double => type_name("DOUBLE", vec![]),
-            SqlType::Decimal { precision, scale } => type_name(
-                "DECIMAL128",
-                vec![number(precision.to_string()), number(scale.to_string())],
-            ),
-            SqlType::String => type_name("STRING", vec![]),
-            SqlType::Json => type_name("JSON", vec![]),
-            SqlType::Binary => type_name("VARBINARY", vec![]),
-            SqlType::Bitmap => type_name("BITMAP", vec![]),
-            SqlType::Hll => type_name("HLL", vec![]),
-            SqlType::Object | SqlType::Percentile => {
-                return Err(
-                    "internal opaque value domains have no public view SQL type name".into(),
-                );
-            }
-            SqlType::Boolean => type_name("BOOLEAN", vec![]),
-            SqlType::Date => type_name("DATE", vec![]),
-            SqlType::DateTime => type_name("DATETIME", vec![]),
-            SqlType::DateTimeNs => type_name("DATETIME_NS", vec![]),
-            SqlType::Time => type_name("TIME", vec![]),
-            SqlType::Array(element) => {
-                type_name("ARRAY", vec![TypeNameArgument::Type(convert(*element)?)])
-            }
-            SqlType::Map(key, value) => type_name(
-                "MAP",
-                vec![
-                    TypeNameArgument::Type(convert(*key)?),
-                    TypeNameArgument::Type(convert(*value)?),
-                ],
-            ),
-            SqlType::Struct(fields) => type_name(
-                "STRUCT",
-                fields
-                    .into_iter()
-                    .map(|(name, field_type)| {
-                        Ok(TypeNameArgument::Field(StructField {
-                            name: ident(name),
-                            data_type: convert(field_type)?,
-                            span: span(),
-                        }))
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-            ),
-            SqlType::Variant => type_name("VARIANT", vec![]),
-            SqlType::Uuid => type_name("UUID", vec![]),
-        })
-    }
-
-    convert(arrow_data_type_to_sql_type(data_type)?)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::*;
     use novarocks_parser::printer::Printer;
-    use novarocks_parser::{
-        Span,
-        ast::{Ident, ObjectName, TypeName},
-    };
 
     #[derive(Default)]
     struct FakeViewEngine;
@@ -620,13 +541,11 @@ mod tests {
             unreachable!("empty view service must not access the engine")
         }
 
-        fn analyze_external_view(
+        fn analyze_view_definition(
             &self,
-            _catalog: &str,
-            _database: &str,
-            _query: &Query,
+            _request: ViewDefinitionAnalysisRequest<'_>,
             _context: &ConnectorRequestContext,
-        ) -> Result<Vec<ViewColumnDefinition>, String> {
+        ) -> Result<Vec<ViewColumnDefinition>, novarocks_sql::compiler::SqlCompileError> {
             unreachable!("empty view service must not access the engine")
         }
     }
@@ -646,24 +565,6 @@ mod tests {
         query.clone()
     }
 
-    fn native_bigint_type() -> TypeName {
-        let span = Span::new(0, 0);
-        TypeName {
-            name: ObjectName {
-                parts: vec![Ident {
-                    value: "BIGINT".to_string(),
-                    quoted: false,
-                    quote_style: None,
-                    span,
-                }],
-                span,
-            },
-            arguments: Vec::new(),
-            argument_separator_spaces: Vec::new(),
-            span,
-        }
-    }
-
     #[test]
     fn view_ports_and_dtos_are_constructible_by_the_owning_module() {
         let target = ViewTarget {
@@ -674,9 +575,12 @@ mod tests {
         let request = CreateExternalViewRequest {
             target: target.clone(),
             columns: vec![ViewColumnDefinition {
-                name: "sale_count".to_string(),
-                data_type: native_bigint_type(),
-                nullable: false,
+                source_field_name: Some("sale_count".into()),
+                name: "sale_count".into(),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             }],
             definition: PersistedQueryDefinition::new(
                 "SELECT COUNT(*) AS sale_count FROM sales",
@@ -724,6 +628,7 @@ mod tests {
             service
                 .execute_statement(&engine, statement, ctx)
                 .unwrap_err()
+                .to_string()
                 .contains("view service is not injected")
         );
         let mut query = parse_query("SELECT * FROM t");
