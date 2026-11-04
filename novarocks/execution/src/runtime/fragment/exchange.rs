@@ -54,7 +54,8 @@ pub(crate) fn test_receiver_creation_factory() -> Arc<dyn InputConstructionFacto
 /// A compiled receiver is addressed by its edge's physical destination node,
 /// the same id the sender routes to, so `assignments` is keyed by that node
 /// and must cover exactly the program's receivers. Its expected schema is the
-/// compiled ExchangeSource layout, and it binds wire columns by position:
+/// compiled ExchangeSource layout; its wire schema comes from the exact cut
+/// source layout. It binds decoded wire columns to local columns by position:
 /// compiled sender and receiver slot ids are allocated per fragment and are
 /// never comparable.
 fn compiled_exchange_binding_refusal(
@@ -137,16 +138,17 @@ pub(crate) fn materialize_compiled_exchange_receivers(
             node_id: receiver,
         };
         registrations.push({
-            let expected_chunk_schema = creation
-                .ok_or(ConstructionFailure::MissingOwner)?
-                .create_compiled_chunk_schema(node.output_layout())?;
+            let creation = creation.ok_or(ConstructionFailure::MissingOwner)?;
+            let wire_chunk_schema = creation.create_compiled_chunk_schema(&input.wire_layout)?;
+            let expected_chunk_schema =
+                creation.create_compiled_chunk_schema(node.output_layout())?;
             ExchangeReceiverRegistration {
                 key,
                 expected_senders,
-                wire_chunk_schema: expected_chunk_schema.clone(),
+                wire_chunk_schema,
                 expected_chunk_schema,
                 column_binding: ExchangeColumnBinding::Positional,
-                creation_factory: Arc::clone(creation.ok_or(ConstructionFailure::MissingOwner)?),
+                creation_factory: Arc::clone(creation),
             }
         });
         bindings.insert(

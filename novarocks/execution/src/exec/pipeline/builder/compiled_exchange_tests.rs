@@ -49,7 +49,7 @@ use novarocks_type_contract::{
     ExpressionEffectContext, ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId,
     FunctionValueType, PureCompileControl,
 };
-use novarocks_types::UniqueId;
+use novarocks_types::{SlotId, UniqueId};
 
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::fragment::program::FragmentNodeId;
@@ -119,6 +119,15 @@ fn plan_with_key_order(
     values_rows: &[(i64, i64)],
     reverse_keys: bool,
 ) -> (PhysicalPlan, NodeId) {
+    plan_with_local_nullability(hashed, values_rows, reverse_keys, false)
+}
+
+fn plan_with_local_nullability(
+    hashed: bool,
+    values_rows: &[(i64, i64)],
+    reverse_keys: bool,
+    local_nullable: bool,
+) -> (PhysicalPlan, NodeId) {
     let edge = EdgeId::new(5);
     let producer_id = FragmentId::new(1);
     let consumer_id = FragmentId::new(2);
@@ -173,11 +182,12 @@ fn plan_with_key_order(
         )
         .unwrap();
 
+    let local_type = FunctionValueType::new(DataType::Int64, local_nullable);
     let mut consumer = FragmentBuilder::new(consumer_id);
     let exchange = consumer.reserve_node_id().unwrap();
     let b_import = consumer
         .add_value(
-            int64(),
+            local_type.clone(),
             ValueOrigin::ExchangeImport {
                 edge,
                 source_value: b,
@@ -186,7 +196,7 @@ fn plan_with_key_order(
         .unwrap();
     let a_import = consumer
         .add_value(
-            int64(),
+            local_type.clone(),
             ValueOrigin::ExchangeImport {
                 edge,
                 source_value: a,
@@ -265,18 +275,18 @@ fn plan_with_key_order(
         output,
         fields: Box::from([
             ResultField {
-                domain: crate::test_result_domain::result_value_domain(&int64()),
+                domain: crate::test_result_domain::result_value_domain(&local_type),
                 name: "b".into(),
                 alias: None,
                 value: b_import,
-                ty: int64(),
+                ty: local_type.clone(),
             },
             ResultField {
-                domain: crate::test_result_domain::result_value_domain(&int64()),
+                domain: crate::test_result_domain::result_value_domain(&local_type),
                 name: "a".into(),
                 alias: None,
                 value: a_import,
-                ty: int64(),
+                ty: local_type.clone(),
             },
         ]),
     })
@@ -480,6 +490,15 @@ fn compiled_receivers_preserve_exact_destination_hash_key_slots() {
 
 fn programs_shaped(hashed: bool, values_rows: &[(i64, i64)]) -> Programs {
     let (plan, receiver) = plan(hashed, values_rows);
+    programs_from_plan(plan, receiver)
+}
+
+fn programs_with_widened_local_roots() -> Programs {
+    let (plan, receiver) = plan_with_local_nullability(false, &ROWS, false, true);
+    programs_from_plan(plan, receiver)
+}
+
+fn programs_from_plan(plan: PhysicalPlan, receiver: NodeId) -> Programs {
     let mut packages = packages(&plan);
     let producer = packages.remove(&FragmentId::new(1)).unwrap();
     let consumer = packages.remove(&FragmentId::new(2)).unwrap();
@@ -657,8 +676,15 @@ fn int64_column(chunk: &Chunk, column: usize) -> Vec<i64> {
 // binds wire columns by position; by slot id it would swap `a` and `b`.
 #[test]
 fn compiled_gather_stream_reaches_compiled_exchange_source_positionally() {
-    let programs = programs();
+    assert_gather_stream_positionally(programs(), [false, false]);
+}
 
+#[test]
+fn compiled_required_wire_reaches_nullable_local_source_without_changing_values_or_order() {
+    assert_gather_stream_positionally(programs_with_widened_local_roots(), [true, true]);
+}
+
+fn assert_gather_stream_positionally(programs: Programs, local_nullable: [bool; 2]) {
     // The producer routes to the consumer's physical exchange node, and its
     // wire slot ids collide with the receiver's in the opposite order: the
     // exact shape a slot-id binding would silently swap.
@@ -675,6 +701,28 @@ fn compiled_gather_stream_reaches_compiled_exchange_source_positionally() {
     assert_eq!(programs.consumer.exchange_inputs().len(), 1);
     assert_eq!(input.receiver_node, programs.receiver.get());
     assert_eq!((input.edge, input.source_fragment), (5, 1));
+    let local_layout = programs.consumer.graph().nodes()[source.index()].output_layout();
+    assert_eq!(local_layout.slots(), &[SlotId::new(0), SlotId::new(1)]);
+    assert_eq!(input.wire_layout.slots(), &[SlotId::new(0), SlotId::new(1)]);
+    for ordinal in 0..2 {
+        let required = FunctionValueType::new(DataType::Int64, false);
+        let local = FunctionValueType::new(DataType::Int64, local_nullable[ordinal]);
+        for (layout, expected) in [(&input.wire_layout, &required), (local_layout, &local)] {
+            assert!(
+                layout
+                    .value_binding_at(ordinal)
+                    .unwrap()
+                    .borrowed()
+                    .exactly_equals_observed(expected.typed_binding().borrowed(), || Ok::<
+                        (),
+                        std::convert::Infallible,
+                    >(
+                        ()
+                    ))
+                    .unwrap()
+            );
+        }
+    }
     assert_eq!(
         branch.dest_node_id(),
         i32::try_from(programs.receiver.get()).unwrap()
@@ -747,12 +795,28 @@ fn compiled_gather_stream_reaches_compiled_exchange_source_positionally() {
     let chunks = output.take_chunks();
     let mut rows = Vec::new();
     for chunk in &chunks {
+        let schema = chunk.chunk_schema_ref();
+        assert_eq!(schema.slots().len(), 2);
+        assert_eq!(schema.slots()[0].slot_id(), SlotId::new(0));
+        assert_eq!(schema.slots()[1].slot_id(), SlotId::new(1));
+        for ordinal in 0..2 {
+            assert_eq!(schema.slots()[ordinal].data_type(), &DataType::Int64);
+            assert_eq!(schema.slots()[ordinal].nullable(), local_nullable[ordinal]);
+            assert_eq!(
+                chunk.record_batch().schema().field(ordinal).is_nullable(),
+                local_nullable[ordinal]
+            );
+            assert_eq!(chunk.columns()[ordinal].null_count(), 0);
+        }
         let b = int64_column(chunk, 0);
         let a = int64_column(chunk, 1);
         rows.extend(b.into_iter().zip(a));
     }
-    let expected = ROWS.iter().map(|(a, b)| (*b, *a)).collect::<Vec<_>>();
-    assert_eq!(rows, expected, "result rows are (b, a) in literal order");
+    assert_eq!(
+        rows,
+        [(10, 1), (20, 2), (30, 3)],
+        "result rows are (b, a) in literal order"
+    );
 }
 
 #[test]
@@ -1264,7 +1328,7 @@ fn compiled_receiver_schema_uses_real_creator_until_last_slot_after_program_exit
     use crate::exec::pipeline::operator::ConstructionFailure;
     use crate::runtime::mem_tracker::MemTracker;
     use crate::runtime::runtime_state::RuntimeErrorState;
-    let programs = programs();
+    let programs = programs_with_widened_local_roots();
     let weak = Arc::downgrade(&programs.consumer);
     let fixture = Fixture::new();
     let port = fixture.port.clone();
@@ -1293,8 +1357,17 @@ fn compiled_receiver_schema_uses_real_creator_until_last_slot_after_program_exit
         Some(&factory),
     )
     .unwrap();
+    let wire_schema = receivers.registrations[0].wire_chunk_schema.clone();
     let schema = receivers.registrations[0].expected_chunk_schema.clone();
+    let wire_slot = wire_schema.slots()[0].clone();
     let slot = schema.slots()[0].clone();
+    assert!(wire_schema.is_typed());
+    assert_eq!(wire_schema.slots().len(), 2);
+    assert_eq!(schema.slots().len(), 2);
+    for ordinal in 0..2 {
+        assert!(!wire_schema.slots()[ordinal].nullable());
+        assert!(schema.slots()[ordinal].nullable());
+    }
     assert!(schema.is_typed());
     assert!(
         schema
@@ -1307,7 +1380,10 @@ fn compiled_receiver_schema_uses_real_creator_until_last_slot_after_program_exit
     drop(programs);
     assert!(weak.upgrade().is_none());
     assert!(tracker.current() > 0);
+    drop(wire_schema);
     drop(schema);
+    assert!(tracker.current() > 0);
+    drop(wire_slot);
     assert!(tracker.current() > 0);
     drop(slot);
     assert_eq!(tracker.current(), 0);

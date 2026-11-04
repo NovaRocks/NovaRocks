@@ -505,6 +505,10 @@ mod tests {
                 Err(error) => panic!("blackhole accept failed: {error}"),
             }
         };
+        // Accepted sockets can inherit the listener's nonblocking mode.
+        accepted
+            .set_nonblocking(false)
+            .expect("restore bounded blocking request observation");
         accepted
             .set_read_timeout(Some(Duration::from_secs(1)))
             .expect("bound blackhole request observation");

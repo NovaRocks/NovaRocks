@@ -257,7 +257,7 @@ mod logical_finish_graph {
         let rows = [(1, Some("a")), (2, None), (2, Some("b"))];
         let compiled =
             compiled_with_finish_package(0, &rows, writer_dop, finish_dop, logical_package);
-        let (summary_id, summary_input) = compiled
+        let (_, summary_input) = compiled
             .finish
             .exchange_inputs()
             .iter()
@@ -271,7 +271,7 @@ mod logical_finish_graph {
             summary_input.delivery,
             novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
         );
-        let summary_layout = compiled.finish.graph().nodes()[summary_id.index()].output_layout();
+        let summary_layout = &summary_input.wire_layout;
         let fixture = tiny_fixture();
         let port = fixture.port.clone();
         let creation = fixture.creation(FINISH_FINST);
@@ -400,18 +400,35 @@ mod logical_finish_graph {
             novarocks_execution_contract::ExchangeCloseDisposition::Withdrawn
         ));
 
-        let summary_schema = creation
+        let summary_creation = fixture.creation(SUMMARY_FINST);
+        let summary_schema = summary_creation
             .create_compiled_chunk_schema(summary_layout)
             .unwrap();
+        let summary_recipe = crate::runtime::exchange::online_unit::prepare_recipe(
+            &summary_schema,
+            &[],
+            summary_creation.as_ref(),
+        )
+        .unwrap();
+        let summary_control =
+            crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+                fixture.state(SUMMARY_FINST).error_state(),
+            );
         let send_summary = || {
             let counts = novarocks_local_program::LogicalChangeCounts::try_new(2, 3, 4).unwrap();
             let chunk = crate::exec::operators::logical_change_summary::summary_chunk(
                 counts,
                 &summary_schema,
-                creation.as_ref(),
+                summary_creation.as_ref(),
             )
             .unwrap();
-            let payload = crate::runtime::exchange::encode_chunks(&[chunk], true).unwrap();
+            let payload = crate::runtime::exchange::online_unit::encode(
+                &summary_recipe,
+                &chunk,
+                summary_creation.as_ref(),
+                &summary_control,
+            )
+            .unwrap();
             let demand = crate::runtime::fragment::io::exchange_unit::ExchangeUnitDemand {
                 sequence: crate::runtime::fragment::io::exchange_unit::ExchangeUnitSequence::FIRST,
                 wire_bytes: payload.len() as u64,

@@ -160,6 +160,8 @@ pub enum ExchangeColumnBinding {
 /// The receiver's registered type contract and how wire columns bind to it.
 #[derive(Clone)]
 struct ExpectedReceiverSchema {
+    // Local output only. The recipe retains the separately prepared wire
+    // declaration and its original creator storage through actual decode exit.
     chunk_schema: ChunkSchemaRef,
     column_binding: ExchangeColumnBinding,
     creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
@@ -641,20 +643,58 @@ impl ExecutionExchangeRegistry {
         reject_existing: bool,
         creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) -> Result<ExchangeReceiverCloseObserver, ExchangeFailure> {
-        if !chunk_schema.is_typed() {
+        if !wire_chunk_schema.is_typed() || !chunk_schema.is_typed() {
             return Err(exchange_contract(
-                "exchange receiver requires its complete frozen execution schema",
+                "exchange receiver requires complete frozen wire and local schemas",
             ));
         }
         if is_key_canceled(registry, &key) {
             return Err(exchange_stopped());
         }
+        if expected_senders == 0 {
+            return Err(exchange_contract(
+                "exchange receiver requires at least one frozen sender",
+            ));
+        }
+        if wire_chunk_schema.slots().len() != chunk_schema.slots().len() {
+            return Err(exchange_contract(
+                "exchange wire and local schema widths differ",
+            ));
+        }
+        for (wire, local) in wire_chunk_schema.slots().iter().zip(chunk_schema.slots()) {
+            creation_factory.observe_input_work(1)?;
+            if wire.slot_id() != local.slot_id()
+                || (wire.nullable() && !local.nullable())
+                || !wire
+                    .typed_binding()
+                    .borrowed()
+                    .same_physical_binding_ignoring_root_nullability_observed(
+                        local.typed_binding().borrowed(),
+                        || {
+                            creation_factory
+                                .observe_input_work(1)
+                                .map_err(ExchangeFailure::from)
+                        },
+                    )?
+            {
+                return Err(exchange_contract(
+                    "exchange wire and local bindings differ beyond root nullability widening",
+                ));
+            }
+        }
+        // Finish every fallible recipe construction before publishing a new
+        // registry entry: the caller only owns rollback after registration.
+        let recipe =
+            online_unit::prepare_recipe(&wire_chunk_schema, &[], creation_factory.as_ref())?;
+        if is_key_canceled(registry, &key) {
+            return Err(exchange_stopped());
+        }
         let receiver = get_or_create(registry, key);
-        let recipe = online_unit::prepare_recipe(&chunk_schema, &[], creation_factory.as_ref())?;
         let mut st = receiver.mu.lock().expect("exchange receiver lock");
-        if expected_senders == 0
-            || (st.expected.is_some() && st.expected_senders != expected_senders)
-        {
+        if st.canceled {
+            return Err(exchange_stopped());
+        }
+        if st.expected.is_some() && st.expected_senders != expected_senders {
             return Err(exchange_contract(
                 "exchange sender count differs from its frozen receiver declaration",
             ));
@@ -670,6 +710,13 @@ impl ExecutionExchangeRegistry {
             Some(existing) if existing.chunk_schema.as_ref() != chunk_schema.as_ref() => {
                 return Err(exchange_contract(format_args!(
                     "exchange expected chunk schema mismatch: finst={} node_id={}",
+                    key.finst_uuid(),
+                    key.node_id
+                )));
+            }
+            Some(existing) if existing.recipe.value.digest() != recipe.value.digest() => {
+                return Err(exchange_contract(format_args!(
+                    "exchange wire recipe mismatch: finst={} node_id={}",
                     key.finst_uuid(),
                     key.node_id
                 )));

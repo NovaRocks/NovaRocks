@@ -221,6 +221,211 @@ fn compiled_recipe_ignores_root_aliases_but_preserves_logical_nullability() {
     );
 }
 
+fn required_wire_schema(nullable: bool) -> ChunkSchemaRef {
+    use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+    let ty = FunctionValueType::new(DataType::Int32, nullable);
+    let slot = ChunkSlotSchema::try_new_typed(
+        SlotId::new(41),
+        Arc::new(Field::new("receiver", DataType::Int32, nullable)),
+        ty.typed_binding().clone(),
+        None,
+        ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    Arc::new(ChunkSchema::try_new_typed(vec![slot], ValueTypeStorageLifetime::pure()).unwrap())
+}
+
+#[test]
+fn receiver_uses_required_wire_recipe_and_nullable_local_schema() {
+    let wire = required_wire_schema(false);
+    let local = required_wire_schema(true);
+    let factory = crate::runtime::fragment::exchange::test_receiver_creation_factory();
+    let registry = Arc::new(ExecutionExchangeRegistry::default());
+    let key = ExchangeKey {
+        finst_id_hi: 88011,
+        finst_id_lo: 88012,
+        node_id: 3,
+    };
+    registry
+        .try_register_expected_chunk_schema(key, 1, wire.clone(), local.clone(), factory)
+        .unwrap();
+    let fixture = UnitFixture::bind_registered(registry.clone(), key, 1);
+    let source =
+        Chunk::try_new_with_columns(wire.clone(), vec![Arc::new(Int32Array::from(vec![7, 19]))])
+            .unwrap();
+    let frame = fixture.frame(0, 1, online_unit_as(&source, &wire), true);
+    fixture.register(&frame);
+    fixture.receive(frame).unwrap();
+    let decoded = fixture
+        .handle()
+        .try_pop_next_with_stats(1)
+        .unwrap()
+        .unwrap();
+    let ExchangePopResult::Chunk(decoded) = decoded else {
+        panic!("expected the actual decoded unit");
+    };
+    assert_eq!(decoded.chunk_schema_ref().as_ref(), local.as_ref());
+    assert!(decoded.chunk_schema().slots()[0].nullable());
+    assert_eq!(
+        decoded.columns()[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
+        &[7, 19]
+    );
+}
+
+#[test]
+fn receiver_rejects_narrowing_before_registration_and_changed_duplicate_wire() {
+    let required = required_wire_schema(false);
+    let nullable = required_wire_schema(true);
+    let factory = crate::runtime::fragment::exchange::test_receiver_creation_factory();
+    let registry = ExecutionExchangeRegistry::default();
+    let key = ExchangeKey {
+        finst_id_hi: 88013,
+        finst_id_lo: 88014,
+        node_id: 3,
+    };
+    let error = registry
+        .try_register_expected_chunk_schema(
+            key,
+            1,
+            nullable.clone(),
+            required.clone(),
+            factory.clone(),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("beyond root nullability widening")
+    );
+    assert!(registry.snapshot_receiver_state(key).is_none());
+    registry
+        .register_expected_chunk_schema(key, 1, required, nullable.clone(), factory.clone())
+        .unwrap();
+    let error = registry
+        .register_expected_chunk_schema(key, 1, nullable.clone(), nullable, factory)
+        .unwrap_err();
+    assert!(error.to_string().contains("wire recipe mismatch"));
+    assert!(registry.snapshot_receiver_state(key).is_some());
+    registry.cancel_exchange_key(key);
+}
+
+struct RecipeRefusalFactory {
+    inner: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+    begins: std::sync::atomic::AtomicUsize,
+    refuse_at: usize,
+}
+impl crate::exec::pipeline::operator::InputConstructionFactory for RecipeRefusalFactory {
+    fn observe_input_work(
+        &self,
+        units: usize,
+    ) -> Result<(), crate::exec::pipeline::operator::ConstructionFailure> {
+        self.inner.observe_input_work(units)
+    }
+    fn begin_typed_construction(
+        &self,
+        schema: &ChunkSchema,
+    ) -> Result<
+        Box<dyn crate::exec::pipeline::operator::InputConstructionOwner>,
+        crate::exec::pipeline::operator::ConstructionFailure,
+    > {
+        if self
+            .begins
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+            == self.refuse_at
+        {
+            self.tracker
+                .install_limit_once(self.tracker.current() + 1)
+                .unwrap();
+        }
+        self.inner.begin_typed_construction(schema)
+    }
+    fn begin_compiled_layout_construction(
+        &self,
+        layout: &novarocks_local_program::StaticLayout,
+    ) -> Result<
+        Box<dyn crate::exec::pipeline::operator::InputConstructionOwner>,
+        crate::exec::pipeline::operator::ConstructionFailure,
+    > {
+        self.inner.begin_compiled_layout_construction(layout)
+    }
+}
+
+#[test]
+fn first_and_later_recipe_construction_refusals_leave_no_receiver() {
+    use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
+    for refuse_at in [1, 2] {
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("wire recipe refusal");
+        let inner = try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker.clone(),
+            Arc::new(RuntimeErrorState::default()),
+        )
+        .unwrap();
+        let baseline = tracker.current();
+        let factory = Arc::new(RecipeRefusalFactory {
+            inner,
+            tracker: tracker.clone(),
+            begins: std::sync::atomic::AtomicUsize::new(0),
+            refuse_at,
+        });
+        let registry = ExecutionExchangeRegistry::default();
+        let key = ExchangeKey {
+            finst_id_hi: 88015,
+            finst_id_lo: refuse_at as i64,
+            node_id: 3,
+        };
+        let error = registry
+            .try_register_expected_chunk_schema(
+                key,
+                1,
+                required_wire_schema(false),
+                required_wire_schema(true),
+                factory.clone(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&error).class(),
+            novarocks_failure_contract::FailureClass::Resource,
+        );
+        assert_eq!(
+            factory.begins.load(std::sync::atomic::Ordering::SeqCst),
+            refuse_at
+        );
+        assert!(registry.snapshot_receiver_state(key).is_none());
+        assert_eq!(tracker.current(), baseline);
+        registry.cancel_exchange_key(key);
+        let stopped = registry
+            .try_register_expected_chunk_schema(
+                key,
+                0,
+                required_wire_schema(false),
+                required_wire_schema(true),
+                factory.clone(),
+            )
+            .unwrap_err();
+        let fact = novarocks_failure_contract::FailureProjection::failure_fact(&stopped);
+        assert_eq!(
+            fact.class(),
+            novarocks_failure_contract::FailureClass::Control
+        );
+        assert_eq!(fact.reason().code(), 102);
+        assert_eq!(
+            factory.begins.load(std::sync::atomic::Ordering::SeqCst),
+            refuse_at,
+        );
+        assert!(registry.snapshot_receiver_state(key).is_none());
+        assert_eq!(tracker.current(), baseline);
+        drop(factory);
+        assert_eq!(tracker.current(), 0);
+    }
+}
+
 /// One explicit receiver instance: no global registry, inferred stream or raw
 /// queue publication. Every data item goes through its demand and decode lease.
 struct UnitFixture {
@@ -1894,7 +2099,7 @@ fn decode_chunks_for_sender_accepts_runtime_nullable_widening() {
     register_expected_chunk_schema(
         key,
         1,
-        (expected_chunk_schema.clone()).clone(),
+        expected_chunk_schema.clone(),
         expected_chunk_schema.clone(),
     )
     .expect("register schema");
@@ -1998,13 +2203,8 @@ fn decode_chunks_for_sender_decodes_with_wire_meta_before_schema_registration() 
     };
     let payload = online_unit(&[exchange_test_chunk("_cse_0")], true).expect("encode");
     assert!(decode_chunks_for_sender(key, 7, 1, &payload).is_err());
-    register_expected_chunk_schema(
-        key,
-        1,
-        (plain_declaration(exchange_test_chunk("_cse_0").chunk_schema())).clone(),
-        plain_declaration(exchange_test_chunk("_cse_0").chunk_schema()),
-    )
-    .unwrap();
+    let expected = plain_declaration(exchange_test_chunk("_cse_0").chunk_schema());
+    register_expected_chunk_schema(key, 1, expected.clone(), expected).unwrap();
     let decoded = decode_chunks_for_sender(key, 7, 1, &payload).expect("decode after registration");
     assert_eq!(decoded.len(), 1);
     assert_eq!(
@@ -2280,7 +2480,7 @@ fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
         .try_register_expected_chunk_schema(
             default_key,
             1,
-            (expected.clone()).clone(),
+            expected.clone(),
             expected.clone(),
             crate::runtime::fragment::exchange::test_receiver_creation_factory(),
         )

@@ -51,16 +51,20 @@ fn int32_chunk(values: Vec<i32>) -> Chunk {
     )
 }
 
-fn register_int32_receiver(binding: &ExchangeBinding, fixture: &Fixture, sources: &[UniqueId]) {
+fn int32_wire_layout() -> novarocks_local_program::StaticLayout {
     let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-    let layout = crate::exec::chunk::typed_fixture::layout(
+    crate::exec::chunk::typed_fixture::layout(
         schema,
         &[SlotId::new(1)],
         &[novarocks_type_contract::FunctionValueType::new(
             DataType::Int32,
             false,
         )],
-    );
+    )
+}
+
+fn register_int32_receiver(binding: &ExchangeBinding, fixture: &Fixture, sources: &[UniqueId]) {
+    let layout = int32_wire_layout();
     let creation_factory = fixture.creation(receiver_key(binding.key).fragment_instance_id);
     let expected_chunk_schema = creation_factory
         .create_compiled_chunk_schema(&layout)
@@ -117,7 +121,17 @@ fn deliver_fixture_item(
     let key = receiver_key(binding.key);
     let stream = fixture.stream(source, key.fragment_instance_id, key.node_id, ordinal);
     let (item, payload) = if let Some(chunk) = chunk {
-        let payload = exchange::encode_chunks(&[chunk], true).unwrap();
+        let creation = fixture.creation(source);
+        let schema = creation
+            .create_compiled_chunk_schema(&int32_wire_layout())
+            .unwrap();
+        let recipe =
+            exchange::online_unit::prepare_recipe(&schema, &[], creation.as_ref()).unwrap();
+        let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+            fixture.state(source).error_state(),
+        );
+        let payload =
+            exchange::online_unit::encode(&recipe, &chunk, creation.as_ref(), &control).unwrap();
         let demand = ExchangeUnitDemand {
             sequence: ExchangeUnitSequence::try_new(sequence).unwrap(),
             wire_bytes: payload.len() as u64,

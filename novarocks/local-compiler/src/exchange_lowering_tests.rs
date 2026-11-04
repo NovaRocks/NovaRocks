@@ -68,6 +68,8 @@ impl PureCompileControl for FixtureControl {
 enum Shape {
     /// Stream edge, Singleton to Singleton, consumer publishes the result.
     Gather,
+    /// Reversed Boolean/Int64 source with only the Boolean import widened.
+    WidenedGather,
     Hierarchical,
     Conditional,
     RepeatedConditional,
@@ -111,15 +113,22 @@ fn dop() -> PipelineDopDomain {
 }
 
 /// Producer `Values(a = 11, b = 22)` streams the reversed projection `[b, a]`;
-/// the consumer receives `[ib, ia]` positionally at `RECEIVER`.
+/// Boolean variants use NULL/true for `b`. The consumer receives `[ib, ia]`
+/// positionally at `RECEIVER`.
 fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     let ty = ValueType::new(DataType::Int64, false);
+    let widened = shape == Shape::WidenedGather;
     let conditional = matches!(shape, Shape::Conditional | Shape::RepeatedConditional);
     let repeated = matches!(shape, Shape::RepeatedHash | Shape::RepeatedConditional);
-    let b_type = if conditional {
-        ValueType::new(DataType::Boolean, true)
+    let b_type = if conditional || widened {
+        ValueType::new(DataType::Boolean, conditional)
     } else {
         ty.clone()
+    };
+    let received_b_type = if widened {
+        b_type.with_nullable(true).unwrap()
+    } else {
+        b_type.clone()
     };
     let mut producer = FragmentBuilder::new(PRODUCER);
     let mut outputs = Vec::new();
@@ -128,6 +137,8 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         let field_type = if ordinal == 1 { &b_type } else { &ty };
         let literal = if conditional && ordinal == 1 {
             LiteralValue::Null
+        } else if widened && ordinal == 1 {
+            LiteralValue::Boolean(true)
         } else {
             LiteralValue::Int64(literal)
         };
@@ -207,7 +218,11 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
                 source_value,
             }
         };
-        let field_type = if source_value == b { &b_type } else { &ty };
+        let field_type = if source_value == b {
+            &received_b_type
+        } else {
+            &ty
+        };
         builder.add_value(field_type.clone(), origin).unwrap()
     };
     let ib = import(&mut consumer, b);
@@ -228,7 +243,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         Box::from([b, a])
     };
     let (source, destination) = match shape {
-        Shape::Gather => (Distribution::Singleton, Distribution::Singleton),
+        Shape::Gather | Shape::WidenedGather => (Distribution::Singleton, Distribution::Singleton),
         Shape::Hash => (hash([b, a]), hash([ib, ia])),
         Shape::RepeatedHash => (hash([a, b]), hash([ia, ib])),
         Shape::Hierarchical => {
@@ -275,6 +290,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     let gather = matches!(
         shape,
         Shape::Gather
+            | Shape::WidenedGather
             | Shape::RepeatedHash
             | Shape::Hierarchical
             | Shape::Conditional
@@ -333,7 +349,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
                 name: "b".into(),
                 alias: Some("bee".into()),
                 value: ib,
-                ty: b_type.clone(),
+                ty: received_b_type.clone(),
             },
             ResultField {
                 domain: novarocks_physical_plan::ResultValueDomain::Plain,
@@ -349,7 +365,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
                 name: "b".into(),
                 alias: Some("bee_again".into()),
                 value: ib,
-                ty: b_type.clone(),
+                ty: received_b_type.clone(),
             });
         }
         plan.set_result_port(ResultPort {
@@ -528,6 +544,68 @@ fn refused(result: Result<LocalProgram, FragmentCompileError>, expected: &str) {
         Err(FragmentCompileError::Unsupported { feature, .. }) => assert_eq!(feature, expected),
         other => panic!("expected refusal {expected:?}, got {other:?}"),
     }
+}
+
+#[test]
+fn exchange_wire_layout_keeps_source_bindings_when_local_roots_widen() {
+    let mut packages = packages(Shape::WidenedGather);
+    let producer = compile(packages.remove(&PRODUCER).unwrap(), None).unwrap();
+    let consumer = compile(packages.remove(&CONSUMER).unwrap(), Some(1)).unwrap();
+    let source = producer.graph().nodes()[0].output_layout();
+    let receiver = &consumer.graph().nodes()[0];
+    let local = receiver.output_layout();
+    let input = &consumer.exchange_inputs()[&receiver.local_id().unwrap()];
+    let wire = &input.wire_layout;
+    let Some(StaticSinkProgram::DataStream { branch, .. }) = producer.graph().sink() else {
+        panic!("stream sink");
+    };
+
+    // Independent fragments reuse numeric slots in opposite semantic order:
+    // source slot 0 is Int64, but receiver slot 0 receives the Boolean.
+    assert_eq!(source.slots().len(), 2);
+    assert_eq!(local.slots().len(), 2);
+    assert_ne!(source.slots()[0], source.slots()[1]);
+    assert_eq!(local.slots(), source.slots());
+    assert_eq!(
+        branch.output_columns(),
+        &[local.slots()[1], local.slots()[0]]
+    );
+    assert_eq!(wire.slots(), local.slots());
+    let source_types = [
+        ValueType::new(DataType::Boolean, false),
+        ValueType::new(DataType::Int64, false),
+    ];
+    let local_types = [
+        ValueType::new(DataType::Boolean, true),
+        ValueType::new(DataType::Int64, false),
+    ];
+    for ordinal in 0..2 {
+        for (layout, expected) in [
+            (wire, &source_types[ordinal]),
+            (local, &local_types[ordinal]),
+        ] {
+            assert!(
+                layout
+                    .value_binding_at(ordinal)
+                    .unwrap()
+                    .borrowed()
+                    .exactly_equals_observed(expected.typed_binding().borrowed(), || {
+                        Ok::<(), std::convert::Infallible>(())
+                    })
+                    .unwrap()
+            );
+            assert_eq!(
+                layout.schema().field(ordinal).data_type(),
+                expected.data_type()
+            );
+            assert_eq!(
+                layout.schema().field(ordinal).is_nullable(),
+                expected.nullable()
+            );
+        }
+    }
+    assert_eq!(local.schema().field(0).name(), "bee");
+    assert_eq!(local.schema().field(1).name(), "a");
 }
 
 #[test]
