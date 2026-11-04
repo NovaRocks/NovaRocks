@@ -141,6 +141,15 @@ impl CatalogCompletionState {
         self.next_need_ordinal
     }
 
+    pub(super) fn definition_database(&self) -> Result<&str, SqlCompileError> {
+        if self.root_local_view_shadow {
+            return Err(SqlCompileError::InvalidRequest(
+                "view definition analysis requires its frozen exact catalog context".into(),
+            ));
+        }
+        Ok(&self.current_database)
+    }
+
     pub(super) fn with_exchange_budget(
         mut self,
         limits: super::CompletionLimits,

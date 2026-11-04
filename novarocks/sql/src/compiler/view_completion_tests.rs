@@ -378,16 +378,12 @@ fn definition_capture_freezes_exact_context_and_recognizes_replacement_before_ol
     .unwrap();
     let source = source.continue_catalog(vec![fact].into()).unwrap();
     assert!(source.needs().is_empty());
-    let captured = source.capture(&[]).unwrap();
-    let result = crate::analyzer::analyze_with_function_catalog(
-        &query("SELECT x FROM v0"),
-        captured.provider(),
-        "db",
+    let result = source.analyze_view_definition(
+        &[],
         crate::functions::builtin_sql_function_catalog(),
         crate::constant::test_constant_policy(),
-        &SqlCompileControl::unbounded(),
     );
-    assert!(matches!(result, Err(error)
+    assert!(matches!(result, Err(SqlCompileError::Analyze(error))
         if error.kind() == crate::analyze_error::AnalyzeErrorKind::ViewIsRecursive));
 }
 
