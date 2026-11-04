@@ -60,42 +60,42 @@ count(*)
 4093
 
 -- query 20
--- legacy
+-- types	bigint
 count(*)
 0
 
 -- query 21
--- legacy
+-- types	bigint
 count(*)
 4096
 
 -- query 22
--- legacy
+-- types	bigint
 count(*)
 0
 
 -- query 23
--- legacy
+-- types	bigint
 count(*)
 3
 
 -- query 24
--- legacy
+-- types	bigint
 count(*)
 4096
 
 -- query 27
--- legacy
+-- types	bigint
 count(*)
 0
 
 -- query 28
--- legacy
+-- types	bigint
 count(*)
 0
 
 -- query 29
--- legacy
+-- types	bigint
 count(*)
 0
 
@@ -105,7 +105,7 @@ count(*)
 4095
 
 -- query 31
--- legacy
+-- types	bigint
 count(*)
 3
 
@@ -115,6 +115,6 @@ count(*)
 4095
 
 -- query 33
--- legacy
+-- types	bigint
 count(*)
 3

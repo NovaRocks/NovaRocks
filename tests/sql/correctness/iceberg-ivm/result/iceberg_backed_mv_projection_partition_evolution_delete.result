@@ -13,7 +13,7 @@ id	customer	amount
 4	B	40
 
 -- query 10
--- legacy
+-- types	bigint	varchar	bigint
 id	customer	amount
 2	A	20
 4	B	40

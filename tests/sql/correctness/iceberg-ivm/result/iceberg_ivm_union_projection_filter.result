@@ -7,14 +7,14 @@ id	name	amount
 30	archive-only	30
 
 -- query 6
--- legacy
+-- types	integer	varchar	integer
 id	name	amount
 10	same	99
 20	live-only	20
 30	archive-only	30
 
 -- query 9
--- legacy
+-- types	integer	varchar	integer
 id	name	amount
 10	live-new	15
 10	same	120

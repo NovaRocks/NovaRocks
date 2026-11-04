@@ -18,7 +18,7 @@ incremental	3	1	three
 incremental	4	1	four
 
 -- query 8
--- legacy
+-- types	varchar	bigint	integer	varchar
 source	id	p	value
 base	1	1	one
 base	2	1	new-two
@@ -37,7 +37,7 @@ incremental	4	1	four
 incremental	6	1	six
 
 -- query 12
--- legacy
+-- types	varchar	bigint	integer	varchar
 source	id	p	value
 base	1	1	one
 base	3	1	three
@@ -50,7 +50,7 @@ incremental	3	1	three
 incremental	4	1	four
 
 -- query 16
--- legacy
+-- types	varchar	bigint	integer	varchar
 source	id	p	value
 base	1	1	one
 base	3	1	three
@@ -63,7 +63,7 @@ incremental	3	1	three
 incremental	4	1	four
 
 -- query 20
--- legacy
+-- types	varchar	bigint	integer	varchar
 source	id	p	value
 base	7	1	seven
 base	8	1	eight

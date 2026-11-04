@@ -4,7 +4,7 @@ count(1)	count(t1.k1)	count(t1.c_bool_null)
 9996	9996	9996
 
 -- query 13
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_bool_null)
 18653	18568	9996
 
@@ -19,7 +19,7 @@ count(1)	count(t1.k1)	count(t1.c_tinyint_null)
 209	209	209
 
 -- query 16
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_tinyint_null)
 10091	10000	833
 
@@ -34,7 +34,7 @@ count(1)	count(t1.k1)	count(t1.c_smallint_null)
 769	769	769
 
 -- query 19
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_smallint_null)
 19230	10000	769
 
@@ -49,7 +49,7 @@ count(1)	count(t1.k1)	count(t1.c_int)
 19998	19998	19998
 
 -- query 22
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_int)
 19998	19998	19998
 
@@ -64,7 +64,7 @@ count(1)	count(t1.k1)	count(t1.c_int_null)
 714	714	714
 
 -- query 25
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_int_null)
 19286	10000	714
 
@@ -79,7 +79,7 @@ count(1)	count(t1.k1)	count(t1.c_bigint)
 19998	19998	19998
 
 -- query 28
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_bigint)
 19998	19998	19998
 
@@ -94,7 +94,7 @@ count(1)	count(t1.k1)	count(t1.c_bigint_null)
 666	666	666
 
 -- query 31
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_bigint_null)
 19334	10000	666
 
@@ -109,7 +109,7 @@ count(1)	count(t1.k1)	count(t1.c_largeint)
 19998	19998	19998
 
 -- query 34
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_largeint)
 19998	19998	19998
 
@@ -124,7 +124,7 @@ count(1)	count(t1.k1)	count(t1.c_largeint_null)
 625	625	625
 
 -- query 37
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_largeint_null)
 19375	10000	625
 
@@ -139,7 +139,7 @@ count(1)	count(t1.k1)	count(t1.c_float)
 10000	10000	10000
 
 -- query 40
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_float)
 10000	10000	10000
 
@@ -154,7 +154,7 @@ count(1)	count(t1.k1)	count(t1.c_float_null)
 588	588	588
 
 -- query 43
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_float_null)
 19412	10000	588
 
@@ -169,7 +169,7 @@ count(1)	count(t1.k1)	count(t1.c_double)
 10000	10000	10000
 
 -- query 46
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_double)
 10000	10000	10000
 
@@ -184,7 +184,7 @@ count(1)	count(t1.k1)	count(t1.c_double_null)
 555	555	555
 
 -- query 49
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_double_null)
 19445	10000	555
 
@@ -199,7 +199,7 @@ count(1)	count(t1.k1)	count(t1.c_decimalv2)
 20000	20000	20000
 
 -- query 52
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_decimalv2)
 20000	20000	20000
 
@@ -214,7 +214,7 @@ count(1)	count(t1.k1)	count(t1.c_decimalv2_null)
 434	434	434
 
 -- query 55
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_decimalv2_null)
 19566	10000	434
 
@@ -229,7 +229,7 @@ count(1)	count(t1.k1)	count(t1.c_decimal32)
 20000	20000	20000
 
 -- query 58
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_decimal32)
 20000	20000	20000
 
@@ -244,7 +244,7 @@ count(1)	count(t1.k1)	count(t1.c_decimal32_null)
 416	416	416
 
 -- query 61
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_decimal32_null)
 19584	10000	416
 
@@ -259,7 +259,7 @@ count(1)	count(t1.k1)	count(t1.c_decimal64)
 20000	20000	20000
 
 -- query 64
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_decimal64)
 20000	20000	20000
 
@@ -274,7 +274,7 @@ count(1)	count(t1.k1)	count(t1.c_decimal64_null)
 400	400	400
 
 -- query 67
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_decimal64_null)
 19600	10000	400
 
@@ -289,7 +289,7 @@ count(1)	count(t1.k1)	count(t1.c_decimal128)
 20000	20000	20000
 
 -- query 70
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_decimal128)
 20000	20000	20000
 
@@ -304,7 +304,7 @@ count(1)	count(t1.k1)	count(t1.c_decimal128_null)
 384	384	384
 
 -- query 73
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_decimal128_null)
 19616	10000	384
 
@@ -319,7 +319,7 @@ count(1)	count(t1.k1)	count(t1.c_date)
 19998	19998	19998
 
 -- query 76
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_date)
 19998	19998	19998
 
@@ -334,7 +334,7 @@ count(1)	count(t1.k1)	count(t1.c_date_null)
 526	526	526
 
 -- query 79
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_date_null)
 19474	10000	526
 
@@ -349,7 +349,7 @@ count(1)	count(t1.k1)	count(t1.c_datetime)
 19998	19998	19998
 
 -- query 82
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_datetime)
 19998	19998	19998
 
@@ -364,7 +364,7 @@ count(1)	count(t1.k1)	count(t1.c_datetime_null)
 500	500	500
 
 -- query 85
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_datetime_null)
 19500	10000	500
 
@@ -379,7 +379,7 @@ count(1)	count(t1.k1)	count(t1.c_char)
 10000	10000	10000
 
 -- query 88
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_char)
 10000	10000	10000
 
@@ -394,7 +394,7 @@ count(1)	count(t1.k1)	count(t1.c_char_null)
 476	476	476
 
 -- query 91
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_char_null)
 19524	10000	476
 
@@ -409,7 +409,7 @@ count(1)	count(t1.k1)	count(t1.c_varchar)
 10000	10000	10000
 
 -- query 94
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_varchar)
 10000	10000	10000
 
@@ -424,7 +424,7 @@ count(1)	count(t1.k1)	count(t1.c_varchar_null)
 454	454	454
 
 -- query 97
--- legacy
+-- types	bigint	bigint	bigint
 count(1)	count(t1.k1)	count(t1.c_varchar_null)
 19546	10000	454
 

@@ -325,7 +325,7 @@ count(1)
 16380
 
 -- query 93
--- legacy
+-- types	bigint
 count(1)
 8190
 
@@ -375,7 +375,7 @@ count(*)
 20000
 
 -- query 138
--- legacy
+-- types	bigint
 count(*)
 21998
 

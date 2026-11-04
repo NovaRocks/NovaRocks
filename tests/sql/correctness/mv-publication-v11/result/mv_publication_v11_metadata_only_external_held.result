@@ -1,4 +1,4 @@
 -- query 6
--- legacy
+-- types	varchar	bigint
 k	v
 east	10

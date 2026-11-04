@@ -9,7 +9,7 @@ count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
 60961	30480.671904988434	60961	60961	40961
 
 -- query 13
--- legacy
+-- types	bigint	double	bigint	bigint	bigint
 count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
 40961	20480.999975586532	40961	40961	40961
 

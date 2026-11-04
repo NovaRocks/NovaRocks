@@ -11,7 +11,7 @@ APAC	1666	1250334
 EMEA	834	625916
 
 -- query 8
--- legacy
+-- types	varchar	bigint	bigint
 region	cnt	total
 APAC	2147	1538842
 EMEA	824	619921

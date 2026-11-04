@@ -15,7 +15,7 @@ id	score	payload
 99997	3	1999970
 
 -- query 15
--- legacy
+-- types	integer	integer	integer
 id	score	payload
 NULL	NULL	2000000
 99999	1	1999990
@@ -23,7 +23,7 @@ NULL	NULL	2000000
 990	99010	9900
 
 -- query 17
--- legacy
+-- types	integer	integer	integer
 id	score	payload
 NULL	NULL	2000000
 99999	1	1999990

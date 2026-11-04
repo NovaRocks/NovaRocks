@@ -17,7 +17,7 @@ k1	v2
 3	50
 
 -- query 9
--- legacy
+-- types	integer	bigint
 k1	v2
 1	10
 2	20

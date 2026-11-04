@@ -69,12 +69,12 @@ c
 8
 
 -- query 35
--- legacy
+-- types	bigint
 c
 10
 
 -- query 37
--- legacy
+-- types	bigint
 c
 10
 
@@ -149,12 +149,12 @@ c
 8
 
 -- query 68
--- legacy
+-- types	bigint
 c
 10
 
 -- query 70
--- legacy
+-- types	bigint
 c
 10
 
@@ -229,12 +229,12 @@ c
 9
 
 -- query 101
--- legacy
+-- types	bigint
 c
 10
 
 -- query 103
--- legacy
+-- types	bigint
 c
 10
 
@@ -309,11 +309,11 @@ c
 9
 
 -- query 134
--- legacy
+-- types	bigint
 c
 10
 
 -- query 136
--- legacy
+-- types	bigint
 c
 10

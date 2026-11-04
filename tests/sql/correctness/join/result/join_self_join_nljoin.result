@@ -14,12 +14,12 @@ count(*)	count(a.v1)	count(b.v1)
 5	5	3
 
 -- query 7
--- legacy
+-- types	bigint	bigint	bigint
 count(*)	count(a.v1)	count(b.v1)
 5	3	5
 
 -- query 8
--- legacy
+-- types	bigint	bigint	bigint
 count(*)	count(a.v1)	count(b.v1)
 7	5	5
 
