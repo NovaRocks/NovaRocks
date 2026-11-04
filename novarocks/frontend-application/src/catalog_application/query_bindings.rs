@@ -605,6 +605,14 @@ pub struct QueryTableBindingStore {
     exact_binding_receipts: ExactBindingReceiptStore,
     entries: Mutex<HashMap<QueryTableBindingKey, Result<StoredBinding, String>>>,
     by_id: Mutex<HashMap<SqlTableBindingId, Arc<QueryTableBinding>>>,
+    local_views: Mutex<
+        Option<
+            Result<
+                novarocks_query_application::view::LocalViewSnapshot,
+                novarocks_sql::compiler::SqlCompileError,
+            >,
+        >,
+    >,
     pub(crate) relations: Mutex<
         HashMap<
             QueryRelationRequestKey,
@@ -633,6 +641,7 @@ impl QueryTableBindingStore {
             entries: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
             relations: Mutex::new(HashMap::new()),
+            local_views: Mutex::new(None),
             #[cfg(test)]
             sealed_for_topology_replan: AtomicBool::new(false),
         })
@@ -694,6 +703,24 @@ impl QueryTableBindingStore {
             .lock()
             .expect("query table binding allocator lock")
             .scope()
+    }
+
+    pub(crate) fn capture_local_views(
+        &self,
+        capture: impl FnOnce() -> Result<novarocks_query_application::view::LocalViewSnapshot, String>,
+    ) -> Result<
+        novarocks_query_application::view::LocalViewSnapshot,
+        novarocks_sql::compiler::SqlCompileError,
+    > {
+        let mut original = self
+            .local_views
+            .lock()
+            .expect("statement local view snapshot lock");
+        original
+            .get_or_insert_with(|| {
+                capture().map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
+            })
+            .clone()
     }
 
     pub(crate) fn require_catalog_observation_allowed(&self) -> Result<(), String> {
@@ -966,6 +993,38 @@ mod tests {
         QueryTableBinding, QueryTableBindingKey, QueryTableBindingStore,
         parse_time_travel_overlay_identity, prepared_source_selector, time_travel_overlay_identity,
     };
+
+    #[test]
+    fn local_view_capture_keeps_the_original_statement_snapshot_and_failure() {
+        use novarocks_query_application::view::{QueryViewService, ViewService};
+
+        let store = QueryTableBindingStore::try_new().unwrap();
+        let service = QueryViewService::new();
+        let captures = AtomicUsize::new(0);
+        store
+            .capture_local_views(|| {
+                captures.fetch_add(1, Ordering::Relaxed);
+                service.catalog_snapshot()
+            })
+            .unwrap();
+        store
+            .capture_local_views(|| {
+                captures.fetch_add(1, Ordering::Relaxed);
+                Err("another observation must not replace the original snapshot".into())
+            })
+            .unwrap();
+        assert_eq!(captures.load(Ordering::Relaxed), 1);
+
+        let failed = QueryTableBindingStore::try_new().unwrap();
+        let original = failed
+            .capture_local_views(|| Err("original registry failure".into()))
+            .unwrap_err();
+        let repeated = failed
+            .capture_local_views(|| service.catalog_snapshot())
+            .unwrap_err();
+        assert_eq!(original.to_string(), repeated.to_string());
+        assert!(repeated.to_string().contains("original registry failure"));
+    }
 
     #[test]
     fn minted_snapshot_identity_parses_back_to_its_relation_and_snapshot() {

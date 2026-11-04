@@ -524,6 +524,7 @@ async fn build_frontend_role_products(
             mv_candidate_reader.clone(),
             mv_storage_observation.clone(),
             host.connector_blocking_io_supervisor(),
+            view_service.clone(),
         ),
         execution: (
             host.connector_blocking_io_supervisor(),
@@ -571,6 +572,7 @@ async fn build_frontend_role_products(
                         mv_candidate_reader.clone(),
                         mv_storage_observation.clone(),
                         host.connector_blocking_io_supervisor(),
+                        view_service.clone(),
                     ),
                     (
                         host.connector_blocking_io_supervisor(),
@@ -603,6 +605,7 @@ async fn build_frontend_role_products(
             mv_candidate_reader.clone(),
             mv_storage_observation.clone(),
             host.connector_blocking_io_supervisor(),
+            view_service.clone(),
         ),
         connector_control: typed_connector_control.clone(),
         blocking: host.connector_blocking_io_supervisor(),
@@ -776,6 +779,7 @@ fn build_frontend_query_session_factory_from_role_products(
             host.lake_publication_runtime_policy(),
             host.constant_policy(),
             host.static_plan_carrier(),
+            view_service.clone(),
         )
         .with_write_runtime(
             host.connector_blocking_io_supervisor(),

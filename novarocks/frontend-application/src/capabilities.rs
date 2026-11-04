@@ -173,6 +173,7 @@ pub struct DmlEnginePorts {
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
+    view_service: Arc<dyn ViewService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
@@ -206,8 +207,10 @@ impl DmlEnginePorts {
         lake_publication_runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
+        view_service: Arc<dyn ViewService>,
     ) -> Self {
         Self {
+            view_service,
             functions,
             constant_policy,
             static_plan_carrier,
@@ -240,6 +243,7 @@ impl DmlEnginePorts {
                 Arc::clone(&self.catalog_service),
                 self.constant_policy,
                 self.static_plan_carrier.clone(),
+                Arc::clone(&self.view_service),
             ),
             self.catalog_application.clone(),
             Arc::clone(&self.connector_control),

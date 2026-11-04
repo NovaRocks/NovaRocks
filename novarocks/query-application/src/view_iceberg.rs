@@ -67,6 +67,7 @@ pub(crate) fn create_external_view(
     target: ViewTarget,
     statement: &CreateView,
     context: ViewRequestContext<'_>,
+    local_views: &crate::view::LocalViewSnapshot,
 ) -> Result<ViewStatementResult, crate::api::CommandError> {
     let connector_context = context
         .connector_context
@@ -78,27 +79,14 @@ pub(crate) fn create_external_view(
         context.current_catalog.unwrap_or(DEFAULT_CATALOG),
         context.current_database,
     )?;
-    let mut analyzed_query = statement.query.clone();
-    crate::view_rewrite::expand_external_views(
-        engine,
-        &mut analyzed_query,
-        ViewRequestContext {
-            current_catalog: Some(&definition.resolution.default_catalog),
-            current_database: &definition.resolution.default_database,
-            connector_context: Some(connector_context),
-        },
-        // External-view creation uses the same explicit default analysis
-        // policy as analyze_external_view below. This is a consumer policy,
-        // not an inferred semantic snapshot for the persisted definition.
-        &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-    )?;
     let columns = engine.analyze_view_definition(
         crate::view::ViewDefinitionAnalysisRequest {
             catalog: &definition.resolution.default_catalog,
             database: &definition.resolution.default_database,
             target: &target,
-            query: &analyzed_query,
+            query: &statement.query,
             columns: &statement.columns,
+            local_views,
         },
         connector_context,
     )?;

@@ -153,18 +153,48 @@ impl ViewEngine for SessionViewEngine {
 
     fn analyze_view_definition(
         &self,
-        _request: novarocks_query_application::view::ViewDefinitionAnalysisRequest<'_>,
+        request: novarocks_query_application::view::ViewDefinitionAnalysisRequest<'_>,
         _context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Vec<ViewColumnDefinition>, novarocks_sql::compiler::SqlCompileError> {
-        unreachable!("session view must not analyze external views")
+        let preparation =
+            novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new_definition(
+                request.query.clone(),
+                request.catalog,
+                request.database,
+                Some(novarocks_types::naming::TableIdentity::new(
+                    &request.target.catalog,
+                    &request.target.database,
+                    &request.target.view,
+                )),
+                novarocks_sql::compiler::SqlCompileControl::unbounded(),
+            )?;
+        assert!(preparation.needs().is_empty(), "literal definition fixture");
+        preparation
+            .analyze_view_definition(
+                request.columns,
+                novarocks_sql::compiler::builtin_sql_function_catalog(),
+                crate::application::test_constant_policy(),
+            )
+            .map(|columns| columns.into_vec())
     }
 }
 
 fn view_context() -> ViewRequestContext<'static> {
+    static CONTEXT: std::sync::OnceLock<novarocks_spi::connector::ConnectorRequestContext> =
+        std::sync::OnceLock::new();
+    let connector_context = CONTEXT.get_or_init(|| {
+        novarocks_spi::connector::ConnectorRequestContext::try_new(
+            std::time::Instant::now() + Duration::from_secs(300),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap()
+    });
     ViewRequestContext {
         current_catalog: None,
         current_database: "db",
-        connector_context: None,
+        connector_context: Some(connector_context),
     }
 }
 

@@ -18,7 +18,7 @@
 //! Query-application-owned view DDL, metadata, and query rewrite service.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::api::{QueryResult, build_utf8_query_result};
 use crate::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
@@ -39,6 +39,28 @@ pub(crate) struct SessionViewKey {
 pub(crate) struct StoredView {
     pub(crate) definition: PersistedQueryDefinition,
     pub(crate) query: Box<Query>,
+    pub(crate) declaration: Arc<novarocks_sql::planning::catalog::SqlViewDefinition>,
+}
+
+/// Immutable original local view facts. Holding a snapshot neither polls a
+/// service nor grants a provider, scan, or resource capability.
+#[derive(Clone, Debug)]
+pub struct LocalViewSnapshot {
+    entries: Arc<HashMap<SessionViewKey, StoredView>>,
+}
+impl LocalViewSnapshot {
+    pub fn get(
+        &self,
+        identity: &novarocks_types::naming::TableIdentity,
+    ) -> Option<&Arc<novarocks_sql::planning::catalog::SqlViewDefinition>> {
+        self.entries
+            .get(&SessionViewKey {
+                catalog: identity.catalog.clone(),
+                database: identity.namespace.clone(),
+                view: identity.table.clone(),
+            })
+            .map(|view| &view.declaration)
+    }
 }
 
 /// Local (non-external catalog) views, for as long as this query application
@@ -56,7 +78,7 @@ pub(crate) struct StoredView {
 /// needs durable views defines them in an external catalog, whose provider owns
 /// them as its own truth.
 pub struct QueryViewService {
-    registry: RwLock<HashMap<SessionViewKey, StoredView>>,
+    registry: RwLock<Arc<HashMap<SessionViewKey, StoredView>>>,
     /// Serialises view DDL against other view DDL, so that a create and a drop
     /// of the same name keep statement order instead of interleaving their
     /// check-then-write halves.
@@ -66,7 +88,7 @@ pub struct QueryViewService {
 impl QueryViewService {
     pub fn new() -> Self {
         Self {
-            registry: RwLock::new(HashMap::new()),
+            registry: RwLock::new(Arc::new(HashMap::new())),
             mutation: Mutex::new(()),
         }
     }
@@ -84,6 +106,7 @@ impl QueryViewService {
         key: SessionViewKey,
         definition: PersistedQueryDefinition,
         query: Box<Query>,
+        declaration: Arc<novarocks_sql::planning::catalog::SqlViewDefinition>,
         or_replace: bool,
     ) -> Result<(), String> {
         let _mutation = self
@@ -100,7 +123,14 @@ impl QueryViewService {
                 key.database, key.view
             ));
         }
-        registry.insert(key, StoredView { definition, query });
+        Arc::make_mut(&mut registry).insert(
+            key,
+            StoredView {
+                definition,
+                query,
+                declaration,
+            },
+        );
         Ok(())
     }
 
@@ -109,10 +139,11 @@ impl QueryViewService {
             .mutation
             .lock()
             .map_err(|error| format!("view mutation lock: {error}"))?;
-        self.registry
+        let mut registry = self
+            .registry
             .write()
-            .map_err(|error| format!("view registry write lock: {error}"))?
-            .remove(key);
+            .map_err(|error| format!("view registry write lock: {error}"))?;
+        Arc::make_mut(&mut registry).remove(key);
         Ok(())
     }
 
@@ -122,16 +153,56 @@ impl QueryViewService {
         create_view: &CreateView,
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, crate::api::CommandError> {
+        let local_views = self.catalog_snapshot()?;
         let parts = view_object_name_parts(&create_view.name);
         if let Some(target) =
             crate::view_iceberg::resolve_external_target_parts(engine, &parts, context)?
         {
-            return crate::view_iceberg::create_external_view(engine, target, create_view, context);
+            return crate::view_iceberg::create_external_view(
+                engine,
+                target,
+                create_view,
+                context,
+                &local_views,
+            );
         }
         let key = session_view_key(&create_view.name, context.current_database)?;
         let definition = query_definition(&create_view.raw_query_source, context)?;
+        let target = crate::view::ViewTarget {
+            catalog: key.catalog.clone(),
+            database: key.database.clone(),
+            view: key.view.clone(),
+        };
+        let identity =
+            novarocks_types::naming::TableIdentity::new(&key.catalog, &key.database, &key.view);
+        if local_views.get(&identity).is_some() && !create_view.or_replace {
+            return Err(format!("view already exists: {}.{}", key.database, key.view).into());
+        }
+        let connector_context = context.connector_context.ok_or_else(|| {
+            "view definition analysis requires the admitted connector request context".to_string()
+        })?;
+        let columns = engine.analyze_view_definition(
+            crate::view::ViewDefinitionAnalysisRequest {
+                catalog: &definition.resolution.default_catalog,
+                database: &definition.resolution.default_database,
+                target: &target,
+                query: &create_view.query,
+                columns: &create_view.columns,
+                local_views: &local_views,
+            },
+            connector_context,
+        )?;
+        let declaration = Arc::new(novarocks_sql::planning::catalog::SqlViewDefinition {
+            identity,
+            version: uuid::Uuid::now_v7().to_string().into(),
+            raw_sql: definition.raw_query_source.as_str().into(),
+            default_catalog: definition.resolution.default_catalog.as_str().into(),
+            default_database: definition.resolution.default_database.as_str().into(),
+            columns: columns.into(),
+        });
+        declaration.validate()?;
         let query = parse_query(&definition.raw_query_source)?;
-        self.create_session_view(key, definition, query, create_view.or_replace)?;
+        self.create_session_view(key, definition, query, declaration, create_view.or_replace)?;
         Ok(ViewStatementResult::Ok)
     }
 
@@ -210,7 +281,7 @@ impl QueryViewService {
         })
     }
 
-    fn registry_snapshot(&self) -> Result<HashMap<SessionViewKey, StoredView>, String> {
+    fn registry_snapshot(&self) -> Result<Arc<HashMap<SessionViewKey, StoredView>>, String> {
         self.registry
             .read()
             .map_err(|error| format!("view registry read lock: {error}"))
@@ -219,6 +290,12 @@ impl QueryViewService {
 }
 
 impl ViewService for QueryViewService {
+    fn catalog_snapshot(&self) -> Result<LocalViewSnapshot, String> {
+        Ok(LocalViewSnapshot {
+            entries: self.registry_snapshot()?,
+        })
+    }
+
     fn prepare_show_views(
         &self,
         statement: &novarocks_parser::ast::ShowViews,
@@ -293,9 +370,11 @@ impl ViewService for QueryViewService {
             .mutation
             .lock()
             .map_err(|error| format!("view mutation lock: {error}"))?;
-        self.registry
+        let mut registry = self
+            .registry
             .write()
-            .map_err(|error| format!("view registry write lock: {error}"))?
+            .map_err(|error| format!("view registry write lock: {error}"))?;
+        Arc::make_mut(&mut registry)
             .retain(|key, _| key.catalog != catalog || key.database != database);
         Ok(())
     }

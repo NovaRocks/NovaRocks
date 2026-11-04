@@ -35,6 +35,7 @@ use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
 
 #[derive(Default)]
 struct FakeViewEngine {
+    analyze_local_sql: bool,
     rest_catalogs: Mutex<HashSet<String>>,
     tables: Mutex<HashSet<ViewTarget>>,
     views: Mutex<HashMap<ViewTarget, ResolvedExternalView>>,
@@ -183,6 +184,9 @@ impl ViewEngine for FakeViewEngine {
         request: crate::view::ViewDefinitionAnalysisRequest<'_>,
         _context: &ConnectorRequestContext,
     ) -> Result<Vec<ViewColumnDefinition>, novarocks_sql::compiler::SqlCompileError> {
+        if self.analyze_local_sql {
+            return declarations::analyze_local_definition(request);
+        }
         self.analyzed_queries
             .lock()
             .unwrap()
@@ -1345,3 +1349,6 @@ fn show_views_cannot_fall_back_to_synchronous_statement_dispatch() {
         "SHOW VIEWS requires its original governed read source"
     );
 }
+
+#[path = "view_tests/declarations.rs"]
+mod declarations;

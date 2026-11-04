@@ -29,7 +29,7 @@ use novarocks_spi::connector::{ConnectorRequestContext, DropPolicy};
 use crate::api::QueryResult;
 use crate::persisted_query_definition::PersistedQueryDefinition;
 
-pub use crate::view_service::QueryViewService;
+pub use crate::view_service::{LocalViewSnapshot, QueryViewService};
 
 #[derive(Clone, Copy)]
 pub struct ViewRequestContext<'a> {
@@ -60,6 +60,7 @@ pub struct ViewDefinitionAnalysisRequest<'a> {
     pub target: &'a ViewTarget,
     pub query: &'a Query,
     pub columns: &'a [novarocks_parser::ast::Ident],
+    pub local_views: &'a LocalViewSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -111,6 +112,8 @@ impl PreparedShowViews {
 
 /// Query-application-owned view command and rewrite service.
 pub trait ViewService: Send + Sync {
+    fn catalog_snapshot(&self) -> Result<LocalViewSnapshot, String>;
+
     fn prepare_show_views(
         &self,
         statement: &novarocks_parser::ast::ShowViews,

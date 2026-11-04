@@ -243,6 +243,7 @@ pub struct CatalogServiceMaterializer<'a> {
     service: &'a crate::catalog_application::query_catalog::QueryCatalogService,
     bindings: Arc<QueryTableBindingStore>,
     loader: Box<dyn QueryTableBindingLoader + 'a>,
+    local_views: Option<novarocks_query_application::view::LocalViewSnapshot>,
     /// Typed classification paired with binding-store failure memoization.
     /// The binding store owns the canonical at-most-once load; this sidecar
     /// retains the original typed producer failure at legacy string-compatible
@@ -346,6 +347,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
             service,
             bindings,
             loader,
+            local_views: None,
             resolution_errors: Mutex::new(HashMap::new()),
             original_resolution_errors: Mutex::new(HashMap::new()),
             catalog_application: None,
@@ -354,6 +356,14 @@ impl<'a> CatalogServiceMaterializer<'a> {
                 .map(|overlay| (overlay.key(), overlay))
                 .collect(),
         }
+    }
+
+    pub(crate) fn with_local_views(
+        mut self,
+        snapshot: novarocks_query_application::view::LocalViewSnapshot,
+    ) -> Self {
+        self.local_views = Some(snapshot);
+        self
     }
 
     pub fn with_catalog_application(
@@ -2272,6 +2282,15 @@ mod tests {
         let [need] = preparation.needs() else {
             panic!("one actual overlay relation need");
         };
+        // A frozen statement overlay is already authoritative. Looking up a
+        // process view snapshot must not precede or replace this exact input.
+        let ordinary = materializer.resolve_relation_fact(need).unwrap();
+        let ordinary_catalog = preparation.capture(&[ordinary]).unwrap();
+        let ordinary_table = ordinary_catalog
+            .provider()
+            .resolve_table_for_analysis(Some("default_catalog"), "db", "__nr_cow_orders")
+            .unwrap();
+        let ordinary_token = novarocks_sql::planning::catalog::table_binding_id(&ordinary_table);
         let OriginalCatalogLookup::Fact(fact) = materializer
             .begin_original_catalog_lookup(need, &controls)
             .unwrap()
@@ -2284,6 +2303,7 @@ mod tests {
             .resolve_table_for_analysis(Some("default_catalog"), "db", "__nr_cow_orders")
             .unwrap();
         let token = novarocks_sql::planning::catalog::table_binding_id(&resolved);
+        assert_eq!(token, ordinary_token);
         assert!(token.belongs_to(bindings.scope()));
         assert_eq!(
             novarocks_sql::planning::catalog::materialization_identity_facts(&resolved).fqn(),

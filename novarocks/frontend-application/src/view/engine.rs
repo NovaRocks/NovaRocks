@@ -49,6 +49,14 @@ pub(super) struct EmptyViewService;
 
 #[cfg(test)]
 impl ViewService for EmptyViewService {
+    fn catalog_snapshot(
+        &self,
+    ) -> Result<novarocks_query_application::view::LocalViewSnapshot, String> {
+        // This fixture explicitly has no local DDL. Production supplies its
+        // original process service through the composition root.
+        novarocks_query_application::view::QueryViewService::new().catalog_snapshot()
+    }
+
     fn prepare_show_views(
         &self,
         _statement: &novarocks_parser::ast::ShowViews,
@@ -398,6 +406,7 @@ impl ViewEngine for FrontendViewEngine {
                 novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
                 self.catalog_application(),
             );
+        let provider = provider.with_local_views(request.local_views.clone());
         let control =
             crate::query_execution::planning::sql_compile_control_from_connector_request(context);
         let mut preparation =

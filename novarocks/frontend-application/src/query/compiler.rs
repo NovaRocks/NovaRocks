@@ -258,6 +258,7 @@ impl FrontendQueryCompiler {
             self.mv_candidate_reader.clone(),
             Arc::clone(&self.mv_storage_observation),
             self.connector_blocking_io.clone(),
+            Arc::clone(self.view.view_service()),
         )
     }
 

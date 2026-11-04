@@ -401,6 +401,7 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
         inventory.candidate_reader(),
         Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
         blocking.clone(),
+        Arc::new(novarocks_query_application::view::QueryViewService::new()),
     );
     drop(inventory);
     drop(product); // The actual port/closure now owns the only repository/store aliases.

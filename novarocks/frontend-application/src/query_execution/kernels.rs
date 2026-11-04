@@ -176,6 +176,7 @@ pub struct DmlExecutionKernel {
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
+    view_service: Arc<dyn ViewService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<ConnectorControlHost>,
@@ -198,6 +199,7 @@ pub struct DmlPlanningServices {
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
+    view_service: Arc<dyn ViewService>,
 }
 
 impl DmlPlanningServices {
@@ -206,12 +208,14 @@ impl DmlPlanningServices {
         catalog_service: Arc<QueryCatalogService>,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
+        view_service: Arc<dyn ViewService>,
     ) -> Self {
         Self {
             functions,
             constant_policy,
             static_plan_carrier,
             catalog_service,
+            view_service,
         }
     }
 }
@@ -227,12 +231,14 @@ impl DmlExecutionKernel {
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     ) -> Self {
         let DmlPlanningServices {
+            view_service,
             functions,
             constant_policy,
             static_plan_carrier,
             catalog_service,
         } = planning;
         Self {
+            view_service,
             functions,
             constant_policy,
             static_plan_carrier,
@@ -286,6 +292,7 @@ impl DmlExecutionKernel {
                 self.mv_readiness.candidate_reader().clone(),
                 Arc::clone(&self.mv_storage_observation),
                 blocking.clone(),
+                Arc::clone(&self.view_service),
             ),
         )
     }

@@ -85,6 +85,7 @@ use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 /// One value per process: nothing here is statement-scoped.
 #[derive(Clone)]
 pub(crate) struct CompletionFactOwners {
+    view_service: Arc<dyn novarocks_query_application::view::ViewService>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<ConnectorControlHost>,
@@ -103,8 +104,10 @@ impl CompletionFactOwners {
         materialized_views: MvCandidateReader,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         blocking: ConnectorBlockingIoSupervisor,
+        view_service: Arc<dyn novarocks_query_application::view::ViewService>,
     ) -> Self {
         Self {
+            view_service,
             catalog_service,
             catalog_application,
             connector_control,
@@ -218,6 +221,10 @@ impl StatementFactScope {
 
 /// Answers relation lookups from the frontend catalog.
 pub(crate) struct FrontendCatalogFacts {
+    local_views: Result<
+        novarocks_query_application::view::LocalViewSnapshot,
+        novarocks_sql::compiler::SqlCompileError,
+    >,
     owners: CompletionFactOwners,
     scope: StatementFactScope,
     // One original fact source serializes its own observation rounds. This
@@ -226,8 +233,12 @@ pub(crate) struct FrontendCatalogFacts {
 }
 
 impl FrontendCatalogFacts {
-    pub(crate) const fn new(owners: CompletionFactOwners, scope: StatementFactScope) -> Self {
+    pub(crate) fn new(owners: CompletionFactOwners, scope: StatementFactScope) -> Self {
+        let local_views = scope
+            .bindings
+            .capture_local_views(|| owners.view_service.catalog_snapshot());
         Self {
+            local_views,
             owners,
             scope,
             resolving: tokio::sync::Mutex::const_new(()),
@@ -253,7 +264,8 @@ impl CatalogFactPort for FrontendCatalogFacts {
             loader,
             self.scope.query_local_overlays.clone(),
         )
-        .with_catalog_application(self.owners.catalog_application.as_deref());
+        .with_catalog_application(self.owners.catalog_application.as_deref())
+        .with_local_views(self.local_views.clone()?);
         let mut facts = Vec::with_capacity(needs.len());
         for need in needs {
             facts.push(materializer.resolve_relation_fact_async(need).await?);

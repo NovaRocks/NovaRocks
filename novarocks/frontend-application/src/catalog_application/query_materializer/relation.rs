@@ -267,6 +267,38 @@ impl CatalogServiceMaterializer<'_> {
         )
     }
 
+    fn local_view_fact(
+        &self,
+        need: &CatalogRelationNeed,
+    ) -> Option<Result<CatalogRelationFact, SqlCompileError>> {
+        let relation = need.relation();
+        if need.version().is_some()
+            || self
+                .query_overlay(
+                    Some(&relation.catalog),
+                    &relation.namespace,
+                    &relation.table,
+                )
+                .is_some()
+            || !(need.allows_local_view_shadow() || relation.catalog == "default_catalog")
+        {
+            return None;
+        }
+        let Some(snapshot) = self.local_views.as_ref() else {
+            return Some(Err(SqlCompileError::Compilation(
+                "local view snapshot is not installed for this catalog capture".into(),
+            )));
+        };
+        let local = novarocks_types::naming::TableIdentity::new(
+            "default_catalog",
+            &relation.namespace,
+            &relation.table,
+        );
+        snapshot
+            .get(&local)
+            .map(|view| CatalogRelationFact::view(need, view.clone()).map_err(fact_error))
+    }
+
     fn local_relation_fact(
         &self,
         need: &CatalogRelationNeed,
@@ -318,6 +350,9 @@ impl CatalogServiceMaterializer<'_> {
                 ),
             );
         }
+        if let Some(fact) = self.local_view_fact(need) {
+            return fact;
+        }
         if let Some(fact) = self.local_relation_fact(need) {
             return fact;
         }
@@ -361,6 +396,9 @@ impl CatalogServiceMaterializer<'_> {
                 )
                 .await,
             );
+        }
+        if let Some(fact) = self.local_view_fact(need) {
+            return fact;
         }
         if let Some(fact) = self.local_relation_fact(need) {
             return fact;

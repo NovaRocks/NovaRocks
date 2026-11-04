@@ -150,6 +150,7 @@ fn empty_completion_owners(
         inventory.candidate_reader(),
         Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
         blocking,
+        Arc::new(novarocks_query_application::view::QueryViewService::new()),
     )
 }
 
