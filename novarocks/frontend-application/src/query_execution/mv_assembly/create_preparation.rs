@@ -367,6 +367,7 @@ mod tests {
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
             entrance,
             crate::application::test_constant_policy(),
+            Arc::new(novarocks_query_application::view::QueryViewService::new()),
         );
         let sql = "SELECT 1 AS id FROM ice.db.orders";
         let statement = MvCreateStatement {

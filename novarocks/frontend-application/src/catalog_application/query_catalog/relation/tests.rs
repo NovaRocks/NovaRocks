@@ -678,3 +678,33 @@ async fn legacy_and_explicit_snapshot_names_share_one_input_without_sharing_the_
         assert!(resolver.counts.reference.load(Ordering::Relaxed) <= 1);
     }
 }
+
+#[path = "tests/gated_original.rs"]
+mod gated_original;
+
+#[test]
+fn a_provider_table_from_another_relation_cannot_be_relabelled_as_the_requested_input() {
+    for (namespace, table) in [("other", "orders"), ("db", "other")] {
+        let resolver = fixture(None, Some(None));
+        let (lease, expected, context) =
+            begin(&resolver, context(), &need("SELECT x FROM ice.db.orders")).unwrap();
+        let mut returned = expected.clone();
+        returned.namespace = namespace.into();
+        returned.table = table.into();
+        let metadata = lease
+            .binding()
+            .metadata()
+            .load_frontend_table(ConnectorTableRequest {
+                table: returned,
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context,
+            })
+            .unwrap();
+        let error = match finish_table(metadata, lease, None, &expected) {
+            Err(error) => error,
+            Ok(_) => panic!("a different relation cannot supply the requested table"),
+        };
+        assert_eq!(source_kind(error), ConnectorErrorKind::CorruptData);
+        assert_eq!(resolver.counts.view_load.load(Ordering::Relaxed), 0);
+    }
+}

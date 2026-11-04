@@ -255,6 +255,7 @@ impl Fixture {
                 Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
                 entrance.clone(),
                 crate::application::test_constant_policy(),
+            Arc::new(novarocks_query_application::view::QueryViewService::new()),
             )
                     };
                 ReadRequest::Explain(Box::new(MvExplainPreparationInput {

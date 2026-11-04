@@ -208,6 +208,7 @@ impl FrontendRoleProducts {
                         .management_entrance()
                         .expect("serving MV product owns document-management authority"),
                     self.constant_policy,
+                    Arc::clone(&self.view_service),
                 ),
                 self.mv_execution_services.clone(),
             ))
@@ -456,6 +457,7 @@ async fn build_frontend_role_products(
                 .expect("serving MV product owns document-management authority"),
             host.constant_policy(),
             host.static_plan_carrier(),
+            Arc::clone(&view_service),
         ),
     );
     let mv_service = Arc::new(
@@ -740,6 +742,7 @@ fn build_frontend_query_session_factory_from_role_products(
             products.mv_product_service.management_continuation(),
             host.mv_management_audit_sink(),
             host.constant_policy(),
+            Arc::clone(&view_service),
         ))
         .with_execution_services(products.mv_execution_services.clone());
     let mv_command_consumer: Arc<

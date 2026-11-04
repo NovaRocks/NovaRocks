@@ -1783,6 +1783,7 @@ mod original_stage_tests {
                 Arc::new(UnavailableMvStorageObservationPort),
                 entrance.clone(),
                 crate::application::test_constant_policy(),
+                Arc::new(novarocks_query_application::view::QueryViewService::new()),
             );
             let wake = Arc::new(Wake::default());
             let cancellation = QueryCancellationView::governed(scope.cancellation().unwrap(), None);

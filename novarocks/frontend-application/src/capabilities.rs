@@ -491,6 +491,7 @@ pub fn maintenance_read_command_executor(
 /// Leaf ports for MV metadata and refresh execution.
 #[derive(Clone)]
 pub struct MvCommandPorts {
+    view_service: Arc<dyn ViewService>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
@@ -527,8 +528,10 @@ impl MvCommandPorts {
             Arc<dyn novarocks_mv_application::management::ManagementAuditSink>,
         >,
         constant_policy: novarocks_functions::ConstantPolicy,
+        view_service: Arc<dyn ViewService>,
     ) -> Self {
         Self {
+            view_service,
             functions,
             constant_policy,
             catalog_service,
@@ -557,6 +560,7 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
             Arc::clone(&ports.storage_observation),
             Arc::clone(&ports.management_entrance),
             ports.constant_policy,
+            ports.view_service,
         );
     mv_command::MvCommandExecutor::new(
         iceberg_ports,
@@ -667,6 +671,7 @@ pub fn bind_catalog_runtime_projection(
 /// capability: durable refresh activation must not acquire a command router.
 #[derive(Clone)]
 pub(crate) struct MvRefreshProviderActivationPorts {
+    view_service: Arc<dyn ViewService>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: CompiledPackageCarrier,
@@ -705,8 +710,10 @@ impl MvRefreshProviderActivationPorts {
         mv_management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
+        view_service: Arc<dyn ViewService>,
     ) -> Self {
         Self {
+            view_service,
             functions,
             constant_policy,
             static_plan_carrier,
@@ -753,6 +760,7 @@ pub(crate) fn mv_refresh_provider_activation(
             ports.mv_storage_observation,
             ports.mv_management_entrance,
             ports.constant_policy,
+            ports.view_service,
         );
     Arc::new(
         crate::query_execution::mv_assembly::iceberg_activation::IcebergMvRefreshProviderActivation::new(
@@ -883,6 +891,7 @@ fn original_maintenance_context(
 /// Leaf ports for the Frontend-owned MV background worker.
 #[derive(Clone)]
 pub(crate) struct MvBackgroundPorts {
+    view_service: Arc<dyn ViewService>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
@@ -903,8 +912,10 @@ impl MvBackgroundPorts {
         storage_observation: Arc<dyn MvStorageObservationPort>,
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
         constant_policy: novarocks_functions::ConstantPolicy,
+        view_service: Arc<dyn ViewService>,
     ) -> Self {
         Self {
+            view_service,
             functions,
             constant_policy,
             catalog_service,
@@ -935,6 +946,7 @@ impl MvBackgroundPorts {
             self.storage_observation,
             self.management_entrance,
             self.constant_policy,
+            self.view_service,
         )
     }
 }

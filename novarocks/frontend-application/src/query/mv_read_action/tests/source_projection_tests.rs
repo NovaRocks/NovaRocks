@@ -499,6 +499,7 @@ impl SourceFixture {
                 self.clone(),
                 entrance,
                 crate::application::test_constant_policy(),
+                Arc::new(novarocks_query_application::view::QueryViewService::new()),
             )
             .into_core_ports(host);
         }
@@ -512,6 +513,7 @@ impl SourceFixture {
             self.clone(),
             entrance,
             crate::application::test_constant_policy(),
+            Arc::new(novarocks_query_application::view::QueryViewService::new()),
         )
     }
 }

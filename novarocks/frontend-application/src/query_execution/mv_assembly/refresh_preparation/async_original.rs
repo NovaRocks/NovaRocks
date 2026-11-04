@@ -345,6 +345,10 @@ pub(crate) async fn capture_catalog(
         ),
     }
     .map_err(MvApplicationError::from_compile)?;
+    let local_views = input
+        .bindings
+        .capture_local_views(|| input.ports.view_service().catalog_snapshot())
+        .map_err(MvApplicationError::from_compile)?;
     let materializer = build_catalog_service_provider_with_bindings_and_query_local_overlays(
         input.current_catalog.as_deref(),
         input.ports.catalog_service().as_ref(),
@@ -353,25 +357,40 @@ pub(crate) async fn capture_catalog(
         Arc::clone(&input.bindings),
         input.overlays,
         input.ports.catalog_application(),
-    );
+    )
+    .with_local_views(local_views);
     while !preparation.needs().is_empty() {
         let mut facts = Vec::with_capacity(preparation.needs().len());
         for need in preparation.needs() {
-            let fact = match materializer
-                .begin_original_catalog_lookup(need, input.ports.connector_control())?
-            {
-                OriginalCatalogLookup::Fact(fact) => fact,
-                OriginalCatalogLookup::Metadata(lookup) => {
-                    let observed = io
-                        .metadata(
-                            &lookup.planning_pin,
-                            input.context.clone(),
-                            &lookup.namespace,
-                            &lookup.physical_table,
-                            lookup.resolution,
-                        )
-                        .await;
-                    materializer.finish_original_catalog_lookup(lookup, observed)?
+            let fact = if matches!(
+                need.target(),
+                novarocks_sql::compiler::CatalogLookupTarget::Table { .. }
+            ) {
+                materializer
+                    .resolve_original_relation_fact(
+                        need,
+                        input.ports.connector_control(),
+                        input.context.clone(),
+                        io,
+                    )
+                    .await?
+            } else {
+                match materializer
+                    .begin_original_metadata_lookup(need, input.ports.connector_control())?
+                {
+                    OriginalCatalogLookup::Fact(fact) => fact,
+                    OriginalCatalogLookup::Metadata(lookup) => {
+                        let observed = io
+                            .metadata(
+                                &lookup.planning_pin,
+                                input.context.clone(),
+                                &lookup.namespace,
+                                &lookup.physical_table,
+                                lookup.resolution,
+                            )
+                            .await;
+                        materializer.finish_original_metadata_lookup(lookup, observed)?
+                    }
                 }
             };
             facts.push(fact);

@@ -44,7 +44,7 @@ pub enum ConnectorQueryRelationMaterialization {
     SelectionRefused(Box<CatalogRelationFact>),
 }
 
-fn begin(
+pub(crate) fn begin(
     controls: &dyn ConnectorControlResolver,
     context: ConnectorRequestContext,
     need: &CatalogRelationNeed,
@@ -78,7 +78,7 @@ fn begin(
     Ok((lease, identity, context))
 }
 
-fn project_reference(
+pub(crate) fn project_reference(
     need: &CatalogRelationNeed,
     references: ConnectorReadReferenceFacts,
 ) -> CatalogResolutionResult<CatalogTimeTravelResolution> {
@@ -157,18 +157,25 @@ pub(crate) fn project_view(
     })
 }
 
-fn no_view_capability() -> CatalogResolutionError {
+pub(crate) fn no_view_capability() -> CatalogResolutionError {
     CatalogResolutionError::from_connector(ConnectorError::new(
         ConnectorErrorKind::Unsupported,
         "connector generation does not declare view metadata capability",
     ))
 }
 
-fn finish_table(
+pub(crate) fn finish_table(
     metadata: ConnectorTableMetadata,
     lease: ConnectorControlPlanningLease,
     selection: Option<SqlTimeTravelSnapshotBindingFacts>,
+    expected: &ConnectorTableIdentity,
 ) -> CatalogResolutionResult<ConnectorQueryRelationMaterialization> {
+    if &metadata.identity != expected {
+        return Err(CatalogResolutionError::from_connector(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "table observation returned another relation identity",
+        )));
+    }
     let resolution = selection
         .as_ref()
         .map_or(ConnectorTableResolution::StrictBaseTable, |binding| {
@@ -224,7 +231,7 @@ pub(crate) fn load_relation(
             resolution,
             context: context.clone(),
         }) {
-        Ok(metadata) => finish_table(metadata, lease, selection),
+        Ok(metadata) => finish_table(metadata, lease, selection, &identity),
         Err(error) if selection.is_none() && error.kind() == ConnectorErrorKind::NotFound => {
             let capability = lease
                 .binding()
@@ -298,7 +305,7 @@ pub(crate) async fn load_relation_async(
     )
     .await
     {
-        Ok(metadata) => finish_table(metadata, lease, selection),
+        Ok(metadata) => finish_table(metadata, lease, selection, &identity),
         Err(error) if selection.is_none() && error.kind() == ConnectorErrorKind::NotFound => {
             let capability = lease
                 .binding()

@@ -127,6 +127,7 @@ use novarocks_types::naming::{TableIdentity, normalize_identifier};
 /// constructor so a frontend composition must name every dependency.
 #[derive(Clone)]
 pub struct IcebergMvCorePorts {
+    view_service: Arc<dyn novarocks_query_application::view::ViewService>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
@@ -155,8 +156,10 @@ impl IcebergMvCorePorts {
         storage_observation: Arc<dyn MvStorageObservationPort>,
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
         constant_policy: novarocks_functions::ConstantPolicy,
+        view_service: Arc<dyn novarocks_query_application::view::ViewService>,
     ) -> Self {
         Self {
+            view_service,
             functions,
             constant_policy,
             catalog_service,
@@ -167,6 +170,10 @@ impl IcebergMvCorePorts {
             storage_observation,
             management_entrance: Some(management_entrance),
         }
+    }
+
+    pub(crate) fn view_service(&self) -> &Arc<dyn novarocks_query_application::view::ViewService> {
+        &self.view_service
     }
 
     pub(crate) fn management_entrance(

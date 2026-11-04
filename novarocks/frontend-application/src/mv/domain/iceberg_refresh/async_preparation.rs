@@ -1763,6 +1763,7 @@ mod partition_planning_tests {
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
             entrance,
             crate::application::test_constant_policy(),
+            Arc::new(novarocks_query_application::view::QueryViewService::new()),
         );
         // Equal numeric IDs cannot replace the original exact source/window preparation.
         let baseline = RefreshStateBaseline::SnapshotBacked {

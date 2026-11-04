@@ -101,6 +101,14 @@ enum Request {
         context: ConnectorRequestContext,
     },
 
+    ReferenceFacts {
+        lease: ConnectorControlPlanningLease,
+        request: novarocks_spi::connector::ConnectorReadReferenceFactsRequest,
+    },
+    ViewMetadata {
+        lease: ConnectorControlPlanningLease,
+        request: novarocks_spi::connector::ConnectorViewRequest,
+    },
     Metadata {
         planning_pin: ConnectorControlPlanningPin,
         request: ConnectorTableRequest,
@@ -127,6 +135,8 @@ enum Response {
     Admit(Result<(), MvApplicationError>),
     InstallCurrent(Result<(), MvApplicationError>),
     MetadataReady,
+    ReferenceFactsReady,
+    ViewMetadataReady,
     SourceRead(Result<(), ConnectorError>),
 }
 type Operation = Pin<Box<dyn Future<Output = Response> + Send + 'static>>;
@@ -238,6 +248,11 @@ pub(crate) struct MvRefreshPreparationIo {
     admission: Arc<MvPublicationAdmissionReceiving>,
     registration: Arc<CurrentProjectionRegistration>,
     metadata_result: Mutex<Option<Result<ConnectorTablePreparation, ConnectorError>>>,
+    reference_result: Mutex<
+        Option<Result<novarocks_spi::connector::ConnectorReadReferenceFacts, ConnectorError>>,
+    >,
+    view_result:
+        Mutex<Option<Result<novarocks_spi::connector::ConnectorViewPreparation, ConnectorError>>>,
     source_result: Mutex<Option<SourceReceiving>>,
     current_metadata_cpu: Arc<crate::mv::domain::staged_create::CurrentProjectionMetadataCpu>,
     sources: Arc<CapturedRefreshSources>,
@@ -283,6 +298,8 @@ impl MvRefreshPreparationIo {
             admission: Arc::new(MvPublicationAdmissionReceiving::new()),
             registration: Arc::new(CurrentProjectionRegistration::new()),
             metadata_result: Mutex::new(None),
+            reference_result: Mutex::new(None),
+            view_result: Mutex::new(None),
             source_result: Mutex::new(None),
             current_metadata_cpu,
             sources: Arc::new(CapturedRefreshSources::default()),
@@ -490,6 +507,48 @@ impl MvRefreshPreparationIo {
                             Err(error)=>Err(contract_error(error)),
                         };
                         Response::InstallCurrent(result)
+                    }
+                    Request::ReferenceFacts { lease, request } => {
+                        let mut child = lease
+                            .binding()
+                            .metadata()
+                            .read_reference_facts_async(request);
+                        let result = std::future::poll_fn(|cx| child.as_mut().poll(cx)).await;
+                        {
+                            let gate = original_gate
+                                .upgrade()
+                                .expect("original MV gate outlives its child");
+                            let mut receiver = gate
+                                .reference_result
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            assert!(
+                                receiver.is_none(),
+                                "original MV reference receiver is occupied"
+                            );
+                            *receiver = Some(result);
+                        }
+                        drop(child);
+                        Response::ReferenceFactsReady
+                    }
+                    Request::ViewMetadata { lease, request } => {
+                        let capability = lease
+                            .binding()
+                            .view_metadata()
+                            .expect("view capability admitted before requesting I/O");
+                        let mut child = capability.prepare_view(request);
+                        let result = std::future::poll_fn(|cx| child.as_mut().poll(cx)).await;
+                        {
+                            let gate = original_gate
+                                .upgrade()
+                                .expect("original MV gate outlives its child");
+                            let mut receiver =
+                                gate.view_result.lock().unwrap_or_else(|e| e.into_inner());
+                            assert!(receiver.is_none(), "original MV view receiver is occupied");
+                            *receiver = Some(result);
+                        }
+                        drop(child);
+                        Response::ViewMetadataReady
                     }
                     request @ (Request::Metadata { .. } | Request::SourceMetadata { .. }) => {
                         let (planning_pin, request, source_only) = match request {
@@ -888,6 +947,75 @@ impl MvRefreshPreparationIo {
         .map_err(crate::connector::schema_creation::connector_schema_error)
     }
 
+    pub(crate) async fn reference_facts(
+        &self,
+        lease: &ConnectorControlPlanningLease,
+        identity: ConnectorTableIdentity,
+        context: ConnectorRequestContext,
+    ) -> Result<novarocks_spi::connector::ConnectorReadReferenceFacts, ConnectorError> {
+        let context = crate::connector::context_for_planning_lease_typed(lease, context)?;
+        context.original_operation_control().check_active()?;
+        let Response::ReferenceFactsReady = self
+            .exchange(Request::ReferenceFacts {
+                lease: lease.clone(),
+                request: novarocks_spi::connector::ConnectorReadReferenceFactsRequest {
+                    table: identity,
+                    context,
+                },
+            })
+            .await
+        else {
+            panic!("MV reference response changed kind")
+        };
+        self.reference_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("original reference result was received before its child exited")
+    }
+
+    pub(crate) async fn view_metadata(
+        &self,
+        lease: &ConnectorControlPlanningLease,
+        identity: ConnectorTableIdentity,
+        context: ConnectorRequestContext,
+    ) -> Result<novarocks_spi::connector::ConnectorViewMetadataValue, ConnectorError> {
+        let context = crate::connector::context_for_planning_lease_typed(lease, context)?;
+        context.original_operation_control().check_active()?;
+        let capability = lease.binding().view_metadata().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "connector generation does not declare view metadata capability",
+            )
+        })?;
+        let Response::ViewMetadataReady = self
+            .exchange(Request::ViewMetadata {
+                lease: lease.clone(),
+                request: novarocks_spi::connector::ConnectorViewRequest {
+                    view: novarocks_spi::connector::ConnectorViewIdentity {
+                        instance_id: identity.instance_id,
+                        namespace: identity.namespace,
+                        view: identity.table,
+                    },
+                    context: context.clone(),
+                },
+            })
+            .await
+        else {
+            panic!("MV view response changed kind")
+        };
+        let preparation = self
+            .view_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("original view result was received before its child exited")?;
+        crate::connector::schema_creation::with_schema_creation(&context, |creation| {
+            capability.create_prepared_view(preparation, creation)
+        })
+        .map_err(crate::connector::schema_creation::connector_schema_error)
+    }
+
     pub(crate) fn captured_sources(&self) -> Arc<CapturedRefreshSources> {
         Arc::clone(&self.sources)
     }
@@ -958,13 +1086,15 @@ impl MvRefreshPreparationIo {
     }
 }
 
-pub(crate) fn provider_error(error: ConnectorError) -> MvApplicationError {
-    let kind = if error.kind() == novarocks_spi::connector::ConnectorErrorKind::Unavailable {
+pub(crate) fn provider_error_kind(error: &ConnectorError) -> MvApplicationErrorKind {
+    if error.kind() == novarocks_spi::connector::ConnectorErrorKind::Unavailable {
         MvApplicationErrorKind::Unavailable
     } else {
         MvApplicationErrorKind::Engine
-    };
-    MvApplicationError::from_connector(kind, error)
+    }
+}
+pub(crate) fn provider_error(error: ConnectorError) -> MvApplicationError {
+    MvApplicationError::from_connector(provider_error_kind(&error), error)
 }
 pub(crate) fn contract_error(message: impl Into<String>) -> MvApplicationError {
     MvApplicationError::new(MvApplicationErrorKind::InvalidRequest, message)

@@ -61,6 +61,12 @@ pub enum CatalogResolutionError {
     Failed {
         message: String,
         error: novarocks_sql::compiler::SqlCompileError,
+        original_provider: Option<
+            Box<(
+                novarocks_spi::connector::ConnectorError,
+                novarocks_failure_contract::SharedFailureCause,
+            )>,
+        >,
     },
 }
 
@@ -75,6 +81,7 @@ impl CatalogResolutionError {
         let message = message.into();
         Self::Failed {
             error: novarocks_sql::compiler::SqlCompileError::Compilation(message.clone()),
+            original_provider: None,
             message,
         }
     }
@@ -90,6 +97,10 @@ impl CatalogResolutionError {
                 source.downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
             })
             .cloned();
+        let original_source = source
+            .clone()
+            .unwrap_or_else(|| novarocks_failure_contract::SharedFailureCause::new(error.clone()));
+        let original_provider = Some(Box::new((error.clone(), original_source.clone())));
         let error = if let Some(source) = source {
             match source.downcast_ref::<novarocks_type_contract::CompileControlError>() {
                 Some(control) => SqlCompileError::from(control.clone()),
@@ -100,12 +111,30 @@ impl CatalogResolutionError {
                 ConnectorErrorKind::Cancelled => SqlCompileError::Cancelled,
                 ConnectorErrorKind::DeadlineExceeded => SqlCompileError::DeadlineExceeded,
                 ConnectorErrorKind::ResourceExhausted => SqlCompileError::ResourceExhausted,
-                _ => SqlCompileError::CompilationSource(
-                    novarocks_failure_contract::SharedFailureCause::new(error),
-                ),
+                _ => SqlCompileError::CompilationSource(original_source),
             }
         };
-        Self::Failed { message, error }
+        Self::Failed {
+            message,
+            error,
+            original_provider,
+        }
+    }
+
+    pub(crate) fn original_provider(
+        &self,
+    ) -> Option<(
+        &novarocks_spi::connector::ConnectorError,
+        &novarocks_failure_contract::SharedFailureCause,
+    )> {
+        match self {
+            Self::Failed {
+                original_provider, ..
+            } => original_provider
+                .as_deref()
+                .map(|(error, source)| (error, source)),
+            Self::Missing { .. } => None,
+        }
     }
 
     pub fn into_compile(self) -> novarocks_sql::compiler::SqlCompileError {
@@ -128,6 +157,16 @@ impl CatalogResolutionError {
         match self {
             Self::Missing { reason } => reason,
             Self::Failed { message, .. } => message,
+        }
+    }
+}
+
+impl From<novarocks_sql::compiler::SqlCompileError> for CatalogResolutionError {
+    fn from(error: novarocks_sql::compiler::SqlCompileError) -> Self {
+        Self::Failed {
+            message: error.to_string(),
+            error,
+            original_provider: None,
         }
     }
 }
@@ -330,7 +369,7 @@ pub(crate) async fn load_connector_table_materialization_with_resolution_async(
         .map_err(CatalogResolutionError::failed)
 }
 
-fn connector_table_resolution_error(
+pub(super) fn connector_table_resolution_error(
     error: novarocks_spi::connector::ConnectorError,
     namespace: &str,
     table: &str,
