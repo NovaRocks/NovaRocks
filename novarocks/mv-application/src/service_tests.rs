@@ -787,7 +787,7 @@ fn a_typed_admission_refusal_does_not_skip_staged_target_abort() {
             ..Default::default()
         };
         let primary = MvProviderFailure::new(MvProviderFailureKind::InvalidRequest, &message)
-            .with_unavailable_implementation(Some(analyze.clone()));
+            .with_analyze_error(Some(analyze.clone()));
         let staged = MvStagedTarget {
             target: create_command().target,
             staged_operation_id: operation().operation_id,
@@ -798,13 +798,13 @@ fn a_typed_admission_refusal_does_not_skip_staged_target_abort() {
         assert_eq!(failure.kind(), MvProductErrorKind::InvalidRequest);
         assert_eq!(failure.compile_control_error(), None);
         if fail_abort {
-            assert_eq!(failure.unavailable_implementation(), None);
+            assert_eq!(failure.analyze_error(), None);
             assert_eq!(
                 failure.message(),
                 format!("{message}; staged target abort failed: abort failed")
             );
         } else {
-            assert_eq!(failure.unavailable_implementation(), Some(&analyze));
+            assert_eq!(failure.analyze_error(), Some(&analyze));
             assert_eq!(failure.message(), message);
         }
     }
@@ -824,13 +824,13 @@ fn a_committed_finalization_failure_cannot_become_a_pure_admission_refusal() {
     let message = analyze.to_string();
     let failure = super::known_committed_finalize_failure(
         MvProviderFailure::new(MvProviderFailureKind::InvalidRequest, &message)
-            .with_unavailable_implementation(Some(analyze)),
+            .with_analyze_error(Some(analyze)),
     );
     assert_eq!(
         failure.kind(),
         MvProductErrorKind::KnownCommittedFinalizeFailed
     );
-    assert_eq!(failure.unavailable_implementation(), None);
+    assert_eq!(failure.analyze_error(), None);
     assert_eq!(failure.message(), message);
 }
 

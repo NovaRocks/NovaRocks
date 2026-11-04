@@ -2336,7 +2336,7 @@ impl FrontendQuerySession {
                 let result = command_executor
                     .execute_view(&statement, &context, &command_context)
                     .await
-                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
+                    .map_err(product_command_error);
                 Ok((result, execution_owner))
             }),
             other_statement => Box::pin(async move {

@@ -1226,7 +1226,7 @@ fn committed_failure(error: CreatePhaseFailure) -> CreatePhaseFailure {
         domain.message(),
     )
     .with_compile_control(domain.compile_control_error())
-    .with_unavailable_implementation(domain.unavailable_implementation().cloned());
+    .with_analyze_error(domain.analyze_error().cloned());
     if let Some(cause) = domain.original_failure() {
         known = known.with_original_failure(cause.clone())
     }

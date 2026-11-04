@@ -273,7 +273,7 @@ pub struct MvApplicationError {
     message: String,
     original_failure: Option<novarocks_failure_contract::SharedFailureCause>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
-    unavailable_implementation: Option<novarocks_sql::analyze_error::AnalyzeError>,
+    analyze_error: Option<novarocks_sql::analyze_error::AnalyzeError>,
 }
 
 impl MvApplicationError {
@@ -283,7 +283,7 @@ impl MvApplicationError {
             message: message.into(),
             original_failure: None,
             compile_control: None,
-            unavailable_implementation: None,
+            analyze_error: None,
         }
     }
 
@@ -307,7 +307,7 @@ impl MvApplicationError {
         };
         let mut failure = Self::new(kind, error.to_string())
             .with_compile_control(error.compile_control_error())
-            .with_unavailable_implementation(error.unavailable_implementation().cloned());
+            .with_analyze_error(error.analyze_error().cloned());
         if let Some(cause) = error.original_failure() {
             failure = failure.with_original_failure(cause.clone());
         }
@@ -347,13 +347,8 @@ impl MvApplicationError {
             ),
             _ => None,
         };
-        let unavailable_implementation = match &error {
-            novarocks_sql::compiler::SqlCompileError::Analyze(error)
-                if error.kind()
-                    == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation =>
-            {
-                Some(error.clone())
-            }
+        let analyze_error = match &error {
+            novarocks_sql::compiler::SqlCompileError::Analyze(error) => Some(error.clone()),
             _ => None,
         };
         // Public SQL codes are rendered only at the final typed command boundary.
@@ -363,7 +358,7 @@ impl MvApplicationError {
             failure.original_failure = Some(source.clone());
         }
         failure.compile_control = control;
-        failure.unavailable_implementation = unavailable_implementation;
+        failure.analyze_error = analyze_error;
         failure
     }
     pub(crate) fn with_compile_control(
@@ -389,8 +384,8 @@ impl MvApplicationError {
         self.compile_control.clone()
     }
 
-    /// Retain only the typed missing-implementation cause, never diagnostic text.
-    pub(crate) fn with_unavailable_implementation(
+    /// Retain the original typed analysis cause, never classify diagnostic text.
+    pub(crate) fn with_analyze_error(
         mut self,
         error: Option<novarocks_sql::analyze_error::AnalyzeError>,
     ) -> Self {
@@ -399,20 +394,15 @@ impl MvApplicationError {
             MvApplicationErrorKind::CommitUnknown
                 | MvApplicationErrorKind::KnownCommittedFinalizeFailed
         ) {
-            self.unavailable_implementation = None;
+            self.analyze_error = None;
             return self;
         }
-        self.unavailable_implementation = error.filter(|error| {
-            error.kind()
-                == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation
-        });
+        self.analyze_error = error;
         self
     }
 
-    pub fn unavailable_implementation(
-        &self,
-    ) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
-        self.unavailable_implementation.as_ref()
+    pub fn analyze_error(&self) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
+        self.analyze_error.as_ref()
     }
 
     pub fn kind(&self) -> MvApplicationErrorKind {
@@ -454,7 +444,7 @@ mod compile_error_tests {
     use novarocks_type_contract::CompileControlError;
 
     #[test]
-    fn mv_application_and_create_preserve_only_the_missing_implementation_sql_code() {
+    fn mv_application_and_create_preserve_the_original_analysis_code() {
         let compile = SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
             FunctionOverloadId::try_new("fixture/mv/missing-pure-v1").unwrap(),
         ));
@@ -465,10 +455,7 @@ mod compile_error_tests {
         let expected_analyze = analyze.clone();
         let application = MvApplicationError::from_compile(compile.clone());
         assert_eq!(application.kind(), MvApplicationErrorKind::InvalidRequest);
-        assert_eq!(
-            application.unavailable_implementation(),
-            Some(&expected_analyze)
-        );
+        assert_eq!(application.analyze_error(), Some(&expected_analyze));
         assert_eq!(application.message(), expected);
         assert!(
             !application
@@ -509,7 +496,7 @@ mod compile_error_tests {
                     .downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>()
                     .is_some()
             );
-            assert_eq!(application.unavailable_implementation(), None);
+            assert_eq!(application.analyze_error(), None);
         }
     }
 
@@ -520,12 +507,16 @@ mod compile_error_tests {
             SqlCompileError::Analyze(AnalyzeError::internal(message)),
             SqlCompileError::Compilation(message.into()),
         ] {
+            let expected_analyze = match &compile {
+                SqlCompileError::Analyze(error) => Some(error.clone()),
+                _ => None,
+            };
             let expected = compile.to_string();
             let application = MvApplicationError::from_compile(compile.clone());
             assert_eq!(application.message(), expected);
             assert_eq!(application.original_failure(), None);
             assert_eq!(application.compile_control_error(), None);
-            assert_eq!(application.unavailable_implementation(), None);
+            assert_eq!(application.analyze_error(), expected_analyze.as_ref());
         }
     }
 
@@ -540,12 +531,16 @@ mod compile_error_tests {
                 SqlCompileError::from(control.clone()),
                 SqlCompileError::Analyze(AnalyzeError::control(control.clone())),
             ] {
+                let expected_analyze = match &compile {
+                    SqlCompileError::Analyze(error) => Some(error.clone()),
+                    _ => None,
+                };
                 let expected = compile.to_string();
                 let application = MvApplicationError::from_compile(compile.clone());
                 assert_eq!(application.message(), expected);
                 assert_eq!(application.original_failure(), None);
                 assert_eq!(application.compile_control_error(), Some(control.clone()));
-                assert_eq!(application.unavailable_implementation(), None);
+                assert_eq!(application.analyze_error(), expected_analyze.as_ref());
                 assert_eq!(application.kind(), MvApplicationErrorKind::InvalidRequest);
             }
         }
@@ -583,7 +578,7 @@ mod compile_error_tests {
                 .is_some()
         );
         assert_eq!(projected.compile_control_error(), None);
-        assert_eq!(projected.unavailable_implementation(), None);
+        assert_eq!(projected.analyze_error(), None);
     }
 
     #[test]
