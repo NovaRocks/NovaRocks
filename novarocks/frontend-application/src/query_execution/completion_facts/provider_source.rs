@@ -42,6 +42,7 @@ struct ProviderCompletionState {
     facts: Option<Arc<Facts>>,
     provider: Option<Arc<FrontendProviderReadFacts>>,
     owned_catalog_cpu: Option<Arc<FrontendPlanningCpuSource>>,
+    provider_close_outcome: Option<Result<(), StatementNativeHealthFailure>>,
     outcome: Option<CompletionResult>,
     health: Option<StatementNativeHealthFailure>,
     joined: bool,
@@ -289,13 +290,31 @@ impl FrontendCompletionCustody {
         {
             self.retain_health(health);
         }
-        if let Some(provider) = &provider
-            && let Err(cause) = provider.join_local_closed().await
-        {
-            self.retain_health(StatementNativeHealthFailure::actual_exit_unproven(
-                "completion Provider creator actual exit is unproven",
-                cause,
-            ));
+        if let Some(provider) = &provider {
+            let received = self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .provider_close_outcome
+                .clone();
+            let outcome = match received {
+                Some(outcome) => outcome,
+                None => {
+                    let outcome = provider.join_local_closed().await.map_err(|cause| {
+                        StatementNativeHealthFailure::actual_exit_unproven(
+                            "completion Provider creator actual exit is unproven",
+                            cause,
+                        )
+                    });
+                    // Receive this owner's verdict before borrowing the CPU close.
+                    // An unhealthy result remains unhealthy after disposition.
+                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    state.provider_close_outcome.get_or_insert(outcome).clone()
+                }
+            };
+            if let Err(health) = outcome {
+                self.retain_health(health);
+            }
         }
         // Only CPU sources created for this custody enter this slot. A Read
         // or EXPLAIN caller's borrowed CPU must remain available for its later
@@ -426,6 +445,19 @@ mod owned_catalog_cpu_tests {
 
     #[tokio::test]
     async fn dropped_catalog_cpu_borrow_remains_owned_until_real_close_without_a_provider() {
+        assert_owned_catalog_cpu_close(None).await;
+    }
+
+    #[tokio::test]
+    async fn retained_health_cannot_skip_the_owned_catalog_cpu_actual_close() {
+        let health = StatementNativeHealthFailure::actual_exit_unproven(
+            "fixture retains an earlier independent owner failure",
+            Arc::new(std::io::Error::other("original fixture health cause")),
+        );
+        assert_owned_catalog_cpu_close(Some(health)).await;
+    }
+
+    async fn assert_owned_catalog_cpu_close(health: Option<StatementNativeHealthFailure>) {
         let (mut owners, supervisor) =
             crate::task_execution::blocking_io::tests::original_executors(
                 tokio::runtime::Handle::current(),
@@ -460,6 +492,9 @@ mod owned_catalog_cpu_tests {
             "original CPU input is still retained"
         );
         assert!(!gate.returned.load(Ordering::Acquire));
+        if let Some(health) = &health {
+            custody.retain_health(health.clone());
+        }
         let mut close = Box::pin(custody.close());
         assert!(
             futures::poll!(close.as_mut()).is_pending(),
@@ -472,13 +507,29 @@ mod owned_catalog_cpu_tests {
             assert!(Arc::ptr_eq(state.owned_catalog_cpu.as_ref().unwrap(), &cpu));
         }
         assert!(original_catalog.upgrade().is_some());
+        // Cancelling this borrow must retain both the original close verdict
+        // and the actual CPU work for the next close borrow.
+        drop(close);
+        let mut close = Box::pin(custody.close());
+        assert!(futures::poll!(close.as_mut()).is_pending());
         gate.release();
-        close.await.expect("actual original catalog CPU close");
+        let outcome = close.await;
+        if let Some(health) = &health {
+            assert!(
+                matches!(outcome, Err(ref failure) if std::ptr::addr_eq(failure.cause(), health.cause()))
+            );
+            let repeated = custody.close().await;
+            assert!(
+                matches!(repeated, Err(ref failure) if std::ptr::addr_eq(failure.cause(), health.cause()))
+            );
+        } else {
+            outcome.expect("actual original catalog CPU close");
+        }
         assert!(gate.returned.load(Ordering::Acquire));
         {
             let state = custody.state.lock().unwrap();
-            assert!(state.joined);
-            assert!(state.health.is_none());
+            assert_eq!(state.joined, health.is_none());
+            assert_eq!(state.health.is_some(), health.is_some());
             assert!(Arc::ptr_eq(state.owned_catalog_cpu.as_ref().unwrap(), &cpu));
         }
         // The unreceived Inline result remains in the same CPU source body,
