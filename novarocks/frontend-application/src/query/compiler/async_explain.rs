@@ -124,7 +124,7 @@ impl FrontendQueryCompiler {
         if logical_only {
             use novarocks_query_application::preparation::CatalogFactPort;
             let control = sql_compile_control_from_execution(execution);
-            let logical = match planning_cpu
+            let mut logical = match planning_cpu
                 .logical_catalog(
                     query,
                     SqlSessionContext {
@@ -140,7 +140,7 @@ impl FrontendQueryCompiler {
                 Ok(logical) => logical,
                 Err(error) => return Ok(Err(FrontendQueryCompilerError::from_compile(error))),
             };
-            let facts: Result<_, FrontendQueryCompilerError> = async {
+            let catalog: Result<_, FrontendQueryCompilerError> = async {
                 let bindings = Arc::new(
                     QueryTableBindingStore::try_new()
                         .map_err(FrontendQueryCompilerError::Engine)?,
@@ -163,22 +163,31 @@ impl FrontendQueryCompiler {
                     self.completion_fact_owners(),
                     scope,
                 );
-                catalog
-                    .resolve_relations(logical.needs())
-                    .await
-                    .map_err(FrontendQueryCompilerError::Engine)
+                Ok(catalog)
             }
             .await;
-            let facts = match facts {
-                Ok(facts) => facts,
+            let catalog = match catalog {
+                Ok(catalog) => catalog,
                 Err(error) => return Ok(Err(error)),
             };
+            while !logical.needs().is_empty() {
+                let facts = match catalog.resolve_relations(logical.needs()).await {
+                    Ok(facts) => facts,
+                    Err(error) => return Ok(Err(FrontendQueryCompilerError::Engine(error))),
+                };
+                logical = match planning_cpu
+                    .logical_continue(logical, facts.into_boxed_slice())
+                    .await?
+                {
+                    Ok(logical) => logical,
+                    Err(error) => return Ok(Err(FrontendQueryCompilerError::from_compile(error))),
+                };
+            }
             let functions: Arc<dyn novarocks_sql::compiler::SqlFunctionCatalog> =
                 self.functions.clone();
             return Ok(planning_cpu
                 .logical_finish(LogicalFinishInput {
                     logical,
-                    facts,
                     functions,
                     evaluator: crate::query_execution::constant_eval::constant_evaluator(),
                     policy: self.constant_policy(),

@@ -151,7 +151,6 @@ struct ReadEncodedParts {
 }
 pub(crate) struct LogicalFinishInput {
     pub(crate) logical: SqlLogicalExplainCatalog,
-    pub(crate) facts: Vec<CatalogRelationFact>,
     pub(crate) functions: Arc<dyn SqlFunctionCatalog>,
     pub(crate) evaluator: &'static dyn SqlConstantEvaluator,
     pub(crate) policy: novarocks_functions::ConstantPolicy,
@@ -176,6 +175,10 @@ enum PlanningCpuInput {
     },
     Completed(CompletedReadCpuInput),
     LogicalCatalog(Box<LogicalCatalogInput>),
+    LogicalContinue {
+        logical: Box<SqlLogicalExplainCatalog>,
+        facts: Box<[CatalogRelationFact]>,
+    },
     LogicalFinish(Box<LogicalFinishInput>),
 }
 enum PlanningCpuOutput {
@@ -279,10 +282,13 @@ impl PlanningCpuOriginal {
                     query, session, control,
                 )))
             }
+            PlanningCpuInput::LogicalContinue { logical, facts } => {
+                PlanningCpuOutput::LogicalCatalog(Box::new(logical.continue_catalog(facts)))
+            }
             PlanningCpuInput::LogicalFinish(input) => {
                 let input = *input;
                 PlanningCpuOutput::LogicalLines(input.logical.finish(
-                    &input.facts,
+                    &[],
                     input.functions.as_ref(),
                     input.evaluator,
                     input.policy,
@@ -789,6 +795,21 @@ impl FrontendPlanningCpuSource {
         )));
         let PlanningCpuOutput::LogicalCatalog(result) = self.receive().await? else {
             panic!("logical catalog returned another phase")
+        };
+        Ok(*result)
+    }
+    pub(crate) async fn logical_continue(
+        &self,
+        logical: SqlLogicalExplainCatalog,
+        facts: Box<[CatalogRelationFact]>,
+    ) -> Result<Result<SqlLogicalExplainCatalog, SqlCompileError>, StatementNativeHealthFailure>
+    {
+        self.install(PlanningCpuInput::LogicalContinue {
+            logical: Box::new(logical),
+            facts,
+        });
+        let PlanningCpuOutput::LogicalCatalog(result) = self.receive().await? else {
+            panic!("logical continuation returned another phase")
         };
         Ok(*result)
     }

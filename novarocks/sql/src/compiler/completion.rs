@@ -43,7 +43,7 @@ use novarocks_physical_plan::PlanBuilder;
 
 use super::{SqlAuthoredPhysicalPlan, SqlCompileError, SqlCompiler};
 use crate::binding::SqlTableBindingId;
-use crate::catalog::{ResolvedAnalyzerTable, TableLookupMode};
+use crate::catalog::{ResolvedAnalyzerTable, SqlViewDefinition, TableLookupMode};
 use crate::compiler::mv_rewrite::SqlMvRewriteDefinitionFacts;
 use crate::explain::ExplainLevel;
 use crate::planner::distributed::build::LoweredSqlPhysicalDraft;
@@ -60,6 +60,7 @@ pub const DEFAULT_COMPLETION_LIMITS: CompletionLimits = CompletionLimits {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompletionLimits {
+    /// Fixed compiler phases; proven new catalog-discovery rounds are separate.
     pub max_rounds: u32,
     pub max_distinct_needs: u32,
     /// Maximum bytes simultaneously held by the current Need and incoming Fact batches.
@@ -132,6 +133,7 @@ pub struct CatalogRelationNeed {
     id: CompileNeedId,
     relation: TableIdentity,
     target: CatalogLookupTarget,
+    local_view_shadow: bool,
 }
 
 impl CatalogRelationNeed {
@@ -145,7 +147,19 @@ impl CatalogRelationNeed {
             id,
             relation,
             target,
+            local_view_shadow: false,
         })
+    }
+
+    pub(super) fn with_local_view_shadow(mut self) -> Self {
+        assert!(matches!(self.target, CatalogLookupTarget::Table { .. }));
+        self.local_view_shadow = true;
+        self
+    }
+
+    /// Only an implicit root catalog lookup can select the local view snapshot.
+    pub const fn allows_local_view_shadow(&self) -> bool {
+        self.local_view_shadow
     }
 
     pub const fn id(&self) -> CompileNeedId {
@@ -924,6 +938,7 @@ impl SqlNeedBatch {
 #[derive(Debug)]
 pub enum CatalogRelationOutcome {
     Resolved(Box<ResolvedAnalyzerTable>),
+    View(std::sync::Arc<SqlViewDefinition>),
     Missing { reason: Box<str> },
 }
 
@@ -932,6 +947,7 @@ pub struct CatalogRelationFact {
     id: CompileNeedId,
     relation: TableIdentity,
     target: CatalogLookupTarget,
+    local_view_shadow: bool,
     outcome: CatalogRelationOutcome,
 }
 
@@ -954,7 +970,41 @@ impl CatalogRelationFact {
             id: need.id,
             relation: need.relation.clone(),
             target: need.target,
+            local_view_shadow: need.local_view_shadow,
             outcome: CatalogRelationOutcome::Resolved(Box::new(table)),
+        })
+    }
+
+    pub fn view(
+        need: &CatalogRelationNeed,
+        definition: std::sync::Arc<SqlViewDefinition>,
+    ) -> Result<Self, CompletionProtocolError> {
+        if !matches!(need.target, CatalogLookupTarget::Table { .. }) {
+            return Err(CompletionProtocolError::CatalogLookupTargetMismatch { id: need.id });
+        }
+        definition
+            .validate()
+            .map_err(|_| CompletionProtocolError::InvalidFact {
+                id: need.id,
+                reason: "stored view definition is structurally invalid",
+            })?;
+        let shadow = need.local_view_shadow
+            && definition.identity.catalog == novarocks_types::naming::DEFAULT_CATALOG
+            && definition.identity.namespace == need.relation.namespace
+            && definition.identity.table == need.relation.table;
+        if definition.identity != need.relation && !shadow {
+            return Err(CompletionProtocolError::CatalogRelationMismatch {
+                id: need.id,
+                expected: Box::new(need.relation.clone()),
+                actual: Box::new(definition.identity.clone()),
+            });
+        }
+        Ok(Self {
+            id: need.id,
+            relation: need.relation.clone(),
+            target: need.target,
+            local_view_shadow: need.local_view_shadow,
+            outcome: CatalogRelationOutcome::View(definition),
         })
     }
 
@@ -970,6 +1020,7 @@ impl CatalogRelationFact {
             id: need.id,
             relation: need.relation.clone(),
             target: need.target,
+            local_view_shadow: need.local_view_shadow,
             outcome: CatalogRelationOutcome::Missing { reason },
         })
     }
@@ -984,6 +1035,10 @@ impl CatalogRelationFact {
 
     pub const fn target(&self) -> CatalogLookupTarget {
         self.target
+    }
+
+    pub const fn allows_local_view_shadow(&self) -> bool {
+        self.local_view_shadow
     }
 
     pub const fn outcome(&self) -> &CatalogRelationOutcome {
@@ -1527,9 +1582,74 @@ impl SqlDisplayAnnotation {
 }
 
 struct CompletionTracking {
+    catalog_discovery_rounds: u32,
     seen_needs: BTreeSet<CompileNeedId>,
     limits: CompletionLimits,
     usage: CompletionUsage,
+}
+
+/// Schema-only producers use the same need identity and exchange-budget author.
+/// Their existing compilation-error boundary keeps protocol refusals internal;
+/// real SQL/control failures are returned without reconstruction.
+pub(super) struct CatalogExchangeBudget(CompletionTracking);
+impl CatalogExchangeBudget {
+    pub(super) fn new(limits: CompletionLimits) -> Self {
+        Self(CompletionTracking {
+            catalog_discovery_rounds: 0,
+            seen_needs: BTreeSet::new(),
+            limits,
+            usage: CompletionUsage::default(),
+        })
+    }
+    pub(super) fn reserve(
+        &mut self,
+        needs: &[CatalogRelationNeed],
+        discovery: bool,
+    ) -> Result<(), SqlCompileError> {
+        if needs.is_empty() {
+            return Ok(());
+        }
+        reserve_need_batch(
+            &mut self.0,
+            &SqlNeedBatch::CatalogRelations(needs.to_vec().into_boxed_slice()),
+            discovery,
+        )
+        .map_err(|error| SqlCompileError::Compilation(error.to_string()))
+    }
+    pub(super) fn validate_borrowed_bytes(
+        &self,
+        facts: &[CatalogRelationFact],
+    ) -> Result<(), SqlCompileError> {
+        // The legacy borrowed terminal retains the exact fact validator. It
+        // must also check the original exchange peak before cloning table facts
+        // into its immutable catalog, without making the move-only response Clone.
+        let fact_bytes = checked_sum(facts.iter().map(catalog_fact_bytes))
+            .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
+        check_fact_exchange_peak(&self.0, fact_bytes)
+            .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
+        Ok(())
+    }
+    pub(super) fn receive(
+        &mut self,
+        needs: &[CatalogRelationNeed],
+        facts: Box<[CatalogRelationFact]>,
+    ) -> Result<Box<[CatalogRelationFact]>, SqlCompileError> {
+        let needs = SqlNeedBatch::CatalogRelations(needs.to_vec().into_boxed_slice());
+        let facts = SqlFactBatch::CatalogRelations(facts);
+        validate_and_account_facts(&needs, &facts, &mut self.0).map_err(|error| match error {
+            SqlCompileProgressError::Compile(error) => error,
+            SqlCompileProgressError::Protocol(error) => {
+                SqlCompileError::Compilation(error.to_string())
+            }
+        })?;
+        let SqlFactBatch::CatalogRelations(facts) = facts else {
+            unreachable!("same catalog batch")
+        };
+        // As in SqlCompiler::finish, only the current exchange is budgeted.
+        // Retained compiler graph facts belong to the caller's WorkScope.
+        self.0.usage.exchange_bytes = 0;
+        Ok(facts)
+    }
 }
 
 /// Private, move-only compiler state machine. No variant contains a runtime
@@ -1558,6 +1678,10 @@ impl CompilerContinuation {
 
     pub(super) fn provider_read(state: super::SqlProviderReadCompletionState) -> Self {
         Self::ProviderRead(Box::new(state))
+    }
+
+    fn is_catalog_discovery(&self) -> bool {
+        matches!(self, Self::Catalog(state) if state.is_discovery_round())
     }
 
     #[cfg(test)]
@@ -1777,6 +1901,7 @@ impl SqlCompiler {
         advance_step(
             request.first_step,
             CompletionTracking {
+                catalog_discovery_rounds: 0,
                 seen_needs: BTreeSet::new(),
                 limits: request.limits,
                 usage: CompletionUsage::default(),
@@ -1852,6 +1977,10 @@ pub enum CompletionResource {
 
 #[derive(Debug)]
 pub enum CompletionProtocolError {
+    InvalidFact {
+        id: CompileNeedId,
+        reason: &'static str,
+    },
     InvalidLimit(&'static str),
     InvalidRelationIdentity(Box<TableIdentity>),
     InvalidNeed {
@@ -1980,6 +2109,9 @@ pub enum CompletionProtocolError {
 impl fmt::Display for CompletionProtocolError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidFact { id, reason } => {
+                write!(formatter, "invalid catalog fact {}: {reason}", id.get())
+            }
             Self::InvalidLimit(resource) => {
                 write!(
                     formatter,
@@ -2257,7 +2389,7 @@ fn advance_step(
                 }
                 .into());
             }
-            reserve_need_batch(&mut tracking, &batch)?;
+            reserve_need_batch(&mut tracking, &batch, continuation.is_catalog_discovery())?;
             Ok(SqlCompileProgress::Incomplete(SqlCompilation {
                 needs: batch,
                 continuation,
@@ -2334,6 +2466,19 @@ fn validate_and_account_facts(
     validate_fact_semantics(needs, facts)?;
     let request_bytes = needs.accounted_bytes()?;
     let fact_bytes = facts.accounted_bytes()?;
+    let peak = check_fact_exchange_peak(tracking, fact_bytes)?;
+    tracking.usage.exchange_bytes =
+        peak.checked_sub(request_bytes)
+            .ok_or(CompletionProtocolError::ResourceCountOverflow(
+                CompletionResource::ExchangeBytes,
+            ))?;
+    Ok(())
+}
+
+fn check_fact_exchange_peak(
+    tracking: &CompletionTracking,
+    fact_bytes: u64,
+) -> Result<u64, CompletionProtocolError> {
     let peak = tracking
         .usage
         .exchange_bytes
@@ -2346,12 +2491,7 @@ fn validate_and_account_facts(
         tracking.limits.max_exchange_bytes,
         peak,
     )?;
-    tracking.usage.exchange_bytes =
-        peak.checked_sub(request_bytes)
-            .ok_or(CompletionProtocolError::ResourceCountOverflow(
-                CompletionResource::ExchangeBytes,
-            ))?;
-    Ok(())
+    Ok(peak)
 }
 
 fn complete(
@@ -2421,6 +2561,7 @@ fn complete_source(
 fn reserve_need_batch(
     tracking: &mut CompletionTracking,
     needs: &SqlNeedBatch,
+    catalog_discovery: bool,
 ) -> Result<(), CompletionProtocolError> {
     if needs.is_empty() {
         return Err(CompletionProtocolError::EmptyNeedBatch(needs.kind()));
@@ -2450,10 +2591,19 @@ fn reserve_need_batch(
         .ok_or(CompletionProtocolError::ResourceCountOverflow(
             CompletionResource::ExchangeBytes,
         ))?;
+    let discovery_rounds = tracking
+        .catalog_discovery_rounds
+        .checked_add(u32::from(catalog_discovery))
+        .ok_or(CompletionProtocolError::ResourceCountOverflow(
+            CompletionResource::Rounds,
+        ))?;
+    let fixed_rounds = rounds.checked_sub(discovery_rounds).ok_or(
+        CompletionProtocolError::ResourceCountOverflow(CompletionResource::Rounds),
+    )?;
     check_budget(
         CompletionResource::Rounds,
         tracking.limits.max_rounds,
-        rounds,
+        fixed_rounds,
     )?;
     check_budget(
         CompletionResource::BatchItems,
@@ -2470,6 +2620,7 @@ fn reserve_need_batch(
         tracking.limits.max_exchange_bytes,
         exchange_bytes,
     )?;
+    tracking.catalog_discovery_rounds = discovery_rounds;
     tracking.usage = CompletionUsage {
         rounds,
         distinct_needs: distinct,
@@ -2487,10 +2638,15 @@ fn validate_fact_semantics(
         (SqlNeedBatch::CatalogRelations(needs), SqlFactBatch::CatalogRelations(facts)) => {
             let expected = needs
                 .iter()
-                .map(|need| (need.id, (&need.relation, need.target)))
+                .map(|need| {
+                    (
+                        need.id,
+                        (&need.relation, need.target, need.local_view_shadow),
+                    )
+                })
                 .collect::<BTreeMap<_, _>>();
             for fact in facts.iter() {
-                let (expected_relation, expected_target) = expected[&fact.id];
+                let (expected_relation, expected_target, expected_shadow) = expected[&fact.id];
                 if expected_relation != &fact.relation {
                     return Err(CompletionProtocolError::CatalogRelationMismatch {
                         id: fact.id,
@@ -2498,7 +2654,7 @@ fn validate_fact_semantics(
                         actual: Box::new(fact.relation.clone()),
                     });
                 }
-                if expected_target != fact.target {
+                if expected_target != fact.target || expected_shadow != fact.local_view_shadow {
                     return Err(CompletionProtocolError::CatalogLookupTargetMismatch {
                         id: fact.id,
                     });
@@ -2986,6 +3142,7 @@ fn catalog_fact_bytes(fact: &CatalogRelationFact) -> Result<u64, CompletionProto
     let relation = table_identity_bytes(&fact.relation)?;
     let outcome = match &fact.outcome {
         CatalogRelationOutcome::Missing { reason } => checked_size(reason.len())?,
+        CatalogRelationOutcome::View(view) => view_fact_bytes(view)?,
         CatalogRelationOutcome::Resolved(table) => {
             let catalog_columns = checked_sum([
                 checked_mul(
@@ -3014,6 +3171,127 @@ fn catalog_fact_bytes(fact: &CatalogRelationFact) -> Result<u64, CompletionProto
         Ok(relation),
         Ok(outcome),
     ])
+}
+
+fn view_fact_bytes(view: &SqlViewDefinition) -> Result<u64, CompletionProtocolError> {
+    checked_sum([
+        arc_slice_bytes::<SqlViewDefinition>(1),
+        table_identity_bytes(&view.identity),
+        arc_slice_bytes::<u8>(view.version.len()),
+        arc_slice_bytes::<u8>(view.raw_sql.len()),
+        arc_slice_bytes::<u8>(view.default_catalog.len()),
+        arc_slice_bytes::<u8>(view.default_database.len()),
+        arc_slice_bytes::<crate::catalog::SqlViewColumn>(view.columns.len()),
+        checked_sum(view.columns.iter().map(|column| {
+            checked_sum([
+                arc_slice_bytes::<u8>(column.name.len()),
+                column
+                    .source_field_name
+                    .as_ref()
+                    .map_or(Ok(0), |name| arc_slice_bytes::<u8>(name.len())),
+                function_value_type_bytes(&column.value_type),
+            ])
+        })),
+    ])
+}
+
+/// Conservative structural retention, as with table facts; this is neither
+/// allocator measurement nor a second capacity authority for type storage.
+fn arc_slice_bytes<T>(len: usize) -> Result<u64, CompletionProtocolError> {
+    std::alloc::Layout::array::<T>(len)
+        .ok()
+        .and_then(|layout| {
+            novarocks_type_contract::owned_resources::layout::arc_layout(layout).ok()
+        })
+        .ok_or(CompletionProtocolError::ResourceCountOverflow(
+            CompletionResource::ExchangeBytes,
+        ))
+        .and_then(|layout| checked_size(layout.size()))
+}
+
+fn function_value_type_bytes(
+    value: &novarocks_type_contract::FunctionValueType,
+) -> Result<u64, CompletionProtocolError> {
+    checked_sum([
+        semantic_value_bytes(value.value_type()),
+        value_layout_bytes(value.typed_binding().layout()),
+    ])
+}
+fn type_layout_bytes(
+    layout: Result<
+        std::alloc::Layout,
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    >,
+) -> Result<u64, CompletionProtocolError> {
+    layout
+        .map_err(|_| {
+            CompletionProtocolError::ResourceCountOverflow(CompletionResource::ExchangeBytes)
+        })
+        .and_then(|layout| checked_size(layout.size()))
+}
+fn semantic_value_bytes(
+    value: &novarocks_type_contract::ValueTypeRef,
+) -> Result<u64, CompletionProtocolError> {
+    use novarocks_type_contract::ValueKind;
+    let own =
+        type_layout_bytes(novarocks_type_contract::ValueTypeRef::storage_allocation_layout())?;
+    let shape = match value.kind() {
+        ValueKind::Scalar(data_type) => data_type_dynamic_bytes(data_type),
+        ValueKind::Struct(fields) => checked_sum([
+            checked_mul(
+                fields.len(),
+                std::mem::size_of::<novarocks_type_contract::ValueField>(),
+            ),
+            checked_sum(fields.iter().map(|field| {
+                checked_sum([
+                    type_layout_bytes(
+                        novarocks_type_contract::ValueField::storage_allocation_layout(),
+                    ),
+                    checked_size(field.name().len()),
+                    semantic_value_bytes(field.value_type()),
+                ])
+            })),
+        ]),
+        ValueKind::Union(fields) => checked_sum([
+            checked_mul(
+                fields.len(),
+                std::mem::size_of::<novarocks_type_contract::ValueUnionField>(),
+            ),
+            checked_sum(fields.iter().map(|field| {
+                checked_sum([
+                    type_layout_bytes(
+                        novarocks_type_contract::ValueField::storage_allocation_layout(),
+                    ),
+                    checked_size(field.field.name().len()),
+                    semantic_value_bytes(field.field.value_type()),
+                ])
+            })),
+        ]),
+        _ => checked_sum((0..value.child_count()).map(|index| {
+            semantic_value_bytes(value.child_type_at(index).expect("checked semantic child"))
+        })),
+    }?;
+    checked_sum([Ok(own), Ok(shape)])
+}
+fn value_layout_bytes(
+    value: &novarocks_type_contract::ValueLayout,
+) -> Result<u64, CompletionProtocolError> {
+    let mut bytes = checked_sum([
+        type_layout_bytes(novarocks_type_contract::ValueLayout::storage_allocation_layout()),
+        data_type_dynamic_bytes(value.data_type()),
+    ])?;
+    let mut index = 0;
+    while let Some(child) = value.materialized_child_at(index) {
+        bytes = checked_add(
+            bytes,
+            checked_sum([
+                checked_size(std::mem::size_of::<novarocks_type_contract::ValueLayout>()),
+                value_layout_bytes(child),
+            ])?,
+        )?;
+        index += 1;
+    }
+    Ok(bytes)
 }
 
 fn statistics_fact_bytes(fact: &StatisticsFact) -> Result<u64, CompletionProtocolError> {
@@ -3209,19 +3487,18 @@ fn data_type_dynamic_bytes(
 ) -> Result<u64, CompletionProtocolError> {
     use arrow::datatypes::DataType;
     match data_type {
-        DataType::Timestamp(_, timezone) => checked_size(timezone.as_deref().map_or(0, str::len)),
+        DataType::Timestamp(_, timezone) => timezone
+            .as_ref()
+            .map_or(Ok(0), |timezone| arc_slice_bytes::<u8>(timezone.len())),
         DataType::List(field)
         | DataType::LargeList(field)
         | DataType::ListView(field)
         | DataType::LargeListView(field)
         | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => field_bytes(field),
+        | DataType::Map(field, _) => field_ref_bytes(field),
         DataType::Struct(fields) => checked_sum([
-            checked_mul(
-                fields.len(),
-                std::mem::size_of::<arrow::datatypes::FieldRef>(),
-            ),
-            checked_sum(fields.iter().map(|field| field_bytes(field))),
+            arc_slice_bytes::<arrow::datatypes::FieldRef>(fields.len()),
+            checked_sum(fields.iter().map(field_ref_bytes)),
         ]),
         DataType::Union(fields, _) => checked_sum([
             std::alloc::Layout::array::<(i8, arrow::datatypes::FieldRef)>(fields.len())
@@ -3233,7 +3510,7 @@ fn data_type_dynamic_bytes(
                     CompletionResource::ExchangeBytes,
                 ))
                 .and_then(|layout| checked_size(layout.size())),
-            checked_sum(fields.iter().map(|(_, field)| field_bytes(field))),
+            checked_sum(fields.iter().map(|(_, field)| field_ref_bytes(field))),
         ]),
         DataType::Dictionary(key, value) => checked_sum([
             checked_mul(2, std::mem::size_of::<DataType>()),
@@ -3241,13 +3518,13 @@ fn data_type_dynamic_bytes(
             data_type_dynamic_bytes(value),
         ]),
         DataType::RunEndEncoded(run_ends, values) => {
-            checked_sum([field_bytes(run_ends), field_bytes(values)])
+            checked_sum([field_ref_bytes(run_ends), field_ref_bytes(values)])
         }
         _ => Ok(0),
     }
 }
 
-fn field_bytes(field: &arrow::datatypes::Field) -> Result<u64, CompletionProtocolError> {
+fn field_ref_bytes(field: &arrow::datatypes::FieldRef) -> Result<u64, CompletionProtocolError> {
     let metadata =
         checked_sum([
             novarocks_type_contract::owned_resources::arrow_metadata::retained_backing_upper_bound(
@@ -3262,7 +3539,7 @@ fn field_bytes(field: &arrow::datatypes::Field) -> Result<u64, CompletionProtoco
             })),
         ])?;
     checked_sum([
-        Ok(std::mem::size_of::<arrow::datatypes::Field>() as u64),
+        arc_slice_bytes::<arrow::datatypes::Field>(1),
         checked_size(field.name().len()),
         data_type_dynamic_bytes(field.data_type()),
         Ok(metadata),
@@ -3873,16 +4150,23 @@ mod tests {
             key.push('k');
             let mut value = String::with_capacity(value_capacity);
             value.push('v');
-            Field::new("x", DataType::Int32, false)
-                .with_metadata(std::collections::HashMap::from([(key, value)]))
+            std::sync::Arc::new(
+                Field::new("x", DataType::Int32, false)
+                    .with_metadata(std::collections::HashMap::from([(key, value)])),
+            )
         };
         assert_eq!(
-            field_bytes(&field(1, 1)).unwrap(),
-            field_bytes(&field(64, 96)).unwrap()
+            field_ref_bytes(&field(1, 1)).unwrap(),
+            field_ref_bytes(&field(64, 96)).unwrap()
         );
         assert_eq!(
-            field_bytes(&Field::new("x", DataType::Int32, false)).unwrap(),
-            (std::mem::size_of::<Field>() + 1) as u64
+            field_ref_bytes(&std::sync::Arc::new(Field::new(
+                "x",
+                DataType::Int32,
+                false
+            )))
+            .unwrap(),
+            (2 * std::mem::size_of::<usize>() + std::mem::size_of::<Field>() + 1) as u64
         );
     }
 
@@ -3899,7 +4183,7 @@ mod tests {
         .collect();
         assert_eq!(
             data_type_dynamic_bytes(&DataType::Union(fields, UnionMode::Sparse)).unwrap(),
-            (32 + std::mem::size_of::<Field>() + 1) as u64
+            (32 + 2 * std::mem::size_of::<usize>() + std::mem::size_of::<Field>() + 1) as u64
         );
     }
 

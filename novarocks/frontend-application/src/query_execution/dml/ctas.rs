@@ -1181,7 +1181,7 @@ async fn plan_query_for_ctas_source_async(
     .map_err(internal_failure)?;
     let compile_control =
         crate::query_execution::planning::sql_compile_control_from_execution(execution);
-    let preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new(
+    let mut preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlSessionContext {
             sql_semantics: execution.sql_semantics().clone(),
@@ -1193,13 +1193,18 @@ async fn plan_query_for_ctas_source_async(
         novarocks_sql::compiler::RootDistributionRequirement::Any,
     )
     .map_err(CtasFailure::from_compile)?;
-    let catalog_facts = provider_source
-        .resolve_catalog_relations(preparation.needs())
-        .await
-        .map_err(internal_failure)?;
+    while !preparation.needs().is_empty() {
+        let facts = provider_source
+            .resolve_catalog_relations(preparation.needs())
+            .await
+            .map_err(internal_failure)?;
+        preparation = preparation
+            .continue_catalog(facts.into_boxed_slice())
+            .map_err(CtasFailure::from_compile)?;
+    }
     let analyzed = preparation
         .analyze(
-            &catalog_facts,
+            &[],
             state.function_catalog().as_ref(),
             crate::query_execution::constant_eval::constant_evaluator(),
             state.constant_policy(),

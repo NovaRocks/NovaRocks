@@ -1144,7 +1144,7 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
         }
         None => novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(prepared)),
     };
-    let preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new(
+    let mut preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new(
         statement,
         novarocks_sql::compiler::SqlSessionContext {
             sql_semantics: execution.sql_semantics().clone(),
@@ -1156,12 +1156,17 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
         root_distribution,
     )
     .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
-    let catalog_facts = provider_source
-        .resolve_catalog_relations(preparation.needs())
-        .await?;
+    while !preparation.needs().is_empty() {
+        let facts = provider_source
+            .resolve_catalog_relations(preparation.needs())
+            .await?;
+        preparation = preparation
+            .continue_catalog(facts.into_boxed_slice())
+            .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
+    }
     let analyzed = preparation
         .analyze(
-            &catalog_facts,
+            &[],
             DmlQueryExecutionKernel::function_catalog(state),
             crate::query_execution::constant_eval::constant_evaluator(),
             DmlQueryExecutionKernel::constant_policy(state),

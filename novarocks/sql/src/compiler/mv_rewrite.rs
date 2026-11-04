@@ -3396,6 +3396,24 @@ struct DefinitionResolutionCatalog<'a> {
 }
 
 impl PlannerTableProvider for DefinitionResolutionCatalog<'_> {
+    fn resolve_view_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        view: &str,
+    ) -> Result<Option<&crate::catalog::SqlViewDefinition>, crate::analyze_error::AnalyzeError>
+    {
+        self.inner.resolve_view_for_analysis(
+            Some(catalog.unwrap_or(self.default_catalog)),
+            database,
+            view,
+        )
+    }
+
+    fn view_definition_target(&self) -> Option<&novarocks_types::naming::TableIdentity> {
+        self.inner.view_definition_target()
+    }
+
     fn resolve_table_for_analysis(
         &self,
         catalog: Option<&str>,

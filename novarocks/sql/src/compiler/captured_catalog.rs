@@ -45,9 +45,38 @@ impl SqlCapturedCatalogPreparation {
             current_database,
             crate::catalog::TableLookupMode::SchemaOnly,
             0,
-        )?;
+        )?
+        .with_exchange_budget(super::DEFAULT_COMPLETION_LIMITS)?;
         control.check()?;
         Ok(Self { catalog, control })
+    }
+
+    pub fn try_new_definition(
+        query: novarocks_parser::ast::Query,
+        catalog: &str,
+        database: &str,
+        target: Option<novarocks_types::naming::TableIdentity>,
+        control: SqlCompileControl,
+    ) -> Result<Self, SqlCompileError> {
+        control.check()?;
+        let catalog = CatalogCompletionState::try_new(
+            query,
+            Some(catalog),
+            database,
+            crate::catalog::TableLookupMode::SchemaOnly,
+            0,
+        )?
+        .with_definition_context(target, &control)?
+        .with_exchange_budget(super::DEFAULT_COMPLETION_LIMITS)?;
+        Ok(Self { catalog, control })
+    }
+
+    pub fn continue_catalog(
+        mut self,
+        facts: Box<[CatalogRelationFact]>,
+    ) -> Result<Self, SqlCompileError> {
+        self.catalog.accept_facts(facts, &self.control)?;
+        Ok(self)
     }
 
     pub fn needs(&self) -> &[CatalogRelationNeed] {

@@ -331,7 +331,7 @@ pub(crate) async fn capture_catalog(
     input: MvCatalogCaptureInput,
     io: &MvRefreshPreparationIo,
 ) -> Result<MvCatalogCaptureOutput, MvApplicationError> {
-    let preparation = match &input.query {
+    let mut preparation = match &input.query {
         MvCatalogCaptureQuery::Query(query) => SqlCapturedCatalogPreparation::try_new(
             query.as_ref().clone(),
             input.current_catalog.as_deref(),
@@ -354,29 +354,34 @@ pub(crate) async fn capture_catalog(
         input.overlays,
         input.ports.catalog_application(),
     );
-    let mut facts = Vec::with_capacity(preparation.needs().len());
-    for need in preparation.needs() {
-        let fact = match materializer
-            .begin_original_catalog_lookup(need, input.ports.connector_control())?
-        {
-            OriginalCatalogLookup::Fact(fact) => fact,
-            OriginalCatalogLookup::Metadata(lookup) => {
-                let observed = io
-                    .metadata(
-                        &lookup.planning_pin,
-                        input.context.clone(),
-                        &lookup.namespace,
-                        &lookup.physical_table,
-                        lookup.resolution,
-                    )
-                    .await;
-                materializer.finish_original_catalog_lookup(lookup, observed)?
-            }
-        };
-        facts.push(fact);
+    while !preparation.needs().is_empty() {
+        let mut facts = Vec::with_capacity(preparation.needs().len());
+        for need in preparation.needs() {
+            let fact = match materializer
+                .begin_original_catalog_lookup(need, input.ports.connector_control())?
+            {
+                OriginalCatalogLookup::Fact(fact) => fact,
+                OriginalCatalogLookup::Metadata(lookup) => {
+                    let observed = io
+                        .metadata(
+                            &lookup.planning_pin,
+                            input.context.clone(),
+                            &lookup.namespace,
+                            &lookup.physical_table,
+                            lookup.resolution,
+                        )
+                        .await;
+                    materializer.finish_original_catalog_lookup(lookup, observed)?
+                }
+            };
+            facts.push(fact);
+        }
+        preparation = preparation
+            .continue_catalog(facts.into_boxed_slice())
+            .map_err(MvApplicationError::from_compile)?;
     }
     let catalog = preparation
-        .capture(&facts)
+        .capture(&[])
         .map_err(MvApplicationError::from_compile)?;
     Ok(MvCatalogCaptureOutput {
         query: input.query,
