@@ -970,6 +970,7 @@ pub struct DmlCtasSourcePlan {
     root_allow_throw_exception: bool,
     private_output_domain: bool,
     output_domains: Box<[novarocks_physical_plan::ResultValueDomain]>,
+    output_names: Box<[String]>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     optimized: crate::optimizer::OptimizedOperatorNode,
     function_catalog: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
@@ -1001,9 +1002,10 @@ impl DmlCtasSourcePlan {
             .output_columns
             .iter()
             .zip(self.output_domains.iter().copied())
-            .map(|(column, domain)| DmlSourceColumn {
+            .zip(self.output_names.iter())
+            .map(|((column, domain), name)| DmlSourceColumn {
                 domain,
-                name: column.name.clone(),
+                name: name.clone(),
                 value_type: column.value_type.clone(),
             })
             .collect()
@@ -1016,7 +1018,9 @@ impl DmlCtasSourcePlan {
 
         let material = format!(
             "{:#?}\n{:#?}\n{}",
-            self.optimized, self.output_domains, self.private_output_domain
+            self.optimized,
+            (&self.output_domains, &self.output_names),
+            self.private_output_domain
         );
         let root_allow = [u8::from(self.root_allow_throw_exception)];
         let mut digest = Sha256::new();
@@ -1038,10 +1042,16 @@ impl DmlCtasSourcePlan {
 pub fn compile_ctas_source(
     request: crate::compiler::SqlOptimizeRequest<'_>,
 ) -> Result<DmlCtasSourcePlan, crate::compiler::SqlCompileError> {
+    let output_names = request.definition_column_names()?.into_boxed_slice();
     let constant_policy = request.constant_policy();
     let compiled = crate::compiler::SqlCompiler::optimize(request)?
         .into_optimized_output()
         .map_err(|_| "CTAS source did not produce optimized SQL facts".to_string())?;
+    if output_names.len() != compiled.optimized_tree.output_columns.len() {
+        return Err(crate::compiler::SqlCompileError::Compilation(
+            "CTAS output definition width changed during optimization".into(),
+        ));
+    }
     let output_domains = compiled
         .root_semantics
         .domains(&compiled.optimized_tree.output_columns)?
@@ -1052,6 +1062,7 @@ pub fn compile_ctas_source(
         root_allow_throw_exception: compiled.root_allow_throw_exception,
         private_output_domain,
         output_domains,
+        output_names,
         query_statistics: compiled.statistics.snapshot,
         optimized: compiled.optimized_tree,
         function_catalog: compiled.function_catalog,
@@ -4497,17 +4508,17 @@ mod tests {
             ..crate::constant::test_constant_policy()
         };
         for (session_mode, sql, expected) in [
-            ("32", "SELECT 1", false),
-            ("ALLOW_THROW_EXCEPTION", "SELECT 1", true),
-            ("ERROR_IF_OVERFLOW", "SELECT 1", false),
+            ("32", "SELECT 1 AS x", false),
+            ("ALLOW_THROW_EXCEPTION", "SELECT 1 AS x", true),
+            ("ERROR_IF_OVERFLOW", "SELECT 1 AS x", false),
             (
                 "32",
-                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1",
+                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1 AS x",
                 true,
             ),
             (
                 "ALLOW_THROW_EXCEPTION",
-                "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
+                "SELECT /*+ SET_VAR(sql_mode=32) */ 1 AS x",
                 false,
             ),
             (
@@ -4565,6 +4576,59 @@ mod tests {
     }
 
     #[test]
+    fn ctas_definition_uses_original_names_and_ordinal_error_priority() {
+        use crate::compiler::*;
+        fn compile(sql: &str) -> Result<super::DmlCtasSourcePlan, SqlCompileError> {
+            let memory = crate::planning::catalog::PlannerMemoryCatalog::default();
+            let catalog = SqlPlannerTableSnapshot::new(&memory);
+            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                SqlStatementInput::sql(sql),
+                SqlCompileIntent::Query,
+                SqlSessionContext {
+                    sql_semantics: Default::default(),
+                    current_catalog: None,
+                    current_database: "default".into(),
+                    optimizer_settings: Default::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                &catalog,
+                builtin_sql_function_catalog(),
+                noop_constant_evaluator(),
+                None,
+                crate::constant::test_constant_policy(),
+                SqlCompileControl::unbounded(),
+            ))?
+            .into_pending()?;
+            super::compile_ctas_source(SqlOptimizeRequest::new(
+                analyzed,
+                &DmlStatisticsSnapshot::empty(),
+                SqlCompileControl::unbounded(),
+            ))
+        }
+        use crate::analyze_error::AnalyzeErrorKind as K;
+        for (sql, expected) in [
+            ("SELECT 1", K::MissingColumnName),
+            ("SELECT 1 AS a, 2 AS A, 3", K::DuplicateColumnName),
+            ("SELECT 1, 2 AS a, 3 AS A", K::MissingColumnName),
+            ("VALUES (1)", K::MissingColumnName),
+        ] {
+            let SqlCompileError::Analyze(error) = compile(sql).unwrap_err() else {
+                panic!("definition name failure lost its analyze category: {sql}");
+            };
+            assert_eq!(error.kind(), expected, "{sql}");
+            assert!(error.span().is_some(), "real query span: {sql}");
+        }
+        let source = compile("SELECT ID FROM (SELECT 1 AS id) t").unwrap();
+        assert_eq!(source.output_columns()[0].name, "ID");
+        assert_eq!(
+            source.output_columns()[0].value_type.data_type(),
+            &arrow::datatypes::DataType::Int64
+        );
+        let lower = compile("SELECT id FROM (SELECT 1 AS id) t").unwrap();
+        assert_ne!(source.capture_fingerprint(), lower.capture_fingerprint());
+    }
+
+    #[test]
     fn ctas_capture_fingerprint_binds_root_allow_for_identical_actual_optimized_sources() {
         use crate::compiler::{
             SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
@@ -4576,7 +4640,7 @@ mod tests {
         let statistics = DmlStatisticsSnapshot::empty();
         let sources = ["32", "ALLOW_THROW_EXCEPTION"].map(|session_mode| {
             let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-                SqlStatementInput::sql("SELECT 1"),
+                SqlStatementInput::sql("SELECT 1 AS x"),
                 SqlCompileIntent::Query,
                 SqlSessionContext {
                     sql_semantics: crate::sql_mode::SqlSemanticSettings::default()

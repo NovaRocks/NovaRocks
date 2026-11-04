@@ -413,7 +413,36 @@ mod refresh_property_facade_tests {
         let query = parse_query(sql);
         let (resolved, _, _) =
             crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").expect("analyze query");
-        SqlResolvedMvRefreshInput::from_analysis(resolved)
+        SqlResolvedMvRefreshInput::from_analysis(resolved).expect("named MV output declaration")
+    }
+
+    #[test]
+    fn mv_definition_names_are_validated_before_persistence_and_keep_source_case() {
+        use crate::analyze_error::AnalyzeErrorKind as K;
+        for (sql, expected) in [
+            ("SELECT 1 FROM fact_east", K::MissingColumnName),
+            (
+                "SELECT id AS a, amount AS A, 3 FROM fact_east",
+                K::DuplicateColumnName,
+            ),
+            (
+                "SELECT 1, id AS a, amount AS A FROM fact_east",
+                K::MissingColumnName,
+            ),
+        ] {
+            let query = parse_query(sql);
+            let (resolved, _, _) =
+                crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").unwrap();
+            let error = SqlResolvedMvRefreshInput::from_analysis(resolved).unwrap_err();
+            assert_eq!(error.kind(), expected, "{sql}");
+            assert!(
+                error.span().is_none(),
+                "source-less capture must not invent a location"
+            );
+        }
+        let input = analyzed_refresh_input("SELECT ID, amount AS Total FROM fact_east");
+        assert_eq!(input.analysis_facts().output_columns[0].name, "ID");
+        assert_eq!(input.analysis_facts().output_columns[1].name, "Total");
     }
 
     #[test]
@@ -1179,17 +1208,39 @@ mod refresh_property_facade_tests {
 /// second raw-query representation.
 pub trait SqlResolvedMvRefreshInputSource: resolved_mv_refresh_input_private::Sealed {
     #[doc(hidden)]
-    fn into_sql_resolved_mv_refresh_input(self) -> SqlResolvedMvRefreshInput;
+    fn into_sql_resolved_mv_refresh_input(
+        self,
+    ) -> Result<SqlResolvedMvRefreshInput, crate::analyze_error::AnalyzeError>;
 }
 
 /// Opaque analyzed-MV input. It deliberately exposes neither analyzer nodes
 /// nor mutation access; SQL planning facades consume it directly.
 #[derive(Clone, Debug)]
-pub struct SqlResolvedMvRefreshInput(crate::analysis::ResolvedQuery);
+pub struct SqlResolvedMvRefreshInput(crate::analysis::ResolvedQuery, Box<[String]>);
 
 impl SqlResolvedMvRefreshInput {
-    pub fn from_analysis<T: SqlResolvedMvRefreshInputSource>(source: T) -> Self {
+    pub fn from_analysis<T: SqlResolvedMvRefreshInputSource>(
+        source: T,
+    ) -> Result<Self, crate::analyze_error::AnalyzeError> {
         source.into_sql_resolved_mv_refresh_input()
+    }
+
+    pub(crate) fn from_validated_analysis(
+        resolved: crate::analysis::ResolvedQuery,
+        names: Vec<String>,
+    ) -> Self {
+        Self(resolved, names.into_boxed_slice())
+    }
+
+    fn checked(
+        resolved: crate::analysis::ResolvedQuery,
+    ) -> Result<Self, crate::analyze_error::AnalyzeError> {
+        let names = crate::analysis::schema::validate_definition_column_names(
+            &resolved.output_columns,
+            &[],
+            None,
+        )?;
+        Ok(Self::from_validated_analysis(resolved, names))
     }
 
     pub fn refresh_property(
@@ -1223,7 +1274,7 @@ impl SqlResolvedMvRefreshInput {
     /// target schema. Analyzer columns remain private to the SQL crate.
     pub fn analysis_facts(&self) -> SqlMvAnalysisFacts {
         SqlMvAnalysisFacts {
-            output_columns: output_column_facts(&self.0),
+            output_columns: output_column_facts(&self.0, &self.1),
         }
     }
 
@@ -1235,7 +1286,7 @@ impl SqlResolvedMvRefreshInput {
     /// provider object, schema, and field identities remain application-owned
     /// observations that are joined to these occurrence-qualified SQL facts.
     pub fn create_persistence_facts(&self) -> Result<SqlMvCreatePersistenceFacts, String> {
-        super::mv_persistence::project_create_persistence_facts(&self.0)
+        super::mv_persistence::project_create_persistence_facts(&self.0, &self.1)
     }
 
     /// Derive one immutable aggregate-layout input from the admitted query and
@@ -1275,7 +1326,7 @@ impl SqlResolvedMvRefreshInput {
             .collect::<Result<Vec<_>, String>>()?;
         Ok(SqlMvAggregateLayoutFacts {
             calls: aggregate_call_facts,
-            output_columns: output_column_facts(resolved),
+            output_columns: output_column_facts(resolved, &self.1),
             aggregate_input_types,
             group_key_source_indexes,
         })
@@ -1363,16 +1414,20 @@ impl SqlResolvedMvRefreshInput {
 impl resolved_mv_refresh_input_private::Sealed for crate::analysis::ResolvedQuery {}
 
 impl SqlResolvedMvRefreshInputSource for crate::analysis::ResolvedQuery {
-    fn into_sql_resolved_mv_refresh_input(self) -> SqlResolvedMvRefreshInput {
-        SqlResolvedMvRefreshInput(self)
+    fn into_sql_resolved_mv_refresh_input(
+        self,
+    ) -> Result<SqlResolvedMvRefreshInput, crate::analyze_error::AnalyzeError> {
+        SqlResolvedMvRefreshInput::checked(self)
     }
 }
 
 impl resolved_mv_refresh_input_private::Sealed for &crate::analysis::ResolvedQuery {}
 
 impl SqlResolvedMvRefreshInputSource for &crate::analysis::ResolvedQuery {
-    fn into_sql_resolved_mv_refresh_input(self) -> SqlResolvedMvRefreshInput {
-        SqlResolvedMvRefreshInput(self.clone())
+    fn into_sql_resolved_mv_refresh_input(
+        self,
+    ) -> Result<SqlResolvedMvRefreshInput, crate::analyze_error::AnalyzeError> {
+        SqlResolvedMvRefreshInput::checked(self.clone())
     }
 }
 
@@ -2041,29 +2096,20 @@ fn group_key_source_indexes(calls: &SqlMvAggregateCalls) -> Result<Vec<usize>, S
         .collect()
 }
 
-fn output_column_facts(resolved: &crate::analysis::ResolvedQuery) -> Vec<SqlMvOutputColumnFacts> {
-    if resolved.output_columns.is_empty() {
-        match &resolved.body {
-            crate::analysis::QueryBody::Select(select) => select
-                .projection
-                .iter()
-                .map(|item| SqlMvOutputColumnFacts {
-                    name: item.output_name.clone(),
-                    value_type: item.expr.value_type.clone(),
-                })
-                .collect(),
-            _ => Vec::new(),
-        }
-    } else {
-        resolved
-            .output_columns
-            .iter()
-            .map(|column| SqlMvOutputColumnFacts {
-                name: column.name.clone(),
-                value_type: column.value_type.clone(),
-            })
-            .collect()
-    }
+fn output_column_facts(
+    resolved: &crate::analysis::ResolvedQuery,
+    names: &[String],
+) -> Vec<SqlMvOutputColumnFacts> {
+    resolved
+        .output_columns
+        .iter()
+        .filter(|column| !column.is_internal)
+        .zip(names)
+        .map(|(column, name)| SqlMvOutputColumnFacts {
+            name: name.clone(),
+            value_type: column.value_type.clone(),
+        })
+        .collect()
 }
 
 fn first_union_branch_query(query: &Query) -> Result<Query, String> {
@@ -6343,7 +6389,11 @@ fn group_key_output_names(
             }
         }
         if matched {
-            names.push(item.output_name.clone());
+            names.push(item.field_name.clone().ok_or_else(|| {
+                SqlCompileError::Compilation(
+                    "validated MV group-key output has no SQL field name".into(),
+                )
+            })?);
         }
         work.step()?;
     }

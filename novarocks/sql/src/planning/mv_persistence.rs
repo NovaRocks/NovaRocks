@@ -270,6 +270,7 @@ struct ProjectionBuilder {
 
 pub(super) fn project_create_persistence_facts(
     query: &ResolvedQuery,
+    names: &[String],
 ) -> Result<SqlMvCreatePersistenceFacts, String> {
     let mut output_leaves = Vec::new();
     let is_root_union = collect_union_leaves(query, &mut output_leaves)?;
@@ -304,6 +305,9 @@ pub(super) fn project_create_persistence_facts(
     collect_query_semantics(query, &branch_occurrences, &mut builder)?;
 
     let output_columns = output_columns(query);
+    if names.len() != output_columns.len() {
+        return Err("MV persistence output declaration width differs from analyzed output".into());
+    }
     if leaf_expressions
         .iter()
         .any(|expressions| expressions.len() != output_columns.len())
@@ -313,14 +317,14 @@ pub(super) fn project_create_persistence_facts(
     let outputs = output_columns
         .into_iter()
         .enumerate()
-        .map(|(output_index, (name, data_type, nullable))| {
+        .map(|(output_index, (_label, data_type, nullable))| {
             let expressions = leaf_expressions
                 .iter()
                 .map(|branch| branch[output_index].clone())
                 .collect::<Vec<_>>();
             Ok(SqlMvPersistenceOutputFacts {
                 output_ordinal: u32_from_usize("MV output ordinal", output_index)?,
-                name,
+                name: names[output_index].clone(),
                 data_type,
                 nullable,
                 expression: merge_branch_expression_facts(expressions),
@@ -1189,7 +1193,7 @@ mod tests {
         };
         let (resolved, _, _) =
             crate::analyzer::analyze(query, &TestCatalog, "sales").expect("analyze query");
-        SqlResolvedMvRefreshInput::from_analysis(resolved)
+        SqlResolvedMvRefreshInput::from_analysis(resolved).expect("named MV output declaration")
     }
 
     fn facts(sql: &str) -> SqlMvCreatePersistenceFacts {

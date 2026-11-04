@@ -196,37 +196,51 @@ pub struct AnalyzeError {
 
 impl AnalyzeError {
     fn at(kind: AnalyzeErrorKind, message: impl Into<String>, span: Span) -> Self {
+        Self::at_optional(kind, message, Some(span))
+    }
+
+    fn at_optional(kind: AnalyzeErrorKind, message: impl Into<String>, span: Option<Span>) -> Self {
         Self {
             kind,
             message: message.into(),
-            span: Some(span),
+            span,
             control: None,
             source: None,
         }
     }
 
-    pub fn missing_column_name(message: impl Into<String>, span: Span) -> Self {
-        Self::at(AnalyzeErrorKind::MissingColumnName, message, span)
+    pub fn missing_column_name(message: impl Into<String>, span: impl Into<Option<Span>>) -> Self {
+        Self::at_optional(AnalyzeErrorKind::MissingColumnName, message, span.into())
     }
 
-    pub fn duplicate_column_name(message: impl Into<String>, span: Span) -> Self {
-        Self::at(AnalyzeErrorKind::DuplicateColumnName, message, span)
+    pub fn duplicate_column_name(
+        message: impl Into<String>,
+        span: impl Into<Option<Span>>,
+    ) -> Self {
+        Self::at_optional(AnalyzeErrorKind::DuplicateColumnName, message, span.into())
     }
 
-    pub fn mismatched_column_aliases(message: impl Into<String>, span: Span) -> Self {
-        Self::at(AnalyzeErrorKind::MismatchedColumnAliases, message, span)
+    pub fn mismatched_column_aliases(
+        message: impl Into<String>,
+        span: impl Into<Option<Span>>,
+    ) -> Self {
+        Self::at_optional(
+            AnalyzeErrorKind::MismatchedColumnAliases,
+            message,
+            span.into(),
+        )
     }
 
-    pub fn invalid_view(message: impl Into<String>, span: Span) -> Self {
-        Self::at(AnalyzeErrorKind::InvalidView, message, span)
+    pub fn invalid_view(message: impl Into<String>, span: impl Into<Option<Span>>) -> Self {
+        Self::at_optional(AnalyzeErrorKind::InvalidView, message, span.into())
     }
 
-    pub fn view_is_stale(message: impl Into<String>, span: Span) -> Self {
-        Self::at(AnalyzeErrorKind::ViewIsStale, message, span)
+    pub fn view_is_stale(message: impl Into<String>, span: impl Into<Option<Span>>) -> Self {
+        Self::at_optional(AnalyzeErrorKind::ViewIsStale, message, span.into())
     }
 
-    pub fn view_is_recursive(message: impl Into<String>, span: Span) -> Self {
-        Self::at(AnalyzeErrorKind::ViewIsRecursive, message, span)
+    pub fn view_is_recursive(message: impl Into<String>, span: impl Into<Option<Span>>) -> Self {
+        Self::at_optional(AnalyzeErrorKind::ViewIsRecursive, message, span.into())
     }
 
     pub fn unknown_table(message: impl Into<String>, span: Span) -> Self {

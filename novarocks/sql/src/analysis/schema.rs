@@ -104,28 +104,41 @@ pub(crate) fn apply_column_aliases(
 pub(crate) fn validate_definition_column_names(
     fields: &[AnalyzedOutputField],
     aliases: &[novarocks_parser::ast::Ident],
-    span: novarocks_parser::Span,
+    span: impl Into<Option<novarocks_parser::Span>>,
+) -> Result<Vec<String>, crate::analyze_error::AnalyzeError> {
+    validate_definition_field_names(
+        fields
+            .iter()
+            .filter(|field| !field.is_internal)
+            .map(|field| field.field_name.as_deref()),
+        aliases,
+        span.into(),
+    )
+}
+
+/// A frozen root can use the same name check without rebuilding analysis fields.
+pub(crate) fn validate_definition_field_names<'a>(
+    fields: impl IntoIterator<Item = Option<&'a str>>,
+    aliases: &[novarocks_parser::ast::Ident],
+    span: Option<novarocks_parser::Span>,
 ) -> Result<Vec<String>, crate::analyze_error::AnalyzeError> {
     use crate::analyze_error::AnalyzeError;
-    let visible = fields
-        .iter()
-        .filter(|field| !field.is_internal)
-        .collect::<Vec<_>>();
-    if !aliases.is_empty() && aliases.len() != visible.len() {
+    let fields = fields.into_iter().collect::<Vec<_>>();
+    if !aliases.is_empty() && aliases.len() != fields.len() {
         return Err(AnalyzeError::mismatched_column_aliases(
             format!(
                 "Column alias list has {} entries but relation has {} columns available",
                 aliases.len(),
-                visible.len()
+                fields.len()
             ),
             span,
         ));
     }
     let mut seen = std::collections::HashSet::new();
-    let mut names = Vec::with_capacity(visible.len());
-    for (ordinal, field) in visible.into_iter().enumerate() {
+    let mut names = Vec::with_capacity(fields.len());
+    for (ordinal, field) in fields.into_iter().enumerate() {
         let name = if aliases.is_empty() {
-            field.field_name.as_deref()
+            field
         } else {
             Some(aliases[ordinal].value.as_str())
         };

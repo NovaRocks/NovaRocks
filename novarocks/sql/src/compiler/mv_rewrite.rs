@@ -3015,6 +3015,7 @@ impl MvRewriteDefinitionIndex {
 struct AnalyzedMvRewriteCandidate {
     mv_name: String,
     mv: SpjgDescriptor,
+    output_targets: Box<[usize]>,
     mv_scalars: crate::optimizer::scalar::ScalarArena,
     target_database: String,
     target_table: crate::planner::table::TableDef,
@@ -3208,6 +3209,7 @@ pub(crate) fn attach_candidate_statistics(
                 candidates.push(MvRewriteCandidate {
                     mv_name: candidate.mv_name,
                     mv: candidate.mv,
+                    output_targets: candidate.output_targets,
                     mv_scalars: candidate.mv_scalars,
                     target_database: candidate.target_database,
                     target_table: candidate.target_table,
@@ -3258,7 +3260,20 @@ fn build_candidate(
     )
     .map_err(SqlCompileError::from)?;
     let mut returned = returned;
+    let output_names = crate::analysis::schema::validate_definition_column_names(
+        &resolved.output_columns,
+        &[],
+        definition.select_query.span,
+    )?;
+    let analyzed_outputs = resolved.output_columns.clone();
     let mv_logical = crate::planner::plan_query(resolved, ctes, &mut returned, control)?;
+    let root_columns = crate::planner::plan_output_columns(&mv_logical)?;
+    super::root_output::RootOutputSemantics::bind_analyzed(
+        &analyzed_outputs,
+        &root_columns,
+        &returned,
+    )
+    .map_err(SqlCompileError::Compilation)?;
     validate_definition_sources(&mv_logical, &definition.sources)
         .map_err(SqlCompileError::Compilation)?;
     let mut mv_scalars =
@@ -3291,24 +3306,53 @@ fn build_candidate(
         .resolve_table_for_analysis(Some(&target.catalog), &target.namespace, &target.table)
         .map_err(SqlCompileError::Compilation)?
         .planner;
-    let mut names = mv
-        .outputs
+    let visible_roots = root_columns
         .iter()
-        .map(|output| output.name.as_str())
+        .filter(|column| !column.is_internal)
         .collect::<Vec<_>>();
-    names.sort_unstable();
-    if names.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Ok(None);
+    if mv.outputs.len() != output_names.len()
+        || visible_roots.len() != output_names.len()
+        || mv
+            .outputs
+            .iter()
+            .zip(&visible_roots)
+            .any(|(output, root)| output.column_id != root.column_id)
+    {
+        return Err(SqlCompileError::Compilation(
+            "MV descriptor changed the analyzed output occurrence binding".into(),
+        ));
     }
+    let Some(output_targets) = bind_output_targets(&output_names, &target_table) else {
+        return Ok(None);
+    };
     Ok(Some(AnalyzedMvRewriteCandidate {
         mv_name: target.table.clone(),
         mv,
+        output_targets,
         mv_scalars,
         target_database: target.namespace.clone(),
         target_table,
         factory_after_analysis: returned,
         selection: definition.selection.clone(),
     }))
+}
+
+fn bind_output_targets(
+    names: &[String],
+    target: &crate::planner::table::TableDef,
+) -> Option<Box<[usize]>> {
+    names
+        .iter()
+        .map(|name| {
+            let mut matching = target
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| column.name.eq_ignore_ascii_case(name));
+            let (ordinal, _) = matching.next()?;
+            matching.next().is_none().then_some(ordinal)
+        })
+        .collect()
 }
 
 fn validate_definition_sources(
@@ -3881,6 +3925,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn candidate_names_bind_once_to_unique_targets_independent_of_storage_order() {
+        let mut target = CandidateCatalog::table("mv_target", 2);
+        let mut hidden = target.columns[0].clone();
+        hidden.name = "__hidden_apply_key".into();
+        target.columns.insert(0, hidden);
+        assert_eq!(
+            bind_output_targets(&["K".into()], &target)
+                .unwrap()
+                .as_ref(),
+            &[1]
+        );
+        assert!(bind_output_targets(&["missing".into()], &target).is_none());
+        let mut ambiguous = target.columns[1].clone();
+        ambiguous.name = "K".into();
+        target.columns.push(ambiguous);
+        assert!(bind_output_targets(&["k".into()], &target).is_none());
+
+        let catalog = CandidateCatalog::new();
+        let mut definition = candidate_index().definitions[0].clone();
+        definition.select_query = test_query("SELECT K FROM iceberg.db.base");
+        let candidate = build_candidate(
+            &catalog,
+            "caller_db",
+            &definition,
+            &ColumnRefFactory::new(),
+            crate::functions::builtin_sql_function_catalog(),
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("original SQL name K binds the stored k column");
+        assert_eq!(candidate.output_targets.as_ref(), &[0]);
     }
 
     #[test]

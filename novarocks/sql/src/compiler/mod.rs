@@ -1242,6 +1242,10 @@ impl<'a> SqlOptimizeRequest<'a> {
         &self.control
     }
 
+    pub(crate) fn definition_column_names(&self) -> Result<Vec<String>, AnalyzeError> {
+        self.analyzed.root_semantics.definition_column_names()
+    }
+
     pub fn new(
         analyzed: SqlAnalyzedQuery,
         statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
@@ -1362,9 +1366,14 @@ pub fn analyze_mv_refresh_input(
         &control,
     )
     .map_err(SqlCompileError::from)?;
+    let names = crate::analysis::schema::validate_definition_column_names(
+        &resolved.output_columns,
+        &[],
+        query.span,
+    )?;
     crate::planning::mv::validate_persistable_output(&resolved, &factory)
         .map_err(SqlCompileError::Compilation)?;
-    Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_analysis(resolved))
+    Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_validated_analysis(resolved, names))
 }
 
 /// Compile and render an IMV refresh EXPLAIN request without exposing its
@@ -1776,7 +1785,8 @@ impl SqlCompiler {
                     &analyzed_fields,
                     &crate::planner::plan_output_columns(&logical_plan)?,
                     &factory,
-                )?;
+                )?
+                .with_analysis_span(query.span);
                 let consumer_requires_semantic_snapshot =
                     crate::sql_mode::query_uses_group_concat_legacy(
                         &request.session.sql_semantics,

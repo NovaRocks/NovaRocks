@@ -28,6 +28,8 @@ use crate::common::OutputColumn;
 pub(crate) struct RootOutputSemantics {
     occurrences: Box<[(ColumnId, FunctionValueType, ResultValueDomain)]>,
     field_names: Box<[Option<String>]>,
+    definition_internal: Box<[bool]>,
+    source_span: Option<novarocks_parser::Span>,
     scalar_field: Option<ScalarField>,
     private_persistence_domain: bool,
 }
@@ -58,13 +60,15 @@ impl RootOutputSemantics {
                 ));
             }
         }
-        Self::from_declared_names(
+        let mut semantics = Self::from_declared_names(
             columns,
             analyzed
                 .iter()
                 .map(|field| field.field_name.clone())
                 .collect(),
-        )
+        )?;
+        semantics.definition_internal = analyzed.iter().map(|field| field.is_internal).collect();
+        Ok(semantics)
     }
 
     /// Generated SQL owners supply names from their own output contract.
@@ -95,6 +99,8 @@ impl RootOutputSemantics {
                     )
                 });
         Ok(Self {
+            definition_internal: columns.iter().map(|column| column.is_internal).collect(),
+            source_span: None,
             field_names,
             scalar_field,
             private_persistence_domain,
@@ -114,6 +120,25 @@ impl RootOutputSemantics {
                 })
                 .collect(),
         })
+    }
+
+    pub(crate) fn with_analysis_span(mut self, span: novarocks_parser::Span) -> Self {
+        self.source_span = Some(span);
+        self
+    }
+
+    pub(crate) fn definition_column_names(
+        &self,
+    ) -> Result<Vec<String>, crate::analyze_error::AnalyzeError> {
+        crate::analysis::schema::validate_definition_field_names(
+            self.field_names
+                .iter()
+                .zip(self.definition_internal.iter())
+                .filter(|(_, internal)| !**internal)
+                .map(|(name, _)| name.as_deref()),
+            &[],
+            self.source_span,
+        )
     }
 
     /// First-refresh construction appends one contract-owned key to the payload.
