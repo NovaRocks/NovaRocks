@@ -39,7 +39,7 @@ FROM (
             ds_hll_count_distinct(if(province>5 and id>5, age, null), 21) as d1,
             ds_hll_count_distinct(if(id>5 and province>5, age, null), 21) as d2
         FROM t1 GROUP BY dt
-    ) t0, unnest([1, 2, 3]) as unnest
+    ) t0, unnest([1, 2, 3]) as unnest(unnest)
 ) t2
 GROUP BY 1, 2 ORDER BY 1, 2 LIMIT 10;
 
@@ -54,6 +54,6 @@ FROM (
             ds_hll_count_distinct(if(province>5 and id>5, age, null), 21) as d1,
             ds_hll_count_distinct(if(id>5 and province>5, age, null), 21) as d2
         FROM t1 GROUP BY dt
-    ) t0, unnest([1, 2, 3]) as unnest
+    ) t0, unnest([1, 2, 3]) as unnest(unnest)
 ) t2
 GROUP BY 1, 2 ORDER BY 1, 2 LIMIT 10;

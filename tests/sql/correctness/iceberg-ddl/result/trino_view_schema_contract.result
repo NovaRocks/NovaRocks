@@ -1,0 +1,65 @@
+-- query 5
+-- types	integer	integer
+a	b
+1	2
+
+-- query 19
+-- types	bigint
+a
+2
+
+-- query 34
+-- types	integer
+a
+1
+
+-- query 42
+-- types	integer
+a
+7
+
+-- query 45
+-- types	integer
+a
+1
+
+-- query 47
+-- types	integer
+a
+1
+2
+
+-- query 51
+-- types	integer	integer
+a	b
+1	2
+
+-- query 66
+-- types	integer
+x
+11
+
+-- query 67
+-- types	integer
+x
+11
+
+-- query 68
+-- types	integer
+v
+11
+
+-- query 73
+-- types	integer
+x
+11
+
+-- query 74
+-- types	integer
+x
+11
+
+-- query 75
+-- types	integer
+v
+11

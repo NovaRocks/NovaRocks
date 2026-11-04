@@ -23,7 +23,7 @@
 -- 2. MIN/MAX over numeric, string, and timestamp inputs.
 -- 3. NULL handling for AVG / MIN / MAX (whole group of NULLs).
 -- 4. Incremental INSERT correctly updates AVG / MIN / MAX state.
--- 5. DDL rejections: AVG(*), AVG(string), MIN(*).
+-- 5. DDL rejections: AVG(*) and MIN(*) arity, plus an unnamed MV output.
 -- MV is Iceberg-target (PROPERTIES('storage_engine'='iceberg')).
 -- This is the native FE/BE owner case for first refresh plus incremental
 -- aggregate-state persistence; Core's in-process test harness intentionally
@@ -117,10 +117,11 @@ ORDER BY k;
 CREATE MATERIALIZED VIEW bad_avg_star
 DISTRIBUTED BY HASH(k) BUCKETS 2
 PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k, AVG(*) FROM measurements GROUP BY k;
+AS SELECT k, AVG(*) AS invalid_avg FROM measurements GROUP BY k;
 
 -- query 9
--- @expect_error=unsupported identifier `avg(s)`
+-- This expression has no declared name; name validation precedes aggregate admission.
+-- @expect_trino_error=MISSING_COLUMN_NAME,USER_ERROR
 CREATE MATERIALIZED VIEW bad_avg_string
 DISTRIBUTED BY HASH(k) BUCKETS 2
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -131,7 +132,7 @@ AS SELECT k, AVG(s) FROM measurements GROUP BY k;
 CREATE MATERIALIZED VIEW bad_min_star
 DISTRIBUTED BY HASH(k) BUCKETS 2
 PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT k, MIN(*) FROM measurements GROUP BY k;
+AS SELECT k, MIN(*) AS invalid_min FROM measurements GROUP BY k;
 
 -- query 11
 -- @cleanup=true

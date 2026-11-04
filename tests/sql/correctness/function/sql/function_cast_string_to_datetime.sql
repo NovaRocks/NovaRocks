@@ -160,277 +160,277 @@ from t1;
 
 -- query 3
 USE ${case_db};
-select cast(column_0 as datetime) from (values (NULL)) as tmp;
+select cast(column_0 as datetime) from (values (NULL)) as tmp(column_0);
 
 -- query 4
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("20200101")) as tmp;
+select cast(column_0 as datetime) from (values ("20200101")) as tmp(column_0);
 
 -- query 5
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("20200101010203")) as tmp;
+select cast(column_0 as datetime) from (values ("20200101010203")) as tmp(column_0);
 
 -- query 6
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("20200101T010203")) as tmp;
+select cast(column_0 as datetime) from (values ("20200101T010203")) as tmp(column_0);
 
 -- query 7
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("20200101T0102033")) as tmp;
+select cast(column_0 as datetime) from (values ("20200101T0102033")) as tmp(column_0);
 
 -- query 8
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("20200101T010203.123")) as tmp;
+select cast(column_0 as datetime) from (values ("20200101T010203.123")) as tmp(column_0);
 
 -- query 9
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("200101")) as tmp;
+select cast(column_0 as datetime) from (values ("200101")) as tmp(column_0);
 
 -- query 10
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("200101010203")) as tmp;
+select cast(column_0 as datetime) from (values ("200101010203")) as tmp(column_0);
 
 -- query 11
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("200101T010203")) as tmp;
+select cast(column_0 as datetime) from (values ("200101T010203")) as tmp(column_0);
 
 -- query 12
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("200101T0102033")) as tmp;
+select cast(column_0 as datetime) from (values ("200101T0102033")) as tmp(column_0);
 
 -- query 13
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("200101T010203.123")) as tmp;
+select cast(column_0 as datetime) from (values ("200101T010203.123")) as tmp(column_0);
 
 -- query 14
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020.01.01")) as tmp;
+select cast(column_0 as datetime) from (values ("2020.01.01")) as tmp(column_0);
 
 -- query 15
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020.01.01T01.02.03")) as tmp;
+select cast(column_0 as datetime) from (values ("2020.01.01T01.02.03")) as tmp(column_0);
 
 -- query 16
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020.01.01T01.02.033")) as tmp;
+select cast(column_0 as datetime) from (values ("2020.01.01T01.02.033")) as tmp(column_0);
 
 -- query 17
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020.01.01T01.0203.123")) as tmp;
+select cast(column_0 as datetime) from (values ("2020.01.01T01.0203.123")) as tmp(column_0);
 
 -- query 18
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("  20200101 ")) as tmp;
+select cast(column_0 as datetime) from (values ("  20200101 ")) as tmp(column_0);
 
 -- query 19
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("  20200101010203   ")) as tmp;
+select cast(column_0 as datetime) from (values ("  20200101010203   ")) as tmp(column_0);
 
 -- query 20
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("  20200101T010203")) as tmp;
+select cast(column_0 as datetime) from (values ("  20200101T010203")) as tmp(column_0);
 
 -- query 21
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("20200101T0102033  ")) as tmp;
+select cast(column_0 as datetime) from (values ("20200101T0102033  ")) as tmp(column_0);
 
 -- query 22
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("  20200101T010203.123    \n")) as tmp;
+select cast(column_0 as datetime) from (values ("  20200101T010203.123    \n")) as tmp(column_0);
 
 -- query 23
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("  20200101T010203.123    \n \t \v \f \r ")) as tmp;
+select cast(column_0 as datetime) from (values ("  20200101T010203.123    \n \t \v \f \r ")) as tmp(column_0);
 
 -- query 24
 -- Invalid month/day
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020.13.29")) as tmp;
+select cast(column_0 as datetime) from (values ("2020.13.29")) as tmp(column_0);
 
 -- query 25
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020.13.61")) as tmp;
+select cast(column_0 as datetime) from (values ("2020.13.61")) as tmp(column_0);
 
 -- query 26
 -- Leap year: 2020 is leap
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020.02.29")) as tmp;
+select cast(column_0 as datetime) from (values ("2020.02.29")) as tmp(column_0);
 
 -- query 27
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020.02.28")) as tmp;
+select cast(column_0 as datetime) from (values ("2020.02.28")) as tmp(column_0);
 
 -- query 28
 -- Leap year: 2000 is leap (divisible by 400)
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2000.02.29")) as tmp;
+select cast(column_0 as datetime) from (values ("2000.02.29")) as tmp(column_0);
 
 -- query 29
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2000.02.28")) as tmp;
+select cast(column_0 as datetime) from (values ("2000.02.28")) as tmp(column_0);
 
 -- query 30
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2021.02.28")) as tmp;
+select cast(column_0 as datetime) from (values ("2021.02.28")) as tmp(column_0);
 
 -- query 31
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2100.02.28")) as tmp;
+select cast(column_0 as datetime) from (values ("2100.02.28")) as tmp(column_0);
 
 -- query 32
 -- Completely invalid string
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("invalid")) as tmp;
+select cast(column_0 as datetime) from (values ("invalid")) as tmp(column_0);
 
 -- query 33
 -- Non-leap year Feb 29
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2021.02.29")) as tmp;
+select cast(column_0 as datetime) from (values ("2021.02.29")) as tmp(column_0);
 
 -- query 34
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2100.02.29")) as tmp;
+select cast(column_0 as datetime) from (values ("2100.02.29")) as tmp(column_0);
 
 -- query 35
 -- Invalid characters in various positions
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("?100.02.28")) as tmp;
+select cast(column_0 as datetime) from (values ("?100.02.28")) as tmp(column_0);
 
 -- query 36
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2?00.02.28")) as tmp;
+select cast(column_0 as datetime) from (values ("2?00.02.28")) as tmp(column_0);
 
 -- query 37
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("21?0.02.28")) as tmp;
+select cast(column_0 as datetime) from (values ("21?0.02.28")) as tmp(column_0);
 
 -- query 38
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("210?.02.28")) as tmp;
+select cast(column_0 as datetime) from (values ("210?.02.28")) as tmp(column_0);
 
 -- query 39
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2100902.28")) as tmp;
+select cast(column_0 as datetime) from (values ("2100902.28")) as tmp(column_0);
 
 -- query 40
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2100.?2.28")) as tmp;
+select cast(column_0 as datetime) from (values ("2100.?2.28")) as tmp(column_0);
 
 -- query 41
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2100.0?.28")) as tmp;
+select cast(column_0 as datetime) from (values ("2100.0?.28")) as tmp(column_0);
 
 -- query 42
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2100.02928")) as tmp;
+select cast(column_0 as datetime) from (values ("2100.02928")) as tmp(column_0);
 
 -- query 43
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2100.02.?8")) as tmp;
+select cast(column_0 as datetime) from (values ("2100.02.?8")) as tmp(column_0);
 
 -- query 44
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2100.02.2?")) as tmp;
+select cast(column_0 as datetime) from (values ("2100.02.2?")) as tmp(column_0);
 
 -- query 45
 -- ISO 8601 Z-suffix (UTC) formats
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03Z")) as tmp;
+select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03Z")) as tmp(column_0);
 
 -- query 46
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03.123Z")) as tmp;
+select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03.123Z")) as tmp(column_0);
 
 -- query 47
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03.123456Z")) as tmp;
+select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03.123456Z")) as tmp(column_0);
 
 -- query 48
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03.1Z")) as tmp;
+select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03.1Z")) as tmp(column_0);
 
 -- query 49
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("  2020-01-01T01:02:03Z  ")) as tmp;
+select cast(column_0 as datetime) from (values ("  2020-01-01T01:02:03Z  ")) as tmp(column_0);
 
 -- query 50
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("  2020-01-01T01:02:03.123Z  ")) as tmp;
+select cast(column_0 as datetime) from (values ("  2020-01-01T01:02:03.123Z  ")) as tmp(column_0);
 
 -- query 51
 -- Invalid Z-suffix variations
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03z")) as tmp;
+select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03z")) as tmp(column_0);
 
 -- query 52
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03Zextra")) as tmp;
+select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03Zextra")) as tmp(column_0);
 
 -- query 53
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03.Z")) as tmp;
+select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03.Z")) as tmp(column_0);
 
 -- query 54
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03.1234567Z")) as tmp;
+select cast(column_0 as datetime) from (values ("2020-01-01T01:02:03.1234567Z")) as tmp(column_0);
 
 -- query 55
 -- Invalid time components: minute >= 60
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01 01:60:00")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01 01:60:00")) as tmp(column_0);
 
 -- query 56
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01 01:61:00")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01 01:61:00")) as tmp(column_0);
 
 -- query 57
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01 01:99:00")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01 01:99:00")) as tmp(column_0);
 
 -- query 58
 -- Invalid time components: second >= 60
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01 01:30:60")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01 01:30:60")) as tmp(column_0);
 
 -- query 59
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01 01:30:61")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01 01:30:61")) as tmp(column_0);
 
 -- query 60
 -- Invalid time components: hour >= 24
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01 24:00:00")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01 24:00:00")) as tmp(column_0);
 
 -- query 61
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01 25:00:00")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01 25:00:00")) as tmp(column_0);
 
 -- query 62
 -- Valid edge cases for time components
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01 23:59:59")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01 23:59:59")) as tmp(column_0);
 
 -- query 63
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01 00:00:00")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01 00:00:00")) as tmp(column_0);
 
 -- query 64
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01 01:59:00")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01 01:59:00")) as tmp(column_0);
 
 -- query 65
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01 01:30:59")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01 01:30:59")) as tmp(column_0);
 
 -- query 66
 -- Invalid time in ISO 8601 format
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01T01:61:00")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01T01:61:00")) as tmp(column_0);
 
 -- query 67
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01T01:61:00Z")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01T01:61:00Z")) as tmp(column_0);
 
 -- query 68
 USE ${case_db};
-select cast(column_0 as datetime) from (values ("2024-01-01T24:00:00")) as tmp;
+select cast(column_0 as datetime) from (values ("2024-01-01T24:00:00")) as tmp(column_0);

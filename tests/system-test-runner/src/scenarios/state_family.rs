@@ -88,7 +88,7 @@ impl Scenario for WipeStartRebuild {
         // catalog-free on purpose, so its later absence is attributable to the
         // registry being process-local rather than to the attachment going away.
         connection
-            .execute("CREATE VIEW local_probe AS SELECT 1")
+            .execute("CREATE VIEW local_probe AS SELECT 1 AS x")
             .context("create a local view")?;
         let local = sql::integer_column(
             &connection
