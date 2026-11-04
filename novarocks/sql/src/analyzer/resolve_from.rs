@@ -357,6 +357,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 name,
                 metadata,
                 alias,
+                version,
                 ..
             } => {
                 let parts: Vec<String> = name.parts.iter().map(|part| part.value.clone()).collect();
@@ -364,6 +365,12 @@ impl<'a> super::AnalyzerContext<'a> {
                 // `$<metatype>` is a parser-owned relation field. Capability
                 // admission stays in analysis, after catalog resolution.
                 if let Some(metadata) = metadata {
+                    if let Some(version) = version {
+                        return Err(AnalyzeError::unsupported_query_shape(
+                            "time travel is not supported on metadata relations",
+                            version.span,
+                        ));
+                    }
                     let metadata_ty =
                         crate::planner::table::SqlMetadataTableKind::parse(&metadata.value)
                             .map_err(|_| {
@@ -513,6 +520,12 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
 
                     if let Some(&cte_id) = self.ctes.get(&tbl_lower) {
+                        if let Some(version) = version {
+                            return Err(AnalyzeError::unsupported_query_shape(
+                                "time travel is not supported on a CTE relation",
+                                version.span,
+                            ));
+                        }
                         let (producer_columns, entry_id) = {
                             let registry = self.cte_registry.borrow();
                             let entry = registry.get(cte_id).ok_or_else(|| {
@@ -585,18 +598,35 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
                 }
 
-                if let Some(view) = self.catalog.resolve_view_for_analysis(
-                    catalog_override.as_deref(),
-                    &db_lower,
-                    &tbl_lower,
-                )? {
-                    return self.analyze_view_relation(view, alias.as_ref(), &tbl, name.span);
-                }
-
-                let resolved_table = self
-                    .catalog
-                    .resolve_table_for_analysis(catalog_override.as_deref(), &db_lower, &tbl_lower)
-                    .map_err(|error| AnalyzeError::unknown_table(error, name.span))?;
+                let resolved_table = if let Some(version) = version {
+                    // Diagnose an invalid saved selection before asking the
+                    // closed catalog for a key its collector did not publish.
+                    crate::planning::catalog::parse_time_travel_selection(
+                        version,
+                        &parts.join("."),
+                    )?;
+                    self.catalog.resolve_table_version_for_analysis(
+                        catalog_override.as_deref(),
+                        &db_lower,
+                        &tbl_lower,
+                        version,
+                    )?
+                } else {
+                    if let Some(view) = self.catalog.resolve_view_for_analysis(
+                        catalog_override.as_deref(),
+                        &db_lower,
+                        &tbl_lower,
+                    )? {
+                        return self.analyze_view_relation(view, alias.as_ref(), &tbl, name.span);
+                    }
+                    self.catalog
+                        .resolve_table_for_analysis(
+                            catalog_override.as_deref(),
+                            &db_lower,
+                            &tbl_lower,
+                        )
+                        .map_err(|error| AnalyzeError::unknown_table(error, name.span))?
+                };
                 let table_def = resolved_table.planner;
                 let alias_name = alias.as_ref().map(|a| a.name.value.clone());
 

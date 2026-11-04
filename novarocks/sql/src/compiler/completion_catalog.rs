@@ -25,7 +25,7 @@ use novarocks_types::naming::{TableIdentity, normalize_identifier, resolve_catal
 use super::SqlCompileError;
 use super::completion::{
     CatalogLookupTarget, CatalogRelationFact, CatalogRelationNeed, CatalogRelationOutcome,
-    CompileNeedId,
+    CatalogTableSelection, CompileNeedId,
 };
 use crate::catalog::{
     IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, TableLookupMode,
@@ -706,10 +706,36 @@ impl<'a> CatalogNeedCollector<'a> {
                         mode: self.lookup_mode,
                     },
                 };
+                let selection = match version {
+                    Some(version) if metadata.is_some() => {
+                        if self.defer_semantic_refusals {
+                            return self.collect_table_decorations(Some(version), hints, scope);
+                        }
+                        return Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
+                            "time travel is not supported on metadata relations",
+                            version.span,
+                        )
+                        .into());
+                    }
+                    Some(version) => {
+                        match CatalogTableSelection::try_new(version.clone(), &relation) {
+                            Ok(selection) => Some(selection),
+                            Err(_) if self.defer_semantic_refusals => {
+                                return self.collect_table_decorations(Some(version), hints, scope);
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    None => None,
+                };
                 self.add_need_qualified(
                     relation,
                     target,
-                    !self.exact_catalog && metadata.is_none() && name.parts.len() < 3,
+                    !self.exact_catalog
+                        && metadata.is_none()
+                        && version.is_none()
+                        && name.parts.len() < 3,
+                    selection,
                 )?;
                 self.collect_table_decorations(version.as_ref(), hints, scope)
             }
@@ -848,7 +874,7 @@ impl<'a> CatalogNeedCollector<'a> {
         relation: TableIdentity,
         target: CatalogLookupTarget,
     ) -> Result<(), SqlCompileError> {
-        self.add_need_qualified(relation, target, false)
+        self.add_need_qualified(relation, target, false, None)
     }
 
     fn add_need_qualified(
@@ -856,10 +882,12 @@ impl<'a> CatalogNeedCollector<'a> {
         relation: TableIdentity,
         target: CatalogLookupTarget,
         local_view_shadow: bool,
+        selection: Option<CatalogTableSelection>,
     ) -> Result<(), SqlCompileError> {
         self.step()?;
         let mut key = CatalogFactKey::new(relation.clone(), target);
         key.local_view_shadow = local_view_shadow;
+        key.selection = selection.as_ref().map(|selection| selection.key().clone());
         if !self.keys.insert(key) {
             return Ok(());
         }
@@ -868,7 +896,8 @@ impl<'a> CatalogNeedCollector<'a> {
             SqlCompileError::InvalidRequest("catalog completion need identity overflow".to_string())
         })?;
         let need = CatalogRelationNeed::try_new(id, relation, target)
-            .map_err(|error| SqlCompileError::InvalidRequest(error.to_string()))?;
+            .map_err(|error| SqlCompileError::InvalidRequest(error.to_string()))?
+            .with_selection(selection);
         self.needs.push(if local_view_shadow {
             need.with_local_view_shadow()
         } else {
@@ -910,17 +939,20 @@ struct CatalogFactKey {
     relation: TableIdentity,
     target: CatalogTargetKey,
     local_view_shadow: bool,
+    selection: Option<crate::planning::catalog::SqlTimeTravelSelection>,
 }
 
 impl CatalogFactKey {
     fn from_need(need: &CatalogRelationNeed) -> Self {
         let mut key = Self::new(need.relation().clone(), need.target());
         key.local_view_shadow = need.allows_local_view_shadow();
+        key.selection = need.selection_key().cloned();
         key
     }
     fn from_fact(fact: &CatalogRelationFact) -> Self {
         let mut key = Self::new(fact.relation().clone(), fact.target());
         key.local_view_shadow = fact.allows_local_view_shadow();
+        key.selection = fact.selection_key().cloned();
         key
     }
 
@@ -929,6 +961,7 @@ impl CatalogFactKey {
             relation,
             target: CatalogTargetKey::from(target),
             local_view_shadow: false,
+            selection: None,
         }
     }
 }
@@ -958,6 +991,7 @@ enum CatalogEntry {
     Resolved(Box<ResolvedAnalyzerTable>),
     View(std::sync::Arc<crate::catalog::SqlViewDefinition>),
     Missing(Box<str>),
+    SelectionRefused(Box<crate::analyze_error::AnalyzeError>),
 }
 
 /// Analyzer catalog backed solely by one exact completion answer batch.
@@ -993,6 +1027,7 @@ impl FactBackedCatalog {
             if fact.relation() != need.relation()
                 || fact.target() != need.target()
                 || fact.allows_local_view_shadow() != need.allows_local_view_shadow()
+                || fact.selection_key() != need.selection_key()
             {
                 return Err(SqlCompileError::Compilation(format!(
                     "catalog completion fact {} does not match its exact request",
@@ -1007,6 +1042,9 @@ impl FactBackedCatalog {
                 }
                 CatalogRelationOutcome::View(view) => CatalogEntry::View(view.clone()),
                 CatalogRelationOutcome::Missing { reason } => CatalogEntry::Missing(reason.clone()),
+                CatalogRelationOutcome::SelectionRefused(error) => {
+                    CatalogEntry::SelectionRefused(error.clone())
+                }
             };
             if entries.insert(key, entry).is_some() {
                 return Err(SqlCompileError::Compilation(format!(
@@ -1037,6 +1075,17 @@ impl FactBackedCatalog {
         table: &str,
         target: CatalogLookupTarget,
     ) -> Result<&CatalogEntry, String> {
+        self.entry_selected(catalog, database, table, target, None)
+    }
+
+    fn entry_selected(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        target: CatalogLookupTarget,
+        selection: Option<&crate::planning::catalog::SqlTimeTravelSelection>,
+    ) -> Result<&CatalogEntry, String> {
         let parts = match catalog {
             Some(catalog) => vec![catalog.to_string(), database.to_string(), table.to_string()],
             None => vec![database.to_string(), table.to_string()],
@@ -1056,7 +1105,9 @@ impl FactBackedCatalog {
         let mut key = CatalogFactKey::new(identity.clone(), target);
         key.local_view_shadow = self.root_local_view_shadow
             && catalog.is_none()
+            && selection.is_none()
             && matches!(target, CatalogLookupTarget::Table { .. });
+        key.selection = selection.cloned();
         self.entries.get(&key).ok_or_else(|| {
             format!(
                 "catalog relation '{}' was not requested for {target:?}",
@@ -1080,11 +1131,54 @@ impl FactBackedCatalog {
             CatalogEntry::View(_) => Err(format!(
                 "catalog relation '{table}' requires stored-view declaration analysis"
             )),
+            CatalogEntry::SelectionRefused(_) => {
+                Err("historical selection cannot answer a Current lookup".into())
+            }
         }
     }
 }
 
 impl PlannerTableProvider for FactBackedCatalog {
+    fn resolve_table_version_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        version: &ast::TableVersion,
+    ) -> Result<ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
+        use crate::analyze_error::AnalyzeError;
+        let selection = crate::planning::catalog::parse_time_travel_selection(version, table)?;
+        for name in catalog.into_iter().chain([database, table]) {
+            normalize_identifier(name)
+                .map_err(AnalyzeError::unsupported_expression_without_span)?;
+        }
+        match self
+            .entry_selected(
+                catalog,
+                database,
+                table,
+                CatalogLookupTarget::Table {
+                    mode: self.lookup_mode,
+                },
+                Some(&selection),
+            )
+            .map_err(AnalyzeError::internal)?
+        {
+            CatalogEntry::Resolved(table) => Ok(table.as_ref().clone()),
+            CatalogEntry::Missing(reason) => Err(AnalyzeError::unknown_table(
+                reason.to_string(),
+                version.span,
+            )),
+            CatalogEntry::View(_) => Err(AnalyzeError::unsupported_query_shape(
+                "time travel is not supported on a stored view",
+                version.span,
+            )),
+            CatalogEntry::SelectionRefused(error) => Err(error
+                .as_ref()
+                .clone()
+                .at_catalog_selection_reference(version.value.span())),
+        }
+    }
     fn resolve_table_for_analysis(
         &self,
         catalog: Option<&str>,
@@ -1132,6 +1226,11 @@ impl PlannerTableProvider for FactBackedCatalog {
         Ok(match entry {
             CatalogEntry::View(view) => Some(view.as_ref()),
             CatalogEntry::Resolved(_) | CatalogEntry::Missing(_) => None,
+            CatalogEntry::SelectionRefused(_) => {
+                return Err(crate::analyze_error::AnalyzeError::internal(
+                    "historical selection cannot answer a Current view lookup",
+                ));
+            }
         })
     }
 
@@ -1172,6 +1271,15 @@ fn validate_resolved_target(
         )));
     }
     let ScanSource::Sql(source) = &table.planner.source;
+    if let Some(expected) = fact.selected_snapshot()
+        && !matches!(&source.kind, SqlScanKind::Data {
+            version: crate::planner::table::SqlTableVersionSelector::Snapshot(actual), ..
+        } if *actual == expected)
+    {
+        return Err(SqlCompileError::Compilation(
+            "catalog selected fact carries another snapshot or Current".into(),
+        ));
+    }
     if source.table.catalog != fact.relation().catalog
         || source.table.namespace != fact.relation().namespace
         || source.table.table != fact.relation().table

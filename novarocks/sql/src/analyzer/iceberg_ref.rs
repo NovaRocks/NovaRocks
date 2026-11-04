@@ -166,7 +166,7 @@ pub struct IcebergDmlTarget {
     pub write_ref: String,
 }
 
-/// Resolve a SQL `FOR VERSION/TIMESTAMP AS OF` clause into an `IcebergRefBinding`
+/// Resolve a SQL `FOR VERSION/SYSTEM_TIME AS OF` clause into an `IcebergRefBinding`
 /// against the given table metadata.
 ///
 /// Resolution rules (Iceberg spec §4.2):
@@ -174,17 +174,25 @@ pub struct IcebergDmlTarget {
 /// - `VERSION AS OF '<string>'` → named ref (branch or tag); must exist in `metadata.refs()`.
 /// - `FOR SYSTEM_TIME AS OF <integer>` → epoch-ms; finds the
 ///   snapshot with the largest `timestamp_ms` ≤ requested_ms from `metadata.history()`.
-/// - `TIMESTAMP AS OF '<rfc3339-string>'` or `'<YYYY-MM-DD HH:MM:SS>'` → parsed to ms and
+/// - `SYSTEM_TIME AS OF '<rfc3339-string>'` or `'<YYYY-MM-DD HH:MM:SS>'` → parsed to ms and
 ///   treated the same as an integer epoch-ms timestamp.
 /// - Any other expression (function call, identifier, cast, …) → fail-fast error.
 ///
 /// Phase-1 limitation: timestamp expressions must be literals (integer or quoted string).
 /// Expression-level timestamps (e.g. `CURRENT_TIMESTAMP() - INTERVAL 1 HOUR`) are rejected.
-pub fn resolve_read_binding(
+/// An exact parsed request, before catalog admission freezes its snapshot.
+/// Syntax locations stay on the original TableVersion, not in this memo key.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum SqlTimeTravelSelection {
+    SnapshotId(i64),
+    NamedReference(String),
+    TimestampMillis(i64),
+}
+
+pub fn parse_time_travel_selection(
     version: &TableVersion,
-    metadata: &SqlIcebergRefMetadata,
     fully_qualified_name: &str,
-) -> Result<IcebergRefBinding, AnalyzeError> {
+) -> Result<SqlTimeTravelSelection, AnalyzeError> {
     match version.kind {
         TableVersionKind::ForVersionAsOf => match &version.value {
             Expr::Literal(literal) => match &literal.kind {
@@ -195,35 +203,9 @@ pub fn resolve_read_binding(
                             literal.span,
                         )
                     })?;
-                    if !metadata.has_snapshot(snapshot_id) {
-                        return Err(AnalyzeError::invalid_argument(
-                            format!(
-                                "iceberg time travel: snapshot {snapshot_id} not found in {fully_qualified_name}"
-                            ),
-                            literal.span,
-                        ));
-                    }
-                    Ok(IcebergRefBinding {
-                        snapshot_id,
-                        ref_name: None,
-                        ref_kind: None,
-                    })
+                    Ok(SqlTimeTravelSelection::SnapshotId(snapshot_id))
                 }
-                LiteralKind::String(s) => {
-                    let entry = metadata.named_ref(s).ok_or_else(|| {
-                        AnalyzeError::invalid_argument(
-                            format!(
-                                "iceberg time travel: ref '{s}' not found in {fully_qualified_name}"
-                            ),
-                            literal.span,
-                        )
-                    })?;
-                    Ok(IcebergRefBinding {
-                        snapshot_id: entry.snapshot_id,
-                        ref_name: Some(s.clone()),
-                        ref_kind: Some(entry.kind.clone()),
-                    })
-                }
+                LiteralKind::String(s) => Ok(SqlTimeTravelSelection::NamedReference(s.clone())),
                 other => Err(AnalyzeError::invalid_literal(
                     format!(
                         "iceberg time travel: phase 1 only accepts literal snapshot id or ref name for VERSION AS OF; got value: {other:?}"
@@ -238,9 +220,50 @@ pub fn resolve_read_binding(
                 other.span(),
             )),
         },
-
         TableVersionKind::ForSystemTimeAsOf => {
-            let ts_ms = resolve_timestamp_expr(&version.value, fully_qualified_name)?;
+            resolve_timestamp_expr(&version.value, fully_qualified_name)
+                .map(SqlTimeTravelSelection::TimestampMillis)
+        }
+    }
+}
+
+pub fn resolve_read_binding(
+    version: &TableVersion,
+    metadata: &SqlIcebergRefMetadata,
+    fully_qualified_name: &str,
+) -> Result<IcebergRefBinding, AnalyzeError> {
+    match parse_time_travel_selection(version, fully_qualified_name)? {
+        SqlTimeTravelSelection::SnapshotId(snapshot_id) => {
+            if !metadata.has_snapshot(snapshot_id) {
+                return Err(AnalyzeError::invalid_argument(
+                    format!(
+                        "iceberg time travel: snapshot {snapshot_id} not found in {fully_qualified_name}"
+                    ),
+                    version.value.span(),
+                ));
+            }
+            Ok(IcebergRefBinding {
+                snapshot_id,
+                ref_name: None,
+                ref_kind: None,
+            })
+        }
+        SqlTimeTravelSelection::NamedReference(name) => {
+            let entry = metadata.named_ref(&name).ok_or_else(|| {
+                AnalyzeError::invalid_argument(
+                    format!(
+                        "iceberg time travel: ref '{name}' not found in {fully_qualified_name}"
+                    ),
+                    version.value.span(),
+                )
+            })?;
+            Ok(IcebergRefBinding {
+                snapshot_id: entry.snapshot_id,
+                ref_name: Some(name),
+                ref_kind: Some(entry.kind.clone()),
+            })
+        }
+        SqlTimeTravelSelection::TimestampMillis(ts_ms) => {
             find_snapshot_at_or_before(metadata, ts_ms, fully_qualified_name, version.value.span())
         }
     }

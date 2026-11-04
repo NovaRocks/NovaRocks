@@ -299,6 +299,14 @@ impl AnalyzeError {
             .map(|cause| cause.source_sql.as_ref())
     }
 
+    /// A memoized pure catalog selection has one semantic verdict, while
+    /// each syntax occurrence owns its own coordinates (possibly in another
+    /// stored definition). Relocate only that occurrence, never its kind.
+    pub(crate) fn at_catalog_selection_reference(mut self, span: Span) -> Self {
+        self.span = (!span.is_empty()).then_some(span);
+        self
+    }
+
     pub fn view_is_stale(message: impl Into<String>, span: impl Into<Option<Span>>) -> Self {
         Self::at_optional(
             AnalyzeErrorKind::ViewIsStale,

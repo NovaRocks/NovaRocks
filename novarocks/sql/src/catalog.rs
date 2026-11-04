@@ -68,6 +68,20 @@ pub trait PlannerTableProvider {
         table: &str,
     ) -> Result<ResolvedAnalyzerTable, String>;
 
+    /// An explicit historical request never falls back to a Current lookup.
+    fn resolve_table_version_for_analysis(
+        &self,
+        _catalog: Option<&str>,
+        _database: &str,
+        _table: &str,
+        version: &novarocks_parser::ast::TableVersion,
+    ) -> Result<ResolvedAnalyzerTable, crate::analyze_error::AnalyzeError> {
+        Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
+            "catalog does not supply historical table facts",
+            version.span,
+        ))
+    }
+
     /// A fact-only stored definition, selected by the same relation lookup.
     fn resolve_view_for_analysis(
         &self,

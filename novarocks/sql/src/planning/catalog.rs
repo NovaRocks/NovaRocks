@@ -221,20 +221,32 @@ impl SqlTimeTravelReferenceMetadataFacts {
     }
 }
 
+pub use crate::analyzer::iceberg_ref::{SqlTimeTravelSelection, parse_time_travel_selection};
+
 /// Sealed result of resolving one parsed time-travel clause against validated
 /// immutable snapshot facts.  SQL exposes only the frozen snapshot identity
 /// needed for query-local rewrite; ref metadata remains internal.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlTimeTravelSnapshotBindingFacts {
     snapshot_id: i64,
+    selection: SqlTimeTravelSelection,
+    relation_fqn: Box<str>,
 }
 
 impl SqlTimeTravelSnapshotBindingFacts {
+    pub fn relation_fqn(&self) -> &str {
+        &self.relation_fqn
+    }
+    pub const fn selection(&self) -> &SqlTimeTravelSelection {
+        &self.selection
+    }
+
     pub const fn snapshot_id(&self) -> i64 {
         self.snapshot_id
     }
 }
 
-/// Resolve a parsed `FOR VERSION/TIMESTAMP AS OF` clause from copied,
+/// Resolve a parsed `FOR VERSION/SYSTEM_TIME AS OF` clause from copied,
 /// validated snapshot-reference facts.  Unknown requested snapshots and refs
 /// fail closed in SQL before Core creates a synthetic table identity.
 pub fn resolve_time_travel_snapshot_binding(
@@ -250,6 +262,8 @@ pub fn resolve_time_travel_snapshot_binding(
     )?;
     Ok(SqlTimeTravelSnapshotBindingFacts {
         snapshot_id: binding.snapshot_id,
+        selection: parse_time_travel_selection(version, fully_qualified_name)?,
+        relation_fqn: fully_qualified_name.into(),
     })
 }
 
@@ -1178,6 +1192,10 @@ mod tests {
         )
         .expect("known snapshot resolves");
         assert_eq!(snapshot.snapshot_id(), 10);
+        assert_eq!(
+            snapshot.selection(),
+            &SqlTimeTravelSelection::SnapshotId(10)
+        );
 
         let named_ref = resolve_time_travel_snapshot_binding(
             &parsed_time_travel_clause("SELECT id FROM t FOR VERSION AS OF 'dev'"),
@@ -1186,6 +1204,10 @@ mod tests {
         )
         .expect("known named reference resolves");
         assert_eq!(named_ref.snapshot_id(), 20);
+        assert_eq!(
+            named_ref.selection(),
+            &SqlTimeTravelSelection::NamedReference("dev".into())
+        );
 
         let timestamp = resolve_time_travel_snapshot_binding(
             &parsed_time_travel_clause("SELECT id FROM t FOR SYSTEM_TIME AS OF 1700000000500"),
@@ -1194,6 +1216,24 @@ mod tests {
         )
         .expect("snapshot log resolves timestamp");
         assert_eq!(timestamp.snapshot_id(), 10);
+        assert_eq!(
+            timestamp.selection(),
+            &SqlTimeTravelSelection::TimestampMillis(1700000000500)
+        );
+    }
+
+    #[test]
+    fn time_travel_request_identity_reuses_the_original_literal_parser_without_syntax_spans() {
+        let number =
+            parsed_time_travel_clause("SELECT id FROM t FOR SYSTEM_TIME AS OF 1700000000000");
+        let text = parsed_time_travel_clause(
+            "SELECT id FROM ice.analytics.t FOR SYSTEM_TIME AS OF '2023-11-14 22:13:20'",
+        );
+        assert_ne!(number.span, text.span);
+        assert_eq!(
+            parse_time_travel_selection(&number, "t").unwrap(),
+            parse_time_travel_selection(&text, "ice.analytics.t").unwrap()
+        );
     }
 
     #[test]

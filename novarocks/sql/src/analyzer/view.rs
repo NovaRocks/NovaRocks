@@ -356,6 +356,20 @@ struct SavedViewCatalog<'a> {
     catalog: &'a str,
 }
 impl PlannerTableProvider for SavedViewCatalog<'_> {
+    fn resolve_table_version_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        version: &ast::TableVersion,
+    ) -> Result<ResolvedAnalyzerTable, AnalyzeError> {
+        self.inner.resolve_table_version_for_analysis(
+            Some(catalog.unwrap_or(self.catalog)),
+            database,
+            table,
+            version,
+        )
+    }
     fn resolve_table_for_analysis(
         &self,
         catalog: Option<&str>,

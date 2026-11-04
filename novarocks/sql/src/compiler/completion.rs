@@ -134,6 +134,27 @@ pub struct CatalogRelationNeed {
     relation: TableIdentity,
     target: CatalogLookupTarget,
     local_view_shadow: bool,
+    selection: Option<Box<CatalogTableSelection>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CatalogTableSelection {
+    version: novarocks_parser::ast::TableVersion,
+    key: crate::planning::catalog::SqlTimeTravelSelection,
+}
+
+impl CatalogTableSelection {
+    pub(super) fn try_new(
+        version: novarocks_parser::ast::TableVersion,
+        relation: &TableIdentity,
+    ) -> Result<Self, crate::analyze_error::AnalyzeError> {
+        let key = crate::planning::catalog::parse_time_travel_selection(&version, &relation.fqn())?;
+        Ok(Self { version, key })
+    }
+
+    pub(super) const fn key(&self) -> &crate::planning::catalog::SqlTimeTravelSelection {
+        &self.key
+    }
 }
 
 impl CatalogRelationNeed {
@@ -148,6 +169,7 @@ impl CatalogRelationNeed {
             relation,
             target,
             local_view_shadow: false,
+            selection: None,
         })
     }
 
@@ -155,6 +177,55 @@ impl CatalogRelationNeed {
         assert!(matches!(self.target, CatalogLookupTarget::Table { .. }));
         self.local_view_shadow = true;
         self
+    }
+
+    pub(super) fn with_selection(mut self, selection: Option<CatalogTableSelection>) -> Self {
+        self.selection = selection.map(Box::new);
+        self
+    }
+
+    pub fn version(&self) -> Option<&novarocks_parser::ast::TableVersion> {
+        self.selection.as_ref().map(|selection| &selection.version)
+    }
+
+    /// Semantic reference selection is a fact even when it rejects the
+    /// request. Defer that refusal to its real analysis boundary so a saved
+    /// body retains INVALID_VIEW and its original inner cause. Provider I/O
+    /// and control failures are not answers to this pure operation.
+    pub fn resolve_time_travel(
+        &self,
+        metadata: &crate::planning::catalog::SqlTimeTravelReferenceMetadataFacts,
+    ) -> Result<CatalogTimeTravelResolution, CompletionProtocolError> {
+        let Some(version) = self.version() else {
+            return Err(CompletionProtocolError::InvalidNeed {
+                id: self.id,
+                reason: "Current relation has no time travel request",
+            });
+        };
+        match crate::planning::catalog::resolve_time_travel_snapshot_binding(
+            version,
+            metadata,
+            &self.relation.fqn(),
+        ) {
+            Ok(binding) => Ok(CatalogTimeTravelResolution::Selected(binding)),
+            Err(error) => Ok(CatalogTimeTravelResolution::Rejected(Box::new(
+                CatalogRelationFact {
+                    id: self.id,
+                    relation: self.relation.clone(),
+                    target: self.target,
+                    local_view_shadow: self.local_view_shadow,
+                    selection: self.selection.clone(),
+                    selected_snapshot: None,
+                    outcome: CatalogRelationOutcome::SelectionRefused(Box::new(error)),
+                },
+            ))),
+        }
+    }
+
+    pub(super) fn selection_key(
+        &self,
+    ) -> Option<&crate::planning::catalog::SqlTimeTravelSelection> {
+        self.selection.as_ref().map(|selection| selection.key())
     }
 
     /// Only an implicit root catalog lookup can select the local view snapshot.
@@ -900,11 +971,12 @@ impl SqlNeedBatch {
         match self {
             Self::CatalogRelations(needs) => checked_sum([
                 checked_mul(needs.len(), std::mem::size_of::<CatalogRelationNeed>()),
-                checked_sum(
-                    needs
-                        .iter()
-                        .map(|need| table_identity_bytes(&need.relation)),
-                ),
+                checked_sum(needs.iter().map(|need| {
+                    checked_sum([
+                        table_identity_bytes(&need.relation),
+                        catalog_selection_bytes(need.selection.as_deref()),
+                    ])
+                })),
             ]),
             Self::Statistics(needs) => checked_sum([
                 checked_mul(needs.len(), std::mem::size_of::<StatisticsNeed>()),
@@ -940,6 +1012,12 @@ pub enum CatalogRelationOutcome {
     Resolved(Box<ResolvedAnalyzerTable>),
     View(std::sync::Arc<SqlViewDefinition>),
     Missing { reason: Box<str> },
+    SelectionRefused(Box<crate::analyze_error::AnalyzeError>),
+}
+
+pub enum CatalogTimeTravelResolution {
+    Selected(crate::planning::catalog::SqlTimeTravelSnapshotBindingFacts),
+    Rejected(Box<CatalogRelationFact>),
 }
 
 #[derive(Debug)]
@@ -948,6 +1026,8 @@ pub struct CatalogRelationFact {
     relation: TableIdentity,
     target: CatalogLookupTarget,
     local_view_shadow: bool,
+    selection: Option<Box<CatalogTableSelection>>,
+    selected_snapshot: Option<i64>,
     outcome: CatalogRelationOutcome,
 }
 
@@ -955,6 +1035,24 @@ impl CatalogRelationFact {
     pub fn resolved(
         need: &CatalogRelationNeed,
         table: ResolvedAnalyzerTable,
+    ) -> Result<Self, CompletionProtocolError> {
+        Self::resolved_with_selection(need, table, None)
+    }
+
+    /// Pair the historical schema and executable selector with the result of
+    /// SQL's original reference-facts resolver, never an arbitrary snapshot.
+    pub fn resolved_selected(
+        need: &CatalogRelationNeed,
+        table: ResolvedAnalyzerTable,
+        binding: &crate::planning::catalog::SqlTimeTravelSnapshotBindingFacts,
+    ) -> Result<Self, CompletionProtocolError> {
+        Self::resolved_with_selection(need, table, Some(binding))
+    }
+
+    fn resolved_with_selection(
+        need: &CatalogRelationNeed,
+        table: ResolvedAnalyzerTable,
+        binding: Option<&crate::planning::catalog::SqlTimeTravelSnapshotBindingFacts>,
     ) -> Result<Self, CompletionProtocolError> {
         if table.catalog.identity != need.relation {
             return Err(CompletionProtocolError::CatalogRelationMismatch {
@@ -966,11 +1064,33 @@ impl CatalogRelationFact {
         if !catalog_lookup_target_matches_table(need, &table) {
             return Err(CompletionProtocolError::CatalogLookupTargetMismatch { id: need.id });
         }
+        let selected_snapshot = match (need.selection_key(), binding) {
+            (None, None) => None,
+            (Some(request), Some(binding))
+                if request == binding.selection()
+                    && need.relation.fqn() == binding.relation_fqn() =>
+            {
+                let crate::planner::table::ScanSource::Sql(source) = &table.planner.source;
+                if !matches!(&source.kind,
+                    crate::planner::table::SqlScanKind::Data {
+                        version: crate::planner::table::SqlTableVersionSelector::Snapshot(snapshot), ..
+                    } if *snapshot == binding.snapshot_id())
+                {
+                    return Err(CompletionProtocolError::CatalogLookupTargetMismatch {
+                        id: need.id,
+                    });
+                }
+                Some(binding.snapshot_id())
+            }
+            _ => return Err(CompletionProtocolError::CatalogLookupTargetMismatch { id: need.id }),
+        };
         Ok(Self {
             id: need.id,
             relation: need.relation.clone(),
             target: need.target,
             local_view_shadow: need.local_view_shadow,
+            selection: need.selection.clone(),
+            selected_snapshot,
             outcome: CatalogRelationOutcome::Resolved(Box::new(table)),
         })
     }
@@ -979,7 +1099,7 @@ impl CatalogRelationFact {
         need: &CatalogRelationNeed,
         definition: std::sync::Arc<SqlViewDefinition>,
     ) -> Result<Self, CompletionProtocolError> {
-        if !matches!(need.target, CatalogLookupTarget::Table { .. }) {
+        if !matches!(need.target, CatalogLookupTarget::Table { .. }) || need.version().is_some() {
             return Err(CompletionProtocolError::CatalogLookupTargetMismatch { id: need.id });
         }
         definition
@@ -1004,6 +1124,8 @@ impl CatalogRelationFact {
             relation: need.relation.clone(),
             target: need.target,
             local_view_shadow: need.local_view_shadow,
+            selection: need.selection.clone(),
+            selected_snapshot: None,
             outcome: CatalogRelationOutcome::View(definition),
         })
     }
@@ -1021,6 +1143,8 @@ impl CatalogRelationFact {
             relation: need.relation.clone(),
             target: need.target,
             local_view_shadow: need.local_view_shadow,
+            selection: need.selection.clone(),
+            selected_snapshot: None,
             outcome: CatalogRelationOutcome::Missing { reason },
         })
     }
@@ -1043,6 +1167,16 @@ impl CatalogRelationFact {
 
     pub const fn outcome(&self) -> &CatalogRelationOutcome {
         &self.outcome
+    }
+
+    pub(super) fn selection_key(
+        &self,
+    ) -> Option<&crate::planning::catalog::SqlTimeTravelSelection> {
+        self.selection.as_ref().map(|selection| selection.key())
+    }
+
+    pub(super) const fn selected_snapshot(&self) -> Option<i64> {
+        self.selected_snapshot
     }
 }
 
@@ -3142,6 +3276,10 @@ fn catalog_fact_bytes(fact: &CatalogRelationFact) -> Result<u64, CompletionProto
     let relation = table_identity_bytes(&fact.relation)?;
     let outcome = match &fact.outcome {
         CatalogRelationOutcome::Missing { reason } => checked_size(reason.len())?,
+        CatalogRelationOutcome::SelectionRefused(error) => checked_sum([
+            checked_size(std::mem::size_of::<crate::analyze_error::AnalyzeError>()),
+            checked_size(error.message().len()),
+        ])?,
         CatalogRelationOutcome::View(view) => view_fact_bytes(view)?,
         CatalogRelationOutcome::Resolved(table) => {
             let catalog_columns = checked_sum([
@@ -3169,7 +3307,33 @@ fn catalog_fact_bytes(fact: &CatalogRelationFact) -> Result<u64, CompletionProto
     checked_sum([
         Ok(std::mem::size_of::<CatalogRelationFact>() as u64),
         Ok(relation),
+        catalog_selection_bytes(fact.selection.as_deref()),
         Ok(outcome),
+    ])
+}
+
+fn catalog_selection_bytes(
+    selection: Option<&CatalogTableSelection>,
+) -> Result<u64, CompletionProtocolError> {
+    use crate::planning::catalog::SqlTimeTravelSelection;
+    use novarocks_parser::ast::{Expr, LiteralKind};
+    let Some(selection) = selection else {
+        return Ok(0);
+    };
+    let source_bytes = match &selection.version.value {
+        Expr::Literal(literal) => match &literal.kind {
+            LiteralKind::Number(value) | LiteralKind::String(value) => value.len(),
+            _ => unreachable!("closed time travel selection has a numeric or string literal"),
+        },
+        _ => unreachable!("closed time travel selection has a literal expression"),
+    };
+    checked_sum([
+        checked_size(std::mem::size_of::<CatalogTableSelection>()),
+        checked_size(source_bytes),
+        checked_size(match &selection.key {
+            SqlTimeTravelSelection::NamedReference(name) => name.len(),
+            SqlTimeTravelSelection::SnapshotId(_) | SqlTimeTravelSelection::TimestampMillis(_) => 0,
+        }),
     ])
 }
 
@@ -4991,5 +5155,47 @@ mod tests {
                 ..
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod time_travel_exchange_tests {
+    use super::*;
+    use crate::compiler::{SqlCapturedCatalogPreparation, SqlCompileControl};
+
+    fn query(sql: &str) -> novarocks_parser::ast::Query {
+        let statements = novarocks_parser::parse(sql).unwrap();
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query")
+        };
+        query.clone()
+    }
+
+    #[test]
+    fn selection_request_and_reply_strings_consume_the_existing_exchange_budget() {
+        let bytes = |name: &str| {
+            let source = SqlCapturedCatalogPreparation::try_new(
+                query(&format!(
+                    "SELECT x FROM ice.db.t FOR VERSION AS OF '{name}'"
+                )),
+                Some("ice"),
+                "db",
+                SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            let needs = source.needs().to_vec();
+            let need_bytes = SqlNeedBatch::CatalogRelations(needs.clone().into())
+                .accounted_bytes()
+                .unwrap();
+            let fact = CatalogRelationFact::missing(&needs[0], "absent").unwrap();
+            let fact_bytes = SqlFactBatch::CatalogRelations(vec![fact].into())
+                .accounted_bytes()
+                .unwrap();
+            (need_bytes, fact_bytes)
+        };
+        let small = bytes("a");
+        let large = bytes(&"a".repeat(1001));
+        assert_eq!(large.0 - small.0, 2000);
+        assert_eq!(large.1 - small.1, 2000);
     }
 }
