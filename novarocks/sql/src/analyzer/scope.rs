@@ -28,6 +28,14 @@ use crate::column_id::{ColumnId, ColumnRefFactory};
 use novarocks_type_contract::{FunctionValueType, PureCompileControl};
 use novarocks_types::schema::ColumnDef;
 
+type ScopedField = (
+    Option<String>,
+    String,
+    ColumnId,
+    FunctionValueType,
+    Option<String>,
+);
+
 /// Tracks column names and types visible at the current query level.
 /// Similar to `ExprScope` in `resolve.rs` but without physical binding
 /// (no tuple_id / slot_id).
@@ -40,14 +48,8 @@ pub(super) struct AnalyzerScope {
     /// col_name_lower -> (ColumnId, FunctionValueType)
     unqualified: HashMap<String, (ColumnId, FunctionValueType)>,
     /// Ordered columns for SELECT * expansion:
-    /// (qualifier, col_name, ColumnId, FunctionValueType)
-    ordered: Vec<(
-        Option<String>,
-        String,
-        ColumnId,
-        FunctionValueType,
-        Option<String>,
-    )>,
+    /// (qualifier, internal label, value ID, complete type, optional SQL name)
+    ordered: Vec<ScopedField>,
     /// Lambda parameters visible in the current expression scope.
     lambda_params: HashMap<String, LambdaParam>,
     /// For column names that have a canonical qualifier — e.g. a USING-join
@@ -780,13 +782,7 @@ impl AnalyzerScope {
             });
         }
         // Move USING columns to the front in USING-clause order.
-        let mut front: Vec<(
-            Option<String>,
-            String,
-            ColumnId,
-            FunctionValueType,
-            Option<String>,
-        )> = Vec::with_capacity(names_lower.len());
+        let mut front: Vec<ScopedField> = Vec::with_capacity(names_lower.len());
         for (ordinal, using_name) in names_lower.iter().enumerate() {
             if let Some(pos) = self.ordered.iter().position(|(_, _, _, _, name)| {
                 name.as_ref()

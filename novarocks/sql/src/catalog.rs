@@ -21,6 +21,8 @@ use novarocks_types::naming::TableIdentity;
 use novarocks_types::schema::CatalogTable;
 
 pub(crate) mod memory;
+mod view;
+pub use view::{SqlViewColumn, SqlViewDefinition};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TableLookupMode {
@@ -65,6 +67,21 @@ pub trait PlannerTableProvider {
         database: &str,
         table: &str,
     ) -> Result<ResolvedAnalyzerTable, String>;
+
+    /// A fact-only stored definition, selected by the same relation lookup.
+    fn resolve_view_for_analysis(
+        &self,
+        _catalog: Option<&str>,
+        _database: &str,
+        _view: &str,
+    ) -> Result<Option<&SqlViewDefinition>, crate::analyze_error::AnalyzeError> {
+        Ok(None)
+    }
+
+    /// A replacement definition's target; absent relations still resolve Missing.
+    fn view_definition_target(&self) -> Option<&TableIdentity> {
+        None
+    }
 
     fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
         None

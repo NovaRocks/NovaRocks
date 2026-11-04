@@ -181,6 +181,12 @@ impl AnalyzeErrorKind {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredViewAnalysisCause {
+    source_sql: std::sync::Arc<str>,
+    error: AnalyzeError,
+}
+
 /// A user-visible SQL analysis failure.
 ///
 /// Direct failures at user AST nodes carry their parser-owned span. Synthetic
@@ -192,6 +198,7 @@ pub struct AnalyzeError {
     span: Option<Span>,
     control: Option<novarocks_type_contract::CompileControlError>,
     source: Option<novarocks_failure_contract::SharedFailureCause>,
+    view_cause: Option<Box<StoredViewAnalysisCause>>,
 }
 
 impl AnalyzeError {
@@ -206,18 +213,27 @@ impl AnalyzeError {
             span,
             control: None,
             source: None,
+            view_cause: None,
         }
     }
 
     pub fn missing_column_name(message: impl Into<String>, span: impl Into<Option<Span>>) -> Self {
-        Self::at_optional(AnalyzeErrorKind::MissingColumnName, message, span.into())
+        Self::at_optional(
+            AnalyzeErrorKind::MissingColumnName,
+            message,
+            span.into().filter(|span| !span.is_empty()),
+        )
     }
 
     pub fn duplicate_column_name(
         message: impl Into<String>,
         span: impl Into<Option<Span>>,
     ) -> Self {
-        Self::at_optional(AnalyzeErrorKind::DuplicateColumnName, message, span.into())
+        Self::at_optional(
+            AnalyzeErrorKind::DuplicateColumnName,
+            message,
+            span.into().filter(|span| !span.is_empty()),
+        )
     }
 
     pub fn mismatched_column_aliases(
@@ -227,20 +243,76 @@ impl AnalyzeError {
         Self::at_optional(
             AnalyzeErrorKind::MismatchedColumnAliases,
             message,
-            span.into(),
+            span.into().filter(|span| !span.is_empty()),
         )
     }
 
     pub fn invalid_view(message: impl Into<String>, span: impl Into<Option<Span>>) -> Self {
-        Self::at_optional(AnalyzeErrorKind::InvalidView, message, span.into())
+        Self::at_optional(
+            AnalyzeErrorKind::InvalidView,
+            message,
+            span.into().filter(|span| !span.is_empty()),
+        )
+    }
+
+    pub(crate) fn view_cast_preparation(error: novarocks_functions::CastPrepareError) -> Self {
+        if let Some(control) = error.control_error() {
+            return Self::control(control);
+        }
+        Self::control(novarocks_type_contract::CompileControlError::Source(
+            novarocks_failure_contract::SharedFailureCause::new(error),
+        ))
+    }
+
+    pub(crate) fn invalid_view_from_analysis(
+        view: &str,
+        cause: AnalyzeError,
+        source_sql: std::sync::Arc<str>,
+        span: Span,
+    ) -> Self {
+        let mut error = Self::invalid_view(
+            format!("Failed analyzing stored view '{view}': {cause}"),
+            span,
+        );
+        error.view_cause = Some(Box::new(StoredViewAnalysisCause {
+            source_sql,
+            error: cause,
+        }));
+        error
+    }
+
+    /// Rebase only public context; the complete original error and its actual
+    /// definition source remain together in the diagnostic cause chain.
+    pub(crate) fn at_view_reference(self, source_sql: std::sync::Arc<str>, span: Span) -> Self {
+        let mut outer = self.clone();
+        outer.span = (!span.is_empty()).then_some(span);
+        outer.view_cause = Some(Box::new(StoredViewAnalysisCause {
+            source_sql,
+            error: self,
+        }));
+        outer
+    }
+
+    pub fn stored_view_definition_source(&self) -> Option<&str> {
+        self.view_cause
+            .as_ref()
+            .map(|cause| cause.source_sql.as_ref())
     }
 
     pub fn view_is_stale(message: impl Into<String>, span: impl Into<Option<Span>>) -> Self {
-        Self::at_optional(AnalyzeErrorKind::ViewIsStale, message, span.into())
+        Self::at_optional(
+            AnalyzeErrorKind::ViewIsStale,
+            message,
+            span.into().filter(|span| !span.is_empty()),
+        )
     }
 
     pub fn view_is_recursive(message: impl Into<String>, span: impl Into<Option<Span>>) -> Self {
-        Self::at_optional(AnalyzeErrorKind::ViewIsRecursive, message, span.into())
+        Self::at_optional(
+            AnalyzeErrorKind::ViewIsRecursive,
+            message,
+            span.into().filter(|span| !span.is_empty()),
+        )
     }
 
     pub fn unknown_table(message: impl Into<String>, span: Span) -> Self {
@@ -288,6 +360,7 @@ impl AnalyzeError {
             span: None,
             control: None,
             source: Some(source),
+            view_cause: None,
         }
     }
     pub fn source_failure(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
@@ -331,6 +404,7 @@ impl AnalyzeError {
             span: None,
             control: None,
             source: None,
+            view_cause: None,
         }
     }
 
@@ -347,6 +421,7 @@ impl AnalyzeError {
             span: None,
             control: None,
             source: None,
+            view_cause: None,
         }
     }
 
@@ -359,6 +434,7 @@ impl AnalyzeError {
             span: None,
             control: Some(error),
             source: None,
+            view_cause: None,
         }
     }
 
@@ -373,6 +449,7 @@ impl AnalyzeError {
                     span: None,
                     control: None,
                     source: Some(source),
+                    view_cause: None,
                 }
             }
             novarocks_functions::FunctionBindingError::VariantTargetType(source) => {
@@ -387,6 +464,7 @@ impl AnalyzeError {
                     span: None,
                     control: None,
                     source: None,
+                    view_cause: None,
                 }
             }
             error => Self::internal(error.to_string()),
@@ -491,7 +569,10 @@ impl fmt::Display for AnalyzeError {
 
 impl std::error::Error for AnalyzeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|source| source as _)
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+            .or_else(|| self.view_cause.as_deref().map(|cause| &cause.error as _))
     }
 }
 

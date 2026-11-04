@@ -40,7 +40,8 @@ use novarocks_types::schema::{CatalogTable, ColumnDef};
 pub use crate::analyzer::iceberg_metadata::{MetadataColumn, metadata_table_schema};
 pub use crate::catalog::memory::PlannerMemoryCatalog;
 pub use crate::catalog::{
-    IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, TableLookupMode,
+    IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, SqlViewColumn,
+    SqlViewDefinition, TableLookupMode,
 };
 /// SQL metadata-relation vocabulary needed by application catalog admission.
 /// This is a value-only DTO; it carries neither a table definition nor a

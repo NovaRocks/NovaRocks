@@ -585,6 +585,14 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
                 }
 
+                if let Some(view) = self.catalog.resolve_view_for_analysis(
+                    catalog_override.as_deref(),
+                    &db_lower,
+                    &tbl_lower,
+                )? {
+                    return self.analyze_view_relation(view, alias.as_ref(), &tbl, name.span);
+                }
+
                 let resolved_table = self
                     .catalog
                     .resolve_table_for_analysis(catalog_override.as_deref(), &db_lower, &tbl_lower)

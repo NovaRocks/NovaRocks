@@ -8791,6 +8791,7 @@ mod tests {
             constant_policy: crate::constant::test_constant_policy(),
             sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
             factory,
+            view_stack: Default::default(),
             ctes: HashMap::new(),
             pending_ctes: HashSet::new(),
             next_subquery_id: Cell::new(0),

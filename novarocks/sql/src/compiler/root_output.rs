@@ -123,7 +123,7 @@ impl RootOutputSemantics {
     }
 
     pub(crate) fn with_analysis_span(mut self, span: novarocks_parser::Span) -> Self {
-        self.source_span = Some(span);
+        self.source_span = (!span.is_empty()).then_some(span);
         self
     }
 

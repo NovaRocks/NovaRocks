@@ -48,6 +48,7 @@ pub(crate) mod root_output_declaration;
 #[cfg(test)]
 mod scalar_rebind_contract_tests;
 mod value_conversion;
+mod view;
 #[cfg(test)]
 mod window_canonical_tests;
 /// The analyzer owns this bound and enforces it; it is named outside the
@@ -326,6 +327,7 @@ fn analyze_with_factory_and_function_catalog_inner(
         control,
         sql_semantics: sql_semantics.clone(),
         factory: factory.clone(),
+        view_stack: Default::default(),
         ctes: std::collections::HashMap::new(),
         pending_ctes: std::collections::HashSet::new(),
         next_subquery_id: std::cell::Cell::new(0),
@@ -347,6 +349,7 @@ fn analyze_with_factory_and_function_catalog_inner(
 // ---------------------------------------------------------------------------
 
 pub(super) struct AnalyzerContext<'a> {
+    view_stack: view::ViewAnalysisStack,
     pub(super) control: &'a crate::compiler::SqlCompileControl,
     pub(super) constant_policy: novarocks_functions::ConstantPolicy,
     materialized_values: Option<crate::compiler::materialized_values::MaterializedValuesLoan<'a>>,
@@ -400,6 +403,7 @@ impl<'a> AnalyzerContext<'a> {
             function_catalog: self.function_catalog,
             sql_semantics: settings,
             factory: self.factory.clone(),
+            view_stack: self.view_stack.clone(),
             ctes: self.ctes.clone(),
             pending_ctes: self.pending_ctes.clone(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
@@ -476,6 +480,7 @@ impl<'a> AnalyzerContext<'a> {
             function_catalog: self.function_catalog,
             sql_semantics: self.sql_semantics.clone(),
             factory: self.factory.clone(),
+            view_stack: self.view_stack.clone(),
             ctes: self.ctes.clone(),
             pending_ctes: pending_ctes.clone(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
@@ -3371,6 +3376,22 @@ fn sync_output_columns_from_projection(
 ) {
     for (output, item) in output_columns.iter_mut().zip(projection.iter()) {
         output.value_type = item.expr.value_type.clone();
+    }
+}
+
+/// A computed-base dereference never acquires a SQL field name from its suffix.
+fn natural_field_name(expr: &ast::Expr) -> Option<String> {
+    match expr {
+        ast::Expr::Identifier(ident) => Some(ident.value.clone()),
+        ast::Expr::CompoundIdentifier(parts) => parts.parts.last().map(|ident| ident.value.clone()),
+        ast::Expr::Nested(nested) => natural_field_name(&nested.expression),
+        ast::Expr::Access(access) if natural_field_name(&access.expr).is_some() => {
+            match &access.kind {
+                ast::AccessKind::Field(field) => Some(field.value.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -7778,21 +7799,5 @@ mod tests {
             err.contains("subquery is not supported in ORDER BY"),
             "unexpected error: {err}"
         );
-    }
-}
-
-/// A computed-base dereference never acquires a SQL field name from its suffix.
-fn natural_field_name(expr: &ast::Expr) -> Option<String> {
-    match expr {
-        ast::Expr::Identifier(ident) => Some(ident.value.clone()),
-        ast::Expr::CompoundIdentifier(parts) => parts.parts.last().map(|ident| ident.value.clone()),
-        ast::Expr::Nested(nested) => natural_field_name(&nested.expression),
-        ast::Expr::Access(access) if natural_field_name(&access.expr).is_some() => {
-            match &access.kind {
-                ast::AccessKind::Field(field) => Some(field.value.clone()),
-                _ => None,
-            }
-        }
-        _ => None,
     }
 }

@@ -223,6 +223,7 @@ mod scalar_domain_tests {
             function_catalog: crate::functions::builtin_sql_function_catalog(),
             sql_semantics: Default::default(),
             factory,
+            view_stack: Default::default(),
             ctes: Default::default(),
             pending_ctes: Default::default(),
             next_subquery_id: Cell::new(0),

@@ -3344,11 +3344,12 @@ fn bind_output_targets(
     names
         .iter()
         .map(|name| {
+            let name = name.to_lowercase();
             let mut matching = target
                 .columns
                 .iter()
                 .enumerate()
-                .filter(|(_, column)| column.name.eq_ignore_ascii_case(name));
+                .filter(|(_, column)| column.name.to_lowercase() == name);
             let (ordinal, _) = matching.next()?;
             matching.next().is_none().then_some(ordinal)
         })
@@ -3944,6 +3945,16 @@ mod tests {
         ambiguous.name = "K".into();
         target.columns.push(ambiguous);
         assert!(bind_output_targets(&["k".into()], &target).is_none());
+
+        let mut unicode = target.columns[0].clone();
+        unicode.name = "Ä".into();
+        target.columns.push(unicode);
+        assert_eq!(
+            bind_output_targets(&["ä".into()], &target)
+                .unwrap()
+                .as_ref(),
+            &[3]
+        );
 
         let catalog = CandidateCatalog::new();
         let mut definition = candidate_index().definitions[0].clone();

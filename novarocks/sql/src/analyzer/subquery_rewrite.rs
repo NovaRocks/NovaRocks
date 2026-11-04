@@ -3022,6 +3022,7 @@ impl<'a> AnalyzerContext<'a> {
             function_catalog: self.function_catalog,
             sql_semantics: self.sql_semantics.clone(),
             factory: self.factory.clone(),
+            view_stack: self.view_stack.clone(),
             ctes: self.ctes.clone(),
             pending_ctes: self.pending_ctes.clone(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
