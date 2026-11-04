@@ -2997,7 +2997,6 @@ impl IcebergWriteSessionControl {
             .await
         })
         .await
-        .map_err(unavailable)
     }
 
     async fn rewrite_branches_from_frozen_with_io(
@@ -3086,7 +3085,8 @@ impl IcebergWriteSessionControl {
                 snapshot_id,
                 Some(&control),
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
             let snapshot = owned
                 .metadata()
                 .snapshot_by_id(snapshot_id)

@@ -35,6 +35,7 @@ use crate::read_model::{
     IcebergDataFileMetadata, IcebergReadFile, IcebergReadSnapshot, iceberg_partition_key,
 };
 use crate::scan_model::IcebergColumnStats;
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 // Small metadata-only pruning work is bounded independently of the full suffix.
 const MAX_STATS_DELETE_MEMBERS: usize = 256;
@@ -261,22 +262,24 @@ pub async fn build_read_snapshot_at(
     table: &Table,
     snapshot_id: i64,
 ) -> Result<IcebergReadSnapshot, String> {
-    build_read_snapshot_at_with_control(table, snapshot_id, None).await
+    build_read_snapshot_at_with_control(table, snapshot_id, None)
+        .await
+        .map_err(|error| error.message().to_owned())
 }
 
 pub(crate) async fn build_read_snapshot_at_with_control(
     table: &Table,
     snapshot_id: i64,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
-) -> Result<IcebergReadSnapshot, String> {
+) -> Result<IcebergReadSnapshot, ConnectorError> {
     let metadata = table.metadata();
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
-        .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
+        .ok_or_else(|| read_snapshot_error(format!("snapshot {snapshot_id} not found")))?;
     let schema = snapshot
         .schema(metadata)
-        .map_err(|e| format!("resolve snapshot schema: {e}"))?;
-    let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
+        .map_err(|e| read_snapshot_error(format!("resolve snapshot schema: {e}")))?;
+    let domain = mint_read_domain(metadata, snapshot_id, &schema).map_err(read_snapshot_error)?;
     build_read_snapshot_in_domain(table, domain, control).await
 }
 
@@ -286,11 +289,11 @@ pub(crate) async fn build_read_snapshot_in_domain(
     table: &Table,
     domain: Arc<ReadDomain>,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
-) -> Result<IcebergReadSnapshot, String> {
+) -> Result<IcebergReadSnapshot, ConnectorError> {
     let snapshot_id = domain.endpoint().snapshot_id();
     let files = observe_read_files::<DataFile>(table, domain, control, None)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(ReadFailure::into_connector)?;
     Ok(IcebergReadSnapshot {
         snapshot_id: Some(snapshot_id),
         files,
@@ -561,11 +564,16 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
             }
             None => crate::manifest::load_manifest(manifest_file, table.file_io())
                 .await
-                .map_err(|e| {
-                    crate::manifest::with_variant_statistics_hint(
-                        format!("load manifest: {e}"),
-                        metadata,
-                    )
+                .map_err(|error| {
+                    if error.kind() == crate::iceberg::ErrorKind::FeatureUnsupported {
+                        ReadFailure::Original(
+                            crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::raw_read_failure(error).into(),
+                        )
+                    } else {
+                        ReadFailure::Semantic(crate::manifest::with_variant_statistics_hint(
+                            format!("load manifest: {error}"), metadata,
+                        ))
+                    }
                 })?,
         };
         check_read_control(control)?;
@@ -1209,6 +1217,11 @@ fn column_stats_checked(
     } else {
         Ok(None)
     }
+}
+
+fn read_snapshot_error(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::Unavailable, message.into())
+        .with_retryable_before_progress()
 }
 
 fn check_read_control(
@@ -1953,6 +1966,66 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn equality_inventory_and_compaction_preserve_manifest_schema_capability() {
+        let mut ty = Type::Primitive(PrimitiveType::Int);
+        for id in (100..142).rev() {
+            ty = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+                id,
+                format!("n{id}"),
+                ty,
+            ))]));
+        }
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(1, "id", PrimitiveType::Long.into())),
+                Arc::new(NestedField::optional(2, "deep", ty)),
+            ])
+            .build()
+            .unwrap();
+        let table = table_with_schema_and_delete_spec(
+            vec![vec![(equality("e"), 5)]],
+            None,
+            false,
+            false,
+            schema,
+            Transform::Identity,
+        )
+        .await;
+        let metadata = table
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .set_ref(
+                "main",
+                crate::iceberg::spec::SnapshotReference::new(
+                    77,
+                    crate::iceberg::spec::SnapshotRetention::branch(None, None, None),
+                ),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let table = with_metadata(&table, metadata);
+        let inventory =
+            crate::manifest::current_equality_delete_column_names_with_control(&table, None)
+                .await
+                .unwrap_err();
+        let compact =
+            crate::commit::current_live_data_file_compaction_stats(&table, table.file_io(), false)
+                .await
+                .unwrap_err();
+        for error in [inventory, compact] {
+            assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            assert_eq!(
+                error.message(),
+                crate::schema_capability::UNSUPPORTED_SCHEMA
+            );
+            assert!(std::error::Error::source(&error).is_some());
+        }
     }
 
     #[tokio::test]

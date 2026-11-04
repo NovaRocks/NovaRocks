@@ -224,6 +224,13 @@ pub(crate) fn prepare_rest_staged_table(
         .with_fields(super::type_mapping::schema_fields(columns)?)
         .build()
         .map_err(|error| format!("build staged Iceberg schema: {error}"))?;
+    crate::schema_capability::admit_schema(&schema).map_err(|error| {
+        if error.kind() == ConnectorErrorKind::Unsupported {
+            RestStagedPrepareFailure::Unsupported(error.message().to_owned())
+        } else {
+            RestStagedPrepareFailure::from(error)
+        }
+    })?;
     let partition_spec = super::catalog_mutation::initial_partition_spec(&schema, partitioning)?;
     properties.insert(
         "format-version".to_string(),
@@ -1084,6 +1091,13 @@ pub(crate) async fn prepare_rest_staged_table_async(
         .with_fields(super::type_mapping::schema_fields(columns)?)
         .build()
         .map_err(|error| format!("build staged Iceberg schema: {error}"))?;
+    crate::schema_capability::admit_schema(&schema).map_err(|error| {
+        if error.kind() == ConnectorErrorKind::Unsupported {
+            RestStagedPrepareFailure::Unsupported(error.message().to_owned())
+        } else {
+            RestStagedPrepareFailure::from(error)
+        }
+    })?;
     let partition_spec = super::catalog_mutation::initial_partition_spec(&schema, partitioning)?;
     properties.insert(
         "format-version".to_string(),
@@ -3604,6 +3618,64 @@ mod tests {
             IcebergMetadataResources::new(binding, handle),
         )
         .expect("control runtime")
+    }
+
+    #[test]
+    fn schema_nesting_refuses_sync_and_async_ctas_before_any_request() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        use novarocks_spi::connector::{ConnectorDataType, ConnectorStructField};
+        let server = TestServer::start(Script::new());
+        let (executor, adapter) = stage_http_adapter(&server);
+        let mut data_type = ConnectorDataType::Int;
+        for level in (0..42).rev() {
+            data_type = ConnectorDataType::Struct(vec![ConnectorStructField {
+                name: format!("n{level}").into(),
+                data_type,
+                nullable: true,
+            }]);
+        }
+        let columns = vec![ConnectorColumnDefinition {
+            name: "deep".into(),
+            data_type,
+            nullable: true,
+            aggregation: None,
+            default: None,
+        }];
+        let original = context();
+        let sync = prepare_rest_staged_table(
+            &adapter.runtime,
+            Some(&original),
+            None,
+            ConnectorMutationOperationId::new(),
+            novarocks_spi::connector::LakePublicationId::new_v7(),
+            "db",
+            "t",
+            &columns,
+            &[],
+            &[],
+        );
+        let asynchronous = executor.block_on(prepare_rest_staged_table_async(
+            &adapter.runtime,
+            Some(&original),
+            None,
+            ConnectorMutationOperationId::new(),
+            novarocks_spi::connector::LakePublicationId::new_v7(),
+            "db",
+            "t",
+            &columns,
+            &[],
+            &[],
+        ));
+        for result in [sync, asynchronous] {
+            match result {
+                Err(RestStagedPrepareFailure::Unsupported(message)) => {
+                    assert!(message.contains("Iceberg schema JSON exceeds 127 container levels"));
+                }
+                Err(other) => panic!("schema nesting must retain Unsupported: {other:?}"),
+                Ok(_) => panic!("unsupported schema must not stage a target"),
+            }
+        }
+        assert!(server.requests().is_empty());
     }
 
     #[test]

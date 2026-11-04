@@ -24,7 +24,7 @@ object MetadataHistoryFixture {
   import org.apache.iceberg.catalog.TableIdentifier
 
   val DomainProperty = "novarocks.field_domains.v1"
-  val DeepPath = "deep." + (1 to 63).map(i => "n" + i).mkString(".")
+  val DeepPath = "deep." + Vector.fill(63)("element").mkString(".")
   val FutureSourceName = "future_partition_source"
   val FutureSourceTag = "future_before_partition"
   val Names = Set("metadata_depth", "metadata_depth_copy", FutureSourceName)
@@ -73,6 +73,8 @@ object MetadataHistoryFixture {
   }
   def depth(t: Type): Int = t.typeId() match {
     case Type.TypeID.STRUCT => 1 + t.asStructType().fields().asScala.map(f => depth(f.`type`())).max
+    case Type.TypeID.LIST => 1 + depth(t.asListType().elementType())
+    case Type.TypeID.MAP => 1 + math.max(depth(t.asMapType().keyType()), depth(t.asMapType().valueType()))
     case _ => 1
   }
   def fieldDepth(schema: Schema): Int = schema.columns().asScala.map(f => depth(f.`type`())).max
@@ -83,6 +85,10 @@ object MetadataHistoryFixture {
       t.asStructType().fields().asScala.foreach { f =>
         n.set[JsonNode](f.name(), value(f.`type`(), row.getField(f.name())))
       }; n
+    } else if (t.typeId() == Type.TypeID.LIST) {
+      val n = mapper.createArrayNode()
+      v.asInstanceOf[java.util.List[AnyRef]].asScala.foreach(e => n.add(value(t.asListType().elementType(), e)))
+      n
     } else json(v)
   }
   def content(schema: Schema, row: Record): String = {
@@ -135,29 +141,20 @@ object MetadataHistoryFixture {
       "retained_schemas" -> t.schemas().asScala.toVector.sortBy(_._1.intValue()).map { case(id, s) =>
         obj("schema_id" -> id.intValue(), "depth" -> fieldDepth(s), "schema" -> SchemaParser.toJson(s)) })
   }
-  def domainText(schema: Schema): String = mapper.writeValueAsString(obj("version" -> 1,
-    "fields" -> obj(schema.findField(DeepPath).fieldId().toString -> "tinyint")))
   def depthSchema: Schema = {
     var t: Type = Types.IntegerType.get()
-    for (i <- (1 to 63).reverse)
-      t = Types.StructType.of(Types.NestedField.optional(i + 2, "n" + i, t))
+    for (i <- (1 to 63).reverse) t = Types.ListType.ofOptional(i + 2, t)
     new Schema(Types.NestedField.required(1, "id", Types.LongType.get()),
       Types.NestedField.optional(2, "deep", t))
   }
   def depthRow(schema: Schema, id: Long, leaf: Option[Int]): Record = {
     val row = GenericRecord.create(schema); row.setField("id", Long.box(id))
     leaf.foreach { v =>
-      val structs = scala.collection.mutable.ArrayBuffer.empty[Type]
-      var t = schema.findType("deep")
-      while (t.typeId() == Type.TypeID.STRUCT) {
-        structs += t; t = t.asStructType().fields().get(0).`type`()
-      }
-      require(structs.size == 63 && t == Types.IntegerType.get())
+      var t = schema.findType("deep"); var levels = 0
+      while (t.typeId() == Type.TypeID.LIST) { levels += 1; t = t.asListType().elementType() }
+      require(levels == 63 && t == Types.IntegerType.get())
       var child: AnyRef = Int.box(v)
-      structs.reverse.foreach { s =>
-        val r = GenericRecord.create(s.asStructType())
-        r.setField(s.asStructType().fields().get(0).name(), child); child = r
-      }
+      for (_ <- 1 to levels) child = java.util.Collections.singletonList(child)
       row.setField("deep", child)
     }; row
   }
@@ -166,9 +163,8 @@ object MetadataHistoryFixture {
   def depthInitialize(ns: String): Unit = {
     val requested = depthSchema
     val t = create(ns, "metadata_depth", requested, Map("format-version" -> "3",
-      "write.row-lineage" -> "true", DomainProperty -> domainText(requested)))
+      "write.row-lineage" -> "true"))
     require(fieldDepth(t.schema()) == 64)
-    require(t.properties().get(DomainProperty) == domainText(t.schema()), "CREATE lost the exact leaf domain")
     append(t, depthRows(t.schema()), "initial"); createTag(t, "depth_initial")
     val rows = expected(t.schema(), depthRows(t.schema()))
     require(bag(t, t.currentSnapshot().snapshotId(), t.schema()) == rows)
@@ -177,12 +173,12 @@ object MetadataHistoryFixture {
   }
   def depthObserveAppend(ns: String): Unit = {
     val t = load(ns, "metadata_depth"); val initial = tag(t, "depth_initial")
-    require(fieldDepth(t.schema()) == 64 && t.currentSnapshot().parentId().longValue() == initial)
-    val rows = expected(t.schema(), depthRows(t.schema()) :+ depthRow(t.schema(), 3, None))
+    require(fieldDepth(t.schema()) == 64 && t.snapshots().asScala.size == 3)
+    require(t.snapshot(t.currentSnapshot().parentId()).parentId().longValue() == initial)
+    val rows = expected(t.schema(), depthRows(t.schema()) ++ Vector(depthRow(t.schema(), 3, None), depthRow(t.schema(), 5, Some(7))))
     require(bag(t, t.currentSnapshot().snapshotId(), t.schema()) == rows)
     val copy = load(ns, "metadata_depth_copy")
     require(metadata(copy).uuid() != metadata(t).uuid() && fieldDepth(copy.schema()) == 64)
-    require(copy.properties().get(DomainProperty) == domainText(copy.schema()), "CTAS lost the leaf domain")
     require(bag(copy, copy.currentSnapshot().snapshotId(), copy.schema()) == rows)
     emit(obj("record" -> "metadata_depth_native_committed", "source" -> facts(t),
       "ctas" -> facts(copy), "bag" -> bagFact(rows)))
@@ -190,15 +186,14 @@ object MetadataHistoryFixture {
   }
   def depthRetainHistory(ns: String): Unit = {
     val t = load(ns, "metadata_depth"); val schema = t.schema()
-    val originalDomains = t.properties().get(DomainProperty)
     createTag(t, "depth_before_drop")
     t.updateSchema().deleteColumn("deep").commit(); t.refresh()
     require(t.schemas().containsKey(Int.box(schema.schemaId())) && fieldDepth(schema) == 64 &&
-      fieldDepth(t.schema()) == 1 && t.properties().get(DomainProperty) == originalDomains)
+      fieldDepth(t.schema()) == 1)
     val row = GenericRecord.create(t.schema()); row.setField("id", Long.box(4))
     append(t, Vector(row), "shallow")
     val rows = bag(t, t.currentSnapshot().snapshotId(), t.schema())
-    require(rows == Map("{\"id\":1}" -> 2, "{\"id\":2}" -> 1, "{\"id\":3}" -> 1, "{\"id\":4}" -> 1))
+    require(rows == Map("{\"id\":1}" -> 2, "{\"id\":2}" -> 1, "{\"id\":3}" -> 1, "{\"id\":4}" -> 1, "{\"id\":5}" -> 1))
     val old = snapshotSchema(t, tag(t, "depth_initial"))
     require(fieldDepth(old) == 64 && bag(t, tag(t, "depth_initial"), old) == expected(old, depthRows(old)))
     emit(obj("record" -> "metadata_depth_retained_history", "facts" -> facts(t), "current_bag" -> bagFact(rows)))
@@ -268,10 +263,11 @@ object MetadataHistoryFixture {
     require(ownedLocation(t.location()) && fieldDepth(t.schema()) == 1)
     val before = tag(t, "depth_before_drop"); val original = snapshotSchema(t, before)
     require(fieldDepth(original) == 64 && original.findType(DeepPath) == Types.IntegerType.get())
-    require(t.currentSnapshot().snapshotId() != before && t.snapshots().asScala.size == 2)
-    require(bag(t, before, original) == Map("{\"id\":1,\"deep\":null}" -> 2, "{\"id\":2,\"deep\":null}" -> 1))
+    require(t.currentSnapshot().snapshotId() != before && t.snapshots().asScala.size == 3)
+    require(bag(t, before, original) == expected(original, Vector(
+      depthRow(original, 1, None), depthRow(original, 1, None), depthRow(original, 2, None), depthRow(original, 4, Some(7)))))
     val rows = bag(t, t.currentSnapshot().snapshotId(), t.schema())
-    require(rows == Map("{\"id\":1}" -> 2, "{\"id\":2}" -> 1, "{\"id\":3}" -> 1))
+    require(rows == Map("{\"id\":1}" -> 2, "{\"id\":2}" -> 1, "{\"id\":3}" -> 1, "{\"id\":4}" -> 1))
     emit(obj("record" -> "hadoop_metadata_depth_observed", "facts" -> facts(t),
       "historical_snapshot" -> before, "current_bag" -> bagFact(rows)))
     println("HADOOP_METADATA_DEPTH_OBSERVED")

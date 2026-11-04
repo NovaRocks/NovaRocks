@@ -2509,6 +2509,20 @@
       "review_by": "2026-12-15",
       "reason": "User ruling on 2026-11-03 permits exact blocked depth64 cases to be temporarily ignored without imposing new implementation limits. Original 1FE+3BE observations are retained in UEA-7B3-A attempts 20261103T111804Z-candidate-2381d00-dev-sql-f97868 and 20261103T112438Z-dev-sql-derived-inputs-distribution-7318c3; suite, server and fixture cleanup were OK. This is quarantine, not a known-error exemption, expected-error rewrite or PASS. After replacing unsupported multi-consumer CTE inputs with equivalent independent branches, the original positive logical64 query returns query.execution.resource_exhausted with a generic pure-compilation message. The originating owner is not yet established; this is not a confirmed upstream defect or a measured work-budget shortage.",
       "exit_condition": "Separately diagnose the first original source error and approve any necessary capability restoration. Rerun the complete original positive logical64 Map aggregate case with both placements, all value/type and plan assertions and actual role/fixture cleanup; remove only after that evidence passes."
+    },
+    {
+      "unit": "sql-case:iceberg/novarocks_full_metadata_depth64",
+      "owner": "UEA-7B3-B / Iceberg suite owner",
+      "review_by": "2026-12-15",
+      "reason": "User scope decision on 2026-11-03: keep finite support under current upstream limitations; stop maximum-depth expansion and temporarily ignore this exact depth64 case. Native rerun reaches the private-read codec refusal Positions requested=65 limit=64 after the client type-signature fix. The SDK metadata decode success does not prove scan/write support. The iceberg-rust 0.11 embedded-manifest-schema recursion limit is a separately confirmed upstream gap; do not relabel all observed failures as that SDK cause. Preserve original SQL, goldens, SDK inputs and native failures; this is a case-scope quarantine, not a generic error-code waiver.",
+      "exit_condition": "After an official upstream release/public API satisfies the manifest recovery condition, explicitly reassess the remaining codec, Writer, value-path and client gaps under a separately approved scope. Run the original complete case on native 1FE+3BE, including all result oracles and cleanup; remove this quarantine only after it passes. The review date does not establish support."
+    },
+    {
+      "unit": "sql-case:iceberg-ddl/full_metadata_depth64_hadoop",
+      "owner": "UEA-7B3-B / Iceberg suite owner",
+      "review_by": "2026-12-15",
+      "reason": "User scope decision on 2026-11-03: keep finite support under current upstream limitations; stop maximum-depth expansion and temporarily ignore this exact depth64 case. Native id-only INSERT reaches query.execution.invariant in its DML source domain; the underlying cause remains unconfirmed. The separately confirmed Writer32 refusal is not proof of that Invariant root cause. The iceberg-rust 0.11 embedded-manifest-schema recursion limit is a separately confirmed upstream gap; do not relabel all observed failures as that SDK cause. Preserve original SQL, goldens, SDK inputs and native failures; this is a case-scope quarantine, not a generic error-code waiver.",
+      "exit_condition": "After an official upstream release/public API satisfies the manifest recovery condition, explicitly reassess the remaining codec, Writer, value-path and client gaps under a separately approved scope. Run the original complete case on native 1FE+3BE, including all result oracles and cleanup; remove this quarantine only after it passes. The review date does not establish support."
     }
   ]
 }

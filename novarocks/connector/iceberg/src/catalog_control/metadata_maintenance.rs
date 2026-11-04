@@ -959,9 +959,13 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
             )
             .await
             .map_err(|error| {
-                unavailable(format!(
-                    "observe Iceberg table {namespace}.{table_name} compaction groups: {error}"
-                ))
+                if error.kind() == ConnectorErrorKind::Unsupported {
+                    error
+                } else {
+                    unavailable(format!(
+                        "observe Iceberg table {namespace}.{table_name} compaction groups: {error}"
+                    ))
+                }
             })?;
             let value = u64::try_from(stats.max_compactable_data_files).map_err(|_| {
                 internal(format!(

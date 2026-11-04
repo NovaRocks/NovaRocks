@@ -699,6 +699,113 @@ fn arrays_rows_binary_text_and_variant_are_decoded_without_an_untyped_tree() {
         TrinoValue::Null
     );
 }
+// Logical depth 64 is a supported NovaRocks result. The independent wire
+// text below expands each ARRAY level to three JSON containers and each ROW
+// level to four, so neither may depend on Serde's default JSON recursion cap.
+fn depth64_pages(named_rows: bool) {
+    let mut wire = r#"{"rawType":"integer","arguments":[]}"#.to_owned();
+    let mut expected_signature = TypeSignature::simple("integer");
+    let mut expected_value = TrinoValue::Integer(7);
+    let mut type_name = "integer".to_owned();
+    for _ in 0..63 {
+        if named_rows {
+            wire = format!(
+                r#"{{"rawType":"row","arguments":[{{"kind":"NAMED_TYPE","value":{{"fieldName":{{"name":"v"}},"typeSignature":{wire}}}}}]}}"#,
+            );
+            expected_signature = TypeSignature {
+                raw_type: "row".into(),
+                arguments: vec![TypeArgument::NamedType(NamedTypeSignature {
+                    field_name: Some(RowFieldName { name: "v".into() }),
+                    type_signature: expected_signature,
+                })],
+            };
+            expected_value = TrinoValue::Row(vec![expected_value]);
+            type_name = format!("row(v {type_name})");
+        } else {
+            wire =
+                format!(r#"{{"rawType":"array","arguments":[{{"kind":"TYPE","value":{wire}}}]}}"#,);
+            expected_signature = TypeSignature {
+                raw_type: "array".into(),
+                arguments: vec![TypeArgument::Type(expected_signature)],
+            };
+            expected_value = TrinoValue::Array(vec![expected_value]);
+            type_name = format!("array({type_name})");
+        }
+    }
+    let value = format!("{}7{}", "[".repeat(63), "]".repeat(63));
+    let columns = format!(r#"[{{"name":"deep","type":"{type_name}","typeSignature":{wire}}}]"#,);
+    let first = format!(
+        r#"{{"id":"q","columns":{columns},"data":[[null],[{value}]],"nextUri":"$BASE/next/deep"}}"#,
+    );
+    let second = format!(r#"{{"id":"q","columns":{columns},"data":[[{value}],[null]]}}"#);
+    let server = FakeServer::new(vec![Reply::json(&first), Reply::json(&second)]);
+    let result = server
+        .client()
+        .execute(&mut session(), "SELECT deep", deadline())
+        .unwrap();
+    assert_eq!(result.pages, 2);
+    assert_eq!(
+        result.columns,
+        vec![Column {
+            name: "deep".into(),
+            type_name,
+            type_signature: expected_signature,
+        }]
+    );
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![TrinoValue::Null],
+            vec![expected_value.clone()],
+            vec![expected_value],
+            vec![TrinoValue::Null],
+        ]
+    );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(requests[1].path, "/next/deep");
+}
+#[test]
+fn array64_signatures_and_values_decode_on_initial_and_continuation_pages() {
+    depth64_pages(false);
+}
+#[test]
+fn row64_signatures_and_values_decode_on_initial_and_continuation_pages() {
+    depth64_pages(true);
+}
+#[test]
+fn signature_arguments_keep_original_tags_order_and_refusals() {
+    let arguments: Vec<TypeArgument> = serde_json::from_str(
+        r#"[{"value":12,"kind":"LONG"},{"kind":"TYPE","value":{"rawType":"integer"}},{"value":{"typeSignature":{"rawType":"boolean"},"fieldName":null},"kind":"NAMED_TYPE"}]"#,
+    ).unwrap();
+    assert_eq!(
+        arguments,
+        vec![
+            TypeArgument::Long(12),
+            TypeArgument::Type(TypeSignature::simple("integer")),
+            TypeArgument::NamedType(NamedTypeSignature {
+                field_name: None,
+                type_signature: TypeSignature::simple("boolean"),
+            }),
+        ]
+    );
+    for wire in [
+        r#"{"kind":"OTHER","value":0}"#,
+        r#"{"kind":"LONG","value":-1}"#,
+        r#"{"kind":"TYPE","value":{"rawType":"integer","rawType":"bigint"}}"#,
+        r#"{"kind":"NAMED_TYPE","value":{"fieldName":null}}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<TypeArgument>(wire).is_err(),
+            "{wire}"
+        );
+    }
+    let unsupported = sig(r#"{"rawType":"uuid"}"#);
+    assert!(unsupported.validate().is_err());
+}
+
 #[test]
 fn unsupported_signatures_are_rejected_even_for_null_cells() {
     for ty in [

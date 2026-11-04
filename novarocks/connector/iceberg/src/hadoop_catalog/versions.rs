@@ -279,14 +279,14 @@ impl HadoopFileSystemCatalog {
         } else {
             bytes.as_ref()
         };
-        let metadata: TableMetadata =
-            crate::metadata_json::from_slice(document).map_err(|error| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "Failed to parse table metadata JSON",
-                )
+        let metadata: TableMetadata = crate::metadata_json::from_slice_document(
+            document,
+            crate::metadata_json::Document::TableMetadata,
+        )
+        .map_err(|error| {
+            Error::new(error.iceberg_kind(), "Failed to parse table metadata JSON")
                 .with_source(error)
-            })?;
+        })?;
         active(&binding)?;
         self.validate_table_root(table, metadata.location())?;
         if expected_uuid.is_some_and(|uuid| uuid != metadata.uuid()) {
