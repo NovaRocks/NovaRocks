@@ -348,6 +348,7 @@ fn preflight_source_policy_core<H>(
     let policy = Policy(admission.is_some());
     validate_field(field, work)?;
     if let Some((prefix, admission)) = admission.as_mut().filter(|(_, a)| a.reader) {
+        let mut type_nodes = 0usize;
         let mut headers = Counts {
             fields: 1,
             metadata_entries: field.metadata().len(),
@@ -369,30 +370,33 @@ fn preflight_source_policy_core<H>(
             admission.update(facts).map_err(control_cause_host)
         };
         let mut capture = |visit: ValueTypeVisit<'_>| {
-            if let ValueTypeVisit::TypeNode(_) = visit {
-                headers.types = headers
-                    .types
-                    .checked_add(1)
-                    .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
-                reader_prefix = reader_prefix.with_reader_walker_node_bound(headers.types);
-            }
-            if let ValueTypeVisit::Field(field) = visit {
-                headers.fields = headers
-                    .fields
-                    .checked_add(1)
-                    .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
-                headers.metadata_entries = headers
-                    .metadata_entries
-                    .checked_add(field.metadata().len())
-                    .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
-                headers.string_count = headers
-                    .string_count
-                    .checked_add(1)
-                    .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
-                headers.string_bytes = headers
-                    .string_bytes
-                    .checked_add(field.name().len())
-                    .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+            match visit {
+                ValueTypeVisit::Field(field) => {
+                    headers.fields = headers
+                        .fields
+                        .checked_add(1)
+                        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+                    headers.metadata_entries = headers
+                        .metadata_entries
+                        .checked_add(field.metadata().len())
+                        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+                    headers.string_count = headers
+                        .string_count
+                        .checked_add(1)
+                        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+                    headers.string_bytes = headers
+                        .string_bytes
+                        .checked_add(field.name().len())
+                        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+                }
+                ValueTypeVisit::ChildEdge(_) => {
+                    prefix.observe_reader_child().map_err(control_cause)?;
+                }
+                ValueTypeVisit::TypeNode(_) => {
+                    type_nodes = type_nodes
+                        .checked_add(1)
+                        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+                }
             }
             let facts = Policy(true)
                 .numeric(headers.schema())
@@ -411,9 +415,9 @@ fn preflight_source_policy_core<H>(
             &mut capture,
             work,
         )?;
-        // This same source's complete scratch count now pre-admits every
-        // allocation of the following structural Vec walk.
-        *prefix = reader_prefix;
+        // The original scratch author has now sealed all datatype edges. The
+        // subsequent Vec walk must observe the same topology under this bound.
+        prefix.validate_reader_nodes(type_nodes)?;
     } else {
         validate_type(field.data_type(), work)?;
     }
@@ -452,6 +456,9 @@ fn preflight_source_policy_core<H>(
             Ok(())
         },
     )?;
+    if let Some((prefix, _)) = admission.as_ref().filter(|(_, a)| a.reader) {
+        prefix.validate_reader_nodes(counts.types)?;
+    }
     Ok(counts)
 }
 
@@ -882,9 +889,8 @@ fn verify_single_field_schema_profile_with_host_in<H>(
         )?;
     }
     source_floor(expected, source)?;
-    // Before the existing fixed-scratch pass only the root is known. That
-    // pass counts all actual nodes and admits the full Vec request bound
-    // before the subsequent structural source walk allocates anything.
+    // Only the root is known before the original fixed-scratch validation.
+    // That pass extends and seals this same bound before the first Vec walk.
     let prefix = policy.numeric(writer_resources::prefix_initial(expected, source, 1))?;
     let mut admission = Admission {
         parent: Some(admit),

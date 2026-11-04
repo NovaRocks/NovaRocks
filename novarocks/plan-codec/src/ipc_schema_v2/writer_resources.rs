@@ -51,12 +51,22 @@ pub(crate) struct SchemaWriterPrefixFacts {
     is_flat: bool,
 }
 impl SchemaWriterPrefixFacts {
-    pub(super) fn with_reader_walker_node_bound(mut self, nodes: usize) -> Self {
-        self.walker_node_bound = nodes;
-        self
+    /// The reader's original fixed-scratch traversal observes every pushed
+    /// datatype edge before its later Vec walk can allocate. Map entries and
+    /// dictionary key/value edges belong to that traversal, not IPC fields.
+    pub(super) fn observe_reader_child(&mut self) -> Result<(), TypeCodecError> {
+        self.walker_node_bound = add(self.walker_node_bound, 1)?;
+        Ok(())
+    }
+    pub(super) fn validate_reader_nodes(&self, nodes: usize) -> Result<(), TypeCodecError> {
+        if self.walker_node_bound != nodes {
+            return Err(TypeCodecError::InvalidShape(
+                "schema reader topology differs from its observed source bound",
+            ));
+        }
+        Ok(())
     }
 }
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SchemaWriterAllocationFacts {
     pub schema: SchemaPreflight,
@@ -506,9 +516,9 @@ pub(super) fn reader_facts(
     prefix: SchemaWriterPrefixFacts,
 ) -> Result<SchemaWriterRequestFacts, TypeCodecError> {
     let mut requests = Requests::default();
-    // The observed strict pass uses fixed scratch and counts this source's
-    // actual nodes before the sole structural Vec walker starts. Every prefix
-    // admits its known requests; the complete bound precedes the first reserve.
+    // The strict pass uses fixed scratch and seals the actual datatype-node
+    // bound before this original structural Vec walk. Its geometric request
+    // model and single-walk ownership remain unchanged.
     walkers(&mut requests, prefix.walker_node_bound, 1, None)?;
     let scratch = Layout::new::<[Option<WalkerEntry<'_>>; MAX_VALUE_TYPE_NODES]>().size();
     let associations = mul(
