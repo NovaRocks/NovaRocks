@@ -19,6 +19,7 @@ use arrow::datatypes::DataType;
 use novarocks_parser::ast;
 use novarocks_parser::printer::print_expr;
 
+use crate::analysis::AnalyzedOutputField as OutputColumn;
 use crate::analysis::*;
 use crate::analyze_error::AnalyzeError;
 use crate::column_id::ColumnId;
@@ -238,12 +239,18 @@ impl<'a> super::AnalyzerContext<'a> {
                                 let name_lower = name.to_lowercase();
                                 let left_q = current_scope
                                     .iter_columns()
-                                    .find(|(_, n, _, _)| n.to_lowercase() == name_lower)
-                                    .and_then(|(q, _, _, _)| q.clone());
+                                    .find(|(_, _, _, _, n)| {
+                                        n.as_ref()
+                                            .is_some_and(|name| name.to_lowercase() == name_lower)
+                                    })
+                                    .and_then(|(q, _, _, _, _)| q.clone());
                                 let right_q = right_scope
                                     .iter_columns()
-                                    .find(|(_, n, _, _)| n.to_lowercase() == name_lower)
-                                    .and_then(|(q, _, _, _)| q.clone());
+                                    .find(|(_, _, _, _, n)| {
+                                        n.as_ref()
+                                            .is_some_and(|name| name.to_lowercase() == name_lower)
+                                    })
+                                    .and_then(|(q, _, _, _, _)| q.clone());
                                 match (left_q, right_q) {
                                     (Some(l), Some(r)) => out.push((name, l, r)),
                                     _ => {
@@ -440,12 +447,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         let mut scope = self.new_scope();
                         for column in &output_columns {
                             self.check_control()?;
-                            scope.add_column_with_id(
-                                Some(&alias_name),
-                                &column.name,
-                                column.column_id,
-                                column.value_type.clone(),
-                            );
+                            scope.add_field(Some(&alias_name), column);
                         }
                         return Ok((
                             Relation::Subquery {
@@ -534,7 +536,7 @@ impl<'a> super::AnalyzerContext<'a> {
                                 Ok(col.column_id)
                             })
                             .collect::<Result<Vec<_>, AnalyzeError>>()?;
-                        let output_columns: Vec<OutputColumn> = producer_columns
+                        let mut output_columns: Vec<OutputColumn> = producer_columns
                             .into_iter()
                             .map(|col| {
                                 self.check_control()?;
@@ -550,6 +552,7 @@ impl<'a> super::AnalyzerContext<'a> {
                                     .transfer_value_provenance(col.column_id, new_id)
                                     .map_err(AnalyzeError::internal)?;
                                 Ok(OutputColumn {
+                                    field_name: col.field_name.clone(),
                                     column_id: new_id,
                                     name: col.name,
                                     value_type: col.value_type.clone(),
@@ -558,15 +561,17 @@ impl<'a> super::AnalyzerContext<'a> {
                                 })
                             })
                             .collect::<Result<Vec<_>, AnalyzeError>>()?;
+                        if let Some(alias) = alias {
+                            crate::analysis::schema::apply_column_aliases(
+                                &mut output_columns,
+                                &alias.columns,
+                                alias.span,
+                            )?;
+                        }
                         let mut scope = self.new_scope();
                         for col in &output_columns {
                             self.check_control()?;
-                            scope.add_column_with_id(
-                                Some(&alias_name),
-                                &col.name,
-                                col.column_id,
-                                col.value_type.clone(),
-                            );
+                            scope.add_field(Some(&alias_name), col);
                         }
                         return Ok((
                             Relation::CTEConsume {
@@ -617,7 +622,15 @@ impl<'a> super::AnalyzerContext<'a> {
                     column_ids.extend(meta_ids);
                 }
 
+                let column_aliases = alias
+                    .as_ref()
+                    .map(|alias| alias.columns.clone())
+                    .unwrap_or_default();
+                let alias_span = alias.as_ref().map(|alias| alias.span).unwrap_or(name.span);
+                scope.apply_column_aliases(&column_aliases, alias_span)?;
                 let relation = Relation::Scan(ScanRelation {
+                    column_aliases,
+                    alias_span,
                     database: db_lower,
                     table: table_def,
                     alias: alias_name,
@@ -652,12 +665,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 let mut scope = self.new_scope();
                 for col in &output_columns {
                     self.check_control()?;
-                    scope.add_column_with_id(
-                        Some(&alias_name),
-                        &col.name,
-                        col.column_id,
-                        col.value_type.clone(),
-                    );
+                    scope.add_field(Some(&alias_name), col);
                 }
 
                 let relation = Relation::Subquery {
@@ -737,7 +745,7 @@ impl<'a> super::AnalyzerContext<'a> {
             })
             .unwrap_or_default();
         if !alias_columns.is_empty() && alias_columns.len() != array_exprs.len() {
-            return Err(AnalyzeError::invalid_query_shape(
+            return Err(AnalyzeError::mismatched_column_aliases(
                 format!(
                     "UNNEST alias has {} columns but produces {} columns",
                     alias_columns.len(),
@@ -811,11 +819,20 @@ impl<'a> super::AnalyzerContext<'a> {
             ));
         }
         let mut output_columns = Vec::with_capacity(names.len());
-        for (name, value_type) in names.into_iter().zip(result_columns.iter()) {
+        for (idx, (name, value_type)) in names.into_iter().zip(result_columns.iter()).enumerate() {
             self.check_control()?;
             super::helpers::validate_value_type(value_type, self.control)?;
-            let column_id = scope.add_column(Some(qualifier), &name, value_type.clone());
+            let column_id =
+                self.alloc_column_id(Some(qualifier.to_owned()), name.clone(), value_type.clone());
+            scope.add_analyzed_field_with_id(
+                Some(qualifier),
+                &name,
+                alias_columns.get(idx).map(String::as_str),
+                column_id,
+                value_type.clone(),
+            );
             output_columns.push(OutputColumn {
+                field_name: alias_columns.get(idx).cloned(),
                 column_id,
                 name,
                 value_type: value_type.clone(),
@@ -1247,26 +1264,7 @@ fn derived_table_output_columns(
     if alias.columns.is_empty() {
         return Ok(columns.to_vec());
     }
-    if alias.columns.len() != columns.len() {
-        return Err(AnalyzeError::invalid_query_shape(
-            format!(
-                "derived table alias '{}' has {} column aliases but subquery produces {} columns",
-                alias.name.value,
-                alias.columns.len(),
-                columns.len()
-            ),
-            alias.span,
-        ));
-    }
-    Ok(columns
-        .iter()
-        .zip(alias.columns.iter())
-        .map(|(col, alias_col)| OutputColumn {
-            column_id: col.column_id,
-            name: alias_col.value.clone(),
-            value_type: col.value_type.clone(),
-
-            is_internal: false,
-        })
-        .collect())
+    let mut fields = columns.to_vec();
+    crate::analysis::schema::apply_column_aliases(&mut fields, &alias.columns, alias.span)?;
+    Ok(fields)
 }

@@ -482,9 +482,13 @@ pub fn analyze_join_first_refresh_connector_write(
         context.constant_policy,
         &context.control,
     )?;
+    let root_semantics = logical_output
+        .root_semantics
+        .first_refresh_output(&crate::planner::plan_output_columns(&plan)?, snapshot)?;
     let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
         plan,
         factory,
+        root_semantics,
         crate::compiler::SqlCompileIntent::IcebergWrite {
             root_distribution: crate::compiler::RootDistributionRequirement::ShuffleOutputName(
                 root_hash_column,
@@ -681,9 +685,19 @@ pub fn analyze_join_incremental_refresh_change_stream(
         context.constant_policy,
         &context.control,
     )?;
+    let descriptor = change_stream_override.as_ref().cloned().unwrap_or_else(|| {
+        crate::planner::imv_rewrite::change_stream::build_change_stream_descriptor(&plan)
+    });
+    let root_semantics = logical_output.root_semantics.imv_output(
+        &crate::planner::plan_output_columns(&plan)?,
+        snapshot,
+        &descriptor,
+        matches!(context.join_mode, SqlMvJoinIncrementalRefreshMode::Coalesce),
+    )?;
     let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
         plan,
         factory,
+        root_semantics,
         crate::compiler::SqlCompileIntent::ChangeStreamWrite,
         crate::compiler::SqlSessionContext {
             sql_semantics,
@@ -1205,7 +1219,8 @@ fn build_join_incremental_refresh_logical_plan(
             )
         })?
         .into_inner();
-    let mut change_stream_override = None;
+    // Keep the actual rewrite annotation for AppendOnly as well as Coalesce.
+    let mut change_stream_override = Some(outcome.annotation.change_stream.clone());
     let plan = match mode {
         SqlMvJoinIncrementalRefreshMode::AppendOnly => outcome.plan,
         SqlMvJoinIncrementalRefreshMode::Coalesce if is_aggregate_refresh => outcome.plan,
@@ -4217,6 +4232,7 @@ mod tests {
         let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
             logical.logical_plan,
             logical.factory,
+            logical.root_semantics,
             crate::compiler::SqlCompileIntent::ChangeStreamWrite,
             crate::compiler::SqlSessionContext {
                 sql_semantics: effective,

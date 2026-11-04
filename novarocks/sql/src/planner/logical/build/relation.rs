@@ -112,8 +112,12 @@ pub(super) fn plan_relation_scoped(
             output_columns,
         } => {
             let inner_plan = plan_scoped_query(*query, cte_registry, factory, control)?;
-            adapt_plan_output_with_qualifier(inner_plan, &output_columns, Some(&alias))
-                .map_err(SqlCompileError::Compilation)
+            adapt_plan_output_with_qualifier(
+                inner_plan,
+                &crate::analysis::schema::planner_columns(&output_columns),
+                Some(&alias),
+            )
+            .map_err(SqlCompileError::Compilation)
         }
         Relation::Join(join_rel) => {
             let JoinRelation {
@@ -146,7 +150,9 @@ pub(super) fn plan_relation_scoped(
                             function_name: "unnest".to_string(),
                             args: unnest.args,
                             binding: unnest.binding,
-                            output_columns: unnest.output_columns,
+                            output_columns: crate::analysis::schema::planner_columns(
+                                &unnest.output_columns,
+                            ),
                             alias: unnest.alias,
                             is_left_join,
                         }),
@@ -191,7 +197,7 @@ pub(super) fn plan_relation_scoped(
             LogicalPlanKind::CTEConsume(PlanCTEConsumeNode {
                 cte_id,
                 alias,
-                output_columns,
+                output_columns: crate::analysis::schema::planner_columns(&output_columns),
                 producer_column_ids,
             }),
             vec![],
@@ -452,7 +458,7 @@ pub(super) fn plan_set_operation_scoped(
                     && offset.is_none()
                     && local_cte_ids.is_empty() =>
             {
-                declared_output = output_columns;
+                declared_output = crate::analysis::schema::planner_columns(&output_columns);
                 current = inner;
                 continue;
             }
@@ -493,7 +499,7 @@ pub(super) fn plan_values(
     values: ResolvedValues,
     _factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlanNode, String> {
-    let columns = values.output_columns;
+    let columns = crate::analysis::schema::planner_columns(&values.output_columns);
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Values(PlanValuesNode {
             rows: values.rows,

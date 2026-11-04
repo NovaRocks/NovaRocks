@@ -377,6 +377,18 @@ fn lower_final_physical_plan_inner_with_domains(
         &root.display_names,
         visitor.control,
     )?;
+    if let Some(semantics) = &semantics {
+        let names = semantics
+            .field_names(&plan.output_columns)
+            .map_err(invalid_write)?;
+        for (ordinal, (field, name)) in result_fields.iter_mut().zip(names).enumerate() {
+            field.alias = Some(
+                name.clone()
+                    .unwrap_or_else(|| format!("_col{ordinal}"))
+                    .into(),
+            );
+        }
+    }
     if let Some(domains) = &domains {
         if domains.len() != result_fields.len() {
             return Err(invalid_write("root semantic field count differs".into()));

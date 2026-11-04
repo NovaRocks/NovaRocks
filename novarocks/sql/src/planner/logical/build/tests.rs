@@ -3290,7 +3290,11 @@ fn assert_m07_planned_domains(sql: &str, expected: Vec<Option<novarocks_types::s
         .iter()
         .map(|column| column.column_id)
         .collect();
-    check_complete(&resolved.output_columns, &expected, sql);
+    check_complete(
+        &crate::analysis::schema::planner_columns(&resolved.output_columns),
+        &expected,
+        sql,
+    );
     let witnesses: Vec<_> = original_ids
         .iter()
         .map(|id| factory.has_json_list_provenance(*id))
@@ -3428,8 +3432,16 @@ fn m07_duplicate_and_window_projections_keep_complete_source_witnesses() {
         vec![],
         None,
     );
-    let plan =
-        super::window::build_window_and_project(input, select.projection, &mut factory).unwrap();
+    let plan = super::window::build_window_and_project(
+        input,
+        select
+            .projection
+            .into_iter()
+            .map(AnalyzedProjectItem::into_planner)
+            .collect(),
+        &mut factory,
+    )
+    .unwrap();
     let columns = plan_output_columns(&plan).unwrap();
     assert_eq!(columns[0].column_id, original);
     assert_ne!(columns[1].column_id, original);
@@ -3538,7 +3550,9 @@ fn flattened_union_spine_keeps_each_original_complete_declaration() {
     let mut original_layers = Vec::new();
     let mut query = &resolved;
     while let QueryBody::SetOperation(operation) = &query.body {
-        original_layers.push(query.output_columns.clone());
+        original_layers.push(crate::analysis::schema::planner_columns(
+            &query.output_columns,
+        ));
         query = &operation.left;
     }
     assert_eq!(original_layers.len(), 2);

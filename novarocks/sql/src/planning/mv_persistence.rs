@@ -589,7 +589,7 @@ fn merge_output_lineages(
 }
 
 fn bind_output_lineages(
-    outputs: &[crate::common::OutputColumn],
+    outputs: &[crate::analysis::AnalyzedOutputField],
     lineages: &[BTreeSet<SqlMvPersistenceSourceFieldReference>],
     builder: &mut ProjectionBuilder,
 ) -> Result<(), String> {

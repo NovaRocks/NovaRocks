@@ -804,6 +804,7 @@ enum SqlStatementInputKind {
     LogicalPlan {
         plan: crate::planner::logical::LogicalPlanNode,
         factory: crate::column_id::ColumnRefFactory,
+        root_semantics: root_output::RootOutputSemantics,
     },
 }
 
@@ -853,9 +854,14 @@ impl SqlStatementInput {
     pub(crate) fn logical_plan(
         plan: crate::planner::logical::LogicalPlanNode,
         factory: crate::column_id::ColumnRefFactory,
+        root_semantics: root_output::RootOutputSemantics,
     ) -> Self {
         Self {
-            kind: SqlStatementInputKind::LogicalPlan { plan, factory },
+            kind: SqlStatementInputKind::LogicalPlan {
+                plan,
+                factory,
+                root_semantics,
+            },
         }
     }
 }
@@ -1065,6 +1071,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
     pub(crate) fn new_logical(
         plan: crate::planner::logical::LogicalPlanNode,
         factory: crate::column_id::ColumnRefFactory,
+        root_semantics: root_output::RootOutputSemantics,
         intent: SqlCompileIntent,
         session: SqlSessionContext,
         environment: SqlPlanningEnvironment,
@@ -1073,7 +1080,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
         control: SqlCompileControl,
     ) -> Self {
         Self {
-            statement: SqlStatementInput::logical_plan(plan, factory),
+            statement: SqlStatementInput::logical_plan(plan, factory, root_semantics),
             intent,
             session,
             environment,
@@ -1146,6 +1153,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
 /// Opaque, move-only compiler state returned after every catalog-touching
 /// analysis path has closed its request-local binding set.
 pub struct SqlAnalyzedQuery {
+    root_semantics: root_output::RootOutputSemantics,
     logical_plan: crate::planner::logical::LogicalPlanNode,
     factory: crate::column_id::ColumnRefFactory,
     intent: SqlCompileIntent,
@@ -1248,6 +1256,7 @@ impl<'a> SqlOptimizeRequest<'a> {
 }
 
 pub(crate) struct SqlAnalysisOutput {
+    pub(crate) root_semantics: root_output::RootOutputSemantics,
     pub(crate) logical_plan: crate::planner::logical::LogicalPlanNode,
     pub(crate) factory: crate::column_id::ColumnRefFactory,
 }
@@ -1685,14 +1694,20 @@ impl SqlCompiler {
         let (
             mut logical_plan,
             mut factory,
+            mut root_semantics,
             logical_input,
             consumer_requires_semantic_snapshot,
             legacy_allow_throw_exception,
             decimal_overflow_policy,
         ) = match &request.statement.kind {
-            SqlStatementInputKind::LogicalPlan { plan, factory } => (
+            SqlStatementInputKind::LogicalPlan {
+                plan,
+                factory,
+                root_semantics,
+            } => (
                 plan.clone(),
                 factory.clone(),
+                root_semantics.clone(),
                 true,
                 (request
                     .session
@@ -1754,8 +1769,14 @@ impl SqlCompiler {
                     request.constant_policy,
                     &request.control,
                 )?;
+                let analyzed_fields = resolved.output_columns.clone();
                 let logical_plan =
                     crate::planner::plan_query(resolved, ctes, &mut factory, &request.control)?;
+                let root_semantics = root_output::RootOutputSemantics::bind_analyzed(
+                    &analyzed_fields,
+                    &crate::planner::plan_output_columns(&logical_plan)?,
+                    &factory,
+                )?;
                 let consumer_requires_semantic_snapshot =
                     crate::sql_mode::query_uses_group_concat_legacy(
                         &request.session.sql_semantics,
@@ -1775,6 +1796,7 @@ impl SqlCompiler {
                 (
                     logical_plan,
                     factory,
+                    root_semantics,
                     false,
                     consumer_requires_semantic_snapshot,
                     crate::sql_mode::query_sql_semantics(&request.session.sql_semantics, &query)
@@ -1795,6 +1817,7 @@ impl SqlCompiler {
                 SqlAnalysisOutput {
                     logical_plan,
                     factory,
+                    root_semantics,
                 },
             )));
         }
@@ -1804,6 +1827,7 @@ impl SqlCompiler {
                 SqlAnalysisOutput {
                     logical_plan,
                     factory,
+                    root_semantics,
                 },
             )));
         }
@@ -1863,6 +1887,12 @@ impl SqlCompiler {
             validate_imv_rewrite_outcome(input, &outcome)?;
             logical_plan = outcome.plan;
             change_stream = outcome.annotation.change_stream;
+            root_semantics = root_semantics.imv_output(
+                &crate::planner::plan_output_columns(&logical_plan)?,
+                input.snapshot(),
+                &change_stream,
+                true,
+            )?;
             factory = std::rc::Rc::try_unwrap(factory_cell)
                 .map_err(|_| {
                     SqlCompileError::Compilation(
@@ -1877,6 +1907,7 @@ impl SqlCompiler {
                 SqlAnalysisOutput {
                     logical_plan,
                     factory,
+                    root_semantics,
                 },
             )));
         }
@@ -1921,6 +1952,7 @@ impl SqlCompiler {
             .snapshot();
 
         Ok(SqlAnalyzeOutput::Pending(SqlAnalyzedQuery {
+            root_semantics,
             logical_plan,
             factory,
             intent: request.intent,
@@ -1940,6 +1972,7 @@ impl SqlCompiler {
 
     pub fn optimize(request: SqlOptimizeRequest<'_>) -> Result<SqlCompileOutput, SqlCompileError> {
         let SqlAnalyzedQuery {
+            root_semantics,
             logical_plan,
             factory,
             intent,
@@ -1954,12 +1987,6 @@ impl SqlCompiler {
         } = request.analyzed;
         let control = request.control;
         control.check()?;
-        let root_semantics = root_output::RootOutputSemantics::capture(
-            &crate::planner::plan_output_columns(&logical_plan)
-                .map_err(SqlCompileError::Compilation)?,
-            &factory,
-        )
-        .map_err(SqlCompileError::Compilation)?;
         let mut scalar_arena =
             crate::optimizer::scalar::ScalarArena::with_constant_policy(constant_policy);
         let mut optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(

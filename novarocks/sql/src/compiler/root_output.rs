@@ -24,18 +24,57 @@ use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use crate::column_id::{ColumnId, ColumnRefFactory};
 use crate::common::OutputColumn;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RootOutputSemantics {
     occurrences: Box<[(ColumnId, FunctionValueType, ResultValueDomain)]>,
+    field_names: Box<[Option<String>]>,
     scalar_field: Option<ScalarField>,
     private_persistence_domain: bool,
 }
 
 impl RootOutputSemantics {
+    #[cfg(test)]
     pub(crate) fn capture(
         columns: &[OutputColumn],
         _factory: &ColumnRefFactory,
     ) -> Result<Self, String> {
+        Self::from_declared_names(columns, vec![None; columns.len()].into_boxed_slice())
+    }
+
+    pub(crate) fn bind_analyzed(
+        analyzed: &[crate::analysis::AnalyzedOutputField],
+        columns: &[OutputColumn],
+        factory: &ColumnRefFactory,
+    ) -> Result<Self, String> {
+        if analyzed.len() != columns.len() {
+            return Err("analyzed root occurrence count changed during logical planning".into());
+        }
+        for (ordinal, (source, actual)) in analyzed.iter().zip(columns).enumerate() {
+            if !factory.same_value_origin(source.column_id, actual.column_id)
+                || !same_captured_binding(&source.value_type, &actual.value_type)
+            {
+                return Err(format!(
+                    "analyzed root value provenance changed at ordinal {ordinal}"
+                ));
+            }
+        }
+        Self::from_declared_names(
+            columns,
+            analyzed
+                .iter()
+                .map(|field| field.field_name.clone())
+                .collect(),
+        )
+    }
+
+    /// Generated SQL owners supply names from their own output contract.
+    pub(crate) fn from_declared_names(
+        columns: &[OutputColumn],
+        field_names: Box<[Option<String>]>,
+    ) -> Result<Self, String> {
+        if columns.len() != field_names.len() {
+            return Err("root name declaration differs from its occurrence count".into());
+        }
         if columns.len() > novarocks_result_contract::RootProfileV1::MAX_COLUMNS {
             return Err("root output occurrence count exceeds its admitted profile".into());
         }
@@ -56,6 +95,7 @@ impl RootOutputSemantics {
                     )
                 });
         Ok(Self {
+            field_names,
             scalar_field,
             private_persistence_domain,
             occurrences: columns
@@ -74,6 +114,223 @@ impl RootOutputSemantics {
                 })
                 .collect(),
         })
+    }
+
+    /// First-refresh construction appends one contract-owned key to the payload.
+    pub(crate) fn first_refresh_output(
+        self,
+        columns: &[OutputColumn],
+        snapshot: &super::mv_rewrite::SqlImvRewriteSnapshot,
+    ) -> Result<Self, String> {
+        let mut declared = self.declared_occurrences();
+        declared.push((
+            Some(
+                snapshot
+                    .schema_contract
+                    .target
+                    .hidden_apply_key
+                    .column_name
+                    .clone(),
+            ),
+            FunctionValueType::new(arrow::datatypes::DataType::Utf8, false),
+        ));
+        Self::bind_transformed(columns, declared)
+    }
+
+    /// An IMV owner replaces the query root with its explicitly declared writer shape.
+    pub(crate) fn imv_output(
+        self,
+        columns: &[OutputColumn],
+        snapshot: &super::mv_rewrite::SqlImvRewriteSnapshot,
+        change_stream: &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
+        locator: bool,
+    ) -> Result<Self, String> {
+        use crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshOutputSource as S;
+        use arrow::datatypes::DataType as D;
+        if self.domains(columns).is_ok() {
+            return Ok(self);
+        }
+        let mut declared = Vec::new();
+        if let Some(execution) = &snapshot.aggregate_execution {
+            let layout = &execution.layout;
+            if self.occurrences.len() != layout.visible_columns.len() {
+                return Err("aggregate root declaration differs from visible payload width".into());
+            }
+            declared.push((
+                Some(layout.row_id_column_name.clone()),
+                FunctionValueType::new(D::Utf8, false),
+            ));
+            for ((name, (_, original, _)), field) in self
+                .field_names
+                .iter()
+                .zip(self.occurrences.iter())
+                .zip(&layout.visible_columns)
+            {
+                if !same_captured_binding(original, &field.value_type) {
+                    return Err("aggregate root declaration changed a visible payload type".into());
+                }
+                declared.push((name.clone(), field.value_type.clone()));
+            }
+            for field in &layout.state_columns {
+                let ty = match field.state_role {
+                    super::mv_rewrite::SqlImvAggregateStateRole::Single
+                    | super::mv_rewrite::SqlImvAggregateStateRole::AvgSum
+                    | super::mv_rewrite::SqlImvAggregateStateRole::AvgCount => {
+                        FunctionValueType::new(D::Binary, field.value_type.nullable())
+                    }
+                    super::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
+                        field.value_type.clone()
+                    }
+                };
+                declared.push((Some(field.name.clone()), ty));
+            }
+            if let Some(branch) = &snapshot.schema_contract.branch {
+                declared.push((
+                    Some(branch.branch_id_column_name.clone()),
+                    FunctionValueType::new(D::Int32, false),
+                ));
+            }
+            append_locator_declarations(&mut declared);
+            declared.push((
+                Some(crate::common::CHANGE_OP_COLUMN.into()),
+                FunctionValueType::new(D::Int8, false),
+            ));
+        } else if let Some(join) = &change_stream.join_refresh {
+            if self.occurrences.len() != join.payload_columns.len() {
+                return Err("join root declaration differs from payload width".into());
+            }
+            if locator {
+                declared = self.declared_occurrences();
+                declared.push((
+                    Some(
+                        snapshot
+                            .schema_contract
+                            .target
+                            .hidden_apply_key
+                            .column_name
+                            .clone(),
+                    ),
+                    join.join_apply_key_column.value_type.clone(),
+                ));
+                append_locator_declarations(&mut declared);
+                declared.push((
+                    Some(crate::common::CHANGE_OP_COLUMN.into()),
+                    join.action_column.value_type.clone(),
+                ));
+            } else {
+                if columns.len() != join.output_mappings.len() {
+                    return Err("join root declaration differs from its output mappings".into());
+                }
+                for (mapping, actual) in join.output_mappings.iter().zip(columns) {
+                    if mapping.mv_output_column.column_id != actual.column_id {
+                        return Err(
+                            "join root output mapping changed its occurrence identity".into()
+                        );
+                    }
+                    let (name, ty) = match mapping.source {
+                        S::Payload(source) => {
+                            let ordinal = join
+                                .payload_columns
+                                .iter()
+                                .position(|field| field.column_id == source)
+                                .ok_or("join root mapping has no payload source")?;
+                            (
+                                self.field_names[ordinal].clone(),
+                                self.occurrences[ordinal].1.clone(),
+                            )
+                        }
+                        S::Action(_) => (
+                            Some(crate::common::CHANGE_OP_COLUMN.into()),
+                            join.action_column.value_type.clone(),
+                        ),
+                        S::JoinApplyKey(_) => (
+                            Some(
+                                snapshot
+                                    .schema_contract
+                                    .target
+                                    .hidden_apply_key
+                                    .column_name
+                                    .clone(),
+                            ),
+                            join.join_apply_key_column.value_type.clone(),
+                        ),
+                    };
+                    declared.push((name, ty));
+                }
+            }
+        } else {
+            declared = self.declared_occurrences();
+            if snapshot.schema_contract.target.hidden_apply_key.source
+                != crate::planner::vocabulary::ApplyKeySource::BaseRowId
+            {
+                return Err("IMV root declaration has no matching key-source descriptor".into());
+            }
+            // InjectApplyKey derives this column from Iceberg's signed Int64
+            // row-lineage contract. A FastAppend target need not store it.
+            declared.push((
+                Some(
+                    snapshot
+                        .schema_contract
+                        .target
+                        .hidden_apply_key
+                        .column_name
+                        .clone(),
+                ),
+                FunctionValueType::new(D::Int64, false),
+            ));
+            if let Some(branch) = &snapshot.schema_contract.branch {
+                declared.push((
+                    Some(branch.branch_id_column_name.clone()),
+                    FunctionValueType::new(D::Int32, false),
+                ));
+            }
+            append_locator_declarations(&mut declared);
+            declared.push((
+                Some(crate::common::CHANGE_OP_COLUMN.into()),
+                FunctionValueType::new(D::Int8, false),
+            ));
+        }
+        Self::bind_transformed(columns, declared)
+    }
+
+    fn declared_occurrences(&self) -> Vec<(Option<String>, FunctionValueType)> {
+        self.field_names
+            .iter()
+            .cloned()
+            .zip(self.occurrences.iter().map(|(_, ty, _)| ty.clone()))
+            .collect()
+    }
+
+    fn bind_transformed(
+        columns: &[OutputColumn],
+        declared: Vec<(Option<String>, FunctionValueType)>,
+    ) -> Result<Self, String> {
+        if columns.len() != declared.len() {
+            return Err(format!(
+                "transformed root declaration width differs: declared {}, actual {}",
+                declared.len(),
+                columns.len()
+            ));
+        }
+        for (ordinal, (column, (_, ty))) in columns.iter().zip(&declared).enumerate() {
+            if !same_captured_binding(ty, &column.value_type) {
+                return Err(format!(
+                    "transformed root declaration type differs at ordinal {ordinal}"
+                ));
+            }
+        }
+        Self::from_declared_names(
+            columns,
+            declared.into_iter().map(|(name, _)| name).collect(),
+        )
+    }
+
+    pub(crate) fn field_names(
+        &self,
+        columns: &[OutputColumn],
+    ) -> Result<&[Option<String>], String> {
+        self.domains(columns)?;
+        Ok(&self.field_names)
     }
 
     /// Retain a complete declared private-domain refusal independently of the
@@ -133,6 +390,19 @@ impl RootOutputSemantics {
     }
 }
 
+/// The writer's signed lineage/locator order is authored by its publication contract.
+fn append_locator_declarations(declared: &mut Vec<(Option<String>, FunctionValueType)>) {
+    use arrow::datatypes::DataType as D;
+    for (name, ty) in [
+        (crate::common::ICEBERG_ROW_ID_COL, D::Int64),
+        (crate::common::ICEBERG_LAST_UPDATED_SEQ_COL, D::Int64),
+        (crate::common::ICEBERG_FILE_PATH_COL, D::Utf8),
+        (crate::common::ICEBERG_ROW_POS_COL, D::Int64),
+    ] {
+        declared.push((Some(name.into()), FunctionValueType::new(ty, true)));
+    }
+}
+
 /// Preserve all captured semantic nodes and precise value layout; only the
 /// final lowered root NULL promise may differ. This borrowed comparison creates
 /// no projected declaration, field metadata or runtime allocation authority.
@@ -160,6 +430,71 @@ mod tests {
     use novarocks_physical_plan::ValueType;
     use novarocks_types::schema::SqlType;
     use std::sync::Arc;
+
+    #[test]
+    fn planned_roots_preserve_names_for_repeated_window_and_rollup_values() {
+        let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
+        for sql in [
+            "SELECT x AS a, x AS B, row_number() OVER (ORDER BY x) AS r FROM (SELECT 1 AS x) AS t",
+            "SELECT x+1 AS a, x+1 AS B FROM (SELECT 1 AS x) AS t GROUP BY ROLLUP(x+1)",
+            "SELECT sum(x) AS a, sum(x) AS B FROM (SELECT 1 AS x) AS t",
+        ] {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let novarocks_parser::ast::Statement::Query(query) = &statements[0] else {
+                panic!("query")
+            };
+            let (resolved, ctes, mut factory) =
+                crate::analyzer::analyze(query, &catalog, "default").unwrap();
+            let fields = resolved.output_columns.clone();
+            let plan = crate::planner::plan_query(
+                resolved,
+                ctes,
+                &mut factory,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            let columns = crate::planner::plan_output_columns(&plan).unwrap();
+            let semantics =
+                RootOutputSemantics::bind_analyzed(&fields, &columns, &factory).unwrap();
+            let names = semantics.field_names(&columns).unwrap();
+            assert_eq!(names[0].as_deref(), Some("a"), "{sql}");
+            assert_eq!(names[1].as_deref(), Some("B"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn root_binding_requires_same_value_witness_and_preserves_duplicate_names() {
+        let mut factory = ColumnRefFactory::new();
+        let ty = FunctionValueType::new(D::Int32, true);
+        let source = factory.create(None, "internal".into(), ty.clone());
+        let fresh = factory.create(None, "internal".into(), ty.clone());
+        let foreign = factory.create(None, "internal".into(), ty.clone());
+        let field = |id, name: &str| crate::analysis::AnalyzedOutputField {
+            column_id: id,
+            name: "internal".into(),
+            field_name: Some(name.into()),
+            value_type: ty.clone(),
+            is_internal: false,
+        };
+        let analyzed = [field(source, "a"), field(source, "B")];
+        let columns = [
+            field(source, "ignored").planner_column(),
+            field(fresh, "ignored").planner_column(),
+        ];
+        assert!(RootOutputSemantics::bind_analyzed(&analyzed, &columns, &factory).is_err());
+        factory.transfer_value_occurrence(source, fresh).unwrap();
+        let semantics = RootOutputSemantics::bind_analyzed(&analyzed, &columns, &factory).unwrap();
+        assert_eq!(
+            semantics.field_names(&columns).unwrap(),
+            &[Some("a".into()), Some("B".into())]
+        );
+        let wrong = [
+            columns[0].clone(),
+            field(foreign, "ignored").planner_column(),
+        ];
+        assert!(RootOutputSemantics::bind_analyzed(&analyzed, &wrong, &factory).is_err());
+        assert!(semantics.domains(&wrong).is_err());
+    }
 
     #[test]
     fn unified_root_value_domains_survive_without_a_legacy_declaration() {

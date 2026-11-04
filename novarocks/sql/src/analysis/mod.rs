@@ -23,6 +23,8 @@
 pub(crate) mod cte;
 pub(crate) mod expr_display;
 pub(crate) mod expr_identity;
+pub(crate) mod schema;
+pub(crate) use schema::{AnalyzedOutputField, AnalyzedProjectItem};
 
 use arrow::datatypes::DataType;
 use novarocks_parser::ast::{Expr as SqlExpr, Query as SqlQuery};
@@ -91,7 +93,7 @@ pub(crate) struct ResolvedQuery {
     pub order_by: Vec<SortItem>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
-    pub output_columns: Vec<OutputColumn>,
+    pub output_columns: Vec<AnalyzedOutputField>,
     /// CTE ids declared by this query block's WITH clause, in declaration order.
     pub local_cte_ids: Vec<cte::CteId>,
 }
@@ -129,7 +131,7 @@ pub(crate) struct ResolvedSelect {
     /// HAVING clause.
     pub having: Option<TypedExpr>,
     /// SELECT list items.
-    pub projection: Vec<ProjectItem>,
+    pub projection: Vec<AnalyzedProjectItem>,
     /// Whether the SELECT contains aggregate functions.
     pub has_aggregation: bool,
     /// Whether SELECT DISTINCT is used.
@@ -200,7 +202,7 @@ pub(crate) enum Relation {
     Subquery {
         query: Box<ResolvedQuery>,
         alias: String,
-        output_columns: Vec<OutputColumn>,
+        output_columns: Vec<AnalyzedOutputField>,
     },
     /// A join between two relations.
     Join(Box<JoinRelation>),
@@ -213,7 +215,7 @@ pub(crate) enum Relation {
     CTEConsume {
         cte_id: cte::CteId,
         alias: String,
-        output_columns: Vec<OutputColumn>,
+        output_columns: Vec<AnalyzedOutputField>,
         producer_column_ids: Vec<ColumnId>,
     },
 }
@@ -232,12 +234,14 @@ pub(crate) struct GenerateSeriesRelation {
 pub(crate) struct UnnestRelation {
     pub args: Vec<TypedExpr>,
     pub binding: crate::binding::SqlFunctionBinding,
-    pub output_columns: Vec<OutputColumn>,
+    pub output_columns: Vec<AnalyzedOutputField>,
     pub alias: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScanRelation {
+    pub column_aliases: Vec<novarocks_parser::ast::Ident>,
+    pub alias_span: novarocks_parser::Span,
     pub database: String,
     pub table: TableDef,
     pub alias: Option<String>,
@@ -328,7 +332,7 @@ pub(crate) enum SetOpKind {
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedValues {
     pub rows: Vec<Vec<TypedExpr>>,
-    pub output_columns: Vec<OutputColumn>,
+    pub output_columns: Vec<AnalyzedOutputField>,
 }
 
 // ---------------------------------------------------------------------------
@@ -757,7 +761,7 @@ pub(crate) struct ApplyScalarSpec {
     pub clause: ApplyClause,
     /// Fresh column representing the subquery's scalar value in outer exprs.
     /// Read by the planner to build the Apply node.
-    pub output_column: OutputColumn,
+    pub output_column: AnalyzedOutputField,
     /// Fully-analyzed inner subquery, with outer references carrying the outer
     /// column ids (via merged-scope analysis). Becomes the Apply's right child.
     /// Read by the planner to plan Apply.right.
@@ -794,7 +798,7 @@ pub(crate) struct ApplyPredicateSpec {
     /// Fresh Boolean indicator column for the subquery in the Apply schema.
     /// Removed from the outer filter (semantics carried by the semi/anti join),
     /// so it is never referenced; it disappears when the join replaces the Apply.
-    pub output_column: OutputColumn,
+    pub output_column: AnalyzedOutputField,
     /// Fully-analyzed inner subquery (outer refs carry outer column ids).
     pub inner: ResolvedQuery,
     /// Outer columns referenced inside the subquery (the correlation keys).

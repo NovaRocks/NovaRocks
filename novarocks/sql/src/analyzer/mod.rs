@@ -72,9 +72,9 @@ use crate::catalog::PlannerTableProvider;
 use crate::column_id::ColumnId;
 
 use crate::analysis::{
-    ExprKind, JoinKind, JoinRelation, OutputColumn, ProjectItem, QueryBody, Relation,
-    ResolvedQuery, ResolvedSelect, ResolvedSetOp, ResolvedValues, SetOpKind, SortItem,
-    SubqueryInfo, TypedExpr,
+    AnalyzedOutputField as OutputColumn, AnalyzedProjectItem as ProjectItem, ExprKind, JoinKind,
+    JoinRelation, QueryBody, Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp,
+    ResolvedValues, SetOpKind, SortItem, SubqueryInfo, TypedExpr,
 };
 
 use helpers::{expr_display_name, extract_limit, extract_offset};
@@ -491,24 +491,12 @@ impl<'a> AnalyzerContext<'a> {
             pending_ctes.remove(&name);
             child_ctx.pending_ctes = pending_ctes.clone();
 
-            let col_aliases: Vec<String> = cte
-                .columns
-                .iter()
-                .map(|ident| {
-                    self.check_control()?;
-                    Ok(ident.value.clone())
-                })
-                .collect::<Result<Vec<_>, AnalyzeError>>()?;
-
             let mut resolved_cte = child_ctx.analyze_query(&cte.query)?;
-            if !col_aliases.is_empty() {
-                for (idx, alias_name) in col_aliases.iter().enumerate() {
-                    self.check_control()?;
-                    if let Some(col) = resolved_cte.output_columns.get_mut(idx) {
-                        col.name = alias_name.clone();
-                    }
-                }
-            }
+            crate::analysis::schema::apply_column_aliases(
+                &mut resolved_cte.output_columns,
+                &cte.columns,
+                cte.span,
+            )?;
 
             let output_columns = resolved_cte.output_columns.clone();
             let cte_id = child_ctx.cte_registry.borrow_mut().register(
@@ -679,6 +667,7 @@ impl<'a> AnalyzerContext<'a> {
                 )?;
                 let column_id = self.alloc_column_id(None, lc.name.clone(), value_type.clone());
                 output_cols.push(OutputColumn {
+                    field_name: lc.field_name.clone(),
                     column_id,
                     name: lc.name.clone(),
                     value_type,
@@ -777,6 +766,7 @@ impl<'a> AnalyzerContext<'a> {
                 let value_type = helpers::with_nullability(ty.clone(), true);
                 let column_id = self.alloc_column_id(None, name.clone(), value_type.clone());
                 Ok(OutputColumn {
+                    field_name: None,
                     column_id,
                     name,
                     value_type,
@@ -942,11 +932,9 @@ impl<'a> AnalyzerContext<'a> {
                     // Try SELECT aliases: GROUP BY alias_name
                     let mut alias_scope = scope.clone();
                     for item in &projection {
-                        alias_scope.add_column(
-                            None,
-                            &item.output_name,
-                            item.expr.value_type.clone(),
-                        );
+                        if let Some(name) = &item.field_name {
+                            alias_scope.add_column(None, name, item.expr.value_type.clone());
+                        }
                     }
                     let typed = self.analyze_expr(gb_expr, &alias_scope)?;
                     // Substitute alias ref with original expression
@@ -995,11 +983,9 @@ impl<'a> AnalyzerContext<'a> {
                         let mut alias_scope = scope.clone();
                         for item in &projection {
                             self.check_control()?;
-                            alias_scope.add_column(
-                                None,
-                                &item.output_name,
-                                item.expr.value_type.clone(),
-                            );
+                            if let Some(name) = &item.field_name {
+                                alias_scope.add_column(None, name, item.expr.value_type.clone());
+                            }
                         }
                         let h = self.analyze_expr(expr, &alias_scope)?;
                         // Substitute alias refs with real expressions
@@ -1079,7 +1065,11 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 let col_lower = column.to_lowercase();
                 for item in projection {
-                    if item.output_name.to_lowercase() == col_lower {
+                    if item
+                        .field_name
+                        .as_ref()
+                        .is_some_and(|name| name.to_lowercase() == col_lower)
+                    {
                         return item.expr.clone();
                     }
                 }
@@ -1289,7 +1279,11 @@ impl<'a> AnalyzerContext<'a> {
                 // Check if this column name matches a SELECT alias
                 let col_lower = column.to_lowercase();
                 for item in projection {
-                    if item.output_name.to_lowercase() == col_lower {
+                    if item
+                        .field_name
+                        .as_ref()
+                        .is_some_and(|name| name.to_lowercase() == col_lower)
+                    {
                         return item.expr.clone();
                     }
                 }
@@ -1792,6 +1786,7 @@ impl<'a> AnalyzerContext<'a> {
                             .set_logical_type(column_id, logical);
                     }
                     output_columns.push(OutputColumn {
+                        field_name: natural_field_name(expr),
                         column_id,
                         name: name.clone(),
                         value_type: typed.value_type.clone(),
@@ -1799,6 +1794,7 @@ impl<'a> AnalyzerContext<'a> {
                         is_internal: false,
                     });
                     projection.push(ProjectItem {
+                        field_name: natural_field_name(expr),
                         expr: typed,
                         output_name: name,
                         output_column_id: column_id,
@@ -1832,6 +1828,7 @@ impl<'a> AnalyzerContext<'a> {
                             .set_logical_type(column_id, logical);
                     }
                     output_columns.push(OutputColumn {
+                        field_name: Some(name.clone()),
                         column_id,
                         name: name.clone(),
                         value_type: typed.value_type.clone(),
@@ -1853,20 +1850,26 @@ impl<'a> AnalyzerContext<'a> {
                         );
                     }
                     projection.push(ProjectItem {
+                        field_name: Some(name.clone()),
                         expr: typed,
                         output_name: name,
                         output_column_id: column_id,
                     });
                 }
                 ast::SelectItem::Wildcard { .. } => {
-                    for (qualifier, col_name, col_id, value_type) in scope.iter_columns() {
+                    for (qualifier, col_name, col_id, value_type, field_name) in
+                        scope.iter_columns()
+                    {
                         self.check_control()?;
                         // FULL OUTER USING columns are exposed as a synthetic
                         // `COALESCE(left.col, right.col)` expression. SELECT *
                         // expansion must use that expression instead of the
                         // raw left-side ColumnRef so right-only rows show
                         // the right-side value.
-                        let typed = if let Some(expr) = scope.computed_column_for(col_name) {
+                        let typed = if let Some(expr) = field_name
+                            .as_deref()
+                            .and_then(|name| scope.computed_column_for(name))
+                        {
                             expr.clone()
                         } else {
                             TypedExpr {
@@ -1879,6 +1882,7 @@ impl<'a> AnalyzerContext<'a> {
                             }
                         };
                         output_columns.push(OutputColumn {
+                            field_name: field_name.clone(),
                             column_id: *col_id,
                             name: col_name.clone(),
                             value_type: value_type.clone(),
@@ -1886,6 +1890,7 @@ impl<'a> AnalyzerContext<'a> {
                             is_internal: false,
                         });
                         projection.push(ProjectItem {
+                            field_name: field_name.clone(),
                             expr: typed,
                             output_name: col_name.clone(),
                             output_column_id: *col_id,
@@ -1910,7 +1915,7 @@ impl<'a> AnalyzerContext<'a> {
                         .unwrap_or(&qualifier_str)
                         .to_string();
                     let mut found = false;
-                    for (qualifier, col_name, col_id, value_type) in
+                    for (qualifier, col_name, col_id, value_type, field_name) in
                         scope.iter_qualified_columns(&qualifier_str).chain(
                             if fallback_qualifier != qualifier_str {
                                 Some(scope.iter_qualified_columns(&fallback_qualifier))
@@ -1932,6 +1937,7 @@ impl<'a> AnalyzerContext<'a> {
                             value_type: value_type.clone(),
                         };
                         output_columns.push(OutputColumn {
+                            field_name: field_name.clone(),
                             column_id: *col_id,
                             name: col_name.clone(),
                             value_type: value_type.clone(),
@@ -1939,6 +1945,7 @@ impl<'a> AnalyzerContext<'a> {
                             is_internal: false,
                         });
                         projection.push(ProjectItem {
+                            field_name: field_name.clone(),
                             expr: typed,
                             output_name: col_name.clone(),
                             output_column_id: *col_id,
@@ -1974,7 +1981,9 @@ impl<'a> AnalyzerContext<'a> {
             self.check_control()?;
             match item {
                 ast::SelectItem::Wildcard { .. } => {
-                    for (qualifier, col_name, col_id, value_type) in wildcard_scope.iter_columns() {
+                    for (qualifier, col_name, col_id, value_type, field_name) in
+                        wildcard_scope.iter_columns()
+                    {
                         self.check_control()?;
                         let typed = TypedExpr {
                             kind: ExprKind::ColumnRef {
@@ -1985,6 +1994,7 @@ impl<'a> AnalyzerContext<'a> {
                             value_type: value_type.clone(),
                         };
                         output_columns.push(OutputColumn {
+                            field_name: field_name.clone(),
                             column_id: *col_id,
                             name: col_name.clone(),
                             value_type: value_type.clone(),
@@ -1992,6 +2002,7 @@ impl<'a> AnalyzerContext<'a> {
                             is_internal: false,
                         });
                         projection.push(ProjectItem {
+                            field_name: field_name.clone(),
                             expr: typed,
                             output_name: col_name.clone(),
                             output_column_id: *col_id,
@@ -2026,35 +2037,38 @@ impl<'a> AnalyzerContext<'a> {
     ) -> Result<(), AnalyzeError> {
         match relation {
             Relation::Scan(scan) => {
+                let mut local_scope = self.new_scope();
                 let qualifier = scan.alias.as_deref().unwrap_or(&scan.table.name);
                 let base_len = scan.table.columns.len();
                 let meta_len = scan.table.iceberg_row_lineage_metadata_columns.len();
                 if scan.column_ids.len() >= base_len {
-                    scope.add_table_with_ids(
+                    local_scope.add_table_with_ids(
                         Some(qualifier),
                         &scan.table.columns,
                         &scan.column_ids[..base_len],
                         self.control,
                     )?;
                 } else {
-                    scope.add_table(Some(qualifier), &scan.table.columns, self.control)?;
+                    local_scope.add_table(Some(qualifier), &scan.table.columns, self.control)?;
                 }
                 if !scan.table.iceberg_row_lineage_metadata_columns.is_empty() {
                     if scan.column_ids.len() == base_len + meta_len {
-                        scope.add_iceberg_metadata_columns_with_ids(
+                        local_scope.add_iceberg_metadata_columns_with_ids(
                             qualifier,
                             &scan.table.iceberg_row_lineage_metadata_columns,
                             &scan.column_ids[base_len..],
                             self.control,
                         )?;
                     } else {
-                        scope.add_iceberg_metadata_columns(
+                        local_scope.add_iceberg_metadata_columns(
                             qualifier,
                             &scan.table.iceberg_row_lineage_metadata_columns,
                             self.control,
                         )?;
                     }
                 }
+                local_scope.apply_column_aliases(&scan.column_aliases, scan.alias_span)?;
+                scope.merge(&local_scope);
                 Ok(())
             }
             Relation::Subquery {
@@ -2063,12 +2077,7 @@ impl<'a> AnalyzerContext<'a> {
                 ..
             } => {
                 for col in output_columns {
-                    scope.add_column_with_id(
-                        Some(alias.as_str()),
-                        &col.name,
-                        col.column_id,
-                        col.value_type.clone(),
-                    );
+                    scope.add_field(Some(alias.as_str()), col);
                 }
                 Ok(())
             }
@@ -2090,7 +2099,7 @@ impl<'a> AnalyzerContext<'a> {
             Relation::Unnest(unnest) => {
                 let qualifier = unnest.alias.as_deref().unwrap_or("unnest");
                 for col in &unnest.output_columns {
-                    scope.add_column(Some(qualifier), &col.name, col.value_type.clone());
+                    scope.add_field(Some(qualifier), col);
                 }
                 Ok(())
             }
@@ -2100,12 +2109,7 @@ impl<'a> AnalyzerContext<'a> {
                 ..
             } => {
                 for col in output_columns {
-                    scope.add_column_with_id(
-                        Some(alias.as_str()),
-                        &col.name,
-                        col.column_id,
-                        col.value_type.clone(),
-                    );
+                    scope.add_field(Some(alias.as_str()), col);
                 }
                 Ok(())
             }
@@ -2176,12 +2180,7 @@ impl<'a> AnalyzerContext<'a> {
         // Build a projection scope from body output columns for ORDER BY resolution.
         let mut projection_scope = self.new_scope();
         for col in body_output {
-            projection_scope.add_column_with_id(
-                None,
-                &col.name,
-                col.column_id,
-                col.value_type.clone(),
-            );
+            projection_scope.add_field(None, col);
         }
         // Also register qualified column refs from projection items
         // so ORDER BY a.id works when SELECT has a.id
@@ -2285,7 +2284,12 @@ impl<'a> AnalyzerContext<'a> {
                         for (ast_item, ir_item) in
                             ast_sel.projection.iter().zip(sel.projection.iter())
                         {
-                            if ob_is_bare_ident && ir_item.output_name.to_lowercase() == ob_text {
+                            if ob_is_bare_ident
+                                && ir_item
+                                    .field_name
+                                    .as_ref()
+                                    .is_some_and(|name| name.to_lowercase() == ob_text)
+                            {
                                 let col_id = select_item_output_column_id(
                                     ir_item,
                                     self,
@@ -2324,7 +2328,11 @@ impl<'a> AnalyzerContext<'a> {
                             // HAVING) can resolve the alias against the
                             // projection-output scope rather than against
                             // the pre-aggregation FROM-scope.
-                            if ir_item.output_name.to_lowercase() == ob_text {
+                            if ir_item
+                                .field_name
+                                .as_ref()
+                                .is_some_and(|name| name.to_lowercase() == ob_text)
+                            {
                                 let col_id = select_item_output_column_id(
                                     ir_item,
                                     self,
@@ -2373,12 +2381,14 @@ impl<'a> AnalyzerContext<'a> {
                                                         self,
                                                         &item.output_name,
                                                     );
-                                                    alias_scope.add_column_with_id(
-                                                        None,
-                                                        &item.output_name,
-                                                        col_id,
-                                                        item.expr.value_type.clone(),
-                                                    );
+                                                    if let Some(name) = &item.field_name {
+                                                        alias_scope.add_column_with_id(
+                                                            None,
+                                                            name,
+                                                            col_id,
+                                                            item.expr.value_type.clone(),
+                                                        );
+                                                    }
                                                 }
                                                 match self.analyze_expr(&ob.expr, &alias_scope) {
                                                     Ok(typed) => self.substitute_select_aliases(
@@ -3356,8 +3366,8 @@ fn is_bitmap_or_hll_type(sql_type: &novarocks_types::schema::SqlType) -> bool {
 }
 
 fn sync_output_columns_from_projection(
-    output_columns: &mut [crate::analysis::OutputColumn],
-    projection: &[crate::analysis::ProjectItem],
+    output_columns: &mut [OutputColumn],
+    projection: &[ProjectItem],
 ) {
     for (output, item) in output_columns.iter_mut().zip(projection.iter()) {
         output.value_type = item.expr.value_type.clone();
@@ -3381,6 +3391,130 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     struct TestCatalog;
+
+    #[test]
+    fn table_column_lists_remain_relation_local_in_order_by_rebuild() {
+        let query = parse_native_query(
+            "SELECT l.x FROM t1 AS l(x,y,z) JOIN t2 AS r(a,b,c) ON l.x=r.a ORDER BY r.a",
+        )
+        .unwrap();
+        let (resolved, _, _) = analyze(&query, &TestCatalog, "default").unwrap();
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("SELECT")
+        };
+        let Some(Relation::Join(join)) = &select.from else {
+            panic!("JOIN")
+        };
+        let Relation::Scan(right) = &join.right else {
+            panic!("right scan")
+        };
+        assert!(
+            matches!(resolved.order_by[0].expr.kind, ExprKind::ColumnRef {column_id, ..} if column_id == right.column_ids[0])
+        );
+    }
+
+    #[test]
+    fn using_after_table_column_lists_uses_public_fields_and_correct_side() {
+        let query = parse_native_query(
+            "SELECT k FROM t1 AS l(k,l2,l3) RIGHT JOIN t2 AS r(k,r2,r3) USING(k)",
+        )
+        .unwrap();
+        let (resolved, _, _) = analyze(&query, &TestCatalog, "default").unwrap();
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("SELECT")
+        };
+        let Some(Relation::Join(join)) = &select.from else {
+            panic!("JOIN")
+        };
+        let Relation::Scan(right) = &join.right else {
+            panic!("right scan")
+        };
+        assert!(
+            matches!(select.projection[0].expr.kind, ExprKind::ColumnRef {column_id, ..} if column_id == right.column_ids[0])
+        );
+        let query = parse_native_query(
+            "SELECT * FROM t1 AS l(k,l2,l3) FULL JOIN t2 AS r(k,r2,r3) USING(K)",
+        )
+        .unwrap();
+        let (resolved, _, _) = analyze(&query, &TestCatalog, "default").unwrap();
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("SELECT")
+        };
+        assert_eq!(resolved.output_columns[0].field_name.as_deref(), Some("K"));
+        assert!(
+            matches!(&select.projection[0].expr.kind, ExprKind::FunctionCall {name, ..} if name == "coalesce")
+        );
+    }
+
+    // SQL analysis owns names; labels remain covered by the existing planner tests.
+    #[test]
+    fn trino_relation_fields_keep_optional_names_by_occurrence() {
+        for (sql, expected) in [
+            (
+                "SELECT CAST(1 AS INT), CAST(2 AS INT) AS Mixed",
+                vec![None, Some("Mixed")],
+            ),
+            (
+                "SELECT X, (x), x + 1 FROM (SELECT 1 AS x) AS t",
+                vec![Some("X"), Some("x"), None],
+            ),
+            (
+                "SELECT x, * FROM (SELECT 1 AS x, 2) AS t",
+                vec![Some("x"), Some("x"), None],
+            ),
+            ("WITH c AS (SELECT 1) SELECT * FROM c", vec![None]),
+            ("WITH c(a) AS (SELECT 1) SELECT * FROM c", vec![Some("a")]),
+            ("SELECT * FROM (VALUES (1, 2)) AS t", vec![None, None]),
+            (
+                "SELECT * FROM (VALUES (1, 2)) AS t(a, B)",
+                vec![Some("a"), Some("B")],
+            ),
+            ("SELECT 1 UNION ALL SELECT 2 AS n", vec![None]),
+        ] {
+            let query = parse_native_query(sql).unwrap();
+            let (resolved, _, _) = analyze(&query, &TestCatalog, "default").unwrap();
+            assert_eq!(
+                resolved
+                    .output_columns
+                    .iter()
+                    .map(|field| field.field_name.as_deref())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn anonymous_relation_labels_never_resolve_as_sql_names() {
+        for sql in [
+            "SELECT _col0 FROM (SELECT 1) AS t",
+            "SELECT column_0 FROM (VALUES (1)) AS t",
+            "SELECT t.`1` FROM (SELECT 1) AS t",
+        ] {
+            let query = parse_native_query(sql).unwrap();
+            assert_eq!(
+                analyze(&query, &TestCatalog, "default").unwrap_err().kind(),
+                crate::analyze_error::AnalyzeErrorKind::UnknownColumn,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn relation_alias_lists_use_visible_width_and_a_single_error_kind() {
+        for sql in [
+            "WITH c(a, b) AS (SELECT 1) SELECT * FROM c",
+            "SELECT * FROM (SELECT 1) AS t(a, b)",
+        ] {
+            let query = parse_native_query(sql).unwrap();
+            assert_eq!(
+                analyze(&query, &TestCatalog, "default").unwrap_err().kind(),
+                crate::analyze_error::AnalyzeErrorKind::MismatchedColumnAliases,
+                "{sql}"
+            );
+        }
+    }
 
     struct AnalysisObservation {
         checks: std::sync::atomic::AtomicUsize,
@@ -4245,10 +4379,11 @@ mod tests {
     #[test]
     fn derived_table_column_alias_count_must_match() {
         let sql = "SELECT a FROM (VALUES (1, 2)) AS tmp(a)";
-        let err = parse_and_analyze_with_registry(sql).expect_err("analysis must fail");
-        assert!(
-            err.contains("has 1 column aliases but subquery produces 2 columns"),
-            "err={err}"
+        let query = parse_native_query(sql).unwrap();
+        let error = analyze(&query, &TestCatalog, "default").expect_err("analysis must fail");
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::MismatchedColumnAliases
         );
     }
 
@@ -7643,5 +7778,21 @@ mod tests {
             err.contains("subquery is not supported in ORDER BY"),
             "unexpected error: {err}"
         );
+    }
+}
+
+/// A computed-base dereference never acquires a SQL field name from its suffix.
+fn natural_field_name(expr: &ast::Expr) -> Option<String> {
+    match expr {
+        ast::Expr::Identifier(ident) => Some(ident.value.clone()),
+        ast::Expr::CompoundIdentifier(parts) => parts.parts.last().map(|ident| ident.value.clone()),
+        ast::Expr::Nested(nested) => natural_field_name(&nested.expression),
+        ast::Expr::Access(access) if natural_field_name(&access.expr).is_some() => {
+            match &access.kind {
+                ast::AccessKind::Field(field) => Some(field.value.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }

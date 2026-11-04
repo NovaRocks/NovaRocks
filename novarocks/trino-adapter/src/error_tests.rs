@@ -37,6 +37,7 @@ const TRINO_483: &[(&str, i32, &str)] = &[
     ("PERMISSION_DENIED", 4, "USER_ERROR"),
     ("NOT_FOUND", 5, "USER_ERROR"),
     ("FUNCTION_NOT_FOUND", 6, "USER_ERROR"),
+    ("INVALID_VIEW", 11, "USER_ERROR"),
     ("ALREADY_EXISTS", 12, "USER_ERROR"),
     ("NOT_SUPPORTED", 13, "USER_ERROR"),
     ("INVALID_SESSION_PROPERTY", 14, "USER_ERROR"),
@@ -48,9 +49,14 @@ const TRINO_483: &[(&str, i32, &str)] = &[
     ("TABLE_NOT_FOUND", 46, "USER_ERROR"),
     ("COLUMN_NOT_FOUND", 47, "USER_ERROR"),
     ("DUPLICATE_NAMED_QUERY", 53, "USER_ERROR"),
+    ("DUPLICATE_COLUMN_NAME", 54, "USER_ERROR"),
+    ("MISSING_COLUMN_NAME", 55, "USER_ERROR"),
     ("TYPE_MISMATCH", 58, "USER_ERROR"),
     ("INVALID_LITERAL", 59, "USER_ERROR"),
+    ("MISMATCHED_COLUMN_ALIASES", 61, "USER_ERROR"),
     ("INVALID_ARGUMENTS", 76, "USER_ERROR"),
+    ("VIEW_IS_STALE", 81, "USER_ERROR"),
+    ("VIEW_IS_RECURSIVE", 82, "USER_ERROR"),
     ("DUPLICATE_WINDOW_NAME", 92, "USER_ERROR"),
     ("GENERIC_INTERNAL_ERROR", 65536, "INTERNAL_ERROR"),
     ("PAGE_TRANSPORT_ERROR", 65539, "INTERNAL_ERROR"),
@@ -107,6 +113,12 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.unknown_table" => "TABLE_NOT_FOUND",
         "sql.analyze.unknown_column" => "COLUMN_NOT_FOUND",
         "sql.analyze.unknown_function" => "FUNCTION_NOT_FOUND",
+        "sql.analyze.missing_column_name" => "MISSING_COLUMN_NAME",
+        "sql.analyze.duplicate_column_name" => "DUPLICATE_COLUMN_NAME",
+        "sql.analyze.mismatched_column_aliases" => "MISMATCHED_COLUMN_ALIASES",
+        "sql.analyze.invalid_view" => "INVALID_VIEW",
+        "sql.analyze.view_is_stale" => "VIEW_IS_STALE",
+        "sql.analyze.view_is_recursive" => "VIEW_IS_RECURSIVE",
         "sql.analyze.type_mismatch" => "TYPE_MISMATCH",
         "sql.analyze.invalid_literal" => "INVALID_LITERAL",
         "sql.analyze.invalid_argument" => "INVALID_ARGUMENTS",
@@ -144,6 +156,55 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         _ => {
             panic!("new descriptor {code} requires an explicit Trino mapping and expected contract")
         }
+    }
+}
+
+#[test]
+fn column_and_view_analysis_errors_preserve_their_trino_wire_identity() {
+    use novarocks_parser::Span;
+    use novarocks_sql::analyze_error::AnalyzeError;
+
+    let sql = "SELECT 1";
+    let span = Span::new(0, 6);
+    let detail = "arbitrary domain detail";
+    for (analysis, name) in [
+        (
+            AnalyzeError::missing_column_name(detail, span),
+            "MISSING_COLUMN_NAME",
+        ),
+        (
+            AnalyzeError::duplicate_column_name(detail, span),
+            "DUPLICATE_COLUMN_NAME",
+        ),
+        (
+            AnalyzeError::mismatched_column_aliases(detail, span),
+            "MISMATCHED_COLUMN_ALIASES",
+        ),
+        (AnalyzeError::invalid_view(detail, span), "INVALID_VIEW"),
+        (AnalyzeError::view_is_stale(detail, span), "VIEW_IS_STALE"),
+        (
+            AnalyzeError::view_is_recursive(detail, span),
+            "VIEW_IS_RECURSIVE",
+        ),
+    ] {
+        let service = QueryServiceError::from_user_error(analysis.to_user_error(Some(sql)));
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql,
+        });
+        assert_wire(&wire, name);
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["errorName"], name);
+        assert_eq!(json["errorCode"], wire.error_code);
+        assert_eq!(json["errorType"], "USER_ERROR");
+        assert_eq!(
+            json["errorLocation"],
+            serde_json::json!({"lineNumber": 1, "columnNumber": 1})
+        );
+        assert_eq!(
+            wire.message,
+            format!("[{}] {detail} at line 1 column 1", analysis.code())
+        );
     }
 }
 

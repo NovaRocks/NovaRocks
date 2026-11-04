@@ -75,6 +75,36 @@ const UNSUPPORTED_QUERY_SHAPE: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const MISSING_COLUMN_NAME: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.missing_column_name"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const DUPLICATE_COLUMN_NAME: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.duplicate_column_name"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const MISMATCHED_COLUMN_ALIASES: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.mismatched_column_aliases"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const INVALID_VIEW: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.invalid_view"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const VIEW_IS_STALE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.view_is_stale"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const VIEW_IS_RECURSIVE: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.view_is_recursive"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const INTERNAL: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.internal"),
     phase: ErrorPhase::Analyze,
@@ -94,6 +124,12 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     UNSUPPORTED_EXPRESSION,
     UNAVAILABLE_IMPLEMENTATION,
     UNSUPPORTED_QUERY_SHAPE,
+    MISSING_COLUMN_NAME,
+    DUPLICATE_COLUMN_NAME,
+    MISMATCHED_COLUMN_ALIASES,
+    INVALID_VIEW,
+    VIEW_IS_STALE,
+    VIEW_IS_RECURSIVE,
     INTERNAL,
 ];
 
@@ -111,6 +147,12 @@ pub enum AnalyzeErrorKind {
     /// A bound overload has no installed pure implementation.
     UnavailableImplementation,
     UnsupportedQueryShape,
+    MissingColumnName,
+    DuplicateColumnName,
+    MismatchedColumnAliases,
+    InvalidView,
+    ViewIsStale,
+    ViewIsRecursive,
     Internal,
 }
 
@@ -128,6 +170,12 @@ impl AnalyzeErrorKind {
             Self::UnsupportedExpression => UNSUPPORTED_EXPRESSION,
             Self::UnavailableImplementation => UNAVAILABLE_IMPLEMENTATION,
             Self::UnsupportedQueryShape => UNSUPPORTED_QUERY_SHAPE,
+            Self::MissingColumnName => MISSING_COLUMN_NAME,
+            Self::DuplicateColumnName => DUPLICATE_COLUMN_NAME,
+            Self::MismatchedColumnAliases => MISMATCHED_COLUMN_ALIASES,
+            Self::InvalidView => INVALID_VIEW,
+            Self::ViewIsStale => VIEW_IS_STALE,
+            Self::ViewIsRecursive => VIEW_IS_RECURSIVE,
             Self::Internal => INTERNAL,
         }
     }
@@ -155,6 +203,30 @@ impl AnalyzeError {
             control: None,
             source: None,
         }
+    }
+
+    pub fn missing_column_name(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::MissingColumnName, message, span)
+    }
+
+    pub fn duplicate_column_name(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::DuplicateColumnName, message, span)
+    }
+
+    pub fn mismatched_column_aliases(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::MismatchedColumnAliases, message, span)
+    }
+
+    pub fn invalid_view(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::InvalidView, message, span)
+    }
+
+    pub fn view_is_stale(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::ViewIsStale, message, span)
+    }
+
+    pub fn view_is_recursive(message: impl Into<String>, span: Span) -> Self {
+        Self::at(AnalyzeErrorKind::ViewIsRecursive, message, span)
     }
 
     pub fn unknown_table(message: impl Into<String>, span: Span) -> Self {
@@ -497,6 +569,12 @@ mod tests {
                 "sql.analyze.unsupported_expression",
                 "sql.analyze.unavailable_implementation",
                 "sql.analyze.unsupported_query_shape",
+                "sql.analyze.missing_column_name",
+                "sql.analyze.duplicate_column_name",
+                "sql.analyze.mismatched_column_aliases",
+                "sql.analyze.invalid_view",
+                "sql.analyze.view_is_stale",
+                "sql.analyze.view_is_recursive",
                 "sql.analyze.internal",
             ]
         );

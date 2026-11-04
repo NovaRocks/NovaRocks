@@ -771,6 +771,7 @@ fn optimize_to_physical(
     control: &SqlCompileControl,
 ) -> Result<OptimizedPhysicalPlan, SqlCompileError> {
     let SqlAnalyzedQuery {
+        root_semantics,
         logical_plan,
         factory,
         intent,
@@ -784,12 +785,6 @@ fn optimize_to_physical(
         constant_policy,
     } = analyzed;
     control.check()?;
-    let root_semantics = super::root_output::RootOutputSemantics::capture(
-        &crate::planner::plan_output_columns(&logical_plan)
-            .map_err(SqlCompileError::Compilation)?,
-        &factory,
-    )
-    .map_err(SqlCompileError::Compilation)?;
     let mut scalar_arena =
         crate::optimizer::scalar::ScalarArena::with_constant_policy(constant_policy);
     let mut optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(

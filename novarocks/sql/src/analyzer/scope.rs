@@ -41,7 +41,13 @@ pub(super) struct AnalyzerScope {
     unqualified: HashMap<String, (ColumnId, FunctionValueType)>,
     /// Ordered columns for SELECT * expansion:
     /// (qualifier, col_name, ColumnId, FunctionValueType)
-    ordered: Vec<(Option<String>, String, ColumnId, FunctionValueType)>,
+    ordered: Vec<(
+        Option<String>,
+        String,
+        ColumnId,
+        FunctionValueType,
+        Option<String>,
+    )>,
     /// Lambda parameters visible in the current expression scope.
     lambda_params: HashMap<String, LambdaParam>,
     /// For column names that have a canonical qualifier — e.g. a USING-join
@@ -110,7 +116,7 @@ impl AnalyzerScope {
     /// entries that aliases may add for compatibility.
     pub(super) fn qualifier_for_binding(&self, name: &str, column_id: ColumnId) -> Option<String> {
         let name_lower = name.to_lowercase();
-        for (qualifier, col_name, id, _) in &self.ordered {
+        for (qualifier, col_name, id, _, _) in &self.ordered {
             if col_name.to_lowercase() == name_lower && *id == column_id {
                 return qualifier.clone();
             }
@@ -251,25 +257,92 @@ impl AnalyzerScope {
         column_id: ColumnId,
         value_type: FunctionValueType,
     ) {
-        let name_lower = name.to_lowercase();
-        if let Some(q) = qualifier {
-            self.qualified.insert(
-                (q.to_lowercase(), name_lower.clone()),
-                (column_id, value_type.clone()),
-            );
+        self.add_analyzed_field_with_id(qualifier, name, Some(name), column_id, value_type);
+    }
+
+    /// Anonymous occurrences stay ordered but never enter a name lookup map.
+    pub(super) fn add_analyzed_field_with_id(
+        &mut self,
+        qualifier: Option<&str>,
+        label: &str,
+        field_name: Option<&str>,
+        column_id: ColumnId,
+        value_type: FunctionValueType,
+    ) {
+        if let Some(name) = field_name {
+            let name_lower = name.to_lowercase();
+            if let Some(q) = qualifier {
+                self.qualified.insert(
+                    (q.to_lowercase(), name_lower.clone()),
+                    (column_id, value_type.clone()),
+                );
+            }
+            self.unqualified
+                .insert(name_lower, (column_id, value_type.clone()));
         }
-        self.unqualified
-            .insert(name_lower, (column_id, value_type.clone()));
         self.ordered.push((
             qualifier.map(str::to_lowercase),
-            name.to_string(),
+            label.to_string(),
             column_id,
             value_type,
+            field_name.map(str::to_owned),
         ));
     }
 
+    pub(super) fn add_field(
+        &mut self,
+        qualifier: Option<&str>,
+        field: &crate::analysis::AnalyzedOutputField,
+    ) {
+        self.add_analyzed_field_with_id(
+            qualifier,
+            &field.name,
+            field.field_name.as_deref(),
+            field.column_id,
+            field.value_type.clone(),
+        );
+    }
+
+    /// Rebind visible fields only; hidden lineage lookup retains its own names.
+    pub(super) fn apply_column_aliases(
+        &mut self,
+        aliases: &[novarocks_parser::ast::Ident],
+        span: Span,
+    ) -> Result<(), AnalyzeError> {
+        if aliases.is_empty() {
+            return Ok(());
+        }
+        if aliases.len() != self.ordered.len() {
+            return Err(AnalyzeError::mismatched_column_aliases(
+                format!(
+                    "Column alias list has {} entries but relation has {} columns available",
+                    aliases.len(),
+                    self.ordered.len()
+                ),
+                span,
+            ));
+        }
+        let ids = self
+            .ordered
+            .iter()
+            .map(|entry| entry.2)
+            .collect::<std::collections::HashSet<_>>();
+        self.unqualified.retain(|_, (id, _)| !ids.contains(id));
+        self.qualified.retain(|_, (id, _)| !ids.contains(id));
+        for ((qualifier, _, id, ty, field_name), alias) in self.ordered.iter_mut().zip(aliases) {
+            *field_name = Some(alias.value.clone());
+            let name = alias.value.to_lowercase();
+            self.unqualified.insert(name.clone(), (*id, ty.clone()));
+            if let Some(qualifier) = qualifier {
+                self.qualified
+                    .insert((qualifier.clone(), name), (*id, ty.clone()));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn contains_column_id(&self, column_id: ColumnId) -> bool {
-        self.ordered.iter().any(|(_, _, id, _)| *id == column_id)
+        self.ordered.iter().any(|(_, _, id, _, _)| *id == column_id)
             || self.qualified.values().any(|(id, _)| *id == column_id)
             || self.unqualified.values().any(|(id, _)| *id == column_id)
     }
@@ -402,7 +475,7 @@ impl AnalyzerScope {
                 .with_nullable(true)
                 .expect("validated root NULL contract");
         }
-        for (_, _, _, ty) in &mut self.ordered {
+        for (_, _, _, ty, _) in &mut self.ordered {
             *ty = ty
                 .with_nullable(true)
                 .expect("validated root NULL contract");
@@ -492,7 +565,15 @@ impl AnalyzerScope {
     /// Iterate columns in declaration order (for SELECT * expansion).
     pub(super) fn iter_columns(
         &self,
-    ) -> impl Iterator<Item = &(Option<String>, String, ColumnId, FunctionValueType)> {
+    ) -> impl Iterator<
+        Item = &(
+            Option<String>,
+            String,
+            ColumnId,
+            FunctionValueType,
+            Option<String>,
+        ),
+    > {
         self.ordered.iter()
     }
 
@@ -500,11 +581,19 @@ impl AnalyzerScope {
     pub(super) fn iter_qualified_columns(
         &self,
         qualifier: &str,
-    ) -> impl Iterator<Item = &(Option<String>, String, ColumnId, FunctionValueType)> {
+    ) -> impl Iterator<
+        Item = &(
+            Option<String>,
+            String,
+            ColumnId,
+            FunctionValueType,
+            Option<String>,
+        ),
+    > {
         let q_lower = qualifier.to_lowercase();
         self.ordered
             .iter()
-            .filter(move |(q, _, _, _)| q.as_deref() == Some(q_lower.as_str()))
+            .filter(move |(q, _, _, _, _)| q.as_deref() == Some(q_lower.as_str()))
     }
 
     /// Register `COALESCE(left.col, right.col)` for every USING column.
@@ -651,14 +740,21 @@ impl AnalyzerScope {
             // Reverse-scan dedup: keep the *last* occurrence of each USING name.
             let mut keep_indices: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
-            for (idx, (_, name, _, _)) in self.ordered.iter().enumerate() {
+            for (idx, (_, _, _, _, field_name)) in self.ordered.iter().enumerate() {
+                let Some(name) = field_name else {
+                    continue;
+                };
                 let n = name.to_lowercase();
                 if names_lower.contains(&n) {
                     keep_indices.insert(n, idx);
                 }
             }
             let mut i = 0;
-            self.ordered.retain(|(_, name, _, _)| {
+            self.ordered.retain(|(_, _, _, _, field_name)| {
+                let Some(name) = field_name else {
+                    i += 1;
+                    return true;
+                };
                 let n = name.to_lowercase();
                 let keep = if names_lower.contains(&n) {
                     keep_indices.get(&n) == Some(&i)
@@ -671,7 +767,10 @@ impl AnalyzerScope {
         } else {
             // Forward-scan dedup: keep the first occurrence of each USING name.
             let mut seen = std::collections::HashSet::new();
-            self.ordered.retain(|(_, name, _, _)| {
+            self.ordered.retain(|(_, _, _, _, field_name)| {
+                let Some(name) = field_name else {
+                    return true;
+                };
                 let n = name.to_lowercase();
                 if names_lower.contains(&n) {
                     seen.insert(n)
@@ -681,15 +780,21 @@ impl AnalyzerScope {
             });
         }
         // Move USING columns to the front in USING-clause order.
-        let mut front: Vec<(Option<String>, String, ColumnId, FunctionValueType)> =
-            Vec::with_capacity(names_lower.len());
-        for using_name in &names_lower {
-            if let Some(pos) = self
-                .ordered
-                .iter()
-                .position(|(_, n, _, _)| n.to_lowercase() == *using_name)
-            {
-                front.push(self.ordered.remove(pos));
+        let mut front: Vec<(
+            Option<String>,
+            String,
+            ColumnId,
+            FunctionValueType,
+            Option<String>,
+        )> = Vec::with_capacity(names_lower.len());
+        for (ordinal, using_name) in names_lower.iter().enumerate() {
+            if let Some(pos) = self.ordered.iter().position(|(_, _, _, _, name)| {
+                name.as_ref()
+                    .is_some_and(|n| n.to_lowercase() == *using_name)
+            }) {
+                let mut entry = self.ordered.remove(pos);
+                entry.4 = Some(using_cols[ordinal].clone());
+                front.push(entry);
             }
         }
         front.append(&mut self.ordered);
@@ -699,14 +804,16 @@ impl AnalyzerScope {
         // an unqualified `id1` in WHERE / SELECT / ORDER BY resolves to the
         // right-side binding (matching the column that wins in `ordered`).
         if prefer_right {
-            for (_, name, id, dt) in self
+            for (_, _, id, dt, field_name) in self
                 .ordered
                 .iter()
                 .take(names_lower.len())
                 .cloned()
                 .collect::<Vec<_>>()
             {
-                self.unqualified.insert(name.to_lowercase(), (id, dt));
+                if let Some(name) = field_name {
+                    self.unqualified.insert(name.to_lowercase(), (id, dt));
+                }
             }
         }
 
@@ -720,7 +827,9 @@ impl AnalyzerScope {
             .ordered
             .iter()
             .take(names_lower.len())
-            .map(|(q, n, _, _)| (n.to_lowercase(), q.clone()))
+            .filter_map(|(q, _, _, _, name)| {
+                name.as_ref().map(|name| (name.to_lowercase(), q.clone()))
+            })
             .collect();
         for (name, qual) in collected {
             if let Some(q) = qual {
@@ -923,7 +1032,7 @@ mod tests {
             .unwrap();
         let names: Vec<_> = scope
             .iter_columns()
-            .map(|(_, n, _, _)| n.as_str())
+            .map(|(_, n, _, _, _)| n.as_str())
             .collect();
         assert_eq!(names, vec!["id"]);
     }
