@@ -120,7 +120,7 @@ pub(crate) fn drop_external_view(
     target: &ViewTarget,
     if_exists: bool,
     context: ViewRequestContext<'_>,
-) -> Result<(), String> {
+) -> Result<(), crate::api::CommandError> {
     let connector_context = context
         .connector_context
         .ok_or_else(|| "external view mutation requires connector request context".to_string())?;
@@ -139,14 +139,16 @@ pub(crate) fn show_create_view(
     engine: &dyn ViewEngine,
     name: &ObjectName,
     context: ViewRequestContext<'_>,
-) -> Result<ViewStatementResult, String> {
+) -> Result<ViewStatementResult, crate::api::CommandError> {
     let parts = name
         .parts
         .iter()
         .map(|part| part.value.clone())
         .collect::<Vec<_>>();
     let Some(target) = resolve_external_target_parts(engine, &parts, context)? else {
-        return Err("SHOW CREATE VIEW only supports views in iceberg catalogs".to_string());
+        return Err("SHOW CREATE VIEW only supports views in iceberg catalogs"
+            .to_string()
+            .into());
     };
     let connector_context = context
         .connector_context

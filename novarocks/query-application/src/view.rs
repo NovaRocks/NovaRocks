@@ -168,18 +168,18 @@ pub trait ViewEngine: Send + Sync {
         &self,
         request: CreateExternalViewRequest,
         context: &ConnectorRequestContext,
-    ) -> Result<(), String>;
+    ) -> Result<(), crate::api::CommandError>;
     fn drop_external_view(
         &self,
         target: &ViewTarget,
         context: &ConnectorRequestContext,
         policy: DropPolicy,
-    ) -> Result<(), String>;
+    ) -> Result<(), crate::api::CommandError>;
     fn load_external_view(
         &self,
         target: &ViewTarget,
         context: &ConnectorRequestContext,
-    ) -> Result<Option<ResolvedExternalView>, String>;
+    ) -> Result<Option<ResolvedExternalView>, crate::api::CommandError>;
 
     fn analyze_view_definition(
         &self,

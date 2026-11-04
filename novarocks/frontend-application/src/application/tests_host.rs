@@ -130,7 +130,7 @@ impl ViewEngine for SessionViewEngine {
         &self,
         _request: CreateExternalViewRequest,
         _context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<(), String> {
+    ) -> Result<(), novarocks_query_application::api::CommandError> {
         unreachable!("session view must not create external views")
     }
 
@@ -139,7 +139,7 @@ impl ViewEngine for SessionViewEngine {
         _target: &ViewTarget,
         _context: &novarocks_spi::connector::ConnectorRequestContext,
         _policy: novarocks_spi::connector::DropPolicy,
-    ) -> Result<(), String> {
+    ) -> Result<(), novarocks_query_application::api::CommandError> {
         unreachable!("session view must not drop external views")
     }
 
@@ -147,7 +147,7 @@ impl ViewEngine for SessionViewEngine {
         &self,
         _target: &ViewTarget,
         _context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<Option<ResolvedExternalView>, String> {
+    ) -> Result<Option<ResolvedExternalView>, novarocks_query_application::api::CommandError> {
         Ok(None)
     }
 

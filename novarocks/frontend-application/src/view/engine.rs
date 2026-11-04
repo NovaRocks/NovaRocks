@@ -273,7 +273,7 @@ impl ViewEngine for FrontendViewEngine {
         &self,
         request: CreateExternalViewRequest,
         context: &ConnectorRequestContext,
-    ) -> Result<(), String> {
+    ) -> Result<(), novarocks_query_application::api::CommandError> {
         let columns: Arc<[novarocks_spi::connector::ConnectorViewColumn]> = request
             .columns
             .into_iter()
@@ -284,9 +284,12 @@ impl ViewEngine for FrontendViewEngine {
             })
             .collect::<Vec<_>>()
             .into();
-        let instance_id = ConnectorInstanceId::parse(&request.target.catalog)
-            .map_err(|error| error.to_string())?;
-        crate::connector::mutation::execute_catalog_mutation(
+        let instance_id = ConnectorInstanceId::parse(&request.target.catalog).map_err(|error| {
+            novarocks_query_application::api::CommandError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(error),
+            )
+        })?;
+        crate::connector::mutation::execute_catalog_mutation_for_command(
             self.connector_control(),
             &instance_id,
             ConnectorCatalogMutationOperation::CreateView {
@@ -327,10 +330,13 @@ impl ViewEngine for FrontendViewEngine {
         target: &ViewTarget,
         context: &ConnectorRequestContext,
         policy: DropPolicy,
-    ) -> Result<(), String> {
-        let instance_id =
-            ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
-        crate::connector::mutation::execute_catalog_mutation(
+    ) -> Result<(), novarocks_query_application::api::CommandError> {
+        let instance_id = ConnectorInstanceId::parse(&target.catalog).map_err(|error| {
+            novarocks_query_application::api::CommandError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(error),
+            )
+        })?;
+        crate::connector::mutation::execute_catalog_mutation_for_command(
             self.connector_control(),
             &instance_id,
             ConnectorCatalogMutationOperation::DropView {
@@ -350,19 +356,19 @@ impl ViewEngine for FrontendViewEngine {
         &self,
         target: &ViewTarget,
         context: &ConnectorRequestContext,
-    ) -> Result<Option<ResolvedExternalView>, String> {
-        let lease = crate::connector::acquire_metadata_planning_pin(
-            self.connector_control(),
-            &target.catalog,
-        )?;
+    ) -> Result<Option<ResolvedExternalView>, novarocks_query_application::api::CommandError> {
+        let lease =
+            crate::connector::metadata_binding_typed(self.connector_control(), &target.catalog)
+                .map_err(crate::connector::mutation::command_error_from_connector)?;
+        let context = crate::connector::context_for_planning_pin_typed(&lease, context.clone())
+            .map_err(crate::connector::mutation::command_error_from_connector)?;
         let binding = lease.binding();
-        let Some(capability) = binding.view_metadata() else {
-            return Err(ConnectorError::new(
+        let capability = binding.view_metadata().ok_or_else(|| {
+            crate::connector::mutation::command_error_from_connector(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 "connector control generation does not declare view metadata",
-            )
-            .to_string());
-        };
+            ))
+        })?;
         let instance_id = binding.descriptor().instance_id.clone();
         match crate::connector::schema_creation::load_frontend_view(
             capability.as_ref(),
@@ -372,21 +378,16 @@ impl ViewEngine for FrontendViewEngine {
                     namespace: Arc::from(target.database.as_str()),
                     view: Arc::from(target.view.as_str()),
                 },
-                context: context.clone(),
+                context,
             },
         ) {
-            Ok(view) => Ok(Some(resolved_external_view(target, view)?)),
-            // See `resolve_external_view`: a catalog without view support has
-            // no view to find.
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ConnectorErrorKind::NotFound | ConnectorErrorKind::Unsupported
-                ) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(error.to_string()),
+            Ok(view) => resolved_external_view(target, view)
+                .map(Some)
+                .map_err(Into::into),
+            Err(error) if error.kind() == ConnectorErrorKind::NotFound => Ok(None),
+            Err(error) => Err(crate::connector::mutation::command_error_from_connector(
+                error,
+            )),
         }
     }
 
@@ -510,7 +511,7 @@ mod tests {
             &self,
             _request: CreateExternalViewRequest,
             _context: &ConnectorRequestContext,
-        ) -> Result<(), String> {
+        ) -> Result<(), novarocks_query_application::api::CommandError> {
             unreachable!("empty view service must not access the engine")
         }
 
@@ -519,7 +520,7 @@ mod tests {
             _target: &ViewTarget,
             _context: &ConnectorRequestContext,
             _policy: DropPolicy,
-        ) -> Result<(), String> {
+        ) -> Result<(), novarocks_query_application::api::CommandError> {
             unreachable!("empty view service must not access the engine")
         }
 
@@ -527,7 +528,8 @@ mod tests {
             &self,
             _target: &ViewTarget,
             _context: &ConnectorRequestContext,
-        ) -> Result<Option<ResolvedExternalView>, String> {
+        ) -> Result<Option<ResolvedExternalView>, novarocks_query_application::api::CommandError>
+        {
             unreachable!("empty view service must not access the engine")
         }
 

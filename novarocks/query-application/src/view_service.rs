@@ -318,7 +318,6 @@ impl ViewService for QueryViewService {
                 .into()),
             ViewStatement::ShowCreate(show_create) => {
                 crate::view_iceberg::show_create_view(engine, &show_create.name, context)
-                    .map_err(Into::into)
             }
         }
     }

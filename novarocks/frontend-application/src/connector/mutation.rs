@@ -34,6 +34,7 @@ use std::fmt;
 
 #[derive(Clone, Debug)]
 pub struct CompletedCatalogMutation {
+    pub effect: novarocks_spi::connector::ExternalMutationEffect,
     pub finalization: ExternalMutationFinalization,
     pub cleanup: ExternalMutationFinalization,
 }
@@ -118,95 +119,6 @@ pub(crate) fn execute_catalog_mutation_for_command(
     ))
 }
 
-#[derive(Debug)]
-enum CatalogMutationCommandFailure {
-    KnownUncommitted {
-        failure: ConnectorMutationFailure,
-        cleanup: ExternalMutationFinalization,
-    },
-    CommitUnknown(ConnectorMutationFailure),
-    CommittedFinalization(ConnectorMutationFailure),
-    Contract(ConnectorError),
-}
-impl FailureProjection for CatalogMutationCommandFailure {
-    fn failure_fact(&self) -> FailureFact {
-        match self {
-            Self::KnownUncommitted { failure, .. }
-            | Self::CommitUnknown(failure)
-            | Self::CommittedFinalization(failure) => failure.failure_fact(),
-            Self::Contract(error) => error.failure_fact(),
-        }
-    }
-}
-impl fmt::Display for CatalogMutationCommandFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::KnownUncommitted { failure, cleanup } => write!(
-                formatter,
-                "{}",
-                EngineError::commit_known_uncommitted(known_uncommitted_message(failure, cleanup))
-            ),
-            Self::CommitUnknown(failure) => formatter.write_str(
-                &EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message(),
-            ),
-            Self::CommittedFinalization(failure) => write!(
-                formatter,
-                "{}",
-                EngineError::commit_known_committed_finalize_failed(failure.to_string())
-            ),
-            Self::Contract(error) => fmt::Display::fmt(error, formatter),
-        }
-    }
-}
-impl std::error::Error for CatalogMutationCommandFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::KnownUncommitted { failure, .. }
-            | Self::CommitUnknown(failure)
-            | Self::CommittedFinalization(failure) => Some(failure),
-            Self::Contract(error) => Some(error),
-        }
-    }
-}
-fn present_catalog_mutation_command_result(
-    result: ResolvedCatalogMutation,
-) -> Result<CompletedCatalogMutation, CommandError> {
-    use StatementExternalEffectDisposition::{CommitUnknown, KnownCommitted, KnownUncommitted};
-    let (cause, disposition) = match result {
-        ResolvedCatalogMutation::KnownCommitted(completed) => {
-            if let ExternalMutationFinalization::Failed(error) = &completed.cleanup {
-                tracing::warn!(%error, "committed catalog mutation retains incomplete cleanup");
-            }
-            match completed.finalization {
-                ExternalMutationFinalization::Complete => return Ok(completed),
-                ExternalMutationFinalization::Failed(failure) => (
-                    CatalogMutationCommandFailure::CommittedFinalization(failure),
-                    KnownCommitted,
-                ),
-            }
-        }
-        ResolvedCatalogMutation::KnownUncommitted { failure, cleanup } => (
-            CatalogMutationCommandFailure::KnownUncommitted { failure, cleanup },
-            KnownUncommitted,
-        ),
-        ResolvedCatalogMutation::CommitUnknown { failure, .. } => (
-            CatalogMutationCommandFailure::CommitUnknown(failure),
-            CommitUnknown,
-        ),
-        ResolvedCatalogMutation::ContractFailure { error, dispatch } => (
-            CatalogMutationCommandFailure::Contract(error),
-            match dispatch {
-                MutationDispatchState::ConfirmedNotDispatched => KnownUncommitted,
-                MutationDispatchState::PossiblyDispatched => CommitUnknown,
-            },
-        ),
-    };
-    Err(
-        CommandError::from_failure_cause(SharedFailureCause::new(cause))
-            .with_external_effect_disposition(Some(disposition)),
-    )
-}
-
 /// Executes and presents a mutation through the exact lease retained during
 /// admission and metadata guards, including its one permitted reconciliation.
 pub(crate) fn execute_catalog_mutation_with_lease(
@@ -249,6 +161,142 @@ fn present_catalog_mutation_result(
         }
         ResolvedCatalogMutation::ContractFailure { error, .. } => Err(error.to_string()),
     }
+}
+
+/// Keep the actual producer cause; a message never selects a command class.
+pub(crate) fn command_error_from_connector(
+    error: ConnectorError,
+) -> novarocks_query_application::api::CommandError {
+    let cause = connector_failure_cause(error);
+    let control = cause
+        .downcast_ref::<novarocks_type_contract::CompileControlError>()
+        .cloned();
+    novarocks_query_application::api::CommandError::from_failure_cause(cause)
+        .with_compile_control(control)
+}
+
+fn connector_failure_cause(
+    error: ConnectorError,
+) -> novarocks_failure_contract::SharedFailureCause {
+    std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<novarocks_failure_contract::SharedFailureCause>())
+        .cloned()
+        .unwrap_or_else(|| novarocks_failure_contract::SharedFailureCause::new(error))
+}
+
+fn mutation_failure_cause(
+    failure: &ConnectorMutationFailure,
+) -> novarocks_failure_contract::SharedFailureCause {
+    match failure.connector_source() {
+        Some(error) => connector_failure_cause(error.clone()),
+        None => novarocks_failure_contract::SharedFailureCause::new(failure.clone()),
+    }
+}
+
+/// The original outcome retains cleanup and unresolved evidence independently
+/// of its primary cause. This wrapper performs no I/O or reconciliation.
+#[derive(Debug)]
+struct CatalogMutationCommandFailure {
+    primary: novarocks_failure_contract::SharedFailureCause,
+    outcome: ResolvedCatalogMutation,
+}
+impl fmt::Display for CatalogMutationCommandFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.outcome {
+            ResolvedCatalogMutation::KnownUncommitted { failure, cleanup } => write!(
+                formatter,
+                "{}",
+                EngineError::commit_known_uncommitted(known_uncommitted_message(failure, cleanup))
+            ),
+            ResolvedCatalogMutation::CommitUnknown { failure, .. } => formatter.write_str(
+                &EngineError::commit_unknown(failure.to_string()).to_bracketed_user_message(),
+            ),
+            ResolvedCatalogMutation::KnownCommitted(completed) => {
+                let ExternalMutationFinalization::Failed(failure) = &completed.finalization else {
+                    unreachable!("successful finalization is not a command failure")
+                };
+                match completed.effect {
+                    novarocks_spi::connector::ExternalMutationEffect::Applied => write!(
+                        formatter,
+                        "{}",
+                        EngineError::commit_known_committed_finalize_failed(failure.to_string())
+                    ),
+                    novarocks_spi::connector::ExternalMutationEffect::NoOp => {
+                        fmt::Display::fmt(failure, formatter)
+                    }
+                }
+            }
+            ResolvedCatalogMutation::ContractFailure { error, .. } => {
+                fmt::Display::fmt(error, formatter)
+            }
+        }
+    }
+}
+impl std::error::Error for CatalogMutationCommandFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+impl FailureProjection for CatalogMutationCommandFailure {
+    fn failure_fact(&self) -> FailureFact {
+        self.primary.failure_fact()
+    }
+}
+
+/// Project the original mutation verdict before any legacy String adapter.
+/// NoOp is an actual effect fact, not an Applied publication.
+pub(crate) fn present_catalog_mutation_command_result(
+    result: ResolvedCatalogMutation,
+) -> Result<CompletedCatalogMutation, novarocks_query_application::api::CommandError> {
+    use novarocks_query_application::api::{CommandError, StatementExternalEffectDisposition as D};
+    use novarocks_spi::connector::ExternalMutationEffect;
+    let (primary, disposition) = match &result {
+        ResolvedCatalogMutation::KnownCommitted(completed) => {
+            if let ExternalMutationFinalization::Failed(error) = &completed.cleanup {
+                tracing::warn!(%error, "committed catalog mutation retains incomplete cleanup");
+            }
+            let ExternalMutationFinalization::Failed(failure) = &completed.finalization else {
+                let ResolvedCatalogMutation::KnownCommitted(completed) = result else {
+                    unreachable!()
+                };
+                return Ok(completed);
+            };
+            (
+                mutation_failure_cause(failure),
+                match completed.effect {
+                    ExternalMutationEffect::Applied => Some(D::KnownCommitted),
+                    ExternalMutationEffect::NoOp => None,
+                },
+            )
+        }
+        ResolvedCatalogMutation::KnownUncommitted { failure, .. } => {
+            (mutation_failure_cause(failure), Some(D::KnownUncommitted))
+        }
+        ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
+            (mutation_failure_cause(failure), Some(D::CommitUnknown))
+        }
+        ResolvedCatalogMutation::ContractFailure { error, dispatch } => (
+            connector_failure_cause(error.clone()),
+            match dispatch {
+                // The lease acquisition failed before any Provider dispatch.
+                MutationDispatchState::ConfirmedNotDispatched => Some(D::KnownUncommitted),
+                MutationDispatchState::PossiblyDispatched => Some(D::CommitUnknown),
+            },
+        ),
+    };
+    let control = primary
+        .downcast_ref::<novarocks_type_contract::CompileControlError>()
+        .cloned();
+    Err(
+        CommandError::from_failure_cause(novarocks_failure_contract::SharedFailureCause::new(
+            CatalogMutationCommandFailure {
+                primary,
+                outcome: result,
+            },
+        ))
+        .with_compile_control(control)
+        .with_external_effect_disposition(disposition),
+    )
 }
 
 /// Executes once and, only for `CommitUnknown`, reconciles once through the
@@ -317,8 +365,10 @@ pub fn dispatch_catalog_mutation_once_with_lease(
         Ok(ExternalMutationOutcome::KnownCommitted {
             finalization,
             cleanup,
+            effect,
             ..
         }) => ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation {
+            effect,
             finalization,
             cleanup,
         }),
@@ -373,8 +423,10 @@ fn resolve_outcome(
         ExternalMutationOutcome::KnownCommitted {
             finalization,
             cleanup,
+            effect,
             ..
         } => ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation {
+            effect,
             finalization,
             cleanup,
         }),
@@ -610,6 +662,7 @@ mod tests {
         let finalization = ExternalMutationFinalization::Failed(cleanup_failure.clone());
         let committed = present_catalog_mutation_result(ResolvedCatalogMutation::KnownCommitted(
             CompletedCatalogMutation {
+                effect: ExternalMutationEffect::Applied,
                 cleanup: ExternalMutationFinalization::Complete,
                 finalization: finalization.clone(),
             },
@@ -695,12 +748,13 @@ mod tests {
             Some(StatementExternalEffectDisposition::KnownUncommitted)
         );
         let cause = command.failure_cause().unwrap().clone();
-        let CatalogMutationCommandFailure::KnownUncommitted {
+        let custody = cause
+            .downcast_ref::<CatalogMutationCommandFailure>()
+            .unwrap();
+        let ResolvedCatalogMutation::KnownUncommitted {
             failure,
             cleanup: retained,
-        } = cause
-            .downcast_ref::<CatalogMutationCommandFailure>()
-            .unwrap()
+        } = &custody.outcome
         else {
             panic!("original noncommit source and cleanup must remain together");
         };
@@ -776,6 +830,7 @@ mod tests {
         );
         let committed = present_catalog_mutation_command_result(
             ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation {
+                effect: ExternalMutationEffect::Applied,
                 cleanup: ExternalMutationFinalization::Complete,
                 finalization: ExternalMutationFinalization::Failed(failure.clone()),
             }),
@@ -912,5 +967,179 @@ mod tests {
                 ..
             }
         ));
+    }
+    fn assert_original_command_reaches_product_route(
+        error: &novarocks_query_application::api::CommandError,
+    ) {
+        let service = crate::query::product_command_service_error(error.clone());
+        assert_eq!(service.failure_cause(), error.failure_cause());
+        assert_eq!(
+            service.external_effect_disposition(),
+            error.external_effect_disposition()
+        );
+        assert_eq!(
+            service.compile_control_error(),
+            error.compile_control_error()
+        );
+        assert_eq!(
+            service.execution_failure().unwrap().fact(),
+            novarocks_failure_contract::FailureProjection::failure_fact(
+                error.failure_cause().unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn command_projection_retains_primary_cleanup_and_exact_committed_effect() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use novarocks_query_application::api::StatementExternalEffectDisposition as D;
+        let connector = ConnectorError::from_domain(
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+            novarocks_workload_control::WorkError::Capacity("original publication"),
+        );
+        let original = std::error::Error::source(&connector)
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap()
+            .clone();
+        let failure = ConnectorMutationFailure::from_connector(connector);
+        let cleanup_failure = ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Unavailable,
+            "original cleanup",
+        );
+        for effect in [
+            ExternalMutationEffect::Applied,
+            ExternalMutationEffect::NoOp,
+        ] {
+            let error = present_catalog_mutation_command_result(
+                ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation {
+                    effect,
+                    finalization: ExternalMutationFinalization::Failed(failure.clone()),
+                    cleanup: ExternalMutationFinalization::Failed(cleanup_failure.clone()),
+                }),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.external_effect_disposition(),
+                match effect {
+                    ExternalMutationEffect::Applied => Some(D::KnownCommitted),
+                    ExternalMutationEffect::NoOp => None,
+                }
+            );
+            assert_original_command_reaches_product_route(&error);
+            if effect == ExternalMutationEffect::NoOp {
+                let service = crate::query::product_command_service_error(error.clone());
+                assert_eq!(service.external_effect_disposition(), None);
+                assert!(service.message().contains(&failure.to_string()));
+                assert!(!service.message().contains("KnownCommitted"));
+                assert!(!service.message().contains("do_not_retry=true"));
+            }
+            let custody = error
+                .failure_cause()
+                .unwrap()
+                .downcast_ref::<CatalogMutationCommandFailure>()
+                .unwrap();
+            assert_eq!(custody.primary, original);
+            assert_eq!(custody.failure_fact(), original.failure_fact());
+            let ResolvedCatalogMutation::KnownCommitted(completed) = &custody.outcome else {
+                panic!("original committed outcome")
+            };
+            assert_eq!(completed.effect, effect);
+            assert!(
+                matches!(&completed.cleanup, ExternalMutationFinalization::Failed(saved) if saved == &cleanup_failure)
+            );
+        }
+        let error =
+            present_catalog_mutation_command_result(ResolvedCatalogMutation::KnownUncommitted {
+                failure,
+                cleanup: ExternalMutationFinalization::Failed(cleanup_failure.clone()),
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.external_effect_disposition(),
+            Some(D::KnownUncommitted)
+        );
+        assert_original_command_reaches_product_route(&error);
+        let custody = error
+            .failure_cause()
+            .unwrap()
+            .downcast_ref::<CatalogMutationCommandFailure>()
+            .unwrap();
+        assert_eq!(custody.primary, original);
+        assert!(
+            matches!(&custody.outcome, ResolvedCatalogMutation::KnownUncommitted { cleanup: ExternalMutationFinalization::Failed(saved), .. } if saved == &cleanup_failure)
+        );
+    }
+
+    #[test]
+    fn command_projection_keeps_unknown_evidence_and_real_dispatch_without_replay() {
+        use novarocks_query_application::api::StatementExternalEffectDisposition as D;
+        let descriptor = ConnectorInstanceDescriptor {
+            instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+        };
+        let incarnation = ProviderBindingEpoch::from_bytes([3; 16]);
+        let operation = create_namespace_operation(descriptor.instance_id.clone());
+        let evidence = ExternalMutationEvidence::try_new(
+            1,
+            descriptor,
+            incarnation,
+            ConnectorMutationOperationId::new(),
+            operation.kind(),
+            Bytes::from_static(b"original unknown proof"),
+        )
+        .unwrap();
+        let error =
+            present_catalog_mutation_command_result(ResolvedCatalogMutation::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "original unknown",
+                ),
+                evidence: evidence.clone(),
+            })
+            .unwrap_err();
+        assert_eq!(error.external_effect_disposition(), Some(D::CommitUnknown));
+        assert_original_command_reaches_product_route(&error);
+        let custody = error
+            .failure_cause()
+            .unwrap()
+            .downcast_ref::<CatalogMutationCommandFailure>()
+            .unwrap();
+        assert!(
+            matches!(&custody.outcome, ResolvedCatalogMutation::CommitUnknown { evidence: saved, .. } if saved == &evidence)
+        );
+        for (dispatch, expected) in [
+            (
+                MutationDispatchState::ConfirmedNotDispatched,
+                Some(D::KnownUncommitted),
+            ),
+            (
+                MutationDispatchState::PossiblyDispatched,
+                Some(D::CommitUnknown),
+            ),
+        ] {
+            let original = novarocks_failure_contract::SharedFailureCause::new(
+                novarocks_type_contract::CompileControlError::Cancelled,
+            );
+            let error =
+                present_catalog_mutation_command_result(ResolvedCatalogMutation::ContractFailure {
+                    error: ConnectorError::compile_interruption(
+                        novarocks_type_contract::CompileControlError::Source(original.clone()),
+                    ),
+                    dispatch,
+                })
+                .unwrap_err();
+            assert_eq!(error.external_effect_disposition(), expected);
+            assert_original_command_reaches_product_route(&error);
+            let custody = error
+                .failure_cause()
+                .unwrap()
+                .downcast_ref::<CatalogMutationCommandFailure>()
+                .unwrap();
+            assert!(
+                matches!(&custody.outcome, ResolvedCatalogMutation::ContractFailure { dispatch: saved, .. } if saved == &dispatch)
+            );
+            assert!(error.compile_control_error().is_some());
+        }
     }
 }

@@ -121,19 +121,21 @@ impl ViewEngine for FakeViewEngine {
         &self,
         request: CreateExternalViewRequest,
         _context: &ConnectorRequestContext,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::api::CommandError> {
         if self.tables.lock().unwrap().contains(&request.target) {
             return Err(format!(
                 "a table named {}.{}.{} already exists",
                 request.target.catalog, request.target.database, request.target.view
-            ));
+            )
+            .into());
         }
         let mut views = self.views.lock().unwrap();
         if views.contains_key(&request.target) && !request.or_replace && !request.if_not_exists {
             return Err(format!(
                 "view already exists: {}.{}.{}",
                 request.target.catalog, request.target.database, request.target.view
-            ));
+            )
+            .into());
         }
         views.insert(
             request.target.clone(),
@@ -158,7 +160,7 @@ impl ViewEngine for FakeViewEngine {
         target: &ViewTarget,
         _context: &ConnectorRequestContext,
         policy: novarocks_spi::connector::DropPolicy,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::api::CommandError> {
         if self.views.lock().unwrap().remove(target).is_some()
             || policy == novarocks_spi::connector::DropPolicy::NoOpIfMissing
         {
@@ -167,7 +169,8 @@ impl ViewEngine for FakeViewEngine {
             Err(format!(
                 "unknown view: {}.{}.{}",
                 target.catalog, target.database, target.view
-            ))
+            )
+            .into())
         }
     }
 
@@ -175,7 +178,7 @@ impl ViewEngine for FakeViewEngine {
         &self,
         target: &ViewTarget,
         _context: &ConnectorRequestContext,
-    ) -> Result<Option<ResolvedExternalView>, String> {
+    ) -> Result<Option<ResolvedExternalView>, crate::api::CommandError> {
         Ok(self.views.lock().unwrap().get(target).cloned())
     }
 
