@@ -848,6 +848,17 @@ fn run_owned(
         errors[4]=(||->Result<()> {
             let before=runtime.block_on(census(context,deadline))?.created;
             facts.health_before_tasks_created=Some(before);
+            ensure!(
+                facts.actor_actual_join && facts.query_actual_join,
+                "original actor and Trino query must join before statement binding retirement"
+            );
+            context.handle().drain_query_lifecycle_statement_binding(
+                statement.as_ref().context(
+                    "original target statement observation disappeared before health"
+                )?,
+                deadline,
+            )?;
+            drop(statement.take());
             let result=SqlSession::new(context.sql_user(),context.trino_port(),deadline)?.execute(HEALTH_SQL)?;
             ensure!(result.is_result_set() && result.columns.len()==1 && result.columns[0].name=="total"
                 && result.columns[0].type_name=="bigint" && result.columns[0].type_signature.raw_type=="bigint"
