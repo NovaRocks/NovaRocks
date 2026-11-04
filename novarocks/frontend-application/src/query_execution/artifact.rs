@@ -1712,6 +1712,121 @@ mod tests {
         cells
     }
 
+    // Finite source-fixture encoding only; all decoding and retained storage
+    // still belong to the actual registered receiver under test.
+    struct FixtureUnitEncoder;
+    impl novarocks_arrow_batch_codec::UnitObserver for FixtureUnitEncoder {
+        type Error = &'static str;
+        fn checkpoint(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn before_allocation(&mut self, _: std::alloc::Layout) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn before_type_scratch(&mut self, _: usize) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn before_metadata_verification(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+            unreachable!("fixture encoder does not decode")
+        }
+        fn copy_body(&mut self, _: &[u8]) -> Result<arrow::buffer::Buffer, Self::Error> {
+            unreachable!("fixture encoder does not decode")
+        }
+        fn before_arrow_decode(
+            &mut self,
+            _: &arrow::datatypes::Schema,
+            _: arrow::ipc::RecordBatch<'_>,
+            _: &arrow::buffer::Buffer,
+            _: &std::collections::HashMap<i64, arrow::array::ArrayRef>,
+            _: novarocks_arrow_batch_codec::DecodeKind,
+        ) -> Result<(), Self::Error> {
+            unreachable!("fixture encoder does not decode")
+        }
+        fn before_recipe(
+            &mut self,
+            _: &[novarocks_arrow_batch_codec::RecipeField<'_>],
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn before_unit_recipe(
+            &mut self,
+            _: &novarocks_arrow_batch_codec::BatchRecipe,
+            _: &[u8],
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn project_carrier(
+            &mut self,
+            _: usize,
+            _: &arrow::array::ArrayRef,
+            _: &arrow::datatypes::DataType,
+        ) -> Result<arrow::array::ArrayRef, Self::Error> {
+            Err("fixture must already have its admitted scalar or dictionary carrier")
+        }
+        fn before_encode_batch(
+            &mut self,
+            _: &novarocks_arrow_batch_codec::BatchRecipe,
+            _: &arrow::record_batch::RecordBatch,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn before_decode_message(
+            &mut self,
+            _: &arrow::datatypes::Schema,
+            _: arrow::ipc::RecordBatch<'_>,
+            _: &[u8],
+        ) -> Result<(), Self::Error> {
+            unreachable!("fixture encoder does not decode")
+        }
+    }
+
+    fn declared_exchange_recipe(
+        schema: &novarocks_execution::exec::chunk::ChunkSchemaRef,
+    ) -> novarocks_arrow_batch_codec::BatchRecipe {
+        use novarocks_arrow_batch_codec::{BatchRecipe, RecipeField, RepresentationPolicy};
+        use novarocks_type_contract::{CarrierNullabilityPolicy, FunctionValueType};
+        let declarations = schema
+            .slots()
+            .iter()
+            .map(|slot| {
+                FunctionValueType::try_from_typed_binding(slot.typed_binding().clone()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let fields = schema.arrow_schema_ref();
+        let views = fields
+            .fields()
+            .iter()
+            .zip(&declarations)
+            .map(|(field, value_type)| RecipeField {
+                field,
+                value_type,
+                representation: if matches!(
+                    field.data_type(),
+                    arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8
+                ) {
+                    RepresentationPolicy::CanonicalOrInt32Utf8Dictionary
+                } else {
+                    RepresentationPolicy::Exact
+                },
+                nullability: CarrierNullabilityPolicy::Permissive,
+            })
+            .collect::<Vec<_>>();
+        BatchRecipe::try_new(&views, &mut FixtureUnitEncoder).unwrap()
+    }
+
+    fn encode_declared_exchange_unit(
+        chunk: &novarocks_execution::exec::chunk::Chunk,
+        declaration: &novarocks_execution::exec::chunk::ChunkSchemaRef,
+    ) -> Vec<u8> {
+        let recipe = declared_exchange_recipe(declaration);
+        novarocks_arrow_batch_codec::encode_unit(
+            &recipe,
+            chunk.record_batch(),
+            &mut FixtureUnitEncoder,
+        )
+        .unwrap()
+    }
+
     fn test_decode_root_chunk(
         payload: &[u8],
         schema: &novarocks_execution::exec::chunk::ChunkSchemaRef,
@@ -2022,13 +2137,12 @@ mod tests {
             };
             let ty = declared_test_value(carrier, false, domain).unwrap();
             let chunk = typed_result_chunk(array, &ty);
-            let payload =
-                novarocks_execution::runtime::exchange::encode_chunks(&[chunk], true).unwrap();
             let output = PlanOutputColumn {
                 name: "declared_value".into(),
                 ty: ty.clone(),
             };
             let expected = super::build_expected_output_schema(&[output]).unwrap();
+            let payload = encode_declared_exchange_unit(&chunk, &expected.chunk_schema);
             let decoded = test_decode_root_chunk(&payload, &expected.chunk_schema).unwrap();
             let result = expected.into_query_result(vec![decoded]).unwrap();
             assert_eq!(result.columns[0].value_type(), &ty);
@@ -2107,13 +2221,12 @@ mod tests {
                 )
                 .unwrap();
                 let chunk = typed_result_chunk(array, &ty);
-                let payload =
-                    novarocks_execution::runtime::exchange::encode_chunks(&[chunk], true).unwrap();
                 let expected = super::build_expected_output_schema(&[PlanOutputColumn {
                     name: "declared".into(),
                     ty: ty.clone(),
                 }])
                 .unwrap();
+                let payload = encode_declared_exchange_unit(&chunk, &expected.chunk_schema);
                 let decoded = test_decode_root_chunk(&payload, &expected.chunk_schema).unwrap();
                 let original = decoded.record_batch().column(0).clone();
                 let result = expected.into_query_result(vec![decoded]).unwrap();

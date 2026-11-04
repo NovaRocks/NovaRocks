@@ -316,9 +316,29 @@ impl State {
             .validate_unclaimed_pair(cell.pair.as_ref().expect("original cut pair"))?;
         let notice = cell.rpc_retirement_notice.clone();
         let cut_pair = cell.pair.as_ref().expect("original cut pair");
+        // An already-admitted Request can outlive producer storage. Closing
+        // admission and draining this actual open prefix leaves no producer
+        // Source to transfer; older partials/aliases keep their own custody.
+        let closed_request_prefix = !self.failed
+            && self.source_closed
+            && !self.open_consuming
+            && self.segments.open_is_empty()
+            && cell.event.as_ref().is_some_and(|event| {
+                matches!(event.kind, CausalEventKind::Request(_))
+                    && event.phase == EventPhase::Reserved
+                    && event.work.is_some()
+                    && event.input.is_none()
+            });
+        if closed_request_prefix && !cell.funding.matches_pair(cut_pair) {
+            return Err(SourcePositionError::ForeignInventory.into());
+        }
         let open_route = self.open_route();
-        let open_pair = self.pair(open_route)?;
-        for pair in [cut_pair, open_pair] {
+        let open_pair = if closed_request_prefix {
+            None
+        } else {
+            Some(self.pair(open_route)?)
+        };
+        for pair in std::iter::once(cut_pair).chain(open_pair) {
             for original in self.observe_owned_pair(pair)? {
                 let allowed = match &notice {
                     Some(notice) => original.custody.can_arm_retirement_notice(false, notice),
@@ -335,30 +355,34 @@ impl State {
         // original wake recipients before transferring either pair.
         let cut_pair = self.cuts[&cut].pair.as_ref().expect("original cut pair");
         wakes.capture_pair(self, cut_pair);
-        wakes.capture_pair(self, self.pair(open_route)?);
+        if !closed_request_prefix {
+            wakes.capture_pair(self, self.pair(open_route)?);
+        }
         if let Some(notice) = &notice {
             for original in self.observe_owned_pair(cut_pair)? {
                 original.custody.clear_pair_retirement_notice(notice);
             }
         }
         self.cuts.get_mut(&cut).expect("original cut").sealed = true;
-        let cut_pair = self
-            .cuts
-            .get_mut(&cut)
-            .expect("original cut")
-            .pair
-            .as_mut()
-            .expect("original cut pair");
-        let open_pair = if self.open_in_spare {
-            &mut self.spare
-        } else {
-            &mut self.open
-        };
-        open_pair
-            .as_mut()
-            .expect("original open segment pair")
-            .swap_with(cut_pair)
-            .expect("same original bank");
+        if !closed_request_prefix {
+            let cut_pair = self
+                .cuts
+                .get_mut(&cut)
+                .expect("original cut")
+                .pair
+                .as_mut()
+                .expect("original cut pair");
+            let open_pair = if self.open_in_spare {
+                &mut self.spare
+            } else {
+                &mut self.open
+            };
+            open_pair
+                .as_mut()
+                .expect("original open segment pair")
+                .swap_with(cut_pair)
+                .expect("same original bank");
+        }
         if let Some(notice) = &notice {
             for original in self.observe_pair(PairRoute::Cut(cut))? {
                 original.custody.arm_retirement_notice(false, notice);

@@ -5517,10 +5517,21 @@ mod tests {
             binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
             context: spi::ConnectorRequestContext,
         ) -> spi::ConnectorRowMutationSelection {
+            use novarocks_execution::runtime::fragment::ExecutionFailure;
             use novarocks_native_adapter::root_cow_selection_codec::{
                 CowSelectionEncoder, CowSelectionTotals,
             };
             use novarocks_result_render::RenderTurnStatus;
+            use novarocks_value_arrays::{
+                ValueFailure,
+                decode::ValueConversionContext,
+                hydrate::{HydrateOptions, HydratePlan, HydrateProjection},
+            };
+            let original =
+                crate::query_execution::original_cow_result_scope::from_original_binding(
+                    binding, &context,
+                )
+                .unwrap();
             let mut consumer =
                 crate::query_execution::row_mutation::CowMatchRootConsumer::try_new_with_capacity(
                     context,
@@ -5536,9 +5547,87 @@ mod tests {
             let mut totals = CowSelectionTotals::default();
             let mut packet = [0u8; 64];
             for batch in fixture.selection.batches() {
+                assert_eq!(batch.num_columns(), recipe.declarations().len());
+                // Match the real Root producer: hydrate the signed values,
+                // then project their wrappers to the frozen wire recipe.
+                // Keep the original Internal receipts until these temporary
+                // columns and the conversion context have actually exited.
+                let retention =
+                    crate::query_execution::internal_result_cpu::InternalResultRetention::try_new(
+                        binding,
+                    )
+                    .unwrap();
+                let mut conversions = ValueConversionContext::new(0);
+                let check = || {
+                    original
+                        .check_active()
+                        .map_err(ExecutionFailure::from_domain)
+                };
+                let mut growth = |layout: std::alloc::Layout| {
+                    check()?;
+                    retention
+                        .reserve_bytes(layout.size())
+                        .map_err(ExecutionFailure::from_domain)
+                };
+                let mut work = |_| check();
+                growth(std::alloc::Layout::array::<ArrayRef>(batch.num_columns()).unwrap())
+                    .unwrap();
+                let mut columns = Vec::with_capacity(batch.num_columns());
+                let value_failure = |error| match error {
+                    ValueFailure::Caller(error) => error,
+                    ValueFailure::Value(error) => ExecutionFailure::from_domain(error),
+                };
+                for ((source, declaration), field) in batch
+                    .columns()
+                    .iter()
+                    .zip(recipe.declarations())
+                    .zip(recipe.schema().fields())
+                {
+                    let plan = HydratePlan::plan_with_options_observed(
+                        source,
+                        declaration.typed_binding(),
+                        HydrateOptions {
+                            dictionary_value_layout: None,
+                            projection: HydrateProjection::FrozenNamesAndNullability,
+                        },
+                        &mut conversions,
+                        &mut |_, _| false,
+                        &mut growth,
+                        &mut work,
+                        &mut |_| Ok(()),
+                    )
+                    .map_err(value_failure)
+                    .unwrap();
+                    plan.require_complete().unwrap();
+                    let column = plan
+                        .execute_observed(&mut conversions, &mut growth, &mut work, &mut |_| Ok(()))
+                        .map_err(value_failure)
+                        .unwrap();
+                    columns.push(
+                        novarocks_functions::array_projection::rebuild_array_observed(
+                            &column,
+                            field.data_type(),
+                            &mut |step| {
+                                novarocks_functions::array_projection::observe_array_normalization_construction::<ExecutionFailure>(
+                                    step,
+                                    &mut growth,
+                                    &mut |bound| {
+                                        check()?;
+                                        retention
+                                            .reserve_bytes(bound.bytes_upper)
+                                            .map_err(ExecutionFailure::from_domain)
+                                    },
+                                    &mut work,
+                                )
+                            },
+                        )
+                        .unwrap(),
+                    );
+                }
+                check().unwrap();
                 let batch = arrow::record_batch::RecordBatch::try_new_with_options(
                     Arc::clone(recipe.schema()),
-                    batch.columns().to_vec(),
+                    columns,
                     &arrow::record_batch::RecordBatchOptions::new()
                         .with_row_count(Some(batch.num_rows())),
                 )
