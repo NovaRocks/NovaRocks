@@ -628,7 +628,7 @@ mod tests {
                 vec![Arc::new(Int32Array::from(values.to_vec()))],
             )
             .unwrap();
-            let payload = Bytes::from(encode_chunks(&[chunk], true).unwrap());
+            let payload = Bytes::from(super::super::tests::online_unit(&[chunk], true).unwrap());
             self.unit_frame(n, payload, end)
         }
 
@@ -927,30 +927,17 @@ mod tests {
     #[test]
     fn receiver_empty_unit_is_ready_for_real_handoff_and_unblocks_the_next_demand() {
         let f = Fixture::new(1);
-        // A real IPC stream with a schema and no record batches is a zero-row
-        // unit. encode_chunks(&[]) emits no wire bytes, not a data Unit.
-        let declaration = f.frame(1, &[], false);
-        let wire_meta = decode_exchange_payload_envelope(&declaration.payload)
-            .unwrap()
-            .wire_meta
-            .unwrap();
-        let mut ipc = Vec::new();
-        arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &f.schema.arrow_schema_ref())
-            .unwrap()
-            .finish()
-            .unwrap();
-        let empty = f.unit_frame(
-            1,
-            Bytes::from(encode_exchange_payload_envelope(&ipc, Some(&wire_meta)).unwrap()),
-            false,
-        );
+        // Even a zero-row Unit carries exactly one complete RecordBatch.
+        let empty = f.frame(1, &[], false);
         f.register(&empty);
         f.registry.receive_unit(f.key, empty).unwrap();
         let next = f.frame(2, &[7], true);
         assert_eq!(f.register(&next).facts.granted_through, 1);
         let receiver = f.receiver();
         assert!(receiver.has_output_or_finished(1));
-        assert!(receiver.try_pop_next_with_stats(1).unwrap().is_none());
+        assert!(
+            matches!(receiver.try_pop_next_with_stats(1).unwrap(), Some(ExchangePopResult::Chunk(chunk)) if chunk.is_empty())
+        );
         assert_eq!(
             f.registry
                 .unit_slots

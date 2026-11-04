@@ -118,11 +118,26 @@ pub fn validate_argument_observed(
                 ));
             }
         }
-        if !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-            argument.array().data_type(),
-            value_type.data_type(),
-            || work.step(),
-        )? {
+        let carrier_matches = if argument.constant_value().is_some() {
+            // The existing ConstantPool source/representation policy is retained.
+            novarocks_type_contract::arrow_data_types_exact_with_profile_observed::<KernelFailure>(
+                argument.array().data_type(),
+                value_type.data_type(),
+                novarocks_type_contract::ArrowTypeProfile::Physical,
+                || work.step(),
+            )?
+        } else {
+            novarocks_type_contract::arrow_data_types_exact_with_profile_and_nullability_observed::<
+                KernelFailure,
+            >(
+                value_type.data_type(),
+                argument.array().data_type(),
+                novarocks_type_contract::ArrowTypeProfile::Value,
+                novarocks_type_contract::CarrierNullabilityPolicy::Permissive,
+                || work.step(),
+            )?
+        };
+        if !carrier_matches {
             return Err(invalid(
                 "evaluated argument differs from its exact selected type",
             ));
@@ -139,6 +154,32 @@ pub fn validate_argument_observed(
                     return Err(invalid("non-null argument contains a selected SQL NULL"));
                 }
             }
+        }
+        if argument.constant_value().is_none() {
+            let shared = std::cell::RefCell::new(&mut work);
+            let rows = selection
+                .iter()
+                .enumerate()
+                .map(|(ordinal, row)| argument.value_row(ordinal, row));
+            novarocks_value_arrays::hydrate::validate_required_rows_observed(
+                argument.array(),
+                value_type.typed_binding(),
+                novarocks_type_contract::CarrierNullabilityPolicy::Permissive,
+                rows,
+                &mut |units| {
+                    for _ in 0..units {
+                        shared.borrow_mut().step()?;
+                    }
+                    Ok(())
+                },
+                &mut |_| shared.borrow_mut().step(),
+            )
+            .map_err(|error| match error {
+                novarocks_value_arrays::ValueFailure::Caller(error) => error,
+                novarocks_value_arrays::ValueFailure::Value(error) => {
+                    KernelFailure::from_domain(error)
+                }
+            })?;
         }
         Ok(())
     })();
@@ -218,43 +259,47 @@ pub fn validate_type_observed(
         .validate_carrier(value.data_type())
         .map_err(type_failure)?;
     use novarocks_type_contract::*;
-    validate_value_type_structure_observed(value.data_type(), |visit| {
-        work.step().map_err(compile_failure)?;
-        match visit {
-            ValueTypeVisit::TypeNode(ty) => {
-                if let DataType::Timestamp(_, Some(zone)) = ty
-                    && zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES
-                {
-                    return Err(KernelFailure::ResourceExhausted);
-                }
-                validate_arrow_carrier_parameters_observed::<KernelFailure>(ty, || {
-                    work.step().map_err(compile_failure)
-                })?;
-            }
-            ValueTypeVisit::Field(field) => {
-                if field.name().len() > MAX_ARROW_FIELD_NAME_BYTES
-                    || field.metadata().len() > MAX_ARROW_FIELD_METADATA_ENTRIES
-                {
-                    return Err(KernelFailure::ResourceExhausted);
-                }
-                let mut bytes = 0usize;
-                for (key, value) in field.metadata() {
-                    work.step().map_err(compile_failure)?;
-                    if key.len() > MAX_ARROW_FIELD_METADATA_KEY_BYTES
-                        || value.len() > MAX_ARROW_FIELD_METADATA_VALUE_BYTES
+    validate_value_type_structure_with_profile_observed(
+        value.data_type(),
+        ArrowTypeProfile::CanonicalValue,
+        |visit| {
+            work.step().map_err(compile_failure)?;
+            match visit {
+                ValueTypeVisit::TypeNode(ty) => {
+                    if let DataType::Timestamp(_, Some(zone)) = ty
+                        && zone.len() > MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES
                     {
                         return Err(KernelFailure::ResourceExhausted);
                     }
-                    bytes += key.len() + value.len();
-                    if bytes > MAX_ARROW_FIELD_METADATA_BYTES {
+                    validate_arrow_carrier_parameters_observed::<KernelFailure>(ty, || {
+                        work.step().map_err(compile_failure)
+                    })?;
+                }
+                ValueTypeVisit::Field(field) => {
+                    if field.name().len() > MAX_ARROW_FIELD_NAME_BYTES
+                        || field.metadata().len() > MAX_ARROW_FIELD_METADATA_ENTRIES
+                    {
                         return Err(KernelFailure::ResourceExhausted);
                     }
+                    let mut bytes = 0usize;
+                    for (key, value) in field.metadata() {
+                        work.step().map_err(compile_failure)?;
+                        if key.len() > MAX_ARROW_FIELD_METADATA_KEY_BYTES
+                            || value.len() > MAX_ARROW_FIELD_METADATA_VALUE_BYTES
+                        {
+                            return Err(KernelFailure::ResourceExhausted);
+                        }
+                        bytes += key.len() + value.len();
+                        if bytes > MAX_ARROW_FIELD_METADATA_BYTES {
+                            return Err(KernelFailure::ResourceExhausted);
+                        }
+                    }
                 }
+                _ => {}
             }
-            _ => {}
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 #[cfg(test)]

@@ -1835,7 +1835,7 @@ fn sender_strict_roots_admit_their_validator_from_actual_type_size() {
     // source root count, far below one MAX_VALUE_TYPE_NODES scratch per root.
     assert!(wide.allocation_requests_upper_bound < 3 * 1000, "{wide:?}");
     let one = strict_value_facts(&scalars[..1]);
-    let tuple = std::mem::size_of::<(&DataType, usize)>();
+    let tuple = std::mem::size_of::<novarocks_type_contract::TypeTraversalFrame<'_>>();
     assert!(one.allocation_request_bytes_upper_bound < MAX_VALUE_TYPE_NODES * tuple);
 
     let nested = |depth: usize| {

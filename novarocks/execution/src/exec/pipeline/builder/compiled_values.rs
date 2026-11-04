@@ -43,7 +43,9 @@ use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
     ProgramNodeKind, StaticValuesBacking,
 };
-use novarocks_type_contract::{ValueSchemaCreation, arrow_data_types_exact_observed};
+use novarocks_type_contract::{
+    ArrowTypeProfile, ValueSchemaCreation, arrow_data_types_exact_with_profile_observed,
+};
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
@@ -315,9 +317,12 @@ fn materialize(
             .ok_or_else(|| invalid("Values cell column is outside its layout"))?;
         work.flush()?;
         let exact = value.len() == 1
-            && arrow_data_types_exact_observed(value.data_type(), field.data_type(), || {
-                work.step()
-            })?;
+            && arrow_data_types_exact_with_profile_observed(
+                value.data_type(),
+                field.data_type(),
+                ArrowTypeProfile::CanonicalValue,
+                || work.step(),
+            )?;
         if !exact {
             return Err(invalid(
                 "Values cell result differs from its frozen column type",
@@ -377,45 +382,55 @@ fn materialize(
         let mut opaque = |bytes| owner.observe_opaque_upper_bound(bytes);
         let mut creation = ValueSchemaCreation::new(storage.clone(), &mut request, &mut opaque);
         work.flush()?;
-        let column =
-            match selected_copy::values_copy_kind_observed(field.data_type(), || work.step())
-                .map_err(|cause| copy_failure(cause.into()))?
-            {
-                selected_copy::ValuesCopyKind::Interleave => {
-                    selected_copy::preflight_interleave_construction(
-                        field.data_type(),
-                        &sources,
-                        &choices,
-                        &mut creation,
-                        control,
-                    )
-                    .map_err(copy_failure)?;
-                    let mut borrowed: Vec<&dyn Array> =
-                        reserve(sources.len(), owner.as_ref(), &mut work)?;
-                    for source in &sources {
-                        borrowed.push(source.as_ref());
-                        work.step()?;
-                    }
-                    work.flush()?;
-                    let column = interleave(&borrowed, &choices).map_err(|error| {
-                        ExecutionFailure::from_domain(ValuesConstructionFailure::Column {
-                            ordinal,
-                            source: error,
-                        })
-                    })?;
-                    work.flush()?;
-                    column
+        let layout = values
+            .layout()
+            .value_binding_at(ordinal)
+            .ok_or_else(|| invalid("Values column has no complete typed binding"))?
+            .layout();
+        let column = match selected_copy::values_copy_kind_for_layout_observed(
+            layout,
+            field.data_type(),
+            || work.step(),
+        )
+        .map_err(|cause| copy_failure(cause.into()))?
+        {
+            selected_copy::ValuesCopyKind::Interleave => {
+                selected_copy::preflight_interleave_for_layout_construction(
+                    layout,
+                    field.data_type(),
+                    &sources,
+                    &choices,
+                    &mut creation,
+                    control,
+                )
+                .map_err(copy_failure)?;
+                let mut borrowed: Vec<&dyn Array> =
+                    reserve(sources.len(), owner.as_ref(), &mut work)?;
+                for source in &sources {
+                    borrowed.push(source.as_ref());
+                    work.step()?;
                 }
-                selected_copy::ValuesCopyKind::Extend => {
-                    selected_copy::copy_nested_values_construction(
-                        &sources,
-                        &choices,
-                        &mut creation,
-                        control,
-                    )
-                    .map_err(copy_failure)?
-                }
-            };
+                work.flush()?;
+                let column = interleave(&borrowed, &choices).map_err(|error| {
+                    ExecutionFailure::from_domain(ValuesConstructionFailure::Column {
+                        ordinal,
+                        source: error,
+                    })
+                })?;
+                work.flush()?;
+                column
+            }
+            selected_copy::ValuesCopyKind::Extend => {
+                selected_copy::copy_nested_values_for_layout_construction(
+                    layout,
+                    &sources,
+                    &choices,
+                    &mut creation,
+                    control,
+                )
+                .map_err(copy_failure)?
+            }
+        };
         columns.push(column);
     }
     work.flush()?;

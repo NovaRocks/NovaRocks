@@ -21,6 +21,7 @@ use arrow_schema::DataType;
 use novarocks_failure_contract::{
     RepresentationBoundary, RepresentationFacts, RepresentationLayout, domain,
 };
+use novarocks_type_contract::{ArrowTypeDepth, ArrowTypeProfile};
 use std::num::NonZeroU16;
 
 /// Stable identifiers; extents use payload bytes (offsets) or one value's bytes
@@ -93,14 +94,14 @@ pub fn validate_engine_carrier_observed<E>(
 ) -> Result<(), ValueFailure<E>> {
     fn walk<E>(
         ty: &DataType,
-        depth: usize,
+        depth: ArrowTypeDepth,
         nodes: &mut usize,
         observe: &mut impl FnMut(&DataType) -> Result<(), E>,
     ) -> Result<(), ValueFailure<E>> {
         observe(ty).map_err(ValueFailure::Caller)?;
-        if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-            return Err(ValueError::Invariant(ValueViolation::Depth).into());
-        }
+        depth
+            .check(ArrowTypeProfile::Value)
+            .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?;
         *nodes += 1;
         if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
             return Err(ValueError::Invariant(ValueViolation::Nodes).into());
@@ -118,29 +119,62 @@ pub fn validate_engine_carrier_observed<E>(
                 if keys.as_ref() != &DataType::Int32 || !supported {
                     return Err(ValueError::Invariant(ValueViolation::Dictionary).into());
                 }
+                let depth = depth
+                    .encoding_child()
+                    .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?;
+                walk(keys, depth, nodes, observe)?;
+                walk(values, depth, nodes, observe)?;
             }
             DataType::RunEndEncoded(..) | DataType::ListView(_) | DataType::LargeListView(_) => {
                 return Err(ValueError::Invariant(ValueViolation::Carrier).into());
             }
             DataType::List(field)
             | DataType::LargeList(field)
-            | DataType::FixedSizeList(field, _)
-            | DataType::Map(field, _) => walk(field.data_type(), depth + 1, nodes, observe)?,
+            | DataType::FixedSizeList(field, _) => walk(
+                field.data_type(),
+                depth
+                    .value_child()
+                    .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
+                nodes,
+                observe,
+            )?,
+            DataType::Map(field, _) => walk(
+                field.data_type(),
+                depth
+                    .map_entries()
+                    .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
+                nodes,
+                observe,
+            )?,
             DataType::Struct(fields) => {
                 for field in fields {
-                    walk(field.data_type(), depth + 1, nodes, observe)?;
+                    walk(
+                        field.data_type(),
+                        depth
+                            .value_child()
+                            .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
+                        nodes,
+                        observe,
+                    )?;
                 }
             }
             DataType::Union(fields, _) => {
                 for (_, field) in fields.iter() {
-                    walk(field.data_type(), depth + 1, nodes, observe)?;
+                    walk(
+                        field.data_type(),
+                        depth
+                            .value_child()
+                            .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
+                        nodes,
+                        observe,
+                    )?;
                 }
             }
             _ => {}
         }
         Ok(())
     }
-    walk(ty, 1, &mut 0, observe)
+    walk(ty, ArrowTypeDepth::ROOT, &mut 0, observe)
 }
 
 #[cfg(test)]

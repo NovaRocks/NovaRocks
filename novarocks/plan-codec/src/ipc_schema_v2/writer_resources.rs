@@ -30,7 +30,9 @@ use crate::{
     physical_type_v2::TypeCodecError,
     resource_source_model::{LOCKED_FAMILY, LOCKED_TOOLCHAIN},
 };
-use arrow::datatypes::{DataType, Field};
+#[cfg(test)]
+use arrow::datatypes::DataType;
+use arrow::datatypes::Field;
 use novarocks_type_contract::{
     CompileCheckpoints, MAX_VALUE_TYPE_NODES, ValueTypeVisit,
     validate_arrow_layout_structure_with_scratch_observed,
@@ -69,7 +71,7 @@ impl std::ops::DerefMut for Requests {
     }
 }
 
-type WalkerEntry<'a> = (&'a DataType, usize);
+type WalkerEntry<'a> = novarocks_type_contract::TypeTraversalFrame<'a>;
 
 fn invalid() -> TypeCodecError {
     TypeCodecError::InvalidShape("schema writer resource extent is not representable")

@@ -89,6 +89,10 @@ impl StaticPlanInterpreter {
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
 ///
+/// Epoch 14 replaces Schema-bearing Exchange payloads with preparation-bound
+/// Arrow units and freezes root COW recipes independently of their records.
+/// Epoch-12 peers cannot interpret these payloads. Epoch 13 remains reserved
+/// for the explicit test-only compatibility island.
 /// Epoch 12 adds receiver-authorized Exchange units, explicit End, immutable
 /// replay and covered grant subscriptions to the complete write runtime.
 /// Epoch-10 binaries cannot enforce these Exchange contracts. Epoch 11 remains
@@ -118,7 +122,7 @@ impl StaticPlanInterpreter {
 /// boundary under the synchronous creation and direct release contract, so
 /// the two never share an island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-pub const NATIVE_COMPAT_EPOCH: u64 = 12;
+pub const NATIVE_COMPAT_EPOCH: u64 = 14;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.
 #[cfg(feature = "native-compatibility-test-fixture")]
@@ -675,7 +679,7 @@ mod tests {
         #[cfg(feature = "native-compatibility-test-fixture")]
         assert_eq!(NATIVE_COMPAT_EPOCH, 13);
         #[cfg(not(feature = "native-compatibility-test-fixture"))]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 12);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 14);
     }
     #[test]
     fn receiver_authorized_exchange_isolates_the_previous_write_runtime_and_test_island() {
@@ -693,6 +697,25 @@ mod tests {
         for previous in [10, 11] {
             assert_ne!(NATIVE_COMPAT_EPOCH, previous);
             assert_ne!(at(NATIVE_COMPAT_EPOCH).id(), at(previous).id());
+        }
+    }
+
+    #[test]
+    fn schema_free_units_isolate_schema_framed_peers_and_the_test_fixture() {
+        let at = |epoch| {
+            derive_native_compatibility_material(
+                b"same-descriptor",
+                carriers(),
+                [0x31; 32],
+                1,
+                COMPILED,
+                epoch,
+            )
+            .unwrap()
+        };
+        let production = at(14);
+        for previous in [12, 13] {
+            assert_ne!(production.id(), at(previous).id());
         }
     }
 

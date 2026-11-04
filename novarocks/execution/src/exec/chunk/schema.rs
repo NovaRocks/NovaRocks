@@ -248,9 +248,9 @@ impl ChunkSlotSchema {
             observe(step).map_err(ChunkObservationFailure::Caller)
         })
         .map_err(ChunkObservationFailure::into_caller)?;
-        if field.is_nullable() != binding.nullable()
+        if (field.is_nullable() != binding.nullable() && !field.is_nullable())
             || !execution_carrier_matches_layout_observed(
-                binding.data_type(),
+                binding.layout(),
                 field.data_type(),
                 &mut |units| observe(ArrayNormalizationStep::InspectConstructionWork { units }),
             )?
@@ -935,10 +935,11 @@ fn legacy_nullable_matches(value: &ValueTypeRef, carrier: &DataType, nullable: b
     }
 }
 
-/// Compare the already-authored plain layout to an actual encoding by borrow.
-/// This performs no type import, layout allocation, value decoding or widening.
+/// Compare the already-authored plain layout to an actual permissive carrier.
+/// Physical nullable fields never authorize logical NULL values; typed ingress
+/// validates those values separately against the original complete binding.
 pub(crate) fn execution_carrier_matches_layout_observed<E: From<ChunkConstructionFailure>>(
-    expected: &DataType,
+    expected: &ValueLayout,
     actual: &DataType,
     work: &mut impl FnMut(usize) -> Result<(), E>,
 ) -> Result<bool, E> {
@@ -951,9 +952,12 @@ pub(crate) fn execution_carrier_matches_layout_observed<E: From<ChunkConstructio
             Self::Source(error)
         }
     }
-    novarocks_type_contract::data_type_layout_matches_carrier_observed(expected, actual, |units| {
-        work(units).map_err(MatchError::Caller)
-    })
+    novarocks_type_contract::value_layout_matches_carrier_with_nullability_observed(
+        expected,
+        actual,
+        novarocks_type_contract::CarrierNullabilityPolicy::Permissive,
+        |units| work(units).map_err(MatchError::Caller),
+    )
     .map_err(|error| match error {
         MatchError::Caller(error) => error,
         MatchError::Source(error) => E::from(ChunkConstructionFailure::from(error)),

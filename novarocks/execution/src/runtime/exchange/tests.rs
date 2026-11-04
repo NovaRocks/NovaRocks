@@ -81,6 +81,146 @@ use novarocks_execution_contract::{
 };
 use novarocks_types::{StageId, TaskId};
 
+/// Explicit fixture declarations author these values; production never learns
+/// semantics from a first payload or Arrow annotations.
+pub(super) fn online_unit_as(chunk: &Chunk, expected: &ChunkSchemaRef) -> Vec<u8> {
+    let factory = crate::runtime::fragment::exchange::test_receiver_creation_factory();
+    let owner = factory.begin_typed_construction(expected).unwrap();
+    let wire = ExchangeWireMeta {
+        slot_ids_by_index: chunk
+            .chunk_schema()
+            .slots()
+            .iter()
+            .map(|slot| slot.slot_id())
+            .collect(),
+    };
+    let chunk = super::materialize_chunk_for_wire_meta(
+        expected,
+        chunk.record_batch().clone(),
+        &wire,
+        false,
+        super::DecodeCarrierContract::Exchange,
+        &super::ExchangeHeaderCreation::Runtime(owner.as_ref()),
+    )
+    .unwrap();
+    let recipe = super::online_unit::prepare_recipe(expected, &[], factory.as_ref()).unwrap();
+    let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::new(
+        RuntimeErrorState::default(),
+    ));
+    super::online_unit::encode(&recipe, &chunk, factory.as_ref(), &control).unwrap()
+}
+pub(super) fn online_unit(chunks: &[Chunk], _: bool) -> Result<Vec<u8>, super::ExchangeFailure> {
+    assert_eq!(chunks.len(), 1, "one complete batch per online Unit");
+    let schema = if chunks[0].chunk_schema().is_typed() {
+        chunks[0].chunk_schema_ref()
+    } else {
+        plain_declaration(chunks[0].chunk_schema())
+    };
+    Ok(online_unit_as(&chunks[0], &schema))
+}
+
+#[test]
+fn compiled_recipe_ignores_root_aliases_but_preserves_logical_nullability() {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use novarocks_local_program::StaticLayout;
+    use novarocks_type_contract::{
+        CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
+        ValueTypeStorageLifetime,
+    };
+
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    let layout = |name: &str, slot, unique_id, nullable| {
+        // Each role freezes its own occurrence identity around the same full
+        // declaration. Neither role learns the declaration from the payload.
+        let value = FunctionValueType::new(DataType::Int32, nullable);
+        StaticLayout::try_new_typed_for_compile(
+            Arc::new(Schema::new(vec![Field::new(
+                name,
+                DataType::Int32,
+                nullable,
+            )])),
+            Arc::from([SlotId::new(slot)]),
+            vec![(value.typed_binding().clone(), Some(unique_id))],
+            ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &Control,
+        )
+        .unwrap()
+    };
+    let factory = crate::runtime::fragment::exchange::test_receiver_creation_factory();
+    let sender_schema = factory
+        .create_compiled_chunk_schema(&layout("sender_id", 17, 101, false))
+        .unwrap();
+    let receiver_schema = factory
+        .create_compiled_chunk_schema(&layout("receiver_alias", 93, 808, false))
+        .unwrap();
+    let nullable_schema = factory
+        .create_compiled_chunk_schema(&layout("receiver_alias", 93, 808, true))
+        .unwrap();
+    let prepare = |schema: &ChunkSchemaRef| {
+        super::online_unit::prepare_recipe(schema, &[], factory.as_ref()).unwrap()
+    };
+    let sender = prepare(&sender_schema);
+    let receiver = prepare(&receiver_schema);
+    let nullable = prepare(&nullable_schema);
+    assert_eq!(sender.value.digest(), receiver.value.digest());
+    // Permissive physical flags do not erase logical requiredness: these two
+    // recipes have equal canonical carrier schemas but different declarations.
+    assert_eq!(receiver.value.schema(), nullable.value.schema());
+    assert_ne!(receiver.value.digest(), nullable.value.digest());
+
+    let columns = vec![Arc::new(Int32Array::from(vec![7, 19])) as ArrayRef];
+    let owner = factory.begin_typed_construction(&sender_schema).unwrap();
+    let chunk = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+        sender_schema,
+        columns,
+        2,
+        owner.storage_lifetime(),
+        |step| owner.observe(0, &[], step),
+    )
+    .unwrap();
+    let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::new(
+        RuntimeErrorState::default(),
+    ));
+    let wire = super::online_unit::encode(&sender, &chunk, factory.as_ref(), &control).unwrap();
+    let decoded =
+        super::online_unit::decode(&receiver, &wire, &receiver_schema, factory.as_ref()).unwrap();
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].len(), 2);
+    assert_eq!(
+        decoded[0].columns()[0].to_data(),
+        chunk.columns()[0].to_data()
+    );
+    assert_eq!(
+        decoded[0].chunk_schema().slots()[0].slot_id(),
+        SlotId::new(93)
+    );
+    assert_eq!(
+        decoded[0].chunk_schema().slots()[0].name(),
+        "receiver_alias"
+    );
+    assert_eq!(decoded[0].chunk_schema().slots()[0].unique_id(), Some(808));
+
+    let error = super::online_unit::decode(&nullable, &wire, &nullable_schema, factory.as_ref())
+        .expect_err("logical nullability remains part of the prepared wire contract");
+    assert!(
+        error
+            .to_string()
+            .contains("recipe digest or version differs")
+    );
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(&error)
+            .reason()
+            .code(),
+        101
+    );
+}
+
 /// One explicit receiver instance: no global registry, inferred stream or raw
 /// queue publication. Every data item goes through its demand and decode lease.
 struct UnitFixture {
@@ -1028,7 +1168,7 @@ fn m07_root_ipc_preserves_large_string_dictionary_without_changing_exchange_admi
     assert!(
         error
             .to_string()
-            .contains("differs from its frozen value layout"),
+            .contains("recipe digest or version differs"),
         "{error}"
     );
 }
@@ -1048,7 +1188,7 @@ fn decode_chunks_for_sender_preserves_dictionary_carrier_with_logical_expected_s
     register_expected_chunk_schema(key, 1, logical_status_schema(SlotId::new(72)))
         .expect("register schema");
 
-    let payload = encode_chunks(&[chunk], true).expect("encode dictionary payload");
+    let payload = online_unit(&[chunk], true).expect("encode dictionary payload");
     let decoded = decode_chunks_for_sender(key, 9, 1, &payload).expect("decode sender payload");
 
     assert_eq!(decoded.len(), 1);
@@ -1173,12 +1313,32 @@ fn encode_chunks_normalizes_runtime_nullable_widening() {
     );
     let widened = Chunk::try_new_with_chunk_schema(widened, widened_chunk_schema).expect("chunk");
 
-    let bytes = encode_chunks(&[strict, widened], true).expect("encode");
-    let decoded = decode_chunks_for_sender(key, 3, 1, &bytes).expect("decode widened payload");
-
-    assert_eq!(decoded.len(), 2);
-    assert!(decoded[0].schema().field(3).is_nullable());
-    assert!(decoded[1].schema().field(3).is_nullable());
+    let prepared = plain_declaration(strict.chunk_schema());
+    for source in [strict, widened] {
+        let bytes = online_unit_as(&source, &prepared);
+        let decoded =
+            decode_chunks_for_sender(key, 3, 1, &bytes).expect("decode independent widened unit");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].len(), 1);
+        for (ordinal, value) in [(0, 1), (1, 2), (2, 3)] {
+            assert_eq!(
+                decoded[0].columns()[ordinal]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                value
+            );
+        }
+        assert_eq!(
+            decoded[0].columns()[3]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "x"
+        );
+    }
 
     cancel_exchange_key(key);
 }
@@ -1255,15 +1415,15 @@ fn decode_chunks_for_sender_rejects_decimal_precision_drift() {
     register_expected_chunk_schema(key, 1, expected_schema).expect("register expected schema");
 
     let chunk = decimal128_chunk_with_over_precision_value(1234_i128);
-    let payload = encode_chunks(&[chunk], true).expect("encode drifted decimal chunk");
+    let payload = online_unit(&[chunk], true).expect("encode drifted decimal chunk");
 
     let err = decode_chunks_for_sender(key, 3, 1, &payload)
         .expect_err("exchange decode must reject decimal precision drift");
 
-    assert!(err.to_string().contains("frozen value layout"), "err={err}");
-    assert!(err.to_string().contains("column 0"), "err={err}");
-    assert!(err.to_string().contains("Decimal128(38, 2)"), "err={err}");
-    assert!(err.to_string().contains("Decimal128(20, 2)"), "err={err}");
+    assert!(
+        err.to_string().contains("recipe digest or version differs"),
+        "err={err}"
+    );
     cancel_exchange_key(key);
 }
 
@@ -1453,7 +1613,7 @@ fn native_exchange_publication_retains_descriptor_metadata_ownership() {
         depth: 64,
     };
     assert!(borrowed_root_chunk_storage(&original, limits).is_err());
-    let payload = encode_chunks(&[original], true).unwrap();
+    let payload = online_unit(&[original], true).unwrap();
     let key = ExchangeKey {
         finst_id_hi: 91_735,
         finst_id_lo: 91_736,
@@ -1635,7 +1795,7 @@ fn decode_chunks_for_sender_uses_slot_id_map_without_field_metadata() {
     register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
 
     let first = exchange_test_chunk_without_metadata("_cse_0");
-    let first_bytes = encode_chunks(&[first], true).expect("encode first");
+    let first_bytes = online_unit(&[first], true).expect("encode first");
     let first_decoded = decode_chunks_for_sender(key, 3, 1, &first_bytes).expect("decode first");
     assert_eq!(first_decoded.len(), 1);
     assert_eq!(
@@ -1645,7 +1805,7 @@ fn decode_chunks_for_sender_uses_slot_id_map_without_field_metadata() {
     assert_eq!(first_decoded[0].schema().field(3).name(), "_cse_0");
 
     let second = exchange_test_chunk_without_metadata("_cse_2");
-    let second_bytes = encode_chunks(&[second], false).expect("encode second");
+    let second_bytes = online_unit(&[second], false).expect("encode second");
     let second_decoded = decode_chunks_for_sender(key, 3, 1, &second_bytes).expect("decode second");
     assert_eq!(second_decoded.len(), 1);
     assert_eq!(
@@ -1679,11 +1839,14 @@ fn decode_chunks_for_sender_rejects_partial_expected_schema_match() {
     )
     .expect("chunk schema");
     let payload =
-        encode_chunks(&[Chunk::new_with_chunk_schema(batch, chunk_schema)], true).expect("encode");
+        online_unit(&[Chunk::new_with_chunk_schema(batch, chunk_schema)], true).expect("encode");
 
     let err = decode_chunks_for_sender(key, 3, 1, &payload)
         .expect_err("partial wire schema must not match registered expected schema");
-    assert!(err.to_string().contains("wire column count"), "err={err}");
+    assert!(
+        err.to_string().contains("recipe digest or version differs"),
+        "err={err}"
+    );
 
     cancel_exchange_key(key);
 }
@@ -1696,7 +1859,7 @@ fn decode_chunks_for_sender_accepts_runtime_nullable_widening() {
         node_id: 17,
     };
     let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
-    register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
+    register_expected_chunk_schema(key, 1, expected_chunk_schema.clone()).expect("register schema");
 
     let strict = exchange_test_chunk_without_metadata("_cse_0");
     let widened_schema = Arc::new(Schema::new(vec![
@@ -1722,12 +1885,18 @@ fn decode_chunks_for_sender_accepts_runtime_nullable_widening() {
     );
     let widened = Chunk::try_new_with_chunk_schema(widened, widened_chunk_schema).expect("chunk");
 
-    let payload = encode_chunks(&[widened], true).expect("encode");
+    let payload = online_unit_as(&widened, &plain_declaration(&expected_chunk_schema));
     let decoded = decode_chunks_for_sender(key, 3, 1, &payload).expect("decode widened chunk");
 
     assert_eq!(decoded.len(), 1);
-    assert!(decoded[0].schema().field(3).is_nullable());
-    assert!(decoded[0].chunk_schema().slots()[3].nullable());
+    assert_eq!(decoded[0].len(), widened.len());
+    assert_eq!(
+        decoded[0].chunk_schema().slots()[3]
+            .typed_binding()
+            .value_type()
+            .nullable(),
+        expected_chunk_schema.slots()[3].nullable()
+    );
 
     cancel_exchange_key(key);
 }
@@ -1770,10 +1939,13 @@ fn decode_chunks_for_sender_rejects_numeric_for_opaque_descriptor() {
     );
     register_expected_chunk_schema(key, 1, expected_schema).expect("register expected schema");
 
-    let payload = encode_chunks(&[wire_chunk], true).expect("encode drifted chunk");
+    let payload = online_unit(&[wire_chunk], true).expect("encode drifted chunk");
     let err = decode_chunks_for_sender(key, 3, 1, &payload)
         .expect_err("numeric payload must not pass as an opaque aggregate state");
-    assert!(err.to_string().contains("frozen value layout"), "err={err}");
+    assert!(
+        err.to_string().contains("recipe digest or version differs"),
+        "err={err}"
+    );
 
     cancel_exchange_key(key);
 }
@@ -1785,7 +1957,7 @@ fn decode_chunks_for_sender_decodes_with_wire_meta_before_schema_registration() 
         finst_id_lo: 202,
         node_id: 19,
     };
-    let payload = encode_chunks(&[exchange_test_chunk("_cse_0")], true).expect("encode");
+    let payload = online_unit(&[exchange_test_chunk("_cse_0")], true).expect("encode");
     assert!(decode_chunks_for_sender(key, 7, 1, &payload).is_err());
     register_expected_chunk_schema(
         key,
@@ -1819,7 +1991,7 @@ fn installed_expected_schema_retags_queued_wire_chunks() {
     )
     .unwrap();
     let f = UnitFixture::new(plain_declaration(&schema), 1);
-    let frame = f.frame(0, 1, encode_chunks(&[source], true).unwrap(), false);
+    let frame = f.frame(0, 1, online_unit(&[source], true).unwrap(), false);
     f.register(&frame);
     f.receive(frame).unwrap();
     let Some(ExchangePopResult::Chunk(chunk)) = f.handle().try_pop_next_with_stats(1).unwrap()
@@ -1835,7 +2007,7 @@ fn installed_expected_schema_preserves_queued_zero_column_row_count() {
     let row_count = 3;
     let chunk = exchange_test_zero_column_chunk(row_count);
     let f = UnitFixture::new(plain_declaration(chunk.chunk_schema()), 1);
-    let frame = f.frame(0, 1, encode_chunks(&[chunk], true).unwrap(), false);
+    let frame = f.frame(0, 1, online_unit(&[chunk], true).unwrap(), false);
     f.register(&frame);
     f.receive(frame).unwrap();
     let Some(ExchangePopResult::Chunk(chunk)) = f.handle().try_pop_next_with_stats(1).unwrap()
@@ -1894,8 +2066,8 @@ fn native_senders_keep_independent_wire_metadata_by_exact_identity() {
     .unwrap();
     let second = Chunk::new_with_chunk_schema(first.record_batch().clone(), second_schema);
     let f = UnitFixture::new(plain_declaration(first.chunk_schema()), 2);
-    let first_payload = encode_chunks(&[first], true).unwrap();
-    let second_payload = encode_chunks(&[second], true).unwrap();
+    let first_payload = online_unit(&[first], true).unwrap();
+    let second_payload = online_unit(&[second], true).unwrap();
     for (sender, payload) in [(0, first_payload), (1, second_payload.clone())] {
         let frame = f.frame(sender, 1, payload, false);
         f.register(&frame);
@@ -1904,24 +2076,10 @@ fn native_senders_keep_independent_wire_metadata_by_exact_identity() {
     }
     let changed = f.frame(0, 2, second_payload, false);
     f.register(&changed);
-    let error = f
-        .receive(changed)
-        .expect_err("one exact sender cannot change its wire metadata");
-    assert!(
-        error
-            .to_string()
-            .contains("sender wire meta changed unexpectedly")
-    );
-    let error = error.into_execution();
-    assert!(
-        f.task
-            .accepted()
-            .unwrap()
-            .originating_failure()
-            .unwrap()
-            .same_occurrence(&error)
-    );
-    assert_eq!(f.slots().facts(f.streams[0]).unwrap().custody_through, 1);
+    f.receive(changed)
+        .expect("local source slot IDs cannot change the frozen edge recipe");
+    assert!(f.task.accepted().is_none());
+    assert_eq!(f.slots().facts(f.streams[0]).unwrap().custody_through, 2);
     assert_eq!(f.slots().facts(f.streams[1]).unwrap().custody_through, 1);
 }
 
@@ -1953,7 +2111,7 @@ fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
         &[SlotId::new(1), SlotId::new(0)],
     )
     .expect("sender chunk schema");
-    let payload = encode_chunks(
+    let payload = online_unit(
         &[Chunk::new_with_chunk_schema(
             sender_batch,
             sender_chunk_schema,
@@ -2070,38 +2228,36 @@ fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
     assert!(retagged.chunk_schema().is_typed());
     assert!(Arc::ptr_eq(&retagged.chunk_schema_ref(), &expected));
 
-    // The same payload under the legacy slot-id binding is exactly the
-    // hazard the positional registration exists to avoid.
-    let by_slot = ExchangeKey {
+    // The default registration has the same frozen ordinal contract; local
+    // source IDs cannot swap equal-typed columns through another entrypoint.
+    let default_key = ExchangeKey {
         node_id: 4,
         ..positional
     };
     registry
         .try_register_expected_chunk_schema(
-            by_slot,
+            default_key,
             1,
             expected.clone(),
             crate::runtime::fragment::exchange::test_receiver_creation_factory(),
         )
-        .expect("register slot-id receiver");
-    let swapped = registry
-        .decode_chunks_for_sender(by_slot, sender, &payload)
-        .expect("slot-id decode");
-    assert_eq!(column(&swapped[0], 0), vec![1, 2]);
-    assert_eq!(column(&swapped[0], 1), vec![10, 20]);
-
-    // One receiver has one binding; a conflicting re-registration fails.
+        .unwrap();
+    let decoded = registry
+        .decode_chunks_for_sender(default_key, sender, &payload)
+        .unwrap();
+    assert_eq!(column(&decoded[0], 0), vec![10, 20]);
+    assert_eq!(column(&decoded[0], 1), vec![1, 2]);
     assert!(
         registry
-            .register_expected_chunk_schema(
+            .try_register_expected_chunk_schema(
                 positional,
                 1,
                 expected,
-                crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+                crate::runtime::fragment::exchange::test_receiver_creation_factory()
             )
-            .expect_err("binding conflict")
+            .unwrap_err()
             .to_string()
-            .contains("exchange column binding mismatch")
+            .contains("already registered")
     );
 }
 
@@ -2111,7 +2267,7 @@ fn native_stream_fixture() -> (UnitFixture, ExchangeUnitReceiverFrame, Chunk) {
     let frame = f.frame(
         0,
         1,
-        encode_chunks(std::slice::from_ref(&chunk), true).unwrap(),
+        online_unit(std::slice::from_ref(&chunk), true).unwrap(),
         false,
     );
     (f, frame, chunk)
@@ -2257,7 +2413,7 @@ fn native_exchange_decode_failure_does_not_advance_and_unit_replays_are_idempote
 fn native_exchange_invalid_schema_retains_its_task_failure_without_custody() {
     let (f, frame, _) = native_stream_fixture();
     let incompatible = exchange_test_zero_column_chunk(1);
-    let invalid = f.frame(0, 1, encode_chunks(&[incompatible], true).unwrap(), false);
+    let invalid = f.frame(0, 1, online_unit(&[incompatible], true).unwrap(), false);
     f.register(&invalid);
     let error = f.receive(invalid).unwrap_err().into_execution();
     assert!(
@@ -2401,6 +2557,15 @@ struct PausedDecoderFactory {
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 impl crate::exec::pipeline::operator::InputConstructionFactory for PausedDecoderFactory {
+    fn retain_decoded_source(
+        &self,
+        array: ArrayRef,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+        work: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+    ) -> Result<ArrayRef, crate::exec::pipeline::operator::ConstructionFailure> {
+        self.inner.retain_decoded_source(array, storage, work)
+    }
+
     fn observe_input_work(
         &self,
         units: usize,
@@ -2452,7 +2617,7 @@ fn paused_decoder_fixture(
         senders,
         factory.clone(),
     );
-    let full = encode_chunks(std::slice::from_ref(&chunk), true).unwrap();
+    let full = online_unit(std::slice::from_ref(&chunk), true).unwrap();
     for stream in &f.streams {
         f.registry
             .decode_chunks_for_sender(
@@ -2467,7 +2632,7 @@ fn paused_decoder_fixture(
     }
     // No metadata construction runs under the receiver lock on this payload:
     // both exact senders retain the metadata established immediately above.
-    let frame = f.frame(0, 1, encode_chunks(&[chunk], false).unwrap(), false);
+    let frame = f.frame(0, 1, online_unit(&[chunk], false).unwrap(), false);
     f.register(&frame);
     factory
         .armed

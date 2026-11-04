@@ -27,7 +27,9 @@ use crate::{
 };
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
-use novarocks_type_contract::{BorrowedTypedValueBinding, TypedValueBinding};
+use novarocks_type_contract::{
+    ArrowTypeDepth, ArrowTypeProfile, BorrowedTypedValueBinding, TypedValueBinding,
+};
 
 /// Validate original encoded keys independently of materialization, then enforce
 /// required values only under active ancestors. No metadata authors semantics,
@@ -68,7 +70,15 @@ pub fn required_values_satisfied_observed<E>(
         Ok(())
     };
     for row in 0..source.len() {
-        validate_row(source, binding.borrowed(), options, row, work, &mut missing)?;
+        validate_row(
+            source,
+            binding.borrowed(),
+            options,
+            row,
+            work,
+            &mut missing,
+            ArrowTypeDepth::ROOT,
+        )?;
     }
     Ok(satisfied)
 }
@@ -83,7 +93,73 @@ pub(super) fn validate_with_options<E>(
     validate_structure(source, binding, options, work, observe)?;
     let mut missing = || Err(ValueError::Invariant(ValueViolation::RequiredNull).into());
     for row in 0..source.len() {
-        validate_row(source, binding.borrowed(), options, row, work, &mut missing)?;
+        validate_row(
+            source,
+            binding.borrowed(),
+            options,
+            row,
+            work,
+            &mut missing,
+            ArrowTypeDepth::ROOT,
+        )?;
+    }
+    Ok(())
+}
+
+/// Validate selected physical rows against the original complete value promise.
+/// Only the explicitly selected physical NULL flags may widen; all names,
+/// metadata, scalar parameters and encoding tags remain exact. The original
+/// active-ancestor/offset row author checks logical requiredness without a mask,
+/// wrapper, type projection or value conversion.
+pub fn validate_required_rows_observed<E>(
+    source: &ArrayRef,
+    binding: &TypedValueBinding,
+    nullability: novarocks_type_contract::CarrierNullabilityPolicy,
+    rows: impl IntoIterator<Item = usize>,
+    work: &mut Work<'_, E>,
+    observe: &mut HydrateObserver<'_, E>,
+) -> Result<(), ValueFailure<E>> {
+    enum MatchError<E> {
+        Caller(E),
+        Contract,
+    }
+    impl<E> From<novarocks_type_contract::ValueTypeError> for MatchError<E> {
+        fn from(_: novarocks_type_contract::ValueTypeError) -> Self {
+            Self::Contract
+        }
+    }
+    let matches =
+        novarocks_type_contract::arrow_data_types_exact_with_profile_and_nullability_observed(
+            binding.layout().data_type(),
+            source.data_type(),
+            novarocks_type_contract::ArrowTypeProfile::Value,
+            nullability,
+            || work(1).map_err(MatchError::Caller),
+        )
+        .map_err(|error| match error {
+            MatchError::Caller(error) => ValueFailure::Caller(error),
+            MatchError::Contract => ValueError::Invariant(ValueViolation::Layout).into(),
+        })?;
+    if !matches {
+        return Err(ValueError::Invariant(ValueViolation::Layout).into());
+    }
+    inspect(source, work, observe, ArrowTypeDepth::ROOT)?;
+    let options = HydrateOptions::default();
+    let mut missing = || Err(ValueError::Invariant(ValueViolation::RequiredNull).into());
+    for row in rows {
+        work(1).map_err(ValueFailure::Caller)?;
+        if row >= source.len() {
+            return Err(ValueError::Invariant(ValueViolation::Bounds).into());
+        }
+        validate_row(
+            source,
+            binding.borrowed(),
+            options,
+            row,
+            work,
+            &mut missing,
+            ArrowTypeDepth::ROOT,
+        )?;
     }
     Ok(())
 }
@@ -122,7 +198,7 @@ fn validate_structure<E>(
     if !matches {
         return Err(ValueError::Invariant(ValueViolation::Layout).into());
     }
-    inspect(source, work, observe, 0)?;
+    inspect(source, work, observe, ArrowTypeDepth::ROOT)?;
     Ok(())
 }
 
@@ -130,15 +206,19 @@ fn inspect<E>(
     source: &ArrayRef,
     work: &mut Work<'_, E>,
     observe: &mut HydrateObserver<'_, E>,
-    depth: usize,
+    depth: ArrowTypeDepth,
 ) -> Result<(), ValueFailure<E>> {
-    if depth >= novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(ValueError::Invariant(ValueViolation::Depth).into());
-    }
+    depth
+        .check(ArrowTypeProfile::Value)
+        .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?;
     work(1).map_err(ValueFailure::Caller)?;
     observe(HydrateEvent::InspectType(source.data_type())).map_err(ValueFailure::Caller)?;
     if matches!(source.data_type(), DataType::Dictionary(..)) {
         let (keys, values) = arrow_raw::source_dictionary(source)?;
+        depth
+            .encoding_child()
+            .and_then(|depth| depth.check(ArrowTypeProfile::Value))
+            .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?;
         for row_start in (0..keys.len()).step_by(1024) {
             let row_count = (keys.len() - row_start).min(1024);
             observe(HydrateEvent::InspectDictionaryRows {
@@ -165,20 +245,41 @@ fn inspect<E>(
         StructuralRef::Struct { fields, children } => {
             for (field, input) in fields.iter().zip(children) {
                 observe(HydrateEvent::InspectField(field)).map_err(ValueFailure::Caller)?;
-                inspect(input, work, observe, depth + 1)?;
+                inspect(
+                    input,
+                    work,
+                    observe,
+                    depth
+                        .value_child()
+                        .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
+                )?;
             }
         }
         StructuralRef::Union { fields, array } => {
             for (id, field) in fields.iter() {
                 observe(HydrateEvent::InspectField(field)).map_err(ValueFailure::Caller)?;
-                inspect(array.child(id), work, observe, depth + 1)?;
+                inspect(
+                    array.child(id),
+                    work,
+                    observe,
+                    depth
+                        .value_child()
+                        .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
+                )?;
             }
         }
         StructuralRef::List32 { field, values, .. }
         | StructuralRef::List64 { field, values, .. }
         | StructuralRef::FixedSizeList { field, values, .. } => {
             observe(HydrateEvent::InspectField(field)).map_err(ValueFailure::Caller)?;
-            inspect(values, work, observe, depth + 1)?;
+            inspect(
+                values,
+                work,
+                observe,
+                depth
+                    .value_child()
+                    .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
+            )?;
         }
         StructuralRef::Map {
             entries_field,
@@ -192,8 +293,12 @@ fn inspect<E>(
                     observe(HydrateEvent::InspectField(field)).map_err(ValueFailure::Caller)?;
                 }
             }
-            inspect(keys, work, observe, depth + 1)?;
-            inspect(values, work, observe, depth + 1)?;
+            let depth = depth
+                .map_entries()
+                .and_then(ArrowTypeDepth::value_child)
+                .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?;
+            inspect(keys, work, observe, depth)?;
+            inspect(values, work, observe, depth)?;
         }
     }
     Ok(())
@@ -205,7 +310,11 @@ fn validate_row<E>(
     row: usize,
     work: &mut Work<'_, E>,
     missing: &mut dyn FnMut() -> Result<(), ValueFailure<E>>,
+    depth: ArrowTypeDepth,
 ) -> Result<(), ValueFailure<E>> {
+    depth
+        .check(ArrowTypeProfile::Value)
+        .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?;
     work(1).map_err(ValueFailure::Caller)?;
     let is_null = if matches!(source.data_type(), DataType::Dictionary(..)) {
         let layout = ByteLayout::from_data_type(binding.data_type()).ok_or_else(invalid)?;
@@ -242,8 +351,14 @@ fn validate_row<E>(
             StructuralRef::Leaf => return Err(invalid().into()),
         };
         let binding = child(binding, index)?;
+        let depth = if matches!(source.data_type(), DataType::Map(..)) {
+            depth.map_entries().and_then(ArrowTypeDepth::value_child)
+        } else {
+            depth.value_child()
+        }
+        .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?;
         for row in start..end {
-            validate_row(input, binding, options, row, work, missing)?;
+            validate_row(input, binding, options, row, work, missing, depth)?;
         }
         Ok(())
     })
@@ -263,7 +378,7 @@ fn parameterized_shape<E>(
         actual: &arrow_schema::Field,
         named: bool,
         options: HydrateOptions,
-        depth: usize,
+        depth: ArrowTypeDepth,
         work: &mut Work<'_, E>,
     ) -> Result<bool, ValueFailure<E>> {
         work(1).map_err(ValueFailure::Caller)?;
@@ -300,14 +415,18 @@ fn parameterized_shape<E>(
         expected: &DataType,
         actual: &DataType,
         options: HydrateOptions,
-        depth: usize,
+        depth: ArrowTypeDepth,
         work: &mut Work<'_, E>,
     ) -> Result<bool, ValueFailure<E>> {
         work(1).map_err(ValueFailure::Caller)?;
-        if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-            return Err(ValueError::Invariant(ValueViolation::Depth).into());
-        }
+        depth
+            .check(ArrowTypeProfile::Value)
+            .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?;
         if let DataType::Dictionary(keys, values) = actual {
+            depth
+                .encoding_child()
+                .and_then(|depth| depth.check(ArrowTypeProfile::Value))
+                .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?;
             let dictionary_layout = options.dictionary_value_layout.or_else(|| {
                 novarocks_type_contract::dictionary_value_layout(expected)
                     .as_ref()
@@ -331,7 +450,16 @@ fn parameterized_shape<E>(
         match (expected, actual) {
             (DataType::Struct(a), DataType::Struct(b)) if a.len() == b.len() => {
                 for (a, b) in a.iter().zip(b) {
-                    if !field(a, b, true, options, depth + 1, work)? {
+                    if !field(
+                        a,
+                        b,
+                        true,
+                        options,
+                        depth
+                            .value_child()
+                            .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
+                        work,
+                    )? {
                         return Ok(false);
                     }
                 }
@@ -339,19 +467,44 @@ fn parameterized_shape<E>(
             }
             (DataType::Union(a, am), DataType::Union(b, bm)) if am == bm && a.len() == b.len() => {
                 for ((ai, a), (bi, b)) in a.iter().zip(b.iter()) {
-                    if ai != bi || !field(a, b, true, options, depth + 1, work)? {
+                    if ai != bi
+                        || !field(
+                            a,
+                            b,
+                            true,
+                            options,
+                            depth
+                                .value_child()
+                                .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
+                            work,
+                        )?
+                    {
                         return Ok(false);
                     }
                 }
                 Ok(true)
             }
             (DataType::List(a), DataType::List(b))
-            | (DataType::LargeList(a), DataType::LargeList(b)) => {
-                field(a, b, false, options, depth + 1, work)
-            }
-            (DataType::FixedSizeList(a, aw), DataType::FixedSizeList(b, bw)) if aw == bw => {
-                field(a, b, false, options, depth + 1, work)
-            }
+            | (DataType::LargeList(a), DataType::LargeList(b)) => field(
+                a,
+                b,
+                false,
+                options,
+                depth
+                    .value_child()
+                    .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
+                work,
+            ),
+            (DataType::FixedSizeList(a, aw), DataType::FixedSizeList(b, bw)) if aw == bw => field(
+                a,
+                b,
+                false,
+                options,
+                depth
+                    .value_child()
+                    .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
+                work,
+            ),
             (DataType::Map(a, asort), DataType::Map(b, bsort))
                 if asort == bsort
                     && (options.projection == HydrateProjection::FrozenNamesAndNullability
@@ -364,8 +517,27 @@ fn parameterized_shape<E>(
                 if af.len() != 2 || bf.len() != 2 {
                     return Ok(false);
                 }
-                Ok(field(&af[0], &bf[0], false, options, depth + 2, work)?
-                    && field(&af[1], &bf[1], false, options, depth + 2, work)?)
+                Ok(field(
+                    &af[0],
+                    &bf[0],
+                    false,
+                    options,
+                    depth
+                        .map_entries()
+                        .and_then(ArrowTypeDepth::value_child)
+                        .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
+                    work,
+                )? && field(
+                    &af[1],
+                    &bf[1],
+                    false,
+                    options,
+                    depth
+                        .map_entries()
+                        .and_then(ArrowTypeDepth::value_child)
+                        .map_err(|_| ValueError::Invariant(ValueViolation::Depth))?,
+                    work,
+                )?)
             }
             _ => {
                 enum ShapeError<E> {
@@ -377,9 +549,10 @@ fn parameterized_shape<E>(
                         Self::Contract
                     }
                 }
-                novarocks_type_contract::data_type_layout_matches_carrier_observed(
+                novarocks_type_contract::data_type_layout_matches_carrier_with_profile_observed(
                     expected,
                     actual,
+                    ArrowTypeProfile::Value,
                     |n| work(n).map_err(ShapeError::Caller),
                 )
                 .map_err(|error| match error {
@@ -389,5 +562,11 @@ fn parameterized_shape<E>(
             }
         }
     }
-    ty(binding.data_type(), source.data_type(), options, 1, work)
+    ty(
+        binding.data_type(),
+        source.data_type(),
+        options,
+        ArrowTypeDepth::ROOT,
+        work,
+    )
 }

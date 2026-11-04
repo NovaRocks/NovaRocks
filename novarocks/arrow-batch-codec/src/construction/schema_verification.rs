@@ -157,7 +157,10 @@ pub fn verify_field<H>(
                 }
                 require(actual.dictionary().is_some(), work)?;
                 let dictionary = actual.dictionary().ok_or(E::InvalidShape(MISMATCH))?;
-                #[allow(deprecated)]
+                #[expect(
+                    deprecated,
+                    reason = "Arrow 60.1 readers still use Field dictionary IDs; the prepared recipe reconstructs the same IDs"
+                )]
                 let expected_id = expected.dict_id();
                 require(
                     Some(dictionary.id()) == expected_id

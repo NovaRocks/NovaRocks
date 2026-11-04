@@ -665,3 +665,51 @@ fn repeated_bindings_count_one_shared_logical_node_and_each_real_layout_containe
         actual.values[1].1.value_type()
     );
 }
+
+fn nested_map_layout(logical_depth: usize) -> DataType {
+    let mut value = DataType::Int64;
+    for _ in 1..logical_depth {
+        value = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Int32, false)),
+                        Arc::new(Field::new("value", value, false)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+    }
+    value
+}
+
+#[test]
+fn logical_depth_64_map_layout_keeps_all_physical_occurrences() {
+    let source = FunctionValueType::new(nested_map_layout(64), false);
+    let table = encode(&source, 0);
+    assert_eq!(decode(&table).unwrap().values[0].1, source);
+    // 63 Maps, 63 entries Structs, 63 keys and one terminal value.
+    // Removing entries from logical depth must not remove their node charge.
+    let roots = [ExecutionTypeRoot {
+        id: 0,
+        value: &source,
+    }];
+    let mut caps = limits();
+    caps.max_layout_nodes = 63 * 3 + 1;
+    let control = Control::good();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    ExecutionTypeTableBuilder::new(&roots)
+        .encode_observed(caps, &mut |_| Ok::<_, AdmissionRefusal<()>>(()), &mut work)
+        .unwrap();
+    caps.max_layout_nodes -= 1;
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    assert!(
+        ExecutionTypeTableBuilder::new(&roots)
+            .encode_observed(caps, &mut |_| Ok::<_, AdmissionRefusal<()>>(()), &mut work)
+            .is_err()
+    );
+}

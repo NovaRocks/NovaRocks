@@ -26,13 +26,17 @@ use std::{alloc::Layout, ptr::NonNull, sync::Arc};
 /// State backing charged to the operator's memory tracker. A block is charged
 /// before it is allocated and released after it is returned, so the tracker
 /// never undercounts live backing.
-pub(crate) struct TrackedStateAllocator {
+pub(crate) struct TrackedStateAllocator<C = ()> {
     tracker: Arc<MemTracker>,
+    _creation: C,
 }
 
 impl TrackedStateAllocator {
     pub(crate) fn new(tracker: Arc<MemTracker>) -> Self {
-        Self { tracker }
+        Self {
+            tracker,
+            _creation: (),
+        }
     }
     /// Read only the original host's immutable tracker ancestry. The caller
     /// must establish the actual instance-host loan before consuming facts.
@@ -51,7 +55,22 @@ pub(crate) fn expression_allocation_host(tracker: Arc<MemTracker>) -> Arc<Tracke
     Arc::new(TrackedStateAllocator::new(tracker))
 }
 
-impl novarocks_functions::opaque_memory::OpaqueAllocationHost for TrackedStateAllocator {
+/// The caller admits this exact Arc<TrackedStateAllocator<C>> before entry.
+/// Its private inline keeper survives all real host aliases, including those
+/// held by source custody. The host Arc is not exposed through a Weak port.
+pub(crate) fn expression_allocation_host_with_creation<C: Send + Sync + 'static>(
+    tracker: Arc<MemTracker>,
+    creation: C,
+) -> Arc<TrackedStateAllocator<C>> {
+    Arc::new(TrackedStateAllocator {
+        tracker,
+        _creation: creation,
+    })
+}
+
+impl<C: Send + Sync> novarocks_functions::opaque_memory::OpaqueAllocationHost
+    for TrackedStateAllocator<C>
+{
     fn reserve_opaque(&self, bytes: usize) -> Result<(), KernelFailure> {
         if bytes == 0 {
             return Ok(());
@@ -79,7 +98,7 @@ impl novarocks_functions::opaque_memory::OpaqueAllocationHost for TrackedStateAl
         }
     }
 }
-impl AggregateStateAllocator for TrackedStateAllocator {
+impl<C: Send + Sync> AggregateStateAllocator for TrackedStateAllocator<C> {
     fn opaque_allocation_host(
         &self,
     ) -> Option<&dyn novarocks_functions::opaque_memory::OpaqueAllocationHost> {

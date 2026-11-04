@@ -42,10 +42,23 @@ impl Fixture {
         ))))
     }
     pub(super) fn with_error(error: Arc<RuntimeErrorState>) -> Self {
-        let source = error
-            .task_identity()
-            .expect("the fixture requires its original Task owner");
         let runtime = crate::runtime::execution_runtime::test_execution_runtime();
+        Self::with_error_and_runtime(error, runtime)
+    }
+    pub(super) fn with_runtime(
+        runtime: Arc<ExecutionRuntime>,
+    ) -> (Self, Arc<crate::runtime::task_control::test_support::Owner>) {
+        let owner = crate::runtime::task_control::test_support::Owner::new();
+        let error = Arc::new(RuntimeErrorState::for_task(Arc::new(
+            owner.view(TaskFailurePhase::Execution),
+        )));
+        (Self::with_error_and_runtime(error, runtime), owner)
+    }
+    fn with_error_and_runtime(
+        error: Arc<RuntimeErrorState>,
+        runtime: Arc<ExecutionRuntime>,
+    ) -> Self {
+        let source = error.task_identity().expect("original Task owner");
         let state = RuntimeState::new(
             None,
             None,
@@ -169,6 +182,9 @@ impl Default for UnitTransport {
 impl UnitTransport {
     pub(super) fn frames(&self) -> Vec<ExchangeUnitFrame> {
         self.state.lock().unwrap().frames.clone()
+    }
+    pub(super) fn take_frames(&self) -> Vec<ExchangeUnitFrame> {
+        std::mem::take(&mut self.state.lock().unwrap().frames)
     }
     pub(super) fn call_count(&self) -> usize {
         self.state.lock().unwrap().frames.len()

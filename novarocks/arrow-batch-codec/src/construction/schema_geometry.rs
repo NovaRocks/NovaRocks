@@ -156,7 +156,12 @@ pub fn schema_writer_allocation_metrics<E: From<IpcGeometryError>>(
     if source.walker_node_bound == 0 {
         return Err(IpcGeometryError::SourceModel.into());
     }
-    requests.geometric::<(&DataType, usize), E>(source.walker_node_bound, 1, 4, observe)?;
+    requests.geometric::<novarocks_type_contract::TypeTraversalFrame<'_>, E>(
+        source.walker_node_bound,
+        1,
+        4,
+        observe,
+    )?;
     requests.exact::<(&str, &str), E>(schema.metadata_entries, 1, observe)?;
     // WIPOffset is the standard four-byte relative wire offset. Its original
     // caller verifies the locked concrete offset/location layouts separately.
@@ -253,7 +258,10 @@ pub fn type_header_geometry(ty: &DataType) -> TypeHeaderGeometry {
 // unchanged from the original codec allocation model. This is a private
 // implementation operation layout, not a wire grammar or allocator fact.
 #[doc(hidden)]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "The pinned FlatBuffers field-location model is used only for its allocation layout"
+)]
 pub struct LockedFieldLocation {
     offset: u32,
     slot: u16,

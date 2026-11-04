@@ -3503,6 +3503,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-arrow-batch-codec"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-ipc",
+ "arrow-schema",
+ "flatbuffers",
+ "novarocks-arrow-ipc-frame",
+ "novarocks-failure-contract",
+ "novarocks-type-contract",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "novarocks-arrow-ipc-frame"
 version = "0.1.0"
 dependencies = [
@@ -3747,6 +3764,7 @@ dependencies = [
  "futures",
  "hashbrown 0.14.5",
  "hex",
+ "novarocks-arrow-batch-codec",
  "novarocks-arrow-ipc-frame",
  "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
@@ -3829,6 +3847,7 @@ dependencies = [
  "h2",
  "hashbrown 0.14.5",
  "hex",
+ "novarocks-arrow-batch-codec",
  "novarocks-catalog-application",
  "novarocks-connector-contract",
  "novarocks-coordination-contract",
@@ -3959,6 +3978,7 @@ dependencies = [
  "hex",
  "libm",
  "md-5 0.10.6",
+ "novarocks-arrow-batch-codec",
  "novarocks-constant-contract",
  "novarocks-failure-contract",
  "novarocks-function-contract",
@@ -4106,6 +4126,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "novarocks-arrow-batch-codec",
  "novarocks-connector-contract",
  "novarocks-execution",
  "novarocks-execution-contract",
@@ -4207,6 +4228,7 @@ dependencies = [
  "arrow-buffer",
  "flatbuffers",
  "hex",
+ "novarocks-arrow-batch-codec",
  "novarocks-arrow-ipc-frame",
  "novarocks-connector-contract",
  "novarocks-constant-contract",

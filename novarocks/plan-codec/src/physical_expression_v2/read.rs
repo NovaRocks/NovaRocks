@@ -38,7 +38,7 @@ use novarocks_physical_plan::{ConstantPoolId, ConstantPools, ConstantReference};
 use novarocks_proto_models::{physical_package_v2 as wire, physical_semantics_v2 as semantics};
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl, SemanticParameterKey,
-    SemanticParameters, arrow_data_types_exact_borrowed_observed,
+    SemanticParameters, arrow_data_types_exact_borrowed_with_profile_observed,
 };
 use std::mem::size_of;
 
@@ -859,11 +859,13 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                     preflight_types(header, header, &mut self.facts, admission, work)?
                 };
                 work.flush()?;
-                let same =
-                    arrow_data_types_exact_borrowed_observed(header.data_type(), carrier, || {
-                        work.step().map_err(TypeCodecError::from)
-                    })
-                    .map_err(Error::from)?;
+                let same = arrow_data_types_exact_borrowed_with_profile_observed(
+                    header.data_type(),
+                    carrier,
+                    novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
+                    || work.step().map_err(TypeCodecError::from),
+                )
+                .map_err(Error::from)?;
                 work.flush()?;
                 if !same {
                     return Err(shape("cast carrier differs from its complete result type"));

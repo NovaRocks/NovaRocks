@@ -24,7 +24,9 @@
 //! arrow-data/data.rs::{ArrayData,ArrayDataBuilder}. The shared private-buffer
 //! owner bound is the existing root_array_storage contract, not a new mirror.
 
-use super::{ArrayNormalizationStep, ArrayProjectionFailure, ArrayProjectionViolation};
+use super::{
+    ArrayNormalizationStep, ArrayPathStep, ArrayProjectionFailure, ArrayProjectionViolation,
+};
 
 fn dictionary_values(source: &dyn Array) -> Option<&ArrayRef> {
     use arrow_array::types::{
@@ -57,6 +59,7 @@ use arrow_array::types::Int32Type;
 use arrow_array::{Array, ArrayRef, DictionaryArray};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, FieldRef};
+use novarocks_type_contract::{ArrowTypeDepth, ArrowTypeProfile};
 use std::alloc::Layout;
 
 /// Original private immutable Buffer-owner bound, pinned by Execution's
@@ -113,19 +116,20 @@ fn clone_parameters<E: From<ArrayProjectionFailure>>(
     ty: &DataType,
     request: &mut Request<'_, E>,
     work: &mut Work<'_, E>,
-    depth: usize,
+    depth: ArrowTypeDepth,
 ) -> Result<(), E> {
     work(1)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(E::from(ArrayProjectionFailure::ValueType(
-            novarocks_type_contract::ValueTypeError::TooDeep,
-        )));
-    }
+    depth
+        .check(ArrowTypeProfile::Value)
+        .map_err(|error| E::from(ArrayProjectionFailure::ValueType(error)))?;
     if let DataType::Dictionary(key, value) = ty {
         request(Layout::new::<DataType>())?;
         request(Layout::new::<DataType>())?;
-        clone_parameters(key, request, work, depth + 1)?;
-        clone_parameters(value, request, work, depth + 1)?;
+        let child = depth
+            .encoding_child()
+            .map_err(|error| E::from(ArrayProjectionFailure::ValueType(error)))?;
+        clone_parameters(key, request, work, child)?;
+        clone_parameters(value, request, work, child)?;
     }
     // Other container/scalar parameters share Arc-owned backing on DataType clone.
     Ok(())
@@ -181,10 +185,13 @@ pub fn observe_array_normalization_construction<E: From<ArrayProjectionFailure>>
             work(channels)?;
             array::<ArrayRef, E>(channels, request)
         }
+        ArrayNormalizationStep::CreateProjectionPath { steps } => {
+            array::<ArrayPathStep, E>(steps, request)
+        }
         ArrayNormalizationStep::RebuildField { target, name, .. } => {
             work(name.len())?;
             array::<u8, E>(name.len(), request)?;
-            clone_parameters(target, request, work, 1)?;
+            clone_parameters(target, request, work, ArrowTypeDepth::ROOT)?;
             arc::<Field, E>(request)
         }
         ArrayNormalizationStep::RebuildType { source } => type_bound(source, opaque, work),
@@ -238,21 +245,30 @@ fn type_bound<E: From<ArrayProjectionFailure>>(
     })
 }
 
-fn datatype_nodes<E: From<ArrayProjectionFailure>>(
+#[derive(Clone, Copy)]
+struct DataTypeGeometry {
+    nodes: usize,
+    physical_depth: usize,
+}
+fn datatype_geometry<E: From<ArrayProjectionFailure>>(
     ty: &DataType,
-    depth: usize,
+    depth: ArrowTypeDepth,
     work: &mut Work<'_, E>,
-) -> Result<usize, E> {
+) -> Result<DataTypeGeometry, E> {
     work(1)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(E::from(ArrayProjectionFailure::ValueType(
-            novarocks_type_contract::ValueTypeError::TooDeep,
-        )));
-    }
-    let mut sum = 1usize;
-    let mut child = |ty: &DataType| -> Result<(), E> {
-        sum = add(sum, datatype_nodes(ty, depth + 1, work)?)?;
-        if sum > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
+    depth
+        .check(ArrowTypeProfile::Value)
+        .map_err(|error| E::from(ArrayProjectionFailure::ValueType(error)))?;
+    let mut geometry = DataTypeGeometry {
+        nodes: 1,
+        physical_depth: depth.physical(),
+    };
+    let mut child = |ty: &DataType, depth: Result<ArrowTypeDepth, _>| -> Result<(), E> {
+        let depth = depth.map_err(|error| E::from(ArrayProjectionFailure::ValueType(error)))?;
+        let child = datatype_geometry(ty, depth, work)?;
+        geometry.nodes = add(geometry.nodes, child.nodes)?;
+        geometry.physical_depth = geometry.physical_depth.max(child.physical_depth);
+        if geometry.nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
             return Err(E::from(ArrayProjectionFailure::ValueType(
                 novarocks_type_contract::ValueTypeError::TooManyNodes,
             )));
@@ -263,28 +279,30 @@ fn datatype_nodes<E: From<ArrayProjectionFailure>>(
         DataType::List(f)
         | DataType::LargeList(f)
         | DataType::FixedSizeList(f, _)
-        | DataType::Map(f, _) => child(f.data_type())?,
+        | DataType::ListView(f)
+        | DataType::LargeListView(f) => child(f.data_type(), depth.value_child())?,
+        DataType::Map(f, _) => child(f.data_type(), depth.map_entries())?,
         DataType::Struct(fs) => {
             for f in fs {
-                child(f.data_type())?;
+                child(f.data_type(), depth.value_child())?;
             }
         }
         DataType::Union(fs, _) => {
             for (_, f) in fs.iter() {
-                child(f.data_type())?;
+                child(f.data_type(), depth.value_child())?;
             }
         }
         DataType::Dictionary(k, v) => {
-            child(k)?;
-            child(v)?;
+            child(k, depth.encoding_child())?;
+            child(v, depth.encoding_child())?;
         }
         DataType::RunEndEncoded(k, v) => {
-            child(k.data_type())?;
-            child(v.data_type())?;
+            child(k.data_type(), depth.encoding_child())?;
+            child(v.data_type(), depth.encoding_child())?;
         }
         _ => {}
     }
-    Ok(sum)
+    Ok(geometry)
 }
 fn array_bound<E: From<ArrayProjectionFailure>>(
     source: &ArrayRef,
@@ -315,7 +333,12 @@ fn array_bound<E: From<ArrayProjectionFailure>>(
                     DataType::Union(_, _) | DataType::RunEndEncoded(_, _) | DataType::Null
                 ) {
                     let mut nodes = 0;
-                    let span = borrowed_array_span(array.as_ref(), 1, &mut nodes, work)?;
+                    let span = borrowed_array_span(
+                        array.as_ref(),
+                        ArrowTypeDepth::ROOT,
+                        &mut nodes,
+                        work,
+                    )?;
                     scratch_rows = add(scratch_rows, mul(nodes, span)?)?;
                     scratch_masks = add(scratch_masks, nodes)?;
                 }
@@ -415,14 +438,21 @@ fn metadata_fallback<E: From<ArrayProjectionFailure>>(
     work: &mut Work<'_, E>,
     slice: bool,
 ) -> Result<(), E> {
-    let nodes = datatype_nodes(source.data_type(), 1, work)?.max(datatype_nodes(target, 1, work)?);
-    let span = borrowed_array_span(source.as_ref(), 1, &mut 0, work)?;
+    let source_geometry = datatype_geometry(source.data_type(), ArrowTypeDepth::ROOT, work)?;
+    let target_geometry = datatype_geometry(target, ArrowTypeDepth::ROOT, work)?;
+    let nodes = source_geometry.nodes.max(target_geometry.nodes);
+    let span = borrowed_array_span(source.as_ref(), ArrowTypeDepth::ROOT, &mut 0, work)?;
     // Slice visits its retained child wrappers; the ArrayData Union/REE branch
-    // can repeatedly reconstruct child subtrees along their bounded depth.
+    // can repeatedly reconstruct child subtrees along their actual depth.
     let factor = if slice {
         4
     } else {
-        novarocks_type_contract::MAX_VALUE_TYPE_DEPTH + 2
+        add(
+            source_geometry
+                .physical_depth
+                .max(target_geometry.physical_depth),
+            2,
+        )?
     };
     let repeats = mul(nodes, factor)?;
     let node_bytes = add(
@@ -476,7 +506,7 @@ fn metadata_fallback<E: From<ArrayProjectionFailure>>(
 
 fn borrowed_array_span<E: From<ArrayProjectionFailure>>(
     source: &dyn Array,
-    depth: usize,
+    depth: ArrowTypeDepth,
     nodes: &mut usize,
     work: &mut Work<'_, E>,
 ) -> Result<usize, E> {
@@ -486,35 +516,34 @@ fn borrowed_array_span<E: From<ArrayProjectionFailure>>(
     };
     work(1)?;
     *nodes = add(*nodes, 1)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(E::from(ArrayProjectionFailure::ValueType(
-            novarocks_type_contract::ValueTypeError::TooDeep,
-        )));
-    }
+    depth
+        .check(ArrowTypeProfile::Value)
+        .map_err(|error| E::from(ArrayProjectionFailure::ValueType(error)))?;
     if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
         return Err(E::from(ArrayProjectionFailure::ValueType(
             novarocks_type_contract::ValueTypeError::TooManyNodes,
         )));
     }
     let mut span = source.len();
-    let mut child = |array: &dyn Array| -> Result<(), E> {
-        span = span.max(borrowed_array_span(array, depth + 1, nodes, work)?);
+    let mut child = |array: &dyn Array, depth: Result<ArrowTypeDepth, _>| -> Result<(), E> {
+        let depth = depth.map_err(|error| E::from(ArrayProjectionFailure::ValueType(error)))?;
+        span = span.max(borrowed_array_span(array, depth, nodes, work)?);
         Ok(())
     };
     if let Some(array) = source.as_any().downcast_ref::<StructArray>() {
         for array in array.columns() {
-            child(array.as_ref())?;
+            child(array.as_ref(), depth.value_child())?;
         }
     } else if let Some(array) = source.as_any().downcast_ref::<MapArray>() {
-        child(array.entries())?;
+        child(array.entries(), depth.map_entries())?;
     } else if let Some(array) = source.as_any().downcast_ref::<ListArray>() {
-        child(array.values().as_ref())?;
+        child(array.values().as_ref(), depth.value_child())?;
     } else if let Some(array) = source.as_any().downcast_ref::<LargeListArray>() {
-        child(array.values().as_ref())?;
+        child(array.values().as_ref(), depth.value_child())?;
     } else if let Some(array) = source.as_any().downcast_ref::<FixedSizeListArray>() {
-        child(array.values().as_ref())?;
+        child(array.values().as_ref(), depth.value_child())?;
     } else if let Some(values) = dictionary_values(source) {
-        child(values.as_ref())?;
+        child(values.as_ref(), depth.encoding_child())?;
     } else if let Some(array) = source.as_any().downcast_ref::<UnionArray>() {
         let DataType::Union(fields, _) = source.data_type() else {
             return Err(E::from(ArrayProjectionFailure::Contract(
@@ -522,14 +551,14 @@ fn borrowed_array_span<E: From<ArrayProjectionFailure>>(
             )));
         };
         for (id, _) in fields.iter() {
-            child(array.child(id).as_ref())?;
+            child(array.child(id).as_ref(), depth.value_child())?;
         }
     } else if let Some(array) = source.as_any().downcast_ref::<RunArray<Int16Type>>() {
-        child(array.values().as_ref())?;
+        child(array.values().as_ref(), depth.encoding_child())?;
     } else if let Some(array) = source.as_any().downcast_ref::<RunArray<Int32Type>>() {
-        child(array.values().as_ref())?;
+        child(array.values().as_ref(), depth.encoding_child())?;
     } else if let Some(array) = source.as_any().downcast_ref::<RunArray<Int64Type>>() {
-        child(array.values().as_ref())?;
+        child(array.values().as_ref(), depth.encoding_child())?;
     }
     Ok(span)
 }
@@ -573,5 +602,46 @@ mod extent_failure_tests {
                 .representation()
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod actual_depth_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn actual_geometry_crosses_the_removed_derived_physical_cap() {
+        let wrappers = 192usize;
+        let mut ty = DataType::Int32;
+        for _ in 0..wrappers {
+            ty = DataType::Dictionary(Box::new(DataType::Int32), Box::new(ty));
+        }
+        let geometry =
+            datatype_geometry::<ArrayProjectionFailure>(&ty, ArrowTypeDepth::ROOT, &mut |_| Ok(()))
+                .unwrap();
+        assert_eq!(geometry.nodes, 2 * wrappers + 1);
+        assert_eq!(geometry.physical_depth, wrappers + 1);
+    }
+
+    #[test]
+    fn actual_projection_path_layout_is_admitted_once_and_refuses_without_tail() {
+        let expected = Layout::array::<ArrayPathStep>(129).unwrap();
+        let mut calls = 0;
+        let original = crate::KernelFailure::Operational(crate::KernelDiagnostic::new(
+            "original path layout admission",
+        ));
+        let failure = observe_array_normalization_construction::<crate::KernelFailure>(
+            ArrayNormalizationStep::CreateProjectionPath { steps: 129 },
+            &mut |layout| {
+                calls += 1;
+                assert_eq!(layout, expected);
+                Err(original.clone())
+            },
+            &mut |_| panic!("path allocation is a concrete Layout, not opaque backing"),
+            &mut |_| panic!("path initialization work is reported by its actual constructor"),
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(failure, original);
     }
 }

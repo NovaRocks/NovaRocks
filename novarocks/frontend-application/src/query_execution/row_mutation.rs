@@ -44,8 +44,8 @@ use novarocks_execution::runtime::query_options::QueryOptions;
 #[cfg(test)]
 use novarocks_native_adapter::root_cow_selection_codec::CowSelectionCodecError;
 use novarocks_native_adapter::root_cow_selection_codec::{
-    COW_SELECTION_MAX_RECORD_BYTES, CowOwnedDecodeError, CowSelectionRecordHeader,
-    CowSelectionRecordKind, CowSelectionStreamDecoder,
+    CowOwnedDecodeError, CowSelectionRecordHeader, CowSelectionRecordKind,
+    CowSelectionStreamDecoder,
 };
 use novarocks_native_adapter::root_record_assembly::{
     RootRecordAssembly, RootRecordAssemblyError, RootRecordDomain, RootRecordFramingError,
@@ -532,7 +532,7 @@ fn normalize_owned_to_signed_selection(
 /// record completes; nothing is a published selection until `finish`.
 pub struct RelayedCowSelectionCollector {
     assembly: RootRecordAssembly,
-    decoder: CowSelectionStreamDecoder,
+    decoder: Option<CowSelectionStreamDecoder>,
     schema: SchemaRef,
     collector: BoundedRowMutationMatchCollector,
     declarations: Vec<novarocks_type_contract::FunctionValueType>,
@@ -556,7 +556,28 @@ impl RelayedCowSelectionCollector {
         Ok(collector)
     }
 
+    #[cfg(test)]
     pub fn try_new_declared(
+        context: ConnectorRequestContext,
+        exec_mem_limit: Option<i64>,
+        schema: SchemaRef,
+        declarations: Vec<novarocks_type_contract::FunctionValueType>,
+    ) -> Result<Self, ConnectorError> {
+        let output = declarations
+            .iter()
+            .enumerate()
+            .map(|(ordinal, ty)| {
+                novarocks_query_application::api::ResultField::new(
+                    format!("__nr_sel_{ordinal}"),
+                    ty.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut collector = Self::try_new_unbound(context, exec_mem_limit, schema, declarations)?;
+        collector.install_recipe(&output)?;
+        Ok(collector)
+    }
+    fn try_new_unbound(
         context: ConnectorRequestContext,
         exec_mem_limit: Option<i64>,
         schema: SchemaRef,
@@ -570,14 +591,11 @@ impl RelayedCowSelectionCollector {
         signed_layout::validate_declarations(&schema, &declarations, &mut |_| {
             collector.check_control()
         })?;
-        let record_bound = collector
-            .max_bytes()
-            .min(COW_SELECTION_MAX_RECORD_BYTES)
-            .min(32 * 1024 * 1024);
+        let record_bound = collector.max_bytes().min(32 * 1024 * 1024);
         let record_bound = usize::try_from(record_bound).unwrap_or(usize::MAX);
         Ok(Self {
             assembly: RootRecordAssembly::new(RootRecordDomain::CowSelection, record_bound),
-            decoder: CowSelectionStreamDecoder::new(),
+            decoder: None,
             schema,
             collector,
             retention: None,
@@ -628,6 +646,9 @@ impl RelayedCowSelectionCollector {
             sql_output,
             ..
         } = self;
+        let decoder = decoder
+            .as_mut()
+            .ok_or_else(|| invalid_match("COW selection has no preparation-installed recipe"))?;
         let consume = |record: &[u8]| {
             let header = CowSelectionRecordHeader::parse(record).map_err(cow_codec_error)?;
             if header.kind() == CowSelectionRecordKind::Batch {
@@ -638,15 +659,9 @@ impl RelayedCowSelectionCollector {
                 Some(guard) => decoder.apply_owned_record_with_guard(record, guard.clone()),
                 None => decoder.apply_owned_record(record),
             };
-            let Some(batch) = decoded.map_err(cow_owned_decode_error)? else {
-                let width = decoder.schema().map_or(0, |relayed| relayed.fields().len());
-                if width != schema.fields().len() {
-                    return Err(invalid_match(
-                        "relayed COW selection schema width differs from its signed contract",
-                    ));
-                }
-                return Ok(());
-            };
+            let batch = decoded
+                .map_err(cow_owned_decode_error)?
+                .ok_or_else(|| invalid_match("COW record produced no batch"))?;
             let batch = normalize_owned_to_signed_selection(
                 schema,
                 &batch,
@@ -682,10 +697,11 @@ impl RelayedCowSelectionCollector {
     pub fn finish(mut self) -> Result<ConnectorRowMutationSelection, ConnectorError> {
         self.conversions.clear();
         self.assembly.finish().map_err(cow_framing_error)?;
-        // Schema-only streams retain the decoder's holder until the whole
-        // selection has its own holder, including its empty indices.
-        let _decoder_schema = self.decoder.finish_with_guard();
-        self.collector.finish()
+        // The installed recipe remains until collection has its own schema
+        // and retention, including a selection containing no batch at all.
+        let selection = self.collector.finish()?;
+        drop(self.decoder);
+        Ok(selection)
     }
 }
 
@@ -697,6 +713,19 @@ pub(crate) struct CowMatchRootConsumer {
 }
 
 impl CowMatchRootConsumer {
+    #[cfg(test)]
+    pub(crate) fn recipe_for_fixture(
+        &self,
+    ) -> Arc<novarocks_native_adapter::root_cow_selection_codec::CowSelectionRecipe> {
+        Arc::clone(
+            self.collector
+                .decoder
+                .as_ref()
+                .expect("fixture installs the frozen selection recipe")
+                .recipe(),
+        )
+    }
+
     #[cfg(test)]
     fn fixture_output(
         declarations: &[novarocks_type_contract::FunctionValueType],
@@ -748,6 +777,7 @@ impl CowMatchRootConsumer {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn try_new_declared(
         context: ConnectorRequestContext,
         schema: SchemaRef,
@@ -756,8 +786,21 @@ impl CowMatchRootConsumer {
         intent: ConnectorRowMutationIntent,
         output: &[novarocks_query_application::api::ResultField],
     ) -> Result<Self, ConnectorError> {
+        let mut consumer =
+            Self::try_new_unbound(context, schema, declarations, contract, intent, output)?;
+        consumer.collector.install_recipe(output)?;
+        Ok(consumer)
+    }
+    fn try_new_unbound(
+        context: ConnectorRequestContext,
+        schema: SchemaRef,
+        declarations: Vec<novarocks_type_contract::FunctionValueType>,
+        contract: ConnectorMutationMatchContract,
+        intent: ConnectorRowMutationIntent,
+        output: &[novarocks_query_application::api::ResultField],
+    ) -> Result<Self, ConnectorError> {
         let mut collector =
-            RelayedCowSelectionCollector::try_new_declared(context, None, schema, declarations)?;
+            RelayedCowSelectionCollector::try_new_unbound(context, None, schema, declarations)?;
         let validator = RowMutationMatchValidator::try_new(contract, intent)?;
         let sql_output = signed_layout::CowSqlOutput::try_new(
             output,
@@ -794,9 +837,10 @@ impl CowMatchRootConsumer {
             .try_spi_guard()
             .map_err(|error| invalid_match(error.to_string()))?;
         let mut consumer =
-            Self::try_new_declared(context, schema, declarations, contract, intent, output)?;
+            Self::try_new_unbound(context, schema, declarations, contract, intent, output)?;
         consumer.collector.collector.retention = Some(guard.clone());
         consumer.collector.retention = Some(guard);
+        consumer.collector.install_recipe(output)?;
         Ok(consumer)
     }
 
@@ -1317,8 +1361,9 @@ mod tests {
         use novarocks_failure_contract::{FailureClass, FailureProjection};
         use novarocks_value_arrays::{ValueError, ValueViolation};
         let input = sql_values([Some(1), Some(10), None]);
-        let stream = relayed_stream(std::slice::from_ref(&input));
-        let mut consumer = constrained_cow_consumer(&frozen_sql_fields([false, false, true]));
+        let nullable = frozen_sql_fields([false, false, true]);
+        let stream = relayed_stream(std::slice::from_ref(&input), &nullable);
+        let mut consumer = constrained_cow_consumer(&nullable);
         let error = consumer.push_body(&stream).unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(error.failure_fact().class(), FailureClass::Data);
@@ -1327,7 +1372,9 @@ mod tests {
                 .to_string()
                 .contains("COW assignment value does not satisfy its required target")
         );
-        let mut consumer = constrained_cow_consumer(&frozen_sql_fields([false, false, false]));
+        let required = frozen_sql_fields([false, false, false]);
+        let stream = relayed_stream(std::slice::from_ref(&input), &required);
+        let mut consumer = constrained_cow_consumer(&required);
         let error = consumer.push_body(&stream).unwrap_err();
         assert_eq!(
             error.failure_fact(),
@@ -1337,11 +1384,10 @@ mod tests {
         // actual SQL promise above or the original Hydrate/selection authors.
         let mut consumer = constrained_cow_consumer(&frozen_sql_fields([false, false, false]));
         consumer
-            .push_body(&relayed_stream(&[sql_values([
-                Some(1),
-                Some(10),
-                Some(11),
-            ])]))
+            .push_body(&relayed_stream(
+                &[sql_values([Some(1), Some(10), Some(11)])],
+                &required,
+            ))
             .unwrap();
         let selection = consumer.finish().unwrap();
         assert_eq!(
@@ -1420,7 +1466,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let error = consumer.push_body(&relayed_stream(&[source])).unwrap_err();
+        let error = consumer
+            .push_body(&relayed_stream(&[source], &output))
+            .unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(error.failure_fact().class(), FailureClass::Data);
         let input =
@@ -1448,7 +1496,10 @@ mod tests {
         for values in [[None, Some(10), None], [Some(1), None, None]] {
             let mut consumer = constrained_cow_consumer(&frozen_sql_fields([true, true, true]));
             let error = consumer
-                .push_body(&relayed_stream(&[sql_values(values)]))
+                .push_body(&relayed_stream(
+                    &[sql_values(values)],
+                    &frozen_sql_fields([true, true, true]),
+                ))
                 .unwrap_err();
             assert_eq!(error.failure_fact(), expected);
         }
@@ -1487,7 +1538,9 @@ mod tests {
             .project(&permutation)
             .unwrap();
         let mut consumer = constrained_cow_consumer(&frozen);
-        consumer.push_body(&relayed_stream(&[input])).unwrap();
+        consumer
+            .push_body(&relayed_stream(&[input], &frozen))
+            .unwrap();
         let selection = consumer.finish().unwrap();
         let batch = &selection.batches()[0];
         assert_eq!(
@@ -1513,20 +1566,36 @@ mod tests {
     #[test]
     fn malformed_sql_carrier_cannot_be_hidden_by_an_after_target_refusal() {
         use novarocks_failure_contract::FailureProjection;
-        use novarocks_value_arrays::{ValueError, ValueViolation};
         let mut output = frozen_sql_fields([false, false, true]);
         output[2] = novarocks_query_application::api::ResultField::new(
             "__nr_sel_2",
             novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
         );
         let mut consumer = constrained_cow_consumer(&output);
+        // The sender declares the actual Int32 SQL result; the receiver is
+        // frozen to Utf8. This must reject before the NULL-to-required-target
+        // business check and before retaining any row.
+        let producer = frozen_sql_fields([false, false, true]);
         let error = consumer
-            .push_body(&relayed_stream(&[sql_values([Some(1), Some(10), None])]))
+            .push_body(&relayed_stream(
+                &[sql_values([Some(1), Some(10), None])],
+                &producer,
+            ))
             .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
         assert_eq!(
             error.failure_fact(),
-            ValueError::Invariant(ValueViolation::Layout).failure_fact()
+            CowSelectionCodecError::RecipeMismatch.failure_fact()
         );
+        assert_eq!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+                .unwrap()
+                .downcast_ref::<CowSelectionCodecError>(),
+            Some(&CowSelectionCodecError::RecipeMismatch)
+        );
+        assert_eq!(consumer.collector.collector.row_count(), 0);
     }
 
     #[test]
@@ -1637,18 +1706,70 @@ mod tests {
         assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
     }
 
-    /// Encode inputs as the Backend's CowSelectionArrowV1 stream.
-    fn relayed_stream(inputs: &[RecordBatch]) -> Vec<u8> {
+    fn relay_recipe(
+        output: &[novarocks_query_application::api::ResultField],
+    ) -> Arc<novarocks_native_adapter::root_cow_selection_codec::CowSelectionRecipe> {
+        // This is the producer's frozen SQL declaration, independent of its
+        // actual Arrow carrier and of the Provider's mutation target fields.
+        let schema = Arc::new(Schema::new(
+            output
+                .iter()
+                .map(|field| Field::new(field.name(), field.data_type().clone(), field.nullable()))
+                .collect::<Vec<_>>(),
+        ));
+        let declarations = output
+            .iter()
+            .map(|field| field.value_type().clone())
+            .collect();
+        let collector = RelayedCowSelectionCollector::try_new_declared(
+            context(
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                64 << 20,
+            ),
+            None,
+            schema,
+            declarations,
+        )
+        .unwrap();
+        Arc::clone(collector.decoder.as_ref().unwrap().recipe())
+    }
+    /// Encode the producer's frozen SQL declaration as a CSA2 stream.
+    fn relayed_stream(
+        inputs: &[RecordBatch],
+        output: &[novarocks_query_application::api::ResultField],
+    ) -> Vec<u8> {
         use novarocks_native_adapter::root_cow_selection_codec::{
             CowSelectionEncoder, CowSelectionTotals,
         };
         use novarocks_result_render::RenderTurnStatus;
 
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+        let recipe = relay_recipe(output);
         let mut totals = CowSelectionTotals::default();
         let mut stream = Vec::new();
         let mut buffer = vec![0_u8; 64];
         for input in inputs {
-            let mut encoder = CowSelectionEncoder::try_new(input, totals, usize::MAX).unwrap();
+            assert_eq!(input.num_columns(), recipe.schema().fields().len());
+            // Only canonicalize physical metadata. A malicious NULL under a
+            // required SQL promise must reach the receiver's original check.
+            // Hydrate/SQL value conversion here would hide that receiver oracle.
+            let columns = input
+                .columns()
+                .iter()
+                .zip(recipe.schema().fields())
+                .map(|(source, field)| {
+                    novarocks_functions::array_projection::rebuild_array_observed::<
+                        novarocks_functions::array_projection::ArrayProjectionFailure,
+                        _,
+                    >(source, field.data_type(), &mut |_| Ok(()))
+                    .unwrap()
+                })
+                .collect();
+            let normalized = RecordBatch::try_new(Arc::clone(recipe.schema()), columns).unwrap();
+            let mut encoder =
+                CowSelectionEncoder::try_new(&normalized, &recipe, totals, usize::MAX).unwrap();
             loop {
                 let turn = encoder.step(&mut buffer);
                 stream.extend_from_slice(&buffer[..turn.emitted_bytes]);
@@ -1662,73 +1783,45 @@ mod tests {
     }
 
     #[test]
-    fn signed_layout_required_null_fails_with_typed_error_at_relay_boundary() {
+    fn relayed_selection_refuses_a_different_frozen_nullability_before_values() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use std::error::Error;
         let input = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)])),
             vec![Arc::new(Int32Array::from(vec![None::<i32>]))],
         )
         .unwrap();
         let signed = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let stop = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
-        let mut collector =
-            RelayedCowSelectionCollector::try_new(context(stop, 1 << 20), None, signed).unwrap();
-        let error = collector
-            .push_body(&relayed_stream(std::slice::from_ref(&input)))
-            .unwrap_err();
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
-        use novarocks_value_arrays::{ValueError, ValueViolation};
-        use std::error::Error;
-        let expected = ValueError::Invariant(ValueViolation::RequiredNull).failure_fact();
-        let assert_original = |error: &ConnectorError| {
-            assert_eq!(error.failure_fact(), expected);
-            let shared = error
-                .source()
-                .unwrap()
-                .downcast_ref::<SharedFailureCause>()
-                .unwrap();
-            let original = shared.downcast_ref::<ValueError>().unwrap();
-            assert!(matches!(
-                original,
-                ValueError::Invariant(ValueViolation::RequiredNull)
-            ));
-            assert_eq!(original.failure_fact(), expected);
-        };
-        assert_original(&error);
-        // Use the real four-column mutation contract at the RootConsumer boundary.
-        let signed = selection_schema();
-        let mut input_fields = signed
-            .fields()
-            .iter()
-            .map(|field| field.as_ref().clone())
-            .collect::<Vec<_>>();
-        input_fields[0] = input_fields[0].clone().with_nullable(true);
-        let input = RecordBatch::try_new(
-            Arc::new(Schema::new(input_fields)),
-            vec![
-                Arc::new(Int32Array::from(vec![None::<i32>])),
-                Arc::new(Int32Array::from(vec![10])),
-                Arc::new(Int32Array::from(vec![Some(11)])),
-                Arc::new(Int8Array::from(vec![REPLACE_EFFECT_TAG])),
-            ],
-        )
-        .unwrap();
-        let mut consumer = CowMatchRootConsumer::try_new(
+        let mut collector = RelayedCowSelectionCollector::try_new(
             context(
                 Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
                 1 << 20,
             ),
+            None,
             signed,
-            contract(),
-            ConnectorRowMutationIntent::Merge {
-                effects: vec![ConnectorRowMutationEffect::Replace],
-            },
         )
         .unwrap();
-        let error = consumer.push_body(&relayed_stream(&[input])).unwrap_err();
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-        assert_eq!(error.failure_fact(), expected);
-        assert_original(&error);
+        let producer = vec![novarocks_query_application::api::ResultField::new(
+            "v",
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+        )];
+        let error = collector
+            .push_body(&relayed_stream(&[input], &producer))
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert_eq!(
+            error.failure_fact(),
+            CowSelectionCodecError::RecipeMismatch.failure_fact()
+        );
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<SharedFailureCause>()
+                .unwrap()
+                .downcast_ref::<CowSelectionCodecError>(),
+            Some(&CowSelectionCodecError::RecipeMismatch)
+        );
     }
 
     #[test]
@@ -1740,7 +1833,7 @@ mod tests {
             ]),
             batch(vec![(3, 30, Some(31), INSERT_EFFECT_TAG)]),
         ];
-        let stream = relayed_stream(&inputs);
+        let stream = relayed_stream(&inputs, &frozen_sql_fields([false, true, true]));
         let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let mut arrow = BoundedRowMutationMatchCollector::try_new_with_schema(
             context(Arc::clone(&cancellation), 1 << 20),
@@ -1785,26 +1878,22 @@ mod tests {
     #[test]
     fn collection_refuses_carrier_changes_without_retaining_the_new_batch() {
         let input = batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)]);
-        let stream = relayed_stream(std::slice::from_ref(&input));
-        let mut decoder = CowSelectionStreamDecoder::new();
-        let schema_len = CowSelectionRecordHeader::parse(&stream)
-            .unwrap()
-            .record_bytes() as usize;
-        assert!(
-            decoder
-                .apply_owned_record(&stream[..schema_len])
-                .unwrap()
-                .is_none()
+        let stream = relayed_stream(
+            std::slice::from_ref(&input),
+            &frozen_sql_fields([false, true, true]),
         );
-        let owned = decoder
-            .apply_owned_record(&stream[schema_len..])
-            .unwrap()
-            .unwrap();
+        let mut decoder =
+            CowSelectionStreamDecoder::new(relay_recipe(&frozen_sql_fields([false, true, true])));
+        let owned = decoder.apply_owned_record(&stream).unwrap().unwrap();
+        // This test isolates owned/legacy carrier mixing. Its first owned
+        // batch uses the exact installed recipe schema, before Provider layout
+        // normalization performed by the relayed collector in other tests.
+        let schema = Arc::clone(decoder.schema());
         let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let mut collector = BoundedRowMutationMatchCollector::try_new_with_schema(
             context(cancellation, 1 << 20),
             None,
-            selection_schema(),
+            schema,
         )
         .unwrap();
         collector.push_owned(owned).unwrap();
@@ -1822,29 +1911,27 @@ mod tests {
     fn relayed_selection_refuses_oversized_records_truncation_and_cancellation() {
         use novarocks_failure_contract::FailureProjection;
         let one = batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)]);
-        let stream = relayed_stream(std::slice::from_ref(&one));
+        let stream = relayed_stream(
+            std::slice::from_ref(&one),
+            &frozen_sql_fields([false, true, true]),
+        );
         let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
 
         // A record declaring more than the whole budget is refused from its
         // header alone, before any assembly buffer beyond the header.
-        let schema_record = {
-            let header = novarocks_native_adapter::root_cow_selection_codec::CowSelectionRecordHeader::parse(&stream)
-                .unwrap();
-            header.record_bytes() as usize
-        };
-        let batch_record = &stream[schema_record..];
-        let budget = schema_record.max(
-            ConnectorRowConversionFootprint::retained_schema_bytes(selection_schema().as_ref())
-                .unwrap(),
-        );
+        let batch_record = &stream;
         let mut small = RelayedCowSelectionCollector::try_new(
-            context(Arc::clone(&cancellation), budget),
+            context(Arc::clone(&cancellation), 1 << 20),
             None,
             selection_schema(),
         )
         .unwrap();
-        small.push_body(&stream[..schema_record]).unwrap();
-        let mut grown = batch_record[..40].to_vec();
+        // Recipe construction has completed. Pressure the actual record bound,
+        // rather than failing setup with the obsolete schema-only footprint.
+        let budget = usize::try_from(small.collector.max_bytes()).unwrap();
+        let mut grown = batch_record
+            [..novarocks_native_adapter::root_cow_selection_codec::COW_SELECTION_HEADER_BYTES]
+            .to_vec();
         grown[8..16].copy_from_slice(&((budget as u64) + 1).to_le_bytes());
         let error = small.push_body(&grown).unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
@@ -1865,7 +1952,12 @@ mod tests {
             Some(RootRecordFramingError::Capacity { requested, limit })
                 if *requested == budget + 1 && *limit == budget
         ));
-        assert!(small.assembly_bytes() <= 32, "{}", small.assembly_bytes());
+        assert!(
+            small.assembly_bytes()
+                <= novarocks_native_adapter::root_cow_selection_codec::COW_SELECTION_HEADER_BYTES,
+            "{}",
+            small.assembly_bytes()
+        );
 
         // End inside an unfinished record is refused.
         let mut truncated = RelayedCowSelectionCollector::try_new(
@@ -1884,7 +1976,7 @@ mod tests {
 
         // A complete record reaches the actual codec sink without erasing its
         // concrete cause through the generic framing callback.
-        let mut malformed_schema = stream[..schema_record].to_vec();
+        let mut malformed_schema = stream.clone();
         malformed_schema[32] = u8::MAX;
         let mut malformed = RelayedCowSelectionCollector::try_new(
             context(Arc::clone(&cancellation), 1 << 20),
@@ -1895,7 +1987,7 @@ mod tests {
         let error = malformed.push_body(&malformed_schema).unwrap_err();
         assert_eq!(
             error.failure_fact(),
-            CowSelectionCodecError::MalformedSchema.failure_fact()
+            CowSelectionCodecError::RecipeMismatch.failure_fact()
         );
         let source = std::error::Error::source(&error)
             .unwrap()
@@ -1903,7 +1995,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             source.downcast_ref::<CowSelectionCodecError>(),
-            Some(&CowSelectionCodecError::MalformedSchema)
+            Some(&CowSelectionCodecError::RecipeMismatch)
         );
 
         // The collector's own cancellation kind survives the relay sink.
@@ -1939,20 +2031,21 @@ mod tests {
             ConnectorErrorKind::ResourceExhausted
         );
 
-        let stream = relayed_stream(&[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])]);
-        let schema_bytes = CowSelectionRecordHeader::parse(&stream)
-            .unwrap()
-            .record_bytes() as usize;
+        let stream = relayed_stream(
+            &[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])],
+            &frozen_sql_fields([false, true, true]),
+        );
+
         let mut relayed = RelayedCowSelectionCollector::try_new(
             context(cancellation, COW_SELECTION_BYTES as usize),
             None,
             selection_schema(),
         )
         .unwrap();
-        relayed.push_body(&stream[..schema_bytes]).unwrap();
+        relayed.push_body(&stream).unwrap();
         let retained_before_refusal = relayed.byte_count();
         assert!(retained_before_refusal > 0);
-        let mut declared = stream[schema_bytes..].to_vec();
+        let mut declared = stream.clone();
         declared[16..24].copy_from_slice(&(COW_SELECTION_ROWS + 1).to_le_bytes());
         // The payload still describes one row. ResourceExhausted proves the
         // declaration was rejected before the decoder would report malformed data.
@@ -1975,7 +2068,10 @@ mod tests {
             signed_layout::fixture_declarations(&selection_schema()),
         )
         .unwrap();
-        let stream = relayed_stream(&[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])]);
+        let stream = relayed_stream(
+            &[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])],
+            &frozen_sql_fields([false, true, true]),
+        );
         let error = collector.push_body(&stream).unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(collector.assembly_bytes(), 0);
@@ -1985,7 +2081,7 @@ mod tests {
     #[test]
     fn actual_root_budget_refusal_reaches_cow_consumer_as_original_work_source() {
         use novarocks_failure_contract::FailureProjection;
-        use novarocks_workload_control::{ResultCapacityConfig, WorkError};
+        use novarocks_workload_control::WorkError;
         use std::error::Error;
         let (_control, root, binding, _) =
             crate::query_execution::internal_result_cpu::admitted_internal_fixture();
@@ -2003,11 +2099,22 @@ mod tests {
             &binding,
         )
         .unwrap();
-        let original_reservation = window
-            .reserve_payload_bytes(ResultCapacityConfig::V1.all_objects_bytes[2])
+        let recipe_bytes = window.retained_payload_bytes();
+        assert!(
+            recipe_bytes > 0,
+            "the installed recipe retains its real receipts"
+        );
+        let remaining_bytes = window
+            .all_objects_bytes()
+            .unwrap()
+            .checked_sub(recipe_bytes)
             .unwrap();
+        let original_reservation = window.reserve_payload_bytes(remaining_bytes).unwrap();
         let held = window.retained_payload_bytes();
-        let stream = relayed_stream(&[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])]);
+        let stream = relayed_stream(
+            &[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])],
+            &frozen_sql_fields([false, true, true]),
+        );
         let error = consumer.push_body(&stream).unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
         let source = error
@@ -2031,7 +2138,7 @@ mod tests {
         );
         assert_eq!(window.retained_payload_bytes(), held);
         drop(consumer);
-        assert_eq!(window.retained_payload_bytes(), held);
+        assert_eq!(window.retained_payload_bytes(), remaining_bytes);
         drop(original_reservation);
         assert_eq!(window.retained_payload_bytes(), 0);
         drop((binding, window));
@@ -2083,7 +2190,10 @@ mod tests {
             )
             .unwrap();
             if !empty {
-                let stream = relayed_stream(&[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])]);
+                let stream = relayed_stream(
+                    &[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])],
+                    &frozen_sql_fields([false, true, true]),
+                );
                 consumer.push_body(&stream).unwrap();
             }
             consumer.check_end(if empty { 0 } else { 1 }).unwrap();
@@ -2175,7 +2285,10 @@ mod tests {
             .unwrap()
         };
         let mut consumer = make();
-        let stream = relayed_stream(&[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])]);
+        let stream = relayed_stream(
+            &[batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)])],
+            &frozen_sql_fields([false, true, true]),
+        );
         for body in stream.chunks(7) {
             consumer.push_body(body).unwrap();
         }
@@ -2185,10 +2298,13 @@ mod tests {
 
         let mut duplicate = make();
         duplicate
-            .push_body(&relayed_stream(&[batch(vec![
-                (1, 10, Some(11), REPLACE_EFFECT_TAG),
-                (1, 10, Some(12), REPLACE_EFFECT_TAG),
-            ])]))
+            .push_body(&relayed_stream(
+                &[batch(vec![
+                    (1, 10, Some(11), REPLACE_EFFECT_TAG),
+                    (1, 10, Some(12), REPLACE_EFFECT_TAG),
+                ])],
+                &frozen_sql_fields([false, true, true]),
+            ))
             .unwrap();
         duplicate.check_end(2).unwrap();
         assert!(
@@ -2291,5 +2407,854 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::InvalidRequest
         );
+    }
+    // This application fixture exercises neutral mutation selection contracts.
+    // It constructs no Provider writer recipe and starts no Provider I/O.
+    mod maximum_depth_cpu {
+        use super::*;
+        use crate::native::data_runtime::FrontendDataRuntime;
+        use crate::query_execution::internal_consumer::domain_cpu::root_action_tests::{
+            bind, drive, paid_claim, root_control,
+        };
+        use crate::query_execution::internal_consumer::domain_state::{
+            InternalDomainSlot, InternalDomainState,
+        };
+        use crate::query_execution::internal_result_cpu::{
+            INTERNAL_PEAK_BYTES, InternalResultCpuOwner, InternalResultOperation,
+            InternalResultValue,
+        };
+        use crate::task_execution::status_intake::TestIntakeWake;
+        use arrow::array::{DictionaryArray, ListArray, StringArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::Int32Type;
+        use novarocks_execution_contract::{
+            identity::TaskIdentity,
+            root_result::{
+                RootReadOutcome, RootReadResponse, RootResultData, RootResultEnd, RootResultReply,
+            },
+        };
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_query_application::{
+            admitted_query_context::QueryResultCapacityBinding,
+            api::{ResultField, RetainedRootReply},
+            cancellation::{QueryCancellationReason, QueryCancellationSource},
+        };
+        use novarocks_result_contract::{InternalResultDomain, RootOutputKind, RootProfileId};
+        use novarocks_spi::connector::{ConnectorPayloadByteBudget, ConnectorStopOwner};
+        use novarocks_type_contract::FunctionValueType;
+        use novarocks_types::{
+            AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+        };
+        use novarocks_value_arrays::{
+            decode::ValueConversionContext,
+            hydrate::{HydrateOptions, HydratePlan, HydrateProjection},
+        };
+        use novarocks_workload_control::{
+            ResultPayloadBytes, ResultWindowAlias, WorkClass, WorkRequest, WorkloadControl,
+            joint_admission::{
+                InternalComputationGrant, JointLane, JointProgress, JointProgressDriver,
+                JointResource, RetainedPayloadGrant,
+            },
+        };
+        use std::{
+            future::Future,
+            num::NonZeroU64,
+            sync::{Mutex, mpsc},
+            task::{Context, Waker},
+            time::Duration,
+        };
+
+        async fn with_driver<F: Future>(
+            control: &WorkloadControl,
+            driver: &mut JointProgressDriver,
+            future: F,
+        ) -> F::Output {
+            tokio::pin!(future);
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    match driver.step() {
+                        JointProgress::More => tokio::task::yield_now().await,
+                        JointProgress::Idle(revision) => tokio::select! {
+                            biased;
+                            result = &mut future => return result,
+                            _ = control.wait_progress(revision) => {},
+                        },
+                    }
+                }
+            })
+            .await
+            .expect("original FE COW CPU operation watchdog")
+        }
+
+        fn deep_array(case: usize) -> ArrayRef {
+            let mut array: ArrayRef = if case == 2 {
+                Arc::new(
+                    DictionaryArray::<Int32Type>::try_new(
+                        Int32Array::from(vec![0]),
+                        Arc::new(StringArray::from(vec!["deep-64"])),
+                    )
+                    .unwrap(),
+                )
+            } else {
+                Arc::new(StringArray::from(vec!["deep-64"]))
+            };
+            for level in 1..64 {
+                let list = case == 1 || (case == 2 && level % 2 == 0);
+                let field = Arc::new(Field::new(
+                    if list { "item" } else { "named" },
+                    array.data_type().clone(),
+                    false,
+                ));
+                array = if list {
+                    Arc::new(ListArray::new(
+                        field,
+                        OffsetBuffer::from_lengths([1]),
+                        array,
+                        None,
+                    ))
+                } else {
+                    Arc::new(StructArray::new(vec![field].into(), vec![array], None))
+                };
+            }
+            array
+        }
+
+        fn deep_contract(
+            after: &FunctionValueType,
+        ) -> (
+            ConnectorMutationMatchContract,
+            SchemaRef,
+            Vec<FunctionValueType>,
+            Vec<ResultField>,
+        ) {
+            let original = contract();
+            let after = ConnectorMutationTargetField::try_new_typed(
+                original.after_fields()[0].token(),
+                Field::new("after", after.data_type().clone(), after.nullable()),
+                2,
+                after.clone(),
+            )
+            .expect("neutral application match fixture, not a Provider writer recipe");
+            let contract = ConnectorMutationMatchContract::try_new(
+                original.owner().clone(),
+                original.table().clone(),
+                original.base_version().clone(),
+                original.identity_fields().to_vec(),
+                original.before_fields().to_vec(),
+                vec![after],
+                original.uniqueness_tokens().to_vec(),
+                original.effect_field().clone(),
+            )
+            .unwrap();
+            let schema = Arc::new(Schema::new(vec![
+                contract.identity_fields()[0].field().clone(),
+                contract.before_fields()[0].field().clone(),
+                contract.after_fields()[0].field().clone(),
+                contract.effect_field().field().clone(),
+            ]));
+            let declarations = signed_layout::fixture_declarations(&schema);
+            let output = declarations
+                .iter()
+                .enumerate()
+                .map(|(ordinal, ty)| ResultField::new(format!("__nr_sel_{ordinal}"), ty.clone()))
+                .collect();
+            (contract, schema, declarations, output)
+        }
+
+        fn stream(
+            case: usize,
+            schema: &SchemaRef,
+            declarations: &[FunctionValueType],
+            output: &[ResultField],
+        ) -> Vec<u8> {
+            // The source has the same actual leaf dictionary as the BE test.
+            // CSA2 freezes its plain representation; use the original Hydrate
+            // author before metadata-only projection by relayed_stream.
+            let after = deep_array(case);
+            let base = batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)]);
+            let columns = vec![
+                Arc::clone(base.column(0)),
+                Arc::clone(base.column(1)),
+                after,
+                Arc::clone(base.column(3)),
+            ];
+            let mut context = ValueConversionContext::new(0);
+            let mut requested = 0usize;
+            let columns = columns
+                .iter()
+                .zip(declarations)
+                .map(|(source, ty)| {
+                    let plan = HydratePlan::plan_with_options_observed::<std::convert::Infallible>(
+                        source,
+                        ty.typed_binding(),
+                        HydrateOptions {
+                            dictionary_value_layout: None,
+                            projection: HydrateProjection::FrozenNamesAndNullability,
+                        },
+                        &mut context,
+                        &mut |_, _| false,
+                        &mut |layout| {
+                            requested += layout.size();
+                            Ok(())
+                        },
+                        &mut |_| Ok(()),
+                        &mut |_| Ok(()),
+                    )
+                    .unwrap();
+                    plan.require_complete().unwrap();
+                    plan.execute_observed(
+                        &mut context,
+                        &mut |layout| {
+                            requested += layout.size();
+                            Ok::<_, std::convert::Infallible>(())
+                        },
+                        &mut |_| Ok(()),
+                        &mut |_| Ok(()),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let input = RecordBatch::try_new(Arc::clone(schema), columns).unwrap();
+            relayed_stream(&[input], output)
+        }
+
+        struct ChargedBody {
+            body: Vec<u8>,
+            _original_bytes: ResultPayloadBytes,
+        }
+        impl AsRef<[u8]> for ChargedBody {
+            fn as_ref(&self) -> &[u8] {
+                &self.body
+            }
+        }
+        fn reply(stream: Vec<u8>, window: &ResultWindowAlias) -> Arc<RetainedRootReply> {
+            let bytes = stream.capacity() as u64;
+            let receipt = window.reserve_payload_bytes(bytes).unwrap();
+            let body = bytes::Bytes::from_owner(ChargedBody {
+                body: stream,
+                _original_bytes: receipt,
+            });
+            let kind = RootOutputKind::InternalFacts(InternalResultDomain::CowSelectionArrowV1);
+            Arc::new(
+                RetainedRootReply::try_new(
+                    RootReadResponse::Reply(RootResultReply {
+                        root_task: TaskIdentity::new(
+                            QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap())
+                                .unwrap(),
+                            StageId::new(1).unwrap(),
+                            TaskId::new(1).unwrap(),
+                            BackendProcessId::new_v7(),
+                        ),
+                        profile: RootProfileId::V1,
+                        kind,
+                        accepted_consumed: 0,
+                        outcome: RootReadOutcome::Data(
+                            RootResultData::try_new(kind, NonZeroU64::new(1).unwrap(), body, None)
+                                .unwrap(),
+                        ),
+                    }),
+                    window.clone(),
+                    bytes,
+                )
+                .unwrap(),
+            )
+        }
+
+        // Test-only pause in the real decoder's allocation callback. This
+        // delegates every byte request to the SAME original Root author; the
+        // gate grants no bytes, replaces no worker, and runs no codec itself.
+        struct BodyAllocationGate {
+            original: ConnectorPayloadRetentionGuard,
+            first: Mutex<
+                Option<(
+                    tokio::sync::oneshot::Sender<String>,
+                    Option<mpsc::Receiver<()>>,
+                )>,
+            >,
+        }
+        impl ConnectorPayloadByteBudget for BodyAllocationGate {
+            fn reserve_bytes(
+                &self,
+                bytes: usize,
+            ) -> Result<ConnectorPayloadRetentionGuard, ConnectorError> {
+                let receipt = self.original.reserve_owned_bytes(bytes)?;
+                if let Some((entered, release)) = self.first.lock().unwrap().take() {
+                    let thread = std::thread::current()
+                        .name()
+                        .unwrap_or("unnamed")
+                        .to_owned();
+                    let _ = entered.send(thread);
+                    if let Some(release) = release {
+                        release
+                            .recv_timeout(Duration::from_secs(15))
+                            .expect("release the actual decoder allocation");
+                    }
+                }
+                Ok(receipt)
+            }
+        }
+
+        fn assert_deep_value(case: usize, selection: &ConnectorRowMutationSelection) {
+            assert_eq!(selection.row_count(), 1);
+            assert!(selection.has_owned_sources());
+            let mut value = selection.batches()[0].column(2).as_ref();
+            for level in (1..64).rev() {
+                assert_eq!(value.len(), 1);
+                assert_eq!(value.null_count(), 0);
+                let list = case == 1 || (case == 2 && level % 2 == 0);
+                value = if list {
+                    value
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .unwrap()
+                        .values()
+                        .as_ref()
+                } else {
+                    value
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .unwrap()
+                        .column(0)
+                        .as_ref()
+                };
+            }
+            assert_eq!(
+                value
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "deep-64"
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn maximum_cow_depth_uses_the_original_fe_cpu_body_and_end_operations() {
+            for case in 0..3 {
+                run(case, false).await;
+            }
+        }
+        #[tokio::test(flavor = "current_thread")]
+        async fn maximum_cow_depth_cancel_waits_for_the_same_running_fe_cpu_join() {
+            run(2, true).await;
+        }
+
+        async fn run(case: usize, cancel: bool) {
+            // The production executor itself selects this existing stack.
+            // This test creates no thread and changes no stack configuration.
+            assert_eq!(novarocks_types::WORKER_STACK_SIZE_BYTES, 16 * 1024 * 1024);
+            let mut owner = InternalResultCpuOwner::try_new_for_test().unwrap();
+            let (control, handle, mut driver) = root_control(&mut owner);
+            let root = control
+                .try_begin_root(WorkRequest::new(WorkClass::Query))
+                .unwrap();
+            let scope = root.owner.scope();
+            bind(&scope, &mut driver);
+            let mut raw = Some(paid_claim(
+                &handle,
+                &root.owner,
+                JointLane::Custody,
+                JointResource::PayloadBytes,
+                INTERNAL_PEAK_BYTES,
+                &mut driver,
+            ));
+            let mut payload = None;
+            RetainedPayloadGrant::adopt_in(&scope, &mut raw, &mut payload)
+                .unwrap()
+                .notify();
+            let mut raw = Some(paid_claim(
+                &handle,
+                &root.owner,
+                JointLane::Foreground,
+                JointResource::Computations,
+                1,
+                &mut driver,
+            ));
+            let mut computation = None;
+            InternalComputationGrant::adopt_in(&scope, &mut raw, &mut computation)
+                .unwrap()
+                .notify();
+            let computation = computation.unwrap();
+            let binding = QueryResultCapacityBinding::from_internal_payload(
+                &scope,
+                &scope,
+                payload.as_ref().unwrap(),
+            )
+            .unwrap();
+            let window = binding.window_alias();
+            let cpu = owner.runtime();
+            let cancellation = QueryCancellationSource::new();
+            let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+            let source = deep_array(case);
+            let after = FunctionValueType::new(source.data_type().clone(), false);
+            assert_eq!(after.value_type().depth(), 64);
+            drop(source);
+            let (contract, schema, declarations, output) = deep_contract(&after);
+            // Neutral application selection contracts are a different boundary.
+            // The real writer law still refuses this same schema at physical32.
+            assert_eq!(
+                novarocks_connector_contract::MAX_WRITE_RELATION_TYPE_DEPTH,
+                32
+            );
+            let writer_refusal = novarocks_connector_contract::validate_write_field_schema(
+                contract.after_fields()[0].field(),
+                1,
+                &mut 0,
+            )
+            .unwrap_err();
+            assert_eq!(writer_refusal.kind(), ConnectorErrorKind::ResourceExhausted);
+            assert!(writer_refusal.message().contains("nesting depth limit"));
+            let body = stream(case, &schema, &declarations, &output);
+            let mut consumer = CowMatchRootConsumer::try_new_declared_with_capacity(
+                context(
+                    Arc::new(ConnectorStopOwner::new()),
+                    COW_SELECTION_BYTES as usize,
+                ),
+                schema,
+                declarations,
+                contract,
+                ConnectorRowMutationIntent::Merge {
+                    effects: vec![ConnectorRowMutationEffect::Replace],
+                },
+                &binding,
+                &output,
+            )
+            .unwrap();
+            let (entered, mut started) = tokio::sync::oneshot::channel();
+            let (release, blocked) = mpsc::channel();
+            let gate =
+                ConnectorPayloadRetentionGuard::from_byte_budget(Arc::new(BodyAllocationGate {
+                    original: consumer.collector.retention.as_ref().unwrap().clone(),
+                    first: Mutex::new(Some((
+                        entered,
+                        if cancel {
+                            Some(blocked)
+                        } else {
+                            drop(blocked);
+                            None
+                        },
+                    ))),
+                }));
+            consumer.collector.retention = Some(gate.clone());
+            consumer.collector.collector.retention = Some(gate);
+            eprintln!(
+                "A04_FE_COW_CPU64 case={case} cancel={cancel} phase=preparation_complete logical_depth=64"
+            );
+            let input =
+                InternalResultValue::try_produce(binding.scope(), binding.window_alias(), |_| {
+                    Ok(InternalDomainSlot::Collecting {
+                        state: Box::new(InternalDomainState::Cow(Box::new(consumer))),
+                        receipt: None,
+                    })
+                })
+                .unwrap()
+                .track_computation_exit(&binding, computation.retain_alias().unwrap())
+                .unwrap();
+            let reply = reply(body, &window);
+            let original_reply = Arc::downgrade(&reply);
+            let mut job = cpu.submit_root_operation(
+                input,
+                cpu.capture_action_source(&computation, &scope).unwrap(),
+                cancellation.view(),
+                &runtime,
+                Arc::new(TestIntakeWake::default()),
+                InternalResultOperation::Body(reply),
+            );
+            if cancel {
+                let entered = with_driver(&control, &mut driver, started).await;
+                cancellation.request(QueryCancellationReason::ExecutionCancellationRequested);
+                let early = with_driver(
+                    &control,
+                    &mut driver,
+                    std::future::poll_fn(|cx| job.poll_take(cx)),
+                )
+                .await;
+                let join_pending = job
+                    .poll_forwarder_closed(&mut Context::from_waker(Waker::noop()))
+                    .is_pending();
+                let input_still_retained = original_reply.upgrade().is_some();
+                let bytes_still_retained = window.retained_payload_bytes() > 0;
+                let mut activity = Box::pin(binding.result_activities_exited());
+                let activity_pending = std::future::Future::poll(
+                    activity.as_mut(),
+                    &mut Context::from_waker(Waker::noop()),
+                )
+                .is_pending();
+                // Release before any assertion so no failing oracle can strand
+                // the original worker or prevent its actual receipt join.
+                let _ = release.send(());
+                let joined = with_driver(&control, &mut driver, job.join_closed()).await;
+                drop(job);
+                with_driver(&control, &mut driver, activity).await;
+                assert!(
+                    entered
+                        .as_ref()
+                        .is_ok_and(|name| name.starts_with("bounded-worker-"))
+                );
+                assert_eq!(
+                    early.err().expect("original cancellation outcome").fact(),
+                    novarocks_query_application::execution_error::QueryFailureReason::Cancelled
+                        .failure_fact(),
+                );
+                assert!(
+                    join_pending
+                        && input_still_retained
+                        && bytes_still_retained
+                        && activity_pending
+                );
+                assert!(joined.is_ok());
+                eprintln!("A04_FE_COW_CPU64 case={case} phase=cancelled_actual_join");
+                assert!(original_reply.upgrade().is_none());
+                assert_eq!(window.retained_payload_bytes(), 0);
+            } else {
+                drop(release);
+                let output = with_driver(
+                    &control,
+                    &mut driver,
+                    std::future::poll_fn(|cx| job.poll_take(cx)),
+                )
+                .await
+                .unwrap();
+                let slot = output
+                    .hand_off(|result, _| result)
+                    .unwrap_or_else(|error| panic!("actual COW Body failed: {error:?}"));
+                assert_eq!(slot.receipt(), Some(0));
+                assert!(started.try_recv().unwrap().starts_with("bounded-worker-"));
+                eprintln!("A04_FE_COW_CPU64 case={case} phase=body_decoded receipt=0");
+                with_driver(&control, &mut driver, job.join_closed())
+                    .await
+                    .unwrap();
+                drop(job);
+                assert!(original_reply.upgrade().is_none());
+                let input = InternalResultValue::try_produce(
+                    binding.scope(),
+                    binding.window_alias(),
+                    |_| Ok(slot),
+                )
+                .unwrap()
+                .track_computation_exit(&binding, computation.retain_alias().unwrap())
+                .unwrap();
+                let mut end = cpu.submit_root_operation(
+                    input,
+                    cpu.capture_action_source(&computation, &scope).unwrap(),
+                    cancellation.view(),
+                    &runtime,
+                    Arc::new(TestIntakeWake::default()),
+                    InternalResultOperation::End(RootResultEnd {
+                        sequence: NonZeroU64::new(2).unwrap(),
+                        output_rows: 1,
+                    }),
+                );
+                let output = with_driver(
+                    &control,
+                    &mut driver,
+                    std::future::poll_fn(|cx| end.poll_take(cx)),
+                )
+                .await
+                .unwrap();
+                let selection = output
+                    .hand_off(|result, _| {
+                        result
+                            .unwrap_or_else(|error| panic!("actual COW End failed: {error:?}"))
+                            .into_cow()
+                    })
+                    .unwrap();
+                with_driver(&control, &mut driver, end.join_closed())
+                    .await
+                    .unwrap();
+                drop(end);
+                assert_deep_value(case, &selection);
+                eprintln!("A04_FE_COW_CPU64 case={case} phase=end_joined leaf=deep-64 rows=1");
+                let last_array = Arc::clone(selection.batches()[0].column(2));
+                drop(selection);
+                assert!(
+                    window.retained_payload_bytes() > 0,
+                    "the actual final Arrow alias retains original byte receipts"
+                );
+                drop(last_array);
+                assert_eq!(window.retained_payload_bytes(), 0);
+                with_driver(&control, &mut driver, binding.result_activities_exited()).await;
+            }
+            drop((binding, window, computation, payload));
+            root.owner.complete();
+            root.business.release();
+            driver.recheck_retired_backing();
+            drive(&mut driver);
+            drop((driver, control));
+            owner
+                .shutdown_until(Instant::now() + Duration::from_secs(15))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// This observer is only a recipe constructor. Online IPC methods are explicit
+/// refusals because COW retains its independent bounded record grammar.
+struct CowRecipeObserver<'a> {
+    collector: &'a BoundedRowMutationMatchCollector,
+    author: Option<&'a ConnectorPayloadRetentionGuard>,
+    requested: usize,
+    receipts: Vec<ConnectorPayloadRetentionGuard>,
+    receipt_backing: Option<ConnectorPayloadRetentionGuard>,
+}
+impl novarocks_arrow_batch_codec::UnitObserver for CowRecipeObserver<'_> {
+    type Error = ConnectorError;
+    fn project_carrier(
+        &mut self,
+        _: usize,
+        _: &ArrayRef,
+        _: &arrow::datatypes::DataType,
+    ) -> Result<ArrayRef, Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot project an online carrier",
+        ))
+    }
+    fn before_type_scratch(&mut self, _: usize) -> Result<(), Self::Error> {
+        // The existing bounded CPU operation and collector control own this
+        // finite synchronous initialization; it grants no retained bytes.
+        self.checkpoint()
+    }
+    fn checkpoint(&mut self) -> Result<(), Self::Error> {
+        self.collector.check_control()
+    }
+    fn before_allocation(&mut self, layout: std::alloc::Layout) -> Result<(), Self::Error> {
+        self.checkpoint()?;
+        self.requested = self
+            .requested
+            .checked_add(layout.size())
+            .ok_or_else(cast_footprint::exhausted)?;
+        if self.requested as u128 > self.collector.max_bytes() as u128 {
+            return Err(cast_footprint::exhausted());
+        }
+        if layout.size() == 0 {
+            return Ok(());
+        }
+        if let Some(author) = self.author {
+            if self.receipts.len() == self.receipts.capacity() {
+                let next = self
+                    .receipts
+                    .capacity()
+                    .max(1)
+                    .checked_mul(2)
+                    .ok_or_else(cast_footprint::exhausted)?;
+                let backing = std::alloc::Layout::array::<ConnectorPayloadRetentionGuard>(next)
+                    .map_err(|_| cast_footprint::exhausted())?;
+                self.requested = self
+                    .requested
+                    .checked_add(backing.size())
+                    .ok_or_else(cast_footprint::exhausted)?;
+                if self.requested as u128 > self.collector.max_bytes() as u128 {
+                    return Err(cast_footprint::exhausted());
+                }
+                let next_receipt = author.reserve_owned_bytes(backing.size())?;
+                // The previous receipt stays live until actual reallocation
+                // has returned and released the old descriptor backing.
+                self.receipts
+                    .try_reserve_exact(next - self.receipts.len())
+                    .map_err(|_| cast_footprint::exhausted())?;
+                self.receipt_backing = Some(next_receipt);
+            }
+            self.receipts
+                .push(author.reserve_owned_bytes(layout.size())?);
+        } else {
+            #[cfg(not(test))]
+            return Err(invalid_match(
+                "COW recipe requires its original Root byte author",
+            ));
+        }
+        Ok(())
+    }
+    fn before_recipe(
+        &mut self,
+        fields: &[novarocks_arrow_batch_codec::RecipeField<'_>],
+    ) -> Result<(), Self::Error> {
+        self.checkpoint()?;
+        for _ in fields {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+    fn before_metadata_verification(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot verify an online IPC message",
+        ))
+    }
+    fn copy_body(&mut self, _: &[u8]) -> Result<arrow::buffer::Buffer, Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot decode an online IPC message",
+        ))
+    }
+    fn before_arrow_decode(
+        &mut self,
+        _: &arrow::datatypes::Schema,
+        _: arrow::ipc::RecordBatch<'_>,
+        _: &arrow::buffer::Buffer,
+        _: &std::collections::HashMap<i64, ArrayRef>,
+        _: novarocks_arrow_batch_codec::DecodeKind,
+    ) -> Result<(), Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot decode an online IPC message",
+        ))
+    }
+    fn before_unit_recipe(
+        &mut self,
+        _: &novarocks_arrow_batch_codec::BatchRecipe,
+        _: &[u8],
+    ) -> Result<(), Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot select an online representation",
+        ))
+    }
+    fn before_encode_batch(
+        &mut self,
+        _: &novarocks_arrow_batch_codec::BatchRecipe,
+        _: &RecordBatch,
+    ) -> Result<(), Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot encode an online IPC message",
+        ))
+    }
+    fn before_decode_message(
+        &mut self,
+        _: &arrow::datatypes::Schema,
+        _: arrow::ipc::RecordBatch<'_>,
+        _: &[u8],
+    ) -> Result<(), Self::Error> {
+        Err(invalid_match(
+            "COW recipe constructor cannot decode an online IPC message",
+        ))
+    }
+}
+fn cow_recipe_failure(
+    error: novarocks_arrow_batch_codec::CodecError<ConnectorError>,
+) -> ConnectorError {
+    use novarocks_arrow_batch_codec::CodecError;
+    match error {
+        CodecError::Observer(error) => error,
+        CodecError::Metadata(source) => ConnectorError::from_domain(
+            ConnectorErrorKind::InvalidRequest,
+            novarocks_native_adapter::root_cow_selection_codec::CowRecipeConstructionFailure(
+                source,
+            ),
+        ),
+        CodecError::ValueType(error) => {
+            ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, error)
+        }
+        CodecError::Layout(error) => {
+            ConnectorError::from_domain(ConnectorErrorKind::ResourceExhausted, error)
+        }
+        CodecError::Carrier(error) => {
+            ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, error)
+        }
+        CodecError::Construction(novarocks_type_contract::ControlResourceError::Control(error)) => {
+            ConnectorError::compile_interruption(error)
+        }
+        CodecError::Construction(error) => {
+            ConnectorError::from_domain(ConnectorErrorKind::InvalidRequest, error)
+        }
+        CodecError::Allocation(error) => ConnectorError::from_domain(
+            ConnectorErrorKind::ResourceExhausted,
+            novarocks_functions::allocation_failure::AllocationRefusal::new(
+                "construct COW root recipe",
+                error,
+            ),
+        ),
+        CodecError::Arrow(source) => ConnectorError::from_domain(
+            ConnectorErrorKind::InvalidRequest,
+            novarocks_functions::array_projection::ArrayProjectionFailure::Arrow {
+                operation:
+                    novarocks_functions::array_projection::ArrayProjectionOperation::RebuildArray,
+                source,
+            },
+        ),
+        CodecError::Invalid(detail) => {
+            ConnectorError::new(ConnectorErrorKind::InvalidRequest, detail)
+        }
+    }
+}
+
+impl RelayedCowSelectionCollector {
+    fn install_recipe(
+        &mut self,
+        output: &[novarocks_query_application::api::ResultField],
+    ) -> Result<(), ConnectorError> {
+        use novarocks_arrow_batch_codec::{
+            BatchRecipe, RecipeField, RepresentationPolicy, UnitObserver,
+        };
+        use novarocks_native_adapter::root_cow_selection_codec::CowSelectionRecipe;
+        let mut observer = CowRecipeObserver {
+            collector: &self.collector,
+            author: self.retention.as_ref(),
+            requested: 0,
+            receipts: Vec::new(),
+            receipt_backing: None,
+        };
+        observer.before_allocation(
+            std::alloc::Layout::array::<std::sync::Arc<arrow::datatypes::Field>>(output.len())
+                .map_err(|_| cast_footprint::exhausted())?,
+        )?;
+        let mut fields = Vec::with_capacity(output.len());
+        observer.before_allocation(
+            std::alloc::Layout::array::<novarocks_type_contract::FunctionValueType>(output.len())
+                .map_err(|_| cast_footprint::exhausted())?,
+        )?;
+        let mut declarations = Vec::with_capacity(output.len());
+        for field in output {
+            observer.checkpoint()?;
+            observer.before_allocation(
+                novarocks_type_contract::owned_resources::layout::arc_layout(
+                    std::alloc::Layout::new::<arrow::datatypes::Field>(),
+                )
+                .map_err(|_| cast_footprint::exhausted())?,
+            )?;
+            // Empty root names allocate nothing and are canonicalized to ordinal
+            // by BatchRecipe. Nested identities/NULL and logical types stay exact.
+            fields.push(Arc::new(arrow::datatypes::Field::new(
+                "",
+                field.data_type().clone(),
+                field.nullable(),
+            )));
+            declarations.push(field.value_type().clone());
+        }
+        observer.before_allocation(
+            std::alloc::Layout::array::<RecipeField<'_>>(output.len())
+                .map_err(|_| cast_footprint::exhausted())?,
+        )?;
+        let views = fields
+            .iter()
+            .zip(&declarations)
+            .map(|(field, value_type)| RecipeField {
+                field,
+                value_type,
+                representation: RepresentationPolicy::Exact,
+                nullability: novarocks_type_contract::CarrierNullabilityPolicy::Permissive,
+            })
+            .collect::<Vec<_>>();
+        let batch = BatchRecipe::try_new(&views, &mut observer).map_err(cow_recipe_failure)?;
+        drop(views);
+        drop(fields);
+        let recipe = CowSelectionRecipe::try_new(batch, declarations).map_err(cow_codec_error)?;
+        observer.before_allocation(
+            novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<CowSelectionRecipe>(),
+            )
+            .map_err(|_| cast_footprint::exhausted())?,
+        )?;
+        observer.before_allocation(
+            novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<(
+                    Vec<ConnectorPayloadRetentionGuard>,
+                    Option<ConnectorPayloadRetentionGuard>,
+                )>(),
+            )
+            .map_err(|_| cast_footprint::exhausted())?,
+        )?;
+        let recipe = recipe.with_metadata_retention(ConnectorPayloadRetentionGuard::new((
+            observer.receipts,
+            observer.receipt_backing,
+        )));
+        self.decoder = Some(CowSelectionStreamDecoder::new(Arc::new(recipe)));
+        Ok(())
     }
 }

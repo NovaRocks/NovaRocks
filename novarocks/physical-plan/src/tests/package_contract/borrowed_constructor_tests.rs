@@ -625,7 +625,11 @@ fn borrowed_result_package_counts_both_original_type_walks_in_existing_decode_sc
     assert_eq!(
         with_type.allocation_request_bytes_upper_bound
             - without_type.allocation_request_bytes_upper_bound,
-        Layout::new::<(&arrow_schema::DataType, usize)>().size()
+        Layout::new::<(
+            &arrow_schema::DataType,
+            novarocks_type_contract::ArrowTypeDepth
+        )>()
+        .size()
     );
     assert!(with_type.cumulative_work_upper_bound - without_type.cumulative_work_upper_bound >= 1);
     every_prefix(&input, Ok(()));
@@ -655,7 +659,11 @@ fn borrowed_package_resource_stage_visits_original_fragment_types_on_decode_scop
     // This actual Values fragment owns one ValueDef and one expression with
     // the same primitive type. Both original occurrences must be visited;
     // sharing that type cannot eliminate either carrier or logical law.
-    let tuple_bytes = Layout::new::<(&arrow_schema::DataType, usize)>().size();
+    let tuple_bytes = Layout::new::<(
+        &arrow_schema::DataType,
+        novarocks_type_contract::ArrowTypeDepth,
+    )>()
+    .size();
     assert_eq!(snapshots[0].allocation_requests_upper_bound, 1);
     assert_eq!(
         snapshots[0].allocation_request_bytes_upper_bound,

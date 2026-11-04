@@ -355,7 +355,7 @@ impl Chunk {
                 )));
             }
             if !execution_carrier_matches_layout_observed(
-                slot.typed_binding().data_type(),
+                slot.typed_binding().layout(),
                 column.data_type(),
                 &mut |units| observe(ArrayNormalizationStep::InspectConstructionWork { units }),
             )? {
@@ -369,7 +369,7 @@ impl Chunk {
             .map_err(ChunkObservationFailure::into_caller)?;
             if normalized.data_type() != slot.data_type()
                 || !execution_carrier_matches_layout_observed(
-                    slot.typed_binding().data_type(),
+                    slot.typed_binding().layout(),
                     normalized.data_type(),
                     &mut |units| observe(ArrayNormalizationStep::InspectConstructionWork { units }),
                 )?
@@ -378,12 +378,11 @@ impl Chunk {
                     ChunkViolation::ColumnBinding { column: index },
                 )));
             }
-            super::required_dictionary_nulls::validate_required_dictionary_children(
+            super::required_dictionary_nulls::validate_required_values(
                 &normalized,
                 slot.typed_binding(),
-                &mut |step| observe(step).map_err(ChunkObservationFailure::Caller),
-            )
-            .map_err(ChunkObservationFailure::into_caller)?;
+                &mut observe,
+            )?;
             *column = normalized;
         }
         let batch = build_record_batch(chunk_schema.arrow_schema_ref(), source.columns, row_count)
@@ -456,7 +455,7 @@ impl Chunk {
                 )));
             }
             if !execution_carrier_matches_layout_observed(
-                slot.typed_binding().data_type(),
+                slot.typed_binding().layout(),
                 field.data_type(),
                 &mut |units| observe(ArrayNormalizationStep::InspectConstructionWork { units }),
             )? {

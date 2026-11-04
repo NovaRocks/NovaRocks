@@ -340,11 +340,8 @@ fn shape_nodes<O: OwnedCopy>(root: &DataType, context: &mut O) -> Result<usize, 
         MAX_VALUE_TYPE_NODES, ValueTypeVisit, validate_arrow_layout_structure_with_scratch_observed,
     };
     context.work(context.add(
-        context.mul(
-            MAX_VALUE_TYPE_NODES,
-            size_of::<Option<(&DataType, usize)>>() + 128,
-        )?,
-        128,
+        novarocks_type_contract::owned_resources::type_validation::scratch_work_upper_bound(),
+        context.add(context.mul(MAX_VALUE_TYPE_NODES, 128)?, 128)?,
     )?)?;
     context.flush()?;
     let mut scratch = [None; MAX_VALUE_TYPE_NODES];

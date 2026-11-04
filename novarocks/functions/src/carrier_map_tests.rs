@@ -378,3 +378,41 @@ fn nullable_map_key_is_rejected_by_sdk_and_checked_typed_author() {
         .is_err()
     );
 }
+
+#[test]
+fn complete_map64_type_validation_uses_canonical_depth_and_original_control_owner() {
+    let mut data_type = DataType::Int32;
+    for _ in 1..64 {
+        data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Int32, false)),
+                        Arc::new(Field::new("value", data_type, false)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+    }
+    let ty = FunctionValueType::new(data_type, false);
+    let recording = TraceControl::new(None);
+    validate_type(&ty, &recording).unwrap();
+    let expected = recording.trace();
+    for at in 0..expected.len() {
+        for cause in CAUSES {
+            let control = TraceControl::new(Some((at, cause.clone())));
+            assert_eq!(validate_type(&ty, &control), Err(kernel_cause(cause)));
+            assert_eq!(control.trace(), expected[..=at]);
+        }
+    }
+    assert!(matches!(
+        novarocks_type_contract::validate_value_type_structure_observed::<
+            novarocks_type_contract::ValueTypeError,
+        >(ty.data_type(), |_| Ok(())),
+        Err(novarocks_type_contract::ValueTypeError::TooDeep)
+    ));
+}

@@ -280,7 +280,15 @@ impl TypeDecodeModel {
         model.requests = add(model.requests, 128)?;
         model.bytes = add(model.bytes, 512)?;
         model.work = add(model.work, add(4 * 512, 128 * 128)?)?;
-        model.work = add(model.work, add(mul(definitions, 256)?, mul(source, 16)?)?)?;
+        // Actual profile sparse lookups and Map edge-role verification are
+        // part of the existing topology pass, before any Arrow materialization.
+        model.work = add(
+            model.work,
+            add(
+                mul(definitions, add(512, mul(model.lookup, 16)?)?)?,
+                mul(source, 16)?,
+            )?,
+        )?;
         Ok(model)
     }
     /// Standalone source graphs own their two actual sparse DTO indexes.
@@ -457,7 +465,7 @@ impl TypeDecodeModel {
         // Even an erroneous zero summary cannot erase the initial singleton.
         // Actual Carrier summaries supplied by the original author are >=1.
         let requests = nodes.max(1);
-        let payload = array::<(&DataType, usize)>(mul(requests, 4)?)?;
+        let payload = array::<novarocks_type_contract::TypeTraversalFrame<'_>>(mul(requests, 4)?)?;
         self.request(payload, 1)?;
         let remaining = requests - 1;
         self.requests = add(self.requests, remaining)?;
@@ -862,12 +870,12 @@ mod tests {
         assert_eq!(
             singleton.allocation_request_bytes_upper_bound
                 - initial.allocation_request_bytes_upper_bound,
-            4 * size_of::<(&DataType, usize)>()
+            4 * size_of::<novarocks_type_contract::TypeTraversalFrame<'_>>()
         );
         assert_eq!(
             singleton.coexisting_source_and_request_bytes_upper_bound
                 - initial.coexisting_source_and_request_bytes_upper_bound,
-            4 * size_of::<(&DataType, usize)>()
+            4 * size_of::<novarocks_type_contract::TypeTraversalFrame<'_>>()
         );
         // Actual vec![root] initially requests one tuple. For 320 pending
         // children its later capacities 4..512 sum to 1020 tuples; the closed
@@ -881,7 +889,7 @@ mod tests {
         assert_eq!(
             wide.allocation_request_bytes_upper_bound
                 - singleton.allocation_request_bytes_upper_bound,
-            1284 * size_of::<(&DataType, usize)>()
+            1284 * size_of::<novarocks_type_contract::TypeTraversalFrame<'_>>()
         );
         // 1284 tuples cover the actual 1+4+8+16+32+64+128+256+512 = 1021.
         assert_eq!(wide.expanded_node_count, 0);

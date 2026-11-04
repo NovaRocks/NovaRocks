@@ -66,7 +66,67 @@ unsafe impl GlobalAlloc for Probe {
 #[global_allocator]
 static ALLOCATOR: Probe = Probe;
 
+mod support {
+    include!("common/cow_recipe.rs");
+}
+
 const UNLIMITED: usize = usize::MAX;
+
+#[test]
+fn record_above_256_mib_uses_the_prepaid_cursor_without_a_codec_size_quota() {
+    // Alias one real payload across independent columns. The serialized record
+    // exceeds 256 MiB while the source has only one MiB of physical backing.
+    let payload = "x".repeat(1024 * 1024);
+    let array: ArrayRef = Arc::new(StringArray::from(vec![payload.as_str()]));
+    let columns = 257;
+    let schema = Arc::new(Schema::new(
+        (0..columns)
+            .map(|index| Field::new(format!("value_{index}"), DataType::Utf8, false))
+            .collect::<Vec<_>>(),
+    ));
+    let source = RecordBatch::try_new(schema, vec![array; columns]).unwrap();
+    let recipe = support::recipe(source.schema_ref());
+    let source = support::normalized(&source, &recipe);
+    let scratch = CowSelectionEncoder::scratch_bytes(&source, &recipe).unwrap();
+    assert!(matches!(
+        CowSelectionEncoder::try_new(&source, &recipe, CowSelectionTotals::default(), scratch - 1),
+        Err(CowSelectionCodecError::ScratchLimit)
+    ));
+    let mut encoder =
+        CowSelectionEncoder::try_new(&source, &recipe, CowSelectionTotals::default(), scratch)
+            .unwrap();
+    let mut output = [0u8; COW_SELECTION_TURN_BYTES];
+    let mut emitted = 0u64;
+    let mut turns = 0;
+    let mut declared = None;
+    loop {
+        TRACK.with(|track| track.set(true));
+        ALLOCATIONS.with(|calls| calls.set(0));
+        let turn = encoder.step(&mut output);
+        TRACK.with(|track| track.set(false));
+        assert_eq!(ALLOCATIONS.with(Cell::get), 0);
+        if turns == 0 {
+            let header = CowSelectionRecordHeader::parse(&output[..turn.emitted_bytes]).unwrap();
+            // Each Utf8 column has one node, three buffer descriptors, no
+            // validity allocation, two i32 offsets and the one MiB payload.
+            let expected = COW_SELECTION_HEADER_BYTES as u64
+                + columns as u64 * (8 * 4 + 8 + payload.len() as u64);
+            assert_eq!(header.record_bytes(), expected);
+            assert!(header.record_bytes() > 256 * 1024 * 1024);
+            declared = Some(header.record_bytes());
+        }
+        emitted += turn.emitted_bytes as u64;
+        turns += 1;
+        assert!(turn.examined_bytes <= COW_SELECTION_TURN_BYTES);
+        assert!(turn.visited_cells <= COW_SELECTION_TURN_WORK);
+        if turn.status == RenderTurnStatus::InputComplete {
+            break;
+        }
+    }
+    assert!(turns > 4096);
+    assert_eq!(Some(emitted), declared);
+    assert_eq!(encoder.totals().rows(), 1);
+}
 
 /// Encode one input; every step is measured for allocation and bounds.
 fn encode(
@@ -74,7 +134,9 @@ fn encode(
     totals: CowSelectionTotals,
     output: usize,
 ) -> (Vec<u8>, CowSelectionTotals, u64) {
-    let mut encoder = CowSelectionEncoder::try_new(batch, totals, UNLIMITED).unwrap();
+    let recipe = support::recipe(batch.schema_ref());
+    let batch = support::normalized(batch, &recipe);
+    let mut encoder = CowSelectionEncoder::try_new(&batch, &recipe, totals, UNLIMITED).unwrap();
     let mut buffer = vec![0_u8; output];
     let (mut bytes, mut rows) = (Vec::new(), 0);
     loop {
@@ -103,18 +165,15 @@ fn split(mut bytes: &[u8]) -> Vec<(CowSelectionRecordHeader, &[u8])> {
     records
 }
 /// Decode a complete stream back to its batches.
-fn decode(bytes: &[u8]) -> (SchemaRef, Vec<RecordBatch>) {
-    let records = split(bytes);
-    assert_eq!(records[0].0.kind(), CowSelectionRecordKind::Schema);
-    let schema = CowSelectionDecoder::decode_schema(records[0].1).unwrap();
-    let batches = records[1..]
+fn decode(bytes: &[u8], recipe: &CowSelectionRecipe) -> (SchemaRef, Vec<RecordBatch>) {
+    let batches = split(bytes)
         .iter()
         .map(|(header, record)| {
             assert_eq!(header.kind(), CowSelectionRecordKind::Batch);
-            CowSelectionDecoder::decode_batch(&schema, record).unwrap()
+            CowSelectionDecoder::decode_batch(recipe, record).unwrap()
         })
         .collect();
-    (schema, batches)
+    (Arc::clone(recipe.schema()), batches)
 }
 
 fn wide_batch() -> RecordBatch {
@@ -279,9 +338,10 @@ fn every_supported_carrier_round_trips_exactly() {
     let (bytes, totals, rows) = encode(&batch, CowSelectionTotals::default(), 1 << 20);
     assert_eq!(rows, 11);
     assert_eq!((totals.batches(), totals.rows()), (1, 11));
-    let (schema, batches) = decode(&bytes);
-    assert_eq!(schema.fields(), batch.schema().fields());
-    assert_eq!(batches, [batch]);
+    let recipe = support::recipe(batch.schema_ref());
+    let (schema, batches) = decode(&bytes, &recipe);
+    assert_eq!(&schema, recipe.schema());
+    assert_eq!(batches, [support::normalized(&batch, &recipe)]);
 }
 
 #[test]
@@ -291,8 +351,13 @@ fn sliced_inputs_rebase_bitmaps_and_offsets() {
         let slice = batch.slice(offset, len);
         let (bytes, _, rows) = encode(&slice, CowSelectionTotals::default(), 1 << 20);
         assert_eq!(rows, len as u64);
-        let (_, batches) = decode(&bytes);
-        assert_eq!(batches, [slice], "slice {offset}+{len}");
+        let recipe = support::recipe(slice.schema_ref());
+        let (_, batches) = decode(&bytes, &recipe);
+        assert_eq!(
+            batches,
+            [support::normalized(&slice, &recipe)],
+            "slice {offset}+{len}"
+        );
     }
 }
 
@@ -312,18 +377,19 @@ fn tiny_outputs_produce_identical_bytes_and_large_values_split_turns() {
     let (whole, ..) = encode(&batch, CowSelectionTotals::default(), 4 << 20);
     let (tiny, ..) = encode(&batch, CowSelectionTotals::default(), 5);
     assert_eq!(whole, tiny);
-    assert_eq!(decode(&whole).1, [batch]);
+    let recipe = support::recipe(batch.schema_ref());
+    assert_eq!(
+        decode(&whole, &recipe).1,
+        [support::normalized(&batch, &recipe)]
+    );
 }
 
 #[test]
-fn schema_is_sent_once_and_empty_inputs_emit_no_batch() {
+fn installed_recipe_requires_no_schema_and_empty_inputs_emit_no_batch() {
     let batch = wide_batch();
     let empty = batch.slice(0, 0);
     let (first, totals, _) = encode(&empty, CowSelectionTotals::default(), 1 << 20);
-    let records = split(&first);
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].0.kind(), CowSelectionRecordKind::Schema);
-    assert!(totals.schema_sent());
+    assert!(first.is_empty());
     assert_eq!(totals.batches(), 0);
     let (second, totals, _) = encode(&batch, totals, 1 << 20);
     let records = split(&second);
@@ -334,13 +400,19 @@ fn schema_is_sent_once_and_empty_inputs_emit_no_batch() {
     assert_eq!(totals.batches(), 1);
     let mut stream = first;
     stream.extend_from_slice(&second);
-    assert_eq!(decode(&stream).1, [batch]);
+    let recipe = support::recipe(batch.schema_ref());
+    assert_eq!(
+        decode(&stream, &recipe).1,
+        [support::normalized(&batch, &recipe)]
+    );
 }
 
 #[test]
 fn schema_change_map_batch_count_and_scratch_are_refused_at_construction() {
     let batch = wide_batch();
     let (_, totals, _) = encode(&batch, CowSelectionTotals::default(), 1 << 20);
+    let recipe = support::recipe(batch.schema_ref());
+    let batch = support::normalized(&batch, &recipe);
     let other = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
             "_file",
@@ -351,7 +423,7 @@ fn schema_change_map_batch_count_and_scratch_are_refused_at_construction() {
     )
     .unwrap();
     assert!(matches!(
-        CowSelectionEncoder::try_new(&other, totals.clone(), UNLIMITED),
+        CowSelectionEncoder::try_new(&other, &recipe, totals.clone(), UNLIMITED),
         Err(CowSelectionCodecError::SchemaChanged)
     ));
     let entries = Arc::new(Field::new(
@@ -389,16 +461,18 @@ fn schema_change_map_batch_count_and_scratch_are_refused_at_construction() {
     )
     .unwrap();
     assert!(matches!(
-        CowSelectionEncoder::try_new(&with_map, CowSelectionTotals::default(), UNLIMITED),
+        CowSelectionRecipe::validate_supported(with_map.schema_ref()),
         Err(CowSelectionCodecError::UnsupportedType)
     ));
-    let needed =
-        CowSelectionEncoder::scratch_bytes(&batch, &CowSelectionTotals::default()).unwrap();
+    let needed = CowSelectionEncoder::scratch_bytes(&batch, &recipe).unwrap();
     assert!(matches!(
-        CowSelectionEncoder::try_new(&batch, CowSelectionTotals::default(), needed - 1),
+        CowSelectionEncoder::try_new(&batch, &recipe, CowSelectionTotals::default(), needed - 1),
         Err(CowSelectionCodecError::ScratchLimit)
     ));
-    assert!(CowSelectionEncoder::try_new(&batch, CowSelectionTotals::default(), needed).is_ok());
+    assert!(
+        CowSelectionEncoder::try_new(&batch, &recipe, CowSelectionTotals::default(), needed)
+            .is_ok()
+    );
     let mut totals = totals;
     let one = batch.slice(0, 1);
     for _ in 1..MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES {
@@ -409,11 +483,11 @@ fn schema_change_map_batch_count_and_scratch_are_refused_at_construction() {
         MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES
     );
     assert!(matches!(
-        CowSelectionEncoder::try_new(&one, totals.clone(), UNLIMITED),
+        CowSelectionEncoder::try_new(&one, &recipe, totals.clone(), UNLIMITED),
         Err(CowSelectionCodecError::BatchLimit)
     ));
     // An empty input still passes once the batch count is reached.
-    assert!(CowSelectionEncoder::try_new(&batch.slice(0, 0), totals, UNLIMITED).is_ok());
+    assert!(CowSelectionEncoder::try_new(&batch.slice(0, 0), &recipe, totals, UNLIMITED).is_ok());
 }
 
 #[test]
@@ -421,8 +495,8 @@ fn forged_headers_and_payloads_are_refused() {
     let batch = wide_batch();
     let (bytes, ..) = encode(&batch, CowSelectionTotals::default(), 1 << 20);
     let records = split(&bytes);
-    let (schema_record, batch_record) = (records[0].1.to_vec(), records[1].1.to_vec());
-    let schema = CowSelectionDecoder::decode_schema(&schema_record).unwrap();
+    let batch_record = records[0].1.to_vec();
+    let recipe = support::recipe(batch.schema_ref());
     let forged = |record: &[u8], at: usize, value: u8| {
         let mut copy = record.to_vec();
         copy[at] = value;
@@ -441,7 +515,7 @@ fn forged_headers_and_payloads_are_refused() {
         Err(CowSelectionCodecError::TruncatedHeader)
     );
     assert_eq!(
-        CowSelectionDecoder::decode_batch(&schema, &batch_record[..batch_record.len() - 1]),
+        CowSelectionDecoder::decode_batch(&recipe, &batch_record[..batch_record.len() - 1]),
         Err(CowSelectionCodecError::TruncatedRecord)
     );
     // A batch record decoded under a different schema is refused.
@@ -450,16 +524,18 @@ fn forged_headers_and_payloads_are_refused() {
         DataType::Utf8,
         false,
     )]));
+    let narrow = support::recipe(&narrow);
     assert_eq!(
         CowSelectionDecoder::decode_batch(&narrow, &batch_record),
-        Err(CowSelectionCodecError::MalformedBatch)
+        Err(CowSelectionCodecError::RecipeMismatch)
     );
-    assert!(CowSelectionDecoder::decode_batch(&schema, &batch_record).is_ok());
-    // A schema record that claims an unknown tag.
-    let unknown = forged(&schema_record, COW_SELECTION_HEADER_BYTES, 200);
+    assert!(CowSelectionDecoder::decode_batch(&recipe, &batch_record).is_ok());
+    // Legacy Schema records are not a decoding fallback.
+    let mut legacy = batch_record.clone();
+    legacy[4] = 1;
     assert_eq!(
-        CowSelectionDecoder::decode_schema(&unknown),
-        Err(CowSelectionCodecError::MalformedSchema)
+        CowSelectionRecordHeader::parse(&legacy),
+        Err(CowSelectionCodecError::HeaderVersion)
     );
 }
 
@@ -473,40 +549,53 @@ fn rebased_string_offsets_past_their_data_are_refused() {
     .unwrap();
     let (bytes, ..) = encode(&batch, CowSelectionTotals::default(), 1 << 20);
     let records = split(&bytes);
-    let decoded_schema = CowSelectionDecoder::decode_schema(records[0].1).unwrap();
-    let mut record = records[1].1.to_vec();
+    let recipe = support::recipe(batch.schema_ref());
+    let mut record = records[0].1.to_vec();
     // Directory: one node length, three buffer sizes; then validity (0
     // bytes), offsets (12 bytes), data (3 bytes). Corrupt the last offset.
     let offsets = COW_SELECTION_HEADER_BYTES + 8 * 4;
     record[offsets + 8] = 9;
     assert_eq!(
-        CowSelectionDecoder::decode_batch(&decoded_schema, &record),
+        CowSelectionDecoder::decode_batch(&recipe, &record),
         Err(CowSelectionCodecError::MalformedBatch)
     );
 }
 
 #[test]
-fn stream_decoder_requires_one_schema_first_and_returns_every_batch() {
+fn stream_decoder_uses_installed_recipe_for_every_independent_batch() {
     let batch = wide_batch();
     let (first, totals, _) = encode(&batch.slice(0, 4), CowSelectionTotals::default(), 1 << 20);
     let (second, _, _) = encode(&batch.slice(4, 7), totals, 1 << 20);
     let mut stream = first.clone();
     stream.extend_from_slice(&second);
-    let mut decoder = CowSelectionStreamDecoder::new();
+    let recipe = support::recipe(batch.schema_ref());
+    let mut decoder = CowSelectionStreamDecoder::new(Arc::clone(&recipe));
     let mut batches = Vec::new();
     for (_, record) in split(&stream) {
         batches.extend(decoder.apply_record(record).unwrap());
     }
     let schema = decoder.finish();
-    assert_eq!(schema.unwrap().fields(), batch.schema().fields());
-    assert_eq!(batches, vec![batch.slice(0, 4), batch.slice(4, 7)]);
-    // A batch before the schema, or a second schema, is refused.
+    assert_eq!(&schema, recipe.schema());
+    assert_eq!(
+        batches,
+        vec![
+            support::normalized(&batch.slice(0, 4), &recipe),
+            support::normalized(&batch.slice(4, 7), &recipe)
+        ]
+    );
+    // A complete first record is independently decodable; no prior data may
+    // establish or change its declaration.
     let records = split(&stream);
-    let mut early = CowSelectionStreamDecoder::new();
-    assert!(early.apply_record(records[1].1).is_err());
-    let mut twice = CowSelectionStreamDecoder::new();
-    twice.apply_record(records[0].1).unwrap();
-    assert!(twice.apply_record(records[0].1).is_err());
-    // An empty selection has no schema.
-    assert!(CowSelectionStreamDecoder::new().finish().is_none());
+    let mut first = CowSelectionStreamDecoder::new(Arc::clone(&recipe));
+    assert!(first.apply_record(records[0].1).unwrap().is_some());
+    let mut wrong = records[0].1.to_vec();
+    wrong[32] ^= 1;
+    assert!(matches!(
+        first.apply_record(&wrong),
+        Err(CowSelectionCodecError::RecipeMismatch)
+    ));
+    assert_eq!(
+        CowSelectionStreamDecoder::new(Arc::clone(&recipe)).finish(),
+        *recipe.schema()
+    );
 }

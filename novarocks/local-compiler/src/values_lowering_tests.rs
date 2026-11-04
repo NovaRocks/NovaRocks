@@ -893,3 +893,37 @@ fn actual_empty_values_keep_nested_nominal_binding_after_source_and_program_drop
     drop(binding);
     assert_eq!(released.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn values_empty_map64_backing_keeps_complete_type_without_constant_pool_admission() {
+    let mut data_type = DataType::Int64;
+    for _ in 1..64 {
+        data_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Int32, false)),
+                        Arc::new(Field::new("value", data_type, false)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+    }
+    let ty = FunctionValueType::new(data_type, false);
+    let package = build_typed(&[], &[], std::slice::from_ref(&ty), false);
+    assert!(package.constants().entries().is_empty());
+    let program = compile(package, &Control::good()).unwrap();
+    assert_eq!(batch(&program).num_rows(), 0);
+    assert_eq!(batch(&program).num_columns(), 1);
+    assert_eq!(batch(&program).column(0).data_type(), ty.data_type());
+    assert_eq!(
+        program.graph().nodes()[0]
+            .output_layout()
+            .value_binding_at(0),
+        Some(ty.typed_binding())
+    );
+}

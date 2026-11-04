@@ -1006,6 +1006,16 @@ mod tests {
         Vec<novarocks_physical_plan::FragmentId>,
         std::collections::BTreeMap<novarocks_physical_plan::FragmentId, Vec<u8>>,
     ) {
+        frozen_packages_with_request(sql, request_for(sql))
+    }
+
+    fn frozen_packages_with_request(
+        sql: &str,
+        request: SqlFinalPlanCompileRequest,
+    ) -> (
+        Vec<novarocks_physical_plan::FragmentId>,
+        std::collections::BTreeMap<novarocks_physical_plan::FragmentId, Vec<u8>>,
+    ) {
         use novarocks_plan_codec::physical_package_v2::test_support::encode_limits;
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1016,7 +1026,7 @@ mod tests {
         let completed = runtime
             .block_on(
                 FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-                    .complete_for_test(request_for(sql), &scope),
+                    .complete_for_test(request, &scope),
             )
             .unwrap_or_else(|error| panic!("{sql}: completes without facts: {error}"));
         let control = SqlCompileControl::unbounded();
@@ -1038,6 +1048,125 @@ mod tests {
             .copied()
             .collect();
         (fragments, packages)
+    }
+
+    /// Independent frozen peers must agree on the complete value declaration,
+    /// including required COUNT state roots. Local slot IDs and labels differ.
+    #[test]
+    fn count_shuffle_frozen_peers_share_exact_partial_state_declarations() {
+        use novarocks_physical_plan::{AggregatePhase, Distribution, ExprKind, NodeKind};
+        use novarocks_plan_codec::physical_package_v2::decode_fragment_package;
+        use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
+        use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
+
+        let sql = "SELECT COUNT(*) AS row_count \
+            FROM (VALUES (7), (19)) AS l(id) \
+            JOIN [shuffle] (VALUES (7), (19)) AS r(id) ON l.id = r.id";
+        let request = request_with_settings(
+            sql,
+            crate::query_execution::constant_eval::constant_evaluator(),
+            SessionOptimizerSettings {
+                cbo_broadcast_node_mem_budget_bytes: Some(0.0),
+                ..SessionOptimizerSettings::default()
+            },
+        );
+        let (_, packages) = frozen_packages_with_request(sql, request);
+        let control = SqlCompileControl::unbounded();
+        let model = FragmentDecodeResourceModel::try_new(&control).unwrap();
+        let decoded = packages
+            .iter()
+            .map(|(id, bytes)| {
+                let package = decode_fragment_package(bytes, &model, &decode_limits(), &control)
+                    .unwrap_or_else(|error| panic!("fragment {id:?} receives: {error}"));
+                (*id, package)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut hash_edges = 0;
+        let mut partial_count_gathers = 0;
+        for (source_id, source) in &decoded {
+            for outbound in &source.cuts().outbound {
+                let receiver = decoded
+                    .get(&outbound.destination_fragment)
+                    .expect("every frozen edge has its peer package");
+                let inbound = receiver
+                    .cuts()
+                    .inbound
+                    .iter()
+                    .find(|cut| cut.edge == outbound.edge)
+                    .expect("peer has the same exact edge");
+                assert_eq!(inbound.source_fragment, *source_id);
+                assert_eq!(inbound.destination_node, outbound.destination_node);
+                assert_eq!(outbound.projection.len(), inbound.imports.len());
+                assert_eq!(outbound.destination_imports, inbound.imports);
+                if matches!(outbound.partitioning.source, Distribution::Hash { .. }) {
+                    hash_edges += 1;
+                }
+                for (ordinal, (projected, imported)) in outbound
+                    .projection
+                    .iter()
+                    .zip(inbound.imports.iter())
+                    .enumerate()
+                {
+                    assert_eq!(projected.value, imported.source.value);
+                    let sent = &source.fragment().values()[&projected.value].ty;
+                    let received = &receiver.fragment().values()[&imported.destination].ty;
+                    for (role, peer) in [
+                        ("outbound cut", &projected.ty),
+                        ("inbound source", &imported.source.ty),
+                        ("receiver output", received),
+                    ] {
+                        assert!(
+                            sent.exactly_equals_observed::<novarocks_type_contract::ValueTypeError>(
+                                peer, || Ok(())
+                            ).unwrap(),
+                            "edge {:?} ordinal {ordinal} {role} differs: sender={sent:?}, peer={peer:?}",
+                            outbound.edge,
+                        );
+                    }
+                    for node in source.fragment().nodes().values() {
+                        let NodeKind::Aggregate { calls, .. } = &node.kind else {
+                            continue;
+                        };
+                        for partial in calls.iter().filter(|call| {
+                            call.output == projected.value
+                                && call.binding.function.function_id.as_str()
+                                    == "builtin.aggregate/count/v1"
+                                && matches!(call.binding.phase, AggregatePhase::Partial { .. })
+                        }) {
+                            assert!(!sent.nullable(), "COUNT partial state stays required");
+                            assert!(matches!(
+                                outbound.partitioning.source,
+                                Distribution::Singleton
+                            ));
+                            assert!(matches!(
+                                outbound.partitioning.destination,
+                                Distribution::Singleton
+                            ));
+                            let final_count = receiver.fragment().nodes().values().any(|node| {
+                                let NodeKind::Aggregate { calls, .. } = &node.kind else { return false };
+                                calls.iter().any(|call| {
+                                    call.binding.function.function_id == partial.binding.function.function_id
+                                        && matches!(call.binding.phase, AggregatePhase::Final { .. })
+                                        && call.binding.phase.sequence() == partial.binding.phase.sequence()
+                                        && call.arguments.len() == 1
+                                        && matches!(receiver.fragment().expressions().get(call.arguments[0]).map(|expr| &expr.kind), Some(ExprKind::Value(value)) if *value == imported.destination)
+                                })
+                            });
+                            assert!(
+                                final_count,
+                                "the gathered original COUNT state feeds its final phase"
+                            );
+                            partial_count_gathers += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(hash_edges > 0, "the forced shuffle must survive planning");
+        assert!(
+            partial_count_gathers > 0,
+            "the original partial COUNT -> gather -> final path must survive planning"
+        );
     }
 
     /// The production FE completion and freeze authors must retain the hidden
@@ -2754,6 +2883,14 @@ mod tests {
         sql: &str,
         constant_evaluator: &'static dyn novarocks_sql::compiler::SqlConstantEvaluator,
     ) -> SqlFinalPlanCompileRequest {
+        request_with_settings(sql, constant_evaluator, SessionOptimizerSettings::default())
+    }
+
+    fn request_with_settings(
+        sql: &str,
+        constant_evaluator: &'static dyn novarocks_sql::compiler::SqlConstantEvaluator,
+        optimizer_settings: SessionOptimizerSettings,
+    ) -> SqlFinalPlanCompileRequest {
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([9; 16]).expect("plan version"),
             SqlStatementInput::sql(sql),
@@ -2762,7 +2899,7 @@ mod tests {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
                 current_catalog: Some("iceberg".to_string()),
                 current_database: "db".to_string(),
-                optimizer_settings: SessionOptimizerSettings::default(),
+                optimizer_settings,
             },
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),

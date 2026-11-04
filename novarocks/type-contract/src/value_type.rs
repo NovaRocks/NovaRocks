@@ -859,7 +859,7 @@ impl ValueTypeRef {
             nullable,
             logical,
             storage,
-            1,
+            crate::ArrowTypeDepth::ROOT,
             &mut 0,
             &mut crate::value_construction::ValueConstruction::new(observer),
         )
@@ -871,7 +871,7 @@ fn from_declared_arrow<E>(
     nullable: bool,
     logical: ValueLogicalType,
     storage: ValueTypeStorageLifetime,
-    depth: usize,
+    depth: crate::ArrowTypeDepth,
     visited: &mut usize,
     construction: &mut crate::value_construction::ValueConstruction<'_, E>,
 ) -> Result<ValueTypeRef, crate::ValueConstructionFailure<E>> {
@@ -886,16 +886,18 @@ fn from_declared_arrow<E>(
         || Ok(()),
     )
     .map_err(|_| ExecutionValueTypeError::Invalid("invalid declared value carrier parameters"))?;
-    if depth > MAX_VALUE_TYPE_DEPTH {
-        return Err(ExecutionValueTypeError::Depth.into());
-    }
+    depth
+        .check(crate::ArrowTypeProfile::Value)
+        .map_err(|_| ExecutionValueTypeError::Depth)?;
     if let DataType::Dictionary(_, values) = ty {
         return from_declared_arrow(
             values,
             nullable,
             logical,
             storage,
-            depth,
+            depth
+                .encoding_child()
+                .map_err(ExecutionValueTypeError::from)?,
             visited,
             construction,
         );
@@ -921,7 +923,9 @@ fn from_declared_arrow<E>(
             nullable,
             logical,
             storage,
-            depth,
+            depth
+                .encoding_child()
+                .map_err(ExecutionValueTypeError::from)?,
             visited,
             construction,
         );
@@ -944,12 +948,18 @@ fn from_declared_arrow<E>(
         | DataType::LargeListView(item) => ValueKind::List(from_external_child(
             item,
             storage.clone(),
-            depth + 1,
+            depth.value_child().map_err(ExecutionValueTypeError::from)?,
             visited,
             construction,
         )?),
         DataType::FixedSizeList(item, length) => ValueKind::FixedSizeList {
-            item: from_external_child(item, storage.clone(), depth + 1, visited, construction)?,
+            item: from_external_child(
+                item,
+                storage.clone(),
+                depth.value_child().map_err(ExecutionValueTypeError::from)?,
+                visited,
+                construction,
+            )?,
             length: *length,
         },
         DataType::Struct(fields) => {
@@ -961,7 +971,7 @@ fn from_declared_arrow<E>(
                         let child = from_external_child(
                             field,
                             storage.clone(),
-                            depth + 1,
+                            depth.value_child().map_err(ExecutionValueTypeError::from)?,
                             visited,
                             construction,
                         )?;
@@ -996,14 +1006,20 @@ fn from_declared_arrow<E>(
                 key: from_external_child(
                     &fields[0],
                     storage.clone(),
-                    depth + 1,
+                    depth
+                        .map_entries()
+                        .and_then(crate::ArrowTypeDepth::value_child)
+                        .map_err(ExecutionValueTypeError::from)?,
                     visited,
                     construction,
                 )?,
                 value: from_external_child(
                     &fields[1],
                     storage.clone(),
-                    depth + 1,
+                    depth
+                        .map_entries()
+                        .and_then(crate::ArrowTypeDepth::value_child)
+                        .map_err(ExecutionValueTypeError::from)?,
                     visited,
                     construction,
                 )?,
@@ -1018,7 +1034,7 @@ fn from_declared_arrow<E>(
                         let child = from_external_child(
                             field,
                             storage.clone(),
-                            depth + 1,
+                            depth.value_child().map_err(ExecutionValueTypeError::from)?,
                             visited,
                             construction,
                         )?;
@@ -1043,7 +1059,7 @@ fn from_declared_arrow<E>(
 fn from_external_child<E>(
     field: &Field,
     storage: ValueTypeStorageLifetime,
-    depth: usize,
+    depth: crate::ArrowTypeDepth,
     visited: &mut usize,
     construction: &mut crate::value_construction::ValueConstruction<'_, E>,
 ) -> Result<ValueTypeRef, crate::ValueConstructionFailure<E>> {

@@ -359,6 +359,17 @@ impl<'source> PreparedPackageTypeGraph<'source> {
     pub(super) fn roots(&self) -> &PackageTypeRootSources<'source> {
         &self.roots
     }
+    pub(super) fn depth_profile(
+        &self,
+        node: Node,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<novarocks_type_contract::ArrowTypeProfile>, TypeCodecError> {
+        work.flush()?;
+        let profile = self.domains.depth_profile(&self.index, node);
+        work.step()?;
+        work.flush()?;
+        profile
+    }
     pub(super) fn domain(
         &self,
         node: Node,

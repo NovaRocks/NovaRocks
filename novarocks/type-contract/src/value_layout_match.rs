@@ -17,8 +17,18 @@
 
 //! Borrowed comparison of an immutable plain layout and its actual encoding.
 
-use crate::{CarrierParameterError, ValueLayout, ValueTypeError};
+use crate::{ArrowTypeDepth, ArrowTypeProfile, CarrierParameterError, ValueLayout, ValueTypeError};
 use arrow_schema::{DataType, Field};
+
+/// The physical NULL declaration selected by a prepared carrier recipe.
+/// Logical requiredness remains with the complete value declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CarrierNullabilityPolicy {
+    Exact,
+    /// Physical nullable fields may carry required logical values. This never
+    /// relaxes Map entries/key constraints or logical value validation.
+    Permissive,
+}
 
 /// Compare actual value shape to a checked, normalized immutable layout.
 ///
@@ -31,7 +41,47 @@ pub fn value_layout_matches_carrier_observed<E: From<ValueTypeError>>(
     actual: &DataType,
     observe: impl FnMut(usize) -> Result<(), E>,
 ) -> Result<bool, E> {
-    data_type_layout_matches_carrier_observed(expected.data_type(), actual, observe)
+    value_layout_matches_carrier_with_nullability_observed(
+        expected,
+        actual,
+        CarrierNullabilityPolicy::Exact,
+        observe,
+    )
+}
+
+/// Compare an explicitly selected physical representation to its complete
+/// normalized layout using the same structural and parameter walker.
+pub fn value_layout_matches_carrier_with_nullability_observed<E: From<ValueTypeError>>(
+    expected: &ValueLayout,
+    actual: &DataType,
+    nullability: CarrierNullabilityPolicy,
+    observe: impl FnMut(usize) -> Result<(), E>,
+) -> Result<bool, E> {
+    value_layout_matches_carrier_with_profile_observed(
+        expected,
+        actual,
+        nullability,
+        ArrowTypeProfile::Value,
+        observe,
+    )
+}
+
+/// An owner with an explicit physical policy can keep it while borrowing the
+/// same comparison body. Selecting a profile does not add encoding support.
+pub fn value_layout_matches_carrier_with_profile_observed<E: From<ValueTypeError>>(
+    expected: &ValueLayout,
+    actual: &DataType,
+    nullability: CarrierNullabilityPolicy,
+    profile: ArrowTypeProfile,
+    mut observe: impl FnMut(usize) -> Result<(), E>,
+) -> Result<bool, E> {
+    Walk {
+        observe: &mut observe,
+        nodes: 0,
+        nullability,
+        profile,
+    }
+    .ty(expected.data_type(), actual, ArrowTypeDepth::ROOT)
 }
 
 /// Compare to an already borrowed normalized plain value layout.
@@ -44,13 +94,29 @@ pub fn value_layout_matches_carrier_observed<E: From<ValueTypeError>>(
 pub fn data_type_layout_matches_carrier_observed<E: From<ValueTypeError>>(
     expected: &DataType,
     actual: &DataType,
+    observe: impl FnMut(usize) -> Result<(), E>,
+) -> Result<bool, E> {
+    data_type_layout_matches_carrier_with_profile_observed(
+        expected,
+        actual,
+        ArrowTypeProfile::Value,
+        observe,
+    )
+}
+
+pub fn data_type_layout_matches_carrier_with_profile_observed<E: From<ValueTypeError>>(
+    expected: &DataType,
+    actual: &DataType,
+    profile: ArrowTypeProfile,
     mut observe: impl FnMut(usize) -> Result<(), E>,
 ) -> Result<bool, E> {
     Walk {
         observe: &mut observe,
         nodes: 0,
+        nullability: CarrierNullabilityPolicy::Exact,
+        profile,
     }
-    .ty(expected, actual, 1)
+    .ty(expected, actual, ArrowTypeDepth::ROOT)
 }
 
 // Design: ADR-0195 (docs/adr/ADR-0195-public-value-access-and-construction.md)
@@ -77,13 +143,13 @@ impl<E> From<CarrierParameterError> for ParameterFailure<E> {
 struct Walk<'a, F> {
     observe: &'a mut F,
     nodes: usize,
+    nullability: CarrierNullabilityPolicy,
+    profile: ArrowTypeProfile,
 }
 impl<E: From<ValueTypeError>, F: FnMut(usize) -> Result<(), E>> Walk<'_, F> {
-    fn node(&mut self, actual: &DataType, depth: usize) -> Result<(), E> {
+    fn node(&mut self, actual: &DataType, depth: ArrowTypeDepth) -> Result<(), E> {
         (self.observe)(1)?;
-        if depth > crate::MAX_VALUE_TYPE_DEPTH {
-            return Err(ValueTypeError::TooDeep.into());
-        }
+        depth.check(self.profile)?;
         self.nodes = self
             .nodes
             .checked_add(1)
@@ -124,10 +190,12 @@ impl<E: From<ValueTypeError>, F: FnMut(usize) -> Result<(), E>> Walk<'_, F> {
         expected: &Field,
         actual: &Field,
         named: bool,
-        depth: usize,
+        depth: ArrowTypeDepth,
     ) -> Result<bool, E> {
         (self.observe)(1)?;
-        if expected.is_nullable() != actual.is_nullable() {
+        if expected.is_nullable() != actual.is_nullable()
+            && !(self.nullability == CarrierNullabilityPolicy::Permissive && actual.is_nullable())
+        {
             return Ok(false);
         }
         if named && !self.bytes(expected.name().as_bytes(), actual.name().as_bytes())? {
@@ -136,23 +204,28 @@ impl<E: From<ValueTypeError>, F: FnMut(usize) -> Result<(), E>> Walk<'_, F> {
         self.ty(expected.data_type(), actual.data_type(), depth)
     }
 
-    fn ty(&mut self, expected: &DataType, actual: &DataType, depth: usize) -> Result<bool, E> {
+    fn ty(
+        &mut self,
+        expected: &DataType,
+        actual: &DataType,
+        depth: ArrowTypeDepth,
+    ) -> Result<bool, E> {
         self.node(actual, depth)?;
         match actual {
             DataType::Dictionary(keys, values) => {
-                self.node(keys, depth + 1)?;
+                self.node(keys, depth.encoding_child()?)?;
                 let dictionary_layout = dictionary_value_layout(expected);
                 return self.ty(
                     dictionary_layout.as_ref().unwrap_or(expected),
                     values,
-                    depth + 1,
+                    depth.encoding_child()?,
                 );
             }
             DataType::RunEndEncoded(ends, values) => {
                 (self.observe)(1)?;
-                self.node(ends.data_type(), depth + 1)?;
+                self.node(ends.data_type(), depth.encoding_child()?)?;
                 (self.observe)(1)?;
-                return self.ty(expected, values.data_type(), depth + 1);
+                return self.ty(expected, values.data_type(), depth.encoding_child()?);
             }
             _ => {}
         }
@@ -161,11 +234,11 @@ impl<E: From<ValueTypeError>, F: FnMut(usize) -> Result<(), E>> Walk<'_, F> {
             | (DataType::LargeList(expected), DataType::LargeList(actual))
             | (DataType::ListView(expected), DataType::ListView(actual))
             | (DataType::LargeListView(expected), DataType::LargeListView(actual)) => {
-                self.field(expected, actual, false, depth + 1)?
+                self.field(expected, actual, false, depth.value_child()?)?
             }
             (DataType::FixedSizeList(expected, el), DataType::FixedSizeList(actual, al)) => {
                 (self.observe)(1)?;
-                el == al && self.field(expected, actual, false, depth + 1)?
+                el == al && self.field(expected, actual, false, depth.value_child()?)?
             }
             (DataType::Struct(expected), DataType::Struct(actual)) => {
                 (self.observe)(1)?;
@@ -173,7 +246,7 @@ impl<E: From<ValueTypeError>, F: FnMut(usize) -> Result<(), E>> Walk<'_, F> {
                     return Ok(false);
                 }
                 for (expected, actual) in expected.iter().zip(actual) {
-                    if !self.field(expected, actual, true, depth + 1)? {
+                    if !self.field(expected, actual, true, depth.value_child()?)? {
                         return Ok(false);
                     }
                 }
@@ -184,7 +257,7 @@ impl<E: From<ValueTypeError>, F: FnMut(usize) -> Result<(), E>> Walk<'_, F> {
                 if eo != ao || expected.is_nullable() != actual.is_nullable() {
                     return Ok(false);
                 }
-                self.node(actual.data_type(), depth + 1)?;
+                self.node(actual.data_type(), depth.map_entries()?)?;
                 let (DataType::Struct(expected), DataType::Struct(actual)) =
                     (expected.data_type(), actual.data_type())
                 else {
@@ -196,8 +269,22 @@ impl<E: From<ValueTypeError>, F: FnMut(usize) -> Result<(), E>> Walk<'_, F> {
                 if expected.len() != 2 || actual.len() != 2 {
                     return Ok(false);
                 }
-                self.field(&expected[0], &actual[0], false, depth + 2)?
-                    && self.field(&expected[1], &actual[1], false, depth + 2)?
+                if self.nullability == CarrierNullabilityPolicy::Permissive
+                    && actual[0].is_nullable()
+                {
+                    return Ok(false);
+                }
+                self.field(
+                    &expected[0],
+                    &actual[0],
+                    false,
+                    depth.map_entries()?.value_child()?,
+                )? && self.field(
+                    &expected[1],
+                    &actual[1],
+                    false,
+                    depth.map_entries()?.value_child()?,
+                )?
             }
             (DataType::Union(expected, em), DataType::Union(actual, am)) => {
                 (self.observe)(1)?;
@@ -206,7 +293,7 @@ impl<E: From<ValueTypeError>, F: FnMut(usize) -> Result<(), E>> Walk<'_, F> {
                 }
                 for ((ei, expected), (ai, actual)) in expected.iter().zip(actual.iter()) {
                     (self.observe)(1)?;
-                    if ei != ai || !self.field(expected, actual, true, depth + 1)? {
+                    if ei != ai || !self.field(expected, actual, true, depth.value_child()?)? {
                         return Ok(false);
                     }
                 }
@@ -242,6 +329,121 @@ mod tests {
     use crate::ValueTypeStorageLifetime;
     use arrow_schema::{Field, TimeUnit, UnionFields, UnionMode};
     use std::sync::Arc;
+    #[test]
+    fn permissive_carrier_widens_null_declarations_without_changing_values() {
+        let required = DataType::Struct(
+            vec![Arc::new(Field::new(
+                "v",
+                DataType::Decimal128(20, 4),
+                false,
+            ))]
+            .into(),
+        );
+        let physical = DataType::Struct(
+            vec![Arc::new(Field::new("v", DataType::Decimal128(20, 4), true))].into(),
+        );
+        let layout = ValueLayout::try_new(&required, ValueTypeStorageLifetime::pure()).unwrap();
+        assert!(
+            !value_layout_matches_carrier_observed::<ValueTypeError>(
+                &layout,
+                &physical,
+                |_| Ok(())
+            )
+            .unwrap()
+        );
+        assert!(
+            value_layout_matches_carrier_with_nullability_observed::<ValueTypeError>(
+                &layout,
+                &physical,
+                CarrierNullabilityPolicy::Permissive,
+                |_| Ok(())
+            )
+            .unwrap()
+        );
+        for wrong in [
+            DataType::Struct(
+                vec![Arc::new(Field::new(
+                    "other",
+                    DataType::Decimal128(20, 4),
+                    true,
+                ))]
+                .into(),
+            ),
+            DataType::Struct(
+                vec![Arc::new(Field::new("v", DataType::Decimal128(20, 3), true))].into(),
+            ),
+        ] {
+            assert!(
+                !value_layout_matches_carrier_with_nullability_observed::<ValueTypeError>(
+                    &layout,
+                    &wrong,
+                    CarrierNullabilityPolicy::Permissive,
+                    |_| Ok(())
+                )
+                .unwrap()
+            );
+        }
+        let optional = ValueLayout::try_new(&physical, ValueTypeStorageLifetime::pure()).unwrap();
+        assert!(
+            !value_layout_matches_carrier_with_nullability_observed::<ValueTypeError>(
+                &optional,
+                &required,
+                CarrierNullabilityPolicy::Permissive,
+                |_| Ok(())
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn permissive_carrier_keeps_map_key_and_entry_declarations_required() {
+        let map = |key_nullable, value_nullable, entries_nullable| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", DataType::Int32, key_nullable)),
+                            Arc::new(Field::new("value", DataType::Utf8, value_nullable)),
+                        ]
+                        .into(),
+                    ),
+                    entries_nullable,
+                )),
+                false,
+            )
+        };
+        let expected = map(false, false, false);
+        let layout = ValueLayout::try_new(&expected, ValueTypeStorageLifetime::pure()).unwrap();
+        assert!(
+            value_layout_matches_carrier_with_nullability_observed::<ValueTypeError>(
+                &layout,
+                &map(false, true, false),
+                CarrierNullabilityPolicy::Permissive,
+                |_| Ok(())
+            )
+            .unwrap()
+        );
+        assert!(
+            !value_layout_matches_carrier_with_nullability_observed::<ValueTypeError>(
+                &layout,
+                &map(true, true, false),
+                CarrierNullabilityPolicy::Permissive,
+                |_| Ok(())
+            )
+            .unwrap()
+        );
+        assert!(
+            value_layout_matches_carrier_with_nullability_observed::<ValueTypeError>(
+                &layout,
+                &map(false, true, true),
+                CarrierNullabilityPolicy::Permissive,
+                |_| Ok(())
+            )
+            .is_err()
+        );
+    }
+
     fn matches(expected: &DataType, actual: &DataType) -> Result<bool, ValueTypeError> {
         let layout = ValueLayout::try_new(expected, ValueTypeStorageLifetime::pure()).unwrap();
         value_layout_matches_carrier_observed(&layout, actual, |_| Ok(()))

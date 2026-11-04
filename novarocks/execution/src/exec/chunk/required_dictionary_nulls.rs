@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Required encoded children use logical NULL on active ancestor rows.
+//! Required values use logical NULL on active ancestor rows.
 //! Arrow's safe ArrayData validation checks physical child masks, whereas its
 //! high-level container constructors also check dictionary value NULLs.
 
@@ -30,10 +30,52 @@ use novarocks_type_contract::ValueKind;
 #[cfg(test)]
 use novarocks_type_contract::ValueTypeRef;
 
-#[cfg(test)]
-use super::typed_array_normalization::ArrayNormalizationStep;
+use super::{
+    construction_failure::ChunkConstructionFailure,
+    typed_array_normalization::ArrayNormalizationStep,
+};
 
-pub(super) use novarocks_functions::array_projection::validate_required_dictionary_children;
+#[cfg(test)]
+use novarocks_functions::array_projection::validate_required_dictionary_children;
+
+/// Borrow the existing value validator after the permissive carrier matcher.
+/// Projection only separates physical NULL flags from the original complete
+/// binding; it performs no hydration, metadata reconstruction or value cast.
+pub(super) fn validate_required_values<E, F>(
+    array: &arrow::array::ArrayRef,
+    binding: &novarocks_type_contract::TypedValueBinding,
+    observe: &mut F,
+) -> Result<(), E>
+where
+    E: From<ChunkConstructionFailure>,
+    F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
+{
+    use novarocks_value_arrays::{
+        ValueFailure,
+        hydrate::{HydrateOptions, HydrateProjection, validate_required_with_options_observed},
+    };
+    // Both callbacks are synchronous loans to the same actual construction
+    // owner. No additional accounting, capacity or control source is created.
+    let observe = std::cell::RefCell::new(observe);
+    validate_required_with_options_observed(
+        array,
+        binding,
+        HydrateOptions {
+            dictionary_value_layout: None,
+            projection: HydrateProjection::FrozenNamesAndNullability,
+        },
+        &mut |units| observe.borrow_mut()(ArrayNormalizationStep::ValueWork { units }),
+        &mut |event| {
+            novarocks_functions::array_projection::observe_value_hydration(event, &mut |step| {
+                observe.borrow_mut()(step)
+            })
+        },
+    )
+    .map_err(|failure| match failure {
+        ValueFailure::Caller(error) => error,
+        ValueFailure::Value(error) => E::from(ChunkConstructionFailure::source(error)),
+    })
+}
 
 #[cfg(test)]
 mod tests {

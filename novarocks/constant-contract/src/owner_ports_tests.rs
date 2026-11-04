@@ -225,8 +225,10 @@ fn parent_pool_keeps_original_field_buffer_ordinal_float_bits_and_typed_null() {
     );
     assert_eq!(
         ConstantPool::type_validation_scratch_layout(),
-        Layout::new::<[Option<(&DataType, usize)>; novarocks_type_contract::MAX_VALUE_TYPE_NODES]>(
-        )
+        Layout::new::<
+            [Option<novarocks_type_contract::TypeTraversalFrame<'_>>;
+                novarocks_type_contract::MAX_VALUE_TYPE_NODES],
+        >()
     );
     assert_eq!(
         ConstantPool::type_validation_scratch_work_upper_bound(),

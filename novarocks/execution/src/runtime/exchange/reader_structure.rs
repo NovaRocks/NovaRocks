@@ -14,23 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Real StreamReader source-schema structures. The full borrowed field
-//! verifier and pinned constructor model are shared; original body/payload
-//! accounting and Arrow array decoding remain unchanged.
+//! Error projection and lifetime regression checks for preparation-bound units.
 use super::*;
-use crate::exec::pipeline::operator::{
-    ConstructionFailure, InputConstructionFactory, InputConstructionOwner,
-};
-use novarocks_functions::arrow_ipc_construction::{
-    FieldVerificationFailure, FieldVerificationPurpose, IpcFieldRole, ReaderStructureClass,
-    ReaderStructureFailure, ReaderStructureObserver, verify_field,
-};
-use novarocks_type_contract::{
-    ValueTypeStorageLifetime,
-    owned_resources::{layout::LayoutResourceError, vec::original_resize_growth},
-};
-
-fn model_error(cause: ReaderStructureFailure<ExchangeFailure>) -> ExchangeFailure {
+use crate::exec::pipeline::operator::ConstructionFailure;
+use novarocks_functions::arrow_ipc_construction::ReaderStructureFailure;
+pub(super) fn model_error(cause: ReaderStructureFailure<ExchangeFailure>) -> ExchangeFailure {
     match cause {
         ReaderStructureFailure::Creator(cause) => cause,
         ReaderStructureFailure::Layout(cause) => cause.into(),
@@ -49,560 +37,26 @@ fn model_error(cause: ReaderStructureFailure<ExchangeFailure>) -> ExchangeFailur
         }
     }
 }
-/// A diagnostic projection of the verified FlatBuffer scalar tag/payload.
-/// This creates no Arrow Field/DataType and reads no semantic annotation.
-struct BorrowedIpcDiagnostic<'a>(arrow::ipc::Field<'a>);
-impl std::fmt::Display for BorrowedIpcDiagnostic<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let actual = self.0;
-        if let Some(dictionary) = actual.dictionary() {
-            write!(f, "Dictionary(index={:?}, value=", dictionary.indexType())?;
-        }
-        match actual.type_type() {
-            arrow::ipc::Type::Decimal => match actual.type_as_decimal() {
-                Some(decimal) => write!(
-                    f,
-                    "Decimal{}({}, {})",
-                    decimal.bitWidth(),
-                    decimal.precision(),
-                    decimal.scale()
-                )?,
-                None => write!(f, "Decimal(missing IPC payload)")?,
-            },
-            arrow::ipc::Type::Int => match actual.type_as_int() {
-                Some(integer) => write!(
-                    f,
-                    "{}Int{}",
-                    if integer.is_signed() { "" } else { "U" },
-                    integer.bitWidth()
-                )?,
-                None => write!(f, "Int(missing IPC payload)")?,
-            },
-            other => write!(f, "{other:?}")?,
-        }
-        if actual.dictionary().is_some() {
-            write!(f, ")")?;
-        }
-        Ok(())
-    }
-}
-fn field_error(
-    cause: FieldVerificationFailure<ExchangeFailure>,
-    ordinal: usize,
-    expected: &DataType,
-    actual: arrow::ipc::Field<'_>,
-) -> ExchangeFailure {
-    match cause {
-        // Preserve the exact original observer refusal without diagnostics or
-        // tail work on the failed creator/control path.
-        FieldVerificationFailure::Observer(cause) => cause,
-        FieldVerificationFailure::InvalidShape(cause) => super::failure::payload(format_args!(
-            "exchange column {ordinal} differs from its frozen value layout: expected={expected:?} actual={} ({cause})",
-            BorrowedIpcDiagnostic(actual),
-        )),
-    }
-}
-
-fn work(owner: &dyn InputConstructionOwner) -> Result<(), ExchangeFailure> {
-    owner.observe(
-        0,
-        &[],
-        crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork { units: 1 },
-    )?;
-    Ok(())
-}
-
-fn inspect_stream(
-    bytes: &[u8],
-    expected: &ChunkSchemaRef,
-    wire: &ExchangeWireMeta,
-    prefer_wire_ids: bool,
-    source_owner: &dyn InputConstructionOwner,
-    scratch_owner: &dyn InputConstructionOwner,
-) -> Result<usize, ExchangeFailure> {
-    let mut offset = 0_usize;
-    let mut metadata_len = 0_usize;
-    let mut metadata_capacity = 0_usize;
-    let mut seen_schema = false;
-    let mut batches = 0_usize;
-    let wire_ids_match = prefer_wire_ids
-        && wire
-            .slot_ids_by_index
-            .iter()
-            .all(|id| expected.slot(*id).is_some());
-    while offset < bytes.len() {
-        work(scratch_owner)?;
-        let (start, len) = match novarocks_arrow_ipc_frame::standard_prefix(bytes, offset)
-            .map_err(|cause| super::failure::metadata("standard prefix", cause))?
-        {
-            novarocks_arrow_ipc_frame::ContinuationPrefix::End { .. } => break,
-            novarocks_arrow_ipc_frame::ContinuationPrefix::Metadata { start, len } => (start, len),
-        };
-        let metadata =
-            novarocks_arrow_ipc_frame::metadata_slice(bytes, start, len).map_err(|source| {
-                super::failure::metadata(
-                    "Arrow IPC metadata extent exceeds its original payload",
-                    source,
-                )
-            })?;
-        let metadata_end = start
-            .checked_add(len)
-            .ok_or(LayoutResourceError::Arithmetic)?;
-        // ONE closed original MessageReader Vec::resize sequence, separate
-        // from the source schema. No cumulative scratch is retained in chunks.
-        let growth = original_resize_growth::<u8>(metadata_len, metadata_capacity, len)
-            .map_err(|cause| model_error(ReaderStructureFailure::Vector(cause)))?;
-        if let Some(layout) = growth.requested_backing {
-            scratch_owner.request(layout)?;
-        }
-        metadata_len = len;
-        metadata_capacity = growth.requested_capacity;
-        work(scratch_owner)?;
-        let message = novarocks_arrow_ipc_frame::verified_message(
-            metadata,
-            &novarocks_arrow_ipc_frame::VerifierOptions::default(),
-        )
-        .map_err(|error| super::failure::metadata("verify IPC message", error))?;
-        work(scratch_owner)?;
-        let body = novarocks_arrow_ipc_frame::nonnegative_length(message.bodyLength()).map_err(
-            |source| super::failure::metadata("Arrow IPC message body length is negative", source),
-        )?;
-        let body_range = novarocks_arrow_ipc_frame::checked_range(bytes.len(), metadata_end, body)
-            .map_err(|source| super::failure::metadata("IPC message body extent", source))?;
-        if !seen_schema {
-            if message.header_type() != arrow::ipc::MessageHeader::Schema {
-                return Err(super::failure::payload(
-                    "Arrow IPC first message is not a schema",
-                ));
-            }
-            let schema = message
-                .header_as_schema()
-                .ok_or_else(|| super::failure::payload("Arrow IPC schema payload missing"))?;
-            if schema.endianness() != arrow::ipc::Endianness::Little {
-                return Err(super::failure::payload(
-                    "Arrow IPC schema endianness is unsupported",
-                ));
-            }
-            let fields = schema
-                .fields()
-                .ok_or_else(|| super::failure::payload("Arrow IPC schema fields missing"))?;
-            let marker = expected.slots().is_empty()
-                && fields.len() == 1
-                && fields.get(0).name() == Some(EXCHANGE_ZERO_COLUMN_MARKER_FIELD);
-            if fields.len() != expected.slots().len() && !marker {
-                return Err(super::failure::payload(
-                    "exchange frozen declaration differs from IPC field count",
-                ));
-            }
-            let mut request = |layout, class| -> Result<(), ExchangeFailure> {
-                match class {
-                    ReaderStructureClass::SourceHeader => source_owner.request(layout)?,
-                    ReaderStructureClass::Temporary => scratch_owner.request(layout)?,
-                }
-                Ok(())
-            };
-            let mut opaque = |bytes, class| -> Result<(), ExchangeFailure> {
-                match class {
-                    ReaderStructureClass::SourceHeader => {
-                        source_owner.observe_opaque_upper_bound(bytes)?
-                    }
-                    ReaderStructureClass::Temporary => {
-                        scratch_owner.observe_opaque_upper_bound(bytes)?
-                    }
-                }
-                Ok(())
-            };
-            let mut observe = || work(scratch_owner);
-            let mut construction = ReaderStructureObserver {
-                request: &mut request,
-                opaque: &mut opaque,
-                work: &mut observe,
-            };
-            for (index, actual) in fields.iter().enumerate() {
-                if marker {
-                    // The count-only marker is an explicit original format
-                    // author, never a logical column inferred from source.
-                    scratch_owner.request(
-                        std::alloc::Layout::array::<u8>(EXCHANGE_ZERO_COLUMN_MARKER_FIELD.len())
-                            .map_err(|_| LayoutResourceError::Arithmetic)?,
-                    )?;
-                    let field = arrow::datatypes::Field::new(
-                        EXCHANGE_ZERO_COLUMN_MARKER_FIELD,
-                        DataType::Int8,
-                        false,
-                    );
-                    verify_field(
-                        &field,
-                        actual,
-                        &mut || work(scratch_owner),
-                        FieldVerificationPurpose::ExecutionCarrier(IpcFieldRole::Root),
-                        &mut |field| construction.field(field).map_err(model_error),
-                    )
-                    .map_err(|cause| field_error(cause, index, field.data_type(), actual))?;
-                } else {
-                    let slot = if wire_ids_match {
-                        expected
-                            .slot(wire.slot_ids_by_index[index])
-                            .expect("explicit occurrence checked")
-                    } else {
-                        &expected.slots()[index]
-                    };
-                    verify_field(
-                        slot.field(),
-                        actual,
-                        &mut || work(scratch_owner),
-                        FieldVerificationPurpose::ExecutionCarrier(IpcFieldRole::Root),
-                        &mut |field| construction.field(field).map_err(model_error),
-                    )
-                    .map_err(|cause| {
-                        field_error(
-                            cause,
-                            index,
-                            slot.typed_binding().layout().data_type(),
-                            actual,
-                        )
-                    })?;
-                }
-            }
-            construction.schema(schema).map_err(model_error)?;
-            seen_schema = true;
-        } else if message.header_type() == arrow::ipc::MessageHeader::RecordBatch {
-            batches = batches
-                .checked_add(1)
-                .ok_or(LayoutResourceError::Arithmetic)?;
-        }
-        offset = body_range.end;
-    }
-    if !seen_schema {
-        return Err(super::failure::payload(
-            "Arrow IPC stream schema is missing",
-        ));
-    }
-    Ok(batches)
-}
-
-// The original StreamReader may consume dictionary messages inside one
-// next(). Inspect that SAME borrowed frame sequence only for constructor
-// geometry. This state supplies no semantic or payload-coverage authority.
-fn upcoming_record<'a>(
-    bytes: &'a [u8],
-    mut offset: usize,
-    dictionaries: &mut std::collections::HashMap<i64, ValueTypeStorageLifetime>,
-    scratch: &dyn InputConstructionOwner,
-    factory: &dyn InputConstructionFactory,
-    expected: &ChunkSchemaRef,
-    schema: &arrow::datatypes::Schema,
-) -> Result<Option<(arrow::ipc::RecordBatch<'a>, &'a [u8])>, ExchangeFailure> {
-    while offset < bytes.len() {
-        work(scratch)?;
-        let (start, len) = match novarocks_arrow_ipc_frame::standard_prefix(bytes, offset)
-            .map_err(|cause| super::failure::metadata("standard prefix", cause))?
-        {
-            novarocks_arrow_ipc_frame::ContinuationPrefix::End { .. } => return Ok(None),
-            novarocks_arrow_ipc_frame::ContinuationPrefix::Metadata { start, len } => (start, len),
-        };
-        let metadata =
-            novarocks_arrow_ipc_frame::metadata_slice(bytes, start, len).map_err(|source| {
-                super::failure::metadata(
-                    "Arrow IPC metadata extent exceeds its original payload",
-                    source,
-                )
-            })?;
-        let message = novarocks_arrow_ipc_frame::verified_message(
-            metadata,
-            &novarocks_arrow_ipc_frame::VerifierOptions::default(),
-        )
-        .map_err(|cause| super::failure::metadata("verify IPC message", cause))?;
-        let end = start
-            .checked_add(len)
-            .ok_or(LayoutResourceError::Arithmetic)?;
-        let body = novarocks_arrow_ipc_frame::nonnegative_length(message.bodyLength()).map_err(
-            |source| super::failure::metadata("Arrow IPC message body length is negative", source),
-        )?;
-        let body_range = novarocks_arrow_ipc_frame::checked_range(bytes.len(), end, body)
-            .map_err(|source| super::failure::metadata("IPC message body extent", source))?;
-        offset = body_range.end;
-        let original_body = &bytes[body_range];
-        match message.header_type() {
-            arrow::ipc::MessageHeader::RecordBatch => {
-                return Ok(message
-                    .header_as_record_batch()
-                    .map(|batch| (batch, original_body)));
-            }
-            arrow::ipc::MessageHeader::Schema => {
-                return Err(super::failure::payload(
-                    "failed to read batch: Ipc error: Expected a record batch, but found a schema",
-                ));
-            }
-            arrow::ipc::MessageHeader::DictionaryBatch => {
-                let dictionary = message.header_as_dictionary_batch().ok_or_else(|| {
-                    super::failure::payload("Arrow IPC dictionary payload missing")
-                })?;
-                work(scratch)?;
-                let old_len = dictionaries.len();
-                let old_capacity = dictionaries.capacity();
-                let present = dictionaries.contains_key(&dictionary.id());
-                work(scratch)?;
-                if !present {
-                    let bytes = novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<i64, ValueTypeStorageLifetime, ExchangeFailure>(
-                        dictionaries.len(), dictionaries.capacity(), || work(scratch),
-                    )?;
-                    if bytes != 0 {
-                        scratch.observe_opaque_upper_bound(bytes)?;
-                    }
-                }
-                // The original dictionary body's Bytes Arc can outlive the
-                // reader via selected output dictionary Buffer aliases. Its
-                // finite header hold is separate from cache/fake-schema scratch.
-                let body_owner = factory.begin_typed_construction(expected)?;
-                body_owner.observe_opaque_upper_bound(
-                    novarocks_functions::arrow_ipc_construction::original_reader_buffer_header_upper_bound()?,
-                )?;
-                let mut body_storage = body_owner.storage_lifetime();
-                if dictionary.isDelta() {
-                    // Original concat remains unchanged. Conservatively retain
-                    // both real message header holders; this is not exact stock
-                    // and does not retain any array, reader, factory or payload.
-                    if let Some(original) = dictionaries.get(&dictionary.id()) {
-                        body_storage = body_storage
-                            .retaining_observed(original, |layout| body_owner.request(layout))?;
-                    }
-                }
-                dictionaries.insert(dictionary.id(), body_storage);
-                let mut request = |layout, _class| -> Result<(), ExchangeFailure> {
-                    scratch.request(layout)?;
-                    Ok(())
-                };
-                let mut opaque = |bytes, class| -> Result<(), ExchangeFailure> {
-                    match class {
-                        novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Retained => body_owner.observe_opaque_upper_bound(bytes)?,
-                        novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Temporary => scratch.observe_opaque_upper_bound(bytes)?,
-                    }
-                    Ok(())
-                };
-                let mut observe = || work(scratch);
-                let mut model =
-                    novarocks_functions::arrow_ipc_construction::ReaderArrayStructureObserver {
-                        request: &mut request,
-                        opaque: &mut opaque,
-                        work: &mut observe,
-                    };
-                model
-                    .dictionary_batch(
-                        schema,
-                        dictionary.id(),
-                        dictionary.data().ok_or_else(|| {
-                            super::failure::payload("Arrow IPC dictionary record missing")
-                        })?,
-                        original_body,
-                    )
-                    .map_err(model_error)?;
-                if dictionary.isDelta() && present {
-                    model
-                        .dictionary_delta(schema, dictionary.id())
-                        .map_err(model_error)?;
-                }
-                if !present {
-                    // Same exact sequence of unique IDs as the real private
-                    // dictionary cache; its table uses ArrayRef entries, not
-                    // this separate finite-holder map's different entry layout.
-                    let private_table = novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<i64, ArrayRef, ExchangeFailure>(
-                        old_len,
-                        old_capacity,
-                        || work(scratch),
-                    )?;
-                    if private_table != 0 {
-                        scratch.observe_opaque_upper_bound(private_table)?;
-                    }
-                }
-                // The dictionary cache and temporary fake schema have only
-                // reader custody. Output value wrappers are recreated into
-                // their own array-only owner by the record model below.
-            }
-            _ => return Ok(None),
-        }
-    }
-    Ok(None)
-}
-
-// The original batch stays ahead of its finite source header marker in drop
-// order. No naked owning RecordBatch is returned from this production body.
-struct DecodedSourceBatch {
-    batch: RecordBatch,
-    source_schema: ValueTypeStorageLifetime,
-}
-
-pub(super) fn decode_owned(
-    bytes: &[u8],
-    expected: &ChunkSchemaRef,
-    wire: &ExchangeWireMeta,
-    prefer_wire_ids: bool,
-    factory: &dyn InputConstructionFactory,
-) -> Result<Vec<Chunk>, ExchangeFailure> {
-    if !expected.is_typed() {
-        return Err(super::failure::contract(
-            "exchange requires complete frozen execution schema",
-        ));
-    }
-    let source_owner = factory.begin_typed_construction(expected)?;
-    let scratch_owner = factory.begin_typed_construction(expected)?;
-    let count = inspect_stream(
-        bytes,
-        expected,
-        wire,
-        prefer_wire_ids,
-        source_owner.as_ref(),
-        scratch_owner.as_ref(),
-    )?;
-    // Actual output container, not a raw intermediate Vec<RecordBatch>. Its
-    // finite group responsibility is conservatively paired with these chunks;
-    // it is not described as exact retained bytes or schema scratch.
-    let output_owner = factory.begin_typed_construction(expected)?;
-    output_owner.request(
-        std::alloc::Layout::array::<Chunk>(count).map_err(|_| LayoutResourceError::Arithmetic)?,
-    )?;
-    let source_storage = source_owner
-        .storage_lifetime()
-        .retaining_observed(&output_owner.storage_lifetime(), |layout| {
-            source_owner.request(layout)
-        })?;
-    work(scratch_owner.as_ref())?;
-    let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
-        .map_err(|source| super::failure::arrow(super::failure::ArrowOperation::Decode, source))?;
-    work(scratch_owner.as_ref())?;
-    let mut out = Vec::with_capacity(count);
-    let mut dictionaries = std::collections::HashMap::new();
-    loop {
-        let position = usize::try_from(reader.get_ref().position())
-            .map_err(|_| LayoutResourceError::Arithmetic)?;
-        let next = upcoming_record(
-            bytes,
-            position,
-            &mut dictionaries,
-            scratch_owner.as_ref(),
-            factory,
-            expected,
-            reader.schema().as_ref(),
-        )?;
-        let array_owner = if let Some((metadata, original_body)) = next {
-            let owner = factory.begin_typed_construction(expected)?;
-            let temporary = factory.begin_typed_construction(expected)?;
-            // body.into() performs one private Bytes Arc adoption. The original
-            // MutableBuffer payload allocation/accounting is unchanged.
-            let body_owner = if expected.slots().is_empty()
-                || metadata.buffers().is_none_or(|buffers| buffers.is_empty())
-            {
-                temporary.as_ref()
-            } else {
-                owner.as_ref()
-            };
-            body_owner.observe_opaque_upper_bound(
-                novarocks_functions::arrow_ipc_construction::original_reader_buffer_header_upper_bound()?,
-            )?;
-            let mut array_storage = owner.storage_lifetime();
-            let mut request = |layout, class| -> Result<(), ExchangeFailure> {
-                match class {
-                    novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Retained => owner.request(layout)?,
-                    novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Temporary => temporary.request(layout)?,
-                }
-                Ok(())
-            };
-            let mut opaque = |bytes, class| -> Result<(), ExchangeFailure> {
-                match class {
-                    novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Retained => owner.observe_opaque_upper_bound(bytes)?,
-                    novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Temporary => temporary.observe_opaque_upper_bound(bytes)?,
-                }
-                Ok(())
-            };
-            let mut observe = || work(temporary.as_ref());
-            let mut model =
-                novarocks_functions::arrow_ipc_construction::ReaderArrayStructureObserver {
-                    request: &mut request,
-                    opaque: &mut opaque,
-                    work: &mut observe,
-                };
-            model
-                .record_batch(reader.schema().as_ref(), metadata, original_body,
-                    if expected.slots().is_empty() {
-                        novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Temporary
-                    } else {
-                        novarocks_functions::arrow_ipc_construction::ReaderArrayHeaderClass::Retained
-                    }, |id| {
-                    work(temporary.as_ref())?;
-                    let original = dictionaries.get(&id);
-                    work(temporary.as_ref())?;
-                    if let Some(original) = original {
-                        array_storage = array_storage
-                            .retaining_observed(original, |layout| owner.request(layout))?;
-                    }
-                    Ok(original.is_some())
-                })
-                .map_err(model_error)?;
-            Some((owner, temporary, array_storage))
-        } else {
-            None
-        };
-        let Some(batch) = reader.next() else {
-            break;
-        };
-        let batch = batch.map_err(|source| {
-            super::failure::arrow(super::failure::ArrowOperation::Decode, source)
-        })?;
-        let (_array_owner, temporary, array_storage) = array_owner.ok_or_else(|| {
-            super::failure::contract(
-                "Arrow IPC reader produced a batch without its original constructor frame",
-            )
-        })?;
-        let source = DecodedSourceBatch {
-            batch,
-            source_schema: source_storage.clone(),
-        };
-        let owner = factory.begin_typed_construction(expected)?;
-        let storage = owner
-            .storage_lifetime()
-            .retaining_observed(&source.source_schema, |layout| owner.request(layout))?;
-        let value = materialize_chunk_for_wire_meta(
-            expected,
-            source.batch,
-            wire,
-            prefer_wire_ids,
-            DecodeCarrierContract::Exchange,
-            &ExchangeHeaderCreation::RuntimeWithSource {
-                owner: owner.as_ref(),
-                storage,
-            },
-        )?;
-        let value = if expected.slots().is_empty() {
-            // The marker's arrays and body header are consumed immediately;
-            // count-only publishes rows, so array scratch cannot follow it.
-            value
-        } else {
-            value.retaining_array_type_storage_observed::<ExchangeFailure>(
-                &array_storage,
-                |layout| Ok(owner.request(layout)?),
-            )?
-        };
-        drop(temporary);
-        // Count comes from the same verified original message headers; retain
-        // a local check before push so no extra unobserved vector growth occurs.
-        if out.len() == count {
-            return Err(super::failure::contract(
-                "Arrow IPC reader produced more batches than its verified header count",
-            ));
-        }
-        out.push(value);
-    }
-    Ok(out)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::pipeline::operator::InputConstructionFactory;
     use arrow::array::{DictionaryArray, Int32Array, StringArray};
     use arrow::datatypes::{Field, Int32Type};
     use novarocks_type_contract::{
         TypedValueBinding, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime,
     };
+    struct Control;
+    impl novarocks_functions::KernelEvaluationControl for Control {
+        fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+            Ok(())
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), novarocks_functions::KernelFailure> {
+            panic!("unit construction does not wait")
+        }
+    }
     fn declaration() -> ChunkSchemaRef {
         let pure = ValueTypeStorageLifetime::pure();
         let value = ValueTypeRef::try_new(
@@ -636,42 +90,55 @@ mod tests {
         let weak = Arc::downgrade(&error);
         (crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),tracker,error).unwrap(),weak)
     }
-    fn bytes() -> Vec<u8> {
+
+    fn unit(
+        expected: &ChunkSchemaRef,
+        factory: &dyn InputConstructionFactory,
+        values: Vec<&str>,
+        key: i32,
+    ) -> (Arc<online_unit::ExchangeRecipe>, Vec<u8>) {
         let array: ArrayRef = Arc::new(
             DictionaryArray::<Int32Type>::try_new(
-                Int32Array::from(vec![0]),
-                Arc::new(StringArray::from(vec![Some("{}"), None])),
+                Int32Array::from(vec![key]),
+                Arc::new(StringArray::from(values)),
             )
             .unwrap(),
         );
-        #[allow(deprecated)]
+        // Source names, IDs and metadata never author the receiver's JSON domain.
+        #[expect(
+            deprecated,
+            reason = "fixture exercises noncanonical source dictionary IDs"
+        )]
         let field = Field::new_dict("wire_json", array.data_type().clone(), false, 271, false)
-            .with_metadata(std::collections::HashMap::from([
-                ("novarocks.logical_type".to_string(), "bitmap".to_string()),
-                ("source.attribute".to_string(), "opaque".to_string()),
-            ]));
+            .with_metadata(HashMap::from([(
+                "novarocks.logical_type".to_owned(),
+                "bitmap".to_owned(),
+            )]));
         let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap();
-        let mut bytes = Vec::new();
-        let mut writer = StreamWriter::try_new(&mut bytes, batch.schema().as_ref()).unwrap();
-        writer.write(&batch).unwrap();
-        writer.finish().unwrap();
-        drop(writer);
-        bytes
+        let owner = factory.begin_typed_construction(expected).unwrap();
+        let chunk = materialize_chunk_for_wire_meta(
+            expected,
+            batch,
+            &ExchangeWireMeta {
+                slot_ids_by_index: vec![SlotId::new(9)],
+            },
+            false,
+            DecodeCarrierContract::Exchange,
+            &ExchangeHeaderCreation::Runtime(owner.as_ref()),
+        )
+        .unwrap();
+        let recipe = online_unit::prepare_recipe(expected, &[], factory).unwrap();
+        let bytes = online_unit::encode(&recipe, &chunk, factory, &Control).unwrap();
+        (recipe, bytes)
     }
     #[test]
     fn reader_source_attributes_never_author_json_and_last_schema_keeps_finite_header_only() {
-        let tracker = MemTracker::new_root("reader finite source schema");
+        let tracker = MemTracker::new_root("reader finite prepared schema");
         let (factory, error_weak) = factory(tracker.clone());
         let factory_weak = Arc::downgrade(&factory);
         let expected = declaration();
-        let wire = ExchangeWireMeta {
-            slot_ids_by_index: vec![SlotId::new(9)],
-        };
-        let source = bytes();
-        let published = StreamReader::try_new(Cursor::new(&source), None)
-            .unwrap()
-            .schema();
-        let chunks = decode_owned(&source, &expected, &wire, true, factory.as_ref()).unwrap();
+        let (recipe, source) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
+        let chunks = online_unit::decode(&recipe, &source, &expected, factory.as_ref()).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].len(), 1);
         let slot = &chunks[0].chunk_schema().slots()[0];
@@ -679,27 +146,17 @@ mod tests {
             slot.typed_binding().value_type().kind(),
             ValueKind::Nominal(ValueLogicalType::Json)
         ));
-        assert!(!slot.nullable());
+        assert!(!slot.nullable(), "retain the frozen root Field declaration");
+        assert!(!slot.typed_binding().nullable());
         assert!(slot.field().metadata().as_arc().is_none());
-        #[allow(deprecated)]
-        {
-            assert_eq!(slot.field().dict_id(), published.field(0).dict_id());
-            assert_eq!(
-                slot.field().dict_is_ordered(),
-                published.field(0).dict_is_ordered()
-            );
-        }
         let schema = chunks[0].chunk_schema_ref();
         drop(chunks);
-        drop(published);
+        drop(recipe);
         drop(source);
         drop(expected);
         drop(factory);
         assert!(factory_weak.upgrade().is_none());
-        assert!(
-            error_weak.upgrade().is_none(),
-            "no original runtime control retained by the type/header projection"
-        );
+        assert!(error_weak.upgrade().is_none());
         assert!(tracker.current() > 0);
         assert!(matches!(
             schema.slots()[0].typed_binding().value_type().kind(),
@@ -709,20 +166,18 @@ mod tests {
         assert_eq!(tracker.current(), 0);
     }
     #[test]
-    fn reader_array_projection_keeps_dictionary_body_header_without_retaining_factory_or_schema_array_group()
-     {
-        let tracker = MemTracker::new_root("reader per-batch array header");
+    fn reader_array_projection_keeps_dictionary_body_without_pinning_array_group_in_schema() {
+        let tracker = MemTracker::new_root("reader per-unit array header");
         let (factory, error_weak) = factory(tracker.clone());
         let factory_weak = Arc::downgrade(&factory);
         let expected = declaration();
-        let wire = ExchangeWireMeta {
-            slot_ids_by_index: vec![SlotId::new(9)],
-        };
-        let source = bytes();
-        let mut chunks = decode_owned(&source, &expected, &wire, true, factory.as_ref()).unwrap();
+        let (recipe, source) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
+        let mut chunks =
+            online_unit::decode(&recipe, &source, &expected, factory.as_ref()).unwrap();
         let schema = chunks[0].chunk_schema_ref();
         let projection = chunks.remove(0).into_batch_projection();
         drop(chunks);
+        drop(recipe);
         drop(source);
         drop(expected);
         drop(factory);
@@ -745,67 +200,345 @@ mod tests {
             "{}"
         );
         drop(projection);
-        assert!(
-            tracker.current() > 0,
-            "the independent schema still holds its own source header"
-        );
+        assert!(tracker.current() > 0);
         assert!(
             tracker.current() < array_and_schema,
-            "array-only header responsibility must end without waiting for independent schema"
+            "independent schema cannot retain the array-only group"
         );
         drop(schema);
         assert_eq!(tracker.current(), 0);
     }
     #[test]
-    fn reader_delta_dictionary_headers_follow_original_rows_and_last_array_projection() {
-        let values1: ArrayRef = Arc::new(
-            DictionaryArray::<Int32Type>::try_new(
-                Int32Array::from(vec![0]),
-                Arc::new(StringArray::from(vec!["{}"])),
-            )
-            .unwrap(),
-        );
-        let values2: ArrayRef = Arc::new(
-            DictionaryArray::<Int32Type>::try_new(
-                Int32Array::from(vec![1]),
-                Arc::new(StringArray::from(vec!["{}", "[]"])),
-            )
-            .unwrap(),
-        );
-        #[allow(deprecated)]
-        let schema = Arc::new(Schema::new(vec![Field::new_dict(
-            "wire_json",
-            values1.data_type().clone(),
-            false,
-            271,
-            false,
-        )]));
-        let mut bytes = Vec::new();
-        let options = arrow::ipc::writer::IpcWriteOptions::default()
-            .with_dictionary_handling(arrow::ipc::writer::DictionaryHandling::Delta);
-        let mut writer =
-            StreamWriter::try_new_with_options(&mut bytes, schema.as_ref(), options).unwrap();
-        writer
-            .write(&RecordBatch::try_new(schema.clone(), vec![values1]).unwrap())
-            .unwrap();
-        writer
-            .write(&RecordBatch::try_new(schema, vec![values2]).unwrap())
-            .unwrap();
-        writer.finish().unwrap();
-        drop(writer);
-        let tracker = MemTracker::new_root("reader actual delta headers");
+    fn reader_last_real_buffer_alias_keeps_body_responsibility_after_chunk_exit() {
+        let tracker = MemTracker::new_root("reader actual Buffer alias exit");
         let (factory, error_weak) = factory(tracker.clone());
         let expected = declaration();
-        let wire = ExchangeWireMeta {
-            slot_ids_by_index: vec![SlotId::new(9)],
-        };
-        let mut chunks = decode_owned(&bytes, &expected, &wire, true, factory.as_ref()).unwrap();
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), 1);
-        assert_eq!(chunks[1].len(), 1);
-        let projection = chunks.pop().unwrap().into_batch_projection();
+        let (recipe, bytes) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
+        let mut chunks = online_unit::decode(&recipe, &bytes, &expected, factory.as_ref()).unwrap();
+        let array = chunks.remove(0).columns()[0].clone();
+        let dictionary = array
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let values = dictionary
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let buffer = values.values().clone();
         drop(chunks);
+        drop(recipe);
         drop(bytes);
+        drop(expected);
+        drop(factory);
+        assert!(error_weak.upgrade().is_none());
+        assert_eq!(values.value(0), "{}");
+        assert!(tracker.current() > 0);
+        drop(array);
+        assert_eq!(buffer.as_slice(), b"{}");
+        assert!(
+            tracker.current() > 0,
+            "naked Buffer alias still owns original decoded storage"
+        );
+        drop(buffer);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn reader_alignment_repair_keeps_original_responsibility_on_last_bare_buffer() {
+        use arrow::array::Array;
+        use novarocks_type_contract::FunctionValueType;
+        let storage = ValueTypeStorageLifetime::pure();
+        let value = FunctionValueType::new(DataType::Int32, false);
+        let slot = crate::exec::chunk::ChunkSlotSchema::try_new_typed(
+            SlotId::new(9),
+            Arc::new(Field::new("number", DataType::Int32, false)),
+            value.typed_binding().clone(),
+            None,
+            storage.clone(),
+        )
+        .unwrap();
+        let expected =
+            Arc::new(crate::exec::chunk::ChunkSchema::try_new_typed(vec![slot], storage).unwrap());
+        let tracker = MemTracker::new_root("reader aligned-copy final Buffer exit");
+        let (factory, error_weak) = factory(tracker.clone());
+        let chunk = Chunk::try_new_typed_with_columns_observed::<ExchangeFailure, _>(
+            expected.clone(),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+            1,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let recipe = online_unit::prepare_recipe(&expected, &[], factory.as_ref()).unwrap();
+        let mut bytes = online_unit::encode(&recipe, &chunk, factory.as_ref(), &Control).unwrap();
+        drop(chunk);
+        // Change only the verified RecordBatch's fixed-width buffer offset,
+        // keeping a valid one-row source value and the exact frozen recipe.
+        let (descriptor_at, body_start, old_offset) = {
+            let (start, len) =
+                match novarocks_arrow_ipc_frame::continuation_prefix(&bytes, 37).unwrap() {
+                    novarocks_arrow_ipc_frame::ContinuationPrefix::Metadata { start, len } => {
+                        (start, len)
+                    }
+                    _ => panic!("one RecordBatch message"),
+                };
+            let message = novarocks_arrow_ipc_frame::verified_message(
+                &bytes[start..start + len],
+                &novarocks_arrow_ipc_frame::VerifierOptions::default(),
+            )
+            .unwrap();
+            let record = message.header_as_record_batch().unwrap();
+            let values = record.buffers().unwrap().get(1);
+            // Buffer is the generated borrowed inline FlatBuffer struct. This
+            // address identifies that actual field; no pointer is dereferenced.
+            let descriptor_at =
+                values as *const arrow::ipc::Buffer as usize - bytes.as_ptr() as usize;
+            assert!((start..start + len).contains(&descriptor_at));
+            let old_offset = usize::try_from(values.offset()).unwrap();
+            assert_eq!(old_offset % 4, 0);
+            assert!(old_offset + 5 <= usize::try_from(message.bodyLength()).unwrap());
+            (descriptor_at, start + len, old_offset)
+        };
+        let original_value: [u8; 4] = bytes[body_start + old_offset..body_start + old_offset + 4]
+            .try_into()
+            .unwrap();
+        bytes[body_start + old_offset + 1..body_start + old_offset + 5]
+            .copy_from_slice(&original_value);
+        bytes[descriptor_at..descriptor_at + 8]
+            .copy_from_slice(&((old_offset + 1) as i64).to_le_bytes());
+        let chunks = online_unit::decode(&recipe, &bytes, &expected, factory.as_ref()).unwrap();
+        let array = chunks[0].columns()[0].clone();
+        let numbers = array.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(numbers.value(0), 1);
+        let last = numbers.values().inner().clone();
+        drop(chunks);
+        drop(recipe);
+        drop(bytes);
+        drop(expected);
+        drop(factory);
+        assert!(
+            error_weak.upgrade().is_none(),
+            "result custody cannot retain runtime control"
+        );
+        assert!(tracker.current() > 0);
+        drop(array);
+        assert_eq!(last.typed_data::<i32>(), &[1]);
+        assert!(
+            tracker.current() > 0,
+            "the repaired allocation remains physically alive"
+        );
+        drop(last);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    fn typed_schema_with_carrier(
+        frozen: &DataType,
+        carrier: &DataType,
+        root_nullable: bool,
+    ) -> ChunkSchemaRef {
+        let storage = ValueTypeStorageLifetime::pure();
+        let value = novarocks_type_contract::FunctionValueType::new(frozen.clone(), root_nullable);
+        let slot = crate::exec::chunk::ChunkSlotSchema::try_new_typed(
+            SlotId::new(9),
+            Arc::new(Field::new("value", carrier.clone(), true)),
+            value.typed_binding().clone(),
+            None,
+            storage.clone(),
+        )
+        .unwrap();
+        Arc::new(crate::exec::chunk::ChunkSchema::try_new_typed(vec![slot], storage).unwrap())
+    }
+
+    #[test]
+    fn real_factory_projects_required_nested_carriers_and_preserves_complete_binding() {
+        use arrow::array::{ListArray, MapArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        let scalar: ArrayRef = Arc::new(Int32Array::from(vec![7]));
+        let required = Arc::new(Field::new("item", DataType::Int32, false));
+        let permissive = Arc::new(Field::new("item", DataType::Int32, true));
+        let struct_array: ArrayRef = Arc::new(StructArray::new(
+            vec![required.clone()].into(),
+            vec![scalar.clone()],
+            None,
+        ));
+        let list_array: ArrayRef = Arc::new(ListArray::new(
+            required.clone(),
+            OffsetBuffer::new(vec![0i32, 1].into()),
+            scalar.clone(),
+            None,
+        ));
+        let key = Arc::new(Field::new("key", DataType::Int32, false));
+        let value = Arc::new(Field::new("value", DataType::Int32, false));
+        let entries = StructArray::new(
+            vec![key.clone(), value].into(),
+            vec![scalar.clone(), scalar],
+            None,
+        );
+        let entries_field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
+        let map_array: ArrayRef = Arc::new(MapArray::new(
+            entries_field,
+            OffsetBuffer::new(vec![0i32, 1].into()),
+            entries,
+            None,
+            false,
+        ));
+        let cases = [
+            (
+                struct_array,
+                DataType::Struct(vec![permissive.clone()].into()),
+            ),
+            (list_array, DataType::List(permissive)),
+            (
+                map_array,
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![key, Arc::new(Field::new("value", DataType::Int32, true))].into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+            ),
+        ];
+        for (array, canonical) in cases {
+            let tracker = MemTracker::new_root("required nested real carrier projection");
+            let (factory, error_weak) = factory(tracker.clone());
+            let frozen = array.data_type().clone();
+            let expected = typed_schema_with_carrier(&frozen, &frozen, false);
+            let widened = typed_schema_with_carrier(&frozen, &canonical, false);
+            let strict_recipe =
+                online_unit::prepare_recipe(&expected, &[], factory.as_ref()).unwrap();
+            let wide_recipe = online_unit::prepare_recipe(&widened, &[], factory.as_ref()).unwrap();
+            assert_eq!(strict_recipe.value.digest(), wide_recipe.value.digest());
+            let owner = factory.begin_typed_construction(&expected).unwrap();
+            let chunk = Chunk::try_new_typed_with_columns_owned_observed::<ExchangeFailure, _>(
+                expected.clone(),
+                vec![array],
+                1,
+                owner.storage_lifetime(),
+                |step| Ok(owner.observe(0, &[], step)?),
+            )
+            .unwrap();
+            let bytes =
+                online_unit::encode(&strict_recipe, &chunk, factory.as_ref(), &Control).unwrap();
+            let decoded =
+                online_unit::decode(&strict_recipe, &bytes, &expected, factory.as_ref()).unwrap();
+            let actual = &decoded[0].chunk_schema().slots()[0];
+            assert_eq!(actual.data_type(), &canonical);
+            assert_eq!(
+                actual.nullable(),
+                expected.slots()[0].nullable(),
+                "retain the frozen root Field declaration"
+            );
+            assert_eq!(actual.typed_binding(), expected.slots()[0].typed_binding());
+            assert!(!actual.typed_binding().nullable());
+            drop(decoded);
+            drop(bytes);
+            drop(chunk);
+            drop(owner);
+            drop(strict_recipe);
+            drop(wide_recipe);
+            drop(expected);
+            drop(widened);
+            drop(factory);
+            assert!(error_weak.upgrade().is_none());
+            assert_eq!(tracker.current(), 0);
+        }
+    }
+
+    #[test]
+    fn permissive_wire_null_flags_do_not_authorize_active_required_child_nulls() {
+        use arrow::array::StructArray;
+        use arrow::buffer::NullBuffer;
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_value_arrays::{ValueError, ValueViolation};
+        let strict =
+            DataType::Struct(vec![Arc::new(Field::new("child", DataType::Int32, false))].into());
+        let permissive_fields = vec![Arc::new(Field::new("child", DataType::Int32, true))];
+        let permissive = DataType::Struct(permissive_fields.clone().into());
+        let expected = typed_schema_with_carrier(&strict, &strict, true);
+        let sender = typed_schema_with_carrier(&permissive, &permissive, true);
+        let tracker = MemTracker::new_root("required child wire validation");
+        let (factory, _) = factory(tracker.clone());
+        let recipe = online_unit::prepare_recipe(&expected, &[], factory.as_ref()).unwrap();
+        for active in [false, true] {
+            let child: ArrayRef = Arc::new(Int32Array::from(vec![None]));
+            let source: ArrayRef = Arc::new(StructArray::new(
+                permissive_fields.clone().into(),
+                vec![child],
+                Some(NullBuffer::from(vec![active])),
+            ));
+            let owner = factory.begin_typed_construction(&sender).unwrap();
+            let chunk = Chunk::try_new_typed_with_columns_owned_observed::<ExchangeFailure, _>(
+                sender.clone(),
+                vec![source],
+                1,
+                owner.storage_lifetime(),
+                |step| Ok(owner.observe(0, &[], step)?),
+            )
+            .unwrap();
+            // Encode through the sender's own complete declaration, then forge
+            // only the claimed receiver digest as an untrusted wire peer can.
+            // The production sender refuses mismatched complete declarations.
+            let sender_recipe =
+                online_unit::prepare_recipe(&sender, &[], factory.as_ref()).unwrap();
+            let mut bytes =
+                online_unit::encode(&sender_recipe, &chunk, factory.as_ref(), &Control).unwrap();
+            bytes[4..36].copy_from_slice(recipe.value.digest());
+            let result = online_unit::decode(&recipe, &bytes, &expected, factory.as_ref());
+            if active {
+                let error = result.err().expect("active required NULL is refused");
+                let expected = ValueError::Invariant(ValueViolation::RequiredNull);
+                assert_eq!(error.failure_fact(), expected.failure_fact());
+                let mut source: &dyn std::error::Error = &error;
+                loop {
+                    if let Some(value) = source.downcast_ref::<ValueError>() {
+                        assert!(matches!(
+                            value,
+                            ValueError::Invariant(ValueViolation::RequiredNull)
+                        ));
+                        break;
+                    }
+                    source = source.source().expect("original required-value refusal");
+                }
+            } else {
+                let decoded = result.unwrap();
+                assert!(decoded[0].columns()[0].is_null(0));
+                assert!(
+                    !decoded[0].chunk_schema().slots()[0]
+                        .typed_binding()
+                        .value_type()
+                        .child_type_at(0)
+                        .unwrap()
+                        .nullable()
+                );
+            }
+        }
+        drop(recipe);
+        drop(factory);
+        drop(expected);
+        drop(sender);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn reader_each_unit_has_complete_dictionary_and_last_projection_releases_its_group() {
+        let tracker = MemTracker::new_root("reader independent full dictionary units");
+        let (factory, error_weak) = factory(tracker.clone());
+        let expected = declaration();
+        let (recipe, first) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
+        let (_, second) = unit(&expected, factory.as_ref(), vec!["{}", "[]"], 1);
+        let first = online_unit::decode(&recipe, &first, &expected, factory.as_ref()).unwrap();
+        let mut second =
+            online_unit::decode(&recipe, &second, &expected, factory.as_ref()).unwrap();
+        assert_eq!(first[0].len(), 1);
+        assert_eq!(second[0].len(), 1);
+        let projection = second.pop().unwrap().into_batch_projection();
+        drop(first);
+        drop(second);
+        drop(recipe);
         drop(expected);
         drop(factory);
         assert!(error_weak.upgrade().is_none());
@@ -828,53 +561,54 @@ mod tests {
         assert_eq!(tracker.current(), 0);
     }
     #[test]
-    fn reader_later_schema_keeps_original_rejection_after_full_flatbuffer_verification() {
-        let original = bytes();
-        let metadata_len = u32::from_le_bytes(original[4..8].try_into().unwrap()) as usize;
-        let schema_end = 8 + metadata_len;
-        let mut source = original[..original.len() - 8].to_vec();
-        source.extend_from_slice(&original[..schema_end]);
-        source.extend_from_slice(&original[original.len() - 8..]);
-        let expected = declaration();
-        let wire = ExchangeWireMeta {
-            slot_ids_by_index: vec![SlotId::new(9)],
-        };
-        let tracker = MemTracker::new_root("later unexpected schema");
+    fn reader_schema_message_is_rejected_and_malformed_metadata_keeps_original_source() {
+        let tracker = MemTracker::new_root("unexpected online schema");
         let (factory, _) = factory(tracker.clone());
-        let error = decode_owned(&source, &expected, &wire, true, factory.as_ref()).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Expected a record batch, but found a schema")
-        );
-        // The invalid string belongs to a later, unsupported schema vertex;
-        // it must still be checked by the SAME full verified-message visitor.
-        let later_start = original.len() - 8;
-        let name = source[later_start..later_start + schema_end]
+        let expected = declaration();
+        let recipe = online_unit::prepare_recipe(&expected, &[], factory.as_ref()).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "wire_json",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(vec!["{}"]))],
+        )
+        .unwrap();
+        let mut stream = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut stream, batch.schema().as_ref()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+        let metadata_len = u32::from_le_bytes(stream[4..8].try_into().unwrap()) as usize;
+        let mut source = b"NRU1".to_vec();
+        source.extend_from_slice(recipe.value.digest());
+        source.push(0);
+        source.extend_from_slice(&stream[..8 + metadata_len]);
+        let error = online_unit::decode(&recipe, &source, &expected, factory.as_ref()).unwrap_err();
+        assert!(error.to_string().contains("RecordBatch is missing"));
+        let name = source
             .windows(b"wire_json".len())
             .position(|part| part == b"wire_json")
             .unwrap();
-        source[later_start + name] = 255;
-        let error = decode_owned(&source, &expected, &wire, true, factory.as_ref()).unwrap_err();
-        // The independent locked verifier owns this actual malformed-string
-        // rejection. Assert its original type/diagnostic survives, rather
-        // than requiring the old transport wrapper's static wording.
+        source[name] = 255;
+        let error = online_unit::decode(&recipe, &source, &expected, factory.as_ref()).unwrap_err();
         fn assert_original<E: std::error::Error + 'static>(
-            failure: &(dyn std::error::Error + 'static),
-            original: &E,
+            error: &(dyn std::error::Error + 'static),
+            expected: &E,
         ) {
-            let mut source = Some(failure);
-            while let Some(current) = source {
-                if let Some(actual) = current.downcast_ref::<E>() {
-                    assert_eq!(actual.to_string(), original.to_string());
+            let mut cause = Some(error);
+            while let Some(current) = cause {
+                if let Some(current) = current.downcast_ref::<E>() {
+                    assert_eq!(current.to_string(), expected.to_string());
                     return;
                 }
-                source = current.source();
+                cause = current.source();
             }
             panic!("original FlatBuffer verifier source was lost");
         }
         let original = novarocks_arrow_ipc_frame::verified_message(
-            &source[later_start + 8..later_start + schema_end],
+            &source[45..45 + metadata_len],
             &novarocks_arrow_ipc_frame::VerifierOptions::default(),
         )
         .unwrap_err();
@@ -882,38 +616,504 @@ mod tests {
         let fact = novarocks_failure_contract::FailureProjection::failure_fact(&error);
         assert_eq!(fact.class(), novarocks_failure_contract::FailureClass::Data);
         assert_eq!(fact.reason().code(), 110);
-        assert!(!error.to_string().contains("Expected a record batch"));
+        drop(error);
+        drop(recipe);
         drop(factory);
         assert_eq!(tracker.current(), 0);
     }
     #[test]
-    fn reader_first_real_metadata_resize_refusal_rolls_back_without_schema_publication() {
-        let tracker = MemTracker::new_root("reader first real metadata header refusal");
+    fn reader_first_unit_recipe_allocation_refusal_rolls_back_without_publication() {
+        let tracker = MemTracker::new_root("reader first unit recipe refusal");
         let (factory, _) = factory(tracker.clone());
         let expected = declaration();
-        let source = factory.begin_typed_construction(&expected).unwrap();
-        let scratch = factory.begin_typed_construction(&expected).unwrap();
+        let (recipe, bytes) = unit(&expected, factory.as_ref(), vec!["{}"], 0);
         let baseline = tracker.current();
         tracker.install_limit_once(baseline + 1).unwrap();
-        let error = inspect_stream(
-            &bytes(),
-            &expected,
-            &ExchangeWireMeta {
-                slot_ids_by_index: vec![SlotId::new(9)],
-            },
-            true,
-            source.as_ref(),
-            scratch.as_ref(),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            ExchangeFailure::Execution(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::Memory(_)))
-        ));
+        let error = online_unit::decode(&recipe, &bytes, &expected, factory.as_ref()).unwrap_err();
+        assert!(
+            matches!(error, ExchangeFailure::Execution(error) if matches!(error.cause(), crate::runtime::fragment::ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))))
+        );
         assert_eq!(tracker.current(), baseline);
-        drop(source);
-        drop(scratch);
+        drop(recipe);
         drop(factory);
         assert_eq!(tracker.current(), 0);
+    }
+    mod bitmap_payload_tests {
+        use super::*;
+        use crate::exec::chunk::{ArrayNormalizationStep, ArrayPathStep, ChunkSchema};
+        use crate::exec::pipeline::operator::{InputConstructionFactory, InputConstructionOwner};
+        use crate::runtime::mem_tracker::MemTrackerLimitExceeded;
+        use std::alloc::Layout;
+        use std::sync::{
+            OnceLock,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        // One fixed V5 Message / RecordBatch FlatBuffer layout. This fixture writer
+        // uses only checked safe slice writes and the public generated verifier below;
+        // it does not import another FlatBuffer author/dependency into Execution.
+        fn hand_record_message(
+            dictionary_id: Option<i64>,
+            rows: i64,
+            nodes: &[(i64, i64)],
+            buffers: &[(i64, i64)],
+            body: &[u8],
+        ) -> Vec<u8> {
+            fn put<const N: usize>(bytes: &mut [u8], at: usize, value: [u8; N]) {
+                bytes[at..at + N].copy_from_slice(&value);
+            }
+            fn vtable(bytes: &mut [u8], at: usize, object: u16, fields: &[u16]) {
+                put(
+                    bytes,
+                    at,
+                    u16::try_from(4 + fields.len() * 2).unwrap().to_le_bytes(),
+                );
+                put(bytes, at + 2, object.to_le_bytes());
+                for (i, value) in fields.iter().enumerate() {
+                    put(bytes, at + 4 + i * 2, value.to_le_bytes());
+                }
+            }
+            let record = if dictionary_id.is_some() { 128 } else { 80 };
+            let nodes_vector = record + 28;
+            let buffers_vector = nodes_vector + 4 + nodes.len() * 16 + 4;
+            let extent = buffers_vector + 4 + buffers.len() * 16;
+            let mut metadata = vec![0u8; extent.next_multiple_of(64)];
+            put(&mut metadata, 0, 32u32.to_le_bytes());
+            vtable(&mut metadata, 8, 24, &[4, 6, 8, 16, 0]);
+            put(&mut metadata, 32, 24i32.to_le_bytes());
+            put(
+                &mut metadata,
+                36,
+                arrow::ipc::MetadataVersion::V5.0.to_le_bytes(),
+            );
+            metadata[38] = if dictionary_id.is_some() {
+                arrow::ipc::MessageHeader::DictionaryBatch.0
+            } else {
+                arrow::ipc::MessageHeader::RecordBatch.0
+            };
+            put(&mut metadata, 40, 40u32.to_le_bytes());
+            put(
+                &mut metadata,
+                48,
+                i64::try_from(body.len()).unwrap().to_le_bytes(),
+            );
+            if let Some(id) = dictionary_id {
+                vtable(&mut metadata, 64, 24, &[8, 16, 0]);
+                put(&mut metadata, 80, 16i32.to_le_bytes());
+                put(&mut metadata, 88, id.to_le_bytes());
+                put(&mut metadata, 96, 32u32.to_le_bytes());
+            }
+            vtable(&mut metadata, record - 16, 24, &[8, 16, 20, 0, 0]);
+            put(&mut metadata, record, 16i32.to_le_bytes());
+            put(&mut metadata, record + 8, rows.to_le_bytes());
+            put(
+                &mut metadata,
+                record + 16,
+                u32::try_from(nodes_vector - record - 16)
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+            put(
+                &mut metadata,
+                record + 20,
+                u32::try_from(buffers_vector - record - 20)
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+            put(
+                &mut metadata,
+                nodes_vector,
+                u32::try_from(nodes.len()).unwrap().to_le_bytes(),
+            );
+            for (i, (len, nulls)) in nodes.iter().enumerate() {
+                put(&mut metadata, nodes_vector + 4 + i * 16, len.to_le_bytes());
+                put(
+                    &mut metadata,
+                    nodes_vector + 12 + i * 16,
+                    nulls.to_le_bytes(),
+                );
+            }
+            put(
+                &mut metadata,
+                buffers_vector,
+                u32::try_from(buffers.len()).unwrap().to_le_bytes(),
+            );
+            for (i, (offset, len)) in buffers.iter().enumerate() {
+                put(
+                    &mut metadata,
+                    buffers_vector + 4 + i * 16,
+                    offset.to_le_bytes(),
+                );
+                put(
+                    &mut metadata,
+                    buffers_vector + 12 + i * 16,
+                    len.to_le_bytes(),
+                );
+            }
+            let verified = novarocks_arrow_ipc_frame::verified_message(
+                &metadata,
+                &novarocks_arrow_ipc_frame::VerifierOptions::default(),
+            )
+            .unwrap();
+            let batch = if dictionary_id.is_some() {
+                verified
+                    .header_as_dictionary_batch()
+                    .unwrap()
+                    .data()
+                    .unwrap()
+            } else {
+                verified.header_as_record_batch().unwrap()
+            };
+            assert_eq!(batch.length(), rows);
+            assert_eq!(batch.nodes().unwrap().len(), nodes.len());
+            assert_eq!(batch.buffers().unwrap().len(), buffers.len());
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&[255; 4]);
+            frame.extend_from_slice(&u32::try_from(metadata.len()).unwrap().to_le_bytes());
+            frame.extend_from_slice(&metadata);
+            frame.extend_from_slice(body);
+            frame
+        }
+
+        fn hand_unit(recipe: &online_unit::ExchangeRecipe, messages: &[Vec<u8>]) -> Vec<u8> {
+            let mut unit = b"NRU1".to_vec();
+            unit.extend_from_slice(recipe.value.digest());
+            unit.push(0); // one Exact Map occurrence; nested dictionary is frozen in it
+            for message in messages {
+                unit.extend_from_slice(message);
+            }
+            unit
+        }
+
+        fn map_carrier(key: DataType) -> DataType {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", key, false)),
+                            Arc::new(Field::new("value", DataType::Null, true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            )
+        }
+
+        // A test-only observing wrapper. It delegates EVERY admission and source
+        // custody operation to the one real installed runtime factory/owner. It never
+        // creates an allocator, grants capacity, or fabricates a construction error.
+        struct BitmapGate {
+            tracker: Arc<MemTracker>,
+            bytes: usize,
+            repair_bytes: usize,
+            armed: AtomicBool,
+            fired: AtomicBool,
+            saw_key_repair: AtomicBool,
+            original: OnceLock<ConstructionFailure>,
+        }
+        struct BitmapFactory {
+            inner: Arc<dyn InputConstructionFactory>,
+            gate: Arc<BitmapGate>,
+        }
+        struct BitmapOwner {
+            inner: Box<dyn InputConstructionOwner>,
+            gate: Arc<BitmapGate>,
+        }
+        impl InputConstructionFactory for BitmapFactory {
+            fn retain_decoded_source(
+                &self,
+                array: ArrayRef,
+                storage: ValueTypeStorageLifetime,
+                work: &dyn InputConstructionOwner,
+            ) -> Result<ArrayRef, ConstructionFailure> {
+                self.inner.retain_decoded_source(array, storage, work)
+            }
+            fn observe_input_work(&self, units: usize) -> Result<(), ConstructionFailure> {
+                self.inner.observe_input_work(units)
+            }
+            fn begin_typed_construction(
+                &self,
+                schema: &ChunkSchema,
+            ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+                Ok(Box::new(BitmapOwner {
+                    inner: self.inner.begin_typed_construction(schema)?,
+                    gate: self.gate.clone(),
+                }))
+            }
+            fn begin_compiled_layout_construction(
+                &self,
+                layout: &novarocks_local_program::StaticLayout,
+            ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+                Ok(Box::new(BitmapOwner {
+                    inner: self.inner.begin_compiled_layout_construction(layout)?,
+                    gate: self.gate.clone(),
+                }))
+            }
+        }
+        impl InputConstructionOwner for BitmapOwner {
+            fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+                self.inner.storage_lifetime()
+            }
+            fn request(&self, layout: Layout) -> Result<(), ConstructionFailure> {
+                self.inner.request(layout)
+            }
+            fn observe_opaque_upper_bound(&self, bytes: usize) -> Result<(), ConstructionFailure> {
+                if self.gate.armed.load(Ordering::Acquire) && bytes == self.gate.repair_bytes {
+                    self.gate.saw_key_repair.store(true, Ordering::Release);
+                }
+                let target = self.gate.armed.load(Ordering::Acquire)
+                    && bytes == self.gate.bytes
+                    && !self.gate.fired.swap(true, Ordering::AcqRel);
+                if target {
+                    // Install the SMALL remaining allowance on the SAME actual tracker,
+                    // after earlier body/alignment admissions have already succeeded.
+                    self.gate
+                        .tracker
+                        .install_limit_once(self.gate.tracker.current() + 64)
+                        .unwrap();
+                }
+                let result = self.inner.observe_opaque_upper_bound(bytes);
+                if target {
+                    self.gate.original.set(result.clone().unwrap_err()).unwrap();
+                }
+                result
+            }
+            fn observe(
+                &self,
+                occurrence: usize,
+                path: &[ArrayPathStep],
+                step: ArrayNormalizationStep<'_>,
+            ) -> Result<(), ConstructionFailure> {
+                self.inner.observe(occurrence, path, step)
+            }
+        }
+        fn gated_factory(
+            tracker: Arc<MemTracker>,
+            bitmap: usize,
+            repair: usize,
+        ) -> (BitmapFactory, Arc<BitmapGate>) {
+            let (inner, _) = factory(tracker.clone());
+            let gate = Arc::new(BitmapGate {
+                tracker,
+                bytes: bitmap,
+                repair_bytes: repair,
+                armed: AtomicBool::new(false),
+                fired: AtomicBool::new(false),
+                saw_key_repair: AtomicBool::new(false),
+                original: OnceLock::new(),
+            });
+            (
+                BitmapFactory {
+                    inner,
+                    gate: gate.clone(),
+                },
+                gate,
+            )
+        }
+        fn assert_original_memory(error: &ExchangeFailure, gate: &BitmapGate) {
+            assert!(
+                gate.fired.load(Ordering::Acquire),
+                "the targeted pre-Arrow payload request ran"
+            );
+            let original = gate.original.get().expect("real tracker admission refused");
+            assert!(matches!(original, ConstructionFailure::Memory(_)));
+            let mut source: &dyn std::error::Error = error;
+            let mut memory = false;
+            let mut construction = false;
+            loop {
+                assert!(
+                    source.downcast_ref::<arrow::error::ArrowError>().is_none(),
+                    "Arrow was never invoked"
+                );
+                if let Some(actual) = source.downcast_ref::<ConstructionFailure>() {
+                    assert_eq!(actual, original);
+                    construction = true;
+                }
+                memory |= source.downcast_ref::<MemTrackerLimitExceeded>().is_some();
+                match source.source() {
+                    Some(next) => source = next,
+                    None => break,
+                }
+            }
+            assert!(
+                memory && construction,
+                "preserve the original real tracker cause"
+            );
+        }
+        fn assert_arrow_cause(error: &ExchangeFailure) {
+            let mut source: &dyn std::error::Error = error;
+            loop {
+                if source.downcast_ref::<arrow::error::ArrowError>().is_some() {
+                    return;
+                }
+                source = source
+                    .source()
+                    .expect("the original Arrow required-key refusal");
+            }
+        }
+
+        #[test]
+        fn real_factory_rejects_null_key_bitmap_before_arrow_with_unused_oversized_entries() {
+            let n = 1i64 << 20;
+            let tracker = MemTracker::new_root("unused Null map key bitmap admission");
+            let (factory, gate) = gated_factory(tracker.clone(), n as usize / 8, 0);
+            let carrier = map_carrier(DataType::Null);
+            let expected = typed_schema_with_carrier(&carrier, &carrier, true);
+            // This MUST succeed; the counterexample is under a fully prepared complete
+            // declaration, never a failure before the actual decoder seam is reached.
+            let recipe = online_unit::prepare_recipe(&expected, &[], &factory).unwrap();
+            let message = hand_record_message(
+                None,
+                1,
+                &[(1, 0), (n, 0), (n, n), (n, n)],
+                &[(0, 0), (0, 8), (8, 0)],
+                &[0; 64],
+            );
+            let wire = hand_unit(&recipe, &[message]);
+            let baseline = tracker.current();
+            gate.armed.store(true, Ordering::Release);
+            let error = online_unit::decode(&recipe, &wire, &expected, &factory)
+                .err()
+                .unwrap();
+            assert_original_memory(&error, &gate);
+            assert_eq!(
+                tracker.current(),
+                baseline,
+                "failed decode released every local owner"
+            );
+            drop(error);
+            drop(recipe);
+            drop(expected);
+            drop(factory);
+            drop(gate);
+            assert_eq!(tracker.current(), 0);
+        }
+
+        #[test]
+        fn real_factory_null_key_with_adequate_budget_preserves_original_arrow_refusal() {
+            let n = 1i64 << 20;
+            let tracker = MemTracker::new_root("unused Null map key original Arrow refusal");
+            let (factory, _) = factory(tracker.clone());
+            let carrier = map_carrier(DataType::Null);
+            let expected = typed_schema_with_carrier(&carrier, &carrier, true);
+            let recipe = online_unit::prepare_recipe(&expected, &[], factory.as_ref()).unwrap();
+            let message = hand_record_message(
+                None,
+                1,
+                &[(1, 0), (n, 0), (n, n), (n, n)],
+                &[(0, 0), (0, 8), (8, 0)],
+                &[0; 64],
+            );
+            let wire = hand_unit(&recipe, &[message]);
+            let baseline = tracker.current();
+            let error = online_unit::decode(&recipe, &wire, &expected, factory.as_ref())
+                .err()
+                .unwrap();
+            assert_arrow_cause(&error);
+            assert_eq!(tracker.current(), baseline);
+            drop(error);
+            drop(recipe);
+            drop(expected);
+            drop(factory);
+            assert_eq!(tracker.current(), 0);
+        }
+
+        fn dictionary_map_wire(
+            recipe: &online_unit::ExchangeRecipe,
+            n: usize,
+            first_null: bool,
+        ) -> Vec<u8> {
+            let mut values = vec![0u8; 192];
+            values[0] = 1; // values [Some("x"), None]
+            values[64..76].copy_from_slice(
+                &[0i32, 1, 1]
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            );
+            values[128] = b'x';
+            let dictionary = hand_record_message(
+                Some(0),
+                2,
+                &[(2, 1)],
+                &[(0, 1), (64, 12), (128, 1)],
+                &values,
+            );
+            let mut body = vec![0u8; (9 + n * 4).next_multiple_of(64)];
+            body[4..8].copy_from_slice(&i32::try_from(n).unwrap().to_le_bytes());
+            if first_null {
+                body[9..13].copy_from_slice(&1i32.to_le_bytes());
+            }
+            // The original keys allocation must genuinely require an alignment copy.
+            let record = hand_record_message(
+                None,
+                1,
+                &[(1, 0), (n as i64, 0), (n as i64, 0), (n as i64, n as i64)],
+                &[(0, 0), (0, 8), (8, 0), (8, 0), (9, (n * 4) as i64)],
+                &body,
+            );
+            hand_unit(recipe, &[dictionary, record])
+        }
+        #[test]
+        fn real_factory_funds_alignment_and_dictionary_logical_bitmap_independently() {
+            let n = 16_384usize;
+            let carrier = map_carrier(DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Utf8),
+            ));
+            let expected = typed_schema_with_carrier(&carrier, &carrier, true);
+            {
+                let tracker = MemTracker::new_root("key repair then independent bitmap refusal");
+                let (factory, gate) = gated_factory(
+                    tracker.clone(),
+                    (n.div_ceil(8)).next_multiple_of(64),
+                    (n * 4).next_multiple_of(64),
+                );
+                let recipe = online_unit::prepare_recipe(&expected, &[], &factory).unwrap();
+                let wire = dictionary_map_wire(&recipe, n, false);
+                let baseline = tracker.current();
+                gate.armed.store(true, Ordering::Release);
+                let error = online_unit::decode(&recipe, &wire, &expected, &factory)
+                    .err()
+                    .unwrap();
+                assert_original_memory(&error, &gate);
+                assert!(
+                    gate.saw_key_repair.load(Ordering::Acquire),
+                    "earlier repair reserve cannot pay this second allocation"
+                );
+                assert_eq!(tracker.current(), baseline);
+                drop(error);
+                drop(recipe);
+                drop(factory);
+                drop(gate);
+                assert_eq!(tracker.current(), 0);
+            }
+            {
+                let tracker = MemTracker::new_root("key repair and logical bitmap adequate budget");
+                let (factory, _) = factory(tracker.clone());
+                let recipe = online_unit::prepare_recipe(&expected, &[], factory.as_ref()).unwrap();
+                let valid = dictionary_map_wire(&recipe, n, false);
+                let result =
+                    online_unit::decode(&recipe, &valid, &expected, factory.as_ref()).unwrap();
+                assert_eq!(result[0].len(), 1);
+                assert_eq!(
+                    result[0].chunk_schema().slots()[0].typed_binding(),
+                    expected.slots()[0].typed_binding()
+                );
+                drop(result);
+                let invalid = dictionary_map_wire(&recipe, n, true);
+                let error = online_unit::decode(&recipe, &invalid, &expected, factory.as_ref())
+                    .err()
+                    .unwrap();
+                assert_arrow_cause(&error);
+                drop(error);
+                drop(recipe);
+                drop(factory);
+                assert_eq!(tracker.current(), 0);
+            }
+        }
     }
 }

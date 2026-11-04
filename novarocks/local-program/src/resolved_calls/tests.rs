@@ -1877,3 +1877,51 @@ fn created_call_table_every_control_boundary_keeps_first_cause_and_no_tail() {
         }
     }
 }
+
+#[test]
+fn canonical_map64_carrier_consistency_keeps_type_and_control_refusals() {
+    let map = |mut data_type: DataType| {
+        for _ in 1..64 {
+            data_type = DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", DataType::Int32, false)),
+                            Arc::new(Field::new("value", data_type, false)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            );
+        }
+        data_type
+    };
+    let left = map(DataType::Utf8);
+    let right = map(DataType::LargeUtf8);
+    let good = Control::default();
+    let mut work = CompileCheckpoints::try_new(&good, CompilePhase::LowerProgram).unwrap();
+    check_arrow(&left, &left, &mut work).unwrap();
+    assert_eq!(
+        check_arrow(&left, &right, &mut work),
+        Err(ProgramResolvedCallsError::TypeMismatch)
+    );
+    work.finish().unwrap();
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let control = Control {
+            failure: Some((256, cause.clone())),
+            ..Control::default()
+        };
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        assert_eq!(
+            check_arrow(&left, &left, &mut work),
+            Err(ProgramResolvedCallsError::Control(cause))
+        );
+    }
+}

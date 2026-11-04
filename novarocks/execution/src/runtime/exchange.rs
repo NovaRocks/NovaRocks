@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Cursor, Read, Write};
+use std::io::Write;
+#[cfg(test)]
+use std::io::{Cursor, Read};
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,6 +44,7 @@ pub(crate) fn emit_exchange_snapshot_marker(
 
 use arrow::array::{Array, ArrayRef, Int8Array};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
+#[cfg(test)]
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -58,6 +61,7 @@ use novarocks_types::format_uuid;
 use novarocks_types::{SlotId, UniqueId};
 use tracing::debug;
 
+pub(crate) mod online_unit;
 mod reader_structure;
 mod result_ipc_preflight;
 mod unit_ingress;
@@ -138,33 +142,19 @@ impl std::fmt::Display for ExchangeSenderIdentity {
 
 mod failure;
 pub use failure::ExchangeFailure;
-use failure::{
-    contract as exchange_contract, payload as exchange_payload, stopped as exchange_stopped,
-};
+use failure::{contract as exchange_contract, stopped as exchange_stopped};
+
+#[cfg(test)]
+use failure::payload as exchange_payload;
 
 /// How a registered receiver binds the columns of a decoded wire payload to
 /// its expected chunk schema.
 ///
-/// The choice belongs to the receiver's registration and is never inferred
-/// from the payload: whether a sender's slot ids mean anything in the
-/// receiver's namespace is a property of how both fragments were compiled.
+/// Frozen edge ordinals pair sender output with receiver imports. Local slot
+/// IDs and root display names never participate in the online wire contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExchangeColumnBinding {
-    /// Legacy fragments share one slot namespace across the edge: a wire
-    /// column binds to the expected slot with the same id whenever every wire
-    /// slot id exists in the expected schema, and by position otherwise.
-    BySlotId,
-    /// Compiled fragments allocate slot ids per fragment, so a sender's ids
-    /// carry no meaning in the receiver. Wire column `i` binds to expected
-    /// slot `i`, exactly the cut law that pairs `projection[i]` with
-    /// `imports[i]`; slot ids are never consulted.
     Positional,
-}
-
-impl ExchangeColumnBinding {
-    const fn prefers_wire_slot_ids(self) -> bool {
-        matches!(self, Self::BySlotId)
-    }
 }
 
 /// The receiver's registered type contract and how wire columns bind to it.
@@ -173,6 +163,7 @@ struct ExpectedReceiverSchema {
     chunk_schema: ChunkSchemaRef,
     column_binding: ExchangeColumnBinding,
     creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    recipe: Arc<online_unit::ExchangeRecipe>,
 }
 
 const CANCELED_KEYS_TTL: Duration = Duration::from_secs(600);
@@ -334,8 +325,6 @@ struct ReceiverState {
     #[cfg(novarocks_dev_controls)]
     test_observer: Option<Arc<dyn TestEventObserver>>,
     expected: Option<ExpectedReceiverSchema>,
-    sender_wire_meta: HashMap<ExchangeSenderIdentity, Arc<GuardedExchangeWireMeta>>,
-    sender_wire_table_storage: Option<novarocks_type_contract::ValueTypeStorageLifetime>,
     finished: HashSet<ExchangeSenderIdentity>,
     chunks: VecDeque<SourcedExchangeChunk>,
     recv_request_count: u128,
@@ -569,15 +558,14 @@ impl ExecutionExchangeRegistry {
             key,
             expected_senders,
             chunk_schema,
-            ExchangeColumnBinding::BySlotId,
+            ExchangeColumnBinding::Positional,
             false,
             creation_factory,
         )
         .map(|_| ())
     }
 
-    /// Register a legacy receiver exactly once: wire columns bind by slot id
-    /// ([`ExchangeColumnBinding::BySlotId`]).
+    /// Register a receiver exactly once with frozen positional columns.
     pub fn try_register_expected_chunk_schema(
         &self,
         key: ExchangeKey,
@@ -589,7 +577,7 @@ impl ExecutionExchangeRegistry {
             key,
             expected_senders,
             chunk_schema,
-            ExchangeColumnBinding::BySlotId,
+            ExchangeColumnBinding::Positional,
             creation_factory,
         )
     }
@@ -653,6 +641,7 @@ impl ExecutionExchangeRegistry {
             return Err(exchange_stopped());
         }
         let receiver = get_or_create(registry, key);
+        let recipe = online_unit::prepare_recipe(&chunk_schema, &[], creation_factory.as_ref())?;
         let mut st = receiver.mu.lock().expect("exchange receiver lock");
         if expected_senders == 0
             || (st.expected.is_some() && st.expected_senders != expected_senders)
@@ -696,6 +685,7 @@ impl ExecutionExchangeRegistry {
                     chunk_schema,
                     column_binding,
                     creation_factory,
+                    recipe,
                 });
             }
         }
@@ -1054,13 +1044,12 @@ impl Write for BoundedPayloadWriter {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 struct BorrowedExchangeWireMeta<'a> {
     words: &'a [u8],
 }
+#[cfg(test)]
 impl<'a> BorrowedExchangeWireMeta<'a> {
-    fn len(self) -> usize {
-        self.words.len() / std::mem::size_of::<u32>()
-    }
     fn ids(self) -> impl Iterator<Item = SlotId> + 'a {
         self.words
             .as_chunks::<4>()
@@ -1068,62 +1057,11 @@ impl<'a> BorrowedExchangeWireMeta<'a> {
             .iter()
             .map(|word| SlotId::new(u32::from_le_bytes(*word)))
     }
-    fn matches(
-        self,
-        original: &ExchangeWireMeta,
-        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
-    ) -> Result<bool, ExchangeFailure> {
-        if self.len() != original.slot_ids_by_index.len() {
-            return Ok(false);
-        }
-        for (actual, expected) in self.ids().zip(&original.slot_ids_by_index) {
-            factory.observe_input_work(1)?;
-            if actual != *expected {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
 }
+#[cfg(test)]
 struct BorrowedExchangePayload<'a> {
     wire_meta: Option<BorrowedExchangeWireMeta<'a>>,
     arrow_payload: &'a [u8],
-}
-struct GuardedExchangeWireMeta {
-    value: ExchangeWireMeta,
-    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
-}
-impl GuardedExchangeWireMeta {
-    fn try_from_source(
-        source: BorrowedExchangeWireMeta<'_>,
-        owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
-    ) -> Result<Arc<Self>, ExchangeFailure> {
-        owner.request(
-            std::alloc::Layout::array::<SlotId>(source.len()).map_err(|_| {
-                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic
-            })?,
-        )?;
-        let mut ids = Vec::with_capacity(source.len());
-        for id in source.ids() {
-            owner.observe(
-                0,
-                &[],
-                crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork { units: 1 },
-            )?;
-            ids.push(id);
-        }
-        owner.request(
-            novarocks_type_contract::owned_resources::layout::arc_layout(
-                std::alloc::Layout::new::<Self>(),
-            )?,
-        )?;
-        Ok(Arc::new(Self {
-            value: ExchangeWireMeta {
-                slot_ids_by_index: ids,
-            },
-            _storage: owner.storage_lifetime(),
-        }))
-    }
 }
 impl From<novarocks_type_contract::owned_resources::hashmap::HashMapResourceError>
     for ExchangeFailure
@@ -1145,6 +1083,7 @@ impl From<novarocks_type_contract::owned_resources::hashmap::HashMapResourceErro
     }
 }
 
+#[cfg(test)]
 fn borrow_exchange_payload_envelope(
     bytes: &[u8],
 ) -> Result<BorrowedExchangePayload<'_>, ExchangeFailure> {
@@ -1592,9 +1531,15 @@ fn materialize_chunk_for_wire_meta(
                 )
             },
         )?;
-        if !novarocks_type_contract::value_layout_matches_carrier_observed(
+        let nullability = if carrier_contract == DecodeCarrierContract::Exchange {
+            novarocks_type_contract::CarrierNullabilityPolicy::Permissive
+        } else {
+            novarocks_type_contract::CarrierNullabilityPolicy::Exact
+        };
+        if !novarocks_type_contract::value_layout_matches_carrier_with_nullability_observed(
             expected_slot.typed_binding().layout(),
             source.data_type(),
+            nullability,
             |units| creation.work(units),
         )? {
             return Err(exchange_contract(format_args!(
@@ -1614,6 +1559,10 @@ fn materialize_chunk_for_wire_meta(
             // A real IPC occurrence publishes its own dictionary descriptor.
             // It never borrows an ID/order fact from the receiver's value type.
             let original = source_schema.field(ordinal);
+            // Root Field NULL metadata belongs to the frozen output. Arrays
+            // keep their canonical permissive nested types; typed ingress
+            // separately checks actual NULLs against the complete binding.
+            let nullable = expected_slot.nullable();
             creation.observe(
                 ordinal,
                 crate::exec::chunk::ArrayNormalizationStep::RebuildField {
@@ -1627,7 +1576,7 @@ fn materialize_chunk_for_wire_meta(
                 arrow::datatypes::Field::new_dict(
                     expected_slot.name(),
                     array.data_type().clone(),
-                    expected_slot.nullable(),
+                    nullable,
                     original.dict_id().ok_or_else(|| {
                         exchange_contract("exchange dictionary occurrence ID is missing")
                     })?,
@@ -1639,7 +1588,7 @@ fn materialize_chunk_for_wire_meta(
                 arrow::datatypes::Field::new(
                     expected_slot.name(),
                     array.data_type().clone(),
-                    expected_slot.nullable(),
+                    nullable,
                 )
             };
             reuses_prepared = false;
@@ -1919,6 +1868,7 @@ fn encode_typed_arrow_ipc_chunks_to<W: std::io::Write>(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn encode_chunks_with_creation(
     chunks: &[Chunk],
     include_slot_ids: bool,
@@ -2196,13 +2146,11 @@ impl ExecutionExchangeRegistry {
     pub fn decode_chunks_for_sender(
         &self,
         key: ExchangeKey,
-        sender: ExchangeSenderIdentity,
+        _sender: ExchangeSenderIdentity,
         bytes: &[u8],
     ) -> Result<Vec<Chunk>, ExchangeFailure> {
-        let BorrowedExchangePayload {
-            wire_meta: source_meta,
-            arrow_payload,
-        } = borrow_exchange_payload_envelope(bytes)?;
+        // Unit ingress already owns the unique grant/decoder claim and exact
+        // frozen sender membership. No first-payload metadata can alter it.
         let receiver = self
             .receivers
             .lock()
@@ -2210,74 +2158,19 @@ impl ExecutionExchangeRegistry {
             .get(&key)
             .cloned()
             .ok_or_else(|| exchange_contract("exchange receiver is not registered"))?;
-        let expected;
-        let wire_meta;
-        {
-            let mut st = receiver.mu.lock().expect("exchange receiver lock");
-            if st.canceled {
+        let expected = {
+            let state = receiver.mu.lock().expect("exchange receiver lock");
+            if state.canceled {
                 return Err(exchange_stopped());
             }
-            expected = st.expected.clone().ok_or_else(|| {
+            state.expected.clone().ok_or_else(|| {
                 exchange_contract("exchange receiver has no complete frozen declaration")
-            })?;
-            if arrow_payload.is_empty() {
-                return Ok(Vec::new());
-            }
-            if let Some(source) = source_meta {
-                if source.len() != expected.chunk_schema.slots().len() {
-                    return Err(exchange_payload(
-                        "exchange frozen declaration differs from wire column count",
-                    ));
-                }
-                // Cache headers own a separate finite scope. Temporary reader
-                // headers never become coupled to the cache's lifetime.
-                if let Some(existing) = st.sender_wire_meta.get(&sender) {
-                    if !source.matches(&existing.value, expected.creation_factory.as_ref())? {
-                        return Err(exchange_payload(format_args!(
-                            "exchange sender wire meta changed unexpectedly: finst={} node_id={} sender={}",
-                            key.finst_uuid(),
-                            key.node_id,
-                            sender
-                        )));
-                    }
-                    wire_meta = existing.clone();
-                } else {
-                    let metadata_owner = expected
-                        .creation_factory
-                        .begin_typed_construction(&expected.chunk_schema)?;
-                    let metadata =
-                        GuardedExchangeWireMeta::try_from_source(source, metadata_owner.as_ref())?;
-                    let growth = novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<ExchangeSenderIdentity, Arc<GuardedExchangeWireMeta>, ExchangeFailure>(
-                        st.sender_wire_meta.len(), st.sender_wire_meta.capacity(),
-                        || { metadata_owner.observe(0, &[], crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork { units: 1 })?; Ok(()) },
-                    )?;
-                    let table_owner = if growth != 0 {
-                        let owner = expected
-                            .creation_factory
-                            .begin_typed_construction(&expected.chunk_schema)?;
-                        owner.observe_opaque_upper_bound(growth)?;
-                        Some(owner)
-                    } else {
-                        None
-                    };
-                    st.sender_wire_meta.insert(sender, metadata.clone());
-                    // Insertion has completed and std dropped the old table.
-                    // Replacing only its finite holder releases original table
-                    // liability, not any payload or metadata-node custody.
-                    if let Some(owner) = table_owner {
-                        st.sender_wire_table_storage = Some(owner.storage_lifetime());
-                    }
-                    wire_meta = metadata;
-                }
-            } else {
-                wire_meta = st.sender_wire_meta.get(&sender).cloned().ok_or_else(|| exchange_payload(format_args!("exchange wire meta missing before first data chunk: finst={} node_id={} sender={}", key.finst_uuid(), key.node_id, sender)))?;
-            }
-        }
-        reader_structure::decode_owned(
-            arrow_payload,
+            })?
+        };
+        online_unit::decode(
+            &expected.recipe,
+            bytes,
             &expected.chunk_schema,
-            &wire_meta.value,
-            expected.column_binding.prefers_wire_slot_ids(),
             expected.creation_factory.as_ref(),
         )
     }
@@ -2476,25 +2369,17 @@ mod typed_receiver_header_tests {
     fn typed_receiver_ipc_dictionary_preserves_json_and_last_schema_hold_only() {
         let expected = declaration();
         let batch = dictionary_batch();
-        let mut ipc = Vec::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut ipc, batch.schema().as_ref()).unwrap();
-            writer.write(&batch).unwrap();
-            writer.finish().unwrap();
-        }
-        // StreamWriter owns the actual occurrence namespace. Compare the
-        // receiver to its published descriptor, never to the source Field ID.
-        let published = StreamReader::try_new(Cursor::new(&ipc), None)
-            .unwrap()
-            .schema();
-        #[allow(deprecated)]
-        let ipc_id = published.field(0).dict_id().unwrap();
-        let ipc_order = published.field(0).dict_is_ordered().unwrap();
-        let wire = ExchangeWireMeta {
-            slot_ids_by_index: vec![SlotId::new(33)],
-        };
-        let payload =
-            encode_exchange_payload_envelope(&ipc, Some(&wire)).expect("exchange envelope fixture");
+        let source_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(33)],
+        )
+        .unwrap();
+        let source = Chunk::new_with_chunk_schema(batch, source_schema);
+        let payload = tests::online_unit_as(&source, &expected);
+        // The per-unit DFS occurrence namespace starts at zero; source 271
+        // and all root display names/slot IDs are absent from the wire.
+        let ipc_id = 0;
+        let ipc_order = false;
         let tracker =
             crate::runtime::mem_tracker::MemTracker::new_root("typed receiver independent schema");
         tracker.install_limit_once(64 * 1024 * 1024).unwrap();

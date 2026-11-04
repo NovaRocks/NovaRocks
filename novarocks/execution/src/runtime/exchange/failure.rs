@@ -109,6 +109,7 @@ enum ExchangeCause {
         operation: ArrowOperation,
         source: arrow::error::ArrowError,
     },
+    #[cfg(test)]
     Read {
         operation: &'static str,
         source: std::io::Error,
@@ -125,7 +126,9 @@ impl fmt::Display for ExchangeCause {
             Self::Stopped => f.write_str("exchange receiver was stopped"),
             Self::Poisoned(lock) => write!(f, "exchange {lock} lock is poisoned"),
             Self::Arrow { operation, source } => write!(f, "exchange {operation:?}: {source}"),
-            Self::Read { operation, source } | Self::Write { operation, source } => {
+            #[cfg(test)]
+            Self::Read { operation, source } => write!(f, "exchange {operation}: {source}"),
+            Self::Write { operation, source } => {
                 write!(f, "exchange {operation}: {source}")
             }
         }
@@ -135,7 +138,9 @@ impl Error for ExchangeCause {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Arrow { source, .. } => Some(source),
-            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
+            #[cfg(test)]
+            Self::Read { source, .. } => Some(source),
+            Self::Write { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -176,6 +181,7 @@ impl FailureProjection for ExchangeCause {
                 operation: ArrowOperation::Construct,
                 ..
             } => (FailureClass::Invariant, 106),
+            #[cfg(test)]
             Self::Read { .. } => (FailureClass::Data, 107),
             Self::Write { .. } => (FailureClass::Invariant, 111),
         };
@@ -211,6 +217,7 @@ pub(super) fn arrow(
 ) -> ExchangeFailure {
     from_cause(ExchangeCause::Arrow { operation, source })
 }
+#[cfg(test)]
 pub(super) fn read(operation: &'static str, source: std::io::Error) -> ExchangeFailure {
     from_cause(ExchangeCause::Read { operation, source })
 }

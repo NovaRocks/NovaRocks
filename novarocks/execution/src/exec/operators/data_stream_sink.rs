@@ -196,7 +196,6 @@ use crate::exec::operators::compiled_expression::{
     root_value_type,
 };
 use crate::runtime::endpoint::FragmentDestination;
-use crate::runtime::exchange;
 use crate::runtime::fragment::io::exchange_retained_payload::ExchangeRetainedPayload;
 use crate::runtime::fragment::io::exchange_sender_group::{ExchangeSenderGroup, GroupPublication};
 use crate::runtime::fragment::io::exchange_stream_sender::ExchangeStreamSenderConfig;
@@ -1573,6 +1572,7 @@ pub struct DataStreamSinkFactory {
     send_group: Arc<ExchangeSenderGroup>,
     edge_gates: Option<Arc<ExchangeEdgeGates>>,
     compiled_partition: Option<CompiledPartitionKeys>,
+    frozen_output: Option<novarocks_local_program::StaticLayout>,
 }
 
 impl DataStreamSinkFactory {
@@ -1604,7 +1604,16 @@ impl DataStreamSinkFactory {
             send_group: ExchangeSenderGroup::new(),
             edge_gates: None,
             compiled_partition: None,
+            frozen_output: None,
         }
+    }
+
+    pub(crate) fn with_frozen_output(
+        mut self,
+        output: &novarocks_local_program::StaticLayout,
+    ) -> Self {
+        self.frozen_output = Some(output.clone());
+        self
     }
 
     /// Evaluate this sink's partition keys through compiled roots. The
@@ -1754,6 +1763,8 @@ impl OperatorFactory for DataStreamSinkFactory {
             end_of_stream_sent: AtomicBool::new(false),
             send_observable,
             construction_factory: None,
+            frozen_output: self.frozen_output.clone(),
+            recipe: None,
             prepared: false,
             exiting: false,
             compiled_control: None,
@@ -1854,6 +1865,8 @@ struct DataStreamSinkOperator {
     compiled_partition: Option<CompiledPartitionState>,
     construction_factory:
         Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    frozen_output: Option<novarocks_local_program::StaticLayout>,
+    recipe: Option<Arc<crate::runtime::exchange::online_unit::ExchangeRecipe>>,
     prepared: bool,
     exiting: bool,
     compiled_control: Option<RuntimeKernelControl>,
@@ -1955,9 +1968,23 @@ impl OperatorLifecycle for DataStreamSinkOperator {
         if self.prepared {
             return Ok(());
         }
-        self.construction_factory
+        let factory = self
+            .construction_factory
             .as_ref()
             .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let output = self
+            .frozen_output
+            .as_ref()
+            .ok_or_else(|| stream_contract("exchange sender has no frozen output declaration"))?;
+        let schema = factory.create_compiled_chunk_schema(output)?;
+        self.recipe = Some(
+            crate::runtime::exchange::online_unit::prepare_recipe(
+                &schema,
+                &self.input.output_columns,
+                factory.as_ref(),
+            )
+            .map_err(|error| error.into_execution())?,
+        );
         self.prepared = true;
         // Align with StarRocks: count actual sink drivers prepared, not planned DOP.
         self.finish_state.register_driver();
@@ -1977,7 +2004,6 @@ impl OperatorLifecycle for DataStreamSinkOperator {
         Ok(())
     }
 
-    #[cfg(test)]
     #[cfg(test)]
     fn pending_finish(&self) -> Option<crate::exec::pipeline::operator::FinishWatch> {
         (!self.send_group.is_idle()).then(|| {
@@ -2668,10 +2694,6 @@ impl DataStreamSinkOperator {
         }
     }
 
-    fn should_include_wire_meta(chunks_empty: bool) -> bool {
-        !chunks_empty
-    }
-
     fn transmit_partition(
         &mut self,
         _dest_idx: usize,
@@ -2724,20 +2746,29 @@ impl DataStreamSinkOperator {
 
         let _projection_owner = projection_owner.as_ref();
         let be_number = self.be_number;
-        // Delivery is asynchronous, so every data payload must be self-describing.
-        let include_slot_ids = Self::should_include_wire_meta(chunks.is_empty());
         let encode_start = std::time::Instant::now();
         let error_state = self
             .error_state
             .as_ref()
             .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
         let control = RuntimeKernelControl::new(error_state.clone());
-        let payload = exchange::encode_chunks_with_creation(
-            chunks,
-            include_slot_ids,
-            factory.as_ref(),
-            &control,
-        )?;
+        let payload = match chunks {
+            [] => Vec::new(),
+            [chunk] => crate::runtime::exchange::online_unit::encode(
+                self.recipe.as_deref().ok_or_else(|| {
+                    stream_contract("exchange sender recipe was not installed during preparation")
+                })?,
+                chunk,
+                factory.as_ref(),
+                &control,
+            )
+            .map_err(|error| error.into_execution())?,
+            _ => {
+                return Err(stream_contract(
+                    "one exchange unit must contain exactly one complete batch",
+                ));
+            }
+        };
         let encode_ns = encode_start.elapsed().as_nanos();
         let payload_bytes = payload.len();
         let payload_capacity_bytes = payload.capacity().max(payload_bytes);
@@ -2874,50 +2905,21 @@ impl DataStreamSinkOperator {
         Ok(())
     }
 
-    fn drain_pending_batch(&mut self, dest_idx: usize) -> ExecutionResult<(Vec<Chunk>, usize)> {
-        let max_bytes = self.max_transmit_batched_bytes.max(1);
+    fn drain_pending_chunk(&mut self, dest_idx: usize) -> ExecutionResult<Option<Chunk>> {
         let pending = self
             .pending_per_dest
             .get_mut(dest_idx)
             .ok_or_else(|| stream_contract("pending buffer index out of range"))?;
-        if pending.is_empty() {
-            return Ok((Vec::new(), 0));
+        let Some(chunk) = pending.pop_front() else {
+            return Ok(None);
+        };
+        let bytes = chunk.record_batch().get_array_memory_size();
+        if let Some(total) = self.pending_bytes_per_dest.get_mut(dest_idx) {
+            *total = total.saturating_sub(bytes);
         }
-
-        let mut batch = Vec::new();
-        let mut batch_bytes = 0usize;
-        let mut first_schema: Option<crate::exec::chunk::ChunkSchemaRef> = None;
-        while let Some(front) = pending.front() {
-            let chunk_bytes = front.record_batch().get_array_memory_size();
-            if let Some(schema) = first_schema.as_ref()
-                && front.chunk_schema() != schema.as_ref()
-            {
-                // Keep a single exchange payload schema-stable. Complex aggregate
-                // outputs can diverge in nested nullability (for example MAP keys)
-                // across drivers, and Arrow IPC normalization cannot widen those
-                // nested field contracts without rebuilding the arrays.
-                break;
-            }
-            if !batch.is_empty() && batch_bytes.saturating_add(chunk_bytes) > max_bytes {
-                break;
-            }
-            let chunk = pending
-                .pop_front()
-                .ok_or_else(|| stream_contract("pending buffer empty unexpectedly"))?;
-            batch_bytes = batch_bytes.saturating_add(chunk_bytes);
-            if first_schema.is_none() {
-                first_schema = Some(chunk.chunk_schema_ref());
-            }
-            batch.push(chunk);
-            if batch_bytes >= max_bytes {
-                break;
-            }
-        }
-
-        if let Some(bytes) = self.pending_bytes_per_dest.get_mut(dest_idx) {
-            *bytes = bytes.saturating_sub(batch_bytes);
-        }
-        Ok((batch, batch_bytes))
+        // Each original chunk is one independently decodable Unit. Remaining
+        // chunks stay queued under the existing sender backpressure owner.
+        Ok(Some(chunk))
     }
 
     fn flush_pending(&mut self, force: bool) -> ExecutionResult<()> {
@@ -2972,11 +2974,10 @@ impl DataStreamSinkOperator {
                 if !self.should_flush_pending_dest(i, force) {
                     break;
                 }
-                let (chunks, _batch_bytes) = self.drain_pending_batch(i)?;
-                if chunks.is_empty() {
+                let Some(chunk) = self.drain_pending_chunk(i)? else {
                     break;
-                }
-                match self.transmit_partition(i, dest, &chunks, false)? {
+                };
+                match self.transmit_partition(i, dest, std::slice::from_ref(&chunk), false)? {
                     PayloadEnqueue::Enqueued => {}
                     PayloadEnqueue::Discarded => {
                         self.discard_pending_for_dest(i);

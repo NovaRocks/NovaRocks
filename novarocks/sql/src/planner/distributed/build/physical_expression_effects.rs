@@ -32,7 +32,7 @@ use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
     EffectContractError, ExpressionUseId, PureCompileControl, SemanticParameterError,
     SemanticParameterRef, SemanticParameterValue, SemanticParameters, ValueTypeError,
-    arrow_data_types_exact_observed,
+    arrow_data_types_exact_with_profile_observed,
 };
 
 use super::{
@@ -641,9 +641,10 @@ fn primitive_own_effects(
             decimal_overflow_policy,
             allow_throw_exception,
         } => {
-            if !arrow_data_types_exact_observed::<PhysicalExpressionEffectsError>(
+            if !arrow_data_types_exact_with_profile_observed::<PhysicalExpressionEffectsError>(
                 target,
                 source.ty.data_type(),
+                novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
                 || work.step().map_err(Into::into),
             )? {
                 return Err(PhysicalExpressionEffectsError::InvalidSource(

@@ -56,7 +56,9 @@ use crate::root_producer_pool::{
 };
 pub use crate::root_producer_pool::{RootProducerLimits, RootProducerPool};
 
-use crate::root_cow_selection_codec::{CowSelectionEncoder, CowSelectionTotals};
+use crate::root_cow_selection_codec::{
+    CowSelectionEncoder, CowSelectionRecipe, CowSelectionTotals,
+};
 use crate::root_scalar_container_codec::{NativeScalarContainerEncoder, is_container};
 use crate::root_scalar_leaf_codec::{NativeScalarLeafEncoder, ScalarSchemaOwner};
 use crate::root_statistics_codec::{
@@ -319,6 +321,11 @@ impl Input {
     /// unlocking; a destructor unwind cannot implicitly drop another field.
     fn take_exit_action(&mut self, phase: InputExitPhase) -> Option<InputExitAction> {
         self.retiring = true;
+        // A cursor/normalizer outside the lock still touches original data.
+        // Empty local fields do not establish that this work has exited.
+        if self.execution != InputExecution::Idle {
+            return None;
+        }
         if self.exits[phase.index()] != InputOwnerExit::NotStarted {
             return None;
         }
@@ -499,7 +506,7 @@ struct ProducerState {
     statistics_totals: StatisticsCodecTotals,
     /// PreparedWriteCommitV1 records completed across every input batch.
     write_totals: WriteCommitTotals,
-    /// CowSelectionArrowV1 schema and batch records completed so far.
+    /// CowSelectionArrowV1 complete batch records completed so far.
     cow_totals: CowSelectionTotals,
     /// ScalarValueV1 rows accepted across every input batch: 0 or 1. Its
     /// record stays in the unpublished segment until the sealed normal End.
@@ -562,6 +569,7 @@ type RootFailureReporter = Arc<novarocks_execution::runtime::task_control::TaskE
 /// The composition retains the pool and explicitly shuts it down before its
 /// driver executor. Runtime Task owners retain the channel, not this session.
 struct RootSessionState {
+    cow_recipe: Option<Arc<CowSelectionRecipe>>,
     channel: Arc<RootResultChannel>,
     authority: RootInputAuthority,
     state: Mutex<ProducerState>,
@@ -658,6 +666,7 @@ impl novarocks_worker::TaskPreparationChild for NativeRootPreparationChild {
     }
 }
 impl NativeRootResultSession {
+    #[cfg(test)]
     pub(crate) fn try_open_prepared(
         channel: Arc<RootResultChannel>,
         pool: &Arc<RootProducerPool>,
@@ -665,6 +674,17 @@ impl NativeRootResultSession {
         preparation_child: &Arc<
             crate::backend_task_execution::prepared_owner::NativePreparationChild,
         >,
+    ) -> Result<Arc<Self>, FragmentIoError> {
+        Self::try_open_prepared_with_cow_recipe(channel, pool, preparation, preparation_child, None)
+    }
+    pub(crate) fn try_open_prepared_with_cow_recipe(
+        channel: Arc<RootResultChannel>,
+        pool: &Arc<RootProducerPool>,
+        preparation: &novarocks_worker::TaskPreparationContext,
+        preparation_child: &Arc<
+            crate::backend_task_execution::prepared_owner::NativePreparationChild,
+        >,
+        cow_recipe: Option<Arc<CowSelectionRecipe>>,
     ) -> Result<Arc<Self>, FragmentIoError> {
         let control = preparation.runtime_control();
         if control.identity() != channel.spec().task
@@ -675,12 +695,20 @@ impl NativeRootResultSession {
                 novarocks_execution::runtime::task_control::TaskControlIdentityMismatch,
             ));
         }
+        let cow = channel.spec().contract.kind()
+            == RootOutputKind::InternalFacts(InternalResultDomain::CowSelectionArrowV1);
+        if cow != cow_recipe.is_some() {
+            return Err(io_error(
+                crate::root_cow_selection_codec::CowSelectionCodecError::RecipeMismatch,
+            ));
+        }
         Self::open_in_scope(
             channel,
             pool,
             control,
             preparation_child,
             preparation.readiness_waker(),
+            cow_recipe,
         )
     }
 
@@ -690,6 +718,7 @@ impl NativeRootResultSession {
         failure_reporter: RootFailureReporter,
         preparation: &Arc<crate::backend_task_execution::prepared_owner::NativePreparationChild>,
         readiness: std::task::Waker,
+        cow_recipe: Option<Arc<CowSelectionRecipe>>,
     ) -> Result<Arc<Self>, FragmentIoError> {
         let contract = &channel.spec().contract;
         // Every closed internal domain has its producer codec; only a scalar
@@ -768,6 +797,7 @@ impl NativeRootResultSession {
             .map_err(io_error)?,
         );
         let shared = Arc::new(RootSessionState {
+            cow_recipe,
             channel,
             authority,
             state: Mutex::new(ProducerState {
@@ -1110,7 +1140,6 @@ impl RootSessionState {
                     &mut state.scalar_rows,
                     state.statistics_totals,
                     state.write_totals,
-                    &state.cow_totals,
                     &mut state.client_types,
                 );
                 input.execution = InputExecution::Idle;
@@ -1221,7 +1250,6 @@ impl RootSessionState {
         scalar_rows: &mut u8,
         statistics_totals: StatisticsCodecTotals,
         write_totals: WriteCommitTotals,
-        cow_totals: &CowSelectionTotals,
         client_types: &mut Option<novarocks_result_render::ValidatedClientInput>,
     ) -> ExecutionResult<InputEncoder> {
         let fits = |inline: usize| inline.checked_add(cloning).is_some_and(|n| n <= capacity);
@@ -1247,15 +1275,8 @@ impl RootSessionState {
                     .map_err(ExecutionFailure::from_domain)
             }
             FrozenRootOutput::InternalFacts(InternalResultDomain::CowSelectionArrowV1) => {
-                // Node/buffer tables and the record prefix are sized exactly
-                // from this input before anything is allocated.
-                CowSelectionEncoder::try_new(
-                    input.chunk().record_batch(),
-                    cow_totals.clone(),
-                    capacity,
-                )
-                .map(|encoder| InputEncoder::CowSelection(Box::new(encoder)))
-                .map_err(ExecutionFailure::from_domain)
+                // COW has its own out-of-lock construction/step path.
+                Err(RootSessionFailure::NoInputCursor.into())
             }
             FrozenRootOutput::ScalarValue(schema) => {
                 // Cumulative cardinality is decided before any cursor: a
@@ -1572,6 +1593,29 @@ impl RootProducerJob for NativeRootWork {
             if let Some(hook) = hook {
                 hook();
             }
+        }
+        if self.shared.cow() {
+            let turn = match self.shared.advance_cow() {
+                Ok(turn) => turn,
+                Err(source) => {
+                    self.shared.capture_failure(source);
+                    RootProducerTurn::Complete
+                }
+            };
+            {
+                let mut state = self.shared.state();
+                state.completed |=
+                    turn_has_published_end(turn, self.shared.channel.snapshot().end_sequence);
+            }
+            if self
+                .shared
+                .retire_failure_source(FailureRecordKind::Primary)
+                == RootCleanupProgress::Unresolved
+                || self.shared.retire_completed_input() == RootCleanupProgress::Unresolved
+            {
+                return RootProducerTurn::Complete;
+            }
+            return turn;
         }
         let mut state = self.shared.state();
         state.completed |= self.shared.channel.snapshot().end_sequence.is_some();
@@ -2124,6 +2168,17 @@ pub(crate) mod terminal_observation_tests {
         limits: WorkerResultRetainedLimits,
         health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
     ) -> Result<Arc<NativeRootResultSession>, FragmentIoError> {
+        open_root_in_preparation_with_layout(preparation, pool, spec, budget, limits, health, None)
+    }
+    pub(crate) fn open_root_in_preparation_with_layout(
+        preparation: &TaskPreparationContext<'_>,
+        pool: &Arc<RootProducerPool>,
+        spec: RootResultWriteSpec,
+        budget: Arc<ResultRetainedBudget>,
+        limits: WorkerResultRetainedLimits,
+        health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
+        root_layout: Option<&novarocks_local_program::StaticLayout>,
+    ) -> Result<Arc<NativeRootResultSession>, FragmentIoError> {
         let child =
             crate::backend_task_execution::prepared_owner::NativePreparationChild::register(
                 preparation,
@@ -2142,8 +2197,40 @@ pub(crate) mod terminal_observation_tests {
         channel
             .bind_preparation_exit_waker(preparation.readiness_waker())
             .unwrap_or_else(|_| panic!("one original Root exit waker"));
-        let result =
-            NativeRootResultSession::try_open_prepared(channel.clone(), pool, preparation, &child);
+        let recipe = if channel.spec().contract.kind()
+            == RootOutputKind::InternalFacts(InternalResultDomain::CowSelectionArrowV1)
+        {
+            let prepared = root_layout
+                .ok_or_else(|| {
+                    io_error(
+                        crate::root_cow_selection_codec::CowSelectionCodecError::RecipeMismatch,
+                    )
+                })
+                .and_then(|layout| {
+                    crate::root_cow_selection_codec::prepare_recipe(
+                        &channel,
+                        layout,
+                        preparation.runtime_control().as_ref(),
+                    )
+                    .map_err(io_error)
+                });
+            match prepared {
+                Ok(recipe) => Some(recipe),
+                Err(cause) => {
+                    channel.close(RootRetentionClose::ContextAborted);
+                    return Err(cause);
+                }
+            }
+        } else {
+            None
+        };
+        let result = NativeRootResultSession::try_open_prepared_with_cow_recipe(
+            channel.clone(),
+            pool,
+            preparation,
+            &child,
+            recipe,
+        );
         if result.is_err() {
             channel.close(RootRetentionClose::ContextAborted);
         }
@@ -4294,3 +4381,328 @@ mod failure_record_tests {
 
 #[cfg(test)]
 mod producer_tests;
+
+// Cursor/builder ownership is returned even during
+// unwind; the original input and permit remain in ProducerState throughout.
+struct CowFlight<'a> {
+    owner: &'a RootSessionState,
+    generation: u64,
+    encoder: Option<std::mem::ManuallyDrop<InputEncoder>>,
+    builder: Option<RootSegmentBuilder>,
+    completed: bool,
+}
+impl CowFlight<'_> {
+    fn restore(&mut self, state: &mut ProducerState) {
+        let input = state.input.as_mut().expect("original in-flight COW input");
+        assert_eq!(
+            input
+                ._permit
+                .as_ref()
+                .expect("original COW permit")
+                .generation(),
+            self.generation,
+            "in-flight COW cursor must return to its original generation"
+        );
+        assert!(input.encoder.is_none() && state.builder.is_none());
+        input.encoder = self.encoder.take();
+        state.builder = self.builder.take();
+        // Only normal return proves that synchronous work stopped touching the
+        // input. An unwind retains the execution marker and original owners.
+        if self.completed {
+            input.execution = InputExecution::Idle;
+        }
+    }
+}
+impl Drop for CowFlight<'_> {
+    fn drop(&mut self) {
+        // Moving owners back is metadata only. No encoder, array, byte receipt
+        // or builder is destroyed under ProducerState's mutex.
+        let mut state = self.owner.state();
+        self.restore(&mut state);
+    }
+}
+
+/// One actual normalization scope under the original Root budget. Deep value
+/// requests extend the same receipt, so depth never creates credit positions.
+pub(crate) struct CowNormalizationRetention {
+    scope: novarocks_worker::root_result_channel::RootConstructionReservation,
+}
+impl CowNormalizationRetention {
+    fn reserve(&mut self, layout: std::alloc::Layout) -> ExecutionResult<()> {
+        self.reserve_bytes(layout.size())
+    }
+    fn reserve_bytes(&mut self, bytes: usize) -> ExecutionResult<()> {
+        self.scope
+            .try_grow(bytes)
+            .map_err(|error| error.into_execution())
+    }
+}
+
+impl RootSessionState {
+    fn cow(&self) -> bool {
+        self.spec().contract.kind()
+            == RootOutputKind::InternalFacts(InternalResultDomain::CowSelectionArrowV1)
+    }
+    fn cow_checkpoint(&self) -> ExecutionResult<()> {
+        let state = self.state();
+        if state.failed.is_some() || state.cleanup_started || self.channel.is_closed() {
+            Err(RootSessionFailure::ObservedStop.into())
+        } else {
+            Ok(())
+        }
+    }
+    fn construct_cow_encoder(
+        &self,
+        chunk: &novarocks_execution::exec::chunk::Chunk,
+        totals: CowSelectionTotals,
+        capacity: usize,
+    ) -> ExecutionResult<InputEncoder> {
+        use crate::root_cow_selection_codec::{CowSelectionCodecError, CowSelectionRecipe};
+        use novarocks_value_arrays::{
+            ValueFailure,
+            hydrate::{HydrateOptions, HydratePlan, HydrateProjection},
+        };
+        CowSelectionRecipe::validate_supported(chunk.record_batch().schema_ref())
+            .map_err(ExecutionFailure::from_domain)?;
+        let recipe = self
+            .cow_recipe
+            .as_ref()
+            .ok_or_else(|| ExecutionFailure::from_domain(CowSelectionCodecError::RecipeMismatch))?;
+        if chunk.columns().len() != recipe.declarations().len() {
+            return Err(ExecutionFailure::from_domain(
+                CowSelectionCodecError::SchemaChanged,
+            ));
+        }
+        for (slot, expected) in chunk
+            .chunk_schema()
+            .slots()
+            .iter()
+            .zip(recipe.declarations())
+        {
+            if !expected
+                .typed_binding()
+                .borrowed()
+                .exactly_equals_observed(slot.typed_binding().borrowed(), || {
+                    self.cow_checkpoint()
+                })?
+            {
+                return Err(ExecutionFailure::from_domain(
+                    CowSelectionCodecError::RecipeMismatch,
+                ));
+            }
+        }
+        let mut retained = CowNormalizationRetention {
+            scope: self
+                .channel
+                .begin_cow_construction()
+                .map_err(|error| error.into_execution())?,
+        };
+        let mut context = novarocks_value_arrays::decode::ValueConversionContext::new(0);
+        retained.reserve(
+            std::alloc::Layout::array::<arrow::array::ArrayRef>(chunk.columns().len())
+                .map_err(|_| ExecutionFailure::from_domain(CowSelectionCodecError::ScratchLimit))?,
+        )?;
+        let mut columns = Vec::with_capacity(chunk.columns().len());
+        let value_failure = |error| match error {
+            ValueFailure::Caller(error) => error,
+            ValueFailure::Value(error) => ExecutionFailure::from_domain(error),
+        };
+        for ((source, declaration), field) in chunk
+            .columns()
+            .iter()
+            .zip(recipe.declarations())
+            .zip(recipe.schema().fields())
+        {
+            self.cow_checkpoint()?;
+            let mut growth = |layout| retained.reserve(layout);
+            let mut work = |_| self.cow_checkpoint();
+            let plan = HydratePlan::plan_with_options_observed(
+                source,
+                declaration.typed_binding(),
+                HydrateOptions {
+                    dictionary_value_layout: None,
+                    projection: HydrateProjection::FrozenNamesAndNullability,
+                },
+                &mut context,
+                &mut |_, _| false,
+                &mut growth,
+                &mut work,
+                &mut |_| Ok(()),
+            )
+            .map_err(value_failure)?;
+            plan.require_complete()
+                .map_err(ExecutionFailure::from_domain)?;
+            let column = plan
+                .execute_observed(&mut context, &mut growth, &mut work, &mut |_| Ok(()))
+                .map_err(value_failure)?;
+            let retained = std::cell::RefCell::new(&mut retained);
+            let column = novarocks_functions::array_projection::rebuild_array_observed(
+                &column,
+                field.data_type(),
+                &mut |step| {
+                    novarocks_functions::array_projection::observe_array_normalization_construction::<
+                        ExecutionFailure,
+                    >(
+                        step,
+                        &mut |layout| {
+                            self.cow_checkpoint()?;
+                            retained.borrow_mut().reserve(layout)
+                        },
+                        &mut |bound| {
+                            self.cow_checkpoint()?;
+                            retained.borrow_mut().reserve_bytes(bound.bytes_upper)
+                        },
+                        &mut |_| self.cow_checkpoint(),
+                    )
+                },
+            )?;
+            columns.push(column);
+        }
+        self.cow_checkpoint()?;
+        let batch = arrow::record_batch::RecordBatch::try_new(Arc::clone(recipe.schema()), columns).map_err(|source| {
+            ExecutionFailure::from_domain(novarocks_functions::array_projection::ArrayProjectionFailure::Arrow {
+                operation: novarocks_functions::array_projection::ArrayProjectionOperation::RebuildArray,
+                source,
+            })
+        })?;
+        let mut encoder = CowSelectionEncoder::try_new(&batch, recipe, totals, capacity)
+            .map_err(ExecutionFailure::from_domain)?;
+        encoder.retain_normalization(retained);
+        Ok(InputEncoder::CowSelection(Box::new(encoder)))
+    }
+    fn advance_cow(&self) -> ExecutionResult<RootProducerTurn> {
+        let mut state = self.state();
+        state.completed |= self.channel.snapshot().end_sequence.is_some();
+        if state.completed || state.failed.is_some() {
+            return Ok(RootProducerTurn::Complete);
+        }
+        if self.channel.is_closed() {
+            return Err(RootSessionFailure::ObservedStop.into());
+        }
+        if state.input.is_none() {
+            return self.advance(&mut state);
+        }
+        let constructing = state.input.as_ref().unwrap().encoder.is_none();
+        let capacity = NativeResultSupportGeometry::V1.root_scratch_capacity_bytes as usize;
+        if constructing {
+            let credit = match self.channel.try_reserve(capacity) {
+                Ok(ResultWriteAdmission::Granted(credit)) => credit,
+                Ok(ResultWriteAdmission::Blocked) => return Ok(RootProducerTurn::Blocked),
+                Err(error) => return Err(error.into_execution()),
+            };
+            state.input.as_mut().unwrap().scratch = Some(std::mem::ManuallyDrop::new(credit));
+        } else if state.builder.is_none() {
+            match self.channel.try_segment() {
+                Ok(Some(builder)) => {
+                    state.builder = Some(builder);
+                    state.used = 0;
+                }
+                Ok(None) => return Ok(RootProducerTurn::Blocked),
+                Err(error) => return Err(error.into_execution()),
+            }
+        }
+        let totals = state.cow_totals.clone();
+        let used = state.used;
+        let source = if constructing {
+            // Chunk clones only its existing Arc/cold owners, with no column
+            // allocation or traversal. The original funded input stays here.
+            Some(state.input.as_ref().unwrap().chunk().clone())
+        } else {
+            None
+        };
+        let builder = state.builder.take();
+        let input = state.input.as_mut().unwrap();
+        input.execution = if constructing {
+            InputExecution::Constructing
+        } else {
+            InputExecution::Rendering
+        };
+        let generation = input._permit.as_ref().unwrap().generation();
+        let mut flight = CowFlight {
+            owner: self,
+            generation,
+            encoder: input.encoder.take(),
+            builder,
+            completed: false,
+        };
+        drop(state);
+        let rendered = if let Some(source) = source {
+            let encoder = self.construct_cow_encoder(&source, totals, capacity);
+            // The temporary source alias exits on the actual producer stack.
+            drop(source);
+            match encoder {
+                Ok(encoder) => {
+                    flight.encoder = Some(std::mem::ManuallyDrop::new(encoder));
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            flight
+                .encoder
+                .as_mut()
+                .unwrap()
+                .step(flight.builder.as_mut().unwrap().output_at(used))
+                .map(Some)
+        };
+        flight.completed = true;
+        drop(flight);
+        let mut state = self.state();
+        // Concurrent cancel/seal observations cannot be overwritten by a late
+        // cursor return. Its exact generation was restored before this check.
+        if state.failed.is_some() || state.cleanup_started || self.channel.is_closed() {
+            return Ok(RootProducerTurn::Complete);
+        }
+        let Some(turn) = rendered? else {
+            return Ok(RootProducerTurn::Yielded);
+        };
+        state.used += turn.emitted_bytes;
+        self.channel
+            .note_rows(turn.completed_rows)
+            .map_err(|error| error.into_execution())?;
+        let complete = turn.status == RenderTurnStatus::InputComplete;
+        if complete {
+            state.cow_totals = state
+                .input
+                .as_ref()
+                .unwrap()
+                .encoder
+                .as_ref()
+                .unwrap()
+                .cow_selection_totals()
+                .unwrap();
+            state.input.as_mut().unwrap().retiring = true;
+        }
+        let finishing = complete && state.sealed;
+        if finishing {
+            self.channel
+                .request_finish()
+                .map_err(|error| error.into_execution())?;
+        }
+        let flush = complete
+            || turn.completed_rows != 0
+            || turn.status == RenderTurnStatus::NeedsOutput
+            || state.used == RootProfileV1::SEGMENT_BYTES;
+        if flush {
+            let builder = state.builder.take().unwrap();
+            let bytes = std::mem::take(&mut state.used);
+            if bytes != 0 {
+                self.channel
+                    .publish_segment(builder, bytes, finishing)
+                    .map_err(|error| error.into_execution())?;
+            } else {
+                drop(state);
+                drop(builder);
+            }
+            if finishing {
+                if bytes == 0 {
+                    self.channel
+                        .publish_end()
+                        .map_err(|error| error.into_execution())?;
+                }
+                return Ok(RootProducerTurn::Complete);
+            }
+        }
+        Ok(RootProducerTurn::Yielded)
+    }
+}

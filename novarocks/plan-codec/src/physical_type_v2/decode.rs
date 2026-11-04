@@ -22,17 +22,17 @@ use super::{
     DecodedTypeTable, Materialized, PackageTypeProjectionFacts, PackageTypeProjectionLimits,
     PackageTypeRootDomain, PackageTypeRootSource, PreparedPackageTypeGraph, TypeCodecError,
     TypeProjectionLimits, decode_resources::TypeDecodeModel, observe_bytes, semantic,
-    validate_type,
+    validate_type_with_profile,
 };
 use arrow::datatypes::{DataType, Field, UnionFields, UnionMode};
 use novarocks_proto_models::{physical_type_v2 as wire, plan};
 use novarocks_type_contract::owned_resources::metadata_materialization::MaterializedMetadataMap;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, FunctionValueType, MAX_ARROW_FIELD_METADATA_BYTES,
-    MAX_ARROW_FIELD_METADATA_ENTRIES, MAX_ARROW_FIELD_METADATA_KEY_BYTES,
-    MAX_ARROW_FIELD_METADATA_VALUE_BYTES, MAX_ARROW_FIELD_NAME_BYTES,
-    MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES,
-    TypedValueBinding, ValueLayout, ValueSchemaCreationScope, ValueTypeError,
+    ArrowTypeProfile, CompileCheckpoints, CompileControlError, FunctionValueType,
+    MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,
+    MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
+    MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, MAX_VALUE_TYPE_DEPTH,
+    MAX_VALUE_TYPE_NODES, TypedValueBinding, ValueLayout, ValueSchemaCreationScope, ValueTypeError,
     ValueTypeStorageLifetime,
 };
 use std::{
@@ -89,6 +89,8 @@ fn flatten<H>(error: ProjectionFailure<E, HostError<H>>) -> HostError<H> {
 struct Summary {
     nodes: usize,
     depth: usize,
+    logical_depth: usize,
+    encoding_depth: usize,
     dictionary_boxes: usize,
     shared_backing: bool,
 }
@@ -174,6 +176,32 @@ fn strict<H>(
         },
     }
 }
+// A package chooses from actual occurrences. The standalone/source decoder
+// retains its original physical-tree policy; a generic carrier is not a value.
+fn depth_profile<H>(
+    receiver: Option<&Receiver<'_, '_, '_, H>>,
+    node: Node,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<ArrowTypeProfile>, E> {
+    match receiver.and_then(|receiver| receiver.graph) {
+        Some(graph) => graph.depth_profile(node, work),
+        None => Ok(Some(ArrowTypeProfile::Physical)),
+    }
+}
+
+fn check_summary_depth(summary: Summary, profile: ArrowTypeProfile) -> Result<(), E> {
+    profile.check_physical_depth(summary.depth)?;
+    if profile != ArrowTypeProfile::Physical && summary.logical_depth > MAX_VALUE_TYPE_DEPTH {
+        return Err(ValueTypeError::TooDeep.into());
+    }
+    match profile {
+        ArrowTypeProfile::CanonicalValue if summary.encoding_depth != 0 => Err(
+            ValueTypeError::InvalidType("canonical value layout contains runtime encoding").into(),
+        ),
+        _ => Ok(()),
+    }
+}
+
 // The old standalone path builds its original Index; a package path borrows
 // the very Index whose source domains were prepared, never a second namespace.
 enum ReceiverIndex<'source, 'graph> {
@@ -477,7 +505,9 @@ struct Frame {
 }
 
 // Fields are graph vertices, but not additional Arrow DataType nodes or depth.
-// A carrier adds one to both; each repeated reference contributes again.
+// Physical summaries count every carrier; logical summaries omit only the
+// scaffold on this Map occurrence and actual encoding wrappers. Repeated
+// references contribute again; a shared Struct never changes its own role.
 fn topology<H>(
     index: &Index<'_>,
     table: &wire::TypeTable,
@@ -520,6 +550,17 @@ fn topology<H>(
             active.insert(root, true);
             Ok(())
         })?;
+        // The original raw physical policy remains independent of value
+        // declarations. Value and Writer paths use the admitted graph's actual
+        // vertices; physical wrappers do not introduce another rejection quota.
+        let max_path_vertices = match depth_profile(receiver.as_ref(), root, work)?
+            .and_then(ArrowTypeProfile::physical_depth_limit)
+        {
+            Some(limit) => limit
+                .checked_mul(2)
+                .ok_or(CompileControlError::ResourceExhausted)?,
+            None => vertices,
+        };
         stack.push(Frame {
             node: root,
             next: 0,
@@ -540,6 +581,10 @@ fn topology<H>(
                         .checked_add(summary.nodes)
                         .ok_or_else(|| summary_overflow(package, "expanded type size overflow"))?;
                     frame.summary.depth = frame.summary.depth.max(summary.depth);
+                    frame.summary.logical_depth =
+                        frame.summary.logical_depth.max(summary.logical_depth);
+                    frame.summary.encoding_depth =
+                        frame.summary.encoding_depth.max(summary.encoding_depth);
                     frame.summary.shared_backing |= summary.shared_backing;
                     frame.summary.dictionary_boxes = frame
                         .summary
@@ -552,11 +597,7 @@ fn topology<H>(
                 if opaque(package, work, |_| Ok(active.insert(child, true)))? == Some(true) {
                     return Err(E::InvalidShape("cyclic type table references").into());
                 }
-                // A valid carrier path has at most 64 carriers and 64 fields.
-                // Bound the explicit DFS scratch before pushing another vertex.
-                if (!package && stack.len() >= MAX_VALUE_TYPE_DEPTH * 2)
-                    || (package && stack.len() >= vertices)
-                {
+                if stack.len() >= max_path_vertices || (package && stack.len() >= vertices) {
                     return Err(ValueTypeError::TooDeep.into());
                 }
                 stack.push(Frame {
@@ -577,6 +618,37 @@ fn topology<H>(
                         .ok_or_else(|| summary_overflow(package, "expanded type depth overflow"))?;
                 }
                 if let Node::Carrier(id) = node {
+                    match index.kind(id)? {
+                        Kind::Map(map) => {
+                            // Validate this edge before removing its entries
+                            // scaffold from semantic depth. The same Struct
+                            // reached through any ordinary edge keeps its level.
+                            let field = index.field(required(map.entries_field_id)?)?;
+                            let Kind::StructType(entries) =
+                                index.kind(required(field.carrier_type_id)?)?
+                            else {
+                                return Err(E::InvalidShape("Map entries must be Struct").into());
+                            };
+                            if entries.field_ids.len() != 2 {
+                                return Err(E::InvalidShape(
+                                    "Map entries must contain key and value",
+                                )
+                                .into());
+                            }
+                        }
+                        Kind::Dictionary(_) | Kind::RunEndEncoded(_) => {
+                            summary.encoding_depth = summary
+                                .encoding_depth
+                                .checked_add(1)
+                                .ok_or(CompileControlError::ResourceExhausted)?;
+                        }
+                        _ => {
+                            summary.logical_depth = summary
+                                .logical_depth
+                                .checked_add(1)
+                                .ok_or(CompileControlError::ResourceExhausted)?;
+                        }
+                    }
                     summary.dictionary_boxes = if matches!(index.kind(id)?, Kind::Dictionary(_)) {
                         summary
                             .dictionary_boxes
@@ -616,8 +688,10 @@ fn topology<H>(
                 if is_strict && summary.nodes > MAX_VALUE_TYPE_NODES {
                     return Err(ValueTypeError::TooManyNodes.into());
                 }
-                if is_strict && summary.depth > MAX_VALUE_TYPE_DEPTH {
-                    return Err(ValueTypeError::TooDeep.into());
+                if is_strict {
+                    let profile = depth_profile(receiver.as_ref(), node, work)?
+                        .ok_or(E::InvalidShape("strict type has no depth profile"))?;
+                    check_summary_depth(summary, profile)?;
                 }
                 if package && !is_strict {
                     // The original Writer depth author protects recursive
@@ -1713,7 +1787,9 @@ fn decode_body<'source, H, F: novarocks_type_contract::ValueSchemaCreationFactor
                         materialize(index.kind(id)?, &carriers, &fields, work, graph)
                     })?;
                     if strict(receiver.as_ref(), node, work)? {
-                        validate_type(&ty, work)?;
+                        let profile = depth_profile(receiver.as_ref(), node, work)?
+                            .ok_or(E::InvalidShape("strict type has no depth profile"))?;
+                        validate_type_with_profile(&ty, profile, work)?;
                     } else {
                         novarocks_type_contract::validate_arrow_carrier_parameters_observed(
                             &ty,
@@ -2738,5 +2814,76 @@ mod funding_forecast_tests {
                 "type backing lifetime holder source model drift"
             )))
         ));
+    }
+}
+
+#[cfg(test)]
+mod depth_summary_tests {
+    use super::*;
+    use novarocks_type_contract::{CompilePhase, PureCompileControl};
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn shared_struct_has_its_ordinary_level_and_map_scaffold_is_occurrence_local() {
+        let table = wire::TypeTable {
+            carriers: vec![
+                wire::CarrierTypeDefinition {
+                    id: 0,
+                    kind: Some(Kind::Primitive(plan::ArrowPrimitiveType::Int64 as i32)),
+                },
+                wire::CarrierTypeDefinition {
+                    id: 1,
+                    kind: Some(Kind::StructType(wire::StructFields {
+                        field_ids: vec![0, 1],
+                    })),
+                },
+                wire::CarrierTypeDefinition {
+                    id: 2,
+                    kind: Some(Kind::Map(wire::MapField {
+                        entries_field_id: Some(2),
+                        ordered: false,
+                    })),
+                },
+                wire::CarrierTypeDefinition {
+                    id: 3,
+                    kind: Some(Kind::StructType(wire::StructFields { field_ids: vec![2] })),
+                },
+            ],
+            fields: (0..3)
+                .map(|id| wire::FieldDefinition {
+                    id,
+                    carrier_type_id: Some(if id == 2 { 1 } else { 0 }),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let index = Index {
+            table: &table,
+            carriers: table.carriers.iter().map(|v| (v.id, v)).collect(),
+            fields: table.fields.iter().map(|v| (v.id, v)).collect(),
+        };
+        let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Decode).unwrap();
+        let (_, _, _, summaries) = topology::<Infallible>(
+            &index,
+            &table,
+            TypeProjectionLimits {
+                max_definitions: 100,
+                max_expanded_nodes: 100,
+                max_string_bytes: 100,
+            },
+            &mut work,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(summaries[&Node::Carrier(1)].logical_depth, 2);
+        assert_eq!(summaries[&Node::Carrier(2)].logical_depth, 2);
+        assert_eq!(summaries[&Node::Carrier(3)].logical_depth, 3);
+        assert_eq!(summaries[&Node::Carrier(2)].nodes, 4);
+        assert_eq!(summaries[&Node::Carrier(3)].nodes, 4);
     }
 }

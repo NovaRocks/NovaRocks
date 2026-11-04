@@ -30,7 +30,7 @@ use novarocks_proto_models::{common, plan as wire, value_type as logical_wire};
 #[cfg(test)]
 use novarocks_type_contract::ValueLayout;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, FunctionValueType, TypedValueBinding,
+    ArrowTypeDepth, CompileCheckpoints, CompileControlError, FunctionValueType, TypedValueBinding,
     ValueTypeStorageLifetime,
 };
 use std::alloc::Layout;
@@ -181,7 +181,7 @@ impl<'a> ExecutionTypeTableBuilder<'a> {
         for (_, ordinal) in &ordered {
             layout::count_source(
                 self.roots[*ordinal].value.data_type(),
-                1,
+                ArrowTypeDepth::ROOT,
                 &mut counts,
                 limits,
                 &mut context,
@@ -458,7 +458,7 @@ fn decode_execution_type_table_core<
                     id,
                     &mut definitions,
                     &logical,
-                    1,
+                    ArrowTypeDepth::ROOT,
                     &mut counts,
                     limits,
                     context,

@@ -427,8 +427,9 @@ impl FunctionValueType {
         scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
         observe: impl FnMut(crate::ValueTypeVisit<'a>) -> Result<(), E>,
     ) -> Result<(), E> {
-        crate::validate_value_type_structure_with_scratch_observed(
+        crate::validate_value_type_structure_with_profile_and_scratch_observed(
             self.data_type(),
+            crate::ArrowTypeProfile::CanonicalValue,
             scratch,
             observe,
         )

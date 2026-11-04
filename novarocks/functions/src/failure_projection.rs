@@ -282,15 +282,6 @@ mod capacity_refusal_tests {
     }
 }
 
-impl FailureProjection for crate::arrow_ipc_construction::IpcGeometryError {
-    fn failure_fact(&self) -> FailureFact {
-        match self {
-            Self::Overflow => fact(FailureClass::Resource, 148),
-            Self::SourceModel => fact(FailureClass::Invariant, 149),
-        }
-    }
-}
-
 impl FailureProjection for crate::AggregateInputBatchError {
     fn failure_fact(&self) -> FailureFact {
         fact(FailureClass::Invariant, 150)

@@ -73,10 +73,59 @@ fn make_test_operator(fixture: &Fixture) -> DataStreamSinkOperator {
         edge_gates: None,
         compiled_partition: None,
         construction_factory: None,
+        frozen_output: Some(frozen_test_output(typed_int64_chunk(0).chunk_schema())),
+        recipe: None,
         prepared: false,
         exiting: false,
         compiled_control: None,
     }
+}
+
+fn frozen_test_output(schema: &ChunkSchema) -> novarocks_local_program::StaticLayout {
+    struct Control;
+    impl novarocks_type_contract::PureCompileControl for Control {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+    // Static output is the canonical projection of the frozen complete
+    // binding. Runtime Field carriers (for example Dictionary) stay on the
+    // actual input Chunk and cannot become ValueLayout projection authority.
+    let fields = schema
+        .slots()
+        .iter()
+        .map(|slot| {
+            let binding = slot.typed_binding();
+            Arc::new(Field::new(
+                slot.name(),
+                binding.layout().data_type().clone(),
+                binding.nullable(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let frozen_schema = Arc::new(Schema::new(fields));
+    novarocks_local_program::StaticLayout::try_new_typed_for_compile(
+        frozen_schema,
+        schema
+            .slots()
+            .iter()
+            .map(|slot| slot.slot_id())
+            .collect::<Vec<_>>()
+            .into(),
+        schema
+            .slots()
+            .iter()
+            .map(|slot| (slot.typed_binding().clone(), None))
+            .collect(),
+        schema.storage_lifetime(),
+        |_| Ok(()),
+        &Control,
+    )
+    .unwrap()
 }
 
 fn prepare_test_operator(fixture: &Fixture, op: &mut DataStreamSinkOperator) {
@@ -580,12 +629,27 @@ fn exchange_unit_carries_distinct_dest_and_sender_finsts() {
 }
 
 #[test]
-fn wire_meta_is_included_for_every_non_empty_payload() {
-    assert!(
-        DataStreamSinkOperator::should_include_wire_meta(false),
-        "non-empty payloads must carry wire meta because enqueue is not delivery confirmation"
-    );
-    assert!(!DataStreamSinkOperator::should_include_wire_meta(true));
+fn every_nonempty_payload_is_an_independent_prepared_unit() {
+    let fixture = Fixture::new();
+    let mut sink = make_test_operator(&fixture);
+    gate_destinations(&mut sink, vec![make_test_destination(&fixture)]);
+    prepare_test_operator(&fixture, &mut sink);
+    sink.buffer_chunk(typed_int64_chunk(2)).unwrap();
+    sink.flush_pending(true).unwrap();
+    let payload = sink.pending_payloads_per_dest[0].as_ref().unwrap();
+    assert_eq!(&payload.payload.bytes()[..4], b"NRU1");
+    let schema = typed_int64_chunk(0).chunk_schema_ref();
+    let recipe = sink.recipe.as_ref().unwrap();
+    let factory = sink.construction_factory.as_ref().unwrap();
+    let decoded = crate::runtime::exchange::online_unit::decode(
+        recipe,
+        payload.payload.bytes(),
+        &schema,
+        factory.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].len(), 2);
 }
 
 #[test]
@@ -1555,12 +1619,14 @@ mod typed_sender_header_tests {
         inner: Arc<dyn InputConstructionFactory>,
         tracker: Arc<MemTracker>,
         requests: Arc<AtomicUsize>,
+        armed: Arc<AtomicBool>,
         later: Arc<AtomicUsize>,
     }
     struct FirstHeaderRefusalOwner {
         inner: Box<dyn InputConstructionOwner>,
         tracker: Arc<MemTracker>,
         requests: Arc<AtomicUsize>,
+        armed: Arc<AtomicBool>,
         later: Arc<AtomicUsize>,
     }
     impl InputConstructionOwner for FirstHeaderRefusalOwner {
@@ -1568,7 +1634,9 @@ mod typed_sender_header_tests {
             self.inner.storage_lifetime()
         }
         fn request(&self, layout: std::alloc::Layout) -> Result<(), ConstructionFailure> {
-            if self.requests.fetch_add(1, Ordering::SeqCst) == 0 {
+            if self.armed.load(Ordering::SeqCst)
+                && self.requests.fetch_add(1, Ordering::SeqCst) == 0
+            {
                 self.tracker
                     .install_limit_once(self.tracker.current() + 1)
                     .unwrap();
@@ -1602,6 +1670,7 @@ mod typed_sender_header_tests {
                 inner: self.inner.begin_typed_construction(schema)?,
                 tracker: self.tracker.clone(),
                 requests: self.requests.clone(),
+                armed: self.armed.clone(),
                 later: self.later.clone(),
             }))
         }
@@ -1619,14 +1688,20 @@ mod typed_sender_header_tests {
         let factory = actual_factory(tracker.clone());
         let source = plain(factory.as_ref());
         let requests = Arc::new(AtomicUsize::new(0));
+        let armed = Arc::new(AtomicBool::new(false));
         let later = Arc::new(AtomicUsize::new(0));
         let refusing = Arc::new(FirstHeaderRefusalFactory {
             inner: factory.clone(),
             tracker: tracker.clone(),
             requests: requests.clone(),
+            armed: armed.clone(),
             later: later.clone(),
         });
         let sink = install_and_prepare(&fixture, refusing);
+        // Preparation now constructs its real frozen recipe. This oracle is
+        // specifically the later first split-header refusal, on the same host.
+        later.store(0, Ordering::SeqCst);
+        armed.store(true, Ordering::SeqCst);
         let baseline = tracker.current();
         let refusal = split_oversized_chunks_with_creation(
             vec![source.clone()],
@@ -1925,6 +2000,27 @@ mod conditional_compiled_selection {
             )
             .unwrap(),
         );
+        compile_checked(
+            package,
+            ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+        )
+    }
+
+    pub(super) fn compile_checked(
+        package: Arc<FragmentPackage>,
+        constants: ConstantPolicy,
+    ) -> Arc<LocalProgram> {
         let providers =
             PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
                 .unwrap();
@@ -1965,18 +2061,7 @@ mod conditional_compiled_selection {
                     pipeline_dop: NonZeroUsize::MIN,
                     root_sink_dop: Some(NonZeroUsize::MIN),
                     kernel_abi: KernelAbiVersion::CURRENT,
-                    constants: ConstantPolicy {
-                        max_rows: 16,
-                        max_array_nodes: 128,
-                        max_logical_elements: 1024,
-                        max_retained_buffer_bytes: 1 << 20,
-                        max_type_depth: 64,
-                        max_type_nodes: 4096,
-                        max_dictionary_depth: 64,
-                        max_metadata_bytes: 1 << 20,
-                        max_library_validation_work: 1 << 20,
-                        max_library_validation_bytes: 1 << 20,
-                    },
+                    constants,
                 },
                 &FixtureControl,
             )
@@ -2408,3 +2493,6 @@ fn required_withdrawal_cannot_skip_parked_payload_or_end_even_after_earlier_poll
         }
     }
 }
+
+#[path = "worker_stack_tests.rs"]
+mod worker_stack_tests;

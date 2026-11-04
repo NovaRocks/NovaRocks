@@ -121,9 +121,7 @@ fn original_carrier_scratch_admission_precedes_initialization_and_pending_contro
             &mut |layout| {
                 assert_eq!(
                     layout,
-                    std::alloc::Layout::new::<
-                        [Option<(&DataType, usize)>; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
-                    >()
+                    std::alloc::Layout::new::<novarocks_type_contract::owned_resources::type_validation::TypeValidationScratch<'_>>()
                 );
                 Err(CompileControlError::ResourceExhausted)
             },

@@ -42,7 +42,7 @@ use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
     ExpressionUseId, FunctionValueType, MAX_CONTROL_USE_REFERENCES, PureCompileControl,
     ValueSchemaCreationScope, ValueTypeError, ValueTypeStorageLifetime, WindowBound,
-    WindowFrameExclusion, WindowFrameUnits, arrow_data_types_exact_observed,
+    WindowFrameExclusion, WindowFrameUnits, arrow_data_types_exact_with_profile_observed,
 };
 use novarocks_types::SlotId;
 use std::{
@@ -1342,9 +1342,12 @@ fn check_arrow(
     expected: &arrow_schema::DataType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramResolvedCallsError> {
-    if arrow_data_types_exact_observed::<ProgramResolvedCallsError>(actual, expected, || {
-        work.step().map_err(Into::into)
-    })? {
+    if arrow_data_types_exact_with_profile_observed::<ProgramResolvedCallsError>(
+        actual,
+        expected,
+        novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
+        || work.step().map_err(Into::into),
+    )? {
         Ok(())
     } else {
         Err(ProgramResolvedCallsError::TypeMismatch)

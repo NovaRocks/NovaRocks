@@ -119,12 +119,16 @@ pub(in crate::exec::operators::hashjoin) fn copy_column(
         control.checkpoint(0).map_err(JoinGatherError::Kernel)?;
         return Ok(result);
     }
-    let kind =
-        selected_copy::values_copy_kind_observed(target.data_type(), || control.checkpoint(1))
-            .map_err(copy_failure)?;
+    let kind = selected_copy::values_copy_kind_for_layout_observed(
+        target.typed_binding().layout(),
+        target.data_type(),
+        || control.checkpoint(1),
+    )
+    .map_err(copy_failure)?;
     let result = match kind {
         selected_copy::ValuesCopyKind::Interleave => {
-            selected_copy::preflight_interleave_construction(
+            selected_copy::preflight_interleave_for_layout_construction(
+                target.typed_binding().layout(),
                 target.data_type(),
                 sources,
                 choices,
@@ -141,8 +145,14 @@ pub(in crate::exec::operators::hashjoin) fn copy_column(
             arrow::compute::interleave(&borrowed, choices).map_err(gather_kernel)?
         }
         selected_copy::ValuesCopyKind::Extend => {
-            selected_copy::copy_nested_values_construction(sources, choices, &mut creation, control)
-                .map_err(copy_error)?
+            selected_copy::copy_nested_values_for_layout_construction(
+                target.typed_binding().layout(),
+                sources,
+                choices,
+                &mut creation,
+                control,
+            )
+            .map_err(copy_error)?
         }
     };
     control.checkpoint(0).map_err(JoinGatherError::Kernel)?;

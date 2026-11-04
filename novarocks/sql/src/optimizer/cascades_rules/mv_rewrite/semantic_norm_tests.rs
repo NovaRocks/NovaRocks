@@ -551,3 +551,61 @@ fn mv_dimension_mapping_requires_exact_source_and_output_types_before_publicatio
     )];
     every_callback(|c| MvColumnMap::try_new(complete.clone(), c).map(|map| map.is_some()));
 }
+
+fn map64_carrier(mut leaf: DataType) -> DataType {
+    for _ in 0..63 {
+        leaf = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Int32, false)),
+                        Arc::new(Field::new("value", leaf, false)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+    }
+    leaf
+}
+
+#[test]
+fn typed_map64_mv_normalization_fingerprint_and_cast_keep_complete_identity() {
+    let ty = FunctionValueType::new(map64_carrier(DataType::Int64), false);
+    let expression = col("m", ty.clone());
+    assert_eq!(key(&expression), key(&expression.clone()));
+    assert_ne!(
+        key(&expression),
+        key(&col(
+            "m",
+            FunctionValueType::new(map64_carrier(DataType::Int32), false)
+        ))
+    );
+    let mut arena = ScalarArena::new();
+    let value = intern(&mut arena, ScalarNode::ColumnRef(ColumnId(17)), ty.clone());
+    let cast = intern(
+        &mut arena,
+        ScalarNode::Cast {
+            child: value,
+            target: ty.data_type().clone(),
+            decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
+        },
+        ty.clone(),
+    );
+    let normalized = normalize(
+        &arena,
+        cast,
+        &HashMap::from([(ColumnId(17), "m".into())]),
+        &control(),
+    )
+    .unwrap()
+    .expect("valid typed cast remains normalizable");
+    assert_eq!(normalized.value_type().value_type().depth(), 64);
+    assert!(
+        key(&normalized) != key(&expression),
+        "a retained cast keeps its own normalized expression identity"
+    );
+}

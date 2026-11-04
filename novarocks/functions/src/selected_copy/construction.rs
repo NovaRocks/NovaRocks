@@ -28,10 +28,49 @@ use crate::{KernelControlObservation, KernelEvaluationControl};
 use arrow_array::{Array, ArrayRef};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
-use novarocks_type_contract::ValueSchemaCreation;
+use novarocks_type_contract::{ArrowTypeDepth, ArrowTypeProfile, ValueLayout, ValueSchemaCreation};
 
 pub fn preflight_interleave_construction<H>(
     ty: &DataType,
+    sources: &[ArrayRef],
+    choices: &[(usize, usize)],
+    creation: &mut ValueSchemaCreation<'_, H>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<CopyOperationFacts, CopyConstructionError<H>> {
+    preflight_interleave_with_profile(
+        ty,
+        ArrowTypeProfile::Physical,
+        sources,
+        choices,
+        creation,
+        control,
+    )
+}
+
+/// Observe the original interleave for an already checked typed carrier.
+/// The caller retains the complete binding proof. `ty` is the original actual
+/// target representation; the layout never substitutes its physical attributes.
+pub fn preflight_interleave_for_layout_construction<H>(
+    _layout: &ValueLayout,
+    ty: &DataType,
+    sources: &[ArrayRef],
+    choices: &[(usize, usize)],
+    creation: &mut ValueSchemaCreation<'_, H>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<CopyOperationFacts, CopyConstructionError<H>> {
+    preflight_interleave_with_profile(
+        ty,
+        ArrowTypeProfile::Value,
+        sources,
+        choices,
+        creation,
+        control,
+    )
+}
+
+fn preflight_interleave_with_profile<H>(
+    ty: &DataType,
+    profile: ArrowTypeProfile,
     sources: &[ArrayRef],
     choices: &[(usize, usize)],
     creation: &mut ValueSchemaCreation<'_, H>,
@@ -70,7 +109,11 @@ pub fn preflight_interleave_construction<H>(
             }
         };
         let mut work = CopyObservation(
-            super::WorkObservation::Legacy(&mut observe),
+            if profile == ArrowTypeProfile::Value {
+                super::WorkObservation::Value(&mut observe)
+            } else {
+                super::WorkObservation::Legacy(&mut observe)
+            },
             None,
             ScratchCoverage::RecursiveSelections,
             Some(&mut invoice),
@@ -1067,11 +1110,31 @@ pub enum ValuesCopyKind {
 
 pub fn values_copy_kind_observed(
     ty: &DataType,
+    observe: impl FnMut() -> Result<(), crate::KernelFailure>,
+) -> Result<ValuesCopyKind, CopyError> {
+    values_copy_kind_with_profile(ty, ArrowTypeProfile::Physical, observe)
+}
+
+/// Select the existing constructor for an already checked typed carrier.
+/// The caller owns its complete binding proof; the original actual type keeps
+/// its encoding and physical attributes. The layout selects value depth only.
+pub fn values_copy_kind_for_layout_observed(
+    _layout: &ValueLayout,
+    ty: &DataType,
+    observe: impl FnMut() -> Result<(), crate::KernelFailure>,
+) -> Result<ValuesCopyKind, CopyError> {
+    values_copy_kind_with_profile(ty, ArrowTypeProfile::Value, observe)
+}
+
+fn values_copy_kind_with_profile(
+    ty: &DataType,
+    profile: ArrowTypeProfile,
     mut observe: impl FnMut() -> Result<(), crate::KernelFailure>,
 ) -> Result<ValuesCopyKind, CopyError> {
     fn visit(
         ty: &DataType,
-        depth: usize,
+        depth: ArrowTypeDepth,
+        profile: ArrowTypeProfile,
         visited: &mut usize,
         observe: &mut impl FnMut() -> Result<(), crate::KernelFailure>,
     ) -> Result<(), CopyError> {
@@ -1079,8 +1142,7 @@ pub fn values_copy_kind_observed(
         *visited = visited
             .checked_add(1)
             .ok_or_else(|| CopyError::arithmetic(None))?;
-        if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH
-            || *visited > novarocks_type_contract::MAX_VALUE_TYPE_NODES
+        if depth.check(profile).is_err() || *visited > novarocks_type_contract::MAX_VALUE_TYPE_NODES
         {
             return Err(CopyError::Invalid(
                 "Values copy type exceeds the frozen recursive type bounds",
@@ -1103,11 +1165,38 @@ pub fn values_copy_kind_observed(
             | DataType::LargeList(child)
             | DataType::ListView(child)
             | DataType::LargeListView(child)
-            | DataType::FixedSizeList(child, _)
-            | DataType::Map(child, _) => visit(child.data_type(), depth + 1, visited, observe),
+            | DataType::FixedSizeList(child, _) => visit(
+                child.data_type(),
+                depth
+                    .value_child()
+                    .map_err(crate::KernelFailure::from)
+                    .map_err(CopyError::Control)?,
+                profile,
+                visited,
+                observe,
+            ),
+            DataType::Map(child, _) => visit(
+                child.data_type(),
+                depth
+                    .map_entries()
+                    .map_err(crate::KernelFailure::from)
+                    .map_err(CopyError::Control)?,
+                profile,
+                visited,
+                observe,
+            ),
             DataType::Struct(fields) => {
                 for field in fields {
-                    visit(field.data_type(), depth + 1, visited, observe)?;
+                    visit(
+                        field.data_type(),
+                        depth
+                            .value_child()
+                            .map_err(crate::KernelFailure::from)
+                            .map_err(CopyError::Control)?,
+                        profile,
+                        visited,
+                        observe,
+                    )?;
                 }
                 Ok(())
             }
@@ -1116,22 +1205,67 @@ pub fn values_copy_kind_observed(
                     return Err(CopyError::unsupported(ty));
                 }
                 for (_, field) in fields.iter() {
-                    visit(field.data_type(), depth + 1, visited, observe)?;
+                    visit(
+                        field.data_type(),
+                        depth
+                            .value_child()
+                            .map_err(crate::KernelFailure::from)
+                            .map_err(CopyError::Control)?,
+                        profile,
+                        visited,
+                        observe,
+                    )?;
                 }
                 Ok(())
             }
             DataType::Dictionary(key, value) => {
-                visit(key, depth + 1, visited, observe)?;
-                visit(value, depth + 1, visited, observe)
+                visit(
+                    key,
+                    depth
+                        .encoding_child()
+                        .map_err(crate::KernelFailure::from)
+                        .map_err(CopyError::Control)?,
+                    profile,
+                    visited,
+                    observe,
+                )?;
+                visit(
+                    value,
+                    depth
+                        .encoding_child()
+                        .map_err(crate::KernelFailure::from)
+                        .map_err(CopyError::Control)?,
+                    profile,
+                    visited,
+                    observe,
+                )
             }
             DataType::RunEndEncoded(ends, values) => {
-                visit(ends.data_type(), depth + 1, visited, observe)?;
-                visit(values.data_type(), depth + 1, visited, observe)
+                visit(
+                    ends.data_type(),
+                    depth
+                        .encoding_child()
+                        .map_err(crate::KernelFailure::from)
+                        .map_err(CopyError::Control)?,
+                    profile,
+                    visited,
+                    observe,
+                )?;
+                visit(
+                    values.data_type(),
+                    depth
+                        .encoding_child()
+                        .map_err(crate::KernelFailure::from)
+                        .map_err(CopyError::Control)?,
+                    profile,
+                    visited,
+                    observe,
+                )
             }
             _ => Err(CopyError::unsupported(ty)),
         }
     }
-    visit(ty, 1, &mut 0, &mut observe)?;
+    visit(ty, ArrowTypeDepth::ROOT, profile, &mut 0, &mut observe)?;
     Ok(
         if ty.primitive_width().is_some()
             || matches!(
@@ -1156,6 +1290,29 @@ pub fn values_copy_kind_observed(
 /// cells share this actual constructor. Source payload custody stays with the
 /// caller's original retained holds; this port creates no memory authority.
 pub fn copy_nested_values_construction<H>(
+    sources: &[ArrayRef],
+    choices: &[(usize, usize)],
+    creation: &mut ValueSchemaCreation<'_, H>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<ArrayRef, CopyConstructionError<H>> {
+    copy_nested_values_with_layout(None, sources, choices, creation, control)
+}
+
+/// Execute the same nested author after the caller has verified complete
+/// value bindings. Actual sources retain their original exact comparison;
+/// the layout selects semantic depth without becoming a carrier byte author.
+pub fn copy_nested_values_for_layout_construction<H>(
+    layout: &ValueLayout,
+    sources: &[ArrayRef],
+    choices: &[(usize, usize)],
+    creation: &mut ValueSchemaCreation<'_, H>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<ArrayRef, CopyConstructionError<H>> {
+    copy_nested_values_with_layout(Some(layout), sources, choices, creation, control)
+}
+
+fn copy_nested_values_with_layout<H>(
+    expected: Option<&ValueLayout>,
     sources: &[ArrayRef],
     choices: &[(usize, usize)],
     creation: &mut ValueSchemaCreation<'_, H>,
@@ -1207,10 +1364,11 @@ pub fn copy_nested_values_construction<H>(
         work.step().map_err(CopyError::Control)?;
     }
     work.flush().map_err(CopyError::Control)?;
-    super::preflight_extend_multi_construction(
+    super::preflight_extend_multi_construction_with_layout(
         &borrowed,
         &segments,
         choices.len(),
+        expected,
         creation,
         &observed,
     )?;
@@ -1361,6 +1519,331 @@ mod values_copy_tests {
         assert_eq!(output.value_length(3), 0);
         assert!(requests.lock().unwrap().iter().any(|bytes| *bytes > 0));
         assert!(opaque.lock().unwrap().iter().any(|bytes| *bytes > 0));
+    }
+    fn map64_source(leaf: [Option<i64>; 2]) -> ArrayRef {
+        use arrow_array::{MapArray, StructArray};
+        use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow_schema::Field;
+        let mut values: ArrayRef = Arc::new(Int64Array::from(leaf.to_vec()));
+        for _ in 1..novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+            let fields = vec![
+                Arc::new(Field::new("key", DataType::Int64, false)),
+                Arc::new(Field::new("value", values.data_type().clone(), true)),
+            ];
+            let entries = StructArray::new(
+                fields.into(),
+                vec![Arc::new(Int64Array::from(vec![100, 200])), values],
+                None,
+            );
+            let field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
+            values = Arc::new(MapArray::new(
+                field,
+                OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1, 2])),
+                entries,
+                None,
+                false,
+            ));
+        }
+        values
+    }
+    fn selected_map_leaf(mut value: ArrayRef, mut row: usize) -> Option<i64> {
+        for _ in 1..novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+            let map = value
+                .as_any()
+                .downcast_ref::<arrow_array::MapArray>()
+                .unwrap();
+            let entries = map.value(row);
+            let key = entries
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(key.len(), 1);
+            assert!(matches!(key.value(0), 100 | 200));
+            value = Arc::clone(entries.column(1));
+            row = 0;
+        }
+        let leaf = value.as_any().downcast_ref::<Int64Array>().unwrap();
+        leaf.is_valid(row).then(|| leaf.value(row))
+    }
+    #[test]
+    fn typed_map64_selected_copy_uses_original_mutable_constructor() {
+        let sources = vec![
+            map64_source([Some(10), Some(11)]),
+            map64_source([Some(20), None]),
+        ];
+        let layout = ValueLayout::try_new(
+            sources[0].data_type(),
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        assert!(values_copy_kind_observed(sources[0].data_type(), || Ok(())).is_err());
+        assert_eq!(
+            values_copy_kind_for_layout_observed(&layout, sources[0].data_type(), || Ok(()))
+                .unwrap(),
+            ValuesCopyKind::Extend
+        );
+        let mut requested = false;
+        let mut observed = false;
+        let mut request = |_: std::alloc::Layout| {
+            requested = true;
+            Ok::<_, ()>(())
+        };
+        let mut opaque = |_| {
+            observed = true;
+            Ok::<_, ()>(())
+        };
+        let mut creation = ValueSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut opaque,
+        );
+        let copied = copy_nested_values_for_layout_construction(
+            &layout,
+            &sources,
+            &[(1, 1), (0, 0)],
+            &mut creation,
+            &Control(None),
+        )
+        .unwrap();
+        assert_eq!(copied.data_type(), layout.data_type());
+        assert_eq!(copied.len(), 2);
+        assert_eq!(selected_map_leaf(Arc::clone(&copied), 0), None);
+        assert_eq!(selected_map_leaf(copied, 1), Some(10));
+        drop(creation);
+        assert!(requested && observed);
+    }
+    #[test]
+    fn typed_copy_keeps_exact_source_and_target_carrier_checks() {
+        let sources: Vec<ArrayRef> = vec![
+            map64_source([Some(10), Some(11)]),
+            Arc::new(Int64Array::from(vec![10])),
+        ];
+        let layout = ValueLayout::try_new(
+            sources[0].data_type(),
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        let mut request = |_| Ok::<_, ()>(());
+        let mut opaque = |_| Ok::<_, ()>(());
+        let mut creation = ValueSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut opaque,
+        );
+        assert!(matches!(
+            copy_nested_values_for_layout_construction(
+                &layout,
+                &sources,
+                &[(0, 0), (1, 0)],
+                &mut creation,
+                &Control(None)
+            ),
+            Err(CopyConstructionError::Copy(CopyError::Invalid(_)))
+        ));
+        let layout = ValueLayout::try_new(
+            &DataType::Int64,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        let flat: Vec<ArrayRef> = vec![Arc::new(arrow_array::Int32Array::from(vec![10]))];
+        assert!(matches!(
+            preflight_interleave_for_layout_construction(
+                &layout,
+                &DataType::Int64,
+                &flat,
+                &[(0, 0)],
+                &mut creation,
+                &Control(None)
+            ),
+            Err(CopyConstructionError::Copy(CopyError::Invalid(_)))
+        ));
+    }
+    #[test]
+    fn typed_map64_copy_preserves_original_creator_and_control_failures() {
+        let sources = vec![map64_source([Some(10), Some(11)])];
+        let layout = ValueLayout::try_new(
+            sources[0].data_type(),
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        for cause in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+        ] {
+            assert!(
+                matches!(values_copy_kind_for_layout_observed(&layout, sources[0].data_type(), || Err(cause.clone())), Err(CopyError::Control(actual)) if actual == cause)
+            );
+            let mut request = |_| Ok::<_, ()>(());
+            let mut opaque = |_| Ok::<_, ()>(());
+            let mut creation = ValueSchemaCreation::new(
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                &mut request,
+                &mut opaque,
+            );
+            assert!(
+                matches!(copy_nested_values_for_layout_construction(&layout, &sources, &[(0, 0)], &mut creation, &Control(Some(cause.clone()))), Err(CopyConstructionError::Copy(CopyError::Control(actual))) if actual == cause)
+            );
+        }
+        let mut request = |_| Err(OriginalRefusal);
+        let mut opaque = |_| Ok(());
+        let mut creation = ValueSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut opaque,
+        );
+        assert!(matches!(
+            copy_nested_values_for_layout_construction(
+                &layout,
+                &sources,
+                &[(0, 0)],
+                &mut creation,
+                &Control(None)
+            ),
+            Err(CopyConstructionError::Creator(OriginalRefusal))
+        ));
+        let mut request = |_| Ok(());
+        let mut opaque = |_| Err(OriginalRefusal);
+        let mut creation = ValueSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut opaque,
+        );
+        assert!(matches!(
+            copy_nested_values_for_layout_construction(
+                &layout,
+                &sources,
+                &[(0, 0)],
+                &mut creation,
+                &Control(None)
+            ),
+            Err(CopyConstructionError::Creator(OriginalRefusal))
+        ));
+    }
+    #[test]
+    fn typed_copy_keeps_permissive_carrier_null_flags_and_exact_source_policy() {
+        use arrow_array::StructArray;
+        use arrow_schema::Field;
+        let required =
+            DataType::Struct(vec![Arc::new(Field::new("v", DataType::Int64, false))].into());
+        let layout = ValueLayout::try_new(
+            &required,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        let fields = vec![Arc::new(Field::new("v", DataType::Int64, true))].into();
+        let actual: ArrayRef = Arc::new(StructArray::new(
+            fields,
+            vec![Arc::new(Int64Array::from(vec![10, 20]))],
+            None,
+        ));
+        assert!(
+            novarocks_type_contract::value_layout_matches_carrier_with_nullability_observed::<
+                novarocks_type_contract::ValueTypeError,
+            >(
+                &layout,
+                actual.data_type(),
+                novarocks_type_contract::CarrierNullabilityPolicy::Permissive,
+                |_| Ok(())
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            values_copy_kind_for_layout_observed(&layout, actual.data_type(), || Ok(())).unwrap(),
+            ValuesCopyKind::Extend
+        );
+        let mut request = |_| Ok::<_, ()>(());
+        let mut opaque = |_| Ok::<_, ()>(());
+        let mut creation = ValueSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut opaque,
+        );
+        let output = copy_nested_values_for_layout_construction(
+            &layout,
+            &[Arc::clone(&actual)],
+            &[(0, 1), (0, 0)],
+            &mut creation,
+            &Control(None),
+        )
+        .unwrap();
+        assert_eq!(output.data_type(), actual.data_type());
+        let output = output.as_any().downcast_ref::<StructArray>().unwrap();
+        let values = output
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.values().as_ref(), &[20, 10]);
+        let required: ArrayRef = Arc::new(StructArray::new(
+            vec![Arc::new(Field::new("v", DataType::Int64, false))].into(),
+            vec![Arc::new(Int64Array::from(vec![10, 20]))],
+            None,
+        ));
+        assert!(matches!(
+            copy_nested_values_for_layout_construction(
+                &layout,
+                &[actual, required],
+                &[(0, 0), (1, 0)],
+                &mut creation,
+                &Control(None)
+            ),
+            Err(CopyConstructionError::Copy(CopyError::Invalid(_)))
+        ));
+    }
+    #[test]
+    fn typed_copy_classifies_and_preserves_actual_dictionary_carrier() {
+        use arrow_array::{DictionaryArray, Int8Array, StringArray, types::Int8Type};
+        let layout = ValueLayout::try_new(
+            &DataType::Utf8,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        let actual: ArrayRef = Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(vec![0, 1]),
+                Arc::new(StringArray::from(vec!["alpha", "beta"])),
+            )
+            .unwrap(),
+        );
+        assert!(
+            novarocks_type_contract::value_layout_matches_carrier_observed::<
+                novarocks_type_contract::ValueTypeError,
+            >(&layout, actual.data_type(), |_| Ok(()))
+            .unwrap()
+        );
+        assert_eq!(
+            values_copy_kind_for_layout_observed(&layout, actual.data_type(), || Ok(())).unwrap(),
+            ValuesCopyKind::Extend
+        );
+        let mut request = |_| Ok::<_, ()>(());
+        let mut opaque = |_| Ok::<_, ()>(());
+        let mut creation = ValueSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut opaque,
+        );
+        let output = copy_nested_values_for_layout_construction(
+            &layout,
+            &[Arc::clone(&actual)],
+            &[(0, 1), (0, 0)],
+            &mut creation,
+            &Control(None),
+        )
+        .unwrap();
+        assert_eq!(output.data_type(), actual.data_type());
+        let output = output
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .unwrap();
+        let values = output
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.value(output.keys().value(0) as usize), "beta");
+        assert_eq!(values.value(output.keys().value(1) as usize), "alpha");
     }
     #[derive(Debug, Eq, PartialEq)]
     struct OriginalRefusal;

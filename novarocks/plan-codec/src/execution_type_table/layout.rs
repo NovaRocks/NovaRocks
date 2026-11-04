@@ -23,8 +23,8 @@ use super::{
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, UnionFields, UnionMode};
 use logical_wire::logical_type_definition::Kind as L;
 use novarocks_type_contract::{
-    MAX_ARROW_FIELD_NAME_BYTES, MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES, ValueLayout,
-    ValueSchemaCreationFactory, ValueTypeStorageLifetime,
+    ArrowTypeDepth, ArrowTypeProfile, MAX_ARROW_FIELD_NAME_BYTES, MAX_VALUE_TYPE_NODES,
+    ValueLayout, ValueSchemaCreationFactory, ValueTypeStorageLifetime,
 };
 use std::{alloc::Layout, sync::Arc};
 use wire::arrow_physical_type::Kind as P;
@@ -38,12 +38,12 @@ pub(super) struct Counts {
 impl Counts {
     fn node<H>(
         &mut self,
-        depth: usize,
+        depth: ArrowTypeDepth,
         limits: ExecutionTypeTableLimits,
         context: &mut Context<'_, '_, H>,
     ) -> Result<(), Failure<H>> {
         context.step()?;
-        if depth == 1 {
+        if depth.physical() == 1 {
             self.root_nodes = 0;
         }
         self.root_nodes = self
@@ -54,10 +54,10 @@ impl Counts {
             .nodes
             .checked_add(1)
             .ok_or_else(resources::arithmetic)?;
-        if depth > MAX_VALUE_TYPE_DEPTH
-            || self.root_nodes > MAX_VALUE_TYPE_NODES
-            || self.nodes > limits.max_layout_nodes
-        {
+        depth
+            .check(ArrowTypeProfile::CanonicalValue)
+            .map_err(|_| invalid("execution layout exceeds logical or physical depth profile"))?;
+        if self.root_nodes > MAX_VALUE_TYPE_NODES || self.nodes > limits.max_layout_nodes {
             return Err(invalid("execution layout exceeds depth or node profile"));
         }
         Ok(())
@@ -113,7 +113,7 @@ fn source_header<H>(
 }
 fn source_field<H>(
     field: &Field,
-    depth: usize,
+    depth: ArrowTypeDepth,
     counts: &mut Counts,
     limits: ExecutionTypeTableLimits,
     context: &mut Context<'_, '_, H>,
@@ -123,7 +123,7 @@ fn source_field<H>(
 }
 pub(super) fn count_source<H>(
     value: &DataType,
-    depth: usize,
+    depth: ArrowTypeDepth,
     counts: &mut Counts,
     limits: ExecutionTypeTableLimits,
     context: &mut Context<'_, '_, H>,
@@ -134,25 +134,64 @@ pub(super) fn count_source<H>(
         | DataType::LargeList(f)
         | DataType::ListView(f)
         | DataType::LargeListView(f)
-        | DataType::FixedSizeList(f, _) => source_field(f, depth + 1, counts, limits, context)?,
+        | DataType::FixedSizeList(f, _) => source_field(
+            f,
+            depth
+                .value_child()
+                .map_err(|_| invalid("execution layout depth overflow"))?,
+            counts,
+            limits,
+            context,
+        )?,
         DataType::Struct(fields) => {
             for field in fields {
-                source_field(field, depth + 1, counts, limits, context)?;
+                source_field(
+                    field,
+                    depth
+                        .value_child()
+                        .map_err(|_| invalid("execution layout depth overflow"))?,
+                    counts,
+                    limits,
+                    context,
+                )?;
             }
         }
         DataType::Union(fields, _) => {
             for (_, field) in fields.iter() {
-                source_field(field, depth + 1, counts, limits, context)?;
+                source_field(
+                    field,
+                    depth
+                        .value_child()
+                        .map_err(|_| invalid("execution layout depth overflow"))?,
+                    counts,
+                    limits,
+                    context,
+                )?;
             }
         }
         DataType::Map(entries, _) => {
             source_header(entries, counts, limits, context)?;
-            counts.node(depth + 1, limits, context)?;
+            counts.node(
+                depth
+                    .map_entries()
+                    .map_err(|_| invalid("execution layout depth overflow"))?,
+                limits,
+                context,
+            )?;
             let DataType::Struct(fields) = entries.data_type() else {
                 return Err(invalid("Map entries must be Struct"));
             };
             for field in fields {
-                source_field(field, depth + 2, counts, limits, context)?;
+                source_field(
+                    field,
+                    depth
+                        .map_entries()
+                        .and_then(ArrowTypeDepth::value_child)
+                        .map_err(|_| invalid("execution layout depth overflow"))?,
+                    counts,
+                    limits,
+                    context,
+                )?;
             }
         }
         DataType::Dictionary(..) | DataType::RunEndEncoded(..) => {
@@ -407,7 +446,7 @@ pub(super) fn validate_schema_root<H>(
         &field.name,
         index,
         logical,
-        1,
+        ArrowTypeDepth::ROOT,
         counts,
         limits,
         context,
@@ -420,7 +459,7 @@ fn validate_field<H>(
     name: &str,
     index: &mut DefinitionIndex<'_>,
     logical: &DecodedLogicalTypeTable,
-    depth: usize,
+    depth: ArrowTypeDepth,
     counts: &mut Counts,
     limits: ExecutionTypeTableLimits,
     context: &mut Context<'_, '_, H>,
@@ -454,7 +493,7 @@ pub(super) fn validate<H>(
     id: u32,
     index: &mut DefinitionIndex<'_>,
     logical: &DecodedLogicalTypeTable,
-    depth: usize,
+    depth: ArrowTypeDepth,
     counts: &mut Counts,
     limits: ExecutionTypeTableLimits,
     context: &mut Context<'_, '_, H>,
@@ -477,7 +516,9 @@ pub(super) fn validate<H>(
                 "item",
                 index,
                 logical,
-                depth + 1,
+                depth
+                    .value_child()
+                    .map_err(|_| invalid("execution layout depth overflow"))?,
                 counts,
                 limits,
                 context,
@@ -497,7 +538,9 @@ pub(super) fn validate<H>(
                 "item",
                 index,
                 logical,
-                depth + 1,
+                depth
+                    .value_child()
+                    .map_err(|_| invalid("execution layout depth overflow"))?,
                 counts,
                 limits,
                 context,
@@ -520,7 +563,9 @@ pub(super) fn validate<H>(
                     &semantic.name,
                     index,
                     logical,
-                    depth + 1,
+                    depth
+                        .value_child()
+                        .map_err(|_| invalid("execution layout depth overflow"))?,
                     counts,
                     limits,
                     context,
@@ -554,7 +599,9 @@ pub(super) fn validate<H>(
                     &sem.name,
                     index,
                     logical,
-                    depth + 1,
+                    depth
+                        .value_child()
+                        .map_err(|_| invalid("execution layout depth overflow"))?,
                     counts,
                     limits,
                     context,
@@ -577,7 +624,13 @@ pub(super) fn validate<H>(
             let Some(P::StructType(fields)) = entries_type.kind.as_ref() else {
                 return Err(invalid("Map entries must be Struct"));
             };
-            counts.node(depth + 1, limits, context)?;
+            counts.node(
+                depth
+                    .map_entries()
+                    .map_err(|_| invalid("execution layout depth overflow"))?,
+                limits,
+                context,
+            )?;
             if fields.fields.len() != 2 {
                 return Err(invalid("Map entries must contain key and value"));
             }
@@ -589,7 +642,10 @@ pub(super) fn validate<H>(
                 "key",
                 index,
                 logical,
-                depth + 2,
+                depth
+                    .map_entries()
+                    .and_then(ArrowTypeDepth::value_child)
+                    .map_err(|_| invalid("execution layout depth overflow"))?,
                 counts,
                 limits,
                 context,
@@ -602,7 +658,10 @@ pub(super) fn validate<H>(
                 "value",
                 index,
                 logical,
-                depth + 2,
+                depth
+                    .map_entries()
+                    .and_then(ArrowTypeDepth::value_child)
+                    .map_err(|_| invalid("execution layout depth overflow"))?,
                 counts,
                 limits,
                 context,

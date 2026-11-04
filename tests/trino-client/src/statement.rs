@@ -103,7 +103,7 @@ impl TrinoClient {
             .join("/v1/statement")
             .map_err(|e| StatementFailure::protocol(e.to_string()))?;
         let response = self.request(Method::POST, uri, &headers, Some(sql), deadline)?;
-        let page: Page = serde_json::from_slice(&response.body)?;
+        let page = parse_page(&response.body)?;
         *progress = TraceProgress {
             query_id: Some(page.id.clone()),
             initial_next_uri: page.next_uri.clone(),
@@ -215,6 +215,15 @@ struct Page {
     data: Option<Vec<Vec<Box<RawValue>>>>,
     error: Option<TrinoError>,
     update_type: Option<String>,
+}
+
+fn parse_page(bytes: &[u8]) -> Result<Page, StatementFailure> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    // A nested Trino type signature uses several JSON containers per SQL level.
+    deserializer.disable_recursion_limit();
+    let page = Page::deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(page)
 }
 
 /// The statement is registered but not yet executed by NovaRocks. The caller
@@ -353,7 +362,7 @@ impl PendingStatement {
             let response =
                 self.client
                     .request(Method::GET, target, &self.headers, None, deadline)?;
-            page = serde_json::from_slice(&response.body)?;
+            page = parse_page(&response.body)?;
             self.progress.pages += 1;
             if page.update_type.is_some() {
                 self.progress.update_type = page.update_type.clone();

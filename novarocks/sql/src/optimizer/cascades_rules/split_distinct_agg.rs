@@ -276,8 +276,7 @@ fn aggregate_output_columns(
                     PhaseOutput::State => {
                         crate::functions::aggregate_selection(call.source.binding())
                             .intermediate_type
-                            .with_nullable(true)
-                            .expect("validated root NULL contract")
+                            .clone()
                     }
                     PhaseOutput::Result => {
                         crate::functions::aggregate_result_type(call.source.binding()).clone()
@@ -1758,6 +1757,8 @@ mod tests {
         use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 
         for (name, source) in [
+            ("count", FunctionValueType::new(DataType::Int64, false)),
+            ("count", FunctionValueType::new(DataType::Int64, true)),
             (
                 "min",
                 FunctionValueType::try_with_logical_type(
@@ -1793,12 +1794,13 @@ mod tests {
                 resolved,
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             );
-            let mut result = crate::functions::aggregate_result_type(&resolved).clone();
-            result = result.with_nullable(true).unwrap();
-            let mut state = crate::functions::aggregate_selection(&resolved)
+            let result = crate::functions::aggregate_result_type(&resolved).clone();
+            let state = crate::functions::aggregate_selection(&resolved)
                 .intermediate_type
                 .clone();
-            state = state.with_nullable(true).unwrap();
+            if name == "count" {
+                assert_eq!(state, FunctionValueType::new(DataType::Int64, false));
+            }
             let input = TypedExpr {
                 kind: ExprKind::ColumnRef {
                     column_id: test_col_id("a"),

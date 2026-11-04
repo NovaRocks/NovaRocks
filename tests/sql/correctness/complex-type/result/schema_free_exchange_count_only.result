@@ -1,0 +1,9 @@
+-- query 2
+-- types	bigint
+row_count
+4
+
+-- query 4
+-- types	bigint
+row_count
+2

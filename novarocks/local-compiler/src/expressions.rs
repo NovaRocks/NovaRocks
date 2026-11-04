@@ -948,11 +948,14 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                         )
                         .into());
                     };
-                    if !novarocks_type_contract::arrow_data_types_exact_observed::<
+                    if !novarocks_type_contract::arrow_data_types_exact_with_profile_observed::<
                         ExpressionLoweringError,
-                    >(target, node.ty.data_type(), || {
-                        work.step().map_err(ExpressionLoweringError::Control)
-                    })? {
+                    >(
+                        target,
+                        node.ty.data_type(),
+                        novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
+                        || work.step().map_err(ExpressionLoweringError::Control),
+                    )? {
                         return Err(ExpressionLoweringError::Invalid(
                             "cast target differs from result",
                         )
@@ -2103,11 +2106,14 @@ fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                         )
                         .into());
                     }
-                    if !novarocks_type_contract::arrow_data_types_exact_observed::<
+                    if !novarocks_type_contract::arrow_data_types_exact_with_profile_observed::<
                         ExpressionLoweringError,
-                    >(target, source.ty.data_type(), || {
-                        work.step().map_err(ExpressionLoweringError::Control)
-                    })? {
+                    >(
+                        target,
+                        source.ty.data_type(),
+                        novarocks_type_contract::ArrowTypeProfile::CanonicalValue,
+                        || work.step().map_err(ExpressionLoweringError::Control),
+                    )? {
                         return Err(ExpressionLoweringError::Invalid(
                             "cast result differs from frozen target",
                         )

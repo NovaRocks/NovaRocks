@@ -549,3 +549,334 @@ fn bounded_row_projection_shares_null_traversal_observation_instead_of_a_paralle
     }
     assert_eq!(previous, 320);
 }
+
+#[test]
+fn runtime_map64_argument_keeps_selected_values_original_nulls_and_control() {
+    use arrow_array::{Int32Array, MapArray, StructArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+    use novarocks_failure_contract::FailureProjection;
+    fn maps(mut values: ArrayRef) -> ArrayRef {
+        for _ in 1..64 {
+            let fields = vec![
+                Arc::new(Field::new("key", DataType::Int32, false)),
+                Arc::new(Field::new("value", values.data_type().clone(), false)),
+            ]
+            .into();
+            let entries = StructArray::new(
+                fields,
+                vec![Arc::new(Int32Array::from(vec![1, 2])), values],
+                None,
+            );
+            values = Arc::new(MapArray::new(
+                Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1, 2])),
+                entries,
+                None,
+                false,
+            ));
+        }
+        values
+    }
+    let values = maps(Arc::new(Int32Array::from(vec![7, 11])));
+    let value_type = FunctionValueType::new(values.data_type().clone(), false);
+    assert_eq!(value_type.value_type().depth(), 64);
+    // Preserve the raw producer's original failure identity; only this typed
+    // runtime seam chooses the value profile after the original constant branch.
+    let raw = novarocks_type_contract::arrow_data_types_exact_observed::<
+        novarocks_type_contract::ValueTypeError,
+    >(values.data_type(), values.data_type(), || Ok(()))
+    .unwrap_err();
+    assert_eq!(
+        raw.failure_fact(),
+        novarocks_type_contract::ValueTypeError::TooDeep.failure_fact()
+    );
+    let control = Control::default();
+    validate_argument_observed(
+        EvaluatedArgument::Column(&values),
+        Selection::all(2),
+        &value_type,
+        &control,
+    )
+    .unwrap();
+    let trace = control.checks.lock().unwrap().clone();
+    assert!(trace.iter().any(|&units| units > 0));
+    for at in 0..trace.len() {
+        for failure in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+        ] {
+            let refusing = Control {
+                refusal: Some((at, failure.clone())),
+                ..Default::default()
+            };
+            assert_eq!(
+                validate_argument_observed(
+                    EvaluatedArgument::Column(&values),
+                    Selection::all(2),
+                    &value_type,
+                    &refusing
+                ),
+                Err(failure)
+            );
+            assert_eq!(*refusing.checks.lock().unwrap(), trace[..=at]);
+        }
+    }
+    let other = maps(Arc::new(Int64Array::from(vec![7, 11])));
+    let other_type = FunctionValueType::new(other.data_type().clone(), false);
+    assert!(matches!(
+        validate_argument_observed(
+            EvaluatedArgument::Column(&values),
+            Selection::all(2),
+            &other_type,
+            &Control::default()
+        ),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+    let map = values.as_any().downcast_ref::<MapArray>().unwrap().clone();
+    let (field, offsets, entries, _, ordered) = map.into_parts();
+    let nullable: ArrayRef = Arc::new(MapArray::new(
+        field,
+        offsets,
+        entries,
+        Some(NullBuffer::from(vec![true, false])),
+        ordered,
+    ));
+    assert!(matches!(
+        validate_argument_observed(
+            EvaluatedArgument::Column(&nullable),
+            Selection::all(2),
+            &value_type,
+            &Control::default()
+        ),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+    validate_argument_observed(
+        EvaluatedArgument::Column(&nullable),
+        Selection::try_sparse(2, &[0]).unwrap(),
+        &value_type,
+        &Control::default(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn permissive_runtime_struct_preserves_active_requiredness_and_selected_row_mapping() {
+    use arrow_array::{Int32Array, StructArray};
+    use arrow_buffer::NullBuffer;
+    use novarocks_failure_contract::FailureProjection;
+    let logical = FunctionValueType::new(
+        DataType::Struct(vec![Arc::new(Field::new("n", DataType::Int32, false))].into()),
+        true,
+    );
+    let array = |values: Vec<Option<i32>>, parents: Vec<bool>| -> ArrayRef {
+        Arc::new(StructArray::new(
+            vec![Arc::new(Field::new("n", DataType::Int32, true))].into(),
+            vec![Arc::new(Int32Array::from(values))],
+            Some(NullBuffer::from(parents)),
+        ))
+    };
+    let valid = array(vec![None, Some(7)], vec![false, true]);
+    validate_argument_observed(
+        EvaluatedArgument::Column(&valid),
+        Selection::all(2),
+        &logical,
+        &Control::default(),
+    )
+    .unwrap();
+    let DataType::Struct(fields) = valid.data_type() else {
+        panic!("original Struct carrier")
+    };
+    assert!(
+        fields[0].is_nullable(),
+        "validation must not tighten the original Arrow carrier"
+    );
+    let invalid = array(vec![None, None], vec![false, true]);
+    let error = validate_argument_observed(
+        EvaluatedArgument::Column(&invalid),
+        Selection::all(2),
+        &logical,
+        &Control::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.failure_fact(),
+        novarocks_value_arrays::ValueError::Invariant(
+            novarocks_value_arrays::ValueViolation::RequiredNull
+        )
+        .failure_fact()
+    );
+    validate_argument_observed(
+        EvaluatedArgument::Column(&invalid),
+        Selection::try_sparse(2, &[0]).unwrap(),
+        &logical,
+        &Control::default(),
+    )
+    .unwrap();
+    // Compact selected values keep original batch coordinates in Selection, but
+    // the borrowed requiredness author must receive compact physical ordinals.
+    let selected = Selection::try_sparse(6, &[2, 5]).unwrap();
+    let compact =
+        SelectedValues::try_new(selected, valid.data_type(), valid.clone(), Box::default())
+            .unwrap();
+    validate_argument_observed(
+        EvaluatedArgument::SelectedColumn(&compact),
+        selected,
+        &logical,
+        &Control::default(),
+    )
+    .unwrap();
+    let renamed = FunctionValueType::new(
+        DataType::Struct(vec![Arc::new(Field::new("different", DataType::Int32, false))].into()),
+        true,
+    );
+    assert!(matches!(
+        validate_argument_observed(
+            EvaluatedArgument::Column(&valid),
+            Selection::all(2),
+            &renamed,
+            &Control::default()
+        ),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+    let control = Control::default();
+    validate_argument_observed(
+        EvaluatedArgument::Column(&valid),
+        Selection::all(2),
+        &logical,
+        &control,
+    )
+    .unwrap();
+    let trace = control.checks.lock().unwrap().clone();
+    for at in 0..trace.len() {
+        for failure in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+        ] {
+            let refused = Control {
+                refusal: Some((at, failure.clone())),
+                ..Default::default()
+            };
+            assert_eq!(
+                validate_argument_observed(
+                    EvaluatedArgument::Column(&valid),
+                    Selection::all(2),
+                    &logical,
+                    &refused
+                ),
+                Err(failure)
+            );
+            assert_eq!(*refused.checks.lock().unwrap(), trace[..=at]);
+        }
+    }
+}
+
+#[test]
+fn permissive_runtime_list_ignores_parent_null_and_unused_child_nulls() {
+    use arrow_array::{Int32Array, ListArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+    use novarocks_failure_contract::FailureProjection;
+    let logical = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
+        true,
+    );
+    let array = |last: Option<i32>| -> ArrayRef {
+        Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![1_i32, 2, 3, 4])),
+            Arc::new(Int32Array::from(vec![None, Some(11), None, last, None])),
+            Some(NullBuffer::from(vec![true, false, true])),
+        ))
+    };
+    let valid = array(Some(13));
+    validate_argument_observed(
+        EvaluatedArgument::Column(&valid),
+        Selection::all(3),
+        &logical,
+        &Control::default(),
+    )
+    .unwrap();
+    let invalid = array(None);
+    let error = validate_argument_observed(
+        EvaluatedArgument::Column(&invalid),
+        Selection::all(3),
+        &logical,
+        &Control::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.failure_fact(),
+        novarocks_value_arrays::ValueError::Invariant(
+            novarocks_value_arrays::ValueViolation::RequiredNull
+        )
+        .failure_fact()
+    );
+    validate_argument_observed(
+        EvaluatedArgument::Column(&invalid),
+        Selection::try_sparse(3, &[0, 1]).unwrap(),
+        &logical,
+        &Control::default(),
+    )
+    .unwrap();
+    let DataType::List(child) = valid.data_type() else {
+        panic!("original List")
+    };
+    assert!(child.is_nullable());
+}
+
+#[test]
+fn permissive_argument_does_not_admit_foreign_metadata_or_runtime_encoding_wrappers() {
+    use arrow_array::types::Int32Type;
+    use arrow_array::{Int32Array, StructArray};
+    let expected = FunctionValueType::new(
+        DataType::Struct(vec![Arc::new(Field::new("n", DataType::Utf8, false))].into()),
+        true,
+    );
+    let dictionary: ArrayRef = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0, 1]),
+            Arc::new(StringArray::from(vec!["x", "y"])),
+        )
+        .unwrap(),
+    );
+    let run: ArrayRef = Arc::new(
+        RunArray::<Int32Type>::try_new(&Int32Array::from(vec![2]), &StringArray::from(vec!["x"]))
+            .unwrap(),
+    );
+    for child in [dictionary, run] {
+        let source: ArrayRef = Arc::new(StructArray::new(
+            vec![Arc::new(Field::new("n", child.data_type().clone(), true))].into(),
+            vec![child],
+            None,
+        ));
+        assert!(matches!(
+            validate_argument_observed(
+                EvaluatedArgument::Column(&source),
+                Selection::all(2),
+                &expected,
+                &Control::default()
+            ),
+            Err(KernelFailure::InvalidProgram(_))
+        ));
+    }
+    let source: ArrayRef = Arc::new(StructArray::new(
+        vec![Arc::new(
+            Field::new("n", DataType::Utf8, true).with_metadata(std::collections::HashMap::from([
+                ("foreign".into(), "annotation".into()),
+            ])),
+        )]
+        .into(),
+        vec![Arc::new(StringArray::from(vec!["x", "y"]))],
+        None,
+    ));
+    assert!(matches!(
+        validate_argument_observed(
+            EvaluatedArgument::Column(&source),
+            Selection::all(2),
+            &expected,
+            &Control::default()
+        ),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+}

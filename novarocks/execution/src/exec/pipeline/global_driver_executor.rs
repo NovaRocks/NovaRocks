@@ -70,6 +70,9 @@ impl ParkingPhase {
 use driver_batch::{Poll as ReaperPoll, ReaperEntry};
 
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+// Drivers synchronously encode online units and destroy their source arrays.
+// Runtime ownership fixes this stack independently of test thread settings.
+const DRIVER_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 /// Completion result payload reported when a fragment finishes execution.
 pub struct FragmentCompletion {
@@ -698,9 +701,15 @@ impl GlobalDriverExecutor {
         let event_dispatcher = EventDispatcher::new();
 
         let mut workers = Vec::with_capacity(num_threads);
-        for _ in 0..num_threads {
+        for index in 0..num_threads {
             let shared_cloned = Arc::clone(&shared);
-            workers.push(thread::spawn(move || worker_loop(shared_cloned)));
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("novarocks-driver-{index}"))
+                    .stack_size(DRIVER_THREAD_STACK_BYTES)
+                    .spawn(move || worker_loop(shared_cloned))
+                    .expect("spawn pipeline driver worker"),
+            );
         }
 
         Self {

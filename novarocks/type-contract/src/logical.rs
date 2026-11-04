@@ -185,34 +185,33 @@ pub enum ValueTypeVisit<'a> {
 
 trait TypePending<'a> {
     fn len(&self) -> usize;
-    fn push(&mut self, item: (&'a DataType, usize));
-    fn pop(&mut self) -> Option<(&'a DataType, usize)>;
+    fn push(&mut self, item: crate::TypeTraversalFrame<'a>);
+    fn pop(&mut self) -> Option<crate::TypeTraversalFrame<'a>>;
 }
-impl<'a> TypePending<'a> for Vec<(&'a DataType, usize)> {
+impl<'a> TypePending<'a> for Vec<crate::TypeTraversalFrame<'a>> {
     fn len(&self) -> usize {
         Vec::len(self)
     }
-    fn push(&mut self, item: (&'a DataType, usize)) {
+    fn push(&mut self, item: crate::TypeTraversalFrame<'a>) {
         Vec::push(self, item);
     }
-    fn pop(&mut self) -> Option<(&'a DataType, usize)> {
+    fn pop(&mut self) -> Option<crate::TypeTraversalFrame<'a>> {
         Vec::pop(self)
     }
 }
 struct BorrowedTypePending<'a, 's> {
-    slots: &'s mut [Option<(&'a DataType, usize)>; MAX_VALUE_TYPE_NODES],
+    slots: &'s mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
     len: usize,
 }
 impl<'a> TypePending<'a> for BorrowedTypePending<'a, '_> {
     fn len(&self) -> usize {
         self.len
     }
-    fn push(&mut self, item: (&'a DataType, usize)) {
-        // The sole walk's visited+pending gate proves this slot exists.
+    fn push(&mut self, item: crate::TypeTraversalFrame<'a>) {
         self.slots[self.len] = Some(item);
         self.len += 1;
     }
-    fn pop(&mut self) -> Option<(&'a DataType, usize)> {
+    fn pop(&mut self) -> Option<crate::TypeTraversalFrame<'a>> {
         if self.len == 0 {
             return None;
         }
@@ -225,114 +224,170 @@ pub fn validate_value_type_structure_observed<'a, E: From<ValueTypeError>>(
     root: &'a DataType,
     observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
 ) -> Result<(), E> {
-    let mut pending = vec![(root, 1usize)];
-    validate_value_type_structure_with_pending(&mut pending, true, observe)
+    validate_value_type_structure_with_profile_observed(
+        root,
+        crate::ArrowTypeProfile::Physical,
+        observe,
+    )
 }
 
-/// Validate only borrowed Arrow layout shape and bounds. Format annotations
-/// cannot author execution semantics and are never interpreted by this entry.
+pub fn validate_value_type_structure_with_profile_observed<'a, E: From<ValueTypeError>>(
+    root: &'a DataType,
+    profile: crate::ArrowTypeProfile,
+    observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut pending = vec![crate::TypeTraversalFrame::root(root)];
+    visit_value_type_with_pending(&mut pending, profile, false, true, observe)
+}
+
+/// Layout-only validation preserves the original physical policy unless its
+/// owner explicitly supplies the complete-value profile below.
 pub fn validate_arrow_layout_structure_observed<'a, E: From<ValueTypeError>>(
     root: &'a DataType,
     observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
 ) -> Result<(), E> {
-    let mut pending = vec![(root, 1usize)];
-    validate_value_type_structure_with_pending(&mut pending, false, observe)
+    validate_arrow_layout_structure_with_profile_observed(
+        root,
+        crate::ArrowTypeProfile::Physical,
+        observe,
+    )
+}
+pub fn validate_arrow_layout_structure_with_profile_observed<'a, E: From<ValueTypeError>>(
+    root: &'a DataType,
+    profile: crate::ArrowTypeProfile,
+    observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut pending = vec![crate::TypeTraversalFrame::root(root)];
+    visit_value_type_with_pending(&mut pending, profile, false, false, observe)
 }
 
-/// The same grammar, bounds, borrowed events and primary-error order, using
-/// caller-owned fixed scratch. No heap request is made by this walk. Scratch
-/// initialization and metadata/probe work remain the caller's admitted work;
-/// a refusal may leave borrowed pending entries in the caller's scratch.
 pub fn validate_value_type_structure_with_scratch_observed<'a, E: From<ValueTypeError>>(
     root: &'a DataType,
-    scratch: &mut [Option<(&'a DataType, usize)>; MAX_VALUE_TYPE_NODES],
+    scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
+    observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    validate_value_type_structure_with_profile_and_scratch_observed(
+        root,
+        crate::ArrowTypeProfile::Physical,
+        scratch,
+        observe,
+    )
+}
+pub fn validate_value_type_structure_with_profile_and_scratch_observed<
+    'a,
+    E: From<ValueTypeError>,
+>(
+    root: &'a DataType,
+    profile: crate::ArrowTypeProfile,
+    scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
     observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
 ) -> Result<(), E> {
     let mut pending = BorrowedTypePending {
         slots: scratch,
         len: 0,
     };
-    pending.push((root, 1));
-    validate_value_type_structure_with_pending(&mut pending, true, observe)
+    pending.push(crate::TypeTraversalFrame::root(root));
+    visit_value_type_with_pending(&mut pending, profile, false, true, observe)
 }
 
-/// The layout-only grammar and borrowed attributes, using caller-owned scratch.
-/// Source annotations remain observable carrier attributes, never semantics.
 pub fn validate_arrow_layout_structure_with_scratch_observed<'a, E: From<ValueTypeError>>(
     root: &'a DataType,
-    scratch: &mut [Option<(&'a DataType, usize)>; MAX_VALUE_TYPE_NODES],
+    scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
+    observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    validate_arrow_layout_structure_with_profile_and_scratch_observed(
+        root,
+        crate::ArrowTypeProfile::Physical,
+        scratch,
+        observe,
+    )
+}
+pub fn validate_arrow_layout_structure_with_profile_and_scratch_observed<
+    'a,
+    E: From<ValueTypeError>,
+>(
+    root: &'a DataType,
+    profile: crate::ArrowTypeProfile,
+    scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
     observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
 ) -> Result<(), E> {
     let mut pending = BorrowedTypePending {
         slots: scratch,
         len: 0,
     };
-    pending.push((root, 1));
-    validate_value_type_structure_with_pending(&mut pending, false, observe)
+    pending.push(crate::TypeTraversalFrame::root(root));
+    visit_value_type_with_pending(&mut pending, profile, false, false, observe)
 }
 
-fn validate_value_type_structure_with_pending<'a, E: From<ValueTypeError>>(
-    pending: &mut impl TypePending<'a>,
-    validate_annotations: bool,
-    observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
-) -> Result<(), E> {
-    visit_value_type_with_pending(pending, false, validate_annotations, observe)
-}
-
-/// Borrow the owned edges of the original derived DataType::clone. All FieldRef,
-/// Fields, UnionFields and timezone Arc occurrences are shared; only Dictionary
-/// Box children recurse. The same pending scratch and source matcher below own
-/// the traversal. This numerical loan performs no clone or allocation grant.
-/// The caller owns scratch initialization before borrowing this entrypoint.
+/// Borrow the original derived DataType::clone edges. Runtime dictionaries
+/// still have the old physical clone bound; Map Fields remain shared Arcs.
 pub fn visit_original_data_type_clone_with_scratch_observed<'a, E: From<ValueTypeError>>(
     root: &'a DataType,
-    scratch: &mut [Option<(&'a DataType, usize)>; MAX_VALUE_TYPE_NODES],
+    scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
     observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
 ) -> Result<(), E> {
     let mut pending = BorrowedTypePending {
         slots: scratch,
         len: 0,
     };
-    pending.push((root, 1));
-    visit_value_type_with_pending(&mut pending, true, true, observe)
+    pending.push(crate::TypeTraversalFrame::root(root));
+    visit_value_type_with_pending(
+        &mut pending,
+        crate::ArrowTypeProfile::Physical,
+        true,
+        true,
+        observe,
+    )
 }
 
+enum ChildRole {
+    Value,
+    MapEntries,
+    Encoding,
+}
 fn visit_value_type_with_pending<'a, E: From<ValueTypeError>>(
     pending: &mut impl TypePending<'a>,
+    profile: crate::ArrowTypeProfile,
     original_owned_clone: bool,
     validate_annotations: bool,
     mut observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
 ) -> Result<(), E> {
     let mut visited = 0usize;
-    while let Some((ty, depth)) = pending.pop() {
+    while let Some(frame) = pending.pop() {
+        let ty = frame.data_type;
         observe(ValueTypeVisit::TypeNode(ty))?;
         visited += 1;
-        if depth > MAX_VALUE_TYPE_DEPTH {
-            return Err(ValueTypeError::TooDeep.into());
-        }
+        frame.depth.check(profile)?;
         if visited > MAX_VALUE_TYPE_NODES {
             return Err(ValueTypeError::TooManyNodes.into());
         }
-        let mut push = |child: &'a DataType, field: Option<&'a Field>| -> Result<(), E> {
-            if let Some(field) = field {
-                observe(ValueTypeVisit::Field(field))?;
-                if validate_annotations {
-                    field_logical_type(field)?;
+        let mut push =
+            |child: &'a DataType, field: Option<&'a Field>, role: ChildRole| -> Result<(), E> {
+                if let Some(field) = field {
+                    observe(ValueTypeVisit::Field(field))?;
+                    if validate_annotations {
+                        field_logical_type(field)?;
+                    }
                 }
-            }
-            observe(ValueTypeVisit::ChildEdge(child))?;
-            if visited + pending.len() >= MAX_VALUE_TYPE_NODES {
-                return Err(ValueTypeError::TooManyNodes.into());
-            }
-            pending.push((child, depth + 1));
-            Ok(())
-        };
+                observe(ValueTypeVisit::ChildEdge(child))?;
+                if visited + pending.len() >= MAX_VALUE_TYPE_NODES {
+                    return Err(ValueTypeError::TooManyNodes.into());
+                }
+                let depth = match role {
+                    ChildRole::Value => frame.depth.value_child()?,
+                    ChildRole::MapEntries => frame.depth.map_entries()?,
+                    ChildRole::Encoding => frame.depth.encoding_child()?,
+                };
+                pending.push(crate::TypeTraversalFrame {
+                    data_type: child,
+                    depth,
+                });
+                Ok(())
+            };
         if original_owned_clone {
-            // Derived clone copies the Dictionary's two Box<DataType> values.
-            // Every other carrier's descendants are behind shared Arc owners.
             if let DataType::Dictionary(key, value) = ty {
-                push(key, None)?;
-                push(value, None)?;
+                push(key, None, ChildRole::Encoding)?;
+                push(value, None, ChildRole::Encoding)?;
             }
             continue;
         }
@@ -341,27 +396,29 @@ fn visit_value_type_with_pending<'a, E: From<ValueTypeError>>(
             | DataType::LargeList(field)
             | DataType::ListView(field)
             | DataType::LargeListView(field)
-            | DataType::FixedSizeList(field, _)
-            | DataType::Map(field, _) => {
-                push(field.data_type(), Some(field))?;
+            | DataType::FixedSizeList(field, _) => {
+                push(field.data_type(), Some(field), ChildRole::Value)?
+            }
+            DataType::Map(entries, _) => {
+                push(entries.data_type(), Some(entries), ChildRole::MapEntries)?
             }
             DataType::Struct(fields) => {
                 for field in fields {
-                    push(field.data_type(), Some(field))?;
+                    push(field.data_type(), Some(field), ChildRole::Value)?;
                 }
             }
             DataType::Union(fields, _) => {
                 for (_, field) in fields.iter() {
-                    push(field.data_type(), Some(field))?;
+                    push(field.data_type(), Some(field), ChildRole::Value)?;
                 }
             }
             DataType::Dictionary(key, value) => {
-                push(key, None)?;
-                push(value, None)?;
+                push(key, None, ChildRole::Encoding)?;
+                push(value, None, ChildRole::Encoding)?;
             }
             DataType::RunEndEncoded(ends, values) => {
-                push(ends.data_type(), Some(ends))?;
-                push(values.data_type(), Some(values))?;
+                push(ends.data_type(), Some(ends), ChildRole::Encoding)?;
+                push(values.data_type(), Some(values), ChildRole::Encoding)?;
             }
             _ => {}
         }

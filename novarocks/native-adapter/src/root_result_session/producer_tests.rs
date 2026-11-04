@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::terminal_observation_tests::{
-    OriginalRootNode, in_original_preparation, open_root_in_preparation,
+    OriginalRootNode, in_original_preparation, open_root_in_preparation_with_layout,
 };
 use super::{NativeRootResultSession, RootProducerPool};
 use arrow::array::{
@@ -106,6 +106,12 @@ struct Fixture {
 
 impl Fixture {
     fn new(output: FrozenRootOutput) -> Self {
+        Self::with_root_layout(output, None)
+    }
+    fn with_root_layout(
+        output: FrozenRootOutput,
+        root_layout: Option<novarocks_local_program::StaticLayout>,
+    ) -> Self {
         let limits = WorkerResultRetainedLimits::try_new(256 << 20, 512 << 20).unwrap();
         let budget = ResultRetainedBudget::new(limits.per_process());
         let health =
@@ -119,7 +125,7 @@ impl Fixture {
         )
         .unwrap();
         let (session, control, original_node) =
-            open_original(output, &pool, &budget, limits, &health);
+            open_original_with_layout(output, &pool, &budget, limits, &health, root_layout);
         let channel = session.channel().clone();
         Self {
             pool,
@@ -144,13 +150,27 @@ fn open_original(
     Arc<TaskExecutionControl>,
     Arc<OriginalRootNode>,
 ) {
+    open_original_with_layout(output, pool, budget, limits, health, None)
+}
+fn open_original_with_layout(
+    output: FrozenRootOutput,
+    pool: &Arc<RootProducerPool>,
+    budget: &Arc<ResultRetainedBudget>,
+    limits: WorkerResultRetainedLimits,
+    health: &Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
+    root_layout: Option<novarocks_local_program::StaticLayout>,
+) -> (
+    Arc<NativeRootResultSession>,
+    Arc<TaskExecutionControl>,
+    Arc<OriginalRootNode>,
+) {
     let task = task();
     let pool = pool.clone();
     let budget = budget.clone();
     let body_health = health.clone();
     let ((session, control), original_node) =
         in_original_preparation(task, health.clone(), move |preparation| {
-            let session = open_root_in_preparation(
+            let session = open_root_in_preparation_with_layout(
                 preparation,
                 &pool,
                 RootResultWriteSpec {
@@ -160,6 +180,7 @@ fn open_original(
                 budget,
                 limits,
                 body_health,
+                root_layout.as_ref(),
             )
             .unwrap();
             // This producer component explicitly takes the original channel's
@@ -1678,12 +1699,15 @@ async fn every_internal_domain_opens_and_an_untyped_scalar_identity_has_no_chann
         InternalResultDomain::PreparedWriteCommitV1,
         InternalResultDomain::CowSelectionArrowV1,
     ] {
-        let (session, _control, original_node) = open_original(
+        let root_layout = (domain == InternalResultDomain::CowSelectionArrowV1)
+            .then(|| declared_root_layout(longs(vec![]).chunk_schema()));
+        let (session, _control, original_node) = open_original_with_layout(
             FrozenRootOutput::InternalFacts(domain),
             &pool,
             &budget,
             limits,
             &health,
+            root_layout,
         );
         let channel = session.channel().clone();
         session.abort(ResultAbort::Cancelled(String::new()));
@@ -1699,12 +1723,14 @@ async fn every_internal_domain_opens_and_an_untyped_scalar_identity_has_no_chann
 #[tokio::test]
 async fn cow_selection_records_decode_back_to_their_batches() {
     use novarocks_native_adapter::root_cow_selection_codec::{
-        CowSelectionDecoder, CowSelectionRecordHeader, CowSelectionRecordKind,
+        CowSelectionDecoder, CowSelectionRecordHeader,
     };
     use novarocks_result_contract::InternalResultDomain;
-    let fixture = Fixture::new(FrozenRootOutput::InternalFacts(
-        InternalResultDomain::CowSelectionArrowV1,
-    ));
+    let layout = declared_root_layout(longs(vec![]).chunk_schema());
+    let fixture = Fixture::with_root_layout(
+        FrozenRootOutput::InternalFacts(InternalResultDomain::CowSelectionArrowV1),
+        Some(layout),
+    );
     let inputs = [
         longs(vec![]),
         longs(vec![Some(7), None, Some(9)]),
@@ -1730,7 +1756,7 @@ async fn cow_selection_records_decode_back_to_their_batches() {
         };
     }
     fixture.session.finish_input().unwrap();
-    // Three records exceed the unacknowledged window: consume while reading.
+    // Consume while reading so the original bounded ACK window stays live.
     let mut bytes = Vec::new();
     let mut sequence = 1;
     let rows = loop {
@@ -1747,18 +1773,12 @@ async fn cow_selection_records_decode_back_to_their_batches() {
     assert_eq!(rows, 4);
     wait_until(|| fixture.session.producer_state() == RootProducerState::ContextHeld).await;
     let mut rest = bytes.as_slice();
-    let mut schema = None;
+    let recipe = fixture.session.shared.cow_recipe.as_ref().unwrap();
     let mut batches = Vec::new();
     while !rest.is_empty() {
         let header = CowSelectionRecordHeader::parse(rest).unwrap();
         let (record, tail) = rest.split_at(header.record_bytes() as usize);
-        match header.kind() {
-            CowSelectionRecordKind::Schema => {
-                schema = Some(CowSelectionDecoder::decode_schema(record).unwrap())
-            }
-            CowSelectionRecordKind::Batch => batches
-                .push(CowSelectionDecoder::decode_batch(schema.as_ref().unwrap(), record).unwrap()),
-        }
+        batches.push(CowSelectionDecoder::decode_batch(recipe, record).unwrap());
         rest = tail;
     }
     let decoded = batches
@@ -1785,6 +1805,34 @@ fn nullable_i64() -> ScalarField {
         nullable: true,
         value_type: ScalarValueType::SignedInteger(64),
     }
+}
+fn declared_root_layout(schema: &ChunkSchema) -> novarocks_local_program::StaticLayout {
+    // StaticLayout freezes the complete plain output declaration. Runtime
+    // dictionaries are input carriers, never preparation layout declarations.
+    let fields = schema
+        .slots()
+        .iter()
+        .map(|slot| {
+            Field::new(
+                slot.name(),
+                slot.typed_binding().data_type().clone(),
+                slot.typed_binding().nullable(),
+            )
+        })
+        .collect::<Vec<_>>();
+    novarocks_local_program::StaticLayout::try_new_typed_for_compile(
+        Arc::new(Schema::new(fields)),
+        schema.slot_ids().to_vec().into(),
+        schema
+            .slots()
+            .iter()
+            .map(|slot| (slot.typed_binding().clone(), None))
+            .collect(),
+        schema.storage_lifetime(),
+        |_| Ok(()),
+        &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+    )
+    .unwrap()
 }
 fn longs(values: Vec<Option<i64>>) -> Chunk {
     owned_chunk(Arc::new(Int64Array::from(values)))
@@ -2079,4 +2127,151 @@ fn assert_original_root_storage_cause(
         source = cause.source();
     }
     assert_eq!(original, Some(expected));
+}
+
+fn maximum_depth_cow_chunk(case: usize, text: &str) -> Chunk {
+    use arrow::array::{ListArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    let mut array: ArrayRef = if case == 2 {
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0]),
+                Arc::new(StringArray::from(vec![text])),
+            )
+            .unwrap(),
+        )
+    } else {
+        Arc::new(StringArray::from(vec![text]))
+    };
+    let mut owners = Vec::new();
+    for level in 1..64 {
+        let is_list = case == 1 || (case == 2 && level % 2 == 0);
+        let field = owned_field(
+            if is_list { "item" } else { "named" },
+            array.data_type().clone(),
+            false,
+        );
+        array = if is_list {
+            Arc::new(ListArray::new(
+                Arc::clone(field.field()),
+                OffsetBuffer::from_lengths([1]),
+                array,
+                None,
+            ))
+        } else {
+            Arc::new(StructArray::new(
+                vec![Arc::clone(field.field())].into(),
+                vec![array],
+                None,
+            ))
+        };
+        owners.push(field);
+    }
+    owned_nested_chunk(array, owners)
+}
+
+#[tokio::test]
+async fn maximum_cow_depth_round_trips_on_the_original_one_mib_producer() {
+    use arrow::array::{ListArray, StructArray};
+    use novarocks_native_adapter::root_cow_selection_codec::{
+        CowSelectionDecoder, CowSelectionRecordHeader,
+    };
+    use novarocks_result_contract::InternalResultDomain;
+    for case in 0..3 {
+        let chunk = maximum_depth_cow_chunk(case, "deep-64");
+        let fixture = Fixture::with_root_layout(
+            FrozenRootOutput::InternalFacts(InternalResultDomain::CowSelectionArrowV1),
+            Some(declared_root_layout(chunk.chunk_schema())),
+        );
+        let mut submitted = Some(
+            novarocks_execution::runtime::fragment::io::RootResultInput::new(
+                chunk,
+                input(&fixture.session).await,
+            ),
+        );
+        fixture.session.submit_input(&mut submitted).unwrap();
+        assert!(submitted.is_none());
+        fixture.session.finish_input().unwrap();
+        let mut bytes = Vec::new();
+        let mut sequence = 1;
+        loop {
+            let delivery = read(&fixture.channel, Some(sequence), sequence - 1).await;
+            match &delivery.reply().outcome {
+                RootReadOutcome::Data(data) => bytes.extend_from_slice(data.body().as_ref()),
+                RootReadOutcome::End(end) => {
+                    assert_eq!(end.output_rows, 1);
+                    break;
+                }
+                RootReadOutcome::NotReady => continue,
+                other => panic!("unexpected deep COW outcome {other:?}"),
+            }
+            sequence += 1;
+        }
+        await_whole_exit(&fixture.session).await;
+        let recipe = fixture.session.shared.cow_recipe.as_ref().unwrap();
+        let header = CowSelectionRecordHeader::parse(&bytes).unwrap();
+        assert_eq!(header.record_bytes() as usize, bytes.len());
+        let decoded = CowSelectionDecoder::decode_batch(recipe, &bytes).unwrap();
+        let mut value = decoded.column(0).as_ref();
+        for level in (1..64).rev() {
+            assert_eq!(value.len(), 1);
+            assert_eq!(value.null_count(), 0);
+            let is_list = case == 1 || (case == 2 && level % 2 == 0);
+            value = if is_list {
+                value
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap()
+                    .values()
+                    .as_ref()
+            } else {
+                value
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap()
+                    .column(0)
+                    .as_ref()
+            };
+        }
+        assert_eq!(
+            value
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "deep-64"
+        );
+        shutdown(&fixture.pool).await;
+    }
+}
+
+#[tokio::test]
+async fn maximum_cow_depth_cancellation_joins_before_releasing_the_input() {
+    use novarocks_result_contract::InternalResultDomain;
+    let text = "d".repeat(3 << 20);
+    let chunk = maximum_depth_cow_chunk(2, &text);
+    let weak = Arc::downgrade(&chunk.columns()[0]);
+    let fixture = Fixture::with_root_layout(
+        FrozenRootOutput::InternalFacts(InternalResultDomain::CowSelectionArrowV1),
+        Some(declared_root_layout(chunk.chunk_schema())),
+    );
+    let mut submitted = Some(
+        novarocks_execution::runtime::fragment::io::RootResultInput::new(
+            chunk,
+            input(&fixture.session).await,
+        ),
+    );
+    fixture.session.submit_input(&mut submitted).unwrap();
+    assert!(submitted.is_none());
+    wait_until(|| fixture.channel.snapshot().data_positions == 2).await;
+    assert!(weak.upgrade().is_some());
+    fixture.session.abort(ResultAbort::Cancelled(
+        "maximum-depth COW cancellation".into(),
+    ));
+    await_whole_exit(&fixture.session).await;
+    assert!(
+        weak.upgrade().is_none(),
+        "actual producer exit releases the original deep input"
+    );
+    shutdown(&fixture.pool).await;
 }

@@ -1288,7 +1288,7 @@
         "code": "sql.analyze.unavailable_implementation"
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B8",
+      "owner": "UEA-7B3",
       "expires": "2026-12-15"
     },
     {
@@ -1298,7 +1298,7 @@
         "code": "sql.analyze.unavailable_implementation"
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B8",
+      "owner": "UEA-7B3",
       "expires": "2026-12-15"
     },
     {
@@ -1358,7 +1358,7 @@
         "code": "sql.analyze.unavailable_implementation"
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 5 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B8",
+      "owner": "UEA-7B3",
       "expires": "2026-12-15"
     },
     {
@@ -1368,7 +1368,7 @@
         "code": "sql.analyze.unavailable_implementation"
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B8",
+      "owner": "UEA-7B3",
       "expires": "2026-12-15"
     },
     {
@@ -1378,7 +1378,7 @@
         "code": "sql.analyze.unavailable_implementation"
       },
       "reason": "The unchanged complete native case refuses the exact selected overload `builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy` with sql.analyze.unavailable_implementation; the installed pure implementation is absent. Actual first-refusal handoff to UEA-5E B8, under accepted B1b-10, not the historical generic B1/B7 label. Raw case remains FAIL at step 3; 3 required oracle(s) are unfulfilled in this execution. Preserve every original result/expected-error oracle, unexecuted suffix and raw earlier failure. Evidence: p10-ledger-disposition-proposal/mapping.json and p10-v3-sql-isolated-01/sql.results.jsonl. Remove only after the same complete original native 1FE+3BE case passes all required oracles and its original lifecycle cleanup; no inference of System, affected_rows or final CI completion.",
-      "owner": "UEA-5E B8",
+      "owner": "UEA-7B3",
       "expires": "2026-12-15"
     },
     {
@@ -1458,7 +1458,7 @@
         "code": "sql.analyze.unavailable_implementation"
       },
       "reason": "Missing installed pure implementation for builtin.scalar/join_row_key/(binary,i64,binary,i64)->utf8;strict;legacy; owner B8, B1, I5; remove after capability repair and native verification",
-      "owner": "B8, B1, I5",
+      "owner": "UEA-7B3",
       "expires": "2026-12-15"
     },
     {
@@ -2481,6 +2481,34 @@
       "review_by": "2026-12-15",
       "reason": "D0-5(a) proposal only: the unchanged real native 1FE+3BE scenario fails before execution with sql.analyze.unavailable_implementation for the already registered exact builtin.scalar/array_repeat/dynamic-v1 gap. Clean 1f15 original invocation exits 1 with stable declared inputs and producer cleanup ok. Its expected Execution Representation ERR/fact and subsequent recovery checks remain unchanged and unreached. This is not a known-failure disposition or a passing Representation test.",
       "exit_condition": "B7 delivers the actual selected pure array_repeat/dynamic-v1 carrier, effects and required array scalar closure. On one clean candidate and canonical artifacts, run this complete unchanged native 1FE+3BE scenario: original 1105/HY000 ERR; originating Representation KERNEL:320, MinimumUnit layout KERNEL:63, required=2147483648, extent_limit=2147483647, no resource/row/prefix inventions; original attempt 1 and no replacement; actual Worker convergence; exact rows on the original socket and an independent connection; unchanged deadline, exact process identity and cleanup. Reassess each newly exposed first failure separately; admission alone or replacing the expected error with the early refusal is insufficient. Remove this exact quarantine only after the full original scenario passes."
+    },
+    {
+      "unit": "sql-case:complex-type/schema_free_exchange_depth64_struct",
+      "owner": "UEA-7B3-A",
+      "review_by": "2026-12-15",
+      "reason": "User ruling on 2026-11-03 permits exact blocked depth64 cases to be temporarily ignored without imposing new implementation limits. Original 1FE+3BE observations are retained in UEA-7B3-A attempts 20261103T111804Z-candidate-2381d00-dev-sql-f97868 and 20261103T112438Z-dev-sql-derived-inputs-distribution-7318c3; suite, server and fixture cleanup were OK. This is quarantine, not a known-error exemption, expected-error rewrite or PASS. The actual selected overload builtin.scalar/row/dynamic-v1 has no installed implementation; positive depth64 results and both distribution assertions remain unexecuted.",
+      "exit_condition": "Restore the named constructor capability and review the supported depth path; run the complete original positive logical64 case under native 1FE+3BE in both placements, verify all value/type and plan oracles and actual cleanup, then remove this exact quarantine."
+    },
+    {
+      "unit": "sql-case:complex-type/schema_free_exchange_depth64_map",
+      "owner": "UEA-7B3-A",
+      "review_by": "2026-12-15",
+      "reason": "User ruling on 2026-11-03 permits exact blocked depth64 cases to be temporarily ignored without imposing new implementation limits. Original 1FE+3BE observations are retained in UEA-7B3-A attempts 20261103T111804Z-candidate-2381d00-dev-sql-f97868 and 20261103T112438Z-dev-sql-derived-inputs-distribution-7318c3; suite, server and fixture cleanup were OK. This is quarantine, not a known-error exemption, expected-error rewrite or PASS. The actual selected overload builtin.scalar/map/dynamic-v1 has no installed implementation; positive depth64 results and both distribution assertions remain unexecuted.",
+      "exit_condition": "Restore the named constructor capability and review the supported depth path; run the complete original positive logical64 case under native 1FE+3BE in both placements, verify all value/type and plan oracles and actual cleanup, then remove this exact quarantine."
+    },
+    {
+      "unit": "sql-case:complex-type/schema_free_exchange_depth64_list",
+      "owner": "UEA-7B3-A",
+      "review_by": "2026-12-15",
+      "reason": "User ruling on 2026-11-03 permits exact blocked depth64 cases to be temporarily ignored without imposing new implementation limits. Original 1FE+3BE observations are retained in UEA-7B3-A attempts 20261103T111804Z-candidate-2381d00-dev-sql-f97868 and 20261103T112438Z-dev-sql-derived-inputs-distribution-7318c3; suite, server and fixture cleanup were OK. This is quarantine, not a known-error exemption, expected-error rewrite or PASS. The observed first failure is the test Trino client JSON recursion limit while reading the recursive type signature. A focused client repair has local unit evidence only; the complete native case has not subsequently passed. Do not attribute every later failure to this parser or to the upstream Iceberg manifest limitation.",
+      "exit_condition": "Review the actual client and engine path and restore this complete native logical64 case with both original positive result and strict distribution oracles, actual role exit and cleanup. Remove only after the whole case passes; local parser tests do not close this quarantine."
+    },
+    {
+      "unit": "sql-case:complex-type/schema_free_exchange_depth64_map_aggregate",
+      "owner": "UEA-7B3-A",
+      "review_by": "2026-12-15",
+      "reason": "User ruling on 2026-11-03 permits exact blocked depth64 cases to be temporarily ignored without imposing new implementation limits. Original 1FE+3BE observations are retained in UEA-7B3-A attempts 20261103T111804Z-candidate-2381d00-dev-sql-f97868 and 20261103T112438Z-dev-sql-derived-inputs-distribution-7318c3; suite, server and fixture cleanup were OK. This is quarantine, not a known-error exemption, expected-error rewrite or PASS. After replacing unsupported multi-consumer CTE inputs with equivalent independent branches, the original positive logical64 query returns query.execution.resource_exhausted with a generic pure-compilation message. The originating owner is not yet established; this is not a confirmed upstream defect or a measured work-budget shortage.",
+      "exit_condition": "Separately diagnose the first original source error and approve any necessary capability restoration. Rerun the complete original positive logical64 Map aggregate case with both placements, all value/type and plan assertions and actual role/fixture cleanup; remove only after that evidence passes."
     },
     {
       "unit": "sql-case:iceberg/novarocks_full_metadata_depth64",

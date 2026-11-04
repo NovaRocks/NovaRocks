@@ -242,12 +242,14 @@ impl ResultRetainedBudget {
         )))
     }
 
-    pub(crate) fn try_reserve(
-        self: &Arc<Self>,
+    /// Charge one actual byte growth under the original stream/process lock.
+    /// Both fixed credits and a construction scope use this same ledger.
+    fn try_charge(
+        &self,
         key: ResultBufferKey,
         stream_byte_cap: usize,
         bytes: usize,
-    ) -> Result<ResultWriteAdmission, ResultReservationError> {
+    ) -> Result<bool, ResultReservationError> {
         if bytes > stream_byte_cap {
             return Err(ResultReservationError::StreamLimit {
                 key,
@@ -265,22 +267,46 @@ impl ResultRetainedBudget {
             let mut state = self.state.lock().expect("result retained budget lock");
             let stream_retained = state.stream_retained_bytes.get(&key).copied().unwrap_or(0);
             let Some(next_stream) = stream_retained.checked_add(bytes) else {
-                return Ok(ResultWriteAdmission::Blocked);
+                return Ok(false);
             };
             let Some(next_process) = state.process_retained_bytes.checked_add(bytes) else {
-                return Ok(ResultWriteAdmission::Blocked);
+                return Ok(false);
             };
             if next_stream > stream_byte_cap || next_process > self.process_byte_cap {
-                return Ok(ResultWriteAdmission::Blocked);
+                return Ok(false);
             }
             state.stream_retained_bytes.insert(key, next_stream);
             state.process_retained_bytes = next_process;
             state.process_high_water_bytes = state.process_high_water_bytes.max(next_process);
         }
+        Ok(true)
+    }
+
+    pub(crate) fn try_reserve(
+        self: &Arc<Self>,
+        key: ResultBufferKey,
+        stream_byte_cap: usize,
+        bytes: usize,
+    ) -> Result<ResultWriteAdmission, ResultReservationError> {
+        if !self.try_charge(key, stream_byte_cap, bytes)? {
+            return Ok(ResultWriteAdmission::Blocked);
+        }
         Ok(ResultWriteAdmission::Granted(ResultWriteCredit::new(
             bytes,
             Self::stream_credit_release(Arc::downgrade(self), key),
         )))
+    }
+    pub(crate) fn construction_scope(
+        self: &Arc<Self>,
+        key: ResultBufferKey,
+        stream_byte_cap: usize,
+    ) -> ResultConstructionScope {
+        ResultConstructionScope {
+            budget: Arc::clone(self),
+            key,
+            stream_byte_cap,
+            bytes: 0,
+        }
     }
 
     /// Requested Box backing of the very same release closure issued below.
@@ -319,6 +345,40 @@ impl ResultRetainedBudget {
             }
             budget.writable.notify_observers();
         }
+    }
+}
+
+/// One actual construction, extended before its requests without creating a
+/// new credit object per nested value. The original budget remains its author.
+pub(crate) struct ResultConstructionScope {
+    budget: Arc<ResultRetainedBudget>,
+    key: ResultBufferKey,
+    stream_byte_cap: usize,
+    bytes: usize,
+}
+impl ResultConstructionScope {
+    pub(crate) fn try_grow(&mut self, bytes: usize) -> Result<bool, ResultReservationError> {
+        if bytes == 0 {
+            return Ok(true);
+        }
+        let Some(total) = self.bytes.checked_add(bytes) else {
+            return Ok(false);
+        };
+        if !self
+            .budget
+            .try_charge(self.key, self.stream_byte_cap, bytes)?
+        {
+            return Ok(false);
+        }
+        self.bytes = total;
+        Ok(true)
+    }
+}
+impl Drop for ResultConstructionScope {
+    fn drop(&mut self) {
+        ResultRetainedBudget::stream_credit_release(Arc::downgrade(&self.budget), self.key)(
+            self.bytes,
+        );
     }
 }
 
@@ -1449,6 +1509,30 @@ mod tests {
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId as NativeQueryId, StageId, TaskId,
     };
+
+    #[test]
+    fn construction_scope_shares_original_budget_and_rolls_back_exact_growth() {
+        let budget = ResultRetainedBudget::new(NonZeroUsize::new(1024).unwrap());
+        let key = ResultBufferKey::Task(test_task_identity(734));
+        let source = granted_result_credit(budget.try_reserve(key, 1024, 128).unwrap());
+        let mut scope = budget.construction_scope(key, 1024);
+        // A real depth-64 construction may issue many small requests without
+        // allocating one release closure or structural position per request.
+        for _ in 0..64 {
+            assert!(scope.try_grow(8).unwrap());
+        }
+        assert_budget_conservation(&budget, 640, 0, 1, 640);
+        assert!(!scope.try_grow(385).unwrap());
+        assert_budget_conservation(&budget, 640, 0, 1, 640);
+        let independent = granted_result_credit(budget.try_reserve_process(384).unwrap());
+        assert!(!scope.try_grow(1).unwrap());
+        drop(source);
+        assert_budget_conservation(&budget, 896, 384, 1, 1024);
+        drop(scope);
+        assert_budget_conservation(&budget, 384, 384, 0, 1024);
+        drop(independent);
+        assert_budget_conservation(&budget, 0, 0, 0, 1024);
+    }
 
     fn granted_result_credit(admission: ResultWriteAdmission) -> ResultWriteCredit {
         match admission {
