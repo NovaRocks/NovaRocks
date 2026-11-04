@@ -704,7 +704,11 @@ pub fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
 }
 
 pub fn step_retry_count(step: &SqlStep) -> usize {
-    step.meta.retry_count.unwrap_or(1)
+    if step.meta.expect_trino_error.is_some() {
+        1
+    } else {
+        step.meta.retry_count.unwrap_or(1)
+    }
 }
 
 pub fn step_retry_interval(step: &SqlStep) -> Duration {
