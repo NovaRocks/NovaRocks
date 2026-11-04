@@ -59,6 +59,7 @@ use novarocks_type_contract::{
 };
 use novarocks_types::UniqueId;
 
+use super::aggregate_fixture::PreparedUnitRecording;
 use super::family_fixture::{FixtureControl, cell, constant_policy, int64, values};
 use crate::exec::chunk::Chunk;
 use crate::exec::fragment::program::FragmentNodeId;
@@ -67,7 +68,6 @@ use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use crate::runtime::exchange::decode_chunks;
 use crate::runtime::fragment::exchange::{
     CompiledExchangeReceivers, materialize_compiled_exchange_receivers,
 };
@@ -583,15 +583,10 @@ fn compile(package: FragmentPackage, pipeline_dop: usize, result: bool) -> Arc<L
 /// Delivers every encoded frame to the receiver port, as the native data plane
 /// does after its wire hop, and records the rows each frame carried between
 /// each sender and destination instance.
-///
-/// A positional compiled receiver binds wire columns by position but keeps
-/// the sender's field labels, while a compiled root admits only its frozen
-/// input port, labels included. Until the receiver adopts its own frozen
-/// labels, `labels` stands in for that step: it re-encodes each payload with
-/// the destination's frozen receiver fields, the same columns and slot ids.
 struct RecordingTransmitter {
     unit: Arc<UnitLoopback>,
     rows: Mutex<BTreeMap<(UniqueId, UniqueId), Vec<Row>>>,
+    recordings: Mutex<BTreeMap<(UniqueId, i32), Arc<PreparedUnitRecording>>>,
 }
 
 impl RecordingTransmitter {
@@ -615,8 +610,18 @@ impl ExchangeFrameTransmitter for RecordingTransmitter {
     ) {
         let mut carried = Vec::new();
         if !frame.receiver.payload.is_empty() {
-            for chunk in &decode_chunks(&frame.receiver.payload).expect("recorded exchange payload")
-            {
+            let key = (
+                frame.receiver.stream.source().fragment_instance_id(),
+                frame.receiver.stream.destination_node().get(),
+            );
+            let recording = self
+                .recordings
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .expect("sender installed its exact branch before Unit delivery");
+            for chunk in &recording.chunks(&frame.receiver.payload) {
                 carried.extend(rows_of(chunk));
             }
         }
@@ -762,6 +767,16 @@ fn stream_sink(
     destinations: Vec<FragmentDestination>,
     transmitter: &Arc<RecordingTransmitter>,
 ) -> Box<dyn OperatorFactory> {
+    let (node, recording) = PreparedUnitRecording::new(program, fixture.creation(instance));
+    assert!(
+        transmitter
+            .recordings
+            .lock()
+            .unwrap()
+            .insert((instance, node), Arc::new(recording))
+            .is_none(),
+        "each source branch has one original recording declaration"
+    );
     fixture
         .sink(
             program,
@@ -824,6 +839,7 @@ fn run_split(keys: &[Key], limit: u64, offset: u64) -> SplitRun {
     let transmitter = Arc::new(RecordingTransmitter {
         unit: fixture.transport.clone(),
         rows: Mutex::default(),
+        recordings: Mutex::default(),
     });
     let partial_bindings = PARTIAL_FINSTS
         .map(|instance| register(&fixture, &partial, instance, &[SOURCE_FINST], &port));

@@ -261,6 +261,184 @@ pub(in crate::runtime::fragment) fn sql_gather_receiver_program() -> Arc<LocalPr
 }
 
 #[test]
+fn compiled_wire_recipe_and_local_schema_outlive_program_until_last_buffer_alias() {
+    use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
+    use crate::runtime::exchange::{
+        ExchangeColumnBinding, ExchangeKey, ExchangeSenderIdentity, ExecutionExchangeRegistry,
+        online_unit,
+    };
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    let program = sql_gather_receiver_program();
+    let weak = Arc::downgrade(&program);
+    let (&id, input) = program.exchange_inputs().iter().next().unwrap();
+    let tracker =
+        crate::runtime::mem_tracker::MemTracker::new_root("wire and local receiver custody");
+    let factory = try_runtime_input_construction_factory(
+        crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+        tracker.clone(),
+        Arc::new(RuntimeErrorState::default()),
+    )
+    .unwrap();
+    let wire = factory
+        .create_compiled_chunk_schema(&input.wire_layout)
+        .unwrap();
+    let local = factory
+        .create_compiled_chunk_schema(program.graph().nodes()[id.index()].output_layout())
+        .unwrap();
+    assert_eq!(wire.slots().len(), 1);
+    assert_eq!(
+        wire.slots()[0].data_type(),
+        &arrow::datatypes::DataType::Int64
+    );
+    let registry = ExecutionExchangeRegistry::default();
+    let key = ExchangeKey {
+        finst_id_hi: 88021,
+        finst_id_lo: 88022,
+        node_id: input.receiver_node as i32,
+    };
+    registry
+        .try_register_expected_chunk_schema_with_binding(
+            key,
+            1,
+            wire.clone(),
+            local.clone(),
+            ExchangeColumnBinding::Positional,
+            factory.clone(),
+        )
+        .unwrap();
+    drop(program);
+    assert!(
+        weak.upgrade().is_none(),
+        "receiver facts cannot pin the whole Program"
+    );
+    let source =
+        Chunk::try_new_with_columns(wire.clone(), vec![Arc::new(Int64Array::from(vec![7, 19]))])
+            .unwrap();
+    let recipe = online_unit::prepare_recipe(&wire, &[], factory.as_ref()).unwrap();
+    let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::new(
+        RuntimeErrorState::default(),
+    ));
+    let payload = online_unit::encode(&recipe, &source, factory.as_ref(), &control).unwrap();
+    let mut decoded = registry
+        .decode_chunks_for_sender(key, ExchangeSenderIdentity::local(1, 1), &payload)
+        .unwrap();
+    let chunk = decoded.pop().unwrap();
+    let schema = chunk.chunk_schema_ref();
+    let slot = schema.slots()[0].clone();
+    let bare_buffer = chunk.columns()[0].to_data().buffers()[0].clone();
+    assert_eq!(chunk.len(), 2);
+    assert_eq!(schema.as_ref(), local.as_ref());
+    drop(chunk);
+    drop(decoded);
+    drop(source);
+    drop(wire);
+    drop(local);
+    drop(recipe);
+    registry.remove_exchange_key(key);
+    drop(registry);
+    drop(factory);
+    assert!(tracker.current() > 0);
+    drop(schema);
+    assert!(tracker.current() > 0);
+    drop(slot);
+    assert!(
+        tracker.current() > 0,
+        "bare Arrow alias retains its original creator storage"
+    );
+    drop(bare_buffer);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn wire_and_local_schema_memory_refusals_release_all_partial_construction() {
+    use crate::exec::pipeline::operator::{
+        ConstructionFailure, InputConstructionFactory, InputConstructionOwner,
+    };
+    use crate::runtime::mem_tracker::MemTracker;
+    struct RefusingSchemaFactory {
+        inner: Arc<dyn InputConstructionFactory>,
+        tracker: Arc<MemTracker>,
+        begins: std::sync::atomic::AtomicUsize,
+        refuse_at: usize,
+    }
+    impl InputConstructionFactory for RefusingSchemaFactory {
+        fn observe_input_work(&self, units: usize) -> Result<(), ConstructionFailure> {
+            self.inner.observe_input_work(units)
+        }
+        fn begin_typed_construction(
+            &self,
+            schema: &crate::exec::chunk::ChunkSchema,
+        ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+            self.inner.begin_typed_construction(schema)
+        }
+        fn begin_compiled_layout_construction(
+            &self,
+            layout: &novarocks_local_program::StaticLayout,
+        ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+            if self
+                .begins
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1
+                == self.refuse_at
+            {
+                self.tracker
+                    .install_limit_once(self.tracker.current() + 1)
+                    .unwrap();
+            }
+            self.inner.begin_compiled_layout_construction(layout)
+        }
+    }
+    let program = sql_gather_receiver_program();
+    let receiver_id = FragmentNodeId::new(
+        program
+            .exchange_inputs()
+            .values()
+            .next()
+            .unwrap()
+            .receiver_node as i32,
+    );
+    let assignments = ExchangeInputAssignments::new(BTreeMap::from([(
+        receiver_id,
+        ExchangeInputAssignment::new(NonZeroUsize::new(1).unwrap()),
+    )]));
+    for refuse_at in [1, 2] {
+        let tracker = MemTracker::new_root("wire and local schema refusal");
+        let inner = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker.clone(), Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        ).unwrap();
+        let baseline = tracker.current();
+        let factory = Arc::new(RefusingSchemaFactory {
+            inner,
+            tracker: tracker.clone(),
+            begins: std::sync::atomic::AtomicUsize::new(0),
+            refuse_at,
+        });
+        let original: Arc<dyn InputConstructionFactory> = factory.clone();
+        let result = crate::runtime::fragment::exchange::materialize_compiled_exchange_receivers(
+            &program,
+            UniqueId::new(88023, refuse_at as i64),
+            &assignments,
+            Arc::new(crate::runtime::fragment::io::UnavailableExchangeReceiverPort),
+            Some(&original),
+        );
+        assert!(matches!(result, Err(ConstructionFailure::Memory(_))));
+        assert_eq!(
+            factory.begins.load(std::sync::atomic::Ordering::SeqCst),
+            refuse_at
+        );
+        assert_eq!(
+            tracker.current(),
+            baseline,
+            "partial wire/local schema storage must actually exit"
+        );
+        drop(original);
+        drop(factory);
+        assert_eq!(tracker.current(), 0);
+    }
+}
+
+#[test]
 fn compiled_receiver_after_exchange_failure_preserves_primary_cleanup_and_control() {
     use super::super::owner_tests::ReceiverConstructionPort;
     use crate::exec::pipeline::operator::ConstructionFailure;

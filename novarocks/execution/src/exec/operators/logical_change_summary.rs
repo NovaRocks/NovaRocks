@@ -700,7 +700,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::exec::pipeline::step_context::TurnWork;
     use crate::runtime::{
-        exchange::{ExchangeKey, ExecutionExchangeRegistry, encode_chunks},
+        exchange::{ExchangeKey, ExecutionExchangeRegistry, online_unit},
         runtime_state::RuntimeState,
     };
     use novarocks_execution_contract::ExchangeStreamIdentity;
@@ -735,6 +735,7 @@ pub(crate) mod tests {
         pub(crate) layout: StaticLayout,
         pub(crate) schema: ChunkSchemaRef,
         pub(crate) factory: Arc<dyn InputConstructionFactory>,
+        control: crate::exec::operators::compiled_expression::RuntimeKernelControl,
     }
     impl IngressFixture {
         /// Install the explicit original Task for this operator fixture while
@@ -778,7 +779,13 @@ pub(crate) mod tests {
             let factory = creator(state);
             let schema = factory.create_compiled_chunk_schema(&layout).unwrap();
             registry
-                .register_expected_chunk_schema(key, sources, schema.clone(), factory.clone())
+                .register_expected_chunk_schema(
+                    key,
+                    sources,
+                    (schema.clone()).clone(),
+                    schema.clone(),
+                    factory.clone(),
+                )
                 .unwrap();
             let streams: Vec<_> = (0..sources)
                 .map(|i| {
@@ -810,6 +817,9 @@ pub(crate) mod tests {
                 layout,
                 schema,
                 factory,
+                control: crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+                    state.error_state(),
+                ),
             }
         }
         pub(crate) fn input(&self) -> SourceBoundSummaryInput {
@@ -836,11 +846,12 @@ pub(crate) mod tests {
             let stream = self.streams[source];
             let payload = counts
                 .map(|c| {
-                    encode_chunks(
-                        &[summary_chunk(c, &self.schema, self.factory.as_ref()).unwrap()],
-                        true,
-                    )
-                    .unwrap()
+                    let recipe =
+                        online_unit::prepare_recipe(&self.schema, &[], self.factory.as_ref())
+                            .unwrap();
+                    let chunk = summary_chunk(c, &self.schema, self.factory.as_ref()).unwrap();
+                    online_unit::encode(&recipe, &chunk, self.factory.as_ref(), &self.control)
+                        .unwrap()
                 })
                 .unwrap_or_default();
             use crate::runtime::fragment::io::exchange_unit::{

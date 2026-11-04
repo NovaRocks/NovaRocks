@@ -695,9 +695,13 @@ fn compiled_ordered_complete_largeint_payload_keeps_real_source_and_last_buffer_
     assert_eq!(tracker.current(), 0);
     assert!(receiver_tracker.current() > 0);
     drop(receiver_projection);
-    assert_eq!(receiver_tracker.current(), 0);
-    // IPC created fresh payload bytes. The original receiver constructor
-    // metadata belongs to its typed projection, not a copied bare Buffer.
+    assert!(
+        receiver_tracker.current() > 0,
+        "the decoded bare Buffer retains its original receiver construction stock"
+    );
+    // NRU1 decode attaches the receiver's original storage custody to every
+    // actual Buffer alias. Dropping the typed projection cannot release the
+    // budget while this bare payload Buffer remains readable.
     let first: [u8; 16] = receiver_buffer.as_slice()[..16].try_into().unwrap();
     assert!(
         [1_i128, 2, 7, 10]

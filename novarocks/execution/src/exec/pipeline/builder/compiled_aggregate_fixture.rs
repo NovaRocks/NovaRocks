@@ -74,7 +74,7 @@ use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use crate::runtime::exchange::decode_chunks;
+use crate::runtime::exchange::online_unit;
 use crate::runtime::fragment::exchange::{
     CompiledExchangeReceivers, materialize_compiled_exchange_receivers,
 };
@@ -881,11 +881,65 @@ pub(crate) fn compile_with_providers<E: std::error::Error + 'static>(
         .unwrap_or_else(|error| panic!("aggregate scan fragment compiles: {error}"))
 }
 
-/// Delivers every encoded frame to the receiver port, as the native data
-/// plane does after its wire hop, and counts the rows each sender sent.
+/// Test-only observational decoder bound before delivery to the exact source
+/// branch. Actual Unit custody still belongs exclusively to the loopback port.
+pub(crate) struct PreparedUnitRecording {
+    schema: crate::exec::chunk::ChunkSchemaRef,
+    recipe: Arc<online_unit::ExchangeRecipe>,
+    factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+}
+
+impl PreparedUnitRecording {
+    /// Freeze the same source declaration and ordered branch projection as the
+    /// actual sender. Retain finite creator storage, never the source Program.
+    pub(crate) fn new(
+        program: &LocalProgram,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) -> (i32, Self) {
+        let Some(novarocks_local_program::StaticSinkProgram::DataStream { branch, .. }) =
+            program.graph().sink()
+        else {
+            panic!("recording fixture requires its actual DataStream branch");
+        };
+        let output = program.graph().nodes()[program.graph().root().index()].output_layout();
+        let owner = factory.begin_compiled_layout_construction(output).unwrap();
+        // Empty columns retain the sender's complete-layout convention,
+        // including an actually empty layout carrying count-only rows.
+        let projected = output
+            .project_by_slots_typed_with_creator(
+                branch.output_columns(),
+                owner.storage_lifetime(),
+                |layout| {
+                    owner
+                        .request(layout)
+                        .map_err(novarocks_local_program::LayoutCreationFailure::Creator)
+                },
+                &FixtureControl,
+            )
+            .unwrap();
+        let schema = factory.create_compiled_chunk_schema(&projected).unwrap();
+        let recipe = online_unit::prepare_recipe(&schema, &[], factory.as_ref()).unwrap();
+        (
+            branch.dest_node_id(),
+            Self {
+                schema,
+                recipe,
+                factory,
+            },
+        )
+    }
+
+    pub(crate) fn chunks(&self, payload: &[u8]) -> Vec<Chunk> {
+        online_unit::decode(&self.recipe, payload, &self.schema, self.factory.as_ref())
+            .expect("recorded unit must match its frozen source recipe")
+    }
+}
+
+/// Delivers every encoded frame to the receiver port and counts the rows sent.
 pub(crate) struct LoopbackTransmitter {
     unit: Arc<crate::runtime::fragment::io::exchange::test_support::UnitLoopback>,
     rows: Mutex<BTreeMap<(UniqueId, UniqueId), usize>>,
+    recordings: Mutex<BTreeMap<(UniqueId, i32), Arc<PreparedUnitRecording>>>,
 }
 
 impl LoopbackTransmitter {
@@ -895,6 +949,7 @@ impl LoopbackTransmitter {
         Arc::new(Self {
             unit,
             rows: Mutex::default(),
+            recordings: Mutex::default(),
         })
     }
     /// Rows `sender` sent to `destination`.
@@ -919,8 +974,19 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
         let carried = if frame.receiver.payload.is_empty() {
             0
         } else {
-            decode_chunks(&frame.receiver.payload)
-                .expect("exchange payload")
+            let key = (
+                frame.receiver.stream.source().fragment_instance_id(),
+                frame.receiver.stream.destination_node().get(),
+            );
+            let recording = self
+                .recordings
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .expect("sender installed its exact branch before Unit delivery");
+            recording
+                .chunks(&frame.receiver.payload)
                 .iter()
                 .map(Chunk::len)
                 .sum()
@@ -1164,6 +1230,16 @@ pub(crate) fn stream_sink(
     destinations: Vec<FragmentDestination>,
     transmitter: &Arc<LoopbackTransmitter>,
 ) -> Box<dyn OperatorFactory> {
+    let (node, recording) = PreparedUnitRecording::new(program, fixture.creation(instance));
+    assert!(
+        transmitter
+            .recordings
+            .lock()
+            .unwrap()
+            .insert((instance, node), Arc::new(recording))
+            .is_none(),
+        "each source branch has one original recording declaration"
+    );
     fixture
         .sink(
             program,

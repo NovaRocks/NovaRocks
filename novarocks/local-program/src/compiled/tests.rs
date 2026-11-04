@@ -587,6 +587,11 @@ fn every_final_author_callback_propagates_original_control_without_rechecking() 
 #[test]
 fn exchange_input_addresses_cover_exactly_the_actual_exchange_sources() {
     let address = CompiledExchangeInput {
+        wire_layout: exchange_test_layout(
+            &[FunctionValueType::new(DataType::Int64, false)],
+            &[1],
+            "wire",
+        ),
         role: crate::ProgramOutputRole::Relational,
         delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
         routing: crate::CompiledExchangeRouting::Unpartitioned,
@@ -686,4 +691,116 @@ fn aggregate_facts_cover_exactly_the_actual_aggregate_nodes() {
     )
     .unwrap();
     assert!(program.aggregates().is_empty());
+}
+
+fn exchange_test_layout(types: &[FunctionValueType], slots: &[u32], name: &str) -> StaticLayout {
+    let fields = types
+        .iter()
+        .enumerate()
+        .map(|(ordinal, ty)| {
+            Field::new(
+                format!("{name}_{ordinal}"),
+                ty.data_type().clone(),
+                ty.nullable(),
+            )
+        })
+        .collect::<Vec<_>>();
+    StaticLayout::try_new_typed_for_compile(
+        Arc::new(Schema::new(fields)),
+        slots
+            .iter()
+            .copied()
+            .map(SlotId::new)
+            .collect::<Vec<_>>()
+            .into(),
+        types
+            .iter()
+            .map(|ty| (ty.typed_binding().clone(), None))
+            .collect(),
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        |_| Ok(()),
+        &Control::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn exchange_wire_preserves_ordinal_binding_and_allows_only_root_nullability_widening() {
+    let wire_types = [
+        FunctionValueType::new(DataType::Int64, true),
+        FunctionValueType::new(DataType::Int32, false),
+    ];
+    let local_types = [
+        FunctionValueType::new(DataType::Int64, true),
+        FunctionValueType::new(DataType::Int32, true),
+    ];
+    let wire = exchange_test_layout(&wire_types, &[2, 1], "source");
+    let local = exchange_test_layout(&local_types, &[2, 1], "destination");
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+    validate_exchange_wire_layout(ProgramNodeId::new(7), &wire, &local, &mut work).unwrap();
+    work.finish().unwrap();
+
+    let reversed_types = [
+        FunctionValueType::new(DataType::Int32, true),
+        FunctionValueType::new(DataType::Int64, true),
+    ];
+    for (source, destination) in [
+        (local.clone(), wire.clone()),
+        (
+            wire.clone(),
+            exchange_test_layout(&local_types[..1], &[2], "missing"),
+        ),
+        (
+            wire.clone(),
+            exchange_test_layout(&local_types, &[1, 2], "wrong_slots"),
+        ),
+        (
+            wire,
+            exchange_test_layout(&reversed_types, &[2, 1], "wrong_order"),
+        ),
+    ] {
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        assert_eq!(
+            validate_exchange_wire_layout(ProgramNodeId::new(7), &source, &destination, &mut work),
+            Err(LocalProgramCompileError::ExchangeInputMismatch(
+                ProgramNodeId::new(7)
+            ))
+        );
+    }
+}
+
+#[test]
+fn exchange_wire_rejects_nested_nullability_nominal_and_width_changes() {
+    let nested = |child_nullable| {
+        FunctionValueType::new(
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, child_nullable))),
+            false,
+        )
+    };
+    let json = FunctionValueType::try_with_logical_type(
+        DataType::Utf8,
+        false,
+        novarocks_type_contract::ValueLogicalType::Json,
+    )
+    .unwrap();
+    for (source, destination) in [
+        (nested(false), nested(true)),
+        (json, FunctionValueType::new(DataType::Utf8, true)),
+        (
+            FunctionValueType::new(DataType::Int32, false),
+            FunctionValueType::new(DataType::Int64, true),
+        ),
+    ] {
+        let wire = exchange_test_layout(&[source], &[5], "wire");
+        let local = exchange_test_layout(&[destination], &[5], "local");
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
+        assert_eq!(
+            validate_exchange_wire_layout(ProgramNodeId::new(7), &wire, &local, &mut work),
+            Err(LocalProgramCompileError::ExchangeInputMismatch(
+                ProgramNodeId::new(7)
+            ))
+        );
+    }
 }

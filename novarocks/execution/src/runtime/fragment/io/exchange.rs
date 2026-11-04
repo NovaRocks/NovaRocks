@@ -457,12 +457,16 @@ mod tests {
             &[],
             &[],
         );
-        port.register(ExchangeReceiverRegistration {
-            key,
-            expected_senders: 2,
-            expected_chunk_schema: factory.create_compiled_chunk_schema(&layout).unwrap(),
-            column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
-            creation_factory: factory.clone(),
+        port.register({
+            let expected_chunk_schema = factory.create_compiled_chunk_schema(&layout).unwrap();
+            ExchangeReceiverRegistration {
+                key,
+                expected_senders: 2,
+                wire_chunk_schema: expected_chunk_schema.clone(),
+                expected_chunk_schema,
+                column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
+                creation_factory: factory.clone(),
+            }
         })
         .unwrap();
         fixture.bind(key, &sources);

@@ -546,12 +546,16 @@ mod router_runtime_tests {
                 )
             };
             let creation = fixture.creation(instance);
-            port.register(ExchangeReceiverRegistration {
-                key,
-                expected_senders: 1,
-                expected_chunk_schema: creation.create_compiled_chunk_schema(&layout).unwrap(),
-                column_binding: ExchangeColumnBinding::Positional,
-                creation_factory: Arc::clone(&creation),
+            port.register({
+                let expected_chunk_schema = creation.create_compiled_chunk_schema(&layout).unwrap();
+                ExchangeReceiverRegistration {
+                    key,
+                    expected_senders: 1,
+                    wire_chunk_schema: expected_chunk_schema.clone(),
+                    expected_chunk_schema,
+                    column_binding: ExchangeColumnBinding::Positional,
+                    creation_factory: Arc::clone(&creation),
+                }
             })
             .unwrap();
             fixture.bind(key, &[SOURCE]);
