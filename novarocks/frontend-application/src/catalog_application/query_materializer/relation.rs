@@ -519,9 +519,13 @@ impl CatalogServiceMaterializer<'_> {
         if let Some(fact) = self.local_relation_fact(need) {
             return fact;
         }
-        let observation = self
-            .require_catalog_admission(&relation.catalog)
-            .map_err(CatalogResolutionError::into_compile)?;
+        let observation = match self.require_catalog_admission(&relation.catalog) {
+            Ok(observation) => observation,
+            Err(CatalogResolutionError::Missing { reason }) => {
+                return CatalogRelationFact::missing(need, reason).map_err(fact_error);
+            }
+            Err(error) => return Err(error.into_compile()),
+        };
         let key = QueryRelationRequestKey::from_need(need)?;
         let result = if let Some(memo) = self.cached_relation(&key) {
             self.relation_answer(need, memo)
@@ -583,9 +587,13 @@ impl CatalogServiceMaterializer<'_> {
         if let Some(fact) = self.local_relation_fact(need) {
             return fact;
         }
-        let observation = self
-            .require_catalog_admission(&relation.catalog)
-            .map_err(CatalogResolutionError::into_compile)?;
+        let observation = match self.require_catalog_admission(&relation.catalog) {
+            Ok(observation) => observation,
+            Err(CatalogResolutionError::Missing { reason }) => {
+                return CatalogRelationFact::missing(need, reason).map_err(fact_error);
+            }
+            Err(error) => return Err(error.into_compile()),
+        };
         let key = QueryRelationRequestKey::from_need(need)?;
         let result = if let Some(memo) = self.cached_relation(&key) {
             self.relation_answer(need, memo)
@@ -665,6 +673,286 @@ mod tests {
         ) -> CatalogResolutionResult<QueryTableBinding> {
             panic!("ordinary relation facts must not use a metadata alias")
         }
+    }
+
+    struct ObservedCatalogAdmission {
+        answers: Vec<novarocks_catalog_application::CatalogAdmission>,
+        calls: AtomicUsize,
+    }
+    impl novarocks_catalog_application::CatalogApplicationPort for ObservedCatalogAdmission {
+        fn create_catalog(
+            &self,
+            _: novarocks_catalog_application::CatalogCreateCommand,
+        ) -> Result<
+            novarocks_catalog_application::CatalogRuntimeObservation,
+            novarocks_catalog_application::CatalogApplicationError,
+        > {
+            unreachable!("catalog mutation is not part of admission")
+        }
+        fn drop_catalog(
+            &self,
+            _: novarocks_catalog_application::CatalogDropCommand,
+        ) -> Result<(), novarocks_catalog_application::CatalogApplicationError> {
+            unreachable!("catalog mutation is not part of admission")
+        }
+        fn admit_catalog(
+            &self,
+            _: &novarocks_spi::connector::ConnectorInstanceId,
+        ) -> novarocks_catalog_application::CatalogAdmission {
+            let index = self.calls.fetch_add(1, Ordering::Relaxed);
+            self.answers
+                .get(index)
+                .cloned()
+                .expect("one original admission per observation phase")
+        }
+    }
+
+    fn query_source(
+        sql: &str,
+        catalog: Option<&str>,
+        database: &str,
+    ) -> (
+        novarocks_parser::ast::Query,
+        novarocks_sql::compiler::SqlCapturedCatalogPreparation,
+    ) {
+        let statements = novarocks_parser::parse(sql).unwrap();
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query")
+        };
+        let source = novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
+            query.clone(),
+            catalog,
+            database,
+            novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        (query.clone(), source)
+    }
+
+    fn assert_missing_reaches_original_analysis(
+        query: novarocks_parser::ast::Query,
+        source: novarocks_sql::compiler::SqlCapturedCatalogPreparation,
+        fact: CatalogRelationFact,
+        database: &str,
+        missing_name: &str,
+    ) {
+        let source = source
+            .continue_catalog(vec![fact].into_boxed_slice())
+            .unwrap();
+        assert!(source.needs().is_empty());
+        let catalog = source.capture(&[]).unwrap();
+        let result = novarocks_sql::compiler::analyze_mv_refresh_input(
+            novarocks_sql::compiler::SqlMvRefreshAnalysisContext {
+                query: Box::new(query),
+                current_database: database.into(),
+                catalog: &catalog,
+                functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+                constant_policy: crate::application::test_constant_policy(),
+                control: novarocks_sql::compiler::SqlCompileControl::unbounded(),
+            },
+        );
+        let Err(SqlCompileError::Analyze(error)) = result else {
+            panic!("the original SQL analyzer must author the missing relation error")
+        };
+        assert_eq!(
+            error.kind(),
+            novarocks_sql::analyze_error::AnalyzeErrorKind::UnknownTable
+        );
+        assert_eq!(error.code().as_str(), "sql.analyze.unknown_table");
+        assert!(error.message().contains(missing_name));
+        assert!(error.span().is_some());
+    }
+
+    #[tokio::test]
+    async fn initial_absent_catalog_answers_the_exact_need_without_entering_a_provider() {
+        for asynchronous in [false, true] {
+            let service = crate::catalog_application::query_catalog::new_query_catalog_service();
+            let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let application = ObservedCatalogAdmission {
+                answers: vec![novarocks_catalog_application::CatalogAdmission::Absent],
+                calls: AtomicUsize::new(0),
+            };
+            let materializer = CatalogServiceMaterializer::new(
+                Some("ice"),
+                &service,
+                bindings.clone(),
+                Box::new(RefusingLoader {
+                    calls: calls.clone(),
+                    error: CatalogResolutionError::failed(
+                        "Provider must not observe an absent catalog",
+                    ),
+                }),
+            )
+            .with_catalog_application(Some(&application));
+            let (query, source) = query_source("SELECT id FROM ice.db.orders", Some("ice"), "db");
+            let [need] = source.needs() else {
+                panic!("one real SQL relation need")
+            };
+            let fact = if asynchronous {
+                materializer.resolve_relation_fact_async(need).await
+            } else {
+                materializer.resolve_relation_fact(need)
+            }
+            .unwrap();
+            assert_eq!(fact.id(), need.id());
+            assert_eq!(fact.relation(), need.relation());
+            assert!(matches!(
+                fact.outcome(),
+                novarocks_sql::compiler::CatalogRelationOutcome::Missing { reason }
+                    if reason.contains("unknown catalog `ice`")
+            ));
+            assert_eq!(application.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert!(bindings.captured_bindings().is_empty());
+            assert_missing_reaches_original_analysis(query, source, fact, "db", "ice");
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_catalog_is_a_typed_source_and_never_a_missing_fact() {
+        for asynchronous in [false, true] {
+            let service = crate::catalog_application::query_catalog::new_query_catalog_service();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let application = ObservedCatalogAdmission {
+                answers: vec![
+                    novarocks_catalog_application::CatalogAdmission::Unavailable {
+                        reason: "original unavailable projection".into(),
+                    },
+                ],
+                calls: AtomicUsize::new(0),
+            };
+            let materializer = CatalogServiceMaterializer::new(
+                Some("ice"),
+                &service,
+                Arc::new(QueryTableBindingStore::try_new().unwrap()),
+                Box::new(RefusingLoader {
+                    calls: calls.clone(),
+                    error: CatalogResolutionError::failed(
+                        "Provider must not observe an unavailable catalog",
+                    ),
+                }),
+            )
+            .with_catalog_application(Some(&application));
+            let need = orders_need("SELECT x FROM ice.db.orders");
+            let result = if asynchronous {
+                materializer.resolve_relation_fact_async(&need).await
+            } else {
+                materializer.resolve_relation_fact(&need)
+            };
+            let Err(SqlCompileError::CompilationSource(source)) = result else {
+                panic!("unavailable admission must retain the original typed source")
+            };
+            let original = source
+                .downcast_ref::<novarocks_catalog_application::CatalogApplicationError>()
+                .unwrap();
+            assert_eq!(
+                original.kind(),
+                novarocks_catalog_application::CatalogApplicationErrorKind::Unavailable
+            );
+            assert!(
+                original
+                    .to_string()
+                    .contains("original unavailable projection")
+            );
+            assert_eq!(application.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn post_observation_absence_or_unavailability_keeps_the_original_admission_failure() {
+        use novarocks_catalog_application::{CatalogAdmission, CatalogRuntimeObservation};
+        use novarocks_failure_contract::FailureProjection;
+        let id = novarocks_spi::connector::ConnectorInstanceId::parse("ice").unwrap();
+        for answer in [
+            CatalogAdmission::Absent,
+            CatalogAdmission::Unavailable {
+                reason: "original projection changed".into(),
+            },
+        ] {
+            let expected = answer.clone().require_ready(&id).unwrap_err();
+            let observation = CatalogRuntimeObservation {
+                attachment_id: uuid::Uuid::from_u128(1),
+                instance_id: id.clone(),
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .unwrap(),
+                generation: 7,
+            };
+            let application = ObservedCatalogAdmission {
+                answers: vec![CatalogAdmission::Ready(observation.clone()), answer],
+                calls: AtomicUsize::new(0),
+            };
+            let service = crate::catalog_application::query_catalog::new_query_catalog_service();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let materializer = CatalogServiceMaterializer::new(
+                Some("ice"),
+                &service,
+                Arc::new(QueryTableBindingStore::try_new().unwrap()),
+                Box::new(RefusingLoader {
+                    calls: calls.clone(),
+                    error: CatalogResolutionError::failed("this fixture only observes admission"),
+                }),
+            )
+            .with_catalog_application(Some(&application));
+            let admitted = materializer.require_catalog_admission("ice").unwrap();
+            assert_eq!(admitted.as_ref(), Some(&observation));
+            assert_eq!(application.calls.load(Ordering::Relaxed), 1);
+            let error = materializer
+                .verify_catalog_admission("ice", admitted.as_ref())
+                .unwrap_err();
+            let compile = error.clone().into_compile();
+            assert_eq!(compile, error.into_compile());
+            let SqlCompileError::CompilationSource(source) = compile else {
+                panic!("the later absence is an original failure, not a missing relation")
+            };
+            assert_eq!(source.failure_fact(), expected.failure_fact());
+            assert_eq!(
+                source.downcast_ref::<novarocks_catalog_application::CatalogApplicationError>(),
+                Some(&expected)
+            );
+            assert_eq!(application.calls.load(Ordering::Relaxed), 2);
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_local_view_snapshot_keeps_the_local_probe_missing_fact() {
+        use novarocks_query_application::view::ViewService;
+        let service = crate::catalog_application::query_catalog::new_query_catalog_service();
+        let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let application = ObservedCatalogAdmission {
+            answers: Vec::new(),
+            calls: AtomicUsize::new(0),
+        };
+        let views = novarocks_query_application::view::QueryViewService::new();
+        let materializer = CatalogServiceMaterializer::new(
+            None,
+            &service,
+            bindings.clone(),
+            Box::new(RefusingLoader {
+                calls: calls.clone(),
+                error: CatalogResolutionError::failed("local absence cannot acquire a Provider"),
+            }),
+        )
+        .with_catalog_application(Some(&application))
+        .with_local_views(views.catalog_snapshot().unwrap());
+        let database = novarocks_types::naming::DEFAULT_DATABASE;
+        let (query, source) = query_source("SELECT * FROM local_probe", None, database);
+        let fact = materializer
+            .resolve_relation_fact_async(&source.needs()[0])
+            .await
+            .unwrap();
+        assert!(matches!(
+            fact.outcome(),
+            novarocks_sql::compiler::CatalogRelationOutcome::Missing { reason }
+                if reason.contains("local_probe")
+        ));
+        assert_eq!(application.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(bindings.captured_bindings().is_empty());
+        assert_missing_reaches_original_analysis(query, source, fact, database, "local_probe");
     }
 
     fn orders_need(sql: &str) -> CatalogRelationNeed {

@@ -125,9 +125,15 @@ impl CatalogServiceMaterializer<'_> {
     ) -> Option<Result<Option<CatalogRelationFact>, SqlCompileError>> {
         let (source, required) = self.system_source(need)?;
         Some((|| {
-            let admission = self
-                .system_admission(need)
-                .map_err(CatalogResolutionError::into_compile)?;
+            let admission = match self.system_admission(need) {
+                Ok(admission) => admission,
+                Err(CatalogResolutionError::Missing { reason }) => {
+                    return CatalogRelationFact::missing(need, reason)
+                        .map(Some)
+                        .map_err(|error| SqlCompileError::Compilation(error.to_string()));
+                }
+                Err(error) => return Err(error.into_compile()),
+            };
             if let Some(result) = Self::system_historical(need) {
                 return result;
             }
@@ -167,9 +173,15 @@ impl CatalogServiceMaterializer<'_> {
         let (source, required) = self.system_source(need)?;
         Some(
             async {
-                let admission = self
-                    .system_admission(need)
-                    .map_err(CatalogResolutionError::into_compile)?;
+                let admission = match self.system_admission(need) {
+                    Ok(admission) => admission,
+                    Err(CatalogResolutionError::Missing { reason }) => {
+                        return CatalogRelationFact::missing(need, reason)
+                            .map(Some)
+                            .map_err(|error| SqlCompileError::Compilation(error.to_string()));
+                    }
+                    Err(error) => return Err(error.into_compile()),
+                };
                 if let Some(result) = Self::system_historical(need) {
                     return result;
                 }

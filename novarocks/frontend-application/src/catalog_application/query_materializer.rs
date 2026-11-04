@@ -43,6 +43,12 @@ use novarocks_sql::planning::catalog::{
 mod relation;
 mod system;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CatalogAdmissionPhase {
+    InitialLookup,
+    VerifyObservation,
+}
+
 /// Project a provider-neutral SPI metadata materialization into the
 /// request-local SQL binding. Provider aliases retain their separately frozen
 /// provider-owned facts until their dedicated adapters run.
@@ -405,6 +411,15 @@ impl<'a> CatalogServiceMaterializer<'a> {
         catalog: &str,
     ) -> CatalogResolutionResult<Option<novarocks_catalog_application::CatalogRuntimeObservation>>
     {
+        self.catalog_admission(catalog, CatalogAdmissionPhase::InitialLookup)
+    }
+
+    fn catalog_admission(
+        &self,
+        catalog: &str,
+        phase: CatalogAdmissionPhase,
+    ) -> CatalogResolutionResult<Option<novarocks_catalog_application::CatalogRuntimeObservation>>
+    {
         let Some(application) = self.catalog_application else {
             return Ok(None);
         };
@@ -414,8 +429,21 @@ impl<'a> CatalogServiceMaterializer<'a> {
                     "invalid catalog instance `{catalog}`: {error}"
                 ))
             })?;
-        application
-            .admit_catalog(&instance_id)
+        let admission = application.admit_catalog(&instance_id);
+        // Only an initial authoritative absence is a SQL missing-relation fact.
+        // A later absence must retain its original generation-check failure.
+        if phase == CatalogAdmissionPhase::InitialLookup
+            && matches!(
+                &admission,
+                novarocks_catalog_application::CatalogAdmission::Absent
+            )
+        {
+            return Err(CatalogResolutionError::missing(format!(
+                "unknown catalog `{}`",
+                instance_id.as_str()
+            )));
+        }
+        admission
             .require_ready(&instance_id)
             .map(Some)
             .map_err(|error| {
@@ -437,9 +465,11 @@ impl<'a> CatalogServiceMaterializer<'a> {
         let Some(expected) = expected else {
             return Ok(());
         };
-        let current = self.require_catalog_admission(catalog)?.ok_or_else(|| {
-            CatalogResolutionError::failed("catalog admission unexpectedly became legacy")
-        })?;
+        let current = self
+            .catalog_admission(catalog, CatalogAdmissionPhase::VerifyObservation)?
+            .ok_or_else(|| {
+                CatalogResolutionError::failed("catalog admission unexpectedly became legacy")
+            })?;
         if &current != expected {
             return Err(CatalogResolutionError::failed(
                 "catalog attachment generation changed while acquiring its planning pin",

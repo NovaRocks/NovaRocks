@@ -373,3 +373,129 @@ async fn asynchronous_definition_uses_original_cpu_and_its_own_statement_memo() 
     assert_eq!(source.asynchronous.load(Ordering::SeqCst), 1);
     assert_declaration(preparation, first);
 }
+
+struct AbsentCatalogAdmission {
+    calls: AtomicUsize,
+}
+impl novarocks_catalog_application::CatalogApplicationPort for AbsentCatalogAdmission {
+    fn create_catalog(
+        &self,
+        _: novarocks_catalog_application::CatalogCreateCommand,
+    ) -> Result<
+        novarocks_catalog_application::CatalogRuntimeObservation,
+        novarocks_catalog_application::CatalogApplicationError,
+    > {
+        unreachable!("definition lookup must not create a catalog")
+    }
+    fn drop_catalog(
+        &self,
+        _: novarocks_catalog_application::CatalogDropCommand,
+    ) -> Result<(), novarocks_catalog_application::CatalogApplicationError> {
+        unreachable!("definition lookup must not drop a catalog")
+    }
+    fn admit_catalog(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> novarocks_catalog_application::CatalogAdmission {
+        assert_eq!(
+            instance_id,
+            &novarocks_spi::connector::ConnectorInstanceId::parse("catalog").unwrap()
+        );
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        novarocks_catalog_application::CatalogAdmission::Absent
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn absent_external_definition_system_catalog_answers_the_exact_need_before_listing() {
+    use crate::catalog_application::statement::external_listing_tests::{
+        FailurePoint, ListingFixture,
+    };
+    use crate::catalog_application::system_catalog_facts::FrontendSystemCatalogFacts;
+
+    let (mut executors, supervisor) = crate::task_execution::blocking_io::tests::original_executors(
+        tokio::runtime::Handle::current(),
+    );
+    let cpu = crate::query_execution::completion_facts::FrontendPlanningCpuSource::new(supervisor);
+    for on_cpu in [false, true] {
+        let fixture =
+            ListingFixture::new(FailurePoint::Namespaces, ConnectorErrorKind::Unavailable);
+        let application = AbsentCatalogAdmission {
+            calls: AtomicUsize::new(0),
+        };
+        let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
+        let control = SqlCompileControl::unbounded();
+        let preparation = SqlCapturedCatalogPreparation::try_new_definition(
+            query("SELECT * FROM catalog.information_schema.schemata"),
+            "catalog",
+            "db",
+            None,
+            control.clone(),
+        )
+        .unwrap();
+        let [need] = preparation.needs() else {
+            panic!("one original definition need")
+        };
+        let materializer = CatalogServiceMaterializer::new(
+            Some("catalog"),
+            fixture.catalog_service.as_ref(),
+            bindings.clone(),
+            Box::new(NoTableLoader),
+        )
+        .with_catalog_application(Some(&application))
+        .with_local_views(QueryViewService::new().catalog_snapshot().unwrap())
+        .with_system_relations(SystemCatalogRelations::new(
+            Arc::new(FrontendSystemCatalogFacts::new(
+                fixture.catalog_service.clone(),
+                fixture.registry.clone(),
+            )),
+            Arc::new(SystemCatalogService::with_defaults()),
+        ))
+        .with_definition_inputs(
+            crate::connector::test_request_context(),
+            crate::application::test_constant_policy(),
+            control,
+        );
+        let fact = if on_cpu {
+            materializer.system_relation_fact_on_cpu(need, &cpu).await
+        } else {
+            materializer.system_relation_fact(need)
+        }
+        .expect("the installed definition system source owns the need")
+        .expect("absence is an exact fact, not a compile or source failure")
+        .expect("absence must not decline to another provider");
+        assert_eq!(fact.id(), need.id());
+        assert_eq!(fact.relation(), need.relation());
+        assert_eq!(fact.target(), need.target());
+        assert!(fact.is_definition_context());
+        assert!(matches!(
+            fact.outcome(),
+            CatalogRelationOutcome::Missing { .. }
+        ));
+        let completed = preparation
+            .continue_catalog(vec![fact].into_boxed_slice())
+            .unwrap();
+        assert!(completed.needs().is_empty());
+        let result = completed.analyze_view_definition(
+            &[],
+            novarocks_sql::compiler::builtin_sql_function_catalog(),
+            crate::application::test_constant_policy(),
+        );
+        let Err(SqlCompileError::Analyze(error)) = result else {
+            panic!("the original SQL analyzer must classify the missing system relation")
+        };
+        assert_eq!(
+            error.kind(),
+            novarocks_sql::analyze_error::AnalyzeErrorKind::UnknownTable
+        );
+        assert_eq!(error.code().as_str(), "sql.analyze.unknown_table");
+        assert!(error.span().is_some());
+        assert_eq!(application.calls.load(Ordering::SeqCst), 1);
+        assert!(fixture.calls().is_empty());
+        assert!(bindings.captured_bindings().is_empty());
+    }
+    cpu.close().await.unwrap();
+    assert!(cpu.local_health_failure().is_none());
+    drop(cpu);
+    executors.shutdown().await;
+}
