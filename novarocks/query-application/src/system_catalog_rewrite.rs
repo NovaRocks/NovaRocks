@@ -69,6 +69,34 @@ impl SystemCatalogFacts {
 /// catalog resolution instead of allowing the virtual-table path to invent a
 /// catalog error.
 pub trait SystemCatalogFactsPort: Send + Sync {
+    /// Exact definition lookup, retaining the original typed source/control.
+    /// Providers explicitly opt in; no legacy String or synchronous fallback.
+    fn definition_system_catalog_facts(
+        &self,
+        _request: &ConnectorRequestContext,
+        _catalog: &str,
+        _include_tables: bool,
+    ) -> Result<Option<SystemCatalogFacts>, novarocks_sql::compiler::SqlCompileError> {
+        Err(novarocks_sql::compiler::SqlCompileError::Compilation(
+            "definition system catalog facts are not installed".into(),
+        ))
+    }
+    fn definition_system_catalog_facts_async<'a>(
+        &'a self,
+        _request: &'a ConnectorRequestContext,
+        _catalog: &'a str,
+        _include_tables: bool,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<Option<SystemCatalogFacts>, novarocks_sql::compiler::SqlCompileError>,
+    > {
+        Box::pin(async {
+            Err(novarocks_sql::compiler::SqlCompileError::Compilation(
+                "asynchronous definition system catalog facts are not installed".into(),
+            ))
+        })
+    }
+
     fn local_system_catalog_facts(&self) -> Result<SystemCatalogFacts, String>;
 
     fn external_system_catalog_facts_async<'a>(

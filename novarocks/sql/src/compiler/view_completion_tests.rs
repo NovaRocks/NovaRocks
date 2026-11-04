@@ -903,9 +903,16 @@ fn reused_selection_refusal_keeps_the_current_saved_body_coordinates() {
     else {
         panic!("missing ref")
     };
+    let current = refusal.selection_refusal_for(&source.needs()[1]).unwrap();
     let source = source
-        .continue_catalog(vec![first, *refusal].into())
+        .continue_catalog(vec![first, current].into())
         .unwrap();
+    let [saved_need] = source.needs() else {
+        panic!("separate saved definition request")
+    };
+    assert!(saved_need.is_definition_context());
+    let saved = refusal.selection_refusal_for(saved_need).unwrap();
+    let source = source.continue_catalog(vec![saved].into()).unwrap();
     assert!(source.needs().is_empty());
     let captured = source.capture(&[]).unwrap();
     let error = crate::analyzer::analyze(&query(sql), captured.provider(), "outside").unwrap_err();

@@ -134,6 +134,7 @@ pub struct CatalogRelationNeed {
     relation: TableIdentity,
     target: CatalogLookupTarget,
     local_view_shadow: bool,
+    definition_context: bool,
     selection: Option<Box<CatalogTableSelection>>,
 }
 
@@ -169,8 +170,18 @@ impl CatalogRelationNeed {
             relation,
             target,
             local_view_shadow: false,
+            definition_context: false,
             selection: None,
         })
+    }
+
+    pub(super) fn in_definition_context(mut self) -> Self {
+        self.definition_context = matches!(self.target, CatalogLookupTarget::Table { .. });
+        self
+    }
+
+    pub const fn is_definition_context(&self) -> bool {
+        self.definition_context
     }
 
     pub(super) fn with_local_view_shadow(mut self) -> Self {
@@ -214,6 +225,7 @@ impl CatalogRelationNeed {
                     relation: self.relation.clone(),
                     target: self.target,
                     local_view_shadow: self.local_view_shadow,
+                    definition_context: self.definition_context,
                     selection: self.selection.clone(),
                     selected_snapshot: None,
                     outcome: CatalogRelationOutcome::SelectionRefused(Box::new(error)),
@@ -1009,6 +1021,7 @@ impl SqlNeedBatch {
 
 #[derive(Debug)]
 pub enum CatalogRelationOutcome {
+    Inline(std::sync::Arc<crate::catalog::SqlInlineRelation>),
     Resolved(Box<ResolvedAnalyzerTable>),
     View(std::sync::Arc<SqlViewDefinition>),
     Missing { reason: Box<str> },
@@ -1026,12 +1039,70 @@ pub struct CatalogRelationFact {
     relation: TableIdentity,
     target: CatalogLookupTarget,
     local_view_shadow: bool,
+    definition_context: bool,
     selection: Option<Box<CatalogTableSelection>>,
     selected_snapshot: Option<i64>,
     outcome: CatalogRelationOutcome,
 }
 
 impl CatalogRelationFact {
+    pub const fn is_definition_context(&self) -> bool {
+        self.definition_context
+    }
+
+    /// Current-only inline sources cannot answer a historical definition.
+    /// Keep the original selection in a pure capability refusal.
+    pub fn inline_time_travel_unsupported(
+        need: &CatalogRelationNeed,
+    ) -> Result<Self, CompletionProtocolError> {
+        if !need.definition_context || !matches!(need.target, CatalogLookupTarget::Table { .. }) {
+            return Err(CompletionProtocolError::CatalogLookupTargetMismatch { id: need.id });
+        }
+        let Some(version) = need.version() else {
+            return Err(CompletionProtocolError::CatalogLookupTargetMismatch { id: need.id });
+        };
+        Ok(Self {
+            id: need.id,
+            relation: need.relation.clone(),
+            target: need.target,
+            local_view_shadow: need.local_view_shadow,
+            definition_context: need.definition_context,
+            selection: need.selection.clone(),
+            selected_snapshot: None,
+            outcome: CatalogRelationOutcome::SelectionRefused(Box::new(
+                crate::analyze_error::AnalyzeError::unsupported_query_shape(
+                    "historical selection is not supplied by an inline system relation",
+                    version.span,
+                ),
+            )),
+        })
+    }
+
+    pub fn inline(
+        need: &CatalogRelationNeed,
+        relation: std::sync::Arc<crate::catalog::SqlInlineRelation>,
+    ) -> Result<Self, CompletionProtocolError> {
+        if !need.definition_context
+            || need.version().is_some()
+            || !matches!(need.target, CatalogLookupTarget::Table { .. })
+        {
+            return Err(CompletionProtocolError::InvalidFact {
+                id: need.id,
+                reason: "inline values require an exact Current definition relation need",
+            });
+        }
+        Ok(Self {
+            id: need.id,
+            relation: need.relation.clone(),
+            target: need.target,
+            local_view_shadow: need.local_view_shadow,
+            definition_context: need.definition_context,
+            selection: None,
+            selected_snapshot: None,
+            outcome: CatalogRelationOutcome::Inline(relation),
+        })
+    }
+
     /// Re-answer another exact need from the same immutable pure selection
     /// refusal. The application memo cannot manufacture an arbitrary error or
     /// reuse a refusal for another relation/request, and no provider is polled.
@@ -1057,6 +1128,7 @@ impl CatalogRelationFact {
             relation: need.relation.clone(),
             target: need.target,
             local_view_shadow: need.local_view_shadow,
+            definition_context: need.definition_context,
             selection: need.selection.clone(),
             selected_snapshot: None,
             outcome: CatalogRelationOutcome::SelectionRefused(error.clone()),
@@ -1146,6 +1218,7 @@ impl CatalogRelationFact {
             relation: need.relation.clone(),
             target: need.target,
             local_view_shadow: need.local_view_shadow,
+            definition_context: need.definition_context,
             selection: need.selection.clone(),
             selected_snapshot,
             outcome: CatalogRelationOutcome::Resolved(Box::new(table)),
@@ -1181,6 +1254,7 @@ impl CatalogRelationFact {
             relation: need.relation.clone(),
             target: need.target,
             local_view_shadow: need.local_view_shadow,
+            definition_context: need.definition_context,
             selection: need.selection.clone(),
             selected_snapshot: None,
             outcome: CatalogRelationOutcome::View(definition),
@@ -1200,6 +1274,7 @@ impl CatalogRelationFact {
             relation: need.relation.clone(),
             target: need.target,
             local_view_shadow: need.local_view_shadow,
+            definition_context: need.definition_context,
             selection: need.selection.clone(),
             selected_snapshot: None,
             outcome: CatalogRelationOutcome::Missing { reason },
@@ -2832,12 +2907,18 @@ fn validate_fact_semantics(
                 .map(|need| {
                     (
                         need.id,
-                        (&need.relation, need.target, need.local_view_shadow),
+                        (
+                            &need.relation,
+                            need.target,
+                            need.local_view_shadow,
+                            need.definition_context,
+                        ),
                     )
                 })
                 .collect::<BTreeMap<_, _>>();
             for fact in facts.iter() {
-                let (expected_relation, expected_target, expected_shadow) = expected[&fact.id];
+                let (expected_relation, expected_target, expected_shadow, expected_definition) =
+                    expected[&fact.id];
                 if expected_relation != &fact.relation {
                     return Err(CompletionProtocolError::CatalogRelationMismatch {
                         id: fact.id,
@@ -2845,7 +2926,10 @@ fn validate_fact_semantics(
                         actual: Box::new(fact.relation.clone()),
                     });
                 }
-                if expected_target != fact.target || expected_shadow != fact.local_view_shadow {
+                if expected_target != fact.target
+                    || expected_shadow != fact.local_view_shadow
+                    || expected_definition != fact.definition_context
+                {
                     return Err(CompletionProtocolError::CatalogLookupTargetMismatch {
                         id: fact.id,
                     });
@@ -3332,6 +3416,10 @@ fn provider_expression_dynamic_bytes(
 fn catalog_fact_bytes(fact: &CatalogRelationFact) -> Result<u64, CompletionProtocolError> {
     let relation = table_identity_bytes(&fact.relation)?;
     let outcome = match &fact.outcome {
+        CatalogRelationOutcome::Inline(relation) => checked_add(
+            relation.retained_bytes(),
+            (2 * std::mem::size_of::<usize>()) as u64,
+        )?,
         CatalogRelationOutcome::Missing { reason } => checked_size(reason.len())?,
         CatalogRelationOutcome::SelectionRefused(error) => checked_sum([
             checked_size(std::mem::size_of::<crate::analyze_error::AnalyzeError>()),

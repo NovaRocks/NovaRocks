@@ -50,8 +50,21 @@ pub struct SystemTableData {
     pub batches: Vec<RecordBatch>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemCatalogInputRequirement {
+    Schemas,
+    Tables,
+}
+
+mod relations;
+pub use relations::SystemCatalogRelations;
+
 /// Resolves a system-table reference from caller-supplied, read-only facts.
 pub trait SystemCatalog: Send + Sync {
+    fn required_inputs(&self, _db: &str, _table: &str) -> Option<SystemCatalogInputRequirement> {
+        None
+    }
+
     /// `Ok(None)` leaves an unregistered reference for downstream resolution.
     fn resolve(
         &self,
@@ -79,6 +92,7 @@ impl SystemCatalog for EmptySystemCatalog {
 /// core trait, `scan` receives only the narrow inputs it needs — never engine
 /// state.
 trait VirtualTableProvider: Send + Sync {
+    fn required_inputs(&self) -> SystemCatalogInputRequirement;
     fn database(&self) -> &str;
     fn table(&self) -> &str;
     fn columns(&self) -> Vec<ColumnDef>;
@@ -210,6 +224,9 @@ fn build_tables_batch(
 struct TablesProvider;
 
 impl VirtualTableProvider for TablesProvider {
+    fn required_inputs(&self) -> SystemCatalogInputRequirement {
+        SystemCatalogInputRequirement::Tables
+    }
     fn database(&self) -> &str {
         INFORMATION_SCHEMA_DB
     }
@@ -230,6 +247,9 @@ impl VirtualTableProvider for TablesProvider {
 struct SchemataProvider;
 
 impl VirtualTableProvider for SchemataProvider {
+    fn required_inputs(&self) -> SystemCatalogInputRequirement {
+        SystemCatalogInputRequirement::Schemas
+    }
     fn database(&self) -> &str {
         INFORMATION_SCHEMA_DB
     }
@@ -261,6 +281,12 @@ impl SystemCatalogService {
 }
 
 impl SystemCatalog for SystemCatalogService {
+    fn required_inputs(&self, db: &str, table: &str) -> Option<SystemCatalogInputRequirement> {
+        self.registry
+            .lookup(db, table)
+            .map(|provider| provider.required_inputs())
+    }
+
     fn resolve(
         &self,
         db: &str,

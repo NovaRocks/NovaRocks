@@ -4017,3 +4017,6 @@ mod binding_value_type_source_properties {
 
 #[cfg(test)]
 mod decimal_largeint_refusal_tests;
+
+#[cfg(test)]
+mod inline_relation_tests;

@@ -363,7 +363,7 @@ impl PlannerTableProvider for SavedViewCatalog<'_> {
         table: &str,
         version: &ast::TableVersion,
     ) -> Result<ResolvedAnalyzerTable, AnalyzeError> {
-        self.inner.resolve_table_version_for_analysis(
+        self.inner.resolve_definition_table_version_for_analysis(
             Some(catalog.unwrap_or(self.catalog)),
             database,
             table,
@@ -376,7 +376,7 @@ impl PlannerTableProvider for SavedViewCatalog<'_> {
         database: &str,
         table: &str,
     ) -> Result<ResolvedAnalyzerTable, String> {
-        self.inner.resolve_table_for_analysis(
+        self.inner.resolve_definition_table_for_analysis(
             Some(catalog.unwrap_or(self.catalog)),
             database,
             table,
@@ -388,8 +388,23 @@ impl PlannerTableProvider for SavedViewCatalog<'_> {
         database: &str,
         view: &str,
     ) -> Result<Option<&SqlViewDefinition>, AnalyzeError> {
-        self.inner
-            .resolve_view_for_analysis(Some(catalog.unwrap_or(self.catalog)), database, view)
+        self.inner.resolve_definition_view_for_analysis(
+            Some(catalog.unwrap_or(self.catalog)),
+            database,
+            view,
+        )
+    }
+    fn resolve_inline_relation_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<Option<&crate::catalog::SqlInlineRelation>, AnalyzeError> {
+        self.inner.resolve_definition_inline_relation_for_analysis(
+            Some(catalog.unwrap_or(self.catalog)),
+            database,
+            table,
+        )
     }
     fn view_definition_target(&self) -> Option<&novarocks_types::naming::TableIdentity> {
         self.inner.view_definition_target()

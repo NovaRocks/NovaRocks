@@ -619,6 +619,40 @@ impl<'a> super::AnalyzerContext<'a> {
                     )? {
                         return self.analyze_view_relation(view, alias.as_ref(), &tbl, name.span);
                     }
+                    if let Some(values) = self.catalog.resolve_inline_relation_for_analysis(
+                        catalog_override.as_deref(),
+                        &db_lower,
+                        &tbl_lower,
+                    )? {
+                        let (body, output_columns) = self.analyze_inline_values(values)?;
+                        let query = super::ResolvedQuery {
+                            body: super::QueryBody::Values(body),
+                            order_by: Vec::new(),
+                            limit: None,
+                            offset: None,
+                            output_columns,
+                            local_cte_ids: Vec::new(),
+                        };
+                        let output_columns =
+                            derived_table_output_columns(&query.output_columns, alias.as_ref())?;
+                        let alias_name = alias
+                            .as_ref()
+                            .map(|alias| alias.name.value.clone())
+                            .unwrap_or_else(|| tbl.clone());
+                        let mut scope = self.new_scope();
+                        for column in &output_columns {
+                            self.check_control()?;
+                            scope.add_field(Some(&alias_name), column);
+                        }
+                        return Ok((
+                            Relation::Subquery {
+                                query: Box::new(query),
+                                alias: alias_name,
+                                output_columns,
+                            },
+                            scope,
+                        ));
+                    }
                     self.catalog
                         .resolve_table_for_analysis(
                             catalog_override.as_deref(),

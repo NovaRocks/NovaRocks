@@ -20,6 +20,14 @@
 //! This module performs name resolution, type inference, and scope management
 //! without producing any physical plan concepts (tuple_id, slot_id, etc.).
 
+/// Share the catalog declaration author with checked inline relation creation.
+pub(crate) fn inline_column_value_type(
+    column: &novarocks_types::schema::ColumnDef,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<novarocks_type_contract::FunctionValueType, crate::compiler::SqlCompileError> {
+    helpers::column_value_type(column, control).map_err(Into::into)
+}
+
 #[cfg(test)]
 mod canonical_call_tests;
 #[cfg(test)]
@@ -724,54 +732,132 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         values: &ast::Values,
     ) -> Result<(ResolvedValues, Vec<OutputColumn>), AnalyzeError> {
-        let scope = self.new_scope(); // VALUES has no table scope
-        let materialized = self
-            .materialized_values
-            .and_then(|source| source.rows_at(values));
-        let row_count = materialized.map_or(values.rows.len(), |rows| rows.len());
-        let mut resolved_rows = Vec::with_capacity(row_count);
-        let mut column_types: Vec<novarocks_type_contract::FunctionValueType> = Vec::new();
+        self.analyze_values_inner(Some(values), None)
+    }
+
+    fn analyze_inline_values(
+        &self,
+        values: &crate::catalog::SqlInlineRelation,
+    ) -> Result<(ResolvedValues, Vec<OutputColumn>), AnalyzeError> {
+        self.analyze_values_inner(None, Some(values))
+    }
+
+    /// Syntax VALUES infer their fields. An already materialized relation
+    /// retains the original pools and starts from its complete declaration.
+    fn analyze_values_inner(
+        &self,
+        values: Option<&ast::Values>,
+        inline: Option<&crate::catalog::SqlInlineRelation>,
+    ) -> Result<(ResolvedValues, Vec<OutputColumn>), AnalyzeError> {
+        let scope = self.new_scope();
+        let materialized = values.and_then(|values| {
+            self.materialized_values
+                .and_then(|source| source.rows_at(values))
+        });
+        let row_count = match inline {
+            Some(inline) => inline.rows,
+            None => materialized.map_or_else(
+                || values.expect("syntax VALUES input").rows.len(),
+                |rows| rows.len(),
+            ),
+        };
+        let mut resolved_rows = if inline.is_some() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(row_count)
+        };
+        let mut column_types = match inline {
+            Some(inline) => inline
+                .columns
+                .iter()
+                .map(|column| column.value_type.clone())
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+        let mut batch = 0usize;
+        let mut batch_start = 0usize;
         for row_idx in 0..row_count {
             self.check_control()?;
-            let width =
-                materialized.map_or_else(|| values.rows[row_idx].len(), |rows| rows[row_idx].len());
+            let width = match inline {
+                Some(inline) => {
+                    while row_idx - batch_start
+                        >= inline.batches[batch][0].resource_facts().rows as usize
+                    {
+                        batch_start += inline.batches[batch][0].resource_facts().rows as usize;
+                        batch += 1;
+                        self.check_control()?;
+                    }
+                    inline.columns.len()
+                }
+                None => materialized.map_or_else(
+                    || values.expect("syntax VALUES input").rows[row_idx].len(),
+                    |rows| rows[row_idx].len(),
+                ),
+            };
             let mut resolved_row = Vec::with_capacity(width);
             for col_idx in 0..width {
-                let typed = match materialized {
-                    Some(rows) => {
-                        self.check_control()?;
+                self.check_control()?;
+                let typed = match (inline, materialized) {
+                    (Some(inline), _) => {
+                        let ordinal = u32::try_from(row_idx - batch_start).map_err(|_| {
+                            AnalyzeError::internal(
+                                "inline relation ordinal exceeds its checked pool",
+                            )
+                        })?;
+                        let value = inline.batches[batch][col_idx]
+                            .value(ordinal)
+                            .map_err(|error| AnalyzeError::internal(error.to_string()))?;
+                        TypedExpr {
+                            value_type: value.value_type().clone(),
+                            kind: ExprKind::Constant(value),
+                        }
+                    }
+                    (None, Some(rows)) => {
                         let value = &rows[row_idx][col_idx];
                         TypedExpr {
                             kind: ExprKind::Constant(value.clone()),
                             value_type: value.value_type().clone(),
                         }
                     }
-                    None => self.analyze_expr(&values.rows[row_idx][col_idx], &scope)?,
+                    (None, None) => self.analyze_expr(
+                        &values.expect("syntax VALUES input").rows[row_idx][col_idx],
+                        &scope,
+                    )?,
                 };
-                if col_idx < column_types.len() {
-                    column_types[col_idx] = helpers::assignment_common_value_type(
-                        &column_types[col_idx],
-                        &typed.value_type,
-                        self.control,
-                    )?;
-                } else {
-                    column_types.push(typed.value_type.clone());
+                if inline.is_none() {
+                    if col_idx < column_types.len() {
+                        column_types[col_idx] = helpers::assignment_common_value_type(
+                            &column_types[col_idx],
+                            &typed.value_type,
+                            self.control,
+                        )?;
+                    } else {
+                        column_types.push(typed.value_type.clone());
+                    }
                 }
                 resolved_row.push(typed);
             }
             resolved_rows.push(resolved_row);
         }
-
-        let output_cols: Vec<OutputColumn> = column_types
+        let output_cols = column_types
             .iter()
             .enumerate()
             .map(|(i, ty)| {
                 self.check_control()?;
-                let name = format!("column_{i}");
-                let value_type = helpers::with_nullability(ty.clone(), true);
+                let (name, field_name, value_type) = match inline {
+                    Some(inline) => {
+                        let name = inline.columns[i].name.to_string();
+                        (name.clone(), Some(name), ty.clone())
+                    }
+                    None => (
+                        format!("column_{i}"),
+                        None,
+                        helpers::with_nullability(ty.clone(), true),
+                    ),
+                };
                 let column_id = self.alloc_column_id(None, name.clone(), value_type.clone());
                 Ok(OutputColumn {
-                    field_name: None,
+                    field_name,
                     column_id,
                     name,
                     value_type,
@@ -779,7 +865,6 @@ impl<'a> AnalyzerContext<'a> {
                 })
             })
             .collect::<Result<Vec<_>, AnalyzeError>>()?;
-
         Ok((
             ResolvedValues {
                 rows: resolved_rows,
