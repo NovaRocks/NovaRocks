@@ -417,6 +417,24 @@ mod refresh_property_facade_tests {
     }
 
     #[test]
+    fn union_aggregate_uses_root_names_with_anonymous_later_branch() {
+        let input = analyzed_refresh_input(
+            "SELECT id + 1 AS K, count(*) AS C FROM fact_east GROUP BY id + 1 UNION ALL SELECT id + 1, count(*) FROM fact_west GROUP BY id + 1",
+        );
+        assert_eq!(input.analysis_facts().output_columns[0].name, "K");
+        let property = input
+            .refresh_property(&crate::compiler::SqlCompileControl::unbounded())
+            .unwrap();
+        assert_eq!(
+            property.identity,
+            TargetIdentity::BranchScoped(Box::new(TargetIdentity::GroupRowId(vec!["K".into()])))
+        );
+        input
+            .refresh_contract(&crate::compiler::SqlCompileControl::unbounded())
+            .unwrap();
+    }
+
+    #[test]
     fn mv_definition_names_are_validated_before_persistence_and_keep_source_case() {
         use crate::analyze_error::AnalyzeErrorKind as K;
         for (sql, expected) in [
@@ -1248,8 +1266,52 @@ impl SqlResolvedMvRefreshInput {
         control: &dyn PureCompileControl,
     ) -> Result<RefreshFragmentProperty, SqlCompileError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-        let result = derive_fragment_property(&self.0, &mut work);
+        let result = self.bound_refresh_property(&mut work);
         finish_refresh_identity(result, work)
+    }
+
+    fn bound_refresh_property(
+        &self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<RefreshFragmentProperty, SqlCompileError> {
+        // Synthesize and compare internal branch layouts before exposing the
+        // original root's names. Later UNION branches do not declare that root.
+        let mut property = derive_fragment_property(&self.0, work)?;
+        let names = match &mut property.identity {
+            TargetIdentity::GroupRowId(names) => Some(names),
+            TargetIdentity::BranchScoped(inner) => match inner.as_mut() {
+                TargetIdentity::GroupRowId(names) => Some(names),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(names) = names {
+            let branch = first_union_branch_resolved_query(&self.0)?;
+            let QueryBody::Select(select) = &branch.body else {
+                return Err(SqlCompileError::Compilation(
+                    "MV group identity has no SELECT root".into(),
+                ));
+            };
+            let visible = branch
+                .output_columns
+                .iter()
+                .filter(|column| !column.is_internal)
+                .collect::<Vec<_>>();
+            if visible.len() != self.1.len()
+                || select.projection.len() != visible.len()
+                || select
+                    .projection
+                    .iter()
+                    .zip(&visible)
+                    .any(|(item, field)| item.output_column_id != field.column_id)
+            {
+                return Err(SqlCompileError::Compilation(
+                    "MV group identity changed its original root occurrence binding".into(),
+                ));
+            }
+            *names = group_key_output_names(select, Some(&self.1), work)?;
+        }
+        Ok(property)
     }
 
     pub fn refresh_contract(
@@ -1258,7 +1320,7 @@ impl SqlResolvedMvRefreshInput {
     ) -> Result<SqlImvRefreshContractFacts, SqlCompileError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
         let result = (|| {
-            let property = derive_fragment_property(&self.0, &mut work)?;
+            let property = self.bound_refresh_property(&mut work)?;
             // The existing contract projection remains an opaque ordinary owner.
             work.flush()?;
             let contract = property
@@ -5971,7 +6033,7 @@ fn derive_from_select(
         work.flush()?;
         let aggregate_input_shape = classify_aggregate_input_shape(select.from.as_ref(), &child)?;
         work.flush()?;
-        let group_key_output_names = group_key_output_names(select, work)?;
+        let group_key_output_names = group_key_output_names(select, None, work)?;
         Ok(RefreshFragmentProperty {
             identity: TargetIdentity::GroupRowId(group_key_output_names),
             state: StateContract::AggregateState {
@@ -6371,10 +6433,11 @@ fn iceberg_ref_from_scan(scan: &crate::analysis::ScanRelation) -> Result<TableId
 /// GROUP BY key is projected, so this captures the full group-key output set.
 fn group_key_output_names(
     select: &ResolvedSelect,
+    published: Option<&[String]>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<String>, SqlCompileError> {
     let mut names = Vec::new();
-    for item in &select.projection {
+    for (ordinal, item) in select.projection.iter().enumerate() {
         let mut matched = false;
         for group_key in &select.group_by {
             work.flush()?;
@@ -6389,11 +6452,14 @@ fn group_key_output_names(
             }
         }
         if matched {
-            names.push(item.field_name.clone().ok_or_else(|| {
-                SqlCompileError::Compilation(
-                    "validated MV group-key output has no SQL field name".into(),
-                )
-            })?);
+            names.push(match published {
+                Some(names) => names.get(ordinal).cloned().ok_or_else(|| {
+                    SqlCompileError::Compilation(
+                        "MV group key is outside the frozen output declaration".into(),
+                    )
+                })?,
+                None => item.output_name.clone(),
+            });
         }
         work.step()?;
     }
