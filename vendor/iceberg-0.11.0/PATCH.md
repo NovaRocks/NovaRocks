@@ -1,31 +1,29 @@
-# NovaRocks patches over apache/iceberg-rust 0.11.0-rc.2
+# NovaRocks patches over apache/iceberg-rust 0.11.0
 
-Upstream tag: `v0.11.0-rc.2`
-Upstream commit: `859048563bc71a3167d0545cb66756d26c64e4ca`
+Upstream tag: `v0.11.0`
+Upstream commit: `20eb0feddac8f40bb9e9108a0744b7f356d69480`
 Upstream repository: https://github.com/apache/iceberg-rust
-Normalized package: `iceberg-0.11.0.crate`
-Package SHA-256: `83bd584247a59b6ce2d2f6ce08188640977568aff9b7240c4a5e45a1c6214142`
+Registry package: `iceberg-0.11.0.crate`
+Registry SHA-256: `25dd5d1aa2fa92d2c9bc426f72bc16717a27eb73255805beb8845afcca31e58d`
 
-Generation command (Rust/Cargo 1.98.1, from the verified upstream checkout):
+The original registry archive was checked against the index/API checksum and
+its VCS commit/path. Source differences were checked against the rc.2-to-release
+upstream changes; normalized manifests and package-generated files were checked
+separately. The original archive was not regenerated from Git.
 
-```sh
-cargo +1.98.1 package --no-verify --exclude-lockfile --offline \
-  -p iceberg-property-macro -p iceberg -p iceberg-catalog-rest -p iceberg-catalog-hms
-```
-
-`--exclude-lockfile` avoids resolving unrelated unpublished/workspace development
-dependencies while preserving Cargo's normalized manifest and original published
-source files. Each extracted file was compared byte-for-byte with this package.
-The initial source commit is unmodified except for this inventory.
+The published Cargo.lock, Cargo.toml.orig and license inventory retain their
+release bytes. Standalone checks use a candidate source copy and a separate
+validation lock; the root workspace alone owns the production dependency lock.
+Do not format vendor sources. Design: ADR-0215
+(docs/adr/ADR-0215-released-iceberg-package-provenance.md).
 
 ## Dependency policy
 
 Retain upstream registry dependency versions and lints except for the bounded
 Arrow/Parquet upstream backport recorded below (ADR-0204). The root
-`[patch.crates-io]` selects `iceberg`, `iceberg-catalog-hms` and
-`iceberg-property-macro` at version `0.11.0`; the macro has no source patches.
-The unpatched REST SDK is a connector dev-only path dependency, outside the
-production normal/build dependency closures. Do not vendor runtime/network/Arrow
+`[patch.crates-io]` selects `iceberg` and `iceberg-catalog-hms` at version `0.11.0`.
+The unmodified property macro and dev-only REST SDK use crates.io; the REST SDK
+is outside production normal/build dependency closures. Do not vendor runtime/network/Arrow
 crates or add resource accounting hooks. Only the approved protocol/API patch
 inventory and exact upstream dependency-upgrade backports may diverge.
 Backports do not authorize new NovaRocks changes inside third-party code.
@@ -45,7 +43,7 @@ No patches applied in the initial source commit.
 
 - Purpose: preserve the 0.9 `TableMetadata::refs()` read-only accessor.
 - Files: `src/spec/table_metadata.rs`.
-- Upstream status: no tracked upstream issue; rc.2 exposes only individual reference lookup.
+- Upstream status: no tracked upstream issue; 0.11.0 exposes only individual reference lookup.
 - Production dependency: NovaRocks dependency validation, ref preparation, complete branch/table/call retention policy and reclamation protection observe the authoritative full branch/tag reference set.
 - Exit: remove when upstream exposes the same complete reference-map accessor, or a reviewed consumer migration removes the need for it.
 - Coverage: connector dependency/ref tests, fixed retention graphs and actual reclamation root/freshness tests; V2 standalone core check.
@@ -54,7 +52,7 @@ No patches applied in the initial source commit.
 
 - Purpose: preserve the 0.9 read default of `INITIAL_ROW_ID` when v3 metadata omits `next-row-id`; serialization continues emitting it.
 - Files: `src/spec/table_metadata.rs`.
-- Upstream status: no tracked upstream issue; rc.2 requires the field.
+- Upstream status: no tracked upstream issue; 0.11.0 requires the field.
 - Production dependency: reading existing Spark REST v3 metadata without the field.
 - Exit: IRU-8 replaces the external semantic-identity compatibility boundary and removes this patch.
 - Coverage: migrated `test_table_metadata_v3_missing_next_row_id_defaults_to_initial`; existing v3 metadata serde tests.
@@ -63,7 +61,7 @@ No patches applied in the initial source commit.
 
 U4 (direct child directory listing) has been removed. Hadoop discovery now
 uses NovaRocks' own bounded filesystem helpers; the four former U4 source files
-match upstream commit `859048563bc71a3167d0545cb66756d26c64e4ca` byte for byte.
+match upstream commit `20eb0feddac8f40bb9e9108a0744b7f356d69480` byte for byte.
 The SDK Storage/FileIO interfaces no longer carry a directory extension.
 
 
@@ -79,7 +77,7 @@ Iceberg family and does not extend to other vendored crates.
   `665c64e4`: the Arrow 59 dependency step is subsumed by the Arrow 60
   declarations below.
 - [#3257](https://github.com/apache/iceberg-rust/pull/3257), open and unmerged
-  when checked on 2026-10-28, head
+  when checked on 2026-11-04, head
   `0d5eb123495f765ea151e78c8964919d554d4b98`: copy the upstream source changes
   without local modifications in these files:
   - `src/arrow/reader/positional_deletes.rs`
@@ -92,13 +90,8 @@ Iceberg family and does not extend to other vendored crates.
   `arith/array/buffer/cast/ord/schema/select/string` and Parquet use `60.0`;
   development-only `serde_arrow` uses `0.15` with `arrow-60`. Features and lints
   otherwise remain unchanged. `Cargo.toml.orig` and `DEPENDENCIES.rust.tsv`
-  retain the rc.2 baseline as provenance.
+  retain the official 0.11.0 release as provenance.
 - U3 and P7a remain unchanged: both only modify `src/spec/table_metadata.rs`.
-- [#3535](https://github.com/apache/iceberg-rust/pull/3535) is not backported.
-  Disabling Iceberg's Zstd default features would not change the unified
-  Zstd 0.13 features while `mysql_common 0.32.4` enables `default`/`legacy`.
-  The change is already on the upstream 0.11.x branch and will arrive through
-  a coordinated rebaseline.
 
 The page-index evaluator change in #3257 selects all rows when the offset index
 is absent. It affects the SDK ArrowReader, which NovaRocks does not use for
@@ -111,7 +104,7 @@ Deletion and refresh conditions:
 2. When an upstream official release contains these changes, the Iceberg
    dependency maintainer coordinates a rebaseline of the full family under
    ADR-0174 and deletes this backport section. The expected 0.12 release is on
-   a different branch from the recorded rc.2 baseline; a version-only bump is
+   a different branch from the official 0.11.0 baseline; a version-only bump is
    insufficient.
 3. If upstream closes #3257 without merging it, treat the backport as a local
    patch and return to design review; do not silently retain it.

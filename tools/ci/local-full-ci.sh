@@ -715,7 +715,7 @@ run_cargo_gates() {
     tests/sql/fixtures/benchmarks/tests/bootstrap-lifecycle-test.sh
   run_fail_fast_stage "shared benchmark fixture contract" "shared-benchmark-fixture-contract.log" \
     python3 tests/sql/fixtures/benchmarks/tests/fixture-contract-test.py
-  run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
+  run_fail_fast_stage "cargo fmt" "cargo-fmt.log" python3 tools/ci/fmt-workspace.py --check
   # Design: ADR-0194 (docs/adr/ADR-0194-strict-clippy-ci-baseline.md)
   run_fail_fast_stage "cargo clippy" "cargo-clippy.log" \
     ci_main_cargo clippy --all-targets -- -D warnings

@@ -55,7 +55,7 @@ test -x "$NOVA_FDB_FDBCLI"
 
 cd "$WORKSPACE_ROOT"
 
-cargo fmt --all -- --check
+python3 "$SCRIPT_DIR/fmt-workspace.py" --check
 # Test the StateStore contract and shared provider test mechanics.
 cargo test -p novarocks-state-store-api -p novarocks-state-store-testkit
 cargo check -p novarocks-state-store-foundationdb --all-targets

@@ -122,8 +122,8 @@ impl FileWrite for CloseReplyWriter {
     async fn write(&mut self, bytes: Bytes) -> Result<()> {
         self.inner.write(bytes).await
     }
-    async fn close(&mut self) -> Result<()> {
-        self.inner.close().await?;
+    async fn close(&mut self) -> Result<FileMetadata> {
+        let metadata = self.inner.close().await?;
         // The same physical file is fully closed first. Only its acknowledgement
         // is now failed; a successful-object/unknown-result frontier is real.
         let count = self.probe.close_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -133,7 +133,7 @@ impl FileWrite for CloseReplyWriter {
                 "injected close reply loss after actual close",
             ));
         }
-        Ok(())
+        Ok(metadata)
     }
 }
 fn file_io(

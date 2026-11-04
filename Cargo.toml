@@ -211,6 +211,7 @@ lto = "thin"
 codegen-units = 1
 debug-assertions = false
 
+# Design: ADR-0215 (docs/adr/ADR-0215-released-iceberg-package-provenance.md)
 # Design: ADR-0174 (docs/adr/ADR-0174-vendored-iceberg-baseline-and-patch-policy.md)
 # Design: ADR-0176 (docs/adr/ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md)
 # Vendored iceberg-rust 0.11 retains format/read primitives. NovaRocks owns the
@@ -223,10 +224,7 @@ debug-assertions = false
 # inside a third-party crate. Design: ADR-0170
 # (docs/adr/ADR-0170-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
 iceberg = { path = "vendor/iceberg-0.11.0" }
-# The 0.11 source-package macro is vendored without local source patches.
-iceberg-property-macro = { path = "vendor/iceberg-property-macro-0.11.0" }
-# The unpatched REST SDK is a connector dev-only path dependency for wire
-# and Java interoperability comparison; it is absent from production closure.
+# Unmodified property macro and dev-only REST SDK use crates.io.
 # Preserve typed missing-table errors and entity-based table classification.
 # See vendor/iceberg-catalog-hms-0.11.0/PATCH.md.
 iceberg-catalog-hms = { path = "vendor/iceberg-catalog-hms-0.11.0" }

@@ -40,7 +40,8 @@ ignore = [
     # mysql 25 test client via mysql_common 0.32 (TRC-2/TRC-3). Remove this group
     # only when the last affected consumer is gone. Rust API fixes are in zstd
     # >= 0.14.3 and zstd-safe >= 8.2.0; this does not isolate their C decoder.
-    # Iceberg/mysql_common request zstd 0.13 defaults: arrays/legacy/zdict_builder;
+    # mysql_common requests zstd 0.13 defaults: arrays/legacy/zdict_builder;
+    # Iceberg 0.11.0 and Avro disable their zstd default features;
     # Avro's old edge disables defaults. Arrow/Parquet and first-party Iceberg's
     # zstd 0.14 edges also disable defaults, but both Rust lines share one zstd-sys.
     # The old-line legacy request enables the shared C legacy decoder, including

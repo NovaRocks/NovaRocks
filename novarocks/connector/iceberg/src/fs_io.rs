@@ -679,6 +679,7 @@ impl Storage for IcebergFsStorage {
             _phase: phase,
             stream,
             local_closed: false,
+            accepted_bytes: 0,
         }))
     }
 
@@ -815,6 +816,31 @@ struct IcebergFsFileWrite {
     _phase: Option<novarocks_spi::connector::ConnectorIoPermit>,
     stream: Option<novarocks_spi::connector::ConnectorIoStreamCustody>,
     local_closed: bool,
+    // Only writes returned successfully to the SDK contribute to stored size.
+    accepted_bytes: u64,
+}
+
+impl IcebergFsFileWrite {
+    fn closed_metadata(&self, metadata: crate::opendal::Metadata) -> Result<FileMetadata> {
+        let reported = metadata.content_length();
+        if reported != 0 && reported != self.accepted_bytes {
+            let object = self
+                .permit
+                .as_ref()
+                .map(|permit| format!(" for {}", permit.object.path()))
+                .unwrap_or_default();
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "fs closed size mismatch{object}: accepted {}, reported {reported}",
+                    self.accepted_bytes
+                ),
+            ));
+        }
+        Ok(FileMetadata {
+            size: self.accepted_bytes,
+        })
+    }
 }
 
 impl std::fmt::Debug for IcebergFsFileWrite {
@@ -939,31 +965,40 @@ async fn await_stream_step<T>(
 #[async_trait]
 impl FileWrite for IcebergFsFileWrite {
     async fn write(&mut self, bs: Bytes) -> Result<()> {
+        let accepted_bytes = u64::try_from(bs.len())
+            .ok()
+            .and_then(|len| self.accepted_bytes.checked_add(len))
+            .ok_or_else(|| Error::new(ErrorKind::Unexpected, "fs written size exceeds u64"));
         if self.permit.is_none() {
-            return self
-                .writer
+            let accepted_bytes = accepted_bytes?;
+            self.writer
                 .as_mut()
                 .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "write to closed fs file"))?
                 .write(bs)
                 .await
-                .map_err(|e| Error::new(ErrorKind::Unexpected, format!("fs write: {e}")));
+                .map_err(|e| Error::new(ErrorKind::Unexpected, format!("fs write: {e}")))?;
+            self.accepted_bytes = accepted_bytes;
+            return Ok(());
         }
         let mut writer = self
             .writer
             .take()
             .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "write to closed fs file"))?;
         let result = await_stream_step(self.permit.as_ref(), async {
+            let accepted_bytes = accepted_bytes?;
             writer.write(bs).await.map_err(|e| {
                 Error::new(ErrorKind::Unexpected, "fs stream write failed").with_source(e)
-            })
+            })?;
+            Ok(accepted_bytes)
         })
         .await;
         match result {
-            Ok(((), None)) => {
+            Ok((accepted_bytes, None)) => {
+                self.accepted_bytes = accepted_bytes;
                 self.writer = Some(writer);
                 Ok(())
             }
-            Ok(((), Some(error))) | Err(error) => {
+            Ok((_, Some(error))) | Err(error) => {
                 let error = abort_after_failure(&mut writer, error, self.permit.as_ref()).await;
                 drop(writer);
                 self.local_closed = true;
@@ -977,7 +1012,10 @@ impl FileWrite for IcebergFsFileWrite {
         }
     }
 
-    async fn close(&mut self) -> Result<()> {
+    // Stored size feeds manifest lengths, external readers and snapshot reclamation's
+    // immutable-length checks. S3 may report zero on close, so successful writes
+    // author the size; any nonzero storage report must agree with that count.
+    async fn close(&mut self) -> Result<FileMetadata> {
         if self.permit.is_none() {
             let mut writer = self
                 .writer
@@ -993,7 +1031,7 @@ impl FileWrite for IcebergFsFileWrite {
                 stream.closed();
             }
             self._phase.take();
-            return result.map(|_metadata| ());
+            return result.and_then(|metadata| self.closed_metadata(metadata));
         }
         let mut writer = self
             .writer
@@ -1006,11 +1044,14 @@ impl FileWrite for IcebergFsFileWrite {
         })
         .await;
         let result = match result {
-            Ok((_metadata, stopped)) => {
+            Ok((metadata, stopped)) => {
                 // Close has already completed externally. There is no multipart upload
                 // left to abort; retain its object in the ledger for known-uncommitted cleanup.
-                self.permit.as_ref().map_or(Ok(()), WritePermit::complete)?;
-                stopped.map_or(Ok(()), Err)
+                self.permit
+                    .as_ref()
+                    .map_or(Ok(()), WritePermit::complete)
+                    .and_then(|()| stopped.map_or(Ok(()), Err))
+                    .and_then(|()| self.closed_metadata(metadata))
             }
             Err(error) => Err(abort_after_failure(&mut writer, error, self.permit.as_ref()).await),
         };
@@ -1309,6 +1350,7 @@ mod tests {
         semaphore: Arc<tokio::sync::Semaphore>,
         runtime: crate::resources::IcebergCatalogRuntime,
         completed: std::sync::atomic::AtomicUsize,
+        written: std::sync::Mutex<Vec<crate::commit::model::ObjectIdentity>>,
         exit_failures: std::sync::Mutex<Vec<super::StreamExitFailure>>,
     }
     #[async_trait::async_trait]
@@ -1338,8 +1380,9 @@ mod tests {
         }
         fn mark_written(
             &self,
-            _: &crate::commit::model::ObjectIdentity,
+            object: &crate::commit::model::ObjectIdentity,
         ) -> crate::iceberg::Result<()> {
+            self.written.lock().unwrap().push(object.clone());
             self.completed
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -1365,6 +1408,7 @@ mod tests {
         resume: tokio::sync::Notify,
         log: std::sync::Mutex<Vec<&'static str>>,
         fail_abort: std::sync::atomic::AtomicBool,
+        reported_size: std::sync::atomic::AtomicU64,
     }
     #[derive(Debug, Clone)]
     struct ControlledWriterService {
@@ -1488,9 +1532,14 @@ mod tests {
                 self.0.events.resume.notified().await;
             }
             self.0.events.log.lock().unwrap().push("close-exit");
-            Ok(crate::opendal::Metadata::new(
-                crate::opendal::EntryMode::FILE,
-            ))
+            Ok(
+                crate::opendal::Metadata::new(crate::opendal::EntryMode::FILE).with_content_length(
+                    self.0
+                        .events
+                        .reported_size
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                ),
+            )
         }
         async fn abort(&mut self) -> crate::opendal::Result<()> {
             self.0.events.log.lock().unwrap().push("abort-exit");
@@ -1536,6 +1585,7 @@ mod tests {
             semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             runtime: crate::resources::IcebergCatalogRuntime::new(tokio::runtime::Handle::current()),
             completed: std::sync::atomic::AtomicUsize::new(0),
+            written: std::sync::Mutex::new(Vec::new()),
             exit_failures: std::sync::Mutex::new(Vec::new()),
         });
         let permit = admission
@@ -1556,6 +1606,7 @@ mod tests {
                 _phase: None,
                 stream: None,
                 local_closed: false,
+                accepted_bytes: 0,
             },
             admission,
             events,
@@ -1666,6 +1717,8 @@ mod tests {
         let (mut writer, admission, events) = governed_mock_writer(false, true).await;
         assert!(writer.write(Bytes::from_static(b"part")).await.is_err());
         assert_eq!(*events.log.lock().unwrap(), ["write-start", "abort-exit"]);
+        assert_eq!(writer.accepted_bytes, 0);
+        assert!(writer.local_closed);
         assert_eq!(admission.semaphore.available_permits(), 1);
         assert!(writer.write(Bytes::from_static(b"part")).await.is_err());
         assert_eq!(
@@ -1679,6 +1732,9 @@ mod tests {
     async fn cancelled_close_waits_for_actual_close_and_retains_completed_object() {
         use crate::iceberg::io::FileWrite;
         let (mut writer, admission, events) = governed_mock_writer(true, false).await;
+        events
+            .reported_size
+            .store(1, std::sync::atomic::Ordering::SeqCst);
         let task = tokio::spawn(async move { writer.close().await });
         events.started.notified().await;
         admission.cancellation.cancel();
@@ -1686,7 +1742,8 @@ mod tests {
         assert!(!task.is_finished());
         assert_eq!(admission.semaphore.available_permits(), 0);
         events.resume.notify_one();
-        assert!(task.await.unwrap().is_err());
+        let error = task.await.unwrap().err().expect("cancelled close");
+        assert_eq!(stopped_kind(&error), ConnectorErrorKind::Cancelled);
         assert_eq!(*events.log.lock().unwrap(), ["close-start", "close-exit"]);
         assert_eq!(
             admission
@@ -1697,6 +1754,74 @@ mod tests {
         assert_eq!(admission.semaphore.available_permits(), 1);
     }
 
+    #[tokio::test]
+    async fn governed_close_retains_completed_object_when_reported_size_disagrees() {
+        use crate::iceberg::io::FileWrite;
+        use std::sync::atomic::Ordering;
+
+        for reported in [0, 7, 8] {
+            let (mut writer, admission, events) = governed_mock_writer(true, false).await;
+            events.reported_size.store(reported, Ordering::SeqCst);
+            let source = Arc::new(AbortErrorReceiver::default());
+            let request = novarocks_spi::connector::ConnectorIoRequest::from_original(
+                source.clone() as Arc<dyn novarocks_spi::connector::ConnectorIoRequestSource>,
+            );
+            let phase = request.admitted().await.unwrap();
+            writer.stream = Some(phase.begin_stream().unwrap());
+            writer._phase = Some(phase);
+            writer.write(Bytes::from_static(b"part")).await.unwrap();
+            writer.write(Bytes::from_static(b"two")).await.unwrap();
+            assert_eq!(writer.accepted_bytes, 7);
+
+            let task = tokio::spawn(async move {
+                let result = writer.close().await;
+                (writer, result)
+            });
+            events.started.notified().await;
+            assert!(!task.is_finished(), "close must await its actual exit");
+            assert_eq!(admission.semaphore.available_permits(), 0);
+            assert_eq!(admission.completed.load(Ordering::SeqCst), 0);
+            assert!(admission.written.lock().unwrap().is_empty());
+            assert_eq!(source.stream_closed.load(Ordering::SeqCst), 0);
+            events.resume.notify_one();
+            let (writer, result) = task.await.unwrap();
+            if reported == 8 {
+                let error = result.err().expect("nonzero size mismatch must fail");
+                assert_eq!(error.kind(), crate::iceberg::ErrorKind::Unexpected);
+                let message = error.to_string();
+                assert!(message.contains("accepted 7"), "{message}");
+                assert!(message.contains("reported 8"), "{message}");
+                assert!(message.contains("mock.puffin"), "{message}");
+            } else {
+                assert_eq!(result.unwrap().size, 7);
+            }
+            assert!(writer.local_closed);
+            assert!(writer.writer.is_none());
+            assert!(writer.permit.is_none());
+            assert!(writer.stream.is_none());
+            assert!(writer._phase.is_none());
+            assert_eq!(admission.completed.load(Ordering::SeqCst), 1);
+            assert_eq!(admission.written.lock().unwrap()[0].path(), "mock.puffin");
+            assert!(admission.exit_failures.lock().unwrap().is_empty());
+            assert_eq!(admission.semaphore.available_permits(), 1);
+            assert_eq!(source.stream_closed.load(Ordering::SeqCst), 1);
+            assert_eq!(source.stream_lost.load(Ordering::SeqCst), 0);
+            drop(writer);
+            assert_eq!(
+                *events.log.lock().unwrap(),
+                [
+                    "write-start",
+                    "write-exit",
+                    "write-start",
+                    "write-exit",
+                    "close-start",
+                    "close-exit"
+                ],
+                "completed objects must never be aborted, including on size mismatch"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abandoned_governed_writer_waits_for_abort_on_injected_runtime() {
         let (writer, admission, events) = governed_mock_writer(false, false).await;
@@ -1705,8 +1830,11 @@ mod tests {
         assert_eq!(admission.semaphore.available_permits(), 1);
     }
 
+    #[derive(Default)]
     struct AbortErrorReceiver {
         original: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>,
+        stream_closed: std::sync::atomic::AtomicUsize,
+        stream_lost: std::sync::atomic::AtomicUsize,
     }
     impl novarocks_spi::connector::ConnectorIoRequestSource for AbortErrorReceiver {
         fn exit_waker(&self) -> std::task::Waker {
@@ -1715,7 +1843,10 @@ mod tests {
         fn reserve_stream(&self) -> Result<(), ConnectorError> {
             Ok(())
         }
-        fn stream_closed(&self) {}
+        fn stream_closed(&self) {
+            self.stream_closed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         fn install_stream_cleanup_in(
             &self,
             _: &mut Option<novarocks_spi::connector::ConnectorIoCleanupFuture>,
@@ -1725,7 +1856,10 @@ mod tests {
                 "test does not dispatch cleanup",
             ))
         }
-        fn stream_custody_lost(&self) {}
+        fn stream_custody_lost(&self) {
+            self.stream_lost
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         fn record_cleanup_failure(
             &self,
             cause: Box<dyn std::any::Any + Send>,
@@ -1759,9 +1893,7 @@ mod tests {
     }
     #[tokio::test]
     async fn two_real_abort_errors_exit_and_deliver_their_original_errors_once() {
-        let source = Arc::new(AbortErrorReceiver {
-            original: std::sync::Mutex::new(None),
-        });
+        let source = Arc::new(AbortErrorReceiver::default());
         for _ in 0..2 {
             let (mut wrapper, admission, events) = governed_mock_writer(false, false).await;
             events
@@ -2156,34 +2288,34 @@ mod tests {
     #[tokio::test]
     async fn output_file_writer_writes_and_closes() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let file_path = dir.path().join("writer").join("00000.json");
-        let location = format!("file://{}", file_path.display());
-
-        let file_io = build_file_io_for_location(
-            &location,
-            local_test_binding(None, tokio::runtime::Handle::current()),
-        );
-        let mut writer = file_io
-            .new_output(&location)
-            .expect("output file")
-            .writer()
-            .await
-            .expect("writer");
-        writer
-            .write(Bytes::from_static(b"writer payload"))
-            .await
-            .expect("writer write");
-        writer.close().await.expect("writer close");
-
-        assert_eq!(
-            file_io
-                .new_input(&location)
-                .expect("input file")
-                .read()
+        let cases: &[&[&[u8]]] = &[&[], &[b"writer payload"], &[b"writer", b" ", b"payload"]];
+        for (index, parts) in cases.iter().enumerate() {
+            let file_path = dir.path().join("writer").join(format!("{index}.json"));
+            let location = format!("file://{}", file_path.display());
+            let file_io = build_file_io_for_location(
+                &location,
+                local_test_binding(None, tokio::runtime::Handle::current()),
+            );
+            let mut writer = file_io
+                .new_output(&location)
+                .expect("output file")
+                .writer()
                 .await
-                .expect("read"),
-            "writer payload"
-        );
+                .expect("writer");
+            for part in *parts {
+                writer
+                    .write(Bytes::copy_from_slice(part))
+                    .await
+                    .expect("writer write");
+            }
+            let metadata = writer.close().await.expect("writer close");
+            let expected = parts.concat();
+            let input = file_io.new_input(&location).expect("input file");
+            assert_eq!(metadata.size, u64::try_from(expected.len()).unwrap());
+            assert_eq!(metadata.size, std::fs::metadata(&file_path).unwrap().len());
+            assert_eq!(metadata.size, input.metadata().await.unwrap().size);
+            assert_eq!(input.read().await.expect("read"), expected);
+        }
     }
 
     #[tokio::test]
@@ -2434,6 +2566,7 @@ pub(crate) mod manifest_stream_tests {
                 _phase: None,
                 stream: None,
                 local_closed: false,
+                accepted_bytes: 0,
             }))
         }
     }
@@ -2570,7 +2703,7 @@ pub(crate) mod manifest_stream_tests {
             gate.write_exited.store(true, Ordering::SeqCst);
             result
         }
-        async fn close(&mut self) -> Result<()> {
+        async fn close(&mut self) -> Result<FileMetadata> {
             self.inner.close().await
         }
     }
@@ -2684,6 +2817,19 @@ pub(crate) mod manifest_stream_tests {
             .read()
             .await
             .unwrap();
+        let stored_size = artifacts
+            .file_io()
+            .new_input(&manifest.manifest_path)
+            .unwrap()
+            .metadata()
+            .await
+            .unwrap()
+            .size;
+        assert_eq!(
+            u64::try_from(manifest.manifest_length).unwrap(),
+            stored_size
+        );
+        assert_eq!(stored_size, u64::try_from(bytes.len()).unwrap());
         assert_eq!(Manifest::parse_avro(&bytes).unwrap().entries().len(), 1);
         let list = crate::commit::staging::write_manifest_list(
             &artifacts,
@@ -2704,6 +2850,10 @@ pub(crate) mod manifest_stream_tests {
         let parsed = ManifestList::parse_with_version(&bytes, FormatVersion::V3).unwrap();
         assert_eq!(parsed.entries().len(), 1);
         assert_eq!(parsed.entries()[0].manifest_path, manifest.manifest_path);
+        assert_eq!(
+            parsed.entries()[0].manifest_length,
+            manifest.manifest_length
+        );
         assert_eq!(probe.writers.load(Ordering::SeqCst), 2);
         assert_eq!(probe.whole_writes.load(Ordering::SeqCst), 0);
         assert_eq!(probe.allocated_before_output.lock().unwrap().len(), 2);
