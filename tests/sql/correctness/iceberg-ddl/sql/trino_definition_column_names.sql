@@ -104,7 +104,7 @@ SELECT outer_x FROM trc_names_${uuid0}.names_${uuid0}.public_view AS r(outer_x);
 
 -- query 17
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
-CREATE OR REPLACE VIEW trc_names_${uuid0}.names_${uuid0}.public_view(a,b) AS SELECT CAST(1 AS integer);
+CREATE OR REPLACE VIEW public_view(a,b) AS SELECT CAST(1 AS integer);
 
 -- query 18
 SELECT public_x FROM trc_names_${uuid0}.names_${uuid0}.public_view;
