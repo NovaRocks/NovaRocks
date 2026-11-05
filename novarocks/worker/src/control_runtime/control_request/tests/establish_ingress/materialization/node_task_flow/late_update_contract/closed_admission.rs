@@ -181,7 +181,7 @@ fn real_node_closed_context_domain_refusal_physically_disposes_original_ingress(
             let refusal = resources._async_runtime.block_on(async {
                 tokio::time::timeout(
                     Duration::from_secs(5),
-                    control.advance_query_context_domain(request, deadline, ingress),
+                    control.advance_participation_domain(request, deadline, ingress),
                 )
                 .await
             });

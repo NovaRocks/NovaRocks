@@ -1317,7 +1317,7 @@ type PreparingReadHeldHook = Box<
         ParticipationRef,
         &mut TaskResources,
         TaskIdentity,
-        novarocks_worker_protocol::creation::RequestContext,
+        novarocks_worker_protocol::creation::RequestReplyTag,
     ) -> Result<(), Failure>,
 >;
 fn exercise_root_with_preparing_read_hook(
@@ -1462,7 +1462,8 @@ fn exercise_root_with_preparing_read_hook(
                     },
                 )
                 .map_err(|original| Box::new(original) as Failure)?;
-            let Some((actual_actor, work)) = read.endpoint.external.slot().context_author() else {
+            let Some((actual_actor, work)) = read.endpoint.external.slot().participation_author()
+            else {
                 return Err(Box::new((
                     "the original preparing read has no actual R address",
                     read,
@@ -1478,7 +1479,7 @@ fn exercise_root_with_preparing_read_hook(
             // The original accepted but still-preparing CountOnly Task has no
             // dynamic-filter publication. Pure Core authors Idempotent here;
             // no payload is borrowed and no final-info tail can detach.
-            if actual_actor != context_actor()
+            if actual_actor != participation_actor()
                 || delivery.request() != metadata
                 || metadata.operation != operation
                 || metadata.deadline != deadline

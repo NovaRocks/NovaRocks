@@ -476,7 +476,7 @@ fn real_node_late_update_during_accepted_normal_retirement_keeps_original_termin
         move |scene, participation, resources| {
             let held_observation = observed.clone();
             let hook: PreparingReadHeldHook = Box::new(
-                move |scene, participation, resources, task, old_request| {
+                move |scene, participation, resources, task, old_request| -> Result<(), Failure> {
                     // The original preparing GetDynamicFilters delivery is still
                     // alive with its actual non-final-info Task-causal route;
                     // no additional Source, Work, counter or Core fact is minted.

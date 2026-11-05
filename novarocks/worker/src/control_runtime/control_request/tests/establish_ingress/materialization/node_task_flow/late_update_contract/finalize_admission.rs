@@ -68,7 +68,7 @@ fn real_node_late_update_after_finalize_before_retire_handoff_keeps_original_ter
                 task,
             };
             let hook: PreparingReadHeldHook = Box::new(
-                move |scene, participation, resources, task, old_request| {
+                move |scene, participation, resources, task, old_request| -> Result<(), Failure> {
                     let mut actual = None;
                     let window = wait_until(|| {
                         actual = scene
