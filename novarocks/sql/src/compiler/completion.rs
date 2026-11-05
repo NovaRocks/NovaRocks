@@ -3494,10 +3494,6 @@ fn view_fact_bytes(view: &SqlViewDefinition) -> Result<u64, CompletionProtocolEr
         checked_sum(view.columns.iter().map(|column| {
             checked_sum([
                 arc_slice_bytes::<u8>(column.name.len()),
-                column
-                    .source_field_name
-                    .as_ref()
-                    .map_or(Ok(0), |name| arc_slice_bytes::<u8>(name.len())),
                 function_value_type_bytes(&column.value_type),
             ])
         })),

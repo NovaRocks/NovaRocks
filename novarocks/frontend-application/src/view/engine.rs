@@ -38,7 +38,7 @@ use novarocks_query_application::view::{ViewRequestContext, ViewService, ViewSta
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,
-    ConnectorViewRequest, ConnectorViewSourceFormat, CreateOrReplacePolicy, DropPolicy,
+    ConnectorViewRequest, CreateOrReplacePolicy, DropPolicy,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -136,7 +136,6 @@ impl ViewEngine for FrontendViewEngine {
             .columns
             .into_iter()
             .map(|column| novarocks_spi::connector::ConnectorViewColumn {
-                source_field_name: column.source_field_name,
                 name: column.name,
                 value_type: column.value_type,
             })
@@ -161,7 +160,6 @@ impl ViewEngine for FrontendViewEngine {
                     raw_sql: Arc::from(request.definition.raw_query_source),
                     default_catalog: Some(Arc::from(request.definition.resolution.default_catalog)),
                     default_namespace: Arc::from(request.definition.resolution.default_database),
-                    source_format: Some(ConnectorViewSourceFormat::EffectiveUserSourceV1),
                     columns,
                 },
                 comment: request.comment.map(Arc::from),
@@ -296,11 +294,7 @@ impl ViewEngine for FrontendViewEngine {
             preparation = preparation.continue_catalog(facts.into_boxed_slice())?;
         }
         preparation
-            .analyze_view_definition(
-                request.columns,
-                self.function_catalog(),
-                self.kernel.constant_policy(),
-            )
+            .analyze_view_definition(self.function_catalog(), self.kernel.constant_policy())
             .map(|columns| columns.into_vec())
     }
 }
@@ -324,12 +318,6 @@ fn resolved_external_view(
     )?;
     Ok(ResolvedExternalView {
         definition,
-        column_names: view
-            .definition
-            .columns
-            .iter()
-            .map(|column| column.name.to_string())
-            .collect(),
         comment: view.comment.map(|comment| comment.to_string()),
         properties: view
             .properties
@@ -401,11 +389,10 @@ mod tests {
         let request = CreateExternalViewRequest {
             target: target.clone(),
             columns: vec![ViewColumnDefinition {
-                source_field_name: Some("sale_count".into()),
                 name: "sale_count".into(),
                 value_type: novarocks_type_contract::FunctionValueType::new(
                     arrow::datatypes::DataType::Int64,
-                    false,
+                    true,
                 ),
             }],
             definition: PersistedQueryDefinition::new(
@@ -422,7 +409,6 @@ mod tests {
         };
         let resolved = ResolvedExternalView {
             definition: request.definition.clone(),
-            column_names: vec!["sale_count".to_string()],
             comment: request.comment.clone(),
             properties: HashMap::new(),
         };

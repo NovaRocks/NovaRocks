@@ -3791,7 +3791,6 @@ mod tests {
                         raw_sql: "SELECT 1".into(),
                         default_catalog: None,
                         default_namespace: table.namespace.clone(),
-                        source_format: None,
                         columns: Vec::new().into(),
                     },
                     comment: None,
@@ -4424,18 +4423,30 @@ mod tests {
                     policy: DropPolicy::FailIfMissing,
                 }
             } else {
-                ConnectorCatalogMutationOperation::CreateView { view,
-                definition: novarocks_spi::connector::ConnectorViewDefinition {
-                    dialect: novarocks_spi::connector::ConnectorViewDialect::StarRocks,
-                    raw_sql: "select 1 as a".into(), default_catalog: Some("source".into()), default_namespace: "source_db".into(),
-                    source_format: Some(novarocks_spi::connector::ConnectorViewSourceFormat::EffectiveUserSourceV1),
-                    columns: vec![novarocks_spi::connector::ConnectorViewColumn {
-                        source_field_name: Some("a".into()), name: "a".into(),
-                        value_type: novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int32, true),
-                    }].into(),
-                }, comment: None, properties: vec![],
-                policy: if mode == "replace" { CreateOrReplacePolicy::ReplaceIfExists } else { CreateOrReplacePolicy::FailIfExists },
-            }
+                ConnectorCatalogMutationOperation::CreateView {
+                    view,
+                    definition: novarocks_spi::connector::ConnectorViewDefinition {
+                        dialect: novarocks_spi::connector::ConnectorViewDialect::StarRocks,
+                        raw_sql: "select 1 as a".into(),
+                        default_catalog: Some("source".into()),
+                        default_namespace: "source_db".into(),
+                        columns: vec![novarocks_spi::connector::ConnectorViewColumn {
+                            name: "a".into(),
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                arrow::datatypes::DataType::Int32,
+                                true,
+                            ),
+                        }]
+                        .into(),
+                    },
+                    comment: None,
+                    properties: vec![],
+                    policy: if mode == "replace" {
+                        CreateOrReplacePolicy::ReplaceIfExists
+                    } else {
+                        CreateOrReplacePolicy::FailIfExists
+                    },
+                }
             },
             context: context(),
         }
@@ -4450,6 +4461,60 @@ mod tests {
             "version-log":[{"version-id":1, "timestamp-ms":1600000000000_i64}],
             "schemas":[{"type":"struct", "schema-id":0, "fields":[{"id":1, "name":"a", "required":false, "type":"int"}]}], "properties":{}
         }})
+    }
+
+    #[test]
+    fn unsupported_view_types_are_typed_and_never_dispatch_create_or_replace() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for mode in ["create", "replace"] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/tables",
+                        Reply::json(200, &serde_json::json!({"identifiers":[]})),
+                    )
+                    .on(
+                        "HEAD",
+                        "/v1/namespaces/db/views/v",
+                        Reply::status(if mode == "create" { 404 } else { 200 }),
+                    )
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/views/v",
+                        Reply::json(200, &complete_view_response()),
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let mut request = view_request(&provider, mode);
+            let ConnectorCatalogMutationOperation::CreateView { definition, .. } =
+                &mut request.operation
+            else {
+                unreachable!()
+            };
+            definition.raw_sql = "SELECT CAST(1 AS tinyint) AS a".into();
+            definition.columns = vec![novarocks_spi::connector::ConnectorViewColumn {
+                name: "a".into(),
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int8,
+                    false,
+                ),
+            }]
+            .into();
+            let ExternalMutationOutcome::KnownUncommitted { failure, .. } =
+                provider.execute(request).unwrap()
+            else {
+                panic!("unsupported view declaration must fail before publication")
+            };
+            assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unsupported);
+            assert!(
+                server
+                    .requests()
+                    .iter()
+                    .all(|request| request.method != "POST")
+            );
+        }
     }
 
     #[test]

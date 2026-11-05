@@ -1255,7 +1255,6 @@ impl SqlResolvedMvRefreshInput {
     ) -> Result<Self, crate::analyze_error::AnalyzeError> {
         let names = crate::analysis::schema::validate_definition_column_names(
             &resolved.output_columns,
-            &[],
             None,
         )?;
         Ok(Self::from_validated_analysis(resolved, names))

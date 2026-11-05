@@ -582,13 +582,25 @@ impl FunctionValueType {
     /// Logical overload rule that explicitly permits nested NULL widening.
     /// Scalar parameters, nominal identities and semantic field names remain.
     pub fn same_semantics_ignoring_nullability(&self, other: &Self) -> bool {
+        self.same_semantics_ignoring_nullability_observed(other, || {
+            Ok::<(), crate::ValueTypeError>(())
+        })
+        .unwrap_or(false)
+    }
+
+    /// Observe the same logical comparison without adopting the other layout.
+    /// The caller retains the original value binding and observation failure.
+    pub fn same_semantics_ignoring_nullability_observed<E: From<crate::ValueTypeError>>(
+        &self,
+        other: &Self,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
         typed_value::compatible(
             self.value_type(),
             other.value_type(),
             typed_value::Nullability::IgnoreAll,
-            &mut || Ok::<(), crate::ValueTypeError>(()),
+            &mut observe,
         )
-        .unwrap_or(false)
     }
 }
 

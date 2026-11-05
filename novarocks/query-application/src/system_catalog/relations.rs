@@ -192,6 +192,34 @@ mod tests {
                 pair.required_inputs(need),
                 Some(SystemCatalogInputRequirement::Schemas)
             );
+            let original = pair
+                .system_catalog()
+                .resolve(
+                    &need.relation().namespace,
+                    &need.relation().table,
+                    &super::super::SystemCatalogInputs {
+                        catalog_name: "ice",
+                        schema_names: &schemas,
+                        table_names: &[],
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert!(!original.columns[0].nullable);
+            assert!(
+                original
+                    .columns
+                    .iter()
+                    .find(|column| column.name == "sql_path")
+                    .unwrap()
+                    .nullable
+            );
+            let source_column = SqlInlineColumn::from_catalog_column(
+                &original.columns[0],
+                &SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            assert!(!source_column.value_type.nullable());
             let data = pair
                 .materialize(
                     need,
@@ -211,7 +239,6 @@ mod tests {
                     .continue_catalog(vec![fact].into_boxed_slice())
                     .unwrap()
                     .analyze_view_definition(
-                        &[],
                         novarocks_sql::compiler::builtin_sql_function_catalog(),
                         crate::completed_plan_fixture::test_constant_policy(),
                     )
@@ -219,7 +246,7 @@ mod tests {
             );
         }
         assert_eq!(declarations[0], declarations[1]);
-        assert!(!declarations[0][0].value_type.nullable());
+        assert!(declarations[0][0].value_type.nullable());
         assert!(declarations[0][2].value_type.nullable());
         assert_eq!(
             declarations[0][2].value_type.data_type(),

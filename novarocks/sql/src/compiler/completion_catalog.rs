@@ -369,7 +369,7 @@ fn same_view_version(
     }
     for (left, right) in left.columns.iter().zip(right.columns.iter()) {
         work.step()?;
-        if left.name != right.name || left.source_field_name != right.source_field_name {
+        if left.name != right.name {
             return Ok(false);
         }
         let equal = left

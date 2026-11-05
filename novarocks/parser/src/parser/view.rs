@@ -20,7 +20,6 @@
 use crate::{
     ParseError, Span,
     ast::{CreateView, DropView, ShowCreateView, ShowViews, Statement, ViewStatement},
-    token::Symbol,
 };
 
 use super::{StatementParser, query};
@@ -65,11 +64,6 @@ fn parse_create(parser: &mut StatementParser<'_, '_>) -> Result<Statement, Parse
         return Err(parser.unexpected("CREATE OR REPLACE VIEW without IF NOT EXISTS"));
     }
     let name = parser.parse_object_name()?;
-    let columns = if parser.current_is_symbol(Symbol::LParen) {
-        parse_columns(parser)?
-    } else {
-        Vec::new()
-    };
     let comment = if parser.consume_if_word("COMMENT") {
         Some(parser.parse_literal()?)
     } else {
@@ -91,7 +85,6 @@ fn parse_create(parser: &mut StatementParser<'_, '_>) -> Result<Statement, Parse
         or_replace,
         if_not_exists,
         name,
-        columns,
         comment,
         query,
         raw_query_source,
@@ -141,21 +134,6 @@ fn parse_show_create(parser: &mut StatementParser<'_, '_>) -> Result<Statement, 
         name,
         span,
     })))
-}
-
-fn parse_columns(
-    parser: &mut StatementParser<'_, '_>,
-) -> Result<Vec<crate::ast::Ident>, ParseError> {
-    parser.consume_symbol(Symbol::LParen)?;
-    let mut columns = Vec::new();
-    loop {
-        columns.push(parser.parse_ident()?);
-        if parser.consume_if_symbol(Symbol::RParen) {
-            break;
-        }
-        parser.consume_symbol(Symbol::Comma)?;
-    }
-    Ok(columns)
 }
 
 fn consume_if_not_exists(parser: &mut StatementParser<'_, '_>) -> Result<bool, ParseError> {
@@ -221,5 +199,34 @@ mod source_tests {
             };
             assert_eq!(create.raw_query_source, body);
         }
+    }
+
+    #[test]
+    fn create_view_column_lists_fail_at_the_original_as_position() {
+        for source in [
+            "CREATE VIEW v(x) AS SELECT 1",
+            "CREATE OR REPLACE VIEW ice.db.v(x, y) AS SELECT 1, 2",
+            "CREATE VIEW `v` (`x`) AS SELECT 1",
+        ] {
+            let error = crate::parse(source).unwrap_err();
+            let crate::ParserError::Parse(ParseError::UnexpectedToken { span, .. }) = error else {
+                panic!("definition column lists must fail through the original syntax error")
+            };
+            assert_eq!(source.get(span.start()..span.end()), Some("("));
+        }
+    }
+
+    #[test]
+    fn create_view_natural_aliases_keep_cte_and_relation_column_lists() {
+        let source = "CREATE VIEW v AS WITH c(x) AS (VALUES (1)) SELECT y AS named FROM c AS r(y)";
+        let statements = crate::parse(source).unwrap();
+        let Statement::View(ViewStatement::Create(create)) = &statements[0] else {
+            panic!("view")
+        };
+        assert_eq!(
+            create.raw_query_source,
+            "WITH c(x) AS (VALUES (1)) SELECT y AS named FROM c AS r(y)"
+        );
+        crate::parse(&crate::printer::print_statement(&statements[0])).unwrap();
     }
 }

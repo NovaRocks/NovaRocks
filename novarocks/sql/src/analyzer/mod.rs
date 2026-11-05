@@ -28,6 +28,15 @@ pub(crate) fn inline_column_value_type(
     helpers::column_value_type(column, control).map_err(Into::into)
 }
 
+/// A view TypeId carries no value NULL promises. Reuse the original recursive
+/// declaration author without changing the analyzed source or its domains.
+pub(crate) fn view_value_type(
+    value: &novarocks_type_contract::FunctionValueType,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<novarocks_type_contract::FunctionValueType, crate::compiler::SqlCompileError> {
+    root_output_declaration::widen_declaration(value, control)
+}
+
 #[cfg(test)]
 mod canonical_call_tests;
 #[cfg(test)]

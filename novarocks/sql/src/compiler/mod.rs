@@ -1368,7 +1368,6 @@ pub fn analyze_mv_refresh_input(
     .map_err(SqlCompileError::from)?;
     let names = crate::analysis::schema::validate_definition_column_names(
         &resolved.output_columns,
-        &[],
         query.span,
     )?;
     crate::planning::mv::validate_persistable_output(&resolved, &factory)

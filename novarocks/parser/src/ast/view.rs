@@ -22,7 +22,7 @@ use crate::{
     printer::{print_literal, print_object_name},
 };
 
-use super::{Fold, Ident, Literal, ObjectName, Query, Visit};
+use super::{Fold, Literal, ObjectName, Query, Visit};
 
 /// View commands owned by SQLP-2.
 // Keep statement variants inline so parser/visitor consumers retain a uniform typed AST.
@@ -52,11 +52,10 @@ pub struct CreateView {
     pub or_replace: bool,
     pub if_not_exists: bool,
     pub name: ObjectName,
-    pub columns: Vec<Ident>,
     pub comment: Option<Literal>,
     pub query: Query,
     /// Effective user query token range, including internal trivia, captured
-    /// before normalization or AST printing. Envelope and outer trivia are excluded.
+    /// before normalization or AST printing. The CREATE prefix and outer trivia are excluded.
     pub raw_query_source: String,
     /// Original body byte range for admission's exact occurrence substitutions.
     pub query_source_span: Span,
@@ -104,16 +103,6 @@ fn write_create(value: &CreateView, output: &mut String) {
         output.push_str("IF NOT EXISTS ");
     }
     output.push_str(&print_object_name(&value.name));
-    if !value.columns.is_empty() {
-        output.push_str(" (");
-        for (index, column) in value.columns.iter().enumerate() {
-            if index != 0 {
-                output.push_str(", ");
-            }
-            output.push_str(&render_ident(column));
-        }
-        output.push(')');
-    }
     if let Some(comment) = &value.comment {
         output.push_str(" COMMENT ");
         output.push_str(&print_literal(comment));
@@ -138,21 +127,10 @@ fn write_show(value: &ShowViews, output: &mut String) {
     }
 }
 
-fn render_ident(ident: &Ident) -> String {
-    if ident.quoted {
-        format!("`{}`", ident.value.replace('`', "``"))
-    } else {
-        ident.value.clone()
-    }
-}
-
 pub(crate) fn walk<V: Visit + ?Sized>(visitor: &mut V, statement: &ViewStatement) {
     match statement {
         ViewStatement::Create(value) => {
             visitor.visit_object_name(&value.name);
-            for column in &value.columns {
-                visitor.visit_ident(column);
-            }
             if let Some(comment) = &value.comment {
                 visitor.visit_literal(comment);
             }
@@ -172,11 +150,6 @@ pub(crate) fn fold<F: Fold + ?Sized>(folder: &mut F, statement: ViewStatement) -
     match statement {
         ViewStatement::Create(mut value) => {
             value.name = folder.fold_object_name(value.name);
-            value.columns = value
-                .columns
-                .into_iter()
-                .map(|column| folder.fold_ident(column))
-                .collect();
             value.comment = value.comment.map(|comment| folder.fold_literal(comment));
             value.query = folder.fold_query(value.query);
             ViewStatement::Create(value)

@@ -137,7 +137,6 @@ impl RootOutputSemantics {
                 .zip(self.definition_internal.iter())
                 .filter(|(_, internal)| !**internal)
                 .map(|(name, _)| name.as_deref()),
-            &[],
             self.source_span,
         )
     }
@@ -485,6 +484,36 @@ mod tests {
             let names = semantics.field_names(&columns).unwrap();
             assert_eq!(names[0].as_deref(), Some("a"), "{sql}");
             assert_eq!(names[1].as_deref(), Some("B"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn planned_bare_grouping_and_arithmetic_roots_keep_anonymous_fields() {
+        let catalog = crate::catalog::memory::PlannerMemoryCatalog::default();
+        for sql in [
+            "SELECT grouping(a) FROM (VALUES (CAST(1 AS integer))) AS t (a) GROUP BY ROLLUP (a)",
+            "SELECT x + 1 FROM (VALUES (CAST(1 AS integer))) AS t (x) ORDER BY 1",
+        ] {
+            let statements = novarocks_parser::parse(sql).unwrap();
+            let novarocks_parser::ast::Statement::Query(query) = &statements[0] else {
+                panic!("query")
+            };
+            let (resolved, ctes, mut factory) =
+                crate::analyzer::analyze(query, &catalog, "default").unwrap();
+            let fields = resolved.output_columns.clone();
+            assert_eq!(fields.len(), 1, "{sql}");
+            assert_eq!(fields[0].field_name, None, "{sql}");
+            let plan = crate::planner::plan_query(
+                resolved,
+                ctes,
+                &mut factory,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            let columns = crate::planner::plan_output_columns(&plan).unwrap();
+            let semantics =
+                RootOutputSemantics::bind_analyzed(&fields, &columns, &factory).unwrap();
+            assert_eq!(semantics.field_names(&columns).unwrap(), &[None], "{sql}");
         }
     }
 

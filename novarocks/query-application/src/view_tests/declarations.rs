@@ -52,7 +52,6 @@ pub(super) fn analyze_local_definition(
     }
     preparation
         .analyze_view_definition(
-            request.columns,
             novarocks_sql::compiler::builtin_sql_function_catalog(),
             crate::completed_plan_fixture::test_constant_policy(),
         )
@@ -97,21 +96,24 @@ fn assert_refused(
 }
 
 #[test]
-fn local_declarations_keep_source_header_complete_types_and_immutable_versions() {
+fn local_declarations_keep_natural_names_complete_types_and_immutable_versions() {
     let service = QueryViewService::new();
     let engine = engine();
     execute(
         &service,
         &engine,
-        "CREATE VIEW v(public_x) AS SELECT /* original */ 1 AS x",
+        "CREATE VIEW v AS SELECT /* original */ 1 AS public_x",
     )
     .unwrap();
     let original = service.catalog_snapshot().unwrap();
     let view = original.get(&identity("v")).unwrap();
-    assert_eq!(view.raw_sql.as_ref(), "SELECT /* original */ 1 AS x");
-    assert_eq!(view.columns[0].source_field_name.as_deref(), Some("x"));
+    assert_eq!(view.raw_sql.as_ref(), "SELECT /* original */ 1 AS public_x");
+    assert_eq!(
+        view.columns[0].value_type.data_type(),
+        &arrow::datatypes::DataType::Int64
+    );
     assert_eq!(view.columns[0].name.as_ref(), "public_x");
-    assert!(!view.columns[0].value_type.nullable());
+    assert!(view.columns[0].value_type.nullable());
     let old_version = view.version.clone();
     let old_type = view.columns[0].value_type.clone();
     execute(
@@ -151,7 +153,7 @@ fn invalid_local_declarations_never_publish_a_registry_entry() {
             AnalyzeErrorKind::DuplicateColumnName,
         ),
         (
-            "CREATE VIEW v(a,b) AS SELECT 1",
+            "CREATE VIEW v AS SELECT * FROM (SELECT 1 AS a) AS r(a,b)",
             AnalyzeErrorKind::MismatchedColumnAliases,
         ),
     ] {
@@ -204,14 +206,21 @@ fn local_recursion_preserves_the_original_analysis_layer_and_failed_replacement(
 }
 
 #[test]
-fn local_view_public_alias_does_not_hide_a_changed_dependency_header() {
+fn local_view_relation_alias_does_not_hide_changed_dependency_names() {
     let service = QueryViewService::new();
     let engine = engine();
     execute(&service, &engine, "CREATE VIEW base AS SELECT 1 AS x").unwrap();
     execute(
         &service,
         &engine,
-        "CREATE VIEW renamed(public_x) AS SELECT * FROM base",
+        "CREATE VIEW renamed AS SELECT * FROM base",
+    )
+    .unwrap();
+    analyze_snapshot_query(
+        &service.catalog_snapshot().unwrap(),
+        "SELECT * FROM renamed AS r(public_x)",
+        "db",
+        &novarocks_sql::sql_mode::SqlSemanticSettings::default(),
     )
     .unwrap();
     execute(
@@ -223,7 +232,7 @@ fn local_view_public_alias_does_not_hide_a_changed_dependency_header() {
     assert_refused(
         &service,
         &engine,
-        "CREATE VIEW consumer AS SELECT * FROM renamed",
+        "CREATE VIEW consumer AS SELECT * FROM renamed AS r(public_x)",
         AnalyzeErrorKind::ViewIsStale,
     );
     assert!(

@@ -187,11 +187,9 @@ impl ObservedView {
                 raw_sql: "SELECT 1 AS x".into(),
                 default_catalog: Some(self.descriptor.instance_id.as_str().into()),
                 default_namespace: "db".into(),
-                source_format: Some(ConnectorViewSourceFormat::EffectiveUserSourceV1),
                 columns: vec![ConnectorViewColumn {
-                    source_field_name: Some("x".into()),
                     name: "x".into(),
-                    value_type: FunctionValueType::new(arrow::datatypes::DataType::Int64, false),
+                    value_type: FunctionValueType::new(arrow::datatypes::DataType::Int64, true),
                 }]
                 .into(),
             },

@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlViewColumn {
-    pub source_field_name: Option<Arc<str>>,
     pub name: Arc<str>,
     pub value_type: FunctionValueType,
 }
@@ -56,13 +55,7 @@ impl SqlViewDefinition {
         }
         let mut names = std::collections::HashSet::new();
         for column in self.columns.iter() {
-            if column.name.is_empty()
-                || column
-                    .source_field_name
-                    .as_ref()
-                    .is_some_and(|name| name.is_empty())
-                || !names.insert(column.name.to_lowercase())
-            {
+            if column.name.is_empty() || !names.insert(column.name.to_lowercase()) {
                 return Err(
                     "stored view facts have an empty or duplicate declared column name".into(),
                 );

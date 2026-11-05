@@ -97,9 +97,6 @@ pub(crate) fn project_view(
     match value.definition.dialect {
         ConnectorViewDialect::StarRocks => {}
     }
-    match value.definition.source_format {
-        None | Some(ConnectorViewSourceFormat::EffectiveUserSourceV1) => {}
-    }
     if value.identity.instance_id != expected.instance_id
         || value.identity.namespace != expected.namespace
         || value.identity.view != expected.table
@@ -109,21 +106,12 @@ pub(crate) fn project_view(
             "view observation returned another relation identity",
         )));
     }
-    // Missing catalog has provider-defined meaning only for third-party
-    // metadata. The SPI has already refused missing Nova source fields.
-    let default_catalog = match (
-        &value.definition.default_catalog,
-        value.definition.source_format,
-    ) {
-        (Some(catalog), _) => catalog.clone(),
-        (None, None) => expected.instance_id.as_str().into(),
-        (None, Some(_)) => {
-            return Err(CatalogResolutionError::from_connector(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "versioned view definition is missing its saved catalog",
-            )));
-        }
-    };
+    // A standard view without a default catalog resolves within its storing catalog.
+    let default_catalog = value
+        .definition
+        .default_catalog
+        .clone()
+        .unwrap_or_else(|| expected.instance_id.as_str().into());
     let definition = Arc::new(SqlViewDefinition {
         identity: novarocks_types::naming::TableIdentity::new(
             expected.instance_id.as_str(),
@@ -139,7 +127,6 @@ pub(crate) fn project_view(
             .columns
             .iter()
             .map(|column| SqlViewColumn {
-                source_field_name: column.source_field_name.clone(),
                 name: column.name.clone(),
                 value_type: column.value_type.clone(),
             })

@@ -52,7 +52,6 @@ impl FakeViewEngine {
             target,
             ResolvedExternalView {
                 definition,
-                column_names: vec!["a".to_string()],
                 comment: None,
                 properties: HashMap::new(),
             },
@@ -85,11 +84,6 @@ impl ViewEngine for FakeViewEngine {
             request.target.clone(),
             ResolvedExternalView {
                 definition: request.definition.clone(),
-                column_names: request
-                    .columns
-                    .iter()
-                    .map(|column| column.name.to_string())
-                    .collect(),
                 comment: request.comment.clone(),
                 properties: request.properties.iter().cloned().collect(),
             },
@@ -139,26 +133,12 @@ impl ViewEngine for FakeViewEngine {
             SetExpr::Select(select) => select.projection.len(),
             _ => 1,
         };
-        if !request.columns.is_empty() && request.columns.len() != width {
-            return Err(novarocks_sql::compiler::SqlCompileError::Compilation(
-                format!(
-                    "view column list has {} names but the SELECT produces {width} columns",
-                    request.columns.len()
-                ),
-            ));
-        }
         Ok((0..width)
             .map(|index| ViewColumnDefinition {
-                source_field_name: Some(format!("c{}", index + 1).into()),
-                name: request
-                    .columns
-                    .get(index)
-                    .map(|name| name.value.clone())
-                    .unwrap_or_else(|| format!("c{}", index + 1))
-                    .into(),
+                name: format!("c{}", index + 1).into(),
                 value_type: novarocks_type_contract::FunctionValueType::new(
                     arrow::datatypes::DataType::Int64,
-                    false,
+                    true,
                 ),
             })
             .collect())
@@ -464,7 +444,7 @@ fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
     service
         .try_handle_statement(
             &engine,
-            "CREATE VIEW db.v (left_col, right_col) AS SELECT /* preserve */ 1,\n  2",
+            "CREATE VIEW db.v AS SELECT /* preserve */ 1 AS left_col,\n  2 AS right_col",
             context(Some("ice"), "ignored"),
         )
         .unwrap();
@@ -473,7 +453,7 @@ fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
     assert_eq!(created[0].target.database, "db");
     assert_eq!(
         created[0].definition.raw_query_source,
-        "SELECT /* preserve */ 1,\n  2"
+        "SELECT /* preserve */ 1 AS left_col,\n  2 AS right_col"
     );
     assert_eq!(
         created[0].definition.resolution.default_catalog, "ice",
@@ -489,15 +469,24 @@ fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
     );
     drop(created);
 
-    let error = declarations::execute(
-        &service,
-        &engine,
-        "CREATE VIEW ice.db.bad (only_one) AS SELECT 1, 2",
-    )
-    .unwrap_err();
-    assert_eq!(
-        error.analyze_error().map(|error| error.kind()),
-        Some(novarocks_sql::analyze_error::AnalyzeErrorKind::MismatchedColumnAliases)
+    let analyzed_before = *engine.analyzed_count.lock().unwrap();
+    assert!(
+        service
+            .try_handle_statement(
+                &engine,
+                "CREATE VIEW ice.db.bad (only_one) AS SELECT 1, 2",
+                context(None, "db"),
+            )
+            .is_err()
+    );
+    assert_eq!(*engine.analyzed_count.lock().unwrap(), analyzed_before);
+    assert!(
+        engine
+            .created
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.target.view != "bad")
     );
 
     let analyzed_before = *engine.analyzed_count.lock().unwrap();
@@ -530,7 +519,6 @@ fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
                 "db",
             )
             .unwrap(),
-            column_names: vec!["a".to_string()],
             comment: Some("say \"hello\"".to_string()),
             properties: HashMap::new(),
         },
@@ -556,9 +544,18 @@ fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
     assert_eq!(
         query_rows_at(&show_create, 1),
         vec![
-            "CREATE VIEW `ice`.`db`.`v` (`a`)\nCOMMENT \"say \\\"hello\\\"\"\nAS SELECT /* raw body */\n 1 AS a;"
+            "CREATE VIEW `ice`.`db`.`v`\nCOMMENT \"say \\\"hello\\\"\"\nAS SELECT /* raw body */\n 1 AS a;"
         ]
     );
+
+    let displayed = query_rows_at(&show_create, 1);
+    let reparsed = novarocks_parser::parse(&displayed[0]).unwrap();
+    let [ParsedStatement::View(novarocks_parser::ast::ViewStatement::Create(create))] =
+        reparsed.as_slice()
+    else {
+        panic!("SHOW CREATE must be a supported CREATE VIEW statement")
+    };
+    assert_eq!(create.raw_query_source, "SELECT /* raw body */\n 1 AS a");
 
     let show = query_result(
         service

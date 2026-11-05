@@ -3262,7 +3262,6 @@ fn build_candidate(
     let mut returned = returned;
     let output_names = crate::analysis::schema::validate_definition_column_names(
         &resolved.output_columns,
-        &[],
         definition.select_query.span,
     )?;
     let analyzed_outputs = resolved.output_columns.clone();

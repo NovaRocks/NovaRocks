@@ -134,7 +134,7 @@ SELECT x + 1 FROM (VALUES (CAST(1 AS integer))) AS t (x) ORDER BY 1;
 SELECT s.a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;
 
 -- query 37
-SELECT a2[1].a FROM (VALUES (ARRAY[CAST(ROW(1) AS STRUCT<a integer>)])) AS t (a2);
+SELECT a2[1].a FROM (VALUES ([CAST(ROW(1) AS STRUCT<a integer>)])) AS t (a2);
 
 -- query 38
 SELECT (s).a FROM (SELECT CAST(ROW(1) AS STRUCT<a integer>) AS s) AS t;

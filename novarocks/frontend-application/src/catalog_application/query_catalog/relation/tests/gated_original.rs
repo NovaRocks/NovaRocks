@@ -571,13 +571,13 @@ async fn original_system_gate_keeps_one_typed_observation_and_the_same_inline_me
         assert!(Arc::ptr_eq(first_data, second_data));
         assert_eq!(typed.calls.load(Ordering::SeqCst), 1);
         let columns = preparation.continue_catalog(vec![first].into_boxed_slice()).unwrap()
-            .analyze_view_definition(&[], novarocks_sql::compiler::builtin_sql_function_catalog(), crate::application::test_constant_policy()).unwrap();
+            .analyze_view_definition(novarocks_sql::compiler::builtin_sql_function_catalog(), crate::application::test_constant_policy()).unwrap();
         assert_eq!(columns.len(), 5);
         assert_eq!(columns[0].name.as_ref(), "catalog_name");
         assert_eq!(columns[4].name.as_ref(), "sql_path");
         assert_eq!(columns[4].value_type.data_type(), &arrow::datatypes::DataType::Utf8);
         assert!(columns[4].value_type.nullable());
-        assert!(!columns[0].value_type.nullable());
+        assert!(columns[0].value_type.nullable());
         assert_no_system_table_probe(&resolver);
         assert!(bindings.captured_bindings().is_empty());
     })).await;

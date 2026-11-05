@@ -100,10 +100,9 @@ pub(crate) fn apply_column_aliases(
     Ok(())
 }
 
-/// Definition checks follow original ordinal order, after any explicit list.
+/// Definitions require natural names in original visible occurrence order.
 pub(crate) fn validate_definition_column_names(
     fields: &[AnalyzedOutputField],
-    aliases: &[novarocks_parser::ast::Ident],
     span: impl Into<Option<novarocks_parser::Span>>,
 ) -> Result<Vec<String>, crate::analyze_error::AnalyzeError> {
     validate_definition_field_names(
@@ -111,7 +110,6 @@ pub(crate) fn validate_definition_column_names(
             .iter()
             .filter(|field| !field.is_internal)
             .map(|field| field.field_name.as_deref()),
-        aliases,
         span.into(),
     )
 }
@@ -119,30 +117,14 @@ pub(crate) fn validate_definition_column_names(
 /// A frozen root can use the same name check without rebuilding analysis fields.
 pub(crate) fn validate_definition_field_names<'a>(
     fields: impl IntoIterator<Item = Option<&'a str>>,
-    aliases: &[novarocks_parser::ast::Ident],
     span: Option<novarocks_parser::Span>,
 ) -> Result<Vec<String>, crate::analyze_error::AnalyzeError> {
     use crate::analyze_error::AnalyzeError;
     let fields = fields.into_iter().collect::<Vec<_>>();
-    if !aliases.is_empty() && aliases.len() != fields.len() {
-        return Err(AnalyzeError::mismatched_column_aliases(
-            format!(
-                "Column alias list has {} entries but relation has {} columns available",
-                aliases.len(),
-                fields.len()
-            ),
-            span,
-        ));
-    }
     let mut seen = std::collections::HashSet::new();
     let mut names = Vec::with_capacity(fields.len());
     for (ordinal, field) in fields.into_iter().enumerate() {
-        let name = if aliases.is_empty() {
-            field
-        } else {
-            Some(aliases[ordinal].value.as_str())
-        };
-        let name = name.ok_or_else(|| {
+        let name = field.ok_or_else(|| {
             AnalyzeError::missing_column_name(
                 format!("Column name not specified at position {}", ordinal + 1),
                 span,
@@ -196,14 +178,14 @@ mod tests {
                 K::MissingColumnName,
             ),
         ] {
-            let error = validate_definition_column_names(&fields, &[], span).unwrap_err();
+            let error = validate_definition_column_names(&fields, span).unwrap_err();
             assert_eq!(error.kind(), kind);
             assert_eq!(error.span(), Some(span));
         }
     }
 
     #[test]
-    fn definition_lists_precede_name_checks_and_exclude_hidden_fields() {
+    fn relation_aliases_still_name_visible_fields_without_touching_hidden_fields() {
         let span = Span::new(0, 1);
         let fields = vec![
             field(None, false),
@@ -217,11 +199,7 @@ mod tests {
             span,
         });
         assert_eq!(
-            validate_definition_column_names(&fields, &aliases, span).unwrap(),
-            ["a", "B"]
-        );
-        assert_eq!(
-            validate_definition_column_names(&fields, &aliases[..1], span)
+            apply_column_aliases(&mut fields.clone(), &aliases[..1], span)
                 .unwrap_err()
                 .kind(),
             K::MismatchedColumnAliases

@@ -20,7 +20,7 @@
 -- Test Objective: Keep unaliased UNNEST fields anonymous and accept explicit relation column names for the existing scalar array shape.
 
 -- query 1
-SELECT * FROM (VALUES (ARRAY[CAST(1 AS integer)])) AS t (a) CROSS JOIN UNNEST(a);
+SELECT * FROM (VALUES ([CAST(1 AS integer)])) AS t (a) CROSS JOIN UNNEST(a);
 
 -- query 2
-SELECT x FROM (VALUES (ARRAY[CAST(1 AS integer)])) AS t (a) CROSS JOIN UNNEST(a) AS u (x);
+SELECT x FROM (VALUES ([CAST(1 AS integer)])) AS t (a) CROSS JOIN UNNEST(a) AS u (x);

@@ -93,7 +93,6 @@ fn declaration(values: Arc<SqlInlineRelation>, sql: &str) -> Box<[crate::catalog
         .continue_catalog(vec![fact].into_boxed_slice())
         .unwrap()
         .analyze_view_definition(
-            &[],
             builtin_sql_function_catalog(),
             crate::constant::test_constant_policy(),
         )
@@ -115,7 +114,7 @@ fn inline_values_keep_declared_schema_for_zero_rows_and_all_null_cells() {
         assert_eq!(declared[1].name.as_ref(), "optional");
         assert_eq!(
             declared[0].value_type,
-            FunctionValueType::new(DataType::Utf8, false)
+            FunctionValueType::new(DataType::Utf8, true)
         );
         assert_eq!(
             declared[1].value_type,
@@ -166,7 +165,8 @@ fn a_saved_view_uses_definition_inline_facts_without_borrowing_current_lookup_co
         };
         assert!(need.is_definition_context());
         assert_eq!(need.relation().fqn(), "ice.information_schema.schemata");
-        let fact = CatalogRelationFact::inline(need, data(rows)).unwrap();
+        let values = data(rows);
+        let fact = CatalogRelationFact::inline(need, values.clone()).unwrap();
         let source = source
             .continue_catalog(vec![fact].into_boxed_slice())
             .unwrap();
@@ -180,14 +180,58 @@ fn a_saved_view_uses_definition_inline_facts_without_borrowing_current_lookup_co
             &SqlCompileControl::unbounded(),
         )
         .unwrap();
-        assert_eq!(
-            resolved.output_columns[0].value_type,
-            view.columns[0].value_type
-        );
-        assert_eq!(
-            resolved.output_columns[1].value_type,
-            view.columns[1].value_type
-        );
+        let crate::analysis::QueryBody::Select(outer) = &resolved.body else {
+            panic!("outer SELECT")
+        };
+        let Some(crate::analysis::Relation::Subquery {
+            query: view_query, ..
+        }) = &outer.from
+        else {
+            panic!("saved view body")
+        };
+        let crate::analysis::QueryBody::Select(body) = &view_query.body else {
+            panic!("saved SELECT")
+        };
+        let Some(crate::analysis::Relation::Subquery {
+            query: inline_query,
+            ..
+        }) = &body.from
+        else {
+            panic!("original inline relation")
+        };
+        let crate::analysis::QueryBody::Values(inline) = &inline_query.body else {
+            panic!("original typed inline values")
+        };
+        for (ordinal, column) in values.columns.iter().enumerate() {
+            assert!(view.columns[ordinal].value_type.nullable());
+            for fields in [
+                &resolved.output_columns,
+                &view_query.output_columns,
+                &inline_query.output_columns,
+            ] {
+                assert_eq!(fields[ordinal].value_type, column.value_type);
+                assert_eq!(
+                    fields[ordinal].column_id,
+                    inline.output_columns[ordinal].column_id
+                );
+            }
+            assert!(matches!(
+                body.projection[ordinal].expr.kind,
+                crate::analysis::ExprKind::ColumnRef { column_id, .. }
+                    if column_id == inline.output_columns[ordinal].column_id
+            ));
+            for (row, cells) in inline.rows.iter().enumerate() {
+                let crate::analysis::ExprKind::Constant(value) = &cells[ordinal].kind else {
+                    panic!("original pool value")
+                };
+                assert_eq!(cells[ordinal].value_type, column.value_type);
+                assert_eq!(value.ordinal(), u32::try_from(row).unwrap());
+                assert!(Arc::ptr_eq(
+                    value.pool().array(),
+                    values.batches[0][ordinal].array()
+                ));
+            }
+        }
     }
 }
 
@@ -349,7 +393,6 @@ fn historical_inline_definition_is_a_pure_capability_refusal_and_never_current_v
         .unwrap();
     let error = preparation
         .analyze_view_definition(
-            &[],
             builtin_sql_function_catalog(),
             crate::constant::test_constant_policy(),
         )

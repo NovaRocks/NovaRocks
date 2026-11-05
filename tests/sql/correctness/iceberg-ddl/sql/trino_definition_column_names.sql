@@ -18,7 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=false
 -- @tags=column-naming,view-schema
--- Test Objective: Reject missing and duplicate definition names in output order; preserve explicit view and relation column lists.
+-- Test Objective: Reject missing and duplicate definition names in output order; reject view definition column lists and preserve relation column lists.
 
 -- query 1
 -- @skip_result_check=true
@@ -94,7 +94,7 @@ CREATE VIEW trc_names_${uuid0}.names_${uuid0}.case_duplicate AS SELECT CAST(1 AS
 CREATE VIEW default_catalog.default.trc_names_case_${uuid0} AS SELECT CAST(1 AS integer) AS a, CAST(2 AS integer) AS A;
 
 -- query 14
-CREATE VIEW trc_names_${uuid0}.names_${uuid0}.public_view(public_x) AS SELECT CAST(1 AS integer);
+CREATE VIEW trc_names_${uuid0}.names_${uuid0}.public_view AS SELECT CAST(1 AS integer) AS public_x;
 
 -- query 15
 SELECT public_x FROM trc_names_${uuid0}.names_${uuid0}.public_view;
@@ -103,14 +103,14 @@ SELECT public_x FROM trc_names_${uuid0}.names_${uuid0}.public_view;
 SELECT outer_x FROM trc_names_${uuid0}.names_${uuid0}.public_view AS r(outer_x);
 
 -- query 17
--- @expect_trino_error=MISMATCHED_COLUMN_ALIASES,USER_ERROR
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 CREATE OR REPLACE VIEW trc_names_${uuid0}.names_${uuid0}.public_view(a,b) AS SELECT CAST(1 AS integer);
 
 -- query 18
 SELECT public_x FROM trc_names_${uuid0}.names_${uuid0}.public_view;
 
 -- query 19
-CREATE VIEW default_catalog.default.trc_names_public_${uuid0}(public_x) AS SELECT CAST(1 AS integer);
+CREATE VIEW default_catalog.default.trc_names_public_${uuid0} AS SELECT CAST(1 AS integer) AS public_x;
 
 -- query 20
 SELECT public_x FROM default_catalog.default.trc_names_public_${uuid0};
@@ -119,7 +119,7 @@ SELECT public_x FROM default_catalog.default.trc_names_public_${uuid0};
 SELECT outer_x FROM default_catalog.default.trc_names_public_${uuid0} AS r(outer_x);
 
 -- query 22
--- @expect_trino_error=MISMATCHED_COLUMN_ALIASES,USER_ERROR
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 CREATE OR REPLACE VIEW default_catalog.default.trc_names_public_${uuid0}(a,b) AS SELECT CAST(1 AS integer);
 
 -- query 23

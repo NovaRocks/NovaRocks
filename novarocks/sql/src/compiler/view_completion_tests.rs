@@ -36,9 +36,8 @@ fn definition(need: &crate::compiler::CatalogRelationNeed, sql: &str) -> Arc<Sql
         default_catalog: need.relation().catalog.as_str().into(),
         default_database: need.relation().namespace.as_str().into(),
         columns: vec![SqlViewColumn {
-            source_field_name: Some("x".into()),
             name: "x".into(),
-            value_type: FunctionValueType::new(arrow::datatypes::DataType::Int64, false),
+            value_type: FunctionValueType::new(arrow::datatypes::DataType::Int64, true),
         }]
         .into(),
     })
@@ -191,7 +190,6 @@ fn expression_subquery_dependencies_use_saved_context_without_caller_ctes() {
     let mut view = (*definition(&need, "SELECT (SELECT x FROM leaf) AS x")).clone();
     view.default_database = "saved".into();
     view.columns = vec![SqlViewColumn {
-        source_field_name: Some("x".into()),
         name: "x".into(),
         value_type: FunctionValueType::new(arrow::datatypes::DataType::Int64, true),
     }]
@@ -380,7 +378,6 @@ fn definition_capture_freezes_exact_context_and_recognizes_replacement_before_ol
     let source = source.continue_catalog(vec![fact].into()).unwrap();
     assert!(source.needs().is_empty());
     let result = source.analyze_view_definition(
-        &[],
         crate::functions::builtin_sql_function_catalog(),
         crate::constant::test_constant_policy(),
     );

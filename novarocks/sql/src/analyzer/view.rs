@@ -117,12 +117,12 @@ impl AnalyzerContext<'_> {
         }
         let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Validate)
             .map_err(AnalyzeError::control)?;
-        let mut exact_columns = Vec::with_capacity(source.len());
+        let mut passthrough_columns = Vec::with_capacity(source.len());
         for (ordinal, (field, declared)) in source.iter().zip(view.columns.iter()).enumerate() {
             work.step().map_err(AnalyzeError::control)?;
-            let exact = field
+            let passthrough = field
                 .value_type
-                .exactly_equals_observed::<novarocks_functions::FunctionBindingError>(
+                .same_semantics_ignoring_nullability_observed::<novarocks_functions::FunctionBindingError>(
                     &declared.value_type,
                     || {
                         work.step()
@@ -130,8 +130,8 @@ impl AnalyzerContext<'_> {
                     },
                 )
                 .map_err(AnalyzeError::function_binding)?;
-            exact_columns.push(exact);
-            let fits = exact
+            passthrough_columns.push(passthrough);
+            let fits = passthrough
                 || field
                     .value_type
                     .fits_value_type_observed::<novarocks_functions::FunctionBindingError>(
@@ -142,16 +142,13 @@ impl AnalyzerContext<'_> {
                         },
                     )
                     .map_err(AnalyzeError::function_binding)?;
-            if !same_optional_name(
-                field.field_name.as_deref(),
-                declared.source_field_name.as_deref(),
-                &mut work,
-            )? || (!fits
-                && !store_compatible(
-                    field.value_type.value_type(),
-                    declared.value_type.value_type(),
-                    &mut work,
-                )?)
+            if !same_public_name(field.field_name.as_deref(), &declared.name, &mut work)?
+                || (!fits
+                    && !store_compatible(
+                        field.value_type.value_type(),
+                        declared.value_type.value_type(),
+                        &mut work,
+                    )?)
             {
                 return Err(AnalyzeError::view_is_stale(
                     format!(
@@ -164,8 +161,8 @@ impl AnalyzerContext<'_> {
             }
         }
         work.finish().map_err(AnalyzeError::control)?;
-        let exact = exact_columns.iter().all(|exact| *exact);
-        if exact {
+        let passthrough = passthrough_columns.iter().all(|passthrough| *passthrough);
+        if passthrough {
             for (field, declared) in resolved
                 .output_columns
                 .iter_mut()
@@ -179,8 +176,10 @@ impl AnalyzerContext<'_> {
             let input_columns = resolved.output_columns.clone();
             let mut projection = Vec::with_capacity(view.columns.len());
             let mut output_columns = Vec::with_capacity(view.columns.len());
-            for ((field, declared), exact) in
-                source.iter().zip(view.columns.iter()).zip(exact_columns)
+            for ((field, declared), passthrough) in source
+                .iter()
+                .zip(view.columns.iter())
+                .zip(passthrough_columns)
             {
                 self.check_control()?;
                 let expression = TypedExpr {
@@ -191,8 +190,15 @@ impl AnalyzerContext<'_> {
                     },
                     value_type: field.value_type.clone(),
                 };
-                let target = declared.value_type.clone();
-                if !exact {
+                // A view TypeId does not rewrite an existing runtime binding's
+                // NULL facts or physical layout. Only a logical conversion
+                // may introduce a cast and a new value occurrence.
+                let target = if passthrough {
+                    field.value_type.clone()
+                } else {
+                    declared.value_type.clone()
+                };
+                if !passthrough {
                     // Existing Struct CAST may select by name. An assignment
                     // needing a different ordinal mapping has no such authority.
                     let mut cast_work =
@@ -232,8 +238,12 @@ impl AnalyzerContext<'_> {
                     )
                     .map_err(AnalyzeError::view_cast_preparation)?;
                 }
-                let expression = self.cast_to_value_type(expression, target.clone(), span)?;
-                let id = if exact {
+                let expression = if passthrough {
+                    expression
+                } else {
+                    self.cast_to_value_type(expression, target.clone(), span)?
+                };
+                let id = if passthrough {
                     field.column_id
                 } else {
                     let id = self.alloc_column_id(None, field.name.clone(), target.clone());
@@ -301,13 +311,13 @@ impl AnalyzerContext<'_> {
     }
 }
 
-fn same_optional_name(
+fn same_public_name(
     left: Option<&str>,
-    right: Option<&str>,
+    right: &str,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<bool, AnalyzeError> {
-    Ok(match (left, right) {
-        (Some(left), Some(right)) => {
+    Ok(match left {
+        Some(left) => {
             for _ in left.chars().chain(right.chars()) {
                 work.step().map_err(AnalyzeError::control)?;
             }
@@ -316,8 +326,7 @@ fn same_optional_name(
             work.step().map_err(AnalyzeError::control)?;
             equal
         }
-        (None, None) => true,
-        _ => false,
+        None => false,
     })
 }
 
@@ -435,7 +444,8 @@ impl crate::catalog::IcebergMetadataTableProvider for SavedViewCatalog<'_> {
     }
 }
 
-/// Trino 483 TypeCoercion compatibility, plus every published NULL promise.
+/// Trino 483 TypeCoercion compatibility over the public view type. Its value
+/// nodes are nullable; required MAP keys retain their structural role.
 fn store_compatible(
     source: &ValueTypeRef,
     target: &ValueTypeRef,
@@ -619,12 +629,7 @@ mod tests {
                 .resolve_table_for_analysis(catalog, database, table)
         }
     }
-    fn declaration(
-        sql: &str,
-        source: Option<&str>,
-        published: &str,
-        ty: FunctionValueType,
-    ) -> SqlViewDefinition {
+    fn declaration(sql: &str, published: &str, ty: FunctionValueType) -> SqlViewDefinition {
         SqlViewDefinition {
             identity: TableIdentity::new("caller", "db", "v"),
             version: "version-1".into(),
@@ -632,9 +637,12 @@ mod tests {
             default_catalog: "caller".into(),
             default_database: "db".into(),
             columns: vec![SqlViewColumn {
-                source_field_name: source.map(Into::into),
                 name: published.into(),
-                value_type: ty,
+                value_type: crate::analyzer::view_value_type(
+                    &ty,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap(),
             }]
             .into(),
         }
@@ -679,8 +687,7 @@ mod tests {
             ("sql_mode='ERROR_IF_OVERFLOW'", "ERROR_IF_OVERFLOW"),
         ] {
             let catalog = catalog(declaration(
-                &format!("SELECT /*+ SET_VAR({hint}) */ 1 AS a"),
-                Some("a"),
+                &format!("SELECT /*+ SET_VAR({hint}) */ 1 AS x"),
                 "x",
                 FunctionValueType::new(D::Int64, false),
             ));
@@ -692,9 +699,9 @@ mod tests {
     }
 
     #[test]
-    fn published_names_keep_internal_labels_and_validate_header_before_outer_aliases() {
+    fn public_names_are_validated_before_outer_relation_aliases() {
         let ty = FunctionValueType::new(D::Int64, false);
-        let mut catalog = catalog(declaration("SELECT 1 AS a", Some("A"), "Published", ty));
+        let mut catalog = catalog(declaration("SELECT 1 AS published", "Published", ty));
         let resolved = analyze("SELECT Published FROM v", &catalog).unwrap();
         assert_eq!(
             resolved.output_columns[0].field_name.as_deref(),
@@ -711,18 +718,26 @@ mod tests {
         else {
             panic!("view relation");
         };
-        assert_eq!(query.output_columns[0].name, "a");
+        assert_eq!(query.output_columns[0].name, "published");
         assert_eq!(output_columns[0].field_name.as_deref(), Some("Published"));
-        catalog.views.get_mut("caller.db.v").unwrap().raw_sql = "SELECT 1 AS changed".into();
-        let error = analyze("SELECT caller_name FROM v AS t(caller_name)", &catalog).unwrap_err();
-        assert_eq!(error.kind(), AnalyzeErrorKind::ViewIsStale);
+        analyze("SELECT caller_name FROM v AS t(caller_name)", &catalog).unwrap();
+        for changed in [
+            "SELECT 1 AS changed",
+            "SELECT 1",
+            "VALUES (1)",
+            "SELECT 1 AS published, 2 AS extra",
+        ] {
+            catalog.views.get_mut("caller.db.v").unwrap().raw_sql = changed.into();
+            let error =
+                analyze("SELECT caller_name FROM v AS t(caller_name)", &catalog).unwrap_err();
+            assert_eq!(error.kind(), AnalyzeErrorKind::ViewIsStale, "{changed}");
+        }
     }
 
     #[test]
     fn saved_body_has_exact_context_and_its_own_cte_visibility() {
         let mut view = declaration(
-            "SELECT a FROM t",
-            Some("a"),
+            "SELECT a AS x FROM t",
             "x",
             FunctionValueType::new(D::Int64, false),
         );
@@ -749,7 +764,7 @@ mod tests {
             &[("ice".into(), "saved".into(), "t".into())]
         );
         let view = catalog.views.get_mut("caller.db.v").unwrap();
-        view.raw_sql = "WITH t AS (SELECT 1 AS a) SELECT a FROM t".into();
+        view.raw_sql = "WITH t AS (SELECT 1 AS a) SELECT a AS x FROM t".into();
         analyze("WITH t AS (SELECT 'caller' AS a) SELECT x FROM v", &catalog).unwrap();
         catalog.views.get_mut("caller.db.v").unwrap().raw_sql = "SELECT a FROM caller_only".into();
         let error = analyze(
@@ -772,14 +787,12 @@ mod tests {
     fn sibling_views_keep_cte_and_scalar_subquery_identities_distinct() {
         let ty = FunctionValueType::new(D::Int64, true);
         let mut catalog = catalog(declaration(
-            "WITH c AS (SELECT 1 AS a) SELECT (SELECT a FROM c) AS a",
-            Some("a"),
+            "WITH c AS (SELECT 1 AS a) SELECT (SELECT a FROM c) AS x",
             "x",
             ty.clone(),
         ));
         let mut sibling = declaration(
-            "WITH c AS (SELECT 2 AS a) SELECT (SELECT a FROM c) AS a",
-            Some("a"),
+            "WITH c AS (SELECT 2 AS a) SELECT (SELECT a FROM c) AS x",
             "x",
             ty,
         );
@@ -801,13 +814,8 @@ mod tests {
     #[test]
     fn stored_boundaries_wrap_stale_children_and_preserve_actual_control_or_source() {
         let ty = FunctionValueType::new(D::Int64, false);
-        let mut catalog = catalog(declaration(
-            "SELECT x FROM inner_view",
-            Some("x"),
-            "x",
-            ty.clone(),
-        ));
-        let mut inner = declaration("SELECT 1 AS changed", Some("a"), "x", ty.clone());
+        let mut catalog = catalog(declaration("SELECT x FROM inner_view", "x", ty.clone()));
+        let mut inner = declaration("SELECT 1 AS changed", "x", ty.clone());
         inner.identity.table = "inner_view".into();
         catalog.views.insert(inner.identity.fqn(), inner);
         let error = analyze("SELECT x FROM v", &catalog).unwrap_err();
@@ -860,14 +868,17 @@ mod tests {
 
     #[test]
     fn numeric_assignment_preserves_public_type_for_select_values_and_set_roots() {
-        for (sql, source, target) in [
-            ("SELECT CAST(1 AS INT) AS a", Some("a"), D::Int64),
-            ("VALUES (1)", None, D::Int64),
-            ("SELECT 1 AS a UNION ALL SELECT 2", Some("a"), D::Int64),
+        for (sql, target, runtime_nullable) in [
+            ("SELECT CAST(1 AS INT) AS x", D::Int64, true),
+            (
+                "SELECT x FROM (VALUES (CAST(1 AS INT))) AS t(x)",
+                D::Int64,
+                true,
+            ),
+            ("SELECT 1 AS x UNION ALL SELECT 2", D::Int64, false),
         ] {
             let catalog = catalog(declaration(
                 sql,
-                source,
                 "x",
                 FunctionValueType::new(target.clone(), true),
             ));
@@ -877,11 +888,14 @@ mod tests {
                 &target,
                 "{sql}"
             );
-            assert!(resolved.output_columns[0].value_type.nullable());
+            assert_eq!(
+                resolved.output_columns[0].value_type.nullable(),
+                runtime_nullable,
+                "{sql}"
+            );
         }
         let catalog = catalog(declaration(
-            "SELECT '1' AS a",
-            Some("a"),
+            "SELECT '1' AS x",
             "x",
             FunctionValueType::new(D::Int64, true),
         ));
@@ -900,23 +914,21 @@ mod tests {
         };
         let empty = Catalog::default();
         let (original, _, _) = crate::analyzer::analyze(query, &empty, "db").unwrap();
-        let mut view = declaration(
-            body,
-            Some("j"),
-            "j",
-            original.output_columns[0].value_type.clone(),
-        );
+        let mut view = declaration(body, "j", original.output_columns[0].value_type.clone());
         view.columns = original
             .output_columns
             .iter()
             .enumerate()
             .map(|(ordinal, field)| SqlViewColumn {
-                source_field_name: field.field_name.as_deref().map(Into::into),
                 name: field.field_name.as_deref().unwrap().into(),
                 value_type: if ordinal == 2 {
-                    FunctionValueType::new(D::Int64, field.value_type.nullable())
+                    FunctionValueType::new(D::Int64, true)
                 } else {
-                    field.value_type.clone()
+                    crate::analyzer::view_value_type(
+                        &field.value_type,
+                        &crate::compiler::SqlCompileControl::unbounded(),
+                    )
+                    .unwrap()
                 },
             })
             .collect::<Vec<_>>()
@@ -941,6 +953,10 @@ mod tests {
         };
         for ordinal in [0, 1] {
             assert_eq!(
+                wrapper.output_columns[ordinal].value_type,
+                inner.output_columns[ordinal].value_type
+            );
+            assert_eq!(
                 wrapper.output_columns[ordinal].column_id,
                 inner.output_columns[ordinal].column_id
             );
@@ -960,11 +976,167 @@ mod tests {
     }
 
     #[test]
+    fn public_view_type_does_not_freeze_a_row_child_nonnull_fact() {
+        let body = "SELECT ROW(1) AS x";
+        let empty = Catalog::default();
+        let original = analyze(body, &empty).unwrap();
+        let mut catalog = catalog(declaration(
+            body,
+            "x",
+            original.output_columns[0].value_type.clone(),
+        ));
+        let evolved_body = "SELECT ROW(CAST(NULL AS BIGINT)) AS x";
+        let expected = analyze(evolved_body, &empty).unwrap();
+        let evolved = catalog.views.get_mut("caller.db.v").unwrap();
+        evolved.version = "version-2".into();
+        evolved.raw_sql = evolved_body.into();
+        let resolved = analyze("SELECT x FROM v", &catalog).unwrap();
+        assert_eq!(
+            resolved.output_columns[0].value_type,
+            expected.output_columns[0].value_type
+        );
+        let K::Struct(fields) = resolved.output_columns[0].value_type.value_type().kind() else {
+            panic!("ROW output")
+        };
+        assert!(fields[0].value_type().nullable());
+    }
+
+    #[test]
+    fn nullable_only_map_and_nominal_columns_keep_actual_bindings_with_or_without_a_numeric_cast() {
+        use novarocks_types::schema::SqlType;
+        let body = "SELECT m, u, v, n FROM ice.saved.t";
+        for convert_numeric in [false, true] {
+            let mut catalog = Catalog::default();
+            catalog.tables.create_database("saved").unwrap();
+            let map = D::Map(
+                Arc::new(arrow::datatypes::Field::new(
+                    "entries",
+                    D::Struct(
+                        vec![
+                            arrow::datatypes::Field::new("key", D::Utf8, false),
+                            arrow::datatypes::Field::new("value", D::Int32, false),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            );
+            let columns = [
+                ("m", map, None),
+                ("u", D::FixedSizeBinary(16), Some(SqlType::Uuid)),
+                ("v", D::LargeBinary, Some(SqlType::Variant)),
+                ("n", D::Int32, None),
+            ]
+            .into_iter()
+            .map(|(name, data_type, logical_type)| ColumnDef {
+                name: name.into(),
+                data_type,
+                nullable: false,
+                write_default: None,
+                logical_type,
+            })
+            .collect();
+            crate::planning::catalog::register_test_connector_read_table(
+                &mut catalog.tables,
+                "saved",
+                "t",
+                columns,
+            )
+            .unwrap();
+            let original = analyze(body, &catalog).unwrap();
+            let control = crate::compiler::SqlCompileControl::unbounded();
+            let columns = original
+                .output_columns
+                .iter()
+                .enumerate()
+                .map(|(ordinal, field)| SqlViewColumn {
+                    name: field.field_name.as_deref().unwrap().into(),
+                    value_type: if convert_numeric && ordinal == 3 {
+                        FunctionValueType::new(D::Int64, true)
+                    } else {
+                        crate::analyzer::view_value_type(&field.value_type, &control).unwrap()
+                    },
+                })
+                .collect::<Vec<_>>();
+            let mut view = declaration(body, "m", original.output_columns[0].value_type.clone());
+            view.columns = columns.into();
+            catalog.views.insert(view.identity.fqn(), view);
+            let statements = novarocks_parser::parse("SELECT * FROM v").unwrap();
+            let [ast::Statement::Query(query)] = statements.as_slice() else {
+                panic!("query")
+            };
+            let (resolved, ctes, mut factory) =
+                crate::analyzer::analyze(query, &catalog, "db").unwrap();
+            let QueryBody::Select(outer) = &resolved.body else {
+                panic!("outer select")
+            };
+            let Some(Relation::Subquery {
+                query: view_query, ..
+            }) = &outer.from
+            else {
+                panic!("view")
+            };
+            for ordinal in 0..3 {
+                assert_eq!(
+                    view_query.output_columns[ordinal].value_type,
+                    original.output_columns[ordinal].value_type
+                );
+            }
+            if convert_numeric {
+                let QueryBody::Select(wrapper) = &view_query.body else {
+                    panic!("wrapper")
+                };
+                let Some(Relation::Subquery { query: inner, .. }) = &wrapper.from else {
+                    panic!("body")
+                };
+                for ordinal in 0..3 {
+                    assert_eq!(
+                        view_query.output_columns[ordinal].column_id,
+                        inner.output_columns[ordinal].column_id
+                    );
+                    assert!(matches!(
+                        wrapper.projection[ordinal].expr.kind,
+                        ExprKind::ColumnRef { .. }
+                    ));
+                    assert_eq!(
+                        wrapper.projection[ordinal].expr.value_type,
+                        inner.output_columns[ordinal].value_type
+                    );
+                }
+                assert_eq!(
+                    view_query.output_columns[3].value_type.data_type(),
+                    &D::Int64
+                );
+                assert!(!factory.same_value_origin(
+                    view_query.output_columns[3].column_id,
+                    inner.output_columns[3].column_id
+                ));
+            } else {
+                let QueryBody::Select(body) = &view_query.body else {
+                    panic!("body")
+                };
+                assert!(matches!(body.from, Some(Relation::Scan(_))));
+                assert_eq!(
+                    view_query.output_columns[3].value_type,
+                    original.output_columns[3].value_type
+                );
+            }
+            let fields = resolved.output_columns.clone();
+            let plan = crate::planner::plan_query(resolved, ctes, &mut factory, &control).unwrap();
+            let columns = crate::planner::plan_output_columns(&plan).unwrap();
+            crate::compiler::root_output::RootOutputSemantics::bind_analyzed(
+                &fields, &columns, &factory,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn signed_narrowing_never_turns_assignment_overflow_into_a_successful_null() {
         for value in ["1", "2147483648"] {
             let catalog = catalog(declaration(
-                &format!("SELECT CAST({value} AS BIGINT) AS a"),
-                Some("a"),
+                &format!("SELECT CAST({value} AS BIGINT) AS x"),
                 "x",
                 FunctionValueType::new(D::Int32, true),
             ));
@@ -978,18 +1150,16 @@ mod tests {
     fn header_case_folding_uses_the_same_unicode_names_as_scope() {
         let catalog = catalog(declaration(
             "SELECT 1 AS ä",
-            Some("Ä"),
-            "Public",
+            "Ä",
             FunctionValueType::new(D::Int64, false),
         ));
-        analyze("SELECT Public FROM v", &catalog).unwrap();
+        analyze("SELECT Ä FROM v", &catalog).unwrap();
     }
 
     #[test]
     fn recursive_definition_preserves_direct_replace_and_stored_boundary_layering() {
         let mut catalog = catalog(declaration(
-            "SELECT 1 AS a",
-            Some("a"),
+            "SELECT 1 AS x",
             "x",
             FunctionValueType::new(D::Int64, false),
         ));
@@ -1017,7 +1187,6 @@ mod tests {
         );
         let mut outer = declaration(
             "SELECT * FROM v",
-            Some("x"),
             "x",
             FunctionValueType::new(D::Int64, false),
         );
@@ -1041,7 +1210,6 @@ mod tests {
         catalog.target = None;
         let mut recursive = declaration(
             "SELECT * FROM b",
-            Some("x"),
             "x",
             FunctionValueType::new(D::Int64, false),
         );
@@ -1054,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_null_promises_and_row_ordinal_semantics_are_separate_from_cast_capability() {
+    fn public_view_nullability_and_row_ordinals_are_separate_from_cast_capability() {
         let control = crate::compiler::SqlCompileControl::unbounded();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
         let source = FunctionValueType::new(
@@ -1073,7 +1241,8 @@ mod tests {
             ))),
             false,
         );
-        assert!(!store_compatible(source.value_type(), target.value_type(), &mut work).unwrap());
+        let target = crate::analyzer::view_value_type(&target, &control).unwrap();
+        assert!(store_compatible(source.value_type(), target.value_type(), &mut work).unwrap());
         let source = FunctionValueType::new(
             D::Struct(
                 vec![
@@ -1102,14 +1271,12 @@ mod tests {
     #[test]
     fn nested_capability_context_uses_caller_spans_and_keeps_each_actual_definition_source() {
         let inner = declaration(
-            "\n\nSELECT 1 AS a",
-            Some("a"),
+            "\n\nSELECT 1 AS x",
             "x",
             FunctionValueType::new(D::Int64, false),
         );
         let mut outer = declaration(
             "\nSELECT x FROM v",
-            Some("x"),
             "x",
             FunctionValueType::new(D::Int64, false),
         );

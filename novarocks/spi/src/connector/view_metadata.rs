@@ -70,13 +70,7 @@ impl ConnectorViewMetadataValue {
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
-                "connector view metadata contains an empty source field or column name",
-            ));
-        }
-        if definition.source_format.is_some() && definition.default_catalog.is_none() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "versioned connector view source is missing its default catalog",
+                "connector view metadata contains an empty definition source or context",
             ));
         }
         properties.sort_by(|left, right| left.0.cmp(&right.0));
@@ -104,12 +98,7 @@ impl ConnectorViewMetadataValue {
                 .len()
                 .saturating_mul(std::mem::size_of::<super::ConnectorViewColumn>()),
             definition.columns.iter().fold(0usize, |bytes, column| {
-                bytes.saturating_add(column.name.len()).saturating_add(
-                    column
-                        .source_field_name
-                        .as_ref()
-                        .map_or(0, |name| name.len()),
-                )
+                bytes.saturating_add(column.name.len())
             }),
             comment.as_ref().map_or(0, |value| value.len()),
             properties.iter().fold(0usize, |bytes, (key, value)| {
@@ -276,9 +265,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::connector::{
-        ConnectorInstanceId, ConnectorProviderId, ConnectorViewDialect, ConnectorViewSourceFormat,
-    };
+    use crate::connector::{ConnectorInstanceId, ConnectorProviderId, ConnectorViewDialect};
 
     struct ViewCapability {
         descriptor: ConnectorInstanceDescriptor,
@@ -348,16 +335,14 @@ mod tests {
     pub(super) fn definition() -> ConnectorViewDefinition {
         ConnectorViewDefinition {
             dialect: ConnectorViewDialect::StarRocks,
-            raw_sql: Arc::from("SELECT 1"),
+            raw_sql: Arc::from("SELECT 1 AS c"),
             default_catalog: Some(Arc::from("catalog")),
             default_namespace: Arc::from("db"),
-            source_format: Some(ConnectorViewSourceFormat::EffectiveUserSourceV1),
             columns: vec![crate::connector::ConnectorViewColumn {
-                source_field_name: None,
                 name: "c".into(),
                 value_type: novarocks_type_contract::FunctionValueType::new(
                     arrow::datatypes::DataType::Int64,
-                    false,
+                    true,
                 ),
             }]
             .into(),
@@ -402,10 +387,10 @@ mod tests {
     }
 
     #[test]
-    fn spi5b_view_metadata_rejects_versioned_source_without_catalog() {
+    fn spi5b_view_metadata_keeps_an_omitted_standard_default_catalog() {
         let mut definition = definition();
         definition.default_catalog = None;
-        let error = ConnectorViewMetadataValue::try_new(
+        let value = ConnectorViewMetadataValue::try_new(
             identity(),
             definition,
             "same-observed-version".into(),
@@ -413,9 +398,9 @@ mod tests {
             Vec::new(),
             &context(),
         )
-        .expect_err("versioned source requires a frozen catalog");
+        .expect("standard view metadata may omit its default catalog");
 
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert_eq!(value.definition.default_catalog, None);
     }
 
     #[test]
@@ -510,14 +495,13 @@ mod declaration_tests {
     }
 
     #[test]
-    fn original_anonymous_header_and_complete_nullable_type_have_one_public_author() {
+    fn public_name_and_complete_type_have_one_declaration_author() {
         let value = metadata(super::tests::definition(), "version-1").unwrap();
         assert_eq!(value.version.as_ref(), "version-1");
-        assert_eq!(value.definition.columns[0].source_field_name, None);
         assert_eq!(value.definition.columns[0].name.as_ref(), "c");
         assert_eq!(
             value.definition.columns[0].value_type,
-            FunctionValueType::new(DataType::Int64, false)
+            FunctionValueType::new(DataType::Int64, true)
         );
     }
 
@@ -535,7 +519,7 @@ mod declaration_tests {
         );
         let mut definition = super::tests::definition();
         let mut column = definition.columns[0].clone();
-        column.source_field_name = Some("".into());
+        column.name = "".into();
         definition.columns = vec![column].into();
         assert_eq!(
             metadata(definition, "v").unwrap_err().kind(),
@@ -563,10 +547,9 @@ mod declaration_tests {
                 ))]
                 .into(),
             ),
-            false,
+            true,
         );
         definition.columns = vec![super::super::ConnectorViewColumn {
-            source_field_name: None,
             name: "c".into(),
             value_type,
         }]

@@ -149,7 +149,6 @@ impl ViewEngine for SessionViewEngine {
         assert!(preparation.needs().is_empty(), "literal definition fixture");
         preparation
             .analyze_view_definition(
-                request.columns,
                 novarocks_sql::compiler::builtin_sql_function_catalog(),
                 crate::application::test_constant_policy(),
             )

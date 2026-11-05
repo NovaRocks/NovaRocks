@@ -176,7 +176,6 @@ impl QueryViewService {
                 database: &definition.resolution.default_database,
                 target: &target,
                 query: &create_view.query,
-                columns: &create_view.columns,
                 local_views: &local_views,
             },
             connector_context,

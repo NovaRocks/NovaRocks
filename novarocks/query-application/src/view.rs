@@ -59,7 +59,6 @@ pub struct ViewDefinitionAnalysisRequest<'a> {
     pub database: &'a str,
     pub target: &'a ViewTarget,
     pub query: &'a Query,
-    pub columns: &'a [novarocks_parser::ast::Ident],
     pub local_views: &'a LocalViewSnapshot,
 }
 
@@ -77,7 +76,6 @@ pub struct CreateExternalViewRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedExternalView {
     pub definition: PersistedQueryDefinition,
-    pub column_names: Vec<String>,
     pub comment: Option<String>,
     pub properties: HashMap<String, String>,
 }

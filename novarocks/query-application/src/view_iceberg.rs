@@ -85,7 +85,6 @@ pub(crate) fn create_external_view(
             database: &definition.resolution.default_database,
             target: &target,
             query: &statement.query,
-            columns: &statement.columns,
             local_views,
         },
         connector_context,
@@ -161,15 +160,9 @@ pub(crate) fn show_create_view(
                 target.catalog, target.database, target.view
             )
         })?;
-    let columns = view
-        .column_names
-        .iter()
-        .map(|name| format!("`{name}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
     let mut ddl = format!(
-        "CREATE VIEW `{}`.`{}`.`{}` ({})",
-        target.catalog, target.database, target.view, columns
+        "CREATE VIEW `{}`.`{}`.`{}`",
+        target.catalog, target.database, target.view
     );
     if let Some(comment) = &view.comment {
         ddl.push_str(&format!("\nCOMMENT \"{}\"", comment.replace('"', "\\\"")));

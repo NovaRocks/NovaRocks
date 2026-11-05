@@ -174,7 +174,6 @@ fn assert_declaration(preparation: SqlCapturedCatalogPreparation, fact: CatalogR
         .continue_catalog(vec![fact].into_boxed_slice())
         .unwrap()
         .analyze_view_definition(
-            &[],
             novarocks_sql::compiler::builtin_sql_function_catalog(),
             crate::application::test_constant_policy(),
         )
@@ -200,7 +199,10 @@ fn assert_declaration(preparation: SqlCapturedCatalogPreparation, fact: CatalogR
         )
         .unwrap();
         assert_eq!(actual.name, expected.name);
-        assert_eq!(actual.value_type, expected.value_type);
+        assert_eq!(
+            actual.value_type,
+            expected.value_type.with_nullable(true).unwrap()
+        );
     }
 }
 const SQL: &str = "SELECT * FROM information_schema.schemata";
@@ -477,7 +479,6 @@ async fn absent_external_definition_system_catalog_answers_the_exact_need_before
             .unwrap();
         assert!(completed.needs().is_empty());
         let result = completed.analyze_view_definition(
-            &[],
             novarocks_sql::compiler::builtin_sql_function_catalog(),
             crate::application::test_constant_policy(),
         );

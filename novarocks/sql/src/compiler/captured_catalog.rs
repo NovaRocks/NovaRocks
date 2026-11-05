@@ -80,11 +80,9 @@ impl SqlCapturedCatalogPreparation {
     }
 
     /// Analyze the original definition after every exact dependency is known.
-    /// The source header precedes the public alias list and is never rewritten
-    /// from that list or from planner display labels.
+    /// Every public view name comes from the query's analyzed visible fields.
     pub fn analyze_view_definition(
         self,
-        aliases: &[novarocks_parser::ast::Ident],
         functions: &dyn super::SqlFunctionCatalog,
         policy: super::ConstantPolicy,
     ) -> Result<Box<[crate::catalog::SqlViewColumn]>, SqlCompileError> {
@@ -109,7 +107,6 @@ impl SqlCapturedCatalogPreparation {
         .map_err(SqlCompileError::from)?;
         let names = crate::analysis::schema::validate_definition_column_names(
             &resolved.output_columns,
-            aliases,
             query.span,
         )?;
         crate::planning::mv::validate_persistable_output(&resolved, &factory)
@@ -127,9 +124,8 @@ impl SqlCapturedCatalogPreparation {
         {
             work.step()?;
             columns.push(crate::catalog::SqlViewColumn {
-                source_field_name: source.field_name.as_deref().map(std::sync::Arc::from),
                 name: name.into(),
-                value_type: source.value_type.clone(),
+                value_type: crate::analyzer::view_value_type(&source.value_type, &self.control)?,
             });
         }
         work.finish()?;
@@ -273,18 +269,15 @@ mod view_definition_tests {
         )?;
         assert!(source.needs().is_empty());
         source.analyze_view_definition(
-            &create.columns,
             crate::functions::builtin_sql_function_catalog(),
             crate::constant::test_constant_policy(),
         )
     }
 
     #[test]
-    fn public_definition_aliases_do_not_rewrite_the_original_optional_header_or_types() {
-        let columns = definition("CREATE VIEW v(PublicName, SmallValue) AS WITH t AS (SELECT 1 AS x) SELECT x AS MiXeD, CAST(2 AS SMALLINT) FROM t").unwrap();
-        assert_eq!(columns[0].source_field_name.as_deref(), Some("MiXeD"));
+    fn public_definition_uses_query_names_and_keeps_types_without_null_promises() {
+        let columns = definition("CREATE VIEW v AS WITH t AS (SELECT 1 AS x) SELECT x AS PublicName, CAST(2 AS SMALLINT) AS SmallValue FROM t").unwrap();
         assert_eq!(columns[0].name.as_ref(), "PublicName");
-        assert_eq!(columns[1].source_field_name, None);
         assert_eq!(columns[1].name.as_ref(), "SmallValue");
         assert_eq!(
             columns[1].value_type.data_type(),
@@ -294,12 +287,42 @@ mod view_definition_tests {
     }
 
     #[test]
-    fn definition_terminal_keeps_width_then_original_ordinal_name_error_order() {
+    fn public_view_types_widen_nested_nullability_without_erasing_domains() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_type_contract::{FunctionValueType, ValueKind, ValueLogicalType};
+        let source = FunctionValueType::new(
+            DataType::Struct(vec![Field::new("a", DataType::Int32, false)].into()),
+            false,
+        );
+        let public =
+            crate::analyzer::view_value_type(&source, &SqlCompileControl::unbounded()).unwrap();
+        assert!(!source.nullable());
+        let ValueKind::Struct(source_fields) = source.value_type().kind() else {
+            panic!("source Struct declaration")
+        };
+        assert!(!source_fields[0].value_type().nullable());
+        assert!(public.nullable());
+        let ValueKind::Struct(fields) = public.value_type().kind() else {
+            panic!("public Struct declaration")
+        };
+        assert_eq!(fields[0].name(), "a");
+        assert!(fields[0].value_type().nullable());
+        assert_eq!(
+            public.data_type(),
+            &DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into())
+        );
+        let columns = definition("CREATE VIEW v AS SELECT array<json>[] AS js").unwrap();
+        assert!(columns[0].value_type.nullable());
+        let ValueKind::List(item) = columns[0].value_type.value_type().kind() else {
+            panic!("ARRAY declaration")
+        };
+        assert!(item.nullable());
+        assert_eq!(item.kind(), &ValueKind::Nominal(ValueLogicalType::Json));
+    }
+
+    #[test]
+    fn definition_terminal_keeps_original_ordinal_name_error_order() {
         for (sql, expected) in [
-            (
-                "CREATE VIEW v(x) AS SELECT 1, 2",
-                AnalyzeErrorKind::MismatchedColumnAliases,
-            ),
             (
                 "CREATE VIEW v AS SELECT 1 AS A, 2 AS a, 3",
                 AnalyzeErrorKind::DuplicateColumnName,
@@ -309,7 +332,7 @@ mod view_definition_tests {
                 AnalyzeErrorKind::MissingColumnName,
             ),
             (
-                "CREATE VIEW v(A,a) AS SELECT 1, 2",
+                "CREATE VIEW v AS SELECT 1 AS A, 2 AS a",
                 AnalyzeErrorKind::DuplicateColumnName,
             ),
         ] {
@@ -325,7 +348,6 @@ mod view_definition_tests {
     fn set_definition_uses_the_original_first_branch_name_and_type() {
         let columns =
             definition("CREATE VIEW v AS SELECT 1 AS FirstName UNION ALL SELECT 2").unwrap();
-        assert_eq!(columns[0].source_field_name.as_deref(), Some("FirstName"));
         assert_eq!(columns[0].name.as_ref(), "FirstName");
         assert_eq!(
             columns[0].value_type.data_type(),
@@ -353,7 +375,6 @@ mod view_definition_tests {
         .unwrap();
         assert!(matches!(
             source.analyze_view_definition(
-                &[],
                 crate::functions::builtin_sql_function_catalog(),
                 crate::constant::test_constant_policy()
             ),
